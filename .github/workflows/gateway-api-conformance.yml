@@ -111,11 +111,10 @@ jobs:
             --set controlPlane.env.FERRUM_K8S_WATCH_GATEWAY_API_CRDS=true \
             --set controlPlane.env.FERRUM_K8S_WATCH_ISTIO_CRDS=false \
             --set controlPlane.env.FERRUM_K8S_WATCH_MESH_CONFIG=false
-          # The conformance test step is intentionally non-gating, but the
-          # control plane never becoming ready is an infrastructure failure
-          # (image pull error, RBAC misconfig, crashloop). Surface that
-          # explicitly instead of silently running tests against a dead
-          # controller and reporting a wall of unrelated failures.
+          # The conformance assertions are gating, so a dead control plane is
+          # an infrastructure failure (image pull error, RBAC misconfig,
+          # crashloop). Surface that explicitly instead of running tests
+          # against a dead controller and reporting unrelated failures.
           if ! kubectl -n ferrum rollout status deployment/ferrum-mesh-control-plane --timeout=180s; then
             kubectl -n ferrum describe pods || true
             kubectl -n ferrum logs deployment/ferrum-mesh-control-plane --all-containers --tail=200 || true
@@ -157,9 +156,9 @@ jobs:
           status=${PIPESTATUS[0]}
           echo "exit_code=$status" >> "$GITHUB_OUTPUT"
           if [ "$status" -ne 0 ]; then
-            echo "::warning title=Gateway API conformance failed::go test exited with $status; artifacts were uploaded for non-gating review"
+            echo "::error title=Gateway API conformance failed::go test exited with $status; diagnostics will be uploaded"
+            exit "$status"
           fi
-          exit 0
 
       - name: Collect diagnostics
         if: always()
