@@ -176,11 +176,14 @@ Previously deferred and now flipped to `supported`:
 - `istio_virtual_service.authority.{exact,prefix,regex}` — first-class
   `mesh_route_dispatch` `StringMatch` predicate (T1-B.3 / PR #899). Regex
   patterns compile once at config-load time; `exact` / `prefix` operands
-  are lowercased to match the request's normalized `Host` / `:authority`.
+  match raw `Host` / `:authority` case-sensitively, including explicit
+  request ports.
 - `istio_virtual_service.ignoreUriCase: true` — first-class via
-  case-insensitive `listen_path` widening + per-rule `ignore_uri_case`
-  flag (T1-B.5 / PR #901). Plugin re-evaluates with ASCII-only case
-  folding; non-ASCII bytes compare byte-for-byte (matches Istio).
+  escaped case-insensitive `listen_path` widening for exact/prefix URI
+  matches + per-rule `ignore_uri_case` flag (T1-B.5 / PR #901). Regex URI
+  matches keep their operator regex. Plugin re-evaluates exact/prefix with
+  ASCII-only case folding; non-ASCII bytes compare byte-for-byte (matches
+  Istio).
 
 ## Out-of-scope entries
 
@@ -188,4 +191,3 @@ Previously deferred and now flipped to `supported`:
   Wasm filters are an explicit non-goal.
 - **`EnvoyFilter`** — Envoy-specific extension API; not part of Ferrum's
   compatibility surface.
-

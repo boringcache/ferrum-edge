@@ -1033,13 +1033,10 @@ async fn mesh_l7_routing_virtual_service_source_namespace_match_routes_and_misse
 // VirtualService `match[].authority.{exact,prefix,regex}` is now a
 // first-class mesh_route_dispatch predicate. Each test below exercises the
 // full translator → plugin construction → request hot path: the translator
-// emits the correct StringMatch shape, the plugin compiles the regex once
-// at config-load time and lowercases exact/prefix patterns (DNS names are
-// case-insensitive per RFC 4343), and the request path routes vs 404s
-// based on the pre-compiled matcher resolving the request's
-// `Host`/`:authority` (normalized through
-// `proxy::normalize_request_host_for_routing` so port and trailing dot
-// are stripped consistently with the router).
+// emits the correct StringMatch shape, the plugin compiles regex once at
+// config-load time, and the request path routes vs 404s based on a raw
+// `Host`/`:authority` StringMatch. Istio exact/prefix authority predicates
+// are case-sensitive and explicit request ports are part of the matched value.
 
 #[tokio::test]
 async fn mesh_l7_routing_virtual_service_authority_exact_match_routes_and_misses_fall_closed() {
@@ -1101,7 +1098,7 @@ async fn mesh_l7_routing_virtual_service_authority_exact_match_routes_and_misses
     );
     assert_eq!(ctx.route_override_backend_port, Some(8080));
 
-    // Match: case-insensitive comparison (DNS names are case-insensitive).
+    // Miss: Istio StringMatch exact is case-sensitive even for authority.
     let mut ctx = RequestContext::new(
         "127.0.0.1".to_string(),
         "GET".to_string(),
@@ -1110,14 +1107,13 @@ async fn mesh_l7_routing_virtual_service_authority_exact_match_routes_and_misses
     let mut headers = HashMap::from([("host".to_string(), "INTERNAL.EXAMPLE.COM".to_string())]);
     assert!(matches!(
         dispatch.before_proxy(&mut ctx, &mut headers).await,
-        PluginResult::Continue
+        PluginResult::Reject {
+            status_code: 404,
+            ..
+        }
     ));
-    assert_eq!(
-        ctx.route_override_backend_host.as_deref(),
-        Some("internal.default.svc.cluster.local")
-    );
 
-    // Match: port-bearing Host is normalized (port stripped) before compare.
+    // Miss: explicit request ports are not stripped for the authority predicate.
     let mut ctx = RequestContext::new(
         "127.0.0.1".to_string(),
         "GET".to_string(),
@@ -1127,7 +1123,10 @@ async fn mesh_l7_routing_virtual_service_authority_exact_match_routes_and_misses
         HashMap::from([("host".to_string(), "internal.example.com:8443".to_string())]);
     assert!(matches!(
         dispatch.before_proxy(&mut ctx, &mut headers).await,
-        PluginResult::Continue
+        PluginResult::Reject {
+            status_code: 404,
+            ..
+        }
     ));
 
     // Miss: a different authority on the same wildcard-admitted proxy must
@@ -1211,6 +1210,23 @@ async fn mesh_l7_routing_virtual_service_authority_prefix_match_routes_and_misse
         "/api/items".to_string(),
     );
     let mut miss_headers = HashMap::from([("host".to_string(), "admin.example.com".to_string())]);
+    assert!(matches!(
+        dispatch
+            .before_proxy(&mut miss_ctx, &mut miss_headers)
+            .await,
+        PluginResult::Reject {
+            status_code: 404,
+            ..
+        }
+    ));
+
+    // Miss: authority prefix matching is case-sensitive.
+    let mut miss_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api/items".to_string(),
+    );
+    let mut miss_headers = HashMap::from([("host".to_string(), "API.example.com".to_string())]);
     assert!(matches!(
         dispatch
             .before_proxy(&mut miss_ctx, &mut miss_headers)
@@ -1326,7 +1342,7 @@ async fn mesh_l7_routing_virtual_service_ignore_uri_case_routes_both_casings() {
         .config
         .proxies
         .iter()
-        .find(|p| p.listen_path.as_deref() == Some("~(?i)/Api.*"))
+        .find(|p| p.listen_path.as_deref() == Some("~(?i:/Api.*)"))
         .expect("widened case-insensitive listen_path");
     let plugin_config = dispatch_plugin_for_proxy(&result.config, proxy);
     // The dispatch rule carries the operator's original URI predicate AND
@@ -1356,7 +1372,7 @@ async fn mesh_l7_routing_virtual_service_ignore_uri_case_routes_both_casings() {
     // With `ignoreUriCase: true`, the dispatch rule carries an explicit URI
     // predicate so its match_criteria is non-empty — `reject_unmatched: true`
     // applies and the plugin returns a 404 Reject (Envoy parity). In real
-    // traffic the widened `~(?i)/Api.*` regex listen_path would not have
+    // traffic the widened `~(?i:/Api.*)` regex listen_path would not have
     // admitted `/store/items` in the first place; the dispatch-level URI
     // check is defense-in-depth.
     let mut ctx = RequestContext::new(
@@ -1383,8 +1399,578 @@ async fn mesh_l7_routing_virtual_service_ignore_uri_case_routes_both_casings() {
 }
 
 #[tokio::test]
+async fn mesh_l7_routing_virtual_service_ignore_uri_case_fallback_keeps_original_uri_guard() {
+    // Route order case:
+    // 1. `/Api`, ignoreUriCase, plus header gate -> canary
+    // 2. `/api` URI-only -> stable
+    //
+    // Ferrum collapses these onto one widened proxy to preserve Istio route
+    // order, but the stable fallback must still carry its original
+    // case-sensitive URI. Otherwise `/API` without the canary header would be
+    // widened into stable even though no Istio route admitted it.
+    let result = translate_k8s_objects(
+        &[object(
+            "VirtualService",
+            serde_json::json!({
+                "hosts": ["api.example.com"],
+                "http": [
+                    {
+                        "match": [{
+                            "uri": {"prefix": "/Api"},
+                            "ignoreUriCase": true,
+                            "headers": {"x-canary": {"exact": "v2"}}
+                        }],
+                        "route": [{"destination": {"host": "canary.default.svc.cluster.local", "port": {"number": 9090}}}]
+                    },
+                    {
+                        "match": [{"uri": {"prefix": "/api"}}],
+                        "route": [{"destination": {"host": "stable.default.svc.cluster.local", "port": {"number": 8080}}}]
+                    }
+                ]
+            }),
+        )],
+        options(),
+    )
+    .expect("translation succeeds");
+
+    let proxy = result
+        .config
+        .proxies
+        .iter()
+        .find(|p| p.listen_path.as_deref() == Some("~(?i:/Api.*)"))
+        .expect("widened listen_path");
+    let plugin_config = dispatch_plugin_for_proxy(&result.config, proxy);
+    assert_eq!(
+        plugin_config.config["reject_unmatched"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        plugin_config.config["rules"].as_array().map(Vec::len),
+        Some(2)
+    );
+    let dispatch = MeshRouteDispatch::new(&plugin_config.config).expect("plugin config");
+
+    let mut canary_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/API/items".to_string(),
+    );
+    let mut canary_headers = HashMap::from([("x-canary".to_string(), "v2".to_string())]);
+    assert!(matches!(
+        dispatch
+            .before_proxy(&mut canary_ctx, &mut canary_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        canary_ctx.route_override_backend_host.as_deref(),
+        Some("canary.default.svc.cluster.local")
+    );
+
+    let mut stable_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api/items".to_string(),
+    );
+    let mut stable_headers = HashMap::new();
+    assert!(matches!(
+        dispatch
+            .before_proxy(&mut stable_ctx, &mut stable_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        stable_ctx.route_override_backend_host.as_deref(),
+        Some("stable.default.svc.cluster.local")
+    );
+
+    let mut widened_miss_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/API/items".to_string(),
+    );
+    let mut widened_miss_headers = HashMap::new();
+    assert!(matches!(
+        dispatch
+            .before_proxy(&mut widened_miss_ctx, &mut widened_miss_headers)
+            .await,
+        PluginResult::Reject {
+            status_code: 404,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn mesh_l7_routing_virtual_service_ignore_uri_case_later_predicate_keeps_uri_guard() {
+    let result = translate_k8s_objects(
+        &[object(
+            "VirtualService",
+            serde_json::json!({
+                "hosts": ["api.example.com"],
+                "http": [
+                    {
+                        "match": [{
+                            "uri": {"prefix": "/Api"},
+                            "ignoreUriCase": true,
+                            "headers": {"x-canary": {"exact": "v2"}}
+                        }],
+                        "route": [{"destination": {"host": "canary.default.svc.cluster.local", "port": {"number": 9090}}}]
+                    },
+                    {
+                        "match": [{
+                            "uri": {"prefix": "/api"},
+                            "method": {"exact": "GET"}
+                        }],
+                        "route": [{"destination": {"host": "stable.default.svc.cluster.local", "port": {"number": 8080}}}]
+                    }
+                ]
+            }),
+        )],
+        options(),
+    )
+    .expect("translation succeeds");
+
+    let proxy = result
+        .config
+        .proxies
+        .iter()
+        .find(|p| p.listen_path.as_deref() == Some("~(?i:/Api.*)"))
+        .expect("widened listen_path");
+    let plugin_config = dispatch_plugin_for_proxy(&result.config, proxy);
+    let dispatch = MeshRouteDispatch::new(&plugin_config.config).expect("plugin config");
+
+    let mut stable_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api/items".to_string(),
+    );
+    let mut stable_headers = HashMap::new();
+    assert!(matches!(
+        dispatch
+            .before_proxy(&mut stable_ctx, &mut stable_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        stable_ctx.route_override_backend_host.as_deref(),
+        Some("stable.default.svc.cluster.local")
+    );
+
+    let mut widened_miss_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/API/items".to_string(),
+    );
+    let mut widened_miss_headers = HashMap::new();
+    assert!(matches!(
+        dispatch
+            .before_proxy(&mut widened_miss_ctx, &mut widened_miss_headers)
+            .await,
+        PluginResult::Reject {
+            status_code: 404,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn mesh_l7_routing_virtual_service_ignore_uri_case_inverse_order_guards_pending_route() {
+    let result = translate_k8s_objects(
+        &[object(
+            "VirtualService",
+            serde_json::json!({
+                "hosts": ["api.example.com"],
+                "http": [
+                    {
+                        "match": [{
+                            "uri": {"prefix": "/api"},
+                            "headers": {"x-canary": {"exact": "v2"}}
+                        }],
+                        "route": [{"destination": {"host": "canary.default.svc.cluster.local", "port": {"number": 9090}}}]
+                    },
+                    {
+                        "match": [{
+                            "uri": {"prefix": "/Api"},
+                            "ignoreUriCase": true
+                        }],
+                        "route": [{"destination": {"host": "stable.default.svc.cluster.local", "port": {"number": 8080}}}]
+                    }
+                ]
+            }),
+        )],
+        options(),
+    )
+    .expect("translation succeeds");
+
+    let proxy = result
+        .config
+        .proxies
+        .iter()
+        .find(|p| p.listen_path.as_deref() == Some("~(?i:/Api.*)"))
+        .expect("widened listen_path");
+    let plugin_config = dispatch_plugin_for_proxy(&result.config, proxy);
+    let dispatch = MeshRouteDispatch::new(&plugin_config.config).expect("plugin config");
+
+    let mut canary_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api/items".to_string(),
+    );
+    let mut canary_headers = HashMap::from([("x-canary".to_string(), "v2".to_string())]);
+    assert!(matches!(
+        dispatch
+            .before_proxy(&mut canary_ctx, &mut canary_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        canary_ctx.route_override_backend_host.as_deref(),
+        Some("canary.default.svc.cluster.local")
+    );
+
+    let mut stable_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/API/items".to_string(),
+    );
+    let mut stable_headers = HashMap::from([("x-canary".to_string(), "v2".to_string())]);
+    assert!(matches!(
+        dispatch
+            .before_proxy(&mut stable_ctx, &mut stable_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        stable_ctx.route_override_backend_host.as_deref(),
+        Some("stable.default.svc.cluster.local")
+    );
+}
+
+#[tokio::test]
+async fn mesh_l7_routing_virtual_service_ignore_uri_case_inverse_prefix_exact_preserves_fallthrough()
+ {
+    let result = translate_k8s_objects(
+        &[object(
+            "VirtualService",
+            serde_json::json!({
+                "hosts": ["api.example.com"],
+                "http": [
+                    {
+                        "match": [{
+                            "uri": {"prefix": "/api"},
+                            "headers": {"x-canary": {"exact": "v2"}}
+                        }],
+                        "route": [{"destination": {"host": "canary.default.svc.cluster.local", "port": {"number": 9090}}}]
+                    },
+                    {
+                        "match": [{
+                            "uri": {"exact": "/Api"},
+                            "ignoreUriCase": true
+                        }],
+                        "route": [{"destination": {"host": "stable.default.svc.cluster.local", "port": {"number": 8080}}}]
+                    }
+                ]
+            }),
+        )],
+        options(),
+    )
+    .expect("translation succeeds");
+
+    assert!(
+        !result
+            .config
+            .proxies
+            .iter()
+            .any(|p| p.listen_path.as_deref() == Some("/api")),
+        "the earlier prefix proxy must be consumed so predicate misses can fall through"
+    );
+    let proxy = result
+        .config
+        .proxies
+        .iter()
+        .find(|p| p.listen_path.as_deref() == Some("~(?i:/api.*)"))
+        .expect("synthesized widened prefix proxy");
+    let plugin_config = dispatch_plugin_for_proxy(&result.config, proxy);
+    let dispatch = MeshRouteDispatch::new(&plugin_config.config).expect("plugin config");
+
+    let mut canary_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api".to_string(),
+    );
+    let mut canary_headers = HashMap::from([("x-canary".to_string(), "v2".to_string())]);
+    assert!(matches!(
+        dispatch
+            .before_proxy(&mut canary_ctx, &mut canary_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        canary_ctx.route_override_backend_host.as_deref(),
+        Some("canary.default.svc.cluster.local")
+    );
+
+    let mut stable_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api".to_string(),
+    );
+    let mut stable_headers = HashMap::new();
+    assert!(matches!(
+        dispatch
+            .before_proxy(&mut stable_ctx, &mut stable_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        stable_ctx.route_override_backend_host.as_deref(),
+        Some("stable.default.svc.cluster.local")
+    );
+
+    let mut exact_miss_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api/foo".to_string(),
+    );
+    let mut exact_miss_headers = HashMap::new();
+    assert!(matches!(
+        dispatch
+            .before_proxy(&mut exact_miss_ctx, &mut exact_miss_headers)
+            .await,
+        PluginResult::Reject {
+            status_code: 404,
+            ..
+        }
+    ));
+
+    let mut case_sensitive_miss_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/API".to_string(),
+    );
+    let mut case_sensitive_headers = HashMap::from([("x-canary".to_string(), "v2".to_string())]);
+    assert!(matches!(
+        dispatch
+            .before_proxy(&mut case_sensitive_miss_ctx, &mut case_sensitive_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        case_sensitive_miss_ctx
+            .route_override_backend_host
+            .as_deref(),
+        Some("stable.default.svc.cluster.local")
+    );
+}
+
+#[tokio::test]
+async fn mesh_l7_routing_virtual_service_ignore_uri_case_chained_inverse_prefix_consumes_later_route()
+ {
+    let result = translate_k8s_objects(
+        &[object(
+            "VirtualService",
+            serde_json::json!({
+                "hosts": ["api.example.com"],
+                "http": [
+                    {
+                        "match": [{
+                            "uri": {"prefix": "/api"},
+                            "headers": {"x-canary": {"exact": "v2"}}
+                        }],
+                        "route": [{"destination": {"host": "canary.default.svc.cluster.local", "port": {"number": 9090}}}]
+                    },
+                    {
+                        "match": [{
+                            "uri": {"exact": "/Api"},
+                            "ignoreUriCase": true
+                        }],
+                        "route": [{"destination": {"host": "stable.default.svc.cluster.local", "port": {"number": 8080}}}]
+                    },
+                    {
+                        "match": [{"uri": {"prefix": "/api/foo"}}],
+                        "route": [{"destination": {"host": "foo.default.svc.cluster.local", "port": {"number": 7070}}}]
+                    }
+                ]
+            }),
+        )],
+        options(),
+    )
+    .expect("translation succeeds");
+
+    assert!(
+        !result
+            .config
+            .proxies
+            .iter()
+            .any(|p| { matches!(p.listen_path.as_deref(), Some("/api") | Some("/api/foo")) }),
+        "no stale prefix-tier proxy should bypass the widened ordered dispatcher"
+    );
+    let proxy = result
+        .config
+        .proxies
+        .iter()
+        .find(|p| p.listen_path.as_deref() == Some("~(?i:/api.*)"))
+        .expect("synthesized widened prefix proxy");
+    let plugin_config = dispatch_plugin_for_proxy(&result.config, proxy);
+    let dispatch = MeshRouteDispatch::new(&plugin_config.config).expect("plugin config");
+
+    let mut canary_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api".to_string(),
+    );
+    let mut canary_headers = HashMap::from([("x-canary".to_string(), "v2".to_string())]);
+    assert!(matches!(
+        dispatch
+            .before_proxy(&mut canary_ctx, &mut canary_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        canary_ctx.route_override_backend_host.as_deref(),
+        Some("canary.default.svc.cluster.local")
+    );
+
+    let mut stable_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/API".to_string(),
+    );
+    let mut stable_headers = HashMap::new();
+    assert!(matches!(
+        dispatch
+            .before_proxy(&mut stable_ctx, &mut stable_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        stable_ctx.route_override_backend_host.as_deref(),
+        Some("stable.default.svc.cluster.local")
+    );
+
+    let mut foo_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api/foo/bar".to_string(),
+    );
+    let mut foo_headers = HashMap::new();
+    assert!(matches!(
+        dispatch.before_proxy(&mut foo_ctx, &mut foo_headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        foo_ctx.route_override_backend_host.as_deref(),
+        Some("foo.default.svc.cluster.local")
+    );
+
+    let mut miss_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api/bar".to_string(),
+    );
+    let mut miss_headers = HashMap::new();
+    assert!(matches!(
+        dispatch
+            .before_proxy(&mut miss_ctx, &mut miss_headers)
+            .await,
+        PluginResult::Reject {
+            status_code: 404,
+            ..
+        }
+    ));
+
+    let mut case_sensitive_miss_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/API/foo".to_string(),
+    );
+    let mut case_sensitive_headers = HashMap::from([("x-canary".to_string(), "v2".to_string())]);
+    assert!(matches!(
+        dispatch
+            .before_proxy(&mut case_sensitive_miss_ctx, &mut case_sensitive_headers)
+            .await,
+        PluginResult::Reject {
+            status_code: 404,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn mesh_l7_routing_virtual_service_ignore_uri_case_prefix_preserves_order_before_exact() {
+    let result = translate_k8s_objects(
+        &[object(
+            "VirtualService",
+            serde_json::json!({
+                "hosts": ["api.example.com"],
+                "http": [
+                    {
+                        "match": [{
+                            "uri": {"prefix": "/Api"},
+                            "ignoreUriCase": true,
+                            "headers": {"x-canary": {"exact": "v2"}}
+                        }],
+                        "route": [{"destination": {"host": "canary.default.svc.cluster.local", "port": {"number": 9090}}}]
+                    },
+                    {
+                        "match": [{"uri": {"exact": "/api/admin"}}],
+                        "route": [{"destination": {"host": "stable.default.svc.cluster.local", "port": {"number": 8080}}}]
+                    }
+                ]
+            }),
+        )],
+        options(),
+    )
+    .expect("translation succeeds");
+
+    let proxy = result
+        .config
+        .proxies
+        .iter()
+        .find(|p| p.listen_path.as_deref() == Some("~(?i:/Api.*)"))
+        .expect("widened listen_path");
+    let plugin_config = dispatch_plugin_for_proxy(&result.config, proxy);
+    let dispatch = MeshRouteDispatch::new(&plugin_config.config).expect("plugin config");
+
+    let mut canary_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api/admin".to_string(),
+    );
+    let mut canary_headers = HashMap::from([("x-canary".to_string(), "v2".to_string())]);
+    assert!(matches!(
+        dispatch
+            .before_proxy(&mut canary_ctx, &mut canary_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        canary_ctx.route_override_backend_host.as_deref(),
+        Some("canary.default.svc.cluster.local")
+    );
+
+    let mut stable_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api/admin".to_string(),
+    );
+    let mut stable_headers = HashMap::new();
+    assert!(matches!(
+        dispatch
+            .before_proxy(&mut stable_ctx, &mut stable_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        stable_ctx.route_override_backend_host.as_deref(),
+        Some("stable.default.svc.cluster.local")
+    );
+}
+
+#[tokio::test]
 async fn mesh_l7_routing_virtual_service_ignore_uri_case_with_method_and_headers() {
-    // Mixed: case-folded URI prefix + case-sensitive method + case-insensitive
+    // Mixed: case-folded URI prefix + case-sensitive method + case-sensitive
     // header. All-of semantics: every predicate must hold.
     let result = translate_k8s_objects(
         &[object(
@@ -1410,7 +1996,7 @@ async fn mesh_l7_routing_virtual_service_ignore_uri_case_with_method_and_headers
         .config
         .proxies
         .iter()
-        .find(|p| p.listen_path.as_deref() == Some("~(?i)/Api.*"))
+        .find(|p| p.listen_path.as_deref() == Some("~(?i:/Api.*)"))
         .expect("widened listen_path");
     let plugin_config = dispatch_plugin_for_proxy(&result.config, proxy);
     let dispatch = MeshRouteDispatch::new(&plugin_config.config).expect("plugin config");

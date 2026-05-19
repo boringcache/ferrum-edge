@@ -68,7 +68,6 @@ use crate::plugins::utils::route_header_transform::{
 use crate::plugins::{
     HTTP_FAMILY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext, priority,
 };
-use crate::proxy::normalize_request_host_for_routing;
 
 /// Top-level config for the plugin.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,7 +124,7 @@ impl MeshRouteDispatchConfig {
             if rule.match_.is_empty() && !has_transforms {
                 return Err(format!(
                     "mesh_route_dispatch.rules[{idx}].match requires at least one of \
-                     methods / headers / query_params / authority / source_namespace \
+                     methods / headers / query_params / authority / source_namespace / uri \
                      (an empty match would silently never fire, contradicting \
                      first-match-wins semantics)"
                 ));
@@ -347,7 +346,7 @@ pub struct RouteRule {
     headers_compiled: HashMap<String, HeaderMatcher>,
     /// Pre-compiled `match.authority` matcher built during normalize. `Regex`
     /// values are compiled here, not per request — the hot path resolves the
-    /// request's normalized `Host`/`:authority` once and runs the compiled
+    /// request's raw `Host`/`:authority` once and runs the compiled
     /// matcher. `None` when `match.authority` is unset (no authority
     /// restriction). Istio `HTTPMatchRequest.authority` is exactly one
     /// predicate per rule, so this is `Option<_>` (not `Vec<_>`).
@@ -357,8 +356,9 @@ pub struct RouteRule {
     /// `match.uri` predicate this stays `None` and the hot path skips URI
     /// evaluation entirely (preserving the legacy behavior of routing solely
     /// by the proxy's `listen_path`). When set, the matcher already carries
-    /// the case-folded operand (exact / prefix) or the `(?i)`-flagged regex,
-    /// so the hot path is one allocation-free compare against `ctx.path`.
+    /// the case-folded operand (exact / prefix) or the compiled operator
+    /// regex, so the hot path is one allocation-free compare against
+    /// `ctx.path`.
     #[serde(skip)]
     uri_compiled: Option<UriMatcher>,
 }
@@ -426,12 +426,11 @@ pub struct MatchCriteria {
     /// translator projects exactly that. Distinct from VirtualService-level
     /// `hosts`, which gates which proxy admits a request — this is a
     /// per-rule predicate evaluated AFTER routing has picked the proxy. The
-    /// hot path normalizes the request's `Host`/`:authority` once
-    /// (case-folded, port-stripped, trailing-dot stripped) and matches the
-    /// configured operator against that normalized value:
+    /// hot path compares the request's `Host`/`:authority` value as presented
+    /// by the client:
     ///
-    /// - `exact` / `prefix` patterns are lowercased at compile time (DNS
-    ///   names are case-insensitive per RFC 4343);
+    /// - `exact` / `prefix` patterns are case-sensitive, per Istio
+    ///   `StringMatch` semantics;
     /// - `regex` patterns are NOT folded — operators who want
     ///   case-insensitivity should write `(?i)` in their pattern.
     ///
@@ -444,8 +443,9 @@ pub struct MatchCriteria {
     /// the rule needs additional URI evaluation at the dispatch layer, e.g.,
     /// VirtualService `match[].ignoreUriCase: true`. In that case the
     /// translator widens the proxy's `listen_path` to a case-insensitive
-    /// regex (so both casings reach the proxy) and emits this predicate
-    /// here so the original Istio match precision is preserved.
+    /// regex for exact/prefix URI matches (so both casings reach the proxy)
+    /// and emits this predicate here so the original Istio match precision is
+    /// preserved. Regex URI matches are not affected by `ignore_uri_case`.
     ///
     /// `None` (the legacy shape) preserves "no URI re-evaluation in the
     /// plugin"; the proxy's `listen_path` already gates the request.
@@ -506,16 +506,11 @@ pub enum AuthorityStringMatch {
 }
 
 /// Compiled hot-path representation of an `AuthorityMatchOp`. Regexes are
-/// stored as `Regex` (compiled once at config load); exact/prefix keep an
-/// owned (already lowercased) `String`. `Clone` is cheap because the `regex`
-/// crate's `Regex` is `Arc`-backed internally and clones are refcount bumps,
-/// not pattern recompiles.
-///
-/// `Exact` and `Prefix` are lowercased at compile time because DNS names are
-/// case-insensitive (RFC 4343) and the hot path normalizes the request's
-/// authority to lowercase before comparison. `Regex` deliberately keeps the
-/// operator's pattern verbatim — operators who want case-insensitivity
-/// should write `(?i)` in the pattern (same convention as Istio Envoy).
+/// stored as `Regex` (compiled once at config load); exact/prefix keep the
+/// operator string verbatim because Istio `StringMatch` exact/prefix matching
+/// is case-sensitive. `Clone` is cheap because the `regex` crate's `Regex` is
+/// `Arc`-backed internally and clones are refcount bumps, not pattern
+/// recompiles.
 #[derive(Debug, Clone)]
 pub(crate) enum AuthorityMatcher {
     Exact(String),
@@ -524,11 +519,13 @@ pub(crate) enum AuthorityMatcher {
 }
 
 impl AuthorityMatcher {
-    fn matches(&self, normalized_authority: &str) -> bool {
+    fn matches(&self, authority: &str) -> bool {
         match self {
-            AuthorityMatcher::Exact(expected) => normalized_authority == expected.as_str(),
-            AuthorityMatcher::Prefix(prefix) => normalized_authority.starts_with(prefix.as_str()),
-            AuthorityMatcher::Regex(re) => re.is_match(normalized_authority),
+            AuthorityMatcher::Exact(expected) => authority == expected.as_str(),
+            AuthorityMatcher::Prefix(prefix) => authority.starts_with(prefix.as_str()),
+            AuthorityMatcher::Regex(re) => re
+                .find(authority)
+                .is_some_and(|m| m.start() == 0 && m.end() == authority.len()),
         }
     }
 }
@@ -660,10 +657,10 @@ pub enum UriMatchOp {
 /// Compiled hot-path representation of a `UriMatchOp`. `Exact` / `Prefix`
 /// store the operand (lowercased at compile time when `ignore_uri_case`); the
 /// hot path uses `eq_ignore_ascii_case` / a manual byte-level prefix compare
-/// so it never allocates. `Regex` stores a pre-compiled `Regex`; when
-/// `ignore_uri_case` is set the pattern is wrapped with `(?i)` at compile
-/// time so the same `is_match` call covers both casings. The `regex` crate's
-/// `Regex` is `Arc`-backed internally — `Clone` is a refcount bump.
+/// so it never allocates. `Regex` stores a pre-compiled operator regex. Istio
+/// documents `ignoreUriCase` as exact/prefix-only, so regex URI matches are not
+/// rewritten by the flag. The `regex` crate's `Regex` is `Arc`-backed
+/// internally — `Clone` is a refcount bump.
 #[derive(Debug, Clone)]
 pub(crate) enum UriMatcher {
     /// Exact-path equality. `case_insensitive` controls whether the hot path
@@ -679,9 +676,7 @@ pub(crate) enum UriMatcher {
         value: String,
         case_insensitive: bool,
     },
-    /// Compiled regex. When `ignore_uri_case` is true at compile time the
-    /// pattern is wrapped with `(?i)` so the matcher itself carries the flag
-    /// and the hot path is one `is_match` call.
+    /// Compiled operator regex. `ignore_uri_case` does not affect this arm.
     Regex(Regex),
 }
 
@@ -816,12 +811,11 @@ fn normalize_source_namespace(
 /// operator-provided string) is a hard error from `Plugin::new()`, per
 /// CLAUDE.md's "no Ok-with-runtime-panic" plugin-config-validation rule.
 ///
-/// DNS names are case-insensitive (RFC 4343), and the hot path normalizes
-/// the request's `Host`/`:authority` to lowercase before comparison. To
-/// avoid per-request casing on the configured side, `Exact` and `Prefix`
-/// inputs are lowercased here at compile time. `Regex` patterns are NOT
-/// folded — operators who want case-insensitivity should write `(?i)` in
-/// the pattern (same convention as Istio Envoy).
+/// Istio models `authority` as a `StringMatch`. Exact and prefix matches are
+/// case-sensitive and compare the request authority as presented, including
+/// an explicit port when the client sent one. Regex patterns are likewise not
+/// folded — operators who want case-insensitivity should write `(?i)` in the
+/// pattern.
 fn compile_authority_matcher(
     rule_idx: usize,
     authority: Option<&AuthorityMatchOp>,
@@ -836,7 +830,7 @@ fn compile_authority_matcher(
                     "mesh_route_dispatch.rules[{rule_idx}].match.authority must not be empty"
                 ));
             }
-            AuthorityMatcher::Exact(value.to_ascii_lowercase())
+            AuthorityMatcher::Exact(value.clone())
         }
         AuthorityMatchOp::Tagged(AuthorityStringMatch::Exact(value)) => {
             if value.is_empty() {
@@ -844,7 +838,7 @@ fn compile_authority_matcher(
                     "mesh_route_dispatch.rules[{rule_idx}].match.authority.exact must not be empty"
                 ));
             }
-            AuthorityMatcher::Exact(value.to_ascii_lowercase())
+            AuthorityMatcher::Exact(value.clone())
         }
         AuthorityMatchOp::Tagged(AuthorityStringMatch::Prefix(prefix)) => {
             if prefix.is_empty() {
@@ -853,7 +847,7 @@ fn compile_authority_matcher(
                      empty (every authority would match — likely a misconfiguration)"
                 ));
             }
-            AuthorityMatcher::Prefix(prefix.to_ascii_lowercase())
+            AuthorityMatcher::Prefix(prefix.clone())
         }
         AuthorityMatchOp::Tagged(AuthorityStringMatch::Regex(pattern)) => {
             if pattern.is_empty() {
@@ -879,12 +873,10 @@ fn compile_authority_matcher(
 /// predicate only (not headers / methods / authority). For `Exact` and
 /// `Prefix` the operand is lowercased at compile time so the hot-path
 /// compare can stay byte-level (the path is matched via `eq_ignore_ascii_case`
-/// / manual case-folded prefix scan — both allocation-free). For `Regex` the
-/// pattern is wrapped with `(?i)` if it isn't already case-insensitive so
-/// the same `is_match` call covers both casings. `regex` is idempotent with
-/// nested `(?i)` flags, so wrapping a pattern that already starts with
-/// `(?i)` is harmless — operator can opt into case-folding for one rule
-/// even when `ignore_uri_case` is false by writing `(?i)` themselves.
+/// / manual case-folded prefix scan — both allocation-free). Regex URI matches
+/// keep their operator regex unchanged because Istio documents
+/// `ignoreUriCase` as exact/prefix-only; operators who want case-insensitive
+/// regex matching can write `(?i)` themselves.
 ///
 /// Invalid regex (or an empty pattern after the operator-provided string) is
 /// a hard error from `Plugin::new()`, per CLAUDE.md's
@@ -947,46 +939,13 @@ fn compile_uri_matcher(
                     "mesh_route_dispatch.rules[{rule_idx}].match.uri.regex must not be empty"
                 ));
             }
-            // Wrap with `(?i)` when `ignore_uri_case` is set and the pattern
-            // doesn't already carry a case-insensitive flag. We check `(?i)`
-            // and `(?si)` / `(?im)` etc. by scanning the leading flag-group
-            // form `(?<flags>)` for the `i` flag. `regex` accepts nested
-            // `(?i)` wrappers, so this is a "don't double-wrap if already
-            // present" optimization, not a correctness requirement.
-            let wrapped = if ignore_uri_case && !regex_pattern_is_case_insensitive(pattern) {
-                format!("(?i){pattern}")
-            } else {
-                pattern.clone()
-            };
-            let re = Regex::new(&wrapped).map_err(|e| {
+            let re = Regex::new(pattern).map_err(|e| {
                 format!("mesh_route_dispatch.rules[{rule_idx}].match.uri.regex is invalid: {e}")
             })?;
             UriMatcher::Regex(re)
         }
     };
     Ok(Some(matcher))
-}
-
-/// Return `true` when the regex pattern's leading flag group sets the `i`
-/// flag. Accepts `(?i)`, `(?si)`, `(?-x i)`, etc. — anything starting with
-/// `(?` and containing `i` before the closing `)` or `:`. Conservative:
-/// patterns that don't start with `(?` return `false` and the caller wraps
-/// them. False negatives are harmless because `regex` tolerates duplicate
-/// `(?i)` flags.
-fn regex_pattern_is_case_insensitive(pattern: &str) -> bool {
-    let Some(after_open) = pattern.strip_prefix("(?") else {
-        return false;
-    };
-    // Scan until the group terminator (`)` for a group-only directive like
-    // `(?i)`, or `:` for an inline group like `(?i:...)`).
-    for ch in after_open.chars() {
-        match ch {
-            'i' => return true,
-            ')' | ':' => return false,
-            _ => continue,
-        }
-    }
-    false
 }
 
 fn normalize_header_match_keys(
@@ -1281,28 +1240,19 @@ fn rule_matches(rule: &RouteRule, ctx: &RequestContext, headers: &HashMap<String
         }
     }
     if let Some(matcher) = rule.authority_compiled.as_ref() {
-        // Read the request's `Host` from the in-flight header map. The
-        // routing layer in `proxy/mod.rs` synthesizes `Host` from
-        // HTTP/2/3 `:authority` before `before_proxy` runs, so a single
-        // lookup covers H1/H2/H3 uniformly. The router already
-        // case-folds and port-strips the value for proxy lookup; mirror
-        // that normalization here so an `authority: "api.example.com"`
-        // predicate matches both `Host: api.example.com` and
-        // `Host: API.example.com:8443` (port stripped, then folded).
-        // `normalize_request_host_for_routing` allocates one short ASCII
-        // string per matched-rule evaluation — acceptable because this
-        // path is taken only when a rule actually configures `authority`,
-        // and only for rules that have already passed the other
-        // predicates (cheap method/header/query checks short-circuit
-        // first).
-        let normalized = match headers.get("host") {
-            Some(raw) => normalize_request_host_for_routing(raw),
-            None => None,
-        };
-        let Some(authority) = normalized else {
+        // Read the request's `Host` from the in-flight header map. The routing
+        // layer in `proxy/mod.rs` synthesizes `Host` from HTTP/2/3 `:authority`
+        // before `before_proxy` runs, so the `host` lookup covers the steady
+        // state. Keep `:authority` as a defensive fallback for direct tests or
+        // future call sites that invoke the plugin before that synthesis.
+        //
+        // Do not route-normalize here. Istio `authority` is a `StringMatch`;
+        // exact/prefix comparisons are case-sensitive and include an explicit
+        // port when the client sent one.
+        let Some(authority) = headers.get("host").or_else(|| headers.get(":authority")) else {
             return false;
         };
-        if !matcher.matches(&authority) {
+        if !matcher.matches(authority) {
             return false;
         }
     }
@@ -2951,11 +2901,11 @@ mod tests {
     //
     // T1-B.3: VirtualService translation can emit an `authority` predicate per
     // rule; the plugin compiles the regex at config-load time and the hot path
-    // resolves the request's normalized `Host`/`:authority` once and runs the
-    // compiled matcher. DNS names are case-insensitive (RFC 4343), so
-    // `Exact` and `Prefix` patterns are lowercased at compile time. `Regex`
-    // patterns are NOT folded — operators who want case-insensitivity should
-    // write `(?i)` in the pattern (same convention as Istio Envoy).
+    // resolves the request's raw `Host`/`:authority` once and runs the
+    // compiled matcher. Istio `StringMatch` semantics are case-sensitive for
+    // `exact` and `prefix`; explicit request ports are part of the value.
+    // `Regex` patterns are also kept verbatim — operators who want
+    // case-insensitivity should write `(?i)` in the pattern.
     //
     // The match is a per-rule predicate; VirtualService-level `hosts` is the
     // proxy-admission gate and is unchanged by this PR.
@@ -2968,10 +2918,9 @@ mod tests {
     }
 
     #[test]
-    fn accepts_tagged_exact_authority_match_lowercased_at_load() {
-        // DNS case-insensitivity: operator-provided casing is folded once
-        // at compile time so the hot path is a single case-sensitive
-        // compare against the already-lowercased normalized authority.
+    fn accepts_tagged_exact_authority_match_verbatim_at_load() {
+        // Istio `StringMatch.exact` is case-sensitive, so operator-provided
+        // casing is preserved and compared against the raw request authority.
         let plugin = MeshRouteDispatch::new(&json!({
             "rules": [{
                 "match": {"authority": {"exact": "API.example.COM"}},
@@ -2984,7 +2933,7 @@ mod tests {
             .as_ref()
             .expect("authority must compile")
         {
-            AuthorityMatcher::Exact(v) => assert_eq!(v, "api.example.com"),
+            AuthorityMatcher::Exact(v) => assert_eq!(v, "API.example.COM"),
             other => panic!("expected Exact, got {other:?}"),
         }
     }
@@ -3007,13 +2956,13 @@ mod tests {
             .as_ref()
             .expect("authority must compile")
         {
-            AuthorityMatcher::Exact(v) => assert_eq!(v, "api.example.com"),
+            AuthorityMatcher::Exact(v) => assert_eq!(v, "API.example.COM"),
             other => panic!("expected Exact, got {other:?}"),
         }
     }
 
     #[test]
-    fn accepts_prefix_authority_match_lowercased_at_load() {
+    fn accepts_prefix_authority_match_verbatim_at_load() {
         let plugin = MeshRouteDispatch::new(&json!({
             "rules": [{
                 "match": {"authority": {"prefix": "API."}},
@@ -3026,7 +2975,7 @@ mod tests {
             .as_ref()
             .expect("authority must compile")
         {
-            AuthorityMatcher::Prefix(p) => assert_eq!(p, "api."),
+            AuthorityMatcher::Prefix(p) => assert_eq!(p, "API."),
             other => panic!("expected Prefix, got {other:?}"),
         }
     }
@@ -3034,9 +2983,9 @@ mod tests {
     #[test]
     fn accepts_regex_authority_match_at_load_without_folding_pattern() {
         // Regex is NOT folded — operators who want case-insensitivity write
-        // `(?i)` in the pattern. The matcher input (request authority) is
-        // already lowercased, so a pattern that targets lowercase letters
-        // matches without further work.
+        // `(?i)` in the pattern. The matcher input is the raw request
+        // authority, so a pattern that targets lowercase letters remains
+        // case-sensitive.
         let plugin = MeshRouteDispatch::new(&json!({
             "rules": [{
                 "match": {"authority": {"regex": "^api\\.(prod|staging)\\.example\\.com$"}},
@@ -3188,14 +3137,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exact_authority_match_strips_port_from_request_host() {
-        // The router strips the port when looking up proxies; the
-        // authority matcher must mirror that normalization so an
-        // `exact: "api.example.com"` rule matches a request whose `Host`
-        // carries an explicit port.
+    async fn exact_authority_match_includes_request_port() {
+        // Istio authority matching is a raw StringMatch over Host/:authority;
+        // explicit request ports are part of the matched value.
         let plugin = MeshRouteDispatch::new(&json!({
             "rules": [{
-                "match": {"authority": {"exact": "api.example.com"}},
+                "match": {"authority": {"exact": "api.example.com:8443"}},
                 "destination": {"upstream_id": "internal"}
             }]
         }))
@@ -3207,11 +3154,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exact_authority_match_is_case_insensitive() {
-        // DNS names are case-insensitive (RFC 4343). The matcher input is
-        // pre-lowercased at compile time, and the hot path lowercases the
-        // request authority during normalization, so `Host: API.EXAMPLE.COM`
-        // matches `exact: "api.example.com"`.
+    async fn exact_authority_without_port_does_not_match_port_bearing_host() {
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"authority": {"exact": "api.example.com"}},
+                "destination": {"upstream_id": "internal"}
+            }]
+        }))
+        .unwrap();
+        let mut ctx = ctx_for_authority();
+        let mut headers = host_headers("api.example.com:8443");
+        let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert!(ctx.route_override_upstream_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn exact_authority_match_is_case_sensitive() {
+        // Istio StringMatch exact/prefix predicates are case-sensitive even
+        // for authority. Host routing normalization is not reused here.
         let plugin = MeshRouteDispatch::new(&json!({
             "rules": [{
                 "match": {"authority": {"exact": "api.example.com"}},
@@ -3222,7 +3182,7 @@ mod tests {
         let mut ctx = ctx_for_authority();
         let mut headers = host_headers("API.EXAMPLE.COM");
         let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
-        assert_eq!(ctx.route_override_upstream_id.as_deref(), Some("internal"));
+        assert!(ctx.route_override_upstream_id.is_none());
     }
 
     #[tokio::test]
@@ -3260,10 +3220,9 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_host_header_does_not_match_authority_predicate() {
-        // `normalize_request_host_for_routing` returns `None` for unbracketed
-        // IPv6 literals and other invalid authority shapes; the predicate
-        // treats that as "no match" rather than panicking or matching
-        // accidentally.
+        // The predicate is a raw StringMatch. Malformed authority shapes are
+        // not normalized or rejected by this plugin; they simply compare as
+        // ordinary strings and therefore do not match this exact operand.
         let plugin = MeshRouteDispatch::new(&json!({
             "rules": [{
                 "match": {"authority": {"exact": "api.example.com"}},
@@ -3350,12 +3309,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn regex_authority_requires_full_string_match() {
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"authority": {"regex": "internal"}},
+                "destination": {"upstream_id": "internal"}
+            }]
+        }))
+        .unwrap();
+
+        let mut ctx = ctx_for_authority();
+        let mut headers = host_headers("not-internal.example.com");
+        let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert!(ctx.route_override_upstream_id.is_none());
+
+        let mut ctx = ctx_for_authority();
+        let mut headers = host_headers("internal");
+        let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_eq!(ctx.route_override_upstream_id.as_deref(), Some("internal"));
+    }
+
+    #[tokio::test]
     async fn case_insensitive_regex_via_inline_flag_matches_uppercase_request() {
         // Operators who want case-insensitivity write `(?i)` themselves —
-        // this is the documented contract because the matcher input is
-        // already lowercased and folding the pattern would be redundant.
+        // this is the documented contract for StringMatch regex predicates.
         // The test verifies the contract works end-to-end on a mixed-case
-        // pattern via the inline flag.
+        // pattern and a differently-cased raw request authority.
         let plugin = MeshRouteDispatch::new(&json!({
             "rules": [{
                 "match": {"authority": {"regex": "(?i)^API\\.example\\.com$"}},
@@ -3436,12 +3415,12 @@ mod tests {
 
     // ── UriMatchOp + ignore_uri_case (T1-B.5) ─────────────────────────────
     //
-    // Istio `HTTPMatchRequest.ignoreUriCase: true` folds ASCII case for the
-    // URI predicate only (not headers / methods / authority). The plugin
-    // pre-folds the operand at compile time so the hot path uses
-    // `eq_ignore_ascii_case` / a byte-level manual prefix scan — both
-    // allocation-free. Regex URIs get `(?i)` wrapped at compile time when
-    // not already case-insensitive.
+    // Istio `HTTPMatchRequest.ignoreUriCase: true` folds ASCII case for
+    // exact/prefix URI predicates only (not headers / methods / authority,
+    // and not regex). The plugin pre-folds literal operands at compile time
+    // so the hot path uses `eq_ignore_ascii_case` / a byte-level manual
+    // prefix scan — both allocation-free. Regex URIs keep the operator's
+    // pattern verbatim.
 
     #[test]
     fn accepts_uri_exact_match_at_load() {
@@ -3551,11 +3530,9 @@ mod tests {
     }
 
     #[test]
-    fn uri_regex_with_ignore_uri_case_wraps_with_inline_flag() {
-        // Regex compilation should accept either ASCII casing once the
-        // `(?i)` flag is wrapped on; we assert positive cases instead of
-        // peeking at the pattern string (an `Arc<Box<[u8]>>` internal to
-        // the regex crate).
+    fn uri_regex_with_ignore_uri_case_keeps_regex_case_sensitive() {
+        // Istio documents `ignoreUriCase` as exact/prefix-only. Regex
+        // operands keep their operator-supplied case behavior.
         let plugin = MeshRouteDispatch::new(&json!({
             "rules": [{
                 "match": {"uri": {"regex": "^/api/v[0-9]+"}, "ignore_uri_case": true},
@@ -3566,8 +3543,8 @@ mod tests {
         match &plugin.rules()[0].uri_compiled {
             Some(UriMatcher::Regex(re)) => {
                 assert!(re.is_match("/api/v1"));
-                assert!(re.is_match("/API/v1"));
-                assert!(re.is_match("/Api/V2"));
+                assert!(!re.is_match("/API/v1"));
+                assert!(!re.is_match("/Api/V2"));
                 assert!(!re.is_match("/store/v1"));
             }
             other => panic!("expected Regex, got {other:?}"),
@@ -3575,11 +3552,9 @@ mod tests {
     }
 
     #[test]
-    fn uri_regex_with_existing_case_flag_is_not_double_wrapped() {
-        // Operator-supplied `(?i)` patterns should compile + match without
-        // double-wrapping; the `regex` crate tolerates duplicates but the
-        // listen_path / pattern string is the operator-visible key and we
-        // shouldn't churn it.
+    fn uri_regex_with_inline_case_flag_still_matches_when_ignore_uri_case_true() {
+        // Operator-supplied `(?i)` patterns should compile + match even when
+        // the ignored exact/prefix-only flag is present.
         let plugin = MeshRouteDispatch::new(&json!({
             "rules": [{
                 "match": {"uri": {"regex": "(?i)^/api"}, "ignore_uri_case": true},

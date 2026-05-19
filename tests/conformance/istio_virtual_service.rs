@@ -274,11 +274,11 @@ async fn vs_method_exact_match() {
 /// VS predicate: `authority.{exact,prefix,regex}` — T1-B.3 (PR #899). The
 /// translator emits the predicate as a first-class `mesh_route_dispatch` rule
 /// (`exact` as a bare string for wire back-compat, `prefix` / `regex` as the
-/// tagged `StringMatch` shape). The plugin compiles the regex once at
-/// config-load time and lowercases `exact` / `prefix` operands (DNS names are
-/// case-insensitive per RFC 4343). The request hot path resolves the
-/// normalized `Host` / `:authority` once and runs the compiled matcher
-/// against it.
+/// tagged `StringMatch` shape). The plugin compiles regex once at
+/// config-load time. The request hot path resolves raw `Host` / `:authority`
+/// once and runs the compiled matcher against it. Istio exact/prefix
+/// authority predicates are case-sensitive, and explicit request ports are
+/// part of the matched value.
 ///
 /// Sibling rules in the same `match[]` no longer get dropped: a rule with
 /// `authority: internal.example.com` and a sibling with `headers.x-canary`
@@ -291,7 +291,7 @@ async fn vs_authority_match() {
         category = CATEGORY,
         feature = "authority.{exact,prefix,regex}",
         status = Status::Supported,
-        notes = "T1-B.3 (PR #899): authority is a first-class mesh_route_dispatch StringMatch predicate (exact / prefix / regex); compiled once at config-load time; lowercased operands match normalized Host/:authority; sibling rules continue to emit independently.",
+        notes = "T1-B.3 (PR #899): authority is a first-class mesh_route_dispatch StringMatch predicate (exact / prefix / regex); regex is compiled once at config-load time; exact/prefix operands match raw Host/:authority case-sensitively including explicit ports; sibling rules continue to emit independently.",
     );
     let result = translate_k8s_objects(
         &[virtual_service(json!({
@@ -446,20 +446,20 @@ async fn vs_source_namespace_match() {
 
 /// VS predicate: `ignoreUriCase: true` — T1-B.5 (PR #901). The translator
 /// widens the URI's `listen_path` to a case-insensitive regex (`prefix: "/Api"`
-/// → `~(?i)/Api.*`) so the router admits both casings, and emits a
+/// → `~(?i:/Api.*)`) so the router admits both casings, and emits a
 /// `mesh_route_dispatch` rule carrying the original URI predicate +
 /// `ignore_uri_case: true`. The plugin re-evaluates with ASCII-only case
 /// folding (non-ASCII bytes compare byte-for-byte, matching Istio's
-/// documented behavior). The sibling case-sensitive `/api` proxy is unaffected
-/// and gets NO `request_termination` — the case-insensitive branch is no
-/// longer a fail-closed path.
+/// documented behavior). A later same-shape case-sensitive `/api` route
+/// collapses onto the widened proxy so Ferrum's router preserves Istio route
+/// order for that case variant.
 #[tokio::test]
 async fn vs_ignore_uri_case_routes_both_casings() {
     register_feature!(
         category = CATEGORY,
         feature = "ignoreUriCase: true",
         status = Status::Supported,
-        notes = "T1-B.5 (PR #901): listen_path is widened to a case-insensitive regex (~(?i)/Api.*) so the router admits both casings; the dispatch rule carries the original URI predicate + ignore_uri_case=true; plugin re-evaluates with ASCII-only case folding (non-ASCII bytes compare byte-for-byte). Sibling case-sensitive routes are unaffected.",
+        notes = "T1-B.5 (PR #901): exact/prefix URI matches widen to escaped case-insensitive regex listen_paths (for example ~(?i:/Api.*)); the dispatch rule carries the original URI predicate + ignore_uri_case=true; plugin re-evaluates with ASCII-only case folding; same-shape later case variants collapse onto the widened proxy to preserve Istio route order.",
     );
     let result = translate_k8s_objects(
         &[virtual_service(json!({
@@ -479,18 +479,19 @@ async fn vs_ignore_uri_case_routes_both_casings() {
     )
     .expect("translation succeeds");
 
-    // The canary proxy uses a widened case-insensitive regex listen_path that
-    // matches both `/Api*` and `/api*` (and any other casing).
-    let widened_listen_path = "~(?i)/Api.*";
-    let canary_proxy = result
+    // The selected proxy uses the widened regex listen_path so both `/Api*`
+    // and `/api*` hit one hot-router entry. Its default backend is the later
+    // stable route; the prior canary route is guarded by the dispatch plugin.
+    let widened_listen_path = "~(?i:/Api.*)";
+    let stable_proxy = result
         .config
         .proxies
         .iter()
         .find(|p| {
             p.listen_path.as_deref() == Some(widened_listen_path)
-                && p.backend_host == "canary.default.svc.cluster.local"
+                && p.backend_host == "stable.default.svc.cluster.local"
         })
-        .expect("ignoreUriCase emits a case-insensitive regex listen_path");
+        .expect("same-shape ignoreUriCase route collapses onto widened stable proxy");
 
     // The dispatch rule carries the URI predicate + `ignore_uri_case` so the
     // plugin can re-evaluate at request time.
@@ -500,32 +501,24 @@ async fn vs_ignore_uri_case_routes_both_casings() {
         .iter()
         .find(|p| {
             p.plugin_name == "mesh_route_dispatch"
-                && p.proxy_id.as_deref() == Some(canary_proxy.id.as_str())
+                && p.proxy_id.as_deref() == Some(stable_proxy.id.as_str())
         })
         .expect("mesh_route_dispatch rule emitted for ignoreUriCase branch");
     let match_obj = &plugin.config["rules"][0]["match"];
     assert_eq!(match_obj["uri"]["prefix"].as_str(), Some("/Api"));
     assert_eq!(match_obj["ignore_uri_case"].as_bool(), Some(true));
+    assert_eq!(
+        plugin.config["rules"][0]["destination"]["backend_host"].as_str(),
+        Some("canary.default.svc.cluster.local")
+    );
 
-    // The sibling case-sensitive proxy must NOT carry a request_termination
-    // (the case-insensitive branch is no longer treated as unsupported).
-    let stable_proxy = result
-        .config
-        .proxies
-        .iter()
-        .find(|p| {
-            p.listen_path.as_deref() == Some("/api")
-                && p.backend_host == "stable.default.svc.cluster.local"
-        })
-        .expect("case-sensitive sibling proxy must still emit");
     assert!(
         !result
             .config
-            .plugin_configs
+            .proxies
             .iter()
-            .any(|p| p.plugin_name == "request_termination"
-                && p.proxy_id.as_deref() == Some(stable_proxy.id.as_str())),
-        "ignoreUriCase=true is first-class now; the sibling proxy must NOT be wrapped in a fail-closed request_termination"
+            .any(|p| p.listen_path.as_deref() == Some("/api")),
+        "the same-shape later route must not remain in the prefix tier"
     );
 
     // Drive the plugin to prove ASCII case folding works.
