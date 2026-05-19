@@ -1095,9 +1095,8 @@ impl MetricsRegistry {
             // nominal nodes — total cardinality is bounded per node.
             output.push_str(
                 "# HELP ferrum_mesh_node_topology_degraded \
-                 Node-agent fell back from eBPF capture to iptables because the kernel \
-                 did not meet eBPF prerequisites. 1 with a reason label means degraded, \
-                 0 with reason=\"none\" means nominal.\n",
+                 Node-agent detected missing eBPF prerequisites. 1 with a reason label means \
+                 degraded, 0 with reason=\"none\" means nominal.\n",
             );
             output.push_str("# TYPE ferrum_mesh_node_topology_degraded gauge\n");
             let (reason, value) = match snapshot.topology_degraded_reason {
