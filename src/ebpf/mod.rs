@@ -207,8 +207,8 @@ pub struct NodeAgentMetrics {
     /// are routinely observed during early pod startup and are retried
     /// on the next Apply event without ever needing operator attention.
     pub pod_annotation_updates_failed: AtomicU64,
-    /// Reason this node fell back from eBPF capture to iptables, or `None`
-    /// when running the nominal eBPF capture path. Stored via `ArcSwap` so
+    /// Reason this node detected missing eBPF prerequisites, or `None` when
+    /// running the nominal eBPF capture path. Stored via `ArcSwap` so
     /// the Prometheus render path is lock-free. The value is set exactly
     /// once at startup (after the kernel probe runs) — operators must
     /// restart the node agent after a kernel/cgroup/bpffs change, which
@@ -309,8 +309,8 @@ impl NodeAgentMetrics {
         }
     }
 
-    /// Record that this node agent has fallen back to iptables capture
-    /// because the kernel did not meet eBPF prerequisites. `reason` is a
+    /// Record that this node agent detected missing eBPF prerequisites.
+    /// `reason` is a
     /// closed-set snake_case label from
     /// [`crate::ebpf::kernel_probe::KernelProbeResult::degradation_reason`].
     /// Idempotent — repeat calls with the same reason are no-ops.

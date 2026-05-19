@@ -11,12 +11,13 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use dashmap::DashMap;
 use futures_util::StreamExt;
 use k8s_openapi::api::core::v1::Pod;
-use kube::api::Api;
 use kube::runtime::watcher::{self as kube_watcher, Event};
+use kube::{Client, api::Api};
 use tracing::{debug, error, info, warn};
 
 use crate::admin::jwt_auth::create_jwt_manager_from_env;
@@ -43,7 +44,8 @@ use crate::modes::node_agent_cni_server::{
 
 const DEFAULT_CGROUP_ROOT: &str = "/sys/fs/cgroup";
 const DEFAULT_BPF_FS_PATH: &str = "/sys/fs/bpf";
-const DEFAULT_FALLBACK_MODE: &str = "iptables";
+const DEFAULT_FALLBACK_MODE: &str = "fail";
+const CNI_METADATA_FETCH_TIMEOUT: Duration = Duration::from_millis(750);
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -166,9 +168,10 @@ pub async fn run(
         handle_fallback(
             &config,
             &probe,
-            metrics.as_ref(),
+            metrics.clone(),
             &shutdown_tx,
             startup_ready,
+            cni_config,
         )
         .await
     } else {
@@ -366,7 +369,7 @@ async fn run_with_backend(
 
     let mut shutdown_rx = shutdown_tx.subscribe();
     let client = build_node_agent_kube_client().await?;
-    let pods: Api<Pod> = Api::all(client);
+    let pods: Api<Pod> = Api::all(client.clone());
     let watcher_config =
         kube_watcher::Config::default().fields(&format!("spec.nodeName={}", config.node_name));
     let mut pod_stream = Box::pin(kube_watcher::watcher(pods, watcher_config));
@@ -393,6 +396,7 @@ async fn run_with_backend(
     // listener task exits — otherwise the select! would park forever on
     // the receiver during shutdown.
     drop(cni_work_tx);
+    let mut cni_work_open = true;
 
     info!(
         "Node agent initialized, watching pod events on node {}",
@@ -463,7 +467,7 @@ async fn run_with_backend(
                     }
                 }
             }
-            cni_work = cni_work_rx.recv() => {
+            cni_work = cni_work_rx.recv(), if cni_work_open => {
                 match cni_work {
                     Some(work) => {
                         process_cni_work_item(
@@ -471,14 +475,15 @@ async fn run_with_backend(
                             &pod_states,
                             config,
                             metrics.as_ref(),
+                            &client,
                             work,
-                        );
+                        ).await;
                     }
                     None => {
-                        // Channel closed — listener task exited (likely
-                        // shutdown). Stop selecting on this arm by
-                        // breaking; future iterations of select! will
-                        // still respect the shutdown_rx arm.
+                        // Channel closed — listener task exited. Disable this
+                        // select arm so the watcher keeps running instead of
+                        // spinning on an immediately-ready closed receiver.
+                        cni_work_open = false;
                         debug!("CNI work queue closed; CNI plugin path inactive for the remainder of this run");
                     }
                 }
@@ -510,43 +515,141 @@ async fn run_with_backend(
 /// inherited from `handle_pod_added` / `handle_pod_removed`: repeat
 /// calls with the same identity are no-ops.
 ///
-/// Why an empty `labels`/`annotations` view? The CNI plugin is invoked
-/// at pod-sandbox setup time, BEFORE the kubelet has finished syncing
-/// the pod spec to the API server (the CNI binary is a one-shot
-/// invocation that runs from kubelet's local PLEG with just the CRI
-/// payload). Real labels/annotations arrive a moment later via the
-/// kube-rs watcher's `Apply` event and `handle_pod_added`'s
-/// `evaluate_enrollment` is the gatekeeper for actual BPF attachment.
-///
-/// Result on the ADD path: with empty labels the enrollment evaluator
-/// returns `Skip`, so the CNI ADD is intentionally a no-op for the
-/// BPF maps — the watcher's later reconcile is what actually attaches.
-/// What the CNI hook still buys us is (a) a deterministic
-/// "kubelet-told-us-the-pod-exists" signal we acknowledge with `Ok`
-/// (so kubelet doesn't retry against us) and (b) a metric counter so
-/// operators can see CNI plugin traffic. The kube-rs watcher remains
-/// the source of truth for enrollment, mirroring Istio's ambient
-/// `istio-cni` pattern where the watcher / ztunnel reconcile decides
-/// the final mesh membership.
+/// The production ADD path first fetches pod metadata from the Kubernetes API
+/// in [`apply_cni_request_with_kube_metadata`]. This pure helper keeps the
+/// no-metadata fallback behavior testable: if that API GET fails, ADD is
+/// acknowledged without BPF attachment and the kube-rs watcher reconciles when
+/// its event arrives.
 ///
 /// On the DEL path: when we already have a pod-state entry, we tear
 /// down BPF attachment immediately — the CNI DEL is a strong signal
 /// that the sandbox is going away, and waiting for the watcher's
 /// `Delete` event would leave stale BPF state for the gap.
-fn process_cni_work_item(
+async fn process_cni_work_item(
     backend: &mut dyn EbpfBackend,
     pod_states: &DashMap<String, PodAttachmentState>,
     config: &NodeAgentConfig,
     metrics: &NodeAgentMetrics,
+    kube_client: &Client,
     work: CniWorkItem,
 ) {
     let CniWorkItem { request, respond } = work;
-    let response = apply_cni_request(backend, pod_states, config, metrics, &request);
+    let response = apply_cni_request_with_kube_metadata(
+        backend,
+        pod_states,
+        config,
+        metrics,
+        kube_client,
+        &request,
+    )
+    .await;
     // The remote receiver may have been dropped (CNI client timed out or
     // the listener task is shutting down); that's fine — we still
     // applied the side-effect. The metric/log already reflect the
     // outcome from the server's side.
     let _ = respond.send(response);
+}
+
+async fn apply_cni_request_with_kube_metadata(
+    backend: &mut dyn EbpfBackend,
+    pod_states: &DashMap<String, PodAttachmentState>,
+    config: &NodeAgentConfig,
+    metrics: &NodeAgentMetrics,
+    kube_client: &Client,
+    request: &CniRpcRequest,
+) -> CniRpcResponse {
+    if request.verb != RpcVerb::Add {
+        return apply_cni_request(backend, pod_states, config, metrics, request);
+    }
+
+    let pod_api: Api<Pod> = Api::namespaced(kube_client.clone(), &request.pod_namespace);
+    match tokio::time::timeout(CNI_METADATA_FETCH_TIMEOUT, pod_api.get(&request.pod_name)).await {
+        Ok(Ok(pod)) => apply_cni_add_from_pod(backend, pod_states, config, metrics, request, &pod),
+        Ok(Err(err)) => {
+            debug!(
+                namespace = %request.pod_namespace,
+                pod_name = %request.pod_name,
+                error = %err,
+                "CNI ADD could not fetch pod metadata; kube-rs watcher will reconcile"
+            );
+            apply_cni_request(backend, pod_states, config, metrics, request)
+        }
+        Err(_elapsed) => {
+            debug!(
+                namespace = %request.pod_namespace,
+                pod_name = %request.pod_name,
+                timeout_ms = CNI_METADATA_FETCH_TIMEOUT.as_millis(),
+                "CNI ADD pod metadata fetch timed out; kube-rs watcher will reconcile"
+            );
+            apply_cni_request(backend, pod_states, config, metrics, request)
+        }
+    }
+}
+
+fn apply_cni_add_from_pod(
+    backend: &mut dyn EbpfBackend,
+    pod_states: &DashMap<String, PodAttachmentState>,
+    config: &NodeAgentConfig,
+    metrics: &NodeAgentMetrics,
+    request: &CniRpcRequest,
+    pod: &Pod,
+) -> CniRpcResponse {
+    let Some(api_uid) = pod_uid(pod) else {
+        return CniRpcResponse::Rejected {
+            reason: "Kubernetes API pod is missing metadata.uid; kube-rs watcher will reconcile"
+                .to_string(),
+        };
+    };
+    if let Some(request_uid) = request.pod_uid.as_deref()
+        && request_uid != api_uid
+    {
+        return CniRpcResponse::Rejected {
+            reason: format!(
+                "CNI pod UID {request_uid} does not match Kubernetes API pod UID {api_uid}; kube-rs watcher will reconcile"
+            ),
+        };
+    }
+
+    let labels: HashMap<String, String> = pod
+        .metadata
+        .labels
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    let annotations: HashMap<String, String> = pod
+        .metadata
+        .annotations
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    let pod_name = pod
+        .metadata
+        .name
+        .as_deref()
+        .unwrap_or(request.pod_name.as_str());
+    let namespace = pod
+        .metadata
+        .namespace
+        .as_deref()
+        .unwrap_or(request.pod_namespace.as_str());
+    let pod_ip = pod
+        .status
+        .as_ref()
+        .and_then(|status| status.pod_ip.as_deref());
+    let event = PodEvent {
+        pod_uid: &api_uid,
+        pod_name,
+        namespace,
+        labels: &labels,
+        annotations: &annotations,
+        pod_ip_str: pod_ip,
+        pod_pid: None,
+        veth_iface_override: None,
+    };
+    handle_pod_added(backend, pod_states, config, metrics, &event);
+    CniRpcResponse::Ok
 }
 
 /// Pure-function core of [`process_cni_work_item`] so tests can drive
@@ -1254,19 +1357,59 @@ pub fn handle_pod_removed(
 async fn handle_fallback(
     config: &NodeAgentConfig,
     probe: &KernelProbeResult,
-    metrics: &NodeAgentMetrics,
+    metrics: Arc<NodeAgentMetrics>,
     shutdown_tx: &tokio::sync::watch::Sender<bool>,
     startup_ready: Arc<AtomicBool>,
+    cni_config: CniListenerConfig,
 ) -> Result<(), anyhow::Error> {
-    handle_fallback_with(
+    let cni_handles =
+        if cni_config.enabled && matches!(config.fallback_mode, FallbackMode::Iptables) {
+            Some(spawn_cni_passthrough_listener(
+                cni_config.socket_path.clone(),
+                metrics.clone(),
+                shutdown_tx.subscribe(),
+            ))
+        } else {
+            None
+        };
+
+    let result = handle_fallback_with(
         config,
         probe,
-        metrics,
+        metrics.as_ref(),
         shutdown_tx,
         |cmds, phase| async move { execute_iptables_commands(&cmds, phase).await },
         startup_ready,
     )
-    .await
+    .await;
+
+    if let Some((listener, worker)) = cni_handles {
+        let _ = shutdown_tx.send(true);
+        if let Err(err) = listener.await {
+            warn!(error = %err, "Node agent CNI passthrough listener task panicked");
+        }
+        if let Err(err) = worker.await {
+            warn!(error = %err, "Node agent CNI passthrough worker task panicked");
+        }
+    }
+
+    result
+}
+
+fn spawn_cni_passthrough_listener(
+    socket_path: String,
+    metrics: Arc<NodeAgentMetrics>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>) {
+    let (cni_work_tx, mut cni_work_rx) = cni_work_channel();
+    let listener = spawn_cni_listener(socket_path, cni_work_tx.clone(), metrics, shutdown);
+    drop(cni_work_tx);
+    let worker = tokio::spawn(async move {
+        while let Some(work) = cni_work_rx.recv().await {
+            let _ = work.respond.send(CniRpcResponse::Ok);
+        }
+    });
+    (listener, worker)
 }
 
 /// Test seam for [`handle_fallback`]. The production path passes
@@ -1307,9 +1450,9 @@ where
                 degradation_reason = reason,
                 "Kernel does not support eBPF capture, falling back to iptables mode. \
                  Remediation: upgrade kernel to >= 5.7 with cgroup v2 + bpffs mounted, \
-                 or set FERRUM_NODE_AGENT_FALLBACK_MODE=fail to refuse startup on degraded nodes. \
-                 Per-pod ambient capture remains available via iptables injection — \
-                 configure the injector NodeSelector so pods on this node receive an iptables init container."
+                 FERRUM_NODE_AGENT_FALLBACK_MODE=iptables is explicit opt-in and requires a runtime image \
+                 with /bin/sh plus iptables/ip6tables. Per-pod ambient capture remains available via iptables \
+                 injection — configure the injector NodeSelector so pods on this node receive an iptables init container."
             );
 
             let plan = IptablesPlan::for_config(&config.capture_config);
@@ -1354,7 +1497,7 @@ where
                 "eBPF capture requires kernel >= 5.7 with cgroup v2 and bpffs. \
                  Detected: kernel={}, cgroup_v2={}, bpf_fs={}, reason={}. \
                  Set FERRUM_NODE_AGENT_FALLBACK_MODE=iptables to use iptables instead \
-                 (default).",
+                 when the runtime image includes /bin/sh plus iptables/ip6tables.",
                 probe.kernel_release,
                 probe.cgroup_v2_available,
                 probe.bpf_fs_available,
@@ -2316,6 +2459,7 @@ mod tests {
                 veth_iface: Some("veth123".to_string()),
                 attached: true,
                 include_ports_cgroup_id: None,
+                include_ports_policy: None,
             },
         );
         let req = CniRpcRequest {
@@ -2402,6 +2546,7 @@ mod tests {
                 veth_iface: None,
                 attached: true,
                 include_ports_cgroup_id: None,
+                include_ports_policy: None,
             },
         );
         let resp = apply_cni_request(&mut backend, &pod_states, &config, &metrics, &req);
@@ -2583,15 +2728,19 @@ mod tests {
         };
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         let startup_ready = Arc::new(AtomicBool::new(false));
-        let metrics = NodeAgentMetrics::default();
+        let metrics = Arc::new(NodeAgentMetrics::default());
 
         assert!(
             handle_fallback(
                 &config,
                 &probe,
-                &metrics,
+                metrics.clone(),
                 &shutdown_tx,
-                startup_ready.clone()
+                startup_ready.clone(),
+                CniListenerConfig {
+                    enabled: false,
+                    socket_path: "/tmp/ferrum-test.sock".to_string(),
+                }
             )
             .await
             .is_err()

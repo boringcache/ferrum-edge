@@ -262,9 +262,10 @@ Notes:
   The chart provisions this automatically when `nodeAgent.security.readOnlyRootFilesystem`
   is true.
 - `allowPrivilegeEscalation: false` is safe because the agent never
-  exec's a setuid binary; `tokio::process::Command::new("sh")` in the
-  iptables fallback inherits the same uid/caps and does not need to
-  escalate.
+  exec's a setuid binary. When operators explicitly enable
+  `FERRUM_NODE_AGENT_FALLBACK_MODE=iptables` with a custom image that
+  includes `/bin/sh` and iptables tools, that fallback inherits the same
+  uid/caps and does not need to escalate.
 - The AppArmor annotation
   (`container.apparmor.security.beta.kubernetes.io/<container>`) shown
   above is the **deprecated** form — it was removed in Kubernetes 1.31.
@@ -548,7 +549,7 @@ under the `system:serviceaccount:<ns>:ferrum-node-agent` identity.
 | ServiceAccount token theft | Use projected tokens with short `expirationSeconds`; rotate via kubelet | Operator |
 | Excessive RBAC | Chart's ClusterRole is `pods get/list/watch` + `nodes get` — verify on fork | Operator + Gateway |
 | Audit blind spots | `auditd` rules above; agent emits structured tracing events for every attach | Operator |
-| Iptables fallback running on a bad kernel | `FERRUM_NODE_AGENT_FALLBACK_MODE=fail` to refuse to start instead of falling back | Operator |
+| Iptables fallback running on a bad kernel | Default `FERRUM_NODE_AGENT_FALLBACK_MODE=fail`; set `iptables` only on custom images that intentionally support it | Operator |
 | AppArmor / SELinux misconfigured | Profile in this doc allows only the documented mounts and syscalls; load before enabling | Operator |
 | PSS misconfigured (restricted / baseline) | This doc explicitly states `privileged` is required; do not apply restricted/baseline to the namespace | Operator |
 | Pinned BPF maps left behind after crash | Cleanup path unpins on SIGTERM; stale pins are removed by `pin_map_at` on next start | Gateway |

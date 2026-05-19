@@ -29,5 +29,6 @@
 //! hasn't landed or the cluster's primary CNI rejects the chained config).
 
 pub mod client;
+pub mod install;
 pub mod rpc;
 pub mod spec;

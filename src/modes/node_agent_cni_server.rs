@@ -308,13 +308,10 @@ async fn write_response_frame(
 /// Translate a CNI RPC request into a `PodEvent` the existing
 /// [`crate::modes::node_agent::handle_pod_added`] path can consume.
 ///
-/// The CNI plugin doesn't have rich pod metadata (no labels, no
-/// annotations, no pod IP — those come from the K8s API after the
-/// sandbox is created), so the event we emit is intentionally
-/// minimal. Result: the CNI ADD reserves the pod's BPF state and
-/// the kube-rs watcher's subsequent `Apply` reconciles in the
-/// real labels/annotations/IP. This is the same pattern Istio's
-/// ambient `istio-cni` uses.
+/// This helper intentionally emits only the identity carried on the CNI wire.
+/// Production ADD handling enriches the request from the Kubernetes API before
+/// it calls the node-agent enrollment path; tests and fallback paths use this
+/// minimal shape to verify the no-metadata behavior.
 pub fn pod_event_from_request<'a>(
     request: &'a CniRpcRequest,
     labels: &'a HashMap<String, String>,
@@ -328,6 +325,7 @@ pub fn pod_event_from_request<'a>(
         annotations,
         pod_ip_str: None,
         pod_pid: None,
+        veth_iface_override: None,
     }
 }
 

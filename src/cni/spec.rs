@@ -78,6 +78,13 @@ pub struct CniInvocation {
 }
 
 impl CniInvocation {
+    pub fn command_from_env() -> Result<CniCommand, CniError> {
+        env::var("CNI_COMMAND")
+            .map_err(|_| CniError::missing_env("CNI_COMMAND"))?
+            .parse::<CniCommand>()
+            .map_err(|_| CniError::missing_env("CNI_COMMAND"))
+    }
+
     /// Read the CNI invocation from `std::env`.
     ///
     /// Empty `CNI_NETNS` is normalized to `None`; the spec allows DEL to
@@ -85,10 +92,11 @@ impl CniInvocation {
     /// `""` and unset identically here saves the node-agent server from
     /// having to do the same dance.
     pub fn from_env() -> Result<Self, CniError> {
-        let command = env::var("CNI_COMMAND")
-            .map_err(|_| CniError::missing_env("CNI_COMMAND"))?
-            .parse::<CniCommand>()
-            .map_err(|_| CniError::missing_env("CNI_COMMAND"))?;
+        let command = Self::command_from_env()?;
+        Self::from_env_for_command(command)
+    }
+
+    pub fn from_env_for_command(command: CniCommand) -> Result<Self, CniError> {
         let container_id =
             env::var("CNI_CONTAINERID").map_err(|_| CniError::missing_env("CNI_CONTAINERID"))?;
         if container_id.trim().is_empty() {
@@ -227,10 +235,11 @@ pub struct FerrumCniOptions {
 ///
 /// Ferrum is a chained "meta-plugin" that does NOT allocate IPs or
 /// interfaces of its own — those come from the primary CNI (Calico,
-/// Cilium, etc.). On ADD we pass `prevResult` through verbatim so the
-/// kubelet sees the same allocation. On a fresh (non-chained) conflist
-/// where `prevResult` is absent, we emit a minimal valid `Result` with
-/// just `cniVersion` — kubelet tolerates that for meta-plugins.
+/// Cilium, etc.). On ADD we pass `prevResult` allocation fields through
+/// while dropping its nested `cniVersion`, because the result already emits
+/// a top-level `cniVersion`. On a fresh (non-chained) conflist where
+/// `prevResult` is absent, we emit a minimal valid `Result` with just
+/// `cniVersion` — kubelet tolerates that for meta-plugins.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CniSuccessResult {
     #[serde(rename = "cniVersion")]
@@ -241,12 +250,13 @@ pub struct CniSuccessResult {
 
 impl CniSuccessResult {
     pub fn passthrough(cni_version: &str, prev_result: Option<&serde_json::Value>) -> Self {
-        let prev_result = match prev_result {
+        let mut prev_result: HashMap<String, serde_json::Value> = match prev_result {
             Some(serde_json::Value::Object(map)) => {
                 map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
             }
             _ => HashMap::new(),
         };
+        prev_result.remove("cniVersion");
         Self {
             cni_version: cni_version.to_string(),
             prev_result,
@@ -425,6 +435,7 @@ mod tests {
     #[test]
     fn passthrough_result_inlines_prev_result_fields() {
         let prev = serde_json::json!({
+            "cniVersion": "0.4.0",
             "interfaces": [{"name": "eth0"}],
             "ips": [{"address": "10.0.0.1/24"}],
         });
@@ -432,6 +443,11 @@ mod tests {
         assert_eq!(result.cni_version, "0.4.0");
         assert_eq!(result.prev_result.len(), 2);
         let json = serde_json::to_string(&result).expect("serializes");
+        assert_eq!(
+            json.matches("cniVersion").count(),
+            1,
+            "top-level cniVersion should not be duplicated from prevResult"
+        );
         assert!(json.contains("\"interfaces\""));
         assert!(json.contains("\"ips\""));
     }

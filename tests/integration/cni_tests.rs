@@ -5,11 +5,10 @@
 //!     ferrum-cni client      ──▶  UDS  ──▶      node-agent CNI server
 //!     (blocking sync client)        (length-prefixed JSON)
 //!
-//! Instead of running the standalone `ferrum-cni` binary (which would
-//! require `assert_cmd` plumbing for every test variant), we drive the
-//! same `cni::client::send_rpc` API the binary uses. That keeps the
-//! tests fast (no process spawn) while still proving every byte the
-//! kubelet eventually sees is the byte the server emits.
+//! Most tests drive the same `cni::client::send_rpc` API the binary uses.
+//! That keeps the tests fast while still proving the UDS framing. One
+//! targeted test invokes the standalone `ferrum-cni` binary to verify
+//! kubelet-visible exit/status behavior.
 //!
 //! Each test:
 //! 1. Builds a tokio runtime + a single oneshot worker that drains the
@@ -24,6 +23,8 @@
 //! round-trips) and one error path (server replies with `Error` →
 //! `send_rpc` decodes it correctly).
 
+use std::io::Write;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -258,6 +259,101 @@ async fn cni_round_trip_surfaces_main_loop_error() {
         1,
         "expected one CHECK error in metrics"
     );
+    let _ = shutdown_tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(2), listener).await;
+}
+
+/// Binary-level behavior: a rejected CHECK must fail the CNI invocation
+/// so kubelet can detect that the pod is not currently enrolled.
+#[tokio::test]
+async fn ferrum_cni_binary_check_rejection_exits_nonzero() {
+    let dir = tempdir().expect("tempdir");
+    let socket_path = dir.path().join("agent.sock");
+    let socket_path_str = socket_path.to_string_lossy().to_string();
+    let metrics = Arc::new(NodeAgentMetrics::default());
+    let (work_tx, mut work_rx) = cni_work_channel();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let drained = tokio::spawn(async move {
+        let work = work_rx.recv().await.expect("work item arrives");
+        assert_eq!(work.request.verb, RpcVerb::Check);
+        let _ = work.respond.send(CniRpcResponse::Rejected {
+            reason: "pod not currently enrolled".to_string(),
+        });
+    });
+
+    let listener = spawn_cni_listener(
+        socket_path_str.clone(),
+        work_tx,
+        metrics.clone(),
+        shutdown_rx,
+    );
+
+    let output = tokio::task::spawn_blocking(move || {
+        for _ in 0..50 {
+            if socket_path.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let stdin_config = serde_json::json!({
+            "cniVersion": "0.4.0",
+            "name": "ferrum-mesh-chain",
+            "type": "ferrum-cni",
+            "ferrum": {
+                "socketPath": socket_path_str
+            },
+            "prevResult": {
+                "interfaces": [],
+                "ips": []
+            }
+        })
+        .to_string();
+
+        let mut child = Command::new(env!("CARGO_BIN_EXE_ferrum-cni"))
+            .env("CNI_COMMAND", "CHECK")
+            .env("CNI_CONTAINERID", "ctr-1")
+            .env("CNI_NETNS", "/var/run/netns/cni-1")
+            .env("CNI_IFNAME", "eth0")
+            .env(
+                "CNI_ARGS",
+                "K8S_POD_NAMESPACE=demo;K8S_POD_NAME=alpha;K8S_POD_UID=uid-1",
+            )
+            .env("CNI_PATH", "/opt/cni/bin")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn ferrum-cni");
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin pipe")
+            .write_all(stdin_config.as_bytes())
+            .expect("write stdin");
+        child.wait_with_output().expect("wait ferrum-cni")
+    })
+    .await
+    .expect("blocking task joined");
+
+    assert!(
+        !output.status.success(),
+        "CHECK rejection must fail CNI CHECK, stdout={}, stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("CNI error JSON should parse");
+    assert_eq!(payload["code"], 12);
+    assert!(
+        payload["msg"]
+            .as_str()
+            .is_some_and(|msg| msg.contains("pod not currently enrolled")),
+        "unexpected payload: {payload}"
+    );
+
+    drained.await.expect("drainer joined");
     let _ = shutdown_tx.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(2), listener).await;
 }

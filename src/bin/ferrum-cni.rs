@@ -29,6 +29,7 @@ mod cni_main {
     use std::time::Duration;
 
     use ferrum_edge::cni::client::{DEFAULT_RPC_TIMEOUT, send_rpc};
+    use ferrum_edge::cni::install;
     use ferrum_edge::cni::rpc::{CniRpcRequest, CniRpcResponse, RpcVerb};
     use ferrum_edge::cni::spec::{
         CniCommand, CniError, CniInvocation, CniNetConfig, CniSuccessResult, K8sPodIdentity,
@@ -43,6 +44,31 @@ mod cni_main {
     const DEFAULT_CNI_SOCKET_PATH: &str = "/var/run/ferrum/node-agent-cni.sock";
 
     pub fn run() -> ExitCode {
+        if std::env::args().nth(1).as_deref() == Some("install") {
+            return match install::install_from_env() {
+                Ok(path) => {
+                    eprintln!(
+                        "ferrum-cni: installed chained CNI config at {}",
+                        path.display()
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(err) => {
+                    eprintln!("ferrum-cni: install failed: {err}");
+                    ExitCode::from(1)
+                }
+            };
+        }
+
+        let command = match CniInvocation::command_from_env() {
+            Ok(CniCommand::Version) => return emit_version("0.4.0"),
+            Ok(CniCommand::Unsupported) => {
+                return emit_error("0.4.0", &CniError::UnsupportedCommand);
+            }
+            Ok(command) => command,
+            Err(err) => return emit_error("0.4.0", &err),
+        };
+
         let mut stdin_buf = String::new();
         if let Err(err) = std::io::stdin().read_to_string(&mut stdin_buf) {
             return emit_error("0.4.0", &CniError::BadConfig(format!("read stdin: {err}")));
@@ -53,7 +79,7 @@ mod cni_main {
         };
         let cni_version = net_config.cni_version.clone();
 
-        let invocation = match CniInvocation::from_env() {
+        let invocation = match CniInvocation::from_env_for_command(command) {
             Ok(inv) => inv,
             Err(err) => return emit_error(&cni_version, &err),
         };
@@ -121,6 +147,7 @@ mod cni_main {
             Ok(CniRpcResponse::Rejected { reason }) => {
                 eprintln!("ferrum-cni: node-agent rejected enrollment: {reason}");
                 match command {
+                    CniCommand::Check => emit_error(&cni_version, &CniError::Rejected(reason)),
                     CniCommand::Del => emit_empty_success(),
                     _ => emit_success(&cni_version, net_config.prev_result.as_ref()),
                 }
