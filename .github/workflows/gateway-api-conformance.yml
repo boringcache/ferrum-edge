@@ -44,7 +44,7 @@ jobs:
 
     steps:
       - name: Checkout Ferrum Edge
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Resolve inputs
         id: inputs
@@ -66,7 +66,7 @@ jobs:
           echo "conformance_tests=$conformance_tests" >> "$GITHUB_OUTPUT"
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:
           go-version: "1.25.x"
 
@@ -246,7 +246,7 @@ jobs:
 
       - name: Upload conformance artifacts
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: gateway-api-conformance-${{ steps.inputs.outputs.gateway_api_version }}
           path: conformance-results/
