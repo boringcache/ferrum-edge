@@ -225,14 +225,14 @@ fn build_h3_quinn_server_config(
     ));
     transport_config.max_concurrent_bidi_streams(h3_config.max_concurrent_streams.into());
 
-    // QUIC flow-control tuning — larger windows improve throughput on modern networks.
+    // QUIC flow-control tuning — conservative defaults for untrusted clients.
     transport_config.stream_receive_window(crate::http3::config::quic_varint_or_default(
         h3_config.stream_receive_window,
-        crate::http3::config::H3_STREAM_RECEIVE_WINDOW_DEFAULT,
+        crate::http3::config::H3_FRONTEND_STREAM_RECEIVE_WINDOW,
     ));
     transport_config.receive_window(crate::http3::config::quic_varint_or_default(
         h3_config.receive_window,
-        crate::http3::config::H3_RECEIVE_WINDOW_DEFAULT,
+        crate::http3::config::H3_FRONTEND_RECEIVE_WINDOW,
     ));
     transport_config.send_window(h3_config.send_window);
 
