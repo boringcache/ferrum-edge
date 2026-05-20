@@ -1,7 +1,7 @@
 //! Integration coverage for the RTDS runtime-overlay consumer dispatch.
 //!
-//! `MeshRuntimeState::install_slice` is the single touch point that fans
-//! out a slice's `runtime_overlay` to every consumer (fault injection,
+//! `MeshRuntimeState::record_applied_slice` is the single touch point that fans
+//! out an accepted slice's `runtime_overlay` to every consumer (fault injection,
 //! header transformer gates, tracing log levels). These tests install
 //! representative slices and assert each consumer reflects the overlay,
 //! covering the full cold-path wiring without depending on the live xDS
@@ -18,13 +18,13 @@ use ferrum_edge::plugins::fault_injection::runtime_overlay as fault_overlay;
 use ferrum_edge::plugins::request_transformer::runtime_overlay as request_gate;
 use ferrum_edge::plugins::response_transformer::runtime_overlay as response_gate;
 
-/// Process-global lock serialising every test in this module — the RTDS
-/// consumers all back onto module-level `ArcSwap` state, so two tests racing
-/// `apply_overlay` / `reset_for_test` would corrupt each other's
-/// assertions. Defined at module scope so every test acquires the SAME
-/// mutex; a `static` defined inside each test is a distinct mutex (local
-/// statics are per-function) and would not serialise at all.
-static CONSUMER_TEST_GUARD: Mutex<()> = Mutex::new(());
+/// Process-global lock serialising every test that touches RTDS consumer
+/// state. The consumers all back onto module-level `ArcSwap` state, so two
+/// tests racing `apply_overlay` / `reset_for_test` would corrupt each other's
+/// assertions.
+fn consumer_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    ferrum_edge::modes::mesh::runtime_overlay_consumers::test_lock()
+}
 
 #[derive(Default, Clone)]
 struct CapturingReloader {
@@ -42,12 +42,14 @@ impl LogLevelReloader for CapturingReloader {
 }
 
 fn install_slice_with_overlay(state: &MeshRuntimeState, overlay: MeshRuntimeOverlay) {
-    state.install_slice(MeshSlice {
+    let slice = MeshSlice {
         namespace: "alpha".to_string(),
         version: "consumer-test".to_string(),
         runtime_overlay: overlay,
         ..MeshSlice::default()
-    });
+    };
+    state.install_slice(slice.clone());
+    state.record_applied_slice(&slice);
 }
 
 #[test]
@@ -57,9 +59,7 @@ fn slice_install_fans_out_to_every_consumer() {
     // module-level `CONSUMER_TEST_GUARD` mutex. Reset every consumer at
     // entry and exit so leftover state from an earlier sibling can't
     // corrupt assertions.
-    let _guard = CONSUMER_TEST_GUARD
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let _guard = consumer_test_guard();
 
     fault_overlay::reset_for_test();
     request_gate::reset_for_test();
@@ -135,9 +135,7 @@ fn slice_install_fans_out_to_every_consumer() {
 
 #[test]
 fn dropping_key_from_subsequent_slice_clears_the_consumer_value() {
-    let _guard = CONSUMER_TEST_GUARD
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let _guard = consumer_test_guard();
 
     fault_overlay::reset_for_test();
     request_gate::reset_for_test();
@@ -171,4 +169,50 @@ fn dropping_key_from_subsequent_slice_clears_the_consumer_value() {
 
     fault_overlay::reset_for_test();
     request_gate::reset_for_test();
+}
+
+#[test]
+fn rejected_slice_receive_does_not_mutate_consumer_values() {
+    let _guard = consumer_test_guard();
+
+    fault_overlay::reset_for_test();
+
+    let state = MeshRuntimeState::new();
+    let mut accepted_fields = HashMap::new();
+    accepted_fields.insert(
+        "ferrum.fault_injection.stable.abort_percent".to_string(),
+        RuntimeValue::Number(10.0),
+    );
+    install_slice_with_overlay(
+        &state,
+        MeshRuntimeOverlay {
+            fields: accepted_fields,
+        },
+    );
+    assert_eq!(
+        fault_overlay::current_overrides().abort_percent("stable"),
+        Some(10.0)
+    );
+
+    let mut rejected_fields = HashMap::new();
+    rejected_fields.insert(
+        "ferrum.fault_injection.stable.abort_percent".to_string(),
+        RuntimeValue::Number(90.0),
+    );
+    state.install_slice(MeshSlice {
+        namespace: "alpha".to_string(),
+        version: "received-but-not-accepted".to_string(),
+        runtime_overlay: MeshRuntimeOverlay {
+            fields: rejected_fields,
+        },
+        ..MeshSlice::default()
+    });
+
+    assert_eq!(
+        fault_overlay::current_overrides().abort_percent("stable"),
+        Some(10.0),
+        "received-only slices must not update live RTDS consumers"
+    );
+
+    fault_overlay::reset_for_test();
 }

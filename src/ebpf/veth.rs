@@ -23,6 +23,12 @@ use std::path::Path;
 /// Returns `None` if the interface cannot be determined (non-Linux or missing
 /// procfs/sysfs entries).
 pub fn discover_veth_for_pod(pod_pid: Option<u32>, cgroup_path: Option<&str>) -> Option<String> {
+    #[cfg(test)]
+    {
+        if let Some(name) = tests::test_override() {
+            return Some(name);
+        }
+    }
     #[cfg(target_os = "linux")]
     {
         if let Some(pid) = pod_pid
@@ -213,14 +219,61 @@ fn setns(fd: std::os::fd::RawFd) -> Option<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use std::cell::RefCell;
+
     #[cfg(target_os = "linux")]
     use tempfile::tempdir;
 
     #[cfg(target_os = "linux")]
     fn write(path: &Path, value: &str) {
         std::fs::write(path, value).unwrap();
+    }
+
+    thread_local! {
+        /// Test-only override consulted by `discover_veth_for_pod` before
+        /// it tries procfs/sysfs. Set via [`TestOverrideGuard`] in tests
+        /// that exercise `handle_pod_added` (or any other production code
+        /// that calls `discover_veth_for_pod`) on a host that does not
+        /// have the pod's network namespace materialised (which is every
+        /// machine running `cargo test`). The guard restores the previous
+        /// value on drop so concurrent tests stay isolated.
+        static TEST_VETH_OVERRIDE: RefCell<Option<String>> = const { RefCell::new(None) };
+    }
+
+    /// Read the current thread-local override (if any) without taking
+    /// ownership. Called from the production path under `#[cfg(test)]`.
+    pub(crate) fn test_override() -> Option<String> {
+        TEST_VETH_OVERRIDE.with(|cell| cell.borrow().clone())
+    }
+
+    /// Drop guard that scopes a test-only veth override to a single test.
+    /// Pin one of these on the stack before calling into production code
+    /// that may invoke `discover_veth_for_pod`; previous value is restored
+    /// when the guard drops, so nested overrides still work correctly.
+    pub struct TestOverrideGuard {
+        previous: Option<String>,
+    }
+
+    impl TestOverrideGuard {
+        pub fn new(name: &str) -> Self {
+            let previous = TEST_VETH_OVERRIDE.with(|cell| {
+                let prev = cell.borrow().clone();
+                *cell.borrow_mut() = Some(name.to_string());
+                prev
+            });
+            Self { previous }
+        }
+    }
+
+    impl Drop for TestOverrideGuard {
+        fn drop(&mut self) {
+            let previous = self.previous.take();
+            TEST_VETH_OVERRIDE.with(|cell| {
+                *cell.borrow_mut() = previous;
+            });
+        }
     }
 
     #[test]
@@ -337,6 +390,19 @@ mod tests {
                 }
             ),
             None
+        );
+    }
+
+    #[test]
+    fn discover_veth_test_override_takes_precedence() {
+        let _guard = TestOverrideGuard::new("vethTEST");
+        assert_eq!(
+            discover_veth_for_pod(None, None).as_deref(),
+            Some("vethTEST")
+        );
+        assert_eq!(
+            discover_veth_for_pod(Some(999_999_999), None).as_deref(),
+            Some("vethTEST")
         );
     }
 }

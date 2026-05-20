@@ -680,7 +680,7 @@ mod tests {
     }
 
     #[test]
-    fn normalize_mesh_policy_header_names_preserves_conflicting_case_collisions() {
+    fn normalize_mesh_policy_header_names_collapses_conflicting_case_collisions() {
         let mut policy = MeshPolicy {
             name: "headers".to_string(),
             namespace: "default".to_string(),
@@ -705,8 +705,8 @@ mod tests {
 
         normalize_mesh_policy_header_names(&mut policy);
 
-        assert_eq!(policy.rules[0].to[0].headers.len(), 2);
-        assert!(policy.rules[0].to[0].headers.contains_key("X-Tenant"));
+        assert_eq!(policy.rules[0].to[0].headers.len(), 1);
+        assert!(!policy.rules[0].to[0].headers.contains_key("X-Tenant"));
         assert!(policy.rules[0].to[0].headers.contains_key("x-tenant"));
     }
 

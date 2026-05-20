@@ -25,12 +25,22 @@
 
 #![allow(dead_code)]
 
+use std::sync::{LazyLock, Mutex, MutexGuard};
+
 use crate::modes::mesh::config::MeshRuntimeOverlay;
 
+static RUNTIME_OVERLAY_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+#[doc(hidden)]
+pub fn test_lock() -> MutexGuard<'static, ()> {
+    RUNTIME_OVERLAY_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Apply every RTDS-driven runtime knob exposed on `overlay`. Called from
-/// `MeshRuntimeState::install_slice` after the slice is staged so consumers
-/// always see the value that's about to be (or has just been) published on
-/// the lock-free snapshot.
+/// `MeshRuntimeState::record_applied_slice` after the proxy runtime accepts a
+/// slice so consumers never observe values from rejected updates.
 ///
 /// Cold path; allocations are bounded by the number of `ferrum.*` keys in
 /// the overlay. No-op when none are present.

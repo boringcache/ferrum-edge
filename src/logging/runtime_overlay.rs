@@ -83,12 +83,14 @@ mod tests {
 
     #[test]
     fn missing_key_returns_none() {
+        let _guard = crate::modes::mesh::runtime_overlay_consumers::test_lock();
         let overlay = MeshRuntimeOverlay::default();
         assert_eq!(apply_overlay(&overlay), None);
     }
 
     #[test]
     fn non_string_value_returns_none() {
+        let _guard = crate::modes::mesh::runtime_overlay_consumers::test_lock();
         // A reloader may or may not have been installed by another test in
         // the same binary. We only assert the apply path doesn't panic and
         // returns None for non-string values.
@@ -98,6 +100,7 @@ mod tests {
 
     #[test]
     fn empty_string_returns_none() {
+        let _guard = crate::modes::mesh::runtime_overlay_consumers::test_lock();
         let overlay = overlay_with_log_level(RuntimeValue::String("   ".into()));
         assert_eq!(apply_overlay(&overlay), None);
     }

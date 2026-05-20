@@ -22,12 +22,15 @@ use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use anyhow::Context as _;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
+use crate::admin::jwt_auth::create_jwt_manager_from_env;
+use crate::admin::{self, AdminState};
 use crate::config::EnvConfig;
 use crate::config::conf_file::resolve_ferrum_var;
 use crate::config::types::{
@@ -3269,6 +3272,20 @@ async fn serve_mesh_runtime(
     } else {
         proxy_state
     };
+    if let Some(ref slice) = initial_applied_mesh_slice {
+        mesh_state.record_applied_slice(slice);
+    }
+    let startup_ready = Arc::new(AtomicBool::new(false));
+    let admin_handles = start_mesh_admin_listeners(
+        &env_config,
+        &shutdown_tx,
+        proxy_state.clone(),
+        mesh_state.clone(),
+        startup_ready.clone(),
+        &tls_policy,
+        &crls,
+    )?;
+    mesh_background_handles.extend(admin_handles);
     crate::runtime_metrics::global().configure(
         env_config.status_counts_max_entries,
         env_config.runtime_metrics_pool_tracking_enabled,
@@ -3564,6 +3581,7 @@ async fn serve_mesh_runtime(
             .stream_listener_manager
             .wait_until_started(Duration::from_secs(10))
             .await?;
+        startup_ready.store(true, std::sync::atomic::Ordering::Release);
         info!("Mesh runtime startup complete");
         Ok(())
     }
@@ -3624,6 +3642,139 @@ async fn serve_mesh_runtime(
     info!("Mesh runtime mode shutting down");
     listener_result?;
     Ok(())
+}
+
+fn start_mesh_admin_listeners(
+    env_config: &EnvConfig,
+    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    proxy_state: ProxyState,
+    mesh_state: MeshRuntimeState,
+    startup_ready: Arc<AtomicBool>,
+    tls_policy: &TlsPolicy,
+    crls: &tls::CrlList,
+) -> Result<Vec<JoinHandle<()>>, anyhow::Error> {
+    let admin_allowed_cidrs = Arc::new(
+        crate::proxy::client_ip::TrustedProxies::parse_strict(&env_config.admin_allowed_cidrs)
+            .map_err(|err| anyhow::anyhow!("Invalid FERRUM_ADMIN_ALLOWED_CIDRS: {err}"))?,
+    );
+    let jwt_manager = match create_jwt_manager_from_env() {
+        Ok(manager) => manager,
+        Err(err) => {
+            warn!(
+                "Admin JWT not configured for mesh mode ({}), admin endpoints will reject operator tokens",
+                err
+            );
+            let random_secret = format!("{}{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+            crate::admin::jwt_auth::JwtManager::new(crate::admin::jwt_auth::JwtConfig {
+                secret: random_secret,
+                ..Default::default()
+            })
+        }
+    };
+    let admin_state = AdminState {
+        db: None,
+        jwt_manager,
+        cached_config: Some(proxy_state.config.clone()),
+        proxy_state: Some(proxy_state.clone()),
+        mode: "mesh".to_string(),
+        read_only: true,
+        admin_audit_enabled: env_config.admin_audit_enabled,
+        startup_ready: Some(startup_ready),
+        db_available: None,
+        admin_restore_max_body_size_mib: env_config.admin_restore_max_body_size_mib,
+        admin_spec_max_body_size_mib: env_config.admin_spec_max_body_size_mib,
+        reserved_ports: env_config.reserved_gateway_ports(),
+        stream_proxy_bind_address: env_config.stream_proxy_bind_address.clone(),
+        admin_allowed_cidrs,
+        cached_db_health: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
+        dp_registry: None,
+        mesh_registry: None,
+        cp_connection_state: None,
+        admin_http_header_read_timeout_seconds: env_config.http_header_read_timeout_seconds,
+        mesh_runtime_state: Some(mesh_state),
+        admin_tls_handshake_timeout_seconds: env_config.frontend_tls_handshake_timeout_seconds,
+    };
+
+    let mut handles = Vec::new();
+    let admin_state_for_https = admin_state.clone();
+
+    if env_config.admin_http_port != 0 {
+        let admin_http_addr = env_config.admin_socket_addr(env_config.admin_http_port);
+        let shutdown = shutdown_tx.subscribe();
+        handles.push(tokio::spawn(async move {
+            info!("Starting mesh admin HTTP listener on {}", admin_http_addr);
+            if let Err(err) =
+                admin::start_admin_listener(admin_http_addr, admin_state, shutdown).await
+            {
+                error!("Mesh admin HTTP listener error: {}", err);
+            }
+        }));
+    } else {
+        info!("FERRUM_ADMIN_HTTP_PORT=0 — plaintext mesh admin HTTP listener disabled");
+    }
+
+    if let (Some(admin_cert_path), Some(admin_key_path)) = (
+        &env_config.admin_tls_cert_path,
+        &env_config.admin_tls_key_path,
+    ) {
+        let admin_https_addr = env_config.admin_socket_addr(env_config.admin_https_port);
+        let admin_client_ca_bundle = env_config.admin_tls_client_ca_bundle_path.as_deref();
+        let admin_tls_config = tls::load_tls_config_with_client_auth(
+            admin_cert_path,
+            admin_key_path,
+            admin_client_ca_bundle,
+            env_config.admin_tls_no_verify,
+            tls_policy,
+            env_config.tls_cert_expiry_warning_days,
+            crls,
+        )
+        .map_err(|err| anyhow::anyhow!("Invalid mesh admin TLS configuration: {err}"))?;
+        let admin_reload_handles = crate::modes::tls_reload::prepare_admin_frontend_tls(
+            admin_tls_config.clone(),
+            env_config,
+            tls_policy,
+            crls,
+            Some(shutdown_tx.subscribe()),
+        );
+        if admin_reload_handles.watcher_handle.is_some() {
+            info!("Frontend TLS live reload enabled for mesh admin HTTPS");
+        }
+        let admin_tls_slot = admin_reload_handles.slot.clone();
+        let shutdown = shutdown_tx.subscribe();
+        handles.push(tokio::spawn(async move {
+            info!("Starting mesh admin HTTPS listener on {}", admin_https_addr);
+            let result = if let Some(slot) = admin_tls_slot {
+                admin::start_admin_listener_with_dynamic_tls(
+                    admin_https_addr,
+                    admin_state_for_https,
+                    shutdown,
+                    slot,
+                )
+                .await
+            } else {
+                admin::start_admin_listener_with_tls(
+                    admin_https_addr,
+                    admin_state_for_https,
+                    shutdown,
+                    Some(admin_tls_config),
+                )
+                .await
+            };
+            if let Err(err) = result {
+                error!("Mesh admin HTTPS listener error: {}", err);
+            }
+        }));
+    } else {
+        info!("Mesh admin TLS not configured - HTTPS listener disabled");
+    }
+
+    if env_config.admin_http_port == 0 && env_config.admin_tls_cert_path.is_none() {
+        warn!(
+            "No mesh admin API listeners are active — FERRUM_ADMIN_HTTP_PORT=0 and no admin TLS configured. The admin API is unreachable."
+        );
+    }
+
+    Ok(handles)
 }
 
 /// Resolve the effective mTLS mode for the inbound TLS-terminating listener
@@ -4122,6 +4273,12 @@ fn start_mesh_slice_apply_task(
                 let slice_unchanged =
                     mesh_slice_matches_last_applied(last_applied_slice.as_deref(), slice);
                 if slice_unchanged && !federation_changed {
+                    record_mesh_slice_apply_result(
+                        &mesh_state,
+                        &mut last_applied_slice,
+                        slice,
+                        true,
+                    );
                     debug!(
                         mesh_slice_version = %slice.version,
                         "Skipping no-op mesh slice update"
@@ -4197,6 +4354,7 @@ fn start_mesh_slice_apply_task(
                                     candidate_loaded_at,
                                 );
                                 record_mesh_slice_apply_result(
+                                    &mesh_state,
                                     &mut last_applied_slice,
                                     slice,
                                     accepted,
@@ -4284,11 +4442,13 @@ fn mesh_slice_matches_last_applied(
 }
 
 fn record_mesh_slice_apply_result(
+    mesh_state: &MeshRuntimeState,
     last_applied_slice: &mut Option<Arc<MeshSlice>>,
     slice: &MeshSlice,
     applied: bool,
 ) {
     if applied {
+        mesh_state.record_applied_slice(slice);
         *last_applied_slice = Some(Arc::new(slice.clone()));
     }
 }
@@ -5220,6 +5380,12 @@ mod tests {
     }
 
     fn destination_rule_test_proxy(id: &str, upstream_id: &str) -> Proxy {
+        // PR a8dce394 scoped DestinationRule application to namespace, so
+        // the test proxy must share the namespace of the test upstream and
+        // the test DR (both `"default"`) — otherwise the namespace gate
+        // skips the projection and tests inherit the un-updated upstream
+        // defaults. `destination_rule_does_not_apply_across_namespaces`
+        // covers the cross-namespace deny path explicitly.
         serde_json::from_value(serde_json::json!({
             "id": id,
             "namespace": "default",
@@ -8207,14 +8373,16 @@ mod tests {
 
     #[test]
     fn mesh_slice_rejection_does_not_advance_apply_dedupe_baseline() {
+        let mesh_state = MeshRuntimeState::new();
         let mut last_applied_slice = None;
         let rejected = MeshSlice {
             version: "bad-v1".to_string(),
             labels: [("app".to_string(), "api".to_string())].into(),
             ..MeshSlice::default()
         };
-        record_mesh_slice_apply_result(&mut last_applied_slice, &rejected, false);
+        record_mesh_slice_apply_result(&mesh_state, &mut last_applied_slice, &rejected, false);
         assert!(last_applied_slice.is_none());
+        assert!(mesh_state.applied_snapshot().as_ref().is_none());
         assert!(!mesh_slice_matches_last_applied(
             last_applied_slice.as_deref(),
             &MeshSlice {
@@ -8224,7 +8392,8 @@ mod tests {
             }
         ));
 
-        record_mesh_slice_apply_result(&mut last_applied_slice, &rejected, true);
+        record_mesh_slice_apply_result(&mesh_state, &mut last_applied_slice, &rejected, true);
+        assert!(mesh_state.applied_snapshot().as_ref().is_some());
         assert!(mesh_slice_matches_last_applied(
             last_applied_slice.as_deref(),
             &MeshSlice {
@@ -8233,6 +8402,38 @@ mod tests {
                 ..MeshSlice::default()
             }
         ));
+    }
+
+    #[test]
+    fn no_op_restamp_updates_applied_snapshot_version() {
+        let mesh_state = MeshRuntimeState::new();
+        let mut last_applied_slice = None;
+        let v1 = MeshSlice {
+            version: "v1".to_string(),
+            labels: [("app".to_string(), "api".to_string())].into(),
+            ..MeshSlice::default()
+        };
+        let v2 = MeshSlice {
+            version: "v2".to_string(),
+            labels: [("app".to_string(), "api".to_string())].into(),
+            ..MeshSlice::default()
+        };
+
+        record_mesh_slice_apply_result(&mesh_state, &mut last_applied_slice, &v1, true);
+        assert!(mesh_slice_matches_last_applied(
+            last_applied_slice.as_deref(),
+            &v2
+        ));
+        record_mesh_slice_apply_result(&mesh_state, &mut last_applied_slice, &v2, true);
+
+        let applied = mesh_state.applied_snapshot();
+        assert_eq!(
+            applied
+                .as_ref()
+                .as_ref()
+                .map(|slice| slice.version.as_str()),
+            Some("v2")
+        );
     }
 
     #[test]

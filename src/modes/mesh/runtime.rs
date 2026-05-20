@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 use tokio::sync::{Notify, watch};
 use tracing::{info, warn};
@@ -28,11 +29,12 @@ pub struct MeshEgressScopeHealth {
 /// Per-runtime operator surface for the active mesh egress scope.
 ///
 /// Hangs off [`MeshRuntimeState`] so tests get isolated state. Updated only
-/// when a mesh slice is installed, never from the request path.
+/// when a mesh slice is accepted by the proxy runtime, never from the request
+/// path.
 pub struct MeshEgressScopeState {
     current: Arc<ArcSwap<Option<MeshEgressScopeSnapshot>>>,
-    /// Cached `OutboundRegistry` built from the installed snapshot's
-    /// `known_destinations`. Rebuilt only when a new slice is installed so
+    /// Cached `OutboundRegistry` built from the accepted snapshot's
+    /// `known_destinations`. Rebuilt only when a new slice is accepted so
     /// `POST /mesh/egress-scope/test` does not re-normalise the registry on
     /// every admin call.
     test_registry: Arc<ArcSwap<Option<Arc<OutboundRegistry>>>>,
@@ -64,7 +66,7 @@ impl MeshEgressScopeState {
     }
 
     /// Returns the memoised `OutboundRegistry` matching the current snapshot
-    /// for admin-side dry-run lookups, or `None` if no slice has been installed
+    /// for admin-side dry-run lookups, or `None` if no slice has been accepted
     /// yet (or the build failed).
     pub fn test_registry(&self) -> Option<Arc<OutboundRegistry>> {
         self.test_registry.load_full().as_ref().clone()
@@ -101,7 +103,7 @@ impl MeshEgressScopeState {
             info!("Sidecar egress dry-run denials recovered");
         }
 
-        // Rebuild the test-side OutboundRegistry on each slice install. Cold
+        // Rebuild the test-side OutboundRegistry on each accepted slice. Cold
         // path; per-request admin handlers reuse the resulting Arc.
         let registry = snapshot.as_ref().and_then(|scope| {
             match OutboundRegistry::new(&serde_json::json!({
@@ -111,7 +113,7 @@ impl MeshEgressScopeState {
                 Err(err) => {
                     warn!(
                         error = %err,
-                        "Failed to rebuild mesh egress-scope test registry from installed slice"
+                        "Failed to rebuild mesh egress-scope test registry from accepted slice"
                     );
                     None
                 }
@@ -166,6 +168,18 @@ impl PolicyScopeCache {
 #[derive(Clone)]
 pub struct MeshRuntimeState {
     current: Arc<ArcSwap<Option<MeshSlice>>>,
+    applied: Arc<ArcSwap<Option<MeshSlice>>>,
+    /// Wall-clock timestamp of the most recent `install_slice` call. Stays in lock-step
+    /// with `record_mesh_config_received` (the Prometheus metric backing the
+    /// `ferrum_mesh_config_last_received_timestamp_seconds` gauge) so dashboard
+    /// staleness alerts observe the same receive events. `None` until the first
+    /// slice arrives.
+    last_install_at: Arc<ArcSwap<Option<DateTime<Utc>>>>,
+    /// Wall-clock timestamp of the most recent slice accepted by the proxy
+    /// runtime. This intentionally differs from `last_install_at`: invalid
+    /// updates may be received and rejected while the proxy continues serving
+    /// the previous accepted slice.
+    last_applied_at: Arc<ArcSwap<Option<DateTime<Utc>>>>,
     first_ready: Arc<Notify>,
     has_first: Arc<AtomicBool>,
     revision_tx: Arc<watch::Sender<u64>>,
@@ -178,6 +192,9 @@ impl MeshRuntimeState {
         let (revision_tx, _) = watch::channel(0u64);
         Self {
             current: Arc::new(ArcSwap::new(Arc::new(None))),
+            applied: Arc::new(ArcSwap::new(Arc::new(None))),
+            last_install_at: Arc::new(ArcSwap::new(Arc::new(None))),
+            last_applied_at: Arc::new(ArcSwap::new(Arc::new(None))),
             first_ready: Arc::new(Notify::new()),
             has_first: Arc::new(AtomicBool::new(false)),
             revision_tx: Arc::new(revision_tx),
@@ -191,6 +208,24 @@ impl MeshRuntimeState {
         self.current.load_full()
     }
 
+    /// Return the latest slice accepted by the proxy runtime.
+    pub fn applied_snapshot(&self) -> Arc<Option<MeshSlice>> {
+        self.applied.load_full()
+    }
+
+    /// Wall-clock timestamp of the most recent slice install, or `None` if no
+    /// slice has been installed yet. Read lock-free by the
+    /// `/mesh/config-drift` admin handler to compute slice staleness.
+    pub fn last_install_at(&self) -> Option<DateTime<Utc>> {
+        *self.last_install_at.load_full().as_ref()
+    }
+
+    /// Wall-clock timestamp of the most recent accepted slice, or `None` if
+    /// no slice has been accepted by the proxy runtime yet.
+    pub fn last_applied_at(&self) -> Option<DateTime<Utc>> {
+        *self.last_applied_at.load_full().as_ref()
+    }
+
     /// True once at least one mesh slice has been installed.
     pub fn has_first_slice(&self) -> bool {
         self.has_first.load(Ordering::Acquire)
@@ -202,7 +237,7 @@ impl MeshRuntimeState {
     }
 
     /// Operator surface for the active mesh egress scope. Updated only when a
-    /// new slice is installed.
+    /// new slice is accepted by the proxy runtime.
     pub fn egress_scope_state(&self) -> &MeshEgressScopeState {
         &self.egress_scope
     }
@@ -218,18 +253,29 @@ impl MeshRuntimeState {
     /// Hot-swap the live mesh slice and notify waiters on the first install.
     pub fn install_slice(&self, slice: MeshSlice) {
         crate::plugins::mesh::prometheus_helpers::record_mesh_config_received(&slice.namespace);
-        self.egress_scope.install_from_slice(&slice);
-        // GAP-3E: refresh RTDS-driven consumers (fault injection, log levels,
-        // header filter gates) from the slice's runtime overlay before the
-        // snapshot is published. Cold path; each consumer owns its own
-        // ArcSwap so the hot path only reads its own state.
-        crate::modes::mesh::runtime_overlay_consumers::apply_overlay(&slice.runtime_overlay);
         self.current.store(Arc::new(Some(slice)));
+        // Stamp the receive timestamp before publishing the revision bump so
+        // any observer that reacts to the revision sees a fresh
+        // `last_install_at` rather than the stale one.
+        self.last_install_at.store(Arc::new(Some(Utc::now())));
         self.revision_tx.send_modify(|revision| *revision += 1);
         let was_first = self.has_first.swap(true, Ordering::AcqRel);
         if !was_first {
             self.first_ready.notify_waiters();
         }
+    }
+
+    /// Publish a slice after the mesh proxy runtime accepts it.
+    pub fn record_applied_slice(&self, slice: &MeshSlice) {
+        // GAP-3E: refresh RTDS-driven consumers only after proxy config
+        // acceptance. Rejected slices must not mutate live fault/log/transformer
+        // state while the proxy keeps serving the previous accepted config.
+        #[cfg(test)]
+        let _overlay_guard = crate::modes::mesh::runtime_overlay_consumers::test_lock();
+        crate::modes::mesh::runtime_overlay_consumers::apply_overlay(&slice.runtime_overlay);
+        self.egress_scope.install_from_slice(slice);
+        self.applied.store(Arc::new(Some(slice.clone())));
+        self.last_applied_at.store(Arc::new(Some(Utc::now())));
     }
 
     /// Resolve once the initial mesh slice is available.
@@ -260,6 +306,10 @@ mod tests {
     use super::*;
     use crate::modes::mesh::config::{PolicyScope, WorkloadSelector};
 
+    fn install_slice_for_test(state: &MeshRuntimeState, slice: MeshSlice) {
+        state.install_slice(slice);
+    }
+
     #[tokio::test]
     async fn wait_for_first_slice_resolves_after_install() {
         let state = MeshRuntimeState::new();
@@ -276,10 +326,13 @@ mod tests {
         };
 
         tokio::task::yield_now().await;
-        state.install_slice(MeshSlice {
-            version: "v1".to_string(),
-            ..MeshSlice::default()
-        });
+        install_slice_for_test(
+            &state,
+            MeshSlice {
+                version: "v1".to_string(),
+                ..MeshSlice::default()
+            },
+        );
 
         let observed = waiter.await.expect("waiter task should complete");
         assert_eq!(observed.as_deref(), Some("v1"));
@@ -288,10 +341,13 @@ mod tests {
     #[tokio::test]
     async fn wait_for_first_slice_returns_immediately_when_already_installed() {
         let state = MeshRuntimeState::new();
-        state.install_slice(MeshSlice {
-            version: "v1".to_string(),
-            ..MeshSlice::default()
-        });
+        install_slice_for_test(
+            &state,
+            MeshSlice {
+                version: "v1".to_string(),
+                ..MeshSlice::default()
+            },
+        );
 
         tokio::time::timeout(
             std::time::Duration::from_millis(50),
@@ -299,6 +355,79 @@ mod tests {
         )
         .await
         .expect("already-installed slice should not block");
+    }
+
+    #[tokio::test]
+    async fn last_install_at_tracks_each_install() {
+        // The receive metric reads this field for the slice staleness signal,
+        // so verify it is `None` pre-install, populated after the first install,
+        // and advances on each
+        // subsequent install (no caching/clamping). Use an explicit
+        // delay between installs because two `Utc::now()` calls inside
+        // the same nanosecond would compare equal on fast machines and
+        // mask a bug where the second install failed to swap the slot.
+        let state = MeshRuntimeState::new();
+        assert!(state.last_install_at().is_none(), "no slice installed yet");
+
+        install_slice_for_test(
+            &state,
+            MeshSlice {
+                version: "v1".to_string(),
+                ..MeshSlice::default()
+            },
+        );
+        let first = state
+            .last_install_at()
+            .expect("first install must stamp last_install_at");
+
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        install_slice_for_test(
+            &state,
+            MeshSlice {
+                version: "v2".to_string(),
+                ..MeshSlice::default()
+            },
+        );
+        let second = state
+            .last_install_at()
+            .expect("second install must keep last_install_at populated");
+
+        assert!(
+            second > first,
+            "second install must advance last_install_at past the first"
+        );
+    }
+
+    #[tokio::test]
+    async fn applied_snapshot_tracks_only_accepted_slices() {
+        let state = MeshRuntimeState::new();
+        install_slice_for_test(
+            &state,
+            MeshSlice {
+                version: "received-only".to_string(),
+                ..MeshSlice::default()
+            },
+        );
+
+        assert!(state.applied_snapshot().as_ref().is_none());
+        assert!(state.last_applied_at().is_none());
+
+        let accepted = MeshSlice {
+            version: "accepted".to_string(),
+            ..MeshSlice::default()
+        };
+        state.record_applied_slice(&accepted);
+
+        assert_eq!(
+            state
+                .applied_snapshot()
+                .as_ref()
+                .as_ref()
+                .map(|slice| slice.version.as_str()),
+            Some("accepted")
+        );
+        assert!(state.last_applied_at().is_some());
     }
 
     #[test]

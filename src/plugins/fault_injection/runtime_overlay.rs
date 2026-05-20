@@ -140,14 +140,13 @@ mod tests {
         MeshRuntimeOverlay { fields }
     }
 
-    // The tests in this module share the process-global `OVERRIDES` ArcSwap,
-    // so they must each reset state at the top. Running them in serial via
-    // a mutex would be cleaner, but the cargo-test default already
-    // serializes lib tests by module path, and each test below only reads
-    // / writes its own scope key.
+    // The tests in this module share process-global overlay state with
+    // MeshRuntimeState::install_slice tests, so each test holds the shared
+    // overlay mutex from reset through assertion.
 
     #[test]
     fn empty_overlay_clears_state() {
+        let _overlay_guard = crate::modes::mesh::runtime_overlay_consumers::test_lock();
         reset_for_test();
         apply_overlay(&overlay(&[(
             "ferrum.fault_injection.cart.abort_percent",
@@ -163,6 +162,7 @@ mod tests {
 
     #[test]
     fn parses_numeric_abort_and_delay() {
+        let _overlay_guard = crate::modes::mesh::runtime_overlay_consumers::test_lock();
         reset_for_test();
         apply_overlay(&overlay(&[
             (
@@ -181,6 +181,7 @@ mod tests {
 
     #[test]
     fn parses_fractional_percent() {
+        let _overlay_guard = crate::modes::mesh::runtime_overlay_consumers::test_lock();
         reset_for_test();
         apply_overlay(&overlay(&[(
             "ferrum.fault_injection.reviews.abort_percent",
@@ -195,6 +196,7 @@ mod tests {
 
     #[test]
     fn rejects_non_numeric_values() {
+        let _overlay_guard = crate::modes::mesh::runtime_overlay_consumers::test_lock();
         reset_for_test();
         apply_overlay(&overlay(&[
             (
@@ -213,6 +215,7 @@ mod tests {
 
     #[test]
     fn rejects_out_of_range_numbers() {
+        let _overlay_guard = crate::modes::mesh::runtime_overlay_consumers::test_lock();
         reset_for_test();
         apply_overlay(&overlay(&[
             (
@@ -231,6 +234,7 @@ mod tests {
 
     #[test]
     fn ignores_keys_with_empty_scope() {
+        let _overlay_guard = crate::modes::mesh::runtime_overlay_consumers::test_lock();
         reset_for_test();
         apply_overlay(&overlay(&[(
             "ferrum.fault_injection..abort_percent",
@@ -242,6 +246,7 @@ mod tests {
 
     #[test]
     fn ignores_unrelated_keys() {
+        let _overlay_guard = crate::modes::mesh::runtime_overlay_consumers::test_lock();
         reset_for_test();
         apply_overlay(&overlay(&[
             ("envoy.reloadable_features.foo", RuntimeValue::Number(50.0)),
