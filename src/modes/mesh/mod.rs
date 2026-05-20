@@ -310,6 +310,13 @@ pub struct MeshRuntimeConfig {
     /// services. Sourced from `FERRUM_MESH_SIDECAR_IDENTITY_NARROWING`
     /// (default `false`).
     pub sidecar_identity_narrowing: bool,
+    /// Opt-in for stream-family (TCP/UDP) egress proxy materialization.
+    /// Default `false` because stream egress proxies bind plaintext listeners
+    /// (frontend_tls: false) and mesh_authz cannot authenticate connections
+    /// without TLS client certs. Operators must explicitly enable via
+    /// `FERRUM_MESH_EGRESS_STREAM_ENABLED=true` after configuring alternative
+    /// authentication for stream listeners.
+    pub egress_stream_enabled: bool,
 }
 
 impl MeshRuntimeConfig {
@@ -513,6 +520,9 @@ impl MeshRuntimeConfig {
             sidecar_enforced: env_config.mesh_sidecar_enforced,
             sidecar_enforced_dry_run: env_config.mesh_sidecar_enforced_dry_run,
             sidecar_identity_narrowing: env_config.mesh_sidecar_identity_narrowing,
+            egress_stream_enabled: resolve_ferrum_var("FERRUM_MESH_EGRESS_STREAM_ENABLED")
+                .map(|v| v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
         })
     }
 
@@ -1895,6 +1905,7 @@ fn materialize_egress_gateway_proxies(
         service_entries,
         &runtime.namespace,
         &mesh_reserved_ports,
+        runtime.egress_stream_enabled,
     );
 
     if proxies.is_empty() {
@@ -1963,6 +1974,7 @@ fn build_egress_proxies_and_upstreams(
     service_entries: &[ServiceEntry],
     namespace: &str,
     mesh_reserved_ports: &std::collections::HashSet<u16>,
+    egress_stream_enabled: bool,
 ) -> (Vec<Proxy>, Vec<Upstream>) {
     let mut proxies = Vec::new();
     let mut upstreams = Vec::new();
@@ -2005,6 +2017,19 @@ fn build_egress_proxies_and_upstreams(
             };
 
             if egress_is_stream_protocol(port_spec.protocol) {
+                if !egress_stream_enabled {
+                    warn!(
+                        service_entry = %entry.name,
+                        namespace = %entry.namespace,
+                        port = port_spec.port,
+                        protocol = ?port_spec.protocol,
+                        "Skipping stream egress ServiceEntry port: stream egress proxies \
+                         bind plaintext listeners without mTLS and mesh_authz cannot \
+                         authenticate connections. Set FERRUM_MESH_EGRESS_STREAM_ENABLED=true \
+                         to opt in after configuring alternative authentication."
+                    );
+                    continue;
+                }
                 build_stream_egress_for_entry(
                     entry,
                     port_spec,
@@ -5026,6 +5051,7 @@ mod tests {
             sidecar_enforced: false,
             sidecar_enforced_dry_run: false,
             sidecar_identity_narrowing: false,
+            egress_stream_enabled: false,
         };
         let config = prepare_gateway_config_for_mesh(GatewayConfig::default(), &runtime).unwrap();
         let mesh_state = MeshRuntimeState::new();
@@ -5125,6 +5151,7 @@ mod tests {
             sidecar_enforced: false,
             sidecar_enforced_dry_run: false,
             sidecar_identity_narrowing: false,
+            egress_stream_enabled: false,
         }
     }
 
@@ -9587,6 +9614,7 @@ mod tests {
             &service_entries,
             "default",
             &std::collections::HashSet::new(),
+            true,
         );
 
         assert_eq!(proxies.len(), 1);
@@ -9647,6 +9675,7 @@ mod tests {
             &service_entries,
             "default",
             &std::collections::HashSet::new(),
+            true,
         );
 
         assert!(proxies.is_empty());
@@ -9680,6 +9709,7 @@ mod tests {
             &service_entries,
             "default",
             &std::collections::HashSet::new(),
+            true,
         );
 
         assert!(proxies.is_empty());
@@ -9700,6 +9730,7 @@ mod tests {
             &[service_entry.clone()],
             "default",
             &std::collections::HashSet::new(),
+            true,
         );
         assert!(proxies.is_empty());
         assert!(upstreams.is_empty());
@@ -9709,6 +9740,7 @@ mod tests {
             &[service_entry],
             "default",
             &std::collections::HashSet::new(),
+            true,
         );
         assert_eq!(proxies.len(), 1);
         assert_eq!(upstreams.len(), 1);
@@ -9739,6 +9771,7 @@ mod tests {
             &service_entries,
             "default",
             &std::collections::HashSet::new(),
+            true,
         );
         assert_eq!(proxies.len(), 1);
         assert_eq!(upstreams.len(), 1);
@@ -9774,6 +9807,7 @@ mod tests {
             &service_entries,
             "default",
             &std::collections::HashSet::new(),
+            true,
         );
 
         assert_eq!(proxies.len(), 1);
@@ -9829,6 +9863,7 @@ mod tests {
             &service_entries,
             "default",
             &std::collections::HashSet::new(),
+            true,
         );
 
         // Host-only HTTP proxies cannot safely distinguish multiple ports for
@@ -9889,6 +9924,7 @@ mod tests {
             &service_entries,
             "default",
             &std::collections::HashSet::new(),
+            true,
         );
 
         assert_eq!(proxies.len(), 1);
@@ -9921,6 +9957,7 @@ mod tests {
             &service_entries,
             "default",
             &std::collections::HashSet::new(),
+            true,
         );
 
         assert_eq!(upstreams.len(), 2);
@@ -9943,8 +9980,12 @@ mod tests {
 
     #[test]
     fn egress_empty_service_entries_produces_no_proxies() {
-        let (proxies, upstreams) =
-            build_egress_proxies_and_upstreams(&[], "default", &std::collections::HashSet::new());
+        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+            &[],
+            "default",
+            &std::collections::HashSet::new(),
+            true,
+        );
         assert!(proxies.is_empty());
         assert!(upstreams.is_empty());
     }
@@ -10131,6 +10172,7 @@ mod tests {
             &service_entries,
             "default",
             &std::collections::HashSet::new(),
+            true,
         );
 
         assert_eq!(proxies.len(), 1);
@@ -10175,6 +10217,7 @@ mod tests {
             &service_entries,
             "default",
             &std::collections::HashSet::new(),
+            true,
         );
 
         assert_eq!(proxies.len(), 1);
@@ -10211,6 +10254,7 @@ mod tests {
             &service_entries,
             "default",
             &std::collections::HashSet::new(),
+            true,
         );
         assert!(proxies.is_empty());
         assert!(upstreams.is_empty());
@@ -10339,6 +10383,7 @@ mod tests {
             &service_entries,
             "default",
             &std::collections::HashSet::new(),
+            true,
         );
 
         assert_eq!(proxies.len(), 1);
@@ -10378,6 +10423,7 @@ mod tests {
             &service_entries,
             "default",
             &std::collections::HashSet::new(),
+            true,
         );
 
         assert_eq!(proxies.len(), 1);
@@ -10430,6 +10476,7 @@ mod tests {
             &service_entries,
             "default",
             &std::collections::HashSet::new(),
+            true,
         );
 
         assert_eq!(proxies.len(), 1);
@@ -10468,6 +10515,7 @@ mod tests {
             &service_entries,
             "default",
             &std::collections::HashSet::new(),
+            true,
         );
 
         assert_eq!(proxies.len(), 1, "only the first SE wins on port collision");
@@ -10502,6 +10550,7 @@ mod tests {
             &service_entries,
             "default",
             &std::collections::HashSet::new(),
+            true,
         );
 
         assert_eq!(proxies.len(), 2);
@@ -10561,6 +10610,7 @@ mod tests {
             &service_entries,
             "default",
             &std::collections::HashSet::new(),
+            true,
         );
 
         assert_eq!(proxies.len(), 2);
@@ -10610,6 +10660,7 @@ mod tests {
         // each port owns one proxy).
         let runtime = MeshRuntimeConfig {
             topology: MeshTopology::EgressGateway,
+            egress_stream_enabled: true,
             ..test_mesh_runtime_config()
         };
         let config = GatewayConfig {
@@ -10660,7 +10711,7 @@ mod tests {
         )];
 
         let (proxies, upstreams) =
-            build_egress_proxies_and_upstreams(&service_entries, "default", &reserved);
+            build_egress_proxies_and_upstreams(&service_entries, "default", &reserved, true);
 
         assert!(
             proxies.is_empty(),
@@ -10689,6 +10740,7 @@ mod tests {
             &service_entries,
             "default",
             &std::collections::HashSet::new(),
+            true,
         );
 
         assert!(
