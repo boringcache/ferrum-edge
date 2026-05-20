@@ -403,11 +403,16 @@ jobs:
         run: |
           set -euo pipefail
           kubectl create namespace ferrum
+          # Exercise the Gateway API controller only; do not install the
+          # injector webhook because it can intercept pod admission before its
+          # own TLS secret/endpoints exist in this single-node conformance lab.
           helm upgrade --install ferrum ./charts/ferrum-mesh \
             --namespace ferrum \
             --set image.repository=ferrum-edge \
             --set image.tag=gateway-api-conformance \
             --set image.pullPolicy=IfNotPresent \
+            --set injector.enabled=false \
+            --set ca.enabled=false \
             --set controlPlane.rbac.create=true \
             --set controlPlane.rbac.gatewayApi=true \
             --set controlPlane.rbac.istio=false \
@@ -417,8 +422,11 @@ jobs:
             --set controlPlane.env.FERRUM_K8S_WATCH_ISTIO_CRDS=false \
             --set controlPlane.env.FERRUM_K8S_WATCH_MESH_CONFIG=false
           if ! kubectl -n ferrum rollout status deployment/ferrum-mesh-control-plane --timeout=180s; then
+            kubectl -n ferrum describe deployment/ferrum-mesh-control-plane || true
+            kubectl -n ferrum describe replicasets || true
             kubectl -n ferrum describe pods || true
             kubectl -n ferrum logs deployment/ferrum-mesh-control-plane --all-containers --tail=200 || true
+            kubectl -n ferrum get events --sort-by=.lastTimestamp || true
             echo "::error title=Control plane never reached Ready::skipping conformance run"
             exit 1
           fi
@@ -464,6 +472,8 @@ jobs:
           mkdir -p "$results"
           kubectl get gatewayclasses,gateways,httproutes,grpcroutes -A -o yaml > "$results/gateway-api-resources.yaml"
           kubectl -n ferrum get all -o wide > "$results/ferrum-namespace.txt"
+          kubectl -n ferrum describe deployment/ferrum-mesh-control-plane > "$results/ferrum-control-plane-deployment.txt"
+          kubectl -n ferrum get events --sort-by=.lastTimestamp > "$results/ferrum-events.txt"
           kubectl -n ferrum logs deployment/ferrum-mesh-control-plane --all-containers --tail=1000 > "$results/ferrum-control-plane.log"
           cat > "$results/CONFORMANCE.md" <<EOF
           # Gateway API Conformance
@@ -477,6 +487,8 @@ jobs:
           - gateway-api-conformance-report.yaml
           - gateway-api-resources.yaml
           - ferrum-namespace.txt
+          - ferrum-control-plane-deployment.txt
+          - ferrum-events.txt
           - ferrum-control-plane.log
           EOF
 
