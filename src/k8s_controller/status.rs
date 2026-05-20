@@ -978,9 +978,9 @@ fn is_status_kind(kind: &str) -> bool {
 fn api_resource_for_update(update: &GatewayApiStatusUpdate) -> Option<ApiResource> {
     let (group, version) = update.api_version.split_once('/')?;
     let plural = match (update.kind.as_str(), version) {
-        ("GatewayClass", "v1") => "gatewayclasses",
-        ("Gateway", "v1") => "gateways",
-        ("HTTPRoute", "v1") => "httproutes",
+        ("GatewayClass", "v1" | "v1beta1") => "gatewayclasses",
+        ("Gateway", "v1" | "v1beta1") => "gateways",
+        ("HTTPRoute", "v1" | "v1beta1") => "httproutes",
         ("GRPCRoute", "v1") => "grpcroutes",
         _ => return None,
     };
@@ -1081,6 +1081,32 @@ mod tests {
             .iter()
             .find(|update| update.kind == kind && update.name == name)
             .unwrap_or_else(|| panic!("missing status update for {kind}/{name}"))
+    }
+
+    #[test]
+    fn status_writer_supports_gateway_api_v1beta1_status_resources() {
+        for (kind, plural) in [
+            ("GatewayClass", "gatewayclasses"),
+            ("Gateway", "gateways"),
+            ("HTTPRoute", "httproutes"),
+        ] {
+            let update = GatewayApiStatusUpdate {
+                api_version: "gateway.networking.k8s.io/v1beta1".to_string(),
+                kind: kind.to_string(),
+                namespace: "default".to_string(),
+                name: "example".to_string(),
+                status: json!({}),
+            };
+
+            let resource = api_resource_for_update(&update)
+                .expect("v1beta1 Gateway API status resource should be supported");
+
+            assert_eq!(resource.group, "gateway.networking.k8s.io");
+            assert_eq!(resource.version, "v1beta1");
+            assert_eq!(resource.api_version, "gateway.networking.k8s.io/v1beta1");
+            assert_eq!(resource.kind, kind);
+            assert_eq!(resource.plural, plural);
+        }
     }
 
     fn route_with_created_at(name: &str, created_at: &str) -> K8sObject {
