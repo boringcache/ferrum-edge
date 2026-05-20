@@ -417,6 +417,10 @@ jobs:
             --set controlPlane.rbac.gatewayApi=true \
             --set controlPlane.rbac.istio=false \
             --set controlPlane.rbac.meshConfig=false \
+            --set controlPlane.env.FERRUM_DB_TYPE=sqlite \
+            --set-string 'controlPlane.env.FERRUM_DB_URL=sqlite:////tmp/ferrum-gateway-api-conformance.db?mode=rwc' \
+            --set controlPlane.env.FERRUM_ADMIN_JWT_SECRET=ferrum-edge-gateway-api-conformance-admin-secret \
+            --set controlPlane.env.FERRUM_CP_DP_GRPC_JWT_SECRET=ferrum-edge-gateway-api-conformance-grpc-secret \
             --set controlPlane.env.FERRUM_K8S_CONTROLLER_ENABLED=true \
             --set controlPlane.env.FERRUM_K8S_WATCH_GATEWAY_API_CRDS=true \
             --set controlPlane.env.FERRUM_K8S_WATCH_ISTIO_CRDS=false \
