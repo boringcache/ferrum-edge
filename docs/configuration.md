@@ -424,9 +424,9 @@ Admin listener TLS and mTLS variables are listed in [Admin API](#admin-api).
 | `FERRUM_ENABLE_HTTP3` | No | `false` | Enable HTTP/3 (QUIC) listener on the HTTPS port |
 | `FERRUM_HTTP3_IDLE_TIMEOUT` | No | `30` | HTTP/3 connection idle timeout in seconds |
 | `FERRUM_HTTP3_MAX_STREAMS` | No | `1000` | Maximum concurrent HTTP/3 streams per connection |
-| `FERRUM_HTTP3_STREAM_RECEIVE_WINDOW` | No | `8388608` | HTTP/3 per-stream receive window in bytes (default: 8 MiB) |
-| `FERRUM_HTTP3_RECEIVE_WINDOW` | No | `33554432` | HTTP/3 connection-level receive window in bytes (default: 32 MiB) |
-| `FERRUM_HTTP3_SEND_WINDOW` | No | `8388608` | HTTP/3 per-connection send window in bytes (default: 8 MiB) |
+| `FERRUM_HTTP3_STREAM_RECEIVE_WINDOW` | No | `262144` | HTTP/3 per-stream receive window in bytes (default: 256 KiB — conservative for frontend listeners serving untrusted clients) |
+| `FERRUM_HTTP3_RECEIVE_WINDOW` | No | `2097152` | HTTP/3 connection-level receive window in bytes (default: 2 MiB — conservative for frontend listeners serving untrusted clients) |
+| `FERRUM_HTTP3_SEND_WINDOW` | No | `2097152` | HTTP/3 per-connection send window in bytes (default: 2 MiB — conservative for frontend listeners) |
 | `FERRUM_HTTP3_CONNECTIONS_PER_BACKEND` | No | `4` | QUIC connections per H3 backend (pool sharding) |
 | `FERRUM_HTTP3_POOL_IDLE_TIMEOUT_SECONDS` | No | `120` | H3 backend connection idle eviction in seconds |
 | `FERRUM_HTTP3_COALESCE_MIN_BYTES` | No | `32768` | Response coalesce flush target (native H3 + cross-protocol bridge) |
@@ -503,6 +503,9 @@ See [client_ip_resolution.md](client_ip_resolution.md) for the security model an
 | `FERRUM_STATUS_COUNTS_MAX_ENTRIES` | No | `200` | Max distinct HTTP status code counter entries |
 | `FERRUM_TCP_LISTEN_BACKLOG` | No | `2048` | TCP listen backlog size (min 128); raise `net.core.somaxconn` to match |
 | `FERRUM_ACCEPT_THREADS` | No | `0` (auto-detect) | Parallel accept() loops per proxy listener port via SO_REUSEPORT. `0` = CPU cores, `1` = single listener. Parallelizes kernel-level connection intake independently of worker threads. Unix only (Linux 3.9+, macOS, BSDs); non-Unix platforms warn and run one accept loop |
+| `FERRUM_FRONTEND_H2_INITIAL_STREAM_WINDOW_SIZE` | No | `262144` | Frontend HTTP/2 per-stream flow-control window in bytes (256 KiB — conservative for untrusted clients; raise for benchmarking). Clamped to 65535..128 MiB |
+| `FERRUM_FRONTEND_H2_INITIAL_CONNECTION_WINDOW_SIZE` | No | `2097152` | Frontend HTTP/2 connection-level flow-control window in bytes (2 MiB — conservative for untrusted clients; raise for benchmarking). Clamped to 65535..128 MiB |
+| `FERRUM_FRONTEND_H2_MAX_FRAME_SIZE` | No | `16384` | Frontend HTTP/2 max frame size in bytes (RFC 9113 default). Clamped to 16384..1 MiB |
 | `FERRUM_SERVER_HTTP2_MAX_CONCURRENT_STREAMS` | No | `1000` | Server-side HTTP/2 max concurrent streams per inbound connection |
 | `FERRUM_SERVER_HTTP2_MAX_PENDING_ACCEPT_RESET_STREAMS` | No | `64` | Rapid-reset mitigation threshold for pending accept-reset streams |
 | `FERRUM_SERVER_HTTP2_MAX_LOCAL_ERROR_RESET_STREAMS` | No | `256` | Rapid-reset mitigation threshold for locally reset streams |

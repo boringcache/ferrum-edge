@@ -189,6 +189,7 @@ fn east_west_gateway_skips_remote_gateway_from_other_namespace() {
 fn egress_runtime() -> ferrum_edge::modes::mesh::MeshRuntimeConfig {
     let mut runtime = runtime_for_topology(MeshTopology::EgressGateway);
     runtime.namespace = DEFAULT_NAMESPACE.to_string();
+    runtime.egress_stream_enabled = true;
     runtime
 }
 
