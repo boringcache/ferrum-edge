@@ -323,24 +323,32 @@ The test configures the gateway with optimized connection pool settings matching
 | `FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE` | true | Reuse connections to backend |
 | `FERRUM_POOL_ENABLE_HTTP2` | Run 1: `false`, Run 2: `true` | Test runs both modes for comparison |
 
-### HTTP/2 Flow Control
+### Frontend HTTP/2 Flow Control (client → gateway)
 
 | Env Var | Value | Purpose |
 |---------|-------|---------|
-| `FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE` | 8388608 (8 MiB) | Per-stream receive window |
-| `FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE` | 33554432 (32 MiB) | Per-connection receive window |
-| `FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW` | false | Fixed windows, no auto-tuning overhead |
-| `FERRUM_POOL_HTTP2_MAX_FRAME_SIZE` | 65535 | Max HTTP/2 frame size |
-| `FERRUM_POOL_HTTP2_MAX_CONCURRENT_STREAMS` | 1000 | H2 concurrent streams per connection |
+| `FERRUM_FRONTEND_H2_INITIAL_STREAM_WINDOW_SIZE` | 8388608 (8 MiB) | Frontend per-stream receive window (default 256 KiB; raised for load testing) |
+| `FERRUM_FRONTEND_H2_INITIAL_CONNECTION_WINDOW_SIZE` | 33554432 (32 MiB) | Frontend per-connection receive window (default 2 MiB; raised for load testing) |
+| `FERRUM_FRONTEND_H2_MAX_FRAME_SIZE` | 1048576 (1 MiB) | Frontend max frame size (default 16 KiB; raised for load testing) |
 
-### HTTP/3 (QUIC) Transport
+### Backend HTTP/2 Pool Flow Control (gateway → upstream)
+
+| Env Var | Value | Purpose |
+|---------|-------|---------|
+| `FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE` | 8388608 (8 MiB) | Backend per-stream receive window |
+| `FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE` | 33554432 (32 MiB) | Backend per-connection receive window |
+| `FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW` | false | Fixed windows, no auto-tuning overhead |
+| `FERRUM_POOL_HTTP2_MAX_FRAME_SIZE` | 65535 | Backend max HTTP/2 frame size |
+| `FERRUM_POOL_HTTP2_MAX_CONCURRENT_STREAMS` | 1000 | H2 concurrent streams per backend connection |
+
+### Frontend HTTP/3 (QUIC) Transport (client → gateway)
 
 | Env Var | Value | Purpose |
 |---------|-------|---------|
 | `FERRUM_HTTP3_MAX_STREAMS` | 1000 | QUIC max concurrent streams |
-| `FERRUM_HTTP3_STREAM_RECEIVE_WINDOW` | 8388608 (8 MiB) | Per-stream QUIC receive window |
-| `FERRUM_HTTP3_RECEIVE_WINDOW` | 33554432 (32 MiB) | Per-connection QUIC receive window |
-| `FERRUM_HTTP3_SEND_WINDOW` | 8388608 (8 MiB) | QUIC send window |
+| `FERRUM_HTTP3_STREAM_RECEIVE_WINDOW` | 8388608 (8 MiB) | Frontend per-stream QUIC receive window (default 256 KiB; raised for load testing) |
+| `FERRUM_HTTP3_RECEIVE_WINDOW` | 33554432 (32 MiB) | Frontend per-connection QUIC receive window (default 2 MiB; raised for load testing) |
+| `FERRUM_HTTP3_SEND_WINDOW` | 8388608 (8 MiB) | Frontend QUIC send window (default 2 MiB; raised for load testing) |
 
 ### Other
 

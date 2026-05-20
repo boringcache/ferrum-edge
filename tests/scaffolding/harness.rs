@@ -552,6 +552,29 @@ fn apply_env_overrides(
             "FERRUM_SHUTDOWN_DRAIN_SECONDS" => {
                 env_config.shutdown_drain_seconds = parse_numeric(k, v)?;
             }
+            "FERRUM_FRONTEND_H2_INITIAL_STREAM_WINDOW_SIZE" => {
+                let val: u32 = parse_numeric(k, v)?;
+                env_config.frontend_h2_initial_stream_window_size =
+                    val.clamp(65_535, 128 * 1024 * 1024);
+            }
+            "FERRUM_FRONTEND_H2_INITIAL_CONNECTION_WINDOW_SIZE" => {
+                let val: u32 = parse_numeric(k, v)?;
+                env_config.frontend_h2_initial_connection_window_size =
+                    val.clamp(65_535, 128 * 1024 * 1024);
+            }
+            "FERRUM_FRONTEND_H2_MAX_FRAME_SIZE" => {
+                let val: u32 = parse_numeric(k, v)?;
+                env_config.frontend_h2_max_frame_size = val.clamp(16_384, 1_048_576);
+            }
+            "FERRUM_HTTP3_STREAM_RECEIVE_WINDOW" => {
+                env_config.http3_stream_receive_window = parse_numeric(k, v)?;
+            }
+            "FERRUM_HTTP3_RECEIVE_WINDOW" => {
+                env_config.http3_receive_window = parse_numeric(k, v)?;
+            }
+            "FERRUM_HTTP3_SEND_WINDOW" => {
+                env_config.http3_send_window = parse_numeric(k, v)?;
+            }
             // Unknown vars: ignored. Add cases as tests need them.
             _ => {}
         }

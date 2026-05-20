@@ -1346,6 +1346,17 @@ pub struct EnvConfig {
     /// multi-listener. Only effective on Unix with SO_REUSEPORT (Linux 3.9+,
     /// macOS, BSDs).
     pub accept_threads: usize,
+    /// Frontend HTTP/2 per-stream flow-control window (bytes).
+    /// Conservative default for untrusted clients; raise for benchmarking.
+    /// Clamped to 65535..128 MiB. Default: 256 KiB.
+    pub frontend_h2_initial_stream_window_size: u32,
+    /// Frontend HTTP/2 connection-level flow-control window (bytes).
+    /// Conservative default for untrusted clients; raise for benchmarking.
+    /// Clamped to 65535..128 MiB. Default: 2 MiB.
+    pub frontend_h2_initial_connection_window_size: u32,
+    /// Frontend HTTP/2 max frame size (bytes).
+    /// Clamped to 16384..1 MiB (RFC 9113 range). Default: 16384.
+    pub frontend_h2_max_frame_size: u32,
     /// Server-side HTTP/2 max concurrent streams per inbound connection.
     /// Limits how many requests a single HTTP/2 client can multiplex.
     /// Default: 1000 (nginx=128, envoy=100, unlimited by spec).
@@ -1616,9 +1627,9 @@ impl Default for EnvConfig {
             enable_http3: false,
             http3_idle_timeout: 30,
             http3_max_streams: 1000,
-            http3_stream_receive_window: crate::http3::config::H3_STREAM_RECEIVE_WINDOW_DEFAULT,
-            http3_receive_window: crate::http3::config::H3_RECEIVE_WINDOW_DEFAULT,
-            http3_send_window: crate::http3::config::H3_SEND_WINDOW_DEFAULT,
+            http3_stream_receive_window: crate::http3::config::H3_FRONTEND_STREAM_RECEIVE_WINDOW,
+            http3_receive_window: crate::http3::config::H3_FRONTEND_RECEIVE_WINDOW,
+            http3_send_window: crate::http3::config::H3_FRONTEND_SEND_WINDOW,
             http3_connections_per_backend: 4,
             http3_pool_idle_timeout_seconds: 120,
             http3_coalesce_min_bytes: crate::http3::config::H3_COALESCE_MAX_DEFAULT,
@@ -1689,6 +1700,11 @@ impl Default for EnvConfig {
             runtime_metrics_status_tracking_enabled: true,
             tcp_listen_backlog: 2048,
             accept_threads: 0,
+            frontend_h2_initial_stream_window_size:
+                crate::proxy::FRONTEND_H2_INITIAL_STREAM_WINDOW_SIZE,
+            frontend_h2_initial_connection_window_size:
+                crate::proxy::FRONTEND_H2_INITIAL_CONNECTION_WINDOW_SIZE,
+            frontend_h2_max_frame_size: crate::proxy::FRONTEND_H2_MAX_FRAME_SIZE,
             server_http2_max_concurrent_streams: 1000,
             server_http2_max_pending_accept_reset_streams: 64,
             server_http2_max_local_error_reset_streams: 256,
@@ -1962,9 +1978,9 @@ impl EnvConfig {
             enable_http3: bool = "FERRUM_ENABLE_HTTP3" => false;
             http3_idle_timeout: u64 = "FERRUM_HTTP3_IDLE_TIMEOUT" => 30u64;
             http3_max_streams: u32 = "FERRUM_HTTP3_MAX_STREAMS" => 1000u32;
-            http3_stream_receive_window: u64 = "FERRUM_HTTP3_STREAM_RECEIVE_WINDOW" => crate::http3::config::H3_STREAM_RECEIVE_WINDOW_DEFAULT;
-            http3_receive_window: u64 = "FERRUM_HTTP3_RECEIVE_WINDOW" => crate::http3::config::H3_RECEIVE_WINDOW_DEFAULT;
-            http3_send_window: u64 = "FERRUM_HTTP3_SEND_WINDOW" => crate::http3::config::H3_SEND_WINDOW_DEFAULT;
+            http3_stream_receive_window: u64 = "FERRUM_HTTP3_STREAM_RECEIVE_WINDOW" => crate::http3::config::H3_FRONTEND_STREAM_RECEIVE_WINDOW;
+            http3_receive_window: u64 = "FERRUM_HTTP3_RECEIVE_WINDOW" => crate::http3::config::H3_FRONTEND_RECEIVE_WINDOW;
+            http3_send_window: u64 = "FERRUM_HTTP3_SEND_WINDOW" => crate::http3::config::H3_FRONTEND_SEND_WINDOW;
             http3_connections_per_backend: usize = "FERRUM_HTTP3_CONNECTIONS_PER_BACKEND" => 4usize, max(1usize);
             http3_pool_idle_timeout_seconds: u64 = "FERRUM_HTTP3_POOL_IDLE_TIMEOUT_SECONDS" => 120u64;
             http3_coalesce_max_bytes: usize = "FERRUM_HTTP3_COALESCE_MAX_BYTES" => crate::http3::config::H3_COALESCE_MAX_DEFAULT, clamp(crate::http3::config::H3_COALESCE_MIN_FLOOR, crate::http3::config::H3_COALESCE_MAX_CAP);
@@ -2039,6 +2055,9 @@ impl EnvConfig {
             runtime_metrics_pool_tracking_enabled: bool = "FERRUM_METRICS_POOL_TRACKING_ENABLED" => true;
             runtime_metrics_status_tracking_enabled: bool = "FERRUM_METRICS_STATUS_TRACKING_ENABLED" => true;
             tcp_listen_backlog: u32 = "FERRUM_TCP_LISTEN_BACKLOG" => 2048u32, max(128u32);
+            frontend_h2_initial_stream_window_size: u32 = "FERRUM_FRONTEND_H2_INITIAL_STREAM_WINDOW_SIZE" => crate::proxy::FRONTEND_H2_INITIAL_STREAM_WINDOW_SIZE, clamp(65_535u32, 128 * 1024 * 1024u32);
+            frontend_h2_initial_connection_window_size: u32 = "FERRUM_FRONTEND_H2_INITIAL_CONNECTION_WINDOW_SIZE" => crate::proxy::FRONTEND_H2_INITIAL_CONNECTION_WINDOW_SIZE, clamp(65_535u32, 128 * 1024 * 1024u32);
+            frontend_h2_max_frame_size: u32 = "FERRUM_FRONTEND_H2_MAX_FRAME_SIZE" => crate::proxy::FRONTEND_H2_MAX_FRAME_SIZE, clamp(16_384u32, 1_048_576u32);
             server_http2_max_concurrent_streams: u32 = "FERRUM_SERVER_HTTP2_MAX_CONCURRENT_STREAMS" => 1000u32, max(1u32);
             server_http2_max_pending_accept_reset_streams: usize = "FERRUM_SERVER_HTTP2_MAX_PENDING_ACCEPT_RESET_STREAMS" => 64usize, max(1usize);
             server_http2_max_local_error_reset_streams: usize = "FERRUM_SERVER_HTTP2_MAX_LOCAL_ERROR_RESET_STREAMS" => 256usize, max(1usize);
@@ -2414,6 +2433,9 @@ impl EnvConfig {
             runtime_metrics_status_tracking_enabled,
             tcp_listen_backlog,
             accept_threads,
+            frontend_h2_initial_stream_window_size,
+            frontend_h2_initial_connection_window_size,
+            frontend_h2_max_frame_size,
             server_http2_max_concurrent_streams,
             server_http2_max_pending_accept_reset_streams,
             server_http2_max_local_error_reset_streams,

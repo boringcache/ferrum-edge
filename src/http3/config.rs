@@ -4,17 +4,24 @@ use std::time::Duration;
 
 use bytes::{Buf, Bytes};
 
-/// Default HTTP/3 per-stream receive window. Larger than quinn's baseline
-/// while keeping the aggregate connection budget modest by default.
+/// Default HTTP/3 per-stream receive window for backend (client) connections.
+/// Larger than quinn's baseline for backend throughput.
 pub const H3_STREAM_RECEIVE_WINDOW_DEFAULT: u64 = 8 * 1024 * 1024;
 
-/// Default HTTP/3 connection-level receive window. This aggregate connection
-/// budget bounds the sum of active per-stream receive windows.
+/// Default HTTP/3 connection-level receive window for backend connections.
 pub const H3_RECEIVE_WINDOW_DEFAULT: u64 = 32 * 1024 * 1024;
 
-/// Default HTTP/3 send window. This bounds unacknowledged outbound data per
-/// QUIC connection.
+/// Default HTTP/3 send window for backend connections.
 pub const H3_SEND_WINDOW_DEFAULT: u64 = 8 * 1024 * 1024;
+
+/// Conservative frontend H3 per-stream receive window for untrusted clients.
+pub const H3_FRONTEND_STREAM_RECEIVE_WINDOW: u64 = 256 * 1024; // 256 KiB
+
+/// Conservative frontend H3 connection receive window for untrusted clients.
+pub const H3_FRONTEND_RECEIVE_WINDOW: u64 = 2 * 1024 * 1024; // 2 MiB
+
+/// Conservative frontend H3 send window for untrusted clients.
+pub const H3_FRONTEND_SEND_WINDOW: u64 = 2 * 1024 * 1024; // 2 MiB
 
 /// Largest value encodable as a QUIC variable-length integer.
 pub const QUIC_VARINT_MAX_U64: u64 = (1 << 62) - 1;
@@ -151,9 +158,9 @@ impl Default for Http3ServerConfig {
         Self {
             max_concurrent_streams: 1000,
             idle_timeout: Duration::from_secs(30),
-            stream_receive_window: H3_STREAM_RECEIVE_WINDOW_DEFAULT,
-            receive_window: H3_RECEIVE_WINDOW_DEFAULT,
-            send_window: H3_SEND_WINDOW_DEFAULT,
+            stream_receive_window: H3_FRONTEND_STREAM_RECEIVE_WINDOW,
+            receive_window: H3_FRONTEND_RECEIVE_WINDOW,
+            send_window: H3_FRONTEND_SEND_WINDOW,
             initial_mtu: 1500,
             // Default mirrors `EnvConfig::default().frontend_tls_handshake_timeout_seconds`
             // (10 seconds). `Duration::ZERO` here would silently disable the bound.
