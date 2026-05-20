@@ -1882,6 +1882,30 @@ pub fn anchor_regex_pattern(pattern: &str) -> String {
     anchored
 }
 
+fn contains_encoded_slash(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 < bytes.len() && bytes[i + 1] == b'2' && matches!(bytes[i + 2], b'F' | b'f') {
+                return true;
+            }
+            if i + 4 < bytes.len()
+                && bytes[i + 1] == b'2'
+                && bytes[i + 2] == b'5'
+                && bytes[i + 3] == b'2'
+                && matches!(bytes[i + 4], b'F' | b'f')
+            {
+                return true;
+            }
+        }
+        i += 1;
+    }
+
+    false
+}
+
 impl GatewayConfig {
     /// Validate that all proxy (host, listen_path) combinations are unique.
     ///
@@ -3098,6 +3122,12 @@ impl Proxy {
                     } else if !path.starts_with('/') {
                         errors.push(
                             "listen_path must start with '/', '~' (regex), or '=/' (exact)"
+                                .to_string(),
+                        );
+                    }
+                    if contains_encoded_slash(path) {
+                        errors.push(
+                            "listen_path must not contain encoded slashes (%2F or %252F)"
                                 .to_string(),
                         );
                     }

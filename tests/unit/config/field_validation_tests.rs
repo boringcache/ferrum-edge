@@ -219,6 +219,26 @@ fn test_proxy_http_listen_path_must_start_with_slash_or_regex_prefix() {
 }
 
 #[test]
+fn test_proxy_listen_path_rejects_encoded_slashes() {
+    let mut proxy = make_proxy("test", "/api");
+    proxy.listen_path = Some("/api%2Fadmin".into());
+    let errs = proxy.validate_fields().unwrap_err();
+    assert!(
+        errs.iter().any(|e| e.contains("encoded slashes")),
+        "expected encoded slash rejection, got {:?}",
+        errs
+    );
+
+    proxy.listen_path = Some("/api%252Fadmin".into());
+    let errs = proxy.validate_fields().unwrap_err();
+    assert!(
+        errs.iter().any(|e| e.contains("encoded slashes")),
+        "expected double-encoded slash rejection, got {:?}",
+        errs
+    );
+}
+
+#[test]
 fn test_stream_proxy_requires_listen_path_none() {
     // Stream proxies route on listen_port and must have listen_path == None.
     // A populated listen_path is now a hard error (breaking change).
