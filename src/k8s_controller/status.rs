@@ -59,8 +59,21 @@ impl GatewayApiStatusWriter {
             let namespace = update.namespace.clone();
             Some(async move {
                 let result = async {
-                    let live = api.get_status(&name).await?;
-                    let patch = status_patch_for_update(update, live.data.get("status"));
+                    let live_status = match api.get_status(&name).await {
+                        Ok(live) => live.data.get("status").cloned(),
+                        Err(error) => {
+                            warn!(
+                                api_version = %update.api_version,
+                                kind = %update.kind,
+                                namespace = %update.namespace,
+                                name = %update.name,
+                                error = %error,
+                                "Gateway API status read failed; attempting status patch from planned state"
+                            );
+                            None
+                        }
+                    };
+                    let patch = status_patch_for_update(update, live_status.as_ref());
                     // TODO(ssa): switch to Patch::Apply once the chart guarantees the
                     // status subresource accepts server-side apply. JSON Merge Patch
                     // (RFC 7396) replaces arrays wholesale, leaving a narrow TOCTOU
@@ -1219,6 +1232,71 @@ mod tests {
         assert_condition(conditions, "ResolvedRefs", "True");
         assert_condition(conditions, "Programmed", "True");
         assert_condition(conditions, "Conflicted", "False");
+    }
+
+    #[test]
+    fn gateway_status_updates_v1beta1_conformance_base_gateway_conditions() {
+        let mut gateway_class = ferrum_gateway_class();
+        gateway_class.metadata.namespace = String::new();
+        let mut gateway = object(
+            "Gateway",
+            "all-namespaces",
+            json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "http",
+                    "port": 80,
+                    "protocol": "HTTP",
+                    "allowedRoutes": { "namespaces": { "from": "All" } }
+                }]
+            }),
+        );
+        gateway.api_version = "gateway.networking.k8s.io/v1beta1".to_string();
+        gateway.metadata.namespace = "gateway-conformance-infra".to_string();
+        gateway.metadata.generation = Some(1);
+        gateway.status = json!({
+            "conditions": [
+                {
+                    "type": "Accepted",
+                    "status": "False",
+                    "observedGeneration": 0,
+                    "reason": "Pending",
+                    "message": "waiting for controller",
+                    "lastTransitionTime": "2026-01-01T00:00:00Z"
+                },
+                {
+                    "type": "Programmed",
+                    "status": "False",
+                    "observedGeneration": 0,
+                    "reason": "Pending",
+                    "message": "waiting for controller",
+                    "lastTransitionTime": "2026-01-01T00:00:00Z"
+                }
+            ]
+        });
+
+        let updates = plan_status_updates(
+            &[gateway_class, gateway],
+            options().with_source_namespaces(Vec::new()),
+        );
+
+        let gateway_update = update_for(&updates, "Gateway", "all-namespaces");
+        assert_eq!(
+            gateway_update.api_version,
+            "gateway.networking.k8s.io/v1beta1"
+        );
+        assert_eq!(gateway_update.namespace, "gateway-conformance-infra");
+        let conditions = gateway_update.status["conditions"].as_array().unwrap();
+        assert_condition(conditions, "Accepted", "True");
+        assert_condition(conditions, "Programmed", "True");
+        assert_eq!(
+            find_condition(conditions, "Accepted")["observedGeneration"].as_i64(),
+            Some(1)
+        );
+        assert_eq!(
+            find_condition(conditions, "Programmed")["observedGeneration"].as_i64(),
+            Some(1)
+        );
     }
 
     #[test]

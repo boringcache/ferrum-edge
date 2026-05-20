@@ -421,6 +421,7 @@ jobs:
             --set-string 'controlPlane.env.FERRUM_DB_URL=sqlite:////tmp/ferrum-gateway-api-conformance.db?mode=rwc' \
             --set controlPlane.env.FERRUM_ADMIN_JWT_SECRET=ferrum-edge-gateway-api-conformance-admin-secret \
             --set controlPlane.env.FERRUM_CP_DP_GRPC_JWT_SECRET=ferrum-edge-gateway-api-conformance-grpc-secret \
+            --set controlPlane.env.FERRUM_LOG_LEVEL=info \
             --set controlPlane.env.FERRUM_K8S_CONTROLLER_ENABLED=true \
             --set controlPlane.env.FERRUM_K8S_WATCH_GATEWAY_API_CRDS=true \
             --set controlPlane.env.FERRUM_K8S_WATCH_ISTIO_CRDS=false \
@@ -479,6 +480,14 @@ jobs:
           kubectl -n ferrum describe deployment/ferrum-mesh-control-plane > "$results/ferrum-control-plane-deployment.txt"
           kubectl -n ferrum get events --sort-by=.lastTimestamp > "$results/ferrum-events.txt"
           kubectl -n ferrum logs deployment/ferrum-mesh-control-plane --all-containers --tail=1000 > "$results/ferrum-control-plane.log"
+          {
+            kubectl auth can-i get gatewayclasses/status --as=system:serviceaccount:ferrum:ferrum-mesh
+            kubectl auth can-i patch gatewayclasses/status --as=system:serviceaccount:ferrum:ferrum-mesh
+            kubectl auth can-i get gateways/status --as=system:serviceaccount:ferrum:ferrum-mesh -n gateway-conformance-infra
+            kubectl auth can-i patch gateways/status --as=system:serviceaccount:ferrum:ferrum-mesh -n gateway-conformance-infra
+            kubectl auth can-i get httproutes/status --as=system:serviceaccount:ferrum:ferrum-mesh -n gateway-conformance-infra
+            kubectl auth can-i patch httproutes/status --as=system:serviceaccount:ferrum:ferrum-mesh -n gateway-conformance-infra
+          } > "$results/ferrum-rbac-can-i.txt"
           cat > "$results/CONFORMANCE.md" <<EOF
           # Gateway API Conformance
 
@@ -494,6 +503,7 @@ jobs:
           - ferrum-control-plane-deployment.txt
           - ferrum-events.txt
           - ferrum-control-plane.log
+          - ferrum-rbac-can-i.txt
           EOF
 
       - name: Upload Gateway API conformance artifacts

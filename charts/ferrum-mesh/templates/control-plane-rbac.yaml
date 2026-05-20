@@ -24,10 +24,11 @@ rules:
       - gateways/status
       - httproutes/status
       - grpcroutes/status
-    # Newer kube-rs SSA paths may fall back to `update status` after a 409
-    # conflict, and the Gateway API conformance docs reference both verbs.
-    # Granting both now keeps the chart stable if we move to server-side apply.
-    verbs: ["patch", "update"]
+    # kube-rs reads the live status before patching so it can preserve
+    # conditions owned by other controllers. Newer SSA paths may also fall
+    # back to `update status` after a 409 conflict, and the Gateway API
+    # conformance docs reference both mutating verbs.
+    verbs: ["get", "patch", "update"]
   {{- end }}
   {{- if .Values.controlPlane.rbac.istio }}
   - apiGroups: ["security.istio.io"]
