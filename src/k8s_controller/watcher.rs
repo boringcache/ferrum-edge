@@ -118,6 +118,13 @@ pub const GATEWAY_API_CRDS: &[CrdSpec] = &[
     },
     CrdSpec {
         group: "gateway.networking.k8s.io",
+        version: "v1beta1",
+        kind: "GatewayClass",
+        plural: "gatewayclasses",
+        namespaced: false,
+    },
+    CrdSpec {
+        group: "gateway.networking.k8s.io",
         version: "v1",
         kind: "Gateway",
         plural: "gateways",
@@ -125,7 +132,21 @@ pub const GATEWAY_API_CRDS: &[CrdSpec] = &[
     },
     CrdSpec {
         group: "gateway.networking.k8s.io",
+        version: "v1beta1",
+        kind: "Gateway",
+        plural: "gateways",
+        namespaced: true,
+    },
+    CrdSpec {
+        group: "gateway.networking.k8s.io",
         version: "v1",
+        kind: "HTTPRoute",
+        plural: "httproutes",
+        namespaced: true,
+    },
+    CrdSpec {
+        group: "gateway.networking.k8s.io",
+        version: "v1beta1",
         kind: "HTTPRoute",
         plural: "httproutes",
         namespaced: true,
@@ -149,6 +170,13 @@ pub const GATEWAY_API_CRDS: &[CrdSpec] = &[
         version: "v1alpha2",
         kind: "TCPRoute",
         plural: "tcproutes",
+        namespaced: true,
+    },
+    CrdSpec {
+        group: "gateway.networking.k8s.io",
+        version: "v1",
+        kind: "ReferenceGrant",
+        plural: "referencegrants",
         namespaced: true,
     },
     CrdSpec {
@@ -700,6 +728,19 @@ mod tests {
 
         assert!(!gateway_class.namespaced);
         assert_eq!(gateway_class.plural, "gatewayclasses");
+    }
+
+    #[test]
+    fn gateway_api_watches_served_v1beta1_compatibility_versions() {
+        assert!(GATEWAY_API_CRDS.iter().any(|resource| {
+            resource.kind == "Gateway" && resource.version == "v1beta1" && resource.namespaced
+        }));
+        assert!(GATEWAY_API_CRDS.iter().any(|resource| {
+            resource.kind == "HTTPRoute" && resource.version == "v1beta1" && resource.namespaced
+        }));
+        assert!(GATEWAY_API_CRDS.iter().any(|resource| {
+            resource.kind == "ReferenceGrant" && resource.version == "v1" && resource.namespaced
+        }));
     }
 
     #[test]
