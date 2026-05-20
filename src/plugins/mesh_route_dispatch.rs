@@ -117,17 +117,19 @@ impl MeshRouteDispatchConfig {
         for (idx, rule) in self.rules.iter_mut().enumerate() {
             normalize_header_match_keys(idx, &mut rule.match_.headers)?;
             // Empty match is normally rejected because it would silently
-            // shadow later rules. The exception is a "transform catch-all":
+            // shadow later rules. The exception is a "route-action catch-all":
             // a rule emitted by the K8s VirtualService translator for a
-            // URI-only `match.uri` whose http[] carries header transforms.
+            // URI-only `match.uri` whose http[] carries header transforms
+            // or route-local fault injection.
             // Such a rule has no routing effect (its destination is the
-            // proxy's default) but carries the per-rule transform Arcs.
+            // proxy's default) but carries per-rule actions.
             // `rule_matches` treats empty match as "match all" only when
-            // transforms are present, so this stays a no-op for any other
+            // route-local actions are present, so this stays a no-op for any other
             // operator config.
-            let has_transforms =
-                !rule.request_transform.is_empty() || !rule.response_transform.is_empty();
-            if rule.match_.is_empty() && !has_transforms {
+            let has_route_actions = !rule.request_transform.is_empty()
+                || !rule.response_transform.is_empty()
+                || rule.fault.is_some();
+            if rule.match_.is_empty() && !has_route_actions {
                 return Err(format!(
                     "mesh_route_dispatch.rules[{idx}].match requires at least one of \
                      methods / headers / query_params / authority / source_namespace / uri \
@@ -1432,13 +1434,14 @@ fn rule_matches(rule: &RouteRule, ctx: &RequestContext, headers: &HashMap<String
     let m = &rule.match_;
     if m.is_empty() {
         // Empty match means "match all". `normalize_and_validate` accepts
-        // this only when the rule carries route-level transforms — that
-        // narrow shape comes from the K8s VirtualService translator's
-        // catch-all rule for URI-only matches. `compile_transform_field`
-        // returns `None` for empty input, so an `Arc` is only present when
-        // there is at least one rule to apply.
+        // this only when the rule carries route-local actions — that narrow
+        // shape comes from the K8s VirtualService translator's catch-all
+        // rule for URI-only matches. `compile_transform_field` returns
+        // `None` for empty input, so an `Arc` is only present when there is
+        // at least one rule to apply.
         return rule.request_transform_compiled.is_some()
-            || rule.response_transform_compiled.is_some();
+            || rule.response_transform_compiled.is_some()
+            || rule.fault.is_some();
     }
     // URI predicate (when set): evaluate first because it cheaply rejects
     // requests that the broader (case-insensitive) `listen_path` lets
@@ -2256,15 +2259,41 @@ mod tests {
     }
 
     #[test]
-    fn rejects_empty_match_without_transforms() {
-        // The empty-match exception is narrow: only allowed when transforms
-        // are present. A rule with empty match AND no transforms is still
-        // rejected (it would be a silent no-op otherwise).
+    fn rejects_empty_match_without_route_actions() {
+        // The empty-match exception is narrow: only allowed when route-local
+        // actions are present. A rule with empty match AND no route actions is
+        // still rejected (it would shadow later rules otherwise).
         let err = MeshRouteDispatch::new(&json!({
             "rules": [{"match": {}, "destination": {"upstream_id": "x"}}]
         }))
         .unwrap_err();
         assert!(err.contains("match requires at least one"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn empty_match_with_fault_matches_all() {
+        // Translator-generated catch-all for URI-only VirtualService routes:
+        // the proxy's listen_path filter gates traffic, while the dispatch
+        // rule carries the per-route fault action.
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {},
+                "destination": {"backend_host": "v1.svc", "backend_port": 8080},
+                "fault": {"abort": {"status_code": 503, "percentage": 100.0}}
+            }]
+        }))
+        .unwrap();
+
+        let mut ctx = ctx_with("GET", "/v1/anything");
+        let mut headers = HashMap::new();
+        match plugin.before_proxy(&mut ctx, &mut headers).await {
+            PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 503),
+            other => panic!("expected 503 reject, got: {other:?}"),
+        }
+        assert_eq!(
+            ctx.metadata.get("fault_injected").map(String::as_str),
+            Some("true")
+        );
     }
 
     #[test]
