@@ -685,6 +685,8 @@ fn build_sidecar_patch_for_namespace(
         return Ok(Vec::new());
     }
 
+    reject_reserved_name_conflicts(pod, config)?;
+
     let mut patch = Vec::new();
     let pod_namespace = pod_namespace(pod, admission_namespace, config);
     ensure_metadata_annotations(pod, &mut patch);
@@ -728,8 +730,6 @@ fn should_inject(pod: &Value, config: &InjectorConfig) -> bool {
     if value_is_false(annotations.and_then(|m| m.get("sidecar.istio.io/inject")))
         || value_is_false(annotations.and_then(|m| m.get("ferrum.io/inject")))
         || value_is_false(labels.and_then(|m| m.get("ferrum.io/mesh")))
-        || pod_has_ferrum_sidecar(pod)
-        || (config.capture_mode == CaptureMode::Iptables && pod_has_ferrum_init_container(pod))
     {
         return false;
     }
@@ -744,6 +744,24 @@ fn should_inject(pod: &Value, config: &InjectorConfig) -> bool {
             .and_then(|m| m.get("ferrum.io/mesh"))
             .and_then(Value::as_str)
             .is_some_and(|value| value == "enabled")
+}
+
+fn reject_reserved_name_conflicts(pod: &Value, config: &InjectorConfig) -> Result<(), String> {
+    if pod_has_ferrum_sidecar(pod) {
+        return Err(
+            "pod spec already defines reserved container name ferrum-edge; refusing injection"
+                .to_string(),
+        );
+    }
+
+    if config.capture_mode == CaptureMode::Iptables && pod_has_ferrum_init_container(pod) {
+        return Err(
+            "pod spec already defines reserved init container name ferrum-edge-init; refusing injection"
+                .to_string(),
+        );
+    }
+
+    Ok(())
 }
 
 fn value_is_true(value: Option<&Value>) -> bool {
@@ -1191,7 +1209,7 @@ mod tests {
     }
 
     #[test]
-    fn patch_skips_already_injected_pod() {
+    fn patch_rejects_reserved_sidecar_name_conflict() {
         let pod = json!({
             "metadata": {
                 "labels": {"ferrum.io/mesh": "enabled"},
@@ -1201,13 +1219,33 @@ mod tests {
                 "containers": [{"name": "ferrum-edge", "image": "ferrum-edge:latest"}]
             }
         });
-        let patch = build_sidecar_patch_for_namespace(
+        let err = build_sidecar_patch_for_namespace(
             &pod,
             &test_config(true, CaptureMode::Iptables),
             None,
         )
-        .expect("patch");
-        assert!(patch.is_empty());
+        .expect_err("reserved name conflict should be rejected");
+        assert!(err.contains("reserved container name ferrum-edge"));
+    }
+
+    #[test]
+    fn patch_rejects_reserved_init_name_conflict_in_iptables_mode() {
+        let pod = json!({
+            "metadata": {
+                "labels": {"ferrum.io/mesh": "enabled"}
+            },
+            "spec": {
+                "containers": [{"name": "app", "image": "app:test"}],
+                "initContainers": [{"name": "ferrum-edge-init", "image": "fake:init"}]
+            }
+        });
+        let err = build_sidecar_patch_for_namespace(
+            &pod,
+            &test_config(true, CaptureMode::Iptables),
+            None,
+        )
+        .expect_err("reserved init name conflict should be rejected");
+        assert!(err.contains("reserved init container name ferrum-edge-init"));
     }
 
     #[test]
