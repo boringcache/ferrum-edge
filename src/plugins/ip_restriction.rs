@@ -215,6 +215,22 @@ pub(super) fn parse_rule(rule: &str) -> Option<ParsedRule> {
             if prefix_len > 128 {
                 return None;
             }
+
+            if let Some(v4_bits) = ipv6_parts_to_ipv4_mapped_u32(&parts) {
+                if prefix_len >= 96 {
+                    let v4_prefix_len = prefix_len - 96;
+                    let mask = if v4_prefix_len == 0 {
+                        0u32
+                    } else {
+                        !0u32 << (32 - v4_prefix_len)
+                    };
+                    return Some(ParsedRule::CidrV4 {
+                        network: v4_bits & mask,
+                        mask,
+                    });
+                }
+            }
+
             let network = ipv6_to_u128(&parts);
             let mask = if prefix_len == 0 {
                 0u128
@@ -234,6 +250,9 @@ pub(super) fn parse_rule(rule: &str) -> Option<ParsedRule> {
             return Some(ParsedRule::ExactV4(u32::from_be_bytes(octets)));
         }
         if let Some(parts) = parse_ipv6(rule) {
+            if let Some(v4_bits) = ipv6_parts_to_ipv4_mapped_u32(&parts) {
+                return Some(ParsedRule::ExactV4(v4_bits));
+            }
             return Some(ParsedRule::ExactV6(ipv6_to_u128(&parts)));
         }
         None
@@ -330,6 +349,12 @@ fn parse_ipv6(ip: &str) -> Option<[u16; 8]> {
     };
 
     ip.parse::<Ipv6Addr>().ok().map(|ip| ip.segments())
+}
+
+
+fn ipv6_parts_to_ipv4_mapped_u32(parts: &[u16; 8]) -> Option<u32> {
+    let v6 = Ipv6Addr::from(*parts);
+    v6.to_ipv4_mapped().map(u32::from)
 }
 
 fn ipv6_to_u128(parts: &[u16; 8]) -> u128 {
