@@ -520,9 +520,7 @@ impl MeshRuntimeConfig {
             sidecar_enforced: env_config.mesh_sidecar_enforced,
             sidecar_enforced_dry_run: env_config.mesh_sidecar_enforced_dry_run,
             sidecar_identity_narrowing: env_config.mesh_sidecar_identity_narrowing,
-            egress_stream_enabled: resolve_ferrum_var("FERRUM_MESH_EGRESS_STREAM_ENABLED")
-                .map(|v| v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false),
+            egress_stream_enabled: env_config.mesh_egress_stream_enabled,
         })
     }
 
