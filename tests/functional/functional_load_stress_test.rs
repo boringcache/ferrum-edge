@@ -446,7 +446,14 @@ impl LoadTestHarness {
                 "FERRUM_POOL_ENABLE_HTTP2",
                 if enable_http2 { "true" } else { "false" },
             )
-            // HTTP/2 flow control tuning
+            // Frontend HTTP/2 flow control — large trusted-client windows for load testing
+            .env("FERRUM_FRONTEND_H2_INITIAL_STREAM_WINDOW_SIZE", "8388608")
+            .env(
+                "FERRUM_FRONTEND_H2_INITIAL_CONNECTION_WINDOW_SIZE",
+                "33554432",
+            )
+            .env("FERRUM_FRONTEND_H2_MAX_FRAME_SIZE", "1048576")
+            // Backend HTTP/2 pool flow control tuning
             .env("FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE", "8388608")
             .env(
                 "FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE",
@@ -455,7 +462,7 @@ impl LoadTestHarness {
             .env("FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW", "false")
             .env("FERRUM_POOL_HTTP2_MAX_FRAME_SIZE", "65535")
             .env("FERRUM_POOL_HTTP2_MAX_CONCURRENT_STREAMS", "1000")
-            // HTTP/3 (QUIC) transport tuning
+            // Frontend HTTP/3 — large trusted-client windows for load testing
             .env("FERRUM_HTTP3_MAX_STREAMS", "1000")
             .env("FERRUM_HTTP3_STREAM_RECEIVE_WINDOW", "8388608")
             .env("FERRUM_HTTP3_RECEIVE_WINDOW", "33554432")

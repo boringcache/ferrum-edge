@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use ferrum_edge::config::EnvConfig;
 use ferrum_edge::http3::config::{
-    H3_RECEIVE_WINDOW_DEFAULT, H3_SEND_WINDOW_DEFAULT, H3_STREAM_RECEIVE_WINDOW_DEFAULT,
+    H3_FRONTEND_RECEIVE_WINDOW, H3_FRONTEND_SEND_WINDOW, H3_FRONTEND_STREAM_RECEIVE_WINDOW,
     Http3ServerConfig,
 };
 
@@ -12,12 +12,13 @@ fn test_http3_server_config_default_values() {
 
     assert_eq!(config.max_concurrent_streams, 1000);
     assert_eq!(config.idle_timeout, Duration::from_secs(30));
+    // Default() uses conservative frontend values for untrusted clients
     assert_eq!(
         config.stream_receive_window,
-        H3_STREAM_RECEIVE_WINDOW_DEFAULT
+        H3_FRONTEND_STREAM_RECEIVE_WINDOW
     );
-    assert_eq!(config.receive_window, H3_RECEIVE_WINDOW_DEFAULT);
-    assert_eq!(config.send_window, H3_SEND_WINDOW_DEFAULT);
+    assert_eq!(config.receive_window, H3_FRONTEND_RECEIVE_WINDOW);
+    assert_eq!(config.send_window, H3_FRONTEND_SEND_WINDOW);
     assert_eq!(config.initial_mtu, 1500);
     // Default mirrors EnvConfig::default().frontend_tls_handshake_timeout_seconds (10s).
     assert_eq!(config.handshake_timeout, Duration::from_secs(10));
@@ -75,6 +76,7 @@ fn test_http3_server_config_initial_mtu_from_env() {
 #[test]
 fn test_http3_server_config_from_env_config_defaults() {
     // EnvConfig::default() should produce the same values as Http3ServerConfig::default()
+    // (conservative frontend values for untrusted clients)
     let env = EnvConfig::default();
     let config = Http3ServerConfig::from_env_config(&env);
 
@@ -82,10 +84,10 @@ fn test_http3_server_config_from_env_config_defaults() {
     assert_eq!(config.idle_timeout, Duration::from_secs(30));
     assert_eq!(
         config.stream_receive_window,
-        H3_STREAM_RECEIVE_WINDOW_DEFAULT
+        H3_FRONTEND_STREAM_RECEIVE_WINDOW
     );
-    assert_eq!(config.receive_window, H3_RECEIVE_WINDOW_DEFAULT);
-    assert_eq!(config.send_window, H3_SEND_WINDOW_DEFAULT);
+    assert_eq!(config.receive_window, H3_FRONTEND_RECEIVE_WINDOW);
+    assert_eq!(config.send_window, H3_FRONTEND_SEND_WINDOW);
 }
 
 #[test]

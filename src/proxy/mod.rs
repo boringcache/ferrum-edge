@@ -202,13 +202,12 @@ pub(crate) fn validate_mesh_route_dispatch_upstream_references(
 /// not inherit long per-request connect timeouts that could hold readiness.
 const BACKEND_CAPABILITY_PROBE_TIMEOUT_MS_CAP: u64 = 5_000;
 
-// Frontend HTTP/2 flow-control constants. These are intentionally more
-// conservative than the backend pool defaults (8 MiB stream / 32 MiB conn)
-// because the frontend serves untrusted clients. Large windows let a malicious
-// client cause the gateway to buffer excessive data.
-const FRONTEND_H2_INITIAL_STREAM_WINDOW_SIZE: u32 = 256 * 1024; // 256 KiB
-const FRONTEND_H2_INITIAL_CONNECTION_WINDOW_SIZE: u32 = 2 * 1024 * 1024; // 2 MiB
-const FRONTEND_H2_MAX_FRAME_SIZE: u32 = 16_384; // 16 KiB (RFC 9113 default)
+// Frontend HTTP/2 flow-control defaults. Conservative for untrusted clients;
+// operators can override via FERRUM_FRONTEND_H2_* env vars for benchmarking
+// or trusted-network deployments.
+pub(crate) const FRONTEND_H2_INITIAL_STREAM_WINDOW_SIZE: u32 = 256 * 1024; // 256 KiB
+pub(crate) const FRONTEND_H2_INITIAL_CONNECTION_WINDOW_SIZE: u32 = 2 * 1024 * 1024; // 2 MiB
+pub(crate) const FRONTEND_H2_MAX_FRAME_SIZE: u32 = 16_384; // 16 KiB (RFC 9113 default)
 const GATEWAY_WORKLOAD_METRICS_PLUGIN_ID: &str = "__gateway_workload_metrics";
 const WORKLOAD_METRICS_PLUGIN_NAME: &str = "workload_metrics";
 const HBONE_INNER_IDENTITY_BAGGAGE_PREFIXES: &[&str] = &[
@@ -4565,10 +4564,10 @@ async fn handle_connection(
     builder
         .http2()
         .max_header_list_size(state.max_header_size_bytes.min(u32::MAX as usize) as u32)
-        .initial_stream_window_size(FRONTEND_H2_INITIAL_STREAM_WINDOW_SIZE)
-        .initial_connection_window_size(FRONTEND_H2_INITIAL_CONNECTION_WINDOW_SIZE)
+        .initial_stream_window_size(state.env_config.frontend_h2_initial_stream_window_size)
+        .initial_connection_window_size(state.env_config.frontend_h2_initial_connection_window_size)
         .adaptive_window(false)
-        .max_frame_size(FRONTEND_H2_MAX_FRAME_SIZE)
+        .max_frame_size(state.env_config.frontend_h2_max_frame_size)
         .max_concurrent_streams(state.env_config.server_http2_max_concurrent_streams)
         .max_pending_accept_reset_streams(Some(
             state
@@ -7096,10 +7095,10 @@ async fn handle_tls_connection(
     builder
         .http2()
         .max_header_list_size(state.max_header_size_bytes.min(u32::MAX as usize) as u32)
-        .initial_stream_window_size(FRONTEND_H2_INITIAL_STREAM_WINDOW_SIZE)
-        .initial_connection_window_size(FRONTEND_H2_INITIAL_CONNECTION_WINDOW_SIZE)
+        .initial_stream_window_size(state.env_config.frontend_h2_initial_stream_window_size)
+        .initial_connection_window_size(state.env_config.frontend_h2_initial_connection_window_size)
         .adaptive_window(false)
-        .max_frame_size(FRONTEND_H2_MAX_FRAME_SIZE)
+        .max_frame_size(state.env_config.frontend_h2_max_frame_size)
         .max_concurrent_streams(state.env_config.server_http2_max_concurrent_streams)
         .max_pending_accept_reset_streams(Some(
             state

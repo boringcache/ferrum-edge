@@ -490,14 +490,25 @@ fn test_env_config_http3_defaults() {
             remove_var("FERRUM_ENABLE_HTTP3");
             remove_var("FERRUM_HTTP3_IDLE_TIMEOUT");
             remove_var("FERRUM_HTTP3_MAX_STREAMS");
+            remove_var("FERRUM_HTTP3_STREAM_RECEIVE_WINDOW");
+            remove_var("FERRUM_HTTP3_RECEIVE_WINDOW");
+            remove_var("FERRUM_HTTP3_SEND_WINDOW");
+            remove_var("FERRUM_FRONTEND_H2_INITIAL_STREAM_WINDOW_SIZE");
+            remove_var("FERRUM_FRONTEND_H2_INITIAL_CONNECTION_WINDOW_SIZE");
+            remove_var("FERRUM_FRONTEND_H2_MAX_FRAME_SIZE");
 
             let config = EnvConfig::from_env().unwrap();
             assert!(!config.enable_http3);
             assert_eq!(config.http3_idle_timeout, 30);
             assert_eq!(config.http3_max_streams, 1000);
-            assert_eq!(config.http3_stream_receive_window, 8_388_608);
-            assert_eq!(config.http3_receive_window, 33_554_432);
-            assert_eq!(config.http3_send_window, 8_388_608);
+            // Frontend H3 defaults (conservative for untrusted clients)
+            assert_eq!(config.http3_stream_receive_window, 262_144);
+            assert_eq!(config.http3_receive_window, 2_097_152);
+            assert_eq!(config.http3_send_window, 2_097_152);
+            // Frontend H2 defaults (conservative for untrusted clients)
+            assert_eq!(config.frontend_h2_initial_stream_window_size, 262_144);
+            assert_eq!(config.frontend_h2_initial_connection_window_size, 2_097_152);
+            assert_eq!(config.frontend_h2_max_frame_size, 16_384);
             assert_eq!(config.server_http2_max_pending_accept_reset_streams, 64);
             assert_eq!(config.server_http2_max_local_error_reset_streams, 256);
             assert_eq!(config.websocket_max_connections, 20_000);

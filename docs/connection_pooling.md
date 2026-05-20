@@ -53,12 +53,14 @@ proxies:
 | `FERRUM_POOL_TCP_KEEPALIVE_SECONDS` | `60` | TCP keep-alive interval in seconds |
 | `FERRUM_POOL_HTTP2_KEEP_ALIVE_INTERVAL_SECONDS` | `30` | HTTP/2 keep-alive ping interval in seconds |
 | `FERRUM_POOL_HTTP2_KEEP_ALIVE_TIMEOUT_SECONDS` | `45` | HTTP/2 keep-alive timeout in seconds |
-| `FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE` | `8388608` | HTTP/2 per-stream flow-control window (bytes). Default: 8 MiB |
-| `FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE` | `33554432` | HTTP/2 connection-level flow-control window (bytes). Default: 32 MiB |
+| `FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE` | `8388608` | Backend HTTP/2 per-stream flow-control window (bytes). Default: 8 MiB |
+| `FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE` | `33554432` | Backend HTTP/2 connection-level flow-control window (bytes). Default: 32 MiB |
 | `FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW` | `true` | Enable adaptive flow-control (BDP probing) |
-| `FERRUM_POOL_HTTP2_MAX_FRAME_SIZE` | `1048576` | Maximum HTTP/2 frame payload (bytes). Range: 16384–1048576. Default: 1 MiB |
+| `FERRUM_POOL_HTTP2_MAX_FRAME_SIZE` | `1048576` | Maximum backend HTTP/2 frame payload (bytes). Range: 16384–1048576. Default: 1 MiB |
 | `FERRUM_POOL_HTTP2_MAX_CONCURRENT_STREAMS` | `1000` | Max concurrent HTTP/2 streams per backend connection |
 | `FERRUM_GRPC_POOL_READY_WAIT_MS` | `1` | Milliseconds the dedicated gRPC pool waits for a free H2 stream before opening another backend connection |
+
+> **Frontend vs backend HTTP/2 windows**: the `FERRUM_POOL_HTTP2_*` settings above control the **backend** (gateway-to-upstream) connection pool. The **frontend** (client-to-gateway) HTTP/2 listener uses separate, conservative defaults: `FERRUM_FRONTEND_H2_INITIAL_STREAM_WINDOW_SIZE` (256 KiB), `FERRUM_FRONTEND_H2_INITIAL_CONNECTION_WINDOW_SIZE` (2 MiB), `FERRUM_FRONTEND_H2_MAX_FRAME_SIZE` (16 KiB). Raise the frontend values for benchmarking or trusted-network deployments. See [configuration.md](configuration.md) for the full reference.
 
 ## Sizing `FERRUM_POOL_MAX_IDLE_PER_HOST`
 
