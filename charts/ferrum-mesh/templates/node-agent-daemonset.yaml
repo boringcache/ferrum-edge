@@ -29,6 +29,11 @@
 {{- $seccompProfile = $candidate -}}
 {{- end -}}
 {{- end -}}
+{{- $cni := .Values.nodeAgent.cni }}
+{{- $cniSocketPath := "" }}
+{{- if and $cni $cni.enabled }}
+{{- $cniSocketPath = printf "%s/%s" $cni.hostSocketDir $cni.socketFileName }}
+{{- end }}
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -54,6 +59,42 @@ spec:
       securityContext:
         seccompProfile:
           {{- toYaml $seccompProfile | nindent 10 }}
+      {{- if and $cni $cni.enabled }}
+      # CNI installer init container (opt-in). Executes the distroless-safe
+      # `ferrum-cni install` mode: it copies the binary into the host CNI
+      # plugin dir, reads the existing primary CNI config, appends Ferrum as a
+      # meta-plugin, and writes the generated conflist.
+      initContainers:
+        - name: ferrum-cni-installer
+          image: "{{ .Values.nodeAgent.image.repository }}:{{ .Values.nodeAgent.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - /app/ferrum-cni
+            - install
+          env:
+            - name: HOST_BIN_DIR
+              value: {{ $cni.hostBinDir | quote }}
+            - name: HOST_CONF_DIR
+              value: {{ $cni.hostConfDir | quote }}
+            - name: HOST_SOCKET_DIR
+              value: {{ $cni.hostSocketDir | quote }}
+            - name: CONF_FILE_NAME
+              value: {{ $cni.confFileName | quote }}
+            - name: CHAINED_WITH
+              value: {{ $cni.chainedWith | quote }}
+            - name: SOCKET_PATH
+              value: {{ $cniSocketPath | quote }}
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+          volumeMounts:
+            - name: host-cni-bin
+              mountPath: {{ $cni.hostBinDir }}
+            - name: host-cni-conf
+              mountPath: {{ $cni.hostConfDir }}
+            - name: host-ferrum-socket-dir
+              mountPath: {{ $cni.hostSocketDir }}
+      {{- end }}
       containers:
         - name: ferrum-edge
           image: "{{ .Values.nodeAgent.image.repository }}:{{ .Values.nodeAgent.image.tag }}"
@@ -94,6 +135,12 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            {{- if and $cni $cni.enabled }}
+            - name: FERRUM_NODE_AGENT_CNI_ENABLED
+              value: "true"
+            - name: FERRUM_NODE_AGENT_CNI_SOCKET_PATH
+              value: {{ $cniSocketPath | quote }}
+            {{- end }}
           volumeMounts:
             - name: bpf-fs
               mountPath: {{ .Values.nodeAgent.bpfFsPath }}
@@ -106,6 +153,10 @@ spec:
             # docs/node_agent_security.md for the full rationale.
             - name: tmp
               mountPath: /tmp
+            {{- end }}
+            {{- if and $cni $cni.enabled }}
+            - name: host-ferrum-socket-dir
+              mountPath: {{ $cni.hostSocketDir }}
             {{- end }}
           resources:
             {{- toYaml .Values.nodeAgent.resources | nindent 12 }}
@@ -121,5 +172,19 @@ spec:
         {{- if $readOnlyRoot }}
         - name: tmp
           emptyDir: {}
+        {{- end }}
+        {{- if and $cni $cni.enabled }}
+        - name: host-cni-bin
+          hostPath:
+            path: {{ $cni.hostBinDir }}
+            type: DirectoryOrCreate
+        - name: host-cni-conf
+          hostPath:
+            path: {{ $cni.hostConfDir }}
+            type: DirectoryOrCreate
+        - name: host-ferrum-socket-dir
+          hostPath:
+            path: {{ $cni.hostSocketDir }}
+            type: DirectoryOrCreate
         {{- end }}
 {{- end }}

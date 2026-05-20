@@ -716,11 +716,13 @@ jobs:
             target: x86_64-unknown-linux-gnu
             artifact_name: ferrum-edge
             asset_name: ferrum-edge-linux-x86_64
+            cni_asset_name: ferrum-cni-linux-x86_64
 
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             artifact_name: ferrum-edge
             asset_name: ferrum-edge-linux-aarch64
+            cni_asset_name: ferrum-cni-linux-aarch64
 
           - os: macos-latest
             target: x86_64-apple-darwin
@@ -802,13 +804,19 @@ jobs:
         run: |
           mkdir -p release-assets
           cp "target/${{ matrix.target }}/release/${{ matrix.artifact_name }}" "release-assets/${{ matrix.asset_name }}"
-          cd release-assets
-          if command -v sha256sum &> /dev/null; then
-            sha256sum "${{ matrix.asset_name }}" > "${{ matrix.asset_name }}.sha256"
-          else
-            shasum -a 256 "${{ matrix.asset_name }}" > "${{ matrix.asset_name }}.sha256"
+          if [[ -n "${{ matrix.cni_asset_name }}" ]]; then
+            cp "target/${{ matrix.target }}/release/ferrum-cni" "release-assets/${{ matrix.cni_asset_name }}"
           fi
-          cat "${{ matrix.asset_name }}.sha256"
+          cd release-assets
+          for asset in *; do
+            [[ "$asset" == *.sha256 ]] && continue
+            if command -v sha256sum &> /dev/null; then
+              sha256sum "$asset" > "$asset.sha256"
+            else
+              shasum -a 256 "$asset" > "$asset.sha256"
+            fi
+            cat "$asset.sha256"
+          done
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v7
@@ -859,7 +867,9 @@ jobs:
           | Platform | Binary |
           |----------|--------|
           | Linux x86_64 | `ferrum-edge-linux-x86_64` |
+          | Linux x86_64 CNI plugin | `ferrum-cni-linux-x86_64` |
           | Linux ARM64 | `ferrum-edge-linux-aarch64` |
+          | Linux ARM64 CNI plugin | `ferrum-cni-linux-aarch64` |
           | macOS x86_64 | `ferrum-edge-macos-x86_64` |
           | macOS ARM64 (Apple Silicon) | `ferrum-edge-macos-aarch64` |
           | Windows x86_64 | `ferrum-edge-windows-x86_64.exe` |
@@ -901,10 +911,12 @@ jobs:
           - platform: linux/amd64
             binary_target: x86_64-unknown-linux-gnu
             binary_asset: ferrum-edge-linux-x86_64
+            cni_asset: ferrum-cni-linux-x86_64
             arch_dir: amd64
           - platform: linux/arm64
             binary_target: aarch64-unknown-linux-gnu
             binary_asset: ferrum-edge-linux-aarch64
+            cni_asset: ferrum-cni-linux-aarch64
             arch_dir: arm64
     steps:
       - uses: actions/checkout@v6
@@ -919,6 +931,7 @@ jobs:
         run: |
           mkdir -p docker-context/bin/${{ matrix.arch_dir }}
           cp downloaded-artifacts/${{ matrix.binary_asset }} docker-context/bin/${{ matrix.arch_dir }}/ferrum-edge
+          cp downloaded-artifacts/${{ matrix.cni_asset }} docker-context/bin/${{ matrix.arch_dir }}/ferrum-cni
           cp Dockerfile.release docker-context/Dockerfile
 
       - name: Set up Docker Buildx
