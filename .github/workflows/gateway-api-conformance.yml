@@ -11,6 +11,13 @@ on:
         description: Comma-separated Gateway API conformance features
         required: false
         default: Gateway,HTTPRoute
+      conformance_tests:
+        description: Space-separated upstream conformance test short names to run
+        required: false
+        # This workflow deploys the Gateway API controller/status surface only.
+        # Full GATEWAY-HTTP traffic profile runs need a routable Ferrum data
+        # plane Service and should be enabled with that runtime work.
+        default: GatewayClassObservedGenerationBump GatewayObservedGenerationBump HTTPRouteObservedGenerationBump HTTPRouteInvalidCrossNamespaceParentRef
   schedule:
     - cron: "0 7 * * 1"
 
@@ -44,14 +51,19 @@ jobs:
         run: |
           gateway_api_version="${{ github.event.inputs.gateway_api_version }}"
           supported_features="${{ github.event.inputs.supported_features }}"
+          conformance_tests="${{ github.event.inputs.conformance_tests }}"
           if [ -z "$gateway_api_version" ]; then
             gateway_api_version="v1.5.1"
           fi
           if [ -z "$supported_features" ]; then
             supported_features="Gateway,HTTPRoute"
           fi
+          if [ -z "$conformance_tests" ]; then
+            conformance_tests="GatewayClassObservedGenerationBump GatewayObservedGenerationBump HTTPRouteObservedGenerationBump HTTPRouteInvalidCrossNamespaceParentRef"
+          fi
           echo "gateway_api_version=$gateway_api_version" >> "$GITHUB_OUTPUT"
           echo "supported_features=$supported_features" >> "$GITHUB_OUTPUT"
+          echo "conformance_tests=$conformance_tests" >> "$GITHUB_OUTPUT"
 
       - name: Set up Go
         uses: actions/setup-go@v6
@@ -150,25 +162,40 @@ jobs:
 
       - name: Run upstream Gateway API conformance
         id: conformance
+        env:
+          GATEWAY_API_CONFORMANCE_TESTS: ${{ steps.inputs.outputs.conformance_tests }}
+          GATEWAY_API_SUPPORTED_FEATURES: ${{ steps.inputs.outputs.supported_features }}
         run: |
           set -uo pipefail
           results="$GITHUB_WORKSPACE/conformance-results"
           mkdir -p "$results"
           git clone --depth 1 --branch "${{ steps.inputs.outputs.gateway_api_version }}" https://github.com/kubernetes-sigs/gateway-api.git /tmp/gateway-api
           cd /tmp/gateway-api
-          set +e
-          go test -json ./conformance -run TestConformance -count=1 -timeout=45m -args \
-            --gateway-class=ferrum \
-            --supported-features="${{ steps.inputs.outputs.supported_features }}" \
-            --conformance-profiles=GATEWAY-HTTP \
-            --organization=Ferrum \
-            --project="Ferrum Edge" \
-            --url=https://github.com/ferrum-edge/ferrum-edge \
-            --version="${GITHUB_SHA}" \
-            --contact=https://github.com/ferrum-edge/ferrum-edge/issues \
-            --report-output="$results/gateway-api-conformance-report.yaml" \
-            2>&1 | tee "$results/gateway-api-conformance-test.json"
-          status=${PIPESTATUS[0]}
+          : > "$results/gateway-api-conformance-test.json"
+          status=0
+          for test_name in $GATEWAY_API_CONFORMANCE_TESTS; do
+            echo "::group::Gateway API conformance: ${test_name}"
+            test_log="$results/gateway-api-conformance-${test_name}.json"
+            test_report="$results/gateway-api-conformance-${test_name}-report.yaml"
+            go test -json ./conformance -run TestConformance -count=1 -timeout=10m -args \
+              --gateway-class=ferrum \
+              --supported-features="$GATEWAY_API_SUPPORTED_FEATURES" \
+              --run-test="$test_name" \
+              --organization=Ferrum \
+              --project="Ferrum Edge" \
+              --url=https://github.com/ferrum-edge/ferrum-edge \
+              --version="${GITHUB_SHA}" \
+              --contact=https://github.com/ferrum-edge/ferrum-edge/issues \
+              --report-output="$test_report" \
+              2>&1 | tee "$test_log"
+            test_status=${PIPESTATUS[0]}
+            cat "$test_log" >> "$results/gateway-api-conformance-test.json"
+            if [ "$test_status" -ne 0 ]; then
+              echo "::error title=Gateway API conformance failed::${test_name} exited with ${test_status}"
+              status="$test_status"
+            fi
+            echo "::endgroup::"
+          done
           echo "exit_code=$status" >> "$GITHUB_OUTPUT"
           if [ "$status" -ne 0 ]; then
             echo "::error title=Gateway API conformance failed::go test exited with $status; diagnostics will be uploaded"
@@ -201,11 +228,13 @@ jobs:
 
           Supported features: ${{ steps.inputs.outputs.supported_features }}
 
+          Targeted upstream tests: ${{ steps.inputs.outputs.conformance_tests }}
+
           Conformance exit code: ${{ steps.conformance.outputs.exit_code }}
 
           Artifacts:
           - gateway-api-conformance-test.json
-          - gateway-api-conformance-report.yaml
+          - gateway-api-conformance-*-report.yaml
           - gateway-api-resources.yaml
           - ferrum-namespace.txt
           - ferrum-control-plane-deployment.txt

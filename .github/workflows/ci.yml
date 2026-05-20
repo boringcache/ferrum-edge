@@ -342,6 +342,14 @@ jobs:
       KUBECTL_VERSION: v1.32.3
       GATEWAY_API_VERSION: v1.5.1
       GATEWAY_API_SUPPORTED_FEATURES: Gateway,HTTPRoute
+      # This CI lab deploys the Gateway API controller/status surface only.
+      # Full GATEWAY-HTTP profile traffic conformance needs a routable Ferrum
+      # data-plane Service and should be enabled with that runtime work.
+      GATEWAY_API_CONFORMANCE_TESTS: >-
+        GatewayClassObservedGenerationBump
+        GatewayObservedGenerationBump
+        HTTPRouteObservedGenerationBump
+        HTTPRouteInvalidCrossNamespaceParentRef
     steps:
       - uses: actions/checkout@v6
         with:
@@ -459,17 +467,32 @@ jobs:
           mkdir -p "$results"
           git clone --depth 1 --branch "$GATEWAY_API_VERSION" https://github.com/kubernetes-sigs/gateway-api.git /tmp/gateway-api
           cd /tmp/gateway-api
-          go test -json ./conformance -run TestConformance -count=1 -timeout=45m -args \
-            --gateway-class=ferrum \
-            --supported-features="$GATEWAY_API_SUPPORTED_FEATURES" \
-            --conformance-profiles=GATEWAY-HTTP \
-            --organization=Ferrum \
-            --project="Ferrum Edge" \
-            --url=https://github.com/ferrum-edge/ferrum-edge \
-            --version="${GITHUB_SHA}" \
-            --contact=https://github.com/ferrum-edge/ferrum-edge/issues \
-            --report-output="$results/gateway-api-conformance-report.yaml" \
-            2>&1 | tee "$results/gateway-api-conformance-test.json"
+          : > "$results/gateway-api-conformance-test.json"
+          status=0
+          for test_name in $GATEWAY_API_CONFORMANCE_TESTS; do
+            echo "::group::Gateway API conformance: ${test_name}"
+            test_log="$results/gateway-api-conformance-${test_name}.json"
+            test_report="$results/gateway-api-conformance-${test_name}-report.yaml"
+            go test -json ./conformance -run TestConformance -count=1 -timeout=10m -args \
+              --gateway-class=ferrum \
+              --supported-features="$GATEWAY_API_SUPPORTED_FEATURES" \
+              --run-test="$test_name" \
+              --organization=Ferrum \
+              --project="Ferrum Edge" \
+              --url=https://github.com/ferrum-edge/ferrum-edge \
+              --version="${GITHUB_SHA}" \
+              --contact=https://github.com/ferrum-edge/ferrum-edge/issues \
+              --report-output="$test_report" \
+              2>&1 | tee "$test_log"
+            test_status=${PIPESTATUS[0]}
+            cat "$test_log" >> "$results/gateway-api-conformance-test.json"
+            if [ "$test_status" -ne 0 ]; then
+              echo "::error title=Gateway API conformance failed::${test_name} exited with ${test_status}"
+              status="$test_status"
+            fi
+            echo "::endgroup::"
+          done
+          exit "$status"
 
       - name: Collect Gateway API conformance diagnostics
         if: always() && steps.changes.outputs.gateway_api_changed == 'true'
@@ -497,9 +520,11 @@ jobs:
 
           Supported features: ${GATEWAY_API_SUPPORTED_FEATURES}
 
+          Targeted upstream tests: ${GATEWAY_API_CONFORMANCE_TESTS}
+
           Artifacts:
           - gateway-api-conformance-test.json
-          - gateway-api-conformance-report.yaml
+          - gateway-api-conformance-*-report.yaml
           - gateway-api-resources.yaml
           - ferrum-namespace.txt
           - ferrum-control-plane-deployment.txt

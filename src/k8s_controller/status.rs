@@ -394,6 +394,15 @@ fn route_status(
                             "Ferrum accepted this route but could not resolve all backendRefs: {error}"
                         ),
                     )
+                } else if error_is_parent_ref_not_allowed(error) {
+                    (
+                        false,
+                        true,
+                        false,
+                        "NotAllowedByListeners",
+                        "ResolvedRefs",
+                        format!("Ferrum rejected this route attachment: {error}"),
+                    )
                 } else {
                     (
                         false,
@@ -977,6 +986,16 @@ fn error_is_reference_resolution(error: &K8sTranslateError) -> bool {
     }
 }
 
+fn error_is_parent_ref_not_allowed(error: &K8sTranslateError) -> bool {
+    match error {
+        K8sTranslateError::InvalidResource { message, .. } => {
+            message.contains("parentRef.namespace")
+                && message.contains("only same-namespace Gateway attachments are accepted")
+        }
+        K8sTranslateError::Unsupported(_) => false,
+    }
+}
+
 fn same_resource(left: &K8sObject, right: &K8sObject) -> bool {
     left.api_version == right.api_version
         && left.kind == right.kind
@@ -1425,6 +1444,50 @@ mod tests {
         assert_eq!(
             find_condition(conditions, "ResolvedRefs")["reason"].as_str(),
             Some("RefNotPermitted")
+        );
+    }
+
+    #[test]
+    fn route_status_reports_cross_namespace_parent_ref_not_allowed_with_resolved_refs_true() {
+        let mut route = object(
+            "HTTPRoute",
+            "api",
+            json!({
+                "parentRefs": [{
+                    "group": "gateway.networking.k8s.io",
+                    "kind": "Gateway",
+                    "name": "edge",
+                    "namespace": "gateway-conformance-infra"
+                }],
+                "rules": [{
+                    "backendRefs": [{"name": "api", "port": 8080}]
+                }]
+            }),
+        );
+        route.metadata.namespace = "gateway-conformance-web-backend".to_string();
+
+        let gateway_class = ferrum_gateway_class();
+        let mut gateway = ferrum_gateway("edge");
+        gateway.metadata.namespace = "gateway-conformance-infra".to_string();
+        let updates = plan_status_updates(
+            &[gateway_class, gateway, route],
+            options().with_source_namespaces(vec![]),
+        );
+
+        let route_update = update_for(&updates, "HTTPRoute", "api");
+        let parents = route_update.status["parents"].as_array().unwrap();
+        assert_eq!(parents.len(), 1);
+        let conditions = parents[0]["conditions"].as_array().unwrap();
+        assert_condition(conditions, "Accepted", "False");
+        assert_condition(conditions, "ResolvedRefs", "True");
+        assert_condition(conditions, "Programmed", "False");
+        assert_eq!(
+            find_condition(conditions, "Accepted")["reason"].as_str(),
+            Some("NotAllowedByListeners")
+        );
+        assert_eq!(
+            find_condition(conditions, "ResolvedRefs")["reason"].as_str(),
+            Some("ResolvedRefs")
         );
     }
 
