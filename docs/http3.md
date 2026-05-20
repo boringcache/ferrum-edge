@@ -363,7 +363,7 @@ These are enforced separately from hyper's built-in validation because the H3 li
 
 ## Flow-control window tuning
 
-The default QUIC flow-control windows are moderate by design: 8 MiB per stream, 32 MiB receive budget per connection, and 8 MiB send budget per connection. The connection-level receive window is the aggregate governor, so active per-stream receive windows cannot exceed the connection receive budget in total. Memory budget per QUIC connection scales with `FERRUM_HTTP3_RECEIVE_WINDOW + FERRUM_HTTP3_SEND_WINDOW`; raise these values only after benchmarking a workload that benefits from larger windows. Explicit env values continue to override these defaults.
+The default QUIC flow-control windows are conservative because the H3 listener serves untrusted clients: 256 KiB per stream, 2 MiB receive budget per connection, and 2 MiB send budget per connection. The connection-level receive window is the aggregate governor, so active per-stream receive windows cannot exceed the connection receive budget in total. Memory budget per QUIC connection scales with `FERRUM_HTTP3_RECEIVE_WINDOW + FERRUM_HTTP3_SEND_WINDOW`; raise these values only after benchmarking a workload that benefits from larger windows. Explicit env values continue to override these defaults. Note: the H3 *backend* pool (gateway-to-upstream) uses larger windows internally (8 MiB stream / 32 MiB connection / 8 MiB send) — these are not exposed as env vars because the backend pool talks to trusted upstreams.
 
 ## Environment variables
 
@@ -372,9 +372,9 @@ The default QUIC flow-control windows are moderate by design: 8 MiB per stream, 
 | `FERRUM_ENABLE_HTTP3` | `false` | Enable the QUIC listener |
 | `FERRUM_HTTP3_IDLE_TIMEOUT` | `30` | QUIC idle timeout (seconds) |
 | `FERRUM_HTTP3_MAX_STREAMS` | `1000` | Max concurrent streams per QUIC connection |
-| `FERRUM_HTTP3_STREAM_RECEIVE_WINDOW` | `8,388,608` | Per-stream QUIC flow-control window (8 MiB) |
-| `FERRUM_HTTP3_RECEIVE_WINDOW` | `33,554,432` | Connection-level QUIC flow-control window (32 MiB) |
-| `FERRUM_HTTP3_SEND_WINDOW` | `8,388,608` | Connection-level send window (8 MiB) |
+| `FERRUM_HTTP3_STREAM_RECEIVE_WINDOW` | `262,144` | Per-stream QUIC flow-control window (256 KiB — frontend default; raise for high-throughput workloads) |
+| `FERRUM_HTTP3_RECEIVE_WINDOW` | `2,097,152` | Connection-level QUIC flow-control window (2 MiB — frontend default; raise for high-throughput workloads) |
+| `FERRUM_HTTP3_SEND_WINDOW` | `2,097,152` | Connection-level send window (2 MiB — frontend default) |
 | `FERRUM_HTTP3_CONNECTIONS_PER_BACKEND` | `4` | H3 backend pool connections per target |
 | `FERRUM_HTTP3_POOL_IDLE_TIMEOUT_SECONDS` | `120` | H3 backend connection idle eviction |
 | `FERRUM_HTTP3_COALESCE_MIN_BYTES` | `32,768` | Response coalesce flush target. Clamped to `[H3_COALESCE_MIN_FLOOR=1 KiB, H3_COALESCE_MAX_CAP=1 MiB]`. |

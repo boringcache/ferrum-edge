@@ -423,9 +423,9 @@ Admin listener TLS and mTLS variables are listed in [Admin API](#admin-api).
 | `FERRUM_ENABLE_HTTP3` | No | `false` | Enable HTTP/3 (QUIC) listener on the HTTPS port |
 | `FERRUM_HTTP3_IDLE_TIMEOUT` | No | `30` | HTTP/3 connection idle timeout in seconds |
 | `FERRUM_HTTP3_MAX_STREAMS` | No | `1000` | Maximum concurrent HTTP/3 streams per connection |
-| `FERRUM_HTTP3_STREAM_RECEIVE_WINDOW` | No | `8388608` | HTTP/3 per-stream receive window in bytes (default: 8 MiB) |
-| `FERRUM_HTTP3_RECEIVE_WINDOW` | No | `33554432` | HTTP/3 connection-level receive window in bytes (default: 32 MiB) |
-| `FERRUM_HTTP3_SEND_WINDOW` | No | `8388608` | HTTP/3 per-connection send window in bytes (default: 8 MiB) |
+| `FERRUM_HTTP3_STREAM_RECEIVE_WINDOW` | No | `262144` | HTTP/3 per-stream receive window in bytes (default: 256 KiB — conservative for frontend listeners serving untrusted clients) |
+| `FERRUM_HTTP3_RECEIVE_WINDOW` | No | `2097152` | HTTP/3 connection-level receive window in bytes (default: 2 MiB — conservative for frontend listeners serving untrusted clients) |
+| `FERRUM_HTTP3_SEND_WINDOW` | No | `2097152` | HTTP/3 per-connection send window in bytes (default: 2 MiB — conservative for frontend listeners) |
 | `FERRUM_HTTP3_CONNECTIONS_PER_BACKEND` | No | `4` | QUIC connections per H3 backend (pool sharding) |
 | `FERRUM_HTTP3_POOL_IDLE_TIMEOUT_SECONDS` | No | `120` | H3 backend connection idle eviction in seconds |
 | `FERRUM_HTTP3_COALESCE_MIN_BYTES` | No | `32768` | Response coalesce flush target (native H3 + cross-protocol bridge) |
