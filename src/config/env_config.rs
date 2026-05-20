@@ -682,6 +682,11 @@ pub struct EnvConfig {
     /// slice builder also narrows `workloads` to SPIFFE identities referenced
     /// by admitted services. Default `false` for a one-release rollout window.
     pub mesh_sidecar_identity_narrowing: bool,
+    /// Opt-in for stream-family (TCP/UDP) egress proxy materialization in
+    /// `EgressGateway` topology. Default `false` because stream egress
+    /// listeners are plaintext (no frontend TLS / DTLS) and `mesh_authz`
+    /// cannot verify SPIFFE peer identity without mTLS.
+    pub mesh_egress_stream_enabled: bool,
 
     /// Opt-in live reload for PeerAuthentication-derived inbound mTLS mode
     /// and client CA verifier. Cert/key paths remain static operational
@@ -1527,6 +1532,7 @@ impl Default for EnvConfig {
             mesh_sidecar_enforced: false,
             mesh_sidecar_enforced_dry_run: false,
             mesh_sidecar_identity_narrowing: false,
+            mesh_egress_stream_enabled: false,
             mesh_peer_auth_live_reload_enabled: false,
             mesh_federation_poll_interval_seconds: 300,
             mesh_federation_poll_timeout_seconds: 30,
@@ -1848,6 +1854,7 @@ impl EnvConfig {
             mesh_sidecar_enforced: bool = "FERRUM_MESH_SIDECAR_ENFORCED" => false;
             mesh_sidecar_enforced_dry_run: bool = "FERRUM_MESH_SIDECAR_ENFORCED_DRY_RUN" => false;
             mesh_sidecar_identity_narrowing: bool = "FERRUM_MESH_SIDECAR_IDENTITY_NARROWING" => false;
+            mesh_egress_stream_enabled: bool = "FERRUM_MESH_EGRESS_STREAM_ENABLED" => false;
             mesh_peer_auth_live_reload_enabled: bool = "FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED" => false;
             mesh_federation_poll_interval_seconds: u64 = "FERRUM_MESH_FEDERATION_POLL_INTERVAL_SECONDS" => 300u64;
             mesh_federation_poll_timeout_seconds: u64 = "FERRUM_MESH_FEDERATION_POLL_TIMEOUT_SECONDS" => 30u64;
@@ -2250,6 +2257,7 @@ impl EnvConfig {
             mesh_sidecar_enforced,
             mesh_sidecar_enforced_dry_run,
             mesh_sidecar_identity_narrowing,
+            mesh_egress_stream_enabled,
             mesh_peer_auth_live_reload_enabled,
             mesh_federation_poll_interval_seconds,
             mesh_federation_poll_timeout_seconds,
