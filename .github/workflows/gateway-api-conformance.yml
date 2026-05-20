@@ -181,6 +181,7 @@ jobs:
               --gateway-class=ferrum \
               --supported-features="$GATEWAY_API_SUPPORTED_FEATURES" \
               --run-test="$test_name" \
+              --cleanup-base-resources=false \
               --organization=Ferrum \
               --project="Ferrum Edge" \
               --url=https://github.com/ferrum-edge/ferrum-edge \
