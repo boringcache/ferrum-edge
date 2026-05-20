@@ -932,6 +932,71 @@ fn test_upstream_service_discovery_mesh_validated() {
     assert!(errs.iter().any(|e| e.contains("mesh config is required")));
 }
 
+#[test]
+fn test_mesh_sd_namespace_must_match_upstream_namespace() {
+    let mut upstream = make_upstream("test");
+    upstream.namespace = "prod".to_string();
+    upstream.service_discovery = Some(ServiceDiscoveryConfig {
+        provider: SdProvider::Mesh,
+        dns_sd: None,
+        kubernetes: None,
+        consul: None,
+        mesh: Some(MeshSdConfig {
+            service_name: "my-svc".to_string(),
+            namespace: Some("staging".to_string()),
+            port: None,
+            poll_interval_seconds: 30,
+        }),
+        default_weight: 1,
+    });
+    let errs = upstream.validate_fields().unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("must match the upstream's namespace")),
+        "cross-namespace mesh SD should be rejected: {:?}",
+        errs
+    );
+}
+
+#[test]
+fn test_mesh_sd_namespace_matching_upstream_passes() {
+    let mut upstream = make_upstream("test");
+    upstream.namespace = "prod".to_string();
+    upstream.service_discovery = Some(ServiceDiscoveryConfig {
+        provider: SdProvider::Mesh,
+        dns_sd: None,
+        kubernetes: None,
+        consul: None,
+        mesh: Some(MeshSdConfig {
+            service_name: "my-svc".to_string(),
+            namespace: Some("prod".to_string()),
+            port: None,
+            poll_interval_seconds: 30,
+        }),
+        default_weight: 1,
+    });
+    assert!(upstream.validate_fields().is_ok());
+}
+
+#[test]
+fn test_mesh_sd_namespace_omitted_passes() {
+    let mut upstream = make_upstream("test");
+    upstream.service_discovery = Some(ServiceDiscoveryConfig {
+        provider: SdProvider::Mesh,
+        dns_sd: None,
+        kubernetes: None,
+        consul: None,
+        mesh: Some(MeshSdConfig {
+            service_name: "my-svc".to_string(),
+            namespace: None,
+            port: None,
+            poll_interval_seconds: 30,
+        }),
+        default_weight: 1,
+    });
+    assert!(upstream.validate_fields().is_ok());
+}
+
 // ---- PluginConfig field validation tests ----
 
 #[test]
@@ -1738,6 +1803,7 @@ fn test_mesh_port_zero_rejected() {
 #[test]
 fn test_mesh_valid_optional_fields() {
     let mut upstream = make_upstream("test");
+    upstream.namespace = "production".to_string();
     upstream.service_discovery = Some(ServiceDiscoveryConfig {
         provider: SdProvider::Mesh,
         dns_sd: None,
