@@ -1,4 +1,39 @@
 {{- if .Values.nodeAgent.enabled }}
+{{- /*
+  Resolve security knobs from .Values.nodeAgent.security with hardened defaults.
+  Each toggle is reversible via Helm values so older kernels / strict admission
+  controllers can roll back individually. See docs/node_agent_security.md.
+*/ -}}
+{{- $sec := .Values.nodeAgent.security | default dict -}}
+{{- $addPerfmon := true -}}
+{{- if hasKey $sec "addCapPerfmon" }}{{ $addPerfmon = get $sec "addCapPerfmon" }}{{ end -}}
+{{- $dropSysAdmin := false -}}
+{{- if hasKey $sec "dropCapSysAdmin" }}{{ $dropSysAdmin = get $sec "dropCapSysAdmin" }}{{ end -}}
+{{- $caps := list "BPF" "NET_ADMIN" -}}
+{{- if $addPerfmon }}{{ $caps = append $caps "PERFMON" }}{{ end -}}
+{{- if not $dropSysAdmin }}{{ $caps = append $caps "SYS_ADMIN" }}{{ end -}}
+{{- $readOnlyRoot := true -}}
+{{- if hasKey $sec "readOnlyRootFilesystem" }}{{ $readOnlyRoot = get $sec "readOnlyRootFilesystem" }}{{ end -}}
+{{- $allowEsc := false -}}
+{{- if hasKey $sec "allowPrivilegeEscalation" }}{{ $allowEsc = get $sec "allowPrivilegeEscalation" }}{{ end -}}
+{{- /*
+  seccompProfile is passed through as-is so callers setting
+  `type: Localhost` can also provide `localhostProfile: <path>` (required by
+  the kubernetes API server for that type). Default to RuntimeDefault when
+  the operator unsets the block entirely.
+*/ -}}
+{{- $seccompProfile := dict "type" "RuntimeDefault" -}}
+{{- if and (hasKey $sec "seccompProfile") (get $sec "seccompProfile") -}}
+{{- $candidate := get $sec "seccompProfile" -}}
+{{- if and (kindIs "map" $candidate) (hasKey $candidate "type") (get $candidate "type") -}}
+{{- $seccompProfile = $candidate -}}
+{{- end -}}
+{{- end -}}
+{{- $cni := .Values.nodeAgent.cni }}
+{{- $cniSocketPath := "" }}
+{{- if and $cni $cni.enabled }}
+{{- $cniSocketPath = printf "%s/%s" $cni.hostSocketDir $cni.socketFileName }}
+{{- end }}
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -21,6 +56,45 @@ spec:
       serviceAccountName: ferrum-node-agent
       hostPID: true
       hostNetwork: true
+      securityContext:
+        seccompProfile:
+          {{- toYaml $seccompProfile | nindent 10 }}
+      {{- if and $cni $cni.enabled }}
+      # CNI installer init container (opt-in). Executes the distroless-safe
+      # `ferrum-cni install` mode: it copies the binary into the host CNI
+      # plugin dir, reads the existing primary CNI config, appends Ferrum as a
+      # meta-plugin, and writes the generated conflist.
+      initContainers:
+        - name: ferrum-cni-installer
+          image: "{{ .Values.nodeAgent.image.repository }}:{{ .Values.nodeAgent.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - /app/ferrum-cni
+            - install
+          env:
+            - name: HOST_BIN_DIR
+              value: {{ $cni.hostBinDir | quote }}
+            - name: HOST_CONF_DIR
+              value: {{ $cni.hostConfDir | quote }}
+            - name: HOST_SOCKET_DIR
+              value: {{ $cni.hostSocketDir | quote }}
+            - name: CONF_FILE_NAME
+              value: {{ $cni.confFileName | quote }}
+            - name: CHAINED_WITH
+              value: {{ $cni.chainedWith | quote }}
+            - name: SOCKET_PATH
+              value: {{ $cniSocketPath | quote }}
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+          volumeMounts:
+            - name: host-cni-bin
+              mountPath: {{ $cni.hostBinDir }}
+            - name: host-cni-conf
+              mountPath: {{ $cni.hostConfDir }}
+            - name: host-ferrum-socket-dir
+              mountPath: {{ $cni.hostSocketDir }}
+      {{- end }}
       containers:
         - name: ferrum-edge
           image: "{{ .Values.nodeAgent.image.repository }}:{{ .Values.nodeAgent.image.tag }}"
@@ -30,12 +104,14 @@ spec:
             runAsUser: 0
             runAsGroup: 0
             privileged: false
+            allowPrivilegeEscalation: {{ $allowEsc }}
+            readOnlyRootFilesystem: {{ $readOnlyRoot }}
             capabilities:
+              drop: ["ALL"]
               add:
-                - BPF
-                - NET_ADMIN
-                - SYS_ADMIN
-                - SYS_PTRACE
+                {{- range $cap := $caps }}
+                - {{ $cap }}
+                {{- end }}
           env:
             - name: FERRUM_MODE
               value: "node_agent"
@@ -59,12 +135,29 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            {{- if and $cni $cni.enabled }}
+            - name: FERRUM_NODE_AGENT_CNI_ENABLED
+              value: "true"
+            - name: FERRUM_NODE_AGENT_CNI_SOCKET_PATH
+              value: {{ $cniSocketPath | quote }}
+            {{- end }}
           volumeMounts:
             - name: bpf-fs
               mountPath: {{ .Values.nodeAgent.bpfFsPath }}
             - name: cgroup
               mountPath: {{ .Values.nodeAgent.cgroupRoot }}
               readOnly: true
+            {{- if $readOnlyRoot }}
+            # Scratch tmpfs required when readOnlyRootFilesystem=true so the
+            # tokio/tracing runtime can open transient files. See
+            # docs/node_agent_security.md for the full rationale.
+            - name: tmp
+              mountPath: /tmp
+            {{- end }}
+            {{- if and $cni $cni.enabled }}
+            - name: host-ferrum-socket-dir
+              mountPath: {{ $cni.hostSocketDir }}
+            {{- end }}
           resources:
             {{- toYaml .Values.nodeAgent.resources | nindent 12 }}
       volumes:
@@ -76,4 +169,22 @@ spec:
           hostPath:
             path: {{ .Values.nodeAgent.cgroupRoot }}
             type: Directory
+        {{- if $readOnlyRoot }}
+        - name: tmp
+          emptyDir: {}
+        {{- end }}
+        {{- if and $cni $cni.enabled }}
+        - name: host-cni-bin
+          hostPath:
+            path: {{ $cni.hostBinDir }}
+            type: DirectoryOrCreate
+        - name: host-cni-conf
+          hostPath:
+            path: {{ $cni.hostConfDir }}
+            type: DirectoryOrCreate
+        - name: host-ferrum-socket-dir
+          hostPath:
+            path: {{ $cni.hostSocketDir }}
+            type: DirectoryOrCreate
+        {{- end }}
 {{- end }}

@@ -4162,6 +4162,57 @@ fn test_mesh_peer_auth_live_reload_default_disabled() {
 }
 
 #[test]
+fn test_frontend_tls_live_reload_default_disabled() {
+    let config = EnvConfig::default();
+    assert!(
+        !config.frontend_tls_live_reload_enabled,
+        "Frontend TLS cert/key live reload is opt-in; defaults preserve the historic restart-required behavior"
+    );
+    assert_eq!(
+        config.frontend_tls_watch_interval_seconds, 30,
+        "Default frontend TLS watch interval should be 30 seconds when live reload is enabled"
+    );
+}
+
+#[test]
+fn test_frontend_tls_live_reload_parsed_from_env() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED", "true"),
+            ("FERRUM_FRONTEND_TLS_WATCH_INTERVAL_SECONDS", "5"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert!(config.frontend_tls_live_reload_enabled);
+            assert_eq!(config.frontend_tls_watch_interval_seconds, 5);
+        },
+    );
+}
+
+#[test]
+fn test_frontend_tls_watch_interval_clamps_to_minimum() {
+    // The watcher must not busy-loop the filesystem; an operator who sets 0
+    // gets clamped up to 1 second.
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED", "true"),
+            ("FERRUM_FRONTEND_TLS_WATCH_INTERVAL_SECONDS", "0"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.frontend_tls_watch_interval_seconds, 1,
+                "FERRUM_FRONTEND_TLS_WATCH_INTERVAL_SECONDS=0 should clamp up to 1"
+            );
+        },
+    );
+}
+
+#[test]
 fn test_mesh_peer_auth_live_reload_parsed_from_env() {
     with_env_vars(
         &[
@@ -4287,6 +4338,114 @@ fn test_k8s_istio_root_namespace_rejects_invalid_k8s_namespace() {
         || {
             let err = EnvConfig::from_env().unwrap_err();
             assert!(err.contains("FERRUM_K8S_ISTIO_ROOT_NAMESPACE"));
+        },
+    );
+}
+
+// ── FERRUM_CP_NAMESPACES / FERRUM_CP_REQUIRE_NAMESPACE_CLAIM (MESH-T2-A) ─
+
+#[test]
+fn test_cp_namespaces_defaults_to_empty_for_back_compat() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_CP_NAMESPACES");
+            let config = EnvConfig::from_env().unwrap();
+            assert!(
+                config.cp_namespaces.is_empty(),
+                "default cp_namespaces must be empty (back-compat single-namespace CP)"
+            );
+            assert!(
+                !config.cp_require_namespace_claim,
+                "default cp_require_namespace_claim must be false (back-compat)"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_cp_namespaces_parses_star_for_cluster_wide() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_CP_NAMESPACES", "*"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.cp_namespaces, vec!["*".to_string()]);
+        },
+    );
+}
+
+#[test]
+fn test_cp_namespaces_parses_csv() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_CP_NAMESPACES", "prod,staging,dev"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.cp_namespaces,
+                vec!["prod".to_string(), "staging".to_string(), "dev".to_string()]
+            );
+        },
+    );
+}
+
+#[test]
+fn test_cp_namespaces_rejects_star_combined_with_explicit() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_CP_NAMESPACES", "*,prod"),
+        ],
+        || {
+            let err = EnvConfig::from_env().unwrap_err();
+            assert!(
+                err.contains("FERRUM_CP_NAMESPACES") && err.contains("`*`"),
+                "error should mention FERRUM_CP_NAMESPACES + `*` constraint, got: {err}"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_cp_namespaces_rejects_invalid_namespace_entry() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_CP_NAMESPACES", "prod,Bad Namespace!"),
+        ],
+        || {
+            let err = EnvConfig::from_env().unwrap_err();
+            assert!(
+                err.contains("FERRUM_CP_NAMESPACES"),
+                "error should mention FERRUM_CP_NAMESPACES, got: {err}"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_cp_require_namespace_claim_parses_true() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_CP_REQUIRE_NAMESPACE_CLAIM", "true"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert!(config.cp_require_namespace_claim);
         },
     );
 }

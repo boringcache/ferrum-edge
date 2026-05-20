@@ -11,12 +11,13 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use dashmap::DashMap;
 use futures_util::StreamExt;
 use k8s_openapi::api::core::v1::Pod;
-use kube::api::Api;
 use kube::runtime::watcher::{self as kube_watcher, Event};
+use kube::{Client, api::Api};
 use tracing::{debug, error, info, warn};
 
 use crate::admin::jwt_auth::create_jwt_manager_from_env;
@@ -26,6 +27,7 @@ use crate::capture::{
     ISTIO_INCLUDE_OUTBOUND_PORTS_ANNOTATION, IncludeOutboundPorts, Ip6TablesMode, IptablesPlan,
     XTABLES_LOCK_WAIT_SECONDS, include_outbound_ports_from_annotations,
 };
+use crate::cni::rpc::{CniRpcRequest, CniRpcResponse, RpcVerb};
 use crate::config::EnvConfig;
 use crate::config::conf_file::resolve_ferrum_var;
 use crate::ebpf::cgroup;
@@ -36,10 +38,14 @@ use crate::ebpf::{
     CaptureContract, DEFAULT_NODE_AGENT_SOCKET_PATH, EbpfBackend, FallbackMode, INCLUDE_PORTS_MAX,
     IncludePortsPolicy, NodeAgentMetrics, PodAttachmentState, PodInfo,
 };
+use crate::modes::node_agent_cni_server::{
+    self, CniWorkItem, CniWorkReceiver, cni_work_channel, spawn_cni_listener,
+};
 
 const DEFAULT_CGROUP_ROOT: &str = "/sys/fs/cgroup";
 const DEFAULT_BPF_FS_PATH: &str = "/sys/fs/bpf";
-const DEFAULT_FALLBACK_MODE: &str = "iptables";
+const DEFAULT_FALLBACK_MODE: &str = "fail";
+const CNI_METADATA_FETCH_TIMEOUT: Duration = Duration::from_millis(750);
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -51,6 +57,26 @@ pub struct NodeAgentConfig {
     pub fallback_mode: FallbackMode,
     pub excluded_namespaces: HashSet<String>,
     pub capture_contract: CaptureContract,
+}
+
+/// CNI plugin listener configuration. Resolved from the env config in
+/// `run` so the eBPF path and the fallback path agree on whether the
+/// listener should come up. Empty `socket_path` is normalized to the
+/// default in `EnvConfig`; the boolean `enabled` is the operator switch
+/// that flips the entire CNI hot path on or off.
+#[derive(Debug, Clone)]
+pub struct CniListenerConfig {
+    pub enabled: bool,
+    pub socket_path: String,
+}
+
+impl CniListenerConfig {
+    pub fn from_env_config(env_config: &EnvConfig) -> Self {
+        Self {
+            enabled: env_config.node_agent_cni_enabled,
+            socket_path: env_config.node_agent_cni_socket_path.clone(),
+        }
+    }
 }
 
 impl NodeAgentConfig {
@@ -136,13 +162,16 @@ pub async fn run(
         "Kernel probe complete"
     );
 
+    let cni_config = CniListenerConfig::from_env_config(&env_config);
+
     let result = if !probe.supports_ebpf() {
         handle_fallback(
             &config,
             &probe,
-            metrics.as_ref(),
+            metrics.clone(),
             &shutdown_tx,
             startup_ready,
+            cni_config,
         )
         .await
     } else {
@@ -152,6 +181,7 @@ pub async fn run(
             metrics,
             &shutdown_tx,
             startup_ready,
+            cni_config,
         )
         .await
     };
@@ -331,6 +361,7 @@ async fn run_with_backend(
     metrics: Arc<NodeAgentMetrics>,
     shutdown_tx: &tokio::sync::watch::Sender<bool>,
     startup_ready: Arc<AtomicBool>,
+    cni_config: CniListenerConfig,
 ) -> Result<(), anyhow::Error> {
     initialize_backend(backend.as_mut(), config)?;
 
@@ -338,11 +369,34 @@ async fn run_with_backend(
 
     let mut shutdown_rx = shutdown_tx.subscribe();
     let client = build_node_agent_kube_client().await?;
-    let pods: Api<Pod> = Api::all(client);
+    let pods: Api<Pod> = Api::all(client.clone());
     let watcher_config =
         kube_watcher::Config::default().fields(&format!("spec.nodeName={}", config.node_name));
     let mut pod_stream = Box::pin(kube_watcher::watcher(pods, watcher_config));
     let mut init_seen: Option<HashSet<String>> = None;
+
+    // Optional CNI plugin listener: when enabled, spawns a UDS server that
+    // funnels ADD/DEL/CHECK calls from the `ferrum-cni` binary into this
+    // loop via the `cni_work_rx` channel. When disabled (the default), the
+    // channel stays empty and the receiver in the select! arm parks
+    // forever — the kube-rs watcher remains the sole enrollment driver.
+    let (cni_work_tx, mut cni_work_rx): (_, CniWorkReceiver) = cni_work_channel();
+    let cni_listener_handle = if cni_config.enabled {
+        Some(spawn_cni_listener(
+            cni_config.socket_path.clone(),
+            cni_work_tx.clone(),
+            metrics.clone(),
+            shutdown_tx.subscribe(),
+        ))
+    } else {
+        info!("CNI plugin listener disabled; kube-rs watcher is the sole enrollment path");
+        None
+    };
+    // Drop the local sender so the receiver closes cleanly when the
+    // listener task exits — otherwise the select! would park forever on
+    // the receiver during shutdown.
+    drop(cni_work_tx);
+    let mut cni_work_open = true;
 
     info!(
         "Node agent initialized, watching pod events on node {}",
@@ -413,6 +467,27 @@ async fn run_with_backend(
                     }
                 }
             }
+            cni_work = cni_work_rx.recv(), if cni_work_open => {
+                match cni_work {
+                    Some(work) => {
+                        process_cni_work_item(
+                            backend.as_mut(),
+                            &pod_states,
+                            config,
+                            metrics.as_ref(),
+                            &client,
+                            work,
+                        ).await;
+                    }
+                    None => {
+                        // Channel closed — listener task exited. Disable this
+                        // select arm so the watcher keeps running instead of
+                        // spinning on an immediately-ready closed receiver.
+                        cni_work_open = false;
+                        debug!("CNI work queue closed; CNI plugin path inactive for the remainder of this run");
+                    }
+                }
+            }
         }
     }
 
@@ -425,7 +500,212 @@ async fn run_with_backend(
     );
     cleanup_all_pods(backend.as_mut(), &pod_states);
 
+    if let Some(handle) = cni_listener_handle
+        && let Err(err) = handle.await
+    {
+        warn!(error = %err, "Node agent CNI listener task panicked");
+    }
+
     Ok(())
+}
+
+/// Apply one CNI plugin RPC to the same state the kube-rs watcher
+/// manipulates. The watcher arm and this arm of the select! loop share
+/// `backend` ownership exclusively — no `Mutex`. Idempotency is
+/// inherited from `handle_pod_added` / `handle_pod_removed`: repeat
+/// calls with the same identity are no-ops.
+///
+/// The production ADD path first fetches pod metadata from the Kubernetes API
+/// in [`apply_cni_request_with_kube_metadata`]. This pure helper keeps the
+/// no-metadata fallback behavior testable: if that API GET fails, ADD is
+/// acknowledged without BPF attachment and the kube-rs watcher reconciles when
+/// its event arrives.
+///
+/// On the DEL path: when we already have a pod-state entry, we tear
+/// down BPF attachment immediately — the CNI DEL is a strong signal
+/// that the sandbox is going away, and waiting for the watcher's
+/// `Delete` event would leave stale BPF state for the gap.
+async fn process_cni_work_item(
+    backend: &mut dyn EbpfBackend,
+    pod_states: &DashMap<String, PodAttachmentState>,
+    config: &NodeAgentConfig,
+    metrics: &NodeAgentMetrics,
+    kube_client: &Client,
+    work: CniWorkItem,
+) {
+    let CniWorkItem { request, respond } = work;
+    let response = apply_cni_request_with_kube_metadata(
+        backend,
+        pod_states,
+        config,
+        metrics,
+        kube_client,
+        &request,
+    )
+    .await;
+    // The remote receiver may have been dropped (CNI client timed out or
+    // the listener task is shutting down); that's fine — we still
+    // applied the side-effect. The metric/log already reflect the
+    // outcome from the server's side.
+    let _ = respond.send(response);
+}
+
+async fn apply_cni_request_with_kube_metadata(
+    backend: &mut dyn EbpfBackend,
+    pod_states: &DashMap<String, PodAttachmentState>,
+    config: &NodeAgentConfig,
+    metrics: &NodeAgentMetrics,
+    kube_client: &Client,
+    request: &CniRpcRequest,
+) -> CniRpcResponse {
+    if request.verb != RpcVerb::Add {
+        return apply_cni_request(backend, pod_states, config, metrics, request);
+    }
+
+    let pod_api: Api<Pod> = Api::namespaced(kube_client.clone(), &request.pod_namespace);
+    match tokio::time::timeout(CNI_METADATA_FETCH_TIMEOUT, pod_api.get(&request.pod_name)).await {
+        Ok(Ok(pod)) => apply_cni_add_from_pod(backend, pod_states, config, metrics, request, &pod),
+        Ok(Err(err)) => {
+            debug!(
+                namespace = %request.pod_namespace,
+                pod_name = %request.pod_name,
+                error = %err,
+                "CNI ADD could not fetch pod metadata; kube-rs watcher will reconcile"
+            );
+            apply_cni_request(backend, pod_states, config, metrics, request)
+        }
+        Err(_elapsed) => {
+            debug!(
+                namespace = %request.pod_namespace,
+                pod_name = %request.pod_name,
+                timeout_ms = CNI_METADATA_FETCH_TIMEOUT.as_millis(),
+                "CNI ADD pod metadata fetch timed out; kube-rs watcher will reconcile"
+            );
+            apply_cni_request(backend, pod_states, config, metrics, request)
+        }
+    }
+}
+
+fn apply_cni_add_from_pod(
+    backend: &mut dyn EbpfBackend,
+    pod_states: &DashMap<String, PodAttachmentState>,
+    config: &NodeAgentConfig,
+    metrics: &NodeAgentMetrics,
+    request: &CniRpcRequest,
+    pod: &Pod,
+) -> CniRpcResponse {
+    let Some(api_uid) = pod_uid(pod) else {
+        return CniRpcResponse::Rejected {
+            reason: "Kubernetes API pod is missing metadata.uid; kube-rs watcher will reconcile"
+                .to_string(),
+        };
+    };
+    if let Some(request_uid) = request.pod_uid.as_deref()
+        && request_uid != api_uid
+    {
+        return CniRpcResponse::Rejected {
+            reason: format!(
+                "CNI pod UID {request_uid} does not match Kubernetes API pod UID {api_uid}; kube-rs watcher will reconcile"
+            ),
+        };
+    }
+
+    let labels: HashMap<String, String> = pod
+        .metadata
+        .labels
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    let annotations: HashMap<String, String> = pod
+        .metadata
+        .annotations
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    let pod_name = pod
+        .metadata
+        .name
+        .as_deref()
+        .unwrap_or(request.pod_name.as_str());
+    let namespace = pod
+        .metadata
+        .namespace
+        .as_deref()
+        .unwrap_or(request.pod_namespace.as_str());
+    let pod_ip = pod
+        .status
+        .as_ref()
+        .and_then(|status| status.pod_ip.as_deref());
+    let event = PodEvent {
+        pod_uid: &api_uid,
+        pod_name,
+        namespace,
+        labels: &labels,
+        annotations: &annotations,
+        pod_ip_str: pod_ip,
+        pod_pid: None,
+        veth_iface_override: None,
+    };
+    handle_pod_added(backend, pod_states, config, metrics, &event);
+    CniRpcResponse::Ok
+}
+
+/// Pure-function core of [`process_cni_work_item`] so tests can drive
+/// it without an `mpsc` round-trip.
+pub fn apply_cni_request(
+    backend: &mut dyn EbpfBackend,
+    pod_states: &DashMap<String, PodAttachmentState>,
+    config: &NodeAgentConfig,
+    metrics: &NodeAgentMetrics,
+    request: &CniRpcRequest,
+) -> CniRpcResponse {
+    let labels: HashMap<String, String> = HashMap::new();
+    let annotations: HashMap<String, String> = HashMap::new();
+    let event = node_agent_cni_server::pod_event_from_request(request, &labels, &annotations);
+    match request.verb {
+        RpcVerb::Add => {
+            // `handle_pod_added` short-circuits on empty pod_uid (it's
+            // the DashMap key); the watcher will still pick up the
+            // pod, so this is a soft accept rather than a hard reject.
+            if event.pod_uid.is_empty() {
+                return CniRpcResponse::Rejected {
+                    reason: "missing K8S_POD_UID in CNI args; kube-rs watcher will reconcile"
+                        .to_string(),
+                };
+            }
+            handle_pod_added(backend, pod_states, config, metrics, &event);
+            CniRpcResponse::Ok
+        }
+        RpcVerb::Del => {
+            if event.pod_uid.is_empty() {
+                return CniRpcResponse::Rejected {
+                    reason: "missing K8S_POD_UID in CNI args; kube-rs watcher will reconcile"
+                        .to_string(),
+                };
+            }
+            handle_pod_removed(backend, pod_states, metrics, event.pod_uid);
+            CniRpcResponse::Ok
+        }
+        RpcVerb::Check => {
+            if event.pod_uid.is_empty() {
+                return CniRpcResponse::Rejected {
+                    reason: "missing K8S_POD_UID in CNI args".to_string(),
+                };
+            }
+            // CHECK is best-effort verification: report Ok when we have
+            // a pod-state entry, Rejected otherwise. kubelet treats
+            // Rejected as a hint that ADD needs replaying.
+            if pod_states.contains_key(event.pod_uid) {
+                CniRpcResponse::Ok
+            } else {
+                CniRpcResponse::Rejected {
+                    reason: "pod not currently enrolled".to_string(),
+                }
+            }
+        }
+    }
 }
 
 async fn wait_for_shutdown(shutdown_tx: &tokio::sync::watch::Sender<bool>) {
@@ -534,17 +814,32 @@ fn include_outbound_ports_to_policy(
     IncludePortsPolicy::explicit(&include.ports)
 }
 
+/// Outcome of writing (or attempting to write) a pod's parsed
+/// `includeOutboundPorts` annotation into the BPF map.
+///
+/// Carries both the cgroup id the entry is keyed on (so removal can use
+/// it without re-statting the cgroup) and the [`IncludePortsPolicy`]
+/// actually written, so the watcher can diff against this baseline on
+/// the next Modified event and skip BPF map churn when the parsed value
+/// has not changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AppliedIncludePorts {
+    cgroup_id: u64,
+    policy: IncludePortsPolicy,
+}
+
 /// Push the parsed per-pod include-port policy into the BPF map. Returns
-/// the cgroup id we wrote to so callers can stash it on
-/// `PodAttachmentState` for the eventual un-enrollment. Returns `None`
-/// when there's nothing to write (no annotation, malformed annotation, or
+/// the cgroup id and policy we wrote so callers can stash both on
+/// `PodAttachmentState`: the cgroup id is the removal key, the policy is
+/// the diff baseline for mid-life Modified events. Returns `None` when
+/// there's nothing to write (no annotation, malformed annotation, or
 /// cgroup-id stat failed) — none of which should abort enrollment.
 fn apply_include_outbound_ports(
     backend: &mut dyn EbpfBackend,
     pod_uid: &str,
     cgroup_path: &str,
     annotations: &HashMap<String, String>,
-) -> Option<u64> {
+) -> Option<AppliedIncludePorts> {
     let include = match parse_pod_include_outbound_ports(annotations) {
         Ok(Some(include)) => include,
         Ok(None) => return None,
@@ -568,7 +863,7 @@ fn apply_include_outbound_ports(
                 port_count = policy.port_count,
                 "Wrote per-pod includeOutboundPorts entry to BPF map"
             );
-            Some(cgroup_id)
+            Some(AppliedIncludePorts { cgroup_id, policy })
         }
         Err(e) => {
             warn!(
@@ -622,6 +917,7 @@ fn handle_kube_pod_applied(
         annotations: &annotations,
         pod_ip_str: pod_ip,
         pod_pid: None,
+        veth_iface_override: None,
     };
     handle_pod_added(backend, pod_states, config, metrics, &event);
     Some(pod_uid)
@@ -636,6 +932,15 @@ pub struct PodEvent<'a> {
     pub annotations: &'a HashMap<String, String>,
     pub pod_ip_str: Option<&'a str>,
     pub pod_pid: Option<u32>,
+    /// Pre-resolved host-side veth interface name for this pod, bypassing
+    /// the production resolver. Production always sets this to `None` and
+    /// relies on the procfs/sysfs probe from either the explicit pod PID or
+    /// the resolved pod cgroup; tests set it to a synthetic interface name
+    /// (e.g., `"veth-mock"`) to satisfy the post-`65606d87` enrollment
+    /// invariant that requires an inbound tc attach before the pod is
+    /// considered enrolled, without needing a real pod PID or a Linux kernel
+    /// under test.
+    pub veth_iface_override: Option<&'a str>,
 }
 
 pub fn handle_pod_added(
@@ -664,15 +969,39 @@ pub fn handle_pod_added(
     }
 
     let pod_ip = event.pod_ip_str.and_then(pod_watcher::parse_pod_ip);
-    if let Some(mut state) = pod_states.get_mut(pod_uid) {
-        reconcile_existing_pod_ip(backend, config, metrics, pod_uid, pod_ip, &mut state);
-        debug!(pod_uid, pod_name, "Pod already enrolled, reconciled state");
-        return;
-    }
-
     let cgroup_path = cgroup::resolve_pod_cgroup_path(&config.cgroup_root, pod_uid)
         .map(|p| p.to_string_lossy().to_string());
-    let veth_iface = veth::discover_veth_for_pod(event.pod_pid);
+    // Production: the kube-rs caller sets `veth_iface_override = None`; the
+    // resolver first uses an explicit pod PID when available, then falls back
+    // to the resolved pod cgroup to find a live process in that pod.
+    // Tests supply a synthetic name so the post-65606d87 inbound-tc invariant
+    // is satisfied without a real pod PID / Linux kernel.
+    let veth_iface = event
+        .veth_iface_override
+        .map(|s| s.to_string())
+        .or_else(|| veth::discover_veth_for_pod(event.pod_pid, cgroup_path.as_deref()));
+
+    if let Some(mut state) = pod_states.get_mut(pod_uid) {
+        let attachment_target_changed = state.cgroup_path != cgroup_path
+            || veth_iface
+                .as_ref()
+                .is_some_and(|iface| state.veth_iface.as_ref() != Some(iface));
+        if attachment_target_changed {
+            drop(state);
+            handle_pod_removed(backend, pod_states, metrics, pod_uid);
+        } else {
+            reconcile_existing_pod_ip(backend, config, metrics, pod_uid, pod_ip, &mut state);
+            reconcile_existing_pod_include_ports(
+                backend,
+                metrics,
+                pod_uid,
+                event.annotations,
+                &mut state,
+            );
+            debug!(pod_uid, pod_name, "Pod already enrolled, reconciled state");
+            return;
+        }
+    }
 
     let mut state = PodAttachmentState {
         pod_uid: pod_uid.to_string(),
@@ -683,6 +1012,7 @@ pub fn handle_pod_added(
         veth_iface: veth_iface.clone(),
         attached: false,
         include_ports_cgroup_id: None,
+        include_ports_policy: None,
     };
 
     if let Some(ref cgroup) = cgroup_path {
@@ -743,8 +1073,12 @@ pub fn handle_pod_added(
             // captured at the cgroup level without per-port narrowing
             // (which is the prior GAP-2K behavior). Enrollment itself
             // must not abort on this.
-            state.include_ports_cgroup_id =
-                apply_include_outbound_ports(backend, pod_uid, cgroup, event.annotations);
+            if let Some(applied) =
+                apply_include_outbound_ports(backend, pod_uid, cgroup, event.annotations)
+            {
+                state.include_ports_cgroup_id = Some(applied.cgroup_id);
+                state.include_ports_policy = Some(applied.policy);
+            }
             state.attached = true;
             metrics.pods_enrolled.fetch_add(1, Ordering::Relaxed);
             info!(
@@ -805,6 +1139,181 @@ fn reconcile_existing_pod_ip(
     state.pod_ip = Some(new_ip);
 }
 
+/// Re-evaluate the `includeOutboundPorts` annotations of an already-enrolled
+/// pod (Kubernetes `Apply` events conflate "added" and "modified"), and
+/// reprogram the BPF map if and only if the parsed policy differs from
+/// the baseline stashed at enrollment time.
+///
+/// This is the GAP-2K mid-life update gap: prior to this hook, changing
+/// `traffic.sidecar.istio.io/includeOutboundPorts` (or its Ferrum-native
+/// alias) on a live pod was a no-op until the pod restarted, because the
+/// node-agent only wrote the BPF map on first enrollment. With this hook,
+/// a `kubectl annotate pod ...` reconciles within the watcher's normal
+/// debounce window.
+///
+/// Diff-skip is load-bearing: pods receive `Modified` events for many
+/// reasons (status updates, container restarts, condition flips). Writing
+/// the BPF map on every Modified event would burn syscalls and produce
+/// log noise. We compare the *parsed* policy (post-merge of Istio +
+/// Ferrum aliases, post-sort, post-dedupe), not the raw annotation
+/// strings — so re-ordering ports in the annotation is correctly a no-op.
+///
+/// Long-lived flow caveat: the BPF `connect4` / `connect6` programs run
+/// on `connect(2)`, so the new policy takes effect only for *new* outbound
+/// connections issued by the pod after this hook runs. Already-established
+/// flows continue with the redirect their original connect saw — closing
+/// them is a userspace concern outside this module.
+fn reconcile_existing_pod_include_ports(
+    backend: &mut dyn EbpfBackend,
+    metrics: &NodeAgentMetrics,
+    pod_uid: &str,
+    annotations: &HashMap<String, String>,
+    state: &mut PodAttachmentState,
+) {
+    // Compute the desired policy (or None for absent annotation).
+    let desired = match parse_pod_include_outbound_ports(annotations) {
+        Ok(Some(include)) => Some(include_outbound_ports_to_policy(pod_uid, &include)),
+        Ok(None) => None,
+        Err(e) => {
+            warn!(
+                pod_uid,
+                error = %e,
+                "Mid-life pod annotation update failed to parse; keeping previous includeOutboundPorts policy"
+            );
+            metrics
+                .pod_annotation_updates_failed
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    };
+
+    // Hot-path diff-skip: most Modified events are unrelated to capture
+    // annotations (status updates, container restart counts, etc.). The
+    // `Option<IncludePortsPolicy>` derives `PartialEq`, so this is a
+    // cheap structural compare — no allocations, no syscalls.
+    if desired == state.include_ports_policy {
+        return;
+    }
+
+    // Identity for removal/replace lookups. Prefer the cgroup id stashed
+    // at enrollment (still valid even if the cgroup path was rotated
+    // out from under us); fall back to re-statting the path only when
+    // we have no prior id (the pod was previously unannotated and is
+    // newly transitioning into having a policy).
+    let cgroup_id_for_lookup = state.include_ports_cgroup_id.or_else(|| {
+        state
+            .cgroup_path
+            .as_deref()
+            .and_then(read_cgroup_id_for_pod)
+    });
+
+    match (desired, cgroup_id_for_lookup) {
+        (Some(new_policy), Some(cgroup_id)) => {
+            // Add or replace. `update_pod_include_ports` is an insert-or-
+            // overwrite on the BPF HashMap; the kernel does not require
+            // explicit removal before re-insertion.
+            match backend.update_pod_include_ports(cgroup_id, &new_policy) {
+                Ok(()) => {
+                    let prev_summary = describe_policy(state.include_ports_policy.as_ref());
+                    let new_summary = describe_policy(Some(&new_policy));
+                    info!(
+                        pod_uid,
+                        cgroup_id,
+                        prev_policy = %prev_summary,
+                        new_policy = %new_summary,
+                        "Re-applied mid-life pod includeOutboundPorts annotation update to BPF map"
+                    );
+                    state.include_ports_cgroup_id = Some(cgroup_id);
+                    state.include_ports_policy = Some(new_policy);
+                    metrics
+                        .pod_annotation_updates_applied
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    warn!(
+                        pod_uid,
+                        cgroup_id,
+                        error = %e,
+                        "Failed to re-apply mid-life pod includeOutboundPorts update; keeping previous policy"
+                    );
+                    metrics
+                        .pod_annotation_updates_failed
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        (None, Some(cgroup_id)) => {
+            // The pod removed its annotation entirely → drop the BPF
+            // entry so the gate fail-opens back to "capture everything"
+            // for this pod, matching pre-enrollment behavior.
+            match backend.remove_pod_include_ports(cgroup_id) {
+                Ok(()) => {
+                    let prev_summary = describe_policy(state.include_ports_policy.as_ref());
+                    info!(
+                        pod_uid,
+                        cgroup_id,
+                        prev_policy = %prev_summary,
+                        "Mid-life pod removed includeOutboundPorts annotation; dropped BPF map entry"
+                    );
+                    state.include_ports_cgroup_id = None;
+                    state.include_ports_policy = None;
+                    metrics
+                        .pod_annotation_updates_applied
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    warn!(
+                        pod_uid,
+                        cgroup_id,
+                        error = %e,
+                        "Failed to drop mid-life pod includeOutboundPorts BPF entry; keeping previous policy"
+                    );
+                    metrics
+                        .pod_annotation_updates_failed
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        (Some(_), None) => {
+            // We want to write a new entry but have no cgroup id — most
+            // likely the pod was enrolled before its cgroup path
+            // existed (Kubernetes Pod object reaches the watcher before
+            // kubelet finishes creating the cgroup). Skip and let a
+            // future event retry; do NOT count this as a failure because
+            // it is operationally normal.
+            debug!(
+                pod_uid,
+                "Mid-life includeOutboundPorts update deferred: cgroup id unavailable"
+            );
+        }
+        (None, None) => {
+            // Nothing to write and nothing to remove. Reachable only if
+            // `desired` flipped from `None` to `None` in a way that
+            // disagreed with `state.include_ports_policy` (e.g. the
+            // baseline was `Some(_)` but the cgroup id was unknown when
+            // it was stashed). Clear the baseline so future diffs are
+            // consistent.
+            state.include_ports_policy = None;
+        }
+    }
+}
+
+/// Render an `Option<&IncludePortsPolicy>` as a short structured string
+/// for logging. Only invoked from the success/error arms of
+/// `reconcile_existing_pod_include_ports` — never on the diff-skip
+/// no-op path, which returns early before any formatting work runs.
+fn describe_policy(policy: Option<&IncludePortsPolicy>) -> String {
+    match policy {
+        None => "none".to_string(),
+        Some(p) if p.is_all_ports() => "all".to_string(),
+        Some(p) => {
+            let count = p.port_count as usize;
+            let bounded = count.min(p.ports.len());
+            format!("ports={:?}", &p.ports[..bounded])
+        }
+    }
+}
+
 #[allow(dead_code)]
 pub fn handle_pod_removed(
     backend: &mut dyn EbpfBackend,
@@ -848,19 +1357,59 @@ pub fn handle_pod_removed(
 async fn handle_fallback(
     config: &NodeAgentConfig,
     probe: &KernelProbeResult,
-    metrics: &NodeAgentMetrics,
+    metrics: Arc<NodeAgentMetrics>,
     shutdown_tx: &tokio::sync::watch::Sender<bool>,
     startup_ready: Arc<AtomicBool>,
+    cni_config: CniListenerConfig,
 ) -> Result<(), anyhow::Error> {
-    handle_fallback_with(
+    let cni_handles =
+        if cni_config.enabled && matches!(config.fallback_mode, FallbackMode::Iptables) {
+            Some(spawn_cni_passthrough_listener(
+                cni_config.socket_path.clone(),
+                metrics.clone(),
+                shutdown_tx.subscribe(),
+            ))
+        } else {
+            None
+        };
+
+    let result = handle_fallback_with(
         config,
         probe,
-        metrics,
+        metrics.as_ref(),
         shutdown_tx,
         |cmds, phase| async move { execute_iptables_commands(&cmds, phase).await },
         startup_ready,
     )
-    .await
+    .await;
+
+    if let Some((listener, worker)) = cni_handles {
+        let _ = shutdown_tx.send(true);
+        if let Err(err) = listener.await {
+            warn!(error = %err, "Node agent CNI passthrough listener task panicked");
+        }
+        if let Err(err) = worker.await {
+            warn!(error = %err, "Node agent CNI passthrough worker task panicked");
+        }
+    }
+
+    result
+}
+
+fn spawn_cni_passthrough_listener(
+    socket_path: String,
+    metrics: Arc<NodeAgentMetrics>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>) {
+    let (cni_work_tx, mut cni_work_rx) = cni_work_channel();
+    let listener = spawn_cni_listener(socket_path, cni_work_tx.clone(), metrics, shutdown);
+    drop(cni_work_tx);
+    let worker = tokio::spawn(async move {
+        while let Some(work) = cni_work_rx.recv().await {
+            let _ = work.respond.send(CniRpcResponse::Ok);
+        }
+    });
+    (listener, worker)
 }
 
 /// Test seam for [`handle_fallback`]. The production path passes
@@ -901,9 +1450,9 @@ where
                 degradation_reason = reason,
                 "Kernel does not support eBPF capture, falling back to iptables mode. \
                  Remediation: upgrade kernel to >= 5.7 with cgroup v2 + bpffs mounted, \
-                 or set FERRUM_NODE_AGENT_FALLBACK_MODE=fail to refuse startup on degraded nodes. \
-                 Per-pod ambient capture remains available via iptables injection — \
-                 configure the injector NodeSelector so pods on this node receive an iptables init container."
+                 FERRUM_NODE_AGENT_FALLBACK_MODE=iptables is explicit opt-in and requires a runtime image \
+                 with /bin/sh plus iptables/ip6tables. Per-pod ambient capture remains available via iptables \
+                 injection — configure the injector NodeSelector so pods on this node receive an iptables init container."
             );
 
             let plan = IptablesPlan::for_config(&config.capture_config);
@@ -948,7 +1497,7 @@ where
                 "eBPF capture requires kernel >= 5.7 with cgroup v2 and bpffs. \
                  Detected: kernel={}, cgroup_v2={}, bpf_fs={}, reason={}. \
                  Set FERRUM_NODE_AGENT_FALLBACK_MODE=iptables to use iptables instead \
-                 (default).",
+                 when the runtime image includes /bin/sh plus iptables/ip6tables.",
                 probe.kernel_release,
                 probe.cgroup_v2_available,
                 probe.bpf_fs_available,
@@ -1278,9 +1827,10 @@ mod tests {
                 namespace: "default".to_string(),
                 pod_ip: None,
                 cgroup_path: None,
-                veth_iface: None,
+                veth_iface: Some("veth-mock".to_string()),
                 attached: true,
                 include_ports_cgroup_id: None,
+                include_ports_policy: None,
             },
         );
         pod_states.insert(
@@ -1294,6 +1844,7 @@ mod tests {
                 veth_iface: None,
                 attached: false,
                 include_ports_cgroup_id: None,
+                include_ports_policy: None,
             },
         );
 
@@ -1585,6 +2136,7 @@ mod tests {
             annotations: &HashMap::new(),
             pod_ip_str: Some("10.0.0.5"),
             pod_pid: None,
+            veth_iface_override: Some("veth-mock"),
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -1623,6 +2175,7 @@ mod tests {
             annotations: &HashMap::new(),
             pod_ip_str: Some("10.0.0.5"),
             pod_pid: None,
+            veth_iface_override: Some("veth-mock"),
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -1653,6 +2206,7 @@ mod tests {
             annotations: &HashMap::new(),
             pod_ip_str: None,
             pod_pid: None,
+            veth_iface_override: Some("veth-mock"),
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -1677,6 +2231,7 @@ mod tests {
                 veth_iface: None,
                 attached: true,
                 include_ports_cgroup_id: None,
+                include_ports_policy: None,
             },
         );
         let config = NodeAgentConfig {
@@ -1696,6 +2251,7 @@ mod tests {
             annotations: &HashMap::new(),
             pod_ip_str: None,
             pod_pid: None,
+            veth_iface_override: Some("veth-mock"),
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -1729,6 +2285,7 @@ mod tests {
             annotations: &HashMap::new(),
             pod_ip_str: None,
             pod_pid: None,
+            veth_iface_override: Some("veth-mock"),
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -1754,6 +2311,7 @@ mod tests {
                 veth_iface: Some("veth123".to_string()),
                 attached: true,
                 include_ports_cgroup_id: None,
+                include_ports_policy: None,
             },
         );
         backend
@@ -1786,6 +2344,215 @@ mod tests {
         assert_eq!(metrics.pods_unenrolled.load(Ordering::Relaxed), 0);
     }
 
+    /// `apply_cni_request` ADD with empty labels intentionally short-circuits
+    /// at `evaluate_enrollment` (no `ferrum.io/mesh=enabled` label / inject
+    /// annotation), so the BPF maps stay untouched but the RPC returns `Ok`.
+    /// The kube-rs watcher fills in the real labels and enrolls the pod a
+    /// moment later. We acknowledge the CNI call so kubelet doesn't retry.
+    #[test]
+    fn apply_cni_request_add_with_empty_labels_returns_ok_and_skips_enrollment() {
+        use crate::cni::rpc::{CniRpcRequest, CniRpcResponse, RpcVerb};
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: "/nonexistent".to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+        };
+        let req = CniRpcRequest {
+            verb: RpcVerb::Add,
+            pod_namespace: "default".to_string(),
+            pod_name: "alpha".to_string(),
+            pod_uid: Some("pod-uid-1".to_string()),
+            container_id: "ctr-1".to_string(),
+            netns_path: Some("/var/run/netns/cni-1".to_string()),
+            args: HashMap::new(),
+        };
+        let resp = apply_cni_request(&mut backend, &pod_states, &config, &metrics, &req);
+        assert_eq!(resp, CniRpcResponse::Ok);
+        assert!(
+            !pod_states.contains_key("pod-uid-1"),
+            "empty labels intentionally short-circuit enrollment; the watcher reconciles later"
+        );
+        assert_eq!(
+            metrics.pods_enrolled.load(Ordering::Relaxed),
+            0,
+            "no BPF attach should fire on the empty-label path"
+        );
+    }
+
+    /// `apply_cni_request` ADD without a pod_uid maps to `Rejected` (we
+    /// cannot key BPF state without a UID) — the watcher fallback handles
+    /// the reconcile by selector instead. Kubelet treats `Rejected` as a
+    /// soft signal but the CNI binary still emits a success result so
+    /// pod networking isn't broken.
+    #[test]
+    fn apply_cni_request_add_without_pod_uid_returns_rejected() {
+        use crate::cni::rpc::{CniRpcRequest, CniRpcResponse, RpcVerb};
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: "/nonexistent".to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+        };
+        let req = CniRpcRequest {
+            verb: RpcVerb::Add,
+            pod_namespace: "default".to_string(),
+            pod_name: "alpha".to_string(),
+            pod_uid: None,
+            container_id: "ctr-1".to_string(),
+            netns_path: None,
+            args: HashMap::new(),
+        };
+        let resp = apply_cni_request(&mut backend, &pod_states, &config, &metrics, &req);
+        match resp {
+            CniRpcResponse::Rejected { reason } => {
+                assert!(
+                    reason.contains("K8S_POD_UID"),
+                    "rejection message should explain why; got: {reason}"
+                );
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+    }
+
+    /// `apply_cni_request` DEL tears down BPF state for a pod the watcher
+    /// previously enrolled. Idempotent: a second DEL is a no-op (still
+    /// returns Ok) so kubelet retries are safe.
+    #[test]
+    fn apply_cni_request_del_unenrolls_and_is_idempotent() {
+        use crate::cni::rpc::{CniRpcRequest, CniRpcResponse, RpcVerb};
+        let mut backend = MockEbpfBackend::default();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: "/nonexistent".to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+        };
+        // Pre-populate as if the watcher had already enrolled the pod.
+        pod_states.insert(
+            "pod-uid-1".to_string(),
+            PodAttachmentState {
+                pod_uid: "pod-uid-1".to_string(),
+                pod_name: "alpha".to_string(),
+                namespace: "default".to_string(),
+                pod_ip: None,
+                cgroup_path: Some("/sys/fs/cgroup/kubepods/poduid1".to_string()),
+                veth_iface: Some("veth123".to_string()),
+                attached: true,
+                include_ports_cgroup_id: None,
+                include_ports_policy: None,
+            },
+        );
+        let req = CniRpcRequest {
+            verb: RpcVerb::Del,
+            pod_namespace: "default".to_string(),
+            pod_name: "alpha".to_string(),
+            pod_uid: Some("pod-uid-1".to_string()),
+            container_id: "ctr-1".to_string(),
+            netns_path: None,
+            args: HashMap::new(),
+        };
+        let resp = apply_cni_request(&mut backend, &pod_states, &config, &metrics, &req);
+        assert_eq!(resp, CniRpcResponse::Ok);
+        assert!(
+            !pod_states.contains_key("pod-uid-1"),
+            "DEL should remove the pod-state entry"
+        );
+        assert_eq!(backend.detached_pods, vec!["pod-uid-1".to_string()]);
+
+        // Idempotency: a second DEL is a no-op.
+        let resp2 = apply_cni_request(&mut backend, &pod_states, &config, &metrics, &req);
+        assert_eq!(
+            resp2,
+            CniRpcResponse::Ok,
+            "second DEL still returns Ok so kubelet retries are safe"
+        );
+        // Backend should not detach again — `handle_pod_removed` short-
+        // circuits on the empty state map.
+        assert_eq!(
+            backend.detached_pods,
+            vec!["pod-uid-1".to_string()],
+            "second DEL must not double-detach"
+        );
+    }
+
+    /// `apply_cni_request` CHECK on a tracked pod returns Ok; CHECK on an
+    /// untracked pod returns Rejected. Kubelet uses Rejected as a hint to
+    /// replay ADD.
+    #[test]
+    fn apply_cni_request_check_distinguishes_tracked_and_untracked() {
+        use crate::cni::rpc::{CniRpcRequest, CniRpcResponse, RpcVerb};
+        let mut backend = MockEbpfBackend::default();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: "/nonexistent".to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+        };
+
+        // Untracked pod: CHECK is Rejected.
+        let req = CniRpcRequest {
+            verb: RpcVerb::Check,
+            pod_namespace: "default".to_string(),
+            pod_name: "alpha".to_string(),
+            pod_uid: Some("pod-uid-1".to_string()),
+            container_id: "ctr-1".to_string(),
+            netns_path: None,
+            args: HashMap::new(),
+        };
+        match apply_cni_request(&mut backend, &pod_states, &config, &metrics, &req) {
+            CniRpcResponse::Rejected { reason } => {
+                assert!(
+                    reason.contains("not currently enrolled"),
+                    "expected enrollment-miss reason, got: {reason}"
+                );
+            }
+            other => panic!("expected Rejected for untracked pod, got {other:?}"),
+        }
+
+        // Tracked pod: CHECK is Ok.
+        pod_states.insert(
+            "pod-uid-1".to_string(),
+            PodAttachmentState {
+                pod_uid: "pod-uid-1".to_string(),
+                pod_name: "alpha".to_string(),
+                namespace: "default".to_string(),
+                pod_ip: None,
+                cgroup_path: None,
+                veth_iface: None,
+                attached: true,
+                include_ports_cgroup_id: None,
+                include_ports_policy: None,
+            },
+        );
+        let resp = apply_cni_request(&mut backend, &pod_states, &config, &metrics, &req);
+        assert_eq!(resp, CniRpcResponse::Ok);
+    }
+
     #[test]
     fn handle_pod_added_skips_duplicate() {
         let mut backend = MockEbpfBackend::default();
@@ -1810,9 +2577,10 @@ mod tests {
                 namespace: "default".to_string(),
                 pod_ip: None,
                 cgroup_path: None,
-                veth_iface: None,
+                veth_iface: Some("veth-mock".to_string()),
                 attached: true,
                 include_ports_cgroup_id: None,
+                include_ports_policy: None,
             },
         );
 
@@ -1824,11 +2592,71 @@ mod tests {
             annotations: &HashMap::new(),
             pod_ip_str: None,
             pod_pid: None,
+            veth_iface_override: Some("veth-mock"),
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
 
         assert_eq!(pod_states.get("pod-uid-1").unwrap().pod_name, "existing");
+    }
+
+    #[test]
+    fn handle_pod_added_reattaches_when_veth_changes_for_existing_pod() {
+        let mut backend = MockEbpfBackend::default();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let cgroup_root = tempfile::tempdir().unwrap();
+        let cgroup_path = cgroup_root.path().join("kubepods/podpod-uid-1");
+        std::fs::create_dir_all(&cgroup_path).unwrap();
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: cgroup_root.path().to_string_lossy().to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+        };
+        let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+
+        pod_states.insert(
+            "pod-uid-1".to_string(),
+            PodAttachmentState {
+                pod_uid: "pod-uid-1".to_string(),
+                pod_name: "existing".to_string(),
+                namespace: "default".to_string(),
+                pod_ip: None,
+                cgroup_path: Some(cgroup_path.to_string_lossy().to_string()),
+                veth_iface: Some("veth-old".to_string()),
+                attached: true,
+                include_ports_cgroup_id: None,
+                include_ports_policy: None,
+            },
+        );
+
+        let event = PodEvent {
+            pod_uid: "pod-uid-1",
+            pod_name: "sandbox-recreated",
+            namespace: "default",
+            labels: &labels,
+            annotations: &HashMap::new(),
+            pod_ip_str: Some("10.0.0.9"),
+            pod_pid: None,
+            veth_iface_override: Some("veth-new"),
+        };
+
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+
+        assert_eq!(backend.detached_pods, vec!["pod-uid-1".to_string()]);
+        assert!(
+            backend
+                .tc_attachments
+                .iter()
+                .any(|(iface, program)| iface == "veth-new" && program == "ferrum_tc_inbound")
+        );
+        let state = pod_states.get("pod-uid-1").unwrap();
+        assert_eq!(state.pod_name, "sandbox-recreated");
+        assert_eq!(state.veth_iface.as_deref(), Some("veth-new"));
     }
 
     #[test]
@@ -1855,9 +2683,10 @@ mod tests {
                 namespace: "default".to_string(),
                 pod_ip: None,
                 cgroup_path: None,
-                veth_iface: None,
+                veth_iface: Some("veth-mock".to_string()),
                 attached: true,
                 include_ports_cgroup_id: None,
+                include_ports_policy: None,
             },
         );
 
@@ -1869,6 +2698,7 @@ mod tests {
             annotations: &HashMap::new(),
             pod_ip_str: Some("10.0.0.8"),
             pod_pid: None,
+            veth_iface_override: Some("veth-mock"),
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -1898,15 +2728,19 @@ mod tests {
         };
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         let startup_ready = Arc::new(AtomicBool::new(false));
-        let metrics = NodeAgentMetrics::default();
+        let metrics = Arc::new(NodeAgentMetrics::default());
 
         assert!(
             handle_fallback(
                 &config,
                 &probe,
-                &metrics,
+                metrics.clone(),
                 &shutdown_tx,
-                startup_ready.clone()
+                startup_ready.clone(),
+                CniListenerConfig {
+                    enabled: false,
+                    socket_path: "/tmp/ferrum-test.sock".to_string(),
+                }
             )
             .await
             .is_err()
@@ -2286,6 +3120,7 @@ mod tests {
             annotations: &annotations,
             pod_ip_str: Some("10.0.0.5"),
             pod_pid: None,
+            veth_iface_override: Some("veth-mock"),
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -2331,6 +3166,7 @@ mod tests {
             annotations: &annotations,
             pod_ip_str: Some("10.0.0.5"),
             pod_pid: None,
+            veth_iface_override: Some("veth-mock"),
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -2376,6 +3212,7 @@ mod tests {
             annotations: &HashMap::new(),
             pod_ip_str: Some("10.0.0.5"),
             pod_pid: None,
+            veth_iface_override: Some("veth-mock"),
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -2422,6 +3259,7 @@ mod tests {
             annotations: &annotations,
             pod_ip_str: Some("10.0.0.5"),
             pod_pid: None,
+            veth_iface_override: Some("veth-mock"),
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -2463,6 +3301,7 @@ mod tests {
             annotations: &annotations,
             pod_ip_str: Some("10.0.0.5"),
             pod_pid: None,
+            veth_iface_override: Some("veth-mock"),
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -2474,5 +3313,491 @@ mod tests {
             "removal must drop the include-ports entry"
         );
         assert!(!pod_states.contains_key("pod-uid-1"));
+    }
+
+    // --- T4-B: mid-life pod annotation updates (extends GAP-2K) ---
+    //
+    // `Event::Apply` from kube-rs covers both newly-added and modified pods,
+    // so `handle_pod_added` is the watcher's single entry point for both.
+    // The tests below exercise the diff-and-apply path inside the
+    // "already enrolled" branch (`reconcile_existing_pod_include_ports`)
+    // by calling `handle_pod_added` twice with the same `pod_uid` but
+    // different annotations, simulating what kube-rs would emit for a
+    // `kubectl annotate pod ...` against a live pod.
+
+    /// Build the standard test config + cgroup tempdir layout used by
+    /// every T4-B handle_pod_added round-trip test. Returns the tempdir
+    /// (so the test scope keeps it alive), the resolved cgroup root
+    /// path, and a `NodeAgentConfig` pointing at it.
+    fn t4b_test_config(pod_uid: &str) -> (tempfile::TempDir, NodeAgentConfig) {
+        let cgroup_root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(cgroup_root.path().join(format!("kubepods/pod{pod_uid}"))).unwrap();
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: cgroup_root.path().to_string_lossy().to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+        };
+        (cgroup_root, config)
+    }
+
+    /// Build a `PodEvent` referencing the supplied labels/annotations.
+    /// Encapsulated so each T4-B test reads as "annotate this pod and
+    /// run handle_pod_added" without inlining the same struct literal
+    /// every time.
+    fn t4b_pod_event<'a>(
+        pod_uid: &'a str,
+        labels: &'a HashMap<String, String>,
+        annotations: &'a HashMap<String, String>,
+    ) -> PodEvent<'a> {
+        PodEvent {
+            pod_uid,
+            pod_name: "test-pod",
+            namespace: "default",
+            labels,
+            annotations,
+            pod_ip_str: Some("10.0.0.5"),
+            pod_pid: None,
+            veth_iface_override: Some("veth-mock"),
+        }
+    }
+
+    fn t4b_mesh_labels() -> HashMap<String, String> {
+        HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())])
+    }
+
+    #[test]
+    fn handle_pod_updated_with_same_annotation_is_no_op() {
+        // Diff-skip regression guard: Modified events fire many times
+        // for unrelated reasons (status updates, condition flips, image
+        // pull progress). If we wrote the BPF map on every Modified
+        // event we'd burn syscalls and produce log noise.
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let (_cgroup_root, config) = t4b_test_config("pod-uid-1");
+        let labels = t4b_mesh_labels();
+        let annotations =
+            annotations_with(&[("traffic.sidecar.istio.io/includeOutboundPorts", "80")]);
+
+        // First Apply (the "added" event).
+        handle_pod_added(
+            &mut backend,
+            &pod_states,
+            &config,
+            &metrics,
+            &t4b_pod_event("pod-uid-1", &labels, &annotations),
+        );
+        assert_eq!(backend.include_ports.len(), 1, "initial write must occur");
+        let snapshot_before = backend.include_ports.clone();
+
+        // Second Apply with identical annotations (the "modified-but-
+        // unchanged" event).
+        handle_pod_added(
+            &mut backend,
+            &pod_states,
+            &config,
+            &metrics,
+            &t4b_pod_event("pod-uid-1", &labels, &annotations),
+        );
+
+        assert_eq!(
+            backend.include_ports, snapshot_before,
+            "identical annotations must not mutate the BPF map"
+        );
+        assert_eq!(
+            metrics
+                .pod_annotation_updates_applied
+                .load(Ordering::Relaxed),
+            0,
+            "no-op diff must not bump the applied counter"
+        );
+        assert_eq!(
+            metrics
+                .pod_annotation_updates_failed
+                .load(Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[test]
+    fn handle_pod_updated_explicit_to_explicit_writes_new_ports() {
+        // `80` → `80,443`: the parser sorts/dedupes, so the second policy
+        // genuinely differs. The mock backend's HashMap-shaped
+        // `include_ports` overwrites on insert, so we expect the entry
+        // for this pod's cgroup id to reflect the NEW port set.
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let (_cgroup_root, config) = t4b_test_config("pod-uid-1");
+        let labels = t4b_mesh_labels();
+
+        let initial = annotations_with(&[("traffic.sidecar.istio.io/includeOutboundPorts", "80")]);
+        handle_pod_added(
+            &mut backend,
+            &pod_states,
+            &config,
+            &metrics,
+            &t4b_pod_event("pod-uid-1", &labels, &initial),
+        );
+        let cgroup_id = pod_states
+            .get("pod-uid-1")
+            .expect("pod enrolled")
+            .include_ports_cgroup_id
+            .expect("cgroup id stashed");
+        assert_eq!(backend.include_ports.get(&cgroup_id).unwrap().port_count, 1);
+
+        let updated =
+            annotations_with(&[("traffic.sidecar.istio.io/includeOutboundPorts", "80,443")]);
+        handle_pod_added(
+            &mut backend,
+            &pod_states,
+            &config,
+            &metrics,
+            &t4b_pod_event("pod-uid-1", &labels, &updated),
+        );
+
+        // The entry for this pod's cgroup is replaced — same key, new
+        // value — exactly the contract `update_pod_include_ports`
+        // guarantees on the kernel side.
+        let entry = backend
+            .include_ports
+            .get(&cgroup_id)
+            .expect("entry replaced under same cgroup key");
+        assert!(!entry.is_all_ports());
+        assert_eq!(entry.port_count, 2);
+        assert_eq!(&entry.ports[..2], &[80, 443]);
+        let state = pod_states.get("pod-uid-1").unwrap();
+        assert_eq!(
+            state.include_ports_policy.as_ref().unwrap().port_count,
+            2,
+            "baseline must advance to the new policy for the next diff"
+        );
+        assert_eq!(
+            metrics
+                .pod_annotation_updates_applied
+                .load(Ordering::Relaxed),
+            1,
+            "successful mid-life update must bump the applied counter"
+        );
+    }
+
+    #[test]
+    fn handle_pod_updated_explicit_to_wildcard_writes_all_ports_sentinel() {
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let (_cgroup_root, config) = t4b_test_config("pod-uid-1");
+        let labels = t4b_mesh_labels();
+
+        let initial = annotations_with(&[("traffic.sidecar.istio.io/includeOutboundPorts", "80")]);
+        handle_pod_added(
+            &mut backend,
+            &pod_states,
+            &config,
+            &metrics,
+            &t4b_pod_event("pod-uid-1", &labels, &initial),
+        );
+
+        let updated = annotations_with(&[("traffic.sidecar.istio.io/includeOutboundPorts", "*")]);
+        handle_pod_added(
+            &mut backend,
+            &pod_states,
+            &config,
+            &metrics,
+            &t4b_pod_event("pod-uid-1", &labels, &updated),
+        );
+
+        let cgroup_id = pod_states
+            .get("pod-uid-1")
+            .unwrap()
+            .include_ports_cgroup_id
+            .unwrap();
+        let entry = backend.include_ports.get(&cgroup_id).unwrap();
+        assert!(
+            entry.is_all_ports(),
+            "wildcard transition must write the all-ports sentinel"
+        );
+        assert_eq!(
+            metrics
+                .pod_annotation_updates_applied
+                .load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[test]
+    fn handle_pod_updated_explicit_to_absent_removes_bpf_entry() {
+        // When an operator removes the annotation entirely (e.g.
+        // `kubectl annotate pod foo traffic.sidecar.istio.io/includeOutboundPorts-`),
+        // the BPF gate should fail-open back to "capture everything"
+        // for that pod. That's encoded by removing the map entry.
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let (_cgroup_root, config) = t4b_test_config("pod-uid-1");
+        let labels = t4b_mesh_labels();
+
+        let initial = annotations_with(&[("traffic.sidecar.istio.io/includeOutboundPorts", "80")]);
+        handle_pod_added(
+            &mut backend,
+            &pod_states,
+            &config,
+            &metrics,
+            &t4b_pod_event("pod-uid-1", &labels, &initial),
+        );
+        let cgroup_id_before = pod_states
+            .get("pod-uid-1")
+            .unwrap()
+            .include_ports_cgroup_id
+            .unwrap();
+        assert!(backend.include_ports.contains_key(&cgroup_id_before));
+
+        // Apply with empty annotations — the operator stripped the
+        // includeOutboundPorts key.
+        let empty = HashMap::new();
+        handle_pod_added(
+            &mut backend,
+            &pod_states,
+            &config,
+            &metrics,
+            &t4b_pod_event("pod-uid-1", &labels, &empty),
+        );
+
+        assert!(
+            !backend.include_ports.contains_key(&cgroup_id_before),
+            "removed annotation must drop the BPF entry"
+        );
+        let state = pod_states.get("pod-uid-1").unwrap();
+        assert!(
+            state.include_ports_cgroup_id.is_none(),
+            "state must forget the cgroup id when the entry is removed"
+        );
+        assert!(state.include_ports_policy.is_none());
+        assert_eq!(
+            metrics
+                .pod_annotation_updates_applied
+                .load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[test]
+    fn handle_pod_updated_unannotated_to_explicit_enrolls_new_policy() {
+        // The pod was originally unannotated → no BPF entry. Operator
+        // adds `includeOutboundPorts: 80` → BPF entry should appear.
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let (_cgroup_root, config) = t4b_test_config("pod-uid-1");
+        let labels = t4b_mesh_labels();
+
+        let empty = HashMap::new();
+        handle_pod_added(
+            &mut backend,
+            &pod_states,
+            &config,
+            &metrics,
+            &t4b_pod_event("pod-uid-1", &labels, &empty),
+        );
+        assert!(
+            backend.include_ports.is_empty(),
+            "unannotated pod has no BPF entry initially"
+        );
+
+        let annotated =
+            annotations_with(&[("traffic.sidecar.istio.io/includeOutboundPorts", "80")]);
+        handle_pod_added(
+            &mut backend,
+            &pod_states,
+            &config,
+            &metrics,
+            &t4b_pod_event("pod-uid-1", &labels, &annotated),
+        );
+
+        let state = pod_states.get("pod-uid-1").unwrap();
+        let cgroup_id = state
+            .include_ports_cgroup_id
+            .expect("mid-life add must stash a cgroup id");
+        let entry = backend
+            .include_ports
+            .get(&cgroup_id)
+            .expect("mid-life add must populate the BPF map");
+        assert!(!entry.is_all_ports());
+        assert_eq!(entry.port_count, 1);
+        assert_eq!(entry.ports[0], 80);
+        assert_eq!(
+            metrics
+                .pod_annotation_updates_applied
+                .load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[test]
+    fn handle_pod_updated_opt_out_to_opt_in_re_enrolls() {
+        // `ferrum.io/inject: false` → `ferrum.io/inject: true`. This is
+        // handled by the existing enrollment-decision path (the
+        // un-enrolled pod is not in `pod_states`, so the second Apply
+        // hits the cold enrollment branch). The point of this test is
+        // to confirm the watcher doesn't get stuck on a stale "skip"
+        // decision once the operator flips opt-out off.
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let (_cgroup_root, config) = t4b_test_config("pod-uid-1");
+
+        let opt_out_labels = t4b_mesh_labels();
+        let opt_out_annotations = annotations_with(&[("ferrum.io/inject", "false")]);
+        handle_pod_added(
+            &mut backend,
+            &pod_states,
+            &config,
+            &metrics,
+            &t4b_pod_event("pod-uid-1", &opt_out_labels, &opt_out_annotations),
+        );
+        assert!(
+            !pod_states.contains_key("pod-uid-1"),
+            "opt-out annotation must skip enrollment"
+        );
+
+        let opt_in_annotations = annotations_with(&[("ferrum.io/inject", "true")]);
+        handle_pod_added(
+            &mut backend,
+            &pod_states,
+            &config,
+            &metrics,
+            &t4b_pod_event("pod-uid-1", &opt_out_labels, &opt_in_annotations),
+        );
+
+        let state = pod_states
+            .get("pod-uid-1")
+            .expect("opt-in flip must enroll the pod");
+        assert!(state.attached);
+        assert_eq!(metrics.pods_enrolled.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn handle_pod_updated_opt_in_to_opt_out_unenrolls() {
+        // The opposite: a previously enrolled pod gets `ferrum.io/inject:
+        // false` mid-life. The watcher must call the un-enroll path
+        // (which is what `evaluate_enrollment` returning `Skip` for an
+        // already-tracked pod_uid triggers in `handle_pod_added`).
+        //
+        // Long-lived-flow caveat: this test asserts the BPF map and
+        // pod_states are cleaned up. It does NOT assert anything about
+        // already-established TCP connections — those keep flowing
+        // through the rewrite chosen at their original connect(2) call,
+        // because BPF cgroup_sockaddr only runs on new connects.
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let (_cgroup_root, config) = t4b_test_config("pod-uid-1");
+
+        let labels = t4b_mesh_labels();
+        let opt_in_annotations =
+            annotations_with(&[("traffic.sidecar.istio.io/includeOutboundPorts", "80")]);
+        handle_pod_added(
+            &mut backend,
+            &pod_states,
+            &config,
+            &metrics,
+            &t4b_pod_event("pod-uid-1", &labels, &opt_in_annotations),
+        );
+        assert!(pod_states.contains_key("pod-uid-1"));
+        assert_eq!(backend.include_ports.len(), 1);
+
+        let opt_out_annotations = annotations_with(&[("ferrum.io/inject", "false")]);
+        handle_pod_added(
+            &mut backend,
+            &pod_states,
+            &config,
+            &metrics,
+            &t4b_pod_event("pod-uid-1", &labels, &opt_out_annotations),
+        );
+
+        assert!(
+            !pod_states.contains_key("pod-uid-1"),
+            "opt-out flip must un-enroll the pod"
+        );
+        assert!(
+            backend.include_ports.is_empty(),
+            "un-enrollment must drop the BPF includeOutboundPorts entry"
+        );
+        assert_eq!(metrics.pods_unenrolled.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn handle_pod_updated_malformed_annotation_keeps_previous_policy() {
+        // The pod was enrolled with a valid `80` policy. Operator then
+        // applies a malformed annotation (e.g. typo in port number).
+        // The previous policy MUST be retained — silently widening
+        // capture to "all ports" on a typo would be a surprise.
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let (_cgroup_root, config) = t4b_test_config("pod-uid-1");
+        let labels = t4b_mesh_labels();
+
+        let good = annotations_with(&[("traffic.sidecar.istio.io/includeOutboundPorts", "80")]);
+        handle_pod_added(
+            &mut backend,
+            &pod_states,
+            &config,
+            &metrics,
+            &t4b_pod_event("pod-uid-1", &labels, &good),
+        );
+        let cgroup_id = pod_states
+            .get("pod-uid-1")
+            .unwrap()
+            .include_ports_cgroup_id
+            .unwrap();
+        let before = *backend.include_ports.get(&cgroup_id).unwrap();
+
+        let bad = annotations_with(&[("traffic.sidecar.istio.io/includeOutboundPorts", "bogus")]);
+        handle_pod_added(
+            &mut backend,
+            &pod_states,
+            &config,
+            &metrics,
+            &t4b_pod_event("pod-uid-1", &labels, &bad),
+        );
+
+        let after = *backend.include_ports.get(&cgroup_id).unwrap();
+        assert_eq!(
+            before, after,
+            "malformed annotation must NOT rewrite the BPF entry"
+        );
+        let state = pod_states.get("pod-uid-1").unwrap();
+        assert_eq!(
+            state.include_ports_cgroup_id,
+            Some(cgroup_id),
+            "previous cgroup id must be retained"
+        );
+        assert!(state.include_ports_policy.is_some());
+        assert_eq!(
+            metrics
+                .pod_annotation_updates_failed
+                .load(Ordering::Relaxed),
+            1,
+            "parse failure must bump the failed counter"
+        );
+        assert_eq!(
+            metrics
+                .pod_annotation_updates_applied
+                .load(Ordering::Relaxed),
+            0
+        );
     }
 }

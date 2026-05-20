@@ -64,6 +64,7 @@ WORKDIR /app
 
 # Copy binary from builder
 COPY --from=builder --chown=nonroot:nonroot /build/target/release/ferrum-edge /app/ferrum-edge
+COPY --from=builder --chown=nonroot:nonroot /build/target/release/ferrum-cni /app/ferrum-cni
 
 # Set environment variables
 ENV PATH="/app:${PATH}" \

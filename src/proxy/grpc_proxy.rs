@@ -707,7 +707,13 @@ impl GrpcPoolManager {
             .max_frame_size(pool_config.http2_max_frame_size);
 
         if let Some(max_streams) = pool_config.http2_max_concurrent_streams {
+            // Cap server-initiated streams (push) AND advertise our local
+            // initial cap on locally-initiated streams. The server's SETTINGS
+            // frame can raise the local cap later, but the initial value
+            // gives operators a starting bound that maps onto Istio's
+            // `http2MaxRequests` semantics for outbound concurrent requests.
             builder.max_concurrent_streams(max_streams);
+            builder.initial_max_send_streams(max_streams as usize);
         }
 
         builder
@@ -1106,7 +1112,7 @@ pub struct GrpcResponse {
 const DEFAULT_GRPC_BUFFERED_CAPACITY: usize = 16 * 1024;
 const MAX_GRPC_BUFFERED_PREALLOC_CAPACITY: usize = 1024 * 1024;
 
-pub(crate) fn grpc_buffered_body_capacity_hint(headers: &hyper::HeaderMap) -> usize {
+pub fn grpc_buffered_body_capacity_hint(headers: &hyper::HeaderMap) -> usize {
     headers
         .get("content-length")
         .and_then(|v| v.to_str().ok())
@@ -1689,6 +1695,7 @@ pub(crate) async fn proxy_grpc_request_core(
                 }
             }
         }
+        Ok(())
     };
 
     if let Some(timeout_ms) = effective_timeout_ms {
@@ -1703,9 +1710,9 @@ pub(crate) async fn proxy_grpc_request_core(
                     kind: GrpcTimeoutKind::Read,
                     message: format!("Body read timeout after {}ms", timeout_ms),
                 }
-            })?;
+            })??;
     } else {
-        body_collection.await;
+        body_collection.await?;
     }
 
     Ok(GrpcResponseKind::Buffered(GrpcResponse {

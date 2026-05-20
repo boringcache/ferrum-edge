@@ -4955,7 +4955,7 @@ async fn handle_websocket_request_authenticated(
                             ctx.plugin_http_call_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0;
                         let ws_gateway_overhead_ms =
                             (ws_total_ms - ws_plugin_execution_ms).max(0.0);
-                        let mut metadata = clone_log_metadata(ctx);
+                        let mut metadata = clone_log_metadata(&ctx);
                         metadata.insert(
                             "rejection_phase".to_string(),
                             "websocket_backend_error".to_string(),
@@ -5055,7 +5055,7 @@ async fn handle_websocket_request_authenticated(
         latency_plugin_external_io_ms: ws_plugin_external_io_ms,
         latency_gateway_overhead_ms: ws_gateway_overhead_ms,
         request_user_agent: ctx.headers.get("user-agent").cloned(),
-        metadata: clone_log_metadata(ctx),
+        metadata: clone_log_metadata(&ctx),
         ..TransactionSummary::default()
     };
 
@@ -5200,7 +5200,7 @@ async fn handle_websocket_request_authenticated(
         listen_port,
         consumer_username: ctx.effective_identity().map(str::to_owned),
         auth_method: ctx.auth_method,
-        metadata: clone_log_metadata(ctx),
+        metadata: clone_log_metadata(&ctx),
         session_start: chrono::Utc::now(),
     };
     tokio::spawn(async move {
@@ -5553,7 +5553,7 @@ fn build_websocket_tls_connector(
                         proxy.resolved_tls.san_allow_list.clone(),
                     )?)
                 };
-            b.with_webpki_verifier(verifier)
+            b.dangerous().with_custom_certificate_verifier(verifier)
         }
         Err(e) => {
             warn!(
@@ -5572,7 +5572,9 @@ fn build_websocket_tls_connector(
                         proxy.resolved_tls.san_allow_list.clone(),
                     )?)
                 };
-            rustls::ClientConfig::builder().with_webpki_verifier(verifier)
+            rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(verifier)
         }
     };
 
@@ -6619,6 +6621,35 @@ pub(crate) async fn start_mesh_proxy_listener_with_tls_and_signal(
     .await
 }
 
+/// Start the proxy HTTPS listener with a hot-swappable frontend TLS slot.
+///
+/// Used when `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true`. The frontend TLS
+/// watch task swaps the underlying `ArcSwap` after a validated cert/key
+/// reload; subsequent accepts pick up the new config without restarting the
+/// listener. Existing in-flight TLS sessions keep their original
+/// `ServerConfig`. Mirrors [`start_proxy_listener_with_tls_and_signal`] in
+/// every other respect.
+pub async fn start_proxy_listener_with_dynamic_tls_and_signal(
+    addr: SocketAddr,
+    state: ProxyState,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    tls_slot: crate::tls::SharedFrontendTls,
+    started_tx: Option<tokio::sync::oneshot::Sender<()>>,
+) -> Result<(), anyhow::Error> {
+    start_proxy_listener_with_tls_source_and_signal(
+        addr,
+        state,
+        shutdown,
+        ListenerTlsSource::Dynamic {
+            slot: tls_slot,
+            record_mesh_mtls_metric: false,
+        },
+        None,
+        started_tx,
+    )
+    .await
+}
+
 /// Start a proxy listener whose TLS config is loaded dynamically from
 /// `ProxyState::mesh_inbound_tls` on every accepted connection.
 ///
@@ -6660,6 +6691,15 @@ enum ListenerTlsSource {
     /// every accept so PeerAuthentication changes can hot-swap future
     /// handshakes without restarting the listener.
     MeshInbound,
+    /// Dynamic frontend TLS loaded from a shared `ArcSwap` slot on every
+    /// accept so a successful cert/key reload (opt-in via
+    /// `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED`) takes effect on the next
+    /// handshake without restarting the listener. Existing in-flight TLS
+    /// sessions keep their old `ServerConfig`.
+    Dynamic {
+        slot: crate::tls::SharedFrontendTls,
+        record_mesh_mtls_metric: bool,
+    },
 }
 
 impl ListenerTlsSource {
@@ -6668,10 +6708,14 @@ impl ListenerTlsSource {
     /// `Static` is the ordinary startup-captured path. `MeshInbound` performs
     /// one `ArcSwap::load()` and one inner `Arc` clone per accept; this is
     /// the narrow mesh live-reload carve-out and is not on the request path.
+    /// `Dynamic` performs one `ArcSwap::load()` and one inner `Arc` clone per
+    /// accept; this is the narrow frontend cert/key live-reload carve-out
+    /// and is not on the request path.
     fn load(&self, state: &ProxyState) -> Option<Arc<rustls::ServerConfig>> {
         match self {
             Self::Static { tls_config, .. } => tls_config.clone(),
             Self::MeshInbound => state.mesh_inbound_tls.load().as_ref().clone(),
+            Self::Dynamic { slot, .. } => slot.load().as_ref().clone(),
         }
     }
 
@@ -6682,6 +6726,22 @@ impl ListenerTlsSource {
                 ..
             } => *record_mesh_mtls_metric,
             Self::MeshInbound => true,
+            Self::Dynamic {
+                record_mesh_mtls_metric,
+                ..
+            } => *record_mesh_mtls_metric,
+        }
+    }
+
+    /// Whether this source REQUIRES a TLS config to serve a connection.
+    /// Generic dynamic HTTPS listeners must fail closed when their slot is
+    /// empty. Mesh inbound live reload is different: `None` is the intentional
+    /// representation for PeerAuthentication `DISABLE` and for permissive mode
+    /// without frontend TLS materials, so it must fall through to plaintext.
+    fn requires_tls(&self) -> bool {
+        match self {
+            Self::Static { .. } | Self::MeshInbound => false,
+            Self::Dynamic { .. } => true,
         }
     }
 }
@@ -6883,6 +6943,24 @@ async fn run_accept_loop(
                                 None
                             };
                         let tls_config = tls_source.load(&state);
+                        // Defense in depth: a TLS-required source (Dynamic
+                        // frontend reload slot, MeshInbound peer-auth slot)
+                        // that observes a `None` payload must NOT fall
+                        // through to the plaintext handler — that would be a
+                        // silent TLS-to-HTTP downgrade on a port bound for
+                        // TLS. Drop the connection and continue. In normal
+                        // operation the slot is initialized with a live
+                        // config and only ever stores `Some(..)`; this guard
+                        // protects against a slot transiently or buggily
+                        // holding `None`.
+                        if tls_config.is_none() && tls_source.requires_tls() {
+                            debug!(
+                                remote_addr = %remote_addr.ip(),
+                                "Dropping TLS connection: TLS slot is empty for a TLS-required listener (live-reload race or misconfiguration)"
+                            );
+                            drop(stream);
+                            continue;
+                        }
                         let record_mesh_mtls_metric = tls_source.record_mesh_mtls_metric();
                         // Each connection gets its own subscriber so that
                         // shutdown can interrupt the per-connection serve
@@ -7868,10 +7946,10 @@ async fn handle_proxy_request_inner(
                         ctx.raw_header_get(real_ip_header.as_str())
                     });
             let xff_chain = {
-                let mut values = ctx.raw_header_values("x-forwarded-for").peekable();
-                values.peek().map(|first| {
-                    let mut combined = String::from(*first);
-                    for value in values.skip(1) {
+                let mut values = ctx.raw_header_values("x-forwarded-for");
+                values.next().map(|first| {
+                    let mut combined = String::from(first);
+                    for value in values {
                         combined.push(',');
                         combined.push_str(value);
                     }
@@ -9080,7 +9158,7 @@ async fn handle_proxy_request_inner(
                     let bytes_sent = ctx
                         .bytes_sent_observed
                         .load(std::sync::atomic::Ordering::Acquire);
-                    let mut metadata = clone_log_metadata(ctx);
+                    let mut metadata = clone_log_metadata(&ctx);
                     metadata
                         .entry("request_protocol".to_string())
                         .or_insert_with(|| "grpc".to_string());
@@ -9428,7 +9506,7 @@ async fn handle_proxy_request_inner(
                         request_user_agent: ctx.headers.get("user-agent").cloned(),
                         bytes_sent,
                         bytes_received,
-                        metadata: clone_log_metadata(ctx),
+                        metadata: clone_log_metadata(&ctx),
                         ..TransactionSummary::default()
                     };
                     crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
@@ -9539,7 +9617,7 @@ async fn handle_proxy_request_inner(
                 if !plugins.is_empty() {
                     {
                         let proxy_ref = ctx.matched_proxy.as_ref();
-                        let mut metadata = clone_log_metadata(ctx);
+                        let mut metadata = clone_log_metadata(&ctx);
                         metadata.insert(
                             "rejection_phase".to_string(),
                             "grpc_backend_error".to_string(),
@@ -10110,7 +10188,7 @@ async fn handle_proxy_request_inner(
                 error_class: backend_error_class,
                 bytes_sent,
                 bytes_received: bytes_received_buffered,
-                metadata: clone_log_metadata(ctx),
+                metadata: clone_log_metadata(&ctx),
                 ..TransactionSummary::default()
             };
 
@@ -10607,15 +10685,67 @@ pub(crate) fn resolve_effective_proxy_for_target<'a>(
     let Some(override_config) = overrides.get(&target.port) else {
         return std::borrow::Cow::Borrowed(proxy);
     };
-    let Some(override_ms) = override_config.connect_timeout_ms else {
-        return std::borrow::Cow::Borrowed(proxy);
-    };
-    if override_ms == proxy.backend_connect_timeout_ms {
+
+    // Compare each candidate override against the proxy's current value and
+    // build an owned clone only when at least one field actually differs.
+    // The HTTP-family additions (T1-C) reuse the existing
+    // `connect_timeout_ms` fast path so the common "no override" and "override
+    // matches current value" branches still return a borrowed proxy without
+    // allocating.
+
+    let connect_override = override_config
+        .connect_timeout_ms
+        .filter(|&v| v != proxy.backend_connect_timeout_ms);
+
+    // `pool_http2_max_concurrent_streams` lives on the proxy as
+    // `Option<u32>`; project the per-port value when it differs from what
+    // the proxy already carries (treating `None` as "no proxy default").
+    let h2_streams_override = override_config
+        .h2_max_concurrent_streams
+        .filter(|new| Some(*new) != proxy.pool_http2_max_concurrent_streams);
+
+    // Per-port HTTP idle timeout is exposed as milliseconds on the override
+    // and as whole seconds on the proxy (`pool_idle_timeout_seconds`). The
+    // translator already rejects sub-second durations, so the conversion is
+    // lossless here.
+    let idle_seconds_override = override_config.http_idle_timeout_ms.and_then(|ms| {
+        let secs = ms / 1000;
+        (Some(secs) != proxy.pool_idle_timeout_seconds).then_some(secs)
+    });
+
+    // Per-port `maxRequestsPerConnection` is wire-projected end-to-end onto
+    // `Proxy.pool_max_requests_per_connection`. Hyper does not yet expose a
+    // close-after-N-requests builder knob, so the runtime effect remains
+    // pending (same status as the proxy-level field's existing docstring) —
+    // wiring the per-port projection here means the field will light up the
+    // moment a request-count wrapper is introduced. The proxy field is
+    // `Option<u64>`; widen the `u32` override to match the schema.
+    let max_reqs_override = override_config
+        .http_max_requests_per_connection
+        .map(u64::from)
+        .filter(|new| Some(*new) != proxy.pool_max_requests_per_connection);
+
+    if connect_override.is_none()
+        && h2_streams_override.is_none()
+        && idle_seconds_override.is_none()
+        && max_reqs_override.is_none()
+    {
         return std::borrow::Cow::Borrowed(proxy);
     }
 
     let mut owned = proxy.clone();
-    owned.backend_connect_timeout_ms = override_ms;
+    if let Some(ms) = connect_override {
+        owned.backend_connect_timeout_ms = ms;
+    }
+    if let Some(streams) = h2_streams_override {
+        owned.pool_http2_max_concurrent_streams = Some(streams);
+    }
+    if let Some(secs) = idle_seconds_override {
+        owned.pool_idle_timeout_seconds = Some(secs);
+    }
+    if let Some(n) = max_reqs_override {
+        owned.pool_max_requests_per_connection = Some(n);
+    }
     std::borrow::Cow::Owned(owned)
 }
 
@@ -14189,6 +14319,16 @@ async fn proxy_to_backend_http3_retry(
     }
 }
 
+fn canonicalize_client_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
+    match ip {
+        std::net::IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(std::net::IpAddr::V4)
+            .unwrap_or(std::net::IpAddr::V6(v6)),
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -17176,6 +17316,120 @@ mod tests {
         assert_eq!(effective.backend_connect_timeout_ms, 5000);
     }
 
+    // ── T1-C: HTTP connection-pool projection onto effective proxy ───────
+
+    /// Helper: clone the standard test proxy and add a per-port override
+    /// carrying the three new HTTP fields plus the existing connect timeout
+    /// so each test can dial in only the field it cares about.
+    fn proxy_with_http_overrides_for_test(
+        connect_ms: u64,
+        h2_streams: Option<u32>,
+        http_idle_ms: Option<u64>,
+        max_reqs: Option<u32>,
+    ) -> Proxy {
+        let mut proxy = proxy_with_port_overrides_for_test(connect_ms, &[]);
+        proxy.dispatch_port_overrides = Some(HashMap::from([(
+            8080u16,
+            crate::config::types::ResolvedPortOverride {
+                connect_timeout_ms: Some(connect_ms),
+                h2_max_concurrent_streams: h2_streams,
+                http_idle_timeout_ms: http_idle_ms,
+                http_max_requests_per_connection: max_reqs,
+                ..Default::default()
+            },
+        )]));
+        proxy
+    }
+
+    #[test]
+    fn resolve_effective_proxy_projects_h2_max_concurrent_streams_per_port() {
+        let proxy = proxy_with_http_overrides_for_test(5000, Some(250), None, None);
+        let target = target_for_test(8080);
+        let effective = resolve_effective_proxy_for_target(&proxy, Some(&target));
+        assert!(
+            matches!(effective, std::borrow::Cow::Owned(_)),
+            "differing h2 cap must take the owned-clone branch"
+        );
+        assert_eq!(effective.pool_http2_max_concurrent_streams, Some(250));
+        assert!(
+            proxy.pool_http2_max_concurrent_streams.is_none(),
+            "original proxy is untouched"
+        );
+    }
+
+    #[test]
+    fn resolve_effective_proxy_projects_http_idle_timeout_in_seconds() {
+        // Per-port idle_timeout_ms is whole-second-granular (translator
+        // rejects sub-second). Conversion to `Option<u64>` seconds on the
+        // proxy schema is lossless.
+        let proxy = proxy_with_http_overrides_for_test(5000, None, Some(120_000), None);
+        let target = target_for_test(8080);
+        let effective = resolve_effective_proxy_for_target(&proxy, Some(&target));
+        assert!(matches!(effective, std::borrow::Cow::Owned(_)));
+        assert_eq!(effective.pool_idle_timeout_seconds, Some(120));
+    }
+
+    #[test]
+    fn resolve_effective_proxy_projects_max_requests_per_connection_as_u64() {
+        // Per-port wire field is `u32`; `Proxy.pool_max_requests_per_connection`
+        // is `Option<u64>` for schema compatibility. The widening conversion
+        // must round-trip without sign drift or truncation.
+        let proxy = proxy_with_http_overrides_for_test(5000, None, None, Some(40));
+        let target = target_for_test(8080);
+        let effective = resolve_effective_proxy_for_target(&proxy, Some(&target));
+        assert!(matches!(effective, std::borrow::Cow::Owned(_)));
+        assert_eq!(effective.pool_max_requests_per_connection, Some(40));
+    }
+
+    #[test]
+    fn resolve_effective_proxy_borrows_when_all_http_overrides_match_proxy() {
+        // Set the proxy's fields to the same values the override carries so
+        // every comparison is a no-op. The helper must avoid the clone.
+        let mut proxy =
+            proxy_with_http_overrides_for_test(5000, Some(250), Some(120_000), Some(40));
+        proxy.pool_http2_max_concurrent_streams = Some(250);
+        proxy.pool_idle_timeout_seconds = Some(120);
+        proxy.pool_max_requests_per_connection = Some(40);
+        let target = target_for_test(8080);
+        let effective = resolve_effective_proxy_for_target(&proxy, Some(&target));
+        assert!(
+            matches!(effective, std::borrow::Cow::Borrowed(_)),
+            "all-overrides-match path must avoid the owned clone"
+        );
+    }
+
+    #[test]
+    fn resolve_effective_proxy_combines_connect_timeout_and_http_overrides() {
+        // Mixed override: only `connect_timeout` and `h2_max_concurrent_streams`
+        // differ; the others match the proxy's existing values. The owned
+        // clone must carry both diffs without resetting unrelated proxy
+        // fields.
+        let mut proxy =
+            proxy_with_http_overrides_for_test(5000, Some(250), Some(120_000), Some(40));
+        proxy.backend_connect_timeout_ms = 5000; // override = 5000 too, no diff
+        proxy.pool_idle_timeout_seconds = Some(120); // matches override
+        proxy.pool_max_requests_per_connection = Some(40); // matches override
+        // h2 streams currently None → override Some(250) differs.
+        // Override `connect_timeout_ms` to a different value so it's a diff
+        // too: but we already set proxy=5000 and override=5000 above → matches.
+        // Adjust the override to 750 to force the connect-timeout diff path.
+        if let Some(overrides) = proxy.dispatch_port_overrides.as_mut()
+            && let Some(ovr) = overrides.get_mut(&8080)
+        {
+            ovr.connect_timeout_ms = Some(750);
+        }
+        let target = target_for_test(8080);
+        let effective = resolve_effective_proxy_for_target(&proxy, Some(&target));
+        let std::borrow::Cow::Owned(owned) = effective else {
+            panic!("mixed diff must take owned-clone branch");
+        };
+        assert_eq!(owned.backend_connect_timeout_ms, 750);
+        assert_eq!(owned.pool_http2_max_concurrent_streams, Some(250));
+        // Unchanged fields preserved from proxy:
+        assert_eq!(owned.pool_idle_timeout_seconds, Some(120));
+        assert_eq!(owned.pool_max_requests_per_connection, Some(40));
+    }
+
     #[test]
     fn resolve_backend_connection_proxy_rebases_selected_target_host_port() {
         let proxy = proxy_with_port_overrides_for_test(5000, &[]);
@@ -17315,13 +17569,35 @@ mod tests {
                 .is_none()
         );
     }
-}
-fn canonicalize_client_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
-    match ip {
-        std::net::IpAddr::V6(v6) => v6
-            .to_ipv4_mapped()
-            .map(std::net::IpAddr::V4)
-            .unwrap_or(std::net::IpAddr::V6(v6)),
-        other => other,
+
+    /// Plaintext-only `Static` listener (no TLS configured) must NOT require
+    /// TLS, so the accept loop can correctly route to the plaintext handler.
+    #[test]
+    fn listener_tls_source_static_plaintext_does_not_require_tls() {
+        let source = ListenerTlsSource::Static {
+            tls_config: None,
+            record_mesh_mtls_metric: false,
+        };
+        assert!(
+            !source.requires_tls(),
+            "Static listener with no TLS configured is the legitimate plaintext path"
+        );
+    }
+
+    /// `Dynamic` is only constructed for TLS-terminating HTTPS listeners and
+    /// must fail closed when its slot is empty. `MeshInbound` uses the same
+    /// slot shape for PeerAuthentication live reload, where `None` is a valid
+    /// plaintext state for DISABLE/permissive-without-materials.
+    #[test]
+    fn listener_tls_source_dynamic_requires_tls_but_mesh_inbound_allows_plaintext() {
+        let slot = crate::tls::empty_frontend_tls_slot();
+        let dynamic = ListenerTlsSource::Dynamic {
+            slot,
+            record_mesh_mtls_metric: false,
+        };
+        assert!(dynamic.requires_tls());
+
+        let mesh = ListenerTlsSource::MeshInbound;
+        assert!(!mesh.requires_tls());
     }
 }

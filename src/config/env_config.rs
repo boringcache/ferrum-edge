@@ -386,6 +386,26 @@ pub struct EnvConfig {
     pub proxy_https_port: u16,
     pub frontend_tls_cert_path: Option<String>,
     pub frontend_tls_key_path: Option<String>,
+    /// Opt in to live reload of frontend TLS cert/key files for the proxy
+    /// HTTPS / H2 / H3 listeners, the admin HTTPS listener, and (in mesh
+    /// mode) the mesh inbound TLS listener. When `false` (the default)
+    /// cert/key paths are read once at startup and require a restart to
+    /// rotate. When `true`, a background watcher polls the configured paths
+    /// every [`frontend_tls_watch_interval_seconds`] seconds and atomically
+    /// swaps a rebuilt `rustls::ServerConfig` into the listener's
+    /// `ArcSwap`-backed slot on a validated change. A rebuild that fails
+    /// validation (parse / expired / not-yet-valid / key mismatch) keeps
+    /// the previous config and emits a `warn!` — the gateway never serves a
+    /// known-bad config. In-flight TLS sessions keep their original
+    /// `ServerConfig`; only new handshakes pick up the new config.
+    /// Operator-supplied per-proxy backend TLS paths and the DTLS frontend
+    /// stay static under this knob.
+    pub frontend_tls_live_reload_enabled: bool,
+    /// Poll interval in seconds for the frontend TLS file watcher when
+    /// [`frontend_tls_live_reload_enabled`] is `true`. Defaults to `30`.
+    /// Ignored when live reload is disabled. Clamped to a 1-second minimum
+    /// so an accidental `0` does not busy-loop the filesystem.
+    pub frontend_tls_watch_interval_seconds: u64,
     /// Bind address for proxy listeners (HTTP, HTTPS, HTTP/3).
     /// Default: "0.0.0.0" (IPv4 only). Set to "::" for dual-stack IPv4+IPv6.
     /// On most operating systems, binding to "::" accepts both IPv4 and IPv6
@@ -541,6 +561,23 @@ pub struct EnvConfig {
     /// Higher values trade memory for fewer full-snapshot recoveries under
     /// high config churn. Default: 128.
     pub cp_broadcast_channel_capacity: usize,
+    /// CP namespace scope. Accepts:
+    /// - empty / unset — back-compat: CP serves only `FERRUM_NAMESPACE`.
+    /// - `"*"` — CP serves every namespace present in the database (multi-tenant).
+    /// - CSV (e.g. `"ns-a,ns-b"`) — CP serves only the listed namespaces.
+    ///
+    /// Per-namespace broadcast partitioning ensures a DP subscribing to one
+    /// namespace never receives another namespace's config delta.
+    /// Only meaningful in CP mode. Defaults to the empty list (back-compat).
+    pub cp_namespaces: Vec<String>,
+    /// When `true`, the CP requires every DP/mesh JWT to carry an `ns` claim
+    /// (single string or list of strings). The CP rejects subscriptions whose
+    /// requested namespace is not in the claim. When `false` (default), DPs
+    /// with no claim fall back to the legacy CP-scope check, so existing
+    /// deployments keep working unchanged. Multi-tenant CPs should set this
+    /// to `true` so a compromised DP for tenant A cannot subscribe to tenant
+    /// B by changing only its `FERRUM_NAMESPACE` value.
+    pub cp_require_namespace_claim: bool,
     /// Mount Envoy ADS (`AggregatedDiscoveryService`) on the CP gRPC listener.
     /// Default false so existing CP/DP deployments expose only ConfigSync.
     pub xds_enabled: bool,
@@ -645,6 +682,20 @@ pub struct EnvConfig {
     /// HBONE redirect/listener port included in the node-agent capture
     /// contract and BPF config map. Default: 15008.
     pub node_agent_hbone_redirect_port: u16,
+    /// Opt in to the node-agent CNI plugin lifecycle hook. When `true`, the
+    /// node-agent listens on `FERRUM_NODE_AGENT_CNI_SOCKET_PATH` for ADD /
+    /// DEL / CHECK calls forwarded by the `ferrum-cni` binary that the
+    /// Helm install drops into `/opt/cni/bin/`. Default `false` so existing
+    /// operators with a working install do not change behavior on upgrade;
+    /// the kube-rs pod watcher remains the source of truth for enrollment
+    /// regardless of this flag — CNI is an optimization, not a hard
+    /// dependency.
+    pub node_agent_cni_enabled: bool,
+    /// Path the node-agent listens on for the CNI plugin RPC. Default
+    /// `/var/run/ferrum/node-agent-cni.sock` — a sibling of the existing
+    /// `DEFAULT_NODE_AGENT_SOCKET_PATH` so the two surfaces don't collide.
+    /// Only consulted when `node_agent_cni_enabled` is `true`.
+    pub node_agent_cni_socket_path: String,
 
     // Kubernetes CRD controller (Layer 8)
     /// Enable the Kubernetes CRD controller in CP mode. When true, the CP
@@ -1374,6 +1425,8 @@ impl Default for EnvConfig {
             proxy_https_port: 8443,
             frontend_tls_cert_path: None,
             frontend_tls_key_path: None,
+            frontend_tls_live_reload_enabled: false,
+            frontend_tls_watch_interval_seconds: 30,
             proxy_bind_address: "0.0.0.0".into(),
             admin_http_port: 9000,
             admin_https_port: 9443,
@@ -1418,6 +1471,8 @@ impl Default for EnvConfig {
             cp_grpc_tls_key_path: None,
             cp_grpc_tls_client_ca_path: None,
             cp_broadcast_channel_capacity: 128,
+            cp_namespaces: Vec::new(),
+            cp_require_namespace_claim: false,
             xds_enabled: false,
             xds_stream_channel_capacity: 32,
             mesh_ca_backend: "none".to_string(),
@@ -1441,6 +1496,8 @@ impl Default for EnvConfig {
             node_agent_proxy_mode: NodeAgentProxyMode::LocalPod,
             node_agent_admin_enabled: false,
             node_agent_hbone_redirect_port: ferrum_ebpf_common::INBOUND_HBONE_PORT,
+            node_agent_cni_enabled: false,
+            node_agent_cni_socket_path: "/var/run/ferrum/node-agent-cni.sock".to_string(),
             k8s_controller_enabled: false,
             k8s_pod_discovery_enabled: false,
             k8s_node_locality_enabled: false,
@@ -1650,6 +1707,8 @@ impl EnvConfig {
             proxy_https_port: u16 = "FERRUM_PROXY_HTTPS_PORT" => 8443u16;
             frontend_tls_cert_path: Option<String> = "FERRUM_FRONTEND_TLS_CERT_PATH";
             frontend_tls_key_path: Option<String> = "FERRUM_FRONTEND_TLS_KEY_PATH";
+            frontend_tls_live_reload_enabled: bool = "FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED" => false;
+            frontend_tls_watch_interval_seconds: u64 = "FERRUM_FRONTEND_TLS_WATCH_INTERVAL_SECONDS" => 30u64, clamp(1u64, 3600u64);
             proxy_bind_address: String = "FERRUM_PROXY_BIND_ADDRESS" => "0.0.0.0".to_string();
         }
 
@@ -1733,6 +1792,8 @@ impl EnvConfig {
             cp_grpc_tls_key_path: Option<String> = "FERRUM_CP_GRPC_TLS_KEY_PATH";
             cp_grpc_tls_client_ca_path: Option<String> = "FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH";
             cp_broadcast_channel_capacity: usize = "FERRUM_CP_BROADCAST_CHANNEL_CAPACITY" => 128usize;
+            cp_namespaces: Vec<String> = "FERRUM_CP_NAMESPACES" => Vec::new();
+            cp_require_namespace_claim: bool = "FERRUM_CP_REQUIRE_NAMESPACE_CLAIM" => false;
             xds_enabled: bool = "FERRUM_XDS_ENABLED" => false;
             xds_stream_channel_capacity: usize = "FERRUM_XDS_STREAM_CHANNEL_CAPACITY" => 32usize;
             mesh_ca_backend: String = "FERRUM_MESH_CA_BACKEND" => "none".to_string();
@@ -1756,6 +1817,8 @@ impl EnvConfig {
             node_agent_proxy_mode: NodeAgentProxyMode = "FERRUM_NODE_AGENT_PROXY_MODE" => NodeAgentProxyMode::LocalPod;
             node_agent_admin_enabled: bool = "FERRUM_NODE_AGENT_ADMIN_ENABLED" => false;
             node_agent_hbone_redirect_port: u16 = "FERRUM_NODE_AGENT_HBONE_REDIRECT_PORT" => ferrum_ebpf_common::INBOUND_HBONE_PORT;
+            node_agent_cni_enabled: bool = "FERRUM_NODE_AGENT_CNI_ENABLED" => false;
+            node_agent_cni_socket_path: String = "FERRUM_NODE_AGENT_CNI_SOCKET_PATH" => "/var/run/ferrum/node-agent-cni.sock".to_string();
             k8s_controller_enabled: bool = "FERRUM_K8S_CONTROLLER_ENABLED" => false;
             k8s_pod_discovery_enabled: bool = "FERRUM_K8S_POD_DISCOVERY_ENABLED" => false;
             k8s_node_locality_enabled: bool = "FERRUM_K8S_NODE_LOCALITY_ENABLED" => false;
@@ -2074,6 +2137,8 @@ impl EnvConfig {
             proxy_https_port,
             frontend_tls_cert_path,
             frontend_tls_key_path,
+            frontend_tls_live_reload_enabled,
+            frontend_tls_watch_interval_seconds,
             proxy_bind_address,
             admin_http_port,
             admin_https_port,
@@ -2118,6 +2183,8 @@ impl EnvConfig {
             cp_grpc_tls_key_path,
             cp_grpc_tls_client_ca_path,
             cp_broadcast_channel_capacity,
+            cp_namespaces,
+            cp_require_namespace_claim,
             xds_enabled,
             xds_stream_channel_capacity,
             mesh_ca_backend,
@@ -2141,6 +2208,8 @@ impl EnvConfig {
             node_agent_proxy_mode,
             node_agent_admin_enabled,
             node_agent_hbone_redirect_port,
+            node_agent_cni_enabled,
+            node_agent_cni_socket_path,
             k8s_controller_enabled,
             k8s_pod_discovery_enabled,
             k8s_node_locality_enabled,
@@ -2739,6 +2808,11 @@ impl EnvConfig {
                         .into(),
                 );
             }
+            if self.node_agent_cni_enabled && self.node_agent_cni_socket_path.trim().is_empty() {
+                return Err("FERRUM_NODE_AGENT_CNI_SOCKET_PATH must not be empty when \
+                     FERRUM_NODE_AGENT_CNI_ENABLED is true"
+                    .into());
+            }
         }
 
         self.validate_db_tls_config()?;
@@ -2748,6 +2822,36 @@ impl EnvConfig {
             .map_err(|e| format!("Invalid FERRUM_NAMESPACE: {}", e))?;
         validate_k8s_namespace(&self.k8s_istio_root_namespace)
             .map_err(|e| format!("Invalid FERRUM_K8S_ISTIO_ROOT_NAMESPACE: {}", e))?;
+
+        // Validate FERRUM_CP_NAMESPACES entries. Special token `"*"` means
+        // "all namespaces" — any other value must be a valid namespace label.
+        // Whitespace-only entries are rejected so a typo like `"ns-a, "` is
+        // caught early rather than producing an unreachable subscriber.
+        for raw in &self.cp_namespaces {
+            let entry = raw.trim();
+            if entry.is_empty() {
+                return Err(
+                    "FERRUM_CP_NAMESPACES contains an empty / whitespace-only entry; \
+                     use `*` for cluster-wide or remove the extra comma"
+                        .to_string(),
+                );
+            }
+            if entry == "*" {
+                continue;
+            }
+            crate::config::types::validate_namespace(entry)
+                .map_err(|e| format!("Invalid FERRUM_CP_NAMESPACES entry '{}': {}", entry, e))?;
+        }
+        // `*` must stand alone. A mixed set like `"*,prod"` is ambiguous: it
+        // implies "everything plus an extra one" or "wildcard subset of one".
+        // Reject so operators choose a single semantics.
+        if self.cp_namespaces.iter().any(|raw| raw.trim() == "*") && self.cp_namespaces.len() > 1 {
+            return Err(
+                "FERRUM_CP_NAMESPACES: `*` (all namespaces) cannot be combined with \
+                 explicit namespace entries; use either `*` alone or a comma-separated list"
+                    .to_string(),
+            );
+        }
 
         // Validate TLS version settings
         match self.tls_min_version.as_str() {
@@ -3104,5 +3208,72 @@ mod tests {
         config
             .validate()
             .expect("db_pool_min == max should be valid");
+    }
+
+    // ── FERRUM_CP_NAMESPACES validation ────────────────────────────────────
+
+    #[test]
+    fn validate_accepts_empty_cp_namespaces() {
+        // Back-compat default: unset / empty means "single-namespace CP".
+        let mut config = file_mode_config();
+        config.cp_namespaces = Vec::new();
+        config
+            .validate()
+            .expect("empty cp_namespaces must be valid");
+    }
+
+    #[test]
+    fn validate_accepts_star_cp_namespaces() {
+        let mut config = file_mode_config();
+        config.cp_namespaces = vec!["*".to_string()];
+        config.validate().expect("`*` cp_namespaces must be valid");
+    }
+
+    #[test]
+    fn validate_accepts_csv_cp_namespaces() {
+        let mut config = file_mode_config();
+        config.cp_namespaces = vec!["prod".to_string(), "staging".to_string()];
+        config.validate().expect("CSV cp_namespaces must be valid");
+    }
+
+    #[test]
+    fn validate_rejects_empty_entry_in_cp_namespaces() {
+        let mut config = file_mode_config();
+        // Simulates `FERRUM_CP_NAMESPACES="ns-a, ,ns-c"`.
+        config.cp_namespaces = vec!["ns-a".to_string(), " ".to_string(), "ns-c".to_string()];
+        let err = config
+            .validate()
+            .expect_err("whitespace-only entry must be rejected");
+        assert!(
+            err.contains("empty"),
+            "error should mention empty entry, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_invalid_namespace_in_cp_namespaces() {
+        let mut config = file_mode_config();
+        config.cp_namespaces = vec!["Bad Namespace!".to_string()];
+        let err = config
+            .validate()
+            .expect_err("invalid namespace label must be rejected");
+        assert!(
+            err.contains("FERRUM_CP_NAMESPACES"),
+            "error should mention FERRUM_CP_NAMESPACES, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_star_combined_with_explicit_namespace() {
+        // `*` plus an explicit entry is ambiguous — reject.
+        let mut config = file_mode_config();
+        config.cp_namespaces = vec!["*".to_string(), "prod".to_string()];
+        let err = config
+            .validate()
+            .expect_err("`*` cannot be combined with explicit entries");
+        assert!(
+            err.contains("`*`"),
+            "error should explain the `*` constraint, got: {err}"
+        );
     }
 }

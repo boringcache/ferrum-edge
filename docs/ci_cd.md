@@ -224,7 +224,7 @@ Creates a GitHub Release with all binaries and checksums only after the versione
    - List of binary platforms
    - SHA256 checksums for verification
    - Download instructions
-3. Attachments: All platform-specific binaries
+3. Attachments: All platform-specific gateway binaries, plus Linux `ferrum-cni` binaries for manual CNI installs
 
 **Release Notes Example**:
 ````markdown
@@ -237,7 +237,9 @@ Pre-built binaries for all supported platforms:
 | Platform | Binary |
 |----------|--------|
 | Linux x86_64 | `ferrum-edge-linux-x86_64` |
+| Linux x86_64 CNI plugin | `ferrum-cni-linux-x86_64` |
 | Linux ARM64 | `ferrum-edge-linux-aarch64` |
+| Linux ARM64 CNI plugin | `ferrum-cni-linux-aarch64` |
 | macOS x86_64 | `ferrum-edge-macos-x86_64` |
 | macOS ARM64 (Apple Silicon) | `ferrum-edge-macos-aarch64` |
 | Windows x86_64 | `ferrum-edge-windows-x86_64.exe` |

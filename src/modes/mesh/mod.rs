@@ -1223,8 +1223,7 @@ fn apply_destination_rules(
             .iter()
             .enumerate()
             .filter_map(|(idx, upstream)| {
-                (upstream.namespace == dr.namespace && destination_rule_matches_upstream(dr, upstream))
-                    .then_some(idx)
+                destination_rule_matches_upstream(dr, upstream).then_some(idx)
             })
             .collect();
 
@@ -1278,6 +1277,25 @@ fn apply_destination_rules(
                     if let Some(ref keepalive) = tp.tcp_keepalive {
                         override_slot.tcp_keepalive = Some(keepalive.clone());
                     }
+                }
+            }
+
+            // Top-level `connectionPool.http.*` fans out to every port served
+            // by this upstream so a single DR `trafficPolicy.connectionPool`
+            // block applies uniformly across the upstream. Per-port
+            // `portLevelSettings.connectionPool.http` overrides per-port
+            // below. Service-discovery upstreams skip the fan-out because
+            // their target ports aren't known at apply time (the per-port loop
+            // below still applies if the operator explicitly listed
+            // `portLevelSettings`). Mirrors the T1-D fan-out for
+            // `connectionPool.tcp.{maxConnections,tcpKeepalive}`.
+            if let Some(ref tp) = dr.traffic_policy
+                && let Some(ref http) = tp.connection_pool_http
+                && !has_service_discovery
+            {
+                for port in &upstream_target_ports {
+                    let override_slot = upstream.port_overrides.entry(*port).or_default();
+                    apply_connection_pool_http_to_port_override(override_slot, http);
                 }
             }
 
@@ -1342,9 +1360,10 @@ fn apply_destination_rules(
 
             if let Some(timeout_ms) = connect_timeout_ms {
                 let upstream_id = upstream.id.clone();
+                let upstream_namespace = upstream.namespace.clone();
                 for proxy in &mut config.proxies {
                     if proxy.upstream_id.as_deref() == Some(upstream_id.as_str())
-                        && proxy.namespace == dr.namespace
+                        && proxy.namespace == upstream_namespace
                         && proxy.backend_connect_timeout_ms != timeout_ms
                     {
                         debug!(
@@ -1466,6 +1485,34 @@ fn apply_traffic_policy_to_port_override(
     }
     if let Some(ref keepalive) = policy.tcp_keepalive {
         slot.tcp_keepalive = Some(keepalive.clone());
+    }
+    // Per-port `connectionPool.http.*`. Per-port overrides win over any
+    // top-level fan-out applied earlier; an unset per-port field leaves the
+    // existing slot value (which may have come from the top-level fan-out) in
+    // place rather than clearing it, matching Istio's "per-port settings
+    // layer over top-level" semantics for connectionPool fields.
+    if let Some(ref http) = policy.connection_pool_http {
+        apply_connection_pool_http_to_port_override(slot, http);
+    }
+}
+
+/// Project an HTTP connection-pool overlay onto a per-port slot.
+///
+/// Each field is overlaid independently — `None` leaves the existing slot
+/// value untouched so a per-port partial overlay can layer over a top-level
+/// fan-out without clearing fields the operator did not respecify.
+fn apply_connection_pool_http_to_port_override(
+    slot: &mut UpstreamPortOverride,
+    http: &crate::modes::mesh::config::MeshConnectionPoolHttp,
+) {
+    if let Some(max) = http.max_requests_per_connection {
+        slot.http_max_requests_per_connection = Some(max);
+    }
+    if let Some(idle_ms) = http.idle_timeout_ms {
+        slot.http_idle_timeout_ms = Some(idle_ms);
+    }
+    if let Some(max_streams) = http.http2_max_requests {
+        slot.h2_max_concurrent_streams = Some(max_streams);
     }
 }
 
@@ -1834,8 +1881,21 @@ fn materialize_egress_gateway_proxies(
         return;
     }
 
-    let (proxies, upstreams) =
-        build_egress_proxies_and_upstreams(service_entries, &runtime.namespace);
+    // Stream-family egress proxies bind their own listen_port. Skip ports that
+    // collide with the egress gateway's own mTLS-termination listener
+    // (`egress_listen_addr`, default 15090). Without this guard a ServiceEntry
+    // for, say, `external.io:15090/TCP` would materialize a stream proxy on
+    // the same port the gateway is already binding for HTTP-family egress,
+    // causing the stream listener bind to fail at runtime (EADDRINUSE) with
+    // no actionable signal to the operator.
+    let mut mesh_reserved_ports = std::collections::HashSet::new();
+    mesh_reserved_ports.insert(runtime.egress_listen_addr.port());
+
+    let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+        service_entries,
+        &runtime.namespace,
+        &mesh_reserved_ports,
+    );
 
     if proxies.is_empty() {
         debug!("no external service entries produced egress proxies");
@@ -1881,13 +1941,38 @@ fn materialize_egress_gateway_proxies(
 /// qualifying entry, one upstream per port is created (keyed by host + port
 /// number). DNS-resolution entries use the ServiceEntry hosts as backend
 /// targets; static-resolution entries use the endpoint addresses.
+///
+/// HTTP-family ports (`http`, `http2`, `grpc`, `tls`) are materialized as
+/// host-routed HTTP-family proxies sharing the egress gateway listener
+/// (mTLS termination at `egress_listen_addr`, default 15090). Each host
+/// admits only one HTTP-family proxy across all ports (host-only routing
+/// can't safely disambiguate ports).
+///
+/// Stream-family ports (`tcp`, `mongo`, `redis`, `mysql`, `postgres`) are
+/// materialized as raw L4 stream proxies bound on the ServiceEntry's own
+/// port (e.g., `mongo.external.io:27017/TCP` produces a TCP listener on
+/// port 27017). Each `listen_port` admits at most one stream proxy; later
+/// SEs requesting the same port are skipped with a warning. The materialized
+/// stream proxy and the outbound capture flow share the destination port so
+/// sidecars dialing the external host are routed to the egress gateway
+/// without rewriting the destination port. ServiceEntry ports that collide
+/// with `mesh_reserved_ports` (the egress gateway's own listener port) are
+/// skipped with a warning instead of materializing — letting them through
+/// would fail at listener bind time with EADDRINUSE.
 fn build_egress_proxies_and_upstreams(
     service_entries: &[ServiceEntry],
     namespace: &str,
+    mesh_reserved_ports: &std::collections::HashSet<u16>,
 ) -> (Vec<Proxy>, Vec<Upstream>) {
     let mut proxies = Vec::new();
     let mut upstreams = Vec::new();
-    let mut materialized_hosts = std::collections::HashSet::new();
+    // HTTP-family materialization is host-keyed because the egress listener
+    // shares one port (15090) with host-based routing.
+    let mut materialized_http_hosts = std::collections::HashSet::new();
+    // Stream-family materialization is port-keyed because each stream proxy
+    // owns its own listen_port. Two SEs trying to bind the same port produce
+    // a non-fatal skip (the second one warns).
+    let mut materialized_stream_ports = std::collections::HashSet::new();
     let now = chrono::Utc::now();
 
     for entry in service_entries {
@@ -1905,94 +1990,257 @@ fn build_egress_proxies_and_upstreams(
 
         for port_spec in &entry.ports {
             let Some(backend_scheme) = egress_backend_scheme(port_spec.protocol) else {
+                // Defensive: every AppProtocol variant maps to a concrete
+                // scheme today (HTTP-family or stream-family). Future
+                // protocol additions that haven't been classified land
+                // here and get skipped with a warning instead of panicking.
                 warn!(
                     service_entry = %entry.name,
                     namespace = %entry.namespace,
                     port = port_spec.port,
                     protocol = ?port_spec.protocol,
-                    "Skipping non-HTTP ServiceEntry port for egress gateway materialization"
+                    "Skipping ServiceEntry port for egress gateway: unknown protocol classification"
                 );
                 continue;
             };
 
-            let proxy_hosts: Vec<&String> = entry
-                .hosts
-                .iter()
-                .filter(|host| !materialized_hosts.contains(*host))
-                .collect();
-            if proxy_hosts.is_empty() {
-                warn!(
-                    service_entry = %entry.name,
-                    namespace = %entry.namespace,
-                    port = port_spec.port,
-                    "Skipping egress ServiceEntry port because its hosts were already materialized"
-                );
-                continue;
-            }
-
-            // One proxy per host per port.
-            for host in proxy_hosts {
-                let targets =
-                    build_egress_upstream_targets(entry, host, port_spec.port, &port_spec.name);
-
-                if targets.is_empty() {
-                    debug!(
-                        service_entry = %entry.name,
-                        host = %host,
-                        port = port_spec.port,
-                        "Skipping egress host with no resolvable targets"
-                    );
-                    continue;
-                }
-
-                materialized_hosts.insert(host.clone());
-
-                let upstream_id =
-                    mesh_egress_upstream_id(&entry.namespace, &entry.name, host, port_spec.port);
-
-                let upstream = Upstream {
-                    id: upstream_id.clone(),
-                    name: Some(upstream_id.clone()),
-                    namespace: namespace.to_string(),
-                    targets,
-                    algorithm: LoadBalancerAlgorithm::RoundRobin,
-                    hash_on: None,
-                    hash_on_cookie_config: None,
-                    health_checks: egress_health_checks(),
-                    service_discovery: None,
-                    subsets: None,
-                    port_overrides: HashMap::new(),
-                    source_locality: None,
-                    locality_lb_setting: None,
-                    backend_tls_client_cert_path: None,
-                    backend_tls_client_key_path: None,
-                    backend_tls_verify_server_cert: true,
-                    backend_tls_server_ca_cert_path: None,
-                    backend_tls_sni: None,
-                    backend_tls_san_allow_list: Vec::new(),
-                    resolved_subset_tls: HashMap::new(),
-                    api_spec_id: None,
-                    created_at: now,
-                    updated_at: now,
-                };
-                upstreams.push(upstream);
-
-                let proxy_id =
-                    mesh_egress_proxy_id(&entry.namespace, &entry.name, host, port_spec.port);
-                let proxy = egress_gateway_proxy(
-                    &proxy_id,
-                    host,
+            if egress_is_stream_protocol(port_spec.protocol) {
+                build_stream_egress_for_entry(
+                    entry,
+                    port_spec,
+                    backend_scheme,
                     namespace,
-                    Some(backend_scheme),
-                    &upstream_id,
                     now,
+                    mesh_reserved_ports,
+                    &mut materialized_stream_ports,
+                    &mut proxies,
+                    &mut upstreams,
                 );
-                proxies.push(proxy);
+            } else {
+                build_http_egress_for_entry(
+                    entry,
+                    port_spec,
+                    backend_scheme,
+                    namespace,
+                    now,
+                    &mut materialized_http_hosts,
+                    &mut proxies,
+                    &mut upstreams,
+                );
             }
         }
     }
 
     (proxies, upstreams)
+}
+
+/// HTTP-family egress materialization branch. One proxy per host, host-routed
+/// off the shared egress listener (15090). Each host admits only the first
+/// port we see for it — host-only routing can't disambiguate ports.
+#[allow(clippy::too_many_arguments)]
+fn build_http_egress_for_entry(
+    entry: &ServiceEntry,
+    port_spec: &crate::modes::mesh::config::ServicePort,
+    backend_scheme: BackendScheme,
+    namespace: &str,
+    now: chrono::DateTime<chrono::Utc>,
+    materialized_http_hosts: &mut std::collections::HashSet<String>,
+    proxies: &mut Vec<Proxy>,
+    upstreams: &mut Vec<Upstream>,
+) {
+    let proxy_hosts: Vec<&String> = entry
+        .hosts
+        .iter()
+        .filter(|host| !materialized_http_hosts.contains(*host))
+        .collect();
+    if proxy_hosts.is_empty() {
+        warn!(
+            service_entry = %entry.name,
+            namespace = %entry.namespace,
+            port = port_spec.port,
+            "Skipping egress ServiceEntry port because its hosts were already materialized as HTTP-family"
+        );
+        return;
+    }
+
+    for host in proxy_hosts {
+        let targets = build_egress_upstream_targets(entry, host, port_spec.port, &port_spec.name);
+
+        if targets.is_empty() {
+            debug!(
+                service_entry = %entry.name,
+                host = %host,
+                port = port_spec.port,
+                "Skipping egress host with no resolvable targets"
+            );
+            continue;
+        }
+
+        materialized_http_hosts.insert(host.clone());
+
+        let upstream_id =
+            mesh_egress_upstream_id(&entry.namespace, &entry.name, host, port_spec.port);
+
+        upstreams.push(build_egress_upstream(&upstream_id, namespace, targets, now));
+
+        let proxy_id = mesh_egress_proxy_id(&entry.namespace, &entry.name, host, port_spec.port);
+        let proxy = egress_gateway_proxy(
+            &proxy_id,
+            host,
+            namespace,
+            Some(backend_scheme),
+            &upstream_id,
+            now,
+        );
+        proxies.push(proxy);
+    }
+}
+
+/// Stream-family (TCP / UDP) egress materialization branch. One stream proxy
+/// per ServiceEntry port, listening on the entry's own port number so that
+/// sidecar outbound capture routes traffic to the same destination port the
+/// workload was already dialing. The proxy chooses the first host in the
+/// entry's `hosts` list as the upstream target identity (DNS resolution
+/// flow) or every endpoint address (static resolution flow). Additional
+/// hosts on the same entry / port are ignored — a raw L4 listener cannot
+/// distinguish hosts (no SNI for plain TCP/UDP), so operators should split
+/// multi-host external services into one ServiceEntry per host.
+#[allow(clippy::too_many_arguments)]
+fn build_stream_egress_for_entry(
+    entry: &ServiceEntry,
+    port_spec: &crate::modes::mesh::config::ServicePort,
+    backend_scheme: BackendScheme,
+    namespace: &str,
+    now: chrono::DateTime<chrono::Utc>,
+    mesh_reserved_ports: &std::collections::HashSet<u16>,
+    materialized_stream_ports: &mut std::collections::HashSet<u16>,
+    proxies: &mut Vec<Proxy>,
+    upstreams: &mut Vec<Upstream>,
+) {
+    if port_spec.port == 0 {
+        warn!(
+            service_entry = %entry.name,
+            namespace = %entry.namespace,
+            protocol = ?port_spec.protocol,
+            "Skipping stream egress ServiceEntry port 0: stream proxy listen_port must be >= 1"
+        );
+        return;
+    }
+
+    if mesh_reserved_ports.contains(&port_spec.port) {
+        warn!(
+            service_entry = %entry.name,
+            namespace = %entry.namespace,
+            port = port_spec.port,
+            protocol = ?port_spec.protocol,
+            "Skipping stream egress ServiceEntry port: collides with a mesh gateway listener port \
+             (would fail to bind at runtime). Operators should choose a different ServiceEntry \
+             port or relocate the egress gateway listener."
+        );
+        return;
+    }
+
+    if materialized_stream_ports.contains(&port_spec.port) {
+        warn!(
+            service_entry = %entry.name,
+            namespace = %entry.namespace,
+            port = port_spec.port,
+            protocol = ?port_spec.protocol,
+            "Skipping stream egress ServiceEntry port: another ServiceEntry already \
+             materialized a stream proxy on this listen_port"
+        );
+        return;
+    }
+
+    // Stream-family proxies route by port, not by host, so we materialize at
+    // most one proxy per (entry, port) — using the first host as the upstream
+    // target identity (DNS) or all endpoints (Static). Multi-host stream
+    // entries are not splittable at the L4 listener boundary.
+    let representative_host = match entry.hosts.first() {
+        Some(host) => host,
+        None => {
+            // Guarded above by `entry.hosts.is_empty()`; defensive only.
+            return;
+        }
+    };
+
+    let targets =
+        build_egress_upstream_targets(entry, representative_host, port_spec.port, &port_spec.name);
+
+    if targets.is_empty() {
+        debug!(
+            service_entry = %entry.name,
+            host = %representative_host,
+            port = port_spec.port,
+            protocol = ?port_spec.protocol,
+            "Skipping stream egress port with no resolvable targets"
+        );
+        return;
+    }
+
+    materialized_stream_ports.insert(port_spec.port);
+
+    let upstream_id = mesh_egress_upstream_id(
+        &entry.namespace,
+        &entry.name,
+        representative_host,
+        port_spec.port,
+    );
+    upstreams.push(build_egress_upstream(&upstream_id, namespace, targets, now));
+
+    let proxy_id = mesh_egress_proxy_id(
+        &entry.namespace,
+        &entry.name,
+        representative_host,
+        port_spec.port,
+    );
+    let proxy = stream_egress_gateway_proxy(
+        &proxy_id,
+        representative_host,
+        namespace,
+        backend_scheme,
+        port_spec.port,
+        port_spec.protocol,
+        &upstream_id,
+        now,
+    );
+    proxies.push(proxy);
+}
+
+/// Shared upstream constructor used by both HTTP- and stream-family egress
+/// materialization. Keeps the proxy/upstream pair fields in sync — any new
+/// upstream field added here flows to both materialization paths.
+fn build_egress_upstream(
+    upstream_id: &str,
+    namespace: &str,
+    targets: Vec<UpstreamTarget>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Upstream {
+    Upstream {
+        id: upstream_id.to_string(),
+        name: Some(upstream_id.to_string()),
+        namespace: namespace.to_string(),
+        targets,
+        algorithm: LoadBalancerAlgorithm::RoundRobin,
+        hash_on: None,
+        hash_on_cookie_config: None,
+        health_checks: egress_health_checks(),
+        service_discovery: None,
+        subsets: None,
+        port_overrides: HashMap::new(),
+        source_locality: None,
+        locality_lb_setting: None,
+        backend_tls_client_cert_path: None,
+        backend_tls_client_key_path: None,
+        backend_tls_verify_server_cert: true,
+        backend_tls_server_ca_cert_path: None,
+        backend_tls_sni: None,
+        backend_tls_san_allow_list: Vec::new(),
+        resolved_subset_tls: HashMap::new(),
+        api_spec_id: None,
+        created_at: now,
+        updated_at: now,
+    }
 }
 
 fn egress_health_checks() -> Option<HealthCheckConfig> {
@@ -2049,6 +2297,15 @@ fn build_egress_upstream_targets(
 }
 
 /// Determine the backend scheme from the ServiceEntry port protocol.
+///
+/// HTTP-family protocols (`Http`, `Https/Tls`, `Http2`, `Grpc`, `Unknown`) map
+/// to `Http` / `Https` so the egress gateway terminates inbound mTLS and
+/// re-emits HTTP-family traffic to the external backend. Stream-family
+/// protocols (`Tcp`, `Mongo`, `Redis`, `Mysql`, `Postgres`) map to
+/// `BackendScheme::Tcp` and are materialized as raw L4 stream proxies via
+/// [`build_stream_egress_for_entry`]; protocol-aware mediation
+/// (e.g., Mongo / Redis wire decode) is intentionally out of scope and tracked
+/// separately as T5-C.
 fn egress_backend_scheme(protocol: AppProtocol) -> Option<BackendScheme> {
     match protocol {
         AppProtocol::Tls | AppProtocol::Http2 | AppProtocol::Grpc => Some(BackendScheme::Https),
@@ -2057,7 +2314,42 @@ fn egress_backend_scheme(protocol: AppProtocol) -> Option<BackendScheme> {
         | AppProtocol::Mongo
         | AppProtocol::Redis
         | AppProtocol::Mysql
-        | AppProtocol::Postgres => None,
+        | AppProtocol::Postgres => Some(BackendScheme::Tcp),
+    }
+}
+
+/// True when the ServiceEntry protocol should materialize a stream-family
+/// (TCP / UDP) egress proxy rather than an HTTP-family one. Stream proxies
+/// route on `listen_port` rather than `hosts`, so the materializer uses a
+/// distinct port-dedup path and binds one listener per ServiceEntry port.
+fn egress_is_stream_protocol(protocol: AppProtocol) -> bool {
+    matches!(
+        protocol,
+        AppProtocol::Tcp
+            | AppProtocol::Mongo
+            | AppProtocol::Redis
+            | AppProtocol::Mysql
+            | AppProtocol::Postgres
+    )
+}
+
+/// Pre-interned protocol label used in `Proxy.name` (and consumed by
+/// transaction logs / metrics) so the stream egress materialization stays
+/// allocation-free per call. The same `&'static str` convention is used
+/// by mesh outbound enforcement (T5-B sibling PR) so observability stays
+/// consistent across HTTP / stream egress.
+fn egress_app_protocol_label(protocol: AppProtocol) -> &'static str {
+    match protocol {
+        AppProtocol::Http => "http",
+        AppProtocol::Http2 => "http2",
+        AppProtocol::Grpc => "grpc",
+        AppProtocol::Tls => "tls",
+        AppProtocol::Tcp => "tcp",
+        AppProtocol::Mongo => "mongo",
+        AppProtocol::Redis => "redis",
+        AppProtocol::Mysql => "mysql",
+        AppProtocol::Postgres => "postgres",
+        AppProtocol::Unknown => "unknown",
     }
 }
 
@@ -2118,6 +2410,106 @@ fn egress_gateway_proxy(
         retry: None,
         response_body_mode: ResponseBodyMode::Stream,
         listen_port: None,
+        frontend_tls: false,
+        passthrough: false,
+        udp_idle_timeout_seconds: 60,
+        udp_max_response_amplification_factor: None,
+        tcp_idle_timeout_seconds: None,
+        allowed_methods: None,
+        allowed_ws_origins: Vec::new(),
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+/// Construct a stream-family (TCP / UDP / TCP+TLS / UDP+DTLS) egress gateway
+/// proxy. Unlike `egress_gateway_proxy` (HTTP-family, host-routed off the
+/// shared 15090 listener), the stream variant routes by `listen_port`, owns
+/// its own listener bound to the ServiceEntry's destination port, and has
+/// `hosts: []` / `listen_path: None` per the stream-family proxy contract
+/// (CLAUDE.md "Proxy hosts/listen_path/listen_port contract").
+///
+/// The protocol tag is stamped onto `Proxy.name` for observability (transaction
+/// logs surface the proxy name); the wire-level dispatch is identical for all
+/// stream variants and uses `BackendScheme::Tcp` (TCP-based protocols) per
+/// `egress_backend_scheme`. Protocol-aware mediation (Mongo / Redis wire
+/// inspection) is tracked separately as T5-C.
+#[allow(clippy::too_many_arguments)]
+fn stream_egress_gateway_proxy(
+    id: &str,
+    representative_host: &str,
+    namespace: &str,
+    backend_scheme: BackendScheme,
+    listen_port: u16,
+    protocol: AppProtocol,
+    upstream_id: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Proxy {
+    let protocol_label = egress_app_protocol_label(protocol);
+    Proxy {
+        id: id.to_string(),
+        name: Some(format!(
+            "mesh egress {protocol_label} {representative_host}:{listen_port}"
+        )),
+        namespace: namespace.to_string(),
+        // Stream-family proxies MUST NOT set `hosts` (route key is
+        // `listen_port`). See `validate_stream_proxies()` in
+        // `src/config/types.rs`.
+        hosts: Vec::new(),
+        listen_path: None,
+        backend_scheme: Some(backend_scheme),
+        dispatch_kind: Default::default(),
+        backend_host: String::new(),
+        backend_port: 0,
+        backend_path: None,
+        strip_listen_path: false,
+        preserve_host_header: false,
+        backend_connect_timeout_ms: 30_000,
+        backend_read_timeout_ms: 30_000,
+        backend_write_timeout_ms: 30_000,
+        backend_tls_client_cert_path: None,
+        backend_tls_client_key_path: None,
+        backend_tls_verify_server_cert: true,
+        backend_tls_server_ca_cert_path: None,
+        resolved_tls: BackendTlsConfig::default(),
+        dispatch_port_overrides: None,
+        dns_override: None,
+        dns_cache_ttl_seconds: None,
+        auth_mode: Default::default(),
+        plugins: Vec::<PluginAssociation>::new(),
+        pool_idle_timeout_seconds: None,
+        pool_enable_http_keep_alive: None,
+        pool_enable_http2: None,
+        pool_tcp_keepalive_seconds: None,
+        pool_http2_keep_alive_interval_seconds: None,
+        pool_http2_keep_alive_timeout_seconds: None,
+        pool_http2_initial_stream_window_size: None,
+        pool_http2_initial_connection_window_size: None,
+        pool_http2_adaptive_window: None,
+        pool_http2_max_frame_size: None,
+        pool_http2_max_concurrent_streams: None,
+        pool_http3_connections_per_backend: None,
+        pool_max_requests_per_connection: None,
+        upstream_id: Some(upstream_id.to_string()),
+        upstream_subset: None,
+        api_spec_id: None,
+        circuit_breaker: None,
+        retry: None,
+        response_body_mode: ResponseBodyMode::Stream,
+        listen_port: Some(listen_port),
+        // Stream egress proxies own their own per-port plaintext listener
+        // (e.g., 27017 for Mongo) and forward to the external backend with
+        // `BackendScheme::Tcp`. They are NOT raw SNI passthrough (that's the
+        // east-west gateway flow) — passthrough is false so the bytes pass
+        // through the regular TCP proxy pipeline (idle timeouts, transaction
+        // logging, etc.) rather than `splice(2)` between sockets.
+        //
+        // `frontend_tls: false` reflects the per-port stream LISTENER being
+        // plain TCP. Sidecar traffic still routes to the egress gateway by
+        // way of the workload's outbound capture; the inbound mTLS sidecar
+        // boundary lives on the egress mTLS-termination listener (15090) for
+        // HTTP-family flows, which is a sibling listener — it is not the
+        // termination point for this per-port stream listener.
         frontend_tls: false,
         passthrough: false,
         udp_idle_timeout_seconds: 60,
@@ -3608,7 +4000,7 @@ fn plan_mesh_inbound_tls_reload(
     }
 }
 
-fn apply_mesh_inbound_tls_reload(
+async fn apply_mesh_inbound_tls_reload(
     proxy_state: &ProxyState,
     slice: &MeshSlice,
     mtls_mode: config::MtlsMode,
@@ -3621,7 +4013,73 @@ fn apply_mesh_inbound_tls_reload(
             snapshot,
             tls_config,
         } => {
-            proxy_state.mesh_inbound_tls.store(Arc::new(tls_config));
+            proxy_state
+                .mesh_inbound_tls
+                .store(Arc::new(tls_config.clone()));
+            // Extend the live carve-out to mesh-shared TCP+TLS stream
+            // listeners: swap the shared `rustls::ServerConfig` slot that
+            // every TCP+TLS accept loop snapshots per accept. Existing
+            // sessions keep the `ServerConfig` they handshake with until
+            // they end; new accepts use the swapped config on the next
+            // handshake. Skips when the slot is empty (PeerAuth resolved
+            // to `Disable`).
+            proxy_state
+                .stream_listener_manager
+                .swap_frontend_tls_config(tls_config);
+            // And the same for UDP+DTLS: rebuild a `FrontendDtlsConfig`
+            // from the current env-config inputs and have every active
+            // `DtlsServer` swap atomically. Existing DTLS sessions keep
+            // the crypto material they handshake with; new sessions pick
+            // up the swap on the next ClientHello.
+            //
+            // The DTLS rebuild reuses operator-supplied cert/key/client-CA
+            // paths because PeerAuth live reload, per the operating
+            // invariant, never rotates cert/key paths — those remain
+            // static restart-required inputs. What changes here is the
+            // *mode* (Permissive ↔ Strict) and whether the client CA bundle
+            // is required for mTLS verification.
+            //
+            // Skip the DTLS rebuild entirely on `Disable`: TCP+TLS goes to
+            // plaintext via the cleared slot above, but DTLS cannot speak
+            // plaintext (it is encryption by definition). On topologies
+            // where `Disable` is allowed (Sidecar / EastWestGateway), an
+            // operator with UDP+DTLS listeners is expected to remove
+            // them from the proxy config rather than rely on a PeerAuth
+            // flip; the existing DtlsServer keeps its startup material
+            // so in-flight sessions and any pre-existing handshake
+            // contract remain intact until the listener is reconciled
+            // away.
+            if mtls_mode != config::MtlsMode::Disable {
+                let env = &proxy_state.env_config;
+                let crls = proxy_state.crls.clone();
+                let dtls_cert_key = env
+                    .frontend_tls_cert_path
+                    .as_deref()
+                    .zip(env.frontend_tls_key_path.as_deref())
+                    .map(|(c, k)| (c.to_string(), k.to_string()));
+                let dtls_client_ca = env.frontend_tls_client_ca_bundle_path.clone();
+                if let Some((cert_path, key_path)) = dtls_cert_key {
+                    let swapped = proxy_state
+                        .stream_listener_manager
+                        .swap_active_dtls_frontend_configs(|| {
+                            crate::dtls::build_frontend_dtls_config(
+                                &cert_path,
+                                &key_path,
+                                dtls_client_ca.as_deref(),
+                                &crls,
+                            )
+                        })
+                        .await;
+                    if swapped > 0 {
+                        info!(
+                            mesh_slice_version = %slice.version,
+                            ?mtls_mode,
+                            dtls_listeners = swapped,
+                            "Mesh inbound PeerAuthentication DTLS configs reloaded"
+                        );
+                    }
+                }
+            }
             *last_snapshot = Some(snapshot);
             info!(
                 mesh_slice_version = %slice.version,
@@ -3754,7 +4212,8 @@ fn start_mesh_slice_apply_task(
                                         mtls_mode,
                                         plan,
                                         &mut inbound_tls_reload.last_snapshot,
-                                    );
+                                    )
+                                    .await;
                                 }
                                 if accepted && let Some(ref dns_proxy) = dns_proxy {
                                     dns_proxy.update_from_slice(slice);
@@ -4763,6 +5222,7 @@ mod tests {
     fn destination_rule_test_proxy(id: &str, upstream_id: &str) -> Proxy {
         serde_json::from_value(serde_json::json!({
             "id": id,
+            "namespace": "default",
             "hosts": [format!("{id}.example.com")],
             "backend_host": "",
             "backend_port": 0,
@@ -4825,40 +5285,48 @@ mod tests {
         let mut victim_proxy = destination_rule_test_proxy("p-victim", "u-victim");
         victim_proxy.namespace = "victim".to_string();
 
-        let mut config = GatewayConfig {
+        let config = GatewayConfig {
             proxies: vec![victim_proxy],
             upstreams: vec![victim_upstream],
+            mesh: Some(Box::new(MeshConfig {
+                destination_rules: vec![MeshDestinationRule {
+                    name: "reviews".to_string(),
+                    namespace: "attacker".to_string(),
+                    host: "reviews.victim.svc.cluster.local".to_string(),
+                    traffic_policy: Some(MeshTrafficPolicy {
+                        connect_timeout_ms: Some(1),
+                        load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::Random)),
+                        ..MeshTrafficPolicy::default()
+                    }),
+                    port_level_settings: HashMap::new(),
+                    subsets: vec![MeshSubset {
+                        name: "attacker-subset".to_string(),
+                        labels: HashMap::from([("version".to_string(), "v2".to_string())]),
+                        traffic_policy: None,
+                    }],
+                }],
+                ..MeshConfig::default()
+            })),
             ..GatewayConfig::default()
         };
-        let slice = MeshSlice {
-            destination_rules: vec![MeshDestinationRule {
-                name: "reviews".to_string(),
-                namespace: "attacker".to_string(),
-                host: "reviews.victim.svc.cluster.local".to_string(),
-                traffic_policy: Some(MeshTrafficPolicy {
-                    connect_timeout_ms: Some(1),
-                    load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::Random)),
-                    ..MeshTrafficPolicy::default()
-                }),
-                port_level_settings: HashMap::new(),
-                subsets: vec![MeshSubset {
-                    name: "attacker-subset".to_string(),
-                    labels: HashMap::from([("version".to_string(), "v2".to_string())]),
-                    traffic_policy: None,
-                }],
-            }],
-            ..MeshSlice::default()
+        let original_timeout_ms = config.proxies[0].backend_connect_timeout_ms;
+        let runtime = MeshRuntimeConfig {
+            namespace: "victim".to_string(),
+            ..test_mesh_runtime_config()
         };
 
-        apply_destination_rules(&mut config, &test_mesh_runtime_config(), &slice)
-            .expect("destination rules apply");
+        let config =
+            prepare_gateway_config_for_mesh(config, &runtime).expect("mesh preparation succeeds");
 
         assert_eq!(
             config.upstreams[0].algorithm,
             LoadBalancerAlgorithm::RoundRobin
         );
         assert!(config.upstreams[0].subsets.is_none());
-        assert_eq!(config.proxies[0].backend_connect_timeout_ms, 30_000);
+        assert_eq!(
+            config.proxies[0].backend_connect_timeout_ms,
+            original_timeout_ms
+        );
     }
 
     #[test]
@@ -7900,6 +8368,123 @@ mod tests {
             .expect("apply task should join");
     }
 
+    /// T3-A: apply_mesh_inbound_tls_reload must also publish the swapped
+    /// TLS config into the stream-listener slot so mesh-shared TCP+TLS
+    /// listeners see the new `ServerConfig` on the next accept. Existing
+    /// HBONE/HTTP-frontend slot behavior is preserved (covered by the
+    /// neighbouring `mesh_runtime_apply_task_live_reloads_peer_auth_tls_slot`).
+    #[tokio::test(flavor = "current_thread")]
+    async fn mesh_runtime_apply_task_propagates_peer_auth_swap_to_stream_listener_slot() {
+        let mut runtime = test_mesh_runtime_config();
+        runtime.inbound_listen_addr = "127.0.0.1:15006".parse().unwrap();
+        let env = EnvConfig {
+            mesh_peer_auth_live_reload_enabled: true,
+            frontend_tls_cert_path: Some("tests/certs/server.crt".to_string()),
+            frontend_tls_key_path: Some("tests/certs/server.key".to_string()),
+            frontend_tls_client_ca_bundle_path: Some("tests/certs/server.crt".to_string()),
+            pool_warmup_enabled: false,
+            shutdown_drain_seconds: 0,
+            ..EnvConfig::default()
+        };
+        let proxy_state = make_test_proxy_state_with_env(GatewayConfig::default(), env.clone());
+        let mesh_frontend_identity =
+            load_mesh_frontend_server_identity(&env).expect("mesh frontend identity");
+        let initial_snapshot = mesh_inbound_tls_reload_snapshot(&env, config::MtlsMode::Disable)
+            .expect("initial snapshot");
+        let mesh_state = MeshRuntimeState::new();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let apply_task = start_mesh_slice_apply_task(
+            mesh_state.clone(),
+            proxy_state.clone(),
+            runtime,
+            None,
+            MeshInboundTlsReloadState {
+                server_identity: mesh_frontend_identity,
+                last_snapshot: Some(initial_snapshot),
+            },
+            shutdown_rx,
+            None,
+        );
+
+        // Baseline: stream listener slot starts empty (no startup TLS publish
+        // by this test harness).
+        assert!(
+            proxy_state
+                .stream_listener_manager
+                .snapshot_frontend_tls_config()
+                .is_none(),
+            "stream listener slot starts empty before any slice apply"
+        );
+
+        // Apply a Strict slice; the apply task must publish the new
+        // ServerConfig into BOTH the HBONE slot AND the stream-listener slot.
+        mesh_state.install_slice(MeshSlice {
+            version: "strict-stream".to_string(),
+            ..slice_with_peer_auths(vec![peer_auth_with_port_override(
+                15006,
+                config::MtlsMode::Strict,
+            )])
+        });
+        wait_for_mesh_inbound_tls(&proxy_state, true).await;
+
+        let hbone_slot = proxy_state.mesh_inbound_tls.load_full();
+        let hbone_slot_ref = hbone_slot
+            .as_ref()
+            .as_ref()
+            .expect("HBONE slot populated by Strict apply");
+
+        // Poll briefly for the stream-listener slot publish (the apply path
+        // populates both slots in the same await, but the slot read here can
+        // race the publishing store on the read side).
+        let stream_slot = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(cfg) = proxy_state
+                    .stream_listener_manager
+                    .snapshot_frontend_tls_config()
+                {
+                    return cfg;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("stream listener slot should be populated by apply task");
+
+        assert!(
+            Arc::ptr_eq(hbone_slot_ref, &stream_slot),
+            "apply_mesh_inbound_tls_reload must publish the same ServerConfig Arc \
+             into both the HBONE and the stream-listener slots"
+        );
+
+        // Disable PeerAuth: both slots must clear.
+        mesh_state.install_slice(MeshSlice {
+            version: "disable-stream".to_string(),
+            ..slice_with_peer_auths(vec![peer_auth_with_port_override(
+                15006,
+                config::MtlsMode::Disable,
+            )])
+        });
+        wait_for_mesh_inbound_tls(&proxy_state, false).await;
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while proxy_state
+                .stream_listener_manager
+                .snapshot_frontend_tls_config()
+                .is_some()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("stream-listener slot should clear when PeerAuth flips to Disable");
+
+        let _ = shutdown_tx.send(true);
+        tokio::time::timeout(Duration::from_secs(2), apply_task)
+            .await
+            .expect("apply task should stop")
+            .expect("apply task should join");
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn mesh_runtime_apply_task_rejects_peer_auth_reload_when_tls_rebuild_fails() {
         let mut runtime = test_mesh_runtime_config();
@@ -8998,7 +9583,11 @@ mod tests {
             AppProtocol::Tls,
         )];
 
-        let (proxies, upstreams) = build_egress_proxies_and_upstreams(&service_entries, "default");
+        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+            &service_entries,
+            "default",
+            &std::collections::HashSet::new(),
+        );
 
         assert_eq!(proxies.len(), 1);
         assert_eq!(upstreams.len(), 1);
@@ -9054,7 +9643,11 @@ mod tests {
             workload_selector: None,
         }];
 
-        let (proxies, upstreams) = build_egress_proxies_and_upstreams(&service_entries, "default");
+        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+            &service_entries,
+            "default",
+            &std::collections::HashSet::new(),
+        );
 
         assert!(proxies.is_empty());
         assert!(upstreams.is_empty());
@@ -9083,7 +9676,11 @@ mod tests {
             workload_selector: None,
         }];
 
-        let (proxies, upstreams) = build_egress_proxies_and_upstreams(&service_entries, "default");
+        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+            &service_entries,
+            "default",
+            &std::collections::HashSet::new(),
+        );
 
         assert!(proxies.is_empty());
         assert!(upstreams.is_empty());
@@ -9099,19 +9696,29 @@ mod tests {
         );
         service_entry.namespace = "payments".to_string();
 
-        let (proxies, upstreams) =
-            build_egress_proxies_and_upstreams(&[service_entry.clone()], "default");
+        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+            &[service_entry.clone()],
+            "default",
+            &std::collections::HashSet::new(),
+        );
         assert!(proxies.is_empty());
         assert!(upstreams.is_empty());
 
         service_entry.export_to = vec!["*".to_string()];
-        let (proxies, upstreams) = build_egress_proxies_and_upstreams(&[service_entry], "default");
+        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+            &[service_entry],
+            "default",
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(proxies.len(), 1);
         assert_eq!(upstreams.len(), 1);
     }
 
     #[test]
-    fn egress_skips_l4_service_entry_ports() {
+    fn egress_materializes_l4_service_entry_ports_as_stream_proxies() {
+        // Pre-T5-A this entry was skipped (L4 protocols had no materialization
+        // path). T5-A added stream-family materialization: an L4 SE now
+        // produces a `tcp` stream proxy bound on the SE's own port.
         let service_entries = vec![ServiceEntry {
             name: "mysql".to_string(),
             namespace: "default".to_string(),
@@ -9128,9 +9735,30 @@ mod tests {
             workload_selector: None,
         }];
 
-        let (proxies, upstreams) = build_egress_proxies_and_upstreams(&service_entries, "default");
-        assert!(proxies.is_empty());
-        assert!(upstreams.is_empty());
+        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+            &service_entries,
+            "default",
+            &std::collections::HashSet::new(),
+        );
+        assert_eq!(proxies.len(), 1);
+        assert_eq!(upstreams.len(), 1);
+
+        let proxy = &proxies[0];
+        assert!(proxy.hosts.is_empty(), "stream proxy must have no hosts");
+        assert!(proxy.listen_path.is_none());
+        assert_eq!(proxy.listen_port, Some(3306));
+        assert_eq!(proxy.backend_scheme, Some(BackendScheme::Tcp));
+        assert!(!proxy.passthrough);
+        assert!(!proxy.frontend_tls);
+        assert_eq!(
+            proxy.name.as_deref(),
+            Some("mesh egress mysql db.external.com:3306")
+        );
+
+        let upstream = &upstreams[0];
+        assert_eq!(upstream.targets.len(), 1);
+        assert_eq!(upstream.targets[0].host, "db.external.com");
+        assert_eq!(upstream.targets[0].port, 3306);
     }
 
     #[test]
@@ -9142,7 +9770,11 @@ mod tests {
             AppProtocol::Tls,
         )];
 
-        let (proxies, upstreams) = build_egress_proxies_and_upstreams(&service_entries, "default");
+        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+            &service_entries,
+            "default",
+            &std::collections::HashSet::new(),
+        );
 
         assert_eq!(proxies.len(), 1);
         assert_eq!(
@@ -9193,7 +9825,11 @@ mod tests {
             workload_selector: None,
         }];
 
-        let (proxies, upstreams) = build_egress_proxies_and_upstreams(&service_entries, "default");
+        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+            &service_entries,
+            "default",
+            &std::collections::HashSet::new(),
+        );
 
         // Host-only HTTP proxies cannot safely distinguish multiple ports for
         // the same host, so only the first materialized port owns each host.
@@ -9249,7 +9885,11 @@ mod tests {
             workload_selector: None,
         }];
 
-        let (proxies, upstreams) = build_egress_proxies_and_upstreams(&service_entries, "default");
+        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+            &service_entries,
+            "default",
+            &std::collections::HashSet::new(),
+        );
 
         assert_eq!(proxies.len(), 1);
         assert_eq!(upstreams.len(), 1);
@@ -9277,7 +9917,11 @@ mod tests {
             AppProtocol::Tls,
         )];
 
-        let (_, upstreams) = build_egress_proxies_and_upstreams(&service_entries, "default");
+        let (_, upstreams) = build_egress_proxies_and_upstreams(
+            &service_entries,
+            "default",
+            &std::collections::HashSet::new(),
+        );
 
         assert_eq!(upstreams.len(), 2);
         let primary = upstreams
@@ -9299,7 +9943,8 @@ mod tests {
 
     #[test]
     fn egress_empty_service_entries_produces_no_proxies() {
-        let (proxies, upstreams) = build_egress_proxies_and_upstreams(&[], "default");
+        let (proxies, upstreams) =
+            build_egress_proxies_and_upstreams(&[], "default", &std::collections::HashSet::new());
         assert!(proxies.is_empty());
         assert!(upstreams.is_empty());
     }
@@ -9406,6 +10051,7 @@ mod tests {
 
     #[test]
     fn egress_backend_scheme_maps_protocols_correctly() {
+        // HTTP-family
         assert_eq!(
             egress_backend_scheme(AppProtocol::Tls),
             Some(BackendScheme::Https)
@@ -9426,7 +10072,41 @@ mod tests {
             egress_backend_scheme(AppProtocol::Unknown),
             Some(BackendScheme::Http)
         );
-        assert_eq!(egress_backend_scheme(AppProtocol::Tcp), None);
+        // Stream-family (T5-A): TCP-based L4 protocols all map to
+        // `BackendScheme::Tcp`. Protocol-aware mediation is T5-C.
+        for protocol in [
+            AppProtocol::Tcp,
+            AppProtocol::Mongo,
+            AppProtocol::Redis,
+            AppProtocol::Mysql,
+            AppProtocol::Postgres,
+        ] {
+            assert_eq!(
+                egress_backend_scheme(protocol),
+                Some(BackendScheme::Tcp),
+                "AppProtocol::{:?} must map to BackendScheme::Tcp",
+                protocol
+            );
+            assert!(
+                egress_is_stream_protocol(protocol),
+                "AppProtocol::{:?} must classify as stream-family",
+                protocol
+            );
+        }
+        // HTTP-family must NOT be classified as stream-family.
+        for protocol in [
+            AppProtocol::Http,
+            AppProtocol::Http2,
+            AppProtocol::Grpc,
+            AppProtocol::Tls,
+            AppProtocol::Unknown,
+        ] {
+            assert!(
+                !egress_is_stream_protocol(protocol),
+                "AppProtocol::{:?} must NOT classify as stream-family",
+                protocol
+            );
+        }
     }
 
     #[test]
@@ -9447,7 +10127,11 @@ mod tests {
             workload_selector: None,
         }];
 
-        let (proxies, upstreams) = build_egress_proxies_and_upstreams(&service_entries, "default");
+        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+            &service_entries,
+            "default",
+            &std::collections::HashSet::new(),
+        );
 
         assert_eq!(proxies.len(), 1);
         assert_eq!(upstreams.len(), 1);
@@ -9487,7 +10171,11 @@ mod tests {
             workload_selector: None,
         }];
 
-        let (proxies, upstreams) = build_egress_proxies_and_upstreams(&service_entries, "default");
+        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+            &service_entries,
+            "default",
+            &std::collections::HashSet::new(),
+        );
 
         assert_eq!(proxies.len(), 1);
         assert_eq!(upstreams.len(), 1);
@@ -9519,7 +10207,11 @@ mod tests {
             workload_selector: None,
         }];
 
-        let (proxies, upstreams) = build_egress_proxies_and_upstreams(&service_entries, "default");
+        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+            &service_entries,
+            "default",
+            &std::collections::HashSet::new(),
+        );
         assert!(proxies.is_empty());
         assert!(upstreams.is_empty());
     }
@@ -9602,6 +10294,445 @@ mod tests {
             !egress_proxies
                 .iter()
                 .any(|p| p.hosts.contains(&"internal.svc.cluster.local".to_string()))
+        );
+    }
+
+    // ── T5-A: stream-family egress materialization ───────────────────────
+
+    fn test_external_stream_service_entry(
+        name: &str,
+        host: &str,
+        port: u16,
+        protocol: AppProtocol,
+    ) -> ServiceEntry {
+        assert!(
+            egress_is_stream_protocol(protocol),
+            "test helper requires a stream-family AppProtocol"
+        );
+        ServiceEntry {
+            name: name.to_string(),
+            namespace: "default".to_string(),
+            hosts: vec![host.to_string()],
+            endpoints: Vec::new(),
+            resolution: Resolution::Dns,
+            location: ServiceEntryLocation::MeshExternal,
+            ports: vec![ServicePort {
+                port,
+                protocol,
+                name: Some("stream".to_string()),
+            }],
+            export_to: Vec::new(),
+            workload_selector: None,
+        }
+    }
+
+    #[test]
+    fn egress_stream_tcp_service_entry_produces_one_tcp_stream_proxy() {
+        let service_entries = vec![test_external_stream_service_entry(
+            "raw-tcp",
+            "raw.external.io",
+            6380,
+            AppProtocol::Tcp,
+        )];
+
+        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+            &service_entries,
+            "default",
+            &std::collections::HashSet::new(),
+        );
+
+        assert_eq!(proxies.len(), 1);
+        assert_eq!(upstreams.len(), 1);
+
+        let proxy = &proxies[0];
+        assert!(
+            proxy.hosts.is_empty(),
+            "stream proxies route by listen_port, not host"
+        );
+        assert!(proxy.listen_path.is_none());
+        assert_eq!(proxy.listen_port, Some(6380));
+        assert_eq!(proxy.backend_scheme, Some(BackendScheme::Tcp));
+        assert!(!proxy.passthrough);
+        assert!(!proxy.frontend_tls);
+        assert_eq!(
+            proxy.upstream_id.as_deref(),
+            Some("mesh-egress-up-default-raw-tcp-raw-dot-external-dot-io-6380")
+        );
+
+        let upstream = &upstreams[0];
+        assert_eq!(upstream.targets.len(), 1);
+        assert_eq!(upstream.targets[0].host, "raw.external.io");
+        assert_eq!(upstream.targets[0].port, 6380);
+    }
+
+    #[test]
+    fn egress_stream_mongo_service_entry_produces_tcp_proxy_with_protocol_tag_in_name() {
+        let service_entries = vec![test_external_stream_service_entry(
+            "mongo-prod",
+            "mongo.external.io",
+            27017,
+            AppProtocol::Mongo,
+        )];
+
+        let (proxies, _) = build_egress_proxies_and_upstreams(
+            &service_entries,
+            "default",
+            &std::collections::HashSet::new(),
+        );
+
+        assert_eq!(proxies.len(), 1);
+        let proxy = &proxies[0];
+        // Mongo is TCP-based: same wire-level dispatch, but the protocol
+        // tag in `proxy.name` keeps it observable in transaction logs.
+        assert_eq!(proxy.backend_scheme, Some(BackendScheme::Tcp));
+        assert_eq!(
+            proxy.name.as_deref(),
+            Some("mesh egress mongo mongo.external.io:27017")
+        );
+        assert_eq!(proxy.listen_port, Some(27017));
+    }
+
+    #[test]
+    fn egress_stream_static_resolution_uses_endpoint_addresses_as_targets() {
+        // Same shape as the HTTP-family static-resolution test, but for a
+        // TCP service entry. Endpoints become upstream targets; the proxy
+        // listens on the SE's own port.
+        let service_entries = vec![ServiceEntry {
+            name: "mysql-static".to_string(),
+            namespace: "default".to_string(),
+            hosts: vec!["db.vendor.com".to_string()],
+            endpoints: vec![
+                MeshEndpoint {
+                    address: "203.0.113.20".to_string(),
+                    ports: HashMap::from([("mysql".to_string(), 3306)]),
+                    labels: HashMap::new(),
+                    network: None,
+                },
+                MeshEndpoint {
+                    address: "203.0.113.21".to_string(),
+                    ports: HashMap::from([("mysql".to_string(), 3306)]),
+                    labels: HashMap::new(),
+                    network: None,
+                },
+            ],
+            resolution: Resolution::Static,
+            location: ServiceEntryLocation::MeshExternal,
+            ports: vec![ServicePort {
+                port: 3306,
+                protocol: AppProtocol::Mysql,
+                name: Some("mysql".to_string()),
+            }],
+            export_to: Vec::new(),
+            workload_selector: None,
+        }];
+
+        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+            &service_entries,
+            "default",
+            &std::collections::HashSet::new(),
+        );
+
+        assert_eq!(proxies.len(), 1);
+        assert_eq!(upstreams.len(), 1);
+        assert_eq!(proxies[0].listen_port, Some(3306));
+
+        let upstream = &upstreams[0];
+        assert_eq!(upstream.targets.len(), 2);
+        assert_eq!(upstream.targets[0].host, "203.0.113.20");
+        assert_eq!(upstream.targets[0].port, 3306);
+        assert_eq!(upstream.targets[1].host, "203.0.113.21");
+        assert_eq!(upstream.targets[1].port, 3306);
+    }
+
+    #[test]
+    fn egress_stream_port_collision_skips_second_entry_with_warning() {
+        // Two SEs requesting the same listen_port: the second one is
+        // skipped because each stream proxy must own its listen_port.
+        // The first SE wins (deterministic by config order).
+        let service_entries = vec![
+            test_external_stream_service_entry(
+                "first-redis",
+                "redis-a.external.io",
+                6379,
+                AppProtocol::Redis,
+            ),
+            test_external_stream_service_entry(
+                "second-redis",
+                "redis-b.external.io",
+                6379,
+                AppProtocol::Redis,
+            ),
+        ];
+
+        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+            &service_entries,
+            "default",
+            &std::collections::HashSet::new(),
+        );
+
+        assert_eq!(proxies.len(), 1, "only the first SE wins on port collision");
+        assert_eq!(upstreams.len(), 1);
+        assert_eq!(
+            upstreams[0].targets[0].host, "redis-a.external.io",
+            "first SE in config order should win"
+        );
+    }
+
+    #[test]
+    fn egress_mixed_http_and_stream_entries_materialize_independently() {
+        // Mixed manifest: one HTTP SE, one TCP SE. Both materialize without
+        // cross-contamination (the HTTP host-dedup set and the stream
+        // port-dedup set are independent).
+        let service_entries = vec![
+            test_external_service_entry(
+                "http-api",
+                vec!["api.external.io".to_string()],
+                443,
+                AppProtocol::Tls,
+            ),
+            test_external_stream_service_entry(
+                "tcp-db",
+                "db.external.io",
+                5432,
+                AppProtocol::Postgres,
+            ),
+        ];
+
+        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+            &service_entries,
+            "default",
+            &std::collections::HashSet::new(),
+        );
+
+        assert_eq!(proxies.len(), 2);
+        assert_eq!(upstreams.len(), 2);
+
+        // HTTP-family proxy: host-routed, no listen_port.
+        let http_proxy = proxies
+            .iter()
+            .find(|p| p.hosts == vec!["api.external.io".to_string()])
+            .expect("http proxy materialized");
+        assert!(http_proxy.listen_port.is_none());
+        assert_eq!(http_proxy.backend_scheme, Some(BackendScheme::Https));
+
+        // Stream-family proxy: port-routed, no hosts.
+        let stream_proxy = proxies
+            .iter()
+            .find(|p| p.listen_port == Some(5432))
+            .expect("stream proxy materialized");
+        assert!(stream_proxy.hosts.is_empty());
+        assert_eq!(stream_proxy.backend_scheme, Some(BackendScheme::Tcp));
+        assert_eq!(
+            stream_proxy.name.as_deref(),
+            Some("mesh egress postgres db.external.io:5432")
+        );
+    }
+
+    #[test]
+    fn egress_stream_service_entry_with_multiple_ports_binds_each_port_separately() {
+        // One SE exposing the same external host on two different stream
+        // ports (e.g., a database with primary 5432 and replica 5433).
+        // Both get their own stream proxy because each port owns its
+        // own listener.
+        let service_entries = vec![ServiceEntry {
+            name: "multi-port-db".to_string(),
+            namespace: "default".to_string(),
+            hosts: vec!["db.vendor.com".to_string()],
+            endpoints: Vec::new(),
+            resolution: Resolution::Dns,
+            location: ServiceEntryLocation::MeshExternal,
+            ports: vec![
+                ServicePort {
+                    port: 5432,
+                    protocol: AppProtocol::Postgres,
+                    name: Some("primary".to_string()),
+                },
+                ServicePort {
+                    port: 5433,
+                    protocol: AppProtocol::Postgres,
+                    name: Some("replica".to_string()),
+                },
+            ],
+            export_to: Vec::new(),
+            workload_selector: None,
+        }];
+
+        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+            &service_entries,
+            "default",
+            &std::collections::HashSet::new(),
+        );
+
+        assert_eq!(proxies.len(), 2);
+        assert_eq!(upstreams.len(), 2);
+        assert!(proxies.iter().any(|p| p.listen_port == Some(5432)));
+        assert!(proxies.iter().any(|p| p.listen_port == Some(5433)));
+    }
+
+    #[test]
+    fn egress_stream_topology_gate_skips_when_not_egress_gateway() {
+        // Sidecar topology should NOT materialize stream egress proxies
+        // even when the slice carries L4 ServiceEntries — same topology
+        // gate as the existing HTTP-family egress materialization.
+        let runtime = test_mesh_runtime_config();
+        assert_eq!(runtime.topology, MeshTopology::Sidecar);
+
+        let config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                service_entries: vec![test_external_stream_service_entry(
+                    "ghost-tcp",
+                    "ghost.external.io",
+                    6379,
+                    AppProtocol::Redis,
+                )],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+
+        let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+
+        assert!(
+            !prepared
+                .proxies
+                .iter()
+                .any(|p| p.id.starts_with("mesh-egress-")),
+            "no egress proxies should materialize under sidecar topology"
+        );
+    }
+
+    #[test]
+    fn egress_stream_in_egress_gateway_topology_passes_full_validation() {
+        // Full end-to-end materialization via `prepare_gateway_config_for_mesh`
+        // exercises the validation pipeline that runs after materialization.
+        // A stream egress proxy with a valid listen_port must pass
+        // `validate_stream_proxies()` (each stream proxy needs listen_port,
+        // each port owns one proxy).
+        let runtime = MeshRuntimeConfig {
+            topology: MeshTopology::EgressGateway,
+            ..test_mesh_runtime_config()
+        };
+        let config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                service_entries: vec![test_external_stream_service_entry(
+                    "ext-redis",
+                    "redis.external.io",
+                    6379,
+                    AppProtocol::Redis,
+                )],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+
+        let prepared =
+            prepare_gateway_config_for_mesh(config, &runtime).expect("prepared mesh config");
+
+        let stream_proxy = prepared
+            .proxies
+            .iter()
+            .find(|p| p.listen_port == Some(6379))
+            .expect("stream proxy should be materialized");
+        assert_eq!(stream_proxy.backend_scheme, Some(BackendScheme::Tcp));
+        assert!(stream_proxy.dispatch_kind.is_stream());
+        // Post-materialization stream-proxy validation must pass; the proxy's
+        // `listen_port` is the SE's own port, and there is only one SE on it.
+        prepared
+            .validate_stream_proxies()
+            .expect("stream proxy validation should pass for a single port");
+    }
+
+    #[test]
+    fn egress_stream_skips_service_entry_port_that_collides_with_mesh_listener() {
+        // ServiceEntry port matching `egress_listen_addr.port()` (default
+        // 15090) would bind on the same socket as the egress gateway's own
+        // mTLS-termination listener. The materializer must skip these entries
+        // with a warning rather than emit a stream proxy that fails to bind
+        // at runtime (EADDRINUSE).
+        let mut reserved = std::collections::HashSet::new();
+        reserved.insert(15090);
+
+        let service_entries = vec![test_external_stream_service_entry(
+            "colliding-tcp",
+            "external.io",
+            15090,
+            AppProtocol::Tcp,
+        )];
+
+        let (proxies, upstreams) =
+            build_egress_proxies_and_upstreams(&service_entries, "default", &reserved);
+
+        assert!(
+            proxies.is_empty(),
+            "stream proxy on the mesh listener port must be skipped"
+        );
+        assert!(
+            upstreams.is_empty(),
+            "no upstream should be emitted when the proxy is skipped"
+        );
+    }
+
+    #[test]
+    fn egress_stream_skips_zero_port_service_entry() {
+        // Stream proxies require listen_port >= 1 (validated by
+        // `validate_stream_proxies`). A ServiceEntry with port: 0 would
+        // produce a proxy that fails validation later, killing the entire
+        // slice apply. Skip with a warning instead.
+        let service_entries = vec![test_external_stream_service_entry(
+            "zero-port",
+            "external.io",
+            0,
+            AppProtocol::Tcp,
+        )];
+
+        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+            &service_entries,
+            "default",
+            &std::collections::HashSet::new(),
+        );
+
+        assert!(
+            proxies.is_empty(),
+            "stream proxy with port 0 must be skipped"
+        );
+        assert!(upstreams.is_empty());
+    }
+
+    #[test]
+    fn egress_materialize_skips_mesh_listener_collision_full_path() {
+        // End-to-end: `materialize_egress_gateway_proxies` populates
+        // `mesh_reserved_ports` from `runtime.egress_listen_addr.port()` and
+        // must skip ServiceEntries that target the same port. This guards
+        // against a regression where the runtime forgets to plumb the
+        // reserved ports through to `build_egress_proxies_and_upstreams`.
+        let runtime = MeshRuntimeConfig {
+            topology: MeshTopology::EgressGateway,
+            ..test_mesh_runtime_config()
+        };
+        let egress_port = runtime.egress_listen_addr.port();
+
+        let config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                service_entries: vec![test_external_stream_service_entry(
+                    "colliding-tcp",
+                    "external.io",
+                    egress_port,
+                    AppProtocol::Tcp,
+                )],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+
+        let prepared =
+            prepare_gateway_config_for_mesh(config, &runtime).expect("prepared mesh config");
+
+        assert!(
+            !prepared
+                .proxies
+                .iter()
+                .any(|p| p.listen_port == Some(egress_port)),
+            "no stream proxy should bind on the mesh egress listener port"
         );
     }
 }
