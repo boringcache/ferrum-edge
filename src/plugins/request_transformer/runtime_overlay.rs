@@ -81,14 +81,9 @@ pub fn reset_for_test() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, MutexGuard};
 
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
-
-    fn test_guard() -> MutexGuard<'static, ()> {
-        TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    fn test_guard() -> std::sync::MutexGuard<'static, ()> {
+        crate::modes::mesh::runtime_overlay_consumers::test_lock()
     }
 
     fn overlay(entries: &[(&str, RuntimeValue)]) -> MeshRuntimeOverlay {

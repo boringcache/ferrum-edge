@@ -210,7 +210,9 @@ pub struct MeshSlice {
     /// consumers (fault-injection percentages, request/response transformer
     /// gates, tracing log level) via
     /// `runtime_overlay_consumers::apply_overlay`. Empty unless RTDS layers
-    /// arrived on the stream.
+    /// arrived on the stream. Accepted slices fan this overlay out to live
+    /// consumers; received-but-rejected slices stay visible only on the raw
+    /// runtime snapshot.
     #[serde(default, skip_serializing_if = "MeshRuntimeOverlay::is_empty")]
     pub runtime_overlay: MeshRuntimeOverlay,
 }

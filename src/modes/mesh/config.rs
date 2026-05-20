@@ -2150,15 +2150,17 @@ pub(crate) fn normalize_mesh_policy_header_map(headers: &mut HashMap<String, Str
         return;
     }
 
+    let mut entries = headers.iter().collect::<Vec<_>>();
+    entries.sort_by_key(|(key, _)| *key);
+
     let mut normalized = HashMap::with_capacity(headers.len());
-    for (key, value) in headers.iter() {
+    for (key, value) in entries {
         let lower = key.to_ascii_lowercase();
-        if let Some(existing) = normalized.get(&lower)
-            && existing != value
-        {
-            return;
+        let prefer_value =
+            key == &lower || !headers.contains_key(&lower) || !normalized.contains_key(&lower);
+        if prefer_value {
+            normalized.insert(lower, value.clone());
         }
-        normalized.insert(lower, value.clone());
     }
 
     *headers = normalized;

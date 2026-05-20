@@ -2,7 +2,7 @@
 //!
 //! Exercises the end-to-end RTDS surface: an Envoy `Runtime` proto is
 //! translated through `translate_rtds_layer`, the resulting overlay is
-//! carried on a `MeshSlice`, the slice is installed into a
+//! carried on a `MeshSlice`, the slice is accepted into a
 //! `MeshRuntimeState`, and the admin endpoint must report the parsed
 //! fields. The wire-level decode is exercised in the unit tests; this
 //! integration leg validates the slice → admin handler contract that GAP-3E
@@ -194,12 +194,14 @@ fn build_rtds_layer() -> runtime_proto::Runtime {
 }
 
 fn install_slice_with_overlay(runtime: &MeshRuntimeState, overlay: MeshRuntimeOverlay) {
-    runtime.install_slice(MeshSlice {
+    let slice = MeshSlice {
         namespace: "alpha".to_string(),
         version: "v-runtime".to_string(),
         runtime_overlay: overlay,
         ..MeshSlice::default()
-    });
+    };
+    runtime.install_slice(slice.clone());
+    runtime.record_applied_slice(&slice);
 }
 
 #[tokio::test]
@@ -282,11 +284,11 @@ async fn mesh_runtime_overlay_endpoint_requires_jwt() {
 }
 
 #[tokio::test]
-async fn mesh_runtime_overlay_endpoint_returns_404_without_installed_slice() {
+async fn mesh_runtime_overlay_endpoint_returns_404_without_accepted_slice() {
     let tc = TestConfig::default();
     let token = generate_test_token(&tc);
-    // No slice installed; the snapshot is still `None` so the handler must
-    // 404 instead of synthesising an empty overlay.
+    // No slice accepted; the accepted snapshot is still `None` so the handler
+    // must 404 instead of synthesising an empty overlay.
     let state = build_admin_state(create_test_jwt_manager(&tc), Some(MeshRuntimeState::new()));
     let (base_url, _shutdown) = start_test_admin(state).await;
 
@@ -297,6 +299,52 @@ async fn mesh_runtime_overlay_endpoint_returns_404_without_installed_slice() {
         .await
         .unwrap();
     assert_eq!(response.status().as_u16(), 404);
+}
+
+#[tokio::test]
+async fn mesh_runtime_overlay_endpoint_ignores_received_but_unaccepted_slice() {
+    let tc = TestConfig::default();
+    let token = generate_test_token(&tc);
+    let runtime = MeshRuntimeState::new();
+    let accepted = MeshRuntimeOverlay {
+        fields: HashMap::from([("ferrum.accepted".to_string(), RuntimeValue::Bool(true))]),
+    };
+    install_slice_with_overlay(&runtime, accepted);
+    runtime.install_slice(MeshSlice {
+        namespace: "alpha".to_string(),
+        version: "rejected-runtime".to_string(),
+        runtime_overlay: MeshRuntimeOverlay {
+            fields: HashMap::from([("ferrum.rejected".to_string(), RuntimeValue::Bool(true))]),
+        },
+        ..MeshSlice::default()
+    });
+
+    let state = build_admin_state(create_test_jwt_manager(&tc), Some(runtime));
+    let (base_url, _shutdown) = start_test_admin(state).await;
+
+    let response: Value = reqwest::Client::new()
+        .get(format!("{base_url}/mesh/runtime-overlay"))
+        .header("authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(response["version"], "v-runtime");
+    assert!(
+        response["runtime_overlay"]["fields"]
+            .as_object()
+            .unwrap()
+            .contains_key("ferrum.accepted")
+    );
+    assert!(
+        !response["runtime_overlay"]["fields"]
+            .as_object()
+            .unwrap()
+            .contains_key("ferrum.rejected")
+    );
 }
 
 #[tokio::test]
@@ -318,7 +366,7 @@ async fn mesh_runtime_overlay_endpoint_returns_404_outside_mesh_mode() {
 
 #[tokio::test]
 async fn mesh_runtime_overlay_endpoint_serves_empty_overlay_after_slice_with_no_layers() {
-    // Slice installed but no RTDS layers ever arrived → overlay is empty
+    // Slice accepted but no RTDS layers ever arrived → overlay is empty
     // but the slice exists. Operators get a 200 with `runtime_overlay`
     // elided (`skip_serializing_if`) so dashboards can still inspect
     // `namespace`/`version` and tell apart "no slice" from "slice has no
@@ -359,7 +407,7 @@ async fn mesh_runtime_overlay_endpoint_serves_empty_overlay_after_slice_with_no_
     );
 
     // Sanity: pretend a slice did populate one field; the endpoint must
-    // reflect it after re-install. This verifies the lock-free swap path
+    // reflect it after another accepted slice. This verifies the lock-free swap path
     // produces fresh data on subsequent admin GETs without restart.
     let _ = parsed; // suppress unused if assertion paths change later
     let runtime_again = state_with_overlay(

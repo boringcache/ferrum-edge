@@ -127,7 +127,7 @@ fn build_admin_state(jwt: JwtManager, mesh_runtime_state: Option<MeshRuntimeStat
 }
 
 fn install_default_egress_slice(runtime: &MeshRuntimeState) {
-    runtime.install_slice(MeshSlice {
+    let slice = MeshSlice {
         namespace: "alpha".to_string(),
         sidecar_egress_scope: Some(MeshEgressScopeSnapshot {
             sidecar_enforced: false,
@@ -145,7 +145,9 @@ fn install_default_egress_slice(runtime: &MeshRuntimeState) {
             ..MeshEgressScopeSnapshot::default()
         }),
         ..MeshSlice::default()
-    });
+    };
+    runtime.install_slice(slice.clone());
+    runtime.record_applied_slice(&slice);
 }
 
 fn admin_state(jwt: JwtManager) -> AdminState {
@@ -257,7 +259,7 @@ async fn mesh_egress_scope_endpoint_requires_jwt() {
 }
 
 #[tokio::test]
-async fn mesh_egress_scope_returns_404_without_installed_slice() {
+async fn mesh_egress_scope_returns_404_without_accepted_slice() {
     let tc = TestConfig::default();
     let token = generate_test_token(&tc);
     // No MeshRuntimeState is wired into AdminState — handler should report
@@ -282,6 +284,51 @@ async fn mesh_egress_scope_returns_404_without_installed_slice() {
         .await
         .unwrap();
     assert_eq!(response.status().as_u16(), 404);
+}
+
+#[tokio::test]
+async fn mesh_egress_scope_ignores_received_but_unaccepted_slice() {
+    let tc = TestConfig::default();
+    let token = generate_test_token(&tc);
+    let runtime = MeshRuntimeState::new();
+    install_default_egress_slice(&runtime);
+    runtime.install_slice(MeshSlice {
+        namespace: "alpha".to_string(),
+        sidecar_egress_scope: Some(MeshEgressScopeSnapshot {
+            sidecar_admitted_services: 9,
+            sidecar_denied_services: 9,
+            known_destinations: vec!["rejected.alpha.svc.cluster.local:8080".to_string()],
+            ..MeshEgressScopeSnapshot::default()
+        }),
+        ..MeshSlice::default()
+    });
+    let state = build_admin_state(create_test_jwt_manager(&tc), Some(runtime));
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let client = reqwest::Client::new();
+
+    let response: Value = client
+        .get(format!("{base_url}/mesh/egress-scope"))
+        .header("authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(response["health"]["sidecar_admitted_services"], 1);
+    assert_eq!(response["health"]["sidecar_denied_services"], 1);
+
+    let dry_run: Value = client
+        .post(format!("{base_url}/mesh/egress-scope/test"))
+        .header("authorization", format!("Bearer {token}"))
+        .json(&json!({"host": "rejected.alpha.svc.cluster.local", "port": 8080}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(dry_run["allowed"], false);
 }
 
 #[tokio::test]
