@@ -32,21 +32,33 @@
 //! can write the socket can already enroll pods at the cgroup level.
 
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixListener;
 use tokio::sync::{mpsc, oneshot};
-use tokio::time::timeout;
-use tracing::{debug, error, info, warn};
+use tracing::warn;
 
+use crate::cni::rpc::{CniRpcRequest, CniRpcResponse};
+use crate::ebpf::NodeAgentMetrics;
+
+#[cfg(unix)]
+use std::path::Path;
+#[cfg(unix)]
+use std::time::Duration;
+#[cfg(unix)]
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(unix)]
+use tokio::net::{UnixListener, UnixStream};
+#[cfg(unix)]
+use tokio::time::timeout;
+#[cfg(unix)]
+use tracing::{debug, error, info};
+
+#[cfg(unix)]
 use crate::cni::rpc::{
-    CniRpcRequest, CniRpcResponse, LENGTH_PREFIX_BYTES, MAX_RPC_BYTES, RpcOutcome, RpcVerb,
-    decode_body, encode_frame,
+    LENGTH_PREFIX_BYTES, MAX_RPC_BYTES, RpcOutcome, RpcVerb, decode_body, encode_frame,
 };
-use crate::ebpf::{CniCallOutcome, CniCallVerb, NodeAgentMetrics};
+#[cfg(unix)]
+use crate::ebpf::{CniCallOutcome, CniCallVerb};
 
 /// One unit of work queued from the CNI server to the main node-agent loop.
 ///
@@ -77,6 +89,7 @@ pub fn cni_work_channel() -> (CniWorkSender, CniWorkReceiver) {
 /// Tight bound on how long the CNI server waits for the main loop to
 /// answer a single RPC. Shorter than the CNI binary's own timeout so the
 /// binary sees a structured error rather than the kubelet killing it.
+#[cfg(unix)]
 const MAIN_LOOP_REPLY_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Spawn the CNI Unix-socket listener.
@@ -89,6 +102,7 @@ const MAIN_LOOP_REPLY_TIMEOUT: Duration = Duration::from_secs(3);
 /// just restarted; an old socket file from a previous instance would
 /// make bind fail). Parent directory is created with mode 0755 if
 /// missing — installs that pre-create the dir do not change anything.
+#[cfg(unix)]
 pub fn spawn_cni_listener(
     socket_path: String,
     work_sender: CniWorkSender,
@@ -164,6 +178,27 @@ pub fn spawn_cni_listener(
     })
 }
 
+/// Non-Unix stub so the release build matrix can compile the shared crate.
+///
+/// CNI is a Linux/Unix deployment path because the wire transport is a Unix
+/// domain socket. On Windows the node-agent falls back to the watcher-only
+/// path; this stub preserves that behavior if the mode is ever invoked there.
+#[cfg(not(unix))]
+pub fn spawn_cni_listener(
+    socket_path: String,
+    _work_sender: CniWorkSender,
+    _metrics: Arc<NodeAgentMetrics>,
+    _shutdown: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        warn!(
+            socket_path = %socket_path,
+            "Node-agent CNI listener requested on non-Unix target; listener disabled"
+        );
+    })
+}
+
+#[cfg(unix)]
 async fn prepare_socket_path(socket_path: &str) -> std::io::Result<()> {
     if let Some(parent) = Path::new(socket_path).parent()
         && !parent.as_os_str().is_empty()
@@ -184,19 +219,15 @@ fn set_socket_perms(socket_path: &str) -> std::io::Result<()> {
     std::fs::set_permissions(socket_path, perms)
 }
 
-#[cfg(not(unix))]
-fn set_socket_perms(_socket_path: &str) -> std::io::Result<()> {
-    Ok(())
-}
-
 /// Read one RPC, ship it to the main loop, write the response.
 ///
 /// Connection is closed after one round-trip. Any error before we have a
 /// response logs a `warn!`, increments the `error` outcome counter, and
 /// returns — the client side reports the IPC error to kubelet and the
 /// kube-rs watcher reconciliation path is unaffected.
+#[cfg(unix)]
 async fn handle_one_connection(
-    mut stream: tokio::net::UnixStream,
+    mut stream: UnixStream,
     work_sender: CniWorkSender,
     metrics: Arc<NodeAgentMetrics>,
 ) {
@@ -271,7 +302,8 @@ async fn handle_one_connection(
     }
 }
 
-async fn read_request_frame(stream: &mut tokio::net::UnixStream) -> Result<CniRpcRequest, String> {
+#[cfg(unix)]
+async fn read_request_frame(stream: &mut UnixStream) -> Result<CniRpcRequest, String> {
     let mut len_buf = [0u8; LENGTH_PREFIX_BYTES];
     stream
         .read_exact(&mut len_buf)
@@ -289,8 +321,9 @@ async fn read_request_frame(stream: &mut tokio::net::UnixStream) -> Result<CniRp
     decode_body(&body)
 }
 
+#[cfg(unix)]
 async fn write_response_frame(
-    stream: &mut tokio::net::UnixStream,
+    stream: &mut UnixStream,
     response: &CniRpcResponse,
 ) -> Result<(), String> {
     let frame = encode_frame(response).map_err(|e| format!("encode response: {e}"))?;

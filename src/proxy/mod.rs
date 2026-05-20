@@ -9272,6 +9272,13 @@ async fn handle_proxy_request_inner(
                         grpc_streaming.body,
                         cl,
                     )
+                } else if state.max_response_body_size_bytes > 0 {
+                    crate::proxy::body::size_limited_coalescing_h2_body_strip_hop_by_hop_trailers(
+                        grpc_streaming.body,
+                        state.max_response_body_size_bytes,
+                        cl,
+                        state.h2_coalesce_target_bytes,
+                    )
                 } else {
                     crate::proxy::body::coalescing_h2_body_strip_hop_by_hop_trailers(
                         grpc_streaming.body,

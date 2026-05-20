@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -149,8 +150,13 @@ impl ResourceStoreSet {
 
     pub fn snapshot_all(&self) -> Vec<K8sObject> {
         let mut objects = Vec::new();
+        let mut seen = HashSet::new();
         for store in &self.stores {
-            objects.extend(store.snapshot());
+            for object in store.snapshot() {
+                if seen.insert(resource_identity(&object)) {
+                    objects.push(object);
+                }
+            }
         }
         objects
     }
@@ -172,10 +178,25 @@ impl ResourceStoreSet {
     }
 }
 
+fn resource_identity(object: &K8sObject) -> (String, String, String, String) {
+    let group = object
+        .api_version
+        .split_once('/')
+        .map_or("", |(group, _version)| group);
+    (
+        group.to_string(),
+        object.kind.clone(),
+        object.metadata.namespace.clone(),
+        object.metadata.name.clone(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kube::api::ApiResource;
+    use kube::api::{ApiResource, DynamicObject};
+    use kube::runtime::watcher::Event;
+    use serde_json::json;
 
     fn test_store(api_version: &str, kind: &str) -> Arc<CrdResourceStore> {
         let ar = ApiResource {
@@ -209,6 +230,35 @@ mod tests {
             kind.to_string(),
             scope.to_string(),
             store,
+        ))
+    }
+
+    fn populated_test_store(
+        api_version: &str,
+        kind: &str,
+        name: &str,
+        namespace: &str,
+    ) -> Arc<CrdResourceStore> {
+        let (group, version) = api_version.split_once('/').unwrap_or(("", api_version));
+        let ar = ApiResource {
+            group: group.to_string(),
+            version: version.to_string(),
+            api_version: api_version.to_string(),
+            kind: kind.to_string(),
+            plural: format!("{}s", kind.to_ascii_lowercase()),
+        };
+        let mut writer = reflector::store::Writer::new(ar.clone());
+        let object = DynamicObject::new(name, &ar)
+            .within(namespace)
+            .data(json!({ "spec": {} }));
+        writer.apply_watcher_event(&Event::Init);
+        writer.apply_watcher_event(&Event::InitApply(object));
+        writer.apply_watcher_event(&Event::InitDone);
+        Arc::new(CrdResourceStore::new_scoped(
+            api_version.to_string(),
+            kind.to_string(),
+            "all".to_string(),
+            writer.as_reader(),
         ))
     }
 
@@ -252,5 +302,30 @@ mod tests {
         assert!(set.has_store_for_scope("example.com/v1", "Widget", "namespace:prod",));
         assert!(set.remove_store_for_scope("example.com/v1", "Widget", "namespace:default",));
         assert!(set.has_store_for_scope("example.com/v1", "Widget", "namespace:prod",));
+    }
+
+    #[test]
+    fn snapshot_all_deduplicates_served_version_aliases() {
+        let mut set = ResourceStoreSet::new();
+        assert!(set.add_store(populated_test_store(
+            "gateway.networking.k8s.io/v1",
+            "Gateway",
+            "edge",
+            "default",
+        )));
+        assert!(set.add_store(populated_test_store(
+            "gateway.networking.k8s.io/v1beta1",
+            "Gateway",
+            "edge",
+            "default",
+        )));
+
+        let objects = set.snapshot_all();
+
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0].api_version, "gateway.networking.k8s.io/v1");
+        assert_eq!(objects[0].kind, "Gateway");
+        assert_eq!(objects[0].metadata.namespace, "default");
+        assert_eq!(objects[0].metadata.name, "edge");
     }
 }

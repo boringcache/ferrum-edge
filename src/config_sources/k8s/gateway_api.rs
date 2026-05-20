@@ -682,14 +682,13 @@ fn route_match_descriptor_for_entry(
     entry: &Value,
 ) -> Option<RouteMatchDescriptor> {
     if object.kind == "GRPCRoute" {
+        // GRPCRoute method-only/header-only matches (no explicit path) must NOT
+        // default to "/" — that creates a catch-all proxy that routes ALL traffic
+        // to the backend, bypassing method-specificity. Drop pathless matches
+        // until per-method dispatch is implemented.
+        let listen_path = entry.get("path").and_then(http_path_match)?;
         return Some(RouteMatchDescriptor {
-            listen_path: entry
-                .get("path")
-                .and_then(http_path_match)
-                .unwrap_or_else(|| "/".to_string()),
-            // Ferrum does not yet dispatch GRPCRoute method/header matches within
-            // a shared host/path proxy, so conflict resolution remains scoped to
-            // the materialized path for GRPCRoute.
+            listen_path,
             match_signature: "{}".to_string(),
         });
     }
@@ -2239,7 +2238,7 @@ mod tests {
                 "hostnames": ["grpc.example.com"],
                 "parentRefs": [{"name": "edge"}],
                 "rules": [{
-                    "matches": [{"method": {"service": "helloworld.Greeter"}}],
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/grpc"}}],
                     "backendRefs": [{"name": "greeter", "port": 50051}]
                 }]
             }),
@@ -2252,7 +2251,7 @@ mod tests {
                 "hostnames": ["grpc.example.com"],
                 "parentRefs": [{"name": "edge"}],
                 "rules": [{
-                    "matches": [{"method": {"service": "helloworld.Goodbye"}}],
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/grpc"}}],
                     "backendRefs": [{"name": "goodbye", "port": 50052}]
                 }]
             }),
@@ -2263,11 +2262,8 @@ mod tests {
         let result =
             translate_k8s_objects(&[greeter, goodbye], options()).expect("translation succeeds");
 
-        assert!(result.warnings.iter().any(|warning| {
-            warning.contains(
-                "cannot yet dispatch GRPCRoute method/header matches within a shared path",
-            )
-        }));
+        // Two GRPCRoutes with the same path on the same host conflict — only one wins
+        assert_eq!(result.config.proxies.len(), 1);
     }
 
     #[test]
@@ -2621,7 +2617,10 @@ mod tests {
     }
 
     #[test]
-    fn grpc_route_keeps_pathless_matches_as_catch_all() {
+    fn grpc_route_drops_pathless_method_only_matches() {
+        // GRPCRoute method-only matches (no explicit path) must NOT create
+        // a catch-all "/" proxy. Until per-method dispatch is implemented,
+        // pathless matches are dropped to prevent overbroad traffic routing.
         let result = translate_k8s_objects(
             &[object(
                 "GRPCRoute",
@@ -2640,10 +2639,10 @@ mod tests {
         )
         .expect("translation succeeds");
 
-        assert_eq!(result.config.proxies.len(), 1);
-        assert_eq!(result.config.proxies[0].hosts, vec!["grpc.example.com"]);
-        assert_eq!(result.config.proxies[0].listen_path.as_deref(), Some("/"));
-        assert_eq!(result.config.proxies[0].backend_port, 50051);
+        assert!(
+            result.config.proxies.is_empty(),
+            "pathless GRPCRoute matches should not produce proxies"
+        );
     }
 
     #[test]
@@ -2655,8 +2654,7 @@ mod tests {
                     "hostnames": ["grpc.example.com"],
                     "rules": [{
                         "matches": [
-                            {"method": {"service": "helloworld.Greeter", "method": "SayHello"}},
-                            {"method": {"service": "helloworld.Greeter", "method": "SayGoodbye"}}
+                            {"path": {"type": "PathPrefix", "value": "/helloworld.Greeter"}}
                         ],
                         "backendRefs": [
                             {"name": "grpc-v1", "port": 50051, "weight": 90},
@@ -2670,7 +2668,10 @@ mod tests {
         .expect("translation succeeds");
 
         assert_eq!(result.config.proxies.len(), 1);
-        assert_eq!(result.config.proxies[0].listen_path.as_deref(), Some("/"));
+        assert_eq!(
+            result.config.proxies[0].listen_path.as_deref(),
+            Some("/helloworld.Greeter")
+        );
         assert_eq!(result.config.upstreams.len(), 1);
         assert_eq!(
             result.config.proxies[0].upstream_id.as_deref(),
@@ -2704,7 +2705,7 @@ mod tests {
                         "hostnames": ["grpc.example.com"],
                         "rules": [{
                             "matches": [
-                                {"method": {"service": "helloworld.Greeter", "method": "SayHello"}}
+                                {"path": {"type": "PathPrefix", "value": "/helloworld.Greeter"}}
                             ],
                             "backendRefs": [
                                 {"name": "grpc-v1", "port": 50051, "weight": 90},
