@@ -197,11 +197,15 @@ pub fn plan_istio_status_updates(
             });
             let (status, ferrum_detail) = match object.kind.as_str() {
                 "AuthorizationPolicy" => authorization_policy_status(object, result.as_ref()),
-                "PeerAuthentication" => peer_authentication_status(object, result.as_ref()),
+                "PeerAuthentication" => peer_authentication_status(
+                    object,
+                    result.as_ref(),
+                    &options.istio_root_namespace,
+                ),
                 "DestinationRule" => destination_rule_status(object, result.as_ref()),
                 _ => return None,
             };
-            if status == object.status && ferrum_detail.is_none() {
+            if status == object.status && ferrum_detail_matches(&object.status, &ferrum_detail) {
                 return None;
             }
             Some(IstioStatusUpdate {
@@ -214,6 +218,12 @@ pub fn plan_istio_status_updates(
             })
         })
         .collect()
+}
+
+fn ferrum_detail_matches(status: &Value, desired: &Option<Value>) -> bool {
+    desired
+        .as_ref()
+        .is_none_or(|detail| status.get("ferrum") == Some(detail))
 }
 
 fn is_supported_istio_kind(kind: &str) -> bool {
@@ -242,13 +252,25 @@ fn istio_status_patch(update: &IstioStatusUpdate, live_status: Option<&Value>) -
     let mut status_patch = serde_json::Map::new();
 
     // Owned conditions from `update.status`, merged with the live array
-    // so we don't accidentally remove non-Ferrum-owned conditions.
-    let desired_conditions = update
-        .status
-        .get("conditions")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+    // so we don't accidentally remove or duplicate non-Ferrum-owned
+    // conditions.
+    let desired_conditions =
+        update
+            .status
+            .get("conditions")
+            .and_then(Value::as_array)
+            .map(|conditions| {
+                conditions
+                    .iter()
+                    .filter(|condition| {
+                        condition.get("type").and_then(Value::as_str).is_some_and(
+                            |condition_type| condition_type.starts_with(FERRUM_CONDITION_PREFIX),
+                        )
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
     let live_conditions = live_status
         .and_then(|status| status.get("conditions"))
         .and_then(Value::as_array)
@@ -402,6 +424,7 @@ fn authorization_policy_status(
 fn peer_authentication_status(
     object: &K8sObject,
     result: Result<&K8sTranslation, &K8sTranslateError>,
+    istio_root_namespace: &str,
 ) -> (Value, Option<Value>) {
     let resolved_mode = object
         .spec
@@ -412,8 +435,9 @@ fn peer_authentication_status(
         .to_string();
     let scope = if object.spec.get("selector").is_some() {
         "WorkloadSelector"
-    } else if object.metadata.namespace.is_empty() {
-        // Defensive — should never happen for namespaced PeerAuth.
+    } else if object.metadata.namespace == istio_root_namespace
+        || object.metadata.namespace.is_empty()
+    {
         "MeshWide"
     } else {
         "Namespace"
@@ -884,6 +908,22 @@ mod tests {
     }
 
     #[test]
+    fn peer_auth_root_namespace_without_selector_reports_mesh_wide_scope() {
+        let obj = object(
+            "security.istio.io/v1",
+            "PeerAuthentication",
+            "mesh-default",
+            json!({ "mtls": { "mode": "STRICT" } }),
+        );
+        let updates = plan_istio_status_updates(
+            &[obj],
+            options().with_istio_root_namespace("default".to_string()),
+        );
+        let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        assert_eq!(detail["translation"]["scope"].as_str(), Some("MeshWide"));
+    }
+
+    #[test]
     fn peer_auth_port_level_overrides_appear_in_detail() {
         let obj = object(
             "security.istio.io/v1",
@@ -1014,6 +1054,14 @@ mod tests {
         let desired = json!({
             "conditions": [
                 {
+                    "type": "Reconciled",
+                    "status": "True",
+                    "reason": "Istio",
+                    "message": "Istio reconciled this AuthorizationPolicy",
+                    "lastTransitionTime": "2026-01-01T00:00:00Z",
+                    "observedGeneration": 1,
+                },
+                {
                     "type": "FerrumAccepted",
                     "status": "True",
                     "reason": "Accepted",
@@ -1038,6 +1086,14 @@ mod tests {
             conditions
                 .iter()
                 .any(|c| c["type"].as_str() == Some("Reconciled"))
+        );
+        assert_eq!(
+            conditions
+                .iter()
+                .filter(|c| c["type"].as_str() == Some("Reconciled"))
+                .count(),
+            1,
+            "non-Ferrum conditions from update.status must not duplicate live status"
         );
         // Ferrum's `FerrumAccepted` condition must be present.
         assert!(
@@ -1186,5 +1242,56 @@ mod tests {
         assert_eq!(merged.len(), 2);
         assert!(merged.iter().any(|c| c.get("type").is_none()
             && c["message"].as_str() == Some("weird entry without type")));
+    }
+
+    #[test]
+    fn planner_skips_resource_when_status_and_detail_are_current() {
+        let obj = object(
+            "security.istio.io/v1",
+            "AuthorizationPolicy",
+            "already-current",
+            json!({ "action": "ALLOW", "rules": [{"to": [{"operation": {"methods": ["GET"]}}]}] }),
+        );
+        let first = plan_istio_status_updates(std::slice::from_ref(&obj), options());
+        assert_eq!(first.len(), 1);
+
+        let mut current = obj;
+        current.status = first[0].status.clone();
+        current.status.as_object_mut().unwrap().insert(
+            "ferrum".to_string(),
+            first[0].ferrum_detail.clone().expect("translation detail"),
+        );
+
+        let second = plan_istio_status_updates(&[current], options());
+        assert!(
+            second.is_empty(),
+            "already-current status should not be patched again"
+        );
+    }
+
+    #[test]
+    fn planner_updates_resource_when_detail_is_stale() {
+        let obj = object(
+            "security.istio.io/v1",
+            "AuthorizationPolicy",
+            "stale-detail",
+            json!({ "action": "ALLOW", "rules": [{"to": [{"operation": {"methods": ["GET"]}}]}] }),
+        );
+        let first = plan_istio_status_updates(std::slice::from_ref(&obj), options());
+        assert_eq!(first.len(), 1);
+
+        let mut stale = obj;
+        stale.status = first[0].status.clone();
+        stale.status.as_object_mut().unwrap().insert(
+            "ferrum".to_string(),
+            json!({"translation": {"action": "STALE"}}),
+        );
+
+        let second = plan_istio_status_updates(&[stale], options());
+        assert_eq!(
+            second.len(),
+            1,
+            "stale Ferrum detail must be refreshed even when conditions match"
+        );
     }
 }

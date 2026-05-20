@@ -24,10 +24,12 @@ rules:
       - gateways/status
       - httproutes/status
       - grpcroutes/status
-    # Newer kube-rs SSA paths may fall back to `update status` after a 409
-    # conflict, and the Gateway API conformance docs reference both verbs.
-    # Granting both now keeps the chart stable if we move to server-side apply.
-    verbs: ["patch", "update"]
+    # The status writer reads live status before merge-patching so it can
+    # preserve non-Ferrum conditions. Newer kube-rs SSA paths may fall
+    # back to `update status` after a 409 conflict, and the Gateway API
+    # conformance docs reference both verbs. Granting both now keeps the
+    # chart stable if we move to server-side apply.
+    verbs: ["get", "patch", "update"]
   {{- end }}
   {{- if .Values.controlPlane.rbac.istio }}
   - apiGroups: ["security.istio.io"]
@@ -51,29 +53,24 @@ rules:
   # T2-B: status sub-resource patching for the three Istio CRDs where
   # Ferrum surfaces translation outcome via `kubectl describe`. The
   # CRDs ship `subresources.status: {}` in Istio's own manifests, so a
-  # standard `istioctl install` already supports this. `update` is
-  # granted alongside `patch` so newer kube-rs SSA paths that fall back
-  # to PUT after a 409 conflict keep working — mirrors the Gateway API
-  # block above. RequestAuthentication / VirtualService / ServiceEntry /
-  # Sidecar / Telemetry / WorkloadEntry status subresources are deferred
-  # to a follow-on; granting them now would broaden RBAC without a
-  # corresponding writer in this PR.
+  # standard `istioctl install` already supports this. The writer reads
+  # live status before each merge patch so non-Ferrum conditions are
+  # preserved, hence `get` is required on the status subresources.
+  # `update` is granted alongside `patch` so newer kube-rs SSA paths that
+  # fall back to PUT after a 409 conflict keep working — mirrors the
+  # Gateway API block above. RequestAuthentication / VirtualService /
+  # ServiceEntry / Sidecar / Telemetry / WorkloadEntry status
+  # subresources are deferred to a follow-on; granting them now would
+  # broaden RBAC without a corresponding writer in this PR.
   - apiGroups: ["security.istio.io"]
     resources:
       - authorizationpolicies/status
       - peerauthentications/status
-    verbs: ["patch", "update"]
+    verbs: ["get", "patch", "update"]
   - apiGroups: ["networking.istio.io"]
     resources:
       - destinationrules/status
-    verbs: ["patch", "update"]
-  # T2-B: Events emitted by the controller when it patches the Istio
-  # CRD status so `kubectl describe <kind> <name>` shows the
-  # accept/reject reason in the Events footer.
-  - apiGroups: [""]
-    resources:
-      - events
-    verbs: ["create", "patch"]
+    verbs: ["get", "patch", "update"]
   {{- end }}
   {{- if .Values.controlPlane.rbac.meshConfig }}
   - apiGroups: [""]
