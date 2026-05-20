@@ -4031,7 +4031,7 @@ impl Upstream {
 
         // Service discovery config
         if let Some(ref sd) = self.service_discovery
-            && let Err(sd_errors) = sd.validate_fields()
+            && let Err(sd_errors) = sd.validate_fields(&self.namespace)
         {
             for e in sd_errors {
                 errors.push(format!("service_discovery.{}", e));
@@ -4600,7 +4600,10 @@ impl HealthCheckConfig {
 
 impl ServiceDiscoveryConfig {
     /// Validate service discovery configuration fields.
-    pub fn validate_fields(&self) -> Result<(), Vec<String>> {
+    ///
+    /// `upstream_namespace` is the owning upstream's namespace; mesh SD
+    /// namespace must match it to prevent cross-namespace workload reference.
+    pub fn validate_fields(&self, upstream_namespace: &str) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
         if self.default_weight == 0 || self.default_weight > MAX_TARGET_WEIGHT {
@@ -4758,6 +4761,12 @@ impl ServiceDiscoveryConfig {
                         }
                         if namespace.is_empty() {
                             errors.push("mesh.namespace must not be empty".to_string());
+                        } else if namespace != upstream_namespace {
+                            errors.push(format!(
+                                "mesh.namespace '{}' must match the upstream's namespace '{}' \
+                                 to prevent cross-namespace workload reference",
+                                namespace, upstream_namespace
+                            ));
                         }
                     }
                     if let Some(port) = mesh.port
