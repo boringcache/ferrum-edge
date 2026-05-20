@@ -14,6 +14,7 @@
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use regex::{Regex, RegexSet};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
@@ -439,6 +440,9 @@ impl RouterCache {
         host: Option<&str>,
         path: &str,
     ) -> Option<RouteMatch> {
+        let normalized = normalize_encoded_slashes(path);
+        let path: &str = &normalized;
+
         // Fast path: use thread-local buffer for cache lookup to avoid String
         // allocation on cache hits (99%+ of requests). Only allocate on misses.
         let hit = CACHE_KEY_BUF.with(|buf| {
@@ -1278,6 +1282,60 @@ fn make_cache_key(host: Option<&str>, path: &str) -> String {
     }
 }
 
+/// Normalizes percent-encoded slashes in a URL path for route matching.
+///
+/// Converts `%2F`/`%2f` (single-encoded) and `%252F`/`%252f` (double-encoded)
+/// to literal `/` so that encoded slashes cannot bypass prefix-based route
+/// matching and auth policies. Returns the input unchanged (zero allocation)
+/// when no encoded slashes are present.
+fn normalize_encoded_slashes(path: &str) -> Cow<'_, str> {
+    if !path.as_bytes().contains(&b'%') {
+        return Cow::Borrowed(path);
+    }
+
+    let bytes = path.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    let mut modified = false;
+
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            // Double-encoded slash: %252F / %252f (5 bytes)
+            if i + 4 < bytes.len()
+                && bytes[i + 1] == b'2'
+                && bytes[i + 2] == b'5'
+                && bytes[i + 3] == b'2'
+                && matches!(bytes[i + 4], b'F' | b'f')
+            {
+                out.push(b'/');
+                i += 5;
+                modified = true;
+                continue;
+            }
+            // Single-encoded slash: %2F / %2f (3 bytes)
+            if i + 2 < bytes.len() && bytes[i + 1] == b'2' && matches!(bytes[i + 2], b'F' | b'f') {
+                out.push(b'/');
+                i += 3;
+                modified = true;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+
+    if modified {
+        // Input was valid UTF-8 and we only replaced ASCII percent-sequences
+        // with ASCII '/'; the result is guaranteed valid UTF-8.
+        match String::from_utf8(out) {
+            Ok(s) => Cow::Owned(s),
+            Err(_) => Cow::Borrowed(path),
+        }
+    } else {
+        Cow::Borrowed(path)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1714,5 +1772,56 @@ mod tests {
         let config = config_with_n_proxies(5);
         let cache = RouterCache::with_shard_amount(&config, 5_000, 3);
         assert_eq!(cache.cache_shard_amount(), 4);
+    }
+
+    // ── normalize_encoded_slashes tests ─────────────────────────────────
+
+    #[test]
+    fn encoded_slash_no_percent_unchanged() {
+        let result = normalize_encoded_slashes("/api/admin");
+        assert!(matches!(result, Cow::Borrowed(_)));
+        assert_eq!(result, "/api/admin");
+    }
+
+    #[test]
+    fn encoded_slash_single_lower() {
+        assert_eq!(normalize_encoded_slashes("/api%2fadmin"), "/api/admin");
+    }
+
+    #[test]
+    fn encoded_slash_single_upper() {
+        assert_eq!(normalize_encoded_slashes("/api%2Fadmin"), "/api/admin");
+    }
+
+    #[test]
+    fn encoded_slash_double_lower() {
+        assert_eq!(normalize_encoded_slashes("/api%252fadmin"), "/api/admin");
+    }
+
+    #[test]
+    fn encoded_slash_double_upper() {
+        assert_eq!(normalize_encoded_slashes("/api%252Fadmin"), "/api/admin");
+    }
+
+    #[test]
+    fn encoded_slash_multiple() {
+        assert_eq!(normalize_encoded_slashes("/a%2Fb%2fc%252Fd"), "/a/b/c/d");
+    }
+
+    #[test]
+    fn encoded_slash_other_percent_unchanged() {
+        let result = normalize_encoded_slashes("/api%20name");
+        assert_eq!(result, "/api%20name");
+    }
+
+    #[test]
+    fn encoded_slash_trailing_percent_safe() {
+        assert_eq!(normalize_encoded_slashes("/api%"), "/api%");
+        assert_eq!(normalize_encoded_slashes("/api%2"), "/api%2");
+    }
+
+    #[test]
+    fn encoded_slash_empty_path() {
+        assert_eq!(normalize_encoded_slashes(""), "");
     }
 }

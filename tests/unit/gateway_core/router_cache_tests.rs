@@ -1541,3 +1541,41 @@ fn test_host_only_no_match_without_host_header() {
         "host-only should not match when no host is provided"
     );
 }
+
+// ── Encoded slash normalization (security: prevent prefix auth bypass) ──
+
+#[test]
+fn encoded_slash_matches_protected_prefix() {
+    let config = test_config(vec![
+        test_proxy("protected", "/api"),
+        test_proxy("fallback", "/"),
+    ]);
+    let cache = RouterCache::new(&config, 10_000);
+
+    // Normal path matches protected proxy
+    let normal = cache.find_proxy(None, "/api/admin").unwrap();
+    assert_eq!(normal.proxy.id, "protected");
+
+    // Encoded slash must also match the protected proxy, not fall through
+    let encoded = cache.find_proxy(None, "/api%2Fadmin").unwrap();
+    assert_eq!(encoded.proxy.id, "protected");
+
+    // Double-encoded slash must also match
+    let double = cache.find_proxy(None, "/api%252Fadmin").unwrap();
+    assert_eq!(double.proxy.id, "protected");
+}
+
+#[test]
+fn encoded_slash_case_insensitive_hex() {
+    let config = test_config(vec![
+        test_proxy("protected", "/api"),
+        test_proxy("fallback", "/"),
+    ]);
+    let cache = RouterCache::new(&config, 10_000);
+
+    let lower = cache.find_proxy(None, "/api%2fadmin").unwrap();
+    assert_eq!(lower.proxy.id, "protected");
+
+    let upper = cache.find_proxy(None, "/api%2Fadmin").unwrap();
+    assert_eq!(upper.proxy.id, "protected");
+}
