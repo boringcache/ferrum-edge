@@ -21,10 +21,10 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           toolchain: stable
           components: rustfmt
@@ -37,7 +37,7 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - uses: ./.github/actions/setup-rust-ci
         with:
@@ -53,7 +53,7 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - uses: ./.github/actions/setup-rust-ci
         with:
@@ -74,7 +74,7 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - uses: ./.github/actions/setup-rust-ci
         with:
@@ -90,7 +90,7 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - uses: ./.github/actions/setup-rust-ci
         with:
@@ -106,7 +106,7 @@ jobs:
 
       - name: Upload mesh conformance artifacts
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: mesh-conformance-coverage
           path: target/conformance/
@@ -118,7 +118,7 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - uses: ./.github/actions/setup-rust-ci
         with:
@@ -132,7 +132,7 @@ jobs:
         # the ~60s `cargo build --bin ferrum-edge` step runs once instead of
         # six times. Functional tests look for ./target/debug/ferrum-edge;
         # shards re-create that path on download.
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: ferrum-edge-debug
           path: target/debug/ferrum-edge
@@ -211,6 +211,7 @@ jobs:
               functional_db_outage_test
               functional_db_tls_test
               functional_db_upstream_test
+              functional_mesh_mode_test
               functional_mongodb_test
               functional_namespace_test
               functional_redis_rate_limiting_test
@@ -249,7 +250,7 @@ jobs:
           --health-timeout 5s
           --health-retries 5
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - uses: ./.github/actions/setup-rust-ci
         with:
@@ -260,12 +261,12 @@ jobs:
         # Nextest's process-per-test model isolates port/process contention
         # and ships built-in slow-test + retry support, which fits this E2E
         # suite better than libtest's shared-process scheduler.
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@213ccc1a076163c093f914550b94feb90fab916d # v2
         with:
           tool: cargo-nextest
 
       - name: Download prebuilt gateway binary
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: ferrum-edge-debug
           path: target/debug
@@ -331,6 +332,223 @@ jobs:
         env:
           FUNCTIONAL_FILTERS: ${{ matrix.filters }}
 
+  gateway-api-conformance:
+    name: Gateway API Conformance
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      FERRUM_IMAGE: ferrum-edge:gateway-api-conformance
+      KIND_VERSION: v0.27.0
+      KUBECTL_VERSION: v1.32.3
+      GATEWAY_API_VERSION: v1.5.1
+      GATEWAY_API_SUPPORTED_FEATURES: Gateway,HTTPRoute
+      # This CI lab deploys the Gateway API controller/status surface only.
+      # Full GATEWAY-HTTP profile traffic conformance needs a routable Ferrum
+      # data-plane Service and should be enabled with that runtime work.
+      GATEWAY_API_CONFORMANCE_TESTS: >-
+        GatewayClassObservedGenerationBump
+        GatewayObservedGenerationBump
+        HTTPRouteObservedGenerationBump
+        HTTPRouteInvalidCrossNamespaceParentRef
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Check for Gateway API conformance changes
+        id: changes
+        run: |
+          set -euo pipefail
+          if git diff --name-only "origin/${{ github.base_ref }}...HEAD" | grep -Eq '^(\.github/workflows/(ci|gateway-api-conformance)\.yml|Cargo\.(toml|lock)|Dockerfile|charts/ferrum-mesh/|proto/|src/grpc/|src/k8s_controller/|src/modes/mesh/)'; then
+            echo "gateway_api_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "gateway_api_changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Go
+        if: steps.changes.outputs.gateway_api_changed == 'true'
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.25.x"
+
+      - name: Install Kubernetes tools
+        if: steps.changes.outputs.gateway_api_changed == 'true'
+        run: |
+          set -euo pipefail
+          sudo curl -fsSL -o /usr/local/bin/kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
+          sudo chmod +x /usr/local/bin/kind
+          sudo curl -fsSL -o /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          sudo chmod +x /usr/local/bin/kubectl
+          curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+      - name: Build Ferrum image
+        if: steps.changes.outputs.gateway_api_changed == 'true'
+        run: docker build -t "$FERRUM_IMAGE" .
+
+      - name: Create kind cluster
+        if: steps.changes.outputs.gateway_api_changed == 'true'
+        run: |
+          set -euo pipefail
+          kind create cluster --name ferrum-gwapi --wait 120s
+          kind load docker-image "$FERRUM_IMAGE" --name ferrum-gwapi
+
+      - name: Install Gateway API CRDs
+        if: steps.changes.outputs.gateway_api_changed == 'true'
+        run: |
+          set -euo pipefail
+          kubectl apply --server-side=true -f "https://github.com/kubernetes-sigs/gateway-api/releases/download/${GATEWAY_API_VERSION}/standard-install.yaml"
+          for crd in \
+            gatewayclasses.gateway.networking.k8s.io \
+            gateways.gateway.networking.k8s.io \
+            httproutes.gateway.networking.k8s.io \
+            grpcroutes.gateway.networking.k8s.io \
+            referencegrants.gateway.networking.k8s.io; do
+            kubectl wait --for=condition=Established "crd/${crd}" --timeout=120s
+          done
+
+      - name: Deploy Ferrum mesh controller
+        if: steps.changes.outputs.gateway_api_changed == 'true'
+        run: |
+          set -euo pipefail
+          kubectl create namespace ferrum
+          # Exercise the Gateway API controller only; do not install the
+          # injector webhook because it can intercept pod admission before its
+          # own TLS secret/endpoints exist in this single-node conformance lab.
+          helm upgrade --install ferrum ./charts/ferrum-mesh \
+            --namespace ferrum \
+            --set image.repository=ferrum-edge \
+            --set image.tag=gateway-api-conformance \
+            --set image.pullPolicy=IfNotPresent \
+            --set injector.enabled=false \
+            --set ca.enabled=false \
+            --set controlPlane.rbac.create=true \
+            --set controlPlane.rbac.gatewayApi=true \
+            --set controlPlane.rbac.istio=false \
+            --set controlPlane.rbac.meshConfig=false \
+            --set controlPlane.rbac.podDiscovery=true \
+            --set controlPlane.env.FERRUM_DB_TYPE=sqlite \
+            --set-string 'controlPlane.env.FERRUM_DB_URL=sqlite:////tmp/ferrum-gateway-api-conformance.db?mode=rwc' \
+            --set controlPlane.env.FERRUM_ADMIN_JWT_SECRET=ferrum-edge-gateway-api-conformance-admin-secret \
+            --set controlPlane.env.FERRUM_CP_DP_GRPC_JWT_SECRET=ferrum-edge-gateway-api-conformance-grpc-secret \
+            --set-string 'controlPlane.env.FERRUM_CP_NAMESPACES=*' \
+            --set controlPlane.env.FERRUM_LOG_LEVEL=info \
+            --set controlPlane.env.FERRUM_K8S_CONTROLLER_ENABLED=true \
+            --set controlPlane.env.FERRUM_K8S_WATCH_GATEWAY_API_CRDS=true \
+            --set controlPlane.env.FERRUM_K8S_WATCH_ISTIO_CRDS=false \
+            --set controlPlane.env.FERRUM_K8S_WATCH_MESH_CONFIG=false
+          if ! kubectl -n ferrum rollout status deployment/ferrum-mesh-control-plane --timeout=180s; then
+            kubectl -n ferrum describe deployment/ferrum-mesh-control-plane || true
+            kubectl -n ferrum describe replicasets || true
+            kubectl -n ferrum describe pods || true
+            kubectl -n ferrum logs deployment/ferrum-mesh-control-plane --all-containers --tail=200 || true
+            kubectl -n ferrum get events --sort-by=.lastTimestamp || true
+            echo "::error title=Control plane never reached Ready::skipping conformance run"
+            exit 1
+          fi
+
+      - name: Create Ferrum GatewayClass
+        if: steps.changes.outputs.gateway_api_changed == 'true'
+        run: |
+          cat <<'YAML' | kubectl apply -f -
+          apiVersion: gateway.networking.k8s.io/v1
+          kind: GatewayClass
+          metadata:
+            name: ferrum
+          spec:
+            controllerName: ferrum.io/gateway-controller
+          YAML
+
+      - name: Run upstream Gateway API conformance
+        if: steps.changes.outputs.gateway_api_changed == 'true'
+        id: conformance
+        run: |
+          set -uo pipefail
+          results="$GITHUB_WORKSPACE/conformance-results"
+          mkdir -p "$results"
+          git clone --depth 1 --branch "$GATEWAY_API_VERSION" https://github.com/kubernetes-sigs/gateway-api.git /tmp/gateway-api
+          cd /tmp/gateway-api
+          : > "$results/gateway-api-conformance-test.json"
+          status=0
+          for test_name in $GATEWAY_API_CONFORMANCE_TESTS; do
+            echo "::group::Gateway API conformance: ${test_name}"
+            test_log="$results/gateway-api-conformance-${test_name}.json"
+            test_report="$results/gateway-api-conformance-${test_name}-report.yaml"
+            go test -json ./conformance -run TestConformance -count=1 -timeout=10m -args \
+              --gateway-class=ferrum \
+              --supported-features="$GATEWAY_API_SUPPORTED_FEATURES" \
+              --run-test="$test_name" \
+              --cleanup-base-resources=false \
+              --organization=Ferrum \
+              --project="Ferrum Edge" \
+              --url=https://github.com/ferrum-edge/ferrum-edge \
+              --version="${GITHUB_SHA}" \
+              --contact=https://github.com/ferrum-edge/ferrum-edge/issues \
+              --report-output="$test_report" \
+              2>&1 | tee "$test_log"
+            test_status=${PIPESTATUS[0]}
+            cat "$test_log" >> "$results/gateway-api-conformance-test.json"
+            if [ "$test_status" -ne 0 ]; then
+              echo "::error title=Gateway API conformance failed::${test_name} exited with ${test_status}"
+              status="$test_status"
+            fi
+            echo "::endgroup::"
+          done
+          exit "$status"
+
+      - name: Collect Gateway API conformance diagnostics
+        if: always() && steps.changes.outputs.gateway_api_changed == 'true'
+        run: |
+          set +e
+          results="$GITHUB_WORKSPACE/conformance-results"
+          mkdir -p "$results"
+          kubectl get gatewayclasses,gateways,httproutes,grpcroutes -A -o yaml > "$results/gateway-api-resources.yaml"
+          kubectl -n ferrum get all -o wide > "$results/ferrum-namespace.txt"
+          kubectl -n ferrum describe deployment/ferrum-mesh-control-plane > "$results/ferrum-control-plane-deployment.txt"
+          kubectl -n ferrum get events --sort-by=.lastTimestamp > "$results/ferrum-events.txt"
+          kubectl -n ferrum logs deployment/ferrum-mesh-control-plane --all-containers --tail=1000 > "$results/ferrum-control-plane.log"
+          {
+            kubectl auth can-i get gatewayclasses/status --as=system:serviceaccount:ferrum:ferrum-mesh
+            kubectl auth can-i patch gatewayclasses/status --as=system:serviceaccount:ferrum:ferrum-mesh
+            kubectl auth can-i get gateways/status --as=system:serviceaccount:ferrum:ferrum-mesh -n gateway-conformance-infra
+            kubectl auth can-i patch gateways/status --as=system:serviceaccount:ferrum:ferrum-mesh -n gateway-conformance-infra
+            kubectl auth can-i get httproutes/status --as=system:serviceaccount:ferrum:ferrum-mesh -n gateway-conformance-infra
+            kubectl auth can-i patch httproutes/status --as=system:serviceaccount:ferrum:ferrum-mesh -n gateway-conformance-infra
+          } > "$results/ferrum-rbac-can-i.txt"
+          cat > "$results/CONFORMANCE.md" <<EOF
+          # Gateway API Conformance
+
+          Gateway API version: ${GATEWAY_API_VERSION}
+
+          Supported features: ${GATEWAY_API_SUPPORTED_FEATURES}
+
+          Targeted upstream tests: ${GATEWAY_API_CONFORMANCE_TESTS}
+
+          Artifacts:
+          - gateway-api-conformance-test.json
+          - gateway-api-conformance-*-report.yaml
+          - gateway-api-resources.yaml
+          - ferrum-namespace.txt
+          - ferrum-control-plane-deployment.txt
+          - ferrum-events.txt
+          - ferrum-control-plane.log
+          - ferrum-rbac-can-i.txt
+          EOF
+
+      - name: Upload Gateway API conformance artifacts
+        if: always() && steps.changes.outputs.gateway_api_changed == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: gateway-api-conformance-${{ env.GATEWAY_API_VERSION }}
+          path: conformance-results/
+
+      - name: Summarize Gateway API conformance skip
+        if: steps.changes.outputs.gateway_api_changed != 'true'
+        run: |
+          echo "## Gateway API Conformance" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Skipped: this PR does not touch Gateway API, mesh controller, chart, image, proto, or CI workflow surfaces." >> "$GITHUB_STEP_SUMMARY"
+
   test:
     name: Tests
     if: always() && github.event_name == 'pull_request'
@@ -341,6 +559,7 @@ jobs:
       - test-conformance
       - build-gateway-binary
       - test-functional
+      - gateway-api-conformance
     runs-on: ubuntu-latest
     steps:
       - name: Summarize test results
@@ -355,13 +574,15 @@ jobs:
           echo "| Mesh conformance | ${{ needs.test-conformance.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Gateway binary build | ${{ needs.build-gateway-binary.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Functional shards | ${{ needs.test-functional.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Gateway API conformance | ${{ needs.gateway-api-conformance.result }} |" >> $GITHUB_STEP_SUMMARY
 
           if [ "${{ needs.test-unit.result }}" != "success" ] ||
              [ "${{ needs.test-lib.result }}" != "success" ] ||
              [ "${{ needs.test-integration.result }}" != "success" ] ||
              [ "${{ needs.test-conformance.result }}" != "success" ] ||
              [ "${{ needs.build-gateway-binary.result }}" != "success" ] ||
-             [ "${{ needs.test-functional.result }}" != "success" ]; then
+             [ "${{ needs.test-functional.result }}" != "success" ] ||
+             [ "${{ needs.gateway-api-conformance.result }}" != "success" ]; then
             exit 1
           fi
 
@@ -370,7 +591,7 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - uses: ./.github/actions/setup-rust-ci
         with:
@@ -385,7 +606,7 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           fetch-depth: 0
 
@@ -400,13 +621,13 @@ jobs:
 
       - name: Install nightly Rust with rust-src
         if: steps.changes.outputs.ebpf_changed == 'true'
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
         with:
           components: rust-src
 
       - name: Install stable Rust for shared types
         if: steps.changes.outputs.ebpf_changed == 'true'
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
 
       - if: steps.changes.outputs.ebpf_changed == 'true'
         uses: ./.github/actions/setup-sccache
@@ -428,7 +649,7 @@ jobs:
 
       - name: Upload BPF artifact
         if: steps.changes.outputs.ebpf_changed == 'true'
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: ebpf-programs
           path: ebpf/target/bpfel-unknown-none/release/ferrum-ebpf
@@ -439,7 +660,7 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - uses: ./.github/actions/setup-rust-ci
         with:
@@ -516,7 +737,7 @@ jobs:
 
       - name: Upload performance results
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: performance-results
           path: tests/performance/ci_results/
@@ -574,10 +795,10 @@ jobs:
             asset_name: ferrum-edge-windows-x86_64.exe
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           toolchain: stable
           targets: ${{ matrix.target }}
@@ -587,7 +808,7 @@ jobs:
       - uses: ./.github/actions/setup-fast-linker
 
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         # Cache restore/save is a build-time optimization, not a correctness
         # input. The Windows runner occasionally fails the post-step cache
         # upload to GitHub's cache service with no log output (observed on PR
@@ -653,7 +874,7 @@ jobs:
           done
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: binary-${{ matrix.target }}
           path: release-assets/
@@ -666,10 +887,10 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Download all binary artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: downloaded-artifacts
           pattern: binary-*
@@ -753,10 +974,10 @@ jobs:
             cni_asset: ferrum-cni-linux-aarch64
             arch_dir: arm64
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Download Linux binary
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: binary-${{ matrix.binary_target }}
           path: downloaded-artifacts
@@ -769,24 +990,24 @@ jobs:
           cp Dockerfile.release docker-context/Dockerfile
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v4
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Log in to Docker Hub
-        uses: docker/login-action@v4
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Build and push per-platform digest
         id: build
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7
         with:
           context: docker-context
           platforms: ${{ matrix.platform }}
@@ -800,7 +1021,7 @@ jobs:
           touch "/tmp/digests/${digest#sha256:}"
 
       - name: Upload digest
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: docker-digest-${{ matrix.arch_dir }}
           path: /tmp/digests/*
@@ -816,24 +1037,24 @@ jobs:
       packages: write
     steps:
       - name: Download digests
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: /tmp/digests
           pattern: docker-digest-*
           merge-multiple: true
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v4
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Log in to Docker Hub
-        uses: docker/login-action@v4
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
