@@ -1487,6 +1487,22 @@ pub(crate) fn coalescing_h2_body_strip_hop_by_hop_trailers(
     ProxyBody::streaming(Box::pin(coalescing))
 }
 
+/// Size-limited coalescing HTTP/2 streaming body with hop-by-hop trailer
+/// stripping. Used by the gRPC streaming response path when
+/// `max_response_body_size_bytes > 0` to enforce the operator's size cap on
+/// streaming gRPC responses.
+pub(crate) fn size_limited_coalescing_h2_body_strip_hop_by_hop_trailers(
+    body: Incoming,
+    max_bytes: usize,
+    content_length: Option<u64>,
+    coalesce_target: usize,
+) -> ProxyBody {
+    let stripped = StripHopByHopTrailers::new(body);
+    let limited = SizeLimitedFrameSource::new(stripped, max_bytes);
+    let coalescing = Coalescing::new(limited, coalesce_target, content_length);
+    ProxyBody::streaming(Box::pin(coalescing))
+}
+
 /// Direct (non-coalesced) HTTP/2 streaming body wrapped in
 /// [`StripHopByHopTrailers`]. Counterpart of
 /// [`coalescing_h2_body_strip_hop_by_hop_trailers`] for the gRPC streaming
