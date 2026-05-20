@@ -21,7 +21,7 @@ when neither new env var is set.
 | Variable | Default | Description |
 |---|---|---|
 | `FERRUM_CP_NAMESPACES` | unset | Scope. Empty/unset = back-compat single namespace (`FERRUM_NAMESPACE`). `*` = cluster-wide CP (discovers namespaces dynamically). CSV (`prod,staging`) = explicit set. |
-| `FERRUM_CP_REQUIRE_NAMESPACE_CLAIM` | `false` | When `true`, every DP/mesh JWT must carry an `ns` claim authorising the subscribe namespace; tokens without it are rejected. |
+| `FERRUM_CP_REQUIRE_NAMESPACE_CLAIM` | `false` | When `true`, every DP `ConfigSync.Subscribe` JWT must carry an `ns` claim authorising the subscribe namespace; tokens without it are rejected. |
 
 Both vars live in `[cp_dp]` of `ferrum.conf` next to
 `FERRUM_CP_BROADCAST_CHANNEL_CAPACITY`. The scope is also surfaced in the
@@ -82,8 +82,8 @@ to 32) to keep the per-namespace channel small.
 
 ## JWT tenancy claim
 
-DP/mesh JWTs may carry an optional `ns` claim that pins which namespaces
-the bearer is authorised to subscribe to. The claim accepts:
+DP `ConfigSync.Subscribe` JWTs may carry an optional `ns` claim that pins
+which namespaces the bearer is authorised to subscribe to. The claim accepts:
 
 - a single string: `"ns": "prod"`
 - an array of strings: `"ns": ["prod","staging"]`
@@ -149,7 +149,8 @@ claim as an array.
 - xDS ADS and `MeshConfigSync` continue to use the legacy single-namespace
   path (they consume the CP-wide `broadcast::Sender<ConfigUpdate>` that
   `CpGrpcServerBuilder::build` returns for back-compat). Multi-namespace
-  support for those surfaces is tracked separately.
+  support and `ns`-claim enforcement for those surfaces is tracked
+  separately.
 - Per-namespace gateway trust bundles. The CP currently loads
   `load_gateway_trust_bundles` from `FERRUM_NAMESPACE` only; multi-tenant
   CPs share the same trust material across all served namespaces. Splitting

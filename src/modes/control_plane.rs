@@ -53,30 +53,82 @@ async fn resolve_polled_namespaces(
     db: &dyn DatabaseBackend,
     scope: &CpScope,
     fallback: &str,
+    retain_on_success: &[String],
+    previous_on_error: Option<&[String]>,
 ) -> Vec<String> {
     if let Some(explicit) = scope.explicit_namespaces() {
         return explicit;
     }
     // CpScope::All — discover dynamically.
     match db.list_namespaces().await {
-        Ok(mut ns) if !ns.is_empty() => {
-            ns.sort();
-            ns.dedup();
-            ns
-        }
-        Ok(_) => {
-            // Empty cluster — fall back to FERRUM_NAMESPACE so the admin API
-            // still works.
-            vec![fallback.to_string()]
-        }
+        Ok(ns) => merge_discovered_namespaces(ns, retain_on_success, fallback),
         Err(e) => {
-            warn!(
-                "CP scope=All: list_namespaces() failed ({}); falling back to FERRUM_NAMESPACE='{}'",
-                e, fallback
-            );
-            vec![fallback.to_string()]
+            let retained = previous_on_error.unwrap_or(retain_on_success);
+            let ns = normalize_namespace_list(retained);
+            if !ns.is_empty() {
+                warn!(
+                    "CP scope=All: list_namespaces() failed ({}); keeping previous {} namespace(s): [{}]",
+                    e,
+                    ns.len(),
+                    ns.join(", ")
+                );
+                ns
+            } else {
+                warn!(
+                    "CP scope=All: list_namespaces() failed ({}); falling back to FERRUM_NAMESPACE='{}'",
+                    e, fallback
+                );
+                vec![fallback.to_string()]
+            }
         }
     }
+}
+
+fn merge_discovered_namespaces(
+    discovered: Vec<String>,
+    retain: &[String],
+    fallback: &str,
+) -> Vec<String> {
+    let mut ns = normalize_namespace_list(&discovered);
+    ns.extend(normalize_namespace_list(retain));
+    ns.sort();
+    ns.dedup();
+    if ns.is_empty() {
+        vec![fallback.to_string()]
+    } else {
+        ns
+    }
+}
+
+fn normalize_namespace_list(namespaces: &[String]) -> Vec<String> {
+    let mut ns: Vec<String> = namespaces
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+    ns.sort();
+    ns.dedup();
+    ns
+}
+
+fn namespaces_referenced_by_config(config: &GatewayConfig) -> Vec<String> {
+    let mut namespaces = Vec::new();
+    namespaces.extend(config.known_namespaces.iter().cloned());
+    namespaces.extend(config.proxies.iter().map(|p| p.namespace.clone()));
+    namespaces.extend(config.consumers.iter().map(|c| c.namespace.clone()));
+    namespaces.extend(config.plugin_configs.iter().map(|pc| pc.namespace.clone()));
+    namespaces.extend(config.upstreams.iter().map(|u| u.namespace.clone()));
+    normalize_namespace_list(&namespaces)
+}
+
+fn retained_polled_namespaces(
+    config: &GatewayConfig,
+    broadcast_namespaces: &[String],
+) -> Vec<String> {
+    let mut namespaces = namespaces_referenced_by_config(config);
+    namespaces.extend(normalize_namespace_list(broadcast_namespaces));
+    normalize_namespace_list(&namespaces)
 }
 
 /// Multi-namespace incremental poll. Calls `load_incremental_config` once
@@ -490,7 +542,7 @@ pub async fn run(
     info!("CP mode: serving {}", cp_scope.describe());
     if env_config.cp_require_namespace_claim {
         info!(
-            "FERRUM_CP_REQUIRE_NAMESPACE_CLAIM=true — DP/mesh JWTs without an `ns` claim will be rejected"
+            "FERRUM_CP_REQUIRE_NAMESPACE_CLAIM=true — DP ConfigSync JWTs without an `ns` claim will be rejected"
         );
     }
 
@@ -498,7 +550,7 @@ pub async fn run(
     // explicit set; for `All` we query the DB and re-discover on every poll
     // cycle so newly created namespaces are picked up automatically.
     let polled_namespaces =
-        resolve_polled_namespaces(db.as_ref(), &cp_scope, &env_config.namespace).await;
+        resolve_polled_namespaces(db.as_ref(), &cp_scope, &env_config.namespace, &[], None).await;
     if matches!(cp_scope, CpScope::All) {
         info!(
             "CP scope=All: discovered {} namespace(s) at startup: [{}]",
@@ -979,10 +1031,7 @@ pub async fn run(
     let mesh_registry_poll = mesh_registry.clone();
     let poll_scope = cp_scope.clone();
     let poll_broadcasts = broadcasts.clone();
-    // Track which polled namespace list we ran the last full reload against.
-    // For `All` we rebuild this every tick from `db.list_namespaces()`. For
-    // `Single`/`Set` we trust the operator-provided list.
-    let _ = polled_namespaces; // moved into the spawn below
+    let initial_polled_namespaces = polled_namespaces;
 
     let db_poll_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(poll_interval);
@@ -992,6 +1041,7 @@ pub async fn run(
         let mut last_db_ips: Option<Vec<IpAddr>> = None;
         let mut last_replica_ips: Option<Vec<IpAddr>> = None;
         let mut force_full_reload = false;
+        let mut last_polled_namespaces = initial_polled_namespaces;
 
         // Seed incremental state from the initial config load
         let initial_config = config_poll.load_full();
@@ -1077,12 +1127,18 @@ pub async fn run(
                     if force_full_reload {
                         // Re-resolve the namespace list every full reload so
                         // CpScope::All picks up newly created namespaces
-                        // (and Set/Single short-circuits to the explicit
-                        // list).
+                        // without dropping namespaces still present in the
+                        // current snapshot if discovery temporarily shrinks.
+                        let current_snapshot = config_poll.load_full();
+                        let broadcast_namespaces = poll_broadcasts.namespaces();
+                        let retained_namespaces =
+                            retained_polled_namespaces(&current_snapshot, &broadcast_namespaces);
                         let nslist = resolve_polled_namespaces(
                             db_poll.as_ref(),
                             &poll_scope,
                             &poll_fallback_namespace,
+                            &retained_namespaces,
+                            Some(&last_polled_namespaces),
                         )
                         .await;
                         match load_full_config_multi(db_poll.as_ref(), &nslist).await {
@@ -1102,6 +1158,7 @@ pub async fn run(
                                 known_consumer_ids = next_known_consumer_ids;
                                 known_plugin_config_ids = next_known_plugin_config_ids;
                                 known_upstream_ids = next_known_upstream_ids;
+                                last_polled_namespaces = nslist.clone();
                                 force_full_reload = false;
                                 db_available_poll.store(true, Ordering::Relaxed);
 
@@ -1140,13 +1197,18 @@ pub async fn run(
                         // — bounded cost vs. the per-resource queries that
                         // dominate poll time. Snapshot the current config
                         // for per-namespace deletion routing.
+                        let current_snapshot = config_poll.load_full();
+                        let broadcast_namespaces = poll_broadcasts.namespaces();
+                        let retained_namespaces =
+                            retained_polled_namespaces(&current_snapshot, &broadcast_namespaces);
                         let nslist = resolve_polled_namespaces(
                             db_poll.as_ref(),
                             &poll_scope,
                             &poll_fallback_namespace,
+                            &retained_namespaces,
+                            Some(&last_polled_namespaces),
                         )
                         .await;
-                        let current_snapshot = config_poll.load_full();
                         let (
                             current_proxy_ns,
                             current_consumer_ns,
@@ -1171,6 +1233,7 @@ pub async fn run(
                         {
                             Ok(result) => {
                                 db_available_poll.store(true, Ordering::Relaxed);
+                                last_polled_namespaces = nslist.clone();
                                 if result.is_empty() {
                                     let source_trust_bundles = match db_poll
                                         .load_gateway_trust_bundles(&poll_namespace)
@@ -1353,8 +1416,6 @@ pub async fn run(
                                 // partition (= identical to pre-T2-A
                                 // behavior). For `Set`/`All` each DP sees
                                 // only its own namespace's resources.
-                                let (proxy_ns, consumer_ns, plugin_config_ns, upstream_ns) =
-                                    build_namespace_lookups(&new_config);
                                 let trust_bundles_for_broadcast = if trust_bundles_changed {
                                     new_config.trust_bundles.as_deref()
                                 } else {
@@ -1362,10 +1423,10 @@ pub async fn run(
                                 };
                                 let partitions = partition_incremental_by_namespace(
                                     result.clone(),
-                                    &proxy_ns,
-                                    &consumer_ns,
-                                    &plugin_config_ns,
-                                    &upstream_ns,
+                                    &current_proxy_ns,
+                                    &current_consumer_ns,
+                                    &current_plugin_config_ns,
+                                    &current_upstream_ns,
                                 );
                                 for (ns, ns_delta) in &partitions {
                                     CpGrpcServer::broadcast_namespace_delta(
@@ -1395,12 +1456,6 @@ pub async fn run(
                                     e
                                 );
                                 // Fallback to full config load + full snapshot broadcast
-                                let nslist = resolve_polled_namespaces(
-                                    db_poll.as_ref(),
-                                    &poll_scope,
-                                    &poll_fallback_namespace,
-                                )
-                                .await;
                                 match load_full_config_multi(db_poll.as_ref(), &nslist).await {
                                     Ok(new_config) => {
                                         db_available_poll.store(true, Ordering::Relaxed);
@@ -1409,6 +1464,7 @@ pub async fn run(
                                         known_consumer_ids = c;
                                         known_plugin_config_ids = pc;
                                         known_upstream_ids = u;
+                                        last_polled_namespaces = nslist.clone();
                                         last_poll_at = Some(new_config.loaded_at);
                                         last_gateway_trust_bundles = new_config.trust_bundles.clone();
                                         let new_config_arc = Arc::new(new_config.clone());
@@ -1437,6 +1493,7 @@ pub async fn run(
                                                         known_consumer_ids = c;
                                                         known_plugin_config_ids = pc;
                                                         known_upstream_ids = u;
+                                                        last_polled_namespaces = nslist.clone();
                                                         last_poll_at = Some(new_config.loaded_at);
                                                         last_gateway_trust_bundles = new_config.trust_bundles.clone();
                                                         let new_config_arc = Arc::new(new_config.clone());
@@ -1703,6 +1760,62 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    #[test]
+    fn merge_discovered_namespaces_retains_current_snapshot_namespaces() {
+        let merged = merge_discovered_namespaces(
+            vec!["tenant-a".to_string()],
+            &["tenant-b".to_string()],
+            "ferrum",
+        );
+        assert_eq!(merged, vec!["tenant-a", "tenant-b"]);
+    }
+
+    #[test]
+    fn merge_discovered_namespaces_uses_fallback_only_when_nothing_known() {
+        let merged = merge_discovered_namespaces(Vec::new(), &[], "ferrum");
+        assert_eq!(merged, vec!["ferrum"]);
+    }
+
+    #[test]
+    fn retained_polled_namespaces_includes_resources_known_namespaces_and_subscribers() {
+        let mut proxy = make_proxy("p1");
+        proxy.namespace = "tenant-a".to_string();
+        let config = GatewayConfig {
+            proxies: vec![proxy],
+            known_namespaces: vec!["tenant-b".to_string()],
+            ..Default::default()
+        };
+
+        let retained = retained_polled_namespaces(&config, &["tenant-c".to_string()]);
+        assert_eq!(retained, vec!["tenant-a", "tenant-b", "tenant-c"]);
+    }
+
+    #[test]
+    fn partition_incremental_routes_removed_ids_with_pre_delete_lookup() {
+        let mut proxy = make_proxy("p1");
+        proxy.namespace = "tenant-a".to_string();
+        let current = GatewayConfig {
+            proxies: vec![proxy],
+            ..Default::default()
+        };
+        let (proxy_ns, consumer_ns, plugin_config_ns, upstream_ns) =
+            build_namespace_lookups(&current);
+        let mut result = empty_incremental();
+        result.removed_proxy_ids = vec!["p1".to_string()];
+
+        let partitions = partition_incremental_by_namespace(
+            result,
+            &proxy_ns,
+            &consumer_ns,
+            &plugin_config_ns,
+            &upstream_ns,
+        );
+        let tenant_delta = partitions
+            .get("tenant-a")
+            .expect("removed proxy should be routed to its previous namespace");
+        assert_eq!(tenant_delta.removed_proxy_ids, vec!["p1"]);
     }
 
     // ── upsert_by_id ───────────────────────────────────────────────────

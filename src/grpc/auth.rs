@@ -9,7 +9,7 @@ use serde_json::Value;
 use std::collections::HashSet;
 use tonic::Status;
 
-/// Namespaces a DP/mesh JWT bearer is authorised to subscribe to.
+/// Namespaces a DP ConfigSync JWT bearer is authorised to subscribe to.
 ///
 /// The `ns` claim is optional for back-compat with operator-minted tokens
 /// that predate multi-namespace CPs. Carriers:
@@ -55,10 +55,10 @@ pub(crate) fn verify_grpc_jwt_metadata(
 }
 
 /// Verify the JWT and return any `ns` claim it carried. Use this variant
-/// whenever the caller needs the tenancy-claim path (CP `Subscribe`,
-/// `GetFullConfig`, mesh `MeshSubscribe`, xDS ADS). The verification logic
-/// is identical to [`verify_grpc_jwt_metadata`]; the only difference is the
-/// extra claim extraction.
+/// whenever the caller needs the tenancy-claim path (CP `Subscribe` and
+/// `GetFullConfig` today). The verification logic is identical to
+/// [`verify_grpc_jwt_metadata`]; the only difference is the extra claim
+/// extraction.
 #[allow(clippy::result_large_err)]
 pub(crate) fn verify_grpc_jwt_metadata_with_claims(
     metadata: &tonic::metadata::MetadataMap,
