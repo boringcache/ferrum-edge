@@ -1294,10 +1294,39 @@ VirtualService `timeout` is translated to the proxy's `backend_read_timeout_ms`.
 
 ### Fault Injection
 
-Per-route `fault` configuration is translated to proxy-scoped `fault_injection` plugin instances:
+Per-route `fault` rides on each emitted `mesh_route_dispatch` rule as a per-rule `fault` action (`{delay, abort}`) — the same `FaultRoller` math the proxy-scoped `fault_injection` plugin uses, scoped to the matching dispatch rule. This replaces the historical proxy-scoped emission, which could not be collapsed with sibling routes and previously fail-closed any merged route that carried fault.
 
-- `fault.abort.httpStatus` + `fault.abort.percentage` -> abort with status code at the configured rate.
-- `fault.delay.fixedDelay` + `fault.delay.percentage` -> inject latency at the configured rate.
+- `fault.abort.httpStatus` + `fault.abort.percentage` → rule `fault.abort` with `status_code` + `percentage`. `abort` is dropped (along with the rest of the rule's fault) when `httpStatus` is missing or the percentage is `0`; an accompanying valid `delay` still projects.
+- `fault.delay.fixedDelay` + `fault.delay.percentage` → rule `fault.delay` with `duration_ms` + `percentage`. `fixedDelay` accepts Istio's Go-style duration syntax; values outside `[1 ms, 1 h]` are rejected at translation time.
+- `fault.abort.grpcStatus` (string or numeric `0..=16`) → `fault.abort.grpc_status`. The header is only stamped on the rejection response when the matching request is detected as gRPC (`content-type: application/grpc[+...]`, excluding `application/grpc-web*`); plain HTTP on the same rule never receives a stray `grpc-status` header.
+
+**Ordering:** when both delay and abort trigger on the same request, the delay runs first, then the abort fires — matching the proxy-scoped `fault_injection` plugin so the two surfaces stay semantically identical. A global / proxy-scoped `fault_injection` plugin running before this one (priority 2940 vs 2995) sets `ctx.metadata["fault_injected"]=true`, and the per-rule fault no-ops in that case so the two surfaces never stack a second delay + abort.
+
+**RTDS scope (limitation):** the static percentages baked into a per-rule fault action are **not** runtime-tunable via the GAP-3E RTDS keys `ferrum.fault_injection.<scope>.{abort,delay}_percent` — those keys apply only to `fault_injection` plugin instances configured with `runtime_overlay_scope`. Operators who need RTDS-driven fault percentages should either use a global / proxy-scoped `fault_injection` plugin with `runtime_overlay_scope`, or wait for a follow-on PR that introduces per-rule RTDS scoping.
+
+Example translation:
+
+```yaml
+# VirtualService
+http:
+  - match: [{uri: {prefix: "/v1"}}]
+    route: [{destination: {host: api.default.svc.cluster.local, port: {number: 8080}}}]
+    fault:
+      abort:  {httpStatus: 503, percentage: {value: 25.0}}
+      delay:  {fixedDelay: "200ms", percentage: {value: 50.0}}
+```
+
+```json
+// emitted mesh_route_dispatch rule (URI-only catch-all)
+{
+  "match": {},
+  "destination": {"backend_host": "api.default.svc.cluster.local", "backend_port": 8080},
+  "fault": {
+    "abort": {"status_code": 503, "percentage": 25.0},
+    "delay": {"duration_ms": 200, "percentage": 50.0}
+  }
+}
+```
 
 ### Destination Port Resolution
 

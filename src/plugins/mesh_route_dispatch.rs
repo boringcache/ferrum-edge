@@ -62,12 +62,18 @@ use crate::config::types::{
     normalize_backend_tls_san_allow_list_entry, validate_backend_tls_san_allow_list_entry,
     validate_backend_tls_sni,
 };
+use crate::plugins::utils::fault_roll::FaultRoller;
 use crate::plugins::utils::route_header_transform::{
     RawRouteHeaderTransformRule, RouteHeaderTransformRule, parse_route_header_transforms,
 };
 use crate::plugins::{
     HTTP_FAMILY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext, priority,
 };
+
+/// Maximum delay duration for a route-local fault action (matches the
+/// `fault_injection` plugin's cap so the two surfaces share a single
+/// upper bound).
+const FAULT_ACTION_MAX_DELAY_MS: u64 = 3_600_000;
 
 /// Top-level config for the plugin.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -211,6 +217,14 @@ impl MeshRouteDispatchConfig {
             if let Some(tls) = rule.destination.backend_tls.as_mut() {
                 normalize_and_validate_backend_tls(idx, tls)?;
             }
+            if let Some(fault) = rule.fault.as_ref() {
+                validate_fault_action(idx, fault)?;
+            }
+            rule.fault_roller = if rule.fault.is_some() {
+                Some(Arc::new(FaultRoller::new()))
+            } else {
+                None
+            };
             rule.request_transform_compiled =
                 compile_transform_field(idx, "request_transform", &rule.request_transform)?;
             rule.response_transform_compiled =
@@ -224,6 +238,74 @@ impl MeshRouteDispatchConfig {
         }
         Ok(())
     }
+}
+
+fn validate_fault_action(rule_idx: usize, fault: &FaultActionConfig) -> Result<(), String> {
+    if fault.delay.is_none() && fault.abort.is_none() {
+        return Err(format!(
+            "mesh_route_dispatch.rules[{rule_idx}].fault must contain at least one of \
+             'delay' or 'abort'"
+        ));
+    }
+    if let Some(delay) = fault.delay.as_ref() {
+        if delay.duration_ms == 0 {
+            return Err(format!(
+                "mesh_route_dispatch.rules[{rule_idx}].fault.delay.duration_ms must be > 0"
+            ));
+        }
+        if delay.duration_ms > FAULT_ACTION_MAX_DELAY_MS {
+            return Err(format!(
+                "mesh_route_dispatch.rules[{rule_idx}].fault.delay.duration_ms must be \
+                 <= {FAULT_ACTION_MAX_DELAY_MS} (1 hour), got {}",
+                delay.duration_ms
+            ));
+        }
+        validate_fault_percentage(rule_idx, "fault.delay.percentage", delay.percentage)?;
+    }
+    if let Some(abort) = fault.abort.as_ref() {
+        if !(200..=599).contains(&abort.status_code) {
+            return Err(format!(
+                "mesh_route_dispatch.rules[{rule_idx}].fault.abort.status_code must be \
+                 200-599, got {}",
+                abort.status_code
+            ));
+        }
+        validate_fault_percentage(rule_idx, "fault.abort.percentage", abort.percentage)?;
+        if let Some(code) = abort.grpc_status
+            && code > 16
+        {
+            return Err(format!(
+                "mesh_route_dispatch.rules[{rule_idx}].fault.abort.grpc_status must be \
+                 0-16, got {code}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_fault_percentage(
+    rule_idx: usize,
+    field_name: &str,
+    percentage: f64,
+) -> Result<(), String> {
+    if !percentage.is_finite() {
+        return Err(format!(
+            "mesh_route_dispatch.rules[{rule_idx}].{field_name} must be a finite number"
+        ));
+    }
+    if !(0.0..=100.0).contains(&percentage) {
+        return Err(format!(
+            "mesh_route_dispatch.rules[{rule_idx}].{field_name} must be in [0.0, 100.0], \
+             got {percentage}"
+        ));
+    }
+    if percentage == 0.0 {
+        return Err(format!(
+            "mesh_route_dispatch.rules[{rule_idx}].{field_name} must be > 0.0 (a 0% \
+             fault would be a no-op; omit the action to disable it instead)"
+        ));
+    }
+    Ok(())
 }
 
 fn compile_transform_field(
@@ -323,6 +405,31 @@ pub struct RouteRule {
     /// `request_transform`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub response_transform: Vec<RawRouteHeaderTransformRule>,
+    /// Optional per-rule fault action. Mirrors the proxy-scoped
+    /// `fault_injection` plugin's `delay` / `abort` shape but applies only
+    /// when this dispatch rule matches the request. Used by the K8s
+    /// VirtualService translator to project `http[].fault` onto each
+    /// emitted dispatch rule so fault-carrying routes can be collapsed
+    /// with sibling routes without a fail-closed escape hatch.
+    ///
+    /// **RTDS scope:** the percentages baked into a per-rule fault are
+    /// NOT runtime-tunable via the GAP-3E RTDS keys
+    /// `ferrum.fault_injection.<scope>.{abort,delay}_percent` — those keys
+    /// apply only to `fault_injection` plugin instances configured with
+    /// `runtime_overlay_scope`. Operators who need RTDS-driven fault
+    /// percentages should use a global / proxy-scoped `fault_injection`
+    /// plugin instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fault: Option<FaultActionConfig>,
+    /// Per-rule fault roller. Constructed at config-load time whenever
+    /// `fault` is `Some` so the request hot path does one atomic counter
+    /// increment + a splitmix64 mix per fault decision. `None` when the
+    /// rule carries no fault. The `apply_fault_action` helper falls back
+    /// to a throwaway `FaultRoller::new()` if this is somehow unset on a
+    /// fault-carrying rule — defense in depth for hand-constructed
+    /// `RouteRule` literals in tests.
+    #[serde(skip)]
+    fault_roller: Option<Arc<FaultRoller>>,
     /// Pre-compiled `request_transform` rules, built during normalize so the
     /// hot path clones an `Arc` pointer (not the rule list) on every match.
     /// `None` when `request_transform` is empty.
@@ -756,6 +863,53 @@ impl RouteDestination {
     }
 }
 
+/// Per-rule fault action carried by a single [`RouteRule`]. Projects Istio
+/// `VirtualService.http[].fault` onto the matching dispatch rule so a
+/// fault-carrying route does not have to spin up a separate proxy-scoped
+/// `fault_injection` plugin (which previously fail-closed any
+/// fault-carrying route that had to be collapsed with sibling routes
+/// because the plugin's per-proxy granularity was coarser than the
+/// per-rule semantics Istio specifies).
+///
+/// At least one of `delay` / `abort` must be present; an empty fault
+/// object is rejected at config-load time.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct FaultActionConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delay: Option<FaultDelayConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub abort: Option<FaultAbortConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FaultDelayConfig {
+    /// How long to delay when the percentile roll hits, in milliseconds.
+    /// Bounded to `[1, 3_600_000]` (1 ms to 1 hour) so a misconfigured
+    /// fault can't wedge a proxy forever.
+    pub duration_ms: u64,
+    /// Percent of matching requests that trigger the delay. Range
+    /// `(0.0, 100.0]`. `0.0` is rejected at config-load time because it
+    /// would be a no-op.
+    pub percentage: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FaultAbortConfig {
+    /// HTTP status code returned to the client. `200..=599`.
+    pub status_code: u16,
+    /// Percent of matching requests that trigger the abort. Range
+    /// `(0.0, 100.0]`.
+    pub percentage: f64,
+    /// Optional gRPC status code (`0..=16`) — only emitted when the
+    /// matching request is detected as gRPC. Plain-HTTP requests on the
+    /// same rule never receive a stray `grpc-status` header.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grpc_status: Option<u32>,
+    /// Optional response body. Empty when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+}
+
 #[derive(Debug)]
 pub struct MeshRouteDispatch {
     config: MeshRouteDispatchConfig,
@@ -1103,6 +1257,19 @@ impl Plugin for MeshRouteDispatch {
     ) -> PluginResult {
         for rule in &self.config.rules {
             if rule_matches(rule, ctx, headers) {
+                // Per-rule fault action: fire BEFORE setting any route
+                // override on the context. If the fault aborts, the
+                // request never reaches backend dispatch so the override
+                // would be wasted work — and skipping the assignment
+                // keeps `ctx.route_override_*` untouched (mirroring the
+                // proxy-scoped `fault_injection` plugin's behaviour where
+                // an aborted request never reaches the route override
+                // stage).
+                if let Some(fault) = rule.fault.as_ref()
+                    && let Some(result) = apply_fault_action(ctx, headers, rule, fault).await
+                {
+                    return result;
+                }
                 // Route overrides are a whole-destination decision, not a
                 // field-wise merge. If an earlier plugin instance matched,
                 // this matching instance intentionally replaces all four
@@ -1161,6 +1328,104 @@ impl Plugin for MeshRouteDispatch {
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+/// Apply the per-rule fault action when the rule matched. Returns `Some` to
+/// short-circuit the dispatch chain (delay/abort fired) or `None` to fall
+/// through to the normal route-override path.
+///
+/// The fault decision is one paired `FaultRoller::roll_pair` call (one
+/// atomic increment + splitmix64 mix). When both delay and abort trigger,
+/// the delay runs first, then the abort fires — matching the proxy-scoped
+/// `fault_injection` plugin's ordering so the two surfaces stay
+/// semantically identical.
+///
+/// Guards against double-faulting when a global / proxy-scoped
+/// `fault_injection` plugin (priority 2940, runs before
+/// `mesh_route_dispatch` at 2995) has already injected a fault on this
+/// request — in that case the metadata key `fault_injected` is set and
+/// this helper returns `None` so the route override still applies but no
+/// second fault is stacked.
+async fn apply_fault_action(
+    ctx: &mut RequestContext,
+    headers: &HashMap<String, String>,
+    rule: &RouteRule,
+    fault: &FaultActionConfig,
+) -> Option<PluginResult> {
+    if ctx.metadata.contains_key("fault_injected") {
+        return None;
+    }
+    // Defensive fallback to a throwaway roller protects `RouteRule`
+    // literals constructed outside `normalize_and_validate` (e.g. tests
+    // that build a `RouteRule` directly). The constructor populates
+    // `fault_roller` whenever `fault` is `Some`, so steady-state always
+    // hits the `Some(roller)` arm without allocation.
+    let outcome = match rule.fault_roller.as_ref() {
+        Some(roller) => roller.roll_pair(
+            fault.delay.as_ref().map(|d| d.percentage),
+            fault.abort.as_ref().map(|a| a.percentage),
+        ),
+        None => FaultRoller::new().roll_pair(
+            fault.delay.as_ref().map(|d| d.percentage),
+            fault.abort.as_ref().map(|a| a.percentage),
+        ),
+    };
+
+    if !outcome.delay_triggered && !outcome.abort_triggered {
+        return None;
+    }
+
+    // Mark before any sleeps so concurrent plugin instances (e.g.
+    // proxy-scoped `fault_injection` that runs after this one for some
+    // reason) skip their own fault decision.
+    ctx.metadata
+        .insert("fault_injected".to_string(), "true".to_string());
+
+    if outcome.delay_triggered
+        && let Some(delay) = fault.delay.as_ref()
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(delay.duration_ms)).await;
+    }
+
+    if outcome.abort_triggered
+        && let Some(abort) = fault.abort.as_ref()
+    {
+        let mut reject_headers = HashMap::new();
+        // gRPC-only: emit `grpc-status` so the proxy's trailers-only
+        // normalization in `proxy/mod.rs` can turn the rejection into a
+        // proper `application/grpc` trailers-only response. Plain HTTP
+        // requests on the same rule never receive a stray header.
+        if let Some(grpc_status) = abort.grpc_status
+            && is_grpc_request(headers)
+        {
+            reject_headers.insert("grpc-status".to_string(), grpc_status.to_string());
+        }
+        return Some(PluginResult::Reject {
+            status_code: abort.status_code,
+            body: abort.body.clone().unwrap_or_default(),
+            headers: reject_headers,
+        });
+    }
+
+    // Delay fired but abort did not (or abort wasn't configured) — fall
+    // through to normal route-override processing so the request still
+    // dispatches.
+    None
+}
+
+/// gRPC content-type detection consistent with `proxy::detect_http_flavor`.
+/// Returns `true` only for the `application/grpc[+...]` content types and
+/// explicitly excludes the gRPC-Web variants (`application/grpc-web*`)
+/// because those are normalised by the proxy's gRPC-Web bridge, not the
+/// trailer-based gRPC path.
+fn is_grpc_request(headers: &HashMap<String, String>) -> bool {
+    headers
+        .get("content-type")
+        .map(|ct| {
+            let lower = ct.to_ascii_lowercase();
+            lower.starts_with("application/grpc") && !lower.starts_with("application/grpc-web")
+        })
+        .unwrap_or(false)
 }
 
 fn rule_matches(rule: &RouteRule, ctx: &RequestContext, headers: &HashMap<String, String>) -> bool {
@@ -3827,5 +4092,283 @@ mod tests {
             raw.get("ignore_uri_case").is_none(),
             "ignore_uri_case=false must be omitted from the wire form"
         );
+    }
+
+    // -- Per-rule fault action -------------------------------------------
+
+    #[test]
+    fn rejects_empty_fault_action() {
+        let err = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "canary"},
+                "fault": {}
+            }]
+        }))
+        .unwrap_err();
+        assert!(
+            err.contains("at least one of 'delay' or 'abort'"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_zero_delay_duration() {
+        let err = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "canary"},
+                "fault": {"delay": {"duration_ms": 0, "percentage": 50.0}}
+            }]
+        }))
+        .unwrap_err();
+        assert!(err.contains("duration_ms must be > 0"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_delay_duration_above_one_hour() {
+        let err = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "canary"},
+                "fault": {"delay": {"duration_ms": 3_600_001, "percentage": 50.0}}
+            }]
+        }))
+        .unwrap_err();
+        assert!(err.contains("duration_ms must be"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_zero_percentage() {
+        let err = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "canary"},
+                "fault": {"abort": {"status_code": 503, "percentage": 0.0}}
+            }]
+        }))
+        .unwrap_err();
+        assert!(err.contains("must be > 0.0"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_out_of_range_status_code() {
+        let err = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "canary"},
+                "fault": {"abort": {"status_code": 700, "percentage": 50.0}}
+            }]
+        }))
+        .unwrap_err();
+        assert!(err.contains("status_code must be 200-599"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_out_of_range_grpc_status() {
+        let err = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "canary"},
+                "fault": {"abort": {
+                    "status_code": 503,
+                    "percentage": 50.0,
+                    "grpc_status": 17
+                }}
+            }]
+        }))
+        .unwrap_err();
+        assert!(err.contains("grpc_status must be 0-16"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn full_abort_rejects_request() {
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "canary"},
+                "fault": {"abort": {"status_code": 503, "percentage": 100.0}}
+            }]
+        }))
+        .unwrap();
+        let mut ctx = ctx_with("GET", "/api");
+        let mut headers = HashMap::new();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        match result {
+            PluginResult::Reject { status_code, .. } => {
+                assert_eq!(status_code, 503);
+            }
+            other => panic!("expected reject, got {other:?}"),
+        }
+        // Route override never applies when the request is aborted.
+        assert!(ctx.route_override_upstream_id.is_none());
+        // Mark for downstream guards.
+        assert_eq!(
+            ctx.metadata.get("fault_injected").map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[tokio::test]
+    async fn full_abort_emits_grpc_status_only_for_grpc_requests() {
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": ["POST"]},
+                "destination": {"upstream_id": "canary"},
+                "fault": {"abort": {
+                    "status_code": 200,
+                    "percentage": 100.0,
+                    "grpc_status": 14
+                }}
+            }]
+        }))
+        .unwrap();
+
+        // Plain HTTP: no grpc-status header.
+        let mut ctx = ctx_with("POST", "/api");
+        let mut headers = HashMap::new();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        match result {
+            PluginResult::Reject {
+                headers: resp_headers,
+                ..
+            } => {
+                assert!(
+                    !resp_headers.contains_key("grpc-status"),
+                    "plain HTTP must not receive grpc-status header"
+                );
+            }
+            other => panic!("expected reject, got {other:?}"),
+        }
+
+        // gRPC: grpc-status header present.
+        let mut ctx = ctx_with("POST", "/svc/Method");
+        let mut headers =
+            HashMap::from([("content-type".to_string(), "application/grpc".to_string())]);
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        match result {
+            PluginResult::Reject {
+                headers: resp_headers,
+                ..
+            } => {
+                assert_eq!(
+                    resp_headers.get("grpc-status").map(String::as_str),
+                    Some("14")
+                );
+            }
+            other => panic!("expected reject, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn grpc_web_request_is_not_treated_as_grpc() {
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": ["POST"]},
+                "destination": {"upstream_id": "canary"},
+                "fault": {"abort": {
+                    "status_code": 200,
+                    "percentage": 100.0,
+                    "grpc_status": 14
+                }}
+            }]
+        }))
+        .unwrap();
+        let mut ctx = ctx_with("POST", "/svc/Method");
+        let mut headers = HashMap::from([(
+            "content-type".to_string(),
+            "application/grpc-web+proto".to_string(),
+        )]);
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        match result {
+            PluginResult::Reject {
+                headers: resp_headers,
+                ..
+            } => {
+                assert!(
+                    !resp_headers.contains_key("grpc-status"),
+                    "gRPC-Web requests are handled by the gRPC-Web bridge, \
+                     not the trailer-based gRPC path; do not stamp grpc-status"
+                );
+            }
+            other => panic!("expected reject, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn full_delay_only_falls_through_to_override() {
+        // 100% delay with a tiny duration. Since `tokio::time::sleep(1ms)`
+        // is functionally instant under the test runtime, this confirms the
+        // delay path doesn't accidentally also reject.
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "canary"},
+                "fault": {"delay": {"duration_ms": 1, "percentage": 100.0}}
+            }]
+        }))
+        .unwrap();
+        let mut ctx = ctx_with("GET", "/api");
+        let mut headers = HashMap::new();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert!(matches!(result, PluginResult::Continue));
+        // Route override DOES apply when there's no abort — the request
+        // dispatches normally after the delay.
+        assert_eq!(ctx.route_override_upstream_id.as_deref(), Some("canary"));
+    }
+
+    #[tokio::test]
+    async fn fault_skipped_when_prior_plugin_already_injected() {
+        // A global / proxy-scoped `fault_injection` plugin running before
+        // this one (priority 2940 vs 2995) sets `fault_injected=true` on
+        // ctx.metadata. The per-rule fault must then no-op to avoid
+        // stacking a second delay + abort.
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "canary"},
+                "fault": {"abort": {"status_code": 503, "percentage": 100.0}}
+            }]
+        }))
+        .unwrap();
+        let mut ctx = ctx_with("GET", "/api");
+        ctx.metadata
+            .insert("fault_injected".to_string(), "true".to_string());
+        let mut headers = HashMap::new();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        // No second abort fires; the route override still applies so the
+        // canary upstream still gets the matched request.
+        assert!(matches!(result, PluginResult::Continue));
+        assert_eq!(ctx.route_override_upstream_id.as_deref(), Some("canary"));
+    }
+
+    #[tokio::test]
+    async fn fault_does_not_fire_on_unmatched_rules() {
+        // First-match-wins: if a method=POST rule has a fault but the
+        // request is GET, the fault must not fire from a later rule that
+        // happens to match.
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [
+                {
+                    "match": {"methods": ["POST"]},
+                    "destination": {"upstream_id": "fault-target"},
+                    "fault": {"abort": {"status_code": 503, "percentage": 100.0}}
+                },
+                {
+                    "match": {"methods": ["GET"]},
+                    "destination": {"upstream_id": "safe-target"}
+                }
+            ]
+        }))
+        .unwrap();
+        let mut ctx = ctx_with("GET", "/api");
+        let mut headers = HashMap::new();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert!(matches!(result, PluginResult::Continue));
+        assert_eq!(
+            ctx.route_override_upstream_id.as_deref(),
+            Some("safe-target")
+        );
+        assert!(!ctx.metadata.contains_key("fault_injected"));
     }
 }
