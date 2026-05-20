@@ -657,3 +657,29 @@ async fn deny_mode_ipv4_mapped_ipv6_cidr_rule_rejects_ipv4_mapped_client() {
     let result = plugin.on_request_received(&mut ctx).await;
     plugin_utils::assert_reject(result, Some(403));
 }
+
+#[tokio::test]
+async fn deny_mode_ipv4_mapped_ipv6_exact_rule_rejects_canonicalized_ipv4_client() {
+    let plugin = IpRestriction::new(&json!({
+        "deny": ["::ffff:192.168.1.100"],
+        "mode": "deny_first"
+    }))
+    .unwrap();
+
+    let mut ctx = create_context_with_ip("192.168.1.100");
+    let result = plugin.on_request_received(&mut ctx).await;
+    plugin_utils::assert_reject(result, Some(403));
+}
+
+#[tokio::test]
+async fn deny_mode_ipv4_mapped_ipv6_cidr_rule_rejects_canonicalized_ipv4_client() {
+    let plugin = IpRestriction::new(&json!({
+        "deny": ["::ffff:192.168.1.0/120"],
+        "mode": "deny_first"
+    }))
+    .unwrap();
+
+    let mut ctx = create_context_with_ip("192.168.1.42");
+    let result = plugin.on_request_received(&mut ctx).await;
+    plugin_utils::assert_reject(result, Some(403));
+}

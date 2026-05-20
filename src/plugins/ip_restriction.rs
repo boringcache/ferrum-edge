@@ -222,19 +222,19 @@ pub(super) fn parse_rule(rule: &str) -> Option<ParsedRule> {
                 return None;
             }
 
-            if let Some(v4_bits) = ipv6_parts_to_ipv4_mapped_u32(&parts) {
-                if prefix_len >= 96 {
-                    let v4_prefix_len = prefix_len - 96;
-                    let mask = if v4_prefix_len == 0 {
-                        0u32
-                    } else {
-                        !0u32 << (32 - v4_prefix_len)
-                    };
-                    return Some(ParsedRule::CidrV4 {
-                        network: v4_bits & mask,
-                        mask,
-                    });
-                }
+            if let Some(v4_bits) = ipv6_parts_to_ipv4_mapped_u32(&parts)
+                && prefix_len >= 96
+            {
+                let v4_prefix_len = prefix_len - 96;
+                let mask = if v4_prefix_len == 0 {
+                    0u32
+                } else {
+                    !0u32 << (32 - v4_prefix_len)
+                };
+                return Some(ParsedRule::CidrV4 {
+                    network: v4_bits & mask,
+                    mask,
+                });
             }
 
             let network = ipv6_to_u128(&parts);
@@ -369,7 +369,6 @@ fn parse_ipv6(ip: &str) -> Option<[u16; 8]> {
 
     ip.parse::<Ipv6Addr>().ok().map(|ip| ip.segments())
 }
-
 
 fn ipv6_parts_to_ipv4_mapped_u32(parts: &[u16; 8]) -> Option<u32> {
     let v6 = Ipv6Addr::from(*parts);
