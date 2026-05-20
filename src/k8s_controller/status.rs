@@ -59,8 +59,21 @@ impl GatewayApiStatusWriter {
             let namespace = update.namespace.clone();
             Some(async move {
                 let result = async {
-                    let live = api.get_status(&name).await?;
-                    let patch = status_patch_for_update(update, live.data.get("status"));
+                    let live_status = match api.get_status(&name).await {
+                        Ok(live) => live.data.get("status").cloned(),
+                        Err(error) => {
+                            warn!(
+                                api_version = %update.api_version,
+                                kind = %update.kind,
+                                namespace = %update.namespace,
+                                name = %update.name,
+                                error = %error,
+                                "Gateway API status read failed; attempting status patch from planned state"
+                            );
+                            None
+                        }
+                    };
+                    let patch = status_patch_for_update(update, live_status.as_ref());
                     // TODO(ssa): switch to Patch::Apply once the chart guarantees the
                     // status subresource accepts server-side apply. JSON Merge Patch
                     // (RFC 7396) replaces arrays wholesale, leaving a narrow TOCTOU
@@ -380,6 +393,15 @@ fn route_status(
                         format!(
                             "Ferrum accepted this route but could not resolve all backendRefs: {error}"
                         ),
+                    )
+                } else if error_is_parent_ref_not_allowed(error) {
+                    (
+                        false,
+                        true,
+                        false,
+                        "NotAllowedByListeners",
+                        "ResolvedRefs",
+                        format!("Ferrum rejected this route attachment: {error}"),
                     )
                 } else {
                     (
@@ -964,6 +986,16 @@ fn error_is_reference_resolution(error: &K8sTranslateError) -> bool {
     }
 }
 
+fn error_is_parent_ref_not_allowed(error: &K8sTranslateError) -> bool {
+    match error {
+        K8sTranslateError::InvalidResource { message, .. } => {
+            message.contains("parentRef.namespace")
+                && message.contains("only same-namespace Gateway attachments are accepted")
+        }
+        K8sTranslateError::Unsupported(_) => false,
+    }
+}
+
 fn same_resource(left: &K8sObject, right: &K8sObject) -> bool {
     left.api_version == right.api_version
         && left.kind == right.kind
@@ -978,9 +1010,9 @@ fn is_status_kind(kind: &str) -> bool {
 fn api_resource_for_update(update: &GatewayApiStatusUpdate) -> Option<ApiResource> {
     let (group, version) = update.api_version.split_once('/')?;
     let plural = match (update.kind.as_str(), version) {
-        ("GatewayClass", "v1") => "gatewayclasses",
-        ("Gateway", "v1") => "gateways",
-        ("HTTPRoute", "v1") => "httproutes",
+        ("GatewayClass", "v1" | "v1beta1") => "gatewayclasses",
+        ("Gateway", "v1" | "v1beta1") => "gateways",
+        ("HTTPRoute", "v1" | "v1beta1") => "httproutes",
         ("GRPCRoute", "v1") => "grpcroutes",
         _ => return None,
     };
@@ -1081,6 +1113,32 @@ mod tests {
             .iter()
             .find(|update| update.kind == kind && update.name == name)
             .unwrap_or_else(|| panic!("missing status update for {kind}/{name}"))
+    }
+
+    #[test]
+    fn status_writer_supports_gateway_api_v1beta1_status_resources() {
+        for (kind, plural) in [
+            ("GatewayClass", "gatewayclasses"),
+            ("Gateway", "gateways"),
+            ("HTTPRoute", "httproutes"),
+        ] {
+            let update = GatewayApiStatusUpdate {
+                api_version: "gateway.networking.k8s.io/v1beta1".to_string(),
+                kind: kind.to_string(),
+                namespace: "default".to_string(),
+                name: "example".to_string(),
+                status: json!({}),
+            };
+
+            let resource = api_resource_for_update(&update)
+                .expect("v1beta1 Gateway API status resource should be supported");
+
+            assert_eq!(resource.group, "gateway.networking.k8s.io");
+            assert_eq!(resource.version, "v1beta1");
+            assert_eq!(resource.api_version, "gateway.networking.k8s.io/v1beta1");
+            assert_eq!(resource.kind, kind);
+            assert_eq!(resource.plural, plural);
+        }
     }
 
     fn route_with_created_at(name: &str, created_at: &str) -> K8sObject {
@@ -1193,6 +1251,71 @@ mod tests {
         assert_condition(conditions, "ResolvedRefs", "True");
         assert_condition(conditions, "Programmed", "True");
         assert_condition(conditions, "Conflicted", "False");
+    }
+
+    #[test]
+    fn gateway_status_updates_v1beta1_conformance_base_gateway_conditions() {
+        let mut gateway_class = ferrum_gateway_class();
+        gateway_class.metadata.namespace = String::new();
+        let mut gateway = object(
+            "Gateway",
+            "all-namespaces",
+            json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "http",
+                    "port": 80,
+                    "protocol": "HTTP",
+                    "allowedRoutes": { "namespaces": { "from": "All" } }
+                }]
+            }),
+        );
+        gateway.api_version = "gateway.networking.k8s.io/v1beta1".to_string();
+        gateway.metadata.namespace = "gateway-conformance-infra".to_string();
+        gateway.metadata.generation = Some(1);
+        gateway.status = json!({
+            "conditions": [
+                {
+                    "type": "Accepted",
+                    "status": "False",
+                    "observedGeneration": 0,
+                    "reason": "Pending",
+                    "message": "waiting for controller",
+                    "lastTransitionTime": "2026-01-01T00:00:00Z"
+                },
+                {
+                    "type": "Programmed",
+                    "status": "False",
+                    "observedGeneration": 0,
+                    "reason": "Pending",
+                    "message": "waiting for controller",
+                    "lastTransitionTime": "2026-01-01T00:00:00Z"
+                }
+            ]
+        });
+
+        let updates = plan_status_updates(
+            &[gateway_class, gateway],
+            options().with_source_namespaces(Vec::new()),
+        );
+
+        let gateway_update = update_for(&updates, "Gateway", "all-namespaces");
+        assert_eq!(
+            gateway_update.api_version,
+            "gateway.networking.k8s.io/v1beta1"
+        );
+        assert_eq!(gateway_update.namespace, "gateway-conformance-infra");
+        let conditions = gateway_update.status["conditions"].as_array().unwrap();
+        assert_condition(conditions, "Accepted", "True");
+        assert_condition(conditions, "Programmed", "True");
+        assert_eq!(
+            find_condition(conditions, "Accepted")["observedGeneration"].as_i64(),
+            Some(1)
+        );
+        assert_eq!(
+            find_condition(conditions, "Programmed")["observedGeneration"].as_i64(),
+            Some(1)
+        );
     }
 
     #[test]
@@ -1321,6 +1444,50 @@ mod tests {
         assert_eq!(
             find_condition(conditions, "ResolvedRefs")["reason"].as_str(),
             Some("RefNotPermitted")
+        );
+    }
+
+    #[test]
+    fn route_status_reports_cross_namespace_parent_ref_not_allowed_with_resolved_refs_true() {
+        let mut route = object(
+            "HTTPRoute",
+            "api",
+            json!({
+                "parentRefs": [{
+                    "group": "gateway.networking.k8s.io",
+                    "kind": "Gateway",
+                    "name": "edge",
+                    "namespace": "gateway-conformance-infra"
+                }],
+                "rules": [{
+                    "backendRefs": [{"name": "api", "port": 8080}]
+                }]
+            }),
+        );
+        route.metadata.namespace = "gateway-conformance-web-backend".to_string();
+
+        let gateway_class = ferrum_gateway_class();
+        let mut gateway = ferrum_gateway("edge");
+        gateway.metadata.namespace = "gateway-conformance-infra".to_string();
+        let updates = plan_status_updates(
+            &[gateway_class, gateway, route],
+            options().with_source_namespaces(vec![]),
+        );
+
+        let route_update = update_for(&updates, "HTTPRoute", "api");
+        let parents = route_update.status["parents"].as_array().unwrap();
+        assert_eq!(parents.len(), 1);
+        let conditions = parents[0]["conditions"].as_array().unwrap();
+        assert_condition(conditions, "Accepted", "False");
+        assert_condition(conditions, "ResolvedRefs", "True");
+        assert_condition(conditions, "Programmed", "False");
+        assert_eq!(
+            find_condition(conditions, "Accepted")["reason"].as_str(),
+            Some("NotAllowedByListeners")
+        );
+        assert_eq!(
+            find_condition(conditions, "ResolvedRefs")["reason"].as_str(),
+            Some("ResolvedRefs")
         );
     }
 
