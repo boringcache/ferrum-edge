@@ -964,12 +964,18 @@ pub(crate) fn request_termination_plugin_for_proxy(
     }
 }
 
-/// Build a `fault_injection` plugin config scoped to a specific proxy.
-pub(crate) fn fault_injection_plugin_for_proxy(
-    proxy_id: &str,
-    namespace: &str,
-    fault: &Value,
-) -> Option<PluginConfig> {
+/// Project an Istio `VirtualService.http[].fault` block into the per-rule
+/// `FaultActionConfig` JSON shape consumed by `mesh_route_dispatch`.
+/// Returns `None` when neither side (`delay` nor `abort`) yields a
+/// representable action — for example, an `abort` block missing
+/// `httpStatus`, or a `delay` block with an unparseable `fixedDelay`.
+///
+/// Used by the K8s translator to project the VS-level fault onto every
+/// emitted dispatch rule (including the URI-only catch-all). Replaces the
+/// historical proxy-scoped `fault_injection` plugin emission which could
+/// not be collapsed with sibling routes — moving fault to the dispatch
+/// rule eliminates the previous fail-closed escape hatch.
+pub(crate) fn route_local_fault_value_for_rule(fault: &Value) -> Option<Value> {
     let obj = fault.as_object()?;
     let mut config = serde_json::Map::new();
 
@@ -1007,7 +1013,9 @@ pub(crate) fn fault_injection_plugin_for_proxy(
             abort_value.insert("grpc_status".to_string(), serde_json::json!(grpc));
         }
 
-        // Plugin requires status_code; skip the abort sub-field if absent.
+        // Per-rule abort requires status_code (the plugin's validator rejects
+        // a status-less abort). Skip the abort sub-field if absent so a
+        // standalone delay still projects.
         if abort_value.contains_key("status_code") {
             config.insert("abort".to_string(), Value::Object(abort_value));
         }
@@ -1016,21 +1024,7 @@ pub(crate) fn fault_injection_plugin_for_proxy(
     if config.is_empty() {
         return None;
     }
-
-    let now = Utc::now();
-    Some(PluginConfig {
-        id: format!("istio-vs-fi-{proxy_id}"),
-        plugin_name: "fault_injection".to_string(),
-        namespace: namespace.to_string(),
-        config: Value::Object(config),
-        scope: PluginScope::Proxy,
-        proxy_id: Some(proxy_id.to_string()),
-        enabled: true,
-        priority_override: None,
-        api_spec_id: None,
-        created_at: now,
-        updated_at: now,
-    })
+    Some(Value::Object(config))
 }
 
 pub(crate) struct MeshRouteDispatchDestination<'a> {
@@ -1045,6 +1039,12 @@ pub(crate) struct MeshRouteDispatchPolicy<'a> {
     pub timeout_disabled: bool,
     pub retry: Option<&'a RetryConfig>,
     pub retry_disabled: bool,
+    /// Pre-shaped fault JSON to project onto every emitted dispatch rule.
+    /// `None` when the source `http[]` entry has no `fault` block or when
+    /// the fault block has nothing the per-rule action can represent
+    /// (e.g., abort without `httpStatus`). Cloned per emitted rule via
+    /// [`Value::clone`].
+    pub fault: Option<&'a Value>,
 }
 
 /// Translate a VirtualService `http[]` entry's `match[]` blocks into a
@@ -1420,6 +1420,9 @@ pub(crate) fn mesh_route_dispatch_rules_for_proxy(
                 Value::Array(route_response_transform.clone()),
             );
         }
+        if let Some(fault) = route_policy.fault {
+            rule.insert("fault".to_string(), fault.clone());
+        }
         rules.push(Value::Object(rule));
     }
 
@@ -1437,7 +1440,9 @@ pub(crate) fn mesh_route_dispatch_rules_for_proxy(
     // semantic no-op for routing — its sole purpose is to publish the
     // transform Arcs onto `RequestContext`.
     let needs_catch_all = has_uri_only_match
-        && (!route_request_transform.is_empty() || !route_response_transform.is_empty());
+        && (!route_request_transform.is_empty()
+            || !route_response_transform.is_empty()
+            || route_policy.fault.is_some());
     if needs_catch_all {
         let mut destination = serde_json::Map::new();
         if let Some(uid) = route_destination.upstream_id {
@@ -1479,6 +1484,9 @@ pub(crate) fn mesh_route_dispatch_rules_for_proxy(
                 "response_transform".to_string(),
                 Value::Array(route_response_transform),
             );
+        }
+        if let Some(fault) = route_policy.fault {
+            rule.insert("fault".to_string(), fault.clone());
         }
         rules.push(Value::Object(rule));
     }

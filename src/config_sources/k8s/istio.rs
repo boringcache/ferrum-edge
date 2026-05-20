@@ -19,11 +19,11 @@ use crate::modes::mesh::config::{
 use super::{
     K8sAccumulator, K8sObject, K8sTranslateError, K8sTranslationOptions,
     MeshRouteDispatchDestination, MeshRouteDispatchPolicy, RouteBackend, RouteProxySpec,
-    SourceKind, attach_route_plugins_to_proxy, exact_path_listen_path,
-    fault_injection_plugin_for_proxy, invalid_resource, mesh_route_dispatch_can_emit_rule,
-    mesh_route_dispatch_has_unsupported_predicate, mesh_route_dispatch_plugin_from_rules,
-    mesh_route_dispatch_rules_for_proxy, optional_port_field, parse_istio_duration_ms,
-    port_from_u64, proxy_for_route, request_termination_plugin_for_proxy, resource_id,
+    SourceKind, attach_route_plugins_to_proxy, exact_path_listen_path, invalid_resource,
+    mesh_route_dispatch_can_emit_rule, mesh_route_dispatch_has_unsupported_predicate,
+    mesh_route_dispatch_plugin_from_rules, mesh_route_dispatch_rules_for_proxy,
+    optional_port_field, parse_istio_duration_ms, port_from_u64, proxy_for_route,
+    request_termination_plugin_for_proxy, resource_id, route_local_fault_value_for_rule,
     route_request_transformer_plugin_for_proxy, route_response_transformer_plugin_for_proxy,
     selector_from_istio, string_array, string_field, string_map, upstream_for_route,
     workload_entry_service_key_from_host,
@@ -1993,7 +1993,7 @@ fn virtual_service_routes(
             route_candidates.into_iter().enumerate()
         {
             let is_uri_less_catch_all = listen_path.as_deref() == Some(URI_LESS_MATCH_LISTEN_PATH);
-            let mut route_plugins = Vec::new();
+            let route_plugins = Vec::new();
             let suffix = if match_count == 1 {
                 index.to_string()
             } else {
@@ -2006,16 +2006,14 @@ fn virtual_service_routes(
                 &suffix,
             );
 
-            // Extract fault injection config and create a proxy-scoped plugin
-            if let Some(fault_value) = http.get("fault")
-                && let Some(plugin) = fault_injection_plugin_for_proxy(
-                    &proxy_id,
-                    &object.metadata.namespace,
-                    fault_value,
-                )
-            {
-                route_plugins.push(plugin);
-            }
+            // Project the VirtualService `http[].fault` (if any) onto every
+            // emitted dispatch rule rather than spinning up a separate
+            // proxy-scoped `fault_injection` plugin. The per-rule
+            // representation collapses cleanly with sibling routes — the
+            // historical fail-closed escape hatch
+            // (`route_has_uncollapsible_local_policy` returning true on a
+            // fault-carrying merged route) is no longer needed for fault.
+            let route_fault_value = http.get("fault").and_then(route_local_fault_value_for_rule);
 
             let consumes_pending_uri_less = pending_uri_less_route.is_some();
             let overlaps_pending_scoped = pending_scoped_routes
@@ -2049,6 +2047,7 @@ fn virtual_service_routes(
                     timeout_disabled: timeout_ms.is_none(),
                     retry: retry.as_ref(),
                     retry_disabled: retry.is_none(),
+                    fault: route_fault_value.as_ref(),
                 },
                 false,
             );
@@ -6876,8 +6875,23 @@ extensionProviders:
 
     // -- VirtualService fault injection / retry / timeout ----------------
 
+    /// Extract the per-rule `fault` from the first rule of a
+    /// `mesh_route_dispatch` plugin config. URI-only matches produce a
+    /// single catch-all rule with `match: {}`; that rule's `fault` field
+    /// is what we assert in the VS fault tests below.
+    fn dispatch_rule_fault(plugin: &PluginConfig) -> &Value {
+        assert_eq!(plugin.plugin_name, "mesh_route_dispatch");
+        let rules = plugin
+            .config
+            .get("rules")
+            .and_then(Value::as_array)
+            .expect("rules array");
+        let rule = rules.first().expect("at least one rule");
+        rule.get("fault").expect("rule should carry fault action")
+    }
+
     #[test]
-    fn virtual_service_extracts_fault_injection_abort() {
+    fn virtual_service_extracts_route_local_fault_abort() {
         let result = translate_k8s_objects(
             &[object(
                 "VirtualService",
@@ -6900,20 +6914,25 @@ extensionProviders:
         .expect("translation succeeds");
 
         assert_eq!(result.config.proxies.len(), 1);
+        // VS fault is now carried per dispatch rule rather than as a
+        // separate proxy-scoped `fault_injection` plugin. The translator
+        // emits exactly one plugin (mesh_route_dispatch) for the URI-only
+        // catch-all rule.
         assert_eq!(result.config.plugin_configs.len(), 1);
         let plugin = &result.config.plugin_configs[0];
-        assert_eq!(plugin.plugin_name, "fault_injection");
+        assert_eq!(plugin.plugin_name, "mesh_route_dispatch");
         assert_eq!(
             plugin.proxy_id.as_deref(),
             Some(result.config.proxies[0].id.as_str())
         );
-        let abort = plugin.config.get("abort").expect("abort config");
+        let fault = dispatch_rule_fault(plugin);
+        let abort = fault.get("abort").expect("abort sub-action");
         assert_eq!(abort["status_code"], 503);
         assert_eq!(abort["percentage"], 50.0);
     }
 
     #[test]
-    fn virtual_service_extracts_fault_injection_delay() {
+    fn virtual_service_extracts_route_local_fault_delay() {
         let result = translate_k8s_objects(
             &[object(
                 "VirtualService",
@@ -6937,14 +6956,14 @@ extensionProviders:
 
         assert_eq!(result.config.plugin_configs.len(), 1);
         let plugin = &result.config.plugin_configs[0];
-        assert_eq!(plugin.plugin_name, "fault_injection");
-        let delay = plugin.config.get("delay").expect("delay config");
+        let fault = dispatch_rule_fault(plugin);
+        let delay = fault.get("delay").expect("delay sub-action");
         assert_eq!(delay["duration_ms"], 5000);
         assert_eq!(delay["percentage"], 25.0);
     }
 
     #[test]
-    fn virtual_service_extracts_fault_injection_abort_and_delay() {
+    fn virtual_service_extracts_route_local_fault_abort_and_delay() {
         let result = translate_k8s_objects(
             &[object(
                 "VirtualService",
@@ -6971,10 +6990,11 @@ extensionProviders:
         .expect("translation succeeds");
 
         let plugin = &result.config.plugin_configs[0];
-        assert!(plugin.config.get("abort").is_some());
-        assert!(plugin.config.get("delay").is_some());
-        assert_eq!(plugin.config["abort"]["status_code"], 500);
-        assert_eq!(plugin.config["delay"]["duration_ms"], 2000);
+        let fault = dispatch_rule_fault(plugin);
+        assert!(fault.get("abort").is_some());
+        assert!(fault.get("delay").is_some());
+        assert_eq!(fault["abort"]["status_code"], 500);
+        assert_eq!(fault["delay"]["duration_ms"], 2000);
     }
 
     #[test]
@@ -7447,7 +7467,8 @@ extensionProviders:
         .expect("translation succeeds");
 
         let plugin = &result.config.plugin_configs[0];
-        let delay = plugin.config.get("delay").expect("delay config");
+        let fault = dispatch_rule_fault(plugin);
+        let delay = fault.get("delay").expect("delay sub-action");
         assert_eq!(delay["duration_ms"], 250);
         assert_eq!(delay["percentage"], 100.0);
     }
@@ -7475,7 +7496,8 @@ extensionProviders:
         .expect("translation succeeds");
 
         let plugin = &result.config.plugin_configs[0];
-        let abort = plugin.config.get("abort").expect("abort config");
+        let fault = dispatch_rule_fault(plugin);
+        let abort = fault.get("abort").expect("abort sub-action");
         assert_eq!(abort["percentage"], 100.0);
     }
 
@@ -7534,8 +7556,9 @@ extensionProviders:
 
         assert_eq!(result.config.plugin_configs.len(), 1);
         let plugin = &result.config.plugin_configs[0];
-        assert!(plugin.config.get("abort").is_none());
-        let delay = plugin.config.get("delay").expect("delay config");
+        let fault = dispatch_rule_fault(plugin);
+        assert!(fault.get("abort").is_none());
+        let delay = fault.get("delay").expect("delay sub-action");
         assert_eq!(delay["duration_ms"], 100);
         assert_eq!(delay["percentage"], 25.0);
     }
@@ -7619,7 +7642,8 @@ extensionProviders:
         .expect("translation succeeds");
 
         let plugin = &result.config.plugin_configs[0];
-        let abort = plugin.config.get("abort").expect("abort config");
+        let fault = dispatch_rule_fault(plugin);
+        let abort = fault.get("abort").expect("abort sub-action");
         assert_eq!(abort["grpc_status"], 14);
         assert_eq!(abort["status_code"], 200);
     }
@@ -7649,7 +7673,8 @@ extensionProviders:
         .expect("translation succeeds");
 
         let plugin = &result.config.plugin_configs[0];
-        let abort = plugin.config.get("abort").expect("abort config");
+        let fault = dispatch_rule_fault(plugin);
+        let abort = fault.get("abort").expect("abort sub-action");
         assert_eq!(abort["grpc_status"], 13);
     }
 
@@ -7678,7 +7703,8 @@ extensionProviders:
         .expect("translation succeeds");
 
         let plugin = &result.config.plugin_configs[0];
-        let abort = plugin.config.get("abort").expect("abort config");
+        let fault = dispatch_rule_fault(plugin);
+        let abort = fault.get("abort").expect("abort sub-action");
         assert!(abort.get("grpc_status").is_none());
         assert_eq!(abort["status_code"], 503);
     }
@@ -7707,6 +7733,7 @@ extensionProviders:
         .expect("translation succeeds");
 
         let plugin = &result.config.plugin_configs[0];
+        assert_eq!(plugin.plugin_name, "mesh_route_dispatch");
         assert!(matches!(
             plugin.scope,
             crate::config::types::PluginScope::Proxy
@@ -7717,8 +7744,11 @@ extensionProviders:
         );
         assert!(
             proxy_has_plugin(&result.config.proxies[0], plugin),
-            "generated fault_injection config must be associated with the proxy or PluginCache will not instantiate it"
+            "generated mesh_route_dispatch config must be associated with the proxy or PluginCache will not instantiate it"
         );
+        // The route-local fault must ride on the dispatch rule.
+        let fault = dispatch_rule_fault(plugin);
+        assert_eq!(fault["abort"]["status_code"], 503);
     }
 
     // -- mesh_route_dispatch ----------------------------------------------

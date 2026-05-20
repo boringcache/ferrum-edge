@@ -3,8 +3,8 @@
 //! Each test exercises one matcher predicate type (uri / headers / method /
 //! authority / sourceNamespace / ignoreUriCase / fault) by translating a minimal
 //! `VirtualService` through `translate_k8s_objects` and then driving the
-//! resulting `mesh_route_dispatch` (or `request_termination` / `fault_injection`)
-//! plugin to assert it routes / rejects / falls through as Istio operators expect.
+//! resulting `mesh_route_dispatch` (or `request_termination`) plugin to assert
+//! it routes / rejects / falls through as Istio operators expect.
 //!
 //! Coverage decisions:
 //!   - Only the canonical "happy path" per predicate gets a test — the K8s
@@ -537,16 +537,16 @@ async fn vs_ignore_uri_case_routes_both_casings() {
 }
 
 /// VS feature: `http[].fault` (route-local fault injection) — T1-E (PR #896).
-/// Each fault block translates to a `fault_injection` plugin scoped to the
-/// proxy. The conformance check is that the plugin is emitted with the
-/// translated fault config.
-#[test]
-fn vs_route_local_fault_injection() {
+/// Each fault block translates to a `mesh_route_dispatch` rule-local fault
+/// action. The conformance check is that the translated fault config lands on
+/// the matching rule and can reject a matching request.
+#[tokio::test]
+async fn vs_route_local_fault_injection() {
     register_feature!(
         category = CATEGORY,
         feature = "http[].fault",
         status = Status::Supported,
-        notes = "T1-E (PR #896): route-local fault block compiles to a fault_injection plugin on the matching proxy.",
+        notes = "T1-E (PR #896): route-local fault block compiles to a mesh_route_dispatch rule-local fault action.",
     );
     let result = translate_k8s_objects(
         &[virtual_service(json!({
@@ -554,7 +554,7 @@ fn vs_route_local_fault_injection() {
             "http": [{
                 "match": [{"uri": {"prefix": "/chaos"}}],
                 "fault": {
-                    "abort": {"percentage": {"value": 50.0}, "httpStatus": 503}
+                    "abort": {"percentage": {"value": 100.0}, "httpStatus": 503}
                 },
                 "route": [{"destination": {"host": "chaos.default.svc.cluster.local", "port": {"number": 8080}}}]
             }]
@@ -564,12 +564,50 @@ fn vs_route_local_fault_injection() {
     .expect("translation succeeds");
 
     assert!(
-        result
+        !result
             .config
             .plugin_configs
             .iter()
             .any(|p| p.plugin_name == "fault_injection"),
-        "VirtualService http[].fault must compile to a fault_injection plugin"
+        "VirtualService http[].fault should be carried by mesh_route_dispatch, not a proxy-scoped fault_injection plugin"
+    );
+    assert!(
+        result
+            .config
+            .proxies
+            .iter()
+            .any(|p| p.listen_path.as_deref() == Some("/chaos")),
+        "VirtualService uri prefix must still compile to the /chaos proxy route"
+    );
+
+    let plugin_config = result
+        .config
+        .plugin_configs
+        .iter()
+        .find(|p| p.plugin_name == "mesh_route_dispatch")
+        .expect("VirtualService http[].fault must compile to a mesh_route_dispatch plugin");
+    let rules = plugin_config
+        .config
+        .get("rules")
+        .and_then(Value::as_array)
+        .expect("mesh_route_dispatch rules array");
+    let rule = rules.first().expect("fault-bearing dispatch rule");
+    let fault = rule.get("fault").expect("rule-local fault action");
+    assert_eq!(fault["abort"]["status_code"], 503);
+    assert_eq!(fault["abort"]["percentage"], 100.0);
+
+    let dispatch = MeshRouteDispatch::new(&plugin_config.config).expect("plugin config");
+    let mut req = ctx("GET", "/chaos/ping");
+    let mut headers = HashMap::new();
+    assert!(
+        matches!(
+            dispatch.before_proxy(&mut req, &mut headers).await,
+            PluginResult::Reject {
+                status_code: 503,
+                ..
+            }
+        ),
+        "matching route-local fault must abort the request before proxy dispatch"
     );
 }
 

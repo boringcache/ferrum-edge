@@ -236,6 +236,8 @@ Priority bands are spaced with gaps so future plugins can slot in without renumb
 
 When a `mesh_route_dispatch` rule matches on query params, the plugin opts the whole proxy into decoded query-param materialization for HTTP/3 so its `query_params` predicates see the same percent-decoded values as HTTP/1.1 and HTTP/2. That means every plugin on that proxy observes decoded `ctx.query_params` while the query-rule instance is configured.
 
+A `mesh_route_dispatch` rule may also carry a per-rule `fault` action (`{delay, abort}`) that runs as soon as the rule matches and BEFORE any route override is applied. The fault uses the shared `FaultRoller` (`src/plugins/utils/fault_roll.rs`) so a static-percentage rule samples identically to the proxy-scoped `fault_injection` plugin. When delay and abort both trigger, the delay runs first; the abort then short-circuits dispatch and the route override is skipped. The plugin honours `ctx.metadata["fault_injected"]=true` set by an earlier-priority `fault_injection` plugin (2940 < 2995) and no-ops in that case so the two surfaces never stack a second delay + abort.
+
 ## Complete Execution Order
 
 Given all built-in plugins enabled, the execution order is:
