@@ -37,6 +37,7 @@ fn minimal_plugin_config(plugin_name: &str) -> serde_json::Value {
             json!({"rules": [{"operation": "add", "target": "header", "key": "x-test", "value": "1"}]})
         }
         "request_size_limiting" => json!({"max_bytes": 1048576}),
+        "waf" => json!({}),
         "response_size_limiting" => json!({"max_bytes": 1048576}),
         "ws_message_size_limiting" => json!({"max_frame_bytes": 65536}),
         "ws_rate_limiting" => json!({"frames_per_second": 100}),
@@ -956,6 +957,32 @@ fn test_apply_delta_rejects_invalid_security_plugin() {
         result.is_err(),
         "apply_delta should reject invalid security plugin config"
     );
+}
+
+#[test]
+fn test_plugin_cache_rejects_invalid_waf_config_as_security_plugin() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["pc1"])],
+        vec![PluginConfig {
+            id: "pc1".to_string(),
+            namespace: ferrum_edge::config::types::default_namespace(),
+            plugin_name: "waf".to_string(),
+            config: json!({"max_scan_bytes": 0}),
+            scope: PluginScope::Proxy,
+            proxy_id: Some("p1".to_string()),
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }],
+    );
+
+    let err = PluginCache::new(&config)
+        .err()
+        .expect("invalid WAF config should be rejected");
+    assert!(err.contains("waf"));
+    assert!(err.contains("max_scan_bytes"));
 }
 
 #[test]
@@ -2554,6 +2581,33 @@ fn test_decoded_query_params_capability_preserved_with_priority_override() {
     assert!(
         caps.has(PluginCapabilities::NEEDS_DECODED_QUERY_PARAMS),
         "mesh_route_dispatch query-param rules must opt HTTP/3 into decoded query materialization"
+    );
+}
+
+#[test]
+fn test_waf_sets_needs_final_request_body_context_capability() {
+    // WAF returns true for `needs_final_request_body_context()` because it
+    // annotates request metadata (`waf.rule_hits`, `waf.action`, etc.) from
+    // the body-scan hook. The proxy hot path reads this bit instead of
+    // iterating plugins per request — make sure the bit is set when WAF is
+    // configured.
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["ps1"])],
+        vec![make_plugin_config_with_json(
+            "ps1",
+            "waf",
+            json!({}),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+
+    let caps = cache.get_capabilities("p1", ProxyProtocol::Http);
+    assert!(
+        caps.has(PluginCapabilities::NEEDS_FINAL_REQUEST_BODY_CONTEXT),
+        "WAF plugin must set NEEDS_FINAL_REQUEST_BODY_CONTEXT so the proxy \
+         passes a mutable RequestContext into on_final_request_body hooks"
     );
 }
 

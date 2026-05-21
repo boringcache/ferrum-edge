@@ -1,4 +1,4 @@
-//! Plugin system — 60 built-in plugins with a trait-based architecture.
+//! Plugin system — 61 built-in plugins with a trait-based architecture.
 //!
 //! Plugins execute in priority order (lower number = runs first) through
 //! lifecycle phases: `on_request_received` → `authenticate` → `authorize` →
@@ -10,8 +10,9 @@
 //! The `PluginCache` pre-filters plugins per protocol at config reload time
 //! so the hot path does zero filtering.
 //!
-//! Security plugins (auth, ACL, IP restriction) that fail config validation
-//! cause the gateway to refuse startup — they never silently degrade.
+//! Security plugins (auth, ACL, IP restriction, WAF, and mesh policy gates)
+//! that fail config validation cause the gateway to refuse startup — they
+//! never silently degrade.
 //! Non-security plugins that fail validation are skipped with a warning.
 
 pub mod access_control;
@@ -75,6 +76,7 @@ pub mod transaction_log_schema;
 pub mod udp_logging;
 pub mod udp_rate_limiting;
 pub mod utils;
+pub mod waf;
 pub mod ws_frame_logging;
 pub mod ws_logging;
 pub mod ws_message_size_limiting;
@@ -255,7 +257,9 @@ pub struct WsDisconnectContext {
 /// allocations on the hot path. The raw `http::HeaderMap` and query string are
 /// stored at request init time; the `HashMap<String, String>` representations
 /// are only built when a plugin phase actually needs them (via
-/// `materialize_headers()` / `materialize_query_params()`).
+/// `materialize_headers()` / `materialize_query_params()`). Query
+/// materialization preserves the raw query string so security plugins can still
+/// inspect duplicate pairs that collapse in the parsed `HashMap`.
 #[derive(Debug, Clone)]
 pub struct RequestContext {
     pub client_ip: String,
@@ -273,9 +277,14 @@ pub struct RequestContext {
     /// Materialized headers HashMap. Empty until `materialize_headers()` is
     /// called. Plugin code and backend dispatch read from this field.
     pub headers: HashMap<String, String>,
-    /// Raw query string stored for lazy parsing. `None` when empty or after a
-    /// query-param materializer has consumed it.
+    /// Raw query string stored for lazy parsing. `None` when empty. Preserved
+    /// after query-param materialization so security plugins can inspect raw
+    /// duplicate pairs.
     raw_query_string: Option<String>,
+    /// Whether either decoded or raw query-param materialization has already
+    /// populated `query_params`. Keeps materialization one-shot while preserving
+    /// `raw_query_string` for inspection.
+    query_params_materialized: bool,
     /// Parsed query parameters. Empty until `materialize_query_params()` or
     /// `materialize_query_params_raw()` is called.
     ///
@@ -435,6 +444,7 @@ impl RequestContext {
             raw_headers: None,
             headers: HashMap::new(),
             raw_query_string: None,
+            query_params_materialized: false,
             query_params: HashMap::new(),
             matched_proxy: None,
             identified_consumer: None,
@@ -462,6 +472,51 @@ impl RequestContext {
             node_waypoint_pod_uid: None,
             node_waypoint_policy_scope: None,
             mesh_direction: None,
+        }
+    }
+
+    /// Build the lightweight compatibility context used by final request-body
+    /// hooks when the active plugin needs request metadata after body
+    /// transforms. Only `metadata` is copied back to the real context by the
+    /// proxy caller, so this deliberately skips raw headers, raw query strings,
+    /// parsed query maps, prebuffered body bytes, and mirror receivers.
+    pub(crate) fn clone_for_final_request_body_hooks(&self) -> Self {
+        Self {
+            client_ip: self.client_ip.clone(),
+            method: self.method.clone(),
+            path: self.path.clone(),
+            frontend_listen_port: self.frontend_listen_port,
+            raw_headers: None,
+            headers: self.headers.clone(),
+            raw_query_string: None,
+            query_params_materialized: false,
+            query_params: HashMap::new(),
+            matched_proxy: self.matched_proxy.clone(),
+            identified_consumer: self.identified_consumer.clone(),
+            authenticated_identity: self.authenticated_identity.clone(),
+            authenticated_identity_header: self.authenticated_identity_header.clone(),
+            auth_method: self.auth_method,
+            timestamp_received: self.timestamp_received,
+            metadata: self.metadata.clone(),
+            tls_client_cert_der: self.tls_client_cert_der.clone(),
+            tls_client_cert_chain_der: self.tls_client_cert_chain_der.clone(),
+            peer_spiffe_id: self.peer_spiffe_id.clone(),
+            plugin_http_call_ns: Arc::clone(&self.plugin_http_call_ns),
+            mirror_result_rx: None,
+            request_body_bytes: None,
+            bytes_sent_observed: Arc::clone(&self.bytes_sent_observed),
+            is_early_data: self.is_early_data,
+            route_override_upstream_id: self.route_override_upstream_id.clone(),
+            route_override_backend_host: self.route_override_backend_host.clone(),
+            route_override_backend_port: self.route_override_backend_port,
+            route_override_resolved_tls: self.route_override_resolved_tls.clone(),
+            route_override_backend_read_timeout_ms: self.route_override_backend_read_timeout_ms,
+            route_override_retry: self.route_override_retry.clone(),
+            route_override_request_transform: self.route_override_request_transform.clone(),
+            route_override_response_transform: self.route_override_response_transform.clone(),
+            node_waypoint_pod_uid: self.node_waypoint_pod_uid,
+            node_waypoint_policy_scope: self.node_waypoint_policy_scope.clone(),
+            mesh_direction: self.mesh_direction,
         }
     }
 
@@ -745,16 +800,30 @@ impl RequestContext {
     pub fn set_raw_query_string(&mut self, qs: String) {
         if !qs.is_empty() {
             self.raw_query_string = Some(qs);
+            self.query_params_materialized = false;
         }
+    }
+
+    /// Borrow the raw query string without materializing it.
+    ///
+    /// Inspection plugins use this to detect duplicate/conflicting parameter
+    /// keys that would be collapsed by the parsed `HashMap`.
+    #[inline]
+    pub fn raw_query_string(&self) -> Option<&str> {
+        self.raw_query_string.as_deref()
     }
 
     /// Parse the raw query string into `self.query_params`. Keys and values are
     /// percent-decoded so plugins see human-readable strings. Parameters without
     /// `=` (e.g., `?flag`) are stored with an empty-string value.
     ///
-    /// This is a one-time operation — subsequent calls are no-ops.
+    /// This is a one-time operation — subsequent calls are no-ops. The raw
+    /// query string is intentionally retained for later security inspection.
     pub fn materialize_query_params(&mut self) {
-        if let Some(raw) = self.raw_query_string.take() {
+        if self.query_params_materialized {
+            return;
+        }
+        if let Some(raw) = self.raw_query_string.as_deref() {
             for pair in raw.split('&') {
                 if pair.is_empty() {
                     continue;
@@ -770,6 +839,7 @@ impl RequestContext {
                     .insert(decoded_k.into_owned(), decoded_v.into_owned());
             }
         }
+        self.query_params_materialized = true;
     }
 
     /// Materialize the raw query string into `self.query_params` without
@@ -779,13 +849,17 @@ impl RequestContext {
     /// representation unless an active plugin explicitly opts into decoded
     /// query params.
     pub fn materialize_query_params_raw(&mut self) {
-        if let Some(raw) = self.raw_query_string.take() {
+        if self.query_params_materialized {
+            return;
+        }
+        if let Some(raw) = self.raw_query_string.as_deref() {
             for pair in raw.split('&') {
                 if let Some((k, v)) = pair.split_once('=') {
                     self.query_params.insert(k.to_string(), v.to_string());
                 }
             }
         }
+        self.query_params_materialized = true;
     }
 
     /// Collect mirror response metadata from the `request_mirror` plugin.
@@ -1337,7 +1411,7 @@ pub struct StreamTransactionSummary {
 /// |-----------|-------------|-------------------------------------------|---------|
 /// | Early     | 0–949       | Pre-routing, tracing, and preflight       | otel_tracing (25), correlation_id (50), cors (100), request_termination (125), mesh_outbound_registry (130), ip_restriction (150), bot_detection (200), sse (250), grpc_web (260), grpc_method_router (275), spiffe_identity (940) |
 /// | AuthN     | 950–1999    | Authentication / identity verification    | mtls_auth (950), jwks_auth (1000), jwt_auth (1100), key_auth (1200), ldap_auth (1250), basic_auth (1300), hmac_auth (1400), soap_ws_security (1500) |
-/// | AuthZ     | 2000–2999   | Authorization and admission control       | access_control (2000), tcp_connection_throttle (2050), mesh_authz (2075), request_size_limiting (2800), graphql (2850), rate_limiting (2900), ai_prompt_shield (2925), body_validator (2950), ai_request_guard (2975), ai_federation (2985) |
+/// | AuthZ     | 2000–2999   | Authorization and admission control       | access_control (2000), tcp_connection_throttle (2050), mesh_authz (2075), request_size_limiting (2800), graphql (2850), rate_limiting (2900), ai_prompt_shield (2925), waf (2930), body_validator (2950), ai_request_guard (2975), ai_federation (2985) |
 /// | Transform | 3000–3999   | Request shaping and response buffering    | request_transformer (3000), serverless_function (3025), response_mock (3030), grpc_deadline (3050), request_mirror (3075), response_size_limiting (3490), response_caching (3500) |
 /// | Response  | 4000–4999   | Response transformation and AI accounting | response_transformer (4000), ai_token_metrics (4100), ai_rate_limiter (4200) |
 /// | Logging   | 9000–9999   | Observability and frame logging           | stdout_logging (9000), ws_frame_logging (9050), statsd_logging (9075), http_logging (9100), tcp_logging (9125), kafka_logging (9150), loki_logging (9155), udp_logging (9160), ws_logging (9175), transaction_debugger (9200), prometheus_metrics (9300), api_chargeback (9350), workload_metrics (9360), __mesh_bpf_metrics (9365), access_log (9375) |
@@ -1378,6 +1452,7 @@ pub mod priority {
     pub const GRAPHQL: u16 = 2850;
     pub const RATE_LIMITING: u16 = 2900;
     pub const AI_PROMPT_SHIELD: u16 = 2925;
+    pub const WAF: u16 = 2930;
     pub const FAULT_INJECTION: u16 = 2940;
     pub const BODY_VALIDATOR: u16 = 2950;
     pub const AI_REQUEST_GUARD: u16 = 2975;
@@ -1654,6 +1729,35 @@ pub trait Plugin: Send + Sync {
         _body: &[u8],
     ) -> PluginResult {
         PluginResult::Continue
+    }
+
+    /// Context-aware variant of `on_final_request_body`.
+    ///
+    /// Existing plugins can keep overriding `on_final_request_body`. Plugins
+    /// that need to annotate request metadata after request body transforms
+    /// can override this hook and the proxy will call it instead.
+    ///
+    /// **Contract on the H1/H2 path**: `ctx` is a lightweight clone built by
+    /// [`RequestContext::clone_for_final_request_body_hooks`]; only
+    /// `ctx.metadata` is copied back to the real request context after the
+    /// hook returns. Mutations to other fields (`ctx.headers`,
+    /// `ctx.query_params`, `ctx.route_override_*`, …) on H1/H2 are dropped.
+    /// On the H3 path the hook receives the real `&mut RequestContext`, so
+    /// implementations MUST limit observable side effects to `ctx.metadata`
+    /// if they want consistent behavior across protocols.
+    async fn on_final_request_body_with_context(
+        &self,
+        _ctx: &mut RequestContext,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> PluginResult {
+        self.on_final_request_body(headers, body).await
+    }
+
+    /// Returns true when `on_final_request_body_with_context` needs the real
+    /// mutable request context rather than the compatibility wrapper.
+    fn needs_final_request_body_context(&self) -> bool {
+        false
     }
 
     /// Transform the response body before it is sent to the client.
@@ -1968,6 +2072,7 @@ pub fn create_plugin_with_http_client(
         "request_size_limiting" => Ok(Some(Arc::new(
             request_size_limiting::RequestSizeLimiting::new(config)?,
         ))),
+        "waf" => Ok(Some(Arc::new(waf::Waf::new(config)?))),
         "response_size_limiting" => Ok(Some(Arc::new(
             response_size_limiting::ResponseSizeLimiting::new(config)?,
         ))),
@@ -2090,7 +2195,7 @@ pub fn validate_plugin_config(name: &str, config: &Value) -> Result<(), String> 
 }
 
 /// List of all available plugin names (built-in + custom).
-/// Returns true if the named plugin is security-critical (auth or access control).
+/// Returns true if the named plugin is security-critical.
 ///
 /// Validation failures for these plugins are fatal at startup — the gateway
 /// refuses to start rather than serving traffic without the intended security.
@@ -2109,6 +2214,7 @@ pub fn is_security_plugin(name: &str) -> bool {
             | "access_control"
             | "tcp_connection_throttle"
             | "ip_restriction"
+            | "waf"
             | "soap_ws_security"
     )
 }
@@ -2156,6 +2262,7 @@ pub fn available_plugins() -> Vec<&'static str> {
         "grpc_web",
         "rate_limiting",
         "request_size_limiting",
+        "waf",
         "response_size_limiting",
         "body_validator",
         "request_termination",
