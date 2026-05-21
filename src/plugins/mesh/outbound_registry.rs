@@ -18,10 +18,10 @@
 //!
 //! ## Destination resolution
 //!
-//! - HTTP family only: the gate relies on the `Host` header, so raw TCP/UDP
-//!   outbound traffic bypasses this plugin entirely. Operators relying on
-//!   REGISTRY_ONLY for stream-protocol egress need additional controls
-//!   (capture exclusions, ServiceEntry materialization).
+//! - HTTP family only: this plugin relies on the `Host` header. Stream-family
+//!   REGISTRY_ONLY egress is enforced by
+//!   [`crate::modes::mesh::outbound_enforcement::MeshOutboundEnforcement`]
+//!   at connect / first-datagram time on mesh outbound capture listener ports.
 //! - `Host` header is split into `host` and optional `:port`. Bare registry
 //!   hosts match requests with no explicit Host port. `host:port` entries
 //!   match only that explicit port. `host:*` entries match any explicit Host
@@ -438,9 +438,8 @@ impl Plugin for OutboundRegistry {
     fn supported_protocols(&self) -> &'static [ProxyProtocol] {
         // Host-header gating only applies to HTTP-family traffic. Raw
         // TCP/UDP stream proxies have no Host header; mesh-level egress
-        // scoping for those protocols is enforced at the connect stage via
-        // SNI / destination IP (handled elsewhere by the mesh authz
-        // pipeline), not by this plugin.
+        // scoping for those protocols is enforced at connect / first-datagram
+        // time by MeshOutboundEnforcement, not by this plugin.
         HTTP_FAMILY_PROTOCOLS
     }
 

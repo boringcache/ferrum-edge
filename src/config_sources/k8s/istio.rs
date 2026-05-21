@@ -740,7 +740,7 @@ fn translate_port_level_settings(
 
         if entry.get("tls").is_some() {
             acc.warnings.push(format!(
-                "DestinationRule {}/{}: trafficPolicy.portLevelSettings[].tls is parsed but not enforced per-port today (gateway applies backend TLS policy at upstream scope); only connectTimeout is applied at request time",
+                "DestinationRule {}/{}: trafficPolicy.portLevelSettings[].tls is parsed but not enforced per-port today (gateway applies backend TLS policy at upstream/subset scope); non-TLS port-level traffic policy fields are still applied",
                 object.metadata.namespace, object.metadata.name
             ));
         }

@@ -1332,7 +1332,7 @@ fn apply_destination_rules(
                         rule = %dr.name,
                         upstream = %upstream.id,
                         port = port,
-                        "DestinationRule portLevelSettings.tls is parsed but not enforced per-port today (gateway applies backend TLS policy at upstream scope); only port-level connectTimeout/loadBalancer/outlierDetection are applied"
+                        "DestinationRule portLevelSettings.tls is parsed but not enforced per-port today (gateway applies backend TLS policy at upstream/subset scope); non-TLS port-level traffic policy fields are still applied"
                     );
                 }
 
