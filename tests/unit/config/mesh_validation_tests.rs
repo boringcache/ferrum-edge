@@ -61,7 +61,7 @@ fn workload_rejects_empty_namespace() {
     assert!(
         errors
             .iter()
-            .any(|e| e.contains("namespace must not be empty"))
+            .any(|e| e.contains(".namespace") && e.contains("must not be empty"))
     );
 }
 
@@ -83,7 +83,11 @@ fn mesh_service_rejects_empty_name() {
         protocol_overrides: HashMap::new(),
     };
     let errors = validate_mesh_config(&[], &[svc], &[], &[], &[], &[], None);
-    assert!(errors.iter().any(|e| e.contains("name must not be empty")));
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("MeshService.name") && e.contains("must not be empty"))
+    );
 }
 
 #[test]
@@ -258,11 +262,11 @@ fn mesh_config_validate_rejects_empty_destination_rule_and_sidecar_fields() {
     let errors = mesh.validate();
 
     for expected in [
-        "MeshDestinationRule ''.name",
+        "MeshDestinationRule.name",
         "MeshDestinationRule ''.namespace",
         "MeshDestinationRule ''.host",
         "subsets[0].name",
-        "MeshSidecar ''.name",
+        "MeshSidecar.name",
         "MeshSidecar ''.namespace",
         "egress[0].hosts must not be empty",
         "egress[1].hosts[0]",
@@ -524,7 +528,7 @@ fn peer_authentication_requires_namespace() {
     assert!(
         errors
             .iter()
-            .any(|e| e.contains("namespace must not be empty"))
+            .any(|e| e.contains(".namespace") && e.contains("must not be empty"))
     );
 }
 
@@ -749,6 +753,44 @@ fn gateway_config_validate_mesh_fields_dispatches() {
     };
     let errors = cfg.validate_mesh_fields();
     assert!(!errors.is_empty(), "expected at least one error");
+}
+
+#[test]
+fn sidecar_host_pattern_accepts_valid_patterns() {
+    let valid_patterns = [
+        "*/*",
+        "*/host.example.com",
+        "./host.example.com",
+        "default/*",
+        "default/reviews.default.svc.cluster.local",
+        "~/*",
+        "bare-host",
+        "*.example.com",
+    ];
+    for pattern in valid_patterns {
+        let mesh = MeshConfig {
+            sidecars: vec![MeshSidecar {
+                name: "sc".into(),
+                namespace: "default".into(),
+                workload_selector: None,
+                egress_inherits_defaults: false,
+                egress: vec![MeshSidecarEgress {
+                    hosts: vec![pattern.to_string()],
+                    port: None,
+                }],
+            }],
+            ..MeshConfig::default()
+        };
+        let errors = mesh.validate();
+        let host_errors: Vec<_> = errors
+            .iter()
+            .filter(|e| e.contains("not a valid Sidecar host pattern"))
+            .collect();
+        assert!(
+            host_errors.is_empty(),
+            "pattern {pattern:?} should be accepted, but got: {host_errors:?}"
+        );
+    }
 }
 
 #[test]
