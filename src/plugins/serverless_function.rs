@@ -268,6 +268,14 @@ impl ServerlessFunction {
 
                     let qualifier = optional_config_string(config, "aws_qualifier")?;
 
+                    // Optional override for the AWS Lambda endpoint base URL.
+                    // Defaults to the public Lambda endpoint for the region.
+                    // Primarily used by integration tests against a mock
+                    // server; supports LocalStack / VPC-internal Lambda endpoints
+                    // too. Must be a fully-formed http(s) URL with no path.
+                    let endpoint_override = optional_config_string(config, "aws_endpoint_url")?
+                        .or_else(|| env_non_empty("AWS_LAMBDA_ENDPOINT_URL"));
+
                     // Log which values came from env vars (without leaking secrets)
                     if config["aws_region"]
                         .as_str()
@@ -286,11 +294,16 @@ impl ServerlessFunction {
                         );
                     }
 
-                    // Build the Lambda Invoke API URL
-                    let mut url = format!(
-                        "https://lambda.{}.amazonaws.com/2015-03-31/functions/{}/invocations",
-                        region, function_name
-                    );
+                    // Build the Lambda Invoke API URL. `aws_endpoint_url`
+                    // (or `AWS_LAMBDA_ENDPOINT_URL`) overrides the public
+                    // Lambda host so tests and on-prem/LocalStack deployments
+                    // can route invocations to a mock or VPC-internal endpoint.
+                    let base = endpoint_override
+                        .as_deref()
+                        .map(|s| s.trim_end_matches('/').to_string())
+                        .unwrap_or_else(|| format!("https://lambda.{region}.amazonaws.com"));
+                    let mut url =
+                        format!("{base}/2015-03-31/functions/{function_name}/invocations");
                     if let Some(ref q) = qualifier {
                         url.push_str("?Qualifier=");
                         url.push_str(&aws_sigv4::uri_encode(q, true));

@@ -758,7 +758,8 @@ async fn test_aws_lambda_function_error_does_not_leak_response_body_in_reject_de
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     let server = MockServer::start().await;
-    let lambda_error_body = r#"{"errorMessage":"db_password=supersecret","stackTrace":["/var/task/app.py:42"]}"#;
+    let lambda_error_body =
+        r#"{"errorMessage":"db_password=supersecret","stackTrace":["/var/task/app.py:42"]}"#;
     Mock::given(method("POST"))
         .respond_with(
             ResponseTemplate::new(200)
