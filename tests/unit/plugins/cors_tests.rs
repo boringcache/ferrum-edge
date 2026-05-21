@@ -546,6 +546,35 @@ async fn test_non_cors_request_no_headers_added() {
     );
 }
 
+#[tokio::test]
+async fn test_after_proxy_removes_backend_access_control_headers_when_origin_not_approved() {
+    let plugin = CorsPlugin::new(&json!({
+        "preflight_continue": true,
+        "allowed_origins": ["https://trusted.example"]
+    }))
+    .unwrap();
+
+    let mut ctx = make_cors_ctx("GET", "https://evil.example");
+    let _ = plugin.on_request_received(&mut ctx).await;
+
+    let mut response_headers: HashMap<String, String> = HashMap::from([
+        ("access-control-allow-origin".to_string(), "*".to_string()),
+        (
+            "access-control-allow-credentials".to_string(),
+            "true".to_string(),
+        ),
+        ("x-test".to_string(), "ok".to_string()),
+    ]);
+
+    let _ = plugin
+        .after_proxy(&mut ctx, 200, &mut response_headers)
+        .await;
+
+    assert!(!response_headers.contains_key("access-control-allow-origin"));
+    assert!(!response_headers.contains_key("access-control-allow-credentials"));
+    assert_eq!(response_headers.get("x-test").map(String::as_str), Some("ok"));
+}
+
 // ── Vary header tests ────────────────────────────────────────────────
 
 #[tokio::test]

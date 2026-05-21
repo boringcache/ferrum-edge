@@ -68,6 +68,10 @@ pub struct CorsPlugin {
 }
 
 impl CorsPlugin {
+    fn remove_access_control_headers(response_headers: &mut HashMap<String, String>) {
+        response_headers.retain(|k, _| !k.to_ascii_lowercase().starts_with("access-control-"));
+    }
+
     pub fn new(config: &Value) -> Result<Self, String> {
         let allowed_origins = Self::parse_origins(config)?;
 
@@ -421,6 +425,10 @@ impl Plugin for CorsPlugin {
         _response_status: u16,
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
+        // Strip backend-supplied CORS policy headers so the gateway CORS policy
+        // remains authoritative.
+        Self::remove_access_control_headers(response_headers);
+
         // Check if on_request_received marked this as a valid CORS request
         let origin = match ctx.metadata.get("cors_origin") {
             Some(o) => o.clone(),
