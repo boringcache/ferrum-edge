@@ -117,7 +117,13 @@ use self::http2_pool::Http2ConnectionPool;
 static EMPTY_HEADERS: std::sync::LazyLock<HashMap<String, String>> =
     std::sync::LazyLock::new(HashMap::new);
 
-const REJECTION_RESPONSE_METADATA_KEY: &str = "ferrum:rejection_response";
+/// Metadata key set on the request context for the duration of
+/// `apply_after_proxy_hooks_to_rejection`. Plugins that wire
+/// `applies_after_proxy_on_reject() -> true` can read this key from
+/// `ctx.metadata` to tell apart "after_proxy invoked on a plugin rejection"
+/// (response_headers are plugin-supplied) from the normal "after_proxy
+/// invoked on a backend response" path (response_headers came from upstream).
+pub(crate) const REJECTION_RESPONSE_METADATA_KEY: &str = "ferrum:rejection_response";
 
 fn record_node_waypoint_identity_drop(
     overload: &crate::overload::OverloadState,
