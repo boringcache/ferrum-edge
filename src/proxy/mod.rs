@@ -9779,14 +9779,13 @@ async fn handle_proxy_request_inner(
     );
     let backend_start = Instant::now();
 
-    // Track connection for least-connections load balancing
-    if let (Some(_upstream_id), Some(target), Some(balancer)) = (
-        &proxy.upstream_id,
-        &upstream_target,
-        upstream_balancer.as_ref(),
-    ) {
-        balancer.record_connection_start(target);
-    }
+    // Track connection for least-connections load balancing. The guard calls
+    // record_connection_start now and record_connection_end on drop. For
+    // streaming responses the guard is attached to ProxyBody so it lives as
+    // long as hyper streams the response; for buffered responses it drops
+    // immediately after body construction.
+    let lb_connection_guard =
+        LoadBalancerConnectionGuard::new(upstream_target.clone(), upstream_balancer.clone());
 
     let should_stream = should_stream_response_body(
         &proxy,
@@ -10530,6 +10529,7 @@ async fn handle_proxy_request_inner(
             } else {
                 base
             };
+            let base = base.with_lb_connection_guard(lb_connection_guard);
 
             if state.env_config.enable_streaming_latency_tracking {
                 let (tracked_body, metrics) = base.into_tracked(backend_start);
@@ -10601,7 +10601,9 @@ async fn handle_proxy_request_inner(
                 state.max_response_body_size_bytes,
             );
 
-            if state.response_buffer_cutoff_bytes == 0 && state.max_response_body_size_bytes == 0 {
+            let mut body = if state.response_buffer_cutoff_bytes == 0
+                && state.max_response_body_size_bytes == 0
+            {
                 crate::proxy::body::direct_streaming_h2_body(resp.into_body(), cl)
             } else if state.max_response_body_size_bytes > 0 && cl.is_none() {
                 // No Content-Length — enforce response-size limits while
@@ -10626,13 +10628,16 @@ async fn handle_proxy_request_inner(
                     cl,
                     state.h2_coalesce_target_bytes,
                 )
-            }
+            };
+            body.with_lb_connection_guard(lb_connection_guard)
         }
         ResponseBody::StreamingH3(h3_resp) => {
             let cl = response_headers
                 .get("content-length")
                 .and_then(|v| v.parse::<u64>().ok());
-            if state.response_buffer_cutoff_bytes == 0 && state.max_response_body_size_bytes == 0 {
+            let mut body = if state.response_buffer_cutoff_bytes == 0
+                && state.max_response_body_size_bytes == 0
+            {
                 crate::proxy::body::direct_streaming_h3_body(h3_resp.recv_stream, cl)
             } else if state.max_response_body_size_bytes > 0 && cl.is_none() {
                 crate::proxy::body::size_limited_streaming_h3_body(
@@ -10651,9 +10656,15 @@ async fn handle_proxy_request_inner(
                     state.env_config.http3_coalesce_max_bytes,
                     std::time::Duration::from_micros(state.env_config.http3_flush_interval_micros),
                 )
-            }
+            };
+            body.with_lb_connection_guard(lb_connection_guard)
         }
-        ResponseBody::Buffered(data) => ProxyBody::full(Bytes::from(data)),
+        ResponseBody::Buffered(data) => {
+            // Buffered response: body is fully consumed, drop the guard
+            // immediately so record_connection_end fires now.
+            drop(lb_connection_guard);
+            ProxyBody::full(Bytes::from(data))
+        }
     };
 
     // Attach deferred logger to the body so `log_with_mirror` fires when the
