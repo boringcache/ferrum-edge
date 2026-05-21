@@ -3601,6 +3601,9 @@ impl ProxyState {
         if let Err(errs) = config.validate_regex_listen_paths() {
             errors.extend(errs);
         }
+        if let Err(errs) = config.validate_listen_path_encodings() {
+            errors.extend(errs);
+        }
         if let Err(errs) = config.validate_unique_listen_paths() {
             errors.extend(errs);
         }

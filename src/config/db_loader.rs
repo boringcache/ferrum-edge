@@ -580,6 +580,9 @@ impl DatabaseStore {
             .validate_regex_listen_paths(ValidationAction::FatalStatic(
                 "Database has invalid regex listen_path(s)",
             ))
+            .validate_listen_path_encodings(ValidationAction::FatalStatic(
+                "Database has listen_path(s) containing encoded slashes",
+            ))
             .validate_unique_listen_paths(ValidationAction::FatalStatic(
                 "Database has conflicting host+listen_path combinations",
             ))

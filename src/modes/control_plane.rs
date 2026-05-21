@@ -1362,6 +1362,9 @@ pub async fn run(
                                 if let Err(errs) = new_config.validate_regex_listen_paths() {
                                     validation_errors.extend(errs);
                                 }
+                                if let Err(errs) = new_config.validate_listen_path_encodings() {
+                                    validation_errors.extend(errs);
+                                }
                                 if let Err(errs) = new_config.validate_unique_listen_paths() {
                                     validation_errors.extend(errs);
                                 }

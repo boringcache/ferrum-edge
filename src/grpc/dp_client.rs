@@ -830,6 +830,13 @@ pub async fn connect_and_subscribe_with_startup_ready(
                             error!("Ignoring config update with invalid regex listen_paths");
                             continue;
                         }
+                        if let Err(errors) = config.validate_listen_path_encodings() {
+                            for msg in &errors {
+                                error!("CP config rejected — {}", msg);
+                            }
+                            error!("Ignoring config update with encoded-slash listen_paths");
+                            continue;
+                        }
                         if let Err(errors) = config.validate_unique_listen_paths() {
                             for msg in &errors {
                                 error!("CP config rejected — {}", msg);
