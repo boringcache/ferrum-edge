@@ -9926,6 +9926,12 @@ async fn handle_proxy_request_inner(
             // LB returns the same host:port (single-backend, sticky LB), the
             // snapshot stays unchanged so same-target retries keep the
             // same protocol.
+            //
+            // Save the pre-rotation CB key so the post-loop
+            // `record_backend_outcome` attributes the last *dispatched*
+            // result correctly if we break before dispatching to the new
+            // target (e.g. its circuit breaker is open).
+            let pre_rotation_cb_key = current_cb_target_key.clone();
             if let (Some(_upstream_id), Some(prev_target)) = (&proxy.upstream_id, &current_target)
                 && let Some(ref hash_key) = lb_hash_key
                 && let Some(next) = backend_dispatch::select_next_retry_target(
@@ -9960,6 +9966,23 @@ async fn handle_proxy_request_inner(
                     current_dispatch_h3 =
                         supports_native_http3_backend(&state, &proxy, current_target.as_deref());
                 }
+            }
+
+            // Enforce per-target circuit breaker before each retry attempt.
+            // Retries may switch to a different upstream target, so the
+            // breaker gate must be re-evaluated for the currently selected
+            // target rather than relying on the initial attempt's check.
+            // On break, restore the pre-rotation key so the post-loop
+            // `record_backend_outcome` attributes against the target that
+            // actually produced `result`, not the never-called new target.
+            if let Some(cb_config) = &proxy.circuit_breaker
+                && state
+                    .circuit_breaker_cache
+                    .can_execute(&proxy.id, current_cb_target_key.as_deref(), cb_config)
+                    .is_err()
+            {
+                current_cb_target_key = pre_rotation_cb_key;
+                break;
             }
 
             warn!(
