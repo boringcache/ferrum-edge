@@ -7624,7 +7624,13 @@ pub async fn run_authentication_phase(
                     }
                 }
             }
-            if request_is_authenticated(ctx) || auth_plugins.is_empty() {
+            if request_is_authenticated(ctx)
+                || auth_plugins.is_empty()
+                || ctx
+                    .metadata
+                    .get("mesh_request_auth.permissive_missing_token")
+                    .is_some_and(|v| v == "true")
+            {
                 None
             } else {
                 Some(last_reject.unwrap_or_else(missing_authentication_reject))
@@ -7642,7 +7648,13 @@ pub async fn run_authentication_phase(
                     PluginResult::Continue => {}
                 }
             }
-            if request_is_authenticated(ctx) || auth_plugins.is_empty() {
+            if request_is_authenticated(ctx)
+                || auth_plugins.is_empty()
+                || ctx
+                    .metadata
+                    .get("mesh_request_auth.permissive_missing_token")
+                    .is_some_and(|v| v == "true")
+            {
                 None
             } else {
                 Some(missing_authentication_reject())
