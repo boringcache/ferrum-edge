@@ -33,6 +33,9 @@ enum ValidationStep<'a> {
     RegexListenPaths {
         action: ValidationAction<'a>,
     },
+    ListenPathEncodings {
+        action: ValidationAction<'a>,
+    },
     UniqueListenPaths {
         action: ValidationAction<'a>,
     },
@@ -135,6 +138,12 @@ impl<'a> ValidationPipeline<'a> {
 
     pub(crate) fn validate_regex_listen_paths(mut self, action: ValidationAction<'a>) -> Self {
         self.steps.push(ValidationStep::RegexListenPaths { action });
+        self
+    }
+
+    pub(crate) fn validate_listen_path_encodings(mut self, action: ValidationAction<'a>) -> Self {
+        self.steps
+            .push(ValidationStep::ListenPathEncodings { action });
         self
     }
 
@@ -263,6 +272,11 @@ impl<'a> ValidationPipeline<'a> {
                 }
                 ValidationStep::RegexListenPaths { action } => {
                     if let Err(errors) = config.validate_regex_listen_paths() {
+                        handle_validation_errors(action, errors, &mut collected_errors)?;
+                    }
+                }
+                ValidationStep::ListenPathEncodings { action } => {
+                    if let Err(errors) = config.validate_listen_path_encodings() {
                         handle_validation_errors(action, errors, &mut collected_errors)?;
                     }
                 }

@@ -2046,6 +2046,42 @@ impl GatewayConfig {
         }
     }
 
+    /// Reject any proxy whose `listen_path` contains a percent-encoded slash
+    /// (`%2F`/`%2f` or `%252F`/`%252f`).
+    ///
+    /// Runs as a dedicated rejecting validator on every load/reload path
+    /// because the catch-all `validate_all_fields_with_ip_policy()` is wired
+    /// as warn-only for SQL/DP loads (to tolerate per-DP missing files like
+    /// TLS certs and `.mmdb` databases). Without this dedicated check, a
+    /// `listen_path = "/api%2Fadmin"` row written directly into the DB or
+    /// returned by a Mongo backend would still be served and silently
+    /// unreachable — the routing/auth bypass the admission rejection in
+    /// `Proxy::validate_fields()` is meant to eliminate. Paired with
+    /// `contains_encoded_slash()` in this module and
+    /// `normalize_encoded_slashes()` in `src/router_cache.rs`.
+    pub fn validate_listen_path_encodings(&self) -> Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+        for proxy in &self.proxies {
+            if proxy.dispatch_kind.is_stream() {
+                continue;
+            }
+            let Some(path) = proxy.listen_path.as_deref() else {
+                continue;
+            };
+            if contains_encoded_slash(path) {
+                errors.push(format!(
+                    "Proxy '{}': listen_path '{}' contains encoded slashes (%2F or %252F); request paths are normalized before route lookup, so an encoded-slash listen_path is unreachable and creates a routing/auth bypass",
+                    proxy.id, path
+                ));
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
     /// Normalize all proxy host entries to lowercase.
     pub fn normalize_hosts(&mut self) {
         for proxy in &mut self.proxies {

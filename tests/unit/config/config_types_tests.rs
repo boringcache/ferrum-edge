@@ -1901,6 +1901,57 @@ fn test_regex_listen_path_non_regex_not_checked() {
     assert!(config.validate_regex_listen_paths().is_ok());
 }
 
+// ---- Listen path encoded-slash validation tests ----
+
+#[test]
+fn test_listen_path_encodings_accepts_clean_paths() {
+    let mut config = empty_config();
+    config.proxies = vec![
+        make_proxy("p1", "/api"),
+        make_proxy("p2", "=/exact/path"),
+        make_proxy("p3", "~/regex/.*"),
+        make_proxy("p4", "/with-space%20here"),
+    ];
+    assert!(config.validate_listen_path_encodings().is_ok());
+}
+
+#[test]
+fn test_listen_path_encodings_rejects_single_encoded_slash() {
+    let mut config = empty_config();
+    config.proxies = vec![
+        make_proxy("good", "/api"),
+        make_proxy("bad-upper", "/api%2Fadmin"),
+        make_proxy("bad-lower", "/foo%2fbar"),
+    ];
+    let errs = config.validate_listen_path_encodings().unwrap_err();
+    assert_eq!(errs.len(), 2);
+    assert!(errs.iter().any(|e| e.contains("bad-upper")));
+    assert!(errs.iter().any(|e| e.contains("bad-lower")));
+    assert!(errs.iter().all(|e| e.contains("encoded slashes")));
+}
+
+#[test]
+fn test_listen_path_encodings_rejects_double_encoded_slash() {
+    let mut config = empty_config();
+    config.proxies = vec![
+        make_proxy("bad-upper", "/api%252Fadmin"),
+        make_proxy("bad-lower", "/api%252fadmin"),
+    ];
+    let errs = config.validate_listen_path_encodings().unwrap_err();
+    assert_eq!(errs.len(), 2);
+}
+
+#[test]
+fn test_listen_path_encodings_rejects_exact_and_regex_forms() {
+    let mut config = empty_config();
+    config.proxies = vec![
+        make_proxy("exact-bad", "=/api%2Fadmin"),
+        make_proxy("regex-bad", "~/api%2F.*"),
+    ];
+    let errs = config.validate_listen_path_encodings().unwrap_err();
+    assert_eq!(errs.len(), 2);
+}
+
 #[test]
 fn test_exact_listen_path_validates() {
     let p = make_proxy("exact-path", "=/api/v1");

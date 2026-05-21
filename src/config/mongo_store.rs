@@ -52,7 +52,7 @@ mod inner {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
-    use tracing::{debug, info, warn};
+    use tracing::{debug, error, info, warn};
     // regex::escape is used for safe MongoDB $regex pattern construction in list filters.
     use regex::escape as regex_escape;
 
@@ -1390,6 +1390,19 @@ mod inner {
                 ..Default::default()
             };
             config.resolve_upstream_tls();
+
+            // Defense in depth — Mongo `load_full_config` does not run the
+            // SQL-side `ValidationPipeline`, so a row written directly into
+            // the proxy collection with an encoded-slash listen_path would
+            // otherwise reach `ProxyState::validate_full_config()` as the
+            // only guard. Reject here as well so a Mongo-backed CP broadcast
+            // can never carry the bypass shape downstream.
+            if let Err(errors) = config.validate_listen_path_encodings() {
+                for msg in &errors {
+                    error!("MongoDB config rejected — {}", msg);
+                }
+                anyhow::bail!("MongoDB has listen_path(s) containing encoded slashes");
+            }
 
             Ok(config)
         }

@@ -127,6 +127,9 @@ pub fn load_config_from_file(
         .validate_regex_listen_paths(ValidationAction::FatalCount(
             "Configuration validation failed: {} invalid regex listen_path(s) found",
         ))
+        .validate_listen_path_encodings(ValidationAction::FatalCount(
+            "Configuration validation failed: {} listen_path(s) contain encoded slashes",
+        ))
         .run()?;
 
     // Capture all distinct namespaces before filtering so `GET /namespaces`
