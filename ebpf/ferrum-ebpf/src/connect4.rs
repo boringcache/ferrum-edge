@@ -55,10 +55,10 @@ fn try_connect4(ctx: &SockAddrContext) -> Result<i32, i64> {
     let include_key = LpmKey::new(32, CidrKey4::host(dst_ip));
     let include_cidr_match = FERRUM_CIDR_INCLUDE4.get(&include_key).is_some();
 
-    // Include CIDRs and includeOutboundPorts are additive: capture when either
-    // the destination IP matches include CIDRs OR the destination port is
-    // admitted by the per-cgroup includeOutboundPorts policy.
-    if !include_cidr_match && !include_port_allowed(dst_port) {
+    // When a pod has explicit includeOutboundPorts entries (non-wildcard),
+    // that per-cgroup policy narrows capture and must not be widened by the
+    // node-global implicit include CIDR default (0.0.0.0/0).
+    if !capture_allowed(dst_port, include_cidr_match) {
         return Ok(1);
     }
 
@@ -88,34 +88,45 @@ fn outbound_capture_port() -> u32 {
     }
 }
 
-/// Honor `traffic.sidecar.istio.io/includeOutboundPorts`. Returns `true`
-/// only when a per-cgroup policy exists and admits the destination port
-/// (wildcard policy or explicit allow-list match). Lookup is keyed by the calling
-/// task's cgroup id, so each annotated pod gets its own per-cgroup
-/// policy.
+/// Decide whether this connection should be captured for proxying.
+///
+/// When a per-cgroup `includeOutboundPorts` policy exists with explicit
+/// ports, the port list takes precedence over the node-global include CIDR
+/// (which typically contains the implicit `0.0.0.0/0`). Without this
+/// narrowing, the CIDR match short-circuits port-level restrictions and
+/// overcaptures traffic the operator intended to exclude.
+///
+/// Precedence:
+///   1. No per-cgroup policy → fall back to CIDR match (normal path).
+///   2. Wildcard policy (`all_ports`) → always capture.
+///   3. Empty port list (no wildcard) → fall back to CIDR match.
+///   4. Explicit port list → capture only if port matches.
 #[inline(always)]
-fn include_port_allowed(dst_port: u16) -> bool {
+fn capture_allowed(dst_port: u16, include_cidr_match: bool) -> bool {
     let cgroup_id = unsafe { aya_ebpf::helpers::bpf_get_current_cgroup_id() };
     let Some(policy) = (unsafe { FERRUM_INCLUDE_PORTS.get(&cgroup_id) }) else {
-        // No per-cgroup policy means no annotation-driven port expansion.
-        return false;
+        return include_cidr_match;
     };
-    policy_admits_port(policy, dst_port)
-}
 
-#[inline(always)]
-fn policy_admits_port(policy: &IncludePortsPolicy, dst_port: u16) -> bool {
     if policy.all_ports != 0 {
         return true;
     }
+
     let count = policy.port_count as usize;
-    // Defensive fail-open: an entry without explicit ports and without the
-    // wildcard flag is treated as "no narrowing". Userspace never writes
-    // this shape but kernel-space should not silently drop traffic if the
-    // map is ever populated unexpectedly.
     if count == 0 {
-        return true;
+        return include_cidr_match;
     }
+
+    policy_admits_port(policy, dst_port)
+}
+
+/// Check whether `dst_port` appears in the policy's explicit port list.
+///
+/// Callers (`capture_allowed`) must handle `all_ports` and `count == 0`
+/// before calling — this function only walks the port array.
+#[inline(always)]
+fn policy_admits_port(policy: &IncludePortsPolicy, dst_port: u16) -> bool {
+    let count = policy.port_count as usize;
     let mut i = 0;
     while i < count && i < policy.ports.len() {
         if policy.ports[i] == dst_port {
