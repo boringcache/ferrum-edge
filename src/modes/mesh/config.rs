@@ -946,12 +946,18 @@ impl MeshSidecarEgress {
         let trimmed = host.trim().trim_end_matches('.');
         match trimmed.split_once('/') {
             Some(("*", "*")) => SidecarHostPattern::AllowAll,
-            Some(("*", host)) if !host.is_empty() => SidecarHostPattern::AnyNamespaceHost { host },
-            Some((".", host)) if !host.is_empty() => SidecarHostPattern::SameNamespaceHost { host },
+            Some(("*", host)) if !host.is_empty() && !host.contains('/') => {
+                SidecarHostPattern::AnyNamespaceHost { host }
+            }
+            Some((".", host)) if !host.is_empty() && !host.contains('/') => {
+                SidecarHostPattern::SameNamespaceHost { host }
+            }
             Some((namespace, "*")) if !namespace.is_empty() => {
                 SidecarHostPattern::NamespaceWildcard { namespace }
             }
-            Some((namespace, host)) if !namespace.is_empty() && !host.is_empty() => {
+            Some((namespace, host))
+                if !namespace.is_empty() && !host.is_empty() && !host.contains('/') =>
+            {
                 SidecarHostPattern::NamespaceHost { namespace, host }
             }
             // Fallback: bare host — treat as same-namespace host.
@@ -1515,10 +1521,12 @@ pub enum OutboundTrafficPolicy {
     /// declared ports. Unknown destinations are rejected at the proxy entry
     /// point with a configurable 4xx/5xx status (default 502).
     ///
-    /// HTTP-family only: the gate relies on the `Host` header, so raw TCP
-    /// and UDP outbound traffic bypass this policy. The registry is built
-    /// from the already-projected mesh slice, so future slice-filtering
-    /// refinements naturally narrow the allowed destination set.
+    /// HTTP-family traffic is gated by the auto-injected
+    /// `mesh_outbound_registry` plugin. Stream-family traffic on mesh
+    /// outbound capture listener ports is gated by the stream dispatch
+    /// enforcement slot. Both paths read the same registry built from the
+    /// already-projected mesh slice, so future slice-filtering refinements
+    /// naturally narrow the allowed destination set.
     RegistryOnly,
 }
 
@@ -1531,6 +1539,8 @@ impl MeshConfig {
             &self.peer_authentications,
             &self.service_entries,
             &self.request_authentications,
+            &self.destination_rules,
+            &self.sidecars,
             self.trust_bundles.as_ref(),
             self.multi_cluster.as_ref(),
         )
@@ -1577,6 +1587,8 @@ pub fn validate_mesh_config(
         peer_auths,
         service_entries,
         request_authentications,
+        &[],
+        &[],
         trust_bundles,
         None,
     )
@@ -1590,6 +1602,8 @@ fn validate_mesh_config_internal(
     peer_auths: &[PeerAuthentication],
     service_entries: &[ServiceEntry],
     request_authentications: &[MeshRequestAuthentication],
+    destination_rules: &[MeshDestinationRule],
+    sidecars: &[MeshSidecar],
     trust_bundles: Option<&TrustBundleSet>,
     multi_cluster: Option<&MultiClusterConfig>,
 ) -> Vec<String> {
@@ -1606,18 +1620,16 @@ fn validate_mesh_config_internal(
                 wl.trust_domain
             ));
         }
-        if wl.namespace.is_empty() {
-            errors.push(format!(
-                "Workload '{}': namespace must not be empty",
-                wl.spiffe_id
-            ));
-        }
-        if wl.service_name.is_empty() {
-            errors.push(format!(
-                "Workload '{}': service_name must not be empty",
-                wl.spiffe_id
-            ));
-        }
+        validate_non_empty_string(
+            format!("Workload '{}'.namespace", wl.spiffe_id),
+            &wl.namespace,
+            &mut errors,
+        );
+        validate_non_empty_string(
+            format!("Workload '{}'.service_name", wl.spiffe_id),
+            &wl.service_name,
+            &mut errors,
+        );
         for (i, address) in wl.addresses.iter().enumerate() {
             if address.trim().is_empty() {
                 errors.push(format!(
@@ -1625,6 +1637,13 @@ fn validate_mesh_config_internal(
                     wl.spiffe_id, i
                 ));
             }
+        }
+        for (i, port) in wl.ports.iter().enumerate() {
+            validate_non_zero_port(
+                format!("Workload '{}'.ports[{}].port", wl.spiffe_id, i),
+                port.port,
+                &mut errors,
+            );
         }
         if wl
             .network
@@ -1650,22 +1669,31 @@ fn validate_mesh_config_internal(
 
     // Services
     for svc in services {
-        if svc.name.is_empty() {
-            errors.push("MeshService: name must not be empty".to_string());
+        validate_non_empty_string("MeshService.name".to_string(), &svc.name, &mut errors);
+        validate_non_empty_string(
+            format!("MeshService '{}'.namespace", svc.name),
+            &svc.namespace,
+            &mut errors,
+        );
+        for (i, port) in svc.ports.iter().enumerate() {
+            validate_non_zero_port(
+                format!("MeshService '{}'.ports[{}].port", svc.name, i),
+                port.port,
+                &mut errors,
+            );
         }
-        if svc.namespace.is_empty() {
-            errors.push(format!(
-                "MeshService '{}': namespace must not be empty",
-                svc.name
-            ));
+        for port in svc.protocol_overrides.keys() {
+            validate_non_zero_port(
+                format!("MeshService '{}'.protocol_overrides[{}]", svc.name, port),
+                *port,
+                &mut errors,
+            );
         }
     }
 
     // Policies
     for policy in policies {
-        if policy.name.is_empty() {
-            errors.push("MeshPolicy: name must not be empty".to_string());
-        }
+        validate_non_empty_string("MeshPolicy.name".to_string(), &policy.name, &mut errors);
         for (i, rule) in policy.rules.iter().enumerate() {
             for (j, principal) in rule.from.iter().enumerate() {
                 if principal.spiffe_id_pattern.is_none()
@@ -1754,28 +1782,33 @@ fn validate_mesh_config_internal(
 
     // PeerAuthentications
     for pa in peer_auths {
-        if pa.name.is_empty() {
-            errors.push("PeerAuthentication: name must not be empty".to_string());
-        }
-        if pa.namespace.is_empty() {
-            errors.push(format!(
-                "PeerAuthentication '{}': namespace must not be empty",
-                pa.name
-            ));
+        validate_non_empty_string("PeerAuthentication.name".to_string(), &pa.name, &mut errors);
+        validate_non_empty_string(
+            format!("PeerAuthentication '{}'.namespace", pa.name),
+            &pa.namespace,
+            &mut errors,
+        );
+        for port in pa.port_overrides.keys() {
+            validate_non_zero_port(
+                format!("PeerAuthentication '{}'.port_overrides[{}]", pa.name, port),
+                *port,
+                &mut errors,
+            );
         }
     }
 
     // RequestAuthentications
     for ra in request_authentications {
-        if ra.name.is_empty() {
-            errors.push("MeshRequestAuthentication: name must not be empty".to_string());
-        }
-        if ra.namespace.is_empty() {
-            errors.push(format!(
-                "MeshRequestAuthentication '{}': namespace must not be empty",
-                ra.name
-            ));
-        }
+        validate_non_empty_string(
+            "MeshRequestAuthentication.name".to_string(),
+            &ra.name,
+            &mut errors,
+        );
+        validate_non_empty_string(
+            format!("MeshRequestAuthentication '{}'.namespace", ra.name),
+            &ra.namespace,
+            &mut errors,
+        );
         for (i, rule) in ra.jwt_rules.iter().enumerate() {
             if rule.issuer.trim().is_empty() {
                 errors.push(format!(
@@ -1794,20 +1827,111 @@ fn validate_mesh_config_internal(
 
     // ServiceEntries
     for se in service_entries {
-        if se.name.is_empty() {
-            errors.push("ServiceEntry: name must not be empty".to_string());
-        }
+        validate_non_empty_string("ServiceEntry.name".to_string(), &se.name, &mut errors);
         if se.hosts.is_empty() {
             errors.push(format!(
                 "ServiceEntry '{}': hosts must not be empty",
                 se.name
             ));
         }
+        for (i, port) in se.ports.iter().enumerate() {
+            validate_non_zero_port(
+                format!("ServiceEntry '{}'.ports[{}].port", se.name, i),
+                port.port,
+                &mut errors,
+            );
+        }
+        for (i, endpoint) in se.endpoints.iter().enumerate() {
+            validate_non_empty_string(
+                format!("ServiceEntry '{}'.endpoints[{}].address", se.name, i),
+                &endpoint.address,
+                &mut errors,
+            );
+            for (name, port) in &endpoint.ports {
+                validate_non_zero_port(
+                    format!(
+                        "ServiceEntry '{}'.endpoints[{}].ports['{}']",
+                        se.name, i, name
+                    ),
+                    *port,
+                    &mut errors,
+                );
+            }
+        }
         if se.resolution != Resolution::Static && !se.endpoints.is_empty() {
             errors.push(format!(
                 "ServiceEntry '{}': endpoints are only valid when resolution=static",
                 se.name
             ));
+        }
+    }
+
+    // DestinationRules
+    for dr in destination_rules {
+        validate_non_empty_string(
+            "MeshDestinationRule.name".to_string(),
+            &dr.name,
+            &mut errors,
+        );
+        validate_non_empty_string(
+            format!("MeshDestinationRule '{}'.namespace", dr.name),
+            &dr.namespace,
+            &mut errors,
+        );
+        validate_non_empty_string(
+            format!("MeshDestinationRule '{}'.host", dr.name),
+            &dr.host,
+            &mut errors,
+        );
+        for port in dr.port_level_settings.keys() {
+            validate_non_zero_port(
+                format!(
+                    "MeshDestinationRule '{}'.port_level_settings[{}]",
+                    dr.name, port
+                ),
+                *port,
+                &mut errors,
+            );
+        }
+        for (i, subset) in dr.subsets.iter().enumerate() {
+            validate_non_empty_string(
+                format!("MeshDestinationRule '{}'.subsets[{}].name", dr.name, i),
+                &subset.name,
+                &mut errors,
+            );
+        }
+    }
+
+    // Sidecars
+    for sidecar in sidecars {
+        validate_non_empty_string("MeshSidecar.name".to_string(), &sidecar.name, &mut errors);
+        validate_non_empty_string(
+            format!("MeshSidecar '{}'.namespace", sidecar.name),
+            &sidecar.namespace,
+            &mut errors,
+        );
+        for (i, egress) in sidecar.egress.iter().enumerate() {
+            if egress.hosts.is_empty() {
+                errors.push(format!(
+                    "MeshSidecar '{}'.egress[{}].hosts must not be empty",
+                    sidecar.name, i
+                ));
+            }
+            for (j, host) in egress.hosts.iter().enumerate() {
+                if !is_valid_sidecar_host_pattern(host) {
+                    errors.push(format!(
+                        "MeshSidecar '{}'.egress[{}].hosts[{}] '{}' is not a valid Sidecar host pattern",
+                        sidecar.name, i, j, host
+                    ));
+                }
+            }
+            if let Some(port) = egress.port {
+                validate_non_zero_port(
+                    format!("MeshSidecar '{}'.egress[{}].port", sidecar.name, i),
+                    port,
+                    &mut errors,
+                );
+            }
         }
     }
 
@@ -1850,6 +1974,32 @@ fn validate_mesh_config_internal(
     }
 
     errors
+}
+
+fn validate_non_empty_string(context: String, value: &str, errors: &mut Vec<String>) {
+    if value.trim().is_empty() {
+        errors.push(format!("{context}: must not be empty"));
+    }
+}
+
+fn validate_non_zero_port(context: String, port: u16, errors: &mut Vec<String>) {
+    if port == 0 {
+        errors.push(format!("{context}: port must be greater than 0"));
+    }
+}
+
+fn is_valid_sidecar_host_pattern(pattern: &str) -> bool {
+    let trimmed = pattern.trim().trim_end_matches('.');
+    if trimmed.is_empty() {
+        return false;
+    }
+    match trimmed.split_once('/') {
+        Some(("*", "*")) => true,
+        Some(("*", host)) | Some((".", host)) => !host.is_empty() && !host.contains('/'),
+        Some((namespace, "*")) => !namespace.is_empty(),
+        Some((namespace, host)) => !namespace.is_empty() && !host.is_empty() && !host.contains('/'),
+        None => true,
+    }
 }
 
 fn validate_multi_cluster(

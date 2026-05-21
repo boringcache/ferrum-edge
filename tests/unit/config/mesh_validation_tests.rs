@@ -3,11 +3,12 @@
 use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain};
 use ferrum_edge::modes::mesh::config::{
-    AppProtocol, EastWestGateway, JwtHeader, MeshConfig, MeshEndpoint, MeshJwtRule, MeshPolicy,
-    MeshRequestAuthentication, MeshRule, MeshService, MultiClusterConfig, PeerAuthentication,
-    PolicyAction, PolicyScope, PrincipalMatch, RemoteCluster, RequestMatch, Resolution,
-    ServiceEntry, ServiceEntryLocation, TrustBundle, TrustBundleSet, Workload, WorkloadPort,
-    WorkloadRef, WorkloadSelector, validate_mesh_config,
+    AppProtocol, EastWestGateway, JwtHeader, MeshConfig, MeshDestinationRule, MeshEndpoint,
+    MeshJwtRule, MeshPolicy, MeshRequestAuthentication, MeshRule, MeshService, MeshSidecar,
+    MeshSidecarEgress, MeshSubset, MeshTrafficPolicy, MtlsMode, MultiClusterConfig,
+    PeerAuthentication, PolicyAction, PolicyScope, PrincipalMatch, RemoteCluster, RequestMatch,
+    Resolution, ServiceEntry, ServiceEntryLocation, ServicePort, TrustBundle, TrustBundleSet,
+    Workload, WorkloadPort, WorkloadRef, WorkloadSelector, validate_mesh_config,
 };
 use std::collections::HashMap;
 
@@ -60,7 +61,7 @@ fn workload_rejects_empty_namespace() {
     assert!(
         errors
             .iter()
-            .any(|e| e.contains("namespace must not be empty"))
+            .any(|e| e.contains(".namespace") && e.contains("must not be empty"))
     );
 }
 
@@ -82,7 +83,201 @@ fn mesh_service_rejects_empty_name() {
         protocol_overrides: HashMap::new(),
     };
     let errors = validate_mesh_config(&[], &[svc], &[], &[], &[], &[], None);
-    assert!(errors.iter().any(|e| e.contains("name must not be empty")));
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("MeshService.name") && e.contains("must not be empty"))
+    );
+}
+
+#[test]
+fn mesh_ports_reject_zero_on_core_resources() {
+    let mut wl = fresh_workload();
+    wl.ports[0].port = 0;
+
+    let mut service = MeshService {
+        name: "svc".into(),
+        namespace: "default".into(),
+        ports: vec![ServicePort {
+            port: 0,
+            protocol: AppProtocol::Http,
+            name: Some("http".into()),
+        }],
+        workloads: Vec::new(),
+        protocol_overrides: HashMap::from([(0, AppProtocol::Grpc)]),
+    };
+    service.protocol_overrides.insert(8080, AppProtocol::Http2);
+
+    let mut peer_auth = PeerAuthentication {
+        name: "pa".into(),
+        namespace: "default".into(),
+        scope: None,
+        selector: None,
+        mtls_mode: MtlsMode::Strict,
+        port_overrides: HashMap::from([(0, MtlsMode::Permissive)]),
+    };
+    peer_auth.port_overrides.insert(15006, MtlsMode::Strict);
+
+    let service_entry = ServiceEntry {
+        name: "se".into(),
+        namespace: "default".into(),
+        hosts: vec!["api.external.test".into()],
+        endpoints: vec![MeshEndpoint {
+            address: "".into(),
+            ports: HashMap::from([("http".into(), 0)]),
+            labels: HashMap::new(),
+            network: None,
+        }],
+        resolution: Resolution::Static,
+        location: ServiceEntryLocation::MeshExternal,
+        ports: vec![ServicePort {
+            port: 0,
+            protocol: AppProtocol::Http,
+            name: Some("http".into()),
+        }],
+        export_to: Vec::new(),
+        workload_selector: None,
+    };
+
+    let errors = validate_mesh_config(
+        &[wl],
+        &[service],
+        &[],
+        &[peer_auth],
+        &[service_entry],
+        &[],
+        None,
+    );
+
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("Workload") && e.contains("port must be greater than 0")),
+        "expected workload port error, got: {errors:?}"
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("MeshService") && e.contains("ports[0]")),
+        "expected mesh service port error, got: {errors:?}"
+    );
+    assert!(
+        errors.iter().any(|e| e.contains("protocol_overrides[0]")),
+        "expected protocol override port error, got: {errors:?}"
+    );
+    assert!(
+        errors.iter().any(|e| e.contains("port_overrides[0]")),
+        "expected peer auth port override error, got: {errors:?}"
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("ServiceEntry") && e.contains("ports[0]")),
+        "expected service entry port error, got: {errors:?}"
+    );
+    assert!(
+        errors.iter().any(|e| e.contains("endpoints[0].address")),
+        "expected endpoint address error, got: {errors:?}"
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("endpoints[0].ports['http']")),
+        "expected endpoint named port error, got: {errors:?}"
+    );
+}
+
+#[test]
+fn mesh_config_validate_rejects_zero_ports_on_full_mesh_resources() {
+    let mesh = MeshConfig {
+        destination_rules: vec![MeshDestinationRule {
+            name: "dr".into(),
+            namespace: "default".into(),
+            host: "api.default.svc.cluster.local".into(),
+            traffic_policy: None,
+            port_level_settings: HashMap::from([(0, MeshTrafficPolicy::default())]),
+            subsets: Vec::new(),
+        }],
+        sidecars: vec![MeshSidecar {
+            name: "sc".into(),
+            namespace: "default".into(),
+            workload_selector: None,
+            egress_inherits_defaults: false,
+            egress: vec![MeshSidecarEgress {
+                hosts: vec!["./*".into()],
+                port: Some(0),
+            }],
+        }],
+        ..MeshConfig::default()
+    };
+
+    let errors = mesh.validate();
+
+    assert!(
+        errors.iter().any(|e| e.contains("port_level_settings[0]")),
+        "expected DestinationRule port-level settings error, got: {errors:?}"
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("MeshSidecar") && e.contains("egress[0].port")),
+        "expected Sidecar egress port error, got: {errors:?}"
+    );
+}
+
+#[test]
+fn mesh_config_validate_rejects_empty_destination_rule_and_sidecar_fields() {
+    let mesh = MeshConfig {
+        destination_rules: vec![MeshDestinationRule {
+            name: "".into(),
+            namespace: "".into(),
+            host: "".into(),
+            traffic_policy: None,
+            port_level_settings: HashMap::new(),
+            subsets: vec![MeshSubset {
+                name: "".into(),
+                labels: HashMap::new(),
+                traffic_policy: None,
+            }],
+        }],
+        sidecars: vec![MeshSidecar {
+            name: "".into(),
+            namespace: "".into(),
+            workload_selector: None,
+            egress_inherits_defaults: false,
+            egress: vec![
+                MeshSidecarEgress {
+                    hosts: Vec::new(),
+                    port: None,
+                },
+                MeshSidecarEgress {
+                    hosts: vec!["".into(), "alpha/".into(), "alpha/reviews/extra".into()],
+                    port: None,
+                },
+            ],
+        }],
+        ..MeshConfig::default()
+    };
+
+    let errors = mesh.validate();
+
+    for expected in [
+        "MeshDestinationRule.name",
+        "MeshDestinationRule ''.namespace",
+        "MeshDestinationRule ''.host",
+        "subsets[0].name",
+        "MeshSidecar.name",
+        "MeshSidecar ''.namespace",
+        "egress[0].hosts must not be empty",
+        "egress[1].hosts[0]",
+        "egress[1].hosts[1]",
+        "egress[1].hosts[2]",
+    ] {
+        assert!(
+            errors.iter().any(|e| e.contains(expected)),
+            "expected error containing {expected:?}, got: {errors:?}"
+        );
+    }
 }
 
 #[test]
@@ -333,7 +528,7 @@ fn peer_authentication_requires_namespace() {
     assert!(
         errors
             .iter()
-            .any(|e| e.contains("namespace must not be empty"))
+            .any(|e| e.contains(".namespace") && e.contains("must not be empty"))
     );
 }
 
@@ -558,6 +753,44 @@ fn gateway_config_validate_mesh_fields_dispatches() {
     };
     let errors = cfg.validate_mesh_fields();
     assert!(!errors.is_empty(), "expected at least one error");
+}
+
+#[test]
+fn sidecar_host_pattern_accepts_valid_patterns() {
+    let valid_patterns = [
+        "*/*",
+        "*/host.example.com",
+        "./host.example.com",
+        "default/*",
+        "default/reviews.default.svc.cluster.local",
+        "~/*",
+        "bare-host",
+        "*.example.com",
+    ];
+    for pattern in valid_patterns {
+        let mesh = MeshConfig {
+            sidecars: vec![MeshSidecar {
+                name: "sc".into(),
+                namespace: "default".into(),
+                workload_selector: None,
+                egress_inherits_defaults: false,
+                egress: vec![MeshSidecarEgress {
+                    hosts: vec![pattern.to_string()],
+                    port: None,
+                }],
+            }],
+            ..MeshConfig::default()
+        };
+        let errors = mesh.validate();
+        let host_errors: Vec<_> = errors
+            .iter()
+            .filter(|e| e.contains("not a valid Sidecar host pattern"))
+            .collect();
+        assert!(
+            host_errors.is_empty(),
+            "pattern {pattern:?} should be accepted, but got: {host_errors:?}"
+        );
+    }
 }
 
 #[test]
