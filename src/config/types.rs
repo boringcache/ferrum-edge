@@ -1882,6 +1882,16 @@ pub fn anchor_regex_pattern(pattern: &str) -> String {
     anchored
 }
 
+/// Detects single-encoded (`%2F`/`%2f`) or double-encoded (`%252F`/`%252f`)
+/// slash escapes anywhere in a `listen_path` value.
+///
+/// Must stay in lockstep with `normalize_encoded_slashes` in
+/// `src/router_cache.rs`: the runtime normalizes the same set of encodings
+/// on every inbound request path before route lookup, so admission has to
+/// reject the matching set to keep routing/auth lookups symmetric. If the
+/// runtime normalizer is ever taught to recognise additional encodings
+/// (triple-encoded slashes, encoded backslashes, etc.) this helper must be
+/// extended in the same change.
 fn contains_encoded_slash(path: &str) -> bool {
     let bytes = path.as_bytes();
     let mut i = 0;

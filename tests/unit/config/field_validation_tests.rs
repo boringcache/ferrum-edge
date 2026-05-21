@@ -220,22 +220,53 @@ fn test_proxy_http_listen_path_must_start_with_slash_or_regex_prefix() {
 
 #[test]
 fn test_proxy_listen_path_rejects_encoded_slashes() {
+    // Prefix form, uppercase / lowercase single-encoded.
     let mut proxy = make_proxy("test", "/api");
-    proxy.listen_path = Some("/api%2Fadmin".into());
+    for path in ["/api%2Fadmin", "/api%2fadmin"] {
+        proxy.listen_path = Some(path.into());
+        let errs = proxy.validate_fields().unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains("encoded slashes")),
+            "expected encoded slash rejection for {path:?}, got {errs:?}"
+        );
+    }
+
+    // Prefix form, uppercase / lowercase double-encoded.
+    for path in ["/api%252Fadmin", "/api%252fadmin"] {
+        proxy.listen_path = Some(path.into());
+        let errs = proxy.validate_fields().unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains("encoded slashes")),
+            "expected double-encoded slash rejection for {path:?}, got {errs:?}"
+        );
+    }
+
+    // Exact (`=/…`) form is also rejected.
+    proxy.listen_path = Some("=/api%2Fadmin".into());
     let errs = proxy.validate_fields().unwrap_err();
     assert!(
         errs.iter().any(|e| e.contains("encoded slashes")),
-        "expected encoded slash rejection, got {:?}",
-        errs
+        "expected exact-form rejection, got {errs:?}"
     );
 
-    proxy.listen_path = Some("/api%252Fadmin".into());
+    // Regex (`~…`) form is also rejected — request paths are normalized
+    // before regex evaluation, so a pattern with `%2F` could never match.
+    proxy.listen_path = Some("~/api%2F.*".into());
     let errs = proxy.validate_fields().unwrap_err();
     assert!(
         errs.iter().any(|e| e.contains("encoded slashes")),
-        "expected double-encoded slash rejection, got {:?}",
-        errs
+        "expected regex-form rejection, got {errs:?}"
     );
+
+    // Negative: non-slash percent escapes (e.g. `%20` for space) are allowed.
+    proxy.listen_path = Some("/api%20name".into());
+    let result = proxy.validate_fields();
+    if let Err(errs) = &result {
+        assert!(
+            !errs.iter().any(|e| e.contains("encoded slashes")),
+            "did not expect encoded-slash rejection for `%20`, got {errs:?}"
+        );
+    }
 }
 
 #[test]

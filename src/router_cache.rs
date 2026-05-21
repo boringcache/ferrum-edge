@@ -1288,6 +1288,11 @@ fn make_cache_key(host: Option<&str>, path: &str) -> String {
 /// to literal `/` so that encoded slashes cannot bypass prefix-based route
 /// matching and auth policies. Returns the input unchanged (zero allocation)
 /// when no encoded slashes are present.
+///
+/// Paired with `contains_encoded_slash` in `src/config/types.rs`, which
+/// rejects the same encodings in configured `listen_path` values so that
+/// admission and runtime lookup share the same canonical alphabet. The two
+/// functions must be extended together if additional encodings are added.
 fn normalize_encoded_slashes(path: &str) -> Cow<'_, str> {
     if !path.as_bytes().contains(&b'%') {
         return Cow::Borrowed(path);
