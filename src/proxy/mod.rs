@@ -1101,11 +1101,7 @@ fn http2_pool_sender_error_response(
     if matches!(h2_error_class, retry::ErrorClass::PortExhaustion) {
         state.overload.record_port_exhaustion();
     }
-    let error_body = if h2_error_class == retry::ErrorClass::DnsLookupError {
-        r#"{"error":"DNS resolution for backend failed"}"#.to_string()
-    } else {
-        format!(r#"{{"error":"Backend unavailable: {}"}}"#, msg)
-    };
+    let error_body = r#"{"error":"Backend unavailable"}"#.to_string();
     error!(proxy_id = %proxy.id, error = %msg, "HTTP/2 pool connection failed");
     retry::BackendResponse {
         status_code: 502,
@@ -4856,7 +4852,6 @@ async fn handle_websocket_request_authenticated(
                 // `retry_on_connect_failure` and do NOT charge passive
                 // health as a connect-class failure.
                 let ws_error_class = retry::classify_boxed_setup_error(e.as_ref());
-                let is_ws_dns_error = ws_error_class == retry::ErrorClass::DnsLookupError;
                 let ws_is_pre_wire = !retry::request_reached_wire(ws_error_class);
 
                 // Retry only on PRE-WIRE failures (DNS / TCP refused / TLS
@@ -4879,11 +4874,7 @@ async fn handle_websocket_request_authenticated(
                     let retry_config = match proxy.retry.as_ref() {
                         Some(rc) => rc,
                         None => {
-                            let ws_body = if is_ws_dns_error {
-                                r#"{"error":"DNS resolution for backend failed"}"#
-                            } else {
-                                r#"{"error":"Backend WebSocket connection failed"}"#
-                            };
+                            let ws_body = r#"{"error":"Backend WebSocket connection failed"}"#;
                             return Ok(build_response(StatusCode::BAD_GATEWAY, ws_body));
                         }
                     };
@@ -5022,11 +5013,7 @@ async fn handle_websocket_request_authenticated(
                         .record_http_error(Some(&proxy.id), ws_error_class);
                 }
 
-                let ws_body = if is_ws_dns_error {
-                    r#"{"error":"DNS resolution for backend failed"}"#
-                } else {
-                    r#"{"error":"Backend WebSocket connection failed"}"#
-                };
+                let ws_body = r#"{"error":"Backend WebSocket connection failed"}"#;
                 return Ok(build_response(StatusCode::BAD_GATEWAY, ws_body));
             }
         }
@@ -9680,24 +9667,24 @@ async fn handle_proxy_request_inner(
                 if grpc_error_class == retry::ErrorClass::PortExhaustion {
                     state.overload.record_port_exhaustion();
                 }
-                let (grpc_code, original_msg) = match &e {
-                    GrpcProxyError::BackendUnavailable { message: m, .. } => {
-                        (grpc_proxy::grpc_status::UNAVAILABLE, m.as_str())
+                let grpc_code = match &e {
+                    GrpcProxyError::BackendUnavailable { .. } => {
+                        grpc_proxy::grpc_status::UNAVAILABLE
                     }
-                    GrpcProxyError::BackendTimeout { message: m, .. } => {
-                        (grpc_proxy::grpc_status::DEADLINE_EXCEEDED, m.as_str())
+                    GrpcProxyError::BackendTimeout { .. } => {
+                        grpc_proxy::grpc_status::DEADLINE_EXCEEDED
                     }
-                    GrpcProxyError::ResourceExhausted(m) => {
-                        (grpc_proxy::grpc_status::RESOURCE_EXHAUSTED, m.as_str())
+                    GrpcProxyError::ResourceExhausted(_) => {
+                        grpc_proxy::grpc_status::RESOURCE_EXHAUSTED
                     }
-                    GrpcProxyError::Internal(m) => {
-                        (grpc_proxy::grpc_status::UNAVAILABLE, m.as_str())
-                    }
+                    GrpcProxyError::Internal(_) => grpc_proxy::grpc_status::UNAVAILABLE,
                 };
-                let msg = if grpc_error_class == retry::ErrorClass::DnsLookupError {
-                    "DNS resolution for backend failed"
-                } else {
-                    original_msg
+                // Use a generic client-facing message to avoid leaking
+                // internal backend details (hostnames, DNS errors, etc.).
+                let msg = match grpc_code {
+                    grpc_proxy::grpc_status::DEADLINE_EXCEEDED => "Backend deadline exceeded",
+                    grpc_proxy::grpc_status::RESOURCE_EXHAUSTED => "Resource exhausted",
+                    _ => "Backend unavailable",
                 };
 
                 // Log with error_class for gRPC backend failures
@@ -11249,11 +11236,7 @@ pub(crate) async fn proxy_to_backend_retry(
                 error = %e,
                 "Backend retry request failed"
             );
-            let error_body = if error_class == retry::ErrorClass::DnsLookupError {
-                r#"{"error":"DNS resolution for backend failed"}"#
-            } else {
-                r#"{"error":"Backend unavailable"}"#
-            };
+            let error_body = r#"{"error":"Backend unavailable"}"#;
             retry::BackendResponse {
                 status_code: 502,
                 body: ResponseBody::Buffered(error_body.as_bytes().to_vec()),
@@ -12140,11 +12123,7 @@ async fn proxy_to_backend(
                 error = %e,
                 "Backend request failed"
             );
-            let error_body = if error_class == retry::ErrorClass::DnsLookupError {
-                r#"{"error":"DNS resolution for backend failed"}"#
-            } else {
-                r#"{"error":"Backend unavailable"}"#
-            };
+            let error_body = r#"{"error":"Backend unavailable"}"#;
             retry::BackendResponse {
                 status_code: 502,
                 body: ResponseBody::Buffered(error_body.as_bytes().to_vec()),
