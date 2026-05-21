@@ -190,6 +190,13 @@ impl KafkaLogging {
                         "kafka_logging: 'producer_config.{key}' must not be empty"
                     ));
                 }
+                if key.eq_ignore_ascii_case("bootstrap.servers")
+                    || key.eq_ignore_ascii_case("metadata.broker.list")
+                {
+                    return Err(format!(
+                        "kafka_logging: 'producer_config.{key}' is not allowed"
+                    ));
+                }
                 kafka_config.set(key, prop);
             }
         }

@@ -261,6 +261,21 @@ async fn test_kafka_logging_with_producer_config() {
 }
 
 #[tokio::test]
+async fn test_kafka_logging_rejects_bootstrap_override_in_producer_config() {
+    let result = KafkaLogging::new(
+        &json!({
+            "broker_list": "localhost:9092",
+            "topic": "test",
+            "producer_config": {
+                "bootstrap.servers": "127.0.0.1:9092"
+            }
+        }),
+        &default_http_client(),
+    );
+    assert!(result.is_err());
+}
+
+#[tokio::test]
 async fn test_kafka_logging_buffer_full_drops_gracefully() {
     let plugin = KafkaLogging::new(
         &json!({
