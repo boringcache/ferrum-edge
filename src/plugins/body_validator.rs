@@ -1305,8 +1305,7 @@ impl Plugin for BodyValidator {
             // mis-treat a non-gRPC payload as malformed JSON.
             let has_json_validation =
                 self.json_schema.is_some() || !self.required_fields.is_empty();
-            let has_xml_validation =
-                self.validate_xml || !self.required_xml_elements.is_empty();
+            let has_xml_validation = self.validate_xml || !self.required_xml_elements.is_empty();
             if !has_json_validation && !has_xml_validation {
                 return PluginResult::Continue;
             }
