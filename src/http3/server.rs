@@ -1630,6 +1630,7 @@ async fn handle_h3_request(
         http_flavor,
         &path,
         effective_query_string.as_ref(),
+        strip_len,
         upstream_target.as_deref(),
     );
     let backend_start = std::time::Instant::now();
@@ -1757,6 +1758,7 @@ async fn handle_h3_request(
             proxy_headers,
             requires_ws_frame_hooks,
             is_early_data,
+            strip_len,
         )
         .await;
     }
@@ -3002,6 +3004,7 @@ fn build_h3_backend_url_for_flavor(
     flavor: HttpFlavor,
     path: &str,
     query_string: &str,
+    strip_len: usize,
     upstream_target: Option<&UpstreamTarget>,
 ) -> String {
     if flavor == HttpFlavor::WebSocket {
@@ -3016,6 +3019,7 @@ fn build_h3_backend_url_for_flavor(
             query_string,
             effective_host,
             effective_port,
+            strip_len,
             target_path,
         );
     }
@@ -4443,7 +4447,7 @@ mod h3_backend_url_tests {
     fn websocket_backend_url_uses_wss_scheme_for_https_backends() {
         let proxy = proxy_with_scheme(BackendScheme::Https);
         let url =
-            build_h3_backend_url_for_flavor(&proxy, HttpFlavor::WebSocket, "/ws", "token=1", None);
+            build_h3_backend_url_for_flavor(&proxy, HttpFlavor::WebSocket, "/ws", "token=1", 0, None);
         assert_eq!(url, "wss://backend.example:8443/ws?token=1");
     }
 
@@ -4451,14 +4455,14 @@ mod h3_backend_url_tests {
     fn websocket_backend_url_uses_ws_scheme_for_http_backends() {
         let proxy = proxy_with_scheme(BackendScheme::Http);
         let url =
-            build_h3_backend_url_for_flavor(&proxy, HttpFlavor::WebSocket, "/ws", "token=1", None);
+            build_h3_backend_url_for_flavor(&proxy, HttpFlavor::WebSocket, "/ws", "token=1", 0, None);
         assert_eq!(url, "ws://backend.example:8443/ws?token=1");
     }
 
     #[test]
     fn plain_backend_url_keeps_http_family_scheme() {
         let proxy = proxy_with_scheme(BackendScheme::Https);
-        let url = build_h3_backend_url_for_flavor(&proxy, HttpFlavor::Plain, "/api", "", None);
+        let url = build_h3_backend_url_for_flavor(&proxy, HttpFlavor::Plain, "/api", "", 0, None);
         assert_eq!(url, "https://backend.example:8443/api");
     }
 }
