@@ -615,7 +615,7 @@ async fn test_apply_request_body_plugins_preserves_plugin_order() {
 }
 
 #[tokio::test]
-async fn test_single_auth_allows_mesh_request_auth_permissive_missing_token() {
+async fn test_single_auth_rejects_mesh_request_auth_permissive_missing_token_without_identity() {
     let mesh_request_auth: Arc<dyn Plugin> = Arc::new(PermissiveMissingMeshAuth);
     let auth_plugins: Vec<Arc<dyn Plugin>> = vec![mesh_request_auth];
     let consumer_index = ConsumerIndex::new(&[]);
@@ -628,7 +628,10 @@ async fn test_single_auth_allows_mesh_request_auth_permissive_missing_token() {
     let result =
         run_authentication_phase(AuthMode::Single, &auth_plugins, &mut ctx, &consumer_index).await;
 
-    assert!(result.is_none());
+    assert!(result.is_some());
+    let (status, _body, headers) = result.expect("missing auth should reject");
+    assert_eq!(status, 401);
+    assert_eq!(headers.get("WWW-Authenticate").map(String::as_str), Some("ferrum-edge"));
     assert!(ctx.identified_consumer.is_none());
     assert!(ctx.authenticated_identity.is_none());
 }
@@ -660,7 +663,7 @@ async fn test_multi_auth_clears_reject_when_later_plugin_authenticates() {
 }
 
 #[tokio::test]
-async fn test_multi_auth_allows_mesh_permissive_missing_token() {
+async fn test_multi_auth_rejects_mesh_permissive_missing_token_without_identity() {
     let mesh_request_auth: Arc<dyn Plugin> = Arc::new(PermissiveMissingMeshAuth);
     let auth_plugins: Vec<Arc<dyn Plugin>> = vec![mesh_request_auth];
     let consumer_index = ConsumerIndex::new(&[]);
@@ -673,10 +676,10 @@ async fn test_multi_auth_allows_mesh_permissive_missing_token() {
     let result =
         run_authentication_phase(AuthMode::Multi, &auth_plugins, &mut ctx, &consumer_index).await;
 
-    assert!(
-        result.is_none(),
-        "mesh permissive missing token should pass in multi mode"
-    );
+    assert!(result.is_some());
+    let (status, _body, headers) = result.expect("missing auth should reject");
+    assert_eq!(status, 401);
+    assert_eq!(headers.get("WWW-Authenticate").map(String::as_str), Some("ferrum-edge"));
     assert!(ctx.identified_consumer.is_none());
     assert!(ctx.authenticated_identity.is_none());
 }
