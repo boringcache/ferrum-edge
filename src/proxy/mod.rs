@@ -10139,6 +10139,7 @@ async fn handle_proxy_request_inner(
         final_cb_target_key.as_deref(),
         response_status,
         backend_resp.connection_error,
+        backend_error_class,
         cb_retry_probe_slot_available,
         backend_start.elapsed(),
     );
