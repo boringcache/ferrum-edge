@@ -283,16 +283,8 @@ fn unsupported_cloud_suffix(raw_key: &str) -> Option<(&'static str, &'static str
     const KNOWN: [(&str, &str, bool); 4] = [
         ("_AZURE", "Azure Key Vault", cfg!(feature = "secrets-azure")),
         ("_VAULT", "Vault", cfg!(feature = "secrets-vault")),
-        (
-            "_AWS",
-            "AWS Secrets Manager",
-            cfg!(feature = "secrets-aws"),
-        ),
-        (
-            "_GCP",
-            "GCP Secret Manager",
-            cfg!(feature = "secrets-gcp"),
-        ),
+        ("_AWS", "AWS Secrets Manager", cfg!(feature = "secrets-aws")),
+        ("_GCP", "GCP Secret Manager", cfg!(feature = "secrets-gcp")),
     ];
 
     for (suffix, backend_name, enabled) in KNOWN {
