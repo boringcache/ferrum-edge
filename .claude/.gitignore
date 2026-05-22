@@ -1,3 +1,5 @@
 # Ignore all Claude Code runtime artifacts (lock files, session state, etc.)
 *
 !.gitignore
+!rules/
+!rules/**
