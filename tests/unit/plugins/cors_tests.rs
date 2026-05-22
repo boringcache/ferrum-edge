@@ -999,10 +999,8 @@ async fn test_after_proxy_rejection_with_cors_origin_strips_stale_headers() {
 
     let mut ctx = make_cors_ctx("GET", "https://example.com");
     let _ = plugin.on_request_received(&mut ctx).await;
-    ctx.metadata.insert(
-        "ferrum:rejection_response".to_string(),
-        "true".to_string(),
-    );
+    ctx.metadata
+        .insert("ferrum:rejection_response".to_string(), "true".to_string());
 
     let mut response_headers: HashMap<String, String> = HashMap::new();
     response_headers.insert(
