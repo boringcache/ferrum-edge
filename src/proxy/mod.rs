@@ -7621,10 +7621,11 @@ pub async fn run_authentication_phase(
             }
             if request_is_authenticated(ctx)
                 || auth_plugins.is_empty()
-                || ctx
-                    .metadata
-                    .get("mesh_request_auth.permissive_missing_token")
-                    .is_some_and(|v| v == "true")
+                || (last_reject.is_none()
+                    && ctx
+                        .metadata
+                        .get("mesh_request_auth.permissive_missing_token")
+                        .is_some_and(|v| v == "true"))
             {
                 None
             } else {
