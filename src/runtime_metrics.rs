@@ -100,7 +100,7 @@ const LOG_LEVELS: [LogLevel; 5] = [
     LogLevel::Error,
 ];
 
-const ERROR_CLASSES: [&str; 15] = [
+const ERROR_CLASSES: [&str; 16] = [
     "connection_timeout",
     "connection_refused",
     "connection_reset",
@@ -115,6 +115,7 @@ const ERROR_CLASSES: [&str; 15] = [
     "connection_pool_error",
     "port_exhaustion",
     "graceful_remote_close",
+    "dispatch_policy_rejected",
     "request_error",
 ];
 
@@ -1440,5 +1441,41 @@ mod tests {
                 .map(|counts| counts.http),
             Some(1)
         );
+    }
+
+    #[test]
+    fn error_snapshot_prepopulates_every_error_class() {
+        let metrics = RuntimeMetrics::new();
+        let snapshot = build_errors_snapshot(&metrics);
+        let expected = [
+            ErrorClass::ConnectionTimeout,
+            ErrorClass::ConnectionRefused,
+            ErrorClass::ConnectionReset,
+            ErrorClass::ConnectionClosed,
+            ErrorClass::DnsLookupError,
+            ErrorClass::TlsError,
+            ErrorClass::ReadWriteTimeout,
+            ErrorClass::ClientDisconnect,
+            ErrorClass::ProtocolError,
+            ErrorClass::ResponseBodyTooLarge,
+            ErrorClass::RequestBodyTooLarge,
+            ErrorClass::ConnectionPoolError,
+            ErrorClass::PortExhaustion,
+            ErrorClass::GracefulRemoteClose,
+            ErrorClass::DispatchPolicyRejected,
+            ErrorClass::RequestError,
+        ];
+
+        assert_eq!(snapshot.by_class.len(), expected.len());
+        for class in expected {
+            let counts = snapshot
+                .by_class
+                .get(class.as_str())
+                .unwrap_or_else(|| panic!("missing zero-count slot for {class}"));
+            assert_eq!(counts.http, 0);
+            assert_eq!(counts.grpc, 0);
+            assert_eq!(counts.stream, 0);
+            assert_eq!(counts.body, 0);
+        }
     }
 }
