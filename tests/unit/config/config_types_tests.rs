@@ -1642,6 +1642,37 @@ fn test_validate_host_entry_valid_wildcard() {
 }
 
 #[test]
+fn test_validate_host_entry_rejects_empty_label() {
+    let err = validate_host_entry("api..example.com").unwrap_err();
+    assert!(err.contains("empty labels"));
+}
+
+#[test]
+fn test_validate_host_entry_rejects_label_edge_hyphen() {
+    let err = validate_host_entry("api.-example.com").unwrap_err();
+    assert!(err.contains("start and end"));
+
+    let err = validate_host_entry("api.example-.com").unwrap_err();
+    assert!(err.contains("start and end"));
+}
+
+#[test]
+fn test_validate_host_entry_rejects_oversized_label() {
+    let host = format!("{}.example.com", "a".repeat(64));
+    let err = validate_host_entry(&host).unwrap_err();
+    assert!(err.contains("label longer than 63"));
+}
+
+#[test]
+fn test_validate_host_entry_rejects_invalid_wildcard_suffix_labels() {
+    let err = validate_host_entry("*.api..example.com").unwrap_err();
+    assert!(err.contains("empty labels"));
+
+    let err = validate_host_entry("*.api-.example.com").unwrap_err();
+    assert!(err.contains("start and end"));
+}
+
+#[test]
 fn test_validate_host_entry_rejects_scheme() {
     let err = validate_host_entry("http://example.com").unwrap_err();
     assert!(err.contains("scheme"));

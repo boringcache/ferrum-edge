@@ -216,6 +216,48 @@ async fn functional_cli_validate_invalid_yaml() {
 
 #[ignore]
 #[tokio::test]
+async fn functional_cli_validate_rejects_invalid_proxy_host() {
+    let temp_dir = TempDir::new().unwrap();
+    let spec_path = temp_dir.path().join("bad-host.yaml");
+    std::fs::write(
+        &spec_path,
+        r#"version: "1"
+proxies:
+  - id: bad-host
+    hosts:
+      - "api..example.com"
+    listen_path: /test
+    backend_scheme: http
+    backend_host: localhost
+    backend_port: 3000
+consumers: []
+plugin_configs: []
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(binary_path())
+        .args(["validate", "--spec", spec_path.to_str().unwrap()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("Failed to run ferrum-edge validate");
+
+    assert!(
+        !output.status.success(),
+        "invalid host config unexpectedly passed: stdout={}, stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("invalid host"),
+        "expected hostname validation error, got: {stderr}"
+    );
+}
+
+#[ignore]
+#[tokio::test]
 async fn functional_cli_validate_with_settings() {
     let temp_dir = TempDir::new().unwrap();
 
