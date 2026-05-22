@@ -72,6 +72,39 @@ fn invalid_prefix_length_is_skipped() {
     assert!(tp.is_empty());
 }
 
+#[test]
+fn parse_strict_empty_string_yields_no_proxies() {
+    let tp = TrustedProxies::parse_strict("  ").unwrap();
+
+    assert!(tp.is_empty());
+}
+
+#[test]
+fn parse_strict_accepts_mixed_ip_and_cidr_entries() {
+    let tp = TrustedProxies::parse_strict(" 10.0.0.1 , 192.168.0.0/24 , fd00::/8 ").unwrap();
+
+    assert_eq!(tp.len(), 3);
+    assert!(tp.contains(&"10.0.0.1".parse().unwrap()));
+    assert!(tp.contains(&"192.168.0.42".parse().unwrap()));
+    assert!(tp.contains(&"fd12::1".parse().unwrap()));
+    assert!(!tp.contains(&"203.0.113.9".parse().unwrap()));
+}
+
+#[test]
+fn parse_strict_rejects_any_invalid_entry() {
+    let err = TrustedProxies::parse_strict("10.0.0.1, not-an-ip, 192.168.0.0/24").unwrap_err();
+
+    assert!(err.contains("Invalid CIDR/IP entries: not-an-ip"));
+    assert!(err.contains("Expected formats"));
+}
+
+#[test]
+fn parse_strict_rejects_invalid_ipv4_mapped_ipv6_prefix() {
+    let err = TrustedProxies::parse_strict("::ffff:10.0.0.0/95").unwrap_err();
+
+    assert!(err.contains("Invalid CIDR/IP entries: ::ffff:10.0.0.0/95"));
+}
+
 // ── resolve_client_ip ────────────────────────────────────────────────
 
 #[test]
