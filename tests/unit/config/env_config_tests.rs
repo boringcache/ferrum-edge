@@ -2109,6 +2109,41 @@ fn test_is_private_ip_public_v4() {
 }
 
 #[test]
+fn test_is_private_ip_ipv4_boundary_ranges() {
+    for ip in [
+        "9.255.255.255",
+        "11.0.0.0",
+        "172.15.255.255",
+        "172.32.0.0",
+        "192.167.255.255",
+        "192.169.0.0",
+        "100.63.255.255",
+        "100.128.0.0",
+    ] {
+        assert!(
+            !is_private_ip(&ip.parse().unwrap()),
+            "{ip} should be public"
+        );
+    }
+
+    for ip in [
+        "10.0.0.0",
+        "10.255.255.255",
+        "172.16.0.0",
+        "172.31.255.255",
+        "192.168.0.0",
+        "192.168.255.255",
+        "100.64.0.0",
+        "100.127.255.255",
+    ] {
+        assert!(
+            is_private_ip(&ip.parse().unwrap()),
+            "{ip} should be private/reserved"
+        );
+    }
+}
+
+#[test]
 fn test_is_private_ip_ipv6() {
     assert!(is_private_ip(&"::1".parse().unwrap()));
     assert!(is_private_ip(&"::".parse().unwrap()));
@@ -2141,6 +2176,40 @@ fn test_is_private_ip_ipv6() {
 }
 
 #[test]
+fn test_is_private_ip_ipv6_embedded_ipv4_boundaries() {
+    for ip in [
+        "::ffff:10.0.0.1",
+        "::ffff:100.64.0.1",
+        "::ffff:169.254.169.254",
+        "::ffff:192.0.2.1",
+        "::10.0.0.1",
+        "64:ff9b::10.0.0.1",
+        "64:ff9b::100.64.0.1",
+        "64:ff9b::169.254.169.254",
+        "64:ff9b::192.0.2.1",
+        "64:ff9b:1::8.8.8.8",
+    ] {
+        assert!(
+            is_private_ip(&ip.parse().unwrap()),
+            "{ip} should be private/reserved"
+        );
+    }
+
+    for ip in [
+        "::ffff:8.8.8.8",
+        "::8.8.8.8",
+        "64:ff9b::8.8.8.8",
+        "64:ff9b::192.0.0.9",
+        "64:ff9b::192.0.0.10",
+    ] {
+        assert!(
+            !is_private_ip(&ip.parse().unwrap()),
+            "{ip} should be public"
+        );
+    }
+}
+
+#[test]
 fn test_check_backend_ip_allowed_both_allows_all() {
     let policy = BackendAllowIps::Both;
     assert!(check_backend_ip_allowed(
@@ -2153,6 +2222,10 @@ fn test_check_backend_ip_allowed_both_allows_all() {
     ));
     assert!(check_backend_ip_allowed(
         &"169.254.169.254".parse().unwrap(),
+        &policy
+    ));
+    assert!(check_backend_ip_allowed(
+        &"64:ff9b::192.168.0.1".parse().unwrap(),
         &policy
     ));
 }
@@ -2176,9 +2249,21 @@ fn test_check_backend_ip_allowed_public_denies_private() {
         &"100.64.0.1".parse().unwrap(),
         &policy
     ));
+    assert!(!check_backend_ip_allowed(
+        &"::ffff:10.0.0.1".parse().unwrap(),
+        &policy
+    ));
+    assert!(!check_backend_ip_allowed(
+        &"64:ff9b::192.168.0.1".parse().unwrap(),
+        &policy
+    ));
     // Public allowed
     assert!(check_backend_ip_allowed(
         &"8.8.8.8".parse().unwrap(),
+        &policy
+    ));
+    assert!(check_backend_ip_allowed(
+        &"64:ff9b::8.8.8.8".parse().unwrap(),
         &policy
     ));
 }
@@ -2194,6 +2279,10 @@ fn test_check_backend_ip_allowed_private_denies_public() {
         &"1.1.1.1".parse().unwrap(),
         &policy
     ));
+    assert!(!check_backend_ip_allowed(
+        &"64:ff9b::8.8.8.8".parse().unwrap(),
+        &policy
+    ));
     // Private allowed
     assert!(check_backend_ip_allowed(
         &"10.0.0.1".parse().unwrap(),
@@ -2205,6 +2294,14 @@ fn test_check_backend_ip_allowed_private_denies_public() {
     ));
     assert!(check_backend_ip_allowed(
         &"169.254.169.254".parse().unwrap(),
+        &policy
+    ));
+    assert!(check_backend_ip_allowed(
+        &"::ffff:10.0.0.1".parse().unwrap(),
+        &policy
+    ));
+    assert!(check_backend_ip_allowed(
+        &"64:ff9b::192.168.0.1".parse().unwrap(),
         &policy
     ));
 }
