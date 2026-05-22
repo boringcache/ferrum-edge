@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::net::IpAddr;
 
 use percent_encoding::percent_decode_str;
