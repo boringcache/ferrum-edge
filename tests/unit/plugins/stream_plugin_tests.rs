@@ -42,7 +42,9 @@ async fn test_all_protocol_plugins() {
         ("ip_restriction", json!({"allow": ["10.0.0.0/8"]})),
         (
             "rate_limiting",
-            json!({"window_seconds": 60, "max_requests": 100}),
+            json!({
+                "limits": [{"scope": "default", "window_seconds": 60, "max_requests": 100}]
+            }),
         ),
         ("stdout_logging", json!({})),
         ("prometheus_metrics", json!({})),
@@ -194,7 +196,9 @@ fn test_stream_compatible_plugins_support_tcp_udp() {
         ("ip_restriction", json!({"allow": ["10.0.0.0/8"]})),
         (
             "rate_limiting",
-            json!({"window_seconds": 60, "max_requests": 100}),
+            json!({
+                "limits": [{"scope": "default", "window_seconds": 60, "max_requests": 100}]
+            }),
         ),
         ("stdout_logging", json!({})),
         ("prometheus_metrics", json!({})),
@@ -345,7 +349,11 @@ fn make_stream_summary() -> StreamTransactionSummary {
 
 #[tokio::test]
 async fn test_rate_limiting_stream_connect_allowed() {
-    let plugin = make_plugin("rate_limiting", json!({"requests_per_second": 100})).unwrap();
+    let plugin = make_plugin(
+        "rate_limiting",
+        json!({"limits": [{"scope": "default", "requests_per_second": 100}]}),
+    )
+    .unwrap();
     let mut ctx = make_stream_ctx();
     let result = plugin.on_stream_connect(&mut ctx).await;
     assert!(matches!(result, PluginResult::Continue));
@@ -353,7 +361,11 @@ async fn test_rate_limiting_stream_connect_allowed() {
 
 #[tokio::test]
 async fn test_rate_limiting_stream_connect_rejected() {
-    let plugin = make_plugin("rate_limiting", json!({"requests_per_second": 1})).unwrap();
+    let plugin = make_plugin(
+        "rate_limiting",
+        json!({"limits": [{"scope": "default", "requests_per_second": 1}]}),
+    )
+    .unwrap();
 
     let mut ctx1 = make_stream_ctx();
     let result1 = plugin.on_stream_connect(&mut ctx1).await;
@@ -378,7 +390,10 @@ async fn test_rate_limiting_stream_connect_rejected() {
 async fn test_rate_limiting_stream_connect_consumer_mode_uses_consumer_identity() {
     let plugin = make_plugin(
         "rate_limiting",
-        json!({"requests_per_second": 1, "limit_by": "consumer"}),
+        json!({
+            "limit_by": "consumer",
+            "limits": [{"scope": "default", "requests_per_second": 1}]
+        }),
     )
     .unwrap();
 
@@ -414,7 +429,10 @@ async fn test_rate_limiting_stream_connect_consumer_mode_uses_consumer_identity(
 async fn test_rate_limiting_stream_connect_spiffe_mode_uses_peer_metadata() {
     let plugin = make_plugin(
         "rate_limiting",
-        json!({"requests_per_second": 1, "limit_by": "spiffe_identity"}),
+        json!({
+            "limit_by": "spiffe_identity",
+            "limits": [{"scope": "default", "requests_per_second": 1}]
+        }),
     )
     .unwrap();
 

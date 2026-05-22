@@ -741,8 +741,10 @@ plugin_configs:
     plugin_name: "rate_limiting"
     config:
       limit_by: "consumer"
-      requests_per_second: 10
-      requests_per_minute: 100
+      limits:
+        - scope: "default"
+          requests_per_second: 10
+          requests_per_minute: 100
       burst_size: 20
     scope: global
     enabled: true
@@ -1107,7 +1109,9 @@ plugin_configs:
   - id: "plugin-ratelimit"
     plugin_name: "rate_limiting"
     config:
-      requests_per_second: 10
+      limits:
+        - scope: "default"
+          requests_per_second: 10
     scope: proxy
     proxy_id: "proxy-1"
     enabled: true

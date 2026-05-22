@@ -8,14 +8,18 @@
 //!   for downstream plugins (logging, rate limiting, tracing)
 
 use async_trait::async_trait;
-use dashmap::DashMap;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 
-use super::{GRPC_ONLY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext};
+use super::utils::rate_limit::{
+    DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitBackend, RateLimitOutcome,
+    RateLimitWindowSpec,
+};
+use super::{
+    GRPC_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, ProxyProtocol, RequestContext,
+};
 
 /// Maximum rate-limit state entries before triggering stale eviction.
 const MAX_STATE_ENTRIES: usize = 100_000;
@@ -24,51 +28,7 @@ const MAX_STATE_ENTRIES: usize = 100_000;
 #[derive(Debug, Clone)]
 struct RateSpec {
     max_requests: u64,
-    window: Duration,
-}
-
-/// Token bucket for per-method rate limiting.
-#[derive(Debug)]
-struct TokenBucket {
-    tokens: f64,
-    capacity: f64,
-    refill_rate: f64,
-    last_refill: Instant,
-}
-
-impl TokenBucket {
-    fn new(limit: u64, window: Duration) -> Self {
-        let capacity = limit as f64;
-        let window_secs = window.as_secs_f64().max(0.001);
-        Self {
-            tokens: capacity,
-            capacity,
-            refill_rate: capacity / window_secs,
-            last_refill: Instant::now(),
-        }
-    }
-
-    fn check_and_consume(&mut self) -> bool {
-        let now = Instant::now();
-        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
-        self.last_refill = now;
-        self.tokens = (self.tokens + elapsed * self.refill_rate).min(self.capacity);
-        if self.tokens >= 1.0 {
-            self.tokens -= 1.0;
-            true
-        } else {
-            false
-        }
-    }
-
-    fn remaining(&self) -> u64 {
-        self.tokens.max(0.0) as u64
-    }
-
-    fn has_recent_activity(&self, now: Instant) -> bool {
-        let window_secs = self.capacity / self.refill_rate;
-        now.duration_since(self.last_refill).as_secs_f64() < window_secs
-    }
+    op: DynamicRateLimitOp,
 }
 
 pub struct GrpcMethodRouter {
@@ -76,11 +36,11 @@ pub struct GrpcMethodRouter {
     deny_methods: HashSet<String>,
     method_rate_limits: HashMap<String, RateSpec>,
     limit_by: String,
-    state: Arc<DashMap<String, TokenBucket>>,
+    limiter: RateLimitBackend<String, DynamicHttpRateLimitAlgorithm>,
 }
 
 impl GrpcMethodRouter {
-    pub fn new(config: &Value) -> Result<Self, String> {
+    pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
         let allow_methods = parse_optional_method_set(config, "allow_methods")?;
         let deny_methods = parse_optional_method_set(config, "deny_methods")?.unwrap_or_default();
 
@@ -142,12 +102,16 @@ impl GrpcMethodRouter {
                     ));
                 }
                 let normalized = normalize_config_method_path(method, "method_rate_limits")?;
+                let window = Duration::from_secs(window_seconds);
                 if method_rate_limits
                     .insert(
                         normalized,
                         RateSpec {
                             max_requests,
-                            window: Duration::from_secs(window_seconds),
+                            op: DynamicRateLimitOp::new(vec![RateLimitWindowSpec {
+                                limit: max_requests,
+                                duration: window,
+                            }]),
                         },
                     )
                     .is_some()
@@ -175,36 +139,27 @@ impl GrpcMethodRouter {
             deny_methods,
             method_rate_limits,
             limit_by,
-            state: Arc::new(DashMap::new()),
+            limiter: RateLimitBackend::from_plugin_config(
+                "grpc_method_router",
+                config,
+                &http_client,
+                DynamicHttpRateLimitAlgorithm::new(),
+            )?,
         })
     }
 
     /// Evict entries with no recent activity to bound memory.
     fn evict_stale_entries(&self) {
-        if self.state.len() <= MAX_STATE_ENTRIES {
-            return;
+        if self.limiter.tracked_keys_count() > MAX_STATE_ENTRIES {
+            self.limiter
+                .enforce_capacity(MAX_STATE_ENTRIES, Instant::now());
         }
-        let now = Instant::now();
-        self.state
-            .retain(|_, bucket| bucket.has_recent_activity(now));
     }
 
     /// Check a rate limit by key, creating a bucket if needed.
-    fn check_rate(&self, key: &str, spec: &RateSpec) -> bool {
+    async fn check_rate(&self, key: &str, spec: &RateSpec) -> RateLimitOutcome {
         self.evict_stale_entries();
-        if let Some(mut bucket) = self.state.get_mut(key) {
-            return bucket.check_and_consume();
-        }
-        let mut entry = self
-            .state
-            .entry(key.to_string())
-            .or_insert_with(|| TokenBucket::new(spec.max_requests, spec.window));
-        entry.check_and_consume()
-    }
-
-    /// Get remaining count for a key (for metadata/headers).
-    fn get_remaining(&self, key: &str) -> Option<u64> {
-        self.state.get(key).map(|bucket| bucket.remaining())
+        self.limiter.check(key.to_string(), key, &spec.op).await
     }
 
     /// Build the rate limit key based on `limit_by` config.
@@ -340,7 +295,11 @@ impl Plugin for GrpcMethodRouter {
     }
 
     fn tracked_keys_count(&self) -> Option<usize> {
-        Some(self.state.len())
+        Some(self.limiter.tracked_keys_count())
+    }
+
+    fn warmup_hostnames(&self) -> Vec<String> {
+        self.limiter.warmup_hostname().into_iter().collect()
     }
 
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
@@ -414,13 +373,14 @@ impl Plugin for GrpcMethodRouter {
         // Check per-method rate limits
         if let Some(spec) = self.method_rate_limits.get(full_method) {
             let key = self.rate_key(ctx, full_method);
-            if !self.check_rate(&key, spec) {
+            let outcome = self.check_rate(&key, spec).await;
+            if !outcome.allowed {
                 warn!(
                     method = %full_method,
                     plugin = "grpc_method_router",
                     "gRPC method rate limit exceeded"
                 );
-                let remaining = self.get_remaining(&key).unwrap_or(0);
+                let remaining = outcome.remaining.unwrap_or(0);
                 let mut headers = grpc_content_type_header();
                 headers.insert(
                     "x-grpc-ratelimit-limit".to_string(),
