@@ -418,15 +418,21 @@ async fn do_reconcile(store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>, ctx:
         // Owned `Vec<...>` parameters keep the patch futures Send across
         // `tokio::spawn`'s HRTB analysis — `&[T]` parameters previously
         // tripped the same "Send not general enough" error as the
-        // `&Mutex<...>` borrow above.
-        patch_gateway_api_statuses(
+        // `&Mutex<...>` borrow above. But the helpers immediately return
+        // when their writer is `None`, so gate the calls on the writer
+        // existing before paying for the deep-clone of `objects`
+        // (`K8sObject` carries serde-cloned `spec`/`status` JSON) or for
+        // `options` / `route_conflicts`. Deployments that don't watch
+        // Gateway API / Istio CRDs (the default) get zero per-reconcile
+        // clone cost.
+        run_status_patchers(
             ctx.gateway_status_writer,
-            objects.clone(),
-            options.clone(),
-            translation.route_conflicts.clone(),
+            ctx.istio_status_writer,
+            &objects,
+            &options,
+            Some(&translation.route_conflicts),
         )
         .await;
-        patch_istio_statuses(ctx.istio_status_writer, objects, options).await;
         let elapsed = start.elapsed();
         ctx.metrics.last_reconcile_duration_ms.store(
             elapsed.as_millis() as u64,
@@ -442,14 +448,16 @@ async fn do_reconcile(store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>, ctx:
         new_config.clone(),
         &ctx.mesh_registry,
     );
-    patch_gateway_api_statuses(
+    // Same clone-elision contract as the no-change branch above; see the
+    // comment over `run_status_patchers` there.
+    run_status_patchers(
         ctx.gateway_status_writer,
-        objects.clone(),
-        options.clone(),
-        translation.route_conflicts,
+        ctx.istio_status_writer,
+        &objects,
+        &options,
+        Some(&translation.route_conflicts),
     )
     .await;
-    patch_istio_statuses(ctx.istio_status_writer, objects, options).await;
 
     let elapsed = start.elapsed();
     ctx.metrics.last_reconcile_duration_ms.store(
@@ -466,15 +474,42 @@ async fn do_reconcile(store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>, ctx:
     );
 }
 
+/// Dispatch to whichever status patchers are configured, paying the
+/// `objects` / `options` / `route_conflicts` clone cost only for the writers
+/// that actually exist. Callers in `do_reconcile` previously always cloned —
+/// a regression in deployments that don't watch Gateway API or Istio CRDs
+/// (the default), since `K8sObject` carries serde-cloned `spec`/`status`
+/// JSON and the clone is O(snapshot size) per reconcile. Both writers are
+/// taken by value so they can be moved into the helper futures (required
+/// for `tokio::spawn`'s HRTB Send check — see the `Send is not general
+/// enough` history in `spawn_reconcile_loop`).
+async fn run_status_patchers(
+    gateway_writer: Option<GatewayApiStatusWriter>,
+    istio_writer: Option<IstioStatusWriter>,
+    objects: &[K8sObject],
+    options: &K8sTranslationOptions,
+    route_conflicts: Option<&[crate::config_sources::k8s::GatewayApiRouteConflict]>,
+) {
+    if let Some(writer) = gateway_writer {
+        patch_gateway_api_statuses(
+            writer,
+            objects.to_vec(),
+            options.clone(),
+            route_conflicts.map(<[_]>::to_vec).unwrap_or_default(),
+        )
+        .await;
+    }
+    if let Some(writer) = istio_writer {
+        patch_istio_statuses(writer, objects.to_vec(), options.clone()).await;
+    }
+}
+
 async fn patch_gateway_api_statuses(
-    writer: Option<GatewayApiStatusWriter>,
+    writer: GatewayApiStatusWriter,
     objects: Vec<K8sObject>,
     options: K8sTranslationOptions,
     route_conflicts: Vec<crate::config_sources::k8s::GatewayApiRouteConflict>,
 ) {
-    let Some(writer) = writer else {
-        return;
-    };
     let mut updates = plan_gateway_api_status_updates(&objects, options, &route_conflicts);
     if updates.is_empty() {
         return;
@@ -503,13 +538,10 @@ async fn patch_gateway_api_statuses(
 /// plan is empty (no supported Istio CRDs in the snapshot). Failures
 /// are logged and never abort reconcile.
 async fn patch_istio_statuses(
-    writer: Option<IstioStatusWriter>,
+    writer: IstioStatusWriter,
     objects: Vec<K8sObject>,
     options: K8sTranslationOptions,
 ) {
-    let Some(writer) = writer else {
-        return;
-    };
     let updates = plan_istio_status_updates(&objects, options);
     if updates.is_empty() {
         return;
