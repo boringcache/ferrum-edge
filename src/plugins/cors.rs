@@ -441,15 +441,20 @@ impl Plugin for CorsPlugin {
             .metadata
             .get(crate::proxy::REJECTION_RESPONSE_METADATA_KEY)
             .is_some_and(|v| v == "true");
-        if !is_rejection_path {
+        let origin = ctx.metadata.get("cors_origin").cloned();
+
+        // Keep CORS plugin preflight rejection headers intact: that path is a
+        // rejection without `cors_origin` metadata by design.
+        let preserve_rejection_headers = is_rejection_path && origin.is_none();
+        if !preserve_rejection_headers {
             // Strip backend-supplied CORS policy headers so the gateway CORS
             // policy remains authoritative.
             Self::remove_access_control_headers(response_headers);
         }
 
         // Check if on_request_received marked this as a valid CORS request
-        let origin = match ctx.metadata.get("cors_origin") {
-            Some(o) => o.clone(),
+        let origin = match origin {
+            Some(o) => o,
             None => return PluginResult::Continue,
         };
 

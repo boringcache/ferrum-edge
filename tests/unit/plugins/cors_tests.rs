@@ -988,3 +988,40 @@ async fn test_vary_header_wildcard_preserved_origin_redundant() {
         "Vary: * must be preserved (Origin would be redundant)"
     );
 }
+
+#[tokio::test]
+async fn test_after_proxy_rejection_with_cors_origin_strips_stale_headers() {
+    let plugin = CorsPlugin::new(&json!({
+        "allowed_origins": ["https://example.com"],
+        "allow_credentials": false
+    }))
+    .unwrap();
+
+    let mut ctx = make_cors_ctx("GET", "https://example.com");
+    let _ = plugin.on_request_received(&mut ctx).await;
+    ctx.metadata.insert(
+        "ferrum:rejection_response".to_string(),
+        "true".to_string(),
+    );
+
+    let mut response_headers: HashMap<String, String> = HashMap::new();
+    response_headers.insert(
+        "access-control-allow-credentials".to_string(),
+        "true".to_string(),
+    );
+    response_headers.insert(
+        "access-control-expose-headers".to_string(),
+        "x-secret".to_string(),
+    );
+
+    let _ = plugin
+        .after_proxy(&mut ctx, 200, &mut response_headers)
+        .await;
+
+    assert_eq!(
+        response_headers.get("access-control-allow-origin"),
+        Some(&"https://example.com".to_string())
+    );
+    assert!(!response_headers.contains_key("access-control-allow-credentials"));
+    assert!(!response_headers.contains_key("access-control-expose-headers"));
+}
