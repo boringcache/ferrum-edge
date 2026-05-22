@@ -12707,7 +12707,10 @@ pub fn check_host_authority_consistency(
 ///    duplicate Host headers MUST be rejected with 400 to prevent host-header routing
 ///    confusion between the proxy and backend.
 ///
-/// 4. **TE header validation** (HTTP/2 and HTTP/3): RFC 9113 §8.2.2 and RFC 9114 §4.2 —
+/// 4. **Transfer-Encoding rejection** (HTTP/2 and HTTP/3): RFC 9113 §8.2.2 and
+///    RFC 9114 §4.2 forbid this HTTP/1.x framing header on multiplexed protocols.
+///
+/// 5. **TE header validation** (HTTP/2 and HTTP/3): RFC 9113 §8.2.2 and RFC 9114 §4.2 —
 ///    the only permitted value is "trailers"; any other value (or an empty list element
 ///    such as `,trailers` / `trailers,`) is a protocol violation that could be used to
 ///    confuse intermediaries that translate H2/H3 to HTTP/1.x.
@@ -12780,7 +12783,14 @@ pub fn check_protocol_headers(
         }
     }
 
-    // 4. TE header in HTTP/2 and HTTP/3 must be "trailers" only
+    // 4. HTTP/2 and HTTP/3 must not carry HTTP/1.x Transfer-Encoding.
+    if (version == hyper::Version::HTTP_2 || version == hyper::Version::HTTP_3)
+        && headers.contains_key("transfer-encoding")
+    {
+        return Some(r#"{"error":"HTTP/2 and HTTP/3 do not support Transfer-Encoding"}"#);
+    }
+
+    // 5. TE header in HTTP/2 and HTTP/3 must be "trailers" only
     // (RFC 9113 §8.2.2 for HTTP/2, RFC 9114 §4.2 for HTTP/3).
     // Iterate all TE header entries and comma-separated tokens within each entry.
     // A request with `te: trailers` plus a second `te: gzip` entry (or a single
