@@ -15,8 +15,12 @@ paths:
   - "src/tls_offload.rs"
   - "src/adaptive_buffer.rs"
   - "src/lazy_timeout.rs"
+  - "vendor/reqwest-0.13.3-ferrum-patched/**"
+  - "vendor/h3-0.0.8-ferrum-patched/**"
   - "docs/http3.md"
   - "docs/tcp_udp_proxy.md"
+  - "docs/upstream-reqwest-patches/**"
+  - "docs/upstream-h3-patches/**"
   - "docs/routing.md"
   - "docs/dns_resolver.md"
   - "docs/connection_pooling.md"
@@ -78,6 +82,7 @@ paths:
 - H3 cross-protocol buffering: request bodies buffer because `RequestStream` cannot be captured by reqwest's static body; responses stream with the H3 coalesce window.
 - Forward gRPC trailers with `send_trailers` on buffered and streaming H3 bridge responses.
 - QUIC connection migration must compare `remote_address()` per request. Rebuild `Arc<str>` only on actual change so per-IP limits follow migrated clients.
+- The vendored `h3` crate at `vendor/h3-0.0.8-ferrum-patched/` carries Ferrum's frame-drain-on-QUIC-close and H3 WebSocket Extended CONNECT patches. Keep `docs/upstream-h3-patches/` lifecycle notes in sync when touching H3 dispatch, graceful-close classification, or the vendor copy.
 - gRPC `GrpcBody::Streaming(Incoming)` is used when no body plugins and no retries. Otherwise use `Buffered(Full<Bytes>)`.
 - Streaming gRPC responses use `coalescing_h2_body`, preserve trailers, and keep the 128 KiB target unless tests justify a change.
 
@@ -102,6 +107,7 @@ paths:
 - Never add policy fields such as timeouts, pool sizes, or keepalives to pool keys.
 - Subset must partition pools so DestinationRule subset TLS overlays cannot share connections accidentally.
 - Policy fields are applied per request. Shared reqwest clients must not leak timeouts across proxies.
+- Per-request `connect_timeout` depends on the vendored reqwest patch at `vendor/reqwest-0.13.3-ferrum-patched/` (`docs/upstream-reqwest-patches/001-per-request-connect-timeout/`). Do not change pool sharing or timeout semantics without preserving that request-scoped override behavior.
 - Every production `reqwest::Client::builder()` must install `DnsCacheResolver` from the shared DNS cache.
 - DNS cache is shared, prewarmed, native-TTL by default, floored by `FERRUM_DNS_MIN_TTL_SECONDS`, stale-while-revalidate, and supports TCP fallback for truncated UDP.
 
