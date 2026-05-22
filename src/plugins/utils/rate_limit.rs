@@ -8,7 +8,7 @@ use std::hash::Hash;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use super::http_client::PluginHttpClient;
 use super::redis_rate_limiter::{RedisConfig, RedisRateLimitClient};
@@ -782,7 +782,7 @@ pub struct DynamicHttpRateLimitState {
     windows: Vec<HttpWindowState>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct DynamicHttpRateLimitAlgorithm;
 
 impl DynamicHttpRateLimitAlgorithm {
@@ -809,10 +809,12 @@ impl RateLimitAlgorithm for DynamicHttpRateLimitAlgorithm {
         op: &Self::Op,
         now: Instant,
     ) -> RateLimitOutcome {
-        if state.specs.as_ref() != op.specs() {
-            debug!(
-                "DynamicHttpRateLimitAlgorithm: spec drift detected for in-progress key; counter state will be reset"
-            );
+        if !Arc::ptr_eq(&state.specs, &op.specs) {
+            if !state.windows.is_empty() {
+                warn!(
+                    "DynamicHttpRateLimitAlgorithm: spec change detected for in-progress key; counter state will be reset"
+                );
+            }
             state.specs = Arc::clone(&op.specs);
             state.windows = new_http_window_states(op.specs());
         }

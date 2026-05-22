@@ -426,6 +426,56 @@ async fn test_rate_limiting_stream_connect_consumer_mode_uses_consumer_identity(
 }
 
 #[tokio::test]
+async fn test_rate_limiting_stream_connect_consumer_rules_override_default() {
+    let plugin = make_plugin(
+        "rate_limiting",
+        json!({
+            "limit_by": "consumer",
+            "limits": [
+                { "scope": "default", "requests_per_second": 3 },
+                { "scope": "consumers", "consumers": ["alice"], "requests_per_second": 1 }
+            ]
+        }),
+    )
+    .unwrap();
+
+    let mut alice_1 = make_stream_ctx();
+    alice_1.client_ip = "10.0.0.1".to_string();
+    alice_1.identified_consumer = Some(Arc::new(test_consumer("alice")));
+    assert!(matches!(
+        plugin.on_stream_connect(&mut alice_1).await,
+        PluginResult::Continue
+    ));
+
+    let mut alice_2 = make_stream_ctx();
+    alice_2.client_ip = "10.0.0.2".to_string();
+    alice_2.identified_consumer = Some(Arc::new(test_consumer("alice")));
+    assert!(matches!(
+        plugin.on_stream_connect(&mut alice_2).await,
+        PluginResult::Reject {
+            status_code: 429,
+            ..
+        }
+    ));
+
+    let mut bob_1 = make_stream_ctx();
+    bob_1.client_ip = "10.0.0.3".to_string();
+    bob_1.identified_consumer = Some(Arc::new(test_consumer("bob")));
+    assert!(matches!(
+        plugin.on_stream_connect(&mut bob_1).await,
+        PluginResult::Continue
+    ));
+
+    let mut bob_2 = make_stream_ctx();
+    bob_2.client_ip = "10.0.0.4".to_string();
+    bob_2.identified_consumer = Some(Arc::new(test_consumer("bob")));
+    assert!(matches!(
+        plugin.on_stream_connect(&mut bob_2).await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
 async fn test_rate_limiting_stream_connect_spiffe_mode_uses_peer_metadata() {
     let plugin = make_plugin(
         "rate_limiting",

@@ -1791,7 +1791,7 @@ Each `limits[]` rule configures rate windows in one of two ways:
 1. `window_seconds` + `max_requests` — exact custom window of any duration
 2. One or more of `requests_per_second` / `requests_per_minute` / `requests_per_hour`
 
-At least one rate window must be configured in every rule. When multiple windows are configured in a rule, each request must satisfy ALL windows. Consumer identities are matched against the effective identity used by the plugin: mapped Consumer username first, then external authenticated identity.
+At least one rate window must be configured in every rule. Do not combine the custom-window pair with preset `requests_per_*` fields in the same rule. When multiple preset windows are configured in a rule, each request must satisfy ALL windows. Consumer identities are matched against the effective identity used by the plugin: mapped Consumer username first, then external authenticated identity.
 
 **Algorithm selection** (automatic):
 - Windows ≤ 5 seconds → token bucket (O(1) memory, ideal for TPS limiting)

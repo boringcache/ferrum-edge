@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tracing::warn;
@@ -343,6 +343,20 @@ fn parse_window_specs(
     label: &str,
     object: &serde_json::Map<String, Value>,
 ) -> Result<Vec<RateLimitWindowSpec>, String> {
+    let has_preset = [
+        "requests_per_second",
+        "requests_per_minute",
+        "requests_per_hour",
+    ]
+    .iter()
+    .any(|field| object.contains_key(*field));
+    let has_custom = object.contains_key("window_seconds") || object.contains_key("max_requests");
+    if has_preset && has_custom {
+        return Err(format!(
+            "{label}: cannot combine 'window_seconds'/'max_requests' with 'requests_per_second'/'requests_per_minute'/'requests_per_hour' in the same rule"
+        ));
+    }
+
     if let Some(window_seconds) = parse_optional_u64(object, "window_seconds")? {
         if window_seconds == 0 {
             return Err(format!(
@@ -412,6 +426,8 @@ struct ParsedLimits {
 }
 
 fn parse_limits(object: &serde_json::Map<String, Value>) -> Result<ParsedLimits, String> {
+    reject_legacy_window_fields(object)?;
+
     let limits = object
         .get("limits")
         .ok_or_else(|| "rate_limiting: 'limits' is required".to_string())?
@@ -421,10 +437,9 @@ fn parse_limits(object: &serde_json::Map<String, Value>) -> Result<ParsedLimits,
         return Err("rate_limiting: 'limits' must contain at least one rule".to_string());
     }
 
-    reject_legacy_window_fields(object)?;
-
     let mut default_limit = None;
     let mut consumer_overrides = HashMap::new();
+    let mut consumer_rule_indexes = HashMap::new();
     for (idx, raw_rule) in limits.iter().enumerate() {
         let label = format!("rate_limiting: limits[{idx}]");
         let rule = raw_rule
@@ -442,30 +457,28 @@ fn parse_limits(object: &serde_json::Map<String, Value>) -> Result<ParsedLimits,
 
         match parse_limit_scope(&label, rule)? {
             LimitScope::Default => {
-                if default_limit.replace(limit).is_some() {
-                    return Err(
-                        "rate_limiting: 'limits' must contain exactly one default rule".to_string(),
-                    );
+                if let Some((first_idx, _)) = default_limit.replace((idx, limit)) {
+                    return Err(format!(
+                        "rate_limiting: limits[{idx}] is a second 'scope: default' rule; limits[{first_idx}] already defines the default rule"
+                    ));
                 }
             }
             LimitScope::Consumers(consumers) => {
                 // Each listed consumer gets an independent counter keyed by
                 // consumer:<identity>; the rule only shares the window template.
                 for consumer in consumers {
-                    if consumer_overrides
-                        .insert(consumer.clone(), limit.clone())
-                        .is_some()
-                    {
+                    if let Some(first_idx) = consumer_rule_indexes.insert(consumer.clone(), idx) {
                         return Err(format!(
-                            "rate_limiting: duplicate consumer-specific limit for {consumer:?}"
+                            "rate_limiting: limits[{idx}] duplicates consumer-specific limit for {consumer:?}; first defined in limits[{first_idx}]"
                         ));
                     }
+                    consumer_overrides.insert(consumer.clone(), limit.clone());
                 }
             }
         }
     }
 
-    let Some(default_limit) = default_limit else {
+    let Some((_, default_limit)) = default_limit else {
         return Err(
             "rate_limiting: 'limits' must include one rule with scope='default'".to_string(),
         );
@@ -490,8 +503,9 @@ fn parse_limit_scope(
         .get("scope")
         .and_then(Value::as_str)
         .ok_or_else(|| format!("{label}: 'scope' is required and must be a string"))?;
+    let scope = scope.to_ascii_lowercase();
 
-    match scope {
+    match scope.as_str() {
         "default" => {
             if object.contains_key("consumers") {
                 return Err(format!(
@@ -512,6 +526,7 @@ fn parse_limit_scope(
                 ));
             }
             let mut parsed = Vec::with_capacity(consumers.len());
+            let mut seen = HashSet::with_capacity(consumers.len());
             for (idx, raw_consumer) in consumers.iter().enumerate() {
                 let consumer = raw_consumer
                     .as_str()
@@ -519,6 +534,11 @@ fn parse_limit_scope(
                 if consumer.is_empty() {
                     return Err(format!(
                         "{label}: 'consumers[{idx}]' must be a non-empty string"
+                    ));
+                }
+                if !seen.insert(consumer) {
+                    return Err(format!(
+                        "{label}: 'consumers[{idx}]' duplicates consumer identity {consumer:?} in the same rule"
                     ));
                 }
                 parsed.push(consumer.to_string());

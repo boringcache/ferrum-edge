@@ -139,7 +139,7 @@ impl GraphqlPlugin {
     /// Evict entries with no recent activity to bound memory.
     fn evict_stale_entries(&self) {
         let request = self.request_counter.fetch_add(1, Ordering::Relaxed);
-        if request % EVICTION_CHECK_INTERVAL_REQUESTS != 0 {
+        if !request.is_multiple_of(EVICTION_CHECK_INTERVAL_REQUESTS) {
             return;
         }
         if self.limiter.tracked_keys_count() > MAX_STATE_ENTRIES {

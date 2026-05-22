@@ -8400,11 +8400,23 @@ components:
       type: object
       required: [scope]
       additionalProperties: false
-      anyOf:
-        - required: [requests_per_second]
-        - required: [requests_per_minute]
-        - required: [requests_per_hour]
-        - required: [window_seconds, max_requests]
+      oneOf:
+        - allOf:
+            - required: [window_seconds, max_requests]
+            - not:
+                anyOf:
+                  - required: [requests_per_second]
+                  - required: [requests_per_minute]
+                  - required: [requests_per_hour]
+        - allOf:
+            - anyOf:
+                - required: [requests_per_second]
+                - required: [requests_per_minute]
+                - required: [requests_per_hour]
+            - not:
+                anyOf:
+                  - required: [window_seconds]
+                  - required: [max_requests]
       allOf:
         - if:
             properties:
@@ -8413,7 +8425,7 @@ components:
             required: [scope]
           then:
             required: [consumers]
-      description: "One rate_limiting rule. Every rule must set either one or more preset fields (`requests_per_second`/`requests_per_minute`/`requests_per_hour`) or the custom-window pair (`window_seconds` + `max_requests`). Exactly one rule in the plugin config must use `scope: default`. `scope: consumers` is only valid with `limit_by: consumer`; each listed identity gets its own independent counter using this rule's windows."
+      description: "One rate_limiting rule. Every rule must set either one or more preset fields (`requests_per_second`/`requests_per_minute`/`requests_per_hour`) or the custom-window pair (`window_seconds` + `max_requests`), but not both styles in the same rule. Exactly one rule in the plugin config must use `scope: default`. `scope: consumers` is only valid with `limit_by: consumer`; each listed identity gets its own independent counter using this rule's windows."
       properties:
         scope:
           type: string
@@ -8455,6 +8467,7 @@ components:
     RateLimitingConfig:
       type: object
       required: [limits]
+      additionalProperties: false
       description: "Plugin: rate_limiting — Per-IP, per-consumer, or per-SPIFFE-identity request rate limiting. On stream proxies, consumer mode uses the identified stream Consumer when available and otherwise falls back to client IP; `spiffe_identity` keys on the SPIFFE ID extracted by the `spiffe_identity` / `mtls_auth` mesh chain and falls back to client IP when no SPIFFE identity is present. Supports centralized Redis-backed mode for coordinating rate limits across multiple gateway instances. `limits` must contain exactly one `scope: default` rule for generic keys and fallback IPs, plus optional `scope: consumers` rules that apply the same rate rule to one or many consumer identities, each with an independent counter. Counter storage supports only local memory and Redis; database-backed counters are intentionally unsupported."
       properties:
         limit_by:

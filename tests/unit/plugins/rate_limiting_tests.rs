@@ -285,6 +285,24 @@ async fn test_rate_limiting_consumer_rules_apply_default_to_ip_fallback() {
 }
 
 #[tokio::test]
+async fn test_rate_limiting_limit_scope_is_case_insensitive() {
+    let config = json!({
+        "limit_by": "Consumer",
+        "limits": [
+            { "scope": "Default", "window_seconds": 60, "max_requests": 2 },
+            { "scope": "Consumers", "consumers": ["testuser"], "window_seconds": 60, "max_requests": 1 }
+        ]
+    });
+
+    let plugin = make_rate_limiter(config);
+
+    let mut ctx = create_test_context();
+    assert_continue(plugin.authorize(&mut ctx).await);
+    let mut over = create_test_context();
+    assert_reject(plugin.authorize(&mut over).await, Some(429));
+}
+
+#[tokio::test]
 async fn test_rate_limiting_limits_invalid_config() {
     let cases = [
         json!({
@@ -311,6 +329,12 @@ async fn test_rate_limiting_limits_invalid_config() {
         json!({
             "limit_by": "ip",
             "limits": [
+                { "scope": "default", "window_seconds": 60, "max_requests": 10, "requests_per_minute": 5 }
+            ]
+        }),
+        json!({
+            "limit_by": "ip",
+            "limits": [
                 { "scope": "default", "window_seconds": 60, "max_requests": 10, "limit_by": "consumer" }
             ]
         }),
@@ -324,6 +348,28 @@ async fn test_rate_limiting_limits_invalid_config() {
             "limit_by": "consumer",
             "limits": [
                 { "scope": "consumers", "consumers": ["testuser"], "window_seconds": 60, "max_requests": 1 }
+            ]
+        }),
+        json!({
+            "limit_by": "ip",
+            "limits": [
+                { "scope": "default", "window_seconds": 60, "max_requests": 10 },
+                { "scope": "default", "window_seconds": 60, "max_requests": 20 }
+            ]
+        }),
+        json!({
+            "limit_by": "consumer",
+            "limits": [
+                { "scope": "default", "window_seconds": 60, "max_requests": 10 },
+                { "scope": "consumers", "consumers": ["alice"], "window_seconds": 60, "max_requests": 1 },
+                { "scope": "consumers", "consumers": ["alice"], "window_seconds": 60, "max_requests": 2 }
+            ]
+        }),
+        json!({
+            "limit_by": "consumer",
+            "limits": [
+                { "scope": "default", "window_seconds": 60, "max_requests": 10 },
+                { "scope": "consumers", "consumers": ["alice", "alice"], "window_seconds": 60, "max_requests": 1 }
             ]
         }),
         json!({
