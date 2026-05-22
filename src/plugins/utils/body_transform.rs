@@ -560,8 +560,18 @@ pub fn parse_body_rules(config: &Value) -> Result<Vec<BodyRule>, String> {
                         "rule[{idx}]: body '{op_str}' operation requires a 'value'"
                     ));
                 }
+                if new_key.is_some() {
+                    return Err(format!(
+                        "rule[{idx}]: 'new_key' must not be set for body '{op_str}' operation"
+                    ));
+                }
             }
             BodyOperation::Rename => {
+                if value.is_some() {
+                    return Err(format!(
+                        "rule[{idx}]: 'value' must not be set for body 'rename' operation"
+                    ));
+                }
                 if new_key.is_none() {
                     return Err(format!(
                         "rule[{idx}]: body 'rename' operation requires a 'new_key'"
@@ -582,7 +592,18 @@ pub fn parse_body_rules(config: &Value) -> Result<Vec<BodyRule>, String> {
                     ));
                 }
             }
-            BodyOperation::Remove => {}
+            BodyOperation::Remove => {
+                if value.is_some() {
+                    return Err(format!(
+                        "rule[{idx}]: 'value' must not be set for body 'remove' operation"
+                    ));
+                }
+                if new_key.is_some() {
+                    return Err(format!(
+                        "rule[{idx}]: 'new_key' must not be set for body 'remove' operation"
+                    ));
+                }
+            }
         }
 
         rules.push(BodyRule {
