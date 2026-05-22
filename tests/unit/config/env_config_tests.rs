@@ -3448,6 +3448,46 @@ fn test_reserved_gateway_ports_includes_grpc() {
 }
 
 #[test]
+fn test_reserved_gateway_ports_excludes_disabled_ports() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/tmp/test.yaml"),
+            ("FERRUM_PROXY_HTTP_PORT", "0"),
+            ("FERRUM_PROXY_HTTPS_PORT", "0"),
+            ("FERRUM_ADMIN_HTTP_PORT", "0"),
+            ("FERRUM_ADMIN_HTTPS_PORT", "0"),
+            ("FERRUM_CP_GRPC_LISTEN_ADDR", "0.0.0.0:0"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            let ports = config.reserved_gateway_ports();
+            assert!(
+                !ports.contains(&0),
+                "disabled listener port 0 must not be reserved"
+            );
+            assert!(ports.is_empty(), "all configured listeners are disabled");
+        },
+    );
+}
+
+#[test]
+fn test_reserved_gateway_ports_extracts_ipv6_grpc_port() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/tmp/test.yaml"),
+            ("FERRUM_CP_GRPC_LISTEN_ADDR", "[::]:50051"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            let ports = config.reserved_gateway_ports();
+            assert!(ports.contains(&50051), "should contain IPv6 CP gRPC port");
+        },
+    );
+}
+
+#[test]
 fn test_db_slow_query_threshold_default() {
     with_env_vars(
         &[
