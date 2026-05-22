@@ -681,11 +681,15 @@ pub fn apply_body_rules(body: &[u8], rules: &[BodyRule]) -> Option<Vec<u8>> {
 
 /// Check if a content-type header value indicates JSON.
 ///
-/// Recognizes `application/json` and any `+json` suffix (RFC 6839). ASCII
-/// case-insensitive; allocation-free.
+/// Recognizes `application/json` and any media type ending in `+json` (RFC
+/// 6839), ignoring optional `;` parameters. ASCII case-insensitive and
+/// allocation-free. Deliberately does not use substring matching: values such
+/// as `application/jsonp`, `application/notjson`, or `text/application/json`
+/// are not JSON media types for request/response body mutation.
 pub fn is_json_content_type(content_type: &str) -> bool {
-    ascii_contains_ignore_case(content_type, "application/json")
-        || ascii_contains_ignore_case(content_type, "+json")
+    let media_type = content_type.split(';').next().unwrap_or("").trim();
+    media_type.eq_ignore_ascii_case("application/json")
+        || ascii_ends_with_ignore_case(media_type, "+json")
 }
 
 /// Check if a response Content-Type is Server-Sent Events.
@@ -717,4 +721,14 @@ fn ascii_contains_ignore_case(haystack: &str, needle: &str) -> bool {
         return true;
     }
     false
+}
+
+fn ascii_ends_with_ignore_case(haystack: &str, suffix: &str) -> bool {
+    let hb = haystack.as_bytes();
+    let sb = suffix.as_bytes();
+    hb.len() >= sb.len()
+        && hb[hb.len() - sb.len()..]
+            .iter()
+            .zip(sb)
+            .all(|(left, right)| left.eq_ignore_ascii_case(right))
 }

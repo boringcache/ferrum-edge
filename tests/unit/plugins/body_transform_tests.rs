@@ -111,8 +111,13 @@ fn test_is_json_content_type() {
     assert!(is_json_content_type("application/json"));
     assert!(is_json_content_type("application/json; charset=utf-8"));
     assert!(is_json_content_type("application/vnd.api+json"));
+    assert!(is_json_content_type("application/graphql-response+json"));
     assert!(!is_json_content_type("text/html"));
     assert!(!is_json_content_type("application/xml"));
+    assert!(!is_json_content_type("application/jsonp"));
+    assert!(!is_json_content_type("application/notjson"));
+    assert!(!is_json_content_type("text/application/json"));
+    assert!(!is_json_content_type("application/json-seq"));
 }
 
 #[test]
