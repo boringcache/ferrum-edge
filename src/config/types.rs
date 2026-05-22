@@ -1499,7 +1499,7 @@ pub struct Proxy {
     /// Used only for direct-backend proxies (no `upstream_id`).
     #[serde(default)]
     pub backend_tls_server_ca_cert_path: Option<String>,
-    /// Resolved backend TLS config (populated at config load time).
+    /// Resolved backend TLS config (populated during `normalize_fields()`).
     /// When the proxy references an upstream, this is the upstream's TLS config.
     /// For direct-backend proxies, this is the proxy's own TLS fields.
     /// Not serialized — derived from the upstream or proxy fields.
@@ -2089,7 +2089,8 @@ impl GatewayConfig {
         }
     }
 
-    /// Normalize all resource fields that have canonical in-memory forms.
+    /// Normalize all resource fields that have canonical in-memory forms and
+    /// refresh derived runtime projections skipped by serde.
     pub fn normalize_fields(&mut self) {
         self.normalize_hosts();
         for consumer in &mut self.consumers {
@@ -2105,6 +2106,10 @@ impl GatewayConfig {
         // proxy at load time, so the request hot path never does any
         // scheme branching.
         self.resolve_dispatch_kind();
+        // Rebuild TLS projections after serde or admin/incremental mutations.
+        // `Proxy.resolved_tls` is skipped on the wire, so normalization must
+        // repopulate it before any runtime snapshot can serve traffic.
+        self.resolve_upstream_tls();
         // Project per-port `connect_timeout_ms` overrides from each proxy's
         // upstream onto a flat `Proxy.dispatch_port_overrides` map so the
         // request hot path skips the `ArcSwap` + `DashMap` lookup. No-op for
@@ -2131,9 +2136,9 @@ impl GatewayConfig {
 
     /// Resolve each proxy's `resolved_tls` from its upstream (if any) or its own fields.
     ///
-    /// Must be called after loading/mutating config and before any proxy traffic flows.
-    /// Called by `normalize_fields()` callers, `update_config()`, `apply_incremental()`,
-    /// and admin API mutation handlers.
+    /// Called by `normalize_fields()` after loading/mutating config and before
+    /// any proxy traffic flows. Direct calls are still valid for narrow mutation
+    /// paths that only need to refresh TLS projection.
     ///
     /// Proxies with `upstream_subset` set consult the upstream's
     /// `resolved_subset_tls` map first; when the named subset has a resolved
