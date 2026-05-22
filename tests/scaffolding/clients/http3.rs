@@ -110,6 +110,9 @@ impl Http3Client {
                 req_builder = req_builder.header(http::header::HOST, host_header);
             }
         }
+        for (name, value) in &options.headers {
+            req_builder = req_builder.header(name.as_str(), value.as_str());
+        }
         let req = req_builder
             .body(())
             .map_err(|e| format!("build request: {e}"))?;
@@ -515,6 +518,14 @@ fn try_parse_ws_frame(
 #[derive(Debug, Default, Clone)]
 pub struct GetOptions {
     pub host_header: HostHeader,
+    pub headers: Vec<(String, String)>,
+}
+
+impl GetOptions {
+    pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.push((name.into(), value.into()));
+        self
+    }
 }
 
 /// Controls how the H3 client emits the inbound `Host` header alongside

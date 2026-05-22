@@ -866,6 +866,7 @@ async fn h3_client_without_host_header_synthesizes_from_authority_preserve_false
             &url,
             crate::scaffolding::clients::GetOptions {
                 host_header: crate::scaffolding::clients::HostHeader::Auto,
+                ..Default::default()
             },
         )
         .await
@@ -996,6 +997,7 @@ async fn h3_client_without_host_header_synthesizes_from_authority_preserve_true(
             &url,
             crate::scaffolding::clients::GetOptions {
                 host_header: crate::scaffolding::clients::HostHeader::Auto,
+                ..Default::default()
             },
         )
         .await
@@ -1090,6 +1092,7 @@ async fn h3_client_explicit_host_matches_authority_preserved() {
             &url,
             crate::scaffolding::clients::GetOptions {
                 host_header: crate::scaffolding::clients::HostHeader::SameAsAuthority,
+                ..Default::default()
             },
         )
         .await
@@ -1256,6 +1259,7 @@ async fn h3_native_pool_synthesizes_host_from_upstream_target_not_proxy_backend_
             &url,
             crate::scaffolding::clients::GetOptions {
                 host_header: crate::scaffolding::clients::HostHeader::Auto,
+                ..Default::default()
             },
         )
         .await

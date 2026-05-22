@@ -10,6 +10,7 @@
 //! - Multiple `Host` headers (HTTP/1.1)
 //! - `Host` trailing-dot normalization
 //! - `TRACE` method rejection (XST) on H1 and H2
+//! - `Transfer-Encoding` rejection on H3
 //! - `CONNECT` method rejection on H1 (non-WebSocket)
 //! - Request-side hop-by-hop header stripping (backend must not see `Transfer-Encoding`)
 //! - Response-side hop-by-hop header stripping (client must not see `Proxy-Authenticate`,
@@ -21,6 +22,7 @@
 //! Run: `cargo test --test functional_tests -- --ignored functional_protocol_validation --nocapture`
 
 use crate::common::TestGateway;
+use crate::scaffolding::clients::{GetOptions, Http3Client};
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
@@ -519,7 +521,65 @@ async fn functional_protocol_validation_trace_rejected_http2() {
     h.cleanup();
 }
 
-// --- 8. CONNECT on H1 -------------------------------------------------------
+// --- 8. Transfer-Encoding on H3 -------------------------------------------
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_h3_transfer_encoding_rejected() {
+    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_port = echo_listener.local_addr().unwrap().port();
+    let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
+    sleep(Duration::from_millis(150)).await;
+
+    let https_reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let https_port = https_reservation.local_addr().unwrap().port();
+    drop(https_reservation);
+
+    let mut gateway = TestGateway::builder()
+        .mode_file(build_config(echo_port, false))
+        .log_level("warn")
+        .env("FERRUM_ENABLE_HTTP3", "true")
+        .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
+        .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
+        .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key")
+        .spawn()
+        .await
+        .expect("start gateway with h3");
+
+    let client = Http3Client::insecure().expect("H3 client");
+    let url = format!("https://localhost:{https_port}/");
+    let options = GetOptions::default().header("transfer-encoding", "chunked");
+    let mut last_err = None;
+    let resp = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match client.get_with_options(&url, options.clone()).await {
+                Ok(resp) => break resp,
+                Err(err) if std::time::Instant::now() < deadline => {
+                    last_err = Some(err.to_string());
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(err) => {
+                    panic!(
+                        "H3 request with Transfer-Encoding did not complete; last startup error={last_err:?}; final error={err}"
+                    );
+                }
+            }
+        }
+    };
+
+    assert_eq!(resp.status.as_u16(), 400, "body={}", resp.body_text());
+    assert!(
+        resp.body_text().contains("Transfer-Encoding"),
+        "unexpected body: {}",
+        resp.body_text()
+    );
+
+    gateway.shutdown();
+    echo_task.abort();
+}
+
+// --- 9. CONNECT on H1 -------------------------------------------------------
 
 #[ignore]
 #[tokio::test]
@@ -550,7 +610,7 @@ async fn functional_protocol_validation_connect_rejected_http1() {
     h.cleanup();
 }
 
-// --- 9. Backend sees sanitized request (hop-by-hop headers stripped) ------
+// --- 10. Backend sees sanitized request (hop-by-hop headers stripped) ------
 
 #[ignore]
 #[tokio::test]
@@ -588,7 +648,7 @@ async fn functional_protocol_validation_request_te_stripped_before_backend() {
     h.cleanup();
 }
 
-// --- 10. Response hop-by-hop headers stripped before client ----------------
+// --- 11. Response hop-by-hop headers stripped before client ----------------
 
 #[ignore]
 #[tokio::test]

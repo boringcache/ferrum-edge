@@ -56,21 +56,31 @@ fn http10_allows_cl_only() {
 }
 
 #[test]
-fn http2_allows_cl_and_te_trailers() {
-    // HTTP/2 doesn't use Transfer-Encoding, but if somehow present,
-    // the CL+TE check only applies to HTTP/1.x
+fn http2_rejects_transfer_encoding_even_without_cl() {
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("transfer-encoding", HeaderValue::from_static("chunked"));
+    let result = check_protocol_headers(&headers, hyper::Version::HTTP_2);
+    assert!(result.is_some());
+    assert!(result.unwrap().contains("Transfer-Encoding"));
+}
+
+#[test]
+fn http2_rejects_cl_and_transfer_encoding_together() {
     let mut headers = hyper::HeaderMap::new();
     headers.insert("content-length", HeaderValue::from_static("42"));
     headers.insert("transfer-encoding", HeaderValue::from_static("chunked"));
-    // HTTP/2 skips the CL+TE check (it's a protocol-level concern for HTTP/1.x)
     let result = check_protocol_headers(&headers, hyper::Version::HTTP_2);
-    // Should not trigger the CL+TE error (but may trigger TE validation)
-    assert!(
-        result.is_none()
-            || !result
-                .unwrap()
-                .contains("Content-Length and Transfer-Encoding")
-    );
+    assert!(result.is_some());
+    assert!(result.unwrap().contains("Transfer-Encoding"));
+}
+
+#[test]
+fn http3_rejects_transfer_encoding() {
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("transfer-encoding", HeaderValue::from_static("chunked"));
+    let result = check_protocol_headers(&headers, hyper::Version::HTTP_3);
+    assert!(result.is_some());
+    assert!(result.unwrap().contains("Transfer-Encoding"));
 }
 
 #[test]
