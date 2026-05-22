@@ -68,7 +68,7 @@ use http::header::HeaderName;
 use serde_json::Value;
 use std::collections::HashMap;
 use tracing::{debug, info, warn};
-use url::Url;
+use url::{Host, Url};
 
 use super::utils::aws_sigv4;
 use super::utils::response_body::{
@@ -387,7 +387,7 @@ impl ServerlessFunction {
         // Extract hostname for DNS warmup
         let function_hostname = Url::parse(&function_url)
             .ok()
-            .and_then(|u| u.host_str().map(String::from));
+            .and_then(|u| http_url_hostname(&u, "function_url").ok());
 
         let requires_body = forward_body;
 
@@ -649,13 +649,40 @@ fn validate_http_url_field(url: &str, field: &str) -> Result<(), String> {
         }
     }
 
-    if parsed.host_str().is_none() {
+    if !has_non_empty_authority(url) {
         return Err(format!(
             "serverless_function: {field} must include a hostname or IP address"
         ));
     }
+    http_url_hostname(&parsed, field)?;
 
     Ok(())
+}
+
+fn http_url_hostname(parsed: &Url, field: &str) -> Result<String, String> {
+    let host = parsed.host().ok_or_else(|| {
+        format!("serverless_function: {field} must include a hostname or IP address")
+    })?;
+
+    Ok(match host {
+        Host::Domain(hostname) => hostname.to_string(),
+        Host::Ipv4(address) => address.to_string(),
+        Host::Ipv6(address) => address.to_string(),
+    })
+}
+
+fn has_non_empty_authority(url: &str) -> bool {
+    let Some((_, after_scheme)) = url.split_once(':') else {
+        return false;
+    };
+    let Some(authority_and_path) = after_scheme.strip_prefix("//") else {
+        return false;
+    };
+    let authority_end = authority_and_path
+        .find(['/', '?', '#'])
+        .unwrap_or(authority_and_path.len());
+
+    authority_end > 0
 }
 
 fn contains_json_ascii(value: &str) -> bool {
