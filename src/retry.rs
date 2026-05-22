@@ -912,7 +912,15 @@ pub fn should_retry(
         return false;
     }
 
-    if response.error_class == Some(ErrorClass::DispatchPolicyRejected) {
+    if matches!(
+        response.error_class,
+        Some(
+            ErrorClass::ClientDisconnect
+                | ErrorClass::DispatchPolicyRejected
+                | ErrorClass::RequestBodyTooLarge
+                | ErrorClass::ResponseBodyTooLarge
+        )
+    ) {
         return false;
     }
 

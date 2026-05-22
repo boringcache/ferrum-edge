@@ -46,6 +46,17 @@ fn dispatch_policy_rejection() -> BackendResponse {
     }
 }
 
+fn terminal_gateway_error(status_code: u16, error_class: ErrorClass) -> BackendResponse {
+    BackendResponse {
+        status_code,
+        body: ResponseBody::Buffered(Vec::new()),
+        headers: HashMap::new(),
+        connection_error: false,
+        backend_resolved_ip: None,
+        error_class: Some(error_class),
+    }
+}
+
 #[test]
 fn test_should_retry_on_retryable_status() {
     let config = RetryConfig {
@@ -243,6 +254,54 @@ fn test_dispatch_policy_rejection_is_never_retried() {
         &dispatch_policy_rejection(),
         0
     ));
+}
+
+#[test]
+fn test_terminal_gateway_errors_are_never_retried_by_status_policy() {
+    let config = RetryConfig {
+        max_retries: 3,
+        retry_on_connect_failure: true,
+        retryable_status_codes: vec![413, 499, 502],
+        retryable_methods: vec!["GET".to_string(), "POST".to_string()],
+        ..default_config()
+    };
+
+    for (status, class) in [
+        (413, ErrorClass::RequestBodyTooLarge),
+        (499, ErrorClass::ClientDisconnect),
+        (502, ErrorClass::DispatchPolicyRejected),
+        (502, ErrorClass::ResponseBodyTooLarge),
+    ] {
+        assert!(
+            !should_retry(&config, "GET", &terminal_gateway_error(status, class), 0),
+            "{class:?} must be terminal even when status {status} is configured retryable"
+        );
+    }
+}
+
+#[test]
+fn test_terminal_gateway_errors_are_never_retried_as_connection_failures() {
+    let config = RetryConfig {
+        max_retries: 3,
+        retry_on_connect_failure: true,
+        retryable_status_codes: vec![502],
+        ..default_config()
+    };
+
+    for class in [
+        ErrorClass::ClientDisconnect,
+        ErrorClass::DispatchPolicyRejected,
+        ErrorClass::RequestBodyTooLarge,
+        ErrorClass::ResponseBodyTooLarge,
+    ] {
+        let mut response = terminal_gateway_error(502, class);
+        response.connection_error = true;
+
+        assert!(
+            !should_retry(&config, "POST", &response, 0),
+            "{class:?} must be terminal even if a caller marks connection_error=true"
+        );
+    }
 }
 
 // --- classify_grpc_proxy_error tests ---
