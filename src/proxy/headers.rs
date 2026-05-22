@@ -138,41 +138,40 @@ pub fn strip_connection_listed_headers(headers: &mut http::HeaderMap) {
 /// H3 server cross-protocol bridge). Returns the listed header names in
 /// lowercase ASCII.
 ///
-/// `headers` is expected to use lowercase keys — Ferrum normalises header
-/// names at admission via the plugin pipeline, and HTTP/2 / HTTP/3 deliver
-/// names in lowercase per RFC 9113 §8.2.2 / RFC 9114 §4.2. Callers that
-/// might receive mixed-case keys should look up `connection` directly
-/// (the canonical strip predicate already does case-insensitive
-/// matching via lowercase normalisation).
+/// Ferrum normally stores lowercase keys after admission, but this helper also
+/// accepts mixed-case `Connection` map entries because plugins can synthesize
+/// headers outside the original HTTP parser.
 ///
 /// Unparseable list elements are skipped (no panic). Empty / absent
 /// `Connection` returns an empty `Vec`.
 pub fn parse_connection_listed_from_str_map(
     headers: &std::collections::HashMap<String, String>,
 ) -> Vec<String> {
-    let Some(value) = headers.get("connection") else {
-        return Vec::new();
-    };
     let mut out: Vec<String> = Vec::new();
     // The materialised request map folds multi-valued headers with `, `
-    // (see the request handler), so a single string lookup covers every
-    // value RFC 9110 considers part of the `Connection` field.
-    for token in value.split(',') {
-        let trimmed = token.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        // Validate as a header name to reject garbage tokens (e.g. `close`,
-        // `keep-alive` strip themselves; arbitrary smuggling attempts like
-        // `\r\nX-Foo:` get rejected here). Lowercase the result for the
-        // caller's convenience — it matches the plugin pipeline's lowercase
-        // key invariant.
-        let Ok(name) = http::HeaderName::from_bytes(trimmed.as_bytes()) else {
-            continue;
-        };
-        let lower = name.as_str().to_owned();
-        if !out.contains(&lower) {
-            out.push(lower);
+    // (see the request handler). Walk every case variant defensively so a
+    // plugin-added `Connection` does not bypass listed-header stripping.
+    for value in headers.iter().filter_map(|(name, value)| {
+        name.eq_ignore_ascii_case("connection")
+            .then_some(value.as_str())
+    }) {
+        for token in value.split(',') {
+            let trimmed = token.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            // Validate as a header name to reject garbage tokens (e.g. `close`,
+            // `keep-alive` strip themselves; arbitrary smuggling attempts like
+            // `\r\nX-Foo:` get rejected here). Lowercase the result for the
+            // caller's convenience — it matches the plugin pipeline's lowercase
+            // key invariant.
+            let Ok(name) = http::HeaderName::from_bytes(trimmed.as_bytes()) else {
+                continue;
+            };
+            let lower = name.as_str().to_owned();
+            if !out.contains(&lower) {
+                out.push(lower);
+            }
         }
     }
     out
@@ -763,6 +762,19 @@ mod tests {
         );
         let listed = parse_connection_listed_from_str_map(&headers);
         // x-foo dedup + x-bar → 2 names, both lowercase, in iteration order.
+        assert_eq!(listed.len(), 2);
+        assert!(listed.contains(&"x-foo".to_string()));
+        assert!(listed.contains(&"x-bar".to_string()));
+    }
+
+    #[test]
+    fn parse_connection_listed_from_str_map_accepts_mixed_case_connection_keys() {
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("Connection".to_string(), "x-foo".to_string());
+        headers.insert("CONNECTION".to_string(), "X-Bar, x-foo".to_string());
+
+        let listed = parse_connection_listed_from_str_map(&headers);
+
         assert_eq!(listed.len(), 2);
         assert!(listed.contains(&"x-foo".to_string()));
         assert!(listed.contains(&"x-bar".to_string()));
