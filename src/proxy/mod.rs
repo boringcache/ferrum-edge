@@ -1329,9 +1329,49 @@ pub fn build_forwarded_value(client_ip: &str, proto: &str, host: Option<&str>) -
     val.push_str(proto);
     if let Some(h) = host {
         val.push_str(";host=");
-        val.push_str(h);
+        push_forwarded_param_value(&mut val, h);
     }
     val
+}
+
+fn push_forwarded_param_value(buf: &mut String, value: &str) {
+    if is_forwarded_token(value) {
+        buf.push_str(value);
+        return;
+    }
+
+    buf.push('"');
+    for ch in value.chars() {
+        if ch == '"' || ch == '\\' {
+            buf.push('\\');
+        }
+        buf.push(ch);
+    }
+    buf.push('"');
+}
+
+fn is_forwarded_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
 }
 
 pub(crate) async fn apply_request_body_plugins(
@@ -3716,12 +3756,7 @@ impl ProxyState {
         delta: &crate::config_delta::ConfigDelta,
     ) -> Result<StagedRequestEpoch, String> {
         let proxy_ids_to_rebuild = delta.proxy_ids_needing_plugin_rebuild(new_config);
-        let rebuild_globals = delta
-            .added_plugin_configs
-            .iter()
-            .chain(delta.modified_plugin_configs.iter())
-            .any(|pc| pc.scope == crate::config::types::PluginScope::Global)
-            || !delta.removed_plugin_config_ids.is_empty();
+        let rebuild_globals = delta.global_plugin_configs_changed;
         let route_changed = Self::delta_routes_changed(delta, &current.config);
         let consumer_changed = Self::delta_consumers_changed(delta);
         let lb_changed = Self::delta_load_balancers_changed(delta);
@@ -5295,12 +5330,16 @@ async fn handle_websocket_request_authenticated(
 /// Hop-by-hop headers and WebSocket handshake headers are excluded.
 #[cfg(test)]
 fn collect_forwardable_proxy_headers(headers: &HashMap<String, String>) -> Vec<(String, String)> {
+    let connection_listed_strip = headers_mod::parse_connection_listed_from_str_map(headers);
     headers
         .iter()
         .filter_map(|(name, value)| {
             let lower_name = name.to_ascii_lowercase();
             if headers_mod::is_backend_request_strip_header(lower_name.as_str())
                 || is_websocket_backend_strip_header(lower_name.as_str())
+                || connection_listed_strip
+                    .iter()
+                    .any(|listed| listed == lower_name.as_str())
             {
                 return None;
             }
@@ -5324,11 +5363,20 @@ fn collect_forwardable_websocket_headers(
 ) -> Vec<(String, String)> {
     let mut forwarded = Vec::new();
     let mut preserved_raw_names = HashSet::new();
+    let raw_connection_listed_strip = headers_mod::parse_connection_listed_headers(raw_headers);
+    let proxy_connection_listed_strip =
+        headers_mod::parse_connection_listed_from_str_map(proxy_headers);
 
     for name in raw_headers.keys() {
         let lower_name = name.as_str().to_ascii_lowercase();
         if headers_mod::is_backend_request_strip_header(lower_name.as_str())
             || is_websocket_backend_strip_header(lower_name.as_str())
+            || raw_connection_listed_strip
+                .iter()
+                .any(|listed| listed.as_str() == lower_name.as_str())
+            || proxy_connection_listed_strip
+                .iter()
+                .any(|listed| listed == lower_name.as_str())
         {
             continue;
         }
@@ -5361,6 +5409,12 @@ fn collect_forwardable_websocket_headers(
         if preserved_raw_names.contains(lower_name.as_str())
             || headers_mod::is_backend_request_strip_header(lower_name.as_str())
             || is_websocket_backend_strip_header(lower_name.as_str())
+            || raw_connection_listed_strip
+                .iter()
+                .any(|listed| listed.as_str() == lower_name.as_str())
+            || proxy_connection_listed_strip
+                .iter()
+                .any(|listed| listed == lower_name.as_str())
         {
             continue;
         }
@@ -5435,6 +5489,59 @@ fn sanitize_reserved_consumer_identity_headers(headers: &mut HashMap<String, Str
     headers.remove("x-consumer-custom-id");
 }
 
+#[derive(Clone, Copy)]
+struct BackendPathLayout {
+    is_root: bool,
+    needs_leading_slash: bool,
+    needs_between_slash: bool,
+    len: usize,
+}
+
+fn backend_path_layout(backend_path: &str, remaining_path: &str) -> BackendPathLayout {
+    let is_root = backend_path.is_empty() && remaining_path.is_empty();
+    let combined_starts_with_slash = if !backend_path.is_empty() {
+        backend_path.starts_with('/')
+    } else {
+        remaining_path.starts_with('/')
+    };
+    let needs_leading_slash = !is_root && !combined_starts_with_slash;
+    let needs_between_slash = !backend_path.is_empty()
+        && !remaining_path.is_empty()
+        && !backend_path.ends_with('/')
+        && !remaining_path.starts_with('/');
+    let len = if is_root {
+        1
+    } else {
+        (if needs_leading_slash { 1 } else { 0 })
+            + backend_path.len()
+            + (if needs_between_slash { 1 } else { 0 })
+            + remaining_path.len()
+    };
+
+    BackendPathLayout {
+        is_root,
+        needs_leading_slash,
+        needs_between_slash,
+        len,
+    }
+}
+
+fn push_backend_path(url: &mut String, backend_path: &str, remaining_path: &str) {
+    let layout = backend_path_layout(backend_path, remaining_path);
+    if layout.is_root {
+        url.push('/');
+        return;
+    }
+    if layout.needs_leading_slash {
+        url.push('/');
+    }
+    url.push_str(backend_path);
+    if layout.needs_between_slash {
+        url.push('/');
+    }
+    url.push_str(remaining_path);
+}
+
 /// Build a WebSocket backend URL using a specific target host/port,
 /// respecting strip_listen_path, backend_path, and query string.
 ///
@@ -5470,29 +5577,14 @@ pub(crate) fn build_websocket_backend_url_with_target(
 
     let backend_path = target_path.or(proxy.backend_path.as_deref()).unwrap_or("");
 
-    // Both empty means path is just "/"
-    let path_is_root = backend_path.is_empty() && remaining_path.is_empty();
-
-    // Determine if we need to prepend a '/'. The first byte of the combined
-    // path is determined by backend_path (if non-empty) or remaining_path.
-    let combined_starts_with_slash = if !backend_path.is_empty() {
-        backend_path.starts_with('/')
-    } else {
-        remaining_path.starts_with('/')
-    };
-    let needs_leading_slash = !path_is_root && !combined_starts_with_slash;
+    let path_layout = backend_path_layout(backend_path, remaining_path);
 
     // Pre-calculate capacity and build in a single buffer.
-    let path_len = if path_is_root {
-        1
-    } else {
-        (if needs_leading_slash { 1 } else { 0 }) + backend_path.len() + remaining_path.len()
-    };
     let capacity = scheme.len()
         + 3 // "://"
         + host.len()
         + 6 // ":PORT" (max 5 digits + colon)
-        + path_len
+        + path_layout.len
         + if query_string.is_empty() {
             0
         } else {
@@ -5501,16 +5593,7 @@ pub(crate) fn build_websocket_backend_url_with_target(
 
     let mut url = String::with_capacity(capacity);
     let _ = write!(url, "{}://{}:{}", scheme, host, port);
-
-    if path_is_root {
-        url.push('/');
-    } else {
-        if needs_leading_slash {
-            url.push('/');
-        }
-        url.push_str(backend_path);
-        url.push_str(remaining_path);
-    }
+    push_backend_path(&mut url, backend_path, remaining_path);
 
     if !query_string.is_empty() {
         url.push('?');
@@ -10790,25 +10873,15 @@ pub fn build_backend_url_with_target(
 
     let backend_path = target_path.or(proxy.backend_path.as_deref()).unwrap_or("");
 
-    // Both empty means path is just "/"
-    let path_is_root = backend_path.is_empty() && remaining_path.is_empty();
-
-    // Determine if we need to prepend a '/' (when neither segment starts with one)
-    let needs_leading_slash =
-        !path_is_root && !backend_path.starts_with('/') && !remaining_path.starts_with('/');
+    let path_layout = backend_path_layout(backend_path, remaining_path);
 
     // Build URL in a single buffer, writing the path segments directly to avoid
     // an intermediate `full_path` String allocation from format!().
-    let path_len = if path_is_root {
-        1
-    } else {
-        (if needs_leading_slash { 1 } else { 0 }) + backend_path.len() + remaining_path.len()
-    };
     let capacity = scheme.len()
         + 3
         + host.len()
         + 6
-        + path_len
+        + path_layout.len
         + if query_string.is_empty() {
             0
         } else {
@@ -10817,15 +10890,7 @@ pub fn build_backend_url_with_target(
     let mut url = String::with_capacity(capacity);
     let _ = write!(url, "{}://{}:{}", scheme, host, port);
 
-    if path_is_root {
-        url.push('/');
-    } else {
-        if needs_leading_slash {
-            url.push('/');
-        }
-        url.push_str(backend_path);
-        url.push_str(remaining_path);
-    }
+    push_backend_path(&mut url, backend_path, remaining_path);
 
     if !query_string.is_empty() {
         url.push('?');
@@ -14712,6 +14777,47 @@ mod tests {
     }
 
     #[test]
+    fn websocket_backend_url_with_relative_backend_path_keeps_slash_boundary() {
+        let mut proxy = test_proxy(ResponseBodyMode::Stream);
+        proxy.backend_scheme = Some(BackendScheme::Http);
+        proxy.backend_path = Some("internal".to_string());
+        proxy.listen_path = Some("/ws".to_string());
+        proxy.strip_listen_path = true;
+
+        let url = build_websocket_backend_url_with_target(
+            &proxy,
+            "/ws/chat",
+            "",
+            "backend.local",
+            8080,
+            "/ws".len(),
+            None,
+        );
+
+        assert_eq!(url, "ws://backend.local:8080/internal/chat");
+    }
+
+    #[test]
+    fn websocket_backend_url_with_relative_target_path_inserts_separator() {
+        let mut proxy = test_proxy(ResponseBodyMode::Stream);
+        proxy.backend_scheme = Some(BackendScheme::Http);
+        proxy.listen_path = Some("/ws/".to_string());
+        proxy.strip_listen_path = true;
+
+        let url = build_websocket_backend_url_with_target(
+            &proxy,
+            "/ws/chat",
+            "",
+            "backend.local",
+            8080,
+            "/ws/".len(),
+            Some("internal"),
+        );
+
+        assert_eq!(url, "ws://backend.local:8080/internal/chat");
+    }
+
+    #[test]
     fn websocket_forwardable_headers_use_sanitized_proxy_headers() {
         let mut headers = HashMap::new();
         headers.insert("host".to_string(), "edge.example".to_string());
@@ -14733,6 +14839,82 @@ mod tests {
                 .any(|(name, _)| name.eq_ignore_ascii_case("host")
                     || name.eq_ignore_ascii_case("connection"))
         );
+    }
+
+    #[test]
+    fn websocket_forwardable_proxy_headers_strip_connection_listed_names() {
+        let mut headers = HashMap::new();
+        headers.insert("Connection".to_string(), "upgrade, x-secret".to_string());
+        headers.insert("x-secret".to_string(), "leak".to_string());
+        headers.insert("x-request-id".to_string(), "req-1".to_string());
+
+        let forwarded = collect_forwardable_proxy_headers(&headers);
+
+        assert!(
+            !forwarded
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("x-secret")),
+            "headers named by Connection must not be forwarded to the WebSocket backend"
+        );
+        assert!(forwarded.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("x-request-id") && value == "req-1"
+        }));
+    }
+
+    #[test]
+    fn websocket_forwardable_headers_strip_raw_connection_listed_names() {
+        let mut raw = hyper::HeaderMap::new();
+        raw.insert(
+            hyper::header::CONNECTION,
+            hyper::header::HeaderValue::from_static("upgrade, x-secret"),
+        );
+        raw.insert("x-secret", hyper::header::HeaderValue::from_static("leak"));
+        raw.insert("x-keep", hyper::header::HeaderValue::from_static("ok"));
+
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/ws".to_string(),
+        );
+        ctx.set_raw_headers(raw.clone());
+        ctx.materialize_headers();
+
+        let forwarded = collect_forwardable_websocket_headers(&raw, &ctx.headers);
+
+        assert!(
+            !forwarded
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("x-secret")),
+            "raw Connection-listed header must not be restored from raw WebSocket headers"
+        );
+        assert!(
+            forwarded
+                .iter()
+                .any(|(name, value)| name.eq_ignore_ascii_case("x-keep") && value == "ok")
+        );
+    }
+
+    #[test]
+    fn websocket_forwardable_headers_strip_proxy_connection_listed_plugin_headers() {
+        let mut raw = hyper::HeaderMap::new();
+        raw.insert("x-keep", hyper::header::HeaderValue::from_static("ok"));
+
+        let mut sanitized = HashMap::new();
+        sanitized.insert("Connection".to_string(), "x-plugin-secret".to_string());
+        sanitized.insert("x-plugin-secret".to_string(), "leak".to_string());
+        sanitized.insert("x-added-by-plugin".to_string(), "kept".to_string());
+
+        let forwarded = collect_forwardable_websocket_headers(&raw, &sanitized);
+
+        assert!(
+            !forwarded
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("x-plugin-secret")),
+            "plugin/materialized Connection-listed header must be stripped after merge"
+        );
+        assert!(forwarded.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("x-added-by-plugin") && value == "kept"
+        }));
     }
 
     #[test]
