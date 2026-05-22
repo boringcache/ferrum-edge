@@ -622,15 +622,51 @@ fn parse_forward_headers(config: &Value) -> Result<Vec<String>, String> {
 
 /// Escape special characters for safe JSON string interpolation.
 fn escape_json_string(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('<', "\\u003c")
-        .replace('>', "\\u003e")
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    let mut escaped = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            '\u{08}' => escaped.push_str("\\b"),
+            '\u{0c}' => escaped.push_str("\\f"),
+            '<' => escaped.push_str("\\u003c"),
+            '>' => escaped.push_str("\\u003e"),
+            ch if ch < '\u{20}' => {
+                escaped.push_str("\\u00");
+                let byte = ch as u8;
+                escaped.push(HEX[(byte >> 4) as usize] as char);
+                escaped.push(HEX[(byte & 0x0f) as usize] as char);
+            }
+            ch => escaped.push(ch),
+        }
+    }
+    escaped
 }
 
 /// Validate a function URL (Azure/GCP `function_url`).
 fn validate_function_url(url: &str) -> Result<(), String> {
     validate_http_url_field(url, "function_url")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serverless_escape_json_string_round_trips_control_characters() {
+        let raw = "invoke failed\"\n<script>\u{00}\u{1f}\\";
+        let body = format!(r#"{{"details":"{}"}}"#, escape_json_string(raw));
+        let parsed: Value =
+            serde_json::from_str(&body).expect("escaped serverless error should be valid JSON");
+
+        assert_eq!(parsed["details"], raw);
+        assert!(!escape_json_string(raw).chars().any(|ch| ch < '\u{20}'));
+    }
 }
 
 /// Shared HTTP(S) URL validator for `function_url` (Azure/GCP) and the AWS
