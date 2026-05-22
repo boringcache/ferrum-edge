@@ -5290,12 +5290,16 @@ async fn handle_websocket_request_authenticated(
 /// Hop-by-hop headers and WebSocket handshake headers are excluded.
 #[cfg(test)]
 fn collect_forwardable_proxy_headers(headers: &HashMap<String, String>) -> Vec<(String, String)> {
+    let connection_listed_strip = headers_mod::parse_connection_listed_from_str_map(headers);
     headers
         .iter()
         .filter_map(|(name, value)| {
             let lower_name = name.to_ascii_lowercase();
             if headers_mod::is_backend_request_strip_header(lower_name.as_str())
                 || is_websocket_backend_strip_header(lower_name.as_str())
+                || connection_listed_strip
+                    .iter()
+                    .any(|listed| listed == lower_name.as_str())
             {
                 return None;
             }
@@ -5319,11 +5323,20 @@ fn collect_forwardable_websocket_headers(
 ) -> Vec<(String, String)> {
     let mut forwarded = Vec::new();
     let mut preserved_raw_names = HashSet::new();
+    let raw_connection_listed_strip = headers_mod::parse_connection_listed_headers(raw_headers);
+    let proxy_connection_listed_strip =
+        headers_mod::parse_connection_listed_from_str_map(proxy_headers);
 
     for name in raw_headers.keys() {
         let lower_name = name.as_str().to_ascii_lowercase();
         if headers_mod::is_backend_request_strip_header(lower_name.as_str())
             || is_websocket_backend_strip_header(lower_name.as_str())
+            || raw_connection_listed_strip
+                .iter()
+                .any(|listed| listed.as_str() == lower_name.as_str())
+            || proxy_connection_listed_strip
+                .iter()
+                .any(|listed| listed == lower_name.as_str())
         {
             continue;
         }
@@ -5356,6 +5369,12 @@ fn collect_forwardable_websocket_headers(
         if preserved_raw_names.contains(lower_name.as_str())
             || headers_mod::is_backend_request_strip_header(lower_name.as_str())
             || is_websocket_backend_strip_header(lower_name.as_str())
+            || raw_connection_listed_strip
+                .iter()
+                .any(|listed| listed.as_str() == lower_name.as_str())
+            || proxy_connection_listed_strip
+                .iter()
+                .any(|listed| listed == lower_name.as_str())
         {
             continue;
         }
@@ -14728,6 +14747,82 @@ mod tests {
                 .any(|(name, _)| name.eq_ignore_ascii_case("host")
                     || name.eq_ignore_ascii_case("connection"))
         );
+    }
+
+    #[test]
+    fn websocket_forwardable_proxy_headers_strip_connection_listed_names() {
+        let mut headers = HashMap::new();
+        headers.insert("Connection".to_string(), "upgrade, x-secret".to_string());
+        headers.insert("x-secret".to_string(), "leak".to_string());
+        headers.insert("x-request-id".to_string(), "req-1".to_string());
+
+        let forwarded = collect_forwardable_proxy_headers(&headers);
+
+        assert!(
+            !forwarded
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("x-secret")),
+            "headers named by Connection must not be forwarded to the WebSocket backend"
+        );
+        assert!(forwarded.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("x-request-id") && value == "req-1"
+        }));
+    }
+
+    #[test]
+    fn websocket_forwardable_headers_strip_raw_connection_listed_names() {
+        let mut raw = hyper::HeaderMap::new();
+        raw.insert(
+            hyper::header::CONNECTION,
+            hyper::header::HeaderValue::from_static("upgrade, x-secret"),
+        );
+        raw.insert("x-secret", hyper::header::HeaderValue::from_static("leak"));
+        raw.insert("x-keep", hyper::header::HeaderValue::from_static("ok"));
+
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/ws".to_string(),
+        );
+        ctx.set_raw_headers(raw.clone());
+        ctx.materialize_headers();
+
+        let forwarded = collect_forwardable_websocket_headers(&raw, &ctx.headers);
+
+        assert!(
+            !forwarded
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("x-secret")),
+            "raw Connection-listed header must not be restored from raw WebSocket headers"
+        );
+        assert!(
+            forwarded
+                .iter()
+                .any(|(name, value)| name.eq_ignore_ascii_case("x-keep") && value == "ok")
+        );
+    }
+
+    #[test]
+    fn websocket_forwardable_headers_strip_proxy_connection_listed_plugin_headers() {
+        let mut raw = hyper::HeaderMap::new();
+        raw.insert("x-keep", hyper::header::HeaderValue::from_static("ok"));
+
+        let mut sanitized = HashMap::new();
+        sanitized.insert("Connection".to_string(), "x-plugin-secret".to_string());
+        sanitized.insert("x-plugin-secret".to_string(), "leak".to_string());
+        sanitized.insert("x-added-by-plugin".to_string(), "kept".to_string());
+
+        let forwarded = collect_forwardable_websocket_headers(&raw, &sanitized);
+
+        assert!(
+            !forwarded
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("x-plugin-secret")),
+            "plugin/materialized Connection-listed header must be stripped after merge"
+        );
+        assert!(forwarded.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("x-added-by-plugin") && value == "kept"
+        }));
     }
 
     #[test]
