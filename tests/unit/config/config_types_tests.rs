@@ -388,6 +388,96 @@ fn resolve_upstream_tls_projects_sni_and_sans_to_proxy_cache() {
 }
 
 #[test]
+fn normalize_fields_rebuilds_upstream_resolved_tls_after_serde_round_trip() {
+    let mut upstream = make_upstream("reviews-u");
+    upstream.backend_tls_sni = Some("Reviews.Mesh.Internal".to_string());
+    upstream.backend_tls_san_allow_list = vec!["Reviews.Mesh.Internal".to_string()];
+    let mut proxy = make_proxy("reviews-p", "/reviews");
+    proxy.upstream_id = Some("reviews-u".to_string());
+    proxy.resolved_tls.sni = Some("stale.example".to_string());
+
+    let config = GatewayConfig {
+        upstreams: vec![upstream],
+        proxies: vec![proxy],
+        ..empty_config()
+    };
+    let json = serde_json::to_string(&config).expect("serialize config");
+    let mut decoded: GatewayConfig = serde_json::from_str(&json).expect("deserialize config");
+    assert_eq!(
+        decoded.proxies[0].resolved_tls.sni, None,
+        "resolved_tls is skipped on the wire and must be rebuilt"
+    );
+
+    decoded.normalize_fields();
+
+    let resolved = &decoded.proxies[0].resolved_tls;
+    assert_eq!(resolved.sni.as_deref(), Some("reviews.mesh.internal"));
+    assert_eq!(resolved.san_allow_list, vec!["reviews.mesh.internal"]);
+    assert_eq!(
+        decoded.upstreams[0].backend_tls_sni.as_deref(),
+        Some("reviews.mesh.internal")
+    );
+}
+
+#[test]
+fn normalize_fields_rebuilds_direct_proxy_resolved_tls_after_mutation() {
+    let mut proxy = make_proxy("direct-p", "/direct");
+    proxy.backend_tls_client_cert_path = Some("/certs/client.pem".to_string());
+    proxy.backend_tls_client_key_path = Some("/certs/client-key.pem".to_string());
+    proxy.backend_tls_server_ca_cert_path = Some("/certs/ca.pem".to_string());
+    proxy.backend_tls_verify_server_cert = false;
+
+    let mut config = GatewayConfig {
+        proxies: vec![proxy],
+        ..empty_config()
+    };
+    config.normalize_fields();
+
+    let resolved = &config.proxies[0].resolved_tls;
+    assert_eq!(
+        resolved.client_cert_path.as_deref(),
+        Some("/certs/client.pem")
+    );
+    assert_eq!(
+        resolved.client_key_path.as_deref(),
+        Some("/certs/client-key.pem")
+    );
+    assert_eq!(
+        resolved.server_ca_cert_path.as_deref(),
+        Some("/certs/ca.pem")
+    );
+    assert!(!resolved.verify_server_cert);
+}
+
+#[test]
+fn normalize_fields_reprojects_resolved_tls_after_upstream_mutation() {
+    let mut upstream = make_upstream("reviews-u");
+    upstream.backend_tls_sni = Some("old.mesh.internal".to_string());
+    let mut proxy = make_proxy("reviews-p", "/reviews");
+    proxy.upstream_id = Some("reviews-u".to_string());
+
+    let mut config = GatewayConfig {
+        upstreams: vec![upstream],
+        proxies: vec![proxy],
+        ..empty_config()
+    };
+    config.normalize_fields();
+    assert_eq!(
+        config.proxies[0].resolved_tls.sni.as_deref(),
+        Some("old.mesh.internal")
+    );
+
+    config.upstreams[0].backend_tls_sni = Some("New.Mesh.Internal".to_string());
+    config.proxies[0].resolved_tls.sni = Some("stale.mesh.internal".to_string());
+    config.normalize_fields();
+
+    assert_eq!(
+        config.proxies[0].resolved_tls.sni.as_deref(),
+        Some("new.mesh.internal")
+    );
+}
+
+#[test]
 fn upstream_normalize_fields_lowercases_backend_tls_sni() {
     let mut upstream = make_upstream("tls-upstream");
     upstream.backend_tls_sni = Some("Reviews.Mesh.Internal".to_string());
