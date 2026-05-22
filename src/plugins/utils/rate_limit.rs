@@ -711,14 +711,17 @@ async fn check_http_windows_redis(
     Ok(outcome)
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy)]
 pub struct RequestUnit;
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub struct HttpRateLimitAlgorithm {
     specs: Arc<[RateLimitWindowSpec]>,
 }
 
+#[cfg(test)]
 impl HttpRateLimitAlgorithm {
     pub fn new(specs: Vec<RateLimitWindowSpec>) -> Self {
         Self {
@@ -727,6 +730,7 @@ impl HttpRateLimitAlgorithm {
     }
 }
 
+#[cfg(test)]
 #[async_trait]
 impl RateLimitAlgorithm for HttpRateLimitAlgorithm {
     type State = Vec<HttpWindowState>;
