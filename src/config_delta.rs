@@ -14,7 +14,7 @@
 use chrono::{DateTime, Utc};
 use std::collections::{HashMap, HashSet};
 
-use crate::config::types::{Consumer, GatewayConfig, PluginConfig, Proxy, Upstream};
+use crate::config::types::{Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, Upstream};
 
 /// Summary of routing changes affected by proxy adds, removals, or modifications.
 ///
@@ -54,6 +54,10 @@ pub struct ConfigDelta {
     pub added_plugin_configs: Vec<PluginConfig>,
     pub removed_plugin_config_ids: Vec<String>,
     pub modified_plugin_configs: Vec<PluginConfig>,
+    /// True when a global plugin was added, removed, modified, or changed away
+    /// from global scope. Known proxy plugin lists contain merged global
+    /// instances, so they must all be rebuilt when this is true.
+    pub global_plugin_configs_changed: bool,
 
     // Upstream changes
     pub added_upstreams: Vec<Upstream>,
@@ -68,6 +72,25 @@ impl ConfigDelta {
     /// Returns a delta describing exactly which resources were added,
     /// removed, or modified.
     pub fn compute(old: &GatewayConfig, new: &GatewayConfig) -> Self {
+        let added_plugin_configs = diff_added(&old.plugin_configs, &new.plugin_configs);
+        let removed_plugin_config_ids = diff_removed_ids(&old.plugin_configs, &new.plugin_configs);
+        let modified_plugin_configs = diff_modified(&old.plugin_configs, &new.plugin_configs);
+        let old_global_plugin_ids: HashSet<&str> = old
+            .plugin_configs
+            .iter()
+            .filter(|pc| pc.scope == PluginScope::Global)
+            .map(|pc| pc.id.as_str())
+            .collect();
+        let global_plugin_configs_changed = added_plugin_configs
+            .iter()
+            .any(|pc| pc.scope == PluginScope::Global)
+            || modified_plugin_configs.iter().any(|pc| {
+                pc.scope == PluginScope::Global || old_global_plugin_ids.contains(pc.id.as_str())
+            })
+            || removed_plugin_config_ids
+                .iter()
+                .any(|id| old_global_plugin_ids.contains(id.as_str()));
+
         Self {
             added_proxies: diff_added(&old.proxies, &new.proxies),
             removed_proxy_ids: diff_removed_ids(&old.proxies, &new.proxies),
@@ -77,9 +100,10 @@ impl ConfigDelta {
             removed_consumer_ids: diff_removed_ids(&old.consumers, &new.consumers),
             modified_consumers: diff_modified(&old.consumers, &new.consumers),
 
-            added_plugin_configs: diff_added(&old.plugin_configs, &new.plugin_configs),
-            removed_plugin_config_ids: diff_removed_ids(&old.plugin_configs, &new.plugin_configs),
-            modified_plugin_configs: diff_modified(&old.plugin_configs, &new.plugin_configs),
+            added_plugin_configs,
+            removed_plugin_config_ids,
+            modified_plugin_configs,
+            global_plugin_configs_changed,
 
             added_upstreams: diff_added(&old.upstreams, &new.upstreams),
             removed_upstream_ids: diff_removed_ids(&old.upstreams, &new.upstreams),
@@ -98,6 +122,7 @@ impl ConfigDelta {
             && self.added_plugin_configs.is_empty()
             && self.removed_plugin_config_ids.is_empty()
             && self.modified_plugin_configs.is_empty()
+            && !self.global_plugin_configs_changed
             && self.added_upstreams.is_empty()
             && self.removed_upstream_ids.is_empty()
             && self.modified_upstreams.is_empty()
@@ -155,21 +180,11 @@ impl ConfigDelta {
                 }
             }
 
-            // Global plugin config changes affect ALL proxies
-            let global_changed = self
-                .added_plugin_configs
-                .iter()
-                .chain(self.modified_plugin_configs.iter())
-                .any(|pc| pc.scope == crate::config::types::PluginScope::Global);
-            let global_removed = self.removed_plugin_config_ids.iter().any(|id| {
-                // We don't have the old config's scope info for removed IDs,
-                // so conservatively treat removed plugin configs as potentially global
-                // if they're not in the new config
-                !new_config.plugin_configs.iter().any(|pc| pc.id == *id)
-            });
-
-            if global_changed || global_removed {
-                // A global plugin changed — all proxies need rebuild
+            if self.global_plugin_configs_changed || !self.removed_plugin_config_ids.is_empty() {
+                // A global plugin change affects every merged proxy list. Any
+                // plugin-config deletion also rebuilds every proxy because DB
+                // cascade can remove association rows without updating proxy
+                // timestamps, leaving no reliable proxy-level delta.
                 for proxy in &new_config.proxies {
                     ids.insert(proxy.id.clone());
                 }
