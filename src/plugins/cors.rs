@@ -532,7 +532,7 @@ fn validate_exact_origin(origin: &str) -> Result<(), String> {
             ));
         }
     }
-    if url.host_str().is_none() {
+    if !has_non_empty_authority(origin) || url.host_str().is_none() {
         return Err(format!("cors: origin must include a hostname: {origin}"));
     }
     if !url.username().is_empty() || url.password().is_some() {
@@ -550,6 +550,20 @@ fn validate_exact_origin(origin: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+fn has_non_empty_authority(origin: &str) -> bool {
+    let Some((_, after_scheme)) = origin.split_once(':') else {
+        return false;
+    };
+    let Some(authority_and_path) = after_scheme.strip_prefix("//") else {
+        return false;
+    };
+    let authority_end = authority_and_path
+        .find(['/', '?', '#'])
+        .unwrap_or(authority_and_path.len());
+
+    authority_end > 0
 }
 
 fn bool_config(config: &Value, key: &str, default: bool) -> Result<bool, String> {
