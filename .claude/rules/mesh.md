@@ -23,8 +23,12 @@ paths:
   - "tests/conformance/**"
   - "tests/integration/*mesh*"
   - "tests/integration/*hbone*"
+  - "tests/integration/*ambient*"
+  - "tests/integration/*waypoint*"
+  - "tests/integration/*ztunnel*"
   - "tests/integration/*cni*"
   - "tests/integration/*k8s*"
+  - "tests/functional/*{mesh,node_agent,ambient,waypoint,ztunnel,cni,injector}*"
   - "tests/performance/mesh*/**"
 ---
 

@@ -1,6 +1,7 @@
 ---
 paths:
   - "tests/**"
+  - "tests/functional/**"
   - ".github/**"
   - "scripts/**"
   - "Cargo.toml"

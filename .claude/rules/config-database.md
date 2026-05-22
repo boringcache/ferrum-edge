@@ -91,8 +91,8 @@ paths:
 
 - File mode is read-only admin plus proxy. It loads YAML/JSON and reloads on SIGHUP on Unix.
 - Config validators must behave by mode: file mode should fail startup for invalid local config, DB mode should warn for bad existing data when appropriate, DP should reject bad updates and keep cached config.
-- TLS path validation follows security rules in `.claude/rules/tls-security.md`.
-- Plugin file dependency validation follows plugin rules in `.claude/rules/plugins.md`.
+- Backend TLS cert paths are validated by `validate_all_fields_with_ip_policy()`: file mode is fatal, DB/CP admin warns, and DP rejects the update while keeping old config. Frontend TLS cert failure is always fatal; no silent fallback.
+- Plugin file dependencies such as MaxMind `.mmdb` are validated separately by `validate_plugin_file_dependencies()`: file mode is fatal, DB warns, and CP admin plus DP skip the check because files live on DP nodes. Constructors must tolerate missing plugin dependency files and apply request-time fallback policy.
 
 ## Proto And gRPC Config Sync
 

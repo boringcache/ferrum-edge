@@ -28,12 +28,10 @@ paths:
 
 # TLS, Secrets, And Security Rules
 
-## General Security
+## Boundary Security
 
-- Always set `validation.validate_exp = true` for JWT verification.
 - Validate hostile input at trust boundaries: path traversal, malformed PEM/DER, invalid SANs, oversized bodies, recursive embedded credentials, and archive/file names.
 - Escape user input when interpolating JSON/XML response bodies.
-- Do not log secrets, bearer tokens, cookies, private keys, or unredacted credential metadata.
 - Preserve transaction metadata redaction for all logger sinks.
 
 ## TLS-Only And Frontend Admission

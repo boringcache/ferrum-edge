@@ -8,7 +8,7 @@ Ferrum Edge is a high-performance Rust edge proxy for HTTP/1.1, HTTP/2, HTTP/3, 
 
 ## Build-Out Policy
 
-Ferrum Edge is in active build-out. Do not add DB migrations for new schema work; fold schema changes into the current baseline schema. Do not add or preserve legacy shims for old fields, env vars, config shapes, or database values unless explicitly requested. Breaking changes are acceptable during this phase.
+Ferrum Edge is in active build-out. Do not add schema DB migrations for new schema changes; fold schema changes into the current baseline schema. Do not add or preserve legacy shims for old fields, env vars, config shapes, or database values unless explicitly requested. Custom plugin migrations under `custom_plugins/` are unaffected. Breaking changes are acceptable during this phase.
 
 ## Read Before Touching
 
@@ -71,6 +71,8 @@ Run the full local suite only for shared infrastructure, cross-module refactors,
 - No panics on the proxy request path. Return protocol-appropriate errors.
 - Validate hostile input at the boundary, including path traversal, malformed headers, oversized bodies, and recursive/embedded credentials.
 - Escape user-controlled input when interpolating JSON/XML response bodies.
+- Always set `validation.validate_exp = true` for JWT verification.
+- Do not log secrets, bearer tokens, cookies, private keys, or unredacted credential metadata.
 - Admin API/OpenAPI parity is mandatory: endpoint, field, status-code, or plugin schema changes must update `openapi.yaml`.
 - New `FERRUM_*` env vars require `docs/configuration.md` and `ferrum.conf` updates.
 - Schema additions should use `#[serde(default, skip_serializing_if = "<pred>")]` when optional. Check `deny_unknown_fields` before adding fields.

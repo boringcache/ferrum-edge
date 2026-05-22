@@ -26,7 +26,7 @@ paths:
   - "docs/retry.md"
   - "tests/unit/gateway_core/**"
   - "tests/integration/*{grpc,http2,http3,dtls,tcp,hbone,pool}*"
-  - "tests/functional/*{grpc,websocket,tcp,udp,passthrough,protocol,router,capability}*"
+  - "tests/functional/*{grpc,websocket,tcp,udp,passthrough,protocol,rout,capability,balancer,retry,overload,dns,circuit}*"
 ---
 
 # Proxy And Protocol Rules
