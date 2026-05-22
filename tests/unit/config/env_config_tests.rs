@@ -505,6 +505,9 @@ fn test_env_config_http3_defaults() {
             assert_eq!(config.http3_stream_receive_window, 262_144);
             assert_eq!(config.http3_receive_window, 2_097_152);
             assert_eq!(config.http3_send_window, 2_097_152);
+            assert_eq!(config.http3_connections_per_backend, 4);
+            assert_eq!(config.http3_pool_idle_timeout_seconds, 120);
+            assert_eq!(config.http3_request_body_channel_capacity, 32);
             // Frontend H2 defaults (conservative for untrusted clients)
             assert_eq!(config.frontend_h2_initial_stream_window_size, 262_144);
             assert_eq!(config.frontend_h2_initial_connection_window_size, 2_097_152);
@@ -512,6 +515,116 @@ fn test_env_config_http3_defaults() {
             assert_eq!(config.server_http2_max_pending_accept_reset_streams, 64);
             assert_eq!(config.server_http2_max_local_error_reset_streams, 256);
             assert_eq!(config.websocket_max_connections, 20_000);
+        },
+    );
+}
+
+#[test]
+fn test_http3_connections_per_backend_from_env() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_HTTP3_CONNECTIONS_PER_BACKEND", "8"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.http3_connections_per_backend, 8);
+        },
+    );
+}
+
+#[test]
+fn test_http3_connections_per_backend_clamps_zero() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_HTTP3_CONNECTIONS_PER_BACKEND", "0"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.http3_connections_per_backend, 1);
+        },
+    );
+}
+
+#[test]
+fn test_http3_pool_idle_timeout_from_env() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_HTTP3_POOL_IDLE_TIMEOUT_SECONDS", "45"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.http3_pool_idle_timeout_seconds, 45);
+        },
+    );
+}
+
+#[test]
+fn test_http3_request_body_channel_capacity_from_env() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_HTTP3_REQUEST_BODY_CHANNEL_CAPACITY", "64"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.http3_request_body_channel_capacity, 64);
+        },
+    );
+}
+
+#[test]
+fn test_http3_request_body_channel_capacity_clamped_below_min() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_HTTP3_REQUEST_BODY_CHANNEL_CAPACITY", "0"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.http3_request_body_channel_capacity, 1);
+        },
+    );
+}
+
+#[test]
+fn test_http3_request_body_channel_capacity_clamped_above_max() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_HTTP3_REQUEST_BODY_CHANNEL_CAPACITY", "2048"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.http3_request_body_channel_capacity, 1024);
+        },
+    );
+}
+
+#[test]
+fn test_http3_request_body_channel_capacity_non_numeric_rejected() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_HTTP3_REQUEST_BODY_CHANNEL_CAPACITY", "many"),
+        ],
+        || {
+            let result = EnvConfig::from_env();
+            assert!(result.is_err());
+            let err = result.err().unwrap();
+            assert!(
+                err.contains("FERRUM_HTTP3_REQUEST_BODY_CHANNEL_CAPACITY"),
+                "unexpected error: {err}"
+            );
         },
     );
 }
