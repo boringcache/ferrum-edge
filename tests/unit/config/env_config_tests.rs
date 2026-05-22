@@ -36,6 +36,22 @@ fn remove_var(key: &str) {
     }
 }
 
+const RUNTIME_METRICS_ENV_VARS: &[&str] = &[
+    "FERRUM_METRICS_SYSTEM_SAMPLE_INTERVAL_MS",
+    "FERRUM_METRICS_WINDOW_1M_SECONDS",
+    "FERRUM_METRICS_WINDOW_5M_SECONDS",
+    "FERRUM_METRICS_LOG_COUNTER_ENABLED",
+    "FERRUM_METRICS_RUNTIME_CACHE_MS",
+    "FERRUM_METRICS_POOL_TRACKING_ENABLED",
+    "FERRUM_METRICS_STATUS_TRACKING_ENABLED",
+];
+
+fn remove_runtime_metrics_env_vars() {
+    for key in RUNTIME_METRICS_ENV_VARS {
+        remove_var(key);
+    }
+}
+
 #[test]
 fn test_operating_mode_database() {
     with_env_vars(&[("FERRUM_MODE", "database")], || {
@@ -3716,6 +3732,89 @@ fn test_env_config_status_metrics_window_seconds_minimum_clamped() {
             assert_eq!(
                 config.status_metrics_window_seconds, 1,
                 "status_metrics_window_seconds should be clamped to minimum of 1"
+            );
+        },
+    );
+}
+
+// ============================================================================
+// Runtime Metrics Config Tests
+// ============================================================================
+
+#[test]
+fn test_env_config_runtime_metrics_defaults() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            remove_runtime_metrics_env_vars();
+            let config = EnvConfig::from_env().unwrap();
+
+            assert_eq!(config.runtime_metrics_system_sample_interval_ms, 1000);
+            assert_eq!(config.runtime_metrics_window_1m_seconds, 60);
+            assert_eq!(config.runtime_metrics_window_5m_seconds, 300);
+            assert!(config.runtime_metrics_log_counter_enabled);
+            assert_eq!(config.runtime_metrics_cache_ttl_ms, 1000);
+            assert!(config.runtime_metrics_pool_tracking_enabled);
+            assert!(config.runtime_metrics_status_tracking_enabled);
+        },
+    );
+}
+
+#[test]
+fn test_env_config_runtime_metrics_custom_values() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_METRICS_SYSTEM_SAMPLE_INTERVAL_MS", "250"),
+            ("FERRUM_METRICS_WINDOW_1M_SECONDS", "15"),
+            ("FERRUM_METRICS_WINDOW_5M_SECONDS", "120"),
+            ("FERRUM_METRICS_LOG_COUNTER_ENABLED", "false"),
+            ("FERRUM_METRICS_RUNTIME_CACHE_MS", "0"),
+            ("FERRUM_METRICS_POOL_TRACKING_ENABLED", "false"),
+            ("FERRUM_METRICS_STATUS_TRACKING_ENABLED", "false"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+
+            assert_eq!(config.runtime_metrics_system_sample_interval_ms, 250);
+            assert_eq!(config.runtime_metrics_window_1m_seconds, 15);
+            assert_eq!(config.runtime_metrics_window_5m_seconds, 120);
+            assert!(!config.runtime_metrics_log_counter_enabled);
+            assert_eq!(config.runtime_metrics_cache_ttl_ms, 0);
+            assert!(!config.runtime_metrics_pool_tracking_enabled);
+            assert!(!config.runtime_metrics_status_tracking_enabled);
+        },
+    );
+}
+
+#[test]
+fn test_env_config_runtime_metrics_minimums_are_clamped() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_METRICS_SYSTEM_SAMPLE_INTERVAL_MS", "1"),
+            ("FERRUM_METRICS_WINDOW_1M_SECONDS", "0"),
+            ("FERRUM_METRICS_WINDOW_5M_SECONDS", "0"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+
+            assert_eq!(
+                config.runtime_metrics_system_sample_interval_ms, 100,
+                "system sampler interval should clamp to the documented minimum"
+            );
+            assert_eq!(
+                config.runtime_metrics_window_1m_seconds, 1,
+                "1m runtime metrics window should clamp away from zero"
+            );
+            assert_eq!(
+                config.runtime_metrics_window_5m_seconds, 1,
+                "5m runtime metrics window should clamp away from zero"
             );
         },
     );
