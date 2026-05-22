@@ -1981,6 +1981,7 @@ async fn handle_h3_request(
                     cb_target_key.as_deref(),
                     502,
                     true,
+                    Some(h3_error_class),
                     cb_is_half_open_probe,
                     backend_start.elapsed(),
                 );
@@ -2056,6 +2057,7 @@ async fn handle_h3_request(
                 cb_target_key.as_deref(),
                 502,
                 false,
+                None,
                 cb_is_half_open_probe,
                 backend_start.elapsed(),
             );
@@ -2249,6 +2251,7 @@ async fn handle_h3_request(
             cb_target_key.as_deref(),
             response_status,
             false,
+            None,
             cb_is_half_open_probe,
             backend_start.elapsed(),
         );
@@ -2534,6 +2537,7 @@ async fn handle_h3_request(
             cb_target_key.as_deref(),
             response_status,
             connection_error,
+            h3_error_class,
             cb_is_half_open_probe,
             backend_start.elapsed(),
         );
@@ -2768,6 +2772,7 @@ async fn handle_h3_request(
             final_cb_target_key.as_deref(),
             response_status,
             !h3_request_on_wire,
+            h3_error_class,
             cb_retry_probe_slot_available,
             backend_start.elapsed(),
         );
