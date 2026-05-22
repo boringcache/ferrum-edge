@@ -430,7 +430,7 @@ fn parse_limits(object: &serde_json::Map<String, Value>) -> Result<ParsedLimits,
         let rule = raw_rule
             .as_object()
             .ok_or_else(|| format!("{label} must be an object"))?;
-        reject_limit_rule_storage_fields(&label, rule)?;
+        validate_limit_rule_fields(&label, rule)?;
 
         let specs = parse_window_specs(&label, rule)?;
         if specs.is_empty() {
@@ -449,6 +449,8 @@ fn parse_limits(object: &serde_json::Map<String, Value>) -> Result<ParsedLimits,
                 }
             }
             LimitScope::Consumers(consumers) => {
+                // Each listed consumer gets an independent counter keyed by
+                // consumer:<identity>; the rule only shares the window template.
                 for consumer in consumers {
                     if consumer_overrides
                         .insert(consumer.clone(), limit.clone())
@@ -550,14 +552,29 @@ fn reject_legacy_window_fields(object: &serde_json::Map<String, Value>) -> Resul
     Ok(())
 }
 
-fn reject_limit_rule_storage_fields(
+fn validate_limit_rule_fields(
     label: &str,
     object: &serde_json::Map<String, Value>,
 ) -> Result<(), String> {
+    static ALLOWED_FIELDS: &[&str] = &[
+        "scope",
+        "consumers",
+        "requests_per_second",
+        "requests_per_minute",
+        "requests_per_hour",
+        "window_seconds",
+        "max_requests",
+    ];
+
     for key in object.keys() {
         if key == "sync_mode" || key.starts_with("redis_") {
             return Err(format!(
                 "{label}: '{key}' is not valid inside 'limits'; configure counter storage once at the rate_limiting plugin level"
+            ));
+        }
+        if !ALLOWED_FIELDS.contains(&key.as_str()) {
+            return Err(format!(
+                "{label}: '{key}' is not valid inside 'limits'; allowed fields are scope, consumers, requests_per_second, requests_per_minute, requests_per_hour, window_seconds, max_requests"
             ));
         }
     }

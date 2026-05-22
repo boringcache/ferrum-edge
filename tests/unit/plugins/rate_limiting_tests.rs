@@ -309,6 +309,18 @@ async fn test_rate_limiting_limits_invalid_config() {
             ]
         }),
         json!({
+            "limit_by": "ip",
+            "limits": [
+                { "scope": "default", "window_seconds": 60, "max_requests": 10, "limit_by": "consumer" }
+            ]
+        }),
+        json!({
+            "limit_by": "ip",
+            "limits": [
+                { "scope": "default", "requests_per_minute": 10, "requests_per_minutes": 20 }
+            ]
+        }),
+        json!({
             "limit_by": "consumer",
             "limits": [
                 { "scope": "consumers", "consumers": ["testuser"], "window_seconds": 60, "max_requests": 1 }

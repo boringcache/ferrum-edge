@@ -16,6 +16,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 
@@ -27,6 +28,7 @@ use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
 
 /// Maximum rate-limit state entries before triggering stale eviction.
 const MAX_STATE_ENTRIES: usize = 100_000;
+const EVICTION_CHECK_INTERVAL_REQUESTS: u64 = 1024;
 
 /// A rate window spec parsed from config.
 #[derive(Debug, Clone)]
@@ -63,6 +65,7 @@ pub struct GraphqlPlugin {
     /// Rate limits by named operation
     operation_rate_limits: HashMap<String, RateSpec>,
     limiter: RateLimitBackend<String, DynamicHttpRateLimitAlgorithm>,
+    request_counter: AtomicU64,
     has_any_config: bool,
 }
 
@@ -128,12 +131,17 @@ impl GraphqlPlugin {
                 &http_client,
                 DynamicHttpRateLimitAlgorithm::new(),
             )?,
+            request_counter: AtomicU64::new(0),
             has_any_config,
         })
     }
 
     /// Evict entries with no recent activity to bound memory.
     fn evict_stale_entries(&self) {
+        let request = self.request_counter.fetch_add(1, Ordering::Relaxed);
+        if request % EVICTION_CHECK_INTERVAL_REQUESTS != 0 {
+            return;
+        }
         if self.limiter.tracked_keys_count() > MAX_STATE_ENTRIES {
             self.limiter
                 .enforce_capacity(MAX_STATE_ENTRIES, Instant::now());

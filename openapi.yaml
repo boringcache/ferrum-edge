@@ -8399,24 +8399,33 @@ components:
     RateLimitingRuleConfig:
       type: object
       required: [scope]
+      additionalProperties: false
       anyOf:
         - required: [requests_per_second]
         - required: [requests_per_minute]
         - required: [requests_per_hour]
         - required: [window_seconds, max_requests]
-      description: "One rate_limiting rule. Every rule must set either one or more preset fields (`requests_per_second`/`requests_per_minute`/`requests_per_hour`) or the custom-window pair (`window_seconds` + `max_requests`). Exactly one rule in the plugin config must use `scope: default`. `scope: consumers` is only valid with `limit_by: consumer` and applies the same windows to one or many effective consumer identities."
+      allOf:
+        - if:
+            properties:
+              scope:
+                const: consumers
+            required: [scope]
+          then:
+            required: [consumers]
+      description: "One rate_limiting rule. Every rule must set either one or more preset fields (`requests_per_second`/`requests_per_minute`/`requests_per_hour`) or the custom-window pair (`window_seconds` + `max_requests`). Exactly one rule in the plugin config must use `scope: default`. `scope: consumers` is only valid with `limit_by: consumer`; each listed identity gets its own independent counter using this rule's windows."
       properties:
         scope:
           type: string
           enum: [default, consumers]
-          description: "`default` applies to all keys without a more specific consumer rule and to IP fallback. `consumers` applies to the identities listed in `consumers`."
+          description: "`default` applies to all keys without a more specific consumer rule and to IP fallback. `consumers` selects the identities listed in `consumers`; each identity has its own counter."
         consumers:
           type: array
           minItems: 1
           items:
             type: string
             minLength: 1
-          description: "Effective consumer identities for `scope: consumers` rules. Matched against mapped Consumer username first, then external authenticated identity."
+          description: "Effective consumer identities for `scope: consumers` rules. Each listed identity gets an independent counter using this rule's windows. Matched against mapped Consumer username first, then external authenticated identity."
         requests_per_second:
           type: integer
           format: uint64
@@ -8446,7 +8455,7 @@ components:
     RateLimitingConfig:
       type: object
       required: [limits]
-      description: "Plugin: rate_limiting — Per-IP, per-consumer, or per-SPIFFE-identity request rate limiting. On stream proxies, consumer mode uses the identified stream Consumer when available and otherwise falls back to client IP; `spiffe_identity` keys on the SPIFFE ID extracted by the `spiffe_identity` / `mtls_auth` mesh chain and falls back to client IP when no SPIFFE identity is present. Supports centralized Redis-backed mode for coordinating rate limits across multiple gateway instances. `limits` must contain exactly one `scope: default` rule for generic keys and fallback IPs, plus optional `scope: consumers` rules that set a shared rate window for one or many consumer identities. Counter storage supports only local memory and Redis; database-backed counters are intentionally unsupported."
+      description: "Plugin: rate_limiting — Per-IP, per-consumer, or per-SPIFFE-identity request rate limiting. On stream proxies, consumer mode uses the identified stream Consumer when available and otherwise falls back to client IP; `spiffe_identity` keys on the SPIFFE ID extracted by the `spiffe_identity` / `mtls_auth` mesh chain and falls back to client IP when no SPIFFE identity is present. Supports centralized Redis-backed mode for coordinating rate limits across multiple gateway instances. `limits` must contain exactly one `scope: default` rule for generic keys and fallback IPs, plus optional `scope: consumers` rules that apply the same rate rule to one or many consumer identities, each with an independent counter. Counter storage supports only local memory and Redis; database-backed counters are intentionally unsupported."
       properties:
         limit_by:
           type: string

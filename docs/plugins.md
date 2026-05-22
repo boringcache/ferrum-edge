@@ -1785,7 +1785,7 @@ Enforces request rate limits per time window. Supports limiting by client IP, au
 
 **Priority:** 2900
 
-Configure one or more rules in `limits`. Exactly one rule must use `scope: default`; it applies to every IP/SPIFFE key, every consumer without a specific rule, and the IP fallback when `limit_by: consumer` has no identity. Additional `scope: consumers` rules are only valid with `limit_by: consumer`; each rule can name one or many consumer identities in `consumers`.
+Configure one or more rules in `limits`. Exactly one rule must use `scope: default`; it applies to every IP/SPIFFE key, every consumer without a specific rule, and the IP fallback when `limit_by: consumer` has no identity. Additional `scope: consumers` rules are only valid with `limit_by: consumer`; each rule can name one or many consumer identities in `consumers`, and each listed identity gets its own independent counter using that rule's windows.
 
 Each `limits[]` rule configures rate windows in one of two ways:
 1. `window_seconds` + `max_requests` — exact custom window of any duration
@@ -1803,7 +1803,7 @@ At least one rate window must be configured in every rule. When multiple windows
 | `expose_headers` | bool | `false` | Inject `x-ratelimit-*` headers |
 | `limits` | Array | required | One default rule plus optional consumer-scoped rules |
 | `limits[].scope` | String | required | `default` or `consumers`; exactly one `default` rule is required |
-| `limits[].consumers` | String array | — | Required for `scope: consumers`; one or many effective consumer identities sharing that rule |
+| `limits[].consumers` | String array | — | Required for `scope: consumers`; one or many effective consumer identities, each with an independent counter using this rule's windows |
 | `limits[].window_seconds` | u64 (optional) | — | Custom window duration in seconds. Must be paired with `max_requests` |
 | `limits[].max_requests` | u64 (optional) | — | Maximum requests allowed within `window_seconds`. Must be paired with `window_seconds` and greater than zero |
 | `limits[].requests_per_second` | u64 (optional) | — | Max requests per second |
@@ -1832,6 +1832,8 @@ At least one rate window must be configured in every rule. When multiple windows
 Returns HTTP `429 Too Many Requests` when exceeded.
 
 **Counter storage** (`sync_mode`): only `local` and `redis` are supported. There is intentionally no database-backed counter policy; database writes on the hot path are non-performant and can cause operational issues.
+
+For grouped consumer rules, the list is not a shared budget. For example, `consumers: [premium-app, partner-app]` with `requests_per_minute: 1000` gives `premium-app` 1000/minute and `partner-app` 1000/minute independently.
 
 **Centralized mode** (`sync_mode: "redis"`): Rate limit counters are stored in Redis so multiple gateway instances (e.g., multiple data planes) share a single global rate limit. Uses a two-window weighted approximation algorithm with native Redis commands (`INCR`, `GET`, `EXPIRE` pipelined) for smooth sliding window semantics. If Redis becomes unreachable, the plugin automatically falls back to local in-memory rate limiting and switches back when connectivity is restored. Compatible with any RESP-protocol server: Redis, Valkey, DragonflyDB, KeyDB, or Garnet.
 
