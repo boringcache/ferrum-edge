@@ -1329,9 +1329,49 @@ pub fn build_forwarded_value(client_ip: &str, proto: &str, host: Option<&str>) -
     val.push_str(proto);
     if let Some(h) = host {
         val.push_str(";host=");
-        val.push_str(h);
+        push_forwarded_param_value(&mut val, h);
     }
     val
+}
+
+fn push_forwarded_param_value(buf: &mut String, value: &str) {
+    if is_forwarded_token(value) {
+        buf.push_str(value);
+        return;
+    }
+
+    buf.push('"');
+    for ch in value.chars() {
+        if ch == '"' || ch == '\\' {
+            buf.push('\\');
+        }
+        buf.push(ch);
+    }
+    buf.push('"');
+}
+
+fn is_forwarded_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
 }
 
 pub(crate) async fn apply_request_body_plugins(
