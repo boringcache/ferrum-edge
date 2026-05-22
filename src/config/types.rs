@@ -2772,6 +2772,20 @@ pub fn validate_host_entry(host: &str) -> Result<(), String> {
     if host.is_empty() {
         return Err("host entry must not be empty".to_string());
     }
+    if host.len() > MAX_HOST_LENGTH {
+        return Err(format!(
+            "host '{}' must not exceed {} characters (got {})",
+            host,
+            MAX_HOST_LENGTH,
+            host.len()
+        ));
+    }
+    if host.trim() != host {
+        return Err(format!(
+            "host '{}' must not have leading or trailing whitespace",
+            host
+        ));
+    }
     if host.contains("://") {
         return Err(format!(
             "host '{}' must not contain a scheme (e.g., 'http://')",
@@ -2790,13 +2804,14 @@ pub fn validate_host_entry(host: &str) -> Result<(), String> {
             host
         ));
     }
-    if host.starts_with("*.") {
+    if let Some(wildcard_suffix) = host.strip_prefix("*.") {
         if !WILDCARD_HOST_REGEX.is_match(host) {
             return Err(format!(
                 "wildcard host '{}' is invalid: must be '*.domain.tld' format",
                 host
             ));
         }
+        validate_hostname_labels(wildcard_suffix, host)?;
     } else if host.contains('*') {
         return Err(format!(
             "host '{}' has invalid wildcard: '*' is only allowed as prefix '*.domain'",
@@ -2807,6 +2822,37 @@ pub fn validate_host_entry(host: &str) -> Result<(), String> {
             "host '{}' is invalid: must be a valid hostname (lowercase letters, digits, dots, hyphens)",
             host
         ));
+    } else {
+        validate_hostname_labels(host, host)?;
+    }
+    Ok(())
+}
+
+fn validate_hostname_labels(hostname: &str, original: &str) -> Result<(), String> {
+    for label in hostname.split('.') {
+        if label.is_empty() {
+            return Err(format!("host '{}' must not contain empty labels", original));
+        }
+        if label.len() > 63 {
+            return Err(format!(
+                "host '{}' contains a label longer than 63 characters",
+                original
+            ));
+        }
+        let starts_alnum = label
+            .as_bytes()
+            .first()
+            .is_some_and(|b| b.is_ascii_alphanumeric());
+        let ends_alnum = label
+            .as_bytes()
+            .last()
+            .is_some_and(|b| b.is_ascii_alphanumeric());
+        if !starts_alnum || !ends_alnum {
+            return Err(format!(
+                "host '{}' labels must start and end with an alphanumeric character",
+                original
+            ));
+        }
     }
     Ok(())
 }

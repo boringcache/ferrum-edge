@@ -19,6 +19,8 @@ use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::time::sleep;
+use tokio_tungstenite::tungstenite::Error as WsError;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::Message;
 
 use crate::scaffolding::{Http3Client, WebSocketOptions};
@@ -217,6 +219,46 @@ proxies:
 
 consumers: []
 plugin_configs: []
+"#,
+        backend_port
+    );
+
+    let mut file = std::fs::File::create(config_path).expect("Failed to create config file");
+    file.write_all(config.as_bytes())
+        .expect("Failed to write config");
+}
+
+/// Write a YAML config with a WebSocket proxy protected by key_auth.
+fn write_ws_auth_config(config_path: &std::path::Path, backend_port: u16) {
+    let config = format!(
+        r#"
+version: "1"
+proxies:
+  - id: "ws-secured-proxy"
+    listen_path: "/ws-secure"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: {}
+    strip_listen_path: true
+    auth_mode: single
+    plugins:
+      - plugin_config_id: "plugin-keyauth-ws"
+
+consumers:
+  - id: "consumer-ws-client"
+    username: "ws-test-client"
+    credentials:
+      keyauth:
+        - key: "ws-valid-api-key-112233"
+
+plugin_configs:
+  - id: "plugin-keyauth-ws"
+    plugin_name: "key_auth"
+    config:
+      key_location: "header:x-api-key"
+    scope: proxy
+    proxy_id: "ws-secured-proxy"
+    enabled: true
 "#,
         backend_port
     );
@@ -550,6 +592,100 @@ async fn test_websocket_plaintext_echo() {
     let _ = gateway.wait();
     echo_handle.abort();
     println!("test_websocket_plaintext_echo PASSED");
+}
+
+/// End-to-end test: WebSocket handshakes are rejected by key_auth without a key.
+#[ignore]
+#[tokio::test]
+async fn test_websocket_key_auth_rejects_missing_key() {
+    let backend_port = free_port().await;
+
+    let echo_handle = tokio::spawn(start_ws_echo_server(backend_port));
+    sleep(Duration::from_millis(300)).await;
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    write_ws_auth_config(&config_path, backend_port);
+
+    build_gateway().expect("Failed to build gateway");
+    let (mut gateway, gateway_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap(), None, None, None).await;
+
+    let url = format!("ws://127.0.0.1:{}/ws-secure", gateway_port);
+    let err = match tokio_tungstenite::connect_async(&url).await {
+        Ok(_) => panic!("WebSocket handshake without API key should be rejected"),
+        Err(err) => err,
+    };
+
+    match err {
+        WsError::Http(response) => {
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                response
+                    .headers()
+                    .get("www-authenticate")
+                    .and_then(|v| v.to_str().ok()),
+                Some("ferrum-edge")
+            );
+        }
+        other => panic!("expected HTTP 401 handshake rejection, got {other:?}"),
+    }
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    echo_handle.abort();
+    println!("test_websocket_key_auth_rejects_missing_key PASSED");
+}
+
+/// End-to-end test: WebSocket handshakes with a valid API key reach the backend.
+#[ignore]
+#[tokio::test]
+async fn test_websocket_key_auth_accepts_valid_key() {
+    let backend_port = free_port().await;
+
+    let echo_handle = tokio::spawn(start_ws_echo_server(backend_port));
+    sleep(Duration::from_millis(300)).await;
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    write_ws_auth_config(&config_path, backend_port);
+
+    build_gateway().expect("Failed to build gateway");
+    let (mut gateway, gateway_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap(), None, None, None).await;
+
+    let url = format!("ws://127.0.0.1:{}/ws-secure", gateway_port);
+    let mut request = url
+        .as_str()
+        .into_client_request()
+        .expect("valid WebSocket request");
+    request
+        .headers_mut()
+        .insert("x-api-key", "ws-valid-api-key-112233".parse().unwrap());
+
+    let (mut ws, response) = tokio_tungstenite::connect_async(request)
+        .await
+        .expect("WebSocket handshake with valid API key should succeed");
+    assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+
+    ws.send(Message::Text("auth ok".into()))
+        .await
+        .expect("Failed to send authenticated text");
+    let reply = ws
+        .next()
+        .await
+        .expect("No reply")
+        .expect("Error reading reply");
+    assert_eq!(reply, Message::Text("Echo: auth ok".into()));
+
+    ws.send(Message::Close(None))
+        .await
+        .expect("Failed to send close");
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    echo_handle.abort();
+    println!("test_websocket_key_auth_accepts_valid_key PASSED");
 }
 
 /// Test TLS WebSocket (wss://) proxying: client →(TLS)→ gateway → backend echo.
