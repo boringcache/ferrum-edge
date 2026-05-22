@@ -1,6 +1,6 @@
 # CLAUDE.md - Ferrum Edge
 
-Keep this root memory compact and always relevant. Subsystem details live in path-scoped `.claude/rules/*.md` files and should not be re-added here unless they apply across the whole repository.
+Keep this root memory compact and always relevant. Subsystem details live in path-scoped `.claude/rules/*.md` files and should not be re-added here unless they apply across the whole repository. These rule files are intentionally not `@` imports; Claude Code loads them when matching files are opened/read, not at launch.
 
 ## Project Overview
 
