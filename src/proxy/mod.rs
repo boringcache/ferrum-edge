@@ -5449,6 +5449,59 @@ fn sanitize_reserved_consumer_identity_headers(headers: &mut HashMap<String, Str
     headers.remove("x-consumer-custom-id");
 }
 
+#[derive(Clone, Copy)]
+struct BackendPathLayout {
+    is_root: bool,
+    needs_leading_slash: bool,
+    needs_between_slash: bool,
+    len: usize,
+}
+
+fn backend_path_layout(backend_path: &str, remaining_path: &str) -> BackendPathLayout {
+    let is_root = backend_path.is_empty() && remaining_path.is_empty();
+    let combined_starts_with_slash = if !backend_path.is_empty() {
+        backend_path.starts_with('/')
+    } else {
+        remaining_path.starts_with('/')
+    };
+    let needs_leading_slash = !is_root && !combined_starts_with_slash;
+    let needs_between_slash = !backend_path.is_empty()
+        && !remaining_path.is_empty()
+        && !backend_path.ends_with('/')
+        && !remaining_path.starts_with('/');
+    let len = if is_root {
+        1
+    } else {
+        (if needs_leading_slash { 1 } else { 0 })
+            + backend_path.len()
+            + (if needs_between_slash { 1 } else { 0 })
+            + remaining_path.len()
+    };
+
+    BackendPathLayout {
+        is_root,
+        needs_leading_slash,
+        needs_between_slash,
+        len,
+    }
+}
+
+fn push_backend_path(url: &mut String, backend_path: &str, remaining_path: &str) {
+    let layout = backend_path_layout(backend_path, remaining_path);
+    if layout.is_root {
+        url.push('/');
+        return;
+    }
+    if layout.needs_leading_slash {
+        url.push('/');
+    }
+    url.push_str(backend_path);
+    if layout.needs_between_slash {
+        url.push('/');
+    }
+    url.push_str(remaining_path);
+}
+
 /// Build a WebSocket backend URL using a specific target host/port,
 /// respecting strip_listen_path, backend_path, and query string.
 ///
@@ -5484,29 +5537,14 @@ pub(crate) fn build_websocket_backend_url_with_target(
 
     let backend_path = target_path.or(proxy.backend_path.as_deref()).unwrap_or("");
 
-    // Both empty means path is just "/"
-    let path_is_root = backend_path.is_empty() && remaining_path.is_empty();
-
-    // Determine if we need to prepend a '/'. The first byte of the combined
-    // path is determined by backend_path (if non-empty) or remaining_path.
-    let combined_starts_with_slash = if !backend_path.is_empty() {
-        backend_path.starts_with('/')
-    } else {
-        remaining_path.starts_with('/')
-    };
-    let needs_leading_slash = !path_is_root && !combined_starts_with_slash;
+    let path_layout = backend_path_layout(backend_path, remaining_path);
 
     // Pre-calculate capacity and build in a single buffer.
-    let path_len = if path_is_root {
-        1
-    } else {
-        (if needs_leading_slash { 1 } else { 0 }) + backend_path.len() + remaining_path.len()
-    };
     let capacity = scheme.len()
         + 3 // "://"
         + host.len()
         + 6 // ":PORT" (max 5 digits + colon)
-        + path_len
+        + path_layout.len
         + if query_string.is_empty() {
             0
         } else {
@@ -5515,16 +5553,7 @@ pub(crate) fn build_websocket_backend_url_with_target(
 
     let mut url = String::with_capacity(capacity);
     let _ = write!(url, "{}://{}:{}", scheme, host, port);
-
-    if path_is_root {
-        url.push('/');
-    } else {
-        if needs_leading_slash {
-            url.push('/');
-        }
-        url.push_str(backend_path);
-        url.push_str(remaining_path);
-    }
+    push_backend_path(&mut url, backend_path, remaining_path);
 
     if !query_string.is_empty() {
         url.push('?');
@@ -10804,25 +10833,15 @@ pub fn build_backend_url_with_target(
 
     let backend_path = target_path.or(proxy.backend_path.as_deref()).unwrap_or("");
 
-    // Both empty means path is just "/"
-    let path_is_root = backend_path.is_empty() && remaining_path.is_empty();
-
-    // Determine if we need to prepend a '/' (when neither segment starts with one)
-    let needs_leading_slash =
-        !path_is_root && !backend_path.starts_with('/') && !remaining_path.starts_with('/');
+    let path_layout = backend_path_layout(backend_path, remaining_path);
 
     // Build URL in a single buffer, writing the path segments directly to avoid
     // an intermediate `full_path` String allocation from format!().
-    let path_len = if path_is_root {
-        1
-    } else {
-        (if needs_leading_slash { 1 } else { 0 }) + backend_path.len() + remaining_path.len()
-    };
     let capacity = scheme.len()
         + 3
         + host.len()
         + 6
-        + path_len
+        + path_layout.len
         + if query_string.is_empty() {
             0
         } else {
@@ -10831,15 +10850,7 @@ pub fn build_backend_url_with_target(
     let mut url = String::with_capacity(capacity);
     let _ = write!(url, "{}://{}:{}", scheme, host, port);
 
-    if path_is_root {
-        url.push('/');
-    } else {
-        if needs_leading_slash {
-            url.push('/');
-        }
-        url.push_str(backend_path);
-        url.push_str(remaining_path);
-    }
+    push_backend_path(&mut url, backend_path, remaining_path);
 
     if !query_string.is_empty() {
         url.push('?');
@@ -14723,6 +14734,47 @@ mod tests {
         );
 
         assert_eq!(url, "ws://backend.local:8080/internal?token=1");
+    }
+
+    #[test]
+    fn websocket_backend_url_with_relative_backend_path_keeps_slash_boundary() {
+        let mut proxy = test_proxy(ResponseBodyMode::Stream);
+        proxy.backend_scheme = Some(BackendScheme::Http);
+        proxy.backend_path = Some("internal".to_string());
+        proxy.listen_path = Some("/ws".to_string());
+        proxy.strip_listen_path = true;
+
+        let url = build_websocket_backend_url_with_target(
+            &proxy,
+            "/ws/chat",
+            "",
+            "backend.local",
+            8080,
+            "/ws".len(),
+            None,
+        );
+
+        assert_eq!(url, "ws://backend.local:8080/internal/chat");
+    }
+
+    #[test]
+    fn websocket_backend_url_with_relative_target_path_inserts_separator() {
+        let mut proxy = test_proxy(ResponseBodyMode::Stream);
+        proxy.backend_scheme = Some(BackendScheme::Http);
+        proxy.listen_path = Some("/ws/".to_string());
+        proxy.strip_listen_path = true;
+
+        let url = build_websocket_backend_url_with_target(
+            &proxy,
+            "/ws/chat",
+            "",
+            "backend.local",
+            8080,
+            "/ws/".len(),
+            Some("internal"),
+        );
+
+        assert_eq!(url, "ws://backend.local:8080/internal/chat");
     }
 
     #[test]
