@@ -461,7 +461,11 @@ fn classify_typed_chain(
                     });
                 }
                 std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionAborted => {
-                    return Some(ErrorClass::ConnectionClosed);
+                    return Some(if phase_is_connect {
+                        ErrorClass::ConnectionRefused
+                    } else {
+                        ErrorClass::ConnectionClosed
+                    });
                 }
                 _ => {}
             }
