@@ -1124,6 +1124,51 @@ fn test_classify_boxed_error_typed_io_error_takes_precedence_over_substrings() {
     assert_eq!(classify_boxed_error(&*err), ErrorClass::ConnectionRefused);
 }
 
+#[test]
+fn test_classify_boxed_setup_error_raw_io_broken_pipe_classes_are_pre_wire() {
+    // Setup-phase raw IO errors happen before the backend request is committed.
+    // They must classify as pre-wire so retry_on_connect_failure can replay
+    // safely and the classifier's setup-phase contract stays aligned with
+    // request_reached_wire().
+    for kind in [
+        std::io::ErrorKind::BrokenPipe,
+        std::io::ErrorKind::ConnectionAborted,
+    ] {
+        let err: Box<dyn std::error::Error + Send + Sync> =
+            Box::new(std::io::Error::new(kind, "setup failed before write"));
+        let class = classify_boxed_setup_error(&*err);
+        assert_eq!(
+            class,
+            ErrorClass::ConnectionRefused,
+            "{kind:?} during setup must be grouped with pre-wire connect failures"
+        );
+        assert!(
+            !ferrum_edge::retry::request_reached_wire(class),
+            "{kind:?} during setup must not be considered post-wire"
+        );
+    }
+}
+
+#[test]
+fn test_classify_boxed_error_raw_io_broken_pipe_classes_stay_post_wire() {
+    // The normal boxed-error classifier is used by post-connect paths. The same
+    // raw IO classes remain post-wire there, so non-idempotent requests do not
+    // get replayed via retry_on_connect_failure.
+    for kind in [
+        std::io::ErrorKind::BrokenPipe,
+        std::io::ErrorKind::ConnectionAborted,
+    ] {
+        let err: Box<dyn std::error::Error + Send + Sync> =
+            Box::new(std::io::Error::new(kind, "backend closed midstream"));
+        let class = classify_boxed_error(&*err);
+        assert_eq!(class, ErrorClass::ConnectionClosed);
+        assert!(
+            ferrum_edge::retry::request_reached_wire(class),
+            "{kind:?} after connect must stay post-wire"
+        );
+    }
+}
+
 // --- Substring-fallback anchoring regression tests ---
 
 #[test]
