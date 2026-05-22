@@ -439,7 +439,6 @@ fn parse_limits(object: &serde_json::Map<String, Value>) -> Result<ParsedLimits,
 
     let mut default_limit = None;
     let mut consumer_overrides = HashMap::new();
-    let mut consumer_rule_indexes = HashMap::new();
     for (idx, raw_rule) in limits.iter().enumerate() {
         let label = format!("rate_limiting: limits[{idx}]");
         let rule = raw_rule
@@ -467,12 +466,18 @@ fn parse_limits(object: &serde_json::Map<String, Value>) -> Result<ParsedLimits,
                 // Each listed consumer gets an independent counter keyed by
                 // consumer:<identity>; the rule only shares the window template.
                 for consumer in consumers {
-                    if let Some(first_idx) = consumer_rule_indexes.insert(consumer.clone(), idx) {
-                        return Err(format!(
-                            "rate_limiting: limits[{idx}] duplicates consumer-specific limit for {consumer:?}; first defined in limits[{first_idx}]"
-                        ));
+                    match consumer_overrides.entry(consumer) {
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            entry.insert((idx, limit.clone()));
+                        }
+                        std::collections::hash_map::Entry::Occupied(entry) => {
+                            let first_idx = entry.get().0;
+                            return Err(format!(
+                                "rate_limiting: limits[{idx}] duplicates consumer-specific limit for {:?}; first defined in limits[{first_idx}]",
+                                entry.key()
+                            ));
+                        }
                     }
-                    consumer_overrides.insert(consumer.clone(), limit.clone());
                 }
             }
         }
@@ -486,7 +491,10 @@ fn parse_limits(object: &serde_json::Map<String, Value>) -> Result<ParsedLimits,
 
     Ok(ParsedLimits {
         default_limit,
-        consumer_overrides,
+        consumer_overrides: consumer_overrides
+            .into_iter()
+            .map(|(consumer, (_, limit))| (consumer, limit))
+            .collect(),
     })
 }
 

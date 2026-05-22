@@ -8421,16 +8421,24 @@ components:
         - if:
             properties:
               scope:
-                const: consumers
+                pattern: "^[cC][oO][nN][sS][uU][mM][eE][rR][sS]$"
             required: [scope]
           then:
             required: [consumers]
+        - if:
+            properties:
+              scope:
+                pattern: "^[dD][eE][fF][aA][uU][lL][tT]$"
+            required: [scope]
+          then:
+            not:
+              required: [consumers]
       description: "One rate_limiting rule. Every rule must set either one or more preset fields (`requests_per_second`/`requests_per_minute`/`requests_per_hour`) or the custom-window pair (`window_seconds` + `max_requests`), but not both styles in the same rule. Exactly one rule in the plugin config must use `scope: default`. `scope: consumers` is only valid with `limit_by: consumer`; each listed identity gets its own independent counter using this rule's windows."
       properties:
         scope:
           type: string
-          enum: [default, consumers]
-          description: "`default` applies to all keys without a more specific consumer rule and to IP fallback. `consumers` selects the identities listed in `consumers`; each identity has its own counter."
+          pattern: "^([dD][eE][fF][aA][uU][lL][tT]|[cC][oO][nN][sS][uU][mM][eE][rR][sS])$"
+          description: "`default` applies to all keys without a more specific consumer rule and to IP fallback. `consumers` selects the identities listed in `consumers`; each identity has its own counter. Parsed case-insensitively."
         consumers:
           type: array
           minItems: 1
