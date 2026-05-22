@@ -756,6 +756,27 @@ fn forwarded_ipv4_with_host() {
 }
 
 #[test]
+fn forwarded_quotes_host_with_port() {
+    let val = build_forwarded_value("192.0.2.60", "https", Some("example.com:8443"));
+    assert_eq!(val, "for=192.0.2.60;proto=https;host=\"example.com:8443\"");
+}
+
+#[test]
+fn forwarded_quotes_host_with_parameter_separator() {
+    let val = build_forwarded_value("192.0.2.60", "https", Some("example.com;for=198.51.100.99"));
+    assert_eq!(
+        val,
+        "for=192.0.2.60;proto=https;host=\"example.com;for=198.51.100.99\""
+    );
+}
+
+#[test]
+fn forwarded_escapes_quoted_host_value() {
+    let val = build_forwarded_value("192.0.2.60", "https", Some(r#"exa"mple\host"#));
+    assert_eq!(val, r#"for=192.0.2.60;proto=https;host="exa\"mple\\host""#);
+}
+
+#[test]
 fn forwarded_ipv4_without_host() {
     let val = build_forwarded_value("192.0.2.60", "http", None);
     assert_eq!(val, "for=192.0.2.60;proto=http");
