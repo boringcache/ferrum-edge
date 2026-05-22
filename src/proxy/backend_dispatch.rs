@@ -20,6 +20,7 @@ use crate::load_balancer::{
 use crate::proxy::ProxyState;
 use crate::proxy::is_valid_websocket_key;
 use crate::request_epoch::RequestEpoch;
+use crate::retry::ErrorClass;
 
 // ---------------------------------------------------------------------------
 // Runtime HTTP flavor detection
@@ -423,6 +424,7 @@ pub(crate) fn record_backend_outcome(
     final_cb_target_key: Option<&str>,
     response_status: u16,
     connection_error: bool,
+    error_class: Option<ErrorClass>,
     is_half_open_probe: bool,
     backend_elapsed: Duration,
 ) {
@@ -463,7 +465,9 @@ pub(crate) fn record_backend_outcome(
             state
                 .circuit_breaker_cache
                 .get_or_create(&proxy.id, final_cb_target_key, cb_config);
-        if connection_error {
+        if error_class == Some(ErrorClass::ClientDisconnect) {
+            cb.record_neutral(is_half_open_probe);
+        } else if connection_error {
             // Always route connection errors through record_failure().
             // When trip_on_connection_errors=false, record_failure() treats
             // them as neutral while still releasing half-open probe slots.

@@ -632,6 +632,7 @@ where
             cb_target_key,
             502,
             false,
+            None,
             cb_is_half_open_probe,
             backend_start.elapsed(),
         );
@@ -668,6 +669,7 @@ where
                 cb_target_key,
                 502,
                 true,
+                None,
                 cb_is_half_open_probe,
                 backend_start.elapsed(),
             );
@@ -883,6 +885,7 @@ where
                             current_cb_target_key.as_deref(),
                             attempt_result.status_code,
                             attempt_result.connection_error,
+                            attempt_result.error_class,
                             cb_retry_probe_slot_available,
                             backend_start.elapsed(),
                         );
@@ -1097,6 +1100,7 @@ where
                     current_cb_target_key.as_deref(),
                     413,
                     false,
+                    None,
                     cb_retry_probe_slot_available,
                     backend_start.elapsed(),
                 );
@@ -1136,6 +1140,7 @@ where
                         current_cb_target_key.as_deref(),
                         attempt_result.status_code,
                         attempt_result.connection_error,
+                        attempt_result.error_class,
                         cb_retry_probe_slot_available,
                         backend_start.elapsed(),
                     );
@@ -1178,6 +1183,7 @@ where
             current_cb_target_key.as_deref(),
             502,
             false,
+            None,
             cb_retry_probe_slot_available,
             backend_start.elapsed(),
         );
@@ -1213,6 +1219,7 @@ where
             current_cb_target_key.as_deref(),
             reject.status_code,
             false,
+            None,
             cb_retry_probe_slot_available,
             backend_start.elapsed(),
         );
@@ -1259,6 +1266,7 @@ where
                     current_cb_target_key.as_deref(),
                     502,
                     false,
+                    error_class,
                     cb_retry_probe_slot_available,
                     backend_start.elapsed(),
                 );
@@ -1378,6 +1386,7 @@ where
             current_cb_target_key.as_deref(),
             response_status,
             false,
+            None,
             cb_retry_probe_slot_available,
             backend_start.elapsed(),
         );
@@ -1418,6 +1427,7 @@ where
         current_cb_target_key.as_deref(),
         status,
         false,
+        None,
         cb_retry_probe_slot_available,
         backend_start.elapsed(),
     );
@@ -1784,6 +1794,7 @@ where
                     current_cb_target_key.as_deref(),
                     outcome.response_status,
                     false,
+                    None,
                     cb_is_half_open_probe,
                     backend_start.elapsed(),
                 );
@@ -1900,6 +1911,7 @@ where
                 current_cb_target_key.as_deref(),
                 response_status,
                 false,
+                None,
                 cb_is_half_open_probe,
                 backend_start.elapsed(),
             );
@@ -1959,6 +1971,7 @@ where
                     current_cb_target_key.as_deref(),
                     outcome.response_status,
                     false,
+                    None,
                     cb_is_half_open_probe,
                     backend_start.elapsed(),
                 );
@@ -2001,6 +2014,7 @@ where
                 current_cb_target_key.as_deref(),
                 streaming.status,
                 false,
+                None,
                 cb_is_half_open_probe,
                 backend_start.elapsed(),
             );
@@ -2068,6 +2082,7 @@ where
                 current_cb_target_key.as_deref(),
                 502,
                 connection_error,
+                Some(error_class),
                 cb_is_half_open_probe,
                 backend_start.elapsed(),
             );
