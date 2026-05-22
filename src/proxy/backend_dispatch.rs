@@ -50,29 +50,36 @@ pub fn detect_http_flavor<B>(req: &Request<B>) -> HttpFlavor {
     }
 
     if let Some(ct) = req.headers().get(hyper::header::CONTENT_TYPE)
-        && let Some(prefix) = ct.as_bytes().get(..16)
-        && prefix.eq_ignore_ascii_case(b"application/grpc")
-        // Reject `application/grpc-web*` — different wire format (trailer
-        // frame embedded in the body, NOT HTTP/2 trailers). Routing
-        // gRPC-Web through the gRPC backend pool would wait on H2
-        // trailers that never arrive; it must flow through the regular
-        // HTTP (`Plain`) dispatch so reqwest / H2 direct handle it as
-        // plain HTTP. The `grpc_web` plugin (when enabled) still
-        // translates content-type + body to native gRPC in
-        // `before_proxy` — that transformation now happens on the Plain
-        // dispatch path.
-        //
-        // Byte 16 is `-` for gRPC-Web variants
-        // (`application/grpc-web`, `application/grpc-web+proto`,
-        // `application/grpc-web-text`, …) and `+` / `;` / end-of-string
-        // for native gRPC variants (`application/grpc`,
-        // `application/grpc+proto`, `application/grpc;charset=utf-8`).
-        && ct.as_bytes().get(16).is_none_or(|&b| b != b'-')
+        && is_native_grpc_content_type(ct.as_bytes())
     {
         return HttpFlavor::Grpc;
     }
 
     HttpFlavor::Plain
+}
+
+#[inline]
+fn is_native_grpc_content_type(value: &[u8]) -> bool {
+    const PREFIX: &[u8] = b"application/grpc";
+    let Some(prefix) = value.get(..PREFIX.len()) else {
+        return false;
+    };
+    if !prefix.eq_ignore_ascii_case(PREFIX) {
+        return false;
+    }
+
+    match value.get(PREFIX.len()) {
+        None => true,
+        Some(b'+') | Some(b';') => true,
+        Some(b' ' | b'\t') => {
+            value[PREFIX.len()..]
+                .iter()
+                .copied()
+                .find(|b| !matches!(b, b' ' | b'\t'))
+                == Some(b';')
+        }
+        _ => false,
+    }
 }
 
 /// Extended CONNECT WebSocket check for HTTP/2 (RFC 8441) and HTTP/3

@@ -5,6 +5,7 @@ use ferrum_edge::config::types::{
     AuthMode, BackendScheme, DispatchKind, GatewayConfig, PluginAssociation, PluginConfig,
     PluginScope, Proxy,
 };
+use ferrum_edge::config_delta::ConfigDelta;
 use ferrum_edge::plugins::{Plugin, PluginResult, ProxyProtocol, RequestContext};
 use ferrum_edge::{PluginCache, PluginCapabilities};
 use serde_json::json;
@@ -29,7 +30,9 @@ fn minimal_plugin_config(plugin_name: &str) -> serde_json::Value {
         "access_control" => json!({"allowed_consumers": ["testuser"]}),
         "tcp_connection_throttle" => json!({"max_connections_per_key": 10}),
         "ip_restriction" => json!({"allow": ["0.0.0.0/0"]}),
-        "rate_limiting" => json!({"window_seconds": 60, "max_requests": 100}),
+        "rate_limiting" => json!({
+            "limits": [{"scope": "default", "window_seconds": 60, "max_requests": 100}]
+        }),
         "request_transformer" => {
             json!({"rules": [{"operation": "add", "target": "header", "key": "x-test", "value": "1"}]})
         }
@@ -401,14 +404,20 @@ fn test_request_view_precomputes_authorize_plugins() {
             make_plugin_config_with_json(
                 "rate_ip",
                 "rate_limiting",
-                json!({"window_seconds": 60, "max_requests": 100, "limit_by": "ip"}),
+                json!({
+                    "limit_by": "ip",
+                    "limits": [{"scope": "default", "window_seconds": 60, "max_requests": 100}]
+                }),
                 PluginScope::Proxy,
                 Some("p1"),
             ),
             make_plugin_config_with_json(
                 "rate_consumer",
                 "rate_limiting",
-                json!({"window_seconds": 60, "max_requests": 100, "limit_by": "consumer"}),
+                json!({
+                    "limit_by": "consumer",
+                    "limits": [{"scope": "default", "window_seconds": 60, "max_requests": 100}]
+                }),
                 PluginScope::Proxy,
                 Some("p1"),
             ),
@@ -782,9 +791,8 @@ async fn test_rate_limiter_state_persists_across_calls() {
             namespace: ferrum_edge::config::types::default_namespace(),
             plugin_name: "rate_limiting".to_string(),
             config: json!({
-                "window_seconds": 60,
-                "max_requests": 2,
-                "limit_by": "ip"
+                "limit_by": "ip",
+                "limits": [{"scope": "default", "window_seconds": 60, "max_requests": 2}]
             }),
             scope: PluginScope::Global,
             proxy_id: None,
@@ -1160,6 +1168,63 @@ fn test_apply_delta_prunes_proxy_group_instance_after_last_association_removed()
     assert!(
         !Arc::ptr_eq(&held_group_plugin, reattached_group_plugin),
         "reattaching a previously unused proxy-group config should create fresh state"
+    );
+}
+
+#[test]
+fn test_apply_delta_global_to_proxy_scope_refreshes_all_proxy_views() {
+    let old_global = make_plugin_config("pc1", "stdout_logging", PluginScope::Global, None, true);
+    let old_config = make_config(
+        vec![
+            make_proxy("p1", "/api", vec![]),
+            make_proxy("p2", "/other", vec![]),
+        ],
+        vec![old_global.clone()],
+    );
+    let cache = PluginCache::new(&old_config).unwrap();
+
+    assert_eq!(cache.get_plugins("p1").len(), 1);
+    assert_eq!(cache.get_plugins("p2").len(), 1);
+    assert_eq!(cache.get_plugins("unknown").len(), 1);
+
+    let mut proxy_scoped = make_plugin_config(
+        "pc1",
+        "stdout_logging",
+        PluginScope::Proxy,
+        Some("p1"),
+        true,
+    );
+    proxy_scoped.updated_at = old_global.updated_at + chrono::Duration::seconds(5);
+    let new_config = make_config(
+        vec![
+            make_proxy("p1", "/api", vec!["pc1"]),
+            make_proxy("p2", "/other", vec![]),
+        ],
+        vec![proxy_scoped],
+    );
+    let delta = ConfigDelta::compute(&old_config, &new_config);
+    let proxy_ids = delta.proxy_ids_needing_plugin_rebuild(&new_config);
+
+    assert!(delta.global_plugin_configs_changed);
+    cache
+        .apply_delta(
+            &new_config,
+            &proxy_ids,
+            &delta.removed_proxy_ids,
+            delta.global_plugin_configs_changed,
+        )
+        .unwrap();
+
+    let p1_plugins = cache.get_plugins("p1");
+    assert_eq!(p1_plugins.len(), 1);
+    assert_eq!(p1_plugins[0].name(), "stdout_logging");
+    assert!(
+        cache.get_plugins("p2").is_empty(),
+        "known proxies that no longer reference the plugin must drop stale global instances"
+    );
+    assert!(
+        cache.get_plugins("unknown").is_empty(),
+        "global fallback must drop plugins that changed away from global scope"
     );
 }
 

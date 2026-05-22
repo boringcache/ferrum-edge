@@ -96,6 +96,17 @@ fn test_constructor_rejects_malformed_exact_origin() {
 }
 
 #[test]
+fn test_constructor_rejects_exact_origin_with_empty_authority() {
+    let err = CorsPlugin::new(&json!({
+        "allowed_origins": ["https:///example.com"]
+    }))
+    .err()
+    .expect("empty authority exact origin must be rejected");
+
+    assert!(err.contains("hostname"), "got: {err}");
+}
+
+#[test]
 fn test_constructor_rejects_exact_origin_with_path() {
     let err = CorsPlugin::new(&json!({
         "allowed_origins": ["https://example.com/api"]

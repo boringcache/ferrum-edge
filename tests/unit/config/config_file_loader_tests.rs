@@ -60,6 +60,38 @@ fn test_load_json_config() {
 }
 
 #[test]
+fn test_load_config_rejects_invalid_host_label_shapes() {
+    let yaml = r#"
+version: "1"
+proxies:
+  - id: "bad-host-proxy"
+    hosts:
+      - "api..example.com"
+    listen_path: "/api"
+    backend_scheme: http
+    backend_host: "localhost"
+    backend_port: 3000
+consumers: []
+plugin_configs: []
+"#;
+    let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
+    write!(file, "{}", yaml).unwrap();
+
+    let err = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendAllowIps::Both,
+        "ferrum",
+    )
+    .expect_err("file-mode config loading must reject invalid host labels");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("invalid host"),
+        "error should mention host validation, got: {msg}"
+    );
+}
+
+#[test]
 fn test_duplicate_listen_path_rejected() {
     let yaml = r#"
 version: "1"
@@ -741,9 +773,10 @@ plugin_configs:
     plugin_name: "rate_limiting"
     config:
       limit_by: "consumer"
-      requests_per_second: 10
-      requests_per_minute: 100
-      burst_size: 20
+      limits:
+        - scope: "default"
+          requests_per_second: 10
+          requests_per_minute: 100
     scope: global
     enabled: true
 "#;
@@ -760,8 +793,10 @@ plugin_configs:
     assert_eq!(config.plugin_configs.len(), 1);
     let plugin_cfg = &config.plugin_configs[0];
     assert_eq!(plugin_cfg.config["limit_by"].as_str(), Some("consumer"));
-    assert_eq!(plugin_cfg.config["requests_per_second"].as_i64(), Some(10));
-    assert_eq!(plugin_cfg.config["requests_per_minute"].as_i64(), Some(100));
+    let default_limit = &plugin_cfg.config["limits"][0];
+    assert_eq!(default_limit["scope"].as_str(), Some("default"));
+    assert_eq!(default_limit["requests_per_second"].as_i64(), Some(10));
+    assert_eq!(default_limit["requests_per_minute"].as_i64(), Some(100));
 }
 
 // ============================================================================
@@ -1107,7 +1142,9 @@ plugin_configs:
   - id: "plugin-ratelimit"
     plugin_name: "rate_limiting"
     config:
-      requests_per_second: 10
+      limits:
+        - scope: "default"
+          requests_per_second: 10
     scope: proxy
     proxy_id: "proxy-1"
     enabled: true

@@ -804,10 +804,9 @@ impl RequestContext {
     /// request init time instead of eagerly percent-decoding every param.
     #[inline]
     pub fn set_raw_query_string(&mut self, qs: String) {
-        if !qs.is_empty() {
-            self.raw_query_string = Some(qs);
-            self.query_params_materialized = false;
-        }
+        self.query_params.clear();
+        self.query_params_materialized = false;
+        self.raw_query_string = (!qs.is_empty()).then_some(qs);
     }
 
     /// Borrow the raw query string without materializing it.
@@ -2054,9 +2053,13 @@ pub fn create_plugin_with_http_client(
             response_transformer::ResponseTransformer::new(config)?,
         ))),
         "sse" => Ok(Some(Arc::new(sse::SsePlugin::new(config)?))),
-        "graphql" => Ok(Some(Arc::new(graphql::GraphqlPlugin::new(config)?))),
+        "graphql" => Ok(Some(Arc::new(graphql::GraphqlPlugin::new(
+            config,
+            http_client.clone(),
+        )?))),
         "grpc_method_router" => Ok(Some(Arc::new(grpc_method_router::GrpcMethodRouter::new(
             config,
+            http_client.clone(),
         )?))),
         "grpc_deadline" => Ok(Some(Arc::new(grpc_deadline::GrpcDeadline::new(config)?))),
         "grpc_web" => Ok(Some(Arc::new(grpc_web::GrpcWebPlugin::new(config)?))),
