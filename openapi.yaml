@@ -2307,6 +2307,7 @@ paths:
                 - mtls_auth
                 - spiffe_identity
                 - mesh_authz
+                - opa
                 - mesh_outbound_registry
                 - compression
                 - cors
@@ -4142,7 +4143,7 @@ components:
             again when the plugin is instantiated at config reload time.
             Security plugins (key_auth, basic_auth, jwt_auth, jwks_auth,
             hmac_auth, ldap_auth, mtls_auth, access_control,
-            tcp_connection_throttle, ip_restriction, waf, mesh_authz,
+            tcp_connection_throttle, ip_restriction, waf, mesh_authz, opa,
             mesh_outbound_registry) are validation-fatal: invalid config blocks
             gateway startup in file mode, and on DB/CP polling the new config
             snapshot is rejected as a whole (the gateway keeps serving the
@@ -8025,6 +8026,121 @@ components:
           type: boolean
           default: false
           description: Pass preflight requests to backend
+
+    OpaPluginConfig:
+      type: object
+      required: [opa_host, policy_path]
+      description: |
+        Plugin: opa — Delegates HTTP request authorization to Open Policy
+        Agent's Data API in the `authorize` phase. The gateway POSTs
+        `{ "input": ... }` to `{opa_host}/v1/data/{policy_path}` and allows
+        only `true` decisions or objects with `allow: true` at
+        `decision_pointer`. Fails closed by default; `fail_open: true` is the
+        opt-in availability mode. Request headers are redacted before being
+        sent to OPA.
+      properties:
+        opa_host:
+          type: string
+          format: uri
+          description: >-
+            Base OPA URL using http:// or https://. URL credentials are not
+            allowed; use `headers` for OPA authentication.
+          example: "http://opa.opa-system.svc.cluster.local:8181"
+        policy_path:
+          type: string
+          description: >-
+            OPA data path appended under /v1/data/. Must be non-empty, must not
+            start with '/', and must not contain empty, '.', or '..' segments.
+          example: "ferrum/authz/allow"
+        headers:
+          type: object
+          additionalProperties:
+            type: string
+          default: {}
+          description: Static HTTP headers sent to OPA on every decision request.
+          example:
+            Authorization: "Bearer opa-client-token"
+        timeout_ms:
+          type: integer
+          format: uint64
+          minimum: 1
+          maximum: 30000
+          default: 1000
+          description: Per-decision timeout in milliseconds. Values above 30000 are clamped.
+        fail_open:
+          type: boolean
+          default: false
+          description: Continue when OPA is unavailable, times out, returns non-2xx, or returns malformed JSON.
+        fail_closed:
+          type: boolean
+          default: true
+          description: Inverse of `fail_open`; do not set both fields.
+        deny_status:
+          type: integer
+          format: uint16
+          minimum: 400
+          maximum: 599
+          default: 403
+          description: HTTP status returned on policy denial or fail-closed OPA errors.
+        deny_body:
+          type: string
+          default: '{"error":"forbidden by policy"}'
+          description: Response body returned on denial.
+        deny_headers:
+          type: object
+          additionalProperties:
+            type: string
+          default: {}
+          description: Headers added to the denial response.
+        decision_pointer:
+          type: array
+          items:
+            type: string
+          default: [result]
+          description: JSON object-key path to the decision value in OPA's response.
+        include_method:
+          type: boolean
+          default: true
+        include_path:
+          type: boolean
+          default: true
+        include_query:
+          type: boolean
+          default: true
+        include_headers:
+          type: boolean
+          default: true
+        include_body:
+          type: boolean
+          default: false
+          description: Buffer and forward the request body as `body` and/or `body_base64`.
+        include_consumer:
+          type: boolean
+          default: true
+        include_client_ip:
+          type: boolean
+          default: true
+        include_service:
+          type: boolean
+          default: true
+        redact_headers:
+          type: array
+          items:
+            type: string
+          default:
+            - authorization
+            - proxy-authorization
+            - cookie
+            - set-cookie
+            - x-api-key
+            - x-auth-token
+            - x-csrf-token
+            - x-xsrf-token
+            - www-authenticate
+            - x-forwarded-authorization
+          description: >-
+            Additional request headers to redact from `input.headers`. Built-in
+            sensitive headers are always redacted.
 
     AccessControlConfig:
       type: object
