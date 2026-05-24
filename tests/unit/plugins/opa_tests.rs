@@ -99,6 +99,14 @@ async fn mount_opa(server: &MockServer, status: u16, body: Value) {
         .await;
 }
 
+async fn mount_opa_raw(server: &MockServer, status: u16, body: &'static str) {
+    Mock::given(method("POST"))
+        .and(path(DECISION_PATH))
+        .respond_with(ResponseTemplate::new(status).set_body_string(body))
+        .mount(server)
+        .await;
+}
+
 async fn mount_opa_with_delay(server: &MockServer, delay: Duration) {
     Mock::given(method("POST"))
         .and(path(DECISION_PATH))
@@ -132,8 +140,11 @@ fn opa_validates_config() {
         json!({"opa_host": "http://localhost:8181", "policy_path": ""}),
         json!({"opa_host": "http://localhost:8181", "policy_path": "/ferrum/authz"}),
         json!({"opa_host": "http://localhost:8181", "policy_path": "ferrum/../authz"}),
+        json!({"opa_host": "http://localhost:8181", "policy_path": "ferrum%2F..%2Fauthz"}),
         json!({"opa_host": "http://localhost:8181", "policy_path": POLICY_PATH, "deny_status": 200}),
+        json!({"opa_host": "http://localhost:8181", "policy_path": POLICY_PATH, "fail_closed_status": 200}),
         json!({"opa_host": "http://localhost:8181", "policy_path": POLICY_PATH, "headers": {"Invalid Header": "value"}}),
+        json!({"opa_host": "http://localhost:8181", "policy_path": POLICY_PATH, "headers": {"Content-Type": "text/plain"}}),
         json!({"opa_host": "http://localhost:8181", "policy_path": POLICY_PATH, "fail_open": true, "fail_closed": false}),
     ];
 
@@ -155,6 +166,13 @@ fn opa_validates_config() {
         )
         .is_ok()
     );
+
+    let error = match Opa::new(&json!("opa secret"), default_client()) {
+        Ok(_) => panic!("non-object OPA config should be rejected"),
+        Err(error) => error,
+    };
+    assert_eq!(error, "opa: config must be a JSON object");
+    assert!(!error.contains("opa secret"));
 }
 
 #[test]
@@ -223,6 +241,23 @@ async fn opa_allows_nested_pointer_result() {
 }
 
 #[tokio::test]
+async fn opa_allows_empty_decision_pointer_result() {
+    let server = MockServer::start().await;
+    mount_opa(&server, 200, json!(true)).await;
+    let plugin = plugin(
+        &server,
+        json!({
+            "decision_pointer": []
+        }),
+    );
+
+    let mut ctx = make_ctx();
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert_continue(result);
+}
+
+#[tokio::test]
 async fn opa_allows_object_with_allow_true() {
     let server = MockServer::start().await;
     mount_opa(&server, 200, json!({"result": {"allow": true}})).await;
@@ -257,6 +292,18 @@ async fn opa_denies_false_result() {
         }
         other => panic!("expected reject, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn opa_denies_when_decision_pointer_is_missing() {
+    let server = MockServer::start().await;
+    mount_opa(&server, 200, json!({"other": true})).await;
+    let plugin = plugin(&server, json!({}));
+
+    let mut ctx = make_ctx();
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert_reject(result, Some(403));
 }
 
 #[tokio::test]
@@ -298,8 +345,7 @@ async fn opa_timeout_fails_closed_by_default() {
     let plugin = plugin(
         &server,
         json!({
-            "timeout_ms": 20,
-            "deny_status": 503
+            "timeout_ms": 20
         }),
     );
 
@@ -307,6 +353,40 @@ async fn opa_timeout_fails_closed_by_default() {
     let result = plugin.authorize(&mut ctx).await;
 
     assert_reject(result, Some(503));
+}
+
+#[tokio::test]
+async fn opa_honors_custom_fail_closed_response() {
+    let server = MockServer::start().await;
+    mount_opa(&server, 500, json!({"error": "unavailable"})).await;
+    let plugin = plugin(
+        &server,
+        json!({
+            "deny_status": 451,
+            "deny_body": "blocked by policy",
+            "fail_closed_status": 503,
+            "fail_closed_body": "authorization service unavailable",
+            "fail_closed_headers": {
+                "Retry-After": "2"
+            }
+        }),
+    );
+
+    let mut ctx = make_ctx();
+    let result = plugin.authorize(&mut ctx).await;
+
+    match result {
+        PluginResult::Reject {
+            status_code,
+            body,
+            headers,
+        } => {
+            assert_eq!(status_code, 503);
+            assert_eq!(body, "authorization service unavailable");
+            assert_eq!(headers.get("retry-after").map(String::as_str), Some("2"));
+        }
+        other => panic!("expected reject, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -354,7 +434,19 @@ async fn opa_non_success_fails_closed() {
     let mut ctx = make_ctx();
     let result = plugin.authorize(&mut ctx).await;
 
-    assert_reject(result, Some(403));
+    assert_reject(result, Some(503));
+}
+
+#[tokio::test]
+async fn opa_malformed_json_fails_closed() {
+    let server = MockServer::start().await;
+    mount_opa_raw(&server, 200, "{not-json").await;
+    let plugin = plugin(&server, json!({}));
+
+    let mut ctx = make_ctx();
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert_reject(result, Some(503));
 }
 
 #[tokio::test]
@@ -408,6 +500,37 @@ async fn opa_redacts_sensitive_request_headers_by_default() {
 }
 
 #[tokio::test]
+async fn opa_custom_redact_headers_are_additive() {
+    let server = MockServer::start().await;
+    mount_opa(&server, 200, json!({"result": true})).await;
+    let plugin = plugin(
+        &server,
+        json!({
+            "redact_headers": ["x-tenant"]
+        }),
+    );
+
+    let mut ctx = make_ctx();
+    ctx.headers.clear();
+    ctx.headers.insert(
+        "Authorization".to_string(),
+        "Bearer client-token".to_string(),
+    );
+    ctx.headers
+        .insert("X-Tenant".to_string(), "tenant-secret".to_string());
+    ctx.headers
+        .insert("X-Request-ID".to_string(), "req-456".to_string());
+
+    assert_continue(plugin.authorize(&mut ctx).await);
+
+    let payload = received_opa_payload(&server).await;
+    let headers = &payload["input"]["headers"];
+    assert!(headers.get("authorization").is_none());
+    assert!(headers.get("x-tenant").is_none());
+    assert_eq!(headers["x-request-id"], "req-456");
+}
+
+#[tokio::test]
 async fn opa_body_is_forwarded_only_when_configured() {
     let server = MockServer::start().await;
     mount_opa(&server, 200, json!({"result": true})).await;
@@ -439,10 +562,19 @@ async fn opa_body_is_forwarded_only_when_configured() {
 
     let second_payload = received_opa_payload(&server).await;
     assert_eq!(second_payload["input"]["body"], "{\"hello\":\"world\"}");
-    assert_eq!(
-        second_payload["input"]["body_base64"],
-        "eyJoZWxsbyI6IndvcmxkIn0="
-    );
+    assert!(second_payload["input"].get("body_base64").is_none());
+
+    let server = MockServer::start().await;
+    mount_opa(&server, 200, json!({"result": true})).await;
+    let plugin_with_raw_body = plugin(&server, json!({"include_body": true}));
+
+    let mut ctx = make_ctx();
+    ctx.request_body_bytes = Some(bytes::Bytes::from_static(&[0xff, 0x00]));
+    assert_continue(plugin_with_raw_body.authorize(&mut ctx).await);
+
+    let third_payload = received_opa_payload(&server).await;
+    assert!(third_payload["input"].get("body").is_none());
+    assert_eq!(third_payload["input"]["body_base64"], "/wA=");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -472,7 +604,7 @@ async fn opa_error_logs_do_not_include_request_fields() {
             .insert("request_body".to_string(), "client body secret".to_string());
         ctx.request_body_bytes = Some(bytes::Bytes::from_static(b"client body secret"));
 
-        assert_reject(plugin.authorize(&mut ctx).await, Some(403));
+        assert_reject(plugin.authorize(&mut ctx).await, Some(503));
     }
     drop(guard);
 

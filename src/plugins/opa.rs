@@ -10,9 +10,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::Engine;
-use http::header::{HeaderName, HeaderValue};
+use http::header::{CONTENT_TYPE, HeaderName, HeaderValue};
 use serde_json::{Map, Value, json};
-use tracing::warn;
+use tracing::{info, warn};
 use url::{Host, Url};
 
 use crate::retry::classify_reqwest_error;
@@ -23,6 +23,8 @@ const DEFAULT_TIMEOUT_MS: u64 = 1000;
 const MAX_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_DENY_STATUS: u16 = 403;
 const DEFAULT_DENY_BODY: &str = r#"{"error":"forbidden by policy"}"#;
+const DEFAULT_FAIL_CLOSED_STATUS: u16 = 503;
+const DEFAULT_FAIL_CLOSED_BODY: &str = r#"{"error":"authorization service unavailable"}"#;
 const OPA_DATA_PREFIX: &str = "/v1/data/";
 
 pub struct Opa {
@@ -35,6 +37,9 @@ pub struct Opa {
     deny_status: u16,
     deny_body: String,
     deny_headers: HashMap<String, String>,
+    fail_closed_status: u16,
+    fail_closed_body: String,
+    fail_closed_headers: HashMap<String, String>,
     decision_pointer: Vec<String>,
     include_method: bool,
     include_path: bool,
@@ -51,9 +56,16 @@ impl Opa {
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
         let object = config
             .as_object()
-            .ok_or_else(|| format!("opa: config must be an object, got: {config}"))?;
+            .ok_or_else(|| "opa: config must be a JSON object".to_string())?;
 
         let (decision_url, decision_hostname) = parse_decision_endpoint(object)?;
+        if decision_url.starts_with("https://") {
+            info!(
+                plugin = "opa",
+                scheme = "https",
+                "OPA HTTPS decision endpoint uses global TLS trust configuration"
+            );
+        }
         let custom_headers = parse_header_map(object, "headers", "opa")?;
         let timeout_ms = parse_optional_u64(object, "timeout_ms")?.unwrap_or(DEFAULT_TIMEOUT_MS);
         if timeout_ms == 0 {
@@ -61,13 +73,15 @@ impl Opa {
         }
         let timeout_ms = timeout_ms.min(MAX_TIMEOUT_MS);
         let fail_open = parse_fail_open(object)?;
-        let deny_status = parse_optional_u16(object, "deny_status")?.unwrap_or(DEFAULT_DENY_STATUS);
-        if !(400..=599).contains(&deny_status) {
-            return Err("opa: 'deny_status' must be in the 4xx or 5xx range".to_string());
-        }
+        let deny_status = parse_response_status(object, "deny_status", DEFAULT_DENY_STATUS)?;
         let deny_body = parse_optional_string(object, "deny_body")?
             .unwrap_or_else(|| DEFAULT_DENY_BODY.to_string());
         let deny_headers = parse_string_header_map(object, "deny_headers", "opa")?;
+        let fail_closed_status =
+            parse_response_status(object, "fail_closed_status", DEFAULT_FAIL_CLOSED_STATUS)?;
+        let fail_closed_body = parse_optional_string(object, "fail_closed_body")?
+            .unwrap_or_else(|| DEFAULT_FAIL_CLOSED_BODY.to_string());
+        let fail_closed_headers = parse_string_header_map(object, "fail_closed_headers", "opa")?;
         let decision_pointer = parse_decision_pointer(object)?;
         let redact_headers = parse_redact_headers(object)?;
 
@@ -81,6 +95,9 @@ impl Opa {
             deny_status,
             deny_body,
             deny_headers,
+            fail_closed_status,
+            fail_closed_body,
+            fail_closed_headers,
             decision_pointer,
             include_method: parse_optional_bool(object, "include_method")?.unwrap_or(true),
             include_path: parse_optional_bool(object, "include_path")?.unwrap_or(true),
@@ -211,14 +228,15 @@ impl Opa {
 
     fn insert_body_input(&self, input: &mut Map<String, Value>, ctx: &RequestContext) {
         if let Some(bytes) = ctx.request_body_bytes.as_ref() {
-            input.insert(
-                "body_base64".to_string(),
-                Value::String(base64::engine::general_purpose::STANDARD.encode(bytes)),
-            );
             if let Some(body) = ctx.metadata.get("request_body") {
                 input.insert("body".to_string(), Value::String(body.clone()));
             } else if let Ok(body) = std::str::from_utf8(bytes) {
                 input.insert("body".to_string(), Value::String(body.to_string()));
+            } else {
+                input.insert(
+                    "body_base64".to_string(),
+                    Value::String(base64::engine::general_purpose::STANDARD.encode(bytes)),
+                );
             }
             return;
         }
@@ -232,7 +250,7 @@ impl Opa {
 
     fn evaluate(&self, body: &Value) -> PluginResult {
         let Some(decision) = self.decision_value(body) else {
-            return self.reject_with_config();
+            return self.reject_policy_denial();
         };
 
         if decision.as_bool() == Some(true) {
@@ -248,7 +266,7 @@ impl Opa {
             return PluginResult::Continue;
         }
 
-        self.reject_with_config()
+        self.reject_policy_denial()
     }
 
     fn decision_value<'a>(&self, body: &'a Value) -> Option<&'a Value> {
@@ -269,15 +287,23 @@ impl Opa {
         if self.fail_open {
             PluginResult::Continue
         } else {
-            self.reject_with_config()
+            self.reject_fail_closed()
         }
     }
 
-    fn reject_with_config(&self) -> PluginResult {
+    fn reject_policy_denial(&self) -> PluginResult {
         PluginResult::Reject {
             status_code: self.deny_status,
             body: self.deny_body.clone(),
             headers: self.deny_headers.clone(),
+        }
+    }
+
+    fn reject_fail_closed(&self) -> PluginResult {
+        PluginResult::Reject {
+            status_code: self.fail_closed_status,
+            body: self.fail_closed_body.clone(),
+            headers: self.fail_closed_headers.clone(),
         }
     }
 }
@@ -330,6 +356,8 @@ impl Plugin for Opa {
     }
 
     fn requires_request_body_before_authenticate(&self) -> bool {
+        // There is no authorize-phase body-buffering hook yet; this is the
+        // earliest hook that makes the buffered body available to authorize().
         self.include_body
     }
 
@@ -404,6 +432,9 @@ fn validate_policy_path(policy_path: &str) -> Result<(), String> {
     if policy_path.contains('?') || policy_path.contains('#') {
         return Err("opa: 'policy_path' must not contain '?' or '#'".to_string());
     }
+    if policy_path.contains('%') {
+        return Err("opa: 'policy_path' must not contain percent-encoding".to_string());
+    }
     if policy_path
         .split('/')
         .any(|segment| segment.is_empty() || segment == "." || segment == "..")
@@ -458,10 +489,10 @@ fn parse_redact_headers(object: &Map<String, Value>) -> Result<HashSet<String>, 
             .as_str()
             .filter(|value| !value.is_empty())
             .ok_or_else(|| format!("opa: 'redact_headers[{idx}]' must be a non-empty string"))?;
-        HeaderName::from_bytes(header.as_bytes()).map_err(|error| {
+        let header_name = HeaderName::from_bytes(header.as_bytes()).map_err(|error| {
             format!("opa: invalid redact_headers[{idx}] header name '{header}': {error}")
         })?;
-        headers.insert(header.to_ascii_lowercase());
+        headers.insert(header_name.as_str().to_string());
     }
     Ok(headers)
 }
@@ -471,12 +502,10 @@ fn default_redact_headers() -> HashSet<String> {
         "authorization",
         "proxy-authorization",
         "cookie",
-        "set-cookie",
         "x-api-key",
         "x-auth-token",
         "x-csrf-token",
         "x-xsrf-token",
-        "www-authenticate",
         "x-forwarded-authorization",
     ]
     .into_iter()
@@ -502,6 +531,11 @@ fn parse_header_map(
             .ok_or_else(|| format!("{plugin_name}: {field}['{key}'] must be a string"))?;
         let header_name = HeaderName::from_bytes(key.as_bytes())
             .map_err(|error| format!("{plugin_name}: invalid {field} name '{key}': {error}"))?;
+        if field == "headers" && header_name == CONTENT_TYPE {
+            return Err(format!(
+                "{plugin_name}: '{field}' must not include 'content-type'; OPA decision requests are always sent as JSON"
+            ));
+        }
         let header_value = HeaderValue::from_str(value).map_err(|error| {
             format!("{plugin_name}: invalid {field} value for '{key}': {error}")
         })?;
@@ -528,14 +562,26 @@ fn parse_string_header_map(
         let value = value
             .as_str()
             .ok_or_else(|| format!("{plugin_name}: {field}['{key}'] must be a string"))?;
-        HeaderName::from_bytes(key.as_bytes())
+        let header_name = HeaderName::from_bytes(key.as_bytes())
             .map_err(|error| format!("{plugin_name}: invalid {field} name '{key}': {error}"))?;
         HeaderValue::from_str(value).map_err(|error| {
             format!("{plugin_name}: invalid {field} value for '{key}': {error}")
         })?;
-        parsed.insert(key.clone(), value.to_string());
+        parsed.insert(header_name.as_str().to_string(), value.to_string());
     }
     Ok(parsed)
+}
+
+fn parse_response_status(
+    object: &Map<String, Value>,
+    field: &'static str,
+    default_status: u16,
+) -> Result<u16, String> {
+    let status = parse_optional_u16(object, field)?.unwrap_or(default_status);
+    if !(400..=599).contains(&status) {
+        return Err(format!("opa: '{field}' must be in the 4xx or 5xx range"));
+    }
+    Ok(status)
 }
 
 fn required_string<'a>(

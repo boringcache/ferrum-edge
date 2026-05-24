@@ -1691,20 +1691,23 @@ Delegates HTTP request authorization to [Open Policy Agent](https://www.openpoli
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `opa_host` | String | **required** | Base OPA URL, `http://` or `https://`. Do not include URL credentials; use `headers` for OPA auth. |
-| `policy_path` | String | **required** | OPA data path appended under `/v1/data/`, for example `ferrum/authz/allow`. Must not start with `/` or contain `..`. |
-| `headers` | Object | `{}` | Static headers sent to OPA on every decision request. |
+| `policy_path` | String | **required** | OPA data path appended under `/v1/data/`, for example `ferrum/authz/allow`. Must not start with `/`, contain percent-encoding, or contain empty, `.`, or `..` path segments. |
+| `headers` | Object | `{}` | Static headers sent to OPA on every decision request. `content-type` is managed by the plugin and cannot be configured. |
 | `timeout_ms` | Integer | `1000` | Per-decision request timeout. Values above `30000` are clamped. |
 | `fail_open` | Boolean | `false` | Continue the request when OPA is unavailable, times out, returns non-2xx, or returns malformed JSON. |
 | `fail_closed` | Boolean | `true` | Inverse of `fail_open`, accepted for explicit fail-closed configs. Do not set both fields. |
-| `deny_status` | Integer | `403` | HTTP 4xx/5xx status returned when OPA denies or fail-closed handles an error. |
-| `deny_body` | String | `{"error":"forbidden by policy"}` | Response body returned on denial. |
-| `deny_headers` | Object | `{}` | Headers added to the denial response. Names and values are validated at config load. |
+| `deny_status` | Integer | `403` | HTTP 4xx/5xx status returned when OPA returns a policy denial. |
+| `deny_body` | String | `{"error":"forbidden by policy"}` | Response body returned on policy denial. |
+| `deny_headers` | Object | `{}` | Headers added to the policy-denial response. Names and values are validated at config load. |
+| `fail_closed_status` | Integer | `503` | HTTP 4xx/5xx status returned when fail-closed handles OPA unavailability, timeouts, non-2xx responses, or malformed JSON. |
+| `fail_closed_body` | String | `{"error":"authorization service unavailable"}` | Response body returned on fail-closed OPA errors. |
+| `fail_closed_headers` | Object | `{}` | Headers added to fail-closed OPA error responses. Names and values are validated at config load. |
 | `decision_pointer` | String[] | `["result"]` | Path inside the OPA JSON response to evaluate. Use `["result","allow"]` for `{ "result": { "allow": true } }`. |
 | `include_method` | Boolean | `true` | Include `input.method`. |
 | `include_path` | Boolean | `true` | Include `input.path`. |
 | `include_query` | Boolean | `true` | Include decoded query parameters as `input.query`. |
 | `include_headers` | Boolean | `true` | Include request headers as `input.headers` after redaction. |
-| `include_body` | Boolean | `false` | Buffer and forward the request body. UTF-8 bodies use `input.body`; raw bytes are also sent as `input.body_base64`. |
+| `include_body` | Boolean | `false` | Buffer and forward the request body. UTF-8 bodies use `input.body`; non-UTF-8 raw bytes use `input.body_base64`. |
 | `include_consumer` | Boolean | `true` | Include mapped Consumer data or external authenticated identity. |
 | `include_client_ip` | Boolean | `true` | Include `input.client_ip`. |
 | `include_service` | Boolean | `true` | Include matched proxy/service data. |
@@ -1714,9 +1717,9 @@ Allow decisions:
 
 - `true` at `decision_pointer` continues the request.
 - An object with `allow: true` at `decision_pointer` also continues the request.
-- Any other value denies with the configured rejection response.
+- Any other value denies with the configured policy-denial response.
 
-Built-in request-header redaction always removes `authorization`, `proxy-authorization`, `cookie`, `set-cookie`, `x-api-key`, `x-auth-token`, `x-csrf-token`, `x-xsrf-token`, `www-authenticate`, and `x-forwarded-authorization` before sending `input.headers` to OPA.
+Built-in request-header redaction always removes `authorization`, `proxy-authorization`, `cookie`, `x-api-key`, `x-auth-token`, `x-csrf-token`, `x-xsrf-token`, and `x-forwarded-authorization` before sending `input.headers` to OPA.
 
 The outbound OPA call uses the shared `PluginHttpClient`, so it shares connection pooling, DNS cache warmup, slow-call telemetry, and global outbound TLS settings such as `FERRUM_TLS_CA_BUNDLE_PATH` and `FERRUM_TLS_NO_VERIFY`. Per-proxy backend TLS overrides do not apply; see [configuration.md#tls--mtls](configuration.md#tls--mtls).
 
@@ -1734,6 +1737,10 @@ config:
   deny_body: '{"error":"blocked by policy"}'
   deny_headers:
     content-type: application/json
+  fail_closed_status: 503
+  fail_closed_body: '{"error":"authorization service unavailable"}'
+  fail_closed_headers:
+    retry-after: "2"
 ```
 
 ### `mesh_outbound_registry`

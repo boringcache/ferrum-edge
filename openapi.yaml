@@ -8050,14 +8050,18 @@ components:
           type: string
           description: >-
             OPA data path appended under /v1/data/. Must be non-empty, must not
-            start with '/', and must not contain empty, '.', or '..' segments.
+            start with '/', must not contain percent-encoding, and must not
+            contain empty, '.', or '..' segments.
           example: "ferrum/authz/allow"
         headers:
           type: object
           additionalProperties:
             type: string
           default: {}
-          description: Static HTTP headers sent to OPA on every decision request.
+          description: >-
+            Static HTTP headers sent to OPA on every decision request. The
+            `content-type` header is managed by the plugin and cannot be
+            configured here.
           example:
             Authorization: "Bearer opa-client-token"
         timeout_ms:
@@ -8081,17 +8085,36 @@ components:
           minimum: 400
           maximum: 599
           default: 403
-          description: HTTP status returned on policy denial or fail-closed OPA errors.
+          description: HTTP status returned when OPA returns a policy denial.
         deny_body:
           type: string
           default: '{"error":"forbidden by policy"}'
-          description: Response body returned on denial.
+          description: Response body returned on policy denial.
         deny_headers:
           type: object
           additionalProperties:
             type: string
           default: {}
-          description: Headers added to the denial response.
+          description: Headers added to the policy-denial response.
+        fail_closed_status:
+          type: integer
+          format: uint16
+          minimum: 400
+          maximum: 599
+          default: 503
+          description: >-
+            HTTP status returned when fail-closed handles OPA unavailability,
+            timeouts, non-2xx responses, or malformed JSON.
+        fail_closed_body:
+          type: string
+          default: '{"error":"authorization service unavailable"}'
+          description: Response body returned on fail-closed OPA errors.
+        fail_closed_headers:
+          type: object
+          additionalProperties:
+            type: string
+          default: {}
+          description: Headers added to fail-closed OPA error responses.
         decision_pointer:
           type: array
           items:
@@ -8113,7 +8136,9 @@ components:
         include_body:
           type: boolean
           default: false
-          description: Buffer and forward the request body as `body` and/or `body_base64`.
+          description: >-
+            Buffer and forward the request body. UTF-8 bodies use `body`;
+            non-UTF-8 raw bytes use `body_base64`.
         include_consumer:
           type: boolean
           default: true
@@ -8131,12 +8156,10 @@ components:
             - authorization
             - proxy-authorization
             - cookie
-            - set-cookie
             - x-api-key
             - x-auth-token
             - x-csrf-token
             - x-xsrf-token
-            - www-authenticate
             - x-forwarded-authorization
           description: >-
             Additional request headers to redact from `input.headers`. Built-in
