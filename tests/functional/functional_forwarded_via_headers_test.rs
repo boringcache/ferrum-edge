@@ -62,23 +62,36 @@ impl HeaderHarness {
 
     async fn assert_backend_ok(&self) -> Http1Request {
         self.backend.assert_no_matcher_mismatches().await;
-        // These tests already assert the client saw the complete response.
-        // Under CI load the client/proxy can close before the scripted backend
-        // observes its final write, which is harmless for header propagation.
-        let step_errors = self.backend.step_errors().await;
-        assert!(
-            step_errors
-                .iter()
-                .all(|error| error.contains("Broken pipe")),
-            "unexpected backend script step error(s): {step_errors:?}"
-        );
-        self.backend
+        let request = self
+            .backend
             .received_requests()
             .await
             .into_iter()
             .find(|request| request.method == "GET" && request.path == "/metadata")
-            .expect("backend received metadata request")
+            .expect("backend received metadata request");
+
+        let step_errors = self.backend.step_errors().await;
+        let unexpected_step_errors: Vec<_> = step_errors
+            .iter()
+            // The client response was already asserted complete; a late peer
+            // close while the scripted backend finishes writing is not a
+            // forwarding-header failure.
+            .filter(|error| !is_late_response_peer_close(error))
+            .collect();
+        assert!(
+            unexpected_step_errors.is_empty(),
+            "{} unexpected script step error(s): {:?}",
+            unexpected_step_errors.len(),
+            unexpected_step_errors
+        );
+
+        request
     }
+}
+
+fn is_late_response_peer_close(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("broken pipe") || error.contains("connection reset by peer")
 }
 
 fn build_config(backend_port: u16) -> String {
