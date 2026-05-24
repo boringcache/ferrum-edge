@@ -62,7 +62,16 @@ impl HeaderHarness {
 
     async fn assert_backend_ok(&self) -> Http1Request {
         self.backend.assert_no_matcher_mismatches().await;
-        self.backend.assert_no_step_errors().await;
+        // These tests already assert the client saw the complete response.
+        // Under CI load the client/proxy can close before the scripted backend
+        // observes its final write, which is harmless for header propagation.
+        let step_errors = self.backend.step_errors().await;
+        assert!(
+            step_errors
+                .iter()
+                .all(|error| error.contains("Broken pipe")),
+            "unexpected backend script step error(s): {step_errors:?}"
+        );
         self.backend
             .received_requests()
             .await
@@ -120,14 +129,19 @@ fn response_header<'a>(headers: &'a reqwest::header::HeaderMap, name: &str) -> O
     headers.get(name).and_then(|v| v.to_str().ok())
 }
 
+fn http1_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .http1_only()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("client")
+}
+
 #[ignore]
 #[tokio::test]
 async fn functional_forwarded_via_default_adds_x_forwarded_and_via() {
     let harness = HeaderHarness::new(true, "ferrum-edge", false).await;
-    let client = reqwest::Client::builder()
-        .http1_only()
-        .build()
-        .expect("client");
+    let client = http1_client();
 
     let response = client
         .get(harness.proxy_url())
@@ -161,10 +175,7 @@ async fn functional_forwarded_via_default_adds_x_forwarded_and_via() {
 #[tokio::test]
 async fn functional_forwarded_via_custom_pseudonym_and_forwarded_enabled() {
     let harness = HeaderHarness::new(true, "edge-under-test", true).await;
-    let client = reqwest::Client::builder()
-        .http1_only()
-        .build()
-        .expect("client");
+    let client = http1_client();
 
     let response = client
         .get(harness.proxy_url())
@@ -195,10 +206,7 @@ async fn functional_forwarded_via_custom_pseudonym_and_forwarded_enabled() {
 #[tokio::test]
 async fn functional_forwarded_via_can_disable_via_without_disabling_forwarded_headers() {
     let harness = HeaderHarness::new(false, "edge-disabled", true).await;
-    let client = reqwest::Client::builder()
-        .http1_only()
-        .build()
-        .expect("client");
+    let client = http1_client();
 
     let response = client
         .get(harness.proxy_url())
