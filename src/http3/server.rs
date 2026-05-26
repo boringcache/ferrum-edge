@@ -582,6 +582,10 @@ async fn handle_h3_connection(
         .as_ref()
         .filter(|certs| certs.len() > 1)
         .map(|certs| Arc::new(certs[1..].to_vec()));
+    let frontend_sni_hostname = connection
+        .handshake_data()
+        .and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
+        .and_then(|data| data.server_name.as_deref().map(str::to_ascii_lowercase));
 
     // Keep a handle to the quinn connection so we can detect QUIC connection
     // migration (RFC 9000 §9). When a client migrates to a new IP (e.g., mobile
@@ -626,6 +630,7 @@ async fn handle_h3_connection(
                 let state = state.clone();
                 let cert = client_cert_der.clone();
                 let chain = client_cert_chain_der.clone();
+                let frontend_sni_hostname = frontend_sni_hostname.clone();
                 let socket_ip = Arc::clone(&socket_ip);
                 // Snapshot the early-data flag NOW — before spawning the task.
                 // This captures whether the handshake has completed at the moment
@@ -641,6 +646,7 @@ async fn handle_h3_connection(
                                 current_addr,
                                 &socket_ip,
                                 frontend_listen_port,
+                                frontend_sni_hostname,
                                 cert,
                                 chain,
                                 is_early_data,
@@ -679,6 +685,7 @@ async fn handle_h3_request(
     remote_addr: SocketAddr,
     socket_ip: &str,
     frontend_listen_port: Option<u16>,
+    frontend_sni_hostname: Option<String>,
     tls_client_cert_der: Option<Arc<Vec<u8>>>,
     tls_client_cert_chain_der: Option<Arc<Vec<Vec<u8>>>>,
     is_early_data: bool,
@@ -732,6 +739,7 @@ async fn handle_h3_request(
     // the H3 request. Fall back to the configured HTTPS port only if Quinn
     // cannot report the bound local address.
     ctx.frontend_listen_port = frontend_listen_port.or(Some(state.env_config.proxy_https_port));
+    ctx.frontend_sni_hostname = frontend_sni_hostname;
     ctx.tls_client_cert_der = tls_client_cert_der;
     ctx.tls_client_cert_chain_der = tls_client_cert_chain_der;
 

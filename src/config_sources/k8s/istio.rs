@@ -11,9 +11,10 @@ use crate::modes::mesh::config::{
     MeshSidecar, MeshSidecarEgress, MeshSimpleLb, MeshSubset, MeshTelemetryConfig,
     MeshTelemetryResource, MeshTracingConfig, MeshTrafficPolicy, MeshTrafficPolicyTls,
     MetricTagOverride, MtlsMode, PeerAuthentication, PolicyAction, PolicyScope, PrincipalMatch,
-    RequestMatch, Resolution, ServiceEntry, ServiceEntryLocation, ServicePort,
+    RequestMatch, Resolution, ServiceEntry, ServiceEntryLocation, ServicePort, SourceNegationMatch,
     TagOverrideOperation, TelemetryTracingMode, TracingProvider, Workload, WorkloadPort,
-    WorkloadSelector,
+    WorkloadSelector, is_mesh_condition_ip_key, is_supported_mesh_condition_key,
+    mesh_condition_has_values, validate_mesh_condition_ip_block,
 };
 
 use super::{
@@ -25,8 +26,8 @@ use super::{
     optional_port_field, parse_istio_duration_ms, port_from_u64, proxy_for_route,
     request_termination_plugin_for_proxy, resource_id, route_local_fault_value_for_rule,
     route_request_transformer_plugin_for_proxy, route_response_transformer_plugin_for_proxy,
-    selector_from_istio, string_array, string_field, string_map, upstream_for_route,
-    workload_entry_service_key_from_host,
+    selector_from_istio, sidecar_selector_from_istio, string_array, string_field, string_map,
+    upstream_for_route, workload_entry_service_key_from_host,
 };
 use crate::config::types::{
     BackendScheme, MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES,
@@ -43,7 +44,9 @@ pub(super) fn translate(
 ) -> Result<bool, K8sTranslateError> {
     match object.kind.as_str() {
         "AuthorizationPolicy" => {
-            acc.mesh.mesh_policies.push(authorization_policy(object)?);
+            acc.mesh
+                .mesh_policies
+                .push(authorization_policy(&acc.options, object)?);
             Ok(true)
         }
         "PeerAuthentication" => {
@@ -103,7 +106,10 @@ pub(super) fn translate(
     }
 }
 
-fn authorization_policy(object: &K8sObject) -> Result<MeshPolicy, K8sTranslateError> {
+fn authorization_policy(
+    options: &K8sTranslationOptions,
+    object: &K8sObject,
+) -> Result<MeshPolicy, K8sTranslateError> {
     let action = match string_field(&object.spec, "action").unwrap_or("ALLOW") {
         "ALLOW" => PolicyAction::Allow,
         "DENY" => PolicyAction::Deny,
@@ -116,17 +122,14 @@ fn authorization_policy(object: &K8sObject) -> Result<MeshPolicy, K8sTranslateEr
         }
     };
 
-    let scope = match object.spec.get("selector") {
-        Some(selector) => PolicyScope::WorkloadSelector {
-            selector: WorkloadSelector {
-                labels: selector_from_istio(Some(selector)),
-                namespace: Some(object.metadata.namespace.clone()),
-            },
-        },
-        None => PolicyScope::Namespace {
-            namespace: object.metadata.namespace.clone(),
-        },
-    };
+    if object.spec.get("targetRefs").is_some() {
+        return Err(invalid_resource(
+            object,
+            "AuthorizationPolicy targetRefs are not supported yet; use selector or namespace scope",
+        ));
+    }
+
+    let scope = istio_policy_scope(options, object, object.spec.get("selector"));
 
     let mut rules = Vec::new();
     for rule in object
@@ -175,6 +178,14 @@ fn mesh_rules(
         .flatten()
         .map(|source_entry| source_entry.get("source").unwrap_or(&Value::Null))
         .collect();
+    // Fail closed on any source field we do not yet support, mirroring the
+    // `to.operation` side (`validate_supported_operation_fields`). Without
+    // this gate, an unsupported source key (e.g. a future Istio field) would
+    // be silently dropped and the rule would match more traffic than the
+    // operator authored.
+    for source in &sources {
+        validate_supported_source_fields(object, source)?;
+    }
     let mut to = Vec::new();
     let mut has_unconstrained_to = false;
     for request in rule
@@ -194,13 +205,15 @@ fn mesh_rules(
     if has_unconstrained_to {
         to.clear();
     }
-    let when = rule
-        .get("when")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(condition_match)
-        .collect();
+    let mut when = Vec::new();
+    if let Some(when_value) = rule.get("when") {
+        let conditions = when_value
+            .as_array()
+            .ok_or_else(|| invalid_resource(object, "rules[].when must be an array"))?;
+        for (index, condition) in conditions.iter().enumerate() {
+            when.push(condition_match(object, index, condition)?);
+        }
+    }
 
     if sources.is_empty() {
         return Ok(vec![MeshRule {
@@ -208,41 +221,210 @@ fn mesh_rules(
             to,
             when,
             request_principals: Vec::new(),
+            not_request_principals: Vec::new(),
+            source_negation: SourceNegationMatch::default(),
             never_matches: false,
             action,
         }]);
     }
 
-    Ok(sources
+    sources
         .into_iter()
-        .map(|source| MeshRule {
-            from: principal_matches(source),
-            to: to.clone(),
-            when: when.clone(),
-            request_principals: string_array(source, "requestPrincipals"),
-            never_matches: false,
-            action,
+        .map(|source| {
+            Ok(MeshRule {
+                from: principal_matches(object, source)?,
+                to: to.clone(),
+                when: when.clone(),
+                request_principals: string_array(source, "requestPrincipals"),
+                not_request_principals: string_array(source, "notRequestPrincipals"),
+                source_negation: source_negation_match(object, source)?,
+                never_matches: false,
+                action,
+            })
         })
-        .collect())
+        .collect()
 }
 
-fn principal_matches(source: &Value) -> Vec<PrincipalMatch> {
+fn principal_matches(
+    object: &K8sObject,
+    source: &Value,
+) -> Result<Vec<PrincipalMatch>, K8sTranslateError> {
+    let principals = string_array(source, "principals");
+    let service_accounts = service_account_principal_patterns(object, source, "serviceAccounts")?;
+    let namespaces = string_array(source, "namespaces");
+    let trust_domains = string_array(source, "trustDomains");
+
+    if !service_accounts.is_empty() && (!principals.is_empty() || !namespaces.is_empty()) {
+        return Err(invalid_resource(
+            object,
+            "rules[].from[].source.serviceAccounts cannot be set with principals or namespaces"
+                .to_string(),
+        ));
+    }
+
+    let principal_patterns = if service_accounts.is_empty() {
+        principals
+    } else {
+        service_accounts
+    };
+    if principal_patterns.is_empty() && namespaces.is_empty() && trust_domains.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let principal_patterns = optional_match_values(principal_patterns);
+    let namespaces = optional_match_values(namespaces);
+    let trust_domains = optional_match_values(trust_domains);
+
     let mut matches = Vec::new();
-    for principal in string_array(source, "principals") {
-        matches.push(PrincipalMatch {
-            spiffe_id_pattern: Some(principal),
-            namespace_pattern: None,
-            trust_domain: None,
-        });
+    for principal in &principal_patterns {
+        for namespace in &namespaces {
+            for trust_domain in &trust_domains {
+                matches.push(PrincipalMatch {
+                    spiffe_id_pattern: principal.clone(),
+                    namespace_pattern: namespace.clone(),
+                    trust_domain: None,
+                    trust_domain_pattern: trust_domain.clone(),
+                });
+            }
+        }
     }
-    for namespace in string_array(source, "namespaces") {
-        matches.push(PrincipalMatch {
-            spiffe_id_pattern: None,
-            namespace_pattern: Some(namespace),
-            trust_domain: None,
-        });
+
+    Ok(matches)
+}
+
+fn optional_match_values(values: Vec<String>) -> Vec<Option<String>> {
+    if values.is_empty() {
+        vec![None]
+    } else {
+        values.into_iter().map(Some).collect()
     }
-    matches
+}
+
+fn service_account_principal_patterns(
+    object: &K8sObject,
+    source: &Value,
+    field: &str,
+) -> Result<Vec<String>, K8sTranslateError> {
+    string_array(source, field)
+        .into_iter()
+        .map(|service_account| service_account_principal_pattern(object, field, &service_account))
+        .collect()
+}
+
+fn service_account_principal_pattern(
+    object: &K8sObject,
+    field: &str,
+    service_account: &str,
+) -> Result<String, K8sTranslateError> {
+    if service_account.contains('*') {
+        return Err(invalid_resource(
+            object,
+            format!("rules[].from[].source.{field} '{service_account}' must not contain wildcards"),
+        ));
+    }
+
+    let (namespace, service_account) = match service_account.split_once('/') {
+        Some((namespace, service_account)) if !service_account.contains('/') => {
+            (namespace, service_account)
+        }
+        Some(_) => {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "rules[].from[].source.{field} '{service_account}' must be '<serviceaccount>' or '<namespace>/<serviceaccount>'"
+                ),
+            ));
+        }
+        None => (object.metadata.namespace.as_str(), service_account),
+    };
+
+    if namespace.is_empty() || service_account.is_empty() {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "rules[].from[].source.{field} '{service_account}' must include a non-empty namespace and service account"
+            ),
+        ));
+    }
+
+    Ok(format!("*/ns/{namespace}/sa/{service_account}"))
+}
+
+/// Translate the conjunctive source-negative / IP-block fields of one Istio
+/// `from[].source` block into a [`SourceNegationMatch`]. IP blocks are
+/// validated here so a malformed CIDR rejects the resource (fail-closed)
+/// rather than silently never matching at request time.
+fn source_negation_match(
+    object: &K8sObject,
+    source: &Value,
+) -> Result<SourceNegationMatch, K8sTranslateError> {
+    let validate_ip_blocks = |field: &str| -> Result<Vec<String>, K8sTranslateError> {
+        let blocks = string_array(source, field);
+        for block in &blocks {
+            crate::modes::mesh::policy::validate_source_ip_block(block).map_err(|reason| {
+                invalid_resource(
+                    object,
+                    format!("rules[].from[].source.{field} '{block}' is invalid: {reason}"),
+                )
+            })?;
+        }
+        Ok(blocks)
+    };
+
+    let mut not_spiffe_id_patterns = string_array(source, "notPrincipals");
+    not_spiffe_id_patterns.extend(service_account_principal_patterns(
+        object,
+        source,
+        "notServiceAccounts",
+    )?);
+
+    Ok(SourceNegationMatch {
+        not_spiffe_id_patterns,
+        not_namespace_patterns: string_array(source, "notNamespaces"),
+        not_trust_domain_patterns: string_array(source, "notTrustDomains"),
+        ip_blocks: validate_ip_blocks("ipBlocks")?,
+        not_ip_blocks: validate_ip_blocks("notIpBlocks")?,
+        remote_ip_blocks: validate_ip_blocks("remoteIpBlocks")?,
+        not_remote_ip_blocks: validate_ip_blocks("notRemoteIpBlocks")?,
+    })
+}
+
+/// Reject any `from[].source` field that the translator does not yet support
+/// so the resource fails closed instead of silently admitting more traffic.
+/// Mirrors [`validate_supported_operation_fields`] on the `to.operation` side.
+fn validate_supported_source_fields(
+    object: &K8sObject,
+    source: &Value,
+) -> Result<(), K8sTranslateError> {
+    for key in source
+        .as_object()
+        .into_iter()
+        .flat_map(|fields| fields.keys())
+    {
+        match key.as_str() {
+            "principals"
+            | "notPrincipals"
+            | "serviceAccounts"
+            | "notServiceAccounts"
+            | "namespaces"
+            | "notNamespaces"
+            | "trustDomains"
+            | "notTrustDomains"
+            | "ipBlocks"
+            | "notIpBlocks"
+            | "remoteIpBlocks"
+            | "notRemoteIpBlocks"
+            | "requestPrincipals"
+            | "notRequestPrincipals" => {}
+            _ => {
+                return Err(invalid_resource(
+                    object,
+                    format!("rules[].from[].source.{key} is unsupported"),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn request_match(object: &K8sObject, operation: &Value) -> Result<RequestMatch, K8sTranslateError> {
@@ -342,12 +524,57 @@ fn request_match_is_unconstrained(request: &RequestMatch) -> bool {
         && request.not_ports.is_empty()
 }
 
-fn condition_match(value: &Value) -> Option<ConditionMatch> {
-    Some(ConditionMatch {
-        key: string_field(value, "key")?.to_string(),
-        values: string_array(value, "values"),
-        not_values: string_array(value, "notValues"),
-    })
+fn condition_match(
+    object: &K8sObject,
+    index: usize,
+    value: &Value,
+) -> Result<ConditionMatch, K8sTranslateError> {
+    let key = string_field(value, "key").ok_or_else(|| {
+        invalid_resource(object, format!("rules[].when[{index}].key is required"))
+    })?;
+    if !is_supported_mesh_condition_key(key) {
+        return Err(invalid_resource(
+            object,
+            format!("rules[].when[{index}].key '{key}' is unsupported"),
+        ));
+    }
+    let values = string_array(value, "values");
+    let not_values = string_array(value, "notValues");
+    let condition = ConditionMatch {
+        key: key.to_string(),
+        values,
+        not_values,
+    };
+    if !mesh_condition_has_values(&condition) {
+        return Err(invalid_resource(
+            object,
+            format!("rules[].when[{index}].key '{key}' must set values or notValues"),
+        ));
+    }
+    if is_mesh_condition_ip_key(key) {
+        validate_condition_ip_blocks(object, index, "values", &condition.values)?;
+        validate_condition_ip_blocks(object, index, "notValues", &condition.not_values)?;
+    }
+    Ok(condition)
+}
+
+fn validate_condition_ip_blocks(
+    object: &K8sObject,
+    condition_index: usize,
+    field: &str,
+    values: &[String],
+) -> Result<(), K8sTranslateError> {
+    for (value_index, value) in values.iter().enumerate() {
+        validate_mesh_condition_ip_block(value).map_err(|error| {
+            invalid_resource(
+                object,
+                format!(
+                    "rules[].when[{condition_index}].{field}[{value_index}] '{value}' is invalid: {error}"
+                ),
+            )
+        })?;
+    }
+    Ok(())
 }
 
 fn peer_authentication(
@@ -407,7 +634,7 @@ fn sidecar(
 ) -> Result<MeshSidecar, K8sTranslateError> {
     let workload_selector = match object.spec.get("workloadSelector") {
         Some(selector_value) => {
-            let labels = selector_from_istio(Some(selector_value));
+            let labels = sidecar_selector_from_istio(Some(selector_value));
             if labels.is_empty() {
                 None
             } else {
@@ -783,7 +1010,7 @@ fn translate_traffic_policy(
     let connection_pool_http = value
         .get("connectionPool")
         .and_then(|cp| cp.get("http"))
-        .map(|http| translate_connection_pool_http(object, http))
+        .map(|http| translate_connection_pool_http(acc, object, http))
         .transpose()?
         .flatten();
 
@@ -964,12 +1191,16 @@ fn parse_keepalive_duration_seconds(
 ///
 /// Supported fields (T1-C scope): `maxRequestsPerConnection`, `idleTimeout`,
 /// `http2MaxRequests`. Deferred fields (`http1MaxPendingRequests`,
-/// `maxRetries`, `h2UpgradePolicy`) are detected and emitted as a `debug!`
-/// line so operators see the gateway acknowledging the field but otherwise
-/// dropped. Returning `Ok(None)` from this function signals "block was
-/// present but no supported field was set" so the caller can skip emitting
-/// an empty overlay on the slice.
+/// `maxRetries`, `h2UpgradePolicy`) are detected and pushed onto
+/// `acc.warnings` so operators see the gateway acknowledging the field but
+/// otherwise dropping it — the Istio status writer
+/// (`src/k8s_controller/istio_status.rs`) promotes the same fields into the
+/// DestinationRule `status.ferrum.translation.deferred_fields` list so the
+/// gap is visible from `kubectl describe`. Returning `Ok(None)` from this
+/// function signals "block was present but no supported field was set" so
+/// the caller can skip emitting an empty overlay on the slice.
 fn translate_connection_pool_http(
+    acc: &mut K8sAccumulator,
     object: &K8sObject,
     http: &Value,
 ) -> Result<Option<crate::modes::mesh::config::MeshConnectionPoolHttp>, K8sTranslateError> {
@@ -992,17 +1223,20 @@ fn translate_connection_pool_http(
         None => None,
     };
 
-    // Deferred fields: surface a debug line so operators know the gateway
-    // saw the field but is not yet enforcing it. Keep this list in sync
-    // with docs/mesh.md's `connectionPool.http.*` status table.
+    // Deferred fields: surface an operator-visible warning so the gateway
+    // acknowledges the field but signals it is not yet enforced. The Istio
+    // status writer mirrors the same field list into the DestinationRule
+    // `status.ferrum.translation.deferred_fields` block so the gap is also
+    // visible from `kubectl describe`. Keep this list in sync with
+    // `DEFERRED_CONNECTION_POOL_HTTP_FIELDS` in
+    // `src/k8s_controller/istio_status.rs` and docs/mesh.md's
+    // `connectionPool.http.*` status table.
     for field in ["http1MaxPendingRequests", "maxRetries", "h2UpgradePolicy"] {
         if http.get(field).is_some() {
-            tracing::debug!(
-                rule = %object.metadata.name,
-                namespace = %object.metadata.namespace,
-                field = field,
-                "DestinationRule connectionPool.http.{field} is parsed but not yet projected; tracked as a follow-on (T1-C deferred set)"
-            );
+            acc.warnings.push(format!(
+                "DestinationRule {}/{}: connectionPool.http.{field} is parsed but not yet projected; tracked as a follow-on (T1-C deferred set)",
+                object.metadata.namespace, object.metadata.name
+            ));
         }
     }
 
@@ -3782,6 +4016,74 @@ mod tests {
     }
 
     #[test]
+    fn root_namespace_authorization_policy_without_selector_is_mesh_wide() {
+        let result = translate_k8s_objects(
+            &[object_with_metadata(
+                "AuthorizationPolicy",
+                "security.istio.io/v1",
+                "global-deny",
+                "istio-config",
+                serde_json::json!({
+                    "action": "DENY",
+                    "rules": [{}]
+                }),
+            )],
+            options_for_namespace("istio-config")
+                .with_istio_root_namespace("istio-config".to_string()),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        assert!(matches!(mesh.mesh_policies[0].scope, PolicyScope::MeshWide));
+    }
+
+    #[test]
+    fn root_namespace_authorization_policy_selector_is_mesh_wide_by_labels() {
+        let result = translate_k8s_objects(
+            &[object_with_metadata(
+                "AuthorizationPolicy",
+                "security.istio.io/v1",
+                "global-selector",
+                "istio-config",
+                serde_json::json!({
+                    "action": "ALLOW",
+                    "selector": {"matchLabels": {"app": "api"}},
+                    "rules": [{}]
+                }),
+            )],
+            options_for_namespace("istio-config")
+                .with_istio_root_namespace("istio-config".to_string()),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        assert!(
+            matches!(&mesh.mesh_policies[0].scope, PolicyScope::WorkloadSelector { selector } if selector.namespace.is_none() && selector.labels.get("app") == Some(&"api".to_string()))
+        );
+    }
+
+    #[test]
+    fn rejects_authorization_policy_target_refs_until_supported() {
+        let err = translate_k8s_objects(
+            &[object(
+                "AuthorizationPolicy",
+                serde_json::json!({
+                    "targetRefs": [{
+                        "kind": "Service",
+                        "name": "payments"
+                    }],
+                    "rules": [{}]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("targetRefs must fail closed until target scoping is implemented");
+
+        assert!(err.to_string().contains("targetRefs"));
+        assert!(err.to_string().contains("not supported"));
+    }
+
+    #[test]
     fn translates_missing_action_authorization_policy_without_rules_to_allow_nothing() {
         let policy = translated_authorization_policy(serde_json::json!({}));
 
@@ -4016,6 +4318,78 @@ mod tests {
                 .contains("rules[].to[].operation.someUnsupportedField")
         );
         assert!(err.to_string().contains("unsupported"));
+    }
+
+    #[test]
+    fn rejects_unsupported_authorization_policy_when_key() {
+        let err = translate_k8s_objects(
+            &[object(
+                "AuthorizationPolicy",
+                serde_json::json!({
+                    "action": "DENY",
+                    "rules": [{
+                        "when": [{
+                            "key": "destination.labels[app]",
+                            "values": ["payments"]
+                        }]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("unsupported when keys must fail closed");
+
+        assert!(
+            err.to_string()
+                .contains("rules[].when[0].key 'destination.labels[app]'")
+        );
+        assert!(err.to_string().contains("unsupported"));
+    }
+
+    #[test]
+    fn rejects_authorization_policy_when_without_values() {
+        let err = translate_k8s_objects(
+            &[object(
+                "AuthorizationPolicy",
+                serde_json::json!({
+                    "action": "DENY",
+                    "rules": [{
+                        "when": [{
+                            "key": "connection.sni"
+                        }]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("when conditions without values/notValues must fail closed");
+
+        assert!(err.to_string().contains("rules[].when[0]"));
+        assert!(err.to_string().contains("values or notValues"));
+    }
+
+    #[test]
+    fn rejects_malformed_authorization_policy_ip_when_value() {
+        let err = translate_k8s_objects(
+            &[object(
+                "AuthorizationPolicy",
+                serde_json::json!({
+                    "action": "DENY",
+                    "rules": [{
+                        "when": [{
+                            "key": "source.ip",
+                            "values": ["10.0.0.0/40"]
+                        }]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("malformed source.ip when CIDR must fail closed");
+
+        assert!(err.to_string().contains("rules[].when[0].values[0]"));
+        assert!(err.to_string().contains("10.0.0.0/40"));
+        assert!(err.to_string().contains("prefix length"));
     }
 
     #[test]
@@ -10818,6 +11192,123 @@ extensionProviders:
     }
 
     #[test]
+    fn translates_authorization_policy_source_negation_and_ip_blocks() {
+        let policy = translated_authorization_policy(serde_json::json!({
+            "action": "ALLOW",
+            "rules": [{
+                "from": [{
+                    "source": {
+                        "principals": ["spiffe://cluster.local/ns/default/sa/web"],
+                        "notPrincipals": ["cluster.local/ns/default/sa/legacy"],
+                        "notNamespaces": ["kube-system"],
+                        "ipBlocks": ["10.0.0.0/8"],
+                        "notIpBlocks": ["10.1.0.0/16"],
+                        "remoteIpBlocks": ["203.0.113.0/24"],
+                        "notRemoteIpBlocks": ["198.51.100.0/24"],
+                        "notRequestPrincipals": ["https://issuer/admin"]
+                    }
+                }]
+            }]
+        }));
+
+        assert_eq!(policy.rules.len(), 1);
+        let rule = &policy.rules[0];
+        assert_eq!(rule.from.len(), 1, "positive principal preserved");
+        assert_eq!(
+            rule.not_request_principals,
+            vec!["https://issuer/admin".to_string()]
+        );
+        let neg = &rule.source_negation;
+        assert_eq!(
+            neg.not_spiffe_id_patterns,
+            vec!["cluster.local/ns/default/sa/legacy".to_string()]
+        );
+        assert_eq!(neg.not_namespace_patterns, vec!["kube-system".to_string()]);
+        assert_eq!(neg.ip_blocks, vec!["10.0.0.0/8".to_string()]);
+        assert_eq!(neg.not_ip_blocks, vec!["10.1.0.0/16".to_string()]);
+        assert_eq!(neg.remote_ip_blocks, vec!["203.0.113.0/24".to_string()]);
+        assert_eq!(
+            neg.not_remote_ip_blocks,
+            vec!["198.51.100.0/24".to_string()]
+        );
+    }
+
+    #[test]
+    fn authorization_policy_rejects_unsupported_source_field() {
+        let result = translate_k8s_objects(
+            &[object(
+                "AuthorizationPolicy",
+                serde_json::json!({
+                    "action": "ALLOW",
+                    "rules": [{
+                        "from": [{"source": {"someFutureField": ["x"]}}]
+                    }]
+                }),
+            )],
+            options(),
+        );
+        let err = result.expect_err("unsupported source field must reject the resource");
+        assert!(
+            err.to_string()
+                .contains("source.someFutureField is unsupported"),
+            "error should name the unsupported field, got: {err}"
+        );
+    }
+
+    #[test]
+    fn authorization_policy_rejects_malformed_ip_block() {
+        let result = translate_k8s_objects(
+            &[object(
+                "AuthorizationPolicy",
+                serde_json::json!({
+                    "action": "ALLOW",
+                    "rules": [{
+                        "from": [{"source": {"ipBlocks": ["10.0.0.0/40"]}}]
+                    }]
+                }),
+            )],
+            options(),
+        );
+        let err = result.expect_err("malformed CIDR must reject the resource");
+        assert!(
+            err.to_string().contains("ipBlocks") && err.to_string().contains("invalid"),
+            "error should flag the bad CIDR, got: {err}"
+        );
+    }
+
+    #[test]
+    fn authorization_policy_remote_ip_blocks_enforced_end_to_end() {
+        let policy = translated_authorization_policy(serde_json::json!({
+            "action": "ALLOW",
+            "rules": [{
+                "from": [{"source": {"remoteIpBlocks": ["203.0.113.0/24"]}}]
+            }]
+        }));
+        let slice = MeshSlice {
+            mesh_policies: vec![policy],
+            ..MeshSlice::default()
+        };
+        let inside = MeshAuthzRequest {
+            remote_ip: Some("203.0.113.9".parse().unwrap()),
+            ..MeshAuthzRequest::default()
+        };
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &inside),
+            MeshAuthzDecision::Allow
+        );
+        let outside = MeshAuthzRequest {
+            remote_ip: Some("198.51.100.9".parse().unwrap()),
+            ..MeshAuthzRequest::default()
+        };
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &outside),
+            MeshAuthzDecision::Deny {
+                policy: "implicit-deny".to_string()
+            }
+        );
+    }
+
+    #[test]
     fn authorization_policy_from_entries_remain_or_alternatives() {
         let policy = translated_authorization_policy(serde_json::json!({
             "action": "ALLOW",
@@ -10917,6 +11408,183 @@ extensionProviders:
         assert_eq!(
             evaluate_mesh_authorization(&slice, &both),
             MeshAuthzDecision::Allow
+        );
+    }
+
+    #[test]
+    fn authorization_policy_from_entry_ands_principals_and_namespaces() {
+        let policy = translated_authorization_policy(serde_json::json!({
+            "action": "ALLOW",
+            "rules": [{
+                "from": [{
+                    "source": {
+                        "principals": ["cluster.local/ns/default/sa/web"],
+                        "namespaces": ["default"]
+                    }
+                }]
+            }]
+        }));
+
+        let rule = &policy.rules[0];
+        assert_eq!(rule.from.len(), 1);
+        assert_eq!(
+            rule.from[0].spiffe_id_pattern.as_deref(),
+            Some("cluster.local/ns/default/sa/web")
+        );
+        assert_eq!(rule.from[0].namespace_pattern.as_deref(), Some("default"));
+
+        let slice = MeshSlice {
+            mesh_policies: vec![policy],
+            ..MeshSlice::default()
+        };
+
+        let web = MeshAuthzRequest {
+            source_principal: Some(
+                SpiffeId::new("spiffe://cluster.local/ns/default/sa/web").expect("spiffe id"),
+            ),
+            ..MeshAuthzRequest::default()
+        };
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &web),
+            MeshAuthzDecision::Allow
+        );
+
+        let same_namespace_other_sa = MeshAuthzRequest {
+            source_principal: Some(
+                SpiffeId::new("spiffe://cluster.local/ns/default/sa/other").expect("spiffe id"),
+            ),
+            ..MeshAuthzRequest::default()
+        };
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &same_namespace_other_sa),
+            MeshAuthzDecision::Deny {
+                policy: "implicit-deny".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn authorization_policy_service_accounts_match_istio_source_identity() {
+        let policy = translated_authorization_policy(serde_json::json!({
+            "action": "ALLOW",
+            "rules": [{
+                "from": [{
+                    "source": {
+                        "serviceAccounts": ["web", "payments/api"]
+                    }
+                }]
+            }]
+        }));
+
+        let slice = MeshSlice {
+            mesh_policies: vec![policy],
+            ..MeshSlice::default()
+        };
+
+        let default_web = MeshAuthzRequest {
+            source_principal: Some(
+                SpiffeId::new("spiffe://cluster.local/ns/default/sa/web").expect("spiffe id"),
+            ),
+            ..MeshAuthzRequest::default()
+        };
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &default_web),
+            MeshAuthzDecision::Allow
+        );
+
+        let payments_api = MeshAuthzRequest {
+            source_principal: Some(
+                SpiffeId::new("spiffe://partner.local/ns/payments/sa/api").expect("spiffe id"),
+            ),
+            ..MeshAuthzRequest::default()
+        };
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &payments_api),
+            MeshAuthzDecision::Allow
+        );
+
+        let other = MeshAuthzRequest {
+            source_principal: Some(
+                SpiffeId::new("spiffe://cluster.local/ns/other/sa/web").expect("spiffe id"),
+            ),
+            ..MeshAuthzRequest::default()
+        };
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &other),
+            MeshAuthzDecision::Deny {
+                policy: "implicit-deny".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn authorization_policy_trust_domains_and_not_service_accounts_apply() {
+        let policy = translated_authorization_policy(serde_json::json!({
+            "action": "ALLOW",
+            "rules": [{
+                "from": [{
+                    "source": {
+                        "trustDomains": ["cluster.*"],
+                        "notTrustDomains": ["cluster.bad"],
+                        "notServiceAccounts": ["legacy"]
+                    }
+                }]
+            }]
+        }));
+
+        let slice = MeshSlice {
+            mesh_policies: vec![policy],
+            ..MeshSlice::default()
+        };
+
+        let client = MeshAuthzRequest {
+            source_principal: Some(
+                SpiffeId::new("spiffe://cluster.local/ns/default/sa/client").expect("spiffe id"),
+            ),
+            ..MeshAuthzRequest::default()
+        };
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &client),
+            MeshAuthzDecision::Allow
+        );
+
+        let denied_sa = MeshAuthzRequest {
+            source_principal: Some(
+                SpiffeId::new("spiffe://cluster.local/ns/default/sa/legacy").expect("spiffe id"),
+            ),
+            ..MeshAuthzRequest::default()
+        };
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &denied_sa),
+            MeshAuthzDecision::Deny {
+                policy: "implicit-deny".to_string()
+            }
+        );
+
+        let denied_td = MeshAuthzRequest {
+            source_principal: Some(
+                SpiffeId::new("spiffe://cluster.bad/ns/default/sa/client").expect("spiffe id"),
+            ),
+            ..MeshAuthzRequest::default()
+        };
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &denied_td),
+            MeshAuthzDecision::Deny {
+                policy: "implicit-deny".to_string()
+            }
+        );
+
+        let outside_td = MeshAuthzRequest {
+            source_principal: Some(
+                SpiffeId::new("spiffe://partner.local/ns/default/sa/client").expect("spiffe id"),
+            ),
+            ..MeshAuthzRequest::default()
+        };
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &outside_td),
+            MeshAuthzDecision::Deny {
+                policy: "implicit-deny".to_string()
+            }
         );
     }
 
@@ -13065,11 +13733,13 @@ extensionProviders:
     }
 
     #[test]
-    fn destination_rule_silently_accepts_deferred_http_fields() {
+    fn destination_rule_accepts_deferred_http_fields_with_warning() {
         // `http1MaxPendingRequests`, `maxRetries`, and `h2UpgradePolicy` are
         // tracked T1-C follow-ons. The translator should not fail when
         // operators set them (they would never be able to upgrade off Istio
-        // otherwise); the gateway logs a debug line and drops them.
+        // otherwise); the gateway emits an operator-visible warning per
+        // deferred field and drops them. The Istio status writer mirrors
+        // these into `status.ferrum.translation.deferred_fields`.
         let result = translate_k8s_objects(
             &[object(
                 "DestinationRule",
@@ -13090,6 +13760,16 @@ extensionProviders:
             options(),
         )
         .expect("translation succeeds despite deferred fields");
+        for field in ["http1MaxPendingRequests", "maxRetries", "h2UpgradePolicy"] {
+            assert!(
+                result
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains(field) && w.contains("not yet projected")),
+                "expected a deferred-field warning mentioning {field}; warnings = {:?}",
+                result.warnings
+            );
+        }
         let dr = &result.config.mesh.unwrap().destination_rules[0];
         let http = dr
             .traffic_policy
@@ -13113,7 +13793,7 @@ extensionProviders:
                 "Sidecar",
                 serde_json::json!({
                     "workloadSelector": {
-                        "matchLabels": {"app": "frontend"}
+                        "labels": {"app": "frontend"}
                     },
                     "egress": [
                         {
@@ -13201,7 +13881,7 @@ extensionProviders:
             &[object(
                 "Sidecar",
                 serde_json::json!({
-                    "workloadSelector": {"matchLabels": {"app": "frontend"}},
+                    "workloadSelector": {"labels": {"app": "frontend"}},
                     "ingress": [
                         {"port": {"number": 8080, "protocol": "HTTP", "name": "http"}}
                     ]
@@ -13271,7 +13951,7 @@ extensionProviders:
             &[object(
                 "Sidecar",
                 serde_json::json!({
-                    "workloadSelector": {"matchLabels": {"app": "frontend"}},
+                    "workloadSelector": {"labels": {"app": "frontend"}},
                     "egress": [
                         {"hosts": ["*/*"]}
                     ]
@@ -13294,15 +13974,15 @@ extensionProviders:
     }
 
     #[test]
-    fn sidecar_with_empty_workload_selector_matchlabels_is_namespace_default() {
-        // workloadSelector present but matchLabels empty → treat as no
+    fn sidecar_with_empty_workload_selector_labels_is_namespace_default() {
+        // workloadSelector present but labels empty → treat as no
         // selector. Mirrors Istio: a Sidecar with an empty selector applies
         // to every workload in the namespace (i.e. namespace-default).
         let result = translate_k8s_objects(
             &[object(
                 "Sidecar",
                 serde_json::json!({
-                    "workloadSelector": {"matchLabels": {}},
+                    "workloadSelector": {"labels": {}},
                     "egress": [
                         {"hosts": ["*/*"]}
                     ]
@@ -13316,7 +13996,34 @@ extensionProviders:
         assert_eq!(mesh.sidecars.len(), 1);
         assert!(
             mesh.sidecars[0].workload_selector.is_none(),
-            "empty matchLabels should round-trip to no selector"
+            "empty labels should round-trip to no selector"
+        );
+    }
+
+    #[test]
+    fn sidecar_matchlabels_selector_remains_compatibility_fallback() {
+        let result = translate_k8s_objects(
+            &[object(
+                "Sidecar",
+                serde_json::json!({
+                    "workloadSelector": {"matchLabels": {"app": "frontend"}},
+                    "egress": [
+                        {"hosts": ["*/*"]}
+                    ]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let selector = mesh.sidecars[0]
+            .workload_selector
+            .as_ref()
+            .expect("fallback matchLabels selector should be preserved");
+        assert_eq!(
+            selector.labels.get("app").map(String::as_str),
+            Some("frontend")
         );
     }
 

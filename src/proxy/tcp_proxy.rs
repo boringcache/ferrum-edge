@@ -2097,6 +2097,11 @@ async fn handle_tcp_connection_inner(
         });
         stream_ctx.tls_client_cert_der = peer_cert_der;
         stream_ctx.tls_client_cert_chain_der = peer_chain_tail_der;
+        stream_ctx.sni_hostname = tls_stream
+            .get_ref()
+            .1
+            .server_name()
+            .map(str::to_ascii_lowercase);
 
         // Run on_stream_connect plugins after TLS handshake so client cert is available.
         if !plugins.is_empty() {

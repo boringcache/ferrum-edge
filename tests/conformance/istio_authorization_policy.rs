@@ -146,6 +146,7 @@ fn authz_deny_wins_when_both_match() {
                 spiffe_id_pattern: Some("spiffe://cluster.local/ns/default/sa/rogue".to_string()),
                 namespace_pattern: None,
                 trust_domain: None,
+                trust_domain_pattern: None,
             }],
             ..MeshRule::default()
         }],
@@ -238,6 +239,37 @@ fn authz_allow_with_rules_admits_matching_request() {
         MeshAuthzDecision::Deny {
             policy: "implicit-deny".to_string()
         }
+    );
+}
+
+#[test]
+fn authz_unsupported_when_key_rejects_policy() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "unsupported when keys fail closed",
+        status = Status::Supported,
+        notes = "Translator rejects unsupported AuthorizationPolicy.when keys so DENY conditions cannot silently fail open.",
+    );
+
+    let err = translate_k8s_objects(
+        &[authz_policy(json!({
+            "action": "DENY",
+            "rules": [{
+                "when": [{
+                    "key": "destination.labels[app]",
+                    "values": ["payments"]
+                }]
+            }]
+        }))],
+        options(),
+    )
+    .expect_err("unsupported when key should reject the policy");
+
+    let message = err.to_string();
+    assert!(
+        message.contains("rules[].when[0].key 'destination.labels[app]'")
+            && message.contains("unsupported"),
+        "error should identify unsupported when key, got: {message}"
     );
 }
 

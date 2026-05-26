@@ -3,9 +3,9 @@
 use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain};
 use ferrum_edge::modes::mesh::config::{
-    AppProtocol, EastWestGateway, JwtHeader, MeshConfig, MeshDestinationRule, MeshEndpoint,
-    MeshJwtRule, MeshPolicy, MeshRequestAuthentication, MeshRule, MeshService, MeshSidecar,
-    MeshSidecarEgress, MeshSubset, MeshTrafficPolicy, MtlsMode, MultiClusterConfig,
+    AppProtocol, ConditionMatch, EastWestGateway, JwtHeader, MeshConfig, MeshDestinationRule,
+    MeshEndpoint, MeshJwtRule, MeshPolicy, MeshRequestAuthentication, MeshRule, MeshService,
+    MeshSidecar, MeshSidecarEgress, MeshSubset, MeshTrafficPolicy, MtlsMode, MultiClusterConfig,
     PeerAuthentication, PolicyAction, PolicyScope, PrincipalMatch, RemoteCluster, RequestMatch,
     Resolution, ServiceEntry, ServiceEntryLocation, ServicePort, TrustBundle, TrustBundleSet,
     Workload, WorkloadPort, WorkloadRef, WorkloadSelector, validate_mesh_config,
@@ -291,6 +291,7 @@ fn mesh_policy_principal_must_have_at_least_one_field() {
                 spiffe_id_pattern: None,
                 namespace_pattern: None,
                 trust_domain: None,
+                trust_domain_pattern: None,
             }],
             to: vec![RequestMatch {
                 methods: vec!["GET".into()],
@@ -298,6 +299,8 @@ fn mesh_policy_principal_must_have_at_least_one_field() {
             }],
             when: Vec::new(),
             request_principals: Vec::new(),
+            not_request_principals: Vec::new(),
+            source_negation: Default::default(),
             never_matches: false,
             action: PolicyAction::Allow,
         }],
@@ -321,10 +324,13 @@ fn mesh_policy_request_match_must_have_at_least_one_constraint() {
                 spiffe_id_pattern: Some("spiffe://td/*".into()),
                 namespace_pattern: None,
                 trust_domain: None,
+                trust_domain_pattern: None,
             }],
             to: vec![RequestMatch::default()],
             when: Vec::new(),
             request_principals: Vec::new(),
+            not_request_principals: Vec::new(),
+            source_negation: Default::default(),
             never_matches: false,
             action: PolicyAction::Allow,
         }],
@@ -349,6 +355,7 @@ fn mesh_policy_glob_pattern_must_be_valid() {
                 spiffe_id_pattern: Some("spiffe://prod/[unclosed".into()),
                 namespace_pattern: None,
                 trust_domain: None,
+                trust_domain_pattern: None,
             }],
             to: vec![RequestMatch {
                 methods: vec!["GET".into()],
@@ -356,6 +363,8 @@ fn mesh_policy_glob_pattern_must_be_valid() {
             }],
             when: Vec::new(),
             request_principals: Vec::new(),
+            not_request_principals: Vec::new(),
+            source_negation: Default::default(),
             never_matches: false,
             action: PolicyAction::Allow,
         }],
@@ -378,14 +387,141 @@ fn policy_with_request_match(request: RequestMatch) -> MeshPolicy {
                 spiffe_id_pattern: Some("spiffe://td/*".into()),
                 namespace_pattern: None,
                 trust_domain: None,
+                trust_domain_pattern: None,
             }],
             to: vec![request],
             when: Vec::new(),
             request_principals: Vec::new(),
+            not_request_principals: Vec::new(),
+            source_negation: Default::default(),
             never_matches: false,
             action: PolicyAction::Allow,
         }],
     }
+}
+
+#[test]
+fn mesh_policy_rejects_unsupported_when_condition_key() {
+    let mut policy = policy_with_request_match(RequestMatch {
+        methods: vec!["GET".into()],
+        ..RequestMatch::default()
+    });
+    policy.rules[0].when.push(ConditionMatch {
+        key: "destination.labels[app]".into(),
+        values: vec!["payments".into()],
+        not_values: Vec::new(),
+    });
+
+    let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], &[], None);
+    assert!(
+        errors.iter().any(|e| {
+            e.contains("rules[0].when[0].key")
+                && e.contains("destination.labels[app]")
+                && e.contains("unsupported")
+        }),
+        "expected unsupported when-key error, got: {:?}",
+        errors
+    );
+}
+
+#[test]
+fn mesh_policy_rejects_when_condition_without_values() {
+    let mut policy = policy_with_request_match(RequestMatch {
+        methods: vec!["GET".into()],
+        ..RequestMatch::default()
+    });
+    policy.rules[0].when.push(ConditionMatch {
+        key: "connection.sni".into(),
+        values: Vec::new(),
+        not_values: Vec::new(),
+    });
+
+    let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], &[], None);
+    assert!(
+        errors
+            .iter()
+            .any(|e| { e.contains("rules[0].when[0]") && e.contains("values or not_values") }),
+        "expected missing condition values error, got: {:?}",
+        errors
+    );
+}
+
+#[test]
+fn mesh_policy_rejects_malformed_ip_when_condition_values() {
+    let mut policy = policy_with_request_match(RequestMatch {
+        methods: vec!["GET".into()],
+        ..RequestMatch::default()
+    });
+    policy.rules[0].when.push(ConditionMatch {
+        key: "source.ip".into(),
+        values: vec!["10.0.0.0/40".into()],
+        not_values: Vec::new(),
+    });
+
+    let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], &[], None);
+    assert!(
+        errors.iter().any(|e| {
+            e.contains("rules[0].when[0].values[0]")
+                && e.contains("10.0.0.0/40")
+                && e.contains("prefix length")
+        }),
+        "expected invalid source.ip condition error, got: {:?}",
+        errors
+    );
+}
+
+#[test]
+fn mesh_policy_rejects_mapped_ipv6_when_condition_prefix_below_mapping_bits() {
+    let mut policy = policy_with_request_match(RequestMatch {
+        methods: vec!["GET".into()],
+        ..RequestMatch::default()
+    });
+    policy.rules[0].when.push(ConditionMatch {
+        key: "remote.ip".into(),
+        values: vec!["::ffff:10.0.0.0/95".into()],
+        not_values: Vec::new(),
+    });
+
+    let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], &[], None);
+    assert!(
+        errors.iter().any(|e| {
+            e.contains("rules[0].when[0].values[0]")
+                && e.contains("::ffff:10.0.0.0/95")
+                && e.contains("IPv4-mapped IPv6")
+        }),
+        "expected invalid mapped IPv6 condition error, got: {:?}",
+        errors
+    );
+}
+
+#[test]
+fn mesh_policy_rejects_malformed_source_negation_ip_blocks() {
+    let mut policy = policy_with_request_match(RequestMatch {
+        methods: vec!["GET".into()],
+        ..RequestMatch::default()
+    });
+    policy.rules[0].source_negation.ip_blocks = vec!["10.0.0.0/40".into()];
+    policy.rules[0].source_negation.remote_ip_blocks = vec!["::ffff:10.0.0.0/95".into()];
+
+    let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], &[], None);
+    assert!(
+        errors.iter().any(|e| {
+            e.contains("rules[0].source_negation.ip_blocks[0]")
+                && e.contains("10.0.0.0/40")
+                && e.contains("prefix length")
+        }),
+        "expected invalid ip_blocks error, got: {:?}",
+        errors
+    );
+    assert!(
+        errors.iter().any(|e| {
+            e.contains("rules[0].source_negation.remote_ip_blocks[0]")
+                && e.contains("::ffff:10.0.0.0/95")
+                && e.contains("IPv4-mapped IPv6")
+        }),
+        "expected invalid remote_ip_blocks error, got: {:?}",
+        errors
+    );
 }
 
 #[test]

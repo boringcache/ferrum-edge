@@ -590,6 +590,8 @@ pub struct DtlsServerConn {
     /// DER-encoded intermediate/CA certificates from the client's certificate chain
     /// (all certs after the peer cert). `None` when no chain certs were sent.
     pub tls_client_cert_chain_der: Option<Arc<Vec<Vec<u8>>>>,
+    /// SNI hostname extracted from the initial DTLS ClientHello, if supplied.
+    pub sni_hostname: Option<String>,
 }
 
 /// A cloneable sender half of a `DtlsServerConn`, used to send data back to
@@ -871,6 +873,7 @@ impl DtlsServer {
         let mut app_out_rx = Some(app_out_rx);
         let (app_in_tx, mut app_in_rx) = mpsc::channel::<Vec<u8>>(256);
         let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
+        let sni_hostname = crate::proxy::sni::extract_sni_from_dtls_client_hello(&initial_packet);
 
         self.sessions.insert(
             peer_addr,
@@ -1072,6 +1075,7 @@ impl DtlsServer {
                                 shutdown_tx: shutdown_tx.clone(),
                                 tls_client_cert_der: peer_cert,
                                 tls_client_cert_chain_der: chain_certs,
+                                sni_hostname: sni_hostname.clone(),
                             };
                             if accept_tx.send((conn, peer_addr)).await.is_err() {
                                 return;
@@ -1452,6 +1456,64 @@ mod tests {
         }
 
         panic!("client did not emit a ClientHello packet");
+    }
+
+    fn dtls_client_hello_packet_with_sni(hostname: &str) -> Vec<u8> {
+        let name_bytes = hostname.as_bytes();
+        let sni_entry_len = 1 + 2 + name_bytes.len();
+        let sni_list_len = sni_entry_len;
+        let sni_ext_data_len = 2 + sni_list_len;
+
+        let mut sni_ext = Vec::new();
+        sni_ext.extend_from_slice(&0x0000u16.to_be_bytes());
+        sni_ext.extend_from_slice(&(sni_ext_data_len as u16).to_be_bytes());
+        sni_ext.extend_from_slice(&(sni_list_len as u16).to_be_bytes());
+        sni_ext.push(0x00);
+        sni_ext.extend_from_slice(&(name_bytes.len() as u16).to_be_bytes());
+        sni_ext.extend_from_slice(name_bytes);
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0xfe, 0xfd]);
+        body.extend_from_slice(&[0u8; 32]);
+        body.push(0);
+        body.push(0);
+        body.extend_from_slice(&2u16.to_be_bytes());
+        body.extend_from_slice(&[0x00, 0x2f]);
+        body.push(1);
+        body.push(0);
+        body.extend_from_slice(&(sni_ext.len() as u16).to_be_bytes());
+        body.extend_from_slice(&sni_ext);
+
+        let mut handshake = Vec::new();
+        handshake.push(0x01);
+        let body_len = body.len();
+        handshake.push((body_len >> 16) as u8);
+        handshake.push((body_len >> 8) as u8);
+        handshake.push(body_len as u8);
+        handshake.extend_from_slice(&[0x00, 0x00]);
+        handshake.extend_from_slice(&[0x00, 0x00, 0x00]);
+        handshake.push((body_len >> 16) as u8);
+        handshake.push((body_len >> 8) as u8);
+        handshake.push(body_len as u8);
+        handshake.extend_from_slice(&body);
+
+        let mut record = Vec::new();
+        record.push(0x16);
+        record.extend_from_slice(&[0xfe, 0xfd]);
+        record.extend_from_slice(&[0x00, 0x00]);
+        record.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x01]);
+        record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+        record.extend_from_slice(&handshake);
+        record
+    }
+
+    #[test]
+    fn dtls_client_hello_sni_is_extracted_for_server_connections() {
+        let packet = dtls_client_hello_packet_with_sni("Admin.Mesh.Internal");
+        assert_eq!(
+            crate::proxy::sni::extract_sni_from_dtls_client_hello(&packet).as_deref(),
+            Some("admin.mesh.internal")
+        );
     }
 
     #[tokio::test]

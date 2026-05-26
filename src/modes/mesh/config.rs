@@ -16,6 +16,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::net::IpAddr;
 
 use crate::identity::spiffe::{SpiffeId, TrustDomain};
 use crate::identity::{JwtAuthority as IdentityJwtAuthority, TrustBundle as IdentityTrustBundle};
@@ -177,6 +178,20 @@ pub struct MeshRule {
     /// An empty list means "any request principal" (no filter).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub request_principals: Vec<String>,
+    /// Istio `from[].source.notRequestPrincipals` — conjunctive negative
+    /// match over JWT-derived request principals. When any pattern matches
+    /// the request's `request_principal`, the rule fails. When no request
+    /// principal is present, the negative match succeeds; this is Istio's
+    /// canonical way to match anonymous requests with
+    /// `notRequestPrincipals: ["*"]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_request_principals: Vec<String>,
+    /// Conjunctive source-negative / IP-block matchers for this rule's
+    /// Istio `from[].source`. ANDed with the ORed positive `from` matches.
+    /// Defaults empty so the common case (positive principals only) and old
+    /// slices round-trip unchanged.
+    #[serde(default, skip_serializing_if = "source_negation_is_empty")]
+    pub source_negation: SourceNegationMatch,
     /// Synthetic marker for rules that should affect policy accounting but
     /// never match traffic, e.g. Istio ALLOW-without-rules allow-nothing.
     #[serde(default, skip_serializing_if = "is_false")]
@@ -198,9 +213,10 @@ pub enum PolicyAction {
     Audit,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct PrincipalMatch {
-    /// Glob pattern over SPIFFE IDs, e.g. `spiffe://prod/ns/foo/sa/*`.
+    /// Glob pattern over Istio source principals (`prod/ns/foo/sa/*`).
+    /// Full `spiffe://...` patterns are also accepted for direct configs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spiffe_id_pattern: Option<String>,
     /// Glob pattern over workload namespace.
@@ -209,6 +225,86 @@ pub struct PrincipalMatch {
     /// Restrict matches to a specific trust domain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trust_domain: Option<TrustDomain>,
+    /// Glob pattern over source trust domains, for Istio `trustDomains`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_domain_pattern: Option<String>,
+}
+
+/// Conjunctive source-negative / IP-block matchers for one Istio
+/// AuthorizationPolicy `from[].source`.
+///
+/// Istio ANDs every field inside a single `source` together, and a request
+/// matches the rule's `from` when **any one** source matches. The positive
+/// identity matchers (`principals` / `namespaces`) translate into the ORed
+/// [`PrincipalMatch`] list on [`MeshRule::from`]; the negative and IP-block
+/// matchers live here on [`MeshRule`] because they must AND with — not OR
+/// against — the positive set. Placing them in the ORed `from` vec would let
+/// traffic through whenever a single negative-only entry "matched", which is
+/// the opposite of Istio's deny-listing intent (fail-open).
+///
+/// IP fields are **fail-closed** when the corresponding request attribute is
+/// absent: a non-empty list with no value to test fails the match rather than
+/// admitting traffic the operator meant to gate. Negative identity and
+/// namespace fields preserve Istio semantics for anonymous traffic, so
+/// `notPrincipals: ["*"]` can be used in a DENY policy to require mTLS.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct SourceNegationMatch {
+    /// Istio `notPrincipals` — globs over the source principal
+    /// (`<trust-domain>/ns/<namespace>/sa/<service-account>`). Full
+    /// `spiffe://...` patterns are also accepted for direct configs. When any
+    /// matches, the source fails. Non-empty + no peer ⇒ negative match
+    /// succeeds, allowing `notPrincipals: ["*"]` to match anonymous traffic.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_spiffe_id_patterns: Vec<String>,
+    /// Istio `notNamespaces` — globs over the source workload namespace
+    /// (extracted from the SPIFFE ID). When any matches, the source fails.
+    /// Non-empty + no namespace ⇒ negative match succeeds.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_namespace_patterns: Vec<String>,
+    /// Istio `notTrustDomains` — globs over the source trust domain. When any
+    /// matches, the source fails. Non-empty + no peer ⇒ negative match
+    /// succeeds.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_trust_domain_patterns: Vec<String>,
+    /// Istio `ipBlocks` — CIDR/IP allow-list over the direct connection peer
+    /// IP (`source.ip`). Non-empty ⇒ the source matches only when the peer
+    /// IP is inside one block. Non-empty + no source IP ⇒ fail-closed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ip_blocks: Vec<String>,
+    /// Istio `notIpBlocks` — negative match over the direct connection peer
+    /// IP. Inside any block ⇒ fail. Non-empty + no source IP ⇒ fail-closed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_ip_blocks: Vec<String>,
+    /// Istio `remoteIpBlocks` — CIDR/IP allow-list over the XFF-derived
+    /// remote client IP (`remote.ip`). Non-empty ⇒ the source matches only
+    /// when the remote IP is inside one block. Non-empty + no remote IP ⇒
+    /// fail-closed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remote_ip_blocks: Vec<String>,
+    /// Istio `notRemoteIpBlocks` — negative match over the XFF-derived
+    /// remote client IP. Inside any block ⇒ fail. Non-empty + no remote IP
+    /// ⇒ fail-closed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_remote_ip_blocks: Vec<String>,
+}
+
+impl SourceNegationMatch {
+    /// True when this matcher carries no constraints (the common case for a
+    /// source that only used positive `principals` / `namespaces`).
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.not_spiffe_id_patterns.is_empty()
+            && self.not_namespace_patterns.is_empty()
+            && self.not_trust_domain_patterns.is_empty()
+            && self.ip_blocks.is_empty()
+            && self.not_ip_blocks.is_empty()
+            && self.remote_ip_blocks.is_empty()
+            && self.not_remote_ip_blocks.is_empty()
+    }
+}
+
+fn source_negation_is_empty(value: &SourceNegationMatch) -> bool {
+    value.is_empty()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -254,6 +350,96 @@ pub struct ConditionMatch {
     pub values: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub not_values: Vec<String>,
+}
+
+// Istio `AuthorizationPolicy.when` keys whose attributes Ferrum can source.
+const CONDITION_SOURCE_PRINCIPAL: &str = "source.principal";
+const CONDITION_SOURCE_NAMESPACE: &str = "source.namespace";
+const CONDITION_SOURCE_IP: &str = "source.ip";
+const CONDITION_REMOTE_IP: &str = "remote.ip";
+const CONDITION_REQUEST_AUTH_PRINCIPAL: &str = "request.auth.principal";
+const CONDITION_REQUEST_AUTH_PRESENTER: &str = "request.auth.presenter";
+const CONDITION_REQUEST_AUTH_AUDIENCES: &str = "request.auth.audiences";
+const CONDITION_DESTINATION_PORT: &str = "destination.port";
+const CONDITION_CONNECTION_SNI: &str = "connection.sni";
+const CONDITION_REQUEST_HEADERS_PREFIX: &str = "request.headers[";
+const CONDITION_REQUEST_AUTH_CLAIMS_PREFIX: &str = "request.auth.claims[";
+
+/// Returns `true` when an AuthorizationPolicy `when[].key` can be materialized
+/// by Ferrum. Unknown keys are rejected at config/translation time because
+/// otherwise a DENY condition on an absent, unsupported attribute silently
+/// fails open.
+pub fn is_supported_mesh_condition_key(key: &str) -> bool {
+    match key {
+        CONDITION_SOURCE_PRINCIPAL
+        | CONDITION_SOURCE_NAMESPACE
+        | CONDITION_SOURCE_IP
+        | CONDITION_REMOTE_IP
+        | CONDITION_REQUEST_AUTH_PRINCIPAL
+        | CONDITION_REQUEST_AUTH_PRESENTER
+        | CONDITION_REQUEST_AUTH_AUDIENCES
+        | CONDITION_DESTINATION_PORT
+        | CONDITION_CONNECTION_SNI => true,
+        _ => {
+            bracketed_mesh_condition_name(key, CONDITION_REQUEST_HEADERS_PREFIX).is_some()
+                || bracketed_mesh_condition_name(key, CONDITION_REQUEST_AUTH_CLAIMS_PREFIX)
+                    .is_some()
+        }
+    }
+}
+
+pub fn is_mesh_condition_ip_key(key: &str) -> bool {
+    matches!(key, CONDITION_SOURCE_IP | CONDITION_REMOTE_IP)
+}
+
+pub fn mesh_condition_has_values(condition: &ConditionMatch) -> bool {
+    !condition.values.is_empty() || !condition.not_values.is_empty()
+}
+
+/// Validate the CIDR/bare-IP syntax used by `source.ip` / `remote.ip` condition
+/// values. Malformed entries would never match at runtime, which is fail-open
+/// for DENY policies.
+pub fn validate_mesh_condition_ip_block(cidr: &str) -> Result<(), String> {
+    let trimmed = cidr.trim();
+    if trimmed.is_empty() {
+        return Err("IP block must not be empty".to_string());
+    }
+    match trimmed.split_once('/') {
+        Some((net, prefix_str)) => {
+            let ip = net
+                .parse::<IpAddr>()
+                .map_err(|_| format!("invalid IP in CIDR '{cidr}'"))?;
+            let prefix = prefix_str
+                .parse::<u8>()
+                .map_err(|_| format!("invalid prefix length in CIDR '{cidr}'"))?;
+            let max = match ip {
+                IpAddr::V4(_) => 32,
+                IpAddr::V6(v6) => {
+                    if v6.to_ipv4_mapped().is_some() && prefix < 96 {
+                        return Err(format!(
+                            "IPv4-mapped IPv6 CIDR prefix {prefix} must be at least 96 in CIDR '{cidr}'"
+                        ));
+                    }
+                    128
+                }
+            };
+            if prefix > max {
+                return Err(format!(
+                    "prefix length {prefix} out of range in CIDR '{cidr}'"
+                ));
+            }
+            Ok(())
+        }
+        None => trimmed
+            .parse::<IpAddr>()
+            .map(|_| ())
+            .map_err(|_| format!("invalid IP address '{cidr}'")),
+    }
+}
+
+fn bracketed_mesh_condition_name<'a>(key: &'a str, prefix: &str) -> Option<&'a str> {
+    let name = key.strip_prefix(prefix)?.strip_suffix(']')?;
+    (!name.is_empty()).then_some(name)
 }
 
 /// Abstraction over per-workload label maps.
@@ -1706,11 +1892,12 @@ fn validate_mesh_config_internal(
                 if principal.spiffe_id_pattern.is_none()
                     && principal.namespace_pattern.is_none()
                     && principal.trust_domain.is_none()
+                    && principal.trust_domain_pattern.is_none()
                 {
                     errors.push(format!(
                         "MeshPolicy '{}'.rules[{}].from[{}]: at least one \
-                         of spiffe_id_pattern/namespace_pattern/trust_domain \
-                         must be set",
+                         of spiffe_id_pattern/namespace_pattern/trust_domain/\
+                         trust_domain_pattern must be set",
                         policy.name, i, j
                     ));
                 }
@@ -1728,6 +1915,15 @@ fn validate_mesh_config_internal(
                 {
                     errors.push(format!(
                         "MeshPolicy '{}'.rules[{}].from[{}].namespace_pattern \
+                         '{}' is not a valid glob: {}",
+                        policy.name, i, j, pat, e
+                    ));
+                }
+                if let Some(pat) = principal.trust_domain_pattern.as_ref()
+                    && let Err(e) = glob::Pattern::new(pat)
+                {
+                    errors.push(format!(
+                        "MeshPolicy '{}'.rules[{}].from[{}].trust_domain_pattern \
                          '{}' is not a valid glob: {}",
                         policy.name, i, j, pat, e
                     ));
@@ -1782,6 +1978,68 @@ fn validate_mesh_config_internal(
                             policy.name, i, j, k, pattern
                         ));
                     }
+                }
+            }
+            validate_mesh_source_negation_ip_values(
+                policy,
+                i,
+                "ip_blocks",
+                &rule.source_negation.ip_blocks,
+                &mut errors,
+            );
+            validate_mesh_source_negation_ip_values(
+                policy,
+                i,
+                "not_ip_blocks",
+                &rule.source_negation.not_ip_blocks,
+                &mut errors,
+            );
+            validate_mesh_source_negation_ip_values(
+                policy,
+                i,
+                "remote_ip_blocks",
+                &rule.source_negation.remote_ip_blocks,
+                &mut errors,
+            );
+            validate_mesh_source_negation_ip_values(
+                policy,
+                i,
+                "not_remote_ip_blocks",
+                &rule.source_negation.not_remote_ip_blocks,
+                &mut errors,
+            );
+            for (j, condition) in rule.when.iter().enumerate() {
+                if !is_supported_mesh_condition_key(&condition.key) {
+                    errors.push(format!(
+                        "MeshPolicy '{}'.rules[{}].when[{}].key '{}' is unsupported",
+                        policy.name, i, j, condition.key
+                    ));
+                    continue;
+                }
+                if !mesh_condition_has_values(condition) {
+                    errors.push(format!(
+                        "MeshPolicy '{}'.rules[{}].when[{}].key '{}' must set values or not_values",
+                        policy.name, i, j, condition.key
+                    ));
+                    continue;
+                }
+                if is_mesh_condition_ip_key(&condition.key) {
+                    validate_mesh_condition_ip_values(
+                        policy,
+                        i,
+                        j,
+                        "values",
+                        &condition.values,
+                        &mut errors,
+                    );
+                    validate_mesh_condition_ip_values(
+                        policy,
+                        i,
+                        j,
+                        "not_values",
+                        &condition.not_values,
+                        &mut errors,
+                    );
                 }
             }
         }
@@ -2006,6 +2264,41 @@ fn validate_non_empty_string(context: String, value: &str, errors: &mut Vec<Stri
 fn validate_non_zero_port(context: String, port: u16, errors: &mut Vec<String>) {
     if port == 0 {
         errors.push(format!("{context}: port must be greater than 0"));
+    }
+}
+
+fn validate_mesh_source_negation_ip_values(
+    policy: &MeshPolicy,
+    rule_index: usize,
+    field: &str,
+    blocks: &[String],
+    errors: &mut Vec<String>,
+) {
+    for (block_index, block) in blocks.iter().enumerate() {
+        if let Err(error) = validate_mesh_condition_ip_block(block) {
+            errors.push(format!(
+                "MeshPolicy '{}'.rules[{}].source_negation.{}[{}] '{}': {}",
+                policy.name, rule_index, field, block_index, block, error
+            ));
+        }
+    }
+}
+
+fn validate_mesh_condition_ip_values(
+    policy: &MeshPolicy,
+    rule_index: usize,
+    condition_index: usize,
+    field: &str,
+    blocks: &[String],
+    errors: &mut Vec<String>,
+) {
+    for (block_index, block) in blocks.iter().enumerate() {
+        if let Err(error) = validate_mesh_condition_ip_block(block) {
+            errors.push(format!(
+                "MeshPolicy '{}'.rules[{}].when[{}].{}[{}] '{}': {}",
+                policy.name, rule_index, condition_index, field, block_index, block, error
+            ));
+        }
     }
 }
 

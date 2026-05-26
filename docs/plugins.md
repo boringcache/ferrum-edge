@@ -1337,6 +1337,7 @@ Authenticates using Bearer JWTs validated against one or more Identity Provider 
 | `consumer_header_claim` | String | Global JWT claim for `X-Consumer-Username` header (default: same as `consumer_identity_claim`) |
 | `claim_headers` | Object | Global claim-to-header mappings used when the matched provider has no provider override |
 | `claim_headers_separator` | String | Global separator for array claim header values (default: `","`) |
+| `emit_mesh_request_principal_metadata` | Boolean | Emit `mesh.request_principal` plus mesh JWT claim/audience metadata for direct `mesh_authz` request-principal and `when` condition evaluation (default: `false`) |
 | `require_exp` | Boolean | Global default for requiring an `exp` claim (default: `true`) |
 | `jwks_refresh_interval_secs` | u64 | JWKS key refresh interval in seconds (default: `900`) |
 
