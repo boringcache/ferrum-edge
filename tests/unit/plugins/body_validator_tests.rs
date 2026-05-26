@@ -2105,3 +2105,53 @@ async fn test_on_final_request_body_validates_json_when_before_proxy_cannot() {
 
     assert_reject(result, Some(400));
 }
+
+#[tokio::test]
+async fn billion_laughs_nested_entities_are_rejected() {
+    let plugin = xml_plugin();
+    let body = r#"<?xml version="1.0"?><!DOCTYPE lolz [<!ENTITY lol "lol"><!ENTITY lol2 "&lol;&lol;&lol;"><!ENTITY lol3 "&lol2;&lol2;&lol2;">]><lolz>&lol3;</lolz>"#;
+    let mut ctx = make_xml_ctx(body);
+    let mut headers = make_xml_headers();
+
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+#[tokio::test]
+async fn too_many_xml_entities_are_rejected() {
+    let plugin = BodyValidator::new(&json!({
+        "validate_xml": true,
+        "xml_max_entities": 2
+    }))
+    .unwrap();
+    let body = r#"<!DOCTYPE r [<!ENTITY a "x"><!ENTITY b "y"><!ENTITY c "z">]><r>ok</r>"#;
+    let mut ctx = make_xml_ctx(body);
+    let mut headers = make_xml_headers();
+
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+#[tokio::test]
+async fn benign_doctype_without_nested_entities_is_allowed() {
+    let plugin = xml_plugin();
+    let body = r#"<!DOCTYPE r [<!ENTITY a "hello">]><r>world</r>"#;
+    let mut ctx = make_xml_ctx(body);
+    let mut headers = make_xml_headers();
+
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+}
+
+#[tokio::test]
+async fn nested_entity_rejection_can_be_disabled() {
+    let plugin = BodyValidator::new(&json!({
+        "validate_xml": true,
+        "xml_reject_nested_entities": false
+    }))
+    .unwrap();
+    // Same nesting as the billion-laughs body, but under the count cap and with
+    // the nested-reference check disabled — allowed through.
+    let body = r#"<?xml version="1.0"?><!DOCTYPE lolz [<!ENTITY lol "lol"><!ENTITY lol2 "&lol;&lol;&lol;">]><lolz>&lol2;</lolz>"#;
+    let mut ctx = make_xml_ctx(body);
+    let mut headers = make_xml_headers();
+
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+}

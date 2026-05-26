@@ -44,6 +44,13 @@ pub struct BodyValidator {
     validate_xml: bool,
     /// Required XML elements in request bodies.
     required_xml_elements: Vec<String>,
+    /// Max `<!ENTITY` declarations allowed in an XML DOCTYPE before the body is
+    /// rejected as a possible entity-expansion (billion-laughs) attack. Applies
+    /// to both request and response XML when well-formedness validation runs.
+    xml_max_entities: usize,
+    /// Reject XML whose entity definitions reference other general entities —
+    /// the billion-laughs expansion signature.
+    xml_reject_nested_entities: bool,
     /// Content types to validate for requests (empty = validate all).
     content_types: Vec<String>,
     /// Pre-compiled regexes for JSON Schema `pattern` constraints (request).
@@ -102,6 +109,9 @@ impl BodyValidator {
         let validate_xml = optional_bool(config, "validate_xml")?.unwrap_or(false);
         let required_xml_elements =
             optional_string_vec(config, "required_xml_elements")?.unwrap_or_default();
+        let xml_max_entities = optional_usize(config, "xml_max_entities")?.unwrap_or(100);
+        let xml_reject_nested_entities =
+            optional_bool(config, "xml_reject_nested_entities")?.unwrap_or(true);
         let content_types =
             optional_content_types(config, "content_types")?.unwrap_or_else(default_content_types);
 
@@ -176,6 +186,8 @@ impl BodyValidator {
             required_fields,
             validate_xml,
             required_xml_elements,
+            xml_max_entities,
+            xml_reject_nested_entities,
             content_types,
             compiled_patterns,
             response_json_schema,
@@ -495,7 +507,12 @@ impl BodyValidator {
         Ok(())
     }
 
-    fn validate_xml_body(body: &str, required_xml_elements: &[String]) -> Result<(), String> {
+    fn validate_xml_body(
+        body: &str,
+        required_xml_elements: &[String],
+        max_entities: usize,
+        reject_nested: bool,
+    ) -> Result<(), String> {
         // Basic well-formedness check: must start with < and have matching tags
         let trimmed = body.trim();
         if trimmed.is_empty() {
@@ -504,6 +521,10 @@ impl BodyValidator {
         if !trimmed.starts_with('<') {
             return Err("Invalid XML: must start with '<'".to_string());
         }
+
+        // Reject entity-expansion bombs at the edge (Ferrum does not expand
+        // entities, but backends do).
+        check_xml_entity_expansion(trimmed, max_entities, reject_nested)?;
 
         // Check for required elements
         for element in required_xml_elements {
@@ -851,6 +872,79 @@ fn content_type_matches(configured: &[String], content_type: &str) -> bool {
 
 fn is_grpc_content_type(content_type: &str) -> bool {
     ascii_starts_with_ignore_case(content_type, "application/grpc")
+}
+
+/// Reject XML whose DOCTYPE declares an entity-expansion bomb ("billion
+/// laughs"). Ferrum does not expand entities; this protects backends that do.
+/// `max_entities` caps the number of `<!ENTITY` declarations; when
+/// `reject_nested` is set, any entity whose value references another
+/// general entity (the exponential-expansion signature) is rejected outright.
+fn check_xml_entity_expansion(
+    body: &str,
+    max_entities: usize,
+    reject_nested: bool,
+) -> Result<(), String> {
+    let bytes = body.as_bytes();
+    let needle = b"<!ENTITY";
+    let mut count = 0usize;
+    let mut i = 0usize;
+    while i + needle.len() <= bytes.len() {
+        if bytes[i..i + needle.len()].eq_ignore_ascii_case(needle) {
+            count += 1;
+            if count > max_entities {
+                return Err(format!(
+                    "XML declares more than {max_entities} entities (possible entity-expansion attack)"
+                ));
+            }
+            let decl_end = find_subsequence(&bytes[i..], b">")
+                .map(|end| i + end)
+                .unwrap_or(bytes.len());
+            if reject_nested && entity_value_references_general_entity(&body[i..decl_end]) {
+                return Err(
+                    "XML entity definition references another entity (billion-laughs protection)"
+                        .to_string(),
+                );
+            }
+            i = decl_end;
+        } else {
+            i += 1;
+        }
+    }
+    Ok(())
+}
+
+/// True if an `<!ENTITY ...>` declaration's value references a non-predefined
+/// general entity (`&name;`), which is how billion-laughs chains expansion.
+/// Numeric character references (`&#..;`) and the five predefined entities are
+/// safe and ignored.
+fn entity_value_references_general_entity(decl: &str) -> bool {
+    let bytes = decl.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'&' {
+            if bytes.get(i + 1) == Some(&b'#') {
+                i += 1;
+                continue;
+            }
+            let mut j = i + 1;
+            while j < bytes.len()
+                && j - i <= 32
+                && (bytes[j].is_ascii_alphanumeric() || matches!(bytes[j], b'_' | b'-' | b'.'))
+            {
+                j += 1;
+            }
+            if j > i + 1 && bytes.get(j) == Some(&b';') {
+                let name = &decl[i + 1..j];
+                if !matches!(name, "lt" | "gt" | "amp" | "quot" | "apos") {
+                    return true;
+                }
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    false
 }
 
 fn is_json_like_content_type(content_type: &str) -> bool {
@@ -1256,7 +1350,12 @@ impl Plugin for BodyValidator {
                 &self.compiled_patterns,
             )
         } else if is_xml_like_content_type(content_type) && self.validate_xml {
-            Self::validate_xml_body(body, &self.required_xml_elements)
+            Self::validate_xml_body(
+                body,
+                &self.required_xml_elements,
+                self.xml_max_entities,
+                self.xml_reject_nested_entities,
+            )
         } else {
             Ok(())
         };
@@ -1330,7 +1429,12 @@ impl Plugin for BodyValidator {
                     &self.compiled_patterns,
                 )
             } else if is_xml_like_content_type(content_type) && self.validate_xml {
-                Self::validate_xml_body(body_str, &self.required_xml_elements)
+                Self::validate_xml_body(
+                    body_str,
+                    &self.required_xml_elements,
+                    self.xml_max_entities,
+                    self.xml_reject_nested_entities,
+                )
             } else {
                 Ok(())
             };
@@ -1472,7 +1576,12 @@ impl Plugin for BodyValidator {
                 &self.response_compiled_patterns,
             )
         } else if is_xml_like_content_type(content_type) && self.response_validate_xml {
-            Self::validate_xml_body(body_str, &self.response_required_xml_elements)
+            Self::validate_xml_body(
+                body_str,
+                &self.response_required_xml_elements,
+                self.xml_max_entities,
+                self.xml_reject_nested_entities,
+            )
         } else {
             Ok(())
         };

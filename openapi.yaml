@@ -11370,6 +11370,21 @@ components:
             type: string
           default: []
           description: Required XML element names
+        xml_max_entities:
+          type: integer
+          format: uint64
+          default: 100
+          description: >-
+            Max <!ENTITY declarations allowed in an XML DOCTYPE before the body
+            is rejected as a possible entity-expansion (billion-laughs) attack.
+            Applies to request and response XML when well-formedness validation
+            runs.
+        xml_reject_nested_entities:
+          type: boolean
+          default: true
+          description: >-
+            Reject XML whose entity definitions reference other general
+            entities (the billion-laughs expansion signature).
         content_types:
           type: array
           items:
