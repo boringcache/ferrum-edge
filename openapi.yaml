@@ -9522,6 +9522,17 @@ components:
             `PolicyScopeCache` attached to `RequestContext.node_waypoint_policy_scope`.
             Auto-set by mesh injection on `NodeWaypoint` topology where one
             listener serves many pods.
+        trusted_hbone_assertors:
+          type: array
+          items:
+            type: string
+          description: |
+            Allow-list of identity-asserting infrastructure components whose
+            HBONE baggage `source.principal` may rewrite the authz principal.
+            Bare service-account names match any peer whose SPIFFE path ends
+            with `/sa/<name>`; full SPIFFE IDs match exactly. Default is
+            `["ztunnel", "waypoint"]`. Explicit empty array disables all
+            baggage rewriting.
 
     MeshOutboundRegistryConfig:
       type: object
