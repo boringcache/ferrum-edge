@@ -1790,12 +1790,34 @@ pub fn is_grpc_request(req: &Request<Incoming>) -> bool {
     is_grpc_content_type(req.headers())
 }
 
-/// Check if headers indicate a gRPC request (content-type starts with "application/grpc").
+/// Check if headers indicate a native gRPC request.
 pub fn is_grpc_content_type(headers: &hyper::HeaderMap) -> bool {
+    const PREFIX: &str = "application/grpc";
+
     headers
         .get("content-type")
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|ct| ct.starts_with("application/grpc"))
+        .is_some_and(|ct| {
+            let Some(prefix) = ct.get(..PREFIX.len()) else {
+                return false;
+            };
+            if !prefix.eq_ignore_ascii_case(PREFIX) {
+                return false;
+            }
+
+            match ct.as_bytes().get(PREFIX.len()) {
+                None => true,
+                Some(b'+') | Some(b';') => true,
+                Some(b' ' | b'\t') => {
+                    ct.as_bytes()[PREFIX.len()..]
+                        .iter()
+                        .copied()
+                        .find(|b| !matches!(b, b' ' | b'\t'))
+                        == Some(b';')
+                }
+                _ => false,
+            }
+        })
 }
 
 /// Parse the `grpc-timeout` header value into milliseconds.
