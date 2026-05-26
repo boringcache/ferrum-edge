@@ -824,3 +824,42 @@ fn unknown_rule_modes_id_fails_construction() {
     assert!(err.contains("unknown rule id"));
     assert!(err.contains("FE-XSS-99"));
 }
+
+#[tokio::test]
+async fn body_normalization_catches_escaped_payload_the_raw_scan_misses() {
+    // A custom body rule matches `<script`. The payload arrives `\x`-escaped,
+    // so the raw byte scan never sees the tag — only the decode/normalization
+    // pass recovers it. Regression guard for the body-evasion gap.
+    let plugin = Waf::new(&json!({
+        "include_default_rules": false,
+        "custom_rules": [{
+            "id": "CUSTOM-XSS-BODY",
+            "name": "script tag in body",
+            "category": "custom",
+            "severity": "high",
+            "target": "body_text",
+            "match_kind": "contains",
+            "pattern": "<script",
+            "action": "enforce"
+        }]
+    }))
+    .unwrap();
+    let mut ctx = ctx("POST", "/submit");
+    ctx.headers
+        .insert("content-type".into(), "application/json".into());
+    let headers = ctx.headers.clone();
+
+    // Sanity: the literal escaped form does not contain `<script`.
+    let escaped = br"{q:\x3cscript\x3ealert(1)}";
+    assert!(!escaped.windows(7).any(|w| w == b"<script"));
+
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, escaped)
+        .await;
+
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert_eq!(
+        ctx.metadata.get("waf.rule_hits").map(String::as_str),
+        Some("CUSTOM-XSS-BODY")
+    );
+}

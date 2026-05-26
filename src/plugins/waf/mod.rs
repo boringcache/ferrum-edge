@@ -15,6 +15,7 @@
 mod decode;
 mod defaults;
 mod exemptions;
+mod normalize;
 mod rules;
 mod scan;
 

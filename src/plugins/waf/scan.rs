@@ -6,6 +6,7 @@ use percent_encoding::percent_decode_str;
 
 use super::Waf;
 use super::decode;
+use super::normalize;
 use super::rules::{
     BytesRuleSet, JsonPathMatcher, JsonPathRule, JsonPathSegment, RuleHit, RuleRef, RuleTarget,
     TextRuleSet, extract_ip_tokens,
@@ -203,6 +204,16 @@ impl Waf {
         self.scan_bytes_set(&mut outcome, self.compiled.body_bytes.as_ref(), body, ctx);
         self.scan_json_path_rules(&mut outcome, body, ctx);
         if let Ok(text) = std::str::from_utf8(body) {
+            // Re-scan decoded forms so payloads hidden behind JSON `\uXXXX`,
+            // HTML entities, or percent-encoding cannot evade the raw-byte set.
+            for variant in normalize::decoded_variants(text) {
+                self.scan_bytes_set(
+                    &mut outcome,
+                    self.compiled.body_bytes.as_ref(),
+                    variant.as_bytes(),
+                    ctx,
+                );
+            }
             self.scan_luhn_rules(&mut outcome, text, &self.compiled.body_luhn_rules, ctx);
             self.scan_cidr_rules(&mut outcome, text, &self.compiled.body_cidr_rules, ctx);
         }
@@ -251,6 +262,14 @@ impl Waf {
             ctx,
         );
         if let Ok(text) = std::str::from_utf8(body) {
+            for variant in normalize::decoded_variants(text) {
+                self.scan_bytes_set(
+                    &mut outcome,
+                    self.compiled.response_body_bytes.as_ref(),
+                    variant.as_bytes(),
+                    ctx,
+                );
+            }
             self.scan_luhn_rules(&mut outcome, text, &self.compiled.response_luhn_rules, ctx);
             self.scan_cidr_rules(&mut outcome, text, &self.compiled.response_cidr_rules, ctx);
         }
