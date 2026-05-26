@@ -3318,6 +3318,13 @@ async fn serve_mesh_runtime(
         {
             mesh_background_handles.push(handle);
         }
+        // GAP-1b: spawn the orig-dst → identity bridge. It reads the pinned
+        // FERRUM_ORIG_DST4/6 maps the node-agent populated and mirrors each
+        // socket-cookie record into the resolver, giving record_orig_dst*
+        // their production caller. Without a node-agent / eBPF build the
+        // spawned task logs loudly and returns; the resolver stays empty and
+        // the accept path keeps failing closed.
+        mesh_background_handles.push(spawn_orig_dst_bridge_task(resolver.clone(), &shutdown_tx));
         proxy_state.with_node_waypoint_identity_resolver(resolver)
     } else {
         proxy_state
@@ -4668,6 +4675,25 @@ fn spawn_sock_ops_consumer_task(
         );
         None
     }
+}
+
+/// Spawn the node-waypoint orig-dst → identity bridge (GAP-1b). Always returns
+/// a handle: on non-eBPF / non-Linux builds the task logs once that no capture
+/// runs and returns, so the resolver stays empty and the accept path fails
+/// closed. The bridge owns the startup-race retry and node-agent-restart
+/// re-open logic in `crate::ebpf::orig_dst_bridge`.
+fn spawn_orig_dst_bridge_task(
+    resolver: std::sync::Arc<crate::modes::mesh::node_waypoint::NodeWaypointIdentityResolver>,
+    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+) -> tokio::task::JoinHandle<()> {
+    let shutdown_rx = shutdown_tx.subscribe();
+    tokio::spawn(async move {
+        if let Err(err) =
+            crate::ebpf::orig_dst_bridge::run_orig_dst_bridge(resolver, shutdown_rx).await
+        {
+            tracing::warn!(error = %err, "Node-waypoint orig-dst bridge task exited with error");
+        }
+    })
 }
 
 #[cfg(test)]

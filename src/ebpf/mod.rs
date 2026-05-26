@@ -14,6 +14,7 @@ pub mod kernel_probe;
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 pub mod loader;
 pub mod maps;
+pub mod orig_dst_bridge;
 pub mod pod_watcher;
 pub mod veth;
 
@@ -27,7 +28,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
 use ferrum_ebpf_common::{BpfCaptureConfig, INBOUND_HBONE_PORT, OUTBOUND_CAPTURE_PORT};
-pub use ferrum_ebpf_common::{INCLUDE_PORTS_MAX, IncludePortsPolicy};
+pub use ferrum_ebpf_common::{INCLUDE_PORTS_MAX, IncludePortsPolicy, WorkloadIdentity};
 
 pub const DEFAULT_NODE_AGENT_SOCKET_PATH: &str = "/run/ferrum/node-agent.sock";
 pub const BPF_MAP_ORIG_DST4: &str = "FERRUM_ORIG_DST4";
@@ -41,6 +42,9 @@ pub const BPF_MAP_CIDR_INCLUDE6: &str = "FERRUM_CIDR_INCLUDE6";
 pub const BPF_MAP_PORT_EXCLUDE: &str = "FERRUM_PORT_EXCLUDE";
 pub const BPF_MAP_INCLUDE_PORTS: &str = "FERRUM_INCLUDE_PORTS";
 pub const BPF_MAP_CAPTURE_CONFIG: &str = "FERRUM_CAPTURE_CONFIG";
+/// Per-cgroup source workload identity map. Written by the node-agent on pod
+/// enrollment; read by the connect hooks to stamp orig-dst records.
+pub const BPF_MAP_WORKLOAD_IDENTITY: &str = "FERRUM_WORKLOAD_IDENTITY";
 
 /// Name of the BPF ringbuf map that ferries SOCK_OPS event records from the
 /// kernel to the userspace consumer.
@@ -57,6 +61,15 @@ pub const BPF_SOCK_OPS_EVENTS_PIN_PATH: &str = "/sys/fs/bpf/ferrum/sock_ops_even
 
 /// Pinned path for the SOCK_OPS dropped-events counter array.
 pub const BPF_SOCK_OPS_STATS_PIN_PATH: &str = "/sys/fs/bpf/ferrum/sock_ops_stats";
+
+/// Pinned path for the IPv4 original-destination map. Node-agent loads + pins;
+/// the node-waypoint mesh-proxy opens by path through the orig-dst bridge
+/// (GAP-1b) to recover per-socket source identity. Both sides agree on the
+/// constant so no IPC is required — mirroring the SOCK_OPS pin contract.
+pub const BPF_ORIG_DST4_PIN_PATH: &str = "/sys/fs/bpf/ferrum/orig_dst4";
+
+/// Pinned path for the IPv6 original-destination map.
+pub const BPF_ORIG_DST6_PIN_PATH: &str = "/sys/fs/bpf/ferrum/orig_dst6";
 
 /// Program name of the SOCK_OPS kernel program in the ELF.
 pub const BPF_PROGRAM_SOCK_OPS: &str = "ferrum_sock_ops";
@@ -386,6 +399,11 @@ pub struct PodAttachmentState {
     /// or, worse, ignore live edits to `traffic.sidecar.istio.io/includeOutboundPorts`
     /// (the GAP-2K mid-life update gap this field closes).
     pub include_ports_policy: Option<IncludePortsPolicy>,
+    /// Set when this pod has an active `FERRUM_WORKLOAD_IDENTITY` entry
+    /// (GAP-1b). The cgroup id is the removal key, captured at enrollment so
+    /// un-enrollment can drop the entry without re-statting a possibly-gone
+    /// cgroup path. `None` when the identity could not be derived or written.
+    pub workload_identity_cgroup_id: Option<u64>,
 }
 
 /// Fallback behavior when the kernel does not support eBPF capture.
@@ -445,6 +463,23 @@ pub trait EbpfBackend: Send + Sync {
     /// un-enrollment / removal. Tolerates ENOENT (pod was never
     /// annotated) by returning `Ok(())`.
     fn remove_pod_include_ports(&mut self, cgroup_id: u64) -> Result<(), String>;
+
+    /// Write the source workload identity for a pod cgroup (GAP-1b). The
+    /// node-agent calls this when a pod enrolls so the BPF connect hooks can
+    /// stamp `FERRUM_ORIG_DST4/6` records with the source pod's UID and
+    /// SPIFFE hash. Without it, the connect hooks emit the all-zero sentinel
+    /// and the node-waypoint resolver can never recover a real identity from a
+    /// socket cookie.
+    fn update_workload_identity(
+        &mut self,
+        cgroup_id: u64,
+        identity: &WorkloadIdentity,
+    ) -> Result<(), String>;
+
+    /// Counterpart to `update_workload_identity`. Called on pod
+    /// un-enrollment / removal. Tolerates ENOENT by returning `Ok(())`.
+    fn remove_workload_identity(&mut self, cgroup_id: u64) -> Result<(), String>;
+
     fn cleanup_all(&mut self) -> Result<(), String>;
 
     /// Attach the SOCK_OPS program to the cgroup root and pin the event
@@ -474,6 +509,10 @@ pub struct MockEbpfBackend {
     /// the same `cgroup_id`. Tests assert on this map to verify a pod's
     /// annotation parsed correctly all the way down to the BPF surface.
     pub include_ports: HashMap<u64, IncludePortsPolicy>,
+    /// Per-cgroup source workload identity writes (GAP-1b). Insert overwrites
+    /// the previous entry for the same `cgroup_id`. Tests assert on this map to
+    /// verify a pod's identity reached the BPF surface.
+    pub workload_identities: HashMap<u64, WorkloadIdentity>,
     pub detached_pods: Vec<String>,
     pub cleaned_up: bool,
     pub fail_update_capture_config: bool,
@@ -560,11 +599,26 @@ impl EbpfBackend for MockEbpfBackend {
         Ok(())
     }
 
+    fn update_workload_identity(
+        &mut self,
+        cgroup_id: u64,
+        identity: &WorkloadIdentity,
+    ) -> Result<(), String> {
+        self.workload_identities.insert(cgroup_id, *identity);
+        Ok(())
+    }
+
+    fn remove_workload_identity(&mut self, cgroup_id: u64) -> Result<(), String> {
+        self.workload_identities.remove(&cgroup_id);
+        Ok(())
+    }
+
     fn cleanup_all(&mut self) -> Result<(), String> {
         self.cgroup_attachments.clear();
         self.tc_attachments.clear();
         self.pod_ips.clear();
         self.include_ports.clear();
+        self.workload_identities.clear();
         self.sock_ops_attached_cgroup_root = None;
         self.cleaned_up = true;
         Ok(())
@@ -760,5 +814,29 @@ mod tests {
         );
         backend.cleanup_all().unwrap();
         assert!(backend.sock_ops_attached_cgroup_root.is_none());
+    }
+
+    #[test]
+    fn mock_backend_workload_identity_lifecycle() {
+        let mut backend = MockEbpfBackend::default();
+        let identity = WorkloadIdentity::new([7u8; 16], 0xdead_beef);
+
+        backend.update_workload_identity(4242, &identity).unwrap();
+        assert_eq!(backend.workload_identities.get(&4242), Some(&identity));
+
+        // Re-write overwrites the same cgroup entry.
+        let updated = WorkloadIdentity::new([8u8; 16], 0xfeed_face);
+        backend.update_workload_identity(4242, &updated).unwrap();
+        assert_eq!(backend.workload_identities.get(&4242), Some(&updated));
+
+        backend.remove_workload_identity(4242).unwrap();
+        assert!(backend.workload_identities.is_empty());
+        // Removing a missing cgroup is tolerated.
+        backend.remove_workload_identity(4242).unwrap();
+
+        // cleanup_all clears the identity map too.
+        backend.update_workload_identity(1, &identity).unwrap();
+        backend.cleanup_all().unwrap();
+        assert!(backend.workload_identities.is_empty());
     }
 }
