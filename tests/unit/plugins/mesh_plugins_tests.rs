@@ -97,6 +97,25 @@ fn request_context(source: Option<&str>) -> RequestContext {
     ctx
 }
 
+fn stream_context() -> StreamConnectionContext {
+    StreamConnectionContext {
+        client_ip: "127.0.0.1".to_string(),
+        proxy_id: "tcp-proxy".to_string(),
+        proxy_name: None,
+        listen_port: 15443,
+        backend_scheme: BackendScheme::Tcps,
+        consumer_index: Arc::new(ConsumerIndex::new(&[])),
+        identified_consumer: None,
+        authenticated_identity: None,
+        auth_method: None,
+        metadata: None,
+        tls_client_cert_der: None,
+        tls_client_cert_chain_der: None,
+        sni_hostname: None,
+        mesh_direction: None,
+    }
+}
+
 #[test]
 fn mesh_config_normalize_lowercases_policy_hosts() {
     let mut mesh = MeshConfig {
@@ -245,6 +264,26 @@ fn mesh_authz_rejects_unsupported_direct_when_key() {
 }
 
 #[test]
+fn mesh_authz_rejects_direct_when_condition_without_values() {
+    let mut policy = allow_client_policy(PolicyAction::Deny);
+    policy.rules[0].when.push(ConditionMatch {
+        key: "connection.sni".to_string(),
+        values: Vec::new(),
+        not_values: Vec::new(),
+    });
+
+    let err = match MeshAuthz::new(&json!({
+        "mesh_policies": [policy],
+    })) {
+        Ok(_) => panic!("direct mesh_policies with empty when condition must fail closed"),
+        Err(err) => err,
+    };
+
+    assert!(err.contains("connection.sni"));
+    assert!(err.contains("values or notValues"));
+}
+
+#[test]
 fn mesh_authz_rejects_invalid_direct_when_ip_block() {
     let mut policy = allow_client_policy(PolicyAction::Deny);
     policy.rules[0].when.push(ConditionMatch {
@@ -266,6 +305,39 @@ fn mesh_authz_rejects_invalid_direct_when_ip_block() {
     );
     assert!(err.contains("values"), "error should name field: {err}");
     assert!(err.contains("10.0.0.0/40"), "error should name CIDR: {err}");
+}
+
+#[tokio::test]
+async fn mesh_authz_stream_connection_sni_denies_matching_sni() {
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [{
+            "name": "deny-admin-sni",
+            "namespace": "default",
+            "scope": {"kind": "mesh_wide"},
+            "rules": [{
+                "when": [{
+                    "key": "connection.sni",
+                    "values": ["admin.mesh.internal"]
+                }],
+                "action": "deny"
+            }]
+        }]
+    }))
+    .expect("plugin config");
+
+    let mut blocked = stream_context();
+    blocked.sni_hostname = Some("admin.mesh.internal".to_string());
+    assert!(matches!(
+        plugin.on_stream_connect(&mut blocked).await,
+        PluginResult::Reject { .. }
+    ));
+
+    let mut admitted = stream_context();
+    admitted.sni_hostname = Some("public.mesh.internal".to_string());
+    assert!(matches!(
+        plugin.on_stream_connect(&mut admitted).await,
+        PluginResult::Continue
+    ));
 }
 
 #[tokio::test]

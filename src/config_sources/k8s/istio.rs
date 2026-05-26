@@ -14,7 +14,7 @@ use crate::modes::mesh::config::{
     RequestMatch, Resolution, ServiceEntry, ServiceEntryLocation, ServicePort, SourceNegationMatch,
     TagOverrideOperation, TelemetryTracingMode, TracingProvider, Workload, WorkloadPort,
     WorkloadSelector, is_mesh_condition_ip_key, is_supported_mesh_condition_key,
-    validate_mesh_condition_ip_block,
+    mesh_condition_has_values, validate_mesh_condition_ip_block,
 };
 
 use super::{
@@ -538,15 +538,22 @@ fn condition_match(
     }
     let values = string_array(value, "values");
     let not_values = string_array(value, "notValues");
-    if is_mesh_condition_ip_key(key) {
-        validate_condition_ip_blocks(object, index, "values", &values)?;
-        validate_condition_ip_blocks(object, index, "notValues", &not_values)?;
-    }
-    Ok(ConditionMatch {
+    let condition = ConditionMatch {
         key: key.to_string(),
         values,
         not_values,
-    })
+    };
+    if !mesh_condition_has_values(&condition) {
+        return Err(invalid_resource(
+            object,
+            format!("rules[].when[{index}].key '{key}' must set values or notValues"),
+        ));
+    }
+    if is_mesh_condition_ip_key(key) {
+        validate_condition_ip_blocks(object, index, "values", &condition.values)?;
+        validate_condition_ip_blocks(object, index, "notValues", &condition.not_values)?;
+    }
+    Ok(condition)
 }
 
 fn validate_condition_ip_blocks(
@@ -4267,6 +4274,28 @@ mod tests {
                 .contains("rules[].when[0].key 'destination.labels[app]'")
         );
         assert!(err.to_string().contains("unsupported"));
+    }
+
+    #[test]
+    fn rejects_authorization_policy_when_without_values() {
+        let err = translate_k8s_objects(
+            &[object(
+                "AuthorizationPolicy",
+                serde_json::json!({
+                    "action": "DENY",
+                    "rules": [{
+                        "when": [{
+                            "key": "connection.sni"
+                        }]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("when conditions without values/notValues must fail closed");
+
+        assert!(err.to_string().contains("rules[].when[0]"));
+        assert!(err.to_string().contains("values or notValues"));
     }
 
     #[test]

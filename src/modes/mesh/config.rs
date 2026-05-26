@@ -392,6 +392,10 @@ pub fn is_mesh_condition_ip_key(key: &str) -> bool {
     matches!(key, CONDITION_SOURCE_IP | CONDITION_REMOTE_IP)
 }
 
+pub fn mesh_condition_has_values(condition: &ConditionMatch) -> bool {
+    !condition.values.is_empty() || !condition.not_values.is_empty()
+}
+
 /// Validate the CIDR/bare-IP syntax used by `source.ip` / `remote.ip` condition
 /// values. Malformed entries would never match at runtime, which is fail-open
 /// for DENY policies.
@@ -2008,6 +2012,13 @@ fn validate_mesh_config_internal(
                 if !is_supported_mesh_condition_key(&condition.key) {
                     errors.push(format!(
                         "MeshPolicy '{}'.rules[{}].when[{}].key '{}' is unsupported",
+                        policy.name, i, j, condition.key
+                    ));
+                    continue;
+                }
+                if !mesh_condition_has_values(condition) {
+                    errors.push(format!(
+                        "MeshPolicy '{}'.rules[{}].when[{}].key '{}' must set values or not_values",
                         policy.name, i, j, condition.key
                     ));
                     continue;

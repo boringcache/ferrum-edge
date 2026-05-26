@@ -39,8 +39,8 @@ use std::collections::{BTreeMap, HashMap};
 use crate::identity::{SpiffeId, TrustDomain};
 use crate::modes::mesh::config::{
     MeshPolicy, PolicyScope, is_mesh_condition_ip_key, is_supported_mesh_condition_key,
-    normalize_request_match_host_pattern, policy_scope_applies_to_workload,
-    validate_mesh_condition_ip_block,
+    mesh_condition_has_values, normalize_request_match_host_pattern,
+    policy_scope_applies_to_workload, validate_mesh_condition_ip_block,
 };
 use crate::modes::mesh::hbone::{BAGGAGE_HEADER, HboneIdentity};
 use crate::modes::mesh::policy::{
@@ -953,6 +953,12 @@ fn validate_policy_ip_inputs(policies: &[MeshPolicy]) -> Result<(), String> {
                 if !is_supported_mesh_condition_key(&condition.key) {
                     return Err(format!(
                         "mesh_authz: unsupported condition key in policy '{}'/{} rule {} when {}: '{}'",
+                        policy.namespace, policy.name, rule_idx, condition_idx, condition.key
+                    ));
+                }
+                if !mesh_condition_has_values(condition) {
+                    return Err(format!(
+                        "mesh_authz: condition in policy '{}'/{} rule {} when {} key '{}' must set values or notValues",
                         policy.namespace, policy.name, rule_idx, condition_idx, condition.key
                     ));
                 }

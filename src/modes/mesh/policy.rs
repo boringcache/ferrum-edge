@@ -559,6 +559,9 @@ fn matches_conditions(
     action: PolicyAction,
 ) -> bool {
     matches.iter().all(|match_| {
+        if match_.values.is_empty() && match_.not_values.is_empty() {
+            return false;
+        }
         let value = request.attributes.get(&match_.key);
         if value.is_none()
             && action == PolicyAction::Deny

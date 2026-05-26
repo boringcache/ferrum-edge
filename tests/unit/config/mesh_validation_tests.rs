@@ -425,6 +425,28 @@ fn mesh_policy_rejects_unsupported_when_condition_key() {
 }
 
 #[test]
+fn mesh_policy_rejects_when_condition_without_values() {
+    let mut policy = policy_with_request_match(RequestMatch {
+        methods: vec!["GET".into()],
+        ..RequestMatch::default()
+    });
+    policy.rules[0].when.push(ConditionMatch {
+        key: "connection.sni".into(),
+        values: Vec::new(),
+        not_values: Vec::new(),
+    });
+
+    let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], &[], None);
+    assert!(
+        errors
+            .iter()
+            .any(|e| { e.contains("rules[0].when[0]") && e.contains("values or not_values") }),
+        "expected missing condition values error, got: {:?}",
+        errors
+    );
+}
+
+#[test]
 fn mesh_policy_rejects_malformed_ip_when_condition_values() {
     let mut policy = policy_with_request_match(RequestMatch {
         methods: vec!["GET".into()],
