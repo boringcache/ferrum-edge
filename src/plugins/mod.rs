@@ -16,7 +16,6 @@
 //! Non-security plugins that fail validation are skipped with a warning.
 
 pub mod access_control;
-pub mod access_log;
 pub mod ai_federation;
 pub mod ai_prompt_shield;
 pub mod ai_rate_limiter;
@@ -1425,8 +1424,8 @@ pub struct StreamTransactionSummary {
 /// | AuthN     | 950–1999    | Authentication / identity verification    | mtls_auth (950), jwks_auth (1000), oauth2_introspection (1050), oidc_relying_party (1075), jwt_auth (1100), key_auth (1200), ldap_auth (1250), basic_auth (1300), hmac_auth (1400), soap_ws_security (1500) |
 /// | AuthZ     | 2000–2999   | Authorization and admission control       | access_control (2000), tcp_connection_throttle (2050), mesh_authz (2075), opa (2080), request_size_limiting (2800), graphql (2850), rate_limiting (2900), ai_prompt_shield (2925), waf (2930), body_validator (2950), openapi_validator (2960), ai_request_guard (2975), ai_federation (2985) |
 /// | Transform | 3000–3999   | Request shaping and response buffering    | request_transformer (3000), serverless_function (3025), response_mock (3030), grpc_deadline (3050), request_mirror (3075), response_size_limiting (3490), response_caching (3500) |
-/// | Response  | 4000–4999   | Response transformation and AI accounting | response_transformer (4000), ai_token_metrics (4100), ai_rate_limiter (4200) |
-/// | Logging   | 9000–9999   | Observability and frame logging           | stdout_logging (9000), ws_frame_logging (9050), statsd_logging (9075), http_logging (9100), tcp_logging (9125), kafka_logging (9150), loki_logging (9155), udp_logging (9160), ws_logging (9175), transaction_debugger (9200), prometheus_metrics (9300), api_chargeback (9350), api_chargeback_sink (9351), workload_metrics (9360), __mesh_bpf_metrics (9365), access_log (9375) |
+/// | Response  | 4000–4999   | Response transformation, security headers, and AI accounting | response_transformer (4000), security_headers (4080), ai_token_metrics (4100), ai_rate_limiter (4200) |
+/// | Logging   | 9000–9999   | Observability and frame logging           | stdout_logging (9000), ws_frame_logging (9050), statsd_logging (9075), http_logging (9100), tcp_logging (9125), kafka_logging (9150), loki_logging (9155), udp_logging (9160), ws_logging (9175), transaction_debugger (9200), prometheus_metrics (9300), api_chargeback (9350), api_chargeback_sink (9351), workload_metrics (9360), __mesh_bpf_metrics (9365) |
 #[allow(dead_code)]
 pub mod priority {
     pub const OTEL_TRACING: u16 = 25;
@@ -1516,7 +1515,6 @@ pub mod priority {
     /// metric-emitter plugins so its `log` hook runs after all
     /// transaction-summary serialization.
     pub const MESH_BPF_METRICS: u16 = 9365;
-    pub const ACCESS_LOG: u16 = 9375;
     /// `transaction_log_schema` is a config-only plugin with no lifecycle
     /// hooks; its priority is irrelevant in practice but is kept at the
     /// top of the logging band so any future hook would run after all
@@ -2214,7 +2212,6 @@ pub fn create_plugin_with_http_client(
             };
             Ok(Some(Arc::new(plugin)))
         }
-        "access_log" => Ok(Some(Arc::new(access_log::AccessLog::new(config)?))),
         _ => {
             // Fall through to custom plugins registry
             let result = crate::custom_plugins::create_custom_plugin(name, config, http_client)?;
@@ -2355,7 +2352,6 @@ pub fn available_plugins() -> Vec<&'static str> {
         "workload_metrics",
         "__mesh_bpf_metrics",
         "fault_injection",
-        "access_log",
     ];
     plugins.extend(crate::custom_plugins::custom_plugin_names());
     plugins

@@ -136,7 +136,7 @@ These headers are injected on all proxy paths (HTTP, gRPC, and WebSocket).
 ## Logging Plugins
 
 > **Customizing transaction log output**: every logging plugin below
-> (plus `access_log`) accepts an optional `schema:` block (or
+> accepts an optional `schema:` block (or
 > `schema_ref:` against a named `transaction_log_schema` plugin) to
 > rename keys, drop fields, reorder output, add static stamping, and
 > emit a few derived fields. Metadata redaction always applies on every
@@ -147,14 +147,20 @@ These headers are injected on all proxy paths (HTTP, gRPC, and WebSocket).
 
 ### `stdout_logging`
 
-Logs a JSON transaction summary to stdout for each request via `tracing::info!` on the `access_log` target. Output flows through the non-blocking writer, so logging never blocks request-processing threads.
+Writes one JSON transaction (or stream) summary per line to stdout for each request. Output goes through the same non-blocking writer the runtime tracing logs use, so logging never blocks request-processing threads. It is emitted independent of `FERRUM_LOG_LEVEL` — enabling the plugin is the on/off switch, so lowering runtime verbosity never silences access logs and the default runtime stdout stays quiet until you turn this on.
+
+Scope it to one or more proxies to log only those proxies' traffic, or attach it globally to log every proxy's transactions. An optional `filter` (evaluated before any `schema:`) suppresses entries by status code, latency, or error class. This is also the sink mesh mode injects to honor a Telemetry CRD's `accessLogging` configuration.
 
 **Priority:** 9000
-**Config**: None required.
+**Config**: All fields optional; `config: {}` logs every transaction.
 
 ```yaml
 plugin_name: stdout_logging
-config: {}
+config:
+  filter:                 # optional; all present predicates must match
+    status_code_min: 500  # skip responses with status < 500
+    min_latency_ms: 1000  # skip transactions/streams faster than 1s
+    errors_only: true     # skip transactions with no error
 ```
 
 ### `http_logging`
@@ -2190,7 +2196,7 @@ The response body and `Content-Type` are rendered **once** at construction time 
 | `body` | String | `""` | Explicit response body. When set (non-empty) it is returned verbatim and `message` is ignored. |
 | `content_type` | String | `application/json` | Response `Content-Type` header. Substring match for `json` / `xml` decides how `message` is rendered. |
 | `message` | String | `"Service unavailable"` | Builds the default JSON / XML / plain-text body when `body` is empty. JSON and XML special characters are escaped automatically. |
-| `trigger.path_prefix` | String | _(none)_ | Only terminate when the request path starts with this prefix. Mutually exclusive with `trigger.header`. |
+| `trigger.path_prefix` | String | _(none)_ | Only terminate when the request path starts with this prefix. Must start with `/` (or be exactly `*` to match the asterisk-form target of a server-wide `OPTIONS *` request) and contain no control characters; any other value can never match a request path. Mutually exclusive with `trigger.header`. |
 | `trigger.header` | String | _(none)_ | Only terminate when this request header is present. Header name is matched case-insensitively. Mutually exclusive with `trigger.path_prefix`. |
 | `trigger.header_value` | String | `""` | Optional exact value for `trigger.header`. Empty matches any value. |
 

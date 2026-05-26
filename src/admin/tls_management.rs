@@ -1622,6 +1622,7 @@ fn acme_error_response(error: AcmeError) -> Response<Full<Bytes>> {
         | AcmeError::InvalidDomain(_)
         | AcmeError::InvalidPath(_)
         | AcmeError::InvalidChallengeToken(_)
+        | AcmeError::BlockedDirectoryUrl(_)
         | AcmeError::MissingMaterial { .. } => StatusCode::BAD_REQUEST,
         AcmeError::Read(_) | AcmeError::Write(_) | AcmeError::Parse(_) => {
             StatusCode::INTERNAL_SERVER_ERROR
@@ -1763,6 +1764,11 @@ fn acme_certificate_record_from_request(
     let directory_url =
         validated_optional_acme_string(Some(request.directory_url), "directory_url")?
             .ok_or_else(|| "directory_url must not be empty".to_string())?;
+    // Validate the directory URL at the import boundary so the persisted value is
+    // already trusted by the time the renewal scheduler reads it (defense in depth;
+    // outbound order prep re-validates at the ACME client chokepoint).
+    crate::tls::acme::validate_acme_directory_url_ssrf_policy(&directory_url)
+        .map_err(|error| error.to_string())?;
     let account_id = validated_optional_acme_string(request.account_id, "account_id")?;
     let order_url = validated_optional_acme_string(request.order_url, "order_url")?;
     let cert_pem = combine_cert_and_chain(&request.cert_pem, request.chain_pem.as_deref());
@@ -1800,6 +1806,8 @@ async fn acme_order_record_from_request(
     let directory_url =
         validated_optional_acme_string(Some(request.directory_url), "directory_url")?
             .ok_or_else(|| "directory_url must not be empty".to_string())?;
+    // The ACME client (`client::prepare_order`) validates the directory URL against
+    // SSRF policy at the outbound chokepoint below, so no separate check is needed here.
     let contact = normalize_acme_contact(request.contact)?;
     let existing_account_credentials_json = request
         .existing_account_credentials_json
