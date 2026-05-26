@@ -3,12 +3,16 @@ use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use tracing::warn;
 
-use super::carrier::{MeshSliceCarrier, build_slice_carriers};
+use super::carrier::{
+    FERRUM_CARRIER_RESOURCE_NAME_PREFIX, MeshSliceCarrier, build_slice_carriers,
+    carrier_resource_name_for_type_url,
+};
 use super::proto;
 use super::runtime_proto;
 use super::snapshot::{XdsResource, XdsSnapshot};
 use crate::modes::mesh::config::{
-    FractionalPercentDenominator, MeshRuntimeOverlay, RuntimeFractionalPercent, RuntimeValue,
+    FractionalPercentDenominator, MeshDestinationRule, MeshRuntimeOverlay,
+    RuntimeFractionalPercent, RuntimeValue,
 };
 use crate::modes::mesh::slice::MeshSlice;
 
@@ -27,6 +31,7 @@ pub const RTDS_TYPE_URL: &str = "type.googleapis.com/envoy.service.runtime.v3.Ru
 /// recognizes the marker and applies the embedded DR locally.
 pub const FERRUM_ECDS_DESTINATION_RULE_TYPE_URL: &str =
     "type.googleapis.com/ferrum.config.extension.v3.DestinationRuleCarrier";
+pub const FERRUM_DR_CARRIER_RESOURCE_NAME_PREFIX: &str = "ferrum-destination-rule-carrier/";
 
 pub const XDS_TYPE_URLS: [&str; 7] = [
     LDS_TYPE_URL,
@@ -46,6 +51,7 @@ pub fn translate_mesh_slice_to_snapshot(slice: &MeshSlice) -> XdsSnapshot {
     resources.extend(translate_eds(slice));
     resources.extend(translate_sds(slice));
     resources.extend(translate_ecds(slice));
+    resources.extend(translate_destination_rule_carriers(slice));
     // GAP-1a: emit the security- and policy-bearing slice fields as Ferrum
     // mesh-slice ECDS carriers so the xDS path reaches native parity. Without
     // these, the DP rebuilds the slice with authz/PeerAuth/JWT/trust-bundle/
@@ -190,6 +196,36 @@ pub fn translate_ecds(slice: &MeshSlice) -> Vec<XdsResource> {
         if extension.name.is_empty() || !seen_names.insert(extension.name.clone()) {
             continue;
         }
+        if extension
+            .name
+            .starts_with(FERRUM_CARRIER_RESOURCE_NAME_PREFIX)
+        {
+            warn!(
+                name = %extension.name,
+                type_url = %extension.type_url,
+                "Skipping operator ECDS extension config with reserved Ferrum mesh-slice carrier name"
+            );
+            continue;
+        }
+        if extension
+            .name
+            .starts_with(FERRUM_DR_CARRIER_RESOURCE_NAME_PREFIX)
+        {
+            warn!(
+                name = %extension.name,
+                type_url = %extension.type_url,
+                "Skipping operator ECDS extension config with reserved Ferrum DestinationRule carrier name"
+            );
+            continue;
+        }
+        if carrier_resource_name_for_type_url(&extension.type_url).is_some() {
+            warn!(
+                name = %extension.name,
+                type_url = %extension.type_url,
+                "Skipping operator ECDS extension config with reserved Ferrum mesh-slice carrier type_url"
+            );
+            continue;
+        }
         let typed_config = proto::Any {
             type_url: extension.type_url.clone(),
             value: extension.value.clone(),
@@ -206,6 +242,48 @@ pub fn translate_ecds(slice: &MeshSlice) -> Vec<XdsResource> {
         ));
     }
     resources
+}
+
+/// Translate full `MeshDestinationRule` objects into Ferrum ECDS DR carriers.
+///
+/// CDS/EDS can only expose the effective Envoy cluster shape; they cannot
+/// reconstruct the original Ferrum/Istio DR object. These reserved ECDS
+/// resources carry the full JSON object so the DP recovers native-equivalent
+/// DR semantics through the same `FERRUM_ECDS_DESTINATION_RULE_TYPE_URL` path
+/// that operator-defined extension configs used historically.
+pub fn translate_destination_rule_carriers(slice: &MeshSlice) -> Vec<XdsResource> {
+    let mut resources = Vec::new();
+    for dr in &slice.destination_rules {
+        match encode_destination_rule_carrier(slice, dr) {
+            Ok(resource) => resources.push(resource),
+            Err(e) => warn!(
+                node_id = %slice.node_id,
+                namespace = %dr.namespace,
+                name = %dr.name,
+                error = %e,
+                "Failed to encode DestinationRule ECDS carrier; DR will be missing from xDS slice"
+            ),
+        }
+    }
+    resources
+}
+
+fn encode_destination_rule_carrier(
+    slice: &MeshSlice,
+    dr: &MeshDestinationRule,
+) -> Result<XdsResource, serde_json::Error> {
+    let name = format!(
+        "{FERRUM_DR_CARRIER_RESOURCE_NAME_PREFIX}{}/{}",
+        dr.namespace, dr.name
+    );
+    let message = proto::TypedExtensionConfig {
+        name: name.clone(),
+        typed_config: Some(proto::Any {
+            type_url: FERRUM_ECDS_DESTINATION_RULE_TYPE_URL.to_string(),
+            value: serde_json::to_vec(dr)?,
+        }),
+    };
+    Ok(resource(name, ECDS_TYPE_URL, &slice.version, message))
 }
 
 /// Translate the security- and policy-bearing slice fields into Ferrum

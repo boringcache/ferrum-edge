@@ -20,7 +20,10 @@ use super::proto::{
     DiscoveryResponse,
 };
 use super::snapshot::{XdsConfigFingerprint, XdsSnapshot, XdsSnapshotCache};
-use super::translator::translate_mesh_slice_to_snapshot;
+use super::translator::{
+    CDS_TYPE_URL, ECDS_TYPE_URL, EDS_TYPE_URL, LDS_TYPE_URL, RDS_TYPE_URL,
+    translate_mesh_slice_to_snapshot,
+};
 use crate::FERRUM_VERSION;
 use crate::config::incremental_apply::apply_incremental_to_config_snapshot;
 use crate::config::types::GatewayConfig;
@@ -552,7 +555,7 @@ impl XdsAdsServer {
         let responses = subscriptions
             .values()
             .filter(|subscription| {
-                subscription_resources_changed(previous, &snapshot, subscription)
+                sotw_subscription_resources_changed(previous, &snapshot, subscription)
             })
             .map(|subscription| self.sotw_response(&snapshot, subscription))
             .collect();
@@ -1420,6 +1423,38 @@ fn subscription_resources_changed(
     !resources_equal_ignoring_version(&previous_resources, &next_resources)
 }
 
+fn sotw_subscription_resources_changed(
+    previous: Option<&XdsSnapshot>,
+    snapshot: &XdsSnapshot,
+    subscription: &XdsSubscription,
+) -> bool {
+    if let Some(previous) = previous
+        && required_mesh_slice_type_needs_version_refresh(
+            previous,
+            snapshot,
+            &subscription.type_url,
+        )
+    {
+        return true;
+    }
+    subscription_resources_changed(previous, snapshot, subscription)
+}
+
+fn required_mesh_slice_type_needs_version_refresh(
+    previous: &XdsSnapshot,
+    snapshot: &XdsSnapshot,
+    type_url: &str,
+) -> bool {
+    previous.version != snapshot.version && is_required_mesh_slice_sotw_type_url(type_url)
+}
+
+fn is_required_mesh_slice_sotw_type_url(type_url: &str) -> bool {
+    matches!(
+        type_url,
+        CDS_TYPE_URL | EDS_TYPE_URL | LDS_TYPE_URL | RDS_TYPE_URL | ECDS_TYPE_URL
+    )
+}
+
 fn subscription_change_affects_resources(
     snapshot: &XdsSnapshot,
     previous: Option<&XdsSubscription>,
@@ -1541,7 +1576,8 @@ mod tests {
     use super::*;
     use crate::config::db_loader::IncrementalResult;
     use crate::modes::mesh::config::{
-        AppProtocol, MeshConfig, MeshService, MeshSidecar, MeshSidecarEgress, ServicePort,
+        AppProtocol, MeshConfig, MeshService, MeshSidecar, MeshSidecarEgress, MtlsMode,
+        PeerAuthentication, ServicePort,
     };
     use chrono::{TimeZone, Utc};
     use prost::Message;
@@ -1571,6 +1607,27 @@ mod tests {
         GatewayConfig {
             mesh: Some(Box::new(MeshConfig {
                 services: names.iter().map(|name| mesh_service(name)).collect(),
+                ..MeshConfig::default()
+            })),
+            loaded_at: Utc
+                .with_ymd_and_hms(2026, 5, 5, 12, 0, version_second)
+                .unwrap(),
+            ..GatewayConfig::default()
+        }
+    }
+
+    fn gateway_config_with_service_and_peer_auth(version_second: u32) -> GatewayConfig {
+        GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                services: vec![mesh_service("api")],
+                peer_authentications: vec![PeerAuthentication {
+                    name: "strict".to_string(),
+                    namespace: "default".to_string(),
+                    scope: None,
+                    selector: None,
+                    mtls_mode: MtlsMode::Strict,
+                    port_overrides: HashMap::new(),
+                }],
                 ..MeshConfig::default()
             })),
             loaded_at: Utc
@@ -1734,15 +1791,27 @@ mod tests {
     }
 
     fn cds_subscription() -> HashMap<String, XdsSubscription> {
+        wildcard_subscription(super::super::translator::CDS_TYPE_URL)
+    }
+
+    fn wildcard_subscription(type_url: &str) -> HashMap<String, XdsSubscription> {
         HashMap::from([(
-            super::super::translator::CDS_TYPE_URL.to_string(),
+            type_url.to_string(),
             XdsSubscription {
                 node_id: "node-a".to_string(),
-                type_url: super::super::translator::CDS_TYPE_URL.to_string(),
+                type_url: type_url.to_string(),
                 resource_names: Vec::new(),
                 wildcard: true,
             },
         )])
+    }
+
+    fn required_core_and_ecds_subscriptions() -> HashMap<String, XdsSubscription> {
+        let mut subscriptions = wildcard_subscription(super::super::translator::CDS_TYPE_URL);
+        subscriptions.extend(wildcard_subscription(
+            super::super::translator::ECDS_TYPE_URL,
+        ));
+        subscriptions
     }
 
     #[test]
@@ -1839,7 +1908,7 @@ mod tests {
     }
 
     #[test]
-    fn sotw_update_skips_unchanged_effective_resources() {
+    fn sotw_update_refreshes_required_type_versions_when_resources_unchanged() {
         let server = test_server(gateway_config_with_service(true, 0));
         let subscriptions = cds_subscription();
 
@@ -1849,9 +1918,55 @@ mod tests {
         server
             .config
             .store(Arc::new(gateway_config_with_service(true, 1)));
+        let refreshed = server.sotw_responses_for_subscriptions("node-a", &subscriptions);
+
+        assert_eq!(refreshed.len(), 1);
+        assert_eq!(cluster_names(&refreshed[0]), cluster_names(&initial[0]));
+        assert_ne!(refreshed[0].version_info, initial[0].version_info);
+    }
+
+    #[test]
+    fn sotw_update_skips_unchanged_non_required_effective_resources() {
+        let server = test_server(gateway_config_with_service(true, 0));
+        let subscriptions = wildcard_subscription(super::super::translator::SDS_TYPE_URL);
+
+        let initial = server.sotw_responses_for_subscriptions("node-a", &subscriptions);
+        assert_eq!(initial.len(), 1);
+        assert!(initial[0].resources.is_empty());
+
+        server
+            .config
+            .store(Arc::new(gateway_config_with_service(true, 1)));
         let unchanged = server.sotw_responses_for_subscriptions("node-a", &subscriptions);
 
         assert!(unchanged.is_empty());
+    }
+
+    #[test]
+    fn sotw_policy_only_update_refreshes_required_core_type_versions() {
+        let server = test_server(gateway_config_with_service(true, 0));
+        let subscriptions = required_core_and_ecds_subscriptions();
+
+        let initial = server.sotw_responses_for_subscriptions("node-a", &subscriptions);
+        assert_eq!(initial.len(), 2);
+
+        server
+            .config
+            .store(Arc::new(gateway_config_with_service_and_peer_auth(1)));
+        let refreshed = server.sotw_responses_for_subscriptions("node-a", &subscriptions);
+
+        let cds = refreshed
+            .iter()
+            .find(|response| response.type_url == super::super::translator::CDS_TYPE_URL)
+            .expect("CDS version refresh should be sent");
+        let ecds = refreshed
+            .iter()
+            .find(|response| response.type_url == super::super::translator::ECDS_TYPE_URL)
+            .expect("ECDS policy update should be sent");
+        assert_eq!(cluster_names(cds), vec!["cluster/default/api/8080"]);
+        assert!(!ecds.resources.is_empty());
+        assert_ne!(cds.version_info, initial[0].version_info);
+        assert_eq!(cds.version_info, ecds.version_info);
     }
 
     #[test]

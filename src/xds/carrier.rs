@@ -3,9 +3,10 @@
 //! Standard Envoy xDS resources (CDS/EDS/LDS/RDS/SDS) are name-only on the
 //! wire for Ferrum's purposes — they round-trip service-port discovery but
 //! carry NONE of the security- and policy-bearing slice fields
-//! (authorization policies, PeerAuthentication mTLS posture, request
-//! authentication / JWT rules, ServiceEntry shape, SPIFFE trust bundles,
-//! outbound traffic policy, ProxyConfig, and per-pod workload endpoints).
+//! (authorization policies, PeerAuthentication mTLS posture, effective
+//! workload labels for selector matching, request authentication / JWT rules,
+//! ServiceEntry shape, SPIFFE trust bundles, outbound traffic policy,
+//! ProxyConfig, and per-pod workload endpoints).
 //!
 //! Without this module, `FERRUM_MESH_CONFIG_PROTOCOL=xds` produced an
 //! UNPROTECTED mesh: the DP rebuilt the slice with every one of those fields
@@ -39,13 +40,14 @@
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use std::collections::BTreeMap;
 
 use crate::modes::mesh::config::{
     MeshPolicy, MeshProxyConfig, MeshRequestAuthentication, MeshService, MeshTelemetryResource,
     MultiClusterConfig, OutboundTrafficPolicy, PeerAuthentication, ServiceEntry, TrustBundleSet,
     Workload,
 };
-use crate::modes::mesh::slice::MeshSlice;
+use crate::modes::mesh::slice::{MeshEgressScopeSnapshot, MeshSlice};
 
 /// Common inner `type_url` prefix for every Ferrum mesh-slice carrier.
 pub const FERRUM_CARRIER_TYPE_URL_PREFIX: &str = "type.googleapis.com/ferrum.config.extension.v3.";
@@ -57,6 +59,9 @@ pub const FERRUM_ECDS_SERVICES_TYPE_URL: &str =
 /// Inner `type_url` for the per-pod workload / endpoint carrier.
 pub const FERRUM_ECDS_WORKLOADS_TYPE_URL: &str =
     "type.googleapis.com/ferrum.config.extension.v3.WorkloadsCarrier";
+/// Inner `type_url` for the effective workload-label context carrier.
+pub const FERRUM_ECDS_LABELS_TYPE_URL: &str =
+    "type.googleapis.com/ferrum.config.extension.v3.WorkloadLabelsCarrier";
 /// Inner `type_url` for the authorization-policy carrier (`MeshPolicy` list).
 pub const FERRUM_ECDS_MESH_POLICIES_TYPE_URL: &str =
     "type.googleapis.com/ferrum.config.extension.v3.MeshPoliciesCarrier";
@@ -84,12 +89,14 @@ pub const FERRUM_ECDS_OUTBOUND_POLICY_TYPE_URL: &str =
 /// Inner `type_url` for the multi-cluster-config carrier.
 pub const FERRUM_ECDS_MULTI_CLUSTER_TYPE_URL: &str =
     "type.googleapis.com/ferrum.config.extension.v3.MultiClusterCarrier";
+/// Inner `type_url` for the Sidecar egress-scope snapshot carrier.
+pub const FERRUM_ECDS_SIDECAR_EGRESS_SCOPE_TYPE_URL: &str =
+    "type.googleapis.com/ferrum.config.extension.v3.SidecarEgressScopeCarrier";
 
 /// Stable ECDS resource name for each slice carrier. The CP emits exactly one
-/// ECDS resource per non-empty carrier under these names; the DP keys on the
-/// inner `type_url` (not the resource name) when decoding, so renaming a
-/// resource here is wire-safe — but keeping them stable makes delta-xDS
-/// version skipping effective across reloads.
+/// ECDS resource per non-empty carrier under these names; the DP requires
+/// both the reserved resource name and the inner `type_url` when decoding so
+/// operator-defined ECDS configs cannot impersonate internal slice carriers.
 pub const FERRUM_CARRIER_RESOURCE_NAME_PREFIX: &str = "ferrum-mesh-carrier/";
 
 /// One decoded Ferrum slice carrier. Each variant owns the field group it
@@ -99,6 +106,7 @@ pub const FERRUM_CARRIER_RESOURCE_NAME_PREFIX: &str = "ferrum-mesh-carrier/";
 pub enum MeshSliceCarrier {
     Services(Vec<MeshService>),
     Workloads(Vec<Workload>),
+    WorkloadLabels(BTreeMap<String, String>),
     MeshPolicies(Vec<MeshPolicy>),
     PeerAuthentications(Vec<PeerAuthentication>),
     RequestAuthentications(Vec<MeshRequestAuthentication>),
@@ -108,6 +116,7 @@ pub enum MeshSliceCarrier {
     TrustBundles(TrustBundleSet),
     OutboundTrafficPolicy(OutboundTrafficPolicy),
     MultiCluster(MultiClusterConfig),
+    SidecarEgressScope(MeshEgressScopeSnapshot),
 }
 
 impl MeshSliceCarrier {
@@ -116,6 +125,7 @@ impl MeshSliceCarrier {
         match self {
             MeshSliceCarrier::Services(_) => FERRUM_ECDS_SERVICES_TYPE_URL,
             MeshSliceCarrier::Workloads(_) => FERRUM_ECDS_WORKLOADS_TYPE_URL,
+            MeshSliceCarrier::WorkloadLabels(_) => FERRUM_ECDS_LABELS_TYPE_URL,
             MeshSliceCarrier::MeshPolicies(_) => FERRUM_ECDS_MESH_POLICIES_TYPE_URL,
             MeshSliceCarrier::PeerAuthentications(_) => FERRUM_ECDS_PEER_AUTH_TYPE_URL,
             MeshSliceCarrier::RequestAuthentications(_) => FERRUM_ECDS_REQUEST_AUTH_TYPE_URL,
@@ -125,6 +135,7 @@ impl MeshSliceCarrier {
             MeshSliceCarrier::TrustBundles(_) => FERRUM_ECDS_TRUST_BUNDLES_TYPE_URL,
             MeshSliceCarrier::OutboundTrafficPolicy(_) => FERRUM_ECDS_OUTBOUND_POLICY_TYPE_URL,
             MeshSliceCarrier::MultiCluster(_) => FERRUM_ECDS_MULTI_CLUSTER_TYPE_URL,
+            MeshSliceCarrier::SidecarEgressScope(_) => FERRUM_ECDS_SIDECAR_EGRESS_SCOPE_TYPE_URL,
         }
     }
 
@@ -133,6 +144,7 @@ impl MeshSliceCarrier {
         let suffix = match self {
             MeshSliceCarrier::Services(_) => "services",
             MeshSliceCarrier::Workloads(_) => "workloads",
+            MeshSliceCarrier::WorkloadLabels(_) => "workload-labels",
             MeshSliceCarrier::MeshPolicies(_) => "mesh-policies",
             MeshSliceCarrier::PeerAuthentications(_) => "peer-authentications",
             MeshSliceCarrier::RequestAuthentications(_) => "request-authentications",
@@ -142,6 +154,7 @@ impl MeshSliceCarrier {
             MeshSliceCarrier::TrustBundles(_) => "trust-bundles",
             MeshSliceCarrier::OutboundTrafficPolicy(_) => "outbound-traffic-policy",
             MeshSliceCarrier::MultiCluster(_) => "multi-cluster",
+            MeshSliceCarrier::SidecarEgressScope(_) => "sidecar-egress-scope",
         };
         format!("{FERRUM_CARRIER_RESOURCE_NAME_PREFIX}{suffix}")
     }
@@ -151,6 +164,7 @@ impl MeshSliceCarrier {
         match self {
             MeshSliceCarrier::Services(value) => serde_json::to_vec(value),
             MeshSliceCarrier::Workloads(value) => serde_json::to_vec(value),
+            MeshSliceCarrier::WorkloadLabels(value) => serde_json::to_vec(value),
             MeshSliceCarrier::MeshPolicies(value) => serde_json::to_vec(value),
             MeshSliceCarrier::PeerAuthentications(value) => serde_json::to_vec(value),
             MeshSliceCarrier::RequestAuthentications(value) => serde_json::to_vec(value),
@@ -160,6 +174,7 @@ impl MeshSliceCarrier {
             MeshSliceCarrier::TrustBundles(value) => serde_json::to_vec(value),
             MeshSliceCarrier::OutboundTrafficPolicy(value) => serde_json::to_vec(value),
             MeshSliceCarrier::MultiCluster(value) => serde_json::to_vec(value),
+            MeshSliceCarrier::SidecarEgressScope(value) => serde_json::to_vec(value),
         }
     }
 
@@ -175,6 +190,7 @@ impl MeshSliceCarrier {
         let carrier = match type_url {
             FERRUM_ECDS_SERVICES_TYPE_URL => MeshSliceCarrier::Services(decode_json(value)?),
             FERRUM_ECDS_WORKLOADS_TYPE_URL => MeshSliceCarrier::Workloads(decode_json(value)?),
+            FERRUM_ECDS_LABELS_TYPE_URL => MeshSliceCarrier::WorkloadLabels(decode_json(value)?),
             FERRUM_ECDS_MESH_POLICIES_TYPE_URL => {
                 MeshSliceCarrier::MeshPolicies(decode_json(value)?)
             }
@@ -202,9 +218,35 @@ impl MeshSliceCarrier {
             FERRUM_ECDS_MULTI_CLUSTER_TYPE_URL => {
                 MeshSliceCarrier::MultiCluster(decode_json(value)?)
             }
+            FERRUM_ECDS_SIDECAR_EGRESS_SCOPE_TYPE_URL => {
+                MeshSliceCarrier::SidecarEgressScope(decode_json(value)?)
+            }
             _ => return Ok(None),
         };
         Ok(Some(carrier))
+    }
+}
+
+/// Return the reserved ECDS resource name for a Ferrum mesh-slice carrier
+/// `type_url`, or `None` when the URL is not an internal slice carrier.
+pub fn carrier_resource_name_for_type_url(type_url: &str) -> Option<&'static str> {
+    match type_url {
+        FERRUM_ECDS_SERVICES_TYPE_URL => Some("ferrum-mesh-carrier/services"),
+        FERRUM_ECDS_WORKLOADS_TYPE_URL => Some("ferrum-mesh-carrier/workloads"),
+        FERRUM_ECDS_LABELS_TYPE_URL => Some("ferrum-mesh-carrier/workload-labels"),
+        FERRUM_ECDS_MESH_POLICIES_TYPE_URL => Some("ferrum-mesh-carrier/mesh-policies"),
+        FERRUM_ECDS_PEER_AUTH_TYPE_URL => Some("ferrum-mesh-carrier/peer-authentications"),
+        FERRUM_ECDS_REQUEST_AUTH_TYPE_URL => Some("ferrum-mesh-carrier/request-authentications"),
+        FERRUM_ECDS_SERVICE_ENTRIES_TYPE_URL => Some("ferrum-mesh-carrier/service-entries"),
+        FERRUM_ECDS_TELEMETRY_TYPE_URL => Some("ferrum-mesh-carrier/telemetry-resources"),
+        FERRUM_ECDS_PROXY_CONFIGS_TYPE_URL => Some("ferrum-mesh-carrier/proxy-configs"),
+        FERRUM_ECDS_TRUST_BUNDLES_TYPE_URL => Some("ferrum-mesh-carrier/trust-bundles"),
+        FERRUM_ECDS_OUTBOUND_POLICY_TYPE_URL => Some("ferrum-mesh-carrier/outbound-traffic-policy"),
+        FERRUM_ECDS_MULTI_CLUSTER_TYPE_URL => Some("ferrum-mesh-carrier/multi-cluster"),
+        FERRUM_ECDS_SIDECAR_EGRESS_SCOPE_TYPE_URL => {
+            Some("ferrum-mesh-carrier/sidecar-egress-scope")
+        }
+        _ => None,
     }
 }
 
@@ -216,13 +258,15 @@ fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, serde_json::Error> {
     serde_json::to_vec(value)
 }
 
-/// Build every non-empty slice carrier for `slice`.
+/// Build every slice carrier for `slice`.
 ///
 /// Empty `Vec`/`None` field groups are skipped so a slice with, say, no
 /// PeerAuthentications does not pay for an empty carrier resource on the wire
 /// (and so the DP's "field absent" and "field empty" states stay
 /// indistinguishable, matching native-protocol behavior where an empty list
-/// and an absent list are equivalent).
+/// and an absent list are equivalent). Effective labels are the exception:
+/// an empty label map is meaningful selector context and must override any
+/// local DP labels during xDS recovery.
 ///
 /// Both CDS/EDS (name-only, Envoy-shaped cluster discovery) AND the
 /// `Services`/`ServiceEntries` carriers are emitted. The name-only path keeps
@@ -230,7 +274,8 @@ fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, serde_json::Error> {
 /// FULL `MeshService`/`ServiceEntry` shape (protocol, per-service workload
 /// refs, hosts, resolution, location) that the name-only resources cannot
 /// express. The DP prefers the carried full shapes and only falls back to the
-/// CDS/EDS reconstruction when no carrier is present (e.g. a stock Envoy CP).
+/// CDS/EDS reconstruction when no slice carrier is present (e.g. an older
+/// Ferrum-shaped xDS CP used in tests).
 pub fn build_slice_carriers(slice: &MeshSlice) -> Vec<MeshSliceCarrier> {
     let mut carriers = Vec::new();
     if !slice.services.is_empty() {
@@ -239,6 +284,7 @@ pub fn build_slice_carriers(slice: &MeshSlice) -> Vec<MeshSliceCarrier> {
     if !slice.workloads.is_empty() {
         carriers.push(MeshSliceCarrier::Workloads(slice.workloads.clone()));
     }
+    carriers.push(MeshSliceCarrier::WorkloadLabels(slice.labels.clone()));
     if !slice.mesh_policies.is_empty() {
         carriers.push(MeshSliceCarrier::MeshPolicies(slice.mesh_policies.clone()));
     }
@@ -274,6 +320,9 @@ pub fn build_slice_carriers(slice: &MeshSlice) -> Vec<MeshSliceCarrier> {
     if let Some(multi_cluster) = slice.multi_cluster.as_ref() {
         carriers.push(MeshSliceCarrier::MultiCluster(multi_cluster.clone()));
     }
+    if let Some(scope) = slice.sidecar_egress_scope.as_ref() {
+        carriers.push(MeshSliceCarrier::SidecarEgressScope(scope.clone()));
+    }
     carriers
 }
 
@@ -288,6 +337,7 @@ pub fn apply_carrier(slice: &mut MeshSlice, carrier: MeshSliceCarrier) {
     match carrier {
         MeshSliceCarrier::Services(value) => slice.services = value,
         MeshSliceCarrier::Workloads(value) => slice.workloads = value,
+        MeshSliceCarrier::WorkloadLabels(value) => slice.labels = value,
         MeshSliceCarrier::MeshPolicies(value) => slice.mesh_policies = value,
         MeshSliceCarrier::PeerAuthentications(value) => slice.peer_authentications = value,
         MeshSliceCarrier::RequestAuthentications(value) => slice.request_authentications = value,
@@ -299,6 +349,7 @@ pub fn apply_carrier(slice: &mut MeshSlice, carrier: MeshSliceCarrier) {
             slice.outbound_traffic_policy = Some(value)
         }
         MeshSliceCarrier::MultiCluster(value) => slice.multi_cluster = Some(value),
+        MeshSliceCarrier::SidecarEgressScope(value) => slice.sidecar_egress_scope = Some(value),
     }
 }
 
@@ -327,6 +378,10 @@ mod tests {
         let carriers = vec![
             MeshSliceCarrier::Services(Vec::new()),
             MeshSliceCarrier::Workloads(Vec::new()),
+            MeshSliceCarrier::WorkloadLabels(BTreeMap::from([(
+                "app".to_string(),
+                "api".to_string(),
+            )])),
             MeshSliceCarrier::MeshPolicies(Vec::new()),
             MeshSliceCarrier::PeerAuthentications(Vec::new()),
             MeshSliceCarrier::RequestAuthentications(Vec::new()),
@@ -336,6 +391,7 @@ mod tests {
             MeshSliceCarrier::TrustBundles(sample_trust_bundle_set()),
             MeshSliceCarrier::OutboundTrafficPolicy(OutboundTrafficPolicy::RegistryOnly),
             MeshSliceCarrier::MultiCluster(MultiClusterConfig::default()),
+            MeshSliceCarrier::SidecarEgressScope(MeshEgressScopeSnapshot::default()),
         ];
         for carrier in carriers {
             let type_url = carrier.type_url();
@@ -382,6 +438,10 @@ mod tests {
         let carriers = [
             MeshSliceCarrier::Services(Vec::new()),
             MeshSliceCarrier::Workloads(Vec::new()),
+            MeshSliceCarrier::WorkloadLabels(BTreeMap::from([(
+                "app".to_string(),
+                "api".to_string(),
+            )])),
             MeshSliceCarrier::MeshPolicies(Vec::new()),
             MeshSliceCarrier::PeerAuthentications(Vec::new()),
             MeshSliceCarrier::RequestAuthentications(Vec::new()),
@@ -391,11 +451,19 @@ mod tests {
             MeshSliceCarrier::TrustBundles(sample_trust_bundle_set()),
             MeshSliceCarrier::OutboundTrafficPolicy(OutboundTrafficPolicy::AllowAny),
             MeshSliceCarrier::MultiCluster(MultiClusterConfig::default()),
+            MeshSliceCarrier::SidecarEgressScope(MeshEgressScopeSnapshot::default()),
         ];
         let mut names: Vec<String> = carriers.iter().map(|c| c.resource_name()).collect();
         names.sort();
         names.dedup();
         assert_eq!(names.len(), carriers.len(), "resource names must be unique");
+        for carrier in carriers {
+            let resource_name = carrier.resource_name();
+            assert_eq!(
+                carrier_resource_name_for_type_url(carrier.type_url()),
+                Some(resource_name.as_str())
+            );
+        }
     }
 
     // `encode` helper is exercised indirectly by translator; keep a direct

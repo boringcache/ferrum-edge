@@ -15,8 +15,9 @@ use ferrum_edge::xds::conformance::{XdsConformanceCase, required_phase_b_cases};
 use ferrum_edge::xds::proto;
 use ferrum_edge::xds::{
     AckOutcome, CDS_TYPE_URL, ECDS_TYPE_URL, EDS_TYPE_URL, FERRUM_ECDS_DESTINATION_RULE_TYPE_URL,
-    LDS_TYPE_URL, MeshSlice, MeshSliceRequest, RDS_TYPE_URL, RTDS_TYPE_URL, SDS_TYPE_URL,
-    XdsNonceTracker, XdsSnapshotCache, translate_mesh_slice_to_snapshot, translate_rtds_layer,
+    FERRUM_ECDS_MESH_POLICIES_TYPE_URL, LDS_TYPE_URL, MeshSlice, MeshSliceRequest, RDS_TYPE_URL,
+    RTDS_TYPE_URL, SDS_TYPE_URL, XdsNonceTracker, XdsSnapshotCache,
+    translate_mesh_slice_to_snapshot, translate_rtds_layer,
 };
 
 fn workload(name: &str, app: &str) -> Workload {
@@ -545,10 +546,15 @@ fn slice_with_extension_configs(configs: Vec<MeshExtensionConfig>) -> MeshSlice 
 }
 
 #[test]
-fn translator_emits_no_ecds_resources_when_slice_has_no_extension_configs() {
+fn translator_emits_labels_carrier_when_slice_has_no_extension_configs() {
     let slice = slice_with_extension_configs(Vec::new());
     let snapshot = translate_mesh_slice_to_snapshot(&slice);
-    assert!(snapshot.resources(ECDS_TYPE_URL).is_empty());
+    let names: Vec<_> = snapshot
+        .resources(ECDS_TYPE_URL)
+        .iter()
+        .map(|r| r.name.as_str())
+        .collect();
+    assert_eq!(names, vec!["ferrum-mesh-carrier/workload-labels"]);
 }
 
 #[test]
@@ -572,6 +578,7 @@ fn translator_emits_one_ecds_resource_per_extension_config() {
         .resources(ECDS_TYPE_URL)
         .iter()
         .map(|r| r.name.clone())
+        .filter(|name| !name.starts_with("ferrum-mesh-carrier/"))
         .collect();
     assert_eq!(names, vec!["dr-carrier-admin", "dr-carrier-api"]);
 }
@@ -593,7 +600,44 @@ fn translator_skips_duplicate_extension_config_names() {
         },
     ]);
     let snapshot = translate_mesh_slice_to_snapshot(&slice);
-    assert_eq!(snapshot.resources(ECDS_TYPE_URL).len(), 1);
+    let operator_resources = snapshot
+        .resources(ECDS_TYPE_URL)
+        .iter()
+        .filter(|resource| !resource.name.starts_with("ferrum-mesh-carrier/"))
+        .count();
+    assert_eq!(operator_resources, 1);
+}
+
+#[test]
+fn translator_skips_extension_configs_that_impersonate_slice_carriers() {
+    let slice = slice_with_extension_configs(vec![
+        MeshExtensionConfig {
+            name: "operator-mesh-policies".to_string(),
+            namespace: "default".to_string(),
+            type_url: FERRUM_ECDS_MESH_POLICIES_TYPE_URL.to_string(),
+            value: b"[]".to_vec(),
+        },
+        MeshExtensionConfig {
+            name: "ferrum-mesh-carrier/services".to_string(),
+            namespace: "default".to_string(),
+            type_url: "type.googleapis.com/example.OperatorExtension".to_string(),
+            value: b"{}".to_vec(),
+        },
+        MeshExtensionConfig {
+            name: "dr-carrier-api".to_string(),
+            namespace: "default".to_string(),
+            type_url: FERRUM_ECDS_DESTINATION_RULE_TYPE_URL.to_string(),
+            value: b"{\"name\":\"api\"}".to_vec(),
+        },
+    ]);
+    let snapshot = translate_mesh_slice_to_snapshot(&slice);
+    let names: Vec<_> = snapshot
+        .resources(ECDS_TYPE_URL)
+        .iter()
+        .map(|r| r.name.clone())
+        .filter(|name| !name.starts_with("ferrum-mesh-carrier/"))
+        .collect();
+    assert_eq!(names, vec!["dr-carrier-api"]);
 }
 
 #[test]
@@ -637,7 +681,8 @@ fn translator_round_trips_binary_value_bytes() {
     let snapshot = translate_mesh_slice_to_snapshot(&slice);
     let entry = snapshot
         .resources(ECDS_TYPE_URL)
-        .first()
+        .iter()
+        .find(|resource| resource.name == "binary")
         .cloned()
         .expect("ECDS resource");
     let decoded = proto::TypedExtensionConfig::decode(entry.value.as_slice())
@@ -656,7 +701,8 @@ fn translator_emits_empty_value_when_extension_has_no_inner_bytes() {
     let snapshot = translate_mesh_slice_to_snapshot(&slice);
     let entry = snapshot
         .resources(ECDS_TYPE_URL)
-        .first()
+        .iter()
+        .find(|resource| resource.name == "no-bytes")
         .cloned()
         .expect("ECDS resource");
     let decoded = proto::TypedExtensionConfig::decode(entry.value.as_slice())

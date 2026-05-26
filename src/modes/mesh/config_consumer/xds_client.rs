@@ -16,15 +16,18 @@ use super::common::{
 use crate::grpc::dp_client::{
     DpGrpcTlsConfig, DpGrpcTlsReload, GrpcJwtSecret, generate_dp_jwt_with_issuer,
 };
-use crate::modes::mesh::config::{AppProtocol, MeshRuntimeOverlay, MeshService, ServicePort};
+use crate::modes::mesh::config::{
+    AppProtocol, MeshDestinationRule, MeshRuntimeOverlay, MeshService, ServicePort,
+};
 use crate::modes::mesh::runtime::MeshRuntimeState;
-use crate::modes::mesh::slice::MeshSlice;
+use crate::modes::mesh::slice::{MeshEgressScopeSnapshot, MeshSlice};
 use crate::xds::proto::aggregated_discovery_service_client::AggregatedDiscoveryServiceClient;
 use crate::xds::proto::{self, DiscoveryRequest, Node, Status};
 use crate::xds::runtime_proto;
 use crate::xds::translator::{
-    CDS_TYPE_URL, ECDS_TYPE_URL, EDS_TYPE_URL, FERRUM_ECDS_DESTINATION_RULE_TYPE_URL, LDS_TYPE_URL,
-    RDS_TYPE_URL, RTDS_TYPE_URL, SDS_TYPE_URL, XDS_TYPE_URLS, translate_rtds_layer,
+    CDS_TYPE_URL, ECDS_TYPE_URL, EDS_TYPE_URL, FERRUM_DR_CARRIER_RESOURCE_NAME_PREFIX,
+    FERRUM_ECDS_DESTINATION_RULE_TYPE_URL, LDS_TYPE_URL, RDS_TYPE_URL, RTDS_TYPE_URL, SDS_TYPE_URL,
+    XDS_TYPE_URLS, translate_rtds_layer,
 };
 
 const INITIAL_TYPE_URL_ORDER: [&str; 7] = [
@@ -45,8 +48,13 @@ const INITIAL_TYPE_URL_ORDER: [&str; 7] = [
     // Runtime layers to send.
     RTDS_TYPE_URL,
 ];
-const REQUIRED_MESH_SLICE_TYPE_URLS: [&str; 4] =
-    [CDS_TYPE_URL, EDS_TYPE_URL, LDS_TYPE_URL, RDS_TYPE_URL];
+const REQUIRED_MESH_SLICE_TYPE_URLS: [&str; 5] = [
+    CDS_TYPE_URL,
+    EDS_TYPE_URL,
+    LDS_TYPE_URL,
+    RDS_TYPE_URL,
+    ECDS_TYPE_URL,
+];
 const XDS_APPLY_DEBOUNCE: Duration = Duration::from_millis(25);
 const XDS_CONSECUTIVE_NACK_LIMIT: u32 = 5;
 const XDS_APPLY_MAX_DELAY: Duration = Duration::from_millis(500);
@@ -229,6 +237,17 @@ impl NackCircuitBreaker {
         self.consecutive_nacks_by_type.remove(type_url);
     }
 
+    fn consecutive_nacks(&self, type_url: &str) -> u32 {
+        self.consecutive_nacks_by_type
+            .get(type_url)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn nacked_since(&self, type_url: &str, previous: u32) -> bool {
+        self.consecutive_nacks(type_url) > previous
+    }
+
     fn record_nack(&mut self, type_url: &str) -> u32 {
         let count = self
             .consecutive_nacks_by_type
@@ -291,6 +310,7 @@ impl ResourceAccumulator {
                     "xDS resource for type_url '{type_url}' has an empty name"
                 ));
             }
+            validate_resource_name_shape(type_url, &name)?;
             // ECDS reverse-translation reads the full bytes back to decode
             // its inner TypedExtensionConfig. RTDS reverse-translation does
             // the same to decode the layer struct. Other resource types
@@ -300,7 +320,12 @@ impl ResourceAccumulator {
             } else {
                 Vec::new()
             };
-            accumulated.push(AccumulatedResource { name, bytes });
+            let accumulated_resource = AccumulatedResource { name, bytes };
+            if type_url == ECDS_TYPE_URL {
+                validate_ecds_mesh_slice_carrier(&accumulated_resource)?;
+                validate_ecds_destination_rule_carrier(&accumulated_resource)?;
+            }
+            accumulated.push(accumulated_resource);
         }
 
         self.resources_by_type
@@ -323,8 +348,24 @@ impl ResourceAccumulator {
             .all(|type_url| self.versions_by_type.contains_key(*type_url))
     }
 
+    fn has_coherent_required_versions(&self) -> bool {
+        let Some(first_version) = REQUIRED_MESH_SLICE_TYPE_URLS
+            .iter()
+            .filter_map(|type_url| self.versions_by_type.get(*type_url))
+            .next()
+        else {
+            return false;
+        };
+        REQUIRED_MESH_SLICE_TYPE_URLS
+            .iter()
+            .all(|type_url| self.versions_by_type.get(*type_url) == Some(first_version))
+    }
+
     fn try_build_mesh_slice(&self, config: &XdsClientConfig) -> Result<Option<MeshSlice>, String> {
         if !self.has_required_types() {
+            return Ok(None);
+        }
+        if !self.has_coherent_required_versions() {
             return Ok(None);
         }
         reverse_translate(self, config).map(Some)
@@ -583,6 +624,10 @@ async fn run_ads_stream_with_auth(
                 let Some(response) = response? else {
                     break;
                 };
+                let response_type_url = response.type_url.clone();
+                let nack_count_before = stream_state
+                    .nack_circuit_breaker
+                    .consecutive_nacks(&response_type_url);
                 match handle_ads_response(
                     response,
                     config,
@@ -600,8 +645,32 @@ async fn run_ads_stream_with_auth(
                             .reset(next_xds_apply_deadline(now, first_pending_at));
                         debounce_active = true;
                     }
-                    Ok(None) => {}
+                    Ok(None) => {
+                        if stream_state
+                            .nack_circuit_breaker
+                            .nacked_since(&response_type_url, nack_count_before)
+                        {
+                            discard_pending_xds_slice_after_nack(
+                                config,
+                                &mut pending_slice,
+                                &response_type_url,
+                            );
+                            debounce_active = false;
+                            pending_since = None;
+                        }
+                    }
                     Err(e) => {
+                        if stream_state
+                            .nack_circuit_breaker
+                            .nacked_since(&response_type_url, nack_count_before)
+                        {
+                            discard_pending_xds_slice_after_nack(
+                                config,
+                                &mut pending_slice,
+                                &response_type_url,
+                            );
+                            return Err(e);
+                        }
                         return flush_pending_xds_slice_before_error(
                             consumer,
                             config,
@@ -626,6 +695,23 @@ async fn run_ads_stream_with_auth(
     }
 
     Ok(())
+}
+
+fn discard_pending_xds_slice_after_nack(
+    config: &XdsClientConfig,
+    pending_slice: &mut Option<PendingXdsSlice>,
+    nacked_type_url: &str,
+) -> bool {
+    let discarded = pending_slice.take().is_some();
+    if discarded {
+        warn!(
+            node_id = %config.node_id,
+            namespace = %config.namespace,
+            type_url = %nacked_type_url,
+            "Discarded debounced xDS slice after NACK to avoid applying mixed-version resources"
+        );
+    }
+    discarded
 }
 
 fn flush_pending_xds_slice_before_error(
@@ -724,8 +810,11 @@ async fn handle_ads_response(
                 error = %e,
                 "NACKing invalid xDS ADS response"
             );
-            send_ads_request(tx, subscriptions.build_nack(&type_url, e)).await?;
-            trip_nack_circuit_if_needed(config, nack_circuit_breaker, &type_url)?;
+            let nack = subscriptions.build_nack(&type_url, e);
+            let circuit_result =
+                trip_nack_circuit_if_needed(config, nack_circuit_breaker, &type_url);
+            send_ads_request(tx, nack).await?;
+            circuit_result?;
             Ok(None)
         }
     }
@@ -848,29 +937,31 @@ fn reverse_translate(
     let mut destination_rules = Vec::new();
     let mut dr_carrier_seen = false;
     for resource in accumulator.resources(ECDS_TYPE_URL) {
-        let typed_extension = match proto::TypedExtensionConfig::decode(resource.bytes.as_slice()) {
+        let reserved_dr_name = reserved_destination_rule_carrier_name(&resource.name)?;
+        let typed_extension = match decode_ecds_typed_extension(resource) {
             Ok(value) => value,
             Err(e) => {
-                warn!(
-                    resource_name = %resource.name,
-                    error = %e,
-                    "xDS ECDS resource failed TypedExtensionConfig decode; skipping"
-                );
+                if reserved_dr_name.is_some() {
+                    return Err(e);
+                }
+                warn!(resource_name = %resource.name, error = %e, "xDS ECDS resource failed TypedExtensionConfig decode; skipping");
                 continue;
             }
         };
-        let Some(inner) = typed_extension.typed_config else {
+        let Some(inner) = destination_rule_carrier_inner(resource, &typed_extension)? else {
             continue;
         };
-        if inner.type_url != FERRUM_ECDS_DESTINATION_RULE_TYPE_URL {
-            continue;
-        }
         dr_carrier_seen = true;
-        match serde_json::from_slice::<crate::modes::mesh::config::MeshDestinationRule>(
-            &inner.value,
-        ) {
+        match serde_json::from_slice::<MeshDestinationRule>(&inner.value) {
             Ok(dr) => {
-                if dr.namespace != config.namespace {
+                if let Some((namespace, name)) = reserved_dr_name {
+                    validate_reserved_destination_rule_carrier_name(
+                        &resource.name,
+                        namespace,
+                        name,
+                        &dr,
+                    )?;
+                } else if dr.namespace != config.namespace {
                     debug!(
                         name = %dr.name,
                         namespace = %dr.namespace,
@@ -887,6 +978,12 @@ fn reverse_translate(
                 destination_rules.push(dr);
             }
             Err(e) => {
+                if reserved_dr_name.is_some() {
+                    return Err(format!(
+                        "xDS reserved DestinationRule ECDS carrier '{}' failed JSON decode: {e}",
+                        typed_extension.name
+                    ));
+                }
                 warn!(
                     resource_name = %typed_extension.name,
                     inner_type_url = %inner.type_url,
@@ -918,13 +1015,17 @@ fn reverse_translate(
     // functionally equivalent to native: without this pass the slice below
     // would have empty authz/PeerAuth/JWT/trust-bundle/ServiceEntry/
     // ProxyConfig/workload fields (an unprotected mesh).
-    let recovered = recover_slice_carriers(accumulator);
+    let recovered = recover_slice_carriers(accumulator)?;
 
     // Prefer the full `MeshService` shape recovered from the Services carrier
     // (protocol + per-service workload refs) over the name-only CDS/EDS
-    // reconstruction. The reconstruction stays as the fallback for a stock
-    // Envoy CP that emits CDS/EDS but no Ferrum carrier.
-    let services = recovered.services.unwrap_or_else(|| {
+    // reconstruction. The reconstruction stays as the fallback for an older
+    // Ferrum-shaped xDS CP that emits CDS/EDS but no Ferrum carrier.
+    let services = if let Some(services) = recovered.services {
+        services
+    } else if recovered.slice_carrier_seen {
+        Vec::new()
+    } else {
         service_ports
             .into_iter()
             .map(|((namespace, name), ports)| MeshService {
@@ -942,7 +1043,7 @@ fn reverse_translate(
                 protocol_overrides: HashMap::new(),
             })
             .collect()
-    });
+    };
 
     let mut trust_domains = Vec::new();
     let mut ignored_sds_names = Vec::new();
@@ -991,15 +1092,15 @@ fn reverse_translate(
         namespace: config.namespace.clone(),
         workload_spiffe_id: config.workload_spiffe_id.clone(),
         waypoint_name: config.waypoint_name.clone(),
-        labels: config.labels.clone(),
+        labels: recovered.labels.unwrap_or_else(|| config.labels.clone()),
         version: accumulator
             .versions_by_type
             .get(CDS_TYPE_URL)
             .cloned()
             .unwrap_or_default(),
         // GAP-1a: workloads/endpoints recovered from the Workloads carrier.
-        // Empty only when the CP emitted no carrier (stock Envoy CP) or the
-        // slice genuinely has no workloads.
+        // Empty only when the CP emitted no carrier (older Ferrum-shaped xDS
+        // CP) or the slice genuinely has no workloads.
         workloads: recovered.workloads,
         services,
         // GAP-1a: authorization policies recovered from the MeshPolicies
@@ -1040,7 +1141,7 @@ fn reverse_translate(
         // GAP-1a: mesh-wide outbound traffic policy recovered from the
         // OutboundTrafficPolicy carrier.
         outbound_traffic_policy: recovered.outbound_traffic_policy,
-        sidecar_egress_scope: None,
+        sidecar_egress_scope: recovered.sidecar_egress_scope,
         // GAP-2L.3: xDS-only deployments don't round-trip operator-defined
         // ECDS resources back into the slice today. The carrier paths
         // (GAP-2K DR carrier, GAP-1a slice carriers) land their fields in the
@@ -1062,7 +1163,9 @@ fn reverse_translate(
 /// absent list.
 #[derive(Debug, Default)]
 struct RecoveredSliceCarriers {
+    slice_carrier_seen: bool,
     services: Option<Vec<MeshService>>,
+    labels: Option<BTreeMap<String, String>>,
     workloads: Vec<crate::modes::mesh::config::Workload>,
     mesh_policies: Vec<crate::modes::mesh::config::MeshPolicy>,
     peer_authentications: Vec<crate::modes::mesh::config::PeerAuthentication>,
@@ -1073,50 +1176,205 @@ struct RecoveredSliceCarriers {
     trust_bundles: Option<crate::modes::mesh::config::TrustBundleSet>,
     outbound_traffic_policy: Option<crate::modes::mesh::config::OutboundTrafficPolicy>,
     multi_cluster: Option<crate::modes::mesh::config::MultiClusterConfig>,
+    sidecar_egress_scope: Option<MeshEgressScopeSnapshot>,
 }
 
 /// Decode every Ferrum mesh-slice ECDS carrier in `accumulator` and fold it
 /// into a [`RecoveredSliceCarriers`].
 ///
 /// ECDS resources that are not Ferrum slice carriers (the DR carrier, or any
-/// operator-defined extension config) decode to `None` and are skipped. A
-/// recognized carrier whose JSON fails to parse is warned and skipped so one
-/// malformed carrier never drops the whole slice — matching the DR-carrier
-/// fail-soft behavior above.
-fn recover_slice_carriers(accumulator: &ResourceAccumulator) -> RecoveredSliceCarriers {
+/// operator-defined extension config) are skipped. A recognized slice carrier
+/// whose JSON fails to parse rejects the ECDS response so the client NACKs it
+/// and retains the previous protected slice instead of clearing security fields
+/// fail-open.
+fn recover_slice_carriers(
+    accumulator: &ResourceAccumulator,
+) -> Result<RecoveredSliceCarriers, String> {
     use crate::xds::carrier::MeshSliceCarrier;
-    use crate::xds::translator::FERRUM_ECDS_DESTINATION_RULE_TYPE_URL;
 
     let mut recovered = RecoveredSliceCarriers::default();
     for resource in accumulator.resources(ECDS_TYPE_URL) {
-        let typed_extension = match proto::TypedExtensionConfig::decode(resource.bytes.as_slice()) {
+        let typed_extension = match decode_ecds_typed_extension(resource) {
             Ok(value) => value,
             // The DR-carrier loop already warned on this same resource; stay
             // quiet here to avoid double-logging the same decode failure.
             Err(_) => continue,
         };
-        let Some(inner) = typed_extension.typed_config else {
+        let Some(inner) = mesh_slice_carrier_inner(resource, &typed_extension, false)? else {
             continue;
         };
-        // The DR carrier rides the same ECDS stream but is handled by the
-        // dedicated loop above; skip it here so we don't double-decode.
-        if inner.type_url == FERRUM_ECDS_DESTINATION_RULE_TYPE_URL {
-            continue;
-        }
         match MeshSliceCarrier::decode(&inner.type_url, &inner.value) {
             Ok(Some(carrier)) => apply_recovered_carrier(&mut recovered, carrier),
-            Ok(None) => {
-                // Unrelated operator extension config — not a slice carrier.
+            Ok(None) => {}
+            Err(e) => {
+                return Err(format!(
+                    "xDS mesh-slice ECDS carrier '{}' failed JSON decode for '{}': {e}",
+                    typed_extension.name, inner.type_url
+                ));
             }
-            Err(e) => warn!(
-                resource_name = %typed_extension.name,
-                inner_type_url = %inner.type_url,
-                error = %e,
-                "xDS mesh-slice ECDS carrier failed JSON decode; field will be missing from slice"
-            ),
         }
     }
-    recovered
+    Ok(recovered)
+}
+
+fn validate_ecds_mesh_slice_carrier(resource: &AccumulatedResource) -> Result<(), String> {
+    let typed_extension = decode_ecds_typed_extension(resource)?;
+    let Some(inner) = mesh_slice_carrier_inner(resource, &typed_extension, true)? else {
+        return Ok(());
+    };
+    if let Err(e) = crate::xds::carrier::MeshSliceCarrier::decode(&inner.type_url, &inner.value) {
+        return Err(format!(
+            "xDS mesh-slice ECDS carrier '{}' failed JSON decode for '{}': {e}",
+            typed_extension.name, inner.type_url
+        ));
+    }
+    Ok(())
+}
+
+fn validate_ecds_destination_rule_carrier(resource: &AccumulatedResource) -> Result<(), String> {
+    let Some((namespace, name)) = reserved_destination_rule_carrier_name(&resource.name)? else {
+        return Ok(());
+    };
+    let typed_extension = decode_ecds_typed_extension(resource)?;
+    let Some(inner) = destination_rule_carrier_inner(resource, &typed_extension)? else {
+        return Ok(());
+    };
+    let dr = serde_json::from_slice::<MeshDestinationRule>(&inner.value).map_err(|e| {
+        format!(
+            "xDS reserved DestinationRule ECDS carrier '{}' failed JSON decode: {e}",
+            typed_extension.name
+        )
+    })?;
+    validate_reserved_destination_rule_carrier_name(&resource.name, namespace, name, &dr)
+}
+
+fn decode_ecds_typed_extension(
+    resource: &AccumulatedResource,
+) -> Result<proto::TypedExtensionConfig, String> {
+    proto::TypedExtensionConfig::decode(resource.bytes.as_slice()).map_err(|e| {
+        format!(
+            "xDS ECDS resource '{}' failed TypedExtensionConfig decode: {e}",
+            resource.name
+        )
+    })
+}
+
+fn reserved_destination_rule_carrier_name(name: &str) -> Result<Option<(&str, &str)>, String> {
+    let Some(rest) = name.strip_prefix(FERRUM_DR_CARRIER_RESOURCE_NAME_PREFIX) else {
+        return Ok(None);
+    };
+    let parts: Vec<&str> = rest.split('/').collect();
+    if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
+        return Err(format!(
+            "xDS ECDS resource '{name}' uses reserved Ferrum DestinationRule carrier name but must be named '{FERRUM_DR_CARRIER_RESOURCE_NAME_PREFIX}{{namespace}}/{{name}}'"
+        ));
+    }
+    Ok(Some((parts[0], parts[1])))
+}
+
+fn validate_reserved_destination_rule_carrier_name(
+    resource_name: &str,
+    expected_namespace: &str,
+    expected_name: &str,
+    dr: &MeshDestinationRule,
+) -> Result<(), String> {
+    if dr.namespace == expected_namespace && dr.name == expected_name {
+        return Ok(());
+    }
+    Err(format!(
+        "xDS reserved DestinationRule ECDS carrier '{resource_name}' embeds DestinationRule '{}/{}' but reserved name targets '{}/{}'",
+        dr.namespace, dr.name, expected_namespace, expected_name
+    ))
+}
+
+fn destination_rule_carrier_inner<'a>(
+    resource: &AccumulatedResource,
+    typed_extension: &'a proto::TypedExtensionConfig,
+) -> Result<Option<&'a proto::Any>, String> {
+    let resource_name_is_reserved =
+        reserved_destination_rule_carrier_name(&resource.name)?.is_some();
+    let Some(inner) = typed_extension.typed_config.as_ref() else {
+        if resource_name_is_reserved {
+            return Err(format!(
+                "xDS ECDS resource '{}' uses reserved Ferrum DestinationRule carrier name without typed_config",
+                resource.name
+            ));
+        }
+        return Ok(None);
+    };
+    if inner.type_url != FERRUM_ECDS_DESTINATION_RULE_TYPE_URL {
+        if resource_name_is_reserved {
+            return Err(format!(
+                "xDS ECDS resource '{}' uses reserved Ferrum DestinationRule carrier name with non-DR type_url '{}'",
+                resource.name, inner.type_url
+            ));
+        }
+        return Ok(None);
+    }
+    Ok(Some(inner))
+}
+
+fn mesh_slice_carrier_inner<'a>(
+    resource: &AccumulatedResource,
+    typed_extension: &'a proto::TypedExtensionConfig,
+    warn_on_non_reserved_name: bool,
+) -> Result<Option<&'a proto::Any>, String> {
+    use crate::xds::carrier::{
+        FERRUM_CARRIER_RESOURCE_NAME_PREFIX, carrier_resource_name_for_type_url,
+    };
+    use crate::xds::translator::FERRUM_ECDS_DESTINATION_RULE_TYPE_URL;
+
+    let resource_name_is_reserved = resource
+        .name
+        .starts_with(FERRUM_CARRIER_RESOURCE_NAME_PREFIX);
+    let Some(inner) = typed_extension.typed_config.as_ref() else {
+        if resource_name_is_reserved {
+            return Err(format!(
+                "xDS ECDS resource '{}' uses reserved Ferrum mesh-slice carrier name without typed_config",
+                resource.name
+            ));
+        }
+        return Ok(None);
+    };
+    // The DR carrier rides the same ECDS stream but is handled by the
+    // dedicated loop above; reject it if it tries to use a reserved slice
+    // carrier name.
+    if inner.type_url == FERRUM_ECDS_DESTINATION_RULE_TYPE_URL {
+        if resource_name_is_reserved {
+            return Err(format!(
+                "xDS ECDS resource '{}' uses reserved Ferrum mesh-slice carrier name with non-carrier type_url '{}'",
+                resource.name, inner.type_url
+            ));
+        }
+        return Ok(None);
+    }
+    let Some(expected_name) = carrier_resource_name_for_type_url(&inner.type_url) else {
+        if resource_name_is_reserved {
+            return Err(format!(
+                "xDS ECDS resource '{}' uses reserved Ferrum mesh-slice carrier name with non-carrier type_url '{}'",
+                resource.name, inner.type_url
+            ));
+        }
+        return Ok(None);
+    };
+    if resource.name != expected_name {
+        if resource_name_is_reserved {
+            return Err(format!(
+                "xDS ECDS resource '{}' uses carrier type_url '{}' but must be named '{}'",
+                resource.name, inner.type_url, expected_name
+            ));
+        }
+        if warn_on_non_reserved_name {
+            warn!(
+                resource_name = %resource.name,
+                expected_name = %expected_name,
+                inner_type_url = %inner.type_url,
+                "xDS ECDS resource used reserved Ferrum mesh-slice carrier type_url with non-reserved name; skipping"
+            );
+        }
+        return Ok(None);
+    }
+    Ok(Some(inner))
 }
 
 fn apply_recovered_carrier(
@@ -1124,9 +1382,11 @@ fn apply_recovered_carrier(
     carrier: crate::xds::carrier::MeshSliceCarrier,
 ) {
     use crate::xds::carrier::MeshSliceCarrier;
+    recovered.slice_carrier_seen = true;
     match carrier {
         MeshSliceCarrier::Services(value) => recovered.services = Some(value),
         MeshSliceCarrier::Workloads(value) => recovered.workloads = value,
+        MeshSliceCarrier::WorkloadLabels(value) => recovered.labels = Some(value),
         MeshSliceCarrier::MeshPolicies(value) => recovered.mesh_policies = value,
         MeshSliceCarrier::PeerAuthentications(value) => recovered.peer_authentications = value,
         MeshSliceCarrier::RequestAuthentications(value) => {
@@ -1140,6 +1400,7 @@ fn apply_recovered_carrier(
             recovered.outbound_traffic_policy = Some(value)
         }
         MeshSliceCarrier::MultiCluster(value) => recovered.multi_cluster = Some(value),
+        MeshSliceCarrier::SidecarEgressScope(value) => recovered.sidecar_egress_scope = Some(value),
     }
 }
 
@@ -1167,6 +1428,17 @@ fn decode_resource_name(type_url: &str, value: &[u8]) -> Result<String, String> 
             .map(|resource| resource.name)
             .map_err(|e| format!("failed to decode Runtime resource: {e}")),
         other => Err(format!("unknown xDS type_url '{other}'")),
+    }
+}
+
+fn validate_resource_name_shape(type_url: &str, name: &str) -> Result<(), String> {
+    match type_url {
+        CDS_TYPE_URL | EDS_TYPE_URL => {
+            parse_service_port_resource_name(name, "cluster").map(|_| ())
+        }
+        LDS_TYPE_URL => parse_service_port_resource_name(name, "listener").map(|_| ()),
+        RDS_TYPE_URL => parse_route_resource_name(name).map(|_| ()),
+        _ => Ok(()),
     }
 }
 
@@ -1626,7 +1898,7 @@ mod tests {
             .apply_sotw_response(
                 CDS_TYPE_URL,
                 &[any_resource(CDS_TYPE_URL, "cluster/default/api/8080")],
-                "v1",
+                "v2",
             )
             .expect("CDS applies");
         accumulator
@@ -1637,6 +1909,11 @@ mod tests {
             )
             .expect("RDS applies");
         apply_all_empty(&mut accumulator);
+        for type_url in [EDS_TYPE_URL, LDS_TYPE_URL, ECDS_TYPE_URL] {
+            accumulator
+                .apply_sotw_response(type_url, &[], "v2")
+                .expect("empty v2 response applies");
+        }
 
         let result = handle_ads_response(
             discovery_response(
@@ -1670,6 +1947,309 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mismatched_required_versions_wait_instead_of_applying_mixed_slice() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut state = ClientSubscriptionState::new();
+        let mut accumulator = ResourceAccumulator::new();
+        let mut nack_circuit_breaker = NackCircuitBreaker::default();
+
+        accumulator
+            .apply_sotw_response(
+                CDS_TYPE_URL,
+                &[any_resource(CDS_TYPE_URL, "cluster/default/api/8080")],
+                "v1",
+            )
+            .expect("CDS applies");
+        accumulator
+            .apply_sotw_response(
+                RDS_TYPE_URL,
+                &[any_resource(RDS_TYPE_URL, "route/default/api")],
+                "v1",
+            )
+            .expect("RDS applies");
+        apply_all_empty(&mut accumulator);
+
+        let pending = handle_ads_response(
+            discovery_response(
+                CDS_TYPE_URL,
+                "v2",
+                "n2",
+                vec![any_resource(CDS_TYPE_URL, "cluster/default/api/8080")],
+            ),
+            &test_config(),
+            &tx,
+            &mut state,
+            &mut accumulator,
+            &mut nack_circuit_breaker,
+        )
+        .await
+        .expect("valid but incomplete version set should ACK");
+
+        assert!(
+            pending.is_none(),
+            "CDS v2 must not build a slice while ECDS and the other required types remain on v1"
+        );
+        let ack = rx.recv().await.expect("ACK sent");
+        assert_eq!(ack.type_url, CDS_TYPE_URL);
+        assert_eq!(ack.version_info, "v2");
+        assert_eq!(
+            accumulator.versions_by_type.get(CDS_TYPE_URL).unwrap(),
+            "v2"
+        );
+        assert_eq!(
+            accumulator.versions_by_type.get(ECDS_TYPE_URL).unwrap(),
+            "v1"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_reserved_slice_carrier_is_nacked_and_rolled_back() {
+        use crate::xds::carrier::{
+            FERRUM_ECDS_PEER_AUTH_TYPE_URL, carrier_resource_name_for_type_url,
+        };
+
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut state = ClientSubscriptionState::new();
+        let mut accumulator = ResourceAccumulator::new();
+        let mut nack_circuit_breaker = NackCircuitBreaker::default();
+
+        accumulator
+            .apply_sotw_response(
+                CDS_TYPE_URL,
+                &[any_resource(CDS_TYPE_URL, "cluster/default/api/8080")],
+                "v1",
+            )
+            .expect("CDS applies");
+        accumulator
+            .apply_sotw_response(
+                RDS_TYPE_URL,
+                &[any_resource(RDS_TYPE_URL, "route/default/api")],
+                "v1",
+            )
+            .expect("RDS applies");
+        apply_all_empty(&mut accumulator);
+
+        let carrier_name =
+            carrier_resource_name_for_type_url(FERRUM_ECDS_PEER_AUTH_TYPE_URL).expect("name");
+        let result = handle_ads_response(
+            discovery_response(
+                ECDS_TYPE_URL,
+                "v2",
+                "n2",
+                vec![typed_extension_resource(
+                    carrier_name,
+                    FERRUM_ECDS_PEER_AUTH_TYPE_URL,
+                    b"{not valid json}".to_vec(),
+                )],
+            ),
+            &test_config(),
+            &tx,
+            &mut state,
+            &mut accumulator,
+            &mut nack_circuit_breaker,
+        )
+        .await
+        .expect("bad Ferrum carrier should NACK without closing stream");
+
+        assert!(result.is_none());
+        assert!(
+            accumulator.resources(ECDS_TYPE_URL).is_empty(),
+            "NACK must roll ECDS back to the previous empty accepted response"
+        );
+        let nack = rx.recv().await.expect("NACK sent");
+        assert_eq!(nack.type_url, ECDS_TYPE_URL);
+        assert_eq!(nack.response_nonce, "n2");
+        let detail = nack.error_detail.expect("error detail");
+        assert!(detail.message.contains("failed JSON decode"));
+    }
+
+    #[tokio::test]
+    async fn invalid_ecds_nack_discards_existing_debounced_pending_slice() {
+        use crate::xds::carrier::{
+            FERRUM_ECDS_PEER_AUTH_TYPE_URL, carrier_resource_name_for_type_url,
+        };
+
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut state = ClientSubscriptionState::new();
+        let mut accumulator = ResourceAccumulator::new();
+        let mut nack_circuit_breaker = NackCircuitBreaker::default();
+        let mut pending_slice = Some(PendingXdsSlice {
+            slice: MeshSlice {
+                node_id: "node-a".to_string(),
+                namespace: "default".to_string(),
+                version: "pending".to_string(),
+                ..MeshSlice::default()
+            },
+            type_url: CDS_TYPE_URL.to_string(),
+            all_types_ready: true,
+        });
+        let carrier_name =
+            carrier_resource_name_for_type_url(FERRUM_ECDS_PEER_AUTH_TYPE_URL).expect("name");
+        let nack_count_before = nack_circuit_breaker.consecutive_nacks(ECDS_TYPE_URL);
+
+        let result = handle_ads_response(
+            discovery_response(
+                ECDS_TYPE_URL,
+                "v1",
+                "n1",
+                vec![typed_extension_resource(
+                    carrier_name,
+                    FERRUM_ECDS_PEER_AUTH_TYPE_URL,
+                    b"{not valid json}".to_vec(),
+                )],
+            ),
+            &test_config(),
+            &tx,
+            &mut state,
+            &mut accumulator,
+            &mut nack_circuit_breaker,
+        )
+        .await
+        .expect("bad ECDS carrier should NACK without closing stream");
+
+        assert!(result.is_none());
+        assert!(nack_circuit_breaker.nacked_since(ECDS_TYPE_URL, nack_count_before));
+        assert!(discard_pending_xds_slice_after_nack(
+            &test_config(),
+            &mut pending_slice,
+            ECDS_TYPE_URL
+        ));
+        assert!(
+            pending_slice.is_none(),
+            "a known-type NACK must clear any debounced pending slice"
+        );
+        let nack = rx.recv().await.expect("NACK sent");
+        assert_eq!(nack.type_url, ECDS_TYPE_URL);
+    }
+
+    #[tokio::test]
+    async fn reserved_slice_carrier_missing_typed_config_is_nacked() {
+        use crate::xds::carrier::{
+            FERRUM_ECDS_PEER_AUTH_TYPE_URL, carrier_resource_name_for_type_url,
+        };
+
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut state = ClientSubscriptionState::new();
+        let mut accumulator = ResourceAccumulator::new();
+        let mut nack_circuit_breaker = NackCircuitBreaker::default();
+        let carrier_name =
+            carrier_resource_name_for_type_url(FERRUM_ECDS_PEER_AUTH_TYPE_URL).expect("name");
+
+        let result = handle_ads_response(
+            discovery_response(
+                ECDS_TYPE_URL,
+                "v1",
+                "n1",
+                vec![typed_extension_resource_without_config(carrier_name)],
+            ),
+            &test_config(),
+            &tx,
+            &mut state,
+            &mut accumulator,
+            &mut nack_circuit_breaker,
+        )
+        .await
+        .expect("missing typed_config should NACK without closing stream");
+
+        assert!(result.is_none());
+        assert!(
+            accumulator.resources(ECDS_TYPE_URL).is_empty(),
+            "NACK must not store the malformed ECDS response"
+        );
+        let nack = rx.recv().await.expect("NACK sent");
+        assert_eq!(nack.type_url, ECDS_TYPE_URL);
+        assert_eq!(nack.response_nonce, "n1");
+        let detail = nack.error_detail.expect("error detail");
+        assert!(detail.message.contains("without typed_config"));
+    }
+
+    #[tokio::test]
+    async fn malformed_reserved_slice_carrier_is_nacked_before_required_types_ready() {
+        use crate::xds::carrier::{
+            FERRUM_ECDS_PEER_AUTH_TYPE_URL, carrier_resource_name_for_type_url,
+        };
+
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut state = ClientSubscriptionState::new();
+        let mut accumulator = ResourceAccumulator::new();
+        let mut nack_circuit_breaker = NackCircuitBreaker::default();
+        let carrier_name =
+            carrier_resource_name_for_type_url(FERRUM_ECDS_PEER_AUTH_TYPE_URL).expect("name");
+
+        let result = handle_ads_response(
+            discovery_response(
+                ECDS_TYPE_URL,
+                "v1",
+                "n1",
+                vec![typed_extension_resource(
+                    carrier_name,
+                    FERRUM_ECDS_PEER_AUTH_TYPE_URL,
+                    b"{not valid json}".to_vec(),
+                )],
+            ),
+            &test_config(),
+            &tx,
+            &mut state,
+            &mut accumulator,
+            &mut nack_circuit_breaker,
+        )
+        .await
+        .expect("bad Ferrum carrier should NACK before first-slice readiness");
+
+        assert!(result.is_none());
+        assert!(
+            accumulator.resources(ECDS_TYPE_URL).is_empty(),
+            "validation happens at ECDS ingestion, before all required types are ready"
+        );
+        let nack = rx.recv().await.expect("NACK sent");
+        assert_eq!(nack.type_url, ECDS_TYPE_URL);
+        assert_eq!(nack.response_nonce, "n1");
+        let detail = nack.error_detail.expect("error detail");
+        assert!(detail.message.contains("failed JSON decode"));
+    }
+
+    #[tokio::test]
+    async fn malformed_reserved_destination_rule_carrier_is_nacked_before_required_types_ready() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut state = ClientSubscriptionState::new();
+        let mut accumulator = ResourceAccumulator::new();
+        let mut nack_circuit_breaker = NackCircuitBreaker::default();
+        let carrier_name = format!("{FERRUM_DR_CARRIER_RESOURCE_NAME_PREFIX}default/api-dr");
+
+        let result = handle_ads_response(
+            discovery_response(
+                ECDS_TYPE_URL,
+                "v1",
+                "n1",
+                vec![typed_extension_resource(
+                    &carrier_name,
+                    FERRUM_ECDS_DESTINATION_RULE_TYPE_URL,
+                    b"{not valid json}".to_vec(),
+                )],
+            ),
+            &test_config(),
+            &tx,
+            &mut state,
+            &mut accumulator,
+            &mut nack_circuit_breaker,
+        )
+        .await
+        .expect("bad reserved DR carrier should NACK before first-slice readiness");
+
+        assert!(result.is_none());
+        assert!(
+            accumulator.resources(ECDS_TYPE_URL).is_empty(),
+            "reserved DR carriers are validated at ECDS ingestion"
+        );
+        let nack = rx.recv().await.expect("NACK sent");
+        assert_eq!(nack.type_url, ECDS_TYPE_URL);
+        assert_eq!(nack.response_nonce, "n1");
+        let detail = nack.error_detail.expect("error detail");
+        assert!(detail.message.contains("DestinationRule"));
+        assert!(detail.message.contains("failed JSON decode"));
+    }
+
+    #[tokio::test]
     async fn repeated_invalid_update_trips_nack_circuit_breaker() {
         let (tx, mut rx) = mpsc::channel(8);
         let mut state = ClientSubscriptionState::new();
@@ -1698,7 +2278,7 @@ mod tests {
                     RDS_TYPE_URL,
                     &format!("v{}", attempt + 1),
                     &format!("n{}", attempt + 1),
-                    vec![any_resource(RDS_TYPE_URL, "route/default/missing")],
+                    vec![any_resource(RDS_TYPE_URL, "route/default")],
                 ),
                 &test_config(),
                 &tx,
@@ -1717,7 +2297,7 @@ mod tests {
                 RDS_TYPE_URL,
                 "v-final",
                 "n-final",
-                vec![any_resource(RDS_TYPE_URL, "route/default/missing")],
+                vec![any_resource(RDS_TYPE_URL, "route/default")],
             ),
             &test_config(),
             &tx,
@@ -1807,7 +2387,7 @@ mod tests {
     }
 
     #[test]
-    fn accumulator_requires_core_types_but_not_sds() {
+    fn accumulator_requires_core_types_and_ecds_but_not_sds() {
         let mut accumulator = ResourceAccumulator::new();
         for type_url in [CDS_TYPE_URL, EDS_TYPE_URL, LDS_TYPE_URL] {
             accumulator
@@ -1818,6 +2398,10 @@ mod tests {
         assert!(!accumulator.has_required_types());
         accumulator
             .apply_sotw_response(RDS_TYPE_URL, &[], "v1")
+            .expect("response applies");
+        assert!(!accumulator.has_required_types());
+        accumulator
+            .apply_sotw_response(ECDS_TYPE_URL, &[], "v1")
             .expect("response applies");
         assert!(accumulator.has_required_types());
     }
@@ -1843,6 +2427,23 @@ mod tests {
         assert_eq!(slice.services[0].name, "api");
         assert_eq!(slice.services[0].namespace, "default");
         assert_eq!(slice.services[0].ports[0].port, 8080);
+    }
+
+    #[test]
+    fn reverse_translate_rejects_non_ferrum_cluster_name_shape() {
+        let mut accumulator = ResourceAccumulator::new();
+        let err = accumulator
+            .apply_sotw_response(
+                CDS_TYPE_URL,
+                &[any_resource(
+                    CDS_TYPE_URL,
+                    "outbound|8080||api.default.svc.cluster.local",
+                )],
+                "v1",
+            )
+            .expect_err("non-Ferrum xDS names are not supported");
+
+        assert!(err.contains("cluster/{namespace}/{service}/{port}"));
     }
 
     #[test]
@@ -1928,7 +2529,7 @@ mod tests {
                 "v1",
             )
             .expect("CDS response applies");
-        for type_url in [EDS_TYPE_URL, LDS_TYPE_URL, RDS_TYPE_URL] {
+        for type_url in [EDS_TYPE_URL, LDS_TYPE_URL, RDS_TYPE_URL, ECDS_TYPE_URL] {
             accumulator
                 .apply_sotw_response(type_url, &[], "v1")
                 .expect("empty response applies");
@@ -2012,12 +2613,24 @@ mod tests {
     // `slice.destination_rules`. Other ECDS payloads are silently skipped.
 
     fn dr_carrier_resource(name: &str, dr_json: &str) -> proto::Any {
+        typed_extension_resource(
+            name,
+            FERRUM_ECDS_DESTINATION_RULE_TYPE_URL,
+            dr_json.as_bytes().to_vec(),
+        )
+    }
+
+    fn typed_extension_resource(
+        name: &str,
+        inner_type_url: &str,
+        inner_value: Vec<u8>,
+    ) -> proto::Any {
         use prost::Message;
         let typed_extension = proto::TypedExtensionConfig {
             name: name.to_string(),
             typed_config: Some(proto::Any {
-                type_url: FERRUM_ECDS_DESTINATION_RULE_TYPE_URL.to_string(),
-                value: dr_json.as_bytes().to_vec(),
+                type_url: inner_type_url.to_string(),
+                value: inner_value,
             }),
         };
         let mut value = Vec::new();
@@ -2027,6 +2640,18 @@ mod tests {
         proto::Any {
             type_url: ECDS_TYPE_URL.to_string(),
             value,
+        }
+    }
+
+    fn typed_extension_resource_without_config(name: &str) -> proto::Any {
+        use prost::Message;
+        let typed_extension = proto::TypedExtensionConfig {
+            name: name.to_string(),
+            typed_config: None,
+        };
+        proto::Any {
+            type_url: ECDS_TYPE_URL.to_string(),
+            value: typed_extension.encode_to_vec(),
         }
     }
 
@@ -2169,6 +2794,59 @@ mod tests {
             .expect("reverse translate")
             .expect("all required types present");
         assert!(slice.destination_rules.is_empty());
+    }
+
+    #[test]
+    fn reserved_ecds_dr_carrier_cross_namespace_recovers_destination_rule() {
+        let dr_json = r#"{
+            "name": "api-dr",
+            "namespace": "other",
+            "host": "api.other.svc.cluster.local"
+        }"#;
+        let mut accumulator = primed_accumulator();
+        accumulator
+            .apply_sotw_response(
+                ECDS_TYPE_URL,
+                &[dr_carrier_resource(
+                    &format!("{FERRUM_DR_CARRIER_RESOURCE_NAME_PREFIX}other/api-dr"),
+                    dr_json,
+                )],
+                "v1",
+            )
+            .expect("reserved ECDS DR carrier applies");
+
+        let slice = accumulator
+            .try_build_mesh_slice(&test_config())
+            .expect("reverse translate")
+            .expect("all required types present");
+        assert_eq!(slice.destination_rules.len(), 1);
+        assert_eq!(slice.destination_rules[0].name, "api-dr");
+        assert_eq!(slice.destination_rules[0].namespace, "other");
+        assert_eq!(
+            slice.destination_rules[0].host,
+            "api.other.svc.cluster.local"
+        );
+    }
+
+    #[test]
+    fn reserved_ecds_dr_carrier_name_mismatch_is_rejected() {
+        let dr_json = r#"{
+            "name": "api-dr",
+            "namespace": "other",
+            "host": "api.other.svc.cluster.local"
+        }"#;
+        let mut accumulator = primed_accumulator();
+        let err = accumulator
+            .apply_sotw_response(
+                ECDS_TYPE_URL,
+                &[dr_carrier_resource(
+                    &format!("{FERRUM_DR_CARRIER_RESOURCE_NAME_PREFIX}default/api-dr"),
+                    dr_json,
+                )],
+                "v1",
+            )
+            .expect_err("reserved carrier resource name must match embedded DR");
+        assert!(err.contains("reserved name targets"));
     }
 
     #[test]
@@ -2321,11 +2999,13 @@ mod tests {
     fn representative_protected_slice() -> MeshSlice {
         use crate::identity::spiffe::{SpiffeId, TrustDomain};
         use crate::modes::mesh::config::{
-            MeshEndpoint, MeshJwtRule, MeshPolicy, MeshProxyConfig, MeshRequestAuthentication,
-            MeshRule, MtlsMode, OutboundTrafficPolicy, PeerAuthentication, PolicyAction,
-            PolicyScope, Resolution, ServiceEntry, ServiceEntryLocation, TrustBundle,
-            TrustBundleSet, Workload, WorkloadPort, WorkloadRef, WorkloadSelector,
+            MeshDestinationRule, MeshEndpoint, MeshJwtRule, MeshLoadBalancer, MeshPolicy,
+            MeshProxyConfig, MeshRequestAuthentication, MeshRule, MeshSimpleLb, MeshTrafficPolicy,
+            MtlsMode, OutboundTrafficPolicy, PeerAuthentication, PolicyAction, PolicyScope,
+            Resolution, ServiceEntry, ServiceEntryLocation, TrustBundle, TrustBundleSet, Workload,
+            WorkloadPort, WorkloadRef, WorkloadSelector,
         };
+        use crate::modes::mesh::slice::{MeshEgressScopeResource, MeshEgressScopeSnapshot};
 
         let td = TrustDomain::new("cluster.local").expect("trust domain");
         let workload = Workload {
@@ -2367,6 +3047,7 @@ mod tests {
             node_id: "node-a".to_string(),
             namespace: "default".to_string(),
             version: "v1".to_string(),
+            labels: BTreeMap::from([("app".to_string(), "api".to_string())]),
             workloads: vec![workload],
             services: vec![service],
             mesh_policies: vec![MeshPolicy {
@@ -2385,10 +3066,13 @@ mod tests {
                 }],
             }],
             peer_authentications: vec![PeerAuthentication {
-                name: "strict".to_string(),
+                name: "selector-strict".to_string(),
                 namespace: "default".to_string(),
                 scope: None,
-                selector: None,
+                selector: Some(WorkloadSelector {
+                    labels: HashMap::from([("app".to_string(), "api".to_string())]),
+                    namespace: None,
+                }),
                 mtls_mode: MtlsMode::Strict,
                 port_overrides: HashMap::new(),
             }],
@@ -2432,6 +3116,18 @@ mod tests {
                 name: "default".to_string(),
                 ..MeshProxyConfig::default()
             }],
+            destination_rules: vec![MeshDestinationRule {
+                name: "api-dr".to_string(),
+                namespace: "default".to_string(),
+                host: "api.default.svc.cluster.local".to_string(),
+                traffic_policy: Some(MeshTrafficPolicy {
+                    connect_timeout_ms: Some(250),
+                    load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::LeastRequest)),
+                    ..MeshTrafficPolicy::default()
+                }),
+                port_level_settings: HashMap::new(),
+                subsets: Vec::new(),
+            }],
             trust_bundles: Some(TrustBundleSet {
                 local: TrustBundle {
                     trust_domain: td,
@@ -2442,6 +3138,21 @@ mod tests {
                 federated: Vec::new(),
             }),
             outbound_traffic_policy: Some(OutboundTrafficPolicy::RegistryOnly),
+            sidecar_egress_scope: Some(MeshEgressScopeSnapshot {
+                sidecar_enforced: true,
+                dry_run: true,
+                sidecar_applied: true,
+                sidecar_admitted_services: 1,
+                sidecar_denied_services: 1,
+                services: vec![MeshEgressScopeResource {
+                    namespace: "default".to_string(),
+                    name: "api".to_string(),
+                    hosts: vec!["api.default.svc.cluster.local".to_string()],
+                    ports: vec![8080],
+                }],
+                known_destinations: vec!["api.default.svc.cluster.local:8080".to_string()],
+                ..MeshEgressScopeSnapshot::default()
+            }),
             ..MeshSlice::default()
         }
     }
@@ -2470,13 +3181,16 @@ mod tests {
             native.request_authentications
         );
         assert_eq!(recovered.service_entries, native.service_entries);
+        assert_eq!(recovered.destination_rules, native.destination_rules);
         assert_eq!(recovered.trust_bundles, native.trust_bundles);
         assert_eq!(recovered.proxy_configs, native.proxy_configs);
         assert_eq!(recovered.workloads, native.workloads);
+        assert_eq!(recovered.labels, native.labels);
         assert_eq!(
             recovered.outbound_traffic_policy,
             native.outbound_traffic_policy
         );
+        assert_eq!(recovered.sidecar_egress_scope, native.sidecar_egress_scope);
         // Services round-trip with full protocol + workload-ref shape via the
         // Services carrier (not the name-only CDS/EDS reconstruction).
         assert_eq!(recovered.services, native.services);
@@ -2495,8 +3209,175 @@ mod tests {
     }
 
     #[test]
+    fn xds_round_trip_service_entry_only_slice_does_not_invent_services() {
+        use crate::modes::mesh::config::{
+            MeshEndpoint, Resolution, ServiceEntry, ServiceEntryLocation,
+        };
+
+        let native = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "v1".to_string(),
+            services: Vec::new(),
+            service_entries: vec![ServiceEntry {
+                name: "external-api".to_string(),
+                namespace: "default".to_string(),
+                hosts: vec!["api.example.com".to_string()],
+                endpoints: vec![MeshEndpoint {
+                    address: "203.0.113.10".to_string(),
+                    ports: HashMap::from([("https".to_string(), 443u16)]),
+                    labels: HashMap::new(),
+                    network: None,
+                }],
+                resolution: Resolution::Static,
+                location: ServiceEntryLocation::MeshExternal,
+                ports: vec![ServicePort {
+                    port: 443,
+                    protocol: AppProtocol::Tls,
+                    name: Some("https".to_string()),
+                }],
+                export_to: Vec::new(),
+                workload_selector: None,
+            }],
+            ..MeshSlice::default()
+        };
+        let snapshot = translate_mesh_slice_to_snapshot(&native);
+        let accumulator = accumulator_from_snapshot(&snapshot);
+
+        let mut config = test_config();
+        config.node_id = native.node_id.clone();
+        config.namespace = native.namespace.clone();
+
+        let recovered = accumulator
+            .try_build_mesh_slice(&config)
+            .expect("reverse translate succeeds")
+            .expect("all required types present");
+
+        assert!(recovered.services.is_empty());
+        assert_eq!(recovered.service_entries, native.service_entries);
+    }
+
+    #[test]
+    fn xds_round_trip_preserves_empty_effective_labels_over_client_labels() {
+        use crate::modes::mesh::config::{MtlsMode, PeerAuthentication, WorkloadSelector};
+
+        let native = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "v1".to_string(),
+            labels: BTreeMap::new(),
+            peer_authentications: vec![PeerAuthentication {
+                name: "selector-strict".to_string(),
+                namespace: "default".to_string(),
+                scope: None,
+                selector: Some(WorkloadSelector {
+                    labels: HashMap::from([("app".to_string(), "api".to_string())]),
+                    namespace: None,
+                }),
+                mtls_mode: MtlsMode::Strict,
+                port_overrides: HashMap::new(),
+            }],
+            ..MeshSlice::default()
+        };
+        let snapshot = translate_mesh_slice_to_snapshot(&native);
+        let accumulator = accumulator_from_snapshot(&snapshot);
+
+        let mut config = test_config();
+        config.node_id = native.node_id.clone();
+        config.namespace = native.namespace.clone();
+        config.labels = BTreeMap::from([("app".to_string(), "api".to_string())]);
+
+        let recovered = accumulator
+            .try_build_mesh_slice(&config)
+            .expect("reverse translate succeeds")
+            .expect("all required types present");
+
+        assert!(recovered.labels.is_empty());
+        assert_eq!(
+            recovered.resolve_effective_mtls_mode(8080),
+            MtlsMode::Permissive,
+            "empty CP-computed labels must override local DP labels so selector policy does not start matching after xDS recovery"
+        );
+    }
+
+    #[test]
+    fn xds_round_trip_preserves_cross_namespace_destination_rule() {
+        use crate::modes::mesh::config::MeshDestinationRule;
+
+        let native = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "v1".to_string(),
+            destination_rules: vec![MeshDestinationRule {
+                name: "api-dr".to_string(),
+                namespace: "other".to_string(),
+                host: "api.other.svc.cluster.local".to_string(),
+                traffic_policy: None,
+                port_level_settings: HashMap::new(),
+                subsets: Vec::new(),
+            }],
+            ..MeshSlice::default()
+        };
+        let snapshot = translate_mesh_slice_to_snapshot(&native);
+        let accumulator = accumulator_from_snapshot(&snapshot);
+
+        let mut config = test_config();
+        config.node_id = native.node_id.clone();
+        config.namespace = native.namespace.clone();
+
+        let recovered = accumulator
+            .try_build_mesh_slice(&config)
+            .expect("reverse translate succeeds")
+            .expect("all required types present");
+
+        assert_eq!(recovered.destination_rules, native.destination_rules);
+    }
+
+    #[test]
+    fn xds_slice_carrier_requires_reserved_resource_name() {
+        use crate::modes::mesh::config::{MeshPolicy, MeshRule, PolicyAction, PolicyScope};
+        use crate::xds::carrier::FERRUM_ECDS_MESH_POLICIES_TYPE_URL;
+
+        let malicious_policies = vec![MeshPolicy {
+            name: "clear-or-replace-authz".to_string(),
+            namespace: "default".to_string(),
+            scope: PolicyScope::Namespace {
+                namespace: "default".to_string(),
+            },
+            rules: vec![MeshRule {
+                action: PolicyAction::Deny,
+                ..MeshRule::default()
+            }],
+        }];
+        let payload = serde_json::to_vec(&malicious_policies).expect("policy json");
+        let mut accumulator = primed_accumulator();
+        accumulator
+            .apply_sotw_response(
+                ECDS_TYPE_URL,
+                &[typed_extension_resource(
+                    "operator-mesh-policies",
+                    FERRUM_ECDS_MESH_POLICIES_TYPE_URL,
+                    payload,
+                )],
+                "v1",
+            )
+            .expect("ECDS applies");
+
+        let recovered = accumulator
+            .try_build_mesh_slice(&test_config())
+            .expect("reverse translate succeeds")
+            .expect("all required types present");
+
+        assert!(
+            recovered.mesh_policies.is_empty(),
+            "operator ECDS resources must not impersonate internal slice carriers"
+        );
+    }
+
+    #[test]
     fn xds_round_trip_without_carriers_falls_back_to_name_only_services() {
-        // Simulate a stock Envoy CP: CDS/EDS names only, no Ferrum carriers.
+        // Simulate an older Ferrum-shaped xDS CP: CDS/EDS names only, no
+        // Ferrum carriers.
         // The DP must still reconstruct service ports (fail-open routing) but
         // with empty security fields — the documented degraded mode.
         let mut accumulator = ResourceAccumulator::new();
@@ -2507,7 +3388,13 @@ mod tests {
                 "v1",
             )
             .expect("CDS applies");
-        for type_url in [EDS_TYPE_URL, LDS_TYPE_URL, RDS_TYPE_URL, SDS_TYPE_URL] {
+        for type_url in [
+            EDS_TYPE_URL,
+            LDS_TYPE_URL,
+            RDS_TYPE_URL,
+            ECDS_TYPE_URL,
+            SDS_TYPE_URL,
+        ] {
             accumulator
                 .apply_sotw_response(type_url, &[], "v1")
                 .expect("empty applies");
