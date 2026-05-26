@@ -221,9 +221,17 @@ When `log_to_metadata` is true (default), matches populate request metadata:
 `waf.first_blocking_rule`, `waf.paranoia`, plus `waf.scan_truncated` /
 `waf.scan_timed_out`. `log_to_stdout` emits a structured `warn!` per hit.
 
-Prometheus metrics: `waf_rule_hits_total{rule,category,severity,action}`,
-`waf_requests_blocked_total`, and `waf_score` track activity for tuning and
-alerting. Run in `monitor` first, watch these, then enforce.
+Prometheus metrics (exposed at `/metrics` when the `prometheus_metrics` plugin
+is enabled, derived from the `waf.*` metadata above):
+
+- `ferrum_waf_rule_hits_total{rule}` — matches per rule id.
+- `ferrum_waf_requests_total{action,severity}` — evaluated requests by outcome
+  (`blocked` / `monitored` / `clean`) and highest severity. Blocked volume is
+  the `action="blocked"` series.
+
+The per-request anomaly score is carried in the `waf.score` metadata
+(transaction logs), not a metric. Run in `monitor` first, watch these, then
+enforce.
 
 ## Configuration reference
 
