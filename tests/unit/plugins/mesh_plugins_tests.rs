@@ -112,6 +112,7 @@ fn stream_context() -> StreamConnectionContext {
         tls_client_cert_chain_der: None,
         sni_hostname: None,
         mesh_direction: None,
+        node_waypoint_policy_scope: None,
     }
 }
 
@@ -1527,6 +1528,7 @@ async fn workload_metrics_on_stream_connect_adds_source_identity_metadata() {
         tls_client_cert_chain_der: None,
         sni_hostname: None,
         mesh_direction: None,
+        node_waypoint_policy_scope: None,
     };
 
     let result = plugin.on_stream_connect(&mut ctx).await;
@@ -2440,6 +2442,7 @@ async fn workload_metrics_stream_inbound_listener_stamps_mesh_direction() {
         tls_client_cert_chain_der: None,
         sni_hostname: None,
         mesh_direction: Some(MeshTrafficDirection::Inbound),
+        node_waypoint_policy_scope: None,
     };
 
     let result = plugin.on_stream_connect(&mut ctx).await;

@@ -1359,6 +1359,10 @@ pub struct StreamConnectionContext {
     /// connection. Mirrors `RequestContext::mesh_direction`; `None` for stream
     /// proxies that are not part of a mesh listener.
     pub mesh_direction: Option<MeshTrafficDirection>,
+    /// Pre-resolved per-pod policy scope for node-waypoint topology.
+    /// Mirrors `RequestContext::node_waypoint_policy_scope`; `None` for
+    /// non-waypoint stream proxies.
+    pub node_waypoint_policy_scope: Option<Arc<crate::modes::mesh::runtime::PolicyScopeCache>>,
 }
 
 impl StreamConnectionContext {

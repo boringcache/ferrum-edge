@@ -819,10 +819,21 @@ impl Plugin for MeshAuthz {
             remote_ip: resolved_ip,
             ..MeshAuthzRequest::default()
         };
-        let result = self.decision_to_result(
-            evaluate_mesh_authorization(&self.slice, &request),
-            &mut metadata,
-        );
+        let decision = if self.per_pod_policy_scoping {
+            let scope = ctx.node_waypoint_policy_scope.as_deref();
+            if scope.is_none() {
+                metadata.insert("mesh_authz.scope_missing".to_string(), "true".to_string());
+            }
+            let policies = self
+                .slice
+                .mesh_policies
+                .iter()
+                .filter(|policy| Self::policy_applies_to_pod(policy, scope));
+            evaluate_mesh_authorization_policies(policies, &request)
+        } else {
+            evaluate_mesh_authorization(&self.slice, &request)
+        };
+        let result = self.decision_to_result(decision, &mut metadata);
         if matches!(
             result,
             PluginResult::Reject { .. } | PluginResult::RejectBinary { .. }

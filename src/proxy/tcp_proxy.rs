@@ -1149,6 +1149,7 @@ async fn run_tcp_accept_loop(
                         tls_client_cert_chain_der: None,
                         sni_hostname: None,
                         mesh_direction: None,
+                        node_waypoint_policy_scope: None,
                     };
 
                     // `ArcSwap::load()` returns a `Guard` over `Arc<Option<Arc<...>>>`;

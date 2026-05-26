@@ -136,6 +136,7 @@ fn create_stream_ctx_with_cert(
         tls_client_cert_chain_der: None,
         sni_hostname: None,
         mesh_direction: None,
+        node_waypoint_policy_scope: None,
     }
 }
 
@@ -970,6 +971,7 @@ fn create_udp_stream_ctx_with_cert(
         tls_client_cert_chain_der: None,
         sni_hostname: None,
         mesh_direction: None,
+        node_waypoint_policy_scope: None,
     }
 }
 
@@ -989,6 +991,7 @@ fn create_udp_stream_ctx_no_cert(consumers: Vec<Consumer>) -> StreamConnectionCo
         tls_client_cert_chain_der: None,
         sni_hostname: None,
         mesh_direction: None,
+        node_waypoint_policy_scope: None,
     }
 }
 
@@ -1051,6 +1054,7 @@ async fn test_mtls_auth_dtls_with_allowed_issuer() {
         tls_client_cert_chain_der: Some(Arc::new(vec![ca_der])),
         sni_hostname: None,
         mesh_direction: None,
+        node_waypoint_policy_scope: None,
     };
 
     let result = plugin.on_stream_connect(&mut ctx).await;
@@ -1083,6 +1087,7 @@ async fn test_mtls_auth_dtls_allowed_issuer_rejects_mismatch() {
         tls_client_cert_chain_der: Some(Arc::new(vec![ca_der])),
         sni_hostname: None,
         mesh_direction: None,
+        node_waypoint_policy_scope: None,
     };
 
     let result = plugin.on_stream_connect(&mut ctx).await;
