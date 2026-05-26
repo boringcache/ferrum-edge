@@ -334,11 +334,13 @@ impl Waf {
     fn finish_scan(&self, ctx: &mut RequestContext, outcome: ScanOutcome) -> PluginResult {
         if outcome.hits.is_empty() {
             if outcome.truncated && self.config.log_to_metadata {
-                ctx.metadata
-                    .insert("waf.scan_truncated".to_string(), "true".to_string());
+                ctx.set_waf_metadata("waf.scan_truncated", "true");
             }
             if outcome.timed_out {
                 return self.finish_timeout(ctx);
+            }
+            if self.config.log_to_metadata {
+                ctx.set_waf_metadata_if_absent("waf.action", "clean");
             }
             return PluginResult::Continue;
         }
@@ -384,16 +386,12 @@ impl Waf {
             TooLargeAction::Skip => Err(PluginResult::Continue),
             TooLargeAction::Block => {
                 if self.config.log_to_metadata {
-                    ctx.metadata
-                        .insert("waf.body_too_large".to_string(), "true".to_string());
+                    ctx.set_waf_metadata("waf.body_too_large", "true");
                 }
                 if self.config.mode == GlobalMode::Enforce {
                     if self.config.log_to_metadata {
-                        ctx.metadata
-                            .insert("waf.action".to_string(), "blocked".to_string());
-                        ctx.metadata
-                            .entry("waf.block_reason".to_string())
-                            .or_insert_with(|| "body_too_large".to_string());
+                        ctx.set_waf_metadata("waf.action", "blocked");
+                        ctx.set_waf_metadata_if_absent("waf.block_reason", "body_too_large");
                     }
                     Err(self.reject())
                 } else {
@@ -441,53 +439,34 @@ impl Waf {
         // a single transaction score that can cross the block threshold even
         // when no individual rule is set to enforce.
         let total_score = self.config.scoring.as_ref().map(|scoring| {
-            let prior = ctx
-                .metadata
-                .get("waf.score")
-                .and_then(|value| value.parse::<u32>().ok())
-                .unwrap_or(0);
-            let total = prior.saturating_add(phase_score);
-            // The running score must persist for later phases regardless of
-            // log_to_metadata; it is operational state, not just observability.
-            ctx.metadata
-                .insert("waf.score".to_string(), total.to_string());
-            (total, scoring.block_threshold)
+            ctx.ensure_waf_metadata_initialized();
+            ctx.waf_score = ctx.waf_score.saturating_add(phase_score);
+            (ctx.waf_score, scoring.block_threshold)
         });
         let score_block = enforce_actions
             && self.config.mode == GlobalMode::Enforce
             && total_score.is_some_and(|(total, threshold)| total >= threshold);
 
         if self.config.log_to_metadata {
-            merge_metadata(&mut ctx.metadata, "waf.rule_hits", &rule_ids.join(","));
-            merge_metadata(&mut ctx.metadata, "waf.target", &targets.join(","));
-            ctx.metadata
-                .insert("waf.severity".to_string(), highest.as_str().to_string());
-            ctx.metadata.insert(
-                "waf.paranoia".to_string(),
-                self.config.paranoia_level.to_string(),
-            );
+            ctx.merge_waf_metadata("waf.rule_hits", &rule_ids.join(","));
+            ctx.merge_waf_metadata("waf.target", &targets.join(","));
+            ctx.set_waf_metadata("waf.severity", highest.as_str());
+            ctx.set_waf_metadata("waf.paranoia", self.config.paranoia_level.to_string());
+            if let Some((total, _)) = total_score {
+                ctx.set_waf_metadata("waf.score", total.to_string());
+            }
             if outcome.truncated {
-                ctx.metadata
-                    .insert("waf.scan_truncated".to_string(), "true".to_string());
+                ctx.set_waf_metadata("waf.scan_truncated", "true");
             }
             if let Some(rule_id) = first_blocking_rule {
-                ctx.metadata
-                    .entry("waf.first_blocking_rule".to_string())
-                    .or_insert_with(|| rule_id.to_string());
-                ctx.metadata
-                    .insert("waf.action".to_string(), "blocked".to_string());
-                ctx.metadata
-                    .entry("waf.block_reason".to_string())
-                    .or_insert_with(|| "rule".to_string());
+                ctx.set_waf_metadata_if_absent("waf.first_blocking_rule", rule_id);
+                ctx.set_waf_metadata("waf.action", "blocked");
+                ctx.set_waf_metadata_if_absent("waf.block_reason", "rule");
             } else if score_block {
-                ctx.metadata
-                    .insert("waf.action".to_string(), "blocked".to_string());
-                ctx.metadata
-                    .entry("waf.block_reason".to_string())
-                    .or_insert_with(|| "score".to_string());
-            } else if ctx.metadata.get("waf.action").map(String::as_str) != Some("blocked") {
-                ctx.metadata
-                    .insert("waf.action".to_string(), "monitored".to_string());
+                ctx.set_waf_metadata("waf.action", "blocked");
+                ctx.set_waf_metadata_if_absent("waf.block_reason", "score");
+            } else if ctx.waf_metadata_value("waf.action") != Some("blocked") {
+                ctx.set_waf_metadata("waf.action", "monitored");
             }
         }
 
@@ -496,17 +475,13 @@ impl Waf {
 
     fn finish_timeout(&self, ctx: &mut RequestContext) -> PluginResult {
         if self.config.log_to_metadata {
-            ctx.metadata
-                .insert("waf.scan_timed_out".to_string(), "true".to_string());
+            ctx.set_waf_metadata("waf.scan_timed_out", "true");
             match self.config.on_scan_timeout {
                 TimeoutAction::Block => {
-                    ctx.metadata
-                        .insert("waf.action".to_string(), "blocked".to_string());
+                    ctx.set_waf_metadata("waf.action", "blocked");
                 }
                 TimeoutAction::Allow | TimeoutAction::LogAndAllow => {
-                    ctx.metadata
-                        .entry("waf.action".to_string())
-                        .or_insert_with(|| "clean".to_string());
+                    ctx.set_waf_metadata_if_absent("waf.action", "clean");
                 }
             }
         }
@@ -571,6 +546,9 @@ impl Plugin for Waf {
     }
 
     async fn authorize(&self, ctx: &mut RequestContext) -> PluginResult {
+        if self.active {
+            ctx.ensure_waf_metadata_initialized();
+        }
         if !self.active
             || !self.config.request_inspection
             || !self.compiled.request_cheap_rules_active
@@ -627,6 +605,9 @@ impl Plugin for Waf {
         headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
+        if self.active {
+            ctx.ensure_waf_metadata_initialized();
+        }
         if !self.requires_request_body_buffering()
             || self.exemptions.request_short_circuits(ctx)
             || !self
@@ -656,6 +637,9 @@ impl Plugin for Waf {
         _response_status: u16,
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
+        if self.active {
+            ctx.ensure_waf_metadata_initialized();
+        }
         if !self.active
             || !self.config.response_inspection
             || !self.compiled.response_header_rules_active
@@ -688,6 +672,9 @@ impl Plugin for Waf {
         response_headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
+        if self.active {
+            ctx.ensure_waf_metadata_initialized();
+        }
         if !self.should_buffer_response_body(ctx) {
             return PluginResult::Continue;
         }
@@ -706,21 +693,6 @@ impl Plugin for Waf {
         outcome.truncated = truncated;
         self.finish_scan(ctx, outcome)
     }
-}
-
-fn merge_metadata(metadata: &mut HashMap<String, String>, key: &str, value: &str) {
-    if value.is_empty() {
-        return;
-    }
-    metadata
-        .entry(key.to_string())
-        .and_modify(|existing| {
-            if !existing.is_empty() {
-                existing.push(',');
-            }
-            existing.push_str(value);
-        })
-        .or_insert_with(|| value.to_string());
 }
 
 fn proxy_id(ctx: &RequestContext) -> &str {

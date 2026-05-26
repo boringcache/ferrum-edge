@@ -510,7 +510,7 @@ pub(super) async fn handle_hbone_request(
             latency_plugin_external_io_ms: plugin_external_io_ms,
             latency_gateway_overhead_ms: gateway_overhead_ms,
             request_user_agent: ctx.headers.get("user-agent").cloned(),
-            metadata: ctx.metadata.clone(),
+            metadata: crate::proxy::clone_log_metadata(ctx),
             ..TransactionSummary::default()
         };
         crate::plugins::log_with_mirror(plugins, &summary, ctx).await;

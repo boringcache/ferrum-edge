@@ -426,7 +426,7 @@ mod tests {
     #[test]
     fn disabling_a_default_header() {
         let headers = apply_to(json!({ "frame_options": false }), HashMap::new());
-        assert!(headers.get("x-frame-options").is_none());
+        assert!(!headers.contains_key("x-frame-options"));
         assert_eq!(
             headers.get("x-content-type-options").map(String::as_str),
             Some("nosniff")

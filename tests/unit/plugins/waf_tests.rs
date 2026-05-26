@@ -28,6 +28,22 @@ async fn default_waf_monitors_sqli_query_without_blocking() {
 }
 
 #[tokio::test]
+async fn clean_waf_evaluation_records_clean_action_for_metrics() {
+    let plugin = Waf::new(&json!({})).unwrap();
+    let mut ctx = ctx("GET", "/search");
+    ctx.set_raw_query_string("q=ordinary".into());
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata.get("waf.action").map(String::as_str),
+        Some("clean")
+    );
+    assert!(!ctx.metadata.contains_key("waf.rule_hits"));
+}
+
+#[tokio::test]
 async fn rule_mode_can_enforce_default_rule() {
     let plugin = Waf::new(&json!({
         "rule_modes": { "FE-XSS-001": "enforce" }
@@ -73,6 +89,29 @@ async fn path_exemption_short_circuits_and_writes_no_waf_metadata() {
 
     assert!(matches!(result, PluginResult::Continue));
     assert!(!ctx.metadata.keys().any(|key| key.starts_with("waf.")));
+}
+
+#[tokio::test]
+async fn waf_clears_preexisting_reserved_metadata_before_evaluation() {
+    let plugin = Waf::new(&json!({})).unwrap();
+    let mut ctx = ctx("GET", "/search");
+    ctx.metadata
+        .insert("waf.rule_hits".to_string(), "SPOOFED".to_string());
+    ctx.metadata
+        .insert("waf.action".to_string(), "blocked".to_string());
+    ctx.metadata
+        .insert("waf.severity".to_string(), "critical".to_string());
+    ctx.set_raw_query_string("q=ordinary".into());
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata.get("waf.action").map(String::as_str),
+        Some("clean")
+    );
+    assert!(!ctx.metadata.contains_key("waf.rule_hits"));
+    assert!(!ctx.metadata.contains_key("waf.severity"));
 }
 
 #[tokio::test]
@@ -1229,6 +1268,53 @@ async fn scoring_accumulates_across_query_and_body_phases() {
         ctx.metadata.get("waf.block_reason").map(String::as_str),
         Some("score")
     );
+}
+
+#[tokio::test]
+async fn scoring_ignores_preexisting_public_score_metadata() {
+    let plugin = Waf::new(&json!({
+        "mode": "enforce",
+        "scoring": { "enabled": true, "block_threshold": 8 }
+    }))
+    .unwrap();
+    let mut ctx = ctx("GET", "/search");
+    ctx.metadata
+        .insert("waf.score".to_string(), "1000".to_string());
+    ctx.set_raw_query_string("q=union+select+1".into());
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(ctx.metadata.get("waf.score").map(String::as_str), Some("5"));
+}
+
+#[tokio::test]
+async fn scoring_with_metadata_disabled_uses_private_state() {
+    let plugin = Waf::new(&json!({
+        "mode": "enforce",
+        "log_to_metadata": false,
+        "scoring": { "enabled": true, "block_threshold": 8 }
+    }))
+    .unwrap();
+    let mut ctx = ctx("POST", "/submit");
+    ctx.headers
+        .insert("content-type".into(), "application/json".into());
+    ctx.set_raw_query_string("q=union+select+1".into());
+
+    let result = plugin.authorize(&mut ctx).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!ctx.metadata.keys().any(|key| key.starts_with("waf.")));
+
+    let headers = ctx.headers.clone();
+    let result = plugin
+        .on_final_request_body_with_context(
+            &mut ctx,
+            &headers,
+            br#"{"c":"<script>alert(1)</script>"}"#,
+        )
+        .await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(!ctx.metadata.keys().any(|key| key.starts_with("waf.")));
 }
 
 #[tokio::test]

@@ -320,6 +320,15 @@ pub struct RequestContext {
     pub timestamp_received: DateTime<Utc>,
     /// Extra metadata plugins can attach
     pub metadata: HashMap<String, String>,
+    /// Whether reserved `waf.*` metadata has been cleared for this request.
+    ///
+    /// `metadata` is intentionally public plugin scratch space. WAF-owned log
+    /// fields are mirrored there for compatibility, but the authoritative
+    /// copy lives in `waf_owned_metadata` so other plugins or inbound request
+    /// data cannot spoof WAF transaction-log fields.
+    pub(crate) waf_metadata_initialized: bool,
+    pub(crate) waf_owned_metadata: HashMap<String, String>,
+    pub(crate) waf_score: u32,
     /// DER-encoded client certificate from mTLS handshake (first cert in chain).
     /// Populated when the connection used TLS with client certificate verification.
     /// Shared via Arc to avoid cloning cert bytes for each request on HTTP/2 connections.
@@ -446,6 +455,18 @@ pub struct RequestContext {
     pub mesh_direction: Option<MeshTrafficDirection>,
 }
 
+fn merge_metadata_value(metadata: &mut HashMap<String, String>, key: &str, value: &str) {
+    metadata
+        .entry(key.to_string())
+        .and_modify(|existing| {
+            if !existing.is_empty() {
+                existing.push(',');
+            }
+            existing.push_str(value);
+        })
+        .or_insert_with(|| value.to_string());
+}
+
 impl RequestContext {
     pub fn new(client_ip: String, method: String, path: String) -> Self {
         Self {
@@ -465,6 +486,9 @@ impl RequestContext {
             auth_method: None,
             timestamp_received: Utc::now(),
             metadata: HashMap::new(),
+            waf_metadata_initialized: false,
+            waf_owned_metadata: HashMap::new(),
+            waf_score: 0,
             tls_client_cert_der: None,
             tls_client_cert_chain_der: None,
             peer_spiffe_id: None,
@@ -510,6 +534,9 @@ impl RequestContext {
             auth_method: self.auth_method,
             timestamp_received: self.timestamp_received,
             metadata: self.metadata.clone(),
+            waf_metadata_initialized: self.waf_metadata_initialized,
+            waf_owned_metadata: self.waf_owned_metadata.clone(),
+            waf_score: self.waf_score,
             tls_client_cert_der: self.tls_client_cert_der.clone(),
             tls_client_cert_chain_der: self.tls_client_cert_chain_der.clone(),
             peer_spiffe_id: self.peer_spiffe_id.clone(),
@@ -530,6 +557,56 @@ impl RequestContext {
             node_waypoint_policy_scope: self.node_waypoint_policy_scope.clone(),
             mesh_direction: self.mesh_direction,
         }
+    }
+
+    pub(crate) fn ensure_waf_metadata_initialized(&mut self) {
+        if self.waf_metadata_initialized {
+            return;
+        }
+        self.metadata.retain(|key, _| !key.starts_with("waf."));
+        self.waf_owned_metadata.clear();
+        self.waf_metadata_initialized = true;
+    }
+
+    pub(crate) fn set_waf_metadata(&mut self, key: &str, value: impl Into<String>) {
+        self.ensure_waf_metadata_initialized();
+        let value = value.into();
+        self.waf_owned_metadata
+            .insert(key.to_string(), value.clone());
+        self.metadata.insert(key.to_string(), value);
+    }
+
+    pub(crate) fn set_waf_metadata_if_absent(&mut self, key: &str, value: impl Into<String>) {
+        self.ensure_waf_metadata_initialized();
+        if self.waf_owned_metadata.contains_key(key) {
+            return;
+        }
+        self.set_waf_metadata(key, value);
+    }
+
+    pub(crate) fn merge_waf_metadata(&mut self, key: &str, value: &str) {
+        if value.is_empty() {
+            return;
+        }
+        self.ensure_waf_metadata_initialized();
+        merge_metadata_value(&mut self.waf_owned_metadata, key, value);
+        let Some(owned_value) = self.waf_owned_metadata.get(key).cloned() else {
+            return;
+        };
+        self.metadata.insert(key.to_string(), owned_value);
+    }
+
+    pub(crate) fn waf_metadata_value(&self, key: &str) -> Option<&str> {
+        self.waf_owned_metadata.get(key).map(String::as_str)
+    }
+
+    pub(crate) fn apply_waf_owned_log_metadata(&self, metadata: &mut HashMap<String, String>) {
+        metadata.retain(|key, _| !key.starts_with("waf."));
+        metadata.extend(
+            self.waf_owned_metadata
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
     }
 
     /// Effective upstream id for routing: plugin upstream override >
