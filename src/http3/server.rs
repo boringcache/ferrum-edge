@@ -3341,6 +3341,19 @@ struct H3StreamResult {
     request_on_wire: bool,
 }
 
+async fn run_h3_streaming_after_proxy_hooks(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    response_status: u16,
+    response_headers: &mut HashMap<String, String>,
+    plugin_execution_ns: &mut u64,
+) -> Option<crate::proxy::AfterProxyReject> {
+    let phase_start = std::time::Instant::now();
+    let reject = run_after_proxy_hooks(plugins, ctx, response_status, response_headers).await;
+    *plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+    reject
+}
+
 /// Streaming proxy path: sends backend response chunks directly to the H3 client
 /// as they arrive, without collecting the full body in memory. Returns the status,
 /// final response headers, error class, and body-streaming outcome after the
@@ -3476,15 +3489,29 @@ async fn proxy_to_backend_h3_streaming(
         });
     }
 
-    // after_proxy hooks (run before streaming begins so headers can be modified)
+    // after_proxy hooks run before streaming begins so headers can be modified
+    // or the response can be rejected before any downstream bytes are committed.
+    if let Some(reject) = run_h3_streaming_after_proxy_hooks(
+        plugins,
+        ctx,
+        response_status,
+        &mut response_headers,
+        plugin_execution_ns,
+    )
+    .await
     {
-        let phase_start = std::time::Instant::now();
-        for plugin in plugins.iter() {
-            let _ = plugin
-                .after_proxy(ctx, response_status, &mut response_headers)
-                .await;
-        }
-        *plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+        let reject_status =
+            StatusCode::from_u16(reject.status_code).unwrap_or(StatusCode::BAD_GATEWAY);
+        send_h3_reject_response(h3_stream, reject_status, &reject.body, &reject.headers).await?;
+        return Ok(H3StreamResult {
+            status: reject.status_code,
+            error_class: None,
+            body_completed: true,
+            bytes_streamed: reject.body.len() as u64,
+            client_disconnected: false,
+            body_error_class: None,
+            request_on_wire: true,
+        });
     }
 
     // Sticky session cookie injection
@@ -4200,6 +4227,67 @@ mod h3_proxy_header_tests {
         assert_eq!(
             ctx.headers.get("content-type").map(String::as_str),
             Some("application/json")
+        );
+    }
+}
+
+#[cfg(test)]
+mod h3_streaming_after_proxy_tests {
+    use super::run_h3_streaming_after_proxy_hooks;
+    use crate::plugins::{Plugin, PluginResult, RequestContext};
+    use async_trait::async_trait;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    struct RejectingAfterProxy;
+
+    #[async_trait]
+    impl Plugin for RejectingAfterProxy {
+        fn name(&self) -> &str {
+            "rejecting_after_proxy"
+        }
+
+        async fn after_proxy(
+            &self,
+            _ctx: &mut RequestContext,
+            _status_code: u16,
+            _response_headers: &mut HashMap<String, String>,
+        ) -> PluginResult {
+            PluginResult::Reject {
+                status_code: 451,
+                body: "blocked by response policy".to_string(),
+                headers: HashMap::from([("x-policy".to_string(), "blocked".to_string())]),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_after_proxy_returns_reject_before_downstream_commit() {
+        let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(RejectingAfterProxy)];
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/stream".to_string(),
+        );
+        let mut response_headers =
+            HashMap::from([("content-type".to_string(), "text/plain".to_string())]);
+        let mut plugin_execution_ns = 0;
+
+        let reject = run_h3_streaming_after_proxy_hooks(
+            &plugins,
+            &mut ctx,
+            200,
+            &mut response_headers,
+            &mut plugin_execution_ns,
+        )
+        .await
+        .expect("after_proxy rejection should be surfaced");
+
+        assert_eq!(reject.status_code, 451);
+        assert_eq!(reject.body, b"blocked by response policy");
+        assert_eq!(
+            reject.headers.get("x-policy").map(String::as_str),
+            Some("blocked")
         );
     }
 }
