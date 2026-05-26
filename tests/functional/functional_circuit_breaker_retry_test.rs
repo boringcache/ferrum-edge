@@ -14,7 +14,7 @@ use crate::common::TestGateway;
 use serde_json::json;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // ============================================================================
 // Controllable backend (specific to these tests — the shared echo helpers
@@ -87,6 +87,33 @@ async fn spawn_gateway() -> TestGateway {
         .expect("start gateway")
 }
 
+async fn wait_for_proxy_route(
+    client: &reqwest::Client,
+    url: String,
+    timeout: Duration,
+) -> reqwest::Response {
+    let deadline = Instant::now() + timeout;
+    let mut last_status = None;
+    loop {
+        match client.get(&url).send().await {
+            Ok(resp) if resp.status().as_u16() != 404 => return resp,
+            Ok(resp) => {
+                last_status = Some(resp.status());
+            }
+            Err(err) => {
+                eprintln!("waiting for proxy route {url}: {err}");
+            }
+        }
+
+        assert!(
+            Instant::now() < deadline,
+            "proxy route {url} did not load before timeout; last status: {:?}",
+            last_status
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 // ============================================================================
 // Circuit Breaker Test
 // ============================================================================
@@ -128,14 +155,13 @@ async fn test_circuit_breaker_opens_and_recovers() {
         .unwrap();
     assert!(resp.status().is_success(), "Failed to create proxy");
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
-
     // Phase 1: Verify normal operation
-    let resp = client
-        .get(gateway.proxy_url("/cb/test"))
-        .send()
-        .await
-        .unwrap();
+    let resp = wait_for_proxy_route(
+        &client,
+        gateway.proxy_url("/cb/test"),
+        Duration::from_secs(10),
+    )
+    .await;
     assert_eq!(
         resp.status().as_u16(),
         200,
@@ -235,7 +261,12 @@ async fn test_retry_on_backend_failure() {
         .unwrap();
     assert!(resp.status().is_success(), "Failed to create proxy");
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    let _ = wait_for_proxy_route(
+        &client,
+        gateway.proxy_url("/retry/test"),
+        Duration::from_secs(10),
+    )
+    .await;
 
     request_count.store(0, Ordering::SeqCst);
 
@@ -296,7 +327,12 @@ async fn test_retry_succeeds_on_second_attempt() {
         .unwrap();
     assert!(resp.status().is_success());
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    let _ = wait_for_proxy_route(
+        &client,
+        gateway.proxy_url("/retry-recover/test"),
+        Duration::from_secs(10),
+    )
+    .await;
 
     // Fix backend after a short delay (during retry window)
     request_count.store(0, Ordering::SeqCst);
@@ -371,7 +407,12 @@ async fn test_retry_on_connect_failure() {
         .unwrap();
     assert!(resp.status().is_success());
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    let _ = wait_for_proxy_route(
+        &client,
+        gateway.proxy_url("/retry-connect/test"),
+        Duration::from_secs(10),
+    )
+    .await;
 
     let start = std::time::Instant::now();
     let resp = client
