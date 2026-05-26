@@ -448,6 +448,13 @@ impl Waf {
             && total_score.is_some_and(|(total, threshold)| total >= threshold);
 
         if self.config.log_to_metadata {
+            ctx.ensure_waf_metadata_initialized();
+            if let Some(previous_highest) = ctx
+                .waf_metadata_value("waf.severity")
+                .and_then(parse_severity)
+            {
+                highest = highest.max(previous_highest);
+            }
             ctx.merge_waf_metadata("waf.rule_hits", &rule_ids.join(","));
             ctx.merge_waf_metadata("waf.target", &targets.join(","));
             ctx.set_waf_metadata("waf.severity", highest.as_str());
@@ -715,6 +722,17 @@ fn default_body_content_types() -> Vec<String> {
         "text/plain".into(),
         "text/html".into(),
     ]
+}
+
+fn parse_severity(value: &str) -> Option<Severity> {
+    match value {
+        "info" => Some(Severity::Info),
+        "low" => Some(Severity::Low),
+        "medium" => Some(Severity::Medium),
+        "high" => Some(Severity::High),
+        "critical" => Some(Severity::Critical),
+        _ => None,
+    }
 }
 
 fn parse_global_mode(raw: &str) -> Result<GlobalMode, String> {

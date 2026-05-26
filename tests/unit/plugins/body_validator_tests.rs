@@ -2141,6 +2141,16 @@ async fn benign_doctype_without_nested_entities_is_allowed() {
 }
 
 #[tokio::test]
+async fn entity_literal_inside_cdata_is_not_treated_as_declaration() {
+    let plugin = xml_plugin();
+    let body = r#"<root><![CDATA[<!ENTITY x "&y;">]]></root>"#;
+    let mut ctx = make_xml_ctx(body);
+    let mut headers = make_xml_headers();
+
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+}
+
+#[tokio::test]
 async fn nested_entity_rejection_can_be_disabled() {
     let plugin = BodyValidator::new(&json!({
         "validate_xml": true,

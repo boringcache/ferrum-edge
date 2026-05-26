@@ -889,6 +889,32 @@ fn check_xml_entity_expansion(
     let mut count = 0usize;
     let mut i = 0usize;
     while i + needle.len() <= bytes.len() {
+        if bytes[i] != b'<' {
+            i += 1;
+            continue;
+        }
+        let remaining = &bytes[i..];
+        if remaining.starts_with(b"<![CDATA[") {
+            let Some(end) = find_subsequence(&bytes[i + 9..], b"]]>") else {
+                return Ok(());
+            };
+            i = i + 9 + end + 3;
+            continue;
+        }
+        if remaining.starts_with(b"<!--") {
+            let Some(end) = find_subsequence(&bytes[i + 4..], b"-->") else {
+                return Ok(());
+            };
+            i = i + 4 + end + 3;
+            continue;
+        }
+        if remaining.len() >= 2 && remaining[1] == b'?' {
+            let Some(end) = find_subsequence(&bytes[i + 2..], b"?>") else {
+                return Ok(());
+            };
+            i = i + 2 + end + 2;
+            continue;
+        }
         if bytes[i..i + needle.len()].eq_ignore_ascii_case(needle) {
             count += 1;
             if count > max_entities {

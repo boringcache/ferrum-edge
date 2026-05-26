@@ -936,6 +936,22 @@ impl MetricsRegistry {
             keep
         });
 
+        self.waf_rule_hit_counter.retain(|_, v| {
+            let keep = v.nanos_since_update(self.epoch) < ttl_nanos;
+            if !keep {
+                evicted += 1;
+            }
+            keep
+        });
+
+        self.waf_request_counter.retain(|_, v| {
+            let keep = v.nanos_since_update(self.epoch) < ttl_nanos;
+            if !keep {
+                evicted += 1;
+            }
+            keep
+        });
+
         self.tls_source_fetch_duration_buckets.retain(|_, v| {
             let keep = v.nanos_since_update(self.epoch) < ttl_nanos;
             if !keep {
@@ -1724,6 +1740,27 @@ mod tests {
     fn record_waf_is_noop_without_waf_metadata() {
         let registry = MetricsRegistry::new();
         registry.record_waf(&std::collections::HashMap::new());
+        assert!(!registry.render_uncached().contains("ferrum_waf_"));
+    }
+
+    #[test]
+    fn evict_stale_removes_waf_metrics() {
+        let registry = MetricsRegistry::new();
+        let metadata = std::collections::HashMap::from([
+            ("waf.rule_hits".to_string(), "FE-SQLI-001".to_string()),
+            ("waf.action".to_string(), "blocked".to_string()),
+            ("waf.severity".to_string(), "high".to_string()),
+        ]);
+        registry.record_waf(&metadata);
+
+        assert!(!registry.waf_rule_hit_counter.is_empty());
+        assert!(!registry.waf_request_counter.is_empty());
+
+        let evicted = registry.evict_stale(0);
+
+        assert!(evicted >= 2);
+        assert!(registry.waf_rule_hit_counter.is_empty());
+        assert!(registry.waf_request_counter.is_empty());
         assert!(!registry.render_uncached().contains("ferrum_waf_"));
     }
 

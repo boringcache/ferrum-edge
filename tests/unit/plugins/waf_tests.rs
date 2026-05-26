@@ -239,6 +239,61 @@ async fn request_body_scan_uses_context_aware_final_body_hook() {
 }
 
 #[tokio::test]
+async fn highest_severity_is_preserved_across_scan_phases() {
+    let plugin = Waf::new(&json!({
+        "mode": "monitor",
+        "include_default_rules": false,
+        "custom_rules": [
+            {
+                "id": "CUSTOM-HIGH-QUERY",
+                "name": "high query marker",
+                "category": "custom",
+                "severity": "high",
+                "target": "query_values",
+                "match_kind": "contains",
+                "pattern": "high-marker",
+                "action": "monitor"
+            },
+            {
+                "id": "CUSTOM-LOW-BODY",
+                "name": "low body marker",
+                "category": "custom",
+                "severity": "low",
+                "target": "body_text",
+                "match_kind": "contains",
+                "pattern": "low-marker",
+                "action": "monitor"
+            }
+        ]
+    }))
+    .unwrap();
+    let mut ctx = ctx("POST", "/submit");
+    ctx.set_raw_query_string("q=high-marker".into());
+    ctx.headers
+        .insert("content-type".into(), "text/plain".into());
+
+    assert!(matches!(
+        plugin.authorize(&mut ctx).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.metadata.get("waf.severity").map(String::as_str),
+        Some("high")
+    );
+
+    let headers = ctx.headers.clone();
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, b"low-marker")
+        .await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata.get("waf.severity").map(String::as_str),
+        Some("high")
+    );
+}
+
+#[tokio::test]
 async fn custom_body_json_path_rule_scans_only_selected_value() {
     let plugin = Waf::new(&json!({
         "include_default_rules": false,

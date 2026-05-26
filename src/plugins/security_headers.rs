@@ -137,6 +137,10 @@ impl Plugin for SecurityHeaders {
         self.apply(response_headers);
         PluginResult::Continue
     }
+
+    fn applies_after_proxy_on_reject(&self) -> bool {
+        true
+    }
 }
 
 fn find_header_ci<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<&'a str> {

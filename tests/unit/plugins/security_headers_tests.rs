@@ -76,6 +76,26 @@ fn security_headers_is_a_security_plugin() {
     assert!(is_security_plugin("security_headers"));
 }
 
+#[tokio::test]
+async fn applies_to_gateway_rejection_responses() {
+    let plugin = SecurityHeaders::new(&json!({})).unwrap();
+    let mut ctx = ctx();
+    let mut headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+
+    assert!(plugin.applies_after_proxy_on_reject());
+    let result = plugin.after_proxy(&mut ctx, 403, &mut headers).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        headers.get("x-content-type-options").map(String::as_str),
+        Some("nosniff")
+    );
+    assert_eq!(
+        headers.get("x-frame-options").map(String::as_str),
+        Some("SAMEORIGIN")
+    );
+}
+
 #[test]
 fn invalid_header_value_is_rejected() {
     let err =

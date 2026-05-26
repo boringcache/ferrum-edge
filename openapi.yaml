@@ -5965,7 +5965,7 @@ components:
             Security plugins (key_auth, basic_auth, jwt_auth, jwks_auth,
             oauth2_introspection, oidc_relying_party, hmac_auth, ldap_auth,
             mtls_auth, access_control,
-            tcp_connection_throttle, ip_restriction, waf, mesh_authz, opa,
+            tcp_connection_throttle, ip_restriction, waf, security_headers, mesh_authz, opa,
             mesh_outbound_registry, openapi_validator) are validation-fatal: invalid config blocks
             gateway startup in file mode, and on DB/CP polling the new config
             snapshot is rejected as a whole (the gateway keeps serving the
