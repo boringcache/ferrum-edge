@@ -1976,6 +1976,34 @@ fn validate_mesh_config_internal(
                     }
                 }
             }
+            validate_mesh_source_negation_ip_values(
+                policy,
+                i,
+                "ip_blocks",
+                &rule.source_negation.ip_blocks,
+                &mut errors,
+            );
+            validate_mesh_source_negation_ip_values(
+                policy,
+                i,
+                "not_ip_blocks",
+                &rule.source_negation.not_ip_blocks,
+                &mut errors,
+            );
+            validate_mesh_source_negation_ip_values(
+                policy,
+                i,
+                "remote_ip_blocks",
+                &rule.source_negation.remote_ip_blocks,
+                &mut errors,
+            );
+            validate_mesh_source_negation_ip_values(
+                policy,
+                i,
+                "not_remote_ip_blocks",
+                &rule.source_negation.not_remote_ip_blocks,
+                &mut errors,
+            );
             for (j, condition) in rule.when.iter().enumerate() {
                 if !is_supported_mesh_condition_key(&condition.key) {
                     errors.push(format!(
@@ -2225,6 +2253,23 @@ fn validate_non_empty_string(context: String, value: &str, errors: &mut Vec<Stri
 fn validate_non_zero_port(context: String, port: u16, errors: &mut Vec<String>) {
     if port == 0 {
         errors.push(format!("{context}: port must be greater than 0"));
+    }
+}
+
+fn validate_mesh_source_negation_ip_values(
+    policy: &MeshPolicy,
+    rule_index: usize,
+    field: &str,
+    blocks: &[String],
+    errors: &mut Vec<String>,
+) {
+    for (block_index, block) in blocks.iter().enumerate() {
+        if let Err(error) = validate_mesh_condition_ip_block(block) {
+            errors.push(format!(
+                "MeshPolicy '{}'.rules[{}].source_negation.{}[{}] '{}': {}",
+                policy.name, rule_index, field, block_index, block, error
+            ));
+        }
     }
 }
 

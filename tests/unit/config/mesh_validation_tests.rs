@@ -473,6 +473,36 @@ fn mesh_policy_rejects_mapped_ipv6_when_condition_prefix_below_mapping_bits() {
 }
 
 #[test]
+fn mesh_policy_rejects_malformed_source_negation_ip_blocks() {
+    let mut policy = policy_with_request_match(RequestMatch {
+        methods: vec!["GET".into()],
+        ..RequestMatch::default()
+    });
+    policy.rules[0].source_negation.ip_blocks = vec!["10.0.0.0/40".into()];
+    policy.rules[0].source_negation.remote_ip_blocks = vec!["::ffff:10.0.0.0/95".into()];
+
+    let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], &[], None);
+    assert!(
+        errors.iter().any(|e| {
+            e.contains("rules[0].source_negation.ip_blocks[0]")
+                && e.contains("10.0.0.0/40")
+                && e.contains("prefix length")
+        }),
+        "expected invalid ip_blocks error, got: {:?}",
+        errors
+    );
+    assert!(
+        errors.iter().any(|e| {
+            e.contains("rules[0].source_negation.remote_ip_blocks[0]")
+                && e.contains("::ffff:10.0.0.0/95")
+                && e.contains("IPv4-mapped IPv6")
+        }),
+        "expected invalid remote_ip_blocks error, got: {:?}",
+        errors
+    );
+}
+
+#[test]
 fn mesh_policy_rejects_host_pattern_with_empty_port() {
     let policy = policy_with_request_match(RequestMatch {
         hosts: vec!["example.com:".into()],
