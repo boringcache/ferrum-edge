@@ -10879,6 +10879,14 @@ components:
           type: string
           enum: [enforce, monitor, disabled]
           default: enforce
+        default_rule_action:
+          type: string
+          enum: [enforce, monitor, disabled]
+          description: >-
+            Bulk action applied to every built-in rule. Unset leaves the pack
+            monitor-only; per-rule rule_modes entries still take precedence.
+            Combine with paranoia_level to enforce only the low-false-positive
+            core of the rule pack.
         paranoia_level:
           type: integer
           minimum: 1
@@ -10929,6 +10937,45 @@ components:
           additionalProperties:
             type: string
             enum: [enforce, monitor, disabled]
+        rule_overrides:
+          type: object
+          description: >-
+            Per-rule tuning by rule id (built-in or custom): attach fp_filters,
+            scope via conditions, raise/lower paranoia_min, or change severity
+            without forking the rule pack. Unknown rule ids are rejected.
+          additionalProperties:
+            type: object
+            properties:
+              paranoia_min:
+                type: integer
+                minimum: 1
+                maximum: 4
+              severity:
+                type: string
+                enum: [info, low, medium, high, critical]
+              fp_filters:
+                type: array
+                items:
+                  type: string
+              conditions:
+                type: object
+                properties:
+                  paths:
+                    type: array
+                    items:
+                      type: string
+                  methods:
+                    type: array
+                    items:
+                      type: string
+                  headers:
+                    type: object
+                    additionalProperties:
+                      type: [string, "null"]
+                  consumers:
+                    type: array
+                    items:
+                      type: string
         custom_rules:
           type: array
           items:

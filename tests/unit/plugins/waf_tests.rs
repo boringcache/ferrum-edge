@@ -1030,3 +1030,117 @@ async fn raised_paranoia_level_reactivates_retuned_rules() {
     let _ = plugin.authorize(&mut url_ctx).await;
     assert!(monitored(&url_ctx, "FE-RFI-001"));
 }
+
+#[tokio::test]
+async fn default_rule_action_enforce_blocks_built_in_rules() {
+    // The crux of gap 1.1: a single switch flips the built-in pack from
+    // monitor-only to enforcing, instead of one rule_modes entry per rule.
+    let plugin = Waf::new(&json!({
+        "mode": "enforce",
+        "default_rule_action": "enforce"
+    }))
+    .unwrap();
+    let mut ctx = ctx("GET", "/search");
+    ctx.set_raw_query_string("q=union+select+1".into());
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert_eq!(
+        ctx.metadata
+            .get("waf.first_blocking_rule")
+            .map(String::as_str),
+        Some("FE-SQLI-001")
+    );
+}
+
+#[tokio::test]
+async fn rule_modes_still_overrides_default_rule_action() {
+    let plugin = Waf::new(&json!({
+        "mode": "enforce",
+        "default_rule_action": "enforce",
+        "rule_modes": { "FE-SQLI-001": "monitor" }
+    }))
+    .unwrap();
+    let mut ctx = ctx("GET", "/search");
+    ctx.set_raw_query_string("q=union+select+1".into());
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata.get("waf.action").map(String::as_str),
+        Some("monitored")
+    );
+}
+
+#[tokio::test]
+async fn rule_override_attaches_fp_filter_to_built_in_rule() {
+    // Gap 1.6: tune a noisy built-in without forking the rule pack.
+    let plugin = Waf::new(&json!({
+        "mode": "enforce",
+        "default_rule_action": "enforce",
+        "rule_overrides": { "FE-SQLI-001": { "fp_filters": ["union select version_id"] } }
+    }))
+    .unwrap();
+
+    let mut suppressed = ctx("GET", "/report");
+    suppressed.set_raw_query_string("q=union+select+version_id".into());
+    assert!(matches!(
+        plugin.authorize(&mut suppressed).await,
+        PluginResult::Continue
+    ));
+
+    let mut blocked = ctx("GET", "/report");
+    blocked.set_raw_query_string("q=union+select+password".into());
+    assert!(matches!(
+        plugin.authorize(&mut blocked).await,
+        PluginResult::Reject { .. }
+    ));
+}
+
+#[tokio::test]
+async fn rule_override_scopes_built_in_rule_to_paths() {
+    let plugin = Waf::new(&json!({
+        "mode": "enforce",
+        "default_rule_action": "enforce",
+        "rule_overrides": { "FE-SQLI-001": { "conditions": { "paths": ["/api*"] } } }
+    }))
+    .unwrap();
+
+    let mut outside = ctx("GET", "/public");
+    outside.set_raw_query_string("q=union+select+1".into());
+    assert!(matches!(
+        plugin.authorize(&mut outside).await,
+        PluginResult::Continue
+    ));
+
+    let mut inside = ctx("GET", "/api/users");
+    inside.set_raw_query_string("q=union+select+1".into());
+    assert!(matches!(
+        plugin.authorize(&mut inside).await,
+        PluginResult::Reject { .. }
+    ));
+}
+
+#[tokio::test]
+async fn rule_override_can_lower_paranoia_to_reactivate_rule() {
+    let plugin = Waf::new(&json!({
+        "rule_overrides": { "FE-RFI-001": { "paranoia_min": 1 } }
+    }))
+    .unwrap();
+    let mut ctx = ctx("GET", "/redirect");
+    ctx.set_raw_query_string("next=https://example.com/x".into());
+    let _ = plugin.authorize(&mut ctx).await;
+    assert!(monitored(&ctx, "FE-RFI-001"));
+}
+
+#[test]
+fn unknown_rule_override_id_fails_construction() {
+    let err = Waf::new(&json!({
+        "rule_overrides": { "FE-NOPE-999": { "paranoia_min": 2 } }
+    }))
+    .unwrap_err();
+    assert!(err.contains("rule_overrides"));
+    assert!(err.contains("FE-NOPE-999"));
+}

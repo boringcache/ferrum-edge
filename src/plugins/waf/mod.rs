@@ -29,7 +29,7 @@ use self::defaults::default_rules;
 use self::exemptions::CompiledExemptions;
 use self::rules::{
     CompiledRules, RuleAction, RuleHit, Severity, WafRule, compile_rules, parse_custom_rule,
-    parse_rule_action,
+    parse_rule_action, parse_rule_overrides,
 };
 use self::scan::ScanOutcome;
 use super::utils::sse::is_sse_request;
@@ -141,6 +141,12 @@ impl Waf {
             .into_iter()
             .collect::<HashSet<_>>();
         let rule_modes = parse_rule_modes(object.get("rule_modes"))?;
+        // Bulk action for built-in rules. Unset preserves the safe monitor-only
+        // default; `rule_modes` still overrides individual rules either way.
+        let default_rule_action = optional_string(object, "default_rule_action")?
+            .map(|raw| parse_rule_action(&raw, "default_rule_action"))
+            .transpose()?;
+        let rule_overrides = parse_rule_overrides(object.get("rule_overrides"))?;
         let default_action = match mode {
             GlobalMode::Enforce => RuleAction::Enforce,
             GlobalMode::Monitor | GlobalMode::Disabled => RuleAction::Monitor,
@@ -163,6 +169,8 @@ impl Waf {
             all_rules,
             &disabled_default_rules,
             &rule_modes,
+            default_rule_action,
+            &rule_overrides,
             paranoia_level,
         )?;
         if compiled.is_empty() && mode != GlobalMode::Disabled {

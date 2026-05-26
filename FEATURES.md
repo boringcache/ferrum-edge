@@ -115,7 +115,7 @@ Ferrum supports dynamic upstream target discovery through four providers, config
 - **Rate Limiting** — per-IP or per-consumer with configurable windows and optional header exposure; supports centralized Redis-backed mode (`sync_mode: "redis"`) for coordinated rate limiting across multiple data plane instances. Compatible with any RESP-protocol server (Redis, Valkey, DragonflyDB, KeyDB, Garnet). TLS uses gateway-level `FERRUM_TLS_CA_BUNDLE_PATH` and `FERRUM_TLS_NO_VERIFY`
 - **Request Size Limiting** — per-proxy request body size limits (lower than global default), Content-Length fast path + buffered body check
 - **Response Size Limiting** — per-proxy response body size limits (lower than global default), Content-Length fast path + optional buffered body check
-- **WAF** — OWASP-style SQLi, XSS, command injection, traversal, SSRF, disclosure, and data-leakage detection for HTTP-family traffic with monitor/enforce modes
+- **WAF** — content-pattern threat detection for HTTP-family traffic: SQLi, NoSQLi, XSS, command/template injection, JNDI/Log4Shell, Spring4Shell, path traversal, LFI/RFI, SSRF, XXE, deserialization, prototype pollution, plus response-side disclosure and data-leak rules. Body decode/normalization (unicode/HTML-entity/percent) defeats encoding evasion; tunable via paranoia levels, per-rule overrides and false-positive filters, exemptions, and monitor/enforce posture with bulk (`default_rule_action`) enforcement. See [docs/waf.md](docs/waf.md)
 - **Bot Detection** — User-Agent pattern blocking with allow-list support
 - **CORS** — preflight handling with origin, method, and header validation
 - **Body Validator** — JSON Schema, XML, and gRPC protobuf validation
