@@ -12,6 +12,9 @@
 //! All tests are marked `#[ignore]` — run with:
 //!   cargo build --bin ferrum-edge && cargo test --test functional_tests -- functional_tcp_proxy --ignored --nocapture
 
+use crate::common::{
+    configure_coverage_gateway_command, explicit_test_binary, shutdown_gateway_child,
+};
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -182,12 +185,19 @@ async fn start_tls_echo_server_on(listener: TcpListener) -> tokio::task::JoinHan
 // Gateway Helpers
 // ============================================================================
 
-fn gateway_binary_path() -> &'static str {
-    if std::path::Path::new("./target/debug/ferrum-edge").exists() {
-        "./target/debug/ferrum-edge"
-    } else {
-        "./target/release/ferrum-edge"
+fn gateway_binary_path() -> String {
+    if let Some(path) = explicit_test_binary() {
+        return path.to_string_lossy().into_owned();
     }
+    if std::path::Path::new("./target/debug/ferrum-edge").exists() {
+        "./target/debug/ferrum-edge".to_string()
+    } else {
+        "./target/release/ferrum-edge".to_string()
+    }
+}
+
+fn shutdown_gateway(gateway: &mut std::process::Child) {
+    shutdown_gateway_child(gateway);
 }
 
 fn start_gateway_with_extra_env(
@@ -208,6 +218,7 @@ fn start_gateway_with_extra_env(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+    configure_coverage_gateway_command(&mut cmd);
 
     if let Some(cert) = tls_cert_path {
         cmd.env("FERRUM_FRONTEND_TLS_CERT_PATH", cert);
@@ -334,8 +345,7 @@ where
             "Gateway startup attempt {}/{} failed (ports: stream={}, http={}, admin={})",
             attempt, MAX_ATTEMPTS, proxy_listen_port, http_port, admin_port
         );
-        let _ = child.kill();
-        let _ = child.wait();
+        shutdown_gateway(&mut child);
 
         if attempt < MAX_ATTEMPTS {
             sleep(Duration::from_secs(1)).await;
@@ -473,8 +483,7 @@ plugin_configs: []
     assert_eq!(&buf[..n2], test_data2, "Second echo response should match");
 
     // Cleanup
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    shutdown_gateway(&mut gateway);
     echo_server.abort();
 }
 
@@ -549,8 +558,7 @@ plugin_configs: []
     assert_eq!(&buf[..n], test_data, "Echo response should match sent data");
 
     // Cleanup
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    shutdown_gateway(&mut gateway);
     echo_server.abort();
 }
 
@@ -604,8 +612,7 @@ plugin_configs: []
     assert_eq!(&buf[..n], test_data, "Echo response should match sent data");
 
     // Cleanup
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    shutdown_gateway(&mut gateway);
     echo_server.abort();
 }
 
@@ -679,8 +686,7 @@ plugin_configs: []
     assert_eq!(&buf[..n], test_data, "Full TLS echo should match");
 
     // Cleanup
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    shutdown_gateway(&mut gateway);
     echo_server.abort();
 }
 
@@ -759,8 +765,7 @@ plugin_configs: []
         Err(_) => panic!("Timed out waiting for idle-timeout closure; connection stayed open"),
     }
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    shutdown_gateway(&mut gateway);
     echo_server.abort();
 }
 
@@ -829,8 +834,7 @@ plugin_configs: []
         Err(_) => panic!("timed out waiting for global idle-timeout closure"),
     }
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    shutdown_gateway(&mut gateway);
     echo_server.abort();
 }
 
@@ -890,8 +894,7 @@ plugin_configs: []
         Err(_) => panic!("timed out waiting for backend-read-timeout closure"),
     }
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    shutdown_gateway(&mut gateway);
     silent_backend.abort();
 }
 
@@ -964,8 +967,7 @@ plugin_configs: []
         }
     }
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    shutdown_gateway(&mut gateway);
     echo_server.abort();
 }
 
@@ -1036,8 +1038,7 @@ plugin_configs: []
         .expect("EOF after delayed half-close response read failed");
     assert_eq!(n, 0, "backend close should propagate after response");
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    shutdown_gateway(&mut gateway);
     response_server.abort();
 }
 
@@ -1106,8 +1107,7 @@ plugin_configs: []
 
     #[cfg(not(unix))]
     {
-        let _ = gateway.kill();
-        let _ = gateway.wait();
+        shutdown_gateway(&mut gateway);
         backend_a.abort();
         backend_b.abort();
         return;
@@ -1141,8 +1141,7 @@ plugin_configs: []
 
     tagged_round_trip(&mut active, b"still-old-epoch", b"A:").await;
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    shutdown_gateway(&mut gateway);
     backend_a.abort();
     backend_b.abort();
 }
@@ -1200,6 +1199,5 @@ plugin_configs: []
     }
 
     // Cleanup
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    shutdown_gateway(&mut gateway);
 }

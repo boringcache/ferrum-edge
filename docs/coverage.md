@@ -26,12 +26,25 @@ The script prints a terminal summary and writes:
 
 - HTML: `target/llvm-cov/html/index.html`
 - LCOV: `target/llvm-cov/lcov.info`
+- JSON summary: `target/llvm-cov/coverage.json`
 
 Use a filter for targeted investigation:
 
 ```bash
 scripts/coverage.sh -- plugins::cors
 ```
+
+Run the heavier top-gap functional coverage pass when investigating the proxy,
+HTTP/3, TCP/UDP, admin, and mode-level gaps:
+
+```bash
+scripts/coverage.sh --functional
+```
+
+This opt-in path builds Cargo's instrumented `ferrum-edge` binary and exports
+its path through `FERRUM_EDGE_TEST_BIN` so subprocess-based functional tests
+contribute to the same coverage report. MongoDB functional tests are included
+in the filter list and skip gracefully when local MongoDB is not available.
 
 ## CI Baseline
 
@@ -44,6 +57,27 @@ Current overall coverage: **79.15% line coverage** (`143,848/181,736` lines),
 captured locally on 2026-05-24 with `scripts/coverage.sh`. Replace this local
 snapshot with the first successful `Coverage` workflow artifact value after the
 workflow is merged to `main` if it differs.
+
+Latest opt-in functional benchmark: **81.68% line coverage**
+(`148,432/181,717` lines), captured locally on 2026-05-25 with
+`rustc 1.95.0 (59807616e 2026-04-14)`. This is not the scheduled CI baseline
+because functional coverage is heavier and depends on subprocess-based
+fixtures, but it is the current top-gap benchmark for tracking progress toward
+90%.
+
+The 81.68% profile used:
+
+- `scripts/coverage.sh --functional`
+- `scripts/coverage.sh --functional-filter functional_cp_dp`
+- `scripts/coverage.sh --functional-filter functional_cp_dp_resilience`
+- `scripts/coverage.sh --functional-filter functional_grpc`
+- `scripts/coverage.sh --functional-filter functional_load_balancer`
+
+The default `--functional` filters include coverage-aware TCP/UDP/Mongo and
+common-harness subprocess paths. Broad filters such as `h3`, and additional
+legacy functional filters, can still select tests that under-report
+child-process coverage until their local `kill()` cleanup paths are migrated to
+the shared coverage-aware shutdown helper.
 
 ## Lowest-Covered Modules
 
