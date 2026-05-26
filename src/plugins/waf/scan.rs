@@ -520,7 +520,7 @@ impl Waf {
                 || decode::has_percent_null_byte(value)
                 || decode::has_overlong_utf8_marker(value))
         {
-            self.push_special(outcome, rule_index, ctx);
+            self.push_special(outcome, rule_index, value, ctx);
         }
     }
 
@@ -528,7 +528,7 @@ impl Waf {
         if let Some(rule_index) = self.specials.hpp
             && decode::has_conflicting_duplicate_query_key(raw_query)
         {
-            self.push_special(outcome, rule_index, ctx);
+            self.push_special(outcome, rule_index, raw_query, ctx);
         }
     }
 
@@ -540,7 +540,7 @@ impl Waf {
                 .iter()
                 .any(|configured| configured.eq_ignore_ascii_case(method))
         {
-            self.push_special(outcome, rule_index, ctx);
+            self.push_special(outcome, rule_index, method, ctx);
         }
     }
 
@@ -554,13 +554,23 @@ impl Waf {
             && let Some(override_method) = headers.get("x-http-method-override")
             && !override_method.eq_ignore_ascii_case(&ctx.method)
         {
-            self.push_special(outcome, rule_index, ctx);
+            self.push_special(outcome, rule_index, override_method, ctx);
         }
     }
 
-    fn push_special(&self, outcome: &mut ScanOutcome, rule_index: usize, ctx: &RequestContext) {
+    fn push_special(
+        &self,
+        outcome: &mut ScanOutcome,
+        rule_index: usize,
+        value: &str,
+        ctx: &RequestContext,
+    ) {
         let rule = &self.compiled.rules[rule_index];
-        if rule.matches_conditions(ctx) && !self.exemptions.suppresses_rule_for_request(ctx) {
+        if rule.matches_conditions(ctx)
+            && !self.exemptions.suppresses_rule_for_request(ctx)
+            && !self.exemptions.suppresses_value(value)
+            && !rule.suppresses_text(value)
+        {
             outcome.push(RuleHit {
                 rule_index,
                 target_name: rule.target.log_target(),

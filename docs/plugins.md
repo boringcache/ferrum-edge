@@ -2729,6 +2729,7 @@ scanning the parsed key/value map and a best-effort reconstructed URL.
 | `match_kind` | string | `regex` | `regex`, `literal`, `contains`, `equals`, `luhn`, or `cidr`. |
 | `pattern` | string | `""` | Pattern text. Required except for `luhn` rules. CIDR rules accept an IP or CIDR range. |
 | `action` | string | global default | `enforce`, `monitor`, or `disabled`. |
+| `score` | integer | severity weight | Anomaly-score contribution when `scoring` is enabled. |
 | `fp_filters` | string[] | `[]` | Regex filters that suppress known false-positive captured values for this rule. |
 | `paranoia_min` | u8 | `1` | Minimum paranoia level required for this rule. |
 | `conditions` | object | `{}` | Optional request conditions: `paths`, `methods`, `headers`, and `consumers`. Path entries use the same exact / trailing-`*` prefix / `~` regex grammar as `global_exemptions.paths`. |

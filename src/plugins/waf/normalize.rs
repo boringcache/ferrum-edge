@@ -28,6 +28,10 @@ const MAX_NUMERIC_ENTITY_DIGITS: usize = 16;
 /// hidden behind percent-, HTML-entity-, and JSON/JS-unicode encoding,
 /// including stacked combinations via the fully layered decode.
 pub(super) fn decoded_variants(text: &str) -> Vec<String> {
+    if !has_decodable_marker(text) {
+        return Vec::new();
+    }
+
     // Layered decode catches stacked encodings (e.g. percent-encoded HTML
     // entities). The single-layer decodes are kept as well because a layered
     // percent-decode can mangle a body that merely contains a literal `%`,
@@ -51,6 +55,12 @@ pub(super) fn decoded_variants(text: &str) -> Vec<String> {
         }
     }
     out
+}
+
+fn has_decodable_marker(text: &str) -> bool {
+    text.as_bytes()
+        .iter()
+        .any(|byte| matches!(byte, b'%' | b'+' | b'\\' | b'&'))
 }
 
 fn layered_decode(text: &str) -> String {
@@ -375,6 +385,15 @@ mod tests {
         let variants = decoded_variants("%26lt%3Bscript%26gt%3B");
         assert!(variants.iter().any(|v| v == "<script>"));
         assert!(variants.len() <= MAX_VARIANTS);
+    }
+
+    #[test]
+    fn plain_text_has_no_decodable_markers() {
+        assert!(!has_decodable_marker("nothing to decode"));
+        assert!(has_decodable_marker("%3Cscript%3E"));
+        assert!(has_decodable_marker("&lt;script&gt;"));
+        assert!(has_decodable_marker(r"\u003cscript\u003e"));
+        assert!(has_decodable_marker("a+b"));
     }
 
     #[test]

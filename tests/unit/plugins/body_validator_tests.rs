@@ -2147,6 +2147,27 @@ async fn numeric_ampersand_entity_reference_in_entity_value_is_rejected() {
 }
 
 #[tokio::test]
+async fn numeric_encoded_entity_reference_semicolons_are_rejected() {
+    let plugin = xml_plugin();
+    let body = r#"<!DOCTYPE r [<!ENTITY a "lol"><!ENTITY b "&#38;a&#59;&#x26;a&#x3b;"><!ENTITY c "&#38;b&#59;&#x26;b&#x3b;">]><r>&c;</r>"#;
+    let mut ctx = make_xml_ctx(body);
+    let mut headers = make_xml_headers();
+
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+#[tokio::test]
+async fn numeric_encoded_parameter_entity_references_are_rejected() {
+    let plugin = xml_plugin();
+    let body =
+        r#"<!DOCTYPE r [<!ENTITY % a "lol"><!ENTITY b "&#37;a&#59;&#x25;a&#x3b;">]><r>&b;</r>"#;
+    let mut ctx = make_xml_ctx(body);
+    let mut headers = make_xml_headers();
+
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+#[tokio::test]
 async fn long_xml_entity_names_are_checked_for_nested_references() {
     let plugin = xml_plugin();
     let long_name = "a".repeat(40);

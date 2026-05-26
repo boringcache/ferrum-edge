@@ -4075,8 +4075,7 @@ async fn send_h3_reject_flavor_aware(
     }
 
     // gRPC flavor only — derive signalling now.
-    let grpc_status = h3_http_status_to_grpc_status(http_status);
-    let grpc_message = reject_body_as_grpc_message(http_body, http_status);
+    let (grpc_status, grpc_message) = h3_grpc_reject_signal(http_status, http_body, headers);
 
     // Build a trailers-only gRPC error that preserves any custom headers
     // the plugin attached (e.g., rate-limit metadata), while forcing the
@@ -4122,6 +4121,16 @@ fn h3_reject_log_status_and_metadata(
         return http_status.as_u16();
     }
 
+    let (grpc_status, grpc_message) = h3_grpc_reject_signal(http_status, http_body, headers);
+    crate::proxy::insert_grpc_error_metadata(&mut ctx.metadata, grpc_status, grpc_message.as_ref());
+    StatusCode::OK.as_u16()
+}
+
+fn h3_grpc_reject_signal(
+    http_status: StatusCode,
+    http_body: &[u8],
+    headers: &HashMap<String, String>,
+) -> (u32, std::borrow::Cow<'static, str>) {
     let grpc_status = headers
         .iter()
         .find(|(key, _)| key.eq_ignore_ascii_case("grpc-status"))
@@ -4133,8 +4142,7 @@ fn h3_reject_log_status_and_metadata(
         .map(|(_, value)| std::borrow::Cow::<str>::Owned(sanitize_grpc_message(value)))
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| reject_body_as_grpc_message(http_body, http_status));
-    crate::proxy::insert_grpc_error_metadata(&mut ctx.metadata, grpc_status, grpc_message.as_ref());
-    StatusCode::OK.as_u16()
+    (grpc_status, grpc_message)
 }
 
 /// Extract a grpc-message string from a plugin/auth reject body, which is
@@ -4613,7 +4621,9 @@ mod h3_streaming_outcome_tests {
 
 #[cfg(test)]
 mod h3_plugin_protocol_tests {
-    use super::{h3_plugin_protocol_for_flavor, h3_reject_log_status_and_metadata};
+    use super::{
+        h3_grpc_reject_signal, h3_plugin_protocol_for_flavor, h3_reject_log_status_and_metadata,
+    };
     use crate::config::types::HttpFlavor;
     use crate::plugins::ProxyProtocol;
     use crate::plugins::RequestContext;
@@ -4703,6 +4713,20 @@ mod h3_plugin_protocol_tests {
             ctx.metadata.get("grpc_message").map(String::as_str),
             Some("failed precondition")
         );
+    }
+
+    #[test]
+    fn grpc_reject_signal_prefers_explicit_headers_for_wire_and_logs() {
+        let headers = HashMap::from([
+            ("grpc-status".to_string(), "4".to_string()),
+            ("grpc-message".to_string(), "deadline exceeded".to_string()),
+        ]);
+
+        let (grpc_status, grpc_message) =
+            h3_grpc_reject_signal(StatusCode::OK, b"ignored", &headers);
+
+        assert_eq!(grpc_status, 4);
+        assert_eq!(grpc_message.as_ref(), "deadline exceeded");
     }
 
     #[test]

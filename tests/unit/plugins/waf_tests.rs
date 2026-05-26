@@ -1551,6 +1551,72 @@ async fn rule_override_attaches_fp_filter_to_built_in_rule() {
 }
 
 #[tokio::test]
+async fn rule_override_fp_filter_suppresses_special_encoding_rule() {
+    let plugin = Waf::new(&json!({
+        "mode": "enforce",
+        "default_rule_action": "enforce",
+        "rule_overrides": {
+            "FE-ENCODING-001": { "fp_filters": ["known%252fpath"] }
+        }
+    }))
+    .unwrap();
+
+    let mut suppressed = ctx("GET", "/known%252fpath");
+    assert!(matches!(
+        plugin.authorize(&mut suppressed).await,
+        PluginResult::Continue
+    ));
+    assert!(!suppressed.metadata.contains_key("waf.rule_hits"));
+
+    let mut blocked = ctx("GET", "/blocked%252fpath");
+    assert!(matches!(
+        plugin.authorize(&mut blocked).await,
+        PluginResult::Reject { .. }
+    ));
+    assert_eq!(
+        blocked
+            .metadata
+            .get("waf.first_blocking_rule")
+            .map(String::as_str),
+        Some("FE-ENCODING-001")
+    );
+}
+
+#[tokio::test]
+async fn rule_override_fp_filter_suppresses_special_hpp_rule() {
+    let plugin = Waf::new(&json!({
+        "mode": "enforce",
+        "default_rule_action": "enforce",
+        "rule_overrides": {
+            "FE-HPP-001": { "fp_filters": ["role=user&role=admin"] }
+        }
+    }))
+    .unwrap();
+
+    let mut suppressed = ctx("GET", "/search");
+    suppressed.set_raw_query_string("role=user&role=admin".into());
+    assert!(matches!(
+        plugin.authorize(&mut suppressed).await,
+        PluginResult::Continue
+    ));
+    assert!(!suppressed.metadata.contains_key("waf.rule_hits"));
+
+    let mut blocked = ctx("GET", "/search");
+    blocked.set_raw_query_string("role=user&role=root".into());
+    assert!(matches!(
+        plugin.authorize(&mut blocked).await,
+        PluginResult::Reject { .. }
+    ));
+    assert_eq!(
+        blocked
+            .metadata
+            .get("waf.first_blocking_rule")
+            .map(String::as_str),
+        Some("FE-HPP-001")
+    );
+}
+
+#[tokio::test]
 async fn rule_override_scopes_built_in_rule_to_paths() {
     let plugin = Waf::new(&json!({
         "mode": "enforce",

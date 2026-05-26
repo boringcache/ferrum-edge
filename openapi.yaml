@@ -11109,6 +11109,7 @@ components:
             weights:
               type: object
               description: Per-severity weights; defaults info=0 low=2 medium=3 high=5 critical=10.
+              additionalProperties: false
               properties:
                 info:
                   type: integer

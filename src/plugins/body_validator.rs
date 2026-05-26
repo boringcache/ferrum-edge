@@ -1063,27 +1063,88 @@ fn skip_xml_space(bytes: &[u8], mut i: usize) -> usize {
 
 /// True if an `<!ENTITY ...>` declaration's value references another entity.
 /// General entity refs (`&name;`) and parameter entity refs (`%name;`) can both
-/// create expansion chains. Numeric character refs and the five predefined XML
-/// general entities are safe and ignored.
+/// create expansion chains. Numeric character refs are normalized first because
+/// XML resolves them inside entity replacement text before expansion.
 fn entity_value_references_nested_entity(decl: &str) -> bool {
+    let Some(value) = entity_declaration_value(decl) else {
+        return false;
+    };
+    let decoded = decode_xml_numeric_char_refs(value);
+    entity_replacement_text_references_entity(decoded.as_ref())
+}
+
+fn entity_declaration_value(decl: &str) -> Option<&str> {
     let bytes = decl.as_bytes();
+    let needle = b"<!ENTITY";
+    if bytes.len() < needle.len() || !bytes[..needle.len()].eq_ignore_ascii_case(needle) {
+        return None;
+    }
+    let mut i = needle.len();
+    i = skip_xml_space(bytes, i);
+    if bytes.get(i) == Some(&b'%') {
+        i += 1;
+        i = skip_xml_space(bytes, i);
+    }
+    let name_start = i;
+    while i < bytes.len()
+        && (bytes[i].is_ascii_alphanumeric() || matches!(bytes[i], b'_' | b'-' | b'.'))
+    {
+        i += 1;
+    }
+    if i == name_start {
+        return None;
+    }
+    i = skip_xml_space(bytes, i);
+    let quote = *bytes.get(i)?;
+    if !matches!(quote, b'\'' | b'"') {
+        return None;
+    }
+    i += 1;
+    let value_start = i;
+    while i < bytes.len() && bytes[i] != quote {
+        i += 1;
+    }
+    if i >= bytes.len() {
+        return None;
+    }
+    Some(&decl[value_start..i])
+}
+
+fn decode_xml_numeric_char_refs(value: &str) -> std::borrow::Cow<'_, str> {
+    let bytes = value.as_bytes();
+    let mut i = 0usize;
+    let mut out: Option<String> = None;
+    while i < bytes.len() {
+        if bytes[i] == b'&'
+            && bytes.get(i + 1) == Some(&b'#')
+            && let Some((cp, end)) = numeric_char_ref_at(bytes, i)
+            && let Some(ch) = char::from_u32(cp)
+        {
+            let output = out.get_or_insert_with(|| value[..i].to_string());
+            output.push(ch);
+            i = end;
+            continue;
+        }
+        let Some(ch) = value[i..].chars().next() else {
+            break;
+        };
+        if let Some(output) = &mut out {
+            output.push(ch);
+        }
+        i += ch.len_utf8();
+    }
+    match out {
+        Some(decoded) => std::borrow::Cow::Owned(decoded),
+        None => std::borrow::Cow::Borrowed(value),
+    }
+}
+
+fn entity_replacement_text_references_entity(value: &str) -> bool {
+    let bytes = value.as_bytes();
     let mut i = 0usize;
     while i < bytes.len() {
         if matches!(bytes[i], b'&' | b'%') {
             let marker = bytes[i];
-            if marker == b'&' && bytes.get(i + 1) == Some(&b'#') {
-                if let Some((cp, end)) = numeric_char_ref_at(bytes, i) {
-                    if (cp == u32::from(b'&') || cp == u32::from(b'%'))
-                        && entity_name_reference_follows(bytes, end)
-                    {
-                        return true;
-                    }
-                    i = end;
-                    continue;
-                }
-                i += 1;
-                continue;
-            }
             let mut j = i + 1;
             while j < bytes.len()
                 && (bytes[j].is_ascii_alphanumeric() || matches!(bytes[j], b'_' | b'-' | b'.'))
@@ -1091,7 +1152,7 @@ fn entity_value_references_nested_entity(decl: &str) -> bool {
                 j += 1;
             }
             if j > i + 1 && bytes.get(j) == Some(&b';') {
-                let name = &decl[i + 1..j];
+                let name = &value[i + 1..j];
                 if marker == b'%' || !matches!(name, "lt" | "gt" | "amp" | "quot" | "apos") {
                     return true;
                 }
@@ -1130,17 +1191,6 @@ fn numeric_char_ref_at(bytes: &[u8], start: usize) -> Option<(u32, usize)> {
     let digits = std::str::from_utf8(&bytes[digits_start..i]).ok()?;
     let cp = u32::from_str_radix(digits, radix).ok()?;
     Some((cp, i + 1))
-}
-
-fn entity_name_reference_follows(bytes: &[u8], start: usize) -> bool {
-    let mut i = start;
-    let name_start = i;
-    while i < bytes.len()
-        && (bytes[i].is_ascii_alphanumeric() || matches!(bytes[i], b'_' | b'-' | b'.'))
-    {
-        i += 1;
-    }
-    i > name_start && bytes.get(i) == Some(&b';')
 }
 
 fn is_json_like_content_type(content_type: &str) -> bool {
