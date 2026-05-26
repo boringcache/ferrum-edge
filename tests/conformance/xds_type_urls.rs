@@ -223,6 +223,64 @@ fn xds_ecds_dr_carrier_round_trip() {
     );
 }
 
+/// Ferrum mesh-slice ECDS carriers — GAP-1a (full parity over xDS). A slice
+/// with a PeerAuthentication must emit a `PeerAuthenticationsCarrier` ECDS
+/// resource whose inner `type_url` decodes back to the same PeerAuthentication.
+/// This pins the type-URL contract for the carriers that make xDS reach native
+/// parity: without them the DP rebuilds an unprotected mesh.
+#[test]
+fn xds_mesh_slice_carriers_round_trip() {
+    use ferrum_edge::xds::proto;
+    use ferrum_edge::xds::{
+        FERRUM_ECDS_PEER_AUTH_TYPE_URL, FERRUM_ECDS_SERVICES_TYPE_URL, MeshSliceCarrier,
+    };
+    use prost::Message;
+
+    register_feature!(
+        category = CATEGORY,
+        feature =
+            "Ferrum mesh-slice ECDS carriers (type.googleapis.com/ferrum.config.extension.v3.*)",
+        status = Status::Supported,
+        notes = "GAP-1a: security/policy slice fields (authz, PeerAuth, JWT, ServiceEntry, trust bundles, ProxyConfig, workloads, services, outbound policy) ride ECDS as Ferrum-specific carriers; DP decodes by inner type_url. Ferrum-CP-to-Ferrum-DP only, NOT stock-Envoy/Istio-interoperable.",
+    );
+
+    let snapshot = translate_mesh_slice_to_snapshot(&slice_with_one_service());
+    let ecds = snapshot.resources(ECDS_TYPE_URL);
+
+    // Find the PeerAuthentication carrier among the ECDS resources and confirm
+    // it round-trips through the shared MeshSliceCarrier decoder.
+    let mut found_peer_auth = false;
+    let mut found_services = false;
+    for resource in ecds {
+        let typed =
+            proto::TypedExtensionConfig::decode(resource.value.as_slice()).expect("decode TEC");
+        let inner = typed.typed_config.expect("inner Any");
+        match MeshSliceCarrier::decode(&inner.type_url, &inner.value).expect("decode does not err")
+        {
+            Some(MeshSliceCarrier::PeerAuthentications(pas)) => {
+                assert_eq!(inner.type_url, FERRUM_ECDS_PEER_AUTH_TYPE_URL);
+                assert_eq!(pas.len(), 1);
+                assert_eq!(pas[0].name, "strict");
+                found_peer_auth = true;
+            }
+            Some(MeshSliceCarrier::Services(svcs)) => {
+                assert_eq!(inner.type_url, FERRUM_ECDS_SERVICES_TYPE_URL);
+                assert_eq!(svcs.len(), 1);
+                found_services = true;
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        found_peer_auth,
+        "PeerAuthentication must ride ECDS as a Ferrum mesh-slice carrier"
+    );
+    assert!(
+        found_services,
+        "Services must ride ECDS as a Ferrum mesh-slice carrier"
+    );
+}
+
 /// RTDS round-trip — PR #883. The xDS client decodes RTDS layers via
 /// `translate_rtds_layer` into `MeshRuntimeOverlay`. Confirm the three
 /// runtime-value kinds Ferrum supports (Number, String, FractionalPercent)

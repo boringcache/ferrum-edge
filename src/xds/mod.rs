@@ -9,6 +9,7 @@
 // allowance scoped to dead code only; unused imports should still be caught.
 #![allow(dead_code)]
 
+pub mod carrier;
 pub mod conformance;
 pub mod nonce;
 pub mod server;
@@ -40,6 +41,15 @@ pub mod runtime_proto {
 // target only reaches xDS through narrower module paths.
 #[allow(unused_imports)]
 pub use crate::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
+#[allow(unused_imports)]
+pub use carrier::{
+    FERRUM_ECDS_MESH_POLICIES_TYPE_URL, FERRUM_ECDS_MULTI_CLUSTER_TYPE_URL,
+    FERRUM_ECDS_OUTBOUND_POLICY_TYPE_URL, FERRUM_ECDS_PEER_AUTH_TYPE_URL,
+    FERRUM_ECDS_PROXY_CONFIGS_TYPE_URL, FERRUM_ECDS_REQUEST_AUTH_TYPE_URL,
+    FERRUM_ECDS_SERVICE_ENTRIES_TYPE_URL, FERRUM_ECDS_SERVICES_TYPE_URL,
+    FERRUM_ECDS_TELEMETRY_TYPE_URL, FERRUM_ECDS_TRUST_BUNDLES_TYPE_URL,
+    FERRUM_ECDS_WORKLOADS_TYPE_URL, MeshSliceCarrier, apply_carrier, build_slice_carriers,
+};
 #[allow(unused_imports)]
 pub use nonce::{AckOutcome, XdsNonceTracker};
 pub use server::XdsAdsServer;

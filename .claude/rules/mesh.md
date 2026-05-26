@@ -42,7 +42,8 @@ Full operator docs live in `docs/mesh.md`. Keep this file to implementation inva
 - All topologies share the normal proxy and plugin chain.
 - Mesh runtime state is `ArcSwap<Option<MeshSlice>>` in `runtime.rs`; slice apply is lock-free hot-swap like `GatewayConfig`.
 - `wait_for_first_slice()` blocks startup until the first valid slice arrives.
-- Native config consumption uses `MeshConfigSync.MeshSubscribe` gRPC. xDS uses ADS for CDS/EDS/LDS/RDS/SDS with 25 ms debounce.
+- Native config consumption uses `MeshConfigSync.MeshSubscribe` gRPC. xDS uses ADS for CDS/EDS/LDS/RDS/SDS/ECDS/RTDS with 25 ms debounce.
+- xDS is Ferrum-CP-to-Ferrum-DP, not stock-Envoy/Istio-interoperable: CDS/EDS/LDS/RDS are name-only (service-port discovery); all security/policy slice fields (authz, PeerAuth, JWT, ServiceEntry, trust bundles, ProxyConfig, workloads, outbound policy, telemetry, multi-cluster) ride ECDS as Ferrum mesh-slice carriers. `src/xds/carrier.rs` (`MeshSliceCarrier`) is the single encode/decode source of truth; the CP emits via `translate_mesh_slice_carriers` and the DP recovers in `reverse_translate`. An xDS-built slice must stay functionally equivalent to a native-built one.
 - Native and xDS clients use jittered exponential backoff from 1s to 30s, plus/minus 25%, multi-CP failover via `FERRUM_DP_CP_GRPC_URLS`, and JWT metadata.
 
 ## Scope And Policy Semantics

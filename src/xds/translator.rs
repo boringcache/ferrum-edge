@@ -1,7 +1,9 @@
 use prost::Message;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
+use tracing::warn;
 
+use super::carrier::{MeshSliceCarrier, build_slice_carriers};
 use super::proto;
 use super::runtime_proto;
 use super::snapshot::{XdsResource, XdsSnapshot};
@@ -44,6 +46,11 @@ pub fn translate_mesh_slice_to_snapshot(slice: &MeshSlice) -> XdsSnapshot {
     resources.extend(translate_eds(slice));
     resources.extend(translate_sds(slice));
     resources.extend(translate_ecds(slice));
+    // GAP-1a: emit the security- and policy-bearing slice fields as Ferrum
+    // mesh-slice ECDS carriers so the xDS path reaches native parity. Without
+    // these, the DP rebuilds the slice with authz/PeerAuth/JWT/trust-bundle/
+    // ServiceEntry/ProxyConfig/workload fields emptied — an unprotected mesh.
+    resources.extend(translate_mesh_slice_carriers(slice));
     // Per-resource versions are content-derived so two snapshots with the
     // same resource bytes carry identical resource versions. This is the
     // basis for delta xDS wire-byte reduction: clients that report the
@@ -199,6 +206,54 @@ pub fn translate_ecds(slice: &MeshSlice) -> Vec<XdsResource> {
         ));
     }
     resources
+}
+
+/// Translate the security- and policy-bearing slice fields into Ferrum
+/// mesh-slice ECDS carriers (GAP-1a).
+///
+/// Each non-empty field group becomes one ECDS `XdsResource` whose inner
+/// `TypedExtensionConfig.typed_config.type_url` is a Ferrum-specific marker
+/// (see [`super::carrier`]) and whose inner `value` is the JSON-serialized
+/// field group. The DP's `reverse_translate` recognizes the markers and
+/// reassembles the slice, giving xDS deployments the same authz / mTLS / JWT /
+/// trust-bundle / ServiceEntry / ProxyConfig / workload behavior as native.
+///
+/// These ride the same ECDS resource list as the DestinationRule carrier and
+/// any operator-defined `extension_configs`; the stable
+/// `ferrum-mesh-carrier/<kind>` names avoid colliding with operator names.
+/// A carrier whose JSON encode fails (should not happen for the in-repo
+/// types) is logged and skipped so one bad field never drops the whole
+/// snapshot.
+pub fn translate_mesh_slice_carriers(slice: &MeshSlice) -> Vec<XdsResource> {
+    let mut resources = Vec::new();
+    for carrier in build_slice_carriers(slice) {
+        match encode_slice_carrier(slice, &carrier) {
+            Ok(resource) => resources.push(resource),
+            Err(e) => warn!(
+                node_id = %slice.node_id,
+                type_url = carrier.type_url(),
+                error = %e,
+                "Failed to encode mesh-slice ECDS carrier; field will be missing from xDS slice"
+            ),
+        }
+    }
+    resources
+}
+
+fn encode_slice_carrier(
+    slice: &MeshSlice,
+    carrier: &MeshSliceCarrier,
+) -> Result<XdsResource, serde_json::Error> {
+    let inner_value = carrier.encode_value()?;
+    let name = carrier.resource_name();
+    let message = proto::TypedExtensionConfig {
+        name: name.clone(),
+        typed_config: Some(proto::Any {
+            type_url: carrier.type_url().to_string(),
+            value: inner_value,
+        }),
+    };
+    Ok(resource(name, ECDS_TYPE_URL, &slice.version, message))
 }
 
 pub fn translate_sds(slice: &MeshSlice) -> Vec<XdsResource> {

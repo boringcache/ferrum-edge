@@ -172,9 +172,18 @@ fn mesh_config_extension_configs_are_served_as_ecds_resources() {
     assert_eq!(slice.extension_configs.len(), 1);
 
     let snapshot = translate_mesh_slice_to_snapshot(&slice);
+    // GAP-1a: `gateway_config()` also carries mesh_policies / peer_authentications /
+    // services / workloads, which now ride ECDS as Ferrum mesh-slice carriers
+    // (`ferrum-mesh-carrier/*`). The operator's own extension config still
+    // appears as its own ECDS resource under its declared name; filter for it
+    // explicitly rather than asserting the total ECDS count.
     let ecds = snapshot.resources(ECDS_TYPE_URL);
-    assert_eq!(ecds.len(), 1);
-    assert_eq!(ecds[0].name, "dr-carrier-api");
+    let operator_configs: Vec<&str> = ecds
+        .iter()
+        .map(|r| r.name.as_str())
+        .filter(|name| !name.starts_with("ferrum-mesh-carrier/"))
+        .collect();
+    assert_eq!(operator_configs, vec!["dr-carrier-api"]);
 }
 
 #[test]

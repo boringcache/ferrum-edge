@@ -910,23 +910,39 @@ fn reverse_translate(
         );
     }
 
-    let services = service_ports
-        .into_iter()
-        .map(|((namespace, name), ports)| MeshService {
-            name,
-            namespace,
-            ports: ports
-                .into_iter()
-                .map(|port| ServicePort {
-                    port,
-                    protocol: AppProtocol::Unknown,
-                    name: None,
-                })
-                .collect(),
-            workloads: Vec::new(),
-            protocol_overrides: HashMap::new(),
-        })
-        .collect();
+    // GAP-1a: recover the security- and policy-bearing slice fields from the
+    // Ferrum mesh-slice ECDS carriers the CP emitted alongside CDS/EDS. These
+    // carriers (one per non-empty field group) ride the same ECDS resource
+    // list as the DR carrier above and are distinguished by their inner
+    // `type_url`. Decoding them is what makes `FERRUM_MESH_CONFIG_PROTOCOL=xds`
+    // functionally equivalent to native: without this pass the slice below
+    // would have empty authz/PeerAuth/JWT/trust-bundle/ServiceEntry/
+    // ProxyConfig/workload fields (an unprotected mesh).
+    let recovered = recover_slice_carriers(accumulator);
+
+    // Prefer the full `MeshService` shape recovered from the Services carrier
+    // (protocol + per-service workload refs) over the name-only CDS/EDS
+    // reconstruction. The reconstruction stays as the fallback for a stock
+    // Envoy CP that emits CDS/EDS but no Ferrum carrier.
+    let services = recovered.services.unwrap_or_else(|| {
+        service_ports
+            .into_iter()
+            .map(|((namespace, name), ports)| MeshService {
+                name,
+                namespace,
+                ports: ports
+                    .into_iter()
+                    .map(|port| ServicePort {
+                        port,
+                        protocol: AppProtocol::Unknown,
+                        name: None,
+                    })
+                    .collect(),
+                workloads: Vec::new(),
+                protocol_overrides: HashMap::new(),
+            })
+            .collect()
+    });
 
     let mut trust_domains = Vec::new();
     let mut ignored_sds_names = Vec::new();
@@ -981,16 +997,26 @@ fn reverse_translate(
             .get(CDS_TYPE_URL)
             .cloned()
             .unwrap_or_default(),
-        workloads: Vec::new(),
+        // GAP-1a: workloads/endpoints recovered from the Workloads carrier.
+        // Empty only when the CP emitted no carrier (stock Envoy CP) or the
+        // slice genuinely has no workloads.
+        workloads: recovered.workloads,
         services,
-        mesh_policies: Vec::new(),
-        peer_authentications: Vec::new(),
-        request_authentications: Vec::new(),
-        telemetry_resources: Vec::new(),
-        // Phase B reverse translation rebuilds service routing names only.
-        // External ServiceEntry shape is not recoverable from the minimal
-        // CDS/EDS names consumed here; richer xDS metadata will fill this in.
-        service_entries: Vec::new(),
+        // GAP-1a: authorization policies recovered from the MeshPolicies
+        // carrier. Without this the xDS mesh had NO authz (implicit allow-all).
+        mesh_policies: recovered.mesh_policies,
+        // GAP-1a: PeerAuthentication mTLS posture recovered from the PeerAuth
+        // carrier. Without this every port fell back to Permissive.
+        peer_authentications: recovered.peer_authentications,
+        // GAP-1a: JWT request-authentication rules recovered from the
+        // RequestAuth carrier.
+        request_authentications: recovered.request_authentications,
+        telemetry_resources: recovered.telemetry_resources,
+        // GAP-1a: full ServiceEntry shape recovered from the ServiceEntries
+        // carrier. The name-only CDS/EDS path only reconstructed service
+        // ports for routing; the carrier restores hosts/resolution/location/
+        // endpoints needed for egress and outbound-policy behavior.
+        service_entries: recovered.service_entries,
         // DestinationRule traffic policy is not exposed via standard xDS — its
         // semantics are baked into Envoy Cluster (LB algorithm, outlier
         // detection, connection pool) before the CP emits CDS, so we cannot
@@ -1003,27 +1029,118 @@ fn reverse_translate(
         // still need `FERRUM_MESH_CONFIG_PROTOCOL=native` for full DR
         // semantics; see docs/mesh.md ("DestinationRule support matrix").
         destination_rules,
-        // ProxyConfig is config-time and not exposed via standard xDS — the
-        // CP would have already applied concurrency/image/env-var changes
-        // before emitting CDS, so it cannot be round-tripped here. Operators
-        // relying on ProxyConfig translation must use the native protocol.
-        proxy_configs: Vec::new(),
-        trust_bundles: None,
-        multi_cluster: None,
-        // MeshConfig outboundTrafficPolicy is not represented in the minimal
-        // ADS resources consumed here. xDS deployments use the runtime env
-        // fallback until MeshConfig translation is wired.
-        outbound_traffic_policy: None,
+        // GAP-1a: ProxyConfig recovered from the ProxyConfigs carrier.
+        proxy_configs: recovered.proxy_configs,
+        // GAP-1a: SPIFFE trust bundles recovered from the TrustBundles
+        // carrier. Without this xDS inbound mTLS had no peer-cert authority
+        // material. SDS resource names (the only standard-xDS signal) carry no
+        // authority bytes, so the carrier is the sole round-trip path.
+        trust_bundles: recovered.trust_bundles,
+        multi_cluster: recovered.multi_cluster,
+        // GAP-1a: mesh-wide outbound traffic policy recovered from the
+        // OutboundTrafficPolicy carrier.
+        outbound_traffic_policy: recovered.outbound_traffic_policy,
         sidecar_egress_scope: None,
-        // GAP-2L.3: xDS-only deployments don't round-trip ECDS resources back
-        // into the slice today. The DR-carrier path (GAP-2K) lands them
-        // alongside CDS via the same wire so this stays empty unless future
-        // ADS-side recovery wires it.
+        // GAP-2L.3: xDS-only deployments don't round-trip operator-defined
+        // ECDS resources back into the slice today. The carrier paths
+        // (GAP-2K DR carrier, GAP-1a slice carriers) land their fields in the
+        // dedicated slice fields above instead.
         extension_configs: Vec::new(),
         // GAP-3E: merged RTDS layers. Empty when no Runtime resources have
         // shipped on this stream.
         runtime_overlay,
     })
+}
+
+/// Slice fields recovered from Ferrum mesh-slice ECDS carriers (GAP-1a).
+///
+/// `services` is `Option` so the caller can distinguish "the CP shipped a
+/// Services carrier" (use it verbatim) from "no carrier; fall back to the
+/// name-only CDS/EDS reconstruction". The other fields default to empty/`None`,
+/// which matches both "carrier absent" and "carrier present but empty" — the
+/// same indistinguishability native config has between an empty list and an
+/// absent list.
+#[derive(Debug, Default)]
+struct RecoveredSliceCarriers {
+    services: Option<Vec<MeshService>>,
+    workloads: Vec<crate::modes::mesh::config::Workload>,
+    mesh_policies: Vec<crate::modes::mesh::config::MeshPolicy>,
+    peer_authentications: Vec<crate::modes::mesh::config::PeerAuthentication>,
+    request_authentications: Vec<crate::modes::mesh::config::MeshRequestAuthentication>,
+    service_entries: Vec<crate::modes::mesh::config::ServiceEntry>,
+    telemetry_resources: Vec<crate::modes::mesh::config::MeshTelemetryResource>,
+    proxy_configs: Vec<crate::modes::mesh::config::MeshProxyConfig>,
+    trust_bundles: Option<crate::modes::mesh::config::TrustBundleSet>,
+    outbound_traffic_policy: Option<crate::modes::mesh::config::OutboundTrafficPolicy>,
+    multi_cluster: Option<crate::modes::mesh::config::MultiClusterConfig>,
+}
+
+/// Decode every Ferrum mesh-slice ECDS carrier in `accumulator` and fold it
+/// into a [`RecoveredSliceCarriers`].
+///
+/// ECDS resources that are not Ferrum slice carriers (the DR carrier, or any
+/// operator-defined extension config) decode to `None` and are skipped. A
+/// recognized carrier whose JSON fails to parse is warned and skipped so one
+/// malformed carrier never drops the whole slice — matching the DR-carrier
+/// fail-soft behavior above.
+fn recover_slice_carriers(accumulator: &ResourceAccumulator) -> RecoveredSliceCarriers {
+    use crate::xds::carrier::MeshSliceCarrier;
+    use crate::xds::translator::FERRUM_ECDS_DESTINATION_RULE_TYPE_URL;
+
+    let mut recovered = RecoveredSliceCarriers::default();
+    for resource in accumulator.resources(ECDS_TYPE_URL) {
+        let typed_extension = match proto::TypedExtensionConfig::decode(resource.bytes.as_slice()) {
+            Ok(value) => value,
+            // The DR-carrier loop already warned on this same resource; stay
+            // quiet here to avoid double-logging the same decode failure.
+            Err(_) => continue,
+        };
+        let Some(inner) = typed_extension.typed_config else {
+            continue;
+        };
+        // The DR carrier rides the same ECDS stream but is handled by the
+        // dedicated loop above; skip it here so we don't double-decode.
+        if inner.type_url == FERRUM_ECDS_DESTINATION_RULE_TYPE_URL {
+            continue;
+        }
+        match MeshSliceCarrier::decode(&inner.type_url, &inner.value) {
+            Ok(Some(carrier)) => apply_recovered_carrier(&mut recovered, carrier),
+            Ok(None) => {
+                // Unrelated operator extension config — not a slice carrier.
+            }
+            Err(e) => warn!(
+                resource_name = %typed_extension.name,
+                inner_type_url = %inner.type_url,
+                error = %e,
+                "xDS mesh-slice ECDS carrier failed JSON decode; field will be missing from slice"
+            ),
+        }
+    }
+    recovered
+}
+
+fn apply_recovered_carrier(
+    recovered: &mut RecoveredSliceCarriers,
+    carrier: crate::xds::carrier::MeshSliceCarrier,
+) {
+    use crate::xds::carrier::MeshSliceCarrier;
+    match carrier {
+        MeshSliceCarrier::Services(value) => recovered.services = Some(value),
+        MeshSliceCarrier::Workloads(value) => recovered.workloads = value,
+        MeshSliceCarrier::MeshPolicies(value) => recovered.mesh_policies = value,
+        MeshSliceCarrier::PeerAuthentications(value) => recovered.peer_authentications = value,
+        MeshSliceCarrier::RequestAuthentications(value) => {
+            recovered.request_authentications = value
+        }
+        MeshSliceCarrier::ServiceEntries(value) => recovered.service_entries = value,
+        MeshSliceCarrier::TelemetryResources(value) => recovered.telemetry_resources = value,
+        MeshSliceCarrier::ProxyConfigs(value) => recovered.proxy_configs = value,
+        MeshSliceCarrier::TrustBundles(value) => recovered.trust_bundles = Some(value),
+        MeshSliceCarrier::OutboundTrafficPolicy(value) => {
+            recovered.outbound_traffic_policy = Some(value)
+        }
+        MeshSliceCarrier::MultiCluster(value) => recovered.multi_cluster = Some(value),
+    }
 }
 
 fn decode_resource_name(type_url: &str, value: &[u8]) -> Result<String, String> {
@@ -2169,5 +2286,243 @@ mod tests {
             dr.subsets[0].labels.get("version").map(String::as_str),
             Some("v1")
         );
+    }
+
+    // ── GAP-1a: full-parity slice carriers ──
+    //
+    // These tests pin the core GAP-1a guarantee: a slice carried over xDS is
+    // functionally equivalent to one carried over `native` (same authz / mTLS /
+    // JWT / trust-bundle / ServiceEntry / ProxyConfig / workload behavior). The
+    // round trip drives the REAL production path: CP-side
+    // `translate_mesh_slice_to_snapshot` → ECDS resources on the wire → DP-side
+    // `ResourceAccumulator` → `reverse_translate`.
+
+    /// Feed a CP-built snapshot into a DP accumulator exactly as the live ADS
+    /// stream would (one SotW response per type URL).
+    fn accumulator_from_snapshot(
+        snapshot: &crate::xds::snapshot::XdsSnapshot,
+    ) -> ResourceAccumulator {
+        let mut accumulator = ResourceAccumulator::new();
+        for type_url in XDS_TYPE_URLS {
+            let resources: Vec<proto::Any> = snapshot
+                .resources(type_url)
+                .iter()
+                .map(|resource| resource.to_any())
+                .collect();
+            accumulator
+                .apply_sotw_response(type_url, &resources, &snapshot.version)
+                .expect("snapshot resources apply");
+        }
+        accumulator
+    }
+
+    /// A representative protected slice: authz policy + PeerAuthentication +
+    /// ServiceEntry + trust bundle + request auth + proxy config + workloads.
+    fn representative_protected_slice() -> MeshSlice {
+        use crate::identity::spiffe::{SpiffeId, TrustDomain};
+        use crate::modes::mesh::config::{
+            MeshEndpoint, MeshJwtRule, MeshPolicy, MeshProxyConfig, MeshRequestAuthentication,
+            MeshRule, MtlsMode, OutboundTrafficPolicy, PeerAuthentication, PolicyAction,
+            PolicyScope, Resolution, ServiceEntry, ServiceEntryLocation, TrustBundle,
+            TrustBundleSet, Workload, WorkloadPort, WorkloadRef, WorkloadSelector,
+        };
+
+        let td = TrustDomain::new("cluster.local").expect("trust domain");
+        let workload = Workload {
+            spiffe_id: SpiffeId::new("spiffe://cluster.local/ns/default/sa/api".to_string())
+                .expect("spiffe id"),
+            selector: WorkloadSelector {
+                labels: HashMap::from([("app".to_string(), "api".to_string())]),
+                namespace: Some("default".to_string()),
+            },
+            service_name: "api".to_string(),
+            addresses: vec!["10.0.0.5".to_string()],
+            ports: vec![WorkloadPort {
+                port: 8080,
+                protocol: AppProtocol::Http,
+                name: Some("http".to_string()),
+            }],
+            trust_domain: td.clone(),
+            namespace: "default".to_string(),
+            network: None,
+            cluster: None,
+            weight: None,
+            locality: None,
+            service_account: Some("api".to_string()),
+        };
+        let service = MeshService {
+            name: "api".to_string(),
+            namespace: "default".to_string(),
+            ports: vec![ServicePort {
+                port: 8080,
+                protocol: AppProtocol::Http,
+                name: Some("http".to_string()),
+            }],
+            workloads: vec![WorkloadRef {
+                spiffe_id: workload.spiffe_id.clone(),
+            }],
+            protocol_overrides: HashMap::new(),
+        };
+        MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "v1".to_string(),
+            workloads: vec![workload],
+            services: vec![service],
+            mesh_policies: vec![MeshPolicy {
+                name: "allow-api".to_string(),
+                namespace: "default".to_string(),
+                scope: PolicyScope::Namespace {
+                    namespace: "default".to_string(),
+                },
+                rules: vec![MeshRule {
+                    from: Vec::new(),
+                    to: Vec::new(),
+                    when: Vec::new(),
+                    request_principals: Vec::new(),
+                    never_matches: false,
+                    action: PolicyAction::Allow,
+                }],
+            }],
+            peer_authentications: vec![PeerAuthentication {
+                name: "strict".to_string(),
+                namespace: "default".to_string(),
+                scope: None,
+                selector: None,
+                mtls_mode: MtlsMode::Strict,
+                port_overrides: HashMap::new(),
+            }],
+            request_authentications: vec![MeshRequestAuthentication {
+                name: "jwt".to_string(),
+                namespace: "default".to_string(),
+                scope: PolicyScope::Namespace {
+                    namespace: "default".to_string(),
+                },
+                jwt_rules: vec![MeshJwtRule {
+                    issuer: "https://issuer.example".to_string(),
+                    audiences: vec!["api".to_string()],
+                    jwks_uri: Some("https://issuer.example/jwks".to_string()),
+                    jwks: None,
+                    from_headers: Vec::new(),
+                    from_params: Vec::new(),
+                    forward_original_token: false,
+                }],
+            }],
+            service_entries: vec![ServiceEntry {
+                name: "external-api".to_string(),
+                namespace: "default".to_string(),
+                hosts: vec!["api.example.com".to_string()],
+                endpoints: vec![MeshEndpoint {
+                    address: "203.0.113.10".to_string(),
+                    ports: HashMap::from([("https".to_string(), 443u16)]),
+                    labels: HashMap::new(),
+                    network: None,
+                }],
+                resolution: Resolution::Static,
+                location: ServiceEntryLocation::MeshExternal,
+                ports: vec![ServicePort {
+                    port: 443,
+                    protocol: AppProtocol::Tls,
+                    name: Some("https".to_string()),
+                }],
+                export_to: Vec::new(),
+                workload_selector: None,
+            }],
+            proxy_configs: vec![MeshProxyConfig {
+                name: "default".to_string(),
+                ..MeshProxyConfig::default()
+            }],
+            trust_bundles: Some(TrustBundleSet {
+                local: TrustBundle {
+                    trust_domain: td,
+                    x509_authorities: vec!["QUJD".to_string()],
+                    jwt_authorities: Vec::new(),
+                    refresh_hint_seconds: Some(3600),
+                },
+                federated: Vec::new(),
+            }),
+            outbound_traffic_policy: Some(OutboundTrafficPolicy::RegistryOnly),
+            ..MeshSlice::default()
+        }
+    }
+
+    #[test]
+    fn xds_round_trip_preserves_protected_slice_fields() {
+        let native = representative_protected_slice();
+        let snapshot = translate_mesh_slice_to_snapshot(&native);
+        let accumulator = accumulator_from_snapshot(&snapshot);
+
+        let mut config = test_config();
+        config.node_id = native.node_id.clone();
+        config.namespace = native.namespace.clone();
+
+        let recovered = accumulator
+            .try_build_mesh_slice(&config)
+            .expect("reverse translate succeeds")
+            .expect("all required types present");
+
+        // Every security- and policy-bearing field must round-trip. Before
+        // GAP-1a these were all empty after xDS reverse-translation.
+        assert_eq!(recovered.mesh_policies, native.mesh_policies);
+        assert_eq!(recovered.peer_authentications, native.peer_authentications);
+        assert_eq!(
+            recovered.request_authentications,
+            native.request_authentications
+        );
+        assert_eq!(recovered.service_entries, native.service_entries);
+        assert_eq!(recovered.trust_bundles, native.trust_bundles);
+        assert_eq!(recovered.proxy_configs, native.proxy_configs);
+        assert_eq!(recovered.workloads, native.workloads);
+        assert_eq!(
+            recovered.outbound_traffic_policy,
+            native.outbound_traffic_policy
+        );
+        // Services round-trip with full protocol + workload-ref shape via the
+        // Services carrier (not the name-only CDS/EDS reconstruction).
+        assert_eq!(recovered.services, native.services);
+
+        // Resolved-behavior parity spot-checks: the recovered slice answers
+        // the same mTLS-posture and outbound-policy questions native would.
+        assert_eq!(
+            recovered.resolve_effective_mtls_mode(8080),
+            native.resolve_effective_mtls_mode(8080)
+        );
+        assert_eq!(
+            recovered.resolve_effective_mtls_mode(8080),
+            crate::modes::mesh::config::MtlsMode::Strict,
+            "strict PeerAuthentication must survive the xDS round trip"
+        );
+    }
+
+    #[test]
+    fn xds_round_trip_without_carriers_falls_back_to_name_only_services() {
+        // Simulate a stock Envoy CP: CDS/EDS names only, no Ferrum carriers.
+        // The DP must still reconstruct service ports (fail-open routing) but
+        // with empty security fields — the documented degraded mode.
+        let mut accumulator = ResourceAccumulator::new();
+        accumulator
+            .apply_sotw_response(
+                CDS_TYPE_URL,
+                &[any_resource(CDS_TYPE_URL, "cluster/default/api/8080")],
+                "v1",
+            )
+            .expect("CDS applies");
+        for type_url in [EDS_TYPE_URL, LDS_TYPE_URL, RDS_TYPE_URL, SDS_TYPE_URL] {
+            accumulator
+                .apply_sotw_response(type_url, &[], "v1")
+                .expect("empty applies");
+        }
+
+        let recovered = accumulator
+            .try_build_mesh_slice(&test_config())
+            .expect("reverse translate succeeds")
+            .expect("required types present");
+
+        assert_eq!(recovered.services.len(), 1);
+        assert_eq!(recovered.services[0].name, "api");
+        assert!(recovered.mesh_policies.is_empty());
+        assert!(recovered.peer_authentications.is_empty());
+        assert!(recovered.trust_bundles.is_none());
+        assert!(recovered.workloads.is_empty());
     }
 }
