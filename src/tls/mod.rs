@@ -37,7 +37,7 @@ pub use frontend_reload::{
 #[allow(unused_imports)]
 pub use spiffe::{
     SharedBundleSlot, SpiffeClientCertResolver, SpiffeServerCertResolver, SpiffeTlsError,
-    build_spiffe_inbound_config, build_spiffe_outbound_config,
+    build_spiffe_client_cert_verifier, build_spiffe_inbound_config, build_spiffe_outbound_config,
 };
 
 use rustls::ServerConfig;
@@ -849,6 +849,7 @@ pub fn load_mesh_tls_config_with_identity(
     tls_policy: &TlsPolicy,
     cert_expiry_warning_days: u64,
     crls: &[CertificateRevocationListDer<'static>],
+    spiffe_client_verifier: Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>,
 ) -> Result<Arc<ServerConfig>, anyhow::Error> {
     let client_ca_bundle_material = client_ca_bundle_path
         .map(|path| {
@@ -872,6 +873,7 @@ pub fn load_mesh_tls_config_with_identity(
         tls_policy,
         cert_expiry_warning_days,
         crls,
+        spiffe_client_verifier,
     )
 }
 
@@ -887,6 +889,7 @@ pub(crate) fn load_mesh_tls_config_with_identity_and_client_ca_bytes(
     tls_policy: &TlsPolicy,
     cert_expiry_warning_days: u64,
     crls: &[CertificateRevocationListDer<'static>],
+    spiffe_client_verifier: Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>,
 ) -> Result<Arc<ServerConfig>, anyhow::Error> {
     if let Some(bundle) = client_ca_bundle {
         check_cert_expiry_from_pem_bytes(
@@ -903,57 +906,77 @@ pub(crate) fn load_mesh_tls_config_with_identity_and_client_ca_bytes(
 
     let mut config = match client_auth {
         MeshClientAuth::Required | MeshClientAuth::Optional => {
-            let ca_bundle = client_ca_bundle.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Mesh mTLS {:?} mode requires readable client CA bundle bytes \
-                     (FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH)",
-                    client_auth
-                )
-            })?;
+            // When a SPIFFE verifier is supplied (gateway SVID bundle is
+            // available), use it: it validates the peer cert chain against the
+            // SVID trust bundle AND the peer SAN's trust domain against
+            // local/federated bundles — the actual mesh identity check Istio
+            // relies on. It already encodes the STRICT-vs-PERMISSIVE
+            // `peer_required` behavior. CRL still applies to the operator-CA
+            // path below for deployments without gateway SVID material.
+            if let Some(verifier) = spiffe_client_verifier {
+                info!(
+                    mesh_client_auth = ?client_auth,
+                    "Mesh TLS configuration loaded with SPIFFE trust-domain-validating \
+                     client verifier from cert: {}, key: {}",
+                    identity.cert_path(),
+                    identity.key_path(),
+                );
+                builder
+                    .with_client_cert_verifier(verifier)
+                    .with_single_cert(identity.cert_chain.clone(), identity.key.clone_key())?
+            } else {
+                let ca_bundle = client_ca_bundle.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Mesh mTLS {:?} mode requires readable client CA bundle bytes \
+                         (FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH)",
+                        client_auth
+                    )
+                })?;
 
-            let ca_certs: Vec<_> = certs(&mut &ca_bundle.pem[..])
-                .filter_map(|r| r.ok())
-                .collect();
+                let ca_certs: Vec<_> = certs(&mut &ca_bundle.pem[..])
+                    .filter_map(|r| r.ok())
+                    .collect();
 
-            let mut client_auth_roots = rustls::RootCertStore::empty();
-            let (added, _ignored) = client_auth_roots.add_parsable_certificates(ca_certs);
-            if added == 0 {
-                return Err(anyhow::anyhow!(
-                    "No valid client CA certificates found in {}",
-                    ca_bundle.path
-                ));
+                let mut client_auth_roots = rustls::RootCertStore::empty();
+                let (added, _ignored) = client_auth_roots.add_parsable_certificates(ca_certs);
+                if added == 0 {
+                    return Err(anyhow::anyhow!(
+                        "No valid client CA certificates found in {}",
+                        ca_bundle.path
+                    ));
+                }
+
+                let mut verifier_builder =
+                    rustls::server::WebPkiClientVerifier::builder(Arc::new(client_auth_roots));
+
+                if client_auth == MeshClientAuth::Optional {
+                    verifier_builder = verifier_builder.allow_unauthenticated();
+                }
+
+                if !crls.is_empty() {
+                    verifier_builder = verifier_builder
+                        .with_crls(crls.iter().cloned())
+                        .allow_unknown_revocation_status()
+                        .only_check_end_entity_revocation();
+                }
+
+                let verifier = verifier_builder.build().map_err(|e| {
+                    anyhow::anyhow!("Failed to build mesh client certificate verifier: {}", e)
+                })?;
+
+                info!(
+                    mesh_client_auth = ?client_auth,
+                    "Mesh TLS configuration loaded with {:?} client auth from cert: {}, key: {}, client CA: {}",
+                    client_auth,
+                    identity.cert_path(),
+                    identity.key_path(),
+                    ca_bundle.path,
+                );
+
+                builder
+                    .with_client_cert_verifier(verifier)
+                    .with_single_cert(identity.cert_chain.clone(), identity.key.clone_key())?
             }
-
-            let mut verifier_builder =
-                rustls::server::WebPkiClientVerifier::builder(Arc::new(client_auth_roots));
-
-            if client_auth == MeshClientAuth::Optional {
-                verifier_builder = verifier_builder.allow_unauthenticated();
-            }
-
-            if !crls.is_empty() {
-                verifier_builder = verifier_builder
-                    .with_crls(crls.iter().cloned())
-                    .allow_unknown_revocation_status()
-                    .only_check_end_entity_revocation();
-            }
-
-            let verifier = verifier_builder.build().map_err(|e| {
-                anyhow::anyhow!("Failed to build mesh client certificate verifier: {}", e)
-            })?;
-
-            info!(
-                mesh_client_auth = ?client_auth,
-                "Mesh TLS configuration loaded with {:?} client auth from cert: {}, key: {}, client CA: {}",
-                client_auth,
-                identity.cert_path(),
-                identity.key_path(),
-                ca_bundle.path,
-            );
-
-            builder
-                .with_client_cert_verifier(verifier)
-                .with_single_cert(identity.cert_chain.clone(), identity.key.clone_key())?
         }
         MeshClientAuth::None => {
             info!(

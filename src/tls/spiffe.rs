@@ -92,6 +92,29 @@ pub fn build_spiffe_inbound_config(
     Ok(Arc::new(cfg))
 }
 
+/// Build a [`rustls::server::danger::ClientCertVerifier`] that validates an
+/// inbound peer's SVID: chain-to-bundle plus the peer SAN's trust domain
+/// matching the local or a federated bundle in `bundle_slot`.
+///
+/// Unlike [`build_spiffe_inbound_config`], this returns only the *verifier*,
+/// so a caller can attach it to a `ServerConfig` that still presents the
+/// operator-supplied mesh server certificate and keeps its own ALPN, CRL,
+/// early-data, and session-resumption settings. The mesh inbound listener
+/// uses this so peer SPIFFE SANs are trust-domain-validated without changing
+/// server-cert presentation or forcing h2-only ALPN on the shared
+/// HBONE + mTLS-termination listener.
+///
+/// `peer_required` controls `client_auth_mandatory()`: `true` for STRICT
+/// (reject clients with no cert), `false` for PERMISSIVE (a presented cert is
+/// still trust-domain-validated, but a missing cert is allowed through so the
+/// PERMISSIVE listener can also serve plaintext-identity-less peers).
+pub fn build_spiffe_client_cert_verifier(
+    bundle_slot: SharedBundleSlot,
+    peer_required: bool,
+) -> Arc<dyn rustls::server::danger::ClientCertVerifier> {
+    Arc::new(SpiffeClientCertVerifier::new(bundle_slot, peer_required))
+}
+
 // ── Outbound (client-side) ────────────────────────────────────────────────
 
 /// Build a [`ClientConfig`] that:
@@ -830,5 +853,81 @@ mod tests {
         assert!(!Arc::ptr_eq(&cache_a, &cache_b));
         assert!(Arc::ptr_eq(&cache_b_inner.source, &rotated));
         assert_eq!(cache_b_inner.verifiers.len(), 1);
+    }
+
+    #[test]
+    fn public_client_cert_verifier_validates_trust_domain() {
+        // `build_spiffe_client_cert_verifier` is the entry point the mesh
+        // inbound listener uses. It must reject a peer whose trust domain has
+        // no bundle (the gap PR-2b closes) and accept one that does.
+        let td = TrustDomain::new("td.inbound-verify").unwrap();
+        let id = SpiffeId::from_parts(&td, "ns/foo/sa/bar").unwrap();
+        let (root_der, root_pem, key_pem) = synthetic_root(&td);
+        let leaf = issue_leaf(&id, &root_pem, &key_pem, None);
+        let slot: SharedBundleSlot = Arc::new(ArcSwap::new(Arc::new(Some(svid_bundle_for(
+            id,
+            bundle_for(td, root_der),
+            leaf.clone(),
+        )))));
+
+        let verifier = build_spiffe_client_cert_verifier(slot, true);
+        // Known trust domain + valid chain → accepted.
+        rustls::server::danger::ClientCertVerifier::verify_client_cert(
+            verifier.as_ref(),
+            &CertificateDer::from(leaf),
+            &[],
+            UnixTime::now(),
+        )
+        .expect("peer in a known trust domain should verify");
+
+        // A peer from a foreign trust domain (its own root, not in the slot)
+        // must be rejected even though its chain is internally valid.
+        let foreign_td = TrustDomain::new("td.foreign-inbound").unwrap();
+        let foreign_id = SpiffeId::from_parts(&foreign_td, "ns/x/sa/y").unwrap();
+        let (_foreign_root_der, foreign_root_pem, foreign_key_pem) = synthetic_root(&foreign_td);
+        let foreign_leaf = issue_leaf(&foreign_id, &foreign_root_pem, &foreign_key_pem, None);
+        let err = rustls::server::danger::ClientCertVerifier::verify_client_cert(
+            verifier.as_ref(),
+            &CertificateDer::from(foreign_leaf),
+            &[],
+            UnixTime::now(),
+        )
+        .expect_err("peer from an untrusted trust domain must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("trust domain") || msg.contains("trust bundle"),
+            "rejection should cite the missing trust domain, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn public_client_cert_verifier_permissive_does_not_require_cert() {
+        // PERMISSIVE builds the verifier with `peer_required = false` so a peer
+        // that offers no cert is still admitted (rustls won't invoke
+        // verify_client_cert), while an offered cert is still validated.
+        let td = TrustDomain::new("td.permissive").unwrap();
+        let id = SpiffeId::from_parts(&td, "ns/foo/sa/bar").unwrap();
+        let (root_der, root_pem, key_pem) = synthetic_root(&td);
+        let leaf = issue_leaf(&id, &root_pem, &key_pem, None);
+        let slot: SharedBundleSlot = Arc::new(ArcSwap::new(Arc::new(Some(svid_bundle_for(
+            id,
+            bundle_for(td, root_der),
+            leaf,
+        )))));
+
+        let required = build_spiffe_client_cert_verifier(slot.clone(), true);
+        assert!(
+            rustls::server::danger::ClientCertVerifier::client_auth_mandatory(required.as_ref()),
+            "STRICT verifier must mandate client auth"
+        );
+        let permissive = build_spiffe_client_cert_verifier(slot, false);
+        assert!(
+            !rustls::server::danger::ClientCertVerifier::client_auth_mandatory(permissive.as_ref()),
+            "PERMISSIVE verifier must not mandate client auth"
+        );
+        assert!(
+            rustls::server::danger::ClientCertVerifier::offer_client_auth(permissive.as_ref()),
+            "PERMISSIVE verifier must still offer/request client auth so identity is recorded when present"
+        );
     }
 }

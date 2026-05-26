@@ -790,6 +790,14 @@ pub struct EnvConfig {
     /// and client CA verifier. Cert/key paths remain static operational
     /// inputs.
     pub mesh_peer_auth_live_reload_enabled: bool,
+    /// Whether the auto-injected mesh `RequestAuthentication` (`jwks_auth`)
+    /// plugin requires the JWT `exp` claim to be present. Defaults to `true`
+    /// (secure): tokens that omit `exp` are rejected so they cannot live
+    /// forever. Set `FERRUM_MESH_REQUEST_AUTH_REQUIRE_EXP=false` to accept
+    /// `exp`-less tokens (some Istio issuers legitimately omit `exp`).
+    /// Independent of expiry *validation*: a present-but-expired `exp` is
+    /// always rejected regardless of this flag.
+    pub mesh_request_auth_require_exp: bool,
     /// SPIFFE trust-bundle federation polling interval in seconds.
     /// `0` disables the federation poller entirely; cross-cluster trust
     /// bundles must then be provided via the slice's `TrustBundleSet.federated`
@@ -1667,6 +1675,7 @@ impl Default for EnvConfig {
             mesh_sidecar_identity_narrowing: false,
             mesh_egress_stream_enabled: false,
             mesh_peer_auth_live_reload_enabled: false,
+            mesh_request_auth_require_exp: true,
             mesh_federation_poll_interval_seconds: 300,
             mesh_federation_poll_timeout_seconds: 30,
             mesh_federation_fail_open: false,
@@ -2008,6 +2017,7 @@ impl EnvConfig {
             mesh_sidecar_identity_narrowing: bool = "FERRUM_MESH_SIDECAR_IDENTITY_NARROWING" => false;
             mesh_egress_stream_enabled: bool = "FERRUM_MESH_EGRESS_STREAM_ENABLED" => false;
             mesh_peer_auth_live_reload_enabled: bool = "FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED" => false;
+            mesh_request_auth_require_exp: bool = "FERRUM_MESH_REQUEST_AUTH_REQUIRE_EXP" => true;
             mesh_federation_poll_interval_seconds: u64 = "FERRUM_MESH_FEDERATION_POLL_INTERVAL_SECONDS" => 300u64;
             mesh_federation_poll_timeout_seconds: u64 = "FERRUM_MESH_FEDERATION_POLL_TIMEOUT_SECONDS" => 30u64;
             mesh_federation_fail_open: bool = "FERRUM_MESH_FEDERATION_FAIL_OPEN" => false;
@@ -2583,6 +2593,7 @@ impl EnvConfig {
             mesh_sidecar_identity_narrowing,
             mesh_egress_stream_enabled,
             mesh_peer_auth_live_reload_enabled,
+            mesh_request_auth_require_exp,
             mesh_federation_poll_interval_seconds,
             mesh_federation_poll_timeout_seconds,
             mesh_federation_fail_open,
