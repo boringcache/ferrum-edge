@@ -925,7 +925,7 @@ fn check_xml_entity_expansion(
             let decl_end = find_xml_declaration_end(&bytes[i..])
                 .map(|end| i + end)
                 .unwrap_or(bytes.len());
-            if reject_nested && entity_value_references_general_entity(&body[i..decl_end]) {
+            if reject_nested && entity_value_references_nested_entity(&body[i..decl_end]) {
                 return Err(
                     "XML entity definition references another entity (billion-laughs protection)"
                         .to_string(),
@@ -953,16 +953,17 @@ fn find_xml_declaration_end(bytes: &[u8]) -> Option<usize> {
     None
 }
 
-/// True if an `<!ENTITY ...>` declaration's value references a non-predefined
-/// general entity (`&name;`), which is how billion-laughs chains expansion.
-/// Numeric character references (`&#..;`) and the five predefined entities are
-/// safe and ignored.
-fn entity_value_references_general_entity(decl: &str) -> bool {
+/// True if an `<!ENTITY ...>` declaration's value references another entity.
+/// General entity refs (`&name;`) and parameter entity refs (`%name;`) can both
+/// create expansion chains. Numeric character refs and the five predefined XML
+/// general entities are safe and ignored.
+fn entity_value_references_nested_entity(decl: &str) -> bool {
     let bytes = decl.as_bytes();
     let mut i = 0usize;
     while i < bytes.len() {
-        if bytes[i] == b'&' {
-            if bytes.get(i + 1) == Some(&b'#') {
+        if matches!(bytes[i], b'&' | b'%') {
+            let marker = bytes[i];
+            if marker == b'&' && bytes.get(i + 1) == Some(&b'#') {
                 i += 1;
                 continue;
             }
@@ -975,7 +976,7 @@ fn entity_value_references_general_entity(decl: &str) -> bool {
             }
             if j > i + 1 && bytes.get(j) == Some(&b';') {
                 let name = &decl[i + 1..j];
-                if !matches!(name, "lt" | "gt" | "amp" | "quot" | "apos") {
+                if marker == b'%' || !matches!(name, "lt" | "gt" | "amp" | "quot" | "apos") {
                     return true;
                 }
             }

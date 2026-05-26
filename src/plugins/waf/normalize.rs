@@ -19,7 +19,7 @@ use percent_encoding::percent_decode_str;
 /// Maximum number of normalized variants produced per value (excluding the
 /// raw input). Bounds body-scan cost at `O(VARIANTS × bytes × rules)`; the
 /// underlying `RegexSet` matching is linear so this is a hard multiplier.
-const MAX_VARIANTS: usize = 3;
+const MAX_VARIANTS: usize = 4;
 
 /// Produce normalized decodings of `text` distinct from the raw input.
 ///
@@ -31,11 +31,7 @@ pub(super) fn decoded_variants(text: &str) -> Vec<String> {
     // entities). The single-layer decodes are kept as well because a layered
     // percent-decode can mangle a body that merely contains a literal `%`,
     // and we still want the JSON/HTML-only decode to fire in that case.
-    let layered = {
-        let pct = percent_decode_plus(text);
-        let html = html_entity_decode(&pct);
-        unicode_unescape(&html).into_owned()
-    };
+    let layered = layered_decode(text);
     let candidates = [
         Cow::Owned(layered),
         unicode_unescape(text),
@@ -54,6 +50,20 @@ pub(super) fn decoded_variants(text: &str) -> Vec<String> {
         }
     }
     out
+}
+
+fn layered_decode(text: &str) -> String {
+    let mut current = text.to_string();
+    for _ in 0..3 {
+        let percent = percent_decode_plus(&current).into_owned();
+        let unicode = unicode_unescape(&percent).into_owned();
+        let html = html_entity_decode(&unicode).into_owned();
+        if html == current {
+            break;
+        }
+        current = html;
+    }
+    current
 }
 
 /// Percent-decode (`%XX`) and translate `+` to space (form-encoding). Lossy on
@@ -345,6 +355,12 @@ mod tests {
     fn decoded_variants_recovers_escaped_script() {
         // `\x`-escaped `<script>` — the raw byte scan never sees the tag.
         let variants = decoded_variants(r"{q:\x3cscript\x3ealert(1)}");
+        assert!(variants.iter().any(|v| v.contains("<script>")));
+    }
+
+    #[test]
+    fn decoded_variants_redecodes_unicode_escaped_html_entities() {
+        let variants = decoded_variants(r#"\u0026lt;script\u0026gt;"#);
         assert!(variants.iter().any(|v| v.contains("<script>")));
     }
 }

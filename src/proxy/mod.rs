@@ -15111,6 +15111,7 @@ fn canonicalize_client_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plugins::security_headers::SecurityHeaders;
     use async_trait::async_trait;
     use http::header::HeaderValue;
     use serde_json::json;
@@ -15208,6 +15209,42 @@ mod tests {
         );
         assert_eq!(body, br#"{"error":"blocked"}"#);
         assert!(!ctx.metadata.contains_key(REJECTION_RESPONSE_METADATA_KEY));
+    }
+
+    #[tokio::test]
+    async fn plugin_rejection_response_runs_security_headers() {
+        let plugins: Vec<Arc<dyn Plugin>> =
+            vec![Arc::new(SecurityHeaders::new(&json!({})).unwrap())];
+        let mut ctx = RequestContext::new("203.0.113.10".into(), "GET".into(), "/body".into());
+        let mut response_status = 200;
+        let mut response_headers = HashMap::new();
+        let reject = RejectedResponseParts {
+            status_code: 403,
+            body: br#"{"error":"blocked"}"#.to_vec(),
+            headers: HashMap::new(),
+        };
+
+        let body = apply_plugin_rejection_response(
+            &plugins,
+            &mut ctx,
+            &mut response_status,
+            &mut response_headers,
+            reject,
+        )
+        .await;
+
+        assert_eq!(response_status, 403);
+        assert_eq!(
+            response_headers
+                .get("x-content-type-options")
+                .map(String::as_str),
+            Some("nosniff")
+        );
+        assert_eq!(
+            response_headers.get("x-frame-options").map(String::as_str),
+            Some("SAMEORIGIN")
+        );
+        assert_eq!(body, br#"{"error":"blocked"}"#);
     }
 
     #[test]

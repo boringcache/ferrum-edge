@@ -958,6 +958,28 @@ async fn body_normalization_catches_escaped_payload_the_raw_scan_misses() {
     );
 }
 
+#[tokio::test]
+async fn body_normalization_redecodes_unicode_escaped_html_entities() {
+    let plugin = Waf::new(&json!({
+        "rule_modes": { "FE-XSS-001-B": "enforce" }
+    }))
+    .unwrap();
+    let mut ctx = ctx("POST", "/submit");
+    ctx.headers
+        .insert("content-type".into(), "application/json".into());
+    let headers = ctx.headers.clone();
+    let escaped = br#"{"comment":"\u0026lt;script\u0026gt;alert(1)\u0026lt;/script\u0026gt;"}"#;
+    assert!(!escaped.windows(7).any(|w| w == b"<script"));
+    assert!(!escaped.windows(10).any(|w| w == b"&lt;script"));
+
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, escaped)
+        .await;
+
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(monitored(&ctx, "FE-XSS-001-B"));
+}
+
 fn monitored(ctx: &RequestContext, rule_id: &str) -> bool {
     ctx.metadata
         .get("waf.rule_hits")
