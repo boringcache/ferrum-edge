@@ -1920,6 +1920,7 @@ async fn handle_h3_request(
             ctx.is_early_data,
         );
         let tls_config_fn = || state.connection_pool.get_tls_config_for_backend(&proxy);
+        let request_body_bytes_seen = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
         let streaming_resp = if let Some(target) = upstream_target.as_deref() {
             state
@@ -1933,6 +1934,7 @@ async fn handle_h3_request(
                     &h3_headers,
                     &mut stream,
                     state.max_request_body_size_bytes,
+                    Arc::clone(&request_body_bytes_seen),
                     tls_config_fn,
                 )
                 .await
@@ -1946,6 +1948,7 @@ async fn handle_h3_request(
                     &h3_headers,
                     &mut stream,
                     state.max_request_body_size_bytes,
+                    Arc::clone(&request_body_bytes_seen),
                     tls_config_fn,
                 )
                 .await
@@ -2042,6 +2045,7 @@ async fn handle_h3_request(
                     // Backend connection failed before any streaming began — the 502
                     // response body is built and sent synchronously below.
                     error_class: Some(h3_error_class),
+                    bytes_sent: request_body_bytes_seen.load(std::sync::atomic::Ordering::Acquire),
                     metadata: crate::proxy::clone_log_metadata(&ctx),
                     ..TransactionSummary::default()
                 };
@@ -2320,13 +2324,7 @@ async fn handle_h3_request(
             error_class: None,
             body_error_class,
             body_completed,
-            // Request body was streamed frame-by-frame via the H3 pool
-            // (`request_streaming_body`) — the exact byte count is not
-            // currently surfaced back from the pool. Populating this would
-            // require threading an `Arc<AtomicU64>` through the H3 request
-            // API; deferred to a follow-up. For streaming-request flows,
-            // `bytes_sent` may be 0 even when a non-empty body was sent.
-            bytes_sent: 0,
+            bytes_sent: request_body_bytes_seen.load(std::sync::atomic::Ordering::Acquire),
             // Response bytes delivered to the client — tracked by the
             // streaming loop above as `bytes_streamed`.
             bytes_received: bytes_streamed,
