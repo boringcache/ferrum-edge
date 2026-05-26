@@ -242,6 +242,37 @@ fn authz_allow_with_rules_admits_matching_request() {
     );
 }
 
+#[test]
+fn authz_unsupported_when_key_rejects_policy() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "unsupported when keys fail closed",
+        status = Status::Supported,
+        notes = "Translator rejects unsupported AuthorizationPolicy.when keys so DENY conditions cannot silently fail open.",
+    );
+
+    let err = translate_k8s_objects(
+        &[authz_policy(json!({
+            "action": "DENY",
+            "rules": [{
+                "when": [{
+                    "key": "destination.labels[app]",
+                    "values": ["payments"]
+                }]
+            }]
+        }))],
+        options(),
+    )
+    .expect_err("unsupported when key should reject the policy");
+
+    let message = err.to_string();
+    assert!(
+        message.contains("rules[].when[0].key 'destination.labels[app]'")
+            && message.contains("unsupported"),
+        "error should identify unsupported when key, got: {message}"
+    );
+}
+
 /// PolicyScope is derived from the selector / namespace combination at
 /// translation time. Confirm a `selector: matchLabels` produces a
 /// `WorkloadSelector` scope so the request hot path can filter policies

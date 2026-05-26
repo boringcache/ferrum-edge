@@ -3,9 +3,9 @@
 use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain};
 use ferrum_edge::modes::mesh::config::{
-    AppProtocol, EastWestGateway, JwtHeader, MeshConfig, MeshDestinationRule, MeshEndpoint,
-    MeshJwtRule, MeshPolicy, MeshRequestAuthentication, MeshRule, MeshService, MeshSidecar,
-    MeshSidecarEgress, MeshSubset, MeshTrafficPolicy, MtlsMode, MultiClusterConfig,
+    AppProtocol, ConditionMatch, EastWestGateway, JwtHeader, MeshConfig, MeshDestinationRule,
+    MeshEndpoint, MeshJwtRule, MeshPolicy, MeshRequestAuthentication, MeshRule, MeshService,
+    MeshSidecar, MeshSidecarEgress, MeshSubset, MeshTrafficPolicy, MtlsMode, MultiClusterConfig,
     PeerAuthentication, PolicyAction, PolicyScope, PrincipalMatch, RemoteCluster, RequestMatch,
     Resolution, ServiceEntry, ServiceEntryLocation, ServicePort, TrustBundle, TrustBundleSet,
     Workload, WorkloadPort, WorkloadRef, WorkloadSelector, validate_mesh_config,
@@ -398,6 +398,54 @@ fn policy_with_request_match(request: RequestMatch) -> MeshPolicy {
             action: PolicyAction::Allow,
         }],
     }
+}
+
+#[test]
+fn mesh_policy_rejects_unsupported_when_condition_key() {
+    let mut policy = policy_with_request_match(RequestMatch {
+        methods: vec!["GET".into()],
+        ..RequestMatch::default()
+    });
+    policy.rules[0].when.push(ConditionMatch {
+        key: "destination.labels[app]".into(),
+        values: vec!["payments".into()],
+        not_values: Vec::new(),
+    });
+
+    let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], &[], None);
+    assert!(
+        errors.iter().any(|e| {
+            e.contains("rules[0].when[0].key")
+                && e.contains("destination.labels[app]")
+                && e.contains("unsupported")
+        }),
+        "expected unsupported when-key error, got: {:?}",
+        errors
+    );
+}
+
+#[test]
+fn mesh_policy_rejects_malformed_ip_when_condition_values() {
+    let mut policy = policy_with_request_match(RequestMatch {
+        methods: vec!["GET".into()],
+        ..RequestMatch::default()
+    });
+    policy.rules[0].when.push(ConditionMatch {
+        key: "source.ip".into(),
+        values: vec!["10.0.0.0/40".into()],
+        not_values: Vec::new(),
+    });
+
+    let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], &[], None);
+    assert!(
+        errors.iter().any(|e| {
+            e.contains("rules[0].when[0].values[0]")
+                && e.contains("10.0.0.0/40")
+                && e.contains("prefix length")
+        }),
+        "expected invalid source.ip condition error, got: {:?}",
+        errors
+    );
 }
 
 #[test]

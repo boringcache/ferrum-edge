@@ -13,7 +13,8 @@ use crate::modes::mesh::config::{
     MetricTagOverride, MtlsMode, PeerAuthentication, PolicyAction, PolicyScope, PrincipalMatch,
     RequestMatch, Resolution, ServiceEntry, ServiceEntryLocation, ServicePort, SourceNegationMatch,
     TagOverrideOperation, TelemetryTracingMode, TracingProvider, Workload, WorkloadPort,
-    WorkloadSelector,
+    WorkloadSelector, is_mesh_condition_ip_key, is_supported_mesh_condition_key,
+    validate_mesh_condition_ip_block,
 };
 
 use super::{
@@ -202,13 +203,15 @@ fn mesh_rules(
     if has_unconstrained_to {
         to.clear();
     }
-    let when = rule
-        .get("when")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(condition_match)
-        .collect();
+    let mut when = Vec::new();
+    if let Some(when_value) = rule.get("when") {
+        let conditions = when_value
+            .as_array()
+            .ok_or_else(|| invalid_resource(object, "rules[].when must be an array"))?;
+        for (index, condition) in conditions.iter().enumerate() {
+            when.push(condition_match(object, index, condition)?);
+        }
+    }
 
     if sources.is_empty() {
         return Ok(vec![MeshRule {
@@ -519,12 +522,50 @@ fn request_match_is_unconstrained(request: &RequestMatch) -> bool {
         && request.not_ports.is_empty()
 }
 
-fn condition_match(value: &Value) -> Option<ConditionMatch> {
-    Some(ConditionMatch {
-        key: string_field(value, "key")?.to_string(),
-        values: string_array(value, "values"),
-        not_values: string_array(value, "notValues"),
+fn condition_match(
+    object: &K8sObject,
+    index: usize,
+    value: &Value,
+) -> Result<ConditionMatch, K8sTranslateError> {
+    let key = string_field(value, "key").ok_or_else(|| {
+        invalid_resource(object, format!("rules[].when[{index}].key is required"))
+    })?;
+    if !is_supported_mesh_condition_key(key) {
+        return Err(invalid_resource(
+            object,
+            format!("rules[].when[{index}].key '{key}' is unsupported"),
+        ));
+    }
+    let values = string_array(value, "values");
+    let not_values = string_array(value, "notValues");
+    if is_mesh_condition_ip_key(key) {
+        validate_condition_ip_blocks(object, index, "values", &values)?;
+        validate_condition_ip_blocks(object, index, "notValues", &not_values)?;
+    }
+    Ok(ConditionMatch {
+        key: key.to_string(),
+        values,
+        not_values,
     })
+}
+
+fn validate_condition_ip_blocks(
+    object: &K8sObject,
+    condition_index: usize,
+    field: &str,
+    values: &[String],
+) -> Result<(), K8sTranslateError> {
+    for (value_index, value) in values.iter().enumerate() {
+        validate_mesh_condition_ip_block(value).map_err(|error| {
+            invalid_resource(
+                object,
+                format!(
+                    "rules[].when[{condition_index}].{field}[{value_index}] '{value}' is invalid: {error}"
+                ),
+            )
+        })?;
+    }
+    Ok(())
 }
 
 fn peer_authentication(
@@ -4200,6 +4241,56 @@ mod tests {
                 .contains("rules[].to[].operation.someUnsupportedField")
         );
         assert!(err.to_string().contains("unsupported"));
+    }
+
+    #[test]
+    fn rejects_unsupported_authorization_policy_when_key() {
+        let err = translate_k8s_objects(
+            &[object(
+                "AuthorizationPolicy",
+                serde_json::json!({
+                    "action": "DENY",
+                    "rules": [{
+                        "when": [{
+                            "key": "destination.labels[app]",
+                            "values": ["payments"]
+                        }]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("unsupported when keys must fail closed");
+
+        assert!(
+            err.to_string()
+                .contains("rules[].when[0].key 'destination.labels[app]'")
+        );
+        assert!(err.to_string().contains("unsupported"));
+    }
+
+    #[test]
+    fn rejects_malformed_authorization_policy_ip_when_value() {
+        let err = translate_k8s_objects(
+            &[object(
+                "AuthorizationPolicy",
+                serde_json::json!({
+                    "action": "DENY",
+                    "rules": [{
+                        "when": [{
+                            "key": "source.ip",
+                            "values": ["10.0.0.0/40"]
+                        }]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("malformed source.ip when CIDR must fail closed");
+
+        assert!(err.to_string().contains("rules[].when[0].values[0]"));
+        assert!(err.to_string().contains("10.0.0.0/40"));
+        assert!(err.to_string().contains("prefix length"));
     }
 
     #[test]

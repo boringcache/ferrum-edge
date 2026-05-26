@@ -9450,6 +9450,8 @@ components:
         nested claim leaf paths,
         `request.headers[...]`,
         `destination.port`, `connection.sni`, `source.ip`, `remote.ip`).
+        Unsupported `when:` keys are rejected during translation/config
+        validation so DENY conditions cannot silently fail open.
         DENY rules treat missing HTTP-only operation/condition attributes as
         matches, matching Istio's TCP behavior for policies that mention HTTP
         fields.

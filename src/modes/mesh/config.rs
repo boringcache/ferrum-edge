@@ -16,6 +16,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::net::IpAddr;
 
 use crate::identity::spiffe::{SpiffeId, TrustDomain};
 use crate::identity::{JwtAuthority as IdentityJwtAuthority, TrustBundle as IdentityTrustBundle};
@@ -349,6 +350,85 @@ pub struct ConditionMatch {
     pub values: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub not_values: Vec<String>,
+}
+
+// Istio `AuthorizationPolicy.when` keys whose attributes Ferrum can source.
+const CONDITION_SOURCE_PRINCIPAL: &str = "source.principal";
+const CONDITION_SOURCE_NAMESPACE: &str = "source.namespace";
+const CONDITION_SOURCE_IP: &str = "source.ip";
+const CONDITION_REMOTE_IP: &str = "remote.ip";
+const CONDITION_REQUEST_AUTH_PRINCIPAL: &str = "request.auth.principal";
+const CONDITION_REQUEST_AUTH_PRESENTER: &str = "request.auth.presenter";
+const CONDITION_REQUEST_AUTH_AUDIENCES: &str = "request.auth.audiences";
+const CONDITION_DESTINATION_PORT: &str = "destination.port";
+const CONDITION_CONNECTION_SNI: &str = "connection.sni";
+const CONDITION_REQUEST_HEADERS_PREFIX: &str = "request.headers[";
+const CONDITION_REQUEST_AUTH_CLAIMS_PREFIX: &str = "request.auth.claims[";
+
+/// Returns `true` when an AuthorizationPolicy `when[].key` can be materialized
+/// by Ferrum. Unknown keys are rejected at config/translation time because
+/// otherwise a DENY condition on an absent, unsupported attribute silently
+/// fails open.
+pub fn is_supported_mesh_condition_key(key: &str) -> bool {
+    match key {
+        CONDITION_SOURCE_PRINCIPAL
+        | CONDITION_SOURCE_NAMESPACE
+        | CONDITION_SOURCE_IP
+        | CONDITION_REMOTE_IP
+        | CONDITION_REQUEST_AUTH_PRINCIPAL
+        | CONDITION_REQUEST_AUTH_PRESENTER
+        | CONDITION_REQUEST_AUTH_AUDIENCES
+        | CONDITION_DESTINATION_PORT
+        | CONDITION_CONNECTION_SNI => true,
+        _ => {
+            bracketed_mesh_condition_name(key, CONDITION_REQUEST_HEADERS_PREFIX).is_some()
+                || bracketed_mesh_condition_name(key, CONDITION_REQUEST_AUTH_CLAIMS_PREFIX)
+                    .is_some()
+        }
+    }
+}
+
+pub fn is_mesh_condition_ip_key(key: &str) -> bool {
+    matches!(key, CONDITION_SOURCE_IP | CONDITION_REMOTE_IP)
+}
+
+/// Validate the CIDR/bare-IP syntax used by `source.ip` / `remote.ip` condition
+/// values. Malformed entries would never match at runtime, which is fail-open
+/// for DENY policies.
+pub fn validate_mesh_condition_ip_block(cidr: &str) -> Result<(), String> {
+    let trimmed = cidr.trim();
+    if trimmed.is_empty() {
+        return Err("IP block must not be empty".to_string());
+    }
+    match trimmed.split_once('/') {
+        Some((net, prefix_str)) => {
+            let ip = net
+                .parse::<IpAddr>()
+                .map_err(|_| format!("invalid IP in CIDR '{cidr}'"))?;
+            let prefix = prefix_str
+                .parse::<u8>()
+                .map_err(|_| format!("invalid prefix length in CIDR '{cidr}'"))?;
+            let max = match ip {
+                IpAddr::V4(_) => 32,
+                IpAddr::V6(_) => 128,
+            };
+            if prefix > max {
+                return Err(format!(
+                    "prefix length {prefix} out of range in CIDR '{cidr}'"
+                ));
+            }
+            Ok(())
+        }
+        None => trimmed
+            .parse::<IpAddr>()
+            .map(|_| ())
+            .map_err(|_| format!("invalid IP address '{cidr}'")),
+    }
+}
+
+fn bracketed_mesh_condition_name<'a>(key: &'a str, prefix: &str) -> Option<&'a str> {
+    let name = key.strip_prefix(prefix)?.strip_suffix(']')?;
+    (!name.is_empty()).then_some(name)
 }
 
 /// Abstraction over per-workload label maps.
@@ -1889,6 +1969,33 @@ fn validate_mesh_config_internal(
                     }
                 }
             }
+            for (j, condition) in rule.when.iter().enumerate() {
+                if !is_supported_mesh_condition_key(&condition.key) {
+                    errors.push(format!(
+                        "MeshPolicy '{}'.rules[{}].when[{}].key '{}' is unsupported",
+                        policy.name, i, j, condition.key
+                    ));
+                    continue;
+                }
+                if is_mesh_condition_ip_key(&condition.key) {
+                    validate_mesh_condition_ip_values(
+                        policy,
+                        i,
+                        j,
+                        "values",
+                        &condition.values,
+                        &mut errors,
+                    );
+                    validate_mesh_condition_ip_values(
+                        policy,
+                        i,
+                        j,
+                        "not_values",
+                        &condition.not_values,
+                        &mut errors,
+                    );
+                }
+            }
         }
     }
 
@@ -2111,6 +2218,24 @@ fn validate_non_empty_string(context: String, value: &str, errors: &mut Vec<Stri
 fn validate_non_zero_port(context: String, port: u16, errors: &mut Vec<String>) {
     if port == 0 {
         errors.push(format!("{context}: port must be greater than 0"));
+    }
+}
+
+fn validate_mesh_condition_ip_values(
+    policy: &MeshPolicy,
+    rule_index: usize,
+    condition_index: usize,
+    field: &str,
+    blocks: &[String],
+    errors: &mut Vec<String>,
+) {
+    for (block_index, block) in blocks.iter().enumerate() {
+        if let Err(error) = validate_mesh_condition_ip_block(block) {
+            errors.push(format!(
+                "MeshPolicy '{}'.rules[{}].when[{}].{}[{}] '{}': {}",
+                policy.name, rule_index, condition_index, field, block_index, block, error
+            ));
+        }
     }
 }
 
