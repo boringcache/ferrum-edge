@@ -104,52 +104,9 @@ pub struct RemoteEndpointSnapshot {
 }
 
 impl RemoteEndpointSnapshot {
-    /// Total remote workloads across all clusters. Used by tests and the admin
-    /// surface.
-    pub fn workload_count(&self) -> usize {
-        self.clusters
-            .values()
-            .map(|c| c.endpoints.workloads.len())
-            .sum()
-    }
-
     pub fn is_empty(&self) -> bool {
         self.clusters.is_empty()
     }
-
-    /// Operator-facing per-cluster summary (provenance + counts) for an admin
-    /// introspection surface. Surfaces the trust domain, network, fetch
-    /// timestamp, and endpoint counts each remote cluster contributes so an
-    /// operator can confirm cross-cluster discovery is live and which cluster
-    /// supplied which targets. Sorted by cluster name for stable output.
-    pub fn cluster_summaries(&self) -> Vec<RemoteClusterSummary> {
-        let mut summaries: Vec<RemoteClusterSummary> = self
-            .clusters
-            .values()
-            .map(|entry| RemoteClusterSummary {
-                cluster_name: entry.cluster_name.clone(),
-                trust_domain: entry.trust_domain.as_str().to_string(),
-                network: entry.network.clone(),
-                workloads: entry.endpoints.workloads.len(),
-                services: entry.endpoints.services.len(),
-                fetched_at_unix_seconds: entry.fetched_at_unix_seconds,
-            })
-            .collect();
-        summaries.sort_by(|a, b| a.cluster_name.cmp(&b.cluster_name));
-        summaries
-    }
-}
-
-/// Operator-facing summary of one remote cluster's discovered endpoints.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub struct RemoteClusterSummary {
-    pub cluster_name: String,
-    pub trust_domain: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub network: Option<String>,
-    pub workloads: usize,
-    pub services: usize,
-    pub fetched_at_unix_seconds: u64,
 }
 
 /// Lock-free shared state populated by the discovery poller and consumed by the
@@ -186,6 +143,7 @@ impl RemoteEndpointStore {
     }
 
     /// `true` after at least one remote cluster has been successfully polled.
+    #[cfg(test)]
     pub fn has_first_success(&self) -> bool {
         self.first_ready.load(Ordering::Acquire)
     }
@@ -632,19 +590,23 @@ async fn remote_discovery_loop(
             Ok(endpoints) => {
                 let now = chrono::Utc::now().timestamp().max(0) as u64;
                 let workload_count = endpoints.workloads.len();
-                store.install(RemoteClusterEntry {
+                let entry = RemoteClusterEntry {
                     cluster_name: ctx.cluster_name.clone(),
                     trust_domain: ctx.trust_domain.clone(),
                     network: ctx.network.clone(),
                     endpoints,
                     fetched_at_unix_seconds: now,
-                });
+                };
                 info!(
-                    cluster = %ctx.cluster_name,
+                    cluster = %entry.cluster_name,
+                    trust_domain = %entry.trust_domain,
+                    network = entry.network.as_deref().unwrap_or(""),
+                    fetched_at_unix_seconds = entry.fetched_at_unix_seconds,
                     control_plane = %url_for_logs,
                     workloads = workload_count,
                     "Installed remote-cluster endpoints"
                 );
+                store.install(entry);
                 backoff_secs = REMOTE_BACKOFF_INITIAL_SECS;
                 let elapsed = attempt_started_at.elapsed();
                 (true, ctx.config.poll_interval.saturating_sub(elapsed))
@@ -1113,15 +1075,11 @@ mod tests {
             fetched_at_unix_seconds: 1,
         });
         assert!(store.has_first_success());
-        assert_eq!(store.snapshot().workload_count(), 1);
-
-        // Introspection summary surfaces provenance for the admin surface.
-        let summaries = store.snapshot().cluster_summaries();
-        assert_eq!(summaries.len(), 1);
-        assert_eq!(summaries[0].cluster_name, "west");
-        assert_eq!(summaries[0].trust_domain, "remote.local");
-        assert_eq!(summaries[0].workloads, 1);
-        assert_eq!(summaries[0].fetched_at_unix_seconds, 1);
+        let snapshot = store.snapshot();
+        let entry = snapshot.clusters.get("west").expect("installed entry");
+        assert_eq!(entry.trust_domain.as_str(), "remote.local");
+        assert_eq!(entry.endpoints.workloads.len(), 1);
+        assert_eq!(entry.fetched_at_unix_seconds, 1);
 
         store.remove("west");
         assert!(store.snapshot().is_empty());
@@ -1228,7 +1186,15 @@ mod tests {
             .await
             .expect("install event")
             .expect("revision channel open");
-        assert_eq!(store.snapshot().workload_count(), 1);
+        assert_eq!(
+            store
+                .snapshot()
+                .clusters
+                .values()
+                .map(|entry| entry.endpoints.workloads.len())
+                .sum::<usize>(),
+            1
+        );
 
         // The remote workload was tagged with the synthetic locality.
         let snap = store.snapshot();
@@ -1241,7 +1207,12 @@ mod tests {
         // Let the second (failing) poll run; the last-good snapshot survives.
         tokio::time::sleep(Duration::from_millis(80)).await;
         assert_eq!(
-            store.snapshot().workload_count(),
+            store
+                .snapshot()
+                .clusters
+                .values()
+                .map(|entry| entry.endpoints.workloads.len())
+                .sum::<usize>(),
             1,
             "a failed poll must keep the last-good endpoints"
         );
