@@ -257,6 +257,7 @@ async fn test_all_plugins_available() {
         "api_chargeback_sink",
         "fault_injection",
         "proxy_alerts",
+        "security_headers",
     ]
     .into_iter()
     .collect();

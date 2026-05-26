@@ -21,7 +21,7 @@ Ferrum Edge is a lightweight, extensible edge proxy designed for modern microser
 **Key highlights:**
 
 - **Multi-protocol**: HTTP/1.1, HTTP/2, HTTP/3 (QUIC), WebSocket, gRPC, raw TCP/UDP with TLS/DTLS
-- **65 built-in plugins**: Authentication, authorization, OPA policy decisions, WAF content threat detection, OpenAPI contract validation, rate limiting, fault injection, compression, SSE stream handling, transformation, response mocking, spec exposure, serverless functions, AI/LLM-specific plugins (including AI federation for multi-provider routing), load testing, API chargeback, and observability
+- **66 built-in plugins**: Authentication, authorization, OPA policy decisions, WAF content threat detection, OpenAPI contract validation, rate limiting, fault injection, compression, response security headers, SSE stream handling, transformation, response mocking, spec exposure, serverless functions, AI/LLM-specific plugins (including AI federation for multi-provider routing), load testing, API chargeback, and observability
 - **Seven operating modes**: Database, File, Control Plane, Data Plane, Mesh, Injector, and Migrate
 - **Lock-free hot path**: All request-path reads use `ArcSwap` or `DashMap` — no mutexes on the proxy path
 - **Zero-downtime config reloads**: Atomic config swap via DB polling, SIGHUP, or CP push

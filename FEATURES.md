@@ -118,6 +118,7 @@ Ferrum supports dynamic upstream target discovery through four providers, config
 - **WAF** — content-pattern threat detection for HTTP-family traffic: SQLi, NoSQLi, XSS, command/template injection, JNDI/Log4Shell, Spring4Shell, path traversal, LFI/RFI, SSRF, XXE, deserialization, prototype pollution, plus response-side disclosure and data-leak rules. Body decode/normalization (unicode/HTML-entity/percent) defeats encoding evasion; tunable via paranoia levels, per-rule overrides and false-positive filters, exemptions, and monitor/enforce posture with bulk (`default_rule_action`) enforcement. See [docs/waf.md](docs/waf.md)
 - **Bot Detection** — User-Agent pattern blocking with allow-list support
 - **CORS** — preflight handling with origin, method, and header validation
+- **Security Headers** — injects response security headers with secure defaults (X-Content-Type-Options, X-Frame-Options, Referrer-Policy) plus opt-in HSTS, CSP, and Permissions-Policy, and strips fingerprinting headers (Server, X-Powered-By); arbitrary set/remove with CRLF-injection-safe values
 - **Body Validator** — JSON Schema, XML, and gRPC protobuf validation
 - **OpenAPI Validator** — request/response JSON contract enforcement generated from attached OpenAPI/Swagger specs via `x-ferrum-validate`, with block/log-only/disabled modes and emergency bypasses
 - **Request Deduplication** — idempotency key-based deduplication for POST/PUT/PATCH requests with local in-memory and centralized Redis storage backends

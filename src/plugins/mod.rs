@@ -69,6 +69,7 @@ pub mod response_caching;
 pub mod response_mock;
 pub mod response_size_limiting;
 pub mod response_transformer;
+pub mod security_headers;
 pub mod serverless_function;
 pub mod soap_ws_security;
 pub mod spec_expose;
@@ -1488,6 +1489,11 @@ pub mod priority {
     pub const RESPONSE_TRANSFORMER: u16 = 4000;
     pub const COMPRESSION: u16 = 4050;
     pub const AI_RESPONSE_GUARD: u16 = 4075;
+    /// `security_headers`: injects response security headers and strips
+    /// fingerprinting headers in `after_proxy`. Runs late in the response band
+    /// so it is authoritative over `response_transformer` (4000) and
+    /// `compression` (4050) header changes.
+    pub const SECURITY_HEADERS: u16 = 4080;
     pub const AI_TOKEN_METRICS: u16 = 4100;
     pub const AI_RATE_LIMITER: u16 = 4200;
     pub const STDOUT_LOGGING: u16 = 9000;
@@ -2048,6 +2054,9 @@ pub fn create_plugin_with_http_client(
         )?))),
         "compression" => Ok(Some(Arc::new(compression::CompressionPlugin::new(config)?))),
         "cors" => Ok(Some(Arc::new(cors::CorsPlugin::new(config)?))),
+        "security_headers" => Ok(Some(Arc::new(security_headers::SecurityHeaders::new(
+            config,
+        )?))),
         "access_control" => Ok(Some(Arc::new(access_control::AccessControl::new(config)?))),
         "tcp_connection_throttle" => Ok(Some(Arc::new(
             tcp_connection_throttle::TcpConnectionThrottle::new(config)?,
@@ -2256,6 +2265,7 @@ pub fn is_security_plugin(name: &str) -> bool {
             | "rate_limiting"
             | "ip_restriction"
             | "waf"
+            | "security_headers"
             | "openapi_validator"
             | "soap_ws_security"
     )
@@ -2293,6 +2303,7 @@ pub fn available_plugins() -> Vec<&'static str> {
         "mesh_outbound_registry",
         "compression",
         "cors",
+        "security_headers",
         "access_control",
         "tcp_connection_throttle",
         "ip_restriction",
