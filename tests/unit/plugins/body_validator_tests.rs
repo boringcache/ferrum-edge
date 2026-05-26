@@ -340,6 +340,16 @@ async fn test_xml_doctype_declaration() {
     assert_continue(result);
 }
 
+#[tokio::test]
+async fn test_xml_entity_declaration_quoted_gt_does_not_hide_nested_reference() {
+    let plugin = xml_plugin();
+    let body = r#"<!DOCTYPE root [<!ENTITY a "lol"><!ENTITY b ">&a;&a;">]><root>&b;</root>"#;
+    let mut ctx = make_xml_ctx(body);
+    let mut headers = make_xml_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(400));
+}
+
 // ─── Combined / Mixed Content ──────────────────────────────────────────
 
 #[tokio::test]

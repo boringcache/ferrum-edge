@@ -922,7 +922,7 @@ fn check_xml_entity_expansion(
                     "XML declares more than {max_entities} entities (possible entity-expansion attack)"
                 ));
             }
-            let decl_end = find_subsequence(&bytes[i..], b">")
+            let decl_end = find_xml_declaration_end(&bytes[i..])
                 .map(|end| i + end)
                 .unwrap_or(bytes.len());
             if reject_nested && entity_value_references_general_entity(&body[i..decl_end]) {
@@ -931,12 +931,26 @@ fn check_xml_entity_expansion(
                         .to_string(),
                 );
             }
-            i = decl_end;
+            i = decl_end.saturating_add(1);
         } else {
             i += 1;
         }
     }
     Ok(())
+}
+
+fn find_xml_declaration_end(bytes: &[u8]) -> Option<usize> {
+    let mut quote = None;
+    for (idx, byte) in bytes.iter().copied().enumerate() {
+        match quote {
+            Some(current) if byte == current => quote = None,
+            Some(_) => {}
+            None if matches!(byte, b'"' | b'\'') => quote = Some(byte),
+            None if byte == b'>' => return Some(idx),
+            None => {}
+        }
+    }
+    None
 }
 
 /// True if an `<!ENTITY ...>` declaration's value references a non-predefined

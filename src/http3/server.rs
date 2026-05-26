@@ -32,8 +32,8 @@ use crate::proxy::headers::{
     parse_connection_listed_from_str_map,
 };
 use crate::proxy::{
-    ProxyState, apply_after_proxy_hooks_to_rejection, plugin_result_into_reject_parts,
-    run_after_proxy_hooks, run_authentication_phase,
+    ProxyState, apply_after_proxy_hooks_to_rejection, apply_plugin_rejection_response,
+    plugin_result_into_reject_parts, run_after_proxy_hooks, run_authentication_phase,
 };
 use crate::tls::{CrlList, TlsPolicy};
 
@@ -2841,6 +2841,7 @@ async fn handle_h3_request(
         // Mirrors the HTTP/1.1 path in proxy/mod.rs.
         if !after_proxy_rejected && !plugins.is_empty() {
             let phase_start = std::time::Instant::now();
+            let mut response_body_reject = None;
             for plugin in plugins.iter() {
                 let result = plugin
                     .on_response_body(&mut ctx, response_status, &response_headers, &response_body)
@@ -2865,17 +2866,20 @@ async fn handle_h3_request(
                             status_code = reject.status_code,
                             "Plugin rejected response body (HTTP/3)"
                         );
-                        response_status = reject.status_code;
-                        response_headers.clear();
-                        response_headers
-                            .insert("content-type".to_string(), "application/json".to_string());
-                        for (k, v) in reject.headers {
-                            response_headers.insert(k, v);
-                        }
-                        response_body = reject.body;
+                        response_body_reject = Some(reject);
                         break;
                     }
                 }
+            }
+            if let Some(reject) = response_body_reject {
+                response_body = apply_plugin_rejection_response(
+                    &plugins,
+                    &mut ctx,
+                    &mut response_status,
+                    &mut response_headers,
+                    reject,
+                )
+                .await;
             }
             plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
         }
@@ -2900,6 +2904,7 @@ async fn handle_h3_request(
 
         if !after_proxy_rejected && !plugins.is_empty() {
             let phase_start = std::time::Instant::now();
+            let mut response_body_reject = None;
             for plugin in plugins.iter() {
                 let result = plugin
                     .on_final_response_body(
@@ -2929,17 +2934,20 @@ async fn handle_h3_request(
                             status_code = reject.status_code,
                             "Plugin rejected finalized response body (HTTP/3)"
                         );
-                        response_status = reject.status_code;
-                        response_headers.clear();
-                        response_headers
-                            .insert("content-type".to_string(), "application/json".to_string());
-                        for (k, v) in reject.headers {
-                            response_headers.insert(k, v);
-                        }
-                        response_body = reject.body;
+                        response_body_reject = Some(reject);
                         break;
                     }
                 }
+            }
+            if let Some(reject) = response_body_reject {
+                response_body = apply_plugin_rejection_response(
+                    &plugins,
+                    &mut ctx,
+                    &mut response_status,
+                    &mut response_headers,
+                    reject,
+                )
+                .await;
             }
             plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
         }
