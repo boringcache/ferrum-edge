@@ -156,5 +156,6 @@ fn rp(
         action: RuleAction::Monitor,
         fp_filters: Vec::new(),
         paranoia_min,
+        score: None,
     }
 }

@@ -1144,3 +1144,122 @@ fn unknown_rule_override_id_fails_construction() {
     assert!(err.contains("rule_overrides"));
     assert!(err.contains("FE-NOPE-999"));
 }
+
+#[tokio::test]
+async fn scoring_blocks_on_aggregate_without_any_enforce_rule() {
+    // Two monitor-only High hits (5 + 5) cross the threshold of 8. Nothing is
+    // set to enforce — the block comes purely from the aggregate score.
+    let plugin = Waf::new(&json!({
+        "mode": "enforce",
+        "scoring": { "enabled": true, "block_threshold": 8 }
+    }))
+    .unwrap();
+    let mut ctx = ctx("GET", "/search");
+    ctx.set_raw_query_string("q=<script>union+select+1".into());
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert_eq!(
+        ctx.metadata.get("waf.action").map(String::as_str),
+        Some("blocked")
+    );
+    assert_eq!(
+        ctx.metadata.get("waf.block_reason").map(String::as_str),
+        Some("score")
+    );
+    assert_eq!(
+        ctx.metadata.get("waf.score").map(String::as_str),
+        Some("10")
+    );
+}
+
+#[tokio::test]
+async fn scoring_records_but_does_not_block_in_monitor_mode() {
+    let plugin = Waf::new(&json!({
+        "mode": "monitor",
+        "scoring": { "enabled": true, "block_threshold": 1 }
+    }))
+    .unwrap();
+    let mut ctx = ctx("GET", "/search");
+    ctx.set_raw_query_string("q=union+select+1".into());
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(ctx.metadata.get("waf.score").map(String::as_str), Some("5"));
+    assert_eq!(
+        ctx.metadata.get("waf.action").map(String::as_str),
+        Some("monitored")
+    );
+}
+
+#[tokio::test]
+async fn scoring_accumulates_across_query_and_body_phases() {
+    let plugin = Waf::new(&json!({
+        "mode": "enforce",
+        "scoring": { "enabled": true, "block_threshold": 8 }
+    }))
+    .unwrap();
+    let mut ctx = ctx("POST", "/submit");
+    ctx.headers
+        .insert("content-type".into(), "application/json".into());
+    ctx.set_raw_query_string("q=union+select+1".into());
+
+    // Query phase scores one High (5) — below the threshold, so it passes.
+    let result = plugin.authorize(&mut ctx).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(ctx.metadata.get("waf.score").map(String::as_str), Some("5"));
+
+    // Body phase adds another High (5) → cumulative 10 → blocked.
+    let headers = ctx.headers.clone();
+    let result = plugin
+        .on_final_request_body_with_context(
+            &mut ctx,
+            &headers,
+            br#"{"c":"<script>alert(1)</script>"}"#,
+        )
+        .await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert_eq!(
+        ctx.metadata.get("waf.score").map(String::as_str),
+        Some("10")
+    );
+    assert_eq!(
+        ctx.metadata.get("waf.block_reason").map(String::as_str),
+        Some("score")
+    );
+}
+
+#[tokio::test]
+async fn per_rule_score_override_drives_blocking() {
+    // A low-severity rule with an explicit high score blocks on its own.
+    let plugin = Waf::new(&json!({
+        "mode": "enforce",
+        "scoring": { "enabled": true, "block_threshold": 8 },
+        "include_default_rules": false,
+        "custom_rules": [{
+            "id": "CUSTOM-SCORE",
+            "name": "weighted marker",
+            "category": "custom",
+            "severity": "low",
+            "target": "query_values",
+            "match_kind": "contains",
+            "pattern": "needle",
+            "action": "monitor",
+            "score": 9
+        }]
+    }))
+    .unwrap();
+    let mut ctx = ctx("GET", "/search");
+    ctx.set_raw_query_string("q=needle".into());
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert_eq!(ctx.metadata.get("waf.score").map(String::as_str), Some("9"));
+    assert_eq!(
+        ctx.metadata.get("waf.block_reason").map(String::as_str),
+        Some("score")
+    );
+}

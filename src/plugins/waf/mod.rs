@@ -77,6 +77,22 @@ struct WafConfig {
     reject_status_code: u16,
     reject_content_type: String,
     reject_body: String,
+    scoring: Option<ScoringConfig>,
+}
+
+/// Anomaly-scoring configuration. Present only when scoring is enabled.
+#[derive(Debug)]
+struct ScoringConfig {
+    block_threshold: u32,
+    /// Per-severity weight, indexed by `Severity as usize`
+    /// (info, low, medium, high, critical).
+    weights: [u32; 5],
+}
+
+impl ScoringConfig {
+    fn weight(&self, severity: Severity) -> u32 {
+        self.weights[severity as usize]
+    }
 }
 
 #[derive(Debug)]
@@ -214,6 +230,7 @@ impl Waf {
                 .unwrap_or_else(|| "application/json".to_string()),
             reject_body: optional_string(object, "reject_body")?
                 .unwrap_or_else(|| r#"{"error":"Forbidden"}"#.to_string()),
+            scoring: parse_scoring(object.get("scoring"))?,
         };
         if !(400..=599).contains(&config.reject_status_code) {
             return Err("waf: 'reject_status_code' must be from 400 to 599".to_string());
@@ -306,12 +323,12 @@ impl Waf {
             return PluginResult::Continue;
         }
 
-        let has_blocking_rule = self.record_hits(ctx, &outcome, !outcome.timed_out);
+        let should_block = self.record_hits(ctx, &outcome, !outcome.timed_out);
         if outcome.timed_out {
             return self.finish_timeout(ctx);
         }
 
-        if has_blocking_rule {
+        if should_block {
             let mut headers = HashMap::new();
             headers.insert(
                 "content-type".to_string(),
@@ -337,12 +354,17 @@ impl Waf {
         let mut highest = Severity::Info;
         let mut rule_ids = Vec::with_capacity(outcome.hits.len());
         let mut targets = Vec::with_capacity(outcome.hits.len());
+        let mut phase_score: u32 = 0;
         for hit in &outcome.hits {
             let rule = &self.compiled.rules[hit.rule_index];
             highest = highest.max(rule.severity);
             rule_ids.push(rule.id.as_str());
             if !targets.contains(&hit.target_name) {
                 targets.push(hit.target_name);
+            }
+            if let Some(scoring) = &self.config.scoring {
+                let contribution = rule.score.unwrap_or_else(|| scoring.weight(rule.severity));
+                phase_score = phase_score.saturating_add(contribution);
             }
             if enforce_actions
                 && rule.action == RuleAction::Enforce
@@ -352,6 +374,27 @@ impl Waf {
             }
             self.warn_hit(ctx, hit);
         }
+
+        // Accumulate across all scan phases of this request (carried in
+        // metadata) so weak signals in the query, body, and response add up to
+        // a single transaction score that can cross the block threshold even
+        // when no individual rule is set to enforce.
+        let total_score = self.config.scoring.as_ref().map(|scoring| {
+            let prior = ctx
+                .metadata
+                .get("waf.score")
+                .and_then(|value| value.parse::<u32>().ok())
+                .unwrap_or(0);
+            let total = prior.saturating_add(phase_score);
+            // The running score must persist for later phases regardless of
+            // log_to_metadata; it is operational state, not just observability.
+            ctx.metadata
+                .insert("waf.score".to_string(), total.to_string());
+            (total, scoring.block_threshold)
+        });
+        let score_block = enforce_actions
+            && self.config.mode == GlobalMode::Enforce
+            && total_score.is_some_and(|(total, threshold)| total >= threshold);
 
         if self.config.log_to_metadata {
             merge_metadata(&mut ctx.metadata, "waf.rule_hits", &rule_ids.join(","));
@@ -372,13 +415,22 @@ impl Waf {
                     .or_insert_with(|| rule_id.to_string());
                 ctx.metadata
                     .insert("waf.action".to_string(), "blocked".to_string());
+                ctx.metadata
+                    .entry("waf.block_reason".to_string())
+                    .or_insert_with(|| "rule".to_string());
+            } else if score_block {
+                ctx.metadata
+                    .insert("waf.action".to_string(), "blocked".to_string());
+                ctx.metadata
+                    .entry("waf.block_reason".to_string())
+                    .or_insert_with(|| "score".to_string());
             } else if ctx.metadata.get("waf.action").map(String::as_str) != Some("blocked") {
                 ctx.metadata
                     .insert("waf.action".to_string(), "monitored".to_string());
             }
         }
 
-        first_blocking_rule.is_some()
+        first_blocking_rule.is_some() || score_block
     }
 
     fn finish_timeout(&self, ctx: &mut RequestContext) -> PluginResult {
@@ -684,6 +736,63 @@ fn parse_too_large_action(raw: &str) -> Result<TooLargeAction, String> {
             "waf: 'on_body_too_large' must be scan_truncated or skip; got {other:?}"
         )),
     }
+}
+
+fn parse_scoring(value: Option<&Value>) -> Result<Option<ScoringConfig>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let object = value
+        .as_object()
+        .ok_or_else(|| "waf: 'scoring' must be an object".to_string())?;
+    if !optional_bool(object, "enabled")?.unwrap_or(true) {
+        return Ok(None);
+    }
+    let block_threshold = optional_u64(object, "block_threshold")?
+        .map(|v| {
+            u32::try_from(v).map_err(|_| "waf: 'scoring.block_threshold' is too large".to_string())
+        })
+        .transpose()?
+        .unwrap_or(7);
+    if block_threshold == 0 {
+        return Err("waf: 'scoring.block_threshold' must be greater than zero".to_string());
+    }
+    // Defaults: one critical, or one high plus one medium, crosses the default
+    // threshold of 7; a lone medium does not.
+    let mut weights = [0u32, 2, 3, 5, 10];
+    match object.get("weights") {
+        None | Some(Value::Null) => {}
+        Some(Value::Object(map)) => {
+            for (key, raw) in map {
+                let index = match key.as_str() {
+                    "info" => 0,
+                    "low" => 1,
+                    "medium" => 2,
+                    "high" => 3,
+                    "critical" => 4,
+                    other => {
+                        return Err(format!(
+                            "waf: 'scoring.weights' has unknown severity '{other}'"
+                        ));
+                    }
+                };
+                weights[index] = raw
+                    .as_u64()
+                    .and_then(|v| u32::try_from(v).ok())
+                    .ok_or_else(|| {
+                        format!("waf: 'scoring.weights.{key}' must be a non-negative integer")
+                    })?;
+            }
+        }
+        Some(_) => return Err("waf: 'scoring.weights' must be an object".to_string()),
+    }
+    Ok(Some(ScoringConfig {
+        block_threshold,
+        weights,
+    }))
 }
 
 fn parse_rule_modes(value: Option<&Value>) -> Result<HashMap<String, RuleAction>, String> {

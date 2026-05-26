@@ -10953,6 +10953,9 @@ components:
               severity:
                 type: string
                 enum: [info, low, medium, high, critical]
+              score:
+                type: integer
+                minimum: 0
               fp_filters:
                 type: array
                 items:
@@ -10981,6 +10984,41 @@ components:
           items:
             $ref: "#/components/schemas/WafRule"
           default: []
+        scoring:
+          type: object
+          description: >-
+            Anomaly scoring. When enabled, every matched rule contributes its
+            severity weight (or per-rule score) to a cumulative transaction
+            score; the request is rejected when the score reaches
+            block_threshold and mode is enforce, even when no individual rule
+            is set to enforce. The running total is exposed as waf.score.
+          properties:
+            enabled:
+              type: boolean
+              default: true
+            block_threshold:
+              type: integer
+              minimum: 1
+              default: 7
+            weights:
+              type: object
+              description: Per-severity weights; defaults info=0 low=2 medium=3 high=5 critical=10.
+              properties:
+                info:
+                  type: integer
+                  minimum: 0
+                low:
+                  type: integer
+                  minimum: 0
+                medium:
+                  type: integer
+                  minimum: 0
+                high:
+                  type: integer
+                  minimum: 0
+                critical:
+                  type: integer
+                  minimum: 0
         global_exemptions:
           $ref: "#/components/schemas/WafExemptions"
         body_methods:
@@ -11112,6 +11150,10 @@ components:
           minimum: 1
           maximum: 4
           default: 1
+        score:
+          type: integer
+          minimum: 0
+          description: Anomaly-score contribution when scoring is enabled; defaults to the per-severity weight.
         conditions:
           type: object
           properties:

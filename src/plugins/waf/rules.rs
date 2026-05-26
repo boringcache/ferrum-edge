@@ -211,6 +211,9 @@ pub(super) struct WafRule {
     pub(super) action: RuleAction,
     pub(super) fp_filters: Vec<String>,
     pub(super) paranoia_min: u8,
+    /// Anomaly-score contribution when scoring is enabled. `None` falls back to
+    /// the configured per-severity weight.
+    pub(super) score: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -224,6 +227,7 @@ pub(super) struct CompiledRule {
     conditions: Option<CompiledConditions>,
     fp_filters: Option<RegexSet>,
     pub(super) cidr: Option<IpCidr>,
+    pub(super) score: Option<u32>,
 }
 
 impl CompiledRule {
@@ -417,6 +421,9 @@ pub(super) fn compile_rules(
             if let Some(conditions) = &ov.conditions {
                 rule.conditions = Some(conditions.clone());
             }
+            if let Some(score) = ov.score {
+                rule.score = Some(score);
+            }
         }
         if rule.paranoia_min > paranoia_level {
             continue;
@@ -466,6 +473,7 @@ pub(super) fn compile_rules(
             conditions: compiled_conditions,
             fp_filters,
             cidr,
+            score: rule.score,
         };
         builders.add_rule(rule_index, &rule)?;
         compiled_rules.push(compiled);
@@ -807,6 +815,7 @@ pub(super) struct RuleOverride {
     pub(super) severity: Option<Severity>,
     pub(super) fp_filters: Option<Vec<String>>,
     pub(super) conditions: Option<Conditions>,
+    pub(super) score: Option<u32>,
 }
 
 pub(super) fn parse_rule_overrides(
@@ -833,6 +842,7 @@ pub(super) fn parse_rule_overrides(
                     .transpose()?;
                 let fp_filters = optional_string_vec(object, "fp_filters")?;
                 let conditions = object.get("conditions").map(parse_conditions).transpose()?;
+                let score = optional_u32(object, "score")?;
                 out.insert(
                     id.clone(),
                     RuleOverride {
@@ -840,6 +850,7 @@ pub(super) fn parse_rule_overrides(
                         severity,
                         fp_filters,
                         conditions,
+                        score,
                     },
                 );
             }
@@ -883,6 +894,7 @@ pub(super) fn parse_custom_rule(
         .unwrap_or(default_action);
     let fp_filters = optional_string_vec(object, "fp_filters")?.unwrap_or_default();
     let paranoia_min = optional_u8(object, "paranoia_min")?.unwrap_or(1);
+    let score = optional_u32(object, "score")?;
     let conditions = object.get("conditions").map(parse_conditions).transpose()?;
 
     Ok(WafRule {
@@ -897,6 +909,7 @@ pub(super) fn parse_custom_rule(
         action,
         fp_filters,
         paranoia_min,
+        score,
     })
 }
 
@@ -1045,6 +1058,18 @@ fn optional_u8(object: &serde_json::Map<String, Value>, key: &str) -> Result<Opt
     }
 }
 
+fn optional_u32(object: &serde_json::Map<String, Value>, key: &str) -> Result<Option<u32>, String> {
+    match object.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(value)) => value
+            .as_u64()
+            .and_then(|v| u32::try_from(v).ok())
+            .map(Some)
+            .ok_or_else(|| format!("waf: '{key}' must be a non-negative integer")),
+        Some(other) => Err(format!("waf: '{key}' must be an integer, got {other}")),
+    }
+}
+
 fn optional_string_vec(
     object: &serde_json::Map<String, Value>,
     key: &str,
@@ -1154,6 +1179,7 @@ mod tests {
             action: RuleAction::Monitor,
             fp_filters: vec![],
             paranoia_min: 1,
+            score: None,
         };
         let compiled = compile_rules(
             vec![(rule, false)],
@@ -1182,6 +1208,7 @@ mod tests {
             action: RuleAction::Monitor,
             fp_filters: vec![],
             paranoia_min: 1,
+            score: None,
         };
         let mut modes = HashMap::new();
         modes.insert("R-TYPO".to_string(), RuleAction::Enforce);
@@ -1217,6 +1244,7 @@ mod tests {
             action: RuleAction::Monitor,
             fp_filters: vec![],
             paranoia_min: 4,
+            score: None,
         };
         let mut modes = HashMap::new();
         modes.insert("R1".to_string(), RuleAction::Enforce);
