@@ -9,10 +9,12 @@
 
 use std::collections::BTreeMap;
 
+use std::net::IpAddr;
+
 use crate::identity::SpiffeId;
 use crate::modes::mesh::config::{
     ConditionMatch, MeshPolicy, MeshRule, PolicyAction, PrincipalMatch, RequestMatch,
-    normalize_mesh_policy_header_map,
+    SourceNegationMatch, normalize_mesh_policy_header_map,
 };
 use crate::modes::mesh::slice::MeshSlice;
 
@@ -28,6 +30,14 @@ pub struct MeshAuthzRequest {
     pub port: Option<u16>,
     pub headers: BTreeMap<String, String>,
     pub attributes: BTreeMap<String, String>,
+    /// Direct connection peer IP (`source.ip`), used by Istio source
+    /// `ipBlocks` / `notIpBlocks` matchers. `None` when the listener could
+    /// not resolve a socket peer address.
+    pub source_ip: Option<std::net::IpAddr>,
+    /// XFF-derived remote client IP (`remote.ip`), used by Istio source
+    /// `remoteIpBlocks` / `notRemoteIpBlocks` matchers. `None` when no
+    /// trusted forwarded address was resolved.
+    pub remote_ip: Option<std::net::IpAddr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,8 +119,92 @@ fn rule_matches(rule: &MeshRule, request: &MeshAuthzRequest) -> bool {
     }
     matches_principals(&rule.from, request)
         && matches_request_principals(&rule.request_principals, request)
+        && matches_not_request_principals(&rule.not_request_principals, request)
+        && matches_source_negation(&rule.source_negation, request)
         && matches_requests(&rule.to, request)
         && matches_conditions(&rule.when, request)
+}
+
+/// Enforce the conjunctive source-negative / IP-block matchers for one rule.
+///
+/// Each populated field is **fail-closed** when the request attribute it
+/// tests is absent: a non-empty list with no value to check fails the match
+/// rather than admitting traffic. This mirrors how the positive
+/// `from`/`to` matchers and the HTTP-only negative predicates behave, and is
+/// the security-correct posture for deny-listing — see `.claude/rules/mesh.md`
+/// ("`RequestMatch` negative fields ... are conjunctive").
+fn matches_source_negation(neg: &SourceNegationMatch, request: &MeshAuthzRequest) -> bool {
+    if neg.is_empty() {
+        return true;
+    }
+    // notPrincipals / notNamespaces — operate on the source SPIFFE ID.
+    if !neg.not_spiffe_id_patterns.is_empty() || !neg.not_namespace_patterns.is_empty() {
+        let Some(source) = request.source_principal.as_ref() else {
+            return false;
+        };
+        if neg
+            .not_spiffe_id_patterns
+            .iter()
+            .any(|pattern| wildcard_match(pattern, source.as_str()))
+        {
+            return false;
+        }
+        if !neg.not_namespace_patterns.is_empty() {
+            let Some(namespace) = extract_namespace(source.as_str()) else {
+                return false;
+            };
+            if neg
+                .not_namespace_patterns
+                .iter()
+                .any(|pattern| wildcard_match(pattern, namespace))
+            {
+                return false;
+            }
+        }
+    }
+    // ipBlocks / notIpBlocks — direct connection peer IP (source.ip).
+    if !neg.ip_blocks.is_empty() {
+        let Some(ip) = request.source_ip else {
+            return false;
+        };
+        if !neg.ip_blocks.iter().any(|cidr| cidr_contains(cidr, ip)) {
+            return false;
+        }
+    }
+    if !neg.not_ip_blocks.is_empty() {
+        let Some(ip) = request.source_ip else {
+            return false;
+        };
+        if neg.not_ip_blocks.iter().any(|cidr| cidr_contains(cidr, ip)) {
+            return false;
+        }
+    }
+    // remoteIpBlocks / notRemoteIpBlocks — XFF-derived remote client IP.
+    if !neg.remote_ip_blocks.is_empty() {
+        let Some(ip) = request.remote_ip else {
+            return false;
+        };
+        if !neg
+            .remote_ip_blocks
+            .iter()
+            .any(|cidr| cidr_contains(cidr, ip))
+        {
+            return false;
+        }
+    }
+    if !neg.not_remote_ip_blocks.is_empty() {
+        let Some(ip) = request.remote_ip else {
+            return false;
+        };
+        if neg
+            .not_remote_ip_blocks
+            .iter()
+            .any(|cidr| cidr_contains(cidr, ip))
+        {
+            return false;
+        }
+    }
+    true
 }
 
 /// Istio `requestPrincipals` matching: JWT-derived `iss/sub` identity.
@@ -126,6 +220,26 @@ fn matches_request_principals(patterns: &[String], request: &MeshAuthzRequest) -
             .iter()
             .any(|pattern| wildcard_match(pattern, principal))
     })
+}
+
+/// Istio `notRequestPrincipals` matching: conjunctive negative match over the
+/// JWT-derived `iss/sub` identity.
+///
+/// An empty list means "no negative filter". A non-empty list fails the match
+/// when the request principal matches any pattern, and also fails when no
+/// request principal is present (fail-closed: an anonymous request cannot
+/// satisfy a `notRequestPrincipals` constraint without admitting traffic the
+/// policy meant to gate).
+fn matches_not_request_principals(patterns: &[String], request: &MeshAuthzRequest) -> bool {
+    if patterns.is_empty() {
+        return true;
+    }
+    let Some(principal) = request.request_principal.as_ref() else {
+        return false;
+    };
+    !patterns
+        .iter()
+        .any(|pattern| wildcard_match(pattern, principal))
 }
 
 fn matches_principals(matches: &[PrincipalMatch], request: &MeshAuthzRequest) -> bool {
@@ -252,12 +366,17 @@ fn request_match(match_: &RequestMatch, request: &MeshAuthzRequest) -> bool {
     {
         return false;
     }
-    if !match_.not_ports.is_empty()
-        && request
-            .port
-            .is_some_and(|port| match_.not_ports.contains(&port))
-    {
-        return false;
+    if !match_.not_ports.is_empty() {
+        // Fail-closed on a missing port, matching `not_methods`/`not_paths`/
+        // `not_hosts` above. A `notPorts` rule that silently passed
+        // port-less traffic (e.g. a destination that never resolved a port)
+        // would over-permit the very traffic the operator meant to gate.
+        let Some(port) = request.port else {
+            return false;
+        };
+        if match_.not_ports.contains(&port) {
+            return false;
+        }
     }
     for (name, pattern) in &match_.headers {
         let Some(value) = request_header_value(&request.headers, name) else {
@@ -412,6 +531,114 @@ fn extract_namespace(spiffe_id: &str) -> Option<&str> {
     None
 }
 
+/// Returns `true` when `ip` falls inside the CIDR (or bare IP) `cidr`.
+///
+/// Allocation-light: `IpAddr` / `Ipv4Addr` / `Ipv6Addr` `FromStr` parse into
+/// stack values with no heap allocation, and the prefix comparison is a pure
+/// integer bitmask. IPv4-mapped IPv6 addresses on either side are folded to
+/// IPv4 so a `10.0.0.0/8` block still matches a `::ffff:10.0.0.1` peer,
+/// matching the gateway's `client_ip` CIDR semantics. A bare IP (no `/`) is
+/// treated as a host route (`/32` or `/128`). CIDRs are validated at
+/// translation time, so a malformed entry here simply fails to match (the
+/// rule then fails closed for a positive block / opens for a negative block,
+/// but translation rejects bad CIDRs before they ever reach this path).
+fn cidr_contains(cidr: &str, ip: IpAddr) -> bool {
+    let ip = canonicalize_ip_for_match(ip);
+    let (network_str, prefix) = match cidr.split_once('/') {
+        Some((net, prefix_str)) => match prefix_str.parse::<u8>() {
+            Ok(prefix) => (net, Some(prefix)),
+            Err(_) => return false,
+        },
+        None => (cidr, None),
+    };
+    let Ok(network) = network_str.parse::<IpAddr>() else {
+        return false;
+    };
+    match (canonicalize_ip_for_match(network), ip) {
+        (IpAddr::V4(net), IpAddr::V4(addr)) => {
+            let prefix = prefix.unwrap_or(32);
+            if prefix > 32 {
+                return false;
+            }
+            matches_prefix_u32(u32::from(net), u32::from(addr), prefix)
+        }
+        (IpAddr::V6(net), IpAddr::V6(addr)) => {
+            let prefix = prefix.unwrap_or(128);
+            if prefix > 128 {
+                return false;
+            }
+            matches_prefix_u128(u128::from(net), u128::from(addr), prefix)
+        }
+        // Family mismatch (after canonicalization) never matches.
+        _ => false,
+    }
+}
+
+/// Fold an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) down to its IPv4 form so
+/// CIDR comparisons treat both representations identically.
+#[inline]
+fn canonicalize_ip_for_match(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(v6)),
+        other => other,
+    }
+}
+
+#[inline]
+fn matches_prefix_u32(network: u32, addr: u32, prefix_len: u8) -> bool {
+    if prefix_len == 0 {
+        return true;
+    }
+    let mask = u32::MAX.checked_shl(32 - prefix_len as u32).unwrap_or(0);
+    (network & mask) == (addr & mask)
+}
+
+#[inline]
+fn matches_prefix_u128(network: u128, addr: u128, prefix_len: u8) -> bool {
+    if prefix_len == 0 {
+        return true;
+    }
+    let mask = u128::MAX.checked_shl(128 - prefix_len as u32).unwrap_or(0);
+    (network & mask) == (addr & mask)
+}
+
+/// Validate a CIDR / bare-IP string for an Istio source IP block at config
+/// translation time. Returns `Err` with a human-readable reason so the
+/// resource can be rejected (fail-closed) instead of silently never matching.
+pub fn validate_source_ip_block(cidr: &str) -> Result<(), String> {
+    let trimmed = cidr.trim();
+    if trimmed.is_empty() {
+        return Err("IP block must not be empty".to_string());
+    }
+    match trimmed.split_once('/') {
+        Some((net, prefix_str)) => {
+            let ip = net
+                .parse::<IpAddr>()
+                .map_err(|_| format!("invalid IP in CIDR '{cidr}'"))?;
+            let prefix = prefix_str
+                .parse::<u8>()
+                .map_err(|_| format!("invalid prefix length in CIDR '{cidr}'"))?;
+            let max = match ip {
+                IpAddr::V4(_) => 32,
+                IpAddr::V6(_) => 128,
+            };
+            if prefix > max {
+                return Err(format!(
+                    "prefix length {prefix} out of range in CIDR '{cidr}'"
+                ));
+            }
+            Ok(())
+        }
+        None => trimmed
+            .parse::<IpAddr>()
+            .map(|_| ())
+            .map_err(|_| format!("invalid IP address '{cidr}'")),
+    }
+}
+
 fn wildcard_match(pattern: &str, value: &str) -> bool {
     if pattern == "*" {
         return true;
@@ -520,6 +747,8 @@ mod tests {
                 to: Vec::new(),
                 when: Vec::new(),
                 request_principals: Vec::new(),
+                not_request_principals: Vec::new(),
+                source_negation: Default::default(),
                 never_matches: false,
                 action,
             }],
@@ -602,6 +831,8 @@ mod tests {
                     }],
                     when: Vec::new(),
                     request_principals: Vec::new(),
+                    not_request_principals: Vec::new(),
+                    source_negation: Default::default(),
                     never_matches: false,
                     action: PolicyAction::Allow,
                 }],
@@ -668,6 +899,8 @@ mod tests {
                 when: Vec::new(),
                 action: PolicyAction::Allow,
                 request_principals: Vec::new(),
+                not_request_principals: Vec::new(),
+                source_negation: Default::default(),
                 never_matches: false,
             }],
         };
@@ -699,6 +932,8 @@ mod tests {
                 when: Vec::new(),
                 action: PolicyAction::Allow,
                 request_principals: Vec::new(),
+                not_request_principals: Vec::new(),
+                source_negation: Default::default(),
                 never_matches: false,
             }],
         };
@@ -730,6 +965,8 @@ mod tests {
                 when: Vec::new(),
                 action: PolicyAction::Allow,
                 request_principals: Vec::new(),
+                not_request_principals: Vec::new(),
+                source_negation: Default::default(),
                 never_matches: false,
             }],
         };
@@ -755,6 +992,8 @@ mod tests {
                     }],
                     when: Vec::new(),
                     request_principals: Vec::new(),
+                    not_request_principals: Vec::new(),
+                    source_negation: Default::default(),
                     never_matches: false,
                     action: PolicyAction::Allow,
                 }],
@@ -787,6 +1026,8 @@ mod tests {
                     }],
                     when: Vec::new(),
                     request_principals: Vec::new(),
+                    not_request_principals: Vec::new(),
+                    source_negation: Default::default(),
                     never_matches: false,
                     action: PolicyAction::Allow,
                 }],
@@ -819,6 +1060,8 @@ mod tests {
                     }],
                     when: Vec::new(),
                     request_principals: Vec::new(),
+                    not_request_principals: Vec::new(),
+                    source_negation: Default::default(),
                     never_matches: false,
                     action: PolicyAction::Allow,
                 }],
@@ -851,6 +1094,8 @@ mod tests {
                     }],
                     when: Vec::new(),
                     request_principals: Vec::new(),
+                    not_request_principals: Vec::new(),
+                    source_negation: Default::default(),
                     never_matches: false,
                     action: PolicyAction::Allow,
                 }],
@@ -882,6 +1127,8 @@ mod tests {
                     to: Vec::new(),
                     when: Vec::new(),
                     request_principals: Vec::new(),
+                    not_request_principals: Vec::new(),
+                    source_negation: Default::default(),
                     never_matches: true,
                     action: PolicyAction::Allow,
                 }],
@@ -915,6 +1162,8 @@ mod tests {
                     }],
                     when: Vec::new(),
                     request_principals: Vec::new(),
+                    not_request_principals: Vec::new(),
+                    source_negation: Default::default(),
                     never_matches: false,
                     action: PolicyAction::Allow,
                 }],
@@ -948,6 +1197,8 @@ mod tests {
                     }],
                     when: Vec::new(),
                     request_principals: Vec::new(),
+                    not_request_principals: Vec::new(),
+                    source_negation: Default::default(),
                     never_matches: false,
                     action: PolicyAction::Allow,
                 }],
@@ -999,6 +1250,8 @@ mod tests {
                     }],
                     when: Vec::new(),
                     request_principals: Vec::new(),
+                    not_request_principals: Vec::new(),
+                    source_negation: Default::default(),
                     never_matches: false,
                     action: PolicyAction::Allow,
                 }],
@@ -1050,6 +1303,8 @@ mod tests {
                     }],
                     when: Vec::new(),
                     request_principals: Vec::new(),
+                    not_request_principals: Vec::new(),
+                    source_negation: Default::default(),
                     never_matches: false,
                     action: PolicyAction::Allow,
                 }],
@@ -1162,6 +1417,8 @@ mod tests {
                     to: Vec::new(),
                     when: Vec::new(),
                     request_principals: Vec::new(),
+                    not_request_principals: Vec::new(),
+                    source_negation: Default::default(),
                     never_matches: true,
                     action: PolicyAction::Allow,
                 }],
@@ -1194,6 +1451,8 @@ mod tests {
                     to: Vec::new(),
                     when: Vec::new(),
                     request_principals: Vec::new(),
+                    not_request_principals: Vec::new(),
+                    source_negation: Default::default(),
                     never_matches: true,
                     action: PolicyAction::Deny,
                 }],
@@ -1607,6 +1866,8 @@ mod tests {
                     }],
                     when: Vec::new(),
                     request_principals: Vec::new(),
+                    not_request_principals: Vec::new(),
+                    source_negation: Default::default(),
                     never_matches: false,
                     action: PolicyAction::Allow,
                 }],
@@ -1644,6 +1905,8 @@ mod tests {
                     }],
                     when: Vec::new(),
                     request_principals: Vec::new(),
+                    not_request_principals: Vec::new(),
+                    source_negation: Default::default(),
                     never_matches: false,
                     action: PolicyAction::Allow,
                 }],
@@ -1677,6 +1940,8 @@ mod tests {
                     }],
                     when: Vec::new(),
                     request_principals: Vec::new(),
+                    not_request_principals: Vec::new(),
+                    source_negation: Default::default(),
                     never_matches: false,
                     action: PolicyAction::Allow,
                 }],
@@ -1709,6 +1974,8 @@ mod tests {
                     }],
                     when: Vec::new(),
                     request_principals: Vec::new(),
+                    not_request_principals: Vec::new(),
+                    source_negation: Default::default(),
                     never_matches: false,
                     action: PolicyAction::Allow,
                 }],
@@ -1755,6 +2022,8 @@ mod tests {
                     }],
                     when: Vec::new(),
                     request_principals: Vec::new(),
+                    not_request_principals: Vec::new(),
+                    source_negation: Default::default(),
                     never_matches: false,
                     action: PolicyAction::Allow,
                 }],
@@ -1793,6 +2062,8 @@ mod tests {
                     }],
                     when: Vec::new(),
                     request_principals: Vec::new(),
+                    not_request_principals: Vec::new(),
+                    source_negation: Default::default(),
                     never_matches: false,
                     action: PolicyAction::Allow,
                 }],
@@ -1847,6 +2118,8 @@ mod tests {
                     }],
                     when: Vec::new(),
                     request_principals: Vec::new(),
+                    not_request_principals: Vec::new(),
+                    source_negation: Default::default(),
                     never_matches: false,
                     action: PolicyAction::Allow,
                 }],
@@ -1893,6 +2166,8 @@ mod tests {
                     }],
                     when: Vec::new(),
                     request_principals: Vec::new(),
+                    not_request_principals: Vec::new(),
+                    source_negation: Default::default(),
                     never_matches: false,
                     action: PolicyAction::Allow,
                 }],
@@ -1934,6 +2209,8 @@ mod tests {
                         not_values: Vec::new(),
                     }],
                     request_principals: Vec::new(),
+                    not_request_principals: Vec::new(),
+                    source_negation: Default::default(),
                     never_matches: false,
                     action: PolicyAction::Allow,
                 }],
@@ -2009,6 +2286,8 @@ mod tests {
                         not_values: vec!["internal".to_string()],
                     }],
                     request_principals: Vec::new(),
+                    not_request_principals: Vec::new(),
+                    source_negation: Default::default(),
                     never_matches: false,
                     action: PolicyAction::Deny,
                 }],
@@ -2065,6 +2344,8 @@ mod tests {
                         not_values: vec!["staging".to_string()],
                     }],
                     request_principals: Vec::new(),
+                    not_request_principals: Vec::new(),
+                    source_negation: Default::default(),
                     never_matches: false,
                     action: PolicyAction::Allow,
                 }],
@@ -2121,6 +2402,8 @@ mod tests {
                         not_values: Vec::new(),
                     }],
                     request_principals: Vec::new(),
+                    not_request_principals: Vec::new(),
+                    source_negation: Default::default(),
                     never_matches: false,
                     action: PolicyAction::Allow,
                 }],
@@ -2144,40 +2427,67 @@ mod tests {
     }
 
     #[test]
-    fn condition_missing_attribute_passes_not_values_check() {
-        // If the attribute key is absent, `not_values` check passes because
-        // `value.is_some_and(...)` returns false.
-        let slice = MeshSlice {
+    fn condition_not_values_absent_passes_present_match_fails() {
+        // Istio `notValues` semantics: a condition is satisfied unless the
+        // attribute is present AND matches one of `notValues`. When the
+        // attribute is absent the `not_rule` has nothing to match, so the
+        // condition passes (Envoy RBAC `not_rule(matcher)` is true when the
+        // inner matcher is false). This mirrors Istio's compiled behavior.
+        //
+        // Previously this path was untestable end-to-end because both authz
+        // entry points hard-coded `attributes: BTreeMap::new()`, so a
+        // `when`-gated rule could never observe a populated attribute. Now
+        // that attributes are populated from request context, this test
+        // exercises both the absent (passes) and present-matching (fails)
+        // arms so a `when`-gated DENY actually fires when it should and a
+        // `when`-gated ALLOW correctly stops matching.
+        let allow_unless_blocked = MeshSlice {
             mesh_policies: vec![MeshPolicy {
                 name: "allow-not-blocked".to_string(),
                 namespace: "default".to_string(),
                 scope: PolicyScope::MeshWide,
                 rules: vec![MeshRule {
-                    from: Vec::new(),
-                    to: Vec::new(),
                     when: vec![ConditionMatch {
-                        key: "blocked.key".to_string(),
+                        key: "request.headers[x-env]".to_string(),
                         values: Vec::new(),
-                        not_values: vec!["bad".to_string()],
+                        not_values: vec!["blocked".to_string()],
                     }],
-                    request_principals: Vec::new(),
-                    never_matches: false,
                     action: PolicyAction::Allow,
+                    ..MeshRule::default()
                 }],
             }],
             ..MeshSlice::default()
         };
 
-        // Key absent: not_values does not trigger, condition passes.
+        // Key absent: not_values has nothing to match, condition passes, the
+        // ALLOW rule matches.
         assert_eq!(
             evaluate_mesh_authorization(
-                &slice,
+                &allow_unless_blocked,
                 &MeshAuthzRequest {
                     attributes: BTreeMap::new(),
                     ..MeshAuthzRequest::default()
                 }
             ),
             MeshAuthzDecision::Allow
+        );
+
+        // Key present and matching not_values: condition fails, the ALLOW
+        // rule does not match, so the lone ALLOW policy falls through to
+        // implicit deny.
+        let mut blocked = BTreeMap::new();
+        blocked.insert("request.headers[x-env]".to_string(), "blocked".to_string());
+        assert_eq!(
+            evaluate_mesh_authorization(
+                &allow_unless_blocked,
+                &MeshAuthzRequest {
+                    attributes: blocked,
+                    ..MeshAuthzRequest::default()
+                }
+            ),
+            MeshAuthzDecision::Deny {
+                policy: "implicit-deny".to_string()
+            }
         );
     }
 
@@ -2205,6 +2515,8 @@ mod tests {
                         },
                     ],
                     request_principals: Vec::new(),
+                    not_request_principals: Vec::new(),
+                    source_negation: Default::default(),
                     never_matches: false,
                     action: PolicyAction::Allow,
                 }],
@@ -2259,6 +2571,8 @@ mod tests {
                     to: Vec::new(),
                     when: Vec::new(),
                     request_principals: Vec::new(),
+                    not_request_principals: Vec::new(),
+                    source_negation: Default::default(),
                     never_matches: false,
                     action: PolicyAction::Audit,
                 }],
@@ -2290,6 +2604,8 @@ mod tests {
                         to: Vec::new(),
                         when: Vec::new(),
                         request_principals: Vec::new(),
+                        not_request_principals: Vec::new(),
+                        source_negation: Default::default(),
                         never_matches: false,
                         action: PolicyAction::Audit,
                     }],
@@ -2480,6 +2796,8 @@ mod tests {
                 scope: PolicyScope::MeshWide,
                 rules: vec![MeshRule {
                     request_principals: Vec::new(),
+                    not_request_principals: Vec::new(),
+                    source_negation: Default::default(),
                     action: PolicyAction::Allow,
                     ..MeshRule::default()
                 }],
@@ -2524,6 +2842,8 @@ mod tests {
                 to: vec![request],
                 when: Vec::new(),
                 request_principals: Vec::new(),
+                not_request_principals: Vec::new(),
+                source_negation: Default::default(),
                 never_matches: false,
                 action: PolicyAction::Allow,
             }],
@@ -2838,5 +3158,303 @@ mod tests {
             evaluate_mesh_authorization(&slice, &get_request),
             MeshAuthzDecision::Allow
         );
+    }
+
+    // ── Source negation / IP-block matchers ──────────────────────────────
+
+    fn allow_with_source_negation(neg: SourceNegationMatch) -> MeshSlice {
+        MeshSlice {
+            mesh_policies: vec![MeshPolicy {
+                name: "allow-gated-source".to_string(),
+                namespace: "default".to_string(),
+                scope: PolicyScope::MeshWide,
+                rules: vec![MeshRule {
+                    source_negation: neg,
+                    action: PolicyAction::Allow,
+                    ..MeshRule::default()
+                }],
+            }],
+            ..MeshSlice::default()
+        }
+    }
+
+    #[test]
+    fn not_principals_blocks_matching_source_and_admits_others() {
+        let slice = allow_with_source_negation(SourceNegationMatch {
+            not_spiffe_id_patterns: vec!["spiffe://cluster.local/ns/default/sa/bad".to_string()],
+            ..SourceNegationMatch::default()
+        });
+        // Matching notPrincipals → rule fails → implicit deny.
+        assert_eq!(
+            evaluate_mesh_authorization(
+                &slice,
+                &request("spiffe://cluster.local/ns/default/sa/bad")
+            ),
+            MeshAuthzDecision::Deny {
+                policy: "implicit-deny".to_string()
+            }
+        );
+        // Different source → admitted.
+        assert_eq!(
+            evaluate_mesh_authorization(
+                &slice,
+                &request("spiffe://cluster.local/ns/default/sa/good")
+            ),
+            MeshAuthzDecision::Allow
+        );
+    }
+
+    #[test]
+    fn not_principals_fail_closed_without_peer() {
+        let slice = allow_with_source_negation(SourceNegationMatch {
+            not_spiffe_id_patterns: vec!["spiffe://cluster.local/ns/default/sa/bad".to_string()],
+            ..SourceNegationMatch::default()
+        });
+        // No source principal at all: a notPrincipals constraint cannot be
+        // satisfied, so the rule fails closed (implicit deny), never admits.
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &MeshAuthzRequest::default()),
+            MeshAuthzDecision::Deny {
+                policy: "implicit-deny".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn not_namespaces_blocks_matching_namespace() {
+        let slice = allow_with_source_negation(SourceNegationMatch {
+            not_namespace_patterns: vec!["kube-system".to_string()],
+            ..SourceNegationMatch::default()
+        });
+        assert_eq!(
+            evaluate_mesh_authorization(
+                &slice,
+                &request("spiffe://cluster.local/ns/kube-system/sa/x")
+            ),
+            MeshAuthzDecision::Deny {
+                policy: "implicit-deny".to_string()
+            }
+        );
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &request("spiffe://cluster.local/ns/default/sa/x")),
+            MeshAuthzDecision::Allow
+        );
+    }
+
+    #[test]
+    fn ip_blocks_allow_only_inside_range_and_fail_closed_without_ip() {
+        let slice = allow_with_source_negation(SourceNegationMatch {
+            ip_blocks: vec!["10.0.0.0/8".to_string()],
+            ..SourceNegationMatch::default()
+        });
+        let inside = MeshAuthzRequest {
+            source_ip: Some("10.1.2.3".parse().unwrap()),
+            ..MeshAuthzRequest::default()
+        };
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &inside),
+            MeshAuthzDecision::Allow
+        );
+        let outside = MeshAuthzRequest {
+            source_ip: Some("192.168.1.1".parse().unwrap()),
+            ..MeshAuthzRequest::default()
+        };
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &outside),
+            MeshAuthzDecision::Deny {
+                policy: "implicit-deny".to_string()
+            }
+        );
+        // ipBlocks present but no source IP → fail closed.
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &MeshAuthzRequest::default()),
+            MeshAuthzDecision::Deny {
+                policy: "implicit-deny".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn not_ip_blocks_block_inside_range() {
+        let slice = allow_with_source_negation(SourceNegationMatch {
+            not_ip_blocks: vec!["10.0.0.0/8".to_string()],
+            ..SourceNegationMatch::default()
+        });
+        let inside = MeshAuthzRequest {
+            source_ip: Some("10.1.2.3".parse().unwrap()),
+            ..MeshAuthzRequest::default()
+        };
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &inside),
+            MeshAuthzDecision::Deny {
+                policy: "implicit-deny".to_string()
+            }
+        );
+        let outside = MeshAuthzRequest {
+            source_ip: Some("192.168.1.1".parse().unwrap()),
+            ..MeshAuthzRequest::default()
+        };
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &outside),
+            MeshAuthzDecision::Allow
+        );
+    }
+
+    #[test]
+    fn remote_ip_blocks_use_remote_ip_not_source_ip() {
+        let slice = allow_with_source_negation(SourceNegationMatch {
+            remote_ip_blocks: vec!["203.0.113.0/24".to_string()],
+            ..SourceNegationMatch::default()
+        });
+        // remote.ip inside, source.ip irrelevant → allow.
+        let req = MeshAuthzRequest {
+            source_ip: Some("10.0.0.1".parse().unwrap()),
+            remote_ip: Some("203.0.113.7".parse().unwrap()),
+            ..MeshAuthzRequest::default()
+        };
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &req),
+            MeshAuthzDecision::Allow
+        );
+        // remote.ip outside → deny even though source.ip would not matter.
+        let req_out = MeshAuthzRequest {
+            remote_ip: Some("198.51.100.1".parse().unwrap()),
+            ..MeshAuthzRequest::default()
+        };
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &req_out),
+            MeshAuthzDecision::Deny {
+                policy: "implicit-deny".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn not_request_principals_blocks_matching_jwt_and_fails_closed_when_absent() {
+        let slice = MeshSlice {
+            mesh_policies: vec![MeshPolicy {
+                name: "allow-unless-admin".to_string(),
+                namespace: "default".to_string(),
+                scope: PolicyScope::MeshWide,
+                rules: vec![MeshRule {
+                    not_request_principals: vec!["https://issuer/admin".to_string()],
+                    action: PolicyAction::Allow,
+                    ..MeshRule::default()
+                }],
+            }],
+            ..MeshSlice::default()
+        };
+        // Matching request principal → blocked.
+        let admin = MeshAuthzRequest {
+            request_principal: Some("https://issuer/admin".to_string()),
+            ..MeshAuthzRequest::default()
+        };
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &admin),
+            MeshAuthzDecision::Deny {
+                policy: "implicit-deny".to_string()
+            }
+        );
+        // Different request principal → admitted.
+        let user = MeshAuthzRequest {
+            request_principal: Some("https://issuer/user".to_string()),
+            ..MeshAuthzRequest::default()
+        };
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &user),
+            MeshAuthzDecision::Allow
+        );
+        // No JWT at all → fail closed (cannot satisfy notRequestPrincipals).
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &MeshAuthzRequest::default()),
+            MeshAuthzDecision::Deny {
+                policy: "implicit-deny".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn deny_gated_on_when_condition_now_fires() {
+        // The canonical fail-open case: a DENY gated on a `when:` condition.
+        // Before attributes were populated, this DENY never fired (traffic
+        // admitted). Now a matching attribute makes it fire.
+        let slice = MeshSlice {
+            mesh_policies: vec![MeshPolicy {
+                name: "deny-prod-callers".to_string(),
+                namespace: "default".to_string(),
+                scope: PolicyScope::MeshWide,
+                rules: vec![MeshRule {
+                    when: vec![ConditionMatch {
+                        key: "source.namespace".to_string(),
+                        values: vec!["prod".to_string()],
+                        not_values: Vec::new(),
+                    }],
+                    action: PolicyAction::Deny,
+                    ..MeshRule::default()
+                }],
+            }],
+            ..MeshSlice::default()
+        };
+        let mut attrs = BTreeMap::new();
+        attrs.insert("source.namespace".to_string(), "prod".to_string());
+        let req = MeshAuthzRequest {
+            attributes: attrs,
+            ..MeshAuthzRequest::default()
+        };
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &req),
+            MeshAuthzDecision::Deny {
+                policy: "deny-prod-callers".to_string()
+            }
+        );
+        // Without the attribute (e.g. different namespace) the DENY does not
+        // fire and the request is allowed (no ALLOW policy → default allow).
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &MeshAuthzRequest::default()),
+            MeshAuthzDecision::Allow
+        );
+    }
+
+    #[test]
+    fn cidr_contains_handles_ipv4_ipv6_and_mapped() {
+        assert!(cidr_contains("10.0.0.0/8", "10.255.0.1".parse().unwrap()));
+        assert!(!cidr_contains("10.0.0.0/8", "11.0.0.1".parse().unwrap()));
+        assert!(cidr_contains("192.168.1.1", "192.168.1.1".parse().unwrap()));
+        assert!(!cidr_contains(
+            "192.168.1.1",
+            "192.168.1.2".parse().unwrap()
+        ));
+        // IPv4-mapped IPv6 peer matches an IPv4 block.
+        assert!(cidr_contains(
+            "10.0.0.0/8",
+            "::ffff:10.0.0.5".parse().unwrap()
+        ));
+        // IPv6 block.
+        assert!(cidr_contains(
+            "2001:db8::/32",
+            "2001:db8::1".parse().unwrap()
+        ));
+        assert!(!cidr_contains(
+            "2001:db8::/32",
+            "2001:dead::1".parse().unwrap()
+        ));
+        // /0 matches anything of the same family.
+        assert!(cidr_contains("0.0.0.0/0", "8.8.8.8".parse().unwrap()));
+        // Malformed CIDR never matches.
+        assert!(!cidr_contains("not-a-cidr", "10.0.0.1".parse().unwrap()));
+        assert!(!cidr_contains("10.0.0.0/40", "10.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn validate_source_ip_block_accepts_valid_rejects_invalid() {
+        assert!(validate_source_ip_block("10.0.0.0/8").is_ok());
+        assert!(validate_source_ip_block("192.168.1.1").is_ok());
+        assert!(validate_source_ip_block("2001:db8::/32").is_ok());
+        assert!(validate_source_ip_block("::1").is_ok());
+        assert!(validate_source_ip_block("").is_err());
+        assert!(validate_source_ip_block("10.0.0.0/40").is_err());
+        assert!(validate_source_ip_block("2001:db8::/200").is_err());
+        assert!(validate_source_ip_block("not-an-ip").is_err());
+        assert!(validate_source_ip_block("10.0.0.0/abc").is_err());
     }
 }

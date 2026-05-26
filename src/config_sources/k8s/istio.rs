@@ -11,7 +11,7 @@ use crate::modes::mesh::config::{
     MeshSidecar, MeshSidecarEgress, MeshSimpleLb, MeshSubset, MeshTelemetryConfig,
     MeshTelemetryResource, MeshTracingConfig, MeshTrafficPolicy, MeshTrafficPolicyTls,
     MetricTagOverride, MtlsMode, PeerAuthentication, PolicyAction, PolicyScope, PrincipalMatch,
-    RequestMatch, Resolution, ServiceEntry, ServiceEntryLocation, ServicePort,
+    RequestMatch, Resolution, ServiceEntry, ServiceEntryLocation, ServicePort, SourceNegationMatch,
     TagOverrideOperation, TelemetryTracingMode, TracingProvider, Workload, WorkloadPort,
     WorkloadSelector,
 };
@@ -175,6 +175,14 @@ fn mesh_rules(
         .flatten()
         .map(|source_entry| source_entry.get("source").unwrap_or(&Value::Null))
         .collect();
+    // Fail closed on any source field we do not yet support, mirroring the
+    // `to.operation` side (`validate_supported_operation_fields`). Without
+    // this gate, an unsupported source key (e.g. a future Istio field) would
+    // be silently dropped and the rule would match more traffic than the
+    // operator authored.
+    for source in &sources {
+        validate_supported_source_fields(object, source)?;
+    }
     let mut to = Vec::new();
     let mut has_unconstrained_to = false;
     for request in rule
@@ -208,22 +216,28 @@ fn mesh_rules(
             to,
             when,
             request_principals: Vec::new(),
+            not_request_principals: Vec::new(),
+            source_negation: SourceNegationMatch::default(),
             never_matches: false,
             action,
         }]);
     }
 
-    Ok(sources
+    sources
         .into_iter()
-        .map(|source| MeshRule {
-            from: principal_matches(source),
-            to: to.clone(),
-            when: when.clone(),
-            request_principals: string_array(source, "requestPrincipals"),
-            never_matches: false,
-            action,
+        .map(|source| {
+            Ok(MeshRule {
+                from: principal_matches(source),
+                to: to.clone(),
+                when: when.clone(),
+                request_principals: string_array(source, "requestPrincipals"),
+                not_request_principals: string_array(source, "notRequestPrincipals"),
+                source_negation: source_negation_match(object, source)?,
+                never_matches: false,
+                action,
+            })
         })
-        .collect())
+        .collect()
 }
 
 fn principal_matches(source: &Value) -> Vec<PrincipalMatch> {
@@ -243,6 +257,71 @@ fn principal_matches(source: &Value) -> Vec<PrincipalMatch> {
         });
     }
     matches
+}
+
+/// Translate the conjunctive source-negative / IP-block fields of one Istio
+/// `from[].source` block into a [`SourceNegationMatch`]. IP blocks are
+/// validated here so a malformed CIDR rejects the resource (fail-closed)
+/// rather than silently never matching at request time.
+fn source_negation_match(
+    object: &K8sObject,
+    source: &Value,
+) -> Result<SourceNegationMatch, K8sTranslateError> {
+    let validate_ip_blocks = |field: &str| -> Result<Vec<String>, K8sTranslateError> {
+        let blocks = string_array(source, field);
+        for block in &blocks {
+            crate::modes::mesh::policy::validate_source_ip_block(block).map_err(|reason| {
+                invalid_resource(
+                    object,
+                    format!("rules[].from[].source.{field} '{block}' is invalid: {reason}"),
+                )
+            })?;
+        }
+        Ok(blocks)
+    };
+
+    Ok(SourceNegationMatch {
+        not_spiffe_id_patterns: string_array(source, "notPrincipals"),
+        not_namespace_patterns: string_array(source, "notNamespaces"),
+        ip_blocks: validate_ip_blocks("ipBlocks")?,
+        not_ip_blocks: validate_ip_blocks("notIpBlocks")?,
+        remote_ip_blocks: validate_ip_blocks("remoteIpBlocks")?,
+        not_remote_ip_blocks: validate_ip_blocks("notRemoteIpBlocks")?,
+    })
+}
+
+/// Reject any `from[].source` field that the translator does not yet support
+/// so the resource fails closed instead of silently admitting more traffic.
+/// Mirrors [`validate_supported_operation_fields`] on the `to.operation` side.
+fn validate_supported_source_fields(
+    object: &K8sObject,
+    source: &Value,
+) -> Result<(), K8sTranslateError> {
+    for key in source
+        .as_object()
+        .into_iter()
+        .flat_map(|fields| fields.keys())
+    {
+        match key.as_str() {
+            "principals"
+            | "notPrincipals"
+            | "namespaces"
+            | "notNamespaces"
+            | "ipBlocks"
+            | "notIpBlocks"
+            | "remoteIpBlocks"
+            | "notRemoteIpBlocks"
+            | "requestPrincipals"
+            | "notRequestPrincipals" => {}
+            _ => {
+                return Err(invalid_resource(
+                    object,
+                    format!("rules[].from[].source.{key} is unsupported"),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn request_match(object: &K8sObject, operation: &Value) -> Result<RequestMatch, K8sTranslateError> {
@@ -10821,6 +10900,123 @@ extensionProviders:
         assert!(
             policy.rules[0].request_principals.is_empty(),
             "no requestPrincipals should produce empty list"
+        );
+    }
+
+    #[test]
+    fn translates_authorization_policy_source_negation_and_ip_blocks() {
+        let policy = translated_authorization_policy(serde_json::json!({
+            "action": "ALLOW",
+            "rules": [{
+                "from": [{
+                    "source": {
+                        "principals": ["spiffe://cluster.local/ns/default/sa/web"],
+                        "notPrincipals": ["spiffe://cluster.local/ns/default/sa/legacy"],
+                        "notNamespaces": ["kube-system"],
+                        "ipBlocks": ["10.0.0.0/8"],
+                        "notIpBlocks": ["10.1.0.0/16"],
+                        "remoteIpBlocks": ["203.0.113.0/24"],
+                        "notRemoteIpBlocks": ["198.51.100.0/24"],
+                        "notRequestPrincipals": ["https://issuer/admin"]
+                    }
+                }]
+            }]
+        }));
+
+        assert_eq!(policy.rules.len(), 1);
+        let rule = &policy.rules[0];
+        assert_eq!(rule.from.len(), 1, "positive principal preserved");
+        assert_eq!(
+            rule.not_request_principals,
+            vec!["https://issuer/admin".to_string()]
+        );
+        let neg = &rule.source_negation;
+        assert_eq!(
+            neg.not_spiffe_id_patterns,
+            vec!["spiffe://cluster.local/ns/default/sa/legacy".to_string()]
+        );
+        assert_eq!(neg.not_namespace_patterns, vec!["kube-system".to_string()]);
+        assert_eq!(neg.ip_blocks, vec!["10.0.0.0/8".to_string()]);
+        assert_eq!(neg.not_ip_blocks, vec!["10.1.0.0/16".to_string()]);
+        assert_eq!(neg.remote_ip_blocks, vec!["203.0.113.0/24".to_string()]);
+        assert_eq!(
+            neg.not_remote_ip_blocks,
+            vec!["198.51.100.0/24".to_string()]
+        );
+    }
+
+    #[test]
+    fn authorization_policy_rejects_unsupported_source_field() {
+        let result = translate_k8s_objects(
+            &[object(
+                "AuthorizationPolicy",
+                serde_json::json!({
+                    "action": "ALLOW",
+                    "rules": [{
+                        "from": [{"source": {"someFutureField": ["x"]}}]
+                    }]
+                }),
+            )],
+            options(),
+        );
+        let err = result.expect_err("unsupported source field must reject the resource");
+        assert!(
+            err.to_string()
+                .contains("source.someFutureField is unsupported"),
+            "error should name the unsupported field, got: {err}"
+        );
+    }
+
+    #[test]
+    fn authorization_policy_rejects_malformed_ip_block() {
+        let result = translate_k8s_objects(
+            &[object(
+                "AuthorizationPolicy",
+                serde_json::json!({
+                    "action": "ALLOW",
+                    "rules": [{
+                        "from": [{"source": {"ipBlocks": ["10.0.0.0/40"]}}]
+                    }]
+                }),
+            )],
+            options(),
+        );
+        let err = result.expect_err("malformed CIDR must reject the resource");
+        assert!(
+            err.to_string().contains("ipBlocks") && err.to_string().contains("invalid"),
+            "error should flag the bad CIDR, got: {err}"
+        );
+    }
+
+    #[test]
+    fn authorization_policy_remote_ip_blocks_enforced_end_to_end() {
+        let policy = translated_authorization_policy(serde_json::json!({
+            "action": "ALLOW",
+            "rules": [{
+                "from": [{"source": {"remoteIpBlocks": ["203.0.113.0/24"]}}]
+            }]
+        }));
+        let slice = MeshSlice {
+            mesh_policies: vec![policy],
+            ..MeshSlice::default()
+        };
+        let inside = MeshAuthzRequest {
+            remote_ip: Some("203.0.113.9".parse().unwrap()),
+            ..MeshAuthzRequest::default()
+        };
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &inside),
+            MeshAuthzDecision::Allow
+        );
+        let outside = MeshAuthzRequest {
+            remote_ip: Some("198.51.100.9".parse().unwrap()),
+            ..MeshAuthzRequest::default()
+        };
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &outside),
+            MeshAuthzDecision::Deny {
+                policy: "implicit-deny".to_string()
+            }
         );
     }
 

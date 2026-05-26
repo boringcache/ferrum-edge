@@ -1820,6 +1820,86 @@ async fn test_jwks_auth_sets_request_principal_metadata() {
 }
 
 #[tokio::test]
+async fn test_jwks_auth_emits_mesh_audiences_and_claims_metadata() {
+    // The mesh RequestAuthentication plugin sets
+    // `emit_mesh_request_principal_metadata`, which must surface the JWT
+    // audiences and scalar/string-array claims so mesh authz `when:`
+    // conditions on `request.auth.audiences` / `request.auth.claims[...]`
+    // can be evaluated.
+    let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+
+    let (_server, jwks_uri) = start_jwks_server(public_key_pem).await;
+    // Provider must accept the token's audiences for validation to succeed;
+    // the emitted `request.auth.audiences` metadata reflects the token's
+    // `aud` claim, not the provider's accepted list.
+    let config = json!({
+        "providers": [{
+            "jwks_uri": jwks_uri,
+            "audiences": ["api.default", "api.alt"]
+        }],
+        "emit_mesh_request_principal_metadata": true
+    });
+    let plugin = JwksAuth::new(&config, default_client()).unwrap();
+    plugin.warmup_jwks().await;
+
+    let consumer_index = ConsumerIndex::new(&[]);
+
+    let token = create_rs256_token(
+        &json!({
+            "sub": "user-42",
+            "iss": "https://auth.example.com",
+            "aud": ["api.default", "api.alt"],
+            "groups": ["dev", "ops"],
+            "tier": "gold",
+            "level": 7,
+            "active": true
+        }),
+        private_key_pem,
+    );
+
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("authorization".to_string(), format!("Bearer {}", token));
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_continue(result);
+
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.request_auth.audiences")
+            .map(String::as_str),
+        Some("api.default,api.alt"),
+        "array audiences should be comma-joined"
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.request_auth.claim.groups")
+            .map(String::as_str),
+        Some("dev,ops"),
+        "string-array claim should be comma-joined"
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.request_auth.claim.tier")
+            .map(String::as_str),
+        Some("gold")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.request_auth.claim.level")
+            .map(String::as_str),
+        Some("7"),
+        "numeric claim should render as its string form"
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.request_auth.claim.active")
+            .map(String::as_str),
+        Some("true")
+    );
+}
+
+#[tokio::test]
 async fn test_jwks_auth_request_principal_not_set_without_iss() {
     let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
     let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");

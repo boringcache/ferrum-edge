@@ -75,6 +75,149 @@ pub struct MeshAuthz {
     /// preserves the existing sidecar/ambient/east-west/egress-gateway
     /// behaviour (slice-level filter at construction).
     per_pod_policy_scoping: bool,
+    /// Precomputed set of Istio attribute keys referenced by `when:`
+    /// conditions across the loaded policies. The request hot path only
+    /// materializes attributes named here, so a policy set with no `when:`
+    /// conditions pays nothing and the common cases (a handful of keys)
+    /// avoid building the full attribute namespace per request.
+    condition_keys: ConditionAttributeKeys,
+}
+
+/// Which Istio `when:` attribute keys the loaded policies actually reference.
+///
+/// Built once at construction from `slice.mesh_policies`. Categorised so the
+/// request path can decide cheaply (a `bool` check) whether to touch a given
+/// source — e.g. only parse the peer SPIFFE namespace when some condition asks
+/// for `source.namespace`, only fetch headers/claims for the exact bracketed
+/// keys requested. The dynamic-key sets (`request.headers[...]`,
+/// `request.auth.claims[...]`) store the full bracketed key so lookup is a
+/// direct map/contains check with no per-request parsing.
+#[derive(Debug, Default, Clone)]
+struct ConditionAttributeKeys {
+    /// Any `when:` condition exists at all. When false the request path skips
+    /// attribute materialization entirely.
+    any: bool,
+    source_principal: bool,
+    source_namespace: bool,
+    source_ip: bool,
+    remote_ip: bool,
+    request_auth_principal: bool,
+    request_auth_audiences: bool,
+    destination_port: bool,
+    connection_sni: bool,
+    /// Full `request.headers[<name>]` keys referenced.
+    header_keys: std::collections::BTreeSet<String>,
+    /// Full `request.auth.claims[<name>]` keys referenced.
+    claim_keys: std::collections::BTreeSet<String>,
+}
+
+// A condition on an attribute key the gateway does not source (or sources only
+// for one protocol, e.g. `request.headers[...]` on a stream) is intentionally
+// left out of the materialized map. The evaluator then treats it as absent,
+// which is the correct, fail-closed posture: a `values` condition on a missing
+// attribute never matches, and a `not_values`-only condition on a missing
+// attribute passes (Istio `not_rule` semantics). We never silently treat an
+// unknown key as a positive match.
+
+// ── Istio `when:` attribute key constants ────────────────────────────────
+const ATTR_SOURCE_PRINCIPAL: &str = "source.principal";
+const ATTR_SOURCE_NAMESPACE: &str = "source.namespace";
+const ATTR_SOURCE_IP: &str = "source.ip";
+const ATTR_REMOTE_IP: &str = "remote.ip";
+const ATTR_REQUEST_AUTH_PRINCIPAL: &str = "request.auth.principal";
+const ATTR_REQUEST_AUTH_AUDIENCES: &str = "request.auth.audiences";
+const ATTR_DESTINATION_PORT: &str = "destination.port";
+const ATTR_CONNECTION_SNI: &str = "connection.sni";
+const ATTR_REQUEST_HEADERS_PREFIX: &str = "request.headers[";
+const ATTR_REQUEST_AUTH_CLAIMS_PREFIX: &str = "request.auth.claims[";
+
+impl ConditionAttributeKeys {
+    fn from_policies(policies: &[MeshPolicy]) -> Self {
+        let mut keys = ConditionAttributeKeys::default();
+        for policy in policies {
+            for rule in &policy.rules {
+                for condition in &rule.when {
+                    keys.note_key(&condition.key);
+                }
+            }
+        }
+        keys
+    }
+
+    fn note_key(&mut self, key: &str) {
+        self.any = true;
+        match key {
+            ATTR_SOURCE_PRINCIPAL => self.source_principal = true,
+            ATTR_SOURCE_NAMESPACE => self.source_namespace = true,
+            ATTR_SOURCE_IP => self.source_ip = true,
+            ATTR_REMOTE_IP => self.remote_ip = true,
+            ATTR_REQUEST_AUTH_PRINCIPAL => self.request_auth_principal = true,
+            ATTR_REQUEST_AUTH_AUDIENCES => self.request_auth_audiences = true,
+            ATTR_DESTINATION_PORT => self.destination_port = true,
+            ATTR_CONNECTION_SNI => self.connection_sni = true,
+            _ => {
+                if bracketed_attribute_name(key, ATTR_REQUEST_HEADERS_PREFIX).is_some() {
+                    self.header_keys.insert(key.to_string());
+                } else if bracketed_attribute_name(key, ATTR_REQUEST_AUTH_CLAIMS_PREFIX).is_some() {
+                    self.claim_keys.insert(key.to_string());
+                }
+                // Other keys (unsourced or unknown) are deliberately not
+                // tracked; the evaluator treats them as absent (see note on
+                // `ConditionAttributeKeys`).
+            }
+        }
+    }
+}
+
+/// Extract `<name>` from an Istio bracketed attribute key
+/// (`request.headers[x-foo]` ⇒ `x-foo`). Returns `None` when `key` is not a
+/// `prefix...]` form.
+fn bracketed_attribute_name<'a>(key: &'a str, prefix: &str) -> Option<&'a str> {
+    key.strip_prefix(prefix)?.strip_suffix(']')
+}
+
+/// Metadata key carrying the comma-joined JWT audiences emitted by the mesh
+/// `jwks_auth` instance. Single source of truth shared with `jwks_auth` so the
+/// emit/consume sides cannot drift.
+#[inline]
+fn jwks_audiences_metadata_key() -> &'static str {
+    crate::plugins::jwks_auth::MESH_REQUEST_AUTH_AUDIENCES_KEY
+}
+
+/// Metadata key for a single JWT claim referenced by `request.auth.claims[name]`.
+#[inline]
+fn claim_metadata_key(name: &str) -> String {
+    format!(
+        "{}{name}",
+        crate::plugins::jwks_auth::MESH_REQUEST_AUTH_CLAIM_PREFIX
+    )
+}
+
+/// Resolve a `request.headers[<name>]` value. Reads the already-lowercased
+/// materialized `headers` map when header rules forced materialization;
+/// otherwise falls back to the raw header accessor so a `when:` header
+/// condition still works on a policy set whose `to.headers` were empty.
+/// Istio header names are matched case-insensitively, and the condition key
+/// name is lowercased to match the stored convention.
+fn http_header_attribute(
+    ctx: &RequestContext,
+    materialized_lowercased: &BTreeMap<String, String>,
+    name: &str,
+) -> Option<String> {
+    let lower = name.to_ascii_lowercase();
+    if let Some(value) = materialized_lowercased.get(&lower) {
+        return Some(value.clone());
+    }
+    ctx.raw_header_get(&lower)
+        .or_else(|| ctx.raw_header_get(name))
+        .map(str::to_string)
+}
+
+/// Parse an IP string (the gateway-resolved client IP) into an `IpAddr` for
+/// Istio `source.ip` / `remote.ip` matching. Returns `None` for an
+/// unparseable value so IP-block matchers fail closed.
+fn parse_client_ip(client_ip: &str) -> Option<std::net::IpAddr> {
+    client_ip.trim().parse().ok()
 }
 
 /// Matching rule for the [`MeshAuthz::trusted_hbone_assertors`] allow-list.
@@ -181,13 +324,151 @@ impl MeshAuthz {
             }
         }
         let has_header_rules = mesh_policies_have_header_rules(&slice.mesh_policies);
+        let condition_keys = ConditionAttributeKeys::from_policies(&slice.mesh_policies);
         Ok(Self {
             slice,
             has_header_rules,
             trust_domain_aliases,
             trusted_hbone_assertors,
             per_pod_policy_scoping,
+            condition_keys,
         })
+    }
+
+    /// Build the Istio `when:` attribute map for an HTTP-family request,
+    /// materializing only the keys referenced by some loaded policy (see
+    /// [`ConditionAttributeKeys`]). Returns an empty map when no policy uses
+    /// `when:` conditions so the no-condition hot path allocates nothing
+    /// beyond the empty `BTreeMap` the request already needs.
+    ///
+    /// `source_principal` is the resolved authz principal (post-baggage
+    /// rewrite) so `source.principal` / `source.namespace` reflect the
+    /// identity the rule is actually evaluated against. `headers` are the
+    /// already-lowercased request headers built by the caller when header
+    /// rules exist; conditions on `request.headers[...]` reuse that map.
+    fn build_http_condition_attributes(
+        &self,
+        ctx: &RequestContext,
+        source_principal: Option<&SpiffeId>,
+        port: Option<u16>,
+        resolved_ip: Option<std::net::IpAddr>,
+        headers: &BTreeMap<String, String>,
+    ) -> BTreeMap<String, String> {
+        let mut attributes = BTreeMap::new();
+        let keys = &self.condition_keys;
+        if !keys.any {
+            return attributes;
+        }
+        if keys.source_principal
+            && let Some(principal) = source_principal
+        {
+            attributes.insert(
+                ATTR_SOURCE_PRINCIPAL.to_string(),
+                principal.as_str().to_string(),
+            );
+        }
+        if keys.source_namespace
+            && let Some(namespace) = source_principal.and_then(|principal| principal.namespace())
+        {
+            attributes.insert(ATTR_SOURCE_NAMESPACE.to_string(), namespace.to_string());
+        }
+        if keys.request_auth_principal
+            && let Some(principal) = ctx.metadata.get("mesh.request_principal")
+        {
+            attributes.insert(ATTR_REQUEST_AUTH_PRINCIPAL.to_string(), principal.clone());
+        }
+        if keys.request_auth_audiences
+            && let Some(audiences) = ctx.metadata.get(jwks_audiences_metadata_key())
+        {
+            attributes.insert(ATTR_REQUEST_AUTH_AUDIENCES.to_string(), audiences.clone());
+        }
+        if keys.destination_port
+            && let Some(port) = port
+        {
+            attributes.insert(ATTR_DESTINATION_PORT.to_string(), port.to_string());
+        }
+        // `source.ip` / `remote.ip` as string `when:` attributes. The
+        // gateway-resolved client IP maps to both (see the entry-point
+        // comment); the dedicated `ipBlocks`/`remoteIpBlocks` matchers use the
+        // parsed form on `MeshAuthzRequest` instead.
+        if keys.source_ip
+            && let Some(ip) = resolved_ip
+        {
+            attributes.insert(ATTR_SOURCE_IP.to_string(), ip.to_string());
+        }
+        if keys.remote_ip
+            && let Some(ip) = resolved_ip
+        {
+            attributes.insert(ATTR_REMOTE_IP.to_string(), ip.to_string());
+        }
+        for header_key in &keys.header_keys {
+            if let Some(name) = bracketed_attribute_name(header_key, ATTR_REQUEST_HEADERS_PREFIX)
+                && let Some(value) = http_header_attribute(ctx, headers, name)
+            {
+                attributes.insert(header_key.clone(), value);
+            }
+        }
+        for claim_key in &keys.claim_keys {
+            if let Some(name) = bracketed_attribute_name(claim_key, ATTR_REQUEST_AUTH_CLAIMS_PREFIX)
+                && let Some(value) = ctx.metadata.get(&claim_metadata_key(name))
+            {
+                attributes.insert(claim_key.clone(), value.clone());
+            }
+        }
+        attributes
+    }
+
+    /// Build the Istio `when:` attribute map for a stream (TCP/UDP)
+    /// connection. Only source identity, destination port, connection SNI,
+    /// and IP attributes are available on a stream — HTTP headers and JWT
+    /// claims are HTTP-only and are intentionally absent so a `when:`
+    /// condition on them fails closed (Istio values-check requires presence).
+    fn build_stream_condition_attributes(
+        &self,
+        ctx: &StreamConnectionContext,
+        source_principal: Option<&SpiffeId>,
+        resolved_ip: Option<std::net::IpAddr>,
+    ) -> BTreeMap<String, String> {
+        let mut attributes = BTreeMap::new();
+        let keys = &self.condition_keys;
+        if !keys.any {
+            return attributes;
+        }
+        if keys.source_principal
+            && let Some(principal) = source_principal
+        {
+            attributes.insert(
+                ATTR_SOURCE_PRINCIPAL.to_string(),
+                principal.as_str().to_string(),
+            );
+        }
+        if keys.source_namespace
+            && let Some(namespace) = source_principal.and_then(|principal| principal.namespace())
+        {
+            attributes.insert(ATTR_SOURCE_NAMESPACE.to_string(), namespace.to_string());
+        }
+        if keys.destination_port {
+            attributes.insert(
+                ATTR_DESTINATION_PORT.to_string(),
+                ctx.listen_port.to_string(),
+            );
+        }
+        if keys.connection_sni
+            && let Some(sni) = ctx.sni_hostname.as_ref()
+        {
+            attributes.insert(ATTR_CONNECTION_SNI.to_string(), sni.clone());
+        }
+        if keys.source_ip
+            && let Some(ip) = resolved_ip
+        {
+            attributes.insert(ATTR_SOURCE_IP.to_string(), ip.to_string());
+        }
+        if keys.remote_ip
+            && let Some(ip) = resolved_ip
+        {
+            attributes.insert(ATTR_REMOTE_IP.to_string(), ip.to_string());
+        }
+        attributes
     }
 
     /// Predicate used by [`MeshAuthz::authorize`] to decide whether a
@@ -377,19 +658,40 @@ impl Plugin for MeshAuthz {
             BTreeMap::new()
         };
         let request_principal = ctx.metadata.get("mesh.request_principal").cloned();
+        let port = ctx.frontend_listen_port.or_else(|| {
+            ctx.matched_proxy
+                .as_ref()
+                .and_then(|proxy| proxy.listen_port)
+        });
+        // Istio source IP matchers. The gateway-resolved `client_ip` is the
+        // direct mesh peer for inbound listeners (no XFF rewrite) and the
+        // XFF-derived client when trusted proxies are configured, so it maps
+        // to both `source.ip` and `remote.ip`. CIDR matchers fail closed when
+        // it does not parse.
+        let resolved_ip = parse_client_ip(&ctx.client_ip);
+        // Istio `when:` attributes. Built from the resolved authz principal
+        // (post-baggage rewrite) plus request metadata/headers, and only for
+        // the keys some loaded policy references (`condition_keys`). Without
+        // this, condition-gated DENY rules never fired and condition-gated
+        // ALLOW rules never matched — a fail-open hole this closes.
+        let attributes = self.build_http_condition_attributes(
+            ctx,
+            source_principal.as_ref(),
+            port,
+            resolved_ip,
+            &headers,
+        );
         let request = MeshAuthzRequest {
             source_principal,
             request_principal,
             method: Some(ctx.method.clone()),
             path: Some(ctx.path.clone()),
             host,
-            port: ctx.frontend_listen_port.or_else(|| {
-                ctx.matched_proxy
-                    .as_ref()
-                    .and_then(|proxy| proxy.listen_port)
-            }),
+            port,
             headers,
-            attributes: BTreeMap::new(),
+            attributes,
+            source_ip: resolved_ip,
+            remote_ip: resolved_ip,
         };
         // GAP-2M.4: per-pod scoping for node-waypoint topology.
         //
@@ -473,10 +775,18 @@ impl Plugin for MeshAuthz {
                     .and_then(|value| SpiffeId::new(value).ok())
             });
         let source_for_log = source_principal.as_ref().map(|id| id.as_str().to_string());
+        // Istio `when:` attributes for stream (TCP/UDP) connections. No HTTP
+        // headers or JWT here, but source identity, destination port,
+        // connection SNI, and source/remote IP are all available.
+        let resolved_ip = parse_client_ip(&ctx.client_ip);
+        let attributes =
+            self.build_stream_condition_attributes(ctx, source_principal.as_ref(), resolved_ip);
         let request = MeshAuthzRequest {
             source_principal,
             port: Some(ctx.listen_port),
-            attributes: BTreeMap::new(),
+            attributes,
+            source_ip: resolved_ip,
+            remote_ip: resolved_ip,
             ..MeshAuthzRequest::default()
         };
         let result = self.decision_to_result(

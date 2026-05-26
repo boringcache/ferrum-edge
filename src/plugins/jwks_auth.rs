@@ -1383,7 +1383,15 @@ async fn discover_jwks_uri(
 }
 
 /// Set `mesh.request_principal` metadata to `{iss}/{sub}` when both claims are
-/// present.
+/// present, plus the JWT-derived attributes consumed by mesh
+/// `AuthorizationPolicy` `when:` conditions (`request.auth.audiences` and
+/// `request.auth.claims[...]`).
+///
+/// Only emitted when the auto-injected mesh `RequestAuthentication` plugin set
+/// `emit_mesh_request_principal_metadata`, so non-mesh `jwks_auth` instances
+/// pay nothing. Claim fan-out is bounded by the number of claims in the
+/// already-validated token and limited to scalar values and string arrays so a
+/// hostile token cannot drive unbounded nested-object materialization.
 fn set_mesh_request_principal_metadata(claims: &Value, ctx: &mut RequestContext) {
     if let (Some(iss), Some(sub)) = (
         claims.get("iss").and_then(|v| v.as_str()),
@@ -1391,6 +1399,64 @@ fn set_mesh_request_principal_metadata(claims: &Value, ctx: &mut RequestContext)
     ) {
         ctx.metadata
             .insert("mesh.request_principal".to_string(), format!("{iss}/{sub}"));
+    }
+
+    // `request.auth.audiences` — comma-joined `aud` (string or array form).
+    if let Some(aud) = claims.get("aud")
+        && let Some(joined) = join_string_scalar_or_array(aud)
+    {
+        ctx.metadata
+            .insert(MESH_REQUEST_AUTH_AUDIENCES_KEY.to_string(), joined);
+    }
+
+    // `request.auth.claims[<name>]` — scalar claims and string arrays only.
+    if let Some(obj) = claims.as_object() {
+        for (name, value) in obj {
+            let Some(rendered) = render_claim_attribute_value(value) else {
+                continue;
+            };
+            ctx.metadata
+                .insert(format!("{MESH_REQUEST_AUTH_CLAIM_PREFIX}{name}"), rendered);
+        }
+    }
+}
+
+/// Metadata key carrying the comma-joined JWT audiences for mesh authz
+/// `request.auth.audiences` conditions.
+pub(crate) const MESH_REQUEST_AUTH_AUDIENCES_KEY: &str = "mesh.request_auth.audiences";
+/// Metadata key prefix for individual JWT claims surfaced to mesh authz
+/// `request.auth.claims[<name>]` conditions.
+pub(crate) const MESH_REQUEST_AUTH_CLAIM_PREFIX: &str = "mesh.request_auth.claim.";
+
+/// Render a single JWT claim into the string form Istio uses for
+/// `request.auth.claims[...]` matching. Scalars render directly; string
+/// arrays render as a comma-joined list (Istio list-claim semantics). Nested
+/// objects and non-string arrays are skipped — they are not addressable by a
+/// flat `claims[name]` string condition.
+fn render_claim_attribute_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(s) => Some(s.clone()),
+        Value::Bool(b) => Some(b.to_string()),
+        Value::Number(n) => Some(n.to_string()),
+        Value::Array(_) => join_string_scalar_or_array(value),
+        Value::Null | Value::Object(_) => None,
+    }
+}
+
+/// Join a JSON value that is either a single string scalar or an array of
+/// strings into a comma-separated string. Returns `None` for other shapes.
+fn join_string_scalar_or_array(value: &Value) -> Option<String> {
+    match value {
+        Value::String(s) => Some(s.clone()),
+        Value::Array(items) => {
+            let parts: Vec<&str> = items.iter().filter_map(|item| item.as_str()).collect();
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join(","))
+            }
+        }
+        _ => None,
     }
 }
 

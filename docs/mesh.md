@@ -476,12 +476,13 @@ The canonical matching helper `policy_scope_applies_to_workload()` is shared bet
 
 ### Rule Matching
 
-Each `MeshRule` checks four dimensions (all must match):
+Each `MeshRule` checks the following dimensions (all must match — a conjunction):
 
-- **Principal matching**: SPIFFE ID patterns (glob), namespace patterns (glob), trust domain restriction.
+- **Principal matching** (`from`): SPIFFE ID patterns (glob), namespace patterns (glob), trust domain restriction. Multiple `from[]` source entries are ORed.
 - **Request principal matching**: `request_principals` glob patterns matched against the `{issuer}/{subject}` composite extracted by `jwks_auth`. When `request_principals` is non-empty and no JWT is present, the rule does not match (Istio semantics: anonymous requests fail the principal check). An empty `request_principals` list matches any request including unauthenticated ones.
-- **Request matching**: methods, paths (glob), hosts (normalized, case-insensitive), ports (exact + glob patterns), headers (case-insensitive keys, normalized at config load).
-- **Condition matching**: attribute-based with `values` (OR semantics) and `not_values` (NOT semantics).
+- **Source negation / IP blocks** (per-source, ANDed with the positive `from`): Istio `notPrincipals`, `notNamespaces`, `notRequestPrincipals`, `ipBlocks`, `notIpBlocks`, `remoteIpBlocks`, `notRemoteIpBlocks`. These are **conjunctive** with the positive matchers and **fail closed** when the attribute they test is absent — a `notPrincipals`/`ipBlocks`/etc. constraint with no source identity or no resolved IP fails the match rather than admitting the very traffic it was written to gate. `ipBlocks`/`notIpBlocks` match the direct connection peer IP (`source.ip`); `remoteIpBlocks`/`notRemoteIpBlocks` match the gateway-resolved client IP (`remote.ip`, XFF-derived when trusted proxies are configured). Unsupported source fields fail the resource closed at translation time (mirroring the `to.operation` side); a malformed CIDR rejects the resource.
+- **Request matching** (`to`): methods, paths (glob), hosts (normalized, case-insensitive), ports (exact + glob patterns), headers (case-insensitive keys, normalized at config load). The negative `to.operation` matchers (`notMethods`/`notPaths`/`notHosts`/`notPorts`) are conjunctive and fail closed when the corresponding request attribute is absent.
+- **Condition matching** (`when`): attribute-based with `values` (the attribute must be present and equal one of the values) and `not_values` (the attribute must not equal any value; an absent attribute satisfies a `not_values`-only condition, matching Istio's compiled `not_rule` semantics). Conditions are evaluated against attributes sourced from the request: `source.principal`, `source.namespace` (from the resolved peer SPIFFE ID), `request.auth.principal`, `request.auth.audiences`, `request.auth.claims[<name>]` (from the validated JWT via the mesh `RequestAuthentication` plugin), `request.headers[<name>]`, `destination.port`, `connection.sni` (stream connections), `source.ip`, and `remote.ip`. Only the attribute keys some loaded policy references are materialized per request, so a policy set with no `when:` conditions adds no hot-path cost. A condition on an attribute the gateway does not yet source is treated as absent (it never silently matches).
 
 ### SPIFFE Identity
 

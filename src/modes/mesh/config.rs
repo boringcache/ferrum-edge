@@ -177,6 +177,19 @@ pub struct MeshRule {
     /// An empty list means "any request principal" (no filter).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub request_principals: Vec<String>,
+    /// Istio `from[].source.notRequestPrincipals` — conjunctive negative
+    /// match over JWT-derived request principals. When any pattern matches
+    /// the request's `request_principal`, the rule fails. A non-empty list
+    /// with no present request principal fails the match (fail-closed),
+    /// mirroring the source negative matchers in [`SourceNegationMatch`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_request_principals: Vec<String>,
+    /// Conjunctive source-negative / IP-block matchers for this rule's
+    /// Istio `from[].source`. ANDed with the ORed positive `from` matches.
+    /// Defaults empty so the common case (positive principals only) and old
+    /// slices round-trip unchanged.
+    #[serde(default, skip_serializing_if = "source_negation_is_empty")]
+    pub source_negation: SourceNegationMatch,
     /// Synthetic marker for rules that should affect policy accounting but
     /// never match traffic, e.g. Istio ALLOW-without-rules allow-nothing.
     #[serde(default, skip_serializing_if = "is_false")]
@@ -198,7 +211,7 @@ pub enum PolicyAction {
     Audit,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct PrincipalMatch {
     /// Glob pattern over SPIFFE IDs, e.g. `spiffe://prod/ns/foo/sa/*`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -209,6 +222,72 @@ pub struct PrincipalMatch {
     /// Restrict matches to a specific trust domain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trust_domain: Option<TrustDomain>,
+}
+
+/// Conjunctive source-negative / IP-block matchers for one Istio
+/// AuthorizationPolicy `from[].source`.
+///
+/// Istio ANDs every field inside a single `source` together, and a request
+/// matches the rule's `from` when **any one** source matches. The positive
+/// identity matchers (`principals` / `namespaces`) translate into the ORed
+/// [`PrincipalMatch`] list on [`MeshRule::from`]; the negative and IP-block
+/// matchers live here on [`MeshRule`] because they must AND with — not OR
+/// against — the positive set. Placing them in the ORed `from` vec would let
+/// traffic through whenever a single negative-only entry "matched", which is
+/// the opposite of Istio's deny-listing intent (fail-open).
+///
+/// Every negative / IP field is **fail-closed** when the corresponding
+/// request attribute is absent: a non-empty list with no value to test
+/// fails the match rather than admitting traffic the operator meant to gate.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct SourceNegationMatch {
+    /// Istio `notPrincipals` — globs over the source SPIFFE ID. When any
+    /// matches, the source fails. Non-empty + no peer ⇒ fail-closed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_spiffe_id_patterns: Vec<String>,
+    /// Istio `notNamespaces` — globs over the source workload namespace
+    /// (extracted from the SPIFFE ID). When any matches, the source fails.
+    /// Non-empty + no namespace ⇒ fail-closed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_namespace_patterns: Vec<String>,
+    /// Istio `ipBlocks` — CIDR/IP allow-list over the direct connection peer
+    /// IP (`source.ip`). Non-empty ⇒ the source matches only when the peer
+    /// IP is inside one block. Non-empty + no source IP ⇒ fail-closed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ip_blocks: Vec<String>,
+    /// Istio `notIpBlocks` — negative match over the direct connection peer
+    /// IP. Inside any block ⇒ fail. Non-empty + no source IP ⇒ fail-closed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_ip_blocks: Vec<String>,
+    /// Istio `remoteIpBlocks` — CIDR/IP allow-list over the XFF-derived
+    /// remote client IP (`remote.ip`). Non-empty ⇒ the source matches only
+    /// when the remote IP is inside one block. Non-empty + no remote IP ⇒
+    /// fail-closed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remote_ip_blocks: Vec<String>,
+    /// Istio `notRemoteIpBlocks` — negative match over the XFF-derived
+    /// remote client IP. Inside any block ⇒ fail. Non-empty + no remote IP
+    /// ⇒ fail-closed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_remote_ip_blocks: Vec<String>,
+}
+
+impl SourceNegationMatch {
+    /// True when this matcher carries no constraints (the common case for a
+    /// source that only used positive `principals` / `namespaces`).
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.not_spiffe_id_patterns.is_empty()
+            && self.not_namespace_patterns.is_empty()
+            && self.ip_blocks.is_empty()
+            && self.not_ip_blocks.is_empty()
+            && self.remote_ip_blocks.is_empty()
+            && self.not_remote_ip_blocks.is_empty()
+    }
+}
+
+fn source_negation_is_empty(value: &SourceNegationMatch) -> bool {
+    value.is_empty()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]

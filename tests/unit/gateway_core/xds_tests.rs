@@ -75,6 +75,8 @@ fn mesh_config() -> MeshConfig {
                     to: Vec::new(),
                     when: Vec::new(),
                     request_principals: Vec::new(),
+                    not_request_principals: Vec::new(),
+                    source_negation: Default::default(),
                     never_matches: false,
                     action: PolicyAction::Allow,
                 }],
