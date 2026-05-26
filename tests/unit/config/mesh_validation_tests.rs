@@ -449,6 +449,30 @@ fn mesh_policy_rejects_malformed_ip_when_condition_values() {
 }
 
 #[test]
+fn mesh_policy_rejects_mapped_ipv6_when_condition_prefix_below_mapping_bits() {
+    let mut policy = policy_with_request_match(RequestMatch {
+        methods: vec!["GET".into()],
+        ..RequestMatch::default()
+    });
+    policy.rules[0].when.push(ConditionMatch {
+        key: "remote.ip".into(),
+        values: vec!["::ffff:10.0.0.0/95".into()],
+        not_values: Vec::new(),
+    });
+
+    let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], &[], None);
+    assert!(
+        errors.iter().any(|e| {
+            e.contains("rules[0].when[0].values[0]")
+                && e.contains("::ffff:10.0.0.0/95")
+                && e.contains("IPv4-mapped IPv6")
+        }),
+        "expected invalid mapped IPv6 condition error, got: {:?}",
+        errors
+    );
+}
+
+#[test]
 fn mesh_policy_rejects_host_pattern_with_empty_port() {
     let policy = policy_with_request_match(RequestMatch {
         hosts: vec!["example.com:".into()],

@@ -6,8 +6,8 @@ use ferrum_edge::config::types::{BackendScheme, Proxy};
 use ferrum_edge::identity::{SpiffeId, TrustDomain};
 use ferrum_edge::modes::mesh::MeshTrafficDirection;
 use ferrum_edge::modes::mesh::config::{
-    MeshConfig, MeshPolicy, MeshRule, PolicyAction, PolicyScope, PrincipalMatch, RequestMatch,
-    SourceNegationMatch, WorkloadSelector,
+    ConditionMatch, MeshConfig, MeshPolicy, MeshRule, PolicyAction, PolicyScope, PrincipalMatch,
+    RequestMatch, SourceNegationMatch, WorkloadSelector,
 };
 use ferrum_edge::modes::mesh::slice::MeshSlice;
 use ferrum_edge::plugins::mesh::authz::MeshAuthz;
@@ -216,6 +216,56 @@ fn mesh_authz_rejects_invalid_mesh_slice_source_ip_block() {
         "error should name field: {err}"
     );
     assert!(err.contains("not-a-cidr"), "error should name CIDR: {err}");
+}
+
+#[test]
+fn mesh_authz_rejects_unsupported_direct_when_key() {
+    let mut policy = allow_client_policy(PolicyAction::Deny);
+    policy.rules[0].when.push(ConditionMatch {
+        key: "destination.labels[app]".to_string(),
+        values: vec!["payments".to_string()],
+        not_values: Vec::new(),
+    });
+
+    let err = match MeshAuthz::new(&json!({
+        "mesh_policies": [policy],
+    })) {
+        Ok(_) => panic!("direct mesh_policies with unsupported when key must fail closed"),
+        Err(err) => err,
+    };
+
+    assert!(
+        err.contains("destination.labels[app]"),
+        "error should name unsupported key: {err}"
+    );
+    assert!(
+        err.contains("unsupported"),
+        "error should say unsupported: {err}"
+    );
+}
+
+#[test]
+fn mesh_authz_rejects_invalid_direct_when_ip_block() {
+    let mut policy = allow_client_policy(PolicyAction::Deny);
+    policy.rules[0].when.push(ConditionMatch {
+        key: "source.ip".to_string(),
+        values: vec!["10.0.0.0/40".to_string()],
+        not_values: Vec::new(),
+    });
+
+    let err = match MeshAuthz::new(&json!({
+        "mesh_policies": [policy],
+    })) {
+        Ok(_) => panic!("direct mesh_policies with malformed when source.ip must fail closed"),
+        Err(err) => err,
+    };
+
+    assert!(
+        err.contains("source.ip"),
+        "error should name condition: {err}"
+    );
+    assert!(err.contains("values"), "error should name field: {err}");
+    assert!(err.contains("10.0.0.0/40"), "error should name CIDR: {err}");
 }
 
 #[tokio::test]

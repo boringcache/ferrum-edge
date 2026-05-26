@@ -410,7 +410,14 @@ pub fn validate_mesh_condition_ip_block(cidr: &str) -> Result<(), String> {
                 .map_err(|_| format!("invalid prefix length in CIDR '{cidr}'"))?;
             let max = match ip {
                 IpAddr::V4(_) => 32,
-                IpAddr::V6(_) => 128,
+                IpAddr::V6(v6) => {
+                    if v6.to_ipv4_mapped().is_some() && prefix < 96 {
+                        return Err(format!(
+                            "IPv4-mapped IPv6 CIDR prefix {prefix} must be at least 96 in CIDR '{cidr}'"
+                        ));
+                    }
+                    128
+                }
             };
             if prefix > max {
                 return Err(format!(

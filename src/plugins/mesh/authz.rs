@@ -38,7 +38,9 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::identity::{SpiffeId, TrustDomain};
 use crate::modes::mesh::config::{
-    MeshPolicy, PolicyScope, normalize_request_match_host_pattern, policy_scope_applies_to_workload,
+    MeshPolicy, PolicyScope, is_mesh_condition_ip_key, is_supported_mesh_condition_key,
+    normalize_request_match_host_pattern, policy_scope_applies_to_workload,
+    validate_mesh_condition_ip_block,
 };
 use crate::modes::mesh::hbone::{BAGGAGE_HEADER, HboneIdentity};
 use crate::modes::mesh::policy::{
@@ -294,7 +296,7 @@ impl MeshAuthz {
             slice.labels = labels;
         }
 
-        validate_policy_source_ip_blocks(&slice.mesh_policies)?;
+        validate_policy_ip_inputs(&slice.mesh_policies)?;
 
         let per_pod_policy_scoping = config
             .get("per_pod_policy_scoping")
@@ -915,7 +917,7 @@ enum BaggageOutcome {
     NoBaggageOrNonHbone,
 }
 
-fn validate_policy_source_ip_blocks(policies: &[MeshPolicy]) -> Result<(), String> {
+fn validate_policy_ip_inputs(policies: &[MeshPolicy]) -> Result<(), String> {
     for policy in policies {
         for (rule_idx, rule) in policy.rules.iter().enumerate() {
             validate_source_ip_blocks(
@@ -942,6 +944,32 @@ fn validate_policy_source_ip_blocks(policies: &[MeshPolicy]) -> Result<(), Strin
                 "notRemoteIpBlocks",
                 &rule.source_negation.not_remote_ip_blocks,
             )?;
+            for (condition_idx, condition) in rule.when.iter().enumerate() {
+                if !is_supported_mesh_condition_key(&condition.key) {
+                    return Err(format!(
+                        "mesh_authz: unsupported condition key in policy '{}'/{} rule {} when {}: '{}'",
+                        policy.namespace, policy.name, rule_idx, condition_idx, condition.key
+                    ));
+                }
+                if is_mesh_condition_ip_key(&condition.key) {
+                    validate_condition_ip_blocks(
+                        policy,
+                        rule_idx,
+                        condition_idx,
+                        &condition.key,
+                        "values",
+                        &condition.values,
+                    )?;
+                    validate_condition_ip_blocks(
+                        policy,
+                        rule_idx,
+                        condition_idx,
+                        &condition.key,
+                        "notValues",
+                        &condition.not_values,
+                    )?;
+                }
+            }
         }
     }
     Ok(())
@@ -958,6 +986,25 @@ fn validate_source_ip_blocks(
             format!(
                 "mesh_authz: invalid source IP block in policy '{}'/{} rule {} field {}: '{}' is invalid: {}",
                 policy.namespace, policy.name, rule_idx, field, block, reason
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn validate_condition_ip_blocks(
+    policy: &MeshPolicy,
+    rule_idx: usize,
+    condition_idx: usize,
+    key: &str,
+    field: &str,
+    blocks: &[String],
+) -> Result<(), String> {
+    for block in blocks {
+        validate_mesh_condition_ip_block(block).map_err(|reason| {
+            format!(
+                "mesh_authz: invalid condition IP block in policy '{}'/{} rule {} when {} key '{}' field {}: '{}' is invalid: {}",
+                policy.namespace, policy.name, rule_idx, condition_idx, key, field, block, reason
             )
         })?;
     }

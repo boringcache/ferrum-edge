@@ -679,16 +679,17 @@ fn cidr_contains(cidr: &str, ip: IpAddr) -> bool {
     let Ok(network) = network_str.parse::<IpAddr>() else {
         return false;
     };
-    match (canonicalize_ip_for_match(network), ip) {
+    let Some((network, prefix)) = canonicalize_cidr_network_for_match(network, prefix) else {
+        return false;
+    };
+    match (network, ip) {
         (IpAddr::V4(net), IpAddr::V4(addr)) => {
-            let prefix = prefix.unwrap_or(32);
             if prefix > 32 {
                 return false;
             }
             matches_prefix_u32(u32::from(net), u32::from(addr), prefix)
         }
         (IpAddr::V6(net), IpAddr::V6(addr)) => {
-            let prefix = prefix.unwrap_or(128);
             if prefix > 128 {
                 return false;
             }
@@ -696,6 +697,27 @@ fn cidr_contains(cidr: &str, ip: IpAddr) -> bool {
         }
         // Family mismatch (after canonicalization) never matches.
         _ => false,
+    }
+}
+
+fn canonicalize_cidr_network_for_match(
+    network: IpAddr,
+    prefix: Option<u8>,
+) -> Option<(IpAddr, u8)> {
+    match network {
+        IpAddr::V4(v4) => Some((IpAddr::V4(v4), prefix.unwrap_or(32))),
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                let prefix = match prefix {
+                    Some(prefix) if prefix >= 96 => prefix - 96,
+                    Some(_) => return None,
+                    None => 32,
+                };
+                Some((IpAddr::V4(v4), prefix))
+            } else {
+                Some((IpAddr::V6(v6), prefix.unwrap_or(128)))
+            }
+        }
     }
 }
 
@@ -748,7 +770,14 @@ pub fn validate_source_ip_block(cidr: &str) -> Result<(), String> {
                 .map_err(|_| format!("invalid prefix length in CIDR '{cidr}'"))?;
             let max = match ip {
                 IpAddr::V4(_) => 32,
-                IpAddr::V6(_) => 128,
+                IpAddr::V6(v6) => {
+                    if v6.to_ipv4_mapped().is_some() && prefix < 96 {
+                        return Err(format!(
+                            "IPv4-mapped IPv6 CIDR prefix {prefix} must be at least 96 in CIDR '{cidr}'"
+                        ));
+                    }
+                    128
+                }
             };
             if prefix > max {
                 return Err(format!(
@@ -4081,6 +4110,15 @@ mod tests {
             "10.0.0.0/8",
             "::ffff:10.0.0.5".parse().unwrap()
         ));
+        // IPv4-mapped IPv6 CIDRs use their IPv4-equivalent prefix.
+        assert!(cidr_contains(
+            "::ffff:10.0.0.0/104",
+            "10.255.0.1".parse().unwrap()
+        ));
+        assert!(!cidr_contains(
+            "::ffff:10.0.0.0/104",
+            "11.0.0.1".parse().unwrap()
+        ));
         // Validation accepts surrounding whitespace; matching trims it too.
         assert!(cidr_contains(" 10.0.0.0/8 ", "10.1.2.3".parse().unwrap()));
         // IPv6 block.
@@ -4106,9 +4144,11 @@ mod tests {
         assert!(validate_source_ip_block("192.168.1.1").is_ok());
         assert!(validate_source_ip_block("2001:db8::/32").is_ok());
         assert!(validate_source_ip_block("::1").is_ok());
+        assert!(validate_source_ip_block("::ffff:10.0.0.0/104").is_ok());
         assert!(validate_source_ip_block("").is_err());
         assert!(validate_source_ip_block("10.0.0.0/40").is_err());
         assert!(validate_source_ip_block("2001:db8::/200").is_err());
+        assert!(validate_source_ip_block("::ffff:10.0.0.0/95").is_err());
         assert!(validate_source_ip_block("not-an-ip").is_err());
         assert!(validate_source_ip_block("10.0.0.0/abc").is_err());
     }
