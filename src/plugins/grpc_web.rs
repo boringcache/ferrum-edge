@@ -177,11 +177,15 @@ fn is_valid_trailer_value(value: &str) -> bool {
 /// - N bytes: trailer payload (HTTP header encoding: `key: value\r\n`)
 pub(crate) fn build_trailer_frame(response_headers: &HashMap<String, String>) -> Vec<u8> {
     let mut trailer_payload = Vec::new();
+    let mut has_grpc_status = false;
     for (key, value) in response_headers {
         // Include grpc-* trailers and any custom trailing metadata
         if let Some(header_name) = is_valid_trailer_header(key)
             && is_valid_trailer_value(value)
         {
+            if header_name.as_str() == "grpc-status" {
+                has_grpc_status = true;
+            }
             trailer_payload.extend_from_slice(header_name.as_str().as_bytes());
             trailer_payload.extend_from_slice(b": ");
             trailer_payload.extend_from_slice(value.as_bytes());
@@ -189,9 +193,11 @@ pub(crate) fn build_trailer_frame(response_headers: &HashMap<String, String>) ->
         }
     }
 
-    // If no trailers found, still emit a minimal frame with grpc-status: 0
-    if trailer_payload.is_empty() {
-        trailer_payload.extend_from_slice(b"grpc-status: 0\r\n");
+    // A backend response without a valid grpc-status is malformed. Native gRPC
+    // clients treat HTTP 200 without grpc-status as UNKNOWN; gRPC-Web must not
+    // silently report OK.
+    if !has_grpc_status {
+        trailer_payload.extend_from_slice(b"grpc-status: 2\r\n");
     }
 
     let len = trailer_payload.len() as u32;
