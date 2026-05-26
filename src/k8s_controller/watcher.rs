@@ -262,6 +262,37 @@ fn watch_scope_label(scope: Option<&str>) -> String {
     }
 }
 
+pub(crate) fn namespaces_with_istio_root(
+    namespaces: &[String],
+    istio_root_namespace: &str,
+) -> Vec<String> {
+    if namespaces.is_empty() {
+        return Vec::new();
+    }
+
+    let mut merged = namespaces.to_vec();
+    if !istio_root_namespace.is_empty()
+        && !merged
+            .iter()
+            .any(|namespace| namespace == istio_root_namespace)
+    {
+        merged.push(istio_root_namespace.to_string());
+    }
+    merged
+}
+
+fn crd_watch_namespaces(
+    crd: &CrdSpec,
+    namespaces: &[String],
+    istio_root_namespace: &str,
+) -> Vec<String> {
+    if crd.group.ends_with(".istio.io") {
+        namespaces_with_istio_root(namespaces, istio_root_namespace)
+    } else {
+        namespaces.to_vec()
+    }
+}
+
 fn build_apis_for_resource(
     client: &Client,
     ar: &ApiResource,
@@ -355,7 +386,10 @@ pub async fn start_crd_watchers(
             continue;
         };
 
-        for (api, ar, scope) in build_apis_for_resource(&client, &ar, &namespaces, crd.namespaced) {
+        let crd_namespaces = crd_watch_namespaces(crd, &namespaces, &istio_root_namespace);
+        for (api, ar, scope) in
+            build_apis_for_resource(&client, &ar, &crd_namespaces, crd.namespaced)
+        {
             if store_set
                 .lock()
                 .await
@@ -683,6 +717,50 @@ mod tests {
         assert_eq!(
             watch_scope_label(Some("prod")),
             "namespace:prod".to_string()
+        );
+    }
+
+    #[test]
+    fn istio_watch_namespaces_include_root_namespace_when_namespaced() {
+        assert_eq!(
+            namespaces_with_istio_root(&["default".to_string()], "istio-system"),
+            vec!["default".to_string(), "istio-system".to_string()]
+        );
+        assert_eq!(
+            namespaces_with_istio_root(
+                &["default".to_string(), "istio-system".to_string()],
+                "istio-system"
+            ),
+            vec!["default".to_string(), "istio-system".to_string()]
+        );
+    }
+
+    #[test]
+    fn istio_watch_namespaces_keep_cluster_wide_scope_when_unset() {
+        assert!(
+            namespaces_with_istio_root(&[], "istio-system").is_empty(),
+            "empty namespace list means Api::all and already includes root"
+        );
+    }
+
+    #[test]
+    fn crd_watch_namespaces_only_add_root_for_istio_crds() {
+        let authz = ISTIO_CRDS
+            .iter()
+            .find(|resource| resource.kind == "AuthorizationPolicy")
+            .expect("AuthorizationPolicy spec");
+        let http_route = GATEWAY_API_CRDS
+            .iter()
+            .find(|resource| resource.kind == "HTTPRoute")
+            .expect("HTTPRoute spec");
+
+        assert_eq!(
+            crd_watch_namespaces(authz, &["default".to_string()], "istio-system"),
+            vec!["default".to_string(), "istio-system".to_string()]
+        );
+        assert_eq!(
+            crd_watch_namespaces(http_route, &["default".to_string()], "istio-system"),
+            vec!["default".to_string()]
         );
     }
 
