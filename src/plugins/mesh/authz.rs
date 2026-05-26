@@ -410,6 +410,11 @@ impl MeshAuthz {
         {
             attributes.insert(ATTR_DESTINATION_PORT.to_string(), port.to_string().into());
         }
+        if keys.connection_sni
+            && let Some(sni) = ctx.frontend_sni_hostname.as_ref()
+        {
+            attributes.insert(ATTR_CONNECTION_SNI.to_string(), sni.clone().into());
+        }
         // `source.ip` / `remote.ip` as string `when:` attributes. `source.ip`
         // is the direct downstream peer, while `remote.ip` is the trusted
         // forwarded/original client IP when one was resolved.

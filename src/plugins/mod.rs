@@ -293,6 +293,9 @@ pub struct RequestContext {
     /// HTTP proxy resources do not carry `listen_port`, so mesh authorization
     /// uses this to evaluate Istio `to.ports` matches for HTTP traffic.
     pub frontend_listen_port: Option<u16>,
+    /// SNI hostname from the frontend TLS/QUIC handshake for HTTP-family
+    /// requests. Populated only when the downstream client supplied SNI.
+    pub frontend_sni_hostname: Option<String>,
     /// Raw HTTP headers from the request. Stored at init time and consumed by
     /// `materialize_headers()`. Core proxy lookups (IP resolution, host
     /// extraction) read from this directly via `raw_header_get()` to avoid
@@ -474,6 +477,7 @@ impl RequestContext {
             method,
             path,
             frontend_listen_port: None,
+            frontend_sni_hostname: None,
             raw_headers: None,
             headers: HashMap::new(),
             raw_query_string: None,
@@ -522,6 +526,7 @@ impl RequestContext {
             method: self.method.clone(),
             path: self.path.clone(),
             frontend_listen_port: self.frontend_listen_port,
+            frontend_sni_hostname: self.frontend_sni_hostname.clone(),
             raw_headers: None,
             headers: self.headers.clone(),
             raw_query_string: None,

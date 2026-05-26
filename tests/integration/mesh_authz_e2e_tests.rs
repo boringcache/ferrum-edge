@@ -377,6 +377,53 @@ async fn condition_match_on_request_header_enforces_match_and_no_match() {
 }
 
 #[tokio::test]
+async fn condition_match_on_connection_sni_enforces_match_and_no_match() {
+    let deny_sni = MeshPolicy {
+        name: "deny-admin-sni".to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        scope: PolicyScope::MeshWide,
+        rules: vec![MeshRule {
+            from: Vec::new(),
+            to: Vec::new(),
+            when: vec![ConditionMatch {
+                key: "connection.sni".to_string(),
+                values: vec!["admin.mesh.internal".to_string()],
+                not_values: Vec::new(),
+            }],
+            request_principals: Vec::new(),
+            not_request_principals: Vec::new(),
+            source_negation: Default::default(),
+            never_matches: false,
+            action: PolicyAction::Deny,
+        }],
+    };
+    let plugin = build_mesh_authz_for_workload(&[], vec![deny_sni]);
+
+    let mut matched_ctx = ctx_with_principal("GET", "/api", Some(CLIENT_SPIFFE));
+    matched_ctx.frontend_sni_hostname = Some("admin.mesh.internal".to_string());
+    assert!(
+        matches!(
+            plugin.authorize(&mut matched_ctx).await,
+            PluginResult::Reject { .. }
+        ),
+        "DENY policies gated on connection.sni must fire for HTTP TLS requests"
+    );
+
+    let mut other_ctx = ctx_with_principal("GET", "/api", Some(CLIENT_SPIFFE));
+    other_ctx.frontend_sni_hostname = Some("public.mesh.internal".to_string());
+    assert!(matches!(
+        plugin.authorize(&mut other_ctx).await,
+        PluginResult::Continue
+    ));
+
+    let mut missing_ctx = ctx_with_principal("GET", "/api", Some(CLIENT_SPIFFE));
+    assert!(matches!(
+        plugin.authorize(&mut missing_ctx).await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
 async fn condition_match_on_source_principal_uses_istio_format() {
     let deny_client = MeshPolicy {
         name: "deny-client-source-principal".to_string(),
