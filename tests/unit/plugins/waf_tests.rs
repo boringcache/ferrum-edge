@@ -1232,6 +1232,68 @@ async fn scoring_accumulates_across_query_and_body_phases() {
 }
 
 #[tokio::test]
+async fn on_body_too_large_block_rejects_when_enforcing() {
+    // Fail closed: an oversize body that can't be fully scanned is rejected
+    // rather than passed through unscanned.
+    let plugin = Waf::new(&json!({
+        "mode": "enforce",
+        "max_scan_bytes": 4,
+        "on_body_too_large": "block"
+    }))
+    .unwrap();
+    let mut ctx = ctx("POST", "/submit");
+    ctx.headers
+        .insert("content-type".into(), "application/json".into());
+    let headers = ctx.headers.clone();
+
+    let result = plugin
+        .on_final_request_body_with_context(
+            &mut ctx,
+            &headers,
+            b"this body is far larger than four bytes",
+        )
+        .await;
+
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert_eq!(
+        ctx.metadata.get("waf.block_reason").map(String::as_str),
+        Some("body_too_large")
+    );
+    assert_eq!(
+        ctx.metadata.get("waf.body_too_large").map(String::as_str),
+        Some("true")
+    );
+}
+
+#[tokio::test]
+async fn on_body_too_large_block_in_monitor_mode_does_not_reject() {
+    let plugin = Waf::new(&json!({
+        "mode": "monitor",
+        "max_scan_bytes": 4,
+        "on_body_too_large": "block"
+    }))
+    .unwrap();
+    let mut ctx = ctx("POST", "/submit");
+    ctx.headers
+        .insert("content-type".into(), "application/json".into());
+    let headers = ctx.headers.clone();
+
+    let result = plugin
+        .on_final_request_body_with_context(
+            &mut ctx,
+            &headers,
+            b"this body is far larger than four bytes",
+        )
+        .await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata.get("waf.body_too_large").map(String::as_str),
+        Some("true")
+    );
+}
+
+#[tokio::test]
 async fn per_rule_score_override_drives_blocking() {
     // A low-severity rule with an explicit high score blocks on its own.
     let plugin = Waf::new(&json!({

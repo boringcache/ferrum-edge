@@ -53,6 +53,7 @@ enum TimeoutAction {
 enum TooLargeAction {
     ScanTruncated,
     Skip,
+    Block,
 }
 
 #[derive(Debug)]
@@ -311,6 +312,25 @@ impl Waf {
         outcome
     }
 
+    /// Run a synchronous (header/query/path/response-header) scan under the
+    /// scan budget. The `RegexSet` pass cannot be interrupted, so the budget is
+    /// enforced post-hoc: an over-budget scan is flagged `timed_out` so
+    /// `on_scan_timeout` decides the outcome, matching the body-scan path.
+    fn run_cheap_with_budget<F>(&self, scan: F) -> ScanOutcome
+    where
+        F: FnOnce() -> ScanOutcome,
+    {
+        if self.config.scan_budget_ms == 0 {
+            return scan();
+        }
+        let start = std::time::Instant::now();
+        let mut outcome = scan();
+        if start.elapsed() >= Duration::from_millis(self.config.scan_budget_ms) {
+            outcome.timed_out = true;
+        }
+        outcome
+    }
+
     fn finish_scan(&self, ctx: &mut RequestContext, outcome: ScanOutcome) -> PluginResult {
         if outcome.hits.is_empty() {
             if outcome.truncated && self.config.log_to_metadata {
@@ -329,18 +349,59 @@ impl Waf {
         }
 
         if should_block {
-            let mut headers = HashMap::new();
-            headers.insert(
-                "content-type".to_string(),
-                self.config.reject_content_type.clone(),
-            );
-            PluginResult::Reject {
-                status_code: self.config.reject_status_code,
-                body: self.config.reject_body.clone(),
-                headers,
-            }
+            self.reject()
         } else {
             PluginResult::Continue
+        }
+    }
+
+    /// Build the configured rejection response (status, content-type, body).
+    fn reject(&self) -> PluginResult {
+        PluginResult::Reject {
+            status_code: self.config.reject_status_code,
+            body: self.config.reject_body.clone(),
+            headers: HashMap::from([(
+                "content-type".to_string(),
+                self.config.reject_content_type.clone(),
+            )]),
+        }
+    }
+
+    /// Decide how to handle a body larger than `max_scan_bytes`. Returns the
+    /// (possibly truncated) slice to scan and a `truncated` flag, or a
+    /// short-circuit result: `Skip` → continue unscanned; `Block` → reject when
+    /// enforcing (fail closed), else scan the prefix and flag it.
+    fn clamp_body<'a>(
+        &self,
+        ctx: &mut RequestContext,
+        body: &'a [u8],
+    ) -> Result<(&'a [u8], bool), PluginResult> {
+        if body.len() <= self.config.max_scan_bytes {
+            return Ok((body, false));
+        }
+        match self.config.on_body_too_large {
+            TooLargeAction::ScanTruncated => Ok((&body[..self.config.max_scan_bytes], true)),
+            TooLargeAction::Skip => Err(PluginResult::Continue),
+            TooLargeAction::Block => {
+                if self.config.log_to_metadata {
+                    ctx.metadata
+                        .insert("waf.body_too_large".to_string(), "true".to_string());
+                }
+                if self.config.mode == GlobalMode::Enforce {
+                    if self.config.log_to_metadata {
+                        ctx.metadata
+                            .insert("waf.action".to_string(), "blocked".to_string());
+                        ctx.metadata
+                            .entry("waf.block_reason".to_string())
+                            .or_insert_with(|| "body_too_large".to_string());
+                    }
+                    Err(self.reject())
+                } else {
+                    // Cannot block in monitor mode; scan the prefix instead so
+                    // the oversize body still produces signal.
+                    Ok((&body[..self.config.max_scan_bytes], true))
+                }
+            }
         }
     }
 
@@ -462,14 +523,7 @@ impl Waf {
         }
         match self.config.on_scan_timeout {
             TimeoutAction::Allow | TimeoutAction::LogAndAllow => PluginResult::Continue,
-            TimeoutAction::Block => PluginResult::Reject {
-                status_code: self.config.reject_status_code,
-                body: self.config.reject_body.clone(),
-                headers: HashMap::from([(
-                    "content-type".to_string(),
-                    self.config.reject_content_type.clone(),
-                )]),
-            },
+            TimeoutAction::Block => self.reject(),
         }
     }
 
@@ -526,7 +580,7 @@ impl Plugin for Waf {
         if self.request_is_exempt(ctx) {
             return PluginResult::Continue;
         }
-        let outcome = self.run_cheap_scan(ctx);
+        let outcome = self.run_cheap_with_budget(|| self.run_cheap_scan(ctx));
         self.finish_scan(ctx, outcome)
     }
 
@@ -585,17 +639,9 @@ impl Plugin for Waf {
         {
             return PluginResult::Continue;
         }
-        let mut truncated = false;
-        let body = if body.len() > self.config.max_scan_bytes {
-            match self.config.on_body_too_large {
-                TooLargeAction::Skip => return PluginResult::Continue,
-                TooLargeAction::ScanTruncated => {
-                    truncated = true;
-                    &body[..self.config.max_scan_bytes]
-                }
-            }
-        } else {
-            body
+        let (body, truncated) = match self.clamp_body(ctx, body) {
+            Ok(value) => value,
+            Err(result) => return result,
         };
         let mut outcome = self
             .run_body_scan_with_budget(|| self.run_request_body_scan(ctx, body))
@@ -617,7 +663,8 @@ impl Plugin for Waf {
         {
             return PluginResult::Continue;
         }
-        let outcome = self.run_response_header_scan(ctx, response_headers);
+        let outcome =
+            self.run_cheap_with_budget(|| self.run_response_header_scan(ctx, response_headers));
         self.finish_scan(ctx, outcome)
     }
 
@@ -649,17 +696,9 @@ impl Plugin for Waf {
         ) {
             return PluginResult::Continue;
         }
-        let mut truncated = false;
-        let body = if body.len() > self.config.max_scan_bytes {
-            match self.config.on_body_too_large {
-                TooLargeAction::Skip => return PluginResult::Continue,
-                TooLargeAction::ScanTruncated => {
-                    truncated = true;
-                    &body[..self.config.max_scan_bytes]
-                }
-            }
-        } else {
-            body
+        let (body, truncated) = match self.clamp_body(ctx, body) {
+            Ok(value) => value,
+            Err(result) => return result,
         };
         let mut outcome = self
             .run_body_scan_with_budget(|| self.run_response_body_scan(ctx, body))
@@ -732,8 +771,9 @@ fn parse_too_large_action(raw: &str) -> Result<TooLargeAction, String> {
     match raw {
         "scan_truncated" => Ok(TooLargeAction::ScanTruncated),
         "skip" => Ok(TooLargeAction::Skip),
+        "block" => Ok(TooLargeAction::Block),
         other => Err(format!(
-            "waf: 'on_body_too_large' must be scan_truncated or skip; got {other:?}"
+            "waf: 'on_body_too_large' must be scan_truncated, skip, or block; got {other:?}"
         )),
     }
 }
@@ -1007,5 +1047,25 @@ mod tests {
             ctx.metadata.get("waf.action").map(String::as_str),
             Some("blocked")
         );
+    }
+
+    #[test]
+    fn cheap_scan_budget_flags_timeout() {
+        let plugin = Waf::new(&json!({ "scan_budget_ms": 1 })).unwrap();
+        let outcome = plugin.run_cheap_with_budget(|| {
+            std::thread::sleep(Duration::from_millis(5));
+            ScanOutcome::default()
+        });
+        assert!(outcome.timed_out);
+    }
+
+    #[test]
+    fn cheap_scan_budget_zero_never_times_out() {
+        let plugin = Waf::new(&json!({ "scan_budget_ms": 0 })).unwrap();
+        let outcome = plugin.run_cheap_with_budget(|| {
+            std::thread::sleep(Duration::from_millis(2));
+            ScanOutcome::default()
+        });
+        assert!(!outcome.timed_out);
     }
 }

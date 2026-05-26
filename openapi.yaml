@@ -10922,8 +10922,12 @@ components:
           default: log_and_allow
         on_body_too_large:
           type: string
-          enum: [scan_truncated, skip]
+          enum: [scan_truncated, skip, block]
           default: scan_truncated
+          description: >-
+            Behavior when a body exceeds max_scan_bytes. scan_truncated scans
+            the prefix; skip scans nothing; block rejects (fail closed) when
+            mode is enforce, otherwise scans the prefix.
         include_default_rules:
           type: boolean
           default: true
