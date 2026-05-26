@@ -59,7 +59,7 @@ use tracing::{debug, info, warn};
 
 use crate::grpc::dp_client::{DpGrpcTlsConfig, GrpcJwtSecret};
 use crate::identity::TrustDomain;
-use crate::modes::mesh::config::{MeshService, MultiClusterConfig, Workload};
+use crate::modes::mesh::config::{AppProtocol, MeshService, MultiClusterConfig, Workload};
 
 /// Backoff bounds shared with [`super::federation`] and
 /// `src/grpc/dp_client.rs`. One cross-cluster backoff curve for operators to
@@ -166,10 +166,8 @@ impl RemoteEndpointStore {
         self.revision_tx.send_modify(|revision| *revision += 1);
     }
 
-    /// Remove a remote cluster's endpoints (slice no longer lists it). No-op if
-    /// untracked. Reserved for a reconcile pass; the poller spawns once at
-    /// startup today.
-    #[allow(dead_code)]
+    /// Remove a remote cluster's endpoints (slice no longer lists it or trust was
+    /// withdrawn). No-op if untracked.
     pub fn remove(&self, cluster_name: &str) {
         let mut changed = false;
         self.inner.rcu(|current| {
@@ -214,10 +212,10 @@ fn default_remote_locality(cluster_name: &str, network: Option<&str>) -> String 
 ///
 /// - `cluster` is stamped so introspection / metrics can attribute the target.
 /// - `network` is preserved (multi-network routing).
-/// - `locality` is preserved when the remote workload already declares one
-///   (its real region differs from local, so it naturally tiers below); when
-///   absent, a synthetic `remote-<cluster>` locality is applied so the workload
-///   never accidentally lands in the local source-region tier.
+/// - `locality` is always rewritten to a synthetic `remote-<cluster>` locality.
+///   A remote CP can legitimately report the same region/zone strings as the
+///   local cluster, but remote endpoints must stay below the local priority tier
+///   until local endpoints are exhausted.
 ///
 /// Workloads are NOT renamed or re-keyed: a remote workload keeps its SPIFFE
 /// id, service_name, addresses, and ports so [`MeshServiceDiscoverer`] resolves
@@ -237,15 +235,56 @@ fn tag_remote_workloads(
         {
             workload.network = Some(network.to_string());
         }
-        if workload
-            .locality
-            .as_deref()
-            .map(str::trim)
-            .is_none_or(str::is_empty)
-        {
-            workload.locality = Some(default_remote_locality(cluster_name, network));
-        }
+        workload.locality = Some(default_remote_locality(cluster_name, network));
     }
+}
+
+fn workload_endpoint_key(workload: &Workload) -> WorkloadEndpointKey {
+    let mut addresses = workload.addresses.clone();
+    addresses.sort();
+    let mut ports: Vec<(u16, AppProtocol, Option<String>)> = workload
+        .ports
+        .iter()
+        .map(|port| (port.port, port.protocol, port.name.clone()))
+        .collect();
+    ports.sort_by(|left, right| {
+        (left.0, app_protocol_sort_key(left.1), left.2.as_deref()).cmp(&(
+            right.0,
+            app_protocol_sort_key(right.1),
+            right.2.as_deref(),
+        ))
+    });
+    WorkloadEndpointKey {
+        spiffe_id: workload.spiffe_id.as_str().to_string(),
+        namespace: workload.namespace.clone(),
+        service_name: workload.service_name.clone(),
+        addresses,
+        ports,
+    }
+}
+
+fn app_protocol_sort_key(protocol: AppProtocol) -> u8 {
+    match protocol {
+        AppProtocol::Http => 0,
+        AppProtocol::Http2 => 1,
+        AppProtocol::Grpc => 2,
+        AppProtocol::Tcp => 3,
+        AppProtocol::Tls => 4,
+        AppProtocol::Mongo => 5,
+        AppProtocol::Redis => 6,
+        AppProtocol::Mysql => 7,
+        AppProtocol::Postgres => 8,
+        AppProtocol::Unknown => 9,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct WorkloadEndpointKey {
+    spiffe_id: String,
+    namespace: String,
+    service_name: String,
+    addresses: Vec<String>,
+    ports: Vec<(u16, AppProtocol, Option<String>)>,
 }
 
 /// Merge the remote-endpoint snapshot into a slice's local `workloads` /
@@ -254,10 +293,10 @@ fn tag_remote_workloads(
 /// and remote endpoints for a service.
 ///
 /// Merge rules:
-/// - Remote workloads are appended after local ones. A remote workload whose
-///   SPIFFE id already exists locally is skipped (the local copy wins — a
-///   workload physically present locally must not be shadowed by a stale remote
-///   echo of itself).
+/// - Remote workloads are appended after local ones. Exact endpoint duplicates
+///   are skipped, but workloads with the same SPIFFE ID and different addresses
+///   are retained; multi-cluster services can legitimately expose replicas with
+///   the same service account identity in multiple clusters.
 /// - Remote services are merged by `(namespace, name)`: a service the local
 ///   cluster already advertises keeps the local definition (ports / overrides);
 ///   only the remote `workloads` refs are unioned in so the local service can
@@ -276,10 +315,8 @@ pub fn merge_remote_endpoints_into_mesh(
     }
 
     let mut workloads = local_workloads.to_vec();
-    let mut seen_spiffe: std::collections::HashSet<String> = workloads
-        .iter()
-        .map(|w| w.spiffe_id.as_str().to_string())
-        .collect();
+    let mut seen_workloads: std::collections::HashSet<WorkloadEndpointKey> =
+        workloads.iter().map(workload_endpoint_key).collect();
 
     let mut services = local_services.to_vec();
     // Index local services by (namespace, name) for ref-union.
@@ -299,7 +336,7 @@ pub fn merge_remote_endpoints_into_mesh(
             continue;
         };
         for workload in &entry.endpoints.workloads {
-            if seen_spiffe.insert(workload.spiffe_id.as_str().to_string()) {
+            if seen_workloads.insert(workload_endpoint_key(workload)) {
                 workloads.push(workload.clone());
             }
         }
@@ -330,11 +367,176 @@ pub fn merge_remote_endpoints_into_mesh(
 }
 
 /// Per-cluster poll target derived from a [`MultiClusterConfig`].
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct RemoteClusterPollTarget {
     cluster_name: String,
     trust_domain: TrustDomain,
     network: Option<String>,
     control_plane_url: String,
+}
+
+struct RunningRemoteDiscovery {
+    target: RemoteClusterPollTarget,
+    shutdown_tx: watch::Sender<bool>,
+    handle: JoinHandle<()>,
+}
+
+type RemoteSourceFactory =
+    Arc<dyn Fn(&RemoteClusterPollContext) -> Arc<dyn RemoteServiceSource> + Send + Sync>;
+
+/// Manager that reconciles remote-cluster discovery tasks against the latest
+/// mesh slice and trust-bundle state.
+pub struct RemoteDiscoveryManager {
+    config: Option<RemoteDiscoveryConfig>,
+    store: RemoteEndpointStore,
+    source_factory: RemoteSourceFactory,
+    running: HashMap<String, RunningRemoteDiscovery>,
+}
+
+impl RemoteDiscoveryManager {
+    pub fn new<F>(
+        config: Option<RemoteDiscoveryConfig>,
+        store: RemoteEndpointStore,
+        source_factory: F,
+    ) -> Self
+    where
+        F: Fn(&RemoteClusterPollContext) -> Arc<dyn RemoteServiceSource> + Send + Sync + 'static,
+    {
+        Self {
+            config,
+            store,
+            source_factory: Arc::new(source_factory),
+            running: HashMap::new(),
+        }
+    }
+
+    /// Start/stop per-cluster pollers to match the latest slice and trust state.
+    /// Removing an ineligible cluster also removes its last-good endpoints so a
+    /// stale snapshot cannot keep serving a cluster after trust or config is
+    /// withdrawn.
+    pub fn reconcile(
+        &mut self,
+        multi_cluster: Option<&MultiClusterConfig>,
+        trust_bundle_domains: std::collections::HashSet<TrustDomain>,
+    ) {
+        let (Some(config), Some(multi_cluster)) = (self.config.clone(), multi_cluster) else {
+            self.stop_all(true);
+            return;
+        };
+        let targets = poll_targets_for_multi_cluster(multi_cluster, &trust_bundle_domains);
+        if targets.is_empty() {
+            self.stop_all(true);
+            debug!("No remote clusters eligible for endpoint discovery; pollers stopped");
+            return;
+        }
+
+        let targets_by_name: HashMap<String, RemoteClusterPollTarget> = targets
+            .into_iter()
+            .map(|target| (target.cluster_name.clone(), target))
+            .collect();
+
+        let stale: Vec<String> = self
+            .running
+            .iter()
+            .filter_map(|(name, running)| {
+                let desired = targets_by_name.get(name)?;
+                (&running.target != desired).then(|| name.clone())
+            })
+            .collect();
+        let removed: Vec<String> = self
+            .running
+            .keys()
+            .filter(|name| !targets_by_name.contains_key(*name))
+            .cloned()
+            .collect();
+        for name in stale.into_iter().chain(removed) {
+            self.stop_cluster(&name, true);
+        }
+
+        for target in targets_by_name.into_values() {
+            if !self.running.contains_key(&target.cluster_name) {
+                self.start_cluster(target, config.clone());
+            }
+        }
+    }
+
+    pub fn shutdown(&mut self) {
+        self.stop_all(false);
+    }
+
+    #[cfg(test)]
+    fn running_cluster_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.running.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    fn start_cluster(&mut self, target: RemoteClusterPollTarget, config: RemoteDiscoveryConfig) {
+        let ctx = RemoteClusterPollContext {
+            cluster_name: target.cluster_name.clone(),
+            trust_domain: target.trust_domain.clone(),
+            network: target.network.clone(),
+            control_plane_url: target.control_plane_url.clone(),
+            config,
+        };
+        let source = (self.source_factory)(&ctx);
+        let task_store = self.store.clone();
+        let (cluster_shutdown_tx, cluster_shutdown_rx) = watch::channel(false);
+        let url_for_logs = sanitize_url_for_logging(&target.control_plane_url);
+        info!(
+            cluster = %target.cluster_name,
+            trust_domain = %target.trust_domain,
+            control_plane = %url_for_logs,
+            poll_interval_seconds = ctx.config.poll_interval.as_secs(),
+            "Spawning remote-cluster endpoint discovery"
+        );
+        let handle = tokio::spawn(async move {
+            remote_discovery_loop(ctx, source, task_store, cluster_shutdown_rx).await;
+        });
+        self.running.insert(
+            target.cluster_name.clone(),
+            RunningRemoteDiscovery {
+                target,
+                shutdown_tx: cluster_shutdown_tx,
+                handle,
+            },
+        );
+    }
+
+    fn stop_cluster(&mut self, cluster_name: &str, remove_endpoints: bool) {
+        if let Some(running) = self.running.remove(cluster_name) {
+            let _ = running.shutdown_tx.send(true);
+            running.handle.abort();
+            if remove_endpoints {
+                self.store.remove(cluster_name);
+            }
+        }
+    }
+
+    fn stop_all(&mut self, remove_endpoints: bool) {
+        let names: Vec<String> = self.running.keys().cloned().collect();
+        for name in names {
+            self.stop_cluster(&name, remove_endpoints);
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct RemoteDiscoveryTlsConfig {
+    pub tls_urls: Option<DpGrpcTlsConfig>,
+    pub plain_urls: Option<DpGrpcTlsConfig>,
+}
+
+impl RemoteDiscoveryTlsConfig {
+    fn for_control_plane_url(&self, url: &str) -> Option<DpGrpcTlsConfig> {
+        match reqwest::Url::parse(url)
+            .ok()
+            .map(|parsed| parsed.scheme().to_string())
+        {
+            Some(scheme) if scheme == "https" => self.tls_urls.clone(),
+            _ => self.plain_urls.clone(),
+        }
+    }
 }
 
 /// Knobs derived from `EnvConfig`. Not `Debug` because `DpGrpcTlsConfig`
@@ -350,9 +552,9 @@ pub struct RemoteDiscoveryConfig {
     pub node_id: String,
     /// Namespace scope requested from the remote CP.
     pub namespace: String,
-    /// Optional DP gRPC client TLS for the remote CP channel. `None` =
-    /// plaintext (only acceptable for loopback / test CPs).
-    pub tls_config: Option<DpGrpcTlsConfig>,
+    /// Optional DP gRPC client TLS material, split by remote CP URL scheme so an
+    /// HTTPS remote is not affected by the local CP URL scheme.
+    pub tls_config: RemoteDiscoveryTlsConfig,
 }
 
 impl RemoteDiscoveryConfig {
@@ -364,7 +566,7 @@ impl RemoteDiscoveryConfig {
         jwt_secret: Option<GrpcJwtSecret>,
         node_id: String,
         namespace: String,
-        tls_config: Option<DpGrpcTlsConfig>,
+        tls_config: RemoteDiscoveryTlsConfig,
     ) -> Option<Self> {
         if interval_seconds == 0 {
             return None;
@@ -378,11 +580,6 @@ impl RemoteDiscoveryConfig {
             tls_config,
         })
     }
-}
-
-/// Holds spawned task handles so callers can join during graceful shutdown.
-pub struct RemoteDiscoveryHandles {
-    pub tasks: Vec<JoinHandle<()>>,
 }
 
 /// Resolve the poll-target list from a [`MultiClusterConfig`].
@@ -502,57 +699,6 @@ pub fn trust_domains_from_bundles(
         domains.insert(td.clone());
     }
     domains
-}
-
-/// Spawn the remote-cluster discovery poller. Returns `None` when discovery is
-/// disabled or there are no eligible remote clusters.
-///
-/// `source_factory` builds a [`RemoteServiceSource`] per target. Production
-/// passes [`native_source_factory`]; tests pass a closure returning a mock.
-pub fn spawn_remote_cluster_discovery<F>(
-    multi_cluster: Option<&MultiClusterConfig>,
-    config: Option<RemoteDiscoveryConfig>,
-    trust_bundle_domains: std::collections::HashSet<TrustDomain>,
-    store: RemoteEndpointStore,
-    shutdown_rx: watch::Receiver<bool>,
-    source_factory: F,
-) -> Option<RemoteDiscoveryHandles>
-where
-    F: Fn(&RemoteClusterPollContext) -> Arc<dyn RemoteServiceSource>,
-{
-    let config = config?;
-    let multi_cluster = multi_cluster?;
-    let targets = poll_targets_for_multi_cluster(multi_cluster, &trust_bundle_domains);
-    if targets.is_empty() {
-        debug!("No remote clusters eligible for endpoint discovery; poller disabled");
-        return None;
-    }
-    let mut tasks = Vec::with_capacity(targets.len());
-    for target in targets {
-        let ctx = RemoteClusterPollContext {
-            cluster_name: target.cluster_name.clone(),
-            trust_domain: target.trust_domain.clone(),
-            network: target.network.clone(),
-            control_plane_url: target.control_plane_url.clone(),
-            config: config.clone(),
-        };
-        let source = source_factory(&ctx);
-        let task_store = store.clone();
-        let task_shutdown = shutdown_rx.clone();
-        let url_for_logs = sanitize_url_for_logging(&target.control_plane_url);
-        info!(
-            cluster = %target.cluster_name,
-            trust_domain = %target.trust_domain,
-            control_plane = %url_for_logs,
-            poll_interval_seconds = config.poll_interval.as_secs(),
-            "Spawning remote-cluster endpoint discovery"
-        );
-        let handle = tokio::spawn(async move {
-            remote_discovery_loop(ctx, source, task_store, task_shutdown).await;
-        });
-        tasks.push(handle);
-    }
-    Some(RemoteDiscoveryHandles { tasks })
 }
 
 /// Context passed to the source factory and the poll loop.
@@ -721,7 +867,10 @@ impl NativeRemoteSource {
             node_id: ctx.config.node_id.clone(),
             namespace: ctx.config.namespace.clone(),
             jwt_secret,
-            tls_config: ctx.config.tls_config.clone(),
+            tls_config: ctx
+                .config
+                .tls_config
+                .for_control_plane_url(&ctx.control_plane_url),
             request_timeout: ctx.config.request_timeout,
         }
     }
@@ -957,18 +1106,17 @@ mod tests {
             services: vec![],
         };
         tag_remote_workloads(&mut endpoints, "west", Some("net2"));
-        // Workload without locality gets the synthetic remote locality.
+        // Remote workloads always get the synthetic remote locality, even when
+        // the remote CP supplied a real locality that could collide with local.
         assert_eq!(
             endpoints.workloads[0].locality.as_deref(),
             Some("remote-west/net2")
         );
         assert_eq!(endpoints.workloads[0].cluster.as_deref(), Some("west"));
         assert_eq!(endpoints.workloads[0].network.as_deref(), Some("net2"));
-        // Workload with its own locality keeps it (its real region tiers below
-        // local already).
         assert_eq!(
             endpoints.workloads[1].locality.as_deref(),
-            Some("us-west-2/zone-c")
+            Some("remote-west/net2")
         );
     }
 
@@ -1009,9 +1157,9 @@ mod tests {
     }
 
     #[test]
-    fn merge_skips_remote_workload_already_present_locally() {
-        // A remote echo of a workload that physically exists locally must not
-        // duplicate the target (local copy wins).
+    fn merge_keeps_same_spiffe_remote_workload_with_distinct_endpoint() {
+        // The same service account identity can legitimately appear in multiple
+        // clusters. Only exact endpoint duplicates are collapsed.
         let local = vec![workload(
             "spiffe://cluster.local/ns/default/sa/shared",
             "reviews",
@@ -1029,8 +1177,31 @@ mod tests {
         };
         let snapshot = snapshot_with("west", remote);
         let (workloads, _) = merge_remote_endpoints_into_mesh(&local, &[], &snapshot);
-        assert_eq!(workloads.len(), 1);
+        assert_eq!(workloads.len(), 2);
         assert_eq!(workloads[0].addresses, vec!["10.1.0.1".to_string()]);
+        assert_eq!(workloads[1].addresses, vec!["10.9.9.9".to_string()]);
+    }
+
+    #[test]
+    fn merge_skips_exact_remote_workload_duplicate() {
+        let local = vec![workload(
+            "spiffe://cluster.local/ns/default/sa/shared",
+            "reviews",
+            "10.1.0.1",
+            None,
+        )];
+        let remote = RemoteClusterEndpoints {
+            workloads: vec![workload(
+                "spiffe://cluster.local/ns/default/sa/shared",
+                "reviews",
+                "10.1.0.1",
+                None,
+            )],
+            services: vec![],
+        };
+        let snapshot = snapshot_with("west", remote);
+        let (workloads, _) = merge_remote_endpoints_into_mesh(&local, &[], &snapshot);
+        assert_eq!(workloads.len(), 1);
     }
 
     #[test]
@@ -1114,6 +1285,63 @@ mod tests {
         assert_eq!(targets[0].cluster_name, "trusted");
     }
 
+    #[tokio::test]
+    async fn manager_reconciles_trust_changes_and_removes_stale_endpoints() {
+        let store = RemoteEndpointStore::new();
+        let config = RemoteDiscoveryConfig {
+            poll_interval: Duration::from_secs(60),
+            request_timeout: Duration::from_secs(1),
+            jwt_secret: None,
+            node_id: "dp-1".to_string(),
+            namespace: "default".to_string(),
+            tls_config: RemoteDiscoveryTlsConfig::default(),
+        };
+        let mut manager = RemoteDiscoveryManager::new(Some(config), store.clone(), |ctx| {
+            Arc::new(MissingSecretSource {
+                cluster_name: ctx.cluster_name.clone(),
+            })
+        });
+        let mc = MultiClusterConfig {
+            remote_clusters: vec![RemoteCluster {
+                name: "west".to_string(),
+                trust_domain: td("remote.local"),
+                network: None,
+                control_plane_url: Some("https://cp.remote.example:15010".to_string()),
+                federation_endpoint: None,
+            }],
+            ..MultiClusterConfig::default()
+        };
+        let mut trusted = std::collections::HashSet::new();
+        trusted.insert(td("remote.local"));
+
+        manager.reconcile(Some(&mc), trusted);
+        assert_eq!(manager.running_cluster_names(), vec!["west"]);
+        store.install(RemoteClusterEntry {
+            cluster_name: "west".to_string(),
+            trust_domain: td("remote.local"),
+            network: None,
+            endpoints: RemoteClusterEndpoints {
+                workloads: vec![workload(
+                    "spiffe://remote.local/ns/default/sa/a",
+                    "reviews",
+                    "10.2.0.1",
+                    None,
+                )],
+                services: vec![],
+            },
+            fetched_at_unix_seconds: 1,
+        });
+        assert!(!store.snapshot().is_empty());
+
+        manager.reconcile(Some(&mc), std::collections::HashSet::new());
+        assert!(manager.running_cluster_names().is_empty());
+        assert!(
+            store.snapshot().is_empty(),
+            "trust withdrawal removes stale remote endpoints"
+        );
+        manager.shutdown();
+    }
+
     #[test]
     fn validate_control_plane_url_rejects_metadata_and_bad_scheme() {
         assert!(validate_control_plane_url("https://cp.example:15010").is_ok());
@@ -1121,6 +1349,47 @@ mod tests {
         assert!(validate_control_plane_url("ftp://cp.example").is_err());
         assert!(validate_control_plane_url("https://169.254.169.254/").is_err());
         assert!(validate_control_plane_url("not a url").is_err());
+    }
+
+    #[test]
+    fn native_source_tls_selection_follows_remote_url_scheme() {
+        let config = RemoteDiscoveryConfig {
+            poll_interval: Duration::from_secs(60),
+            request_timeout: Duration::from_secs(1),
+            jwt_secret: None,
+            node_id: "dp-1".to_string(),
+            namespace: "default".to_string(),
+            tls_config: RemoteDiscoveryTlsConfig {
+                tls_urls: Some(DpGrpcTlsConfig {
+                    no_verify: true,
+                    ..DpGrpcTlsConfig::default()
+                }),
+                plain_urls: None,
+            },
+        };
+        let https_ctx = RemoteClusterPollContext {
+            cluster_name: "west".to_string(),
+            trust_domain: td("remote.local"),
+            network: None,
+            control_plane_url: "https://cp.remote.example:15010".to_string(),
+            config: config.clone(),
+        };
+        let http_ctx = RemoteClusterPollContext {
+            control_plane_url: "http://cp.remote.example:15010".to_string(),
+            ..https_ctx.clone()
+        };
+
+        let secret = GrpcJwtSecret::new("secret-padding-for-32-char-min!!".to_string());
+        assert!(
+            NativeRemoteSource::new(&https_ctx, secret.clone())
+                .tls_config
+                .is_some()
+        );
+        assert!(
+            NativeRemoteSource::new(&http_ctx, secret)
+                .tls_config
+                .is_none()
+        );
     }
 
     struct MockSource {
@@ -1171,7 +1440,7 @@ mod tests {
                 jwt_secret: None,
                 node_id: "dp-1".to_string(),
                 namespace: "default".to_string(),
-                tls_config: None,
+                tls_config: RemoteDiscoveryTlsConfig::default(),
             },
         };
 

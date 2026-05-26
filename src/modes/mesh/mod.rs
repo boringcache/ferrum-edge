@@ -3525,30 +3525,25 @@ async fn serve_mesh_runtime(
         info!("SPIFFE trust-bundle federation poller running");
     }
 
-    // Spawn cross-cluster endpoint discovery (Tier 3b). Each
-    // `RemoteCluster.control_plane_url` is dialed to fetch remote service
-    // endpoints, which are merged into the local mesh registry at slice apply
-    // (tagged with remote locality) so locality-aware priority LB fails over
-    // local → remote. Gated on `FERRUM_MESH_REMOTE_DISCOVERY_POLL_INTERVAL_SECONDS`
-    // (default `0` = disabled) and fail-closed on trust: a remote cluster is
-    // only dialed when a federated trust bundle for its trust domain exists.
-    // Reuse the CP↔DP gRPC secret + DP gRPC client TLS to authenticate to the
-    // remote control plane (built locally here from env so the discovery poller
-    // does not depend on the native-client construction scope). `None` secret
-    // leaves discovery's source factory emitting a clear "no secret" error per
-    // poll rather than dialing unauthenticated.
+    // Spawn cross-cluster endpoint discovery (Tier 3b). A reconciler watches
+    // slice + federation updates and keeps one poller per currently eligible
+    // `RemoteCluster.control_plane_url`. This is fail-closed on trust: a remote
+    // cluster is only dialed while a federated trust bundle for its trust domain
+    // exists, and stale endpoints are removed when config or trust withdraws.
     let remote_grpc_secret = env_config.cp_dp_grpc_jwt_secret.clone().map(|secret| {
         crate::grpc::dp_client::GrpcJwtSecret::with_issuer(
             secret,
             env_config.cp_dp_grpc_jwt_issuer.clone(),
         )
     });
-    let remote_grpc_tls = crate::grpc::dp_client::build_dp_grpc_tls_config(
-        &env_config,
-        &runtime.cp_urls,
-        "MeshRemoteDiscovery",
-    )
-    .unwrap_or(None);
+    let remote_grpc_tls = multicluster::RemoteDiscoveryTlsConfig {
+        tls_urls: build_dp_grpc_tls_config(
+            &env_config,
+            &["https://remote-control-plane.invalid".to_string()],
+            "MeshRemoteDiscovery",
+        )?,
+        plain_urls: build_dp_grpc_tls_config(&env_config, &[], "MeshRemoteDiscovery")?,
+    };
     let remote_discovery_config = multicluster::RemoteDiscoveryConfig::new(
         env_config.mesh_remote_discovery_poll_interval_seconds,
         env_config.mesh_remote_discovery_poll_timeout_seconds,
@@ -3557,24 +3552,18 @@ async fn serve_mesh_runtime(
         runtime.namespace.clone(),
         remote_grpc_tls,
     );
-    let remote_trust_domains = multicluster::trust_domains_from_bundles(
-        initial_applied_mesh_slice
-            .as_ref()
-            .and_then(|slice| slice.trust_bundles.as_ref()),
-        &mesh_state.federation_store().snapshot(),
-    );
-    if let Some(handles) = multicluster::spawn_remote_cluster_discovery(
-        initial_multi_cluster.as_ref(),
-        remote_discovery_config,
-        remote_trust_domains,
-        mesh_state.remote_endpoint_store().clone(),
-        shutdown_tx.subscribe(),
-        multicluster::native_source_factory,
-    ) {
-        for handle in handles.tasks {
-            mesh_background_handles.push(handle);
-        }
-        info!("Cross-cluster endpoint discovery running");
+    if let Some(remote_discovery_config) = remote_discovery_config {
+        let remote_discovery_manager = multicluster::RemoteDiscoveryManager::new(
+            Some(remote_discovery_config),
+            mesh_state.remote_endpoint_store().clone(),
+            multicluster::native_source_factory,
+        );
+        mesh_background_handles.push(start_remote_cluster_discovery_reconcile_task(
+            mesh_state.clone(),
+            remote_discovery_manager,
+            shutdown_tx.subscribe(),
+        ));
+        info!("Cross-cluster endpoint discovery reconciler running");
     }
 
     let mesh_apply_handle = start_mesh_slice_apply_task(
@@ -4369,6 +4358,54 @@ async fn apply_mesh_inbound_tls_reload(
             );
         }
     }
+}
+
+fn start_remote_cluster_discovery_reconcile_task(
+    mesh_state: MeshRuntimeState,
+    mut manager: multicluster::RemoteDiscoveryManager,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut updates = mesh_state.subscribe();
+        let mut federation_updates = mesh_state.federation_store().subscribe();
+        loop {
+            if *shutdown_rx.borrow() {
+                manager.shutdown();
+                return;
+            }
+
+            let snapshot = mesh_state.snapshot();
+            let slice = snapshot.as_ref().as_ref();
+            let federation_snapshot = mesh_state.federation_store().snapshot();
+            let trust_domains = multicluster::trust_domains_from_bundles(
+                slice.and_then(|slice| slice.trust_bundles.as_ref()),
+                &federation_snapshot,
+            );
+            manager.reconcile(
+                slice.and_then(|slice| slice.multi_cluster.as_ref()),
+                trust_domains,
+            );
+
+            tokio::select! {
+                changed = updates.changed() => {
+                    if changed.is_err() {
+                        manager.shutdown();
+                        return;
+                    }
+                }
+                changed = federation_updates.changed() => {
+                    if changed.is_err() {
+                        manager.shutdown();
+                        return;
+                    }
+                }
+                _ = wait_for_mesh_shutdown(&mut shutdown_rx) => {
+                    manager.shutdown();
+                    return;
+                },
+            }
+        }
+    })
 }
 
 fn start_mesh_slice_apply_task(
