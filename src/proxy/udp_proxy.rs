@@ -1611,7 +1611,7 @@ async fn start_dtls_frontend_listener(
                     metadata: None,
                     tls_client_cert_der: client_conn.tls_client_cert_der.clone(),
                     tls_client_cert_chain_der: client_conn.tls_client_cert_chain_der.clone(),
-                    sni_hostname: None,
+                    sni_hostname: client_conn.sni_hostname.clone(),
                     mesh_direction: None,
                 };
                 let mut rejected = false;

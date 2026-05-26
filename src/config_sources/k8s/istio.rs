@@ -44,7 +44,9 @@ pub(super) fn translate(
 ) -> Result<bool, K8sTranslateError> {
     match object.kind.as_str() {
         "AuthorizationPolicy" => {
-            acc.mesh.mesh_policies.push(authorization_policy(object)?);
+            acc.mesh
+                .mesh_policies
+                .push(authorization_policy(&acc.options, object)?);
             Ok(true)
         }
         "PeerAuthentication" => {
@@ -104,7 +106,10 @@ pub(super) fn translate(
     }
 }
 
-fn authorization_policy(object: &K8sObject) -> Result<MeshPolicy, K8sTranslateError> {
+fn authorization_policy(
+    options: &K8sTranslationOptions,
+    object: &K8sObject,
+) -> Result<MeshPolicy, K8sTranslateError> {
     let action = match string_field(&object.spec, "action").unwrap_or("ALLOW") {
         "ALLOW" => PolicyAction::Allow,
         "DENY" => PolicyAction::Deny,
@@ -117,17 +122,14 @@ fn authorization_policy(object: &K8sObject) -> Result<MeshPolicy, K8sTranslateEr
         }
     };
 
-    let scope = match object.spec.get("selector") {
-        Some(selector) => PolicyScope::WorkloadSelector {
-            selector: WorkloadSelector {
-                labels: selector_from_istio(Some(selector)),
-                namespace: Some(object.metadata.namespace.clone()),
-            },
-        },
-        None => PolicyScope::Namespace {
-            namespace: object.metadata.namespace.clone(),
-        },
-    };
+    if object.spec.get("targetRefs").is_some() {
+        return Err(invalid_resource(
+            object,
+            "AuthorizationPolicy targetRefs are not supported yet; use selector or namespace scope",
+        ));
+    }
+
+    let scope = istio_policy_scope(options, object, object.spec.get("selector"));
 
     let mut rules = Vec::new();
     for rule in object
@@ -4011,6 +4013,74 @@ mod tests {
         assert_eq!(policy.rules.len(), 1);
         assert_eq!(policy.rules[0].action, PolicyAction::Allow);
         assert!(policy.rules[0].never_matches);
+    }
+
+    #[test]
+    fn root_namespace_authorization_policy_without_selector_is_mesh_wide() {
+        let result = translate_k8s_objects(
+            &[object_with_metadata(
+                "AuthorizationPolicy",
+                "security.istio.io/v1",
+                "global-deny",
+                "istio-config",
+                serde_json::json!({
+                    "action": "DENY",
+                    "rules": [{}]
+                }),
+            )],
+            options_for_namespace("istio-config")
+                .with_istio_root_namespace("istio-config".to_string()),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        assert!(matches!(mesh.mesh_policies[0].scope, PolicyScope::MeshWide));
+    }
+
+    #[test]
+    fn root_namespace_authorization_policy_selector_is_mesh_wide_by_labels() {
+        let result = translate_k8s_objects(
+            &[object_with_metadata(
+                "AuthorizationPolicy",
+                "security.istio.io/v1",
+                "global-selector",
+                "istio-config",
+                serde_json::json!({
+                    "action": "ALLOW",
+                    "selector": {"matchLabels": {"app": "api"}},
+                    "rules": [{}]
+                }),
+            )],
+            options_for_namespace("istio-config")
+                .with_istio_root_namespace("istio-config".to_string()),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        assert!(
+            matches!(&mesh.mesh_policies[0].scope, PolicyScope::WorkloadSelector { selector } if selector.namespace.is_none() && selector.labels.get("app") == Some(&"api".to_string()))
+        );
+    }
+
+    #[test]
+    fn rejects_authorization_policy_target_refs_until_supported() {
+        let err = translate_k8s_objects(
+            &[object(
+                "AuthorizationPolicy",
+                serde_json::json!({
+                    "targetRefs": [{
+                        "kind": "Service",
+                        "name": "payments"
+                    }],
+                    "rules": [{}]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("targetRefs must fail closed until target scoping is implemented");
+
+        assert!(err.to_string().contains("targetRefs"));
+        assert!(err.to_string().contains("not supported"));
     }
 
     #[test]
