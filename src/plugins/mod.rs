@@ -103,6 +103,12 @@ use crate::config::types::{
 use crate::consumer_index::ConsumerIndex;
 use crate::modes::mesh::MeshTrafficDirection;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JwtAuthAttributeValue {
+    Scalar(String),
+    StringList(Vec<String>),
+}
+
 /// Protocol categories that plugins can declare support for.
 ///
 /// TLS/DTLS are transport-layer concerns — a plugin that works on TCP also
@@ -273,13 +279,23 @@ pub struct WsDisconnectContext {
 /// inspect duplicate pairs that collapse in the parsed `HashMap`.
 #[derive(Debug, Clone)]
 pub struct RequestContext {
+    /// Gateway-resolved client IP used for request accounting and legacy
+    /// plugins. This may be rewritten from trusted forwarding headers after
+    /// the context is created.
     pub client_ip: String,
+    /// Immediate downstream socket peer IP captured before trusted-proxy
+    /// resolution. Mesh authz uses this for Istio `source.ip` so forwarded
+    /// `remote.ip` cannot masquerade as the direct peer.
+    pub direct_client_ip: String,
     pub method: String,
     pub path: String,
     /// Frontend listener port that accepted this HTTP-family request.
     /// HTTP proxy resources do not carry `listen_port`, so mesh authorization
     /// uses this to evaluate Istio `to.ports` matches for HTTP traffic.
     pub frontend_listen_port: Option<u16>,
+    /// SNI hostname from the frontend TLS/QUIC handshake for HTTP-family
+    /// requests. Populated only when the downstream client supplied SNI.
+    pub frontend_sni_hostname: Option<String>,
     /// Raw HTTP headers from the request. Stored at init time and consumed by
     /// `materialize_headers()`. Core proxy lookups (IP resolution, host
     /// extraction) read from this directly via `raw_header_get()` to avoid
@@ -319,6 +335,14 @@ pub struct RequestContext {
     pub timestamp_received: DateTime<Utc>,
     /// Extra metadata plugins can attach
     pub metadata: HashMap<String, String>,
+    /// JWT audiences emitted by mesh `jwks_auth` for Istio
+    /// `request.auth.audiences` conditions. Kept out of `metadata` so JWT
+    /// claim material does not flow into transaction logs.
+    pub mesh_request_auth_audiences: Vec<String>,
+    /// JWT scalar/string-array claims emitted by mesh `jwks_auth` for Istio
+    /// `request.auth.claims[...]` conditions. Kept structured so list claims
+    /// retain item boundaries and are not serialized into transaction logs.
+    pub mesh_request_auth_claims: HashMap<String, JwtAuthAttributeValue>,
     /// DER-encoded client certificate from mTLS handshake (first cert in chain).
     /// Populated when the connection used TLS with client certificate verification.
     /// Shared via Arc to avoid cloning cert bytes for each request on HTTP/2 connections.
@@ -448,10 +472,12 @@ pub struct RequestContext {
 impl RequestContext {
     pub fn new(client_ip: String, method: String, path: String) -> Self {
         Self {
+            direct_client_ip: client_ip.clone(),
             client_ip,
             method,
             path,
             frontend_listen_port: None,
+            frontend_sni_hostname: None,
             raw_headers: None,
             headers: HashMap::new(),
             raw_query_string: None,
@@ -464,6 +490,8 @@ impl RequestContext {
             auth_method: None,
             timestamp_received: Utc::now(),
             metadata: HashMap::new(),
+            mesh_request_auth_audiences: Vec::new(),
+            mesh_request_auth_claims: HashMap::new(),
             tls_client_cert_der: None,
             tls_client_cert_chain_der: None,
             peer_spiffe_id: None,
@@ -494,9 +522,11 @@ impl RequestContext {
     pub(crate) fn clone_for_final_request_body_hooks(&self) -> Self {
         Self {
             client_ip: self.client_ip.clone(),
+            direct_client_ip: self.direct_client_ip.clone(),
             method: self.method.clone(),
             path: self.path.clone(),
             frontend_listen_port: self.frontend_listen_port,
+            frontend_sni_hostname: self.frontend_sni_hostname.clone(),
             raw_headers: None,
             headers: self.headers.clone(),
             raw_query_string: None,
@@ -509,6 +539,8 @@ impl RequestContext {
             auth_method: self.auth_method,
             timestamp_received: self.timestamp_received,
             metadata: self.metadata.clone(),
+            mesh_request_auth_audiences: self.mesh_request_auth_audiences.clone(),
+            mesh_request_auth_claims: self.mesh_request_auth_claims.clone(),
             tls_client_cert_der: self.tls_client_cert_der.clone(),
             tls_client_cert_chain_der: self.tls_client_cert_chain_der.clone(),
             peer_spiffe_id: self.peer_spiffe_id.clone(),
@@ -1319,9 +1351,9 @@ pub struct StreamConnectionContext {
     /// DER-encoded CA/intermediate certificates from the client's certificate chain.
     /// Contains all certificates after the peer cert (index 1+) sent during the handshake.
     pub tls_client_cert_chain_der: Option<Arc<Vec<Vec<u8>>>>,
-    /// SNI hostname extracted from the TLS/DTLS ClientHello during passthrough mode.
-    /// Populated only for proxies with `passthrough: true`. Available to plugins for
-    /// logging, routing, or access control without requiring TLS termination.
+    /// SNI hostname from the frontend TLS/DTLS ClientHello or terminated TLS
+    /// handshake when available. Available to plugins for logging, routing, or
+    /// access control.
     pub sni_hostname: Option<String>,
     /// Mesh traffic direction stamped by the stream listener that accepted this
     /// connection. Mirrors `RequestContext::mesh_direction`; `None` for stream

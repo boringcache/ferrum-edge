@@ -25,6 +25,7 @@ fn build_policies(n: usize) -> Vec<MeshPolicy> {
                     )),
                     namespace_pattern: None,
                     trust_domain: None,
+                    trust_domain_pattern: None,
                 }],
                 to: vec![RequestMatch {
                     methods: vec!["GET".to_string(), "POST".to_string()],
