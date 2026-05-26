@@ -505,18 +505,12 @@ impl BodyValidator {
             return Err("Invalid XML: must start with '<'".to_string());
         }
 
-        // Check for required elements
-        for element in required_xml_elements {
-            if !contains_xml_open_tag(trimmed, element) {
-                return Err(format!("Missing required XML element: {}", element));
-            }
-        }
-
         // Tag balance check with proper handling of CDATA, comments,
         // processing instructions, and DOCTYPE declarations.
         let bytes = trimmed.as_bytes();
         let len = bytes.len();
-        let mut depth: i32 = 0;
+        let mut stack: Vec<&str> = Vec::new();
+        let mut required_found = vec![false; required_xml_elements.len()];
         let mut i = 0;
 
         while i < len {
@@ -577,7 +571,19 @@ impl BodyValidator {
             if remaining.len() >= 2 && remaining[1] == b'/' {
                 match find_byte(&bytes[i + 2..], b'>') {
                     Some(end) => {
-                        depth -= 1;
+                        let tag_end = i + 2 + end;
+                        let Some(name) = xml_tag_name(trimmed, i + 2, tag_end) else {
+                            return Err("Invalid XML: empty closing tag".to_string());
+                        };
+                        let Some(open_name) = stack.pop() else {
+                            return Err(format!("Unexpected closing tag: {}", name));
+                        };
+                        if open_name != name {
+                            return Err(format!(
+                                "Mismatched XML closing tag: expected </{}>, got </{}>",
+                                open_name, name
+                            ));
+                        }
                         i = i + 2 + end + 1;
                         continue;
                     }
@@ -592,9 +598,17 @@ impl BodyValidator {
                     // attributes and the slash, e.g., <name attr="v" />). Walk
                     // backward from `>` skipping XML whitespace per W3C XML 1.0 §2.3.
                     let tag_end = i + 1 + end;
+                    let Some(name) = xml_tag_name(trimmed, i + 1, tag_end) else {
+                        return Err("Invalid XML: empty tag name".to_string());
+                    };
+                    for (idx, required) in required_xml_elements.iter().enumerate() {
+                        if name == required {
+                            required_found[idx] = true;
+                        }
+                    }
                     let self_closing = is_self_closing_tag(bytes, i + 1, tag_end);
                     if !self_closing {
-                        depth += 1;
+                        stack.push(name);
                     }
                     i = tag_end + 1;
                 }
@@ -602,8 +616,14 @@ impl BodyValidator {
             }
         }
 
-        if depth != 0 {
-            return Err(format!("Unbalanced XML tags (depth {})", depth));
+        if let Some(unclosed) = stack.last() {
+            return Err(format!("Unclosed XML tag: {}", unclosed));
+        }
+
+        for (idx, element) in required_xml_elements.iter().enumerate() {
+            if !required_found[idx] {
+                return Err(format!("Missing required XML element: {}", element));
+            }
         }
 
         Ok(())
@@ -892,27 +912,6 @@ fn ascii_contains_ignore_case(haystack: &str, needle: &str) -> bool {
     false
 }
 
-fn contains_xml_open_tag(body: &str, element: &str) -> bool {
-    let body = body.as_bytes();
-    let element = element.as_bytes();
-    if element.is_empty() {
-        return false;
-    }
-    // Need: '<' + element + one delimiter byte ('>', '/', or whitespace per XML spec).
-    let window_size = element.len() + 2;
-    if body.len() < window_size {
-        return false;
-    }
-    body.windows(window_size).any(|window| {
-        window[0] == b'<'
-            && &window[1..1 + element.len()] == element
-            && matches!(
-                window[1 + element.len()],
-                b'>' | b'/' | b' ' | b'\t' | b'\r' | b'\n'
-            )
-    })
-}
-
 /// Load protobuf validation config from the plugin config JSON.
 ///
 /// Reads `protobuf_descriptor_path`, resolves message types from
@@ -1065,6 +1064,25 @@ fn find_byte(haystack: &[u8], needle: u8) -> Option<usize> {
     haystack.iter().position(|&b| b == needle)
 }
 
+fn xml_tag_name(body: &str, start_inclusive: usize, tag_end_exclusive: usize) -> Option<&str> {
+    let bytes = body.as_bytes();
+    let mut start = start_inclusive;
+    while start < tag_end_exclusive && is_xml_whitespace(bytes[start]) {
+        start += 1;
+    }
+    let mut end = start;
+    while end < tag_end_exclusive
+        && !is_xml_whitespace(bytes[end])
+        && !matches!(bytes[end], b'/' | b'>')
+    {
+        end += 1;
+    }
+    if end == start {
+        return None;
+    }
+    body.get(start..end)
+}
+
 /// Returns true if the bytes between `start_inclusive` (first byte after `<`)
 /// and `tag_end_exclusive` (position of the `>`) form a self-closing XML tag
 /// (i.e., end with `/`, optionally followed by XML whitespace before the `>`).
@@ -1087,6 +1105,10 @@ fn is_self_closing_tag(bytes: &[u8], start_inclusive: usize, tag_end_exclusive: 
         }
     }
     false
+}
+
+fn is_xml_whitespace(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\r' | b'\n')
 }
 
 /// Validate common string formats (subset of JSON Schema format vocabulary).

@@ -237,6 +237,15 @@ async fn test_xml_unbalanced_tags_rejected() {
     assert_reject(result, Some(400));
 }
 
+#[tokio::test]
+async fn test_xml_mismatched_tag_names_rejected() {
+    let plugin = xml_plugin();
+    let mut ctx = make_xml_ctx("<root><a></b></root>");
+    let mut headers = make_xml_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(400));
+}
+
 // ─── CDATA Handling ────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -394,6 +403,36 @@ async fn test_xml_required_element_with_cdata() {
 async fn test_xml_required_element_missing() {
     let plugin = xml_plugin_with_required(vec!["missing"]);
     let body = "<root><item>content</item></root>";
+    let mut ctx = make_xml_ctx(body);
+    let mut headers = make_xml_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(400));
+}
+
+#[tokio::test]
+async fn test_xml_required_element_in_cdata_does_not_match() {
+    let plugin = xml_plugin_with_required(vec!["item"]);
+    let body = "<root><![CDATA[<item>fake</item>]]></root>";
+    let mut ctx = make_xml_ctx(body);
+    let mut headers = make_xml_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(400));
+}
+
+#[tokio::test]
+async fn test_xml_required_element_in_comment_does_not_match() {
+    let plugin = xml_plugin_with_required(vec!["item"]);
+    let body = "<root><!-- <item>fake</item> --></root>";
+    let mut ctx = make_xml_ctx(body);
+    let mut headers = make_xml_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(400));
+}
+
+#[tokio::test]
+async fn test_xml_required_element_in_processing_instruction_does_not_match() {
+    let plugin = xml_plugin_with_required(vec!["item"]);
+    let body = r#"<root><?fake <item>fake</item> ?></root>"#;
     let mut ctx = make_xml_ctx(body);
     let mut headers = make_xml_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
