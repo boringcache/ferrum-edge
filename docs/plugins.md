@@ -2515,6 +2515,38 @@ Header rules default to `target: header` (no `target` field required). Body rule
 
 Body rules support the same dot-notation features as `request_transformer`: nested paths, array indexing, and `\.` escape. Explicit JSON `null` values on `add` / `update` body rules are preserved — setting a field to `null` is a legitimate operation.
 
+### `security_headers`
+
+Adds secure response header defaults and strips common fingerprinting headers
+after the backend response is available. It also runs for plugin rejection
+responses so locally generated errors receive the same response hardening.
+
+**Priority:** 4080
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `content_type_options` | bool/string/null | `true` | Sets `X-Content-Type-Options`; `true` uses `nosniff`, a string customizes it, `false`/`null` disables it. |
+| `frame_options` | bool/string/null | `true` | Sets `X-Frame-Options`; `true` uses `SAMEORIGIN`, a string customizes it, `false`/`null` disables it. |
+| `referrer_policy` | bool/string/null | `true` | Sets `Referrer-Policy`; `true` uses `strict-origin-when-cross-origin`, a string customizes it, `false`/`null` disables it. |
+| `hsts` | bool/string/object/null | `false` | Sets `Strict-Transport-Security`; `true` uses `max-age=31536000; includeSubDomains`, a string is used verbatim, or an object may set `max_age`, `include_subdomains`, and `preload`. |
+| `content_security_policy` | string/null | _(unset)_ | Optional `Content-Security-Policy` value. |
+| `permissions_policy` | string/null | _(unset)_ | Optional `Permissions-Policy` value. |
+| `set` | object/null | `{}` | Additional headers to set. Values must be strings and header values must not contain CR, LF, or NUL. |
+| `remove` | string[]/null | `["server","x-powered-by"]` | Header names to remove case-insensitively; `null` disables built-in removals. |
+| `override_existing` | bool | `true` | Replace existing response headers with configured values. When `false`, only missing headers are added. |
+
+```yaml
+config:
+  hsts:
+    max_age: 31536000
+    include_subdomains: true
+    preload: false
+  content_security_policy: "default-src 'self'"
+  set:
+    X-Custom-Policy: "enabled"
+  remove: ["server", "x-powered-by"]
+```
+
 ### `compression`
 
 On-the-fly response compression and request decompression. Negotiates the best algorithm via the client's `Accept-Encoding` header (RFC 9110 §12.5.3). Supports gzip and brotli.

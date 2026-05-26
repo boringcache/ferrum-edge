@@ -776,6 +776,33 @@ async fn uppercase_html_entities_are_decoded_for_body_rules() {
     );
 }
 
+#[tokio::test]
+async fn decoded_body_rules_scan_leading_zero_numeric_html_entities() {
+    let plugin = Waf::new(&json!({
+        "rule_modes": { "FE-XSS-001-B": "enforce" }
+    }))
+    .unwrap();
+    let mut ctx = ctx("POST", "/submit");
+    ctx.headers
+        .insert("content-type".into(), "text/html".into());
+    let headers = ctx.headers.clone();
+
+    let result = plugin
+        .on_final_request_body_with_context(
+            &mut ctx,
+            &headers,
+            b"&#000000060;script&#000000062;alert(1)&#000000060;/script&#000000062;",
+        )
+        .await;
+
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(
+        ctx.metadata
+            .get("waf.rule_hits")
+            .is_some_and(|hits| hits.contains("FE-XSS-001-B"))
+    );
+}
+
 #[test]
 fn invalid_custom_regex_is_rejected() {
     let err = Waf::new(&json!({
@@ -1459,6 +1486,26 @@ async fn default_rule_action_enforce_blocks_built_in_rules() {
 }
 
 #[tokio::test]
+async fn default_rule_action_enforce_monitors_when_global_mode_is_monitor() {
+    let plugin = Waf::new(&json!({
+        "mode": "monitor",
+        "default_rule_action": "enforce"
+    }))
+    .unwrap();
+    let mut ctx = ctx("GET", "/search");
+    ctx.set_raw_query_string("q=union+select+1".into());
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata.get("waf.action").map(String::as_str),
+        Some("monitored")
+    );
+    assert!(!ctx.metadata.contains_key("waf.first_blocking_rule"));
+}
+
+#[tokio::test]
 async fn rule_modes_still_overrides_default_rule_action() {
     let plugin = Waf::new(&json!({
         "mode": "enforce",
@@ -1558,6 +1605,26 @@ async fn rule_override_action_enforces_rule() {
             .map(String::as_str),
         Some("FE-SQLI-001")
     );
+}
+
+#[tokio::test]
+async fn rule_override_action_enforce_monitors_when_global_mode_is_monitor() {
+    let plugin = Waf::new(&json!({
+        "mode": "monitor",
+        "rule_overrides": { "FE-SQLI-001": { "action": "enforce" } }
+    }))
+    .unwrap();
+    let mut ctx = ctx("GET", "/search");
+    ctx.set_raw_query_string("q=union+select+1".into());
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata.get("waf.action").map(String::as_str),
+        Some("monitored")
+    );
+    assert!(!ctx.metadata.contains_key("waf.first_blocking_rule"));
 }
 
 #[test]

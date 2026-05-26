@@ -427,6 +427,7 @@ impl Waf {
             }
             if enforce_actions
                 && rule.action == RuleAction::Enforce
+                && self.config.mode == GlobalMode::Enforce
                 && first_blocking_rule.is_none()
             {
                 first_blocking_rule = Some(rule.id.as_str());

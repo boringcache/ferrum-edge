@@ -20,6 +20,7 @@ use percent_encoding::percent_decode_str;
 /// raw input). Bounds body-scan cost at `O(VARIANTS × bytes × rules)`; the
 /// underlying `RegexSet` matching is linear so this is a hard multiplier.
 const MAX_VARIANTS: usize = 4;
+const MAX_NUMERIC_ENTITY_DIGITS: usize = 16;
 
 /// Produce normalized decodings of `text` distinct from the raw input.
 ///
@@ -189,8 +190,8 @@ fn decode_entity(after: &[u8]) -> Option<(EntityVal, usize)> {
             (10u32, 1usize)
         };
         let mut j = start;
-        // Digit runs are short; cap the scan so a stray `&#` does not walk far.
-        while j < after.len() && after[j] != b';' && j - start < 8 {
+        // Keep this bounded while still accepting leading-zero padded entities.
+        while j < after.len() && after[j] != b';' && j - start < MAX_NUMERIC_ENTITY_DIGITS {
             j += 1;
         }
         if j >= after.len() || after[j] != b';' || j == start {
@@ -348,6 +349,10 @@ mod tests {
         assert_eq!(html_entity_decode("&lt;script&gt;"), "<script>");
         assert_eq!(html_entity_decode("&LT;script&GT;"), "<script>");
         assert_eq!(html_entity_decode("&#60;script&#62;"), "<script>");
+        assert_eq!(
+            html_entity_decode("&#000000060;script&#000000062;"),
+            "<script>"
+        );
         assert_eq!(html_entity_decode("&#x3c;script&#x3e;"), "<script>");
         assert!(matches!(
             html_entity_decode("no entities"),

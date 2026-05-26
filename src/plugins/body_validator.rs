@@ -1032,7 +1032,6 @@ fn parameter_entity_reference_at(body: &str, start: usize) -> Option<(&str, usiz
     let mut i = start + 1;
     let name_start = i;
     while i < bytes.len()
-        && i - name_start <= 32
         && (bytes[i].is_ascii_alphanumeric() || matches!(bytes[i], b'_' | b'-' | b'.'))
     {
         i += 1;
@@ -1087,7 +1086,6 @@ fn entity_value_references_nested_entity(decl: &str) -> bool {
             }
             let mut j = i + 1;
             while j < bytes.len()
-                && j - i <= 32
                 && (bytes[j].is_ascii_alphanumeric() || matches!(bytes[j], b'_' | b'-' | b'.'))
             {
                 j += 1;
@@ -1138,7 +1136,6 @@ fn entity_name_reference_follows(bytes: &[u8], start: usize) -> bool {
     let mut i = start;
     let name_start = i;
     while i < bytes.len()
-        && i - name_start <= 32
         && (bytes[i].is_ascii_alphanumeric() || matches!(bytes[i], b'_' | b'-' | b'.'))
     {
         i += 1;

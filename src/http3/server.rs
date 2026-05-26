@@ -1232,6 +1232,7 @@ async fn handle_h3_request(
                     http_flavor,
                     http_status,
                     &reject.body,
+                    &headers,
                 );
                 log_rejected_request(
                     &plugins,
@@ -1332,7 +1333,7 @@ async fn handle_h3_request(
         plugin_execution_ns += auth_phase_start.elapsed().as_nanos() as u64;
         let http_status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::UNAUTHORIZED);
         let log_status_code =
-            h3_reject_log_status_and_metadata(&mut ctx, http_flavor, http_status, &body);
+            h3_reject_log_status_and_metadata(&mut ctx, http_flavor, http_status, &body, &headers);
         log_rejected_request(
             &plugins,
             &ctx,
@@ -1386,6 +1387,7 @@ async fn handle_h3_request(
                         http_flavor,
                         http_status,
                         &reject.body,
+                        &headers,
                     );
                     log_rejected_request(
                         &plugins,
@@ -1501,6 +1503,7 @@ async fn handle_h3_request(
                         http_flavor,
                         http_status,
                         &reject.body,
+                        &headers,
                     );
                     log_rejected_request(
                         &plugins,
@@ -1567,6 +1570,7 @@ async fn handle_h3_request(
                         http_flavor,
                         http_status,
                         &reject.body,
+                        &headers,
                     );
                     log_rejected_request(
                         &plugins,
@@ -2511,7 +2515,6 @@ async fn handle_h3_request(
                 .await?;
                 return Ok(());
             };
-            record_request(&state, reject.status_code);
             let mut headers = reject.headers;
             apply_after_proxy_hooks_to_rejection(
                 &plugins,
@@ -2522,8 +2525,14 @@ async fn handle_h3_request(
             .await;
             let http_status =
                 StatusCode::from_u16(reject.status_code).unwrap_or(StatusCode::PAYLOAD_TOO_LARGE);
-            let log_status_code =
-                h3_reject_log_status_and_metadata(&mut ctx, http_flavor, http_status, &reject.body);
+            let log_status_code = h3_reject_log_status_and_metadata(
+                &mut ctx,
+                http_flavor,
+                http_status,
+                &reject.body,
+                &headers,
+            );
+            record_request(&state, log_status_code);
             log_rejected_request(
                 &plugins,
                 &ctx,
@@ -4107,13 +4116,23 @@ fn h3_reject_log_status_and_metadata(
     flavor: HttpFlavor,
     http_status: StatusCode,
     http_body: &[u8],
+    headers: &HashMap<String, String>,
 ) -> u16 {
     if !matches!(flavor, HttpFlavor::Grpc) {
         return http_status.as_u16();
     }
 
-    let grpc_status = h3_http_status_to_grpc_status(http_status);
-    let grpc_message = reject_body_as_grpc_message(http_body, http_status);
+    let grpc_status = headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("grpc-status"))
+        .and_then(|(_, value)| value.parse::<u32>().ok())
+        .unwrap_or_else(|| h3_http_status_to_grpc_status(http_status));
+    let grpc_message: std::borrow::Cow<'static, str> = headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("grpc-message"))
+        .map(|(_, value)| std::borrow::Cow::<str>::Owned(sanitize_grpc_message(value)))
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| reject_body_as_grpc_message(http_body, http_status));
     crate::proxy::insert_grpc_error_metadata(&mut ctx.metadata, grpc_status, grpc_message.as_ref());
     StatusCode::OK.as_u16()
 }
@@ -4599,6 +4618,7 @@ mod h3_plugin_protocol_tests {
     use crate::plugins::ProxyProtocol;
     use crate::plugins::RequestContext;
     use http::StatusCode;
+    use std::collections::HashMap;
 
     #[test]
     fn maps_websocket_flavor_to_websocket_plugin_protocol() {
@@ -4637,6 +4657,7 @@ mod h3_plugin_protocol_tests {
             HttpFlavor::Grpc,
             StatusCode::UNAUTHORIZED,
             br#"{"error":"missing token"}"#,
+            &HashMap::new(),
         );
 
         assert_eq!(log_status, StatusCode::OK.as_u16());
@@ -4647,6 +4668,40 @@ mod h3_plugin_protocol_tests {
         assert_eq!(
             ctx.metadata.get("grpc_message").map(String::as_str),
             Some("missing token")
+        );
+    }
+
+    #[test]
+    fn grpc_reject_logging_prefers_explicit_grpc_headers() {
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "POST".to_string(),
+            "/pkg.Service/Call".to_string(),
+        );
+        let headers = HashMap::from([
+            ("grpc-status".to_string(), "9".to_string()),
+            (
+                "grpc-message".to_string(),
+                "failed precondition".to_string(),
+            ),
+        ]);
+
+        let log_status = h3_reject_log_status_and_metadata(
+            &mut ctx,
+            HttpFlavor::Grpc,
+            StatusCode::BAD_REQUEST,
+            b"ignored",
+            &headers,
+        );
+
+        assert_eq!(log_status, StatusCode::OK.as_u16());
+        assert_eq!(
+            ctx.metadata.get("grpc_status").map(String::as_str),
+            Some("9")
+        );
+        assert_eq!(
+            ctx.metadata.get("grpc_message").map(String::as_str),
+            Some("failed precondition")
         );
     }
 
@@ -4663,6 +4718,7 @@ mod h3_plugin_protocol_tests {
             HttpFlavor::Plain,
             StatusCode::FORBIDDEN,
             br#"{"error":"blocked"}"#,
+            &HashMap::new(),
         );
 
         assert_eq!(log_status, StatusCode::FORBIDDEN.as_u16());

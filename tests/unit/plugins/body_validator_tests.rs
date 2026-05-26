@@ -2147,6 +2147,20 @@ async fn numeric_ampersand_entity_reference_in_entity_value_is_rejected() {
 }
 
 #[tokio::test]
+async fn long_xml_entity_names_are_checked_for_nested_references() {
+    let plugin = xml_plugin();
+    let long_name = "a".repeat(40);
+    let long_ref = format!("&{long_name};");
+    let body = format!(
+        r#"<!DOCTYPE r [<!ENTITY {long_name} "lol"><!ENTITY b "{long_ref}{long_ref}">]><r>&b;</r>"#
+    );
+    let mut ctx = make_xml_ctx(&body);
+    let mut headers = make_xml_headers();
+
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+#[tokio::test]
 async fn parameter_entity_expanding_entity_declarations_is_rejected() {
     let plugin = BodyValidator::new(&json!({
         "validate_xml": true,

@@ -147,23 +147,28 @@ each rule stays `monitor`:
 When enabled, every matched rule contributes its severity weight (or a per-rule
 `score` override) to a request total. If the total reaches `block_threshold`
 and the global mode is `enforce`, the request is rejected with
-`waf.block_reason = "score"`. Hard per-rule `enforce` still blocks immediately.
+`waf.block_reason = "score"`. Hard per-rule `enforce` still blocks immediately
+when the global mode is `enforce`.
 The total is recorded in `waf.score` metadata regardless of mode.
 
 ## Per-rule overrides and exemptions
 
 `rule_overrides` tunes individual rules — **including built-ins** — without
 forking the rule pack. Attach false-positive filters, scope to paths, raise
-paranoia, or change severity:
+paranoia, change severity/score, or set a per-rule `action`:
 
 ```json
 {
   "rule_overrides": {
     "FE-RFI-001": { "fp_filters": ["^https://cdn\\.example\\.com/"], "paranoia_min": 1 },
+    "FE-SQLI-001": { "action": "enforce" },
     "FE-XSS-001": { "conditions": { "paths": ["/api/*"] } }
   }
 }
 ```
+
+Per-rule `action: "enforce"` only blocks when global `mode` is also
+`enforce`; with `mode: "monitor"` the match is logged but allowed.
 
 `global_exemptions` short-circuits the entire WAF for matching requests:
 
@@ -247,7 +252,7 @@ enforce.
 | `include_default_rules` | bool | `true` | load the built-in pack |
 | `disabled_default_rules` | string[] | `[]` | built-in ids to drop |
 | `rule_modes` | map | `{}` | per-rule action by id |
-| `rule_overrides` | map | `{}` | per-rule fp_filters/conditions/paranoia_min/severity/score |
+| `rule_overrides` | map | `{}` | per-rule fp_filters/conditions/paranoia_min/severity/score/action |
 | `custom_rules` | object[] | `[]` | additional rules |
 | `scoring` | object | _(off)_ | anomaly scoring (see above) |
 | `global_exemptions` | object | _(none)_ | request short-circuits |
