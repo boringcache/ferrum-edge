@@ -17,6 +17,7 @@ use tracing::{info, warn};
 use crate::identity::SpiffeId;
 use crate::modes::mesh::config::{MeshPolicy, Workload, policy_scope_applies_to_workload};
 use crate::modes::mesh::federation::FederationStore;
+use crate::modes::mesh::multicluster::RemoteEndpointStore;
 use crate::modes::mesh::slice::{MeshEgressScopeSnapshot, MeshSlice};
 use crate::plugins::mesh::outbound_registry::OutboundRegistry;
 
@@ -185,6 +186,7 @@ pub struct MeshRuntimeState {
     revision_tx: Arc<watch::Sender<u64>>,
     egress_scope: Arc<MeshEgressScopeState>,
     federation_store: FederationStore,
+    remote_endpoint_store: RemoteEndpointStore,
 }
 
 impl MeshRuntimeState {
@@ -200,6 +202,7 @@ impl MeshRuntimeState {
             revision_tx: Arc::new(revision_tx),
             egress_scope: Arc::new(MeshEgressScopeState::new()),
             federation_store: FederationStore::new(),
+            remote_endpoint_store: RemoteEndpointStore::new(),
         }
     }
 
@@ -248,6 +251,14 @@ impl MeshRuntimeState {
     /// [`FederationStore::has_first_success`].
     pub fn federation_store(&self) -> &FederationStore {
         &self.federation_store
+    }
+
+    /// Returns the live remote-cluster endpoint store. Always present, even
+    /// when no discovery poller has been spawned — callers that need a "has
+    /// discovery populated anything" check should consult
+    /// [`RemoteEndpointStore::has_first_success`].
+    pub fn remote_endpoint_store(&self) -> &RemoteEndpointStore {
+        &self.remote_endpoint_store
     }
 
     /// Hot-swap the live mesh slice and notify waiters on the first install.
