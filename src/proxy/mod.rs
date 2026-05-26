@@ -8067,6 +8067,25 @@ fn apply_grpc_reject_metadata(ctx: &mut RequestContext, reject: &NormalizedRejec
     }
 }
 
+pub(crate) async fn normalize_grpc_plugin_rejection_with_after_proxy_hooks(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    reject: RejectedResponseParts,
+) -> NormalizedRejectResponse {
+    let status = StatusCode::from_u16(reject.status_code).unwrap_or(StatusCode::BAD_GATEWAY);
+    let normalized = finalize_reject_response_with_after_proxy_hooks(
+        plugins,
+        ctx,
+        status,
+        &reject.body,
+        reject.headers,
+        true,
+    )
+    .await;
+    apply_grpc_reject_metadata(ctx, &normalized);
+    normalized
+}
+
 fn build_response_from_normalized_reject(reject: NormalizedRejectResponse) -> Response<ProxyBody> {
     let is_grpc_error = reject.grpc_status.is_some();
     let mut builder = Response::builder().status(reject.http_status);
@@ -9456,25 +9475,18 @@ async fn handle_proxy_request_inner(
                 PluginResult::Continue => {}
                 reject @ PluginResult::Reject { .. }
                 | reject @ PluginResult::RejectBinary { .. } => {
-                    let (status, body, headers) = match reject {
-                        PluginResult::Reject {
-                            status_code,
-                            body,
-                            headers,
-                        } => (status_code, body.into_bytes(), headers),
-                        PluginResult::RejectBinary {
-                            status_code,
-                            body,
-                            headers,
-                        } => (status_code, body.to_vec(), headers),
-                        _ => unreachable!(),
+                    let Some(reject) = plugin_result_into_reject_parts(reject) else {
+                        warn!("reject plugin result could not be converted to response parts");
+                        record_request(&state, StatusCode::INTERNAL_SERVER_ERROR.as_u16());
+                        return Ok(build_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Internal Server Error",
+                        ));
                     };
-                    let normalized = normalize_reject_response(
-                        StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST),
-                        &body,
-                        &headers,
-                        true, // is_grpc_request
-                    );
+                    let normalized = normalize_grpc_plugin_rejection_with_after_proxy_hooks(
+                        &plugins, &mut ctx, reject,
+                    )
+                    .await;
                     record_request(&state, normalized.http_status.as_u16());
                     return Ok(build_response_from_normalized_reject(normalized));
                 }
@@ -10017,14 +10029,11 @@ async fn handle_proxy_request_inner(
                                     status_code = reject.status_code,
                                     "Plugin rejected gRPC response body"
                                 );
-                                let normalized = normalize_reject_response(
-                                    StatusCode::from_u16(reject.status_code)
-                                        .unwrap_or(StatusCode::BAD_GATEWAY),
-                                    &reject.body,
-                                    &reject.headers,
-                                    true,
-                                );
-                                apply_grpc_reject_metadata(&mut ctx, &normalized);
+                                let normalized =
+                                    normalize_grpc_plugin_rejection_with_after_proxy_hooks(
+                                        &plugins, &mut ctx, reject,
+                                    )
+                                    .await;
                                 response_status = normalized.http_status.as_u16();
                                 response_headers = normalized.headers;
                                 response_body = normalized.body;
@@ -10076,14 +10085,11 @@ async fn handle_proxy_request_inner(
                                     status_code = reject.status_code,
                                     "Plugin rejected finalized gRPC response body"
                                 );
-                                let normalized = normalize_reject_response(
-                                    StatusCode::from_u16(reject.status_code)
-                                        .unwrap_or(StatusCode::BAD_GATEWAY),
-                                    &reject.body,
-                                    &reject.headers,
-                                    true,
-                                );
-                                apply_grpc_reject_metadata(&mut ctx, &normalized);
+                                let normalized =
+                                    normalize_grpc_plugin_rejection_with_after_proxy_hooks(
+                                        &plugins, &mut ctx, reject,
+                                    )
+                                    .await;
                                 response_status = normalized.http_status.as_u16();
                                 response_headers = normalized.headers;
                                 response_body = normalized.body;
@@ -15245,6 +15251,46 @@ mod tests {
             Some("SAMEORIGIN")
         );
         assert_eq!(body, br#"{"error":"blocked"}"#);
+    }
+
+    #[tokio::test]
+    async fn grpc_plugin_rejection_response_runs_security_headers() {
+        let plugins: Vec<Arc<dyn Plugin>> =
+            vec![Arc::new(SecurityHeaders::new(&json!({})).unwrap())];
+        let mut ctx = RequestContext::new(
+            "203.0.113.10".into(),
+            "POST".into(),
+            "/grpc.Service/Method".into(),
+        );
+        let reject = RejectedResponseParts {
+            status_code: 403,
+            body: br#"{"error":"Forbidden"}"#.to_vec(),
+            headers: HashMap::new(),
+        };
+
+        let normalized =
+            normalize_grpc_plugin_rejection_with_after_proxy_hooks(&plugins, &mut ctx, reject)
+                .await;
+
+        assert_eq!(normalized.http_status, StatusCode::OK);
+        assert_eq!(
+            normalized.grpc_status,
+            Some(grpc_proxy::grpc_status::PERMISSION_DENIED)
+        );
+        assert_eq!(
+            normalized
+                .headers
+                .get("x-content-type-options")
+                .map(String::as_str),
+            Some("nosniff")
+        );
+        assert_eq!(
+            normalized
+                .headers
+                .get("x-frame-options")
+                .map(String::as_str),
+            Some("SAMEORIGIN")
+        );
     }
 
     #[test]
