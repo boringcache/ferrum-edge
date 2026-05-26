@@ -767,7 +767,7 @@ pub(crate) async fn handle_h3_websocket(
         listen_port: h3_listen_port(&state),
         consumer_username: ctx.effective_identity().map(str::to_owned),
         auth_method: ctx.auth_method,
-        metadata: ctx.metadata.clone(),
+        metadata: crate::proxy::clone_log_metadata(&ctx),
         session_start: Utc::now(),
     };
 
@@ -917,7 +917,7 @@ async fn emit_successful_upgrade_summary(
         latency_plugin_external_io_ms: plugin_external_io_ms,
         latency_gateway_overhead_ms: gateway_overhead_ms,
         request_user_agent: proxy_headers.get("user-agent").cloned(),
-        metadata: ctx.metadata.clone(),
+        metadata: crate::proxy::clone_log_metadata(ctx),
         ..TransactionSummary::default()
     };
     crate::plugins::log_with_mirror(plugins, &summary, ctx).await;
@@ -964,7 +964,7 @@ async fn emit_failed_upgrade_summary(
         .ok()
         .map(|ip| ip.to_string());
 
-    let mut metadata = ctx.metadata.clone();
+    let mut metadata = crate::proxy::clone_log_metadata(ctx);
     metadata.insert(
         "rejection_phase".to_string(),
         "websocket_backend_error".to_string(),
