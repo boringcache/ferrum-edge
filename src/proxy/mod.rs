@@ -9184,6 +9184,22 @@ async fn handle_proxy_request_inner(
     let proxy = ctx.apply_route_overrides_with_upstreams(proxy, epoch.load_balancer.upstreams());
     ctx.matched_proxy = Some(Arc::clone(&proxy));
 
+    // Istio `VirtualService.http[].rewrite.uri`: `mesh_route_dispatch` set
+    // `ctx.route_override_path` for the matched route. Rebase the request path
+    // used for backend URL building (reqwest / direct-H2 / gRPC paths read the
+    // local `path`; the WS / HBONE branches read `ctx.path`, so mirror the
+    // override onto `ctx.path` too). The original path was already used for
+    // route selection and logging; VS-derived proxies never set
+    // `strip_listen_path`, so the rewritten value is the literal forwarded
+    // path. No allocation when no rewrite is set.
+    let path = match ctx.route_override_path.take() {
+        Some(rewritten) => {
+            ctx.path = rewritten.clone();
+            rewritten
+        }
+        None => path,
+    };
+
     // Resolve upstream target and hash key from the request epoch.
     let selection = backend_dispatch::select_upstream_target(
         &proxy,

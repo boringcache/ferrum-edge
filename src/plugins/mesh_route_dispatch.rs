@@ -128,7 +128,9 @@ impl MeshRouteDispatchConfig {
             // operator config.
             let has_route_actions = !rule.request_transform.is_empty()
                 || !rule.response_transform.is_empty()
-                || rule.fault.is_some();
+                || rule.fault.is_some()
+                || rule.rewrite.is_some()
+                || rule.redirect.is_some();
             if rule.match_.is_empty() && !has_route_actions {
                 return Err(format!(
                     "mesh_route_dispatch.rules[{idx}].match requires at least one of \
@@ -138,7 +140,11 @@ impl MeshRouteDispatchConfig {
                 ));
             }
             normalize_source_namespace(idx, &mut rule.match_.source_namespace)?;
-            if rule.destination.is_empty() {
+            // A redirect rule answers the request itself, so it does not need a
+            // backend destination. Every other rule must override the proxy's
+            // destination (or carry the proxy's default for an action-only
+            // catch-all) or it would be a no-op.
+            if rule.destination.is_empty() && rule.redirect.is_none() {
                 return Err(format!(
                     "mesh_route_dispatch.rules[{idx}].destination requires upstream_id or \
                      a direct backend override (backend_host and backend_port); backend_tls \
@@ -221,6 +227,12 @@ impl MeshRouteDispatchConfig {
             }
             if let Some(fault) = rule.fault.as_ref() {
                 validate_fault_action(idx, fault)?;
+            }
+            if let Some(rewrite) = rule.rewrite.as_mut() {
+                validate_and_normalize_rewrite(idx, rewrite)?;
+            }
+            if let Some(redirect) = rule.redirect.as_mut() {
+                validate_and_normalize_redirect(idx, redirect)?;
             }
             rule.fault_roller = if rule.fault.is_some() {
                 Some(Arc::new(FaultRoller::new()))
@@ -310,6 +322,109 @@ fn validate_fault_percentage(
     Ok(())
 }
 
+/// Reject a string that would let an attacker (or a buggy CP) smuggle a CR/LF
+/// into a request line or a response header. Path and authority overrides
+/// flow into the backend request line / `Host` header and the redirect
+/// `Location` header respectively, so a raw CR/LF would split the message.
+fn reject_crlf(rule_idx: usize, field: &str, value: &str) -> Result<(), String> {
+    if value.contains(['\r', '\n']) {
+        return Err(format!(
+            "mesh_route_dispatch.rules[{rule_idx}].{field} must not contain CR or LF"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_and_normalize_rewrite(
+    rule_idx: usize,
+    rewrite: &mut RouteRewriteConfig,
+) -> Result<(), String> {
+    if rewrite.is_empty() {
+        return Err(format!(
+            "mesh_route_dispatch.rules[{rule_idx}].rewrite must set at least one of \
+             'uri' or 'authority'"
+        ));
+    }
+    if let Some(uri) = rewrite.uri.as_deref() {
+        if uri.is_empty() {
+            return Err(format!(
+                "mesh_route_dispatch.rules[{rule_idx}].rewrite.uri must not be empty"
+            ));
+        }
+        reject_crlf(rule_idx, "rewrite.uri", uri)?;
+    }
+    if let Some(authority) = rewrite.authority.as_mut() {
+        if authority.is_empty() {
+            return Err(format!(
+                "mesh_route_dispatch.rules[{rule_idx}].rewrite.authority must not be empty"
+            ));
+        }
+        reject_crlf(rule_idx, "rewrite.authority", authority)?;
+        if authority.chars().any(char::is_whitespace) {
+            return Err(format!(
+                "mesh_route_dispatch.rules[{rule_idx}].rewrite.authority must not contain whitespace"
+            ));
+        }
+    }
+    if let Some(prefix) = rewrite.match_prefix.as_deref()
+        && prefix.is_empty()
+    {
+        // An empty match_prefix would be a degenerate "strip nothing" prefix
+        // rewrite — treat as "no prefix" by clearing it so the hot path takes
+        // the whole-path replacement branch.
+        rewrite.match_prefix = None;
+    }
+    Ok(())
+}
+
+fn validate_and_normalize_redirect(
+    rule_idx: usize,
+    redirect: &mut RouteRedirectConfig,
+) -> Result<(), String> {
+    if redirect.is_empty() {
+        return Err(format!(
+            "mesh_route_dispatch.rules[{rule_idx}].redirect must set at least one of \
+             'uri' / 'authority' / 'scheme' so the redirect target differs from the request"
+        ));
+    }
+    if !(300..=399).contains(&redirect.redirect_code) {
+        return Err(format!(
+            "mesh_route_dispatch.rules[{rule_idx}].redirect.redirect_code must be 300-399, got {}",
+            redirect.redirect_code
+        ));
+    }
+    if let Some(uri) = redirect.uri.as_deref() {
+        if uri.is_empty() {
+            return Err(format!(
+                "mesh_route_dispatch.rules[{rule_idx}].redirect.uri must not be empty"
+            ));
+        }
+        reject_crlf(rule_idx, "redirect.uri", uri)?;
+    }
+    if let Some(authority) = redirect.authority.as_mut() {
+        if authority.is_empty() {
+            return Err(format!(
+                "mesh_route_dispatch.rules[{rule_idx}].redirect.authority must not be empty"
+            ));
+        }
+        reject_crlf(rule_idx, "redirect.authority", authority)?;
+        if authority.chars().any(char::is_whitespace) {
+            return Err(format!(
+                "mesh_route_dispatch.rules[{rule_idx}].redirect.authority must not contain whitespace"
+            ));
+        }
+    }
+    if let Some(scheme) = redirect.scheme.as_mut() {
+        *scheme = scheme.to_ascii_lowercase();
+        if scheme != "http" && scheme != "https" {
+            return Err(format!(
+                "mesh_route_dispatch.rules[{rule_idx}].redirect.scheme must be 'http' or 'https'"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn compile_transform_field(
     rule_idx: usize,
     field: &str,
@@ -375,7 +490,10 @@ pub struct RouteRule {
     #[serde(default, rename = "match")]
     pub match_: MatchCriteria,
     /// What to override on a matching request. At least one override field
-    /// MUST be set; otherwise the rule would be a no-op.
+    /// MUST be set unless the rule carries a `redirect` (which answers the
+    /// request itself and needs no backend); otherwise the rule would be a
+    /// no-op. Defaults to empty so a redirect-only rule can omit it.
+    #[serde(default)]
     pub destination: RouteDestination,
     /// Override the proxy's backend response/read timeout for this rule.
     /// Istio `VirtualService.http[].timeout` is projected here when route
@@ -423,6 +541,20 @@ pub struct RouteRule {
     /// plugin instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fault: Option<FaultActionConfig>,
+    /// Optional per-rule URI / authority rewrite. Projects Istio
+    /// `VirtualService.http[].rewrite` onto each emitted dispatch rule so a
+    /// rewriting route can be collapsed with sibling routes onto one Ferrum
+    /// proxy without rewriting the siblings' traffic. Applied when the rule
+    /// matches and no redirect fires.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rewrite: Option<RouteRewriteConfig>,
+    /// Optional per-rule HTTP redirect. Projects Istio
+    /// `VirtualService.http[].redirect` onto each emitted dispatch rule. When
+    /// the rule matches, the request is short-circuited with a 3xx +
+    /// `Location` response and never reaches a backend. Takes precedence over
+    /// `rewrite` and the route-override destination.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redirect: Option<RouteRedirectConfig>,
     /// Per-rule fault roller. Constructed at config-load time whenever
     /// `fault` is `Some` so the request hot path does one atomic counter
     /// increment + a splitmix64 mix per fault decision. `None` when the
@@ -912,6 +1044,87 @@ pub struct FaultAbortConfig {
     pub body: Option<String>,
 }
 
+/// Per-rule URI / authority rewrite carried by a single [`RouteRule`].
+/// Projects Istio `VirtualService.http[].rewrite` onto the matching dispatch
+/// rule so a rewriting route does not have to spin up a separate
+/// proxy-scoped transformer instance (which would rewrite traffic for every
+/// route collapsed onto the same Ferrum proxy, not just the matched route).
+///
+/// At least one of `uri` / `authority` must be present; an empty rewrite is
+/// rejected at config-load time.
+///
+/// **Semantics** (matching Istio):
+///
+/// - `uri` rewrites the request path forwarded to the backend. When the rule's
+///   `match.uri` is a `prefix`, only the matched prefix is replaced (the
+///   `match_prefix` field carries the literal prefix to strip). For exact /
+///   regex matches — and for rules without a `match.uri` (URI selection came
+///   from the proxy's `listen_path`) — the whole path is replaced.
+/// - `authority` rewrites the `Host` / `:authority` header forwarded to the
+///   backend.
+///
+/// The rewrite is applied AFTER any route override destination is chosen, so a
+/// canary route can both re-target an upstream and rewrite the path it sees.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct RouteRewriteConfig {
+    /// Replacement request path (or path prefix when `match_prefix` is set).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uri: Option<String>,
+    /// Replacement `Host` / `:authority` value forwarded to the backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority: Option<String>,
+    /// When the source `match.uri` was a `prefix`, the literal prefix the
+    /// translator matched. The hot path strips this prefix from the request
+    /// path and prepends `uri`, mirroring Istio's prefix-rewrite semantics.
+    /// `None` (exact / regex match, or no `match.uri`) means `uri` replaces
+    /// the whole path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub match_prefix: Option<String>,
+}
+
+impl RouteRewriteConfig {
+    fn is_empty(&self) -> bool {
+        self.uri.is_none() && self.authority.is_none()
+    }
+}
+
+/// Per-rule HTTP redirect carried by a single [`RouteRule`]. Projects Istio
+/// `VirtualService.http[].redirect` onto the matching dispatch rule. When the
+/// rule matches, the plugin short-circuits the dispatch chain with a redirect
+/// response (3xx + `Location`) and the request never reaches a backend.
+///
+/// At least one of `uri` / `authority` must be present so the redirect target
+/// differs from the request; an empty redirect is rejected at config-load
+/// time. `redirect_code` defaults to 301 and is constrained to the 3xx range.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct RouteRedirectConfig {
+    /// Replacement path for the `Location` header. When unset, the request's
+    /// own path is preserved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uri: Option<String>,
+    /// Replacement authority (host[:port]) for the `Location` header. When
+    /// unset, the request's own `Host` / `:authority` is preserved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority: Option<String>,
+    /// Replacement scheme (`http` / `https`) for the `Location` header. When
+    /// unset, the request's own frontend scheme is preserved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheme: Option<String>,
+    /// HTTP redirect status code. Defaults to 301. Constrained to `300..=399`.
+    #[serde(default = "default_redirect_code")]
+    pub redirect_code: u16,
+}
+
+fn default_redirect_code() -> u16 {
+    301
+}
+
+impl RouteRedirectConfig {
+    fn is_empty(&self) -> bool {
+        self.uri.is_none() && self.authority.is_none() && self.scheme.is_none()
+    }
+}
+
 #[derive(Debug)]
 pub struct MeshRouteDispatch {
     config: MeshRouteDispatchConfig,
@@ -1253,6 +1466,20 @@ impl Plugin for MeshRouteDispatch {
             .any(|rule| !rule.match_.query_params.is_empty())
     }
 
+    fn modifies_request_headers(&self) -> bool {
+        // An Istio `rewrite.authority` writes the new authority into the
+        // forwarded `Host` header. The dispatcher must therefore route the
+        // before_proxy phase through its cloned-header path so the mutation
+        // reaches the backend request. Header / method matching, route
+        // overrides, fault, redirect, and path rewrite never touch the header
+        // map, so this stays `false` for the common case (zero-allocation hot
+        // path preserved).
+        self.config
+            .rules
+            .iter()
+            .any(|rule| rule.rewrite.as_ref().is_some_and(|r| r.authority.is_some()))
+    }
+
     async fn before_proxy(
         &self,
         ctx: &mut RequestContext,
@@ -1260,6 +1487,14 @@ impl Plugin for MeshRouteDispatch {
     ) -> PluginResult {
         for rule in &self.config.rules {
             if rule_matches(rule, ctx, headers) {
+                // Per-rule redirect (Istio `http[].redirect`): answer the
+                // request ourselves with a 3xx + `Location`. Highest
+                // precedence — a redirect short-circuits before fault and
+                // before any route override, because the request never
+                // reaches a backend.
+                if let Some(redirect) = rule.redirect.as_ref() {
+                    return build_redirect_response(ctx, headers, redirect);
+                }
                 // Per-rule fault action: fire BEFORE setting any route
                 // override on the context. If the fault aborts, the
                 // request never reaches backend dispatch so the override
@@ -1309,6 +1544,35 @@ impl Plugin for MeshRouteDispatch {
                     rule.request_transform_compiled.as_ref().map(Arc::clone);
                 ctx.route_override_response_transform =
                     rule.response_transform_compiled.as_ref().map(Arc::clone);
+                // Per-rule rewrite (Istio `http[].rewrite`): rebase the path /
+                // authority forwarded to the backend. A non-matching later
+                // instance must not stomp this, so — like the destination
+                // overrides above — a matching instance sets BOTH fields
+                // (clearing any prior rewrite that no longer applies).
+                if let Some(rewrite) = rule.rewrite.as_ref() {
+                    ctx.route_override_path = rewrite.uri.as_deref().map(|uri| {
+                        rewrite_request_path(
+                            ctx.path.as_str(),
+                            uri,
+                            rewrite.match_prefix.as_deref(),
+                        )
+                    });
+                    // Authority rewrite rebases the forwarded `Host` header.
+                    // Writing it into the live header map plus stamping
+                    // `route_override_authority` (which flips
+                    // `preserve_host_header` on the effective proxy in
+                    // `apply_route_overrides_inner`) makes every backend
+                    // dispatch path forward the rewritten authority.
+                    if let Some(authority) = rewrite.authority.as_deref() {
+                        headers.insert("host".to_string(), authority.to_string());
+                        ctx.route_override_authority = Some(authority.to_string());
+                    } else {
+                        ctx.route_override_authority = None;
+                    }
+                } else {
+                    ctx.route_override_path = None;
+                    ctx.route_override_authority = None;
+                }
                 return PluginResult::Continue;
             }
         }
@@ -1331,6 +1595,91 @@ impl Plugin for MeshRouteDispatch {
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+/// Compute the path forwarded to the backend for an Istio `rewrite.uri`.
+///
+/// When `match_prefix` is set (the source `match.uri` was a `prefix`), only
+/// that matched prefix is replaced by `replacement` and the remainder of the
+/// request path is preserved — mirroring Istio / Envoy `prefix_rewrite`. Any
+/// query string already lives in `ctx.query_params` / the dispatch
+/// `query_string`, so this operates on the path component only.
+///
+/// When `match_prefix` is `None` (exact / regex match, or no `match.uri`)
+/// the whole path is replaced.
+fn rewrite_request_path(
+    original_path: &str,
+    replacement: &str,
+    match_prefix: Option<&str>,
+) -> String {
+    let Some(prefix) = match_prefix else {
+        return replacement.to_string();
+    };
+    // Only strip when the request path actually starts with the literal
+    // prefix. The proxy `listen_path` already gated the request to this
+    // prefix, so this is the steady state; the `else` arm is defensive for a
+    // case-folded (`ignoreUriCase`) listen_path where the byte prefix differs.
+    let Some(tail) = original_path.strip_prefix(prefix) else {
+        return replacement.to_string();
+    };
+    // Join `replacement` + `tail` without doubling or dropping a `/`.
+    let mut out = String::with_capacity(replacement.len() + tail.len() + 1);
+    out.push_str(replacement);
+    if tail.is_empty() {
+        return out;
+    }
+    let repl_slash = replacement.ends_with('/');
+    let tail_slash = tail.starts_with('/');
+    if repl_slash && tail_slash {
+        out.push_str(&tail[1..]);
+    } else if !repl_slash && !tail_slash {
+        out.push('/');
+        out.push_str(tail);
+    } else {
+        out.push_str(tail);
+    }
+    out
+}
+
+/// Build the 3xx redirect response for a matching `redirect` rule. The
+/// `Location` header is assembled from the request's own scheme / authority /
+/// path, with each component overridden when the redirect config sets it.
+/// CR/LF were rejected at config-load time, so the resulting header value is
+/// safe to emit.
+fn build_redirect_response(
+    ctx: &RequestContext,
+    headers: &HashMap<String, String>,
+    redirect: &RouteRedirectConfig,
+) -> PluginResult {
+    let scheme = redirect.scheme.as_deref().unwrap_or_else(|| {
+        ctx.metadata
+            .get("ferrum.frontend_scheme")
+            .map(String::as_str)
+            .unwrap_or("http")
+    });
+    let authority = redirect.authority.as_deref().or_else(|| {
+        headers
+            .get("host")
+            .or_else(|| headers.get(":authority"))
+            .map(String::as_str)
+    });
+    let path = redirect.uri.as_deref().unwrap_or(ctx.path.as_str());
+
+    // Build an absolute Location when we know the authority; otherwise fall
+    // back to a path-only (origin-relative) redirect, which every compliant
+    // user agent resolves against the request URL.
+    let location = match authority {
+        Some(authority) => format!("{scheme}://{authority}{path}"),
+        None => path.to_string(),
+    };
+
+    let mut reject_headers = HashMap::with_capacity(1);
+    reject_headers.insert("location".to_string(), location);
+    PluginResult::Reject {
+        status_code: redirect.redirect_code,
+        body: String::new(),
+        headers: reject_headers,
+    }
 }
 
 /// Apply the per-rule fault action when the rule matched. Returns `Some` to
@@ -1442,7 +1791,9 @@ fn rule_matches(rule: &RouteRule, ctx: &RequestContext, headers: &HashMap<String
         // at least one rule to apply.
         return rule.request_transform_compiled.is_some()
             || rule.response_transform_compiled.is_some()
-            || rule.fault.is_some();
+            || rule.fault.is_some()
+            || rule.rewrite.is_some()
+            || rule.redirect.is_some();
     }
     // URI predicate (when set): evaluate first because it cheaply rejects
     // requests that the broader (case-insensitive) `listen_path` lets
@@ -4449,5 +4800,268 @@ mod tests {
             Some("safe-target")
         );
         assert!(!ctx.metadata.contains_key("fault_injected"));
+    }
+
+    // ── rewrite / redirect ────────────────────────────────────────────────
+
+    #[test]
+    fn rewrite_request_path_replaces_whole_path_without_prefix() {
+        assert_eq!(rewrite_request_path("/api/users", "/v2", None), "/v2");
+    }
+
+    #[test]
+    fn rewrite_request_path_strips_matched_prefix() {
+        // Istio prefix-rewrite: `match.prefix=/api` + `rewrite.uri=/v2` turns
+        // `/api/users` into `/v2/users`.
+        assert_eq!(
+            rewrite_request_path("/api/users", "/v2", Some("/api")),
+            "/v2/users"
+        );
+    }
+
+    #[test]
+    fn rewrite_request_path_joins_without_doubling_slash() {
+        assert_eq!(
+            rewrite_request_path("/api/users", "/v2/", Some("/api")),
+            "/v2/users"
+        );
+        assert_eq!(
+            rewrite_request_path("/apiusers", "/v2", Some("/api")),
+            "/v2/users"
+        );
+        // Empty tail keeps the replacement verbatim.
+        assert_eq!(rewrite_request_path("/api", "/v2", Some("/api")), "/v2");
+    }
+
+    #[tokio::test]
+    async fn rewrite_uri_sets_route_override_path() {
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "x"},
+                "rewrite": {"uri": "/v2", "match_prefix": "/api"}
+            }]
+        }))
+        .unwrap();
+        let mut ctx = ctx_with("GET", "/api/users");
+        let mut headers = HashMap::new();
+        let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_eq!(ctx.route_override_path.as_deref(), Some("/v2/users"));
+        assert!(ctx.route_override_authority.is_none());
+    }
+
+    #[tokio::test]
+    async fn rewrite_authority_sets_host_header_and_override() {
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "x"},
+                "rewrite": {"authority": "internal.example.com"}
+            }]
+        }))
+        .unwrap();
+        let mut ctx = ctx_with("GET", "/api");
+        let mut headers = HashMap::from([("host".to_string(), "public.example.com".to_string())]);
+        let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_eq!(
+            headers.get("host").map(String::as_str),
+            Some("internal.example.com")
+        );
+        assert_eq!(
+            ctx.route_override_authority.as_deref(),
+            Some("internal.example.com")
+        );
+        // No `uri` in the rewrite, so the path is untouched.
+        assert!(ctx.route_override_path.is_none());
+    }
+
+    #[tokio::test]
+    async fn non_matching_rewrite_does_not_set_override() {
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "x"},
+                "rewrite": {"uri": "/v2"}
+            }]
+        }))
+        .unwrap();
+        let mut ctx = ctx_with("POST", "/api");
+        let mut headers = HashMap::new();
+        let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert!(ctx.route_override_path.is_none());
+    }
+
+    #[test]
+    fn declares_modifies_request_headers_only_for_authority_rewrite() {
+        let authority_rewrite = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "x"},
+                "rewrite": {"authority": "internal.svc"}
+            }]
+        }))
+        .unwrap();
+        assert!(authority_rewrite.modifies_request_headers());
+
+        let path_rewrite = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "x"},
+                "rewrite": {"uri": "/v2"}
+            }]
+        }))
+        .unwrap();
+        assert!(
+            !path_rewrite.modifies_request_headers(),
+            "a path-only rewrite must not force the cloned-header dispatch path"
+        );
+    }
+
+    #[tokio::test]
+    async fn redirect_short_circuits_with_absolute_location() {
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "redirect": {"uri": "/new", "authority": "elsewhere.example.com", "redirect_code": 308}
+            }]
+        }))
+        .unwrap();
+        let mut ctx = ctx_with("GET", "/old");
+        ctx.metadata
+            .insert("ferrum.frontend_scheme".to_string(), "https".to_string());
+        let mut headers = HashMap::new();
+        match plugin.before_proxy(&mut ctx, &mut headers).await {
+            PluginResult::Reject {
+                status_code,
+                headers,
+                ..
+            } => {
+                assert_eq!(status_code, 308);
+                assert_eq!(
+                    headers.get("location").map(String::as_str),
+                    Some("https://elsewhere.example.com/new")
+                );
+            }
+            other => panic!("expected redirect Reject, got {other:?}"),
+        }
+        // A redirect must not leave a route override behind.
+        assert!(ctx.route_override_upstream_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn redirect_preserves_request_path_and_authority_when_unset() {
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {},
+                "redirect": {"scheme": "https"}
+            }]
+        }))
+        .unwrap();
+        let mut ctx = ctx_with("GET", "/keep/me");
+        ctx.metadata
+            .insert("ferrum.frontend_scheme".to_string(), "http".to_string());
+        let mut headers = HashMap::from([("host".to_string(), "site.example.com".to_string())]);
+        match plugin.before_proxy(&mut ctx, &mut headers).await {
+            PluginResult::Reject {
+                status_code,
+                headers,
+                ..
+            } => {
+                assert_eq!(status_code, 301, "default redirect code is 301");
+                assert_eq!(
+                    headers.get("location").map(String::as_str),
+                    Some("https://site.example.com/keep/me")
+                );
+            }
+            other => panic!("expected redirect Reject, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn redirect_falls_back_to_relative_location_without_authority() {
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{ "match": {}, "redirect": {"uri": "/relative"} }]
+        }))
+        .unwrap();
+        let mut ctx = ctx_with("GET", "/old");
+        let mut headers = HashMap::new();
+        match plugin.before_proxy(&mut ctx, &mut headers).await {
+            PluginResult::Reject { headers, .. } => {
+                assert_eq!(
+                    headers.get("location").map(String::as_str),
+                    Some("/relative")
+                );
+            }
+            other => panic!("expected redirect Reject, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_empty_rewrite() {
+        let err = MeshRouteDispatch::new(&json!({
+            "rules": [{"match": {"methods": ["GET"]}, "destination": {"upstream_id": "x"}, "rewrite": {}}]
+        }))
+        .unwrap_err();
+        assert!(err.contains("rewrite must set at least one"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_empty_redirect() {
+        let err = MeshRouteDispatch::new(&json!({
+            "rules": [{"match": {"methods": ["GET"]}, "redirect": {}}]
+        }))
+        .unwrap_err();
+        assert!(err.contains("redirect must set at least one"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_redirect_code_out_of_range() {
+        let err = MeshRouteDispatch::new(&json!({
+            "rules": [{"match": {"methods": ["GET"]}, "redirect": {"uri": "/x", "redirect_code": 404}}]
+        }))
+        .unwrap_err();
+        assert!(err.contains("redirect_code must be 300-399"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_crlf_in_rewrite_uri() {
+        let err = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "x"},
+                "rewrite": {"uri": "/x\r\nInjected: 1"}
+            }]
+        }))
+        .unwrap_err();
+        assert!(err.contains("must not contain CR or LF"), "got: {err}");
+    }
+
+    #[test]
+    fn redirect_rule_does_not_require_destination() {
+        // A redirect rule answers the request itself, so it is valid with no
+        // backend destination.
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{"match": {"methods": ["GET"]}, "redirect": {"uri": "/new"}}]
+        }));
+        assert!(
+            plugin.is_ok(),
+            "redirect rule must not need a destination: {plugin:?}"
+        );
+    }
+
+    #[test]
+    fn default_redirect_code_is_301_via_serde() {
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{"match": {}, "redirect": {"uri": "/new"}}]
+        }))
+        .unwrap();
+        assert_eq!(
+            plugin.rules()[0]
+                .redirect
+                .as_ref()
+                .expect("redirect")
+                .redirect_code,
+            301
+        );
     }
 }

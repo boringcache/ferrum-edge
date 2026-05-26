@@ -1553,6 +1553,18 @@ async fn handle_h3_request(
     let proxy = ctx.apply_route_overrides_with_upstreams(proxy, epoch.load_balancer.upstreams());
     ctx.matched_proxy = Some(Arc::clone(&proxy));
 
+    // Istio `VirtualService.http[].rewrite.uri`: mirror the H1/H2 dispatch
+    // contract by rebasing the request path used to build the backend URL when
+    // `mesh_route_dispatch` set `ctx.route_override_path`. Keep in sync with
+    // `src/proxy/mod.rs::handle_proxy_request_inner`.
+    let path = match ctx.route_override_path.take() {
+        Some(rewritten) => {
+            ctx.path = rewritten.clone();
+            rewritten
+        }
+        None => path,
+    };
+
     // Enforce request body size limit via Content-Length fast path. Apply
     // the gRPC-specific ceiling to gRPC requests so H3 matches H1/H2.
     let content_length_limit = if matches!(http_flavor, HttpFlavor::Grpc) {

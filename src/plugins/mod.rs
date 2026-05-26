@@ -439,6 +439,22 @@ pub struct RequestContext {
     /// after its own static header rules.
     pub route_override_response_transform:
         Option<Arc<Vec<utils::route_header_transform::RouteHeaderTransformRule>>>,
+    /// Plugin-set override for the request path forwarded to the backend.
+    /// Set by `mesh_route_dispatch` when a matching rule carries an Istio
+    /// `VirtualService.http[].rewrite.uri`. The proxy dispatch path rebases the
+    /// outgoing request line / backend URL to this value AFTER the
+    /// `before_proxy` phase (the original `ctx.path` stays intact for logging
+    /// and route selection, which already happened). `None` keeps the
+    /// request's own path. Honored on the H1/H2/gRPC/reqwest backend dispatch
+    /// path; VS-derived proxies never set `strip_listen_path`, so the override
+    /// is the literal forwarded path.
+    pub route_override_path: Option<String>,
+    /// Plugin-set override for the `Host` / `:authority` forwarded to the
+    /// backend. Set by `mesh_route_dispatch` for an Istio
+    /// `VirtualService.http[].rewrite.authority`. The proxy dispatch path
+    /// rewrites the forwarded `host` header to this value after `before_proxy`.
+    /// `None` preserves the request's own authority.
+    pub route_override_authority: Option<String>,
     /// In node-waypoint mesh topology, the Kubernetes pod UID resolved from
     /// the eBPF socket-cookie record at accept time. Set by the connection
     /// admit path alongside `peer_spiffe_id`; `None` for non-mesh
@@ -508,6 +524,8 @@ impl RequestContext {
             route_override_retry: None,
             route_override_request_transform: None,
             route_override_response_transform: None,
+            route_override_path: None,
+            route_override_authority: None,
             node_waypoint_pod_uid: None,
             node_waypoint_policy_scope: None,
             mesh_direction: None,
@@ -557,6 +575,8 @@ impl RequestContext {
             route_override_retry: self.route_override_retry.clone(),
             route_override_request_transform: self.route_override_request_transform.clone(),
             route_override_response_transform: self.route_override_response_transform.clone(),
+            route_override_path: self.route_override_path.clone(),
+            route_override_authority: self.route_override_authority.clone(),
             node_waypoint_pod_uid: self.node_waypoint_pod_uid,
             node_waypoint_policy_scope: self.node_waypoint_policy_scope.clone(),
             mesh_direction: self.mesh_direction,
@@ -717,6 +737,14 @@ impl RequestContext {
             .route_override_retry
             .as_ref()
             .is_some_and(|retry| proxy.retry != *retry);
+        // An Istio `rewrite.authority` rebases the `Host`/`:authority` forwarded
+        // to the backend. The plugin already wrote the new authority into the
+        // request `host` header; flipping `preserve_host_header` on the
+        // effective proxy makes every backend-dispatch path (reqwest / H2 /
+        // gRPC / H3 / HBONE) forward that header verbatim instead of clobbering
+        // it with the backend's own host.
+        let preserve_host_changed =
+            self.route_override_authority.is_some() && !proxy.preserve_host_header;
 
         if !upstream_id_changed
             && !backend_host_changed
@@ -725,6 +753,7 @@ impl RequestContext {
             && !dispatch_port_overrides_changed
             && !backend_read_timeout_changed
             && !retry_changed
+            && !preserve_host_changed
         {
             return proxy;
         }
@@ -756,6 +785,9 @@ impl RequestContext {
         }
         if let Some(retry) = &self.route_override_retry {
             overridden.retry = retry.clone();
+        }
+        if preserve_host_changed {
+            overridden.preserve_host_header = true;
         }
         Arc::new(overridden)
     }
