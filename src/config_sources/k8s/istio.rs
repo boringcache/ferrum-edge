@@ -2235,7 +2235,7 @@ fn virtual_service_routes(
         // Extracted before the backend check because a `redirect` route is
         // valid with NO backend — Istio forbids `route` + `redirect` together.
         let route_rewrite_value = route_rewrite_value(http);
-        let route_redirect_value = route_redirect_value(http);
+        let route_redirect_value = route_redirect_value(object, http)?;
 
         let backends = route_backends(object, http, acc, index)?;
         if backends.is_empty() {
@@ -2927,8 +2927,13 @@ fn route_rewrite_value(http: &Value) -> Option<Value> {
 /// authority carries any explicit port). Returns `None` when the block has no
 /// target-changing field so an inert `redirect: {}` does not short-circuit
 /// every request with an unchanged Location.
-fn route_redirect_value(http: &Value) -> Option<Value> {
-    let redirect = http.get("redirect")?.as_object()?;
+fn route_redirect_value(
+    object: &K8sObject,
+    http: &Value,
+) -> Result<Option<Value>, K8sTranslateError> {
+    let Some(redirect) = http.get("redirect").and_then(Value::as_object) else {
+        return Ok(None);
+    };
     let mut out = serde_json::Map::new();
     if let Some(uri) = redirect.get("uri").and_then(Value::as_str)
         && !uri.is_empty()
@@ -2948,17 +2953,29 @@ fn route_redirect_value(http: &Value) -> Option<Value> {
     {
         out.insert("scheme".to_string(), Value::String(scheme.to_string()));
     }
-    if out.is_empty() {
-        return None;
-    }
     // `redirectCode` defaults to 301 in Istio. Carry it explicitly only when
     // the operator set a value; the plugin defaults the field otherwise.
-    if let Some(code) = redirect.get("redirectCode").and_then(Value::as_u64)
-        && (300..=399).contains(&code)
-    {
+    if let Some(code_value) = redirect.get("redirectCode") {
+        let Some(code) = code_value.as_u64() else {
+            return Err(invalid_resource(
+                object,
+                "VirtualService http[].redirect.redirectCode must be an integer in the 300-399 range",
+            ));
+        };
+        if !(300..=399).contains(&code) {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "VirtualService http[].redirect.redirectCode must be in the 300-399 range, got {code}"
+                ),
+            ));
+        }
         out.insert("redirect_code".to_string(), serde_json::json!(code));
     }
-    Some(Value::Object(out))
+    if out.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(Value::Object(out)))
 }
 
 /// Build a proxy-scoped `request_mirror` plugin config for an Istio
@@ -7622,6 +7639,30 @@ extensionProviders:
         assert_eq!(redirect["redirect_code"].as_u64(), Some(302));
         use crate::plugins::mesh_route_dispatch::MeshRouteDispatch;
         MeshRouteDispatch::new(&plugin.config).expect("redirect dispatch config is valid");
+    }
+
+    #[test]
+    fn virtual_service_redirect_rejects_out_of_range_redirect_code() {
+        let err = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/old"}}],
+                        "redirect": {"uri": "/new", "redirectCode": 404}
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("invalid redirectCode must fail closed");
+
+        assert!(
+            err.to_string()
+                .contains("redirectCode must be in the 300-399 range"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

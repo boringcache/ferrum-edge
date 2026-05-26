@@ -9604,6 +9604,9 @@ components:
               One ordered route rule. `destination` is required unless the
               rule carries a `redirect` (which answers the request itself and
               needs no backend). First match wins.
+            anyOf:
+              - required: [destination]
+              - required: [redirect]
             properties:
               match:
                 type: object
