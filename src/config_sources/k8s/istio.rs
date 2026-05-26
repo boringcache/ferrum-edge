@@ -358,18 +358,20 @@ fn source_negation_match(
     object: &K8sObject,
     source: &Value,
 ) -> Result<SourceNegationMatch, K8sTranslateError> {
-    let validate_ip_blocks = |field: &str| -> Result<Vec<String>, K8sTranslateError> {
-        let blocks = string_array(source, field);
-        for block in &blocks {
-            crate::modes::mesh::policy::validate_source_ip_block(block).map_err(|reason| {
-                invalid_resource(
-                    object,
-                    format!("rules[].from[].source.{field} '{block}' is invalid: {reason}"),
-                )
-            })?;
-        }
-        Ok(blocks)
-    };
+    let parse_ip_blocks =
+        |field: &str| -> Result<Vec<crate::modes::mesh::config::ParsedCidr>, K8sTranslateError> {
+            string_array(source, field)
+                .into_iter()
+                .map(|block| {
+                    crate::modes::mesh::config::ParsedCidr::parse(&block).map_err(|reason| {
+                        invalid_resource(
+                            object,
+                            format!("rules[].from[].source.{field} '{block}' is invalid: {reason}"),
+                        )
+                    })
+                })
+                .collect()
+        };
 
     let mut not_spiffe_id_patterns = string_array(source, "notPrincipals");
     not_spiffe_id_patterns.extend(service_account_principal_patterns(
@@ -382,10 +384,10 @@ fn source_negation_match(
         not_spiffe_id_patterns,
         not_namespace_patterns: string_array(source, "notNamespaces"),
         not_trust_domain_patterns: string_array(source, "notTrustDomains"),
-        ip_blocks: validate_ip_blocks("ipBlocks")?,
-        not_ip_blocks: validate_ip_blocks("notIpBlocks")?,
-        remote_ip_blocks: validate_ip_blocks("remoteIpBlocks")?,
-        not_remote_ip_blocks: validate_ip_blocks("notRemoteIpBlocks")?,
+        ip_blocks: parse_ip_blocks("ipBlocks")?,
+        not_ip_blocks: parse_ip_blocks("notIpBlocks")?,
+        remote_ip_blocks: parse_ip_blocks("remoteIpBlocks")?,
+        not_remote_ip_blocks: parse_ip_blocks("notRemoteIpBlocks")?,
     })
 }
 
@@ -3866,6 +3868,7 @@ mod tests {
     use super::*;
     use crate::config_sources::k8s::{K8sMetadata, K8sTranslationOptions, translate_k8s_objects};
     use crate::identity::spiffe::{SpiffeId, TrustDomain};
+    use crate::modes::mesh::config::ParsedCidr;
     use crate::modes::mesh::policy::{
         MeshAuthzDecision, MeshAuthzRequest, evaluate_mesh_authorization,
     };
@@ -11224,12 +11227,21 @@ extensionProviders:
             vec!["cluster.local/ns/default/sa/legacy".to_string()]
         );
         assert_eq!(neg.not_namespace_patterns, vec!["kube-system".to_string()]);
-        assert_eq!(neg.ip_blocks, vec!["10.0.0.0/8".to_string()]);
-        assert_eq!(neg.not_ip_blocks, vec!["10.1.0.0/16".to_string()]);
-        assert_eq!(neg.remote_ip_blocks, vec!["203.0.113.0/24".to_string()]);
+        assert_eq!(
+            neg.ip_blocks,
+            vec![ParsedCidr::parse("10.0.0.0/8").unwrap()]
+        );
+        assert_eq!(
+            neg.not_ip_blocks,
+            vec![ParsedCidr::parse("10.1.0.0/16").unwrap()]
+        );
+        assert_eq!(
+            neg.remote_ip_blocks,
+            vec![ParsedCidr::parse("203.0.113.0/24").unwrap()]
+        );
         assert_eq!(
             neg.not_remote_ip_blocks,
-            vec!["198.51.100.0/24".to_string()]
+            vec![ParsedCidr::parse("198.51.100.0/24").unwrap()]
         );
     }
 

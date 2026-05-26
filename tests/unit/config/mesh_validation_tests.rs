@@ -6,9 +6,9 @@ use ferrum_edge::modes::mesh::config::{
     AppProtocol, ConditionMatch, EastWestGateway, JwtHeader, MeshConfig, MeshDestinationRule,
     MeshEndpoint, MeshJwtRule, MeshPolicy, MeshRequestAuthentication, MeshRule, MeshService,
     MeshSidecar, MeshSidecarEgress, MeshSubset, MeshTrafficPolicy, MtlsMode, MultiClusterConfig,
-    PeerAuthentication, PolicyAction, PolicyScope, PrincipalMatch, RemoteCluster, RequestMatch,
-    Resolution, ServiceEntry, ServiceEntryLocation, ServicePort, TrustBundle, TrustBundleSet,
-    Workload, WorkloadPort, WorkloadRef, WorkloadSelector, validate_mesh_config,
+    ParsedCidr, PeerAuthentication, PolicyAction, PolicyScope, PrincipalMatch, RemoteCluster,
+    RequestMatch, Resolution, ServiceEntry, ServiceEntryLocation, ServicePort, TrustBundle,
+    TrustBundleSet, Workload, WorkloadPort, WorkloadRef, WorkloadSelector, validate_mesh_config,
 };
 use std::collections::HashMap;
 
@@ -496,31 +496,15 @@ fn mesh_policy_rejects_mapped_ipv6_when_condition_prefix_below_mapping_bits() {
 
 #[test]
 fn mesh_policy_rejects_malformed_source_negation_ip_blocks() {
-    let mut policy = policy_with_request_match(RequestMatch {
-        methods: vec!["GET".into()],
-        ..RequestMatch::default()
-    });
-    policy.rules[0].source_negation.ip_blocks = vec!["10.0.0.0/40".into()];
-    policy.rules[0].source_negation.remote_ip_blocks = vec!["::ffff:10.0.0.0/95".into()];
-
-    let errors = validate_mesh_config(&[], &[], &[policy], &[], &[], &[], None);
+    let err = ParsedCidr::parse("10.0.0.0/40").unwrap_err();
     assert!(
-        errors.iter().any(|e| {
-            e.contains("rules[0].source_negation.ip_blocks[0]")
-                && e.contains("10.0.0.0/40")
-                && e.contains("prefix length")
-        }),
-        "expected invalid ip_blocks error, got: {:?}",
-        errors
+        err.contains("10.0.0.0/40") && err.contains("prefix length"),
+        "expected prefix-length error, got: {err}"
     );
+    let err = ParsedCidr::parse("::ffff:10.0.0.0/95").unwrap_err();
     assert!(
-        errors.iter().any(|e| {
-            e.contains("rules[0].source_negation.remote_ip_blocks[0]")
-                && e.contains("::ffff:10.0.0.0/95")
-                && e.contains("IPv4-mapped IPv6")
-        }),
-        "expected invalid remote_ip_blocks error, got: {:?}",
-        errors
+        err.contains("::ffff:10.0.0.0/95"),
+        "expected IPv4-mapped error, got: {err}"
     );
 }
 

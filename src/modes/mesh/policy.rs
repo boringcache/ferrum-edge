@@ -90,10 +90,11 @@ where
     let mut saw_allow = false;
     let mut matched_allow = false;
     let mut matched_audit = None;
+    let normalized_host = request.host.as_deref().and_then(normalize_match_host);
 
     for policy in policies {
         for rule in &policy.rules {
-            if !rule_matches(rule, request) {
+            if !rule_matches(rule, request, normalized_host.as_ref()) {
                 continue;
             }
             match rule.action {
@@ -131,7 +132,11 @@ where
     MeshAuthzDecision::Allow
 }
 
-fn rule_matches(rule: &MeshRule, request: &MeshAuthzRequest) -> bool {
+fn rule_matches(
+    rule: &MeshRule,
+    request: &MeshAuthzRequest,
+    normalized_host: Option<&NormalizedHost>,
+) -> bool {
     if rule.never_matches {
         return false;
     }
@@ -139,7 +144,7 @@ fn rule_matches(rule: &MeshRule, request: &MeshAuthzRequest) -> bool {
         && matches_request_principals(&rule.request_principals, request)
         && matches_not_request_principals(&rule.not_request_principals, request)
         && matches_source_negation(&rule.source_negation, request)
-        && matches_requests(&rule.to, request, rule.action)
+        && matches_requests(&rule.to, request, rule.action, normalized_host)
         && matches_conditions(&rule.when, request, rule.action)
 }
 
@@ -185,7 +190,7 @@ fn matches_source_negation(neg: &SourceNegationMatch, request: &MeshAuthzRequest
         let Some(ip) = request.source_ip else {
             return false;
         };
-        if !neg.ip_blocks.iter().any(|cidr| cidr_contains(cidr, ip)) {
+        if !neg.ip_blocks.iter().any(|cidr| cidr.contains(ip)) {
             return false;
         }
     }
@@ -193,7 +198,7 @@ fn matches_source_negation(neg: &SourceNegationMatch, request: &MeshAuthzRequest
         let Some(ip) = request.source_ip else {
             return false;
         };
-        if neg.not_ip_blocks.iter().any(|cidr| cidr_contains(cidr, ip)) {
+        if neg.not_ip_blocks.iter().any(|cidr| cidr.contains(ip)) {
             return false;
         }
     }
@@ -202,11 +207,7 @@ fn matches_source_negation(neg: &SourceNegationMatch, request: &MeshAuthzRequest
         let Some(ip) = request.remote_ip else {
             return false;
         };
-        if !neg
-            .remote_ip_blocks
-            .iter()
-            .any(|cidr| cidr_contains(cidr, ip))
-        {
+        if !neg.remote_ip_blocks.iter().any(|cidr| cidr.contains(ip)) {
             return false;
         }
     }
@@ -217,7 +218,7 @@ fn matches_source_negation(neg: &SourceNegationMatch, request: &MeshAuthzRequest
         if neg
             .not_remote_ip_blocks
             .iter()
-            .any(|cidr| cidr_contains(cidr, ip))
+            .any(|cidr| cidr.contains(ip))
         {
             return false;
         }
@@ -312,16 +313,22 @@ fn matches_requests(
     matches: &[RequestMatch],
     request: &MeshAuthzRequest,
     action: PolicyAction,
+    normalized_host: Option<&NormalizedHost>,
 ) -> bool {
     if matches.is_empty() {
         return true;
     }
     matches
         .iter()
-        .any(|match_| request_match(match_, request, action))
+        .any(|match_| request_match(match_, request, action, normalized_host))
 }
 
-fn request_match(match_: &RequestMatch, request: &MeshAuthzRequest, action: PolicyAction) -> bool {
+fn request_match(
+    match_: &RequestMatch,
+    request: &MeshAuthzRequest,
+    action: PolicyAction,
+    normalized_host: Option<&NormalizedHost>,
+) -> bool {
     if !match_.methods.is_empty() {
         match request.method.as_ref() {
             Some(method)
@@ -374,9 +381,8 @@ fn request_match(match_: &RequestMatch, request: &MeshAuthzRequest, action: Poli
             None => return false,
         }
     }
-    let normalized_host = request.host.as_deref().and_then(normalize_match_host);
     if !match_.hosts.is_empty() {
-        match normalized_host.as_ref() {
+        match normalized_host {
             Some(host)
                 if match_
                     .hosts
@@ -387,7 +393,7 @@ fn request_match(match_: &RequestMatch, request: &MeshAuthzRequest, action: Poli
         }
     }
     if !match_.not_hosts.is_empty() {
-        match normalized_host.as_ref() {
+        match normalized_host {
             Some(host)
                 if match_
                     .not_hosts
@@ -888,8 +894,8 @@ mod tests {
     use super::*;
     use crate::identity::spiffe::TrustDomain;
     use crate::modes::mesh::config::{
-        ConditionMatch, MeshPolicy, MeshRule, PolicyAction, PolicyScope, PrincipalMatch,
-        RequestMatch, WorkloadSelector,
+        ConditionMatch, MeshPolicy, MeshRule, ParsedCidr, PolicyAction, PolicyScope,
+        PrincipalMatch, RequestMatch, WorkloadSelector,
     };
 
     fn policy(name: &str, action: PolicyAction, from: Vec<PrincipalMatch>) -> MeshPolicy {
@@ -3897,7 +3903,7 @@ mod tests {
     #[test]
     fn ip_blocks_allow_only_inside_range_and_fail_closed_without_ip() {
         let slice = allow_with_source_negation(SourceNegationMatch {
-            ip_blocks: vec!["10.0.0.0/8".to_string()],
+            ip_blocks: vec![ParsedCidr::parse("10.0.0.0/8").unwrap()],
             ..SourceNegationMatch::default()
         });
         let inside = MeshAuthzRequest {
@@ -3930,7 +3936,7 @@ mod tests {
     #[test]
     fn not_ip_blocks_block_inside_range() {
         let slice = allow_with_source_negation(SourceNegationMatch {
-            not_ip_blocks: vec!["10.0.0.0/8".to_string()],
+            not_ip_blocks: vec![ParsedCidr::parse("10.0.0.0/8").unwrap()],
             ..SourceNegationMatch::default()
         });
         let inside = MeshAuthzRequest {
@@ -3956,7 +3962,7 @@ mod tests {
     #[test]
     fn remote_ip_blocks_use_remote_ip_not_source_ip() {
         let slice = allow_with_source_negation(SourceNegationMatch {
-            remote_ip_blocks: vec!["203.0.113.0/24".to_string()],
+            remote_ip_blocks: vec![ParsedCidr::parse("203.0.113.0/24").unwrap()],
             ..SourceNegationMatch::default()
         });
         // remote.ip inside, source.ip irrelevant → allow.

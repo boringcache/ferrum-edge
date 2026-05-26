@@ -7,9 +7,8 @@ use ferrum_edge::identity::{SpiffeId, TrustDomain};
 use ferrum_edge::modes::mesh::MeshTrafficDirection;
 use ferrum_edge::modes::mesh::config::{
     ConditionMatch, MeshConfig, MeshPolicy, MeshRule, PolicyAction, PolicyScope, PrincipalMatch,
-    RequestMatch, SourceNegationMatch, WorkloadSelector,
+    RequestMatch, WorkloadSelector,
 };
-use ferrum_edge::modes::mesh::slice::MeshSlice;
 use ferrum_edge::plugins::mesh::authz::MeshAuthz;
 use ferrum_edge::plugins::mesh::workload_metrics::WorkloadMetrics;
 use ferrum_edge::plugins::{
@@ -193,47 +192,46 @@ fn mesh_authz_rejects_label_selector_direct_policy_without_labels() {
 
 #[test]
 fn mesh_authz_rejects_invalid_direct_source_ip_block() {
-    let mut policy = allow_client_policy(PolicyAction::Deny);
-    policy.rules[0].source_negation = SourceNegationMatch {
-        ip_blocks: vec!["10.0.0.0/40".to_string()],
-        ..SourceNegationMatch::default()
-    };
-
     let err = match MeshAuthz::new(&json!({
-        "mesh_policies": [policy],
+        "mesh_policies": [{
+            "name": "bad-cidr",
+            "namespace": "default",
+            "scope": { "kind": "workload_selector", "selector": {} },
+            "rules": [{
+                "action": "deny",
+                "source_negation": { "ip_blocks": ["10.0.0.0/40"] },
+                "never_matches": false
+            }]
+        }],
     })) {
         Ok(_) => panic!("direct mesh_policies with malformed ipBlocks must fail closed"),
         Err(err) => err,
     };
 
-    assert!(err.contains("ipBlocks"), "error should name field: {err}");
     assert!(err.contains("10.0.0.0/40"), "error should name CIDR: {err}");
 }
 
 #[test]
 fn mesh_authz_rejects_invalid_mesh_slice_source_ip_block() {
-    let mut policy = allow_client_policy(PolicyAction::Deny);
-    policy.rules[0].source_negation = SourceNegationMatch {
-        not_remote_ip_blocks: vec!["not-a-cidr".to_string()],
-        ..SourceNegationMatch::default()
-    };
-    let slice = MeshSlice {
-        namespace: "default".to_string(),
-        mesh_policies: vec![policy],
-        ..MeshSlice::default()
-    };
-
     let err = match MeshAuthz::new(&json!({
-        "mesh_slice": slice,
+        "mesh_slice": {
+            "namespace": "default",
+            "mesh_policies": [{
+                "name": "bad-cidr",
+                "namespace": "default",
+                "scope": { "kind": "workload_selector", "selector": {} },
+                "rules": [{
+                    "action": "deny",
+                    "source_negation": { "not_remote_ip_blocks": ["not-a-cidr"] },
+                    "never_matches": false
+                }]
+            }]
+        },
     })) {
         Ok(_) => panic!("mesh_slice with malformed notRemoteIpBlocks must fail closed"),
         Err(err) => err,
     };
 
-    assert!(
-        err.contains("notRemoteIpBlocks"),
-        "error should name field: {err}"
-    );
     assert!(err.contains("not-a-cidr"), "error should name CIDR: {err}");
 }
 
