@@ -434,6 +434,67 @@ async fn body_luhn_and_cidr_rules_scan_decoded_variants() {
 }
 
 #[tokio::test]
+async fn decoded_body_rules_scan_lossy_utf8_bodies() {
+    let plugin = Waf::new(&json!({
+        "include_default_rules": false,
+        "custom_rules": [
+            {
+                "id": "CUSTOM-SCRIPT-LOSSY",
+                "name": "encoded script marker",
+                "category": "custom",
+                "severity": "high",
+                "target": "body_text",
+                "match_kind": "contains",
+                "pattern": "<script",
+                "action": "enforce"
+            },
+            {
+                "id": "CUSTOM-LUHN-LOSSY",
+                "name": "payment card in lossy text body",
+                "category": "custom",
+                "severity": "high",
+                "target": "body_text",
+                "match_kind": "luhn",
+                "action": "enforce"
+            }
+        ]
+    }))
+    .unwrap();
+
+    let mut encoded_ctx = ctx("POST", "/submit");
+    encoded_ctx
+        .headers
+        .insert("content-type".into(), "text/plain".into());
+    let headers = encoded_ctx.headers.clone();
+    let result = plugin
+        .on_final_request_body_with_context(&mut encoded_ctx, &headers, b"\xffq=%3Cscript%3E")
+        .await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(
+        encoded_ctx
+            .metadata
+            .get("waf.rule_hits")
+            .is_some_and(|hits| hits.contains("CUSTOM-SCRIPT-LOSSY"))
+    );
+
+    let mut luhn_ctx = ctx("POST", "/submit");
+    luhn_ctx
+        .headers
+        .insert("content-type".into(), "text/plain".into());
+    let headers = luhn_ctx.headers.clone();
+    let result = plugin
+        .on_final_request_body_with_context(&mut luhn_ctx, &headers, b"\xff4111111111111111")
+        .await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(
+        luhn_ctx
+            .metadata
+            .get("waf.rule_hits")
+            .is_some_and(|hits| hits.contains("CUSTOM-LUHN-LOSSY"))
+    );
+}
+
+#[tokio::test]
 async fn cidr_text_rules_are_scoped_to_their_configured_target() {
     let plugin = Waf::new(&json!({
         "include_default_rules": false,
@@ -652,6 +713,39 @@ async fn response_luhn_and_cidr_rules_scan_decoded_variants() {
             .metadata
             .get("waf.rule_hits")
             .is_some_and(|hits| hits.contains("CUSTOM-CIDR-RESP-BODY"))
+    );
+}
+
+#[tokio::test]
+async fn decoded_response_body_rules_scan_lossy_utf8_bodies() {
+    let plugin = Waf::new(&json!({
+        "include_default_rules": false,
+        "response_inspection": true,
+        "response_body_inspection": true,
+        "custom_rules": [{
+            "id": "CUSTOM-RESP-LOSSY",
+            "name": "encoded response marker",
+            "category": "custom",
+            "severity": "high",
+            "target": "response_body",
+            "match_kind": "contains",
+            "pattern": "<script",
+            "action": "enforce"
+        }]
+    }))
+    .unwrap();
+    let mut ctx = ctx("GET", "/debug");
+    let headers = HashMap::from([("content-type".to_string(), "text/plain".to_string())]);
+
+    let result = plugin
+        .on_final_response_body(&mut ctx, 200, &headers, b"\xffq=%3Cscript%3E")
+        .await;
+
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(
+        ctx.metadata
+            .get("waf.rule_hits")
+            .is_some_and(|hits| hits.contains("CUSTOM-RESP-LOSSY"))
     );
 }
 
@@ -1445,6 +1539,27 @@ async fn rule_override_can_lower_paranoia_to_reactivate_rule() {
     assert!(monitored(&ctx, "FE-RFI-001"));
 }
 
+#[tokio::test]
+async fn rule_override_action_enforces_rule() {
+    let plugin = Waf::new(&json!({
+        "mode": "enforce",
+        "rule_overrides": { "FE-SQLI-001": { "action": "enforce" } }
+    }))
+    .unwrap();
+    let mut ctx = ctx("GET", "/search");
+    ctx.set_raw_query_string("q=union+select+1".into());
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert_eq!(
+        ctx.metadata
+            .get("waf.first_blocking_rule")
+            .map(String::as_str),
+        Some("FE-SQLI-001")
+    );
+}
+
 #[test]
 fn unknown_rule_override_id_fails_construction() {
     let err = Waf::new(&json!({
@@ -1453,6 +1568,16 @@ fn unknown_rule_override_id_fails_construction() {
     .unwrap_err();
     assert!(err.contains("rule_overrides"));
     assert!(err.contains("FE-NOPE-999"));
+}
+
+#[test]
+fn unknown_rule_override_field_fails_construction() {
+    let err = Waf::new(&json!({
+        "rule_overrides": { "FE-SQLI-001": { "severty": "critical" } }
+    }))
+    .unwrap_err();
+    assert!(err.contains("unsupported field"));
+    assert!(err.contains("severty"));
 }
 
 #[tokio::test]

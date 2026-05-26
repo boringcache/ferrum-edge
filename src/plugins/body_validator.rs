@@ -1073,6 +1073,15 @@ fn entity_value_references_nested_entity(decl: &str) -> bool {
         if matches!(bytes[i], b'&' | b'%') {
             let marker = bytes[i];
             if marker == b'&' && bytes.get(i + 1) == Some(&b'#') {
+                if let Some((cp, end)) = numeric_char_ref_at(bytes, i) {
+                    if (cp == u32::from(b'&') || cp == u32::from(b'%'))
+                        && entity_name_reference_follows(bytes, end)
+                    {
+                        return true;
+                    }
+                    i = end;
+                    continue;
+                }
                 i += 1;
                 continue;
             }
@@ -1095,6 +1104,46 @@ fn entity_value_references_nested_entity(decl: &str) -> bool {
         }
     }
     false
+}
+
+fn numeric_char_ref_at(bytes: &[u8], start: usize) -> Option<(u32, usize)> {
+    if bytes.get(start) != Some(&b'&') || bytes.get(start + 1) != Some(&b'#') {
+        return None;
+    }
+    let mut i = start + 2;
+    let radix = if matches!(bytes.get(i), Some(b'x' | b'X')) {
+        i += 1;
+        16
+    } else {
+        10
+    };
+    let digits_start = i;
+    while i < bytes.len()
+        && match radix {
+            16 => bytes[i].is_ascii_hexdigit(),
+            _ => bytes[i].is_ascii_digit(),
+        }
+    {
+        i += 1;
+    }
+    if i == digits_start || bytes.get(i) != Some(&b';') {
+        return None;
+    }
+    let digits = std::str::from_utf8(&bytes[digits_start..i]).ok()?;
+    let cp = u32::from_str_radix(digits, radix).ok()?;
+    Some((cp, i + 1))
+}
+
+fn entity_name_reference_follows(bytes: &[u8], start: usize) -> bool {
+    let mut i = start;
+    let name_start = i;
+    while i < bytes.len()
+        && i - name_start <= 32
+        && (bytes[i].is_ascii_alphanumeric() || matches!(bytes[i], b'_' | b'-' | b'.'))
+    {
+        i += 1;
+    }
+    i > name_start && bytes.get(i) == Some(&b';')
 }
 
 fn is_json_like_content_type(content_type: &str) -> bool {

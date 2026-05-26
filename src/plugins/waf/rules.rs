@@ -433,6 +433,11 @@ pub(super) fn compile_rules(
         if is_default && let Some(action) = default_rule_action {
             rule.action = action;
         }
+        if let Some(ov) = rule_overrides.get(&rule.id)
+            && let Some(action) = ov.action
+        {
+            rule.action = action;
+        }
         if is_default && disabled_default_rules.contains(&rule.id) {
             continue;
         }
@@ -811,6 +816,7 @@ pub(super) fn parse_rule_action(raw: &str, field: &str) -> Result<RuleAction, St
 /// paranoia, or change severity without forking the rule pack.
 #[derive(Debug, Default)]
 pub(super) struct RuleOverride {
+    pub(super) action: Option<RuleAction>,
     pub(super) paranoia_min: Option<u8>,
     pub(super) severity: Option<Severity>,
     pub(super) fp_filters: Option<Vec<String>>,
@@ -829,6 +835,24 @@ pub(super) fn parse_rule_overrides(
                 let object = raw
                     .as_object()
                     .ok_or_else(|| format!("waf: rule_overrides['{id}'] must be an object"))?;
+                for key in object.keys() {
+                    if !matches!(
+                        key.as_str(),
+                        "action"
+                            | "paranoia_min"
+                            | "severity"
+                            | "fp_filters"
+                            | "conditions"
+                            | "score"
+                    ) {
+                        return Err(format!(
+                            "waf: rule_overrides['{id}'] contains unsupported field '{key}'"
+                        ));
+                    }
+                }
+                let action = optional_string(object, "action")?
+                    .map(|raw| parse_rule_action(&raw, "rule_overrides.action"))
+                    .transpose()?;
                 let paranoia_min = optional_u8(object, "paranoia_min")?;
                 if let Some(p) = paranoia_min
                     && !(1..=4).contains(&p)
@@ -846,6 +870,7 @@ pub(super) fn parse_rule_overrides(
                 out.insert(
                     id.clone(),
                     RuleOverride {
+                        action,
                         paranoia_min,
                         severity,
                         fp_filters,
