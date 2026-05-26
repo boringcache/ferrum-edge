@@ -8975,6 +8975,10 @@ components:
           type: string
           default: ","
           description: Separator for array claim header values
+        emit_mesh_request_principal_metadata:
+          type: boolean
+          default: false
+          description: Emits mesh.request_principal plus mesh JWT claim/audience metadata for direct mesh_authz request-principal and when-condition evaluation
         require_exp:
           type: boolean
           default: true
