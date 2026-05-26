@@ -9436,16 +9436,30 @@ components:
         implicit deny.
 
         Source matching enforces both the positive identity matchers
-        (`principals`/`namespaces`/`requestPrincipals`) and the conjunctive
-        negative and IP-block matchers (`notPrincipals`/`notNamespaces`/
-        `notRequestPrincipals`/`ipBlocks`/`notIpBlocks`/`remoteIpBlocks`/
-        `notRemoteIpBlocks`). `when:` conditions are evaluated against
+        (`principals` in Istio `<trust-domain>/ns/.../sa/...` form,
+        `serviceAccounts`, `namespaces`, `trustDomains`,
+        `requestPrincipals`) and the conjunctive negative and IP-block
+        matchers (`notPrincipals`/`notServiceAccounts`/`notNamespaces`/
+        `notTrustDomains`/`notRequestPrincipals`/`ipBlocks`/`notIpBlocks`/
+        `remoteIpBlocks`/`notRemoteIpBlocks`). `when:` conditions are
+        evaluated against
         request attributes (`source.principal`, `source.namespace`,
-        `request.auth.principal`, `request.auth.audiences`,
-        `request.auth.claims[...]`, `request.headers[...]`,
+        `request.auth.principal`, `request.auth.presenter`,
+        `request.auth.audiences`,
+        `request.auth.claims[...]` string or string-list values including
+        nested claim leaf paths,
+        `request.headers[...]`,
         `destination.port`, `connection.sni`, `source.ip`, `remote.ip`).
-        Negative and IP-block matchers fail closed when the attribute they
-        test is absent. See `docs/mesh.md`.
+        DENY rules treat missing HTTP-only operation/condition attributes as
+        matches, matching Istio's TCP behavior for policies that mention HTTP
+        fields.
+        Negative identity matchers reject only when the source/JWT identity
+        is present and matches an excluded pattern; absent identities satisfy
+        the negative matcher so DENY policies such as `notPrincipals: ["*"]`
+        and `notRequestPrincipals: ["*"]` catch anonymous traffic. IP-block
+        matchers fail closed when the IP they test is absent, and malformed
+        CIDRs reject translated resources or direct plugin config. See
+        `docs/mesh.md`.
 
         Auto-injected by mesh mode on every applicable topology; reserved
         plugin id `__mesh_authz`. PolicyScope filtering (`MeshWide` /

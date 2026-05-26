@@ -146,6 +146,7 @@ fn authz_deny_wins_when_both_match() {
                 spiffe_id_pattern: Some("spiffe://cluster.local/ns/default/sa/rogue".to_string()),
                 namespace_pattern: None,
                 trust_domain: None,
+                trust_domain_pattern: None,
             }],
             ..MeshRule::default()
         }],

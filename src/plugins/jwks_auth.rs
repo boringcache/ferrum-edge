@@ -29,7 +29,7 @@ use super::utils::token_extract::{
     extract_from_location, mark_original_token_stripping_metadata as mark_token_stripping_metadata,
     provider_locations_extract_token,
 };
-use super::{PluginResult, RequestContext};
+use super::{JwtAuthAttributeValue, PluginResult, RequestContext};
 
 /// Default JWKS refresh interval: 15 minutes.
 const DEFAULT_JWKS_REFRESH_INTERVAL_SECS: u64 = 900;
@@ -1389,9 +1389,12 @@ async fn discover_jwks_uri(
 ///
 /// Only emitted when the auto-injected mesh `RequestAuthentication` plugin set
 /// `emit_mesh_request_principal_metadata`, so non-mesh `jwks_auth` instances
-/// pay nothing. Claim fan-out is bounded by the number of claims in the
-/// already-validated token and limited to scalar values and string arrays so a
-/// hostile token cannot drive unbounded nested-object materialization.
+/// pay nothing. Audience and claim attributes are stored on dedicated
+/// `RequestContext` fields, not generic metadata, so they do not flow into
+/// transaction logs. Claim fan-out is bounded by the number of string /
+/// string-array leaves in the already-validated token; nested object claims are
+/// materialized only at leaf paths so nested Istio condition keys remain
+/// addressable without serializing whole objects.
 fn set_mesh_request_principal_metadata(claims: &Value, ctx: &mut RequestContext) {
     if let (Some(iss), Some(sub)) = (
         claims.get("iss").and_then(|v| v.as_str()),
@@ -1401,60 +1404,80 @@ fn set_mesh_request_principal_metadata(claims: &Value, ctx: &mut RequestContext)
             .insert("mesh.request_principal".to_string(), format!("{iss}/{sub}"));
     }
 
-    // `request.auth.audiences` — comma-joined `aud` (string or array form).
+    // `request.auth.audiences` — string or string-array form.
     if let Some(aud) = claims.get("aud")
-        && let Some(joined) = join_string_scalar_or_array(aud)
+        && let Some(audiences) = string_scalar_or_array(aud)
     {
-        ctx.metadata
-            .insert(MESH_REQUEST_AUTH_AUDIENCES_KEY.to_string(), joined);
+        ctx.mesh_request_auth_audiences = audiences;
     }
 
     // `request.auth.claims[<name>]` — scalar claims and string arrays only.
+    // Nested objects are emitted with Istio's bracket path encoding, e.g.
+    // `request.auth.claims[realm_access][roles]` is stored under
+    // `realm_access][roles`. Claim-name segments containing bracket syntax
+    // are skipped so a top-level claim literally named `realm_access][roles`
+    // cannot masquerade as a nested path.
     if let Some(obj) = claims.as_object() {
         for (name, value) in obj {
-            let Some(rendered) = render_claim_attribute_value(value) else {
+            if claim_path_segment_is_ambiguous(name) {
                 continue;
-            };
-            ctx.metadata
-                .insert(format!("{MESH_REQUEST_AUTH_CLAIM_PREFIX}{name}"), rendered);
+            }
+            set_mesh_claim_attribute(name, value, ctx);
         }
     }
 }
 
-/// Metadata key carrying the comma-joined JWT audiences for mesh authz
-/// `request.auth.audiences` conditions.
-pub(crate) const MESH_REQUEST_AUTH_AUDIENCES_KEY: &str = "mesh.request_auth.audiences";
-/// Metadata key prefix for individual JWT claims surfaced to mesh authz
-/// `request.auth.claims[<name>]` conditions.
-pub(crate) const MESH_REQUEST_AUTH_CLAIM_PREFIX: &str = "mesh.request_auth.claim.";
-
-/// Render a single JWT claim into the string form Istio uses for
-/// `request.auth.claims[...]` matching. Scalars render directly; string
-/// arrays render as a comma-joined list (Istio list-claim semantics). Nested
-/// objects and non-string arrays are skipped — they are not addressable by a
-/// flat `claims[name]` string condition.
-fn render_claim_attribute_value(value: &Value) -> Option<String> {
+/// Render a single JWT claim leaf into the string form Istio uses for
+/// `request.auth.claims[...]` matching. String claims render directly; string
+/// arrays stay as lists so one item containing a comma does not broaden policy
+/// matching. Objects and non-string leaves are skipped by this leaf renderer;
+/// object traversal happens in [`set_mesh_claim_attribute`].
+fn render_claim_leaf_attribute_value(value: &Value) -> Option<JwtAuthAttributeValue> {
     match value {
-        Value::String(s) => Some(s.clone()),
-        Value::Bool(b) => Some(b.to_string()),
-        Value::Number(n) => Some(n.to_string()),
-        Value::Array(_) => join_string_scalar_or_array(value),
-        Value::Null | Value::Object(_) => None,
+        Value::String(s) => Some(JwtAuthAttributeValue::Scalar(s.clone())),
+        Value::Array(_) => string_scalar_or_array(value).map(JwtAuthAttributeValue::StringList),
+        Value::Bool(_) | Value::Number(_) | Value::Null | Value::Object(_) => None,
     }
 }
 
-/// Join a JSON value that is either a single string scalar or an array of
-/// strings into a comma-separated string. Returns `None` for other shapes.
-fn join_string_scalar_or_array(value: &Value) -> Option<String> {
+fn set_mesh_claim_attribute(path: &str, value: &Value, ctx: &mut RequestContext) {
+    if let Some(rendered) = render_claim_leaf_attribute_value(value) {
+        ctx.mesh_request_auth_claims
+            .insert(path.to_string(), rendered);
+        return;
+    }
+
+    let Value::Object(obj) = value else {
+        return;
+    };
+
+    for (name, nested) in obj {
+        if claim_path_segment_is_ambiguous(name) {
+            continue;
+        }
+        let mut nested_path = String::with_capacity(path.len() + name.len() + 2);
+        nested_path.push_str(path);
+        nested_path.push_str("][");
+        nested_path.push_str(name);
+        set_mesh_claim_attribute(&nested_path, nested, ctx);
+    }
+}
+
+fn claim_path_segment_is_ambiguous(segment: &str) -> bool {
+    segment.contains('[') || segment.contains(']')
+}
+
+/// Extract a JSON value that is either a single string scalar or an array of
+/// strings. Returns `None` for other shapes.
+fn string_scalar_or_array(value: &Value) -> Option<Vec<String>> {
     match value {
-        Value::String(s) => Some(s.clone()),
+        Value::String(s) => Some(vec![s.clone()]),
         Value::Array(items) => {
-            let parts: Vec<&str> = items.iter().filter_map(|item| item.as_str()).collect();
-            if parts.is_empty() {
-                None
-            } else {
-                Some(parts.join(","))
-            }
+            let parts: Vec<String> = items
+                .iter()
+                .map(|item| item.as_str().map(str::to_string))
+                .collect::<Option<Vec<_>>>()?;
+            if parts.is_empty() { None } else { Some(parts) }
         }
         _ => None,
     }

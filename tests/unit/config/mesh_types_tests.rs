@@ -147,6 +147,7 @@ fn mesh_policy_serializes_with_oneof_scope() {
                 spiffe_id_pattern: Some("spiffe://prod/ns/ext/sa/*".into()),
                 namespace_pattern: None,
                 trust_domain: None,
+                trust_domain_pattern: None,
             }],
             to: vec![RequestMatch {
                 methods: vec!["GET".into()],

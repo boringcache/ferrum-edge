@@ -291,6 +291,7 @@ fn mesh_policy_principal_must_have_at_least_one_field() {
                 spiffe_id_pattern: None,
                 namespace_pattern: None,
                 trust_domain: None,
+                trust_domain_pattern: None,
             }],
             to: vec![RequestMatch {
                 methods: vec!["GET".into()],
@@ -323,6 +324,7 @@ fn mesh_policy_request_match_must_have_at_least_one_constraint() {
                 spiffe_id_pattern: Some("spiffe://td/*".into()),
                 namespace_pattern: None,
                 trust_domain: None,
+                trust_domain_pattern: None,
             }],
             to: vec![RequestMatch::default()],
             when: Vec::new(),
@@ -353,6 +355,7 @@ fn mesh_policy_glob_pattern_must_be_valid() {
                 spiffe_id_pattern: Some("spiffe://prod/[unclosed".into()),
                 namespace_pattern: None,
                 trust_domain: None,
+                trust_domain_pattern: None,
             }],
             to: vec![RequestMatch {
                 methods: vec!["GET".into()],
@@ -384,6 +387,7 @@ fn policy_with_request_match(request: RequestMatch) -> MeshPolicy {
                 spiffe_id_pattern: Some("spiffe://td/*".into()),
                 namespace_pattern: None,
                 trust_domain: None,
+                trust_domain_pattern: None,
             }],
             to: vec![request],
             when: Vec::new(),

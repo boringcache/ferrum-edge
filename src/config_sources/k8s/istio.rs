@@ -227,7 +227,7 @@ fn mesh_rules(
         .into_iter()
         .map(|source| {
             Ok(MeshRule {
-                from: principal_matches(source),
+                from: principal_matches(object, source)?,
                 to: to.clone(),
                 when: when.clone(),
                 request_principals: string_array(source, "requestPrincipals"),
@@ -240,23 +240,109 @@ fn mesh_rules(
         .collect()
 }
 
-fn principal_matches(source: &Value) -> Vec<PrincipalMatch> {
+fn principal_matches(
+    object: &K8sObject,
+    source: &Value,
+) -> Result<Vec<PrincipalMatch>, K8sTranslateError> {
+    let principals = string_array(source, "principals");
+    let service_accounts = service_account_principal_patterns(object, source, "serviceAccounts")?;
+    let namespaces = string_array(source, "namespaces");
+    let trust_domains = string_array(source, "trustDomains");
+
+    if !service_accounts.is_empty() && (!principals.is_empty() || !namespaces.is_empty()) {
+        return Err(invalid_resource(
+            object,
+            "rules[].from[].source.serviceAccounts cannot be set with principals or namespaces"
+                .to_string(),
+        ));
+    }
+
+    let principal_patterns = if service_accounts.is_empty() {
+        principals
+    } else {
+        service_accounts
+    };
+    if principal_patterns.is_empty() && namespaces.is_empty() && trust_domains.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let principal_patterns = optional_match_values(principal_patterns);
+    let namespaces = optional_match_values(namespaces);
+    let trust_domains = optional_match_values(trust_domains);
+
     let mut matches = Vec::new();
-    for principal in string_array(source, "principals") {
-        matches.push(PrincipalMatch {
-            spiffe_id_pattern: Some(principal),
-            namespace_pattern: None,
-            trust_domain: None,
-        });
+    for principal in &principal_patterns {
+        for namespace in &namespaces {
+            for trust_domain in &trust_domains {
+                matches.push(PrincipalMatch {
+                    spiffe_id_pattern: principal.clone(),
+                    namespace_pattern: namespace.clone(),
+                    trust_domain: None,
+                    trust_domain_pattern: trust_domain.clone(),
+                });
+            }
+        }
     }
-    for namespace in string_array(source, "namespaces") {
-        matches.push(PrincipalMatch {
-            spiffe_id_pattern: None,
-            namespace_pattern: Some(namespace),
-            trust_domain: None,
-        });
+
+    Ok(matches)
+}
+
+fn optional_match_values(values: Vec<String>) -> Vec<Option<String>> {
+    if values.is_empty() {
+        vec![None]
+    } else {
+        values.into_iter().map(Some).collect()
     }
-    matches
+}
+
+fn service_account_principal_patterns(
+    object: &K8sObject,
+    source: &Value,
+    field: &str,
+) -> Result<Vec<String>, K8sTranslateError> {
+    string_array(source, field)
+        .into_iter()
+        .map(|service_account| service_account_principal_pattern(object, field, &service_account))
+        .collect()
+}
+
+fn service_account_principal_pattern(
+    object: &K8sObject,
+    field: &str,
+    service_account: &str,
+) -> Result<String, K8sTranslateError> {
+    if service_account.contains('*') {
+        return Err(invalid_resource(
+            object,
+            format!("rules[].from[].source.{field} '{service_account}' must not contain wildcards"),
+        ));
+    }
+
+    let (namespace, service_account) = match service_account.split_once('/') {
+        Some((namespace, service_account)) if !service_account.contains('/') => {
+            (namespace, service_account)
+        }
+        Some(_) => {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "rules[].from[].source.{field} '{service_account}' must be '<serviceaccount>' or '<namespace>/<serviceaccount>'"
+                ),
+            ));
+        }
+        None => (object.metadata.namespace.as_str(), service_account),
+    };
+
+    if namespace.is_empty() || service_account.is_empty() {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "rules[].from[].source.{field} '{service_account}' must include a non-empty namespace and service account"
+            ),
+        ));
+    }
+
+    Ok(format!("*/ns/{namespace}/sa/{service_account}"))
 }
 
 /// Translate the conjunctive source-negative / IP-block fields of one Istio
@@ -280,9 +366,17 @@ fn source_negation_match(
         Ok(blocks)
     };
 
+    let mut not_spiffe_id_patterns = string_array(source, "notPrincipals");
+    not_spiffe_id_patterns.extend(service_account_principal_patterns(
+        object,
+        source,
+        "notServiceAccounts",
+    )?);
+
     Ok(SourceNegationMatch {
-        not_spiffe_id_patterns: string_array(source, "notPrincipals"),
+        not_spiffe_id_patterns,
         not_namespace_patterns: string_array(source, "notNamespaces"),
+        not_trust_domain_patterns: string_array(source, "notTrustDomains"),
         ip_blocks: validate_ip_blocks("ipBlocks")?,
         not_ip_blocks: validate_ip_blocks("notIpBlocks")?,
         remote_ip_blocks: validate_ip_blocks("remoteIpBlocks")?,
@@ -305,8 +399,12 @@ fn validate_supported_source_fields(
         match key.as_str() {
             "principals"
             | "notPrincipals"
+            | "serviceAccounts"
+            | "notServiceAccounts"
             | "namespaces"
             | "notNamespaces"
+            | "trustDomains"
+            | "notTrustDomains"
             | "ipBlocks"
             | "notIpBlocks"
             | "remoteIpBlocks"
@@ -10911,7 +11009,7 @@ extensionProviders:
                 "from": [{
                     "source": {
                         "principals": ["spiffe://cluster.local/ns/default/sa/web"],
-                        "notPrincipals": ["spiffe://cluster.local/ns/default/sa/legacy"],
+                        "notPrincipals": ["cluster.local/ns/default/sa/legacy"],
                         "notNamespaces": ["kube-system"],
                         "ipBlocks": ["10.0.0.0/8"],
                         "notIpBlocks": ["10.1.0.0/16"],
@@ -10933,7 +11031,7 @@ extensionProviders:
         let neg = &rule.source_negation;
         assert_eq!(
             neg.not_spiffe_id_patterns,
-            vec!["spiffe://cluster.local/ns/default/sa/legacy".to_string()]
+            vec!["cluster.local/ns/default/sa/legacy".to_string()]
         );
         assert_eq!(neg.not_namespace_patterns, vec!["kube-system".to_string()]);
         assert_eq!(neg.ip_blocks, vec!["10.0.0.0/8".to_string()]);
@@ -11120,6 +11218,183 @@ extensionProviders:
         assert_eq!(
             evaluate_mesh_authorization(&slice, &both),
             MeshAuthzDecision::Allow
+        );
+    }
+
+    #[test]
+    fn authorization_policy_from_entry_ands_principals_and_namespaces() {
+        let policy = translated_authorization_policy(serde_json::json!({
+            "action": "ALLOW",
+            "rules": [{
+                "from": [{
+                    "source": {
+                        "principals": ["cluster.local/ns/default/sa/web"],
+                        "namespaces": ["default"]
+                    }
+                }]
+            }]
+        }));
+
+        let rule = &policy.rules[0];
+        assert_eq!(rule.from.len(), 1);
+        assert_eq!(
+            rule.from[0].spiffe_id_pattern.as_deref(),
+            Some("cluster.local/ns/default/sa/web")
+        );
+        assert_eq!(rule.from[0].namespace_pattern.as_deref(), Some("default"));
+
+        let slice = MeshSlice {
+            mesh_policies: vec![policy],
+            ..MeshSlice::default()
+        };
+
+        let web = MeshAuthzRequest {
+            source_principal: Some(
+                SpiffeId::new("spiffe://cluster.local/ns/default/sa/web").expect("spiffe id"),
+            ),
+            ..MeshAuthzRequest::default()
+        };
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &web),
+            MeshAuthzDecision::Allow
+        );
+
+        let same_namespace_other_sa = MeshAuthzRequest {
+            source_principal: Some(
+                SpiffeId::new("spiffe://cluster.local/ns/default/sa/other").expect("spiffe id"),
+            ),
+            ..MeshAuthzRequest::default()
+        };
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &same_namespace_other_sa),
+            MeshAuthzDecision::Deny {
+                policy: "implicit-deny".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn authorization_policy_service_accounts_match_istio_source_identity() {
+        let policy = translated_authorization_policy(serde_json::json!({
+            "action": "ALLOW",
+            "rules": [{
+                "from": [{
+                    "source": {
+                        "serviceAccounts": ["web", "payments/api"]
+                    }
+                }]
+            }]
+        }));
+
+        let slice = MeshSlice {
+            mesh_policies: vec![policy],
+            ..MeshSlice::default()
+        };
+
+        let default_web = MeshAuthzRequest {
+            source_principal: Some(
+                SpiffeId::new("spiffe://cluster.local/ns/default/sa/web").expect("spiffe id"),
+            ),
+            ..MeshAuthzRequest::default()
+        };
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &default_web),
+            MeshAuthzDecision::Allow
+        );
+
+        let payments_api = MeshAuthzRequest {
+            source_principal: Some(
+                SpiffeId::new("spiffe://partner.local/ns/payments/sa/api").expect("spiffe id"),
+            ),
+            ..MeshAuthzRequest::default()
+        };
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &payments_api),
+            MeshAuthzDecision::Allow
+        );
+
+        let other = MeshAuthzRequest {
+            source_principal: Some(
+                SpiffeId::new("spiffe://cluster.local/ns/other/sa/web").expect("spiffe id"),
+            ),
+            ..MeshAuthzRequest::default()
+        };
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &other),
+            MeshAuthzDecision::Deny {
+                policy: "implicit-deny".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn authorization_policy_trust_domains_and_not_service_accounts_apply() {
+        let policy = translated_authorization_policy(serde_json::json!({
+            "action": "ALLOW",
+            "rules": [{
+                "from": [{
+                    "source": {
+                        "trustDomains": ["cluster.*"],
+                        "notTrustDomains": ["cluster.bad"],
+                        "notServiceAccounts": ["legacy"]
+                    }
+                }]
+            }]
+        }));
+
+        let slice = MeshSlice {
+            mesh_policies: vec![policy],
+            ..MeshSlice::default()
+        };
+
+        let client = MeshAuthzRequest {
+            source_principal: Some(
+                SpiffeId::new("spiffe://cluster.local/ns/default/sa/client").expect("spiffe id"),
+            ),
+            ..MeshAuthzRequest::default()
+        };
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &client),
+            MeshAuthzDecision::Allow
+        );
+
+        let denied_sa = MeshAuthzRequest {
+            source_principal: Some(
+                SpiffeId::new("spiffe://cluster.local/ns/default/sa/legacy").expect("spiffe id"),
+            ),
+            ..MeshAuthzRequest::default()
+        };
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &denied_sa),
+            MeshAuthzDecision::Deny {
+                policy: "implicit-deny".to_string()
+            }
+        );
+
+        let denied_td = MeshAuthzRequest {
+            source_principal: Some(
+                SpiffeId::new("spiffe://cluster.bad/ns/default/sa/client").expect("spiffe id"),
+            ),
+            ..MeshAuthzRequest::default()
+        };
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &denied_td),
+            MeshAuthzDecision::Deny {
+                policy: "implicit-deny".to_string()
+            }
+        );
+
+        let outside_td = MeshAuthzRequest {
+            source_principal: Some(
+                SpiffeId::new("spiffe://partner.local/ns/default/sa/client").expect("spiffe id"),
+            ),
+            ..MeshAuthzRequest::default()
+        };
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &outside_td),
+            MeshAuthzDecision::Deny {
+                policy: "implicit-deny".to_string()
+            }
         );
     }
 

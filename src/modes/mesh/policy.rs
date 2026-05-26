@@ -29,7 +29,7 @@ pub struct MeshAuthzRequest {
     pub host: Option<String>,
     pub port: Option<u16>,
     pub headers: BTreeMap<String, String>,
-    pub attributes: BTreeMap<String, String>,
+    pub attributes: BTreeMap<String, MeshAuthzAttribute>,
     /// Direct connection peer IP (`source.ip`), used by Istio source
     /// `ipBlocks` / `notIpBlocks` matchers. `None` when the listener could
     /// not resolve a socket peer address.
@@ -38,6 +38,24 @@ pub struct MeshAuthzRequest {
     /// `remoteIpBlocks` / `notRemoteIpBlocks` matchers. `None` when no
     /// trusted forwarded address was resolved.
     pub remote_ip: Option<std::net::IpAddr>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MeshAuthzAttribute {
+    Scalar(String),
+    StringList(Vec<String>),
+}
+
+impl From<String> for MeshAuthzAttribute {
+    fn from(value: String) -> Self {
+        Self::Scalar(value)
+    }
+}
+
+impl From<&str> for MeshAuthzAttribute {
+    fn from(value: &str) -> Self {
+        Self::Scalar(value.to_string())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,45 +139,45 @@ fn rule_matches(rule: &MeshRule, request: &MeshAuthzRequest) -> bool {
         && matches_request_principals(&rule.request_principals, request)
         && matches_not_request_principals(&rule.not_request_principals, request)
         && matches_source_negation(&rule.source_negation, request)
-        && matches_requests(&rule.to, request)
-        && matches_conditions(&rule.when, request)
+        && matches_requests(&rule.to, request, rule.action)
+        && matches_conditions(&rule.when, request, rule.action)
 }
 
 /// Enforce the conjunctive source-negative / IP-block matchers for one rule.
 ///
-/// Each populated field is **fail-closed** when the request attribute it
-/// tests is absent: a non-empty list with no value to check fails the match
-/// rather than admitting traffic. This mirrors how the positive
-/// `from`/`to` matchers and the HTTP-only negative predicates behave, and is
-/// the security-correct posture for deny-listing — see `.claude/rules/mesh.md`
-/// ("`RequestMatch` negative fields ... are conjunctive").
+/// Each populated positive IP field is **fail-closed** when the request
+/// attribute it tests is absent. Negative principal/namespace fields preserve
+/// Istio semantics: when the source identity is absent it does not match any
+/// excluded identity, so DENY policies such as `notPrincipals: ["*"]` can
+/// intentionally catch anonymous traffic.
 fn matches_source_negation(neg: &SourceNegationMatch, request: &MeshAuthzRequest) -> bool {
     if neg.is_empty() {
         return true;
     }
     // notPrincipals / notNamespaces — operate on the source SPIFFE ID.
-    if !neg.not_spiffe_id_patterns.is_empty() || !neg.not_namespace_patterns.is_empty() {
-        let Some(source) = request.source_principal.as_ref() else {
-            return false;
-        };
+    if let Some(source) = request.source_principal.as_ref() {
         if neg
             .not_spiffe_id_patterns
             .iter()
-            .any(|pattern| wildcard_match(pattern, source.as_str()))
+            .any(|pattern| source_principal_pattern_matches(pattern, source))
         {
             return false;
         }
-        if !neg.not_namespace_patterns.is_empty() {
-            let Some(namespace) = extract_namespace(source.as_str()) else {
-                return false;
-            };
-            if neg
-                .not_namespace_patterns
-                .iter()
-                .any(|pattern| wildcard_match(pattern, namespace))
-            {
-                return false;
-            }
+        if !neg.not_namespace_patterns.is_empty()
+            && extract_namespace(source.as_str()).is_some_and(|namespace| {
+                neg.not_namespace_patterns
+                    .iter()
+                    .any(|pattern| wildcard_match(pattern, namespace))
+            })
+        {
+            return false;
+        }
+        if neg
+            .not_trust_domain_patterns
+            .iter()
+            .any(|pattern| wildcard_match(pattern, source.trust_domain().as_str()))
+        {
+            return false;
         }
     }
     // ipBlocks / notIpBlocks — direct connection peer IP (source.ip).
@@ -226,16 +244,16 @@ fn matches_request_principals(patterns: &[String], request: &MeshAuthzRequest) -
 /// JWT-derived `iss/sub` identity.
 ///
 /// An empty list means "no negative filter". A non-empty list fails the match
-/// when the request principal matches any pattern, and also fails when no
-/// request principal is present (fail-closed: an anonymous request cannot
-/// satisfy a `notRequestPrincipals` constraint without admitting traffic the
-/// policy meant to gate).
+/// when the request principal matches any pattern. When no request principal
+/// is present the negative matcher succeeds, matching Istio's semantics and
+/// enabling the canonical `DENY` `notRequestPrincipals: ["*"]` policy for
+/// anonymous requests.
 fn matches_not_request_principals(patterns: &[String], request: &MeshAuthzRequest) -> bool {
     if patterns.is_empty() {
         return true;
     }
     let Some(principal) = request.request_principal.as_ref() else {
-        return false;
+        return true;
     };
     !patterns
         .iter()
@@ -260,8 +278,13 @@ fn principal_match(match_: &PrincipalMatch, source: Option<&SpiffeId>) -> bool {
     {
         return false;
     }
+    if let Some(pattern) = match_.trust_domain_pattern.as_ref()
+        && !wildcard_match(pattern, source.trust_domain().as_str())
+    {
+        return false;
+    }
     if let Some(pattern) = match_.spiffe_id_pattern.as_ref()
-        && !wildcard_match(pattern, source.as_str())
+        && !source_principal_pattern_matches(pattern, source)
     {
         return false;
     }
@@ -273,86 +296,109 @@ fn principal_match(match_: &PrincipalMatch, source: Option<&SpiffeId>) -> bool {
     true
 }
 
-fn matches_requests(matches: &[RequestMatch], request: &MeshAuthzRequest) -> bool {
+pub(crate) fn istio_source_principal(source: &SpiffeId) -> &str {
+    source
+        .as_str()
+        .strip_prefix("spiffe://")
+        .unwrap_or(source.as_str())
+}
+
+fn source_principal_pattern_matches(pattern: &str, source: &SpiffeId) -> bool {
+    wildcard_match(pattern, source.as_str())
+        || wildcard_match(pattern, istio_source_principal(source))
+}
+
+fn matches_requests(
+    matches: &[RequestMatch],
+    request: &MeshAuthzRequest,
+    action: PolicyAction,
+) -> bool {
     if matches.is_empty() {
         return true;
     }
-    matches.iter().any(|match_| request_match(match_, request))
+    matches
+        .iter()
+        .any(|match_| request_match(match_, request, action))
 }
 
-fn request_match(match_: &RequestMatch, request: &MeshAuthzRequest) -> bool {
-    if !match_.methods.is_empty()
-        && !request.method.as_ref().is_some_and(|method| {
-            match_
-                .methods
-                .iter()
-                .any(|allowed| allowed.eq_ignore_ascii_case(method))
-        })
-    {
-        return false;
-    }
-    // HTTP-only negative predicates (`not_methods`, `not_paths`, `not_hosts`)
-    // fail the match when the corresponding HTTP attribute is absent. This
-    // mirrors how the positive `methods`/`paths`/`hosts` checks above behave
-    // for the same case (e.g. raw-TCP `on_stream_connect`, which only carries
-    // a port) — without this, an ALLOW rule that mentions an HTTP-only field
-    // would over-permissively match non-HTTP traffic that should fall through
-    // to implicit deny.
-    if !match_.not_methods.is_empty() {
-        let Some(method) = request.method.as_ref() else {
-            return false;
-        };
-        if match_
-            .not_methods
-            .iter()
-            .any(|denied| denied.eq_ignore_ascii_case(method))
-        {
-            return false;
+fn request_match(match_: &RequestMatch, request: &MeshAuthzRequest, action: PolicyAction) -> bool {
+    if !match_.methods.is_empty() {
+        match request.method.as_ref() {
+            Some(method)
+                if match_
+                    .methods
+                    .iter()
+                    .any(|allowed| allowed.eq_ignore_ascii_case(method)) => {}
+            None if deny_missing_http_attribute_matches(action) => {}
+            _ => return false,
         }
     }
-    if !match_.paths.is_empty()
-        && !request.path.as_ref().is_some_and(|path| {
-            match_
-                .paths
-                .iter()
-                .any(|pattern| wildcard_match(pattern, path))
-        })
-    {
-        return false;
+    if !match_.not_methods.is_empty() {
+        match request.method.as_ref() {
+            Some(method)
+                if match_
+                    .not_methods
+                    .iter()
+                    .any(|denied| denied.eq_ignore_ascii_case(method)) =>
+            {
+                return false;
+            }
+            Some(_) => {}
+            None if deny_missing_http_attribute_matches(action) => {}
+            None => return false,
+        }
+    }
+    if !match_.paths.is_empty() {
+        match request.path.as_ref() {
+            Some(path)
+                if match_
+                    .paths
+                    .iter()
+                    .any(|pattern| wildcard_match(pattern, path)) => {}
+            None if deny_missing_http_attribute_matches(action) => {}
+            _ => return false,
+        }
     }
     if !match_.not_paths.is_empty() {
-        let Some(path) = request.path.as_ref() else {
-            return false;
-        };
-        if match_
-            .not_paths
-            .iter()
-            .any(|pattern| wildcard_match(pattern, path))
-        {
-            return false;
+        match request.path.as_ref() {
+            Some(path)
+                if match_
+                    .not_paths
+                    .iter()
+                    .any(|pattern| wildcard_match(pattern, path)) =>
+            {
+                return false;
+            }
+            Some(_) => {}
+            None if deny_missing_http_attribute_matches(action) => {}
+            None => return false,
         }
     }
     let normalized_host = request.host.as_deref().and_then(normalize_match_host);
-    if !match_.hosts.is_empty()
-        && !normalized_host.as_ref().is_some_and(|host| {
-            match_
-                .hosts
-                .iter()
-                .any(|pattern| normalized_host_matches(pattern, host))
-        })
-    {
-        return false;
+    if !match_.hosts.is_empty() {
+        match normalized_host.as_ref() {
+            Some(host)
+                if match_
+                    .hosts
+                    .iter()
+                    .any(|pattern| normalized_host_matches(pattern, host)) => {}
+            None if deny_missing_http_attribute_matches(action) => {}
+            _ => return false,
+        }
     }
     if !match_.not_hosts.is_empty() {
-        let Some(host) = normalized_host.as_ref() else {
-            return false;
-        };
-        if match_
-            .not_hosts
-            .iter()
-            .any(|pattern| normalized_host_matches(pattern, host))
-        {
-            return false;
+        match normalized_host.as_ref() {
+            Some(host)
+                if match_
+                    .not_hosts
+                    .iter()
+                    .any(|pattern| normalized_host_matches(pattern, host)) =>
+            {
+                return false;
+            }
+            Some(_) => {}
+            None if deny_missing_http_attribute_matches(action) => {}
+            None => return false,
         }
     }
     if (!match_.ports.is_empty() || !match_.port_patterns.is_empty())
@@ -379,14 +425,17 @@ fn request_match(match_: &RequestMatch, request: &MeshAuthzRequest) -> bool {
         }
     }
     for (name, pattern) in &match_.headers {
-        let Some(value) = request_header_value(&request.headers, name) else {
-            return false;
-        };
-        if !wildcard_match(pattern, value) {
-            return false;
+        match request_header_value(&request.headers, name) {
+            Some(value) if wildcard_match(pattern, value) => {}
+            None if deny_missing_http_attribute_matches(action) => {}
+            _ => return false,
         }
     }
     true
+}
+
+fn deny_missing_http_attribute_matches(action: PolicyAction) -> bool {
+    action == PolicyAction::Deny
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -504,21 +553,94 @@ fn is_valid_authority_port(port: &str) -> bool {
     !port.is_empty() && port.parse::<u16>().is_ok()
 }
 
-fn matches_conditions(matches: &[ConditionMatch], request: &MeshAuthzRequest) -> bool {
+fn matches_conditions(
+    matches: &[ConditionMatch],
+    request: &MeshAuthzRequest,
+    action: PolicyAction,
+) -> bool {
     matches.iter().all(|match_| {
-        let value = request.attributes.get(&match_.key).map(String::as_str);
+        let value = request.attributes.get(&match_.key);
+        if value.is_none()
+            && action == PolicyAction::Deny
+            && condition_key_is_http_only(&match_.key)
+        {
+            return true;
+        }
         if !match_.values.is_empty()
-            && !value.is_some_and(|value| match_.values.iter().any(|v| v == value))
+            && !value.is_some_and(|value| {
+                match_
+                    .values
+                    .iter()
+                    .any(|candidate| condition_value_matches(&match_.key, candidate, value))
+            })
         {
             return false;
         }
         if !match_.not_values.is_empty()
-            && value.is_some_and(|value| match_.not_values.iter().any(|v| v == value))
+            && value.is_some_and(|value| {
+                match_
+                    .not_values
+                    .iter()
+                    .any(|candidate| condition_value_matches(&match_.key, candidate, value))
+            })
         {
             return false;
         }
         true
     })
+}
+
+fn condition_value_matches(key: &str, candidate: &str, value: &MeshAuthzAttribute) -> bool {
+    match value {
+        MeshAuthzAttribute::Scalar(value) => condition_scalar_value_matches(key, candidate, value),
+        MeshAuthzAttribute::StringList(values) => values
+            .iter()
+            .any(|value| condition_scalar_value_matches(key, candidate, value)),
+    }
+}
+
+fn condition_scalar_value_matches(key: &str, candidate: &str, value: &str) -> bool {
+    if condition_key_is_ip(key) {
+        return value
+            .parse::<IpAddr>()
+            .is_ok_and(|ip| cidr_contains(candidate, ip));
+    }
+    istio_condition_string_match(candidate, value)
+}
+
+fn condition_key_is_ip(key: &str) -> bool {
+    matches!(key, "source.ip" | "remote.ip")
+}
+
+fn condition_key_is_http_only(key: &str) -> bool {
+    key.starts_with("request.headers[")
+        || key == "request.auth.principal"
+        || key == "request.auth.presenter"
+        || key == "request.auth.audiences"
+        || key.starts_with("request.auth.claims[")
+}
+
+fn istio_condition_string_match(pattern: &str, value: &str) -> bool {
+    if pattern == "*" {
+        return !value.is_empty();
+    }
+    if !pattern.contains('*') {
+        return pattern == value;
+    }
+    let star_count = pattern.bytes().filter(|byte| *byte == b'*').count();
+    if star_count == 1 {
+        if let Some(prefix) = pattern.strip_suffix('*')
+            && !prefix.is_empty()
+        {
+            return value.starts_with(prefix);
+        }
+        if let Some(suffix) = pattern.strip_prefix('*')
+            && !suffix.is_empty()
+        {
+            return value.ends_with(suffix);
+        }
+    }
+    false
 }
 
 fn extract_namespace(spiffe_id: &str) -> Option<&str> {
@@ -538,11 +660,14 @@ fn extract_namespace(spiffe_id: &str) -> Option<&str> {
 /// integer bitmask. IPv4-mapped IPv6 addresses on either side are folded to
 /// IPv4 so a `10.0.0.0/8` block still matches a `::ffff:10.0.0.1` peer,
 /// matching the gateway's `client_ip` CIDR semantics. A bare IP (no `/`) is
-/// treated as a host route (`/32` or `/128`). CIDRs are validated at
-/// translation time, so a malformed entry here simply fails to match (the
-/// rule then fails closed for a positive block / opens for a negative block,
-/// but translation rejects bad CIDRs before they ever reach this path).
+/// treated as a host route (`/32` or `/128`). CIDRs are validated before they
+/// reach request evaluation, so a malformed entry here simply fails to match
+/// as a final guard.
 fn cidr_contains(cidr: &str, ip: IpAddr) -> bool {
+    let cidr = cidr.trim();
+    if cidr.is_empty() {
+        return false;
+    }
     let ip = canonicalize_ip_for_match(ip);
     let (network_str, prefix) = match cidr.split_once('/') {
         Some((net, prefix_str)) => match prefix_str.parse::<u8>() {
@@ -793,6 +918,7 @@ mod tests {
                     spiffe_id_pattern: Some("spiffe://cluster.local/ns/default/sa/client".into()),
                     namespace_pattern: None,
                     trust_domain: None,
+                    trust_domain_pattern: None,
                 }],
             )],
             ..MeshSlice::default()
@@ -1489,6 +1615,7 @@ mod tests {
                         ),
                         namespace_pattern: None,
                         trust_domain: None,
+                        trust_domain_pattern: None,
                     }],
                 ),
             ],
@@ -1548,6 +1675,7 @@ mod tests {
             spiffe_id_pattern: Some(spiffe.into()),
             namespace_pattern: None,
             trust_domain: None,
+            trust_domain_pattern: None,
         };
         let slice = MeshSlice {
             mesh_policies: vec![
@@ -1599,6 +1727,7 @@ mod tests {
                         ),
                         namespace_pattern: None,
                         trust_domain: None,
+                        trust_domain_pattern: None,
                     }],
                 ),
                 policy(
@@ -1610,6 +1739,7 @@ mod tests {
                         ),
                         namespace_pattern: None,
                         trust_domain: None,
+                        trust_domain_pattern: None,
                     }],
                 ),
             ],
@@ -1639,6 +1769,7 @@ mod tests {
                     spiffe_id_pattern: Some("*".into()),
                     namespace_pattern: None,
                     trust_domain: None,
+                    trust_domain_pattern: None,
                 }],
             )],
             ..MeshSlice::default()
@@ -1663,6 +1794,7 @@ mod tests {
                     spiffe_id_pattern: None,
                     namespace_pattern: Some("default".into()),
                     trust_domain: None,
+                    trust_domain_pattern: None,
                 }],
             )],
             ..MeshSlice::default()
@@ -1698,6 +1830,7 @@ mod tests {
                     spiffe_id_pattern: None,
                     namespace_pattern: Some("*".into()),
                     trust_domain: None,
+                    trust_domain_pattern: None,
                 }],
             )],
             ..MeshSlice::default()
@@ -1713,6 +1846,31 @@ mod tests {
     }
 
     #[test]
+    fn istio_principal_format_matches_source_spiffe_id() {
+        let slice = MeshSlice {
+            mesh_policies: vec![policy(
+                "allow-client",
+                PolicyAction::Allow,
+                vec![PrincipalMatch {
+                    spiffe_id_pattern: Some("cluster.local/ns/default/sa/client".into()),
+                    namespace_pattern: None,
+                    trust_domain: None,
+                    trust_domain_pattern: None,
+                }],
+            )],
+            ..MeshSlice::default()
+        };
+
+        assert_eq!(
+            evaluate_mesh_authorization(
+                &slice,
+                &request("spiffe://cluster.local/ns/default/sa/client")
+            ),
+            MeshAuthzDecision::Allow
+        );
+    }
+
+    #[test]
     fn trust_domain_mismatch_rejects() {
         let slice = MeshSlice {
             mesh_policies: vec![policy(
@@ -1722,6 +1880,7 @@ mod tests {
                     spiffe_id_pattern: None,
                     namespace_pattern: None,
                     trust_domain: Some(TrustDomain::new("prod.local").unwrap()),
+                    trust_domain_pattern: None,
                 }],
             )],
             ..MeshSlice::default()
@@ -1778,6 +1937,7 @@ mod tests {
                         ),
                         namespace_pattern: None,
                         trust_domain: None,
+                        trust_domain_pattern: None,
                     },
                     PrincipalMatch {
                         spiffe_id_pattern: Some(
@@ -1785,6 +1945,7 @@ mod tests {
                         ),
                         namespace_pattern: None,
                         trust_domain: None,
+                        trust_domain_pattern: None,
                     },
                 ],
             )],
@@ -1831,6 +1992,7 @@ mod tests {
                     spiffe_id_pattern: Some("*".into()),
                     namespace_pattern: None,
                     trust_domain: None,
+                    trust_domain_pattern: None,
                 }],
             )],
             ..MeshSlice::default()
@@ -2221,7 +2383,7 @@ mod tests {
         let mut attrs_east = BTreeMap::new();
         attrs_east.insert(
             "request.auth.claims[region]".to_string(),
-            "us-east-1".to_string(),
+            "us-east-1".into(),
         );
         assert_eq!(
             evaluate_mesh_authorization(
@@ -2237,7 +2399,7 @@ mod tests {
         let mut attrs_west = BTreeMap::new();
         attrs_west.insert(
             "request.auth.claims[region]".to_string(),
-            "eu-west-1".to_string(),
+            "eu-west-1".into(),
         );
         assert_eq!(
             evaluate_mesh_authorization(
@@ -2253,7 +2415,7 @@ mod tests {
         let mut attrs_other = BTreeMap::new();
         attrs_other.insert(
             "request.auth.claims[region]".to_string(),
-            "ap-south-1".to_string(),
+            "ap-south-1".into(),
         );
         assert_eq!(
             evaluate_mesh_authorization(
@@ -2266,6 +2428,235 @@ mod tests {
             MeshAuthzDecision::Deny {
                 policy: "implicit-deny".to_string()
             }
+        );
+    }
+
+    #[test]
+    fn condition_values_support_istio_wildcards() {
+        let slice = MeshSlice {
+            mesh_policies: vec![MeshPolicy {
+                name: "deny-badbot".to_string(),
+                namespace: "default".to_string(),
+                scope: PolicyScope::MeshWide,
+                rules: vec![MeshRule {
+                    when: vec![ConditionMatch {
+                        key: "request.headers[user-agent]".to_string(),
+                        values: vec!["BadBot/*".to_string()],
+                        not_values: Vec::new(),
+                    }],
+                    action: PolicyAction::Deny,
+                    ..MeshRule::default()
+                }],
+            }],
+            ..MeshSlice::default()
+        };
+
+        let mut attrs = BTreeMap::new();
+        attrs.insert(
+            "request.headers[user-agent]".to_string(),
+            "BadBot/1.0".into(),
+        );
+        assert_eq!(
+            evaluate_mesh_authorization(
+                &slice,
+                &MeshAuthzRequest {
+                    attributes: attrs,
+                    ..MeshAuthzRequest::default()
+                }
+            ),
+            MeshAuthzDecision::Deny {
+                policy: "deny-badbot".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn condition_presence_wildcard_requires_non_empty_attribute() {
+        let slice = MeshSlice {
+            mesh_policies: vec![MeshPolicy {
+                name: "deny-present-env".to_string(),
+                namespace: "default".to_string(),
+                scope: PolicyScope::MeshWide,
+                rules: vec![MeshRule {
+                    when: vec![ConditionMatch {
+                        key: "request.headers[x-env]".to_string(),
+                        values: vec!["*".to_string()],
+                        not_values: Vec::new(),
+                    }],
+                    action: PolicyAction::Deny,
+                    ..MeshRule::default()
+                }],
+            }],
+            ..MeshSlice::default()
+        };
+
+        let mut empty = BTreeMap::new();
+        empty.insert("request.headers[x-env]".to_string(), "".into());
+        assert_eq!(
+            evaluate_mesh_authorization(
+                &slice,
+                &MeshAuthzRequest {
+                    attributes: empty,
+                    ..MeshAuthzRequest::default()
+                }
+            ),
+            MeshAuthzDecision::Allow
+        );
+
+        let mut present = BTreeMap::new();
+        present.insert("request.headers[x-env]".to_string(), "prod".into());
+        assert_eq!(
+            evaluate_mesh_authorization(
+                &slice,
+                &MeshAuthzRequest {
+                    attributes: present,
+                    ..MeshAuthzRequest::default()
+                }
+            ),
+            MeshAuthzDecision::Deny {
+                policy: "deny-present-env".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn condition_values_reject_middle_globs() {
+        let slice = MeshSlice {
+            mesh_policies: vec![MeshPolicy {
+                name: "deny-middle-glob".to_string(),
+                namespace: "default".to_string(),
+                scope: PolicyScope::MeshWide,
+                rules: vec![MeshRule {
+                    when: vec![ConditionMatch {
+                        key: "request.headers[x-env]".to_string(),
+                        values: vec!["pr*d".to_string()],
+                        not_values: Vec::new(),
+                    }],
+                    action: PolicyAction::Deny,
+                    ..MeshRule::default()
+                }],
+            }],
+            ..MeshSlice::default()
+        };
+
+        let mut attrs = BTreeMap::new();
+        attrs.insert("request.headers[x-env]".to_string(), "prod".into());
+        assert_eq!(
+            evaluate_mesh_authorization(
+                &slice,
+                &MeshAuthzRequest {
+                    attributes: attrs,
+                    ..MeshAuthzRequest::default()
+                }
+            ),
+            MeshAuthzDecision::Allow
+        );
+    }
+
+    #[test]
+    fn condition_ip_values_support_cidr_blocks() {
+        let slice = MeshSlice {
+            mesh_policies: vec![MeshPolicy {
+                name: "deny-private-source-ip".to_string(),
+                namespace: "default".to_string(),
+                scope: PolicyScope::MeshWide,
+                rules: vec![MeshRule {
+                    when: vec![ConditionMatch {
+                        key: "source.ip".to_string(),
+                        values: vec!["10.0.0.0/8".to_string()],
+                        not_values: Vec::new(),
+                    }],
+                    action: PolicyAction::Deny,
+                    ..MeshRule::default()
+                }],
+            }],
+            ..MeshSlice::default()
+        };
+
+        let mut attrs = BTreeMap::new();
+        attrs.insert("source.ip".to_string(), "10.2.3.4".into());
+        assert_eq!(
+            evaluate_mesh_authorization(
+                &slice,
+                &MeshAuthzRequest {
+                    attributes: attrs,
+                    ..MeshAuthzRequest::default()
+                }
+            ),
+            MeshAuthzDecision::Deny {
+                policy: "deny-private-source-ip".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn condition_jwt_claim_values_match_any_list_item() {
+        let slice = MeshSlice {
+            mesh_policies: vec![MeshPolicy {
+                name: "allow-group".to_string(),
+                namespace: "default".to_string(),
+                scope: PolicyScope::MeshWide,
+                rules: vec![MeshRule {
+                    when: vec![ConditionMatch {
+                        key: "request.auth.claims[groups]".to_string(),
+                        values: vec!["ops".to_string()],
+                        not_values: Vec::new(),
+                    }],
+                    action: PolicyAction::Allow,
+                    ..MeshRule::default()
+                }],
+            }],
+            ..MeshSlice::default()
+        };
+
+        let mut attrs = BTreeMap::new();
+        attrs.insert(
+            "request.auth.claims[groups]".to_string(),
+            MeshAuthzAttribute::StringList(vec!["dev".to_string(), "ops".to_string()]),
+        );
+        assert_eq!(
+            evaluate_mesh_authorization(
+                &slice,
+                &MeshAuthzRequest {
+                    attributes: attrs,
+                    ..MeshAuthzRequest::default()
+                }
+            ),
+            MeshAuthzDecision::Allow
+        );
+    }
+
+    #[test]
+    fn condition_jwt_scalar_claim_does_not_split_commas() {
+        let slice = MeshSlice {
+            mesh_policies: vec![MeshPolicy {
+                name: "deny-ops".to_string(),
+                namespace: "default".to_string(),
+                scope: PolicyScope::MeshWide,
+                rules: vec![MeshRule {
+                    when: vec![ConditionMatch {
+                        key: "request.auth.claims[groups]".to_string(),
+                        values: vec!["ops".to_string()],
+                        not_values: Vec::new(),
+                    }],
+                    action: PolicyAction::Deny,
+                    ..MeshRule::default()
+                }],
+            }],
+            ..MeshSlice::default()
+        };
+
+        let mut attrs = BTreeMap::new();
+        attrs.insert("request.auth.claims[groups]".to_string(), "dev,ops".into());
+        assert_eq!(
+            evaluate_mesh_authorization(
+                &slice,
+                &MeshAuthzRequest {
+                    attributes: attrs,
+                    ..MeshAuthzRequest::default()
+                }
+            ),
+            MeshAuthzDecision::Allow
         );
     }
 
@@ -2297,7 +2688,7 @@ mod tests {
 
         // Attribute matches not_values: rule does NOT match (condition fails).
         let mut attrs_internal = BTreeMap::new();
-        attrs_internal.insert("source.namespace".to_string(), "internal".to_string());
+        attrs_internal.insert("source.namespace".to_string(), "internal".into());
         assert_eq!(
             evaluate_mesh_authorization(
                 &slice,
@@ -2311,7 +2702,7 @@ mod tests {
 
         // Attribute does not match not_values: condition passes, DENY fires.
         let mut attrs_external = BTreeMap::new();
-        attrs_external.insert("source.namespace".to_string(), "external".to_string());
+        attrs_external.insert("source.namespace".to_string(), "external".into());
         assert_eq!(
             evaluate_mesh_authorization(
                 &slice,
@@ -2355,7 +2746,7 @@ mod tests {
 
         // "prod" is in values, not in not_values: match.
         let mut attrs_prod = BTreeMap::new();
-        attrs_prod.insert("env".to_string(), "prod".to_string());
+        attrs_prod.insert("env".to_string(), "prod".into());
         assert_eq!(
             evaluate_mesh_authorization(
                 &slice,
@@ -2369,7 +2760,7 @@ mod tests {
 
         // "staging" is in both: not_values blocks it.
         let mut attrs_staging = BTreeMap::new();
-        attrs_staging.insert("env".to_string(), "staging".to_string());
+        attrs_staging.insert("env".to_string(), "staging".into());
         assert_eq!(
             evaluate_mesh_authorization(
                 &slice,
@@ -2427,6 +2818,88 @@ mod tests {
     }
 
     #[test]
+    fn deny_condition_missing_http_only_attribute_matches() {
+        let slice = MeshSlice {
+            mesh_policies: vec![MeshPolicy {
+                name: "deny-admin-jwt".to_string(),
+                namespace: "default".to_string(),
+                scope: PolicyScope::MeshWide,
+                rules: vec![MeshRule {
+                    when: vec![ConditionMatch {
+                        key: "request.auth.claims[role]".to_string(),
+                        values: vec!["admin".to_string()],
+                        not_values: Vec::new(),
+                    }],
+                    action: PolicyAction::Deny,
+                    ..MeshRule::default()
+                }],
+            }],
+            ..MeshSlice::default()
+        };
+
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &MeshAuthzRequest::default()),
+            MeshAuthzDecision::Deny {
+                policy: "deny-admin-jwt".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn deny_condition_missing_presenter_attribute_matches() {
+        let slice = MeshSlice {
+            mesh_policies: vec![MeshPolicy {
+                name: "deny-presenter".to_string(),
+                namespace: "default".to_string(),
+                scope: PolicyScope::MeshWide,
+                rules: vec![MeshRule {
+                    when: vec![ConditionMatch {
+                        key: "request.auth.presenter".to_string(),
+                        values: vec!["client-app".to_string()],
+                        not_values: Vec::new(),
+                    }],
+                    action: PolicyAction::Deny,
+                    ..MeshRule::default()
+                }],
+            }],
+            ..MeshSlice::default()
+        };
+
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &MeshAuthzRequest::default()),
+            MeshAuthzDecision::Deny {
+                policy: "deny-presenter".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn deny_condition_missing_non_http_attribute_still_fails_values_check() {
+        let slice = MeshSlice {
+            mesh_policies: vec![MeshPolicy {
+                name: "deny-default-namespace".to_string(),
+                namespace: "default".to_string(),
+                scope: PolicyScope::MeshWide,
+                rules: vec![MeshRule {
+                    when: vec![ConditionMatch {
+                        key: "source.namespace".to_string(),
+                        values: vec!["default".to_string()],
+                        not_values: Vec::new(),
+                    }],
+                    action: PolicyAction::Deny,
+                    ..MeshRule::default()
+                }],
+            }],
+            ..MeshSlice::default()
+        };
+
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &MeshAuthzRequest::default()),
+            MeshAuthzDecision::Allow
+        );
+    }
+
+    #[test]
     fn condition_not_values_absent_passes_present_match_fails() {
         // Istio `notValues` semantics: a condition is satisfied unless the
         // attribute is present AND matches one of `notValues`. When the
@@ -2476,7 +2949,7 @@ mod tests {
         // rule does not match, so the lone ALLOW policy falls through to
         // implicit deny.
         let mut blocked = BTreeMap::new();
-        blocked.insert("request.headers[x-env]".to_string(), "blocked".to_string());
+        blocked.insert("request.headers[x-env]".to_string(), "blocked".into());
         assert_eq!(
             evaluate_mesh_authorization(
                 &allow_unless_blocked,
@@ -2526,8 +2999,8 @@ mod tests {
 
         // Both conditions met.
         let mut attrs_both = BTreeMap::new();
-        attrs_both.insert("env".to_string(), "prod".to_string());
-        attrs_both.insert("region".to_string(), "us-east-1".to_string());
+        attrs_both.insert("env".to_string(), "prod".into());
+        attrs_both.insert("region".to_string(), "us-east-1".into());
         assert_eq!(
             evaluate_mesh_authorization(
                 &slice,
@@ -2541,8 +3014,8 @@ mod tests {
 
         // Only one condition met.
         let mut attrs_one = BTreeMap::new();
-        attrs_one.insert("env".to_string(), "prod".to_string());
-        attrs_one.insert("region".to_string(), "eu-west-1".to_string());
+        attrs_one.insert("env".to_string(), "prod".into());
+        attrs_one.insert("region".to_string(), "eu-west-1".into());
         assert_eq!(
             evaluate_mesh_authorization(
                 &slice,
@@ -2832,7 +3305,11 @@ mod tests {
 
     // ── Istio-style negative-match (notMethods/notPaths/notHosts/notPorts) ─
 
-    fn allow_policy_with_request_match(name: &str, request: RequestMatch) -> MeshPolicy {
+    fn policy_with_request_match(
+        name: &str,
+        action: PolicyAction,
+        request: RequestMatch,
+    ) -> MeshPolicy {
         MeshPolicy {
             name: name.to_string(),
             namespace: "default".to_string(),
@@ -2845,9 +3322,17 @@ mod tests {
                 not_request_principals: Vec::new(),
                 source_negation: Default::default(),
                 never_matches: false,
-                action: PolicyAction::Allow,
+                action,
             }],
         }
+    }
+
+    fn allow_policy_with_request_match(name: &str, request: RequestMatch) -> MeshPolicy {
+        policy_with_request_match(name, PolicyAction::Allow, request)
+    }
+
+    fn deny_policy_with_request_match(name: &str, request: RequestMatch) -> MeshPolicy {
+        policy_with_request_match(name, PolicyAction::Deny, request)
     }
 
     #[test]
@@ -3124,6 +3609,86 @@ mod tests {
     }
 
     #[test]
+    fn deny_request_match_http_only_predicates_match_on_stream_request() {
+        let cases: [(&str, RequestMatch); 7] = [
+            (
+                "methods",
+                RequestMatch {
+                    methods: vec!["POST".to_string()],
+                    ..RequestMatch::default()
+                },
+            ),
+            (
+                "not_methods",
+                RequestMatch {
+                    not_methods: vec!["GET".to_string()],
+                    ..RequestMatch::default()
+                },
+            ),
+            (
+                "paths",
+                RequestMatch {
+                    paths: vec!["/admin/*".to_string()],
+                    ..RequestMatch::default()
+                },
+            ),
+            (
+                "not_paths",
+                RequestMatch {
+                    not_paths: vec!["/public/*".to_string()],
+                    ..RequestMatch::default()
+                },
+            ),
+            (
+                "hosts",
+                RequestMatch {
+                    hosts: vec!["admin.example.com".to_string()],
+                    ..RequestMatch::default()
+                },
+            ),
+            (
+                "not_hosts",
+                RequestMatch {
+                    not_hosts: vec!["public.example.com".to_string()],
+                    ..RequestMatch::default()
+                },
+            ),
+            (
+                "headers",
+                RequestMatch {
+                    headers: BTreeMap::from([("x-admin".to_string(), "true".to_string())])
+                        .into_iter()
+                        .collect(),
+                    ..RequestMatch::default()
+                },
+            ),
+        ];
+
+        for (label, mut request_match) in cases {
+            request_match.ports = vec![8080];
+            let slice = MeshSlice {
+                mesh_policies: vec![deny_policy_with_request_match(
+                    "deny-http-only-on-port",
+                    request_match,
+                )],
+                ..MeshSlice::default()
+            };
+            let stream_request = MeshAuthzRequest {
+                port: Some(8080),
+                ..MeshAuthzRequest::default()
+            };
+
+            assert_eq!(
+                evaluate_mesh_authorization(&slice, &stream_request),
+                MeshAuthzDecision::Deny {
+                    policy: "deny-http-only-on-port".to_string()
+                },
+                "{label}: DENY must treat a missing HTTP-only attribute as a match"
+            );
+        }
+    }
+
+    #[test]
     fn request_match_multiple_not_methods_any_match_rejects() {
         let slice = MeshSlice {
             mesh_policies: vec![allow_policy_with_request_match(
@@ -3205,18 +3770,35 @@ mod tests {
     }
 
     #[test]
-    fn not_principals_fail_closed_without_peer() {
+    fn not_principals_accepts_istio_principal_format() {
+        let slice = allow_with_source_negation(SourceNegationMatch {
+            not_spiffe_id_patterns: vec!["cluster.local/ns/default/sa/bad".to_string()],
+            ..SourceNegationMatch::default()
+        });
+
+        assert_eq!(
+            evaluate_mesh_authorization(
+                &slice,
+                &request("spiffe://cluster.local/ns/default/sa/bad")
+            ),
+            MeshAuthzDecision::Deny {
+                policy: "implicit-deny".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn not_principals_allow_absent_source_identity() {
         let slice = allow_with_source_negation(SourceNegationMatch {
             not_spiffe_id_patterns: vec!["spiffe://cluster.local/ns/default/sa/bad".to_string()],
             ..SourceNegationMatch::default()
         });
-        // No source principal at all: a notPrincipals constraint cannot be
-        // satisfied, so the rule fails closed (implicit deny), never admits.
+        // Istio negative source identity matchers are true when the source
+        // identity is absent; DENY notPrincipals:["*"] uses this to catch
+        // anonymous/plaintext traffic.
         assert_eq!(
             evaluate_mesh_authorization(&slice, &MeshAuthzRequest::default()),
-            MeshAuthzDecision::Deny {
-                policy: "implicit-deny".to_string()
-            }
+            MeshAuthzDecision::Allow
         );
     }
 
@@ -3237,6 +3819,45 @@ mod tests {
         );
         assert_eq!(
             evaluate_mesh_authorization(&slice, &request("spiffe://cluster.local/ns/default/sa/x")),
+            MeshAuthzDecision::Allow
+        );
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &MeshAuthzRequest::default()),
+            MeshAuthzDecision::Allow
+        );
+    }
+
+    #[test]
+    fn deny_not_principals_star_blocks_anonymous_source_identity() {
+        let slice = MeshSlice {
+            mesh_policies: vec![MeshPolicy {
+                name: "deny-plaintext".to_string(),
+                namespace: "default".to_string(),
+                scope: PolicyScope::MeshWide,
+                rules: vec![MeshRule {
+                    source_negation: SourceNegationMatch {
+                        not_spiffe_id_patterns: vec!["*".to_string()],
+                        ..SourceNegationMatch::default()
+                    },
+                    action: PolicyAction::Deny,
+                    ..MeshRule::default()
+                }],
+            }],
+            ..MeshSlice::default()
+        };
+
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &MeshAuthzRequest::default()),
+            MeshAuthzDecision::Deny {
+                policy: "deny-plaintext".to_string()
+            }
+        );
+
+        assert_eq!(
+            evaluate_mesh_authorization(
+                &slice,
+                &request("spiffe://cluster.local/ns/default/sa/client")
+            ),
             MeshAuthzDecision::Allow
         );
     }
@@ -3330,7 +3951,7 @@ mod tests {
     }
 
     #[test]
-    fn not_request_principals_blocks_matching_jwt_and_fails_closed_when_absent() {
+    fn not_request_principals_blocks_matching_jwt_and_allows_absent_principal() {
         let slice = MeshSlice {
             mesh_policies: vec![MeshPolicy {
                 name: "allow-unless-admin".to_string(),
@@ -3364,12 +3985,43 @@ mod tests {
             evaluate_mesh_authorization(&slice, &user),
             MeshAuthzDecision::Allow
         );
-        // No JWT at all → fail closed (cannot satisfy notRequestPrincipals).
+        // No JWT at all → negative request-principal match succeeds.
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &MeshAuthzRequest::default()),
+            MeshAuthzDecision::Allow
+        );
+    }
+
+    #[test]
+    fn deny_not_request_principals_star_blocks_anonymous_requests() {
+        let slice = MeshSlice {
+            mesh_policies: vec![MeshPolicy {
+                name: "deny-anonymous".to_string(),
+                namespace: "default".to_string(),
+                scope: PolicyScope::MeshWide,
+                rules: vec![MeshRule {
+                    not_request_principals: vec!["*".to_string()],
+                    action: PolicyAction::Deny,
+                    ..MeshRule::default()
+                }],
+            }],
+            ..MeshSlice::default()
+        };
+
         assert_eq!(
             evaluate_mesh_authorization(&slice, &MeshAuthzRequest::default()),
             MeshAuthzDecision::Deny {
-                policy: "implicit-deny".to_string()
+                policy: "deny-anonymous".to_string()
             }
+        );
+
+        let authenticated = MeshAuthzRequest {
+            request_principal: Some("https://issuer/user".to_string()),
+            ..MeshAuthzRequest::default()
+        };
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &authenticated),
+            MeshAuthzDecision::Allow
         );
     }
 
@@ -3396,7 +4048,7 @@ mod tests {
             ..MeshSlice::default()
         };
         let mut attrs = BTreeMap::new();
-        attrs.insert("source.namespace".to_string(), "prod".to_string());
+        attrs.insert("source.namespace".to_string(), "prod".into());
         let req = MeshAuthzRequest {
             attributes: attrs,
             ..MeshAuthzRequest::default()
@@ -3429,6 +4081,8 @@ mod tests {
             "10.0.0.0/8",
             "::ffff:10.0.0.5".parse().unwrap()
         ));
+        // Validation accepts surrounding whitespace; matching trims it too.
+        assert!(cidr_contains(" 10.0.0.0/8 ", "10.1.2.3".parse().unwrap()));
         // IPv6 block.
         assert!(cidr_contains(
             "2001:db8::/32",
@@ -3448,6 +4102,7 @@ mod tests {
     #[test]
     fn validate_source_ip_block_accepts_valid_rejects_invalid() {
         assert!(validate_source_ip_block("10.0.0.0/8").is_ok());
+        assert!(validate_source_ip_block(" 10.0.0.0/8 ").is_ok());
         assert!(validate_source_ip_block("192.168.1.1").is_ok());
         assert!(validate_source_ip_block("2001:db8::/32").is_ok());
         assert!(validate_source_ip_block("::1").is_ok());

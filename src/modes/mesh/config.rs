@@ -179,9 +179,10 @@ pub struct MeshRule {
     pub request_principals: Vec<String>,
     /// Istio `from[].source.notRequestPrincipals` — conjunctive negative
     /// match over JWT-derived request principals. When any pattern matches
-    /// the request's `request_principal`, the rule fails. A non-empty list
-    /// with no present request principal fails the match (fail-closed),
-    /// mirroring the source negative matchers in [`SourceNegationMatch`].
+    /// the request's `request_principal`, the rule fails. When no request
+    /// principal is present, the negative match succeeds; this is Istio's
+    /// canonical way to match anonymous requests with
+    /// `notRequestPrincipals: ["*"]`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub not_request_principals: Vec<String>,
     /// Conjunctive source-negative / IP-block matchers for this rule's
@@ -213,7 +214,8 @@ pub enum PolicyAction {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct PrincipalMatch {
-    /// Glob pattern over SPIFFE IDs, e.g. `spiffe://prod/ns/foo/sa/*`.
+    /// Glob pattern over Istio source principals (`prod/ns/foo/sa/*`).
+    /// Full `spiffe://...` patterns are also accepted for direct configs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spiffe_id_pattern: Option<String>,
     /// Glob pattern over workload namespace.
@@ -222,6 +224,9 @@ pub struct PrincipalMatch {
     /// Restrict matches to a specific trust domain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trust_domain: Option<TrustDomain>,
+    /// Glob pattern over source trust domains, for Istio `trustDomains`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_domain_pattern: Option<String>,
 }
 
 /// Conjunctive source-negative / IP-block matchers for one Istio
@@ -236,20 +241,30 @@ pub struct PrincipalMatch {
 /// traffic through whenever a single negative-only entry "matched", which is
 /// the opposite of Istio's deny-listing intent (fail-open).
 ///
-/// Every negative / IP field is **fail-closed** when the corresponding
-/// request attribute is absent: a non-empty list with no value to test
-/// fails the match rather than admitting traffic the operator meant to gate.
+/// IP fields are **fail-closed** when the corresponding request attribute is
+/// absent: a non-empty list with no value to test fails the match rather than
+/// admitting traffic the operator meant to gate. Negative identity and
+/// namespace fields preserve Istio semantics for anonymous traffic, so
+/// `notPrincipals: ["*"]` can be used in a DENY policy to require mTLS.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct SourceNegationMatch {
-    /// Istio `notPrincipals` — globs over the source SPIFFE ID. When any
-    /// matches, the source fails. Non-empty + no peer ⇒ fail-closed.
+    /// Istio `notPrincipals` — globs over the source principal
+    /// (`<trust-domain>/ns/<namespace>/sa/<service-account>`). Full
+    /// `spiffe://...` patterns are also accepted for direct configs. When any
+    /// matches, the source fails. Non-empty + no peer ⇒ negative match
+    /// succeeds, allowing `notPrincipals: ["*"]` to match anonymous traffic.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub not_spiffe_id_patterns: Vec<String>,
     /// Istio `notNamespaces` — globs over the source workload namespace
     /// (extracted from the SPIFFE ID). When any matches, the source fails.
-    /// Non-empty + no namespace ⇒ fail-closed.
+    /// Non-empty + no namespace ⇒ negative match succeeds.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub not_namespace_patterns: Vec<String>,
+    /// Istio `notTrustDomains` — globs over the source trust domain. When any
+    /// matches, the source fails. Non-empty + no peer ⇒ negative match
+    /// succeeds.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_trust_domain_patterns: Vec<String>,
     /// Istio `ipBlocks` — CIDR/IP allow-list over the direct connection peer
     /// IP (`source.ip`). Non-empty ⇒ the source matches only when the peer
     /// IP is inside one block. Non-empty + no source IP ⇒ fail-closed.
@@ -279,6 +294,7 @@ impl SourceNegationMatch {
     pub fn is_empty(&self) -> bool {
         self.not_spiffe_id_patterns.is_empty()
             && self.not_namespace_patterns.is_empty()
+            && self.not_trust_domain_patterns.is_empty()
             && self.ip_blocks.is_empty()
             && self.not_ip_blocks.is_empty()
             && self.remote_ip_blocks.is_empty()
@@ -1785,11 +1801,12 @@ fn validate_mesh_config_internal(
                 if principal.spiffe_id_pattern.is_none()
                     && principal.namespace_pattern.is_none()
                     && principal.trust_domain.is_none()
+                    && principal.trust_domain_pattern.is_none()
                 {
                     errors.push(format!(
                         "MeshPolicy '{}'.rules[{}].from[{}]: at least one \
-                         of spiffe_id_pattern/namespace_pattern/trust_domain \
-                         must be set",
+                         of spiffe_id_pattern/namespace_pattern/trust_domain/\
+                         trust_domain_pattern must be set",
                         policy.name, i, j
                     ));
                 }
@@ -1807,6 +1824,15 @@ fn validate_mesh_config_internal(
                 {
                     errors.push(format!(
                         "MeshPolicy '{}'.rules[{}].from[{}].namespace_pattern \
+                         '{}' is not a valid glob: {}",
+                        policy.name, i, j, pat, e
+                    ));
+                }
+                if let Some(pat) = principal.trust_domain_pattern.as_ref()
+                    && let Err(e) = glob::Pattern::new(pat)
+                {
+                    errors.push(format!(
+                        "MeshPolicy '{}'.rules[{}].from[{}].trust_domain_pattern \
                          '{}' is not a valid glob: {}",
                         policy.name, i, j, pat, e
                     ));

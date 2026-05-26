@@ -33,6 +33,7 @@ fn policy_allow_get_except_admin() -> MeshPolicy {
                 spiffe_id_pattern: Some("spiffe://cluster.local/ns/default/sa/client".to_string()),
                 namespace_pattern: None,
                 trust_domain: Some(TrustDomain::new("cluster.local").expect("trust domain")),
+                trust_domain_pattern: None,
             }],
             to: vec![RequestMatch {
                 methods: vec!["GET".to_string()],
@@ -73,6 +74,7 @@ fn policy_allow_example_except_admin_mixed_case_not_host() -> MeshPolicy {
                 spiffe_id_pattern: Some("spiffe://cluster.local/ns/default/sa/client".to_string()),
                 namespace_pattern: None,
                 trust_domain: Some(TrustDomain::new("cluster.local").expect("trust domain")),
+                trust_domain_pattern: None,
             }],
             to: vec![RequestMatch {
                 hosts: vec!["*.example.com".to_string()],
@@ -336,5 +338,74 @@ async fn allow_with_remote_ip_blocks_enforced_through_plugin() {
             PluginResult::Reject { .. }
         ),
         "client outside 203.0.113.0/24 must be denied"
+    );
+}
+
+#[tokio::test]
+async fn source_ip_blocks_use_direct_peer_not_forwarded_client_ip() {
+    let allow_source = MeshPolicy {
+        name: "allow-direct-peer-range".to_string(),
+        namespace: "default".to_string(),
+        scope: PolicyScope::WorkloadSelector {
+            selector: WorkloadSelector::default(),
+        },
+        rules: vec![MeshRule {
+            source_negation: SourceNegationMatch {
+                ip_blocks: vec!["10.0.0.0/8".to_string()],
+                ..SourceNegationMatch::default()
+            },
+            action: PolicyAction::Allow,
+            ..MeshRule::default()
+        }],
+    };
+    let plugin =
+        MeshAuthz::new(&json!({ "mesh_policies": [allow_source] })).expect("plugin config");
+
+    let mut ctx = RequestContext::new(
+        "10.1.2.3".to_string(),
+        "GET".to_string(),
+        "/api".to_string(),
+    );
+    ctx.peer_spiffe_id =
+        Some(SpiffeId::new("spiffe://cluster.local/ns/default/sa/web").expect("spiffe"));
+    ctx.client_ip = "203.0.113.45".to_string();
+
+    assert!(
+        matches!(plugin.authorize(&mut ctx).await, PluginResult::Continue),
+        "source.ip must be the direct socket peer, not the XFF-resolved remote.ip"
+    );
+
+    let deny_forwarded_as_source = MeshPolicy {
+        name: "allow-forwarded-range-as-source".to_string(),
+        namespace: "default".to_string(),
+        scope: PolicyScope::WorkloadSelector {
+            selector: WorkloadSelector::default(),
+        },
+        rules: vec![MeshRule {
+            source_negation: SourceNegationMatch {
+                ip_blocks: vec!["203.0.113.0/24".to_string()],
+                ..SourceNegationMatch::default()
+            },
+            action: PolicyAction::Allow,
+            ..MeshRule::default()
+        }],
+    };
+    let plugin = MeshAuthz::new(&json!({ "mesh_policies": [deny_forwarded_as_source] }))
+        .expect("plugin config");
+    let mut ctx = RequestContext::new(
+        "10.1.2.3".to_string(),
+        "GET".to_string(),
+        "/api".to_string(),
+    );
+    ctx.peer_spiffe_id =
+        Some(SpiffeId::new("spiffe://cluster.local/ns/default/sa/web").expect("spiffe"));
+    ctx.client_ip = "203.0.113.45".to_string();
+
+    assert!(
+        matches!(
+            plugin.authorize(&mut ctx).await,
+            PluginResult::Reject { .. }
+        ),
+        "forwarded remote.ip must not satisfy source.ip ipBlocks"
     );
 }

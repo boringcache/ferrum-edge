@@ -42,15 +42,15 @@ use crate::modes::mesh::config::{
 };
 use crate::modes::mesh::hbone::{BAGGAGE_HEADER, HboneIdentity};
 use crate::modes::mesh::policy::{
-    MeshAuthzDecision, MeshAuthzRequest, evaluate_mesh_authorization,
-    evaluate_mesh_authorization_policies, mesh_policies_have_header_rules,
-    normalize_mesh_policy_header_names,
+    MeshAuthzAttribute, MeshAuthzDecision, MeshAuthzRequest, evaluate_mesh_authorization,
+    evaluate_mesh_authorization_policies, istio_source_principal, mesh_policies_have_header_rules,
+    normalize_mesh_policy_header_names, validate_source_ip_block,
 };
 use crate::modes::mesh::policy_deny_log::{self, PolicyDenyEvent};
 use crate::modes::mesh::slice::MeshSlice;
 use crate::plugins::{
-    ALL_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext, StreamConnectionContext,
-    priority,
+    ALL_PROTOCOLS, JwtAuthAttributeValue, Plugin, PluginResult, ProxyProtocol, RequestContext,
+    StreamConnectionContext, priority,
 };
 
 pub struct MeshAuthz {
@@ -102,6 +102,7 @@ struct ConditionAttributeKeys {
     source_ip: bool,
     remote_ip: bool,
     request_auth_principal: bool,
+    request_auth_presenter: bool,
     request_auth_audiences: bool,
     destination_port: bool,
     connection_sni: bool,
@@ -125,6 +126,7 @@ const ATTR_SOURCE_NAMESPACE: &str = "source.namespace";
 const ATTR_SOURCE_IP: &str = "source.ip";
 const ATTR_REMOTE_IP: &str = "remote.ip";
 const ATTR_REQUEST_AUTH_PRINCIPAL: &str = "request.auth.principal";
+const ATTR_REQUEST_AUTH_PRESENTER: &str = "request.auth.presenter";
 const ATTR_REQUEST_AUTH_AUDIENCES: &str = "request.auth.audiences";
 const ATTR_DESTINATION_PORT: &str = "destination.port";
 const ATTR_CONNECTION_SNI: &str = "connection.sni";
@@ -152,6 +154,7 @@ impl ConditionAttributeKeys {
             ATTR_SOURCE_IP => self.source_ip = true,
             ATTR_REMOTE_IP => self.remote_ip = true,
             ATTR_REQUEST_AUTH_PRINCIPAL => self.request_auth_principal = true,
+            ATTR_REQUEST_AUTH_PRESENTER => self.request_auth_presenter = true,
             ATTR_REQUEST_AUTH_AUDIENCES => self.request_auth_audiences = true,
             ATTR_DESTINATION_PORT => self.destination_port = true,
             ATTR_CONNECTION_SNI => self.connection_sni = true,
@@ -176,23 +179,6 @@ fn bracketed_attribute_name<'a>(key: &'a str, prefix: &str) -> Option<&'a str> {
     key.strip_prefix(prefix)?.strip_suffix(']')
 }
 
-/// Metadata key carrying the comma-joined JWT audiences emitted by the mesh
-/// `jwks_auth` instance. Single source of truth shared with `jwks_auth` so the
-/// emit/consume sides cannot drift.
-#[inline]
-fn jwks_audiences_metadata_key() -> &'static str {
-    crate::plugins::jwks_auth::MESH_REQUEST_AUTH_AUDIENCES_KEY
-}
-
-/// Metadata key for a single JWT claim referenced by `request.auth.claims[name]`.
-#[inline]
-fn claim_metadata_key(name: &str) -> String {
-    format!(
-        "{}{name}",
-        crate::plugins::jwks_auth::MESH_REQUEST_AUTH_CLAIM_PREFIX
-    )
-}
-
 /// Resolve a `request.headers[<name>]` value. Reads the already-lowercased
 /// materialized `headers` map when header rules forced materialization;
 /// otherwise falls back to the raw header accessor so a `when:` header
@@ -208,16 +194,35 @@ fn http_header_attribute(
     if let Some(value) = materialized_lowercased.get(&lower) {
         return Some(value.clone());
     }
+    if let Some(value) = ctx.headers.get(&lower).or_else(|| ctx.headers.get(name)) {
+        return Some(value.clone());
+    }
     ctx.raw_header_get(&lower)
         .or_else(|| ctx.raw_header_get(name))
         .map(str::to_string)
 }
 
-/// Parse an IP string (the gateway-resolved client IP) into an `IpAddr` for
+/// Parse an IP string into an `IpAddr` for
 /// Istio `source.ip` / `remote.ip` matching. Returns `None` for an
 /// unparseable value so IP-block matchers fail closed.
 fn parse_client_ip(client_ip: &str) -> Option<std::net::IpAddr> {
     client_ip.trim().parse().ok()
+}
+
+fn jwt_attribute_to_mesh_attribute(value: &JwtAuthAttributeValue) -> MeshAuthzAttribute {
+    match value {
+        JwtAuthAttributeValue::Scalar(value) => MeshAuthzAttribute::Scalar(value.clone()),
+        JwtAuthAttributeValue::StringList(values) => MeshAuthzAttribute::StringList(values.clone()),
+    }
+}
+
+fn jwt_scalar_attribute_to_mesh_attribute(
+    value: &JwtAuthAttributeValue,
+) -> Option<MeshAuthzAttribute> {
+    match value {
+        JwtAuthAttributeValue::Scalar(value) => Some(MeshAuthzAttribute::Scalar(value.clone())),
+        JwtAuthAttributeValue::StringList(_) => None,
+    }
 }
 
 /// Matching rule for the [`MeshAuthz::trusted_hbone_assertors`] allow-list.
@@ -289,6 +294,8 @@ impl MeshAuthz {
             slice.labels = labels;
         }
 
+        validate_policy_source_ip_blocks(&slice.mesh_policies)?;
+
         let per_pod_policy_scoping = config
             .get("per_pod_policy_scoping")
             .and_then(Value::as_bool)
@@ -351,9 +358,10 @@ impl MeshAuthz {
         ctx: &RequestContext,
         source_principal: Option<&SpiffeId>,
         port: Option<u16>,
-        resolved_ip: Option<std::net::IpAddr>,
+        source_ip: Option<std::net::IpAddr>,
+        remote_ip: Option<std::net::IpAddr>,
         headers: &BTreeMap<String, String>,
-    ) -> BTreeMap<String, String> {
+    ) -> BTreeMap<String, MeshAuthzAttribute> {
         let mut attributes = BTreeMap::new();
         let keys = &self.condition_keys;
         if !keys.any {
@@ -364,55 +372,67 @@ impl MeshAuthz {
         {
             attributes.insert(
                 ATTR_SOURCE_PRINCIPAL.to_string(),
-                principal.as_str().to_string(),
+                istio_source_principal(principal).to_string().into(),
             );
         }
         if keys.source_namespace
             && let Some(namespace) = source_principal.and_then(|principal| principal.namespace())
         {
-            attributes.insert(ATTR_SOURCE_NAMESPACE.to_string(), namespace.to_string());
+            attributes.insert(
+                ATTR_SOURCE_NAMESPACE.to_string(),
+                namespace.to_string().into(),
+            );
         }
         if keys.request_auth_principal
             && let Some(principal) = ctx.metadata.get("mesh.request_principal")
         {
-            attributes.insert(ATTR_REQUEST_AUTH_PRINCIPAL.to_string(), principal.clone());
+            attributes.insert(
+                ATTR_REQUEST_AUTH_PRINCIPAL.to_string(),
+                principal.clone().into(),
+            );
         }
-        if keys.request_auth_audiences
-            && let Some(audiences) = ctx.metadata.get(jwks_audiences_metadata_key())
+        if keys.request_auth_presenter
+            && let Some(presenter) = ctx.mesh_request_auth_claims.get("azp")
+            && let Some(presenter) = jwt_scalar_attribute_to_mesh_attribute(presenter)
         {
-            attributes.insert(ATTR_REQUEST_AUTH_AUDIENCES.to_string(), audiences.clone());
+            attributes.insert(ATTR_REQUEST_AUTH_PRESENTER.to_string(), presenter);
+        }
+        if keys.request_auth_audiences && !ctx.mesh_request_auth_audiences.is_empty() {
+            attributes.insert(
+                ATTR_REQUEST_AUTH_AUDIENCES.to_string(),
+                MeshAuthzAttribute::StringList(ctx.mesh_request_auth_audiences.clone()),
+            );
         }
         if keys.destination_port
             && let Some(port) = port
         {
-            attributes.insert(ATTR_DESTINATION_PORT.to_string(), port.to_string());
+            attributes.insert(ATTR_DESTINATION_PORT.to_string(), port.to_string().into());
         }
-        // `source.ip` / `remote.ip` as string `when:` attributes. The
-        // gateway-resolved client IP maps to both (see the entry-point
-        // comment); the dedicated `ipBlocks`/`remoteIpBlocks` matchers use the
-        // parsed form on `MeshAuthzRequest` instead.
+        // `source.ip` / `remote.ip` as string `when:` attributes. `source.ip`
+        // is the direct downstream peer, while `remote.ip` is the trusted
+        // forwarded/original client IP when one was resolved.
         if keys.source_ip
-            && let Some(ip) = resolved_ip
+            && let Some(ip) = source_ip
         {
-            attributes.insert(ATTR_SOURCE_IP.to_string(), ip.to_string());
+            attributes.insert(ATTR_SOURCE_IP.to_string(), ip.to_string().into());
         }
         if keys.remote_ip
-            && let Some(ip) = resolved_ip
+            && let Some(ip) = remote_ip
         {
-            attributes.insert(ATTR_REMOTE_IP.to_string(), ip.to_string());
+            attributes.insert(ATTR_REMOTE_IP.to_string(), ip.to_string().into());
         }
         for header_key in &keys.header_keys {
             if let Some(name) = bracketed_attribute_name(header_key, ATTR_REQUEST_HEADERS_PREFIX)
                 && let Some(value) = http_header_attribute(ctx, headers, name)
             {
-                attributes.insert(header_key.clone(), value);
+                attributes.insert(header_key.clone(), value.into());
             }
         }
         for claim_key in &keys.claim_keys {
             if let Some(name) = bracketed_attribute_name(claim_key, ATTR_REQUEST_AUTH_CLAIMS_PREFIX)
-                && let Some(value) = ctx.metadata.get(&claim_metadata_key(name))
+                && let Some(value) = ctx.mesh_request_auth_claims.get(name)
             {
-                attributes.insert(claim_key.clone(), value.clone());
+                attributes.insert(claim_key.clone(), jwt_attribute_to_mesh_attribute(value));
             }
         }
         attributes
@@ -428,7 +448,7 @@ impl MeshAuthz {
         ctx: &StreamConnectionContext,
         source_principal: Option<&SpiffeId>,
         resolved_ip: Option<std::net::IpAddr>,
-    ) -> BTreeMap<String, String> {
+    ) -> BTreeMap<String, MeshAuthzAttribute> {
         let mut attributes = BTreeMap::new();
         let keys = &self.condition_keys;
         if !keys.any {
@@ -439,34 +459,37 @@ impl MeshAuthz {
         {
             attributes.insert(
                 ATTR_SOURCE_PRINCIPAL.to_string(),
-                principal.as_str().to_string(),
+                istio_source_principal(principal).to_string().into(),
             );
         }
         if keys.source_namespace
             && let Some(namespace) = source_principal.and_then(|principal| principal.namespace())
         {
-            attributes.insert(ATTR_SOURCE_NAMESPACE.to_string(), namespace.to_string());
+            attributes.insert(
+                ATTR_SOURCE_NAMESPACE.to_string(),
+                namespace.to_string().into(),
+            );
         }
         if keys.destination_port {
             attributes.insert(
                 ATTR_DESTINATION_PORT.to_string(),
-                ctx.listen_port.to_string(),
+                ctx.listen_port.to_string().into(),
             );
         }
         if keys.connection_sni
             && let Some(sni) = ctx.sni_hostname.as_ref()
         {
-            attributes.insert(ATTR_CONNECTION_SNI.to_string(), sni.clone());
+            attributes.insert(ATTR_CONNECTION_SNI.to_string(), sni.clone().into());
         }
         if keys.source_ip
             && let Some(ip) = resolved_ip
         {
-            attributes.insert(ATTR_SOURCE_IP.to_string(), ip.to_string());
+            attributes.insert(ATTR_SOURCE_IP.to_string(), ip.to_string().into());
         }
         if keys.remote_ip
             && let Some(ip) = resolved_ip
         {
-            attributes.insert(ATTR_REMOTE_IP.to_string(), ip.to_string());
+            attributes.insert(ATTR_REMOTE_IP.to_string(), ip.to_string().into());
         }
         attributes
     }
@@ -663,12 +686,11 @@ impl Plugin for MeshAuthz {
                 .as_ref()
                 .and_then(|proxy| proxy.listen_port)
         });
-        // Istio source IP matchers. The gateway-resolved `client_ip` is the
-        // direct mesh peer for inbound listeners (no XFF rewrite) and the
-        // XFF-derived client when trusted proxies are configured, so it maps
-        // to both `source.ip` and `remote.ip`. CIDR matchers fail closed when
-        // it does not parse.
-        let resolved_ip = parse_client_ip(&ctx.client_ip);
+        // Istio source IP matchers. `source.ip` is the immediate downstream
+        // socket peer captured before trusted-proxy rewriting; `remote.ip` is
+        // the gateway-resolved client IP after XFF / real-IP resolution.
+        let source_ip = parse_client_ip(&ctx.direct_client_ip);
+        let remote_ip = parse_client_ip(&ctx.client_ip);
         // Istio `when:` attributes. Built from the resolved authz principal
         // (post-baggage rewrite) plus request metadata/headers, and only for
         // the keys some loaded policy references (`condition_keys`). Without
@@ -678,7 +700,8 @@ impl Plugin for MeshAuthz {
             ctx,
             source_principal.as_ref(),
             port,
-            resolved_ip,
+            source_ip,
+            remote_ip,
             &headers,
         );
         let request = MeshAuthzRequest {
@@ -690,8 +713,8 @@ impl Plugin for MeshAuthz {
             port,
             headers,
             attributes,
-            source_ip: resolved_ip,
-            remote_ip: resolved_ip,
+            source_ip,
+            remote_ip,
         };
         // GAP-2M.4: per-pod scoping for node-waypoint topology.
         //
@@ -890,6 +913,55 @@ enum BaggageOutcome {
     /// Nothing to surface — non-HBONE request, no baggage, or no authenticated
     /// peer.
     NoBaggageOrNonHbone,
+}
+
+fn validate_policy_source_ip_blocks(policies: &[MeshPolicy]) -> Result<(), String> {
+    for policy in policies {
+        for (rule_idx, rule) in policy.rules.iter().enumerate() {
+            validate_source_ip_blocks(
+                policy,
+                rule_idx,
+                "ipBlocks",
+                &rule.source_negation.ip_blocks,
+            )?;
+            validate_source_ip_blocks(
+                policy,
+                rule_idx,
+                "notIpBlocks",
+                &rule.source_negation.not_ip_blocks,
+            )?;
+            validate_source_ip_blocks(
+                policy,
+                rule_idx,
+                "remoteIpBlocks",
+                &rule.source_negation.remote_ip_blocks,
+            )?;
+            validate_source_ip_blocks(
+                policy,
+                rule_idx,
+                "notRemoteIpBlocks",
+                &rule.source_negation.not_remote_ip_blocks,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_source_ip_blocks(
+    policy: &MeshPolicy,
+    rule_idx: usize,
+    field: &str,
+    blocks: &[String],
+) -> Result<(), String> {
+    for block in blocks {
+        validate_source_ip_block(block).map_err(|reason| {
+            format!(
+                "mesh_authz: invalid source IP block in policy '{}'/{} rule {} field {}: '{}' is invalid: {}",
+                policy.namespace, policy.name, rule_idx, field, block, reason
+            )
+        })?;
+    }
+    Ok(())
 }
 
 pub(crate) fn parse_trust_domain_aliases(config: &Value) -> Result<Vec<TrustDomain>, String> {
