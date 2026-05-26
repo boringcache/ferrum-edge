@@ -211,27 +211,47 @@ fn decode_entity(after: &[u8]) -> Option<(EntityVal, usize)> {
         if j >= after.len() || after[j] != b';' {
             return None;
         }
-        let s = match &after[..j] {
-            b"lt" => "<",
-            b"gt" => ">",
-            b"amp" => "&",
-            b"quot" => "\"",
-            b"apos" => "'",
-            b"sol" => "/",
-            b"colon" => ":",
-            b"lpar" => "(",
-            b"rpar" => ")",
-            b"period" => ".",
-            b"excl" => "!",
-            b"equals" => "=",
-            b"grave" => "`",
-            b"dollar" => "$",
-            b"lbrace" => "{",
-            b"rbrace" => "}",
-            b"nbsp" => " ",
-            b"Tab" => "\t",
-            b"NewLine" => "\n",
-            _ => return None,
+        let name = &after[..j];
+        let s = if name.eq_ignore_ascii_case(b"lt") {
+            "<"
+        } else if name.eq_ignore_ascii_case(b"gt") {
+            ">"
+        } else if name.eq_ignore_ascii_case(b"amp") {
+            "&"
+        } else if name.eq_ignore_ascii_case(b"quot") {
+            "\""
+        } else if name.eq_ignore_ascii_case(b"apos") {
+            "'"
+        } else if name.eq_ignore_ascii_case(b"sol") {
+            "/"
+        } else if name.eq_ignore_ascii_case(b"colon") {
+            ":"
+        } else if name.eq_ignore_ascii_case(b"lpar") {
+            "("
+        } else if name.eq_ignore_ascii_case(b"rpar") {
+            ")"
+        } else if name.eq_ignore_ascii_case(b"period") {
+            "."
+        } else if name.eq_ignore_ascii_case(b"excl") {
+            "!"
+        } else if name.eq_ignore_ascii_case(b"equals") {
+            "="
+        } else if name.eq_ignore_ascii_case(b"grave") {
+            "`"
+        } else if name.eq_ignore_ascii_case(b"dollar") {
+            "$"
+        } else if name.eq_ignore_ascii_case(b"lbrace") {
+            "{"
+        } else if name.eq_ignore_ascii_case(b"rbrace") {
+            "}"
+        } else if name.eq_ignore_ascii_case(b"nbsp") {
+            " "
+        } else if name.eq_ignore_ascii_case(b"tab") {
+            "\t"
+        } else if name.eq_ignore_ascii_case(b"newline") {
+            "\n"
+        } else {
+            return None;
         };
         Some((EntityVal::Str(s), j + 1))
     }
@@ -326,6 +346,7 @@ mod tests {
     #[test]
     fn html_entity_decode_named_and_numeric() {
         assert_eq!(html_entity_decode("&lt;script&gt;"), "<script>");
+        assert_eq!(html_entity_decode("&LT;script&GT;"), "<script>");
         assert_eq!(html_entity_decode("&#60;script&#62;"), "<script>");
         assert_eq!(html_entity_decode("&#x3c;script&#x3e;"), "<script>");
         assert!(matches!(

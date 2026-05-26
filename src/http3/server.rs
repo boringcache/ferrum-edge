@@ -33,7 +33,8 @@ use crate::proxy::headers::{
 };
 use crate::proxy::{
     ProxyState, apply_after_proxy_hooks_to_rejection, apply_plugin_rejection_response,
-    plugin_result_into_reject_parts, run_after_proxy_hooks, run_authentication_phase,
+    log_rejected_request, plugin_result_into_reject_parts, run_after_proxy_hooks,
+    run_authentication_phase,
 };
 use crate::tls::{CrlList, TlsPolicy};
 
@@ -1223,6 +1224,16 @@ async fn handle_h3_request(
                     &mut headers,
                 )
                 .await;
+                plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+                log_rejected_request(
+                    &plugins,
+                    &ctx,
+                    reject.status_code,
+                    start_time,
+                    "on_request_received",
+                    plugin_execution_ns,
+                )
+                .await;
                 let http_status = StatusCode::from_u16(reject.status_code)
                     .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                 send_h3_reject_flavor_aware(
@@ -1312,6 +1323,16 @@ async fn handle_h3_request(
     {
         record_request(&state, status_code);
         apply_after_proxy_hooks_to_rejection(&plugins, &mut ctx, status_code, &mut headers).await;
+        plugin_execution_ns += auth_phase_start.elapsed().as_nanos() as u64;
+        log_rejected_request(
+            &plugins,
+            &ctx,
+            status_code,
+            start_time,
+            "authenticate",
+            plugin_execution_ns,
+        )
+        .await;
         let http_status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::UNAUTHORIZED);
         send_h3_reject_flavor_aware(&mut stream, http_flavor, http_status, &body, &headers).await?;
         return Ok(());
@@ -1327,8 +1348,19 @@ async fn handle_h3_request(
                 PluginResult::Continue => {}
                 reject @ PluginResult::Reject { .. }
                 | reject @ PluginResult::RejectBinary { .. } => {
-                    let reject = plugin_result_into_reject_parts(reject)
-                        .expect("reject result should convert to rejection parts");
+                    let Some(reject) = plugin_result_into_reject_parts(reject) else {
+                        tracing::error!("Plugin result could not be converted to rejection parts");
+                        record_request(&state, 500);
+                        send_h3_reject_flavor_aware(
+                            &mut stream,
+                            http_flavor,
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            b"Internal Server Error",
+                            &HashMap::new(),
+                        )
+                        .await?;
+                        return Ok(());
+                    };
                     record_request(&state, reject.status_code);
                     let mut headers = reject.headers;
                     apply_after_proxy_hooks_to_rejection(
@@ -1336,6 +1368,16 @@ async fn handle_h3_request(
                         &mut ctx,
                         reject.status_code,
                         &mut headers,
+                    )
+                    .await;
+                    plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+                    log_rejected_request(
+                        &plugins,
+                        &ctx,
+                        reject.status_code,
+                        start_time,
+                        "authorize",
+                        plugin_execution_ns,
                     )
                     .await;
                     let http_status =
@@ -1437,6 +1479,16 @@ async fn handle_h3_request(
                         &mut headers,
                     )
                     .await;
+                    plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+                    log_rejected_request(
+                        &plugins,
+                        &ctx,
+                        reject.status_code,
+                        start_time,
+                        "before_proxy",
+                        plugin_execution_ns,
+                    )
+                    .await;
                     let http_status = StatusCode::from_u16(reject.status_code)
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                     send_h3_reject_flavor_aware(
@@ -1485,6 +1537,16 @@ async fn handle_h3_request(
                         &mut ctx,
                         reject.status_code,
                         &mut headers,
+                    )
+                    .await;
+                    plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+                    log_rejected_request(
+                        &plugins,
+                        &ctx,
+                        reject.status_code,
+                        start_time,
+                        "before_proxy",
+                        plugin_execution_ns,
                     )
                     .await;
                     let http_status = StatusCode::from_u16(reject.status_code)
@@ -2430,6 +2492,15 @@ async fn handle_h3_request(
                 &mut ctx,
                 reject.status_code,
                 &mut headers,
+            )
+            .await;
+            log_rejected_request(
+                &plugins,
+                &ctx,
+                reject.status_code,
+                start_time,
+                "on_final_request_body",
+                plugin_execution_ns,
             )
             .await;
             send_h3_reject_response(

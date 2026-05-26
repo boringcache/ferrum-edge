@@ -2137,6 +2137,20 @@ async fn parameter_entity_reference_in_entity_value_is_rejected() {
 }
 
 #[tokio::test]
+async fn parameter_entity_expanding_entity_declarations_is_rejected() {
+    let plugin = BodyValidator::new(&json!({
+        "validate_xml": true,
+        "xml_max_entities": 1
+    }))
+    .unwrap();
+    let body = r#"<!DOCTYPE r [<!ENTITY % many "<!ENTITY a 'x'><!ENTITY b 'y'>">%many;]><r/>"#;
+    let mut ctx = make_xml_ctx(body);
+    let mut headers = make_xml_headers();
+
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+#[tokio::test]
 async fn too_many_xml_entities_are_rejected() {
     let plugin = BodyValidator::new(&json!({
         "validate_xml": true,

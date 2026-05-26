@@ -887,8 +887,35 @@ fn check_xml_entity_expansion(
     let bytes = body.as_bytes();
     let needle = b"<!ENTITY";
     let mut count = 0usize;
+    let mut parameter_entities: Vec<(String, String)> = Vec::new();
     let mut i = 0usize;
-    while i + needle.len() <= bytes.len() {
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && let Some((name, end)) = parameter_entity_reference_at(body, i)
+        {
+            if let Some((_, value)) = parameter_entities
+                .iter()
+                .find(|(entity_name, _)| entity_name == name)
+            {
+                let expanded_entities = entity_declaration_count(value);
+                if expanded_entities > 0 {
+                    if reject_nested {
+                        return Err(
+                            "XML parameter entity expands to entity declarations (billion-laughs protection)"
+                                .to_string(),
+                        );
+                    }
+                    count = count.saturating_add(expanded_entities);
+                    if count > max_entities {
+                        return Err(format!(
+                            "XML declares more than {max_entities} entities after parameter entity expansion (possible entity-expansion attack)"
+                        ));
+                    }
+                }
+            }
+            i = end;
+            continue;
+        }
         if bytes[i] != b'<' {
             i += 1;
             continue;
@@ -915,7 +942,9 @@ fn check_xml_entity_expansion(
             i = i + 2 + end + 2;
             continue;
         }
-        if bytes[i..i + needle.len()].eq_ignore_ascii_case(needle) {
+        if i + needle.len() <= bytes.len()
+            && bytes[i..i + needle.len()].eq_ignore_ascii_case(needle)
+        {
             count += 1;
             if count > max_entities {
                 return Err(format!(
@@ -930,6 +959,9 @@ fn check_xml_entity_expansion(
                     "XML entity definition references another entity (billion-laughs protection)"
                         .to_string(),
                 );
+            }
+            if let Some((name, value)) = parameter_entity_declaration(&body[i..decl_end]) {
+                parameter_entities.push((name.to_string(), value.to_string()));
             }
             i = decl_end.saturating_add(1);
         } else {
@@ -951,6 +983,83 @@ fn find_xml_declaration_end(bytes: &[u8]) -> Option<usize> {
         }
     }
     None
+}
+
+fn parameter_entity_declaration(decl: &str) -> Option<(&str, &str)> {
+    let bytes = decl.as_bytes();
+    let needle = b"<!ENTITY";
+    if bytes.len() < needle.len() || !bytes[..needle.len()].eq_ignore_ascii_case(needle) {
+        return None;
+    }
+    let mut i = needle.len();
+    i = skip_xml_space(bytes, i);
+    if bytes.get(i) != Some(&b'%') {
+        return None;
+    }
+    i += 1;
+    i = skip_xml_space(bytes, i);
+    let name_start = i;
+    while i < bytes.len()
+        && (bytes[i].is_ascii_alphanumeric() || matches!(bytes[i], b'_' | b'-' | b'.'))
+    {
+        i += 1;
+    }
+    if i == name_start {
+        return None;
+    }
+    let name_end = i;
+    i = skip_xml_space(bytes, i);
+    let quote = *bytes.get(i)?;
+    if !matches!(quote, b'\'' | b'"') {
+        return None;
+    }
+    i += 1;
+    let value_start = i;
+    while i < bytes.len() && bytes[i] != quote {
+        i += 1;
+    }
+    if i >= bytes.len() {
+        return None;
+    }
+    Some((&decl[name_start..name_end], &decl[value_start..i]))
+}
+
+fn parameter_entity_reference_at(body: &str, start: usize) -> Option<(&str, usize)> {
+    let bytes = body.as_bytes();
+    if bytes.get(start) != Some(&b'%') {
+        return None;
+    }
+    let mut i = start + 1;
+    let name_start = i;
+    while i < bytes.len()
+        && i - name_start <= 32
+        && (bytes[i].is_ascii_alphanumeric() || matches!(bytes[i], b'_' | b'-' | b'.'))
+    {
+        i += 1;
+    }
+    if i == name_start || bytes.get(i) != Some(&b';') {
+        return None;
+    }
+    Some((&body[name_start..i], i + 1))
+}
+
+fn entity_declaration_count(text: &str) -> usize {
+    let bytes = text.as_bytes();
+    let needle = b"<!ENTITY";
+    if bytes.len() < needle.len() {
+        return 0;
+    }
+    bytes
+        .windows(needle.len())
+        .filter(|window| window.eq_ignore_ascii_case(needle))
+        .count()
+}
+
+fn skip_xml_space(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\r' | b'\n') {
+        i += 1;
+    }
+    i
 }
 
 /// True if an `<!ENTITY ...>` declaration's value references another entity.

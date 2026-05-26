@@ -1343,21 +1343,15 @@ where
                     PluginResult::Continue => {}
                     reject @ PluginResult::Reject { .. }
                     | reject @ PluginResult::RejectBinary { .. } => {
-                        let Some(reject) = crate::proxy::plugin_result_into_reject_parts(reject)
-                        else {
-                            warn!(
-                                "plugin reject arm returned a non-reject result in on_response_body"
-                            );
-                            continue;
-                        };
-                        response_status = reject.status_code;
-                        response_headers.clear();
-                        response_headers
-                            .insert("content-type".to_string(), "application/json".to_string());
-                        for (k, v) in reject.headers {
-                            response_headers.insert(k, v);
-                        }
-                        response_body = reject.body;
+                        apply_buffered_plain_plugin_reject(
+                            plugins,
+                            ctx,
+                            reject,
+                            &mut response_status,
+                            &mut response_headers,
+                            &mut response_body,
+                        )
+                        .await;
                         break;
                     }
                 }
@@ -1386,21 +1380,15 @@ where
                     PluginResult::Continue => {}
                     reject @ PluginResult::Reject { .. }
                     | reject @ PluginResult::RejectBinary { .. } => {
-                        let Some(reject) = crate::proxy::plugin_result_into_reject_parts(reject)
-                        else {
-                            warn!(
-                                "plugin reject arm returned a non-reject result in on_final_response_body"
-                            );
-                            continue;
-                        };
-                        response_status = reject.status_code;
-                        response_headers.clear();
-                        response_headers
-                            .insert("content-type".to_string(), "application/json".to_string());
-                        for (k, v) in reject.headers {
-                            response_headers.insert(k, v);
-                        }
-                        response_body = reject.body;
+                        apply_buffered_plain_plugin_reject(
+                            plugins,
+                            ctx,
+                            reject,
+                            &mut response_status,
+                            &mut response_headers,
+                            &mut response_body,
+                        )
+                        .await;
                         break;
                     }
                 }
@@ -2161,6 +2149,37 @@ where
             Ok(outcome)
         }
     }
+}
+
+async fn apply_buffered_plain_plugin_reject(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    reject: PluginResult,
+    response_status: &mut u16,
+    response_headers: &mut HashMap<String, String>,
+    response_body: &mut Vec<u8>,
+) {
+    let Some(reject) = crate::proxy::plugin_result_into_reject_parts(reject) else {
+        warn!("buffered plain reject helper received a non-reject plugin result");
+        return;
+    };
+    let mut headers = reject.headers;
+    crate::proxy::apply_after_proxy_hooks_to_rejection(
+        plugins,
+        ctx,
+        reject.status_code,
+        &mut headers,
+    )
+    .await;
+    if !headers
+        .keys()
+        .any(|key| key.eq_ignore_ascii_case("content-type"))
+    {
+        headers.insert("content-type".to_string(), "application/json".to_string());
+    }
+    *response_status = reject.status_code;
+    *response_headers = headers;
+    *response_body = reject.body;
 }
 
 async fn apply_buffered_grpc_plugin_reject(
@@ -3004,10 +3023,10 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        apply_buffered_grpc_plugin_reject, apply_h3_grpc_reject_metadata,
-        build_plain_request_builder, normalize_h3_grpc_reject, reject_body_as_h3_grpc_message,
-        sanitize_h3_grpc_message_for_header, should_finish_h3_stream_without_trailers,
-        should_skip_cross_protocol_backend_header,
+        apply_buffered_grpc_plugin_reject, apply_buffered_plain_plugin_reject,
+        apply_h3_grpc_reject_metadata, build_plain_request_builder, normalize_h3_grpc_reject,
+        reject_body_as_h3_grpc_message, sanitize_h3_grpc_message_for_header,
+        should_finish_h3_stream_without_trailers, should_skip_cross_protocol_backend_header,
     };
     use crate::config::EnvConfig;
     use crate::config::types::{GatewayConfig, Proxy};
@@ -3196,6 +3215,57 @@ mod tests {
                 .get("grpc-status")
                 .map(|value| value.as_str()),
             Some("7")
+        );
+    }
+
+    #[tokio::test]
+    async fn buffered_plain_plugin_reject_runs_reject_aware_security_headers() {
+        let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(
+            SecurityHeaders::new(&serde_json::json!({})).unwrap(),
+        )];
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/plain".to_string(),
+        );
+        let mut response_status = 200;
+        let mut response_headers =
+            HashMap::from([("content-type".to_string(), "text/plain".to_string())]);
+        let mut response_body = b"backend-body".to_vec();
+
+        apply_buffered_plain_plugin_reject(
+            &plugins,
+            &mut ctx,
+            PluginResult::Reject {
+                status_code: 403,
+                body: r#"{"error":"Forbidden"}"#.to_string(),
+                headers: HashMap::new(),
+            },
+            &mut response_status,
+            &mut response_headers,
+            &mut response_body,
+        )
+        .await;
+
+        assert_eq!(response_status, 403);
+        assert_eq!(response_body, br#"{"error":"Forbidden"}"#);
+        assert_eq!(
+            response_headers
+                .get("content-type")
+                .map(|value| value.as_str()),
+            Some("application/json")
+        );
+        assert_eq!(
+            response_headers
+                .get("x-content-type-options")
+                .map(|value| value.as_str()),
+            Some("nosniff")
+        );
+        assert_eq!(
+            response_headers
+                .get("x-frame-options")
+                .map(|value| value.as_str()),
+            Some("SAMEORIGIN")
         );
     }
 

@@ -207,12 +207,15 @@ impl Waf {
             // Re-scan decoded forms so payloads hidden behind JSON `\uXXXX`,
             // HTML entities, or percent-encoding cannot evade the raw-byte set.
             for variant in normalize::decoded_variants(text) {
+                self.scan_json_path_rules(&mut outcome, variant.as_bytes(), ctx);
                 self.scan_bytes_set(
                     &mut outcome,
                     self.compiled.body_bytes.as_ref(),
                     variant.as_bytes(),
                     ctx,
                 );
+                self.scan_luhn_rules(&mut outcome, &variant, &self.compiled.body_luhn_rules, ctx);
+                self.scan_cidr_rules(&mut outcome, &variant, &self.compiled.body_cidr_rules, ctx);
             }
             self.scan_luhn_rules(&mut outcome, text, &self.compiled.body_luhn_rules, ctx);
             self.scan_cidr_rules(&mut outcome, text, &self.compiled.body_cidr_rules, ctx);
@@ -267,6 +270,18 @@ impl Waf {
                     &mut outcome,
                     self.compiled.response_body_bytes.as_ref(),
                     variant.as_bytes(),
+                    ctx,
+                );
+                self.scan_luhn_rules(
+                    &mut outcome,
+                    &variant,
+                    &self.compiled.response_luhn_rules,
+                    ctx,
+                );
+                self.scan_cidr_rules(
+                    &mut outcome,
+                    &variant,
+                    &self.compiled.response_cidr_rules,
                     ctx,
                 );
             }

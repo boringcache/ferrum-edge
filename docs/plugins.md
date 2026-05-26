@@ -2661,6 +2661,9 @@ scanning the parsed key/value map and a best-effort reconstructed URL.
 | `include_default_rules` | bool | `true` | Include Ferrum's built-in seed rules. |
 | `disabled_default_rules` | string[] | `[]` | Built-in rule IDs to remove from the active ruleset. |
 | `rule_modes` | object | `{}` | Per-rule action overrides keyed by rule ID. Values: `enforce`, `monitor`, `disabled` (aliases like `block` and `off` are accepted). |
+| `default_rule_action` | string | _(unset)_ | Bulk action for built-in rules: `enforce`, `monitor`, or `disabled`. Unset keeps the safe monitor-only default for built-ins. |
+| `rule_overrides` | object | `{}` | Per-rule field overrides for supported rule metadata such as action/severity/paranoia tuning. |
+| `scoring` | object | _(none)_ | Optional anomaly scoring. Configure `block_threshold` and optional severity weights so multiple monitored hits can block when the accumulated score crosses the threshold. |
 | `custom_rules` | object[] | `[]` | Additional rules. See custom rule fields below. |
 | `global_exemptions` | object | `{}` | Request-level exemptions and false-positive filters. |
 | `request_inspection` | bool | `true` | Inspect request path, query, headers, cookies, method, and configured request bodies. |
@@ -2672,8 +2675,8 @@ scanning the parsed key/value map and a best-effort reconstructed URL.
 | `inspect_multipart` | bool | `false` | Inspect `multipart/*` bodies. |
 | `inspect_binary_body` | bool | `false` | Inspect bodies whose content type is not in `body_content_types`. |
 | `max_scan_bytes` | usize | `1048576` | Maximum bytes scanned from each body. Must be greater than zero. |
-| `on_body_too_large` | string | `scan_truncated` | `scan_truncated` scans the first `max_scan_bytes`; `skip` skips known-oversized bodies. |
-| `scan_budget_ms` | u64 | `50` | Post-hoc deadline for body scan hooks. `0` disables the timeout wrapper. The synchronous scan cannot be cancelled mid-regex; over-budget scans are reported after the scan returns. |
+| `on_body_too_large` | string | `scan_truncated` | `scan_truncated` scans the first `max_scan_bytes`; `skip` skips known-oversized bodies; `block` fail-closes oversized bodies in enforce mode. |
+| `scan_budget_ms` | u64 | `50` | Post-hoc deadline for metadata/header and body scans. `0` disables the timeout wrapper. The synchronous scan cannot be cancelled mid-regex; over-budget scans are reported after the scan returns. |
 | `on_scan_timeout` | string | `log_and_allow` | Action when a body scan times out: `allow`, `block`, or `log_and_allow`. |
 | `disallowed_methods` | string[] | `[]` | Methods that should trigger the built-in `FE-METHOD-001` rule when that rule is active. |
 | `log_to_metadata` | bool | `true` | Write WAF metadata such as `waf.rule_hits`, `waf.action`, and `waf.severity` into transaction logs. |
@@ -2756,6 +2759,8 @@ Request-side validation only buffers matching request bodies: methods that can c
 | `required_fields` | String[] | `[]` | Simple required field names |
 | `validate_xml` | bool | `false` | Enable XML well-formedness validation |
 | `required_xml_elements` | String[] | `[]` | Required XML element names |
+| `xml_max_entities` | usize | `100` | Maximum `<!ENTITY` declarations allowed in XML DOCTYPEs before rejecting as possible entity-expansion abuse. Applies to request and response XML validation. |
+| `xml_reject_nested_entities` | bool | `true` | Reject XML entity definitions, including parameter-entity expansions, that reference or generate other entity definitions. |
 | `content_types` | String[] | `["application/json","application/xml","text/xml"]` | MIME types to validate |
 
 **Response validation:**
@@ -2766,6 +2771,8 @@ Request-side validation only buffers matching request bodies: methods that can c
 | `response_required_fields` | String[] | `[]` | Required field names in response |
 | `response_validate_xml` | bool | `false` | XML validation for responses |
 | `response_required_xml_elements` | String[] | `[]` | Required XML elements in responses |
+| `xml_max_entities` | usize | `100` | Shared request/response cap for XML entity declarations. |
+| `xml_reject_nested_entities` | bool | `true` | Shared request/response protection against nested or declaration-generating XML entities. |
 | `response_content_types` | String[] | `["application/json","application/xml","text/xml"]` | Response MIME types to validate |
 
 **Protobuf validation (gRPC):**

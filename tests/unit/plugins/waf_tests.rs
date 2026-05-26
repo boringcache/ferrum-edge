@@ -330,6 +330,110 @@ async fn custom_body_json_path_rule_scans_only_selected_value() {
 }
 
 #[tokio::test]
+async fn body_json_path_rule_scans_decoded_variants() {
+    let plugin = Waf::new(&json!({
+        "include_default_rules": false,
+        "custom_rules": [{
+            "id": "CUSTOM-JSON-DECODED",
+            "name": "encoded script marker",
+            "category": "custom",
+            "severity": "high",
+            "target": { "type": "body_json_path", "path": "comment" },
+            "match_kind": "contains",
+            "pattern": "<script",
+            "action": "enforce"
+        }]
+    }))
+    .unwrap();
+    let mut ctx = ctx("POST", "/chat");
+    ctx.headers
+        .insert("content-type".into(), "application/json".into());
+    let headers = ctx.headers.clone();
+
+    let result = plugin
+        .on_final_request_body_with_context(
+            &mut ctx,
+            &headers,
+            br#"{"comment":"&lt;script&gt;alert(1)&lt;/script&gt;"}"#,
+        )
+        .await;
+
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert_eq!(
+        ctx.metadata.get("waf.rule_hits").map(String::as_str),
+        Some("CUSTOM-JSON-DECODED")
+    );
+}
+
+#[tokio::test]
+async fn body_luhn_and_cidr_rules_scan_decoded_variants() {
+    let plugin = Waf::new(&json!({
+        "include_default_rules": false,
+        "custom_rules": [
+            {
+                "id": "CUSTOM-LUHN-BODY",
+                "name": "encoded payment card",
+                "category": "custom",
+                "severity": "high",
+                "target": "body_text",
+                "match_kind": "luhn",
+                "action": "enforce"
+            },
+            {
+                "id": "CUSTOM-CIDR-BODY",
+                "name": "encoded private address",
+                "category": "custom",
+                "severity": "high",
+                "target": "body_text",
+                "match_kind": "cidr",
+                "pattern": "10.0.0.0/8",
+                "action": "enforce"
+            }
+        ]
+    }))
+    .unwrap();
+    let mut luhn_ctx = ctx("POST", "/submit");
+    luhn_ctx
+        .headers
+        .insert("content-type".into(), "text/plain".into());
+    let headers = luhn_ctx.headers.clone();
+
+    let result = plugin
+        .on_final_request_body_with_context(
+            &mut luhn_ctx,
+            &headers,
+            b"card=4111 1111 1111 111&#49;",
+        )
+        .await;
+
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(
+        luhn_ctx
+            .metadata
+            .get("waf.rule_hits")
+            .is_some_and(|hits| hits.contains("CUSTOM-LUHN-BODY"))
+    );
+
+    let mut cidr_ctx = ctx("POST", "/submit");
+    cidr_ctx
+        .headers
+        .insert("content-type".into(), "text/plain".into());
+    let headers = cidr_ctx.headers.clone();
+
+    let result = plugin
+        .on_final_request_body_with_context(&mut cidr_ctx, &headers, b"ip=10&#46;1&#46;2&#46;3")
+        .await;
+
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(
+        cidr_ctx
+            .metadata
+            .get("waf.rule_hits")
+            .is_some_and(|hits| hits.contains("CUSTOM-CIDR-BODY"))
+    );
+}
+
+#[tokio::test]
 async fn cidr_text_rules_are_scoped_to_their_configured_target() {
     let plugin = Waf::new(&json!({
         "include_default_rules": false,
@@ -485,6 +589,96 @@ async fn response_body_scan_detects_sensitive_data_when_enabled() {
         ctx.metadata
             .get("waf.rule_hits")
             .is_some_and(|hits| hits.contains("FE-DATA-LEAK-006"))
+    );
+}
+
+#[tokio::test]
+async fn response_luhn_and_cidr_rules_scan_decoded_variants() {
+    let plugin = Waf::new(&json!({
+        "include_default_rules": false,
+        "response_inspection": true,
+        "response_body_inspection": true,
+        "custom_rules": [
+            {
+                "id": "CUSTOM-LUHN-RESP",
+                "name": "encoded response payment card",
+                "category": "custom",
+                "severity": "high",
+                "target": "response_body",
+                "match_kind": "luhn",
+                "action": "enforce"
+            },
+            {
+                "id": "CUSTOM-CIDR-RESP-BODY",
+                "name": "encoded response private address",
+                "category": "custom",
+                "severity": "high",
+                "target": "response_body",
+                "match_kind": "cidr",
+                "pattern": "10.0.0.0/8",
+                "action": "enforce"
+            }
+        ]
+    }))
+    .unwrap();
+    let headers = HashMap::from([("content-type".to_string(), "text/plain".to_string())]);
+
+    let mut luhn_ctx = ctx("GET", "/debug");
+    let result = plugin
+        .on_final_response_body(
+            &mut luhn_ctx,
+            200,
+            &headers,
+            b"card=4111 1111 1111 111&#49;",
+        )
+        .await;
+
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(
+        luhn_ctx
+            .metadata
+            .get("waf.rule_hits")
+            .is_some_and(|hits| hits.contains("CUSTOM-LUHN-RESP"))
+    );
+
+    let mut cidr_ctx = ctx("GET", "/debug");
+    let result = plugin
+        .on_final_response_body(&mut cidr_ctx, 200, &headers, b"ip=10&#46;2&#46;3&#46;4")
+        .await;
+
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(
+        cidr_ctx
+            .metadata
+            .get("waf.rule_hits")
+            .is_some_and(|hits| hits.contains("CUSTOM-CIDR-RESP-BODY"))
+    );
+}
+
+#[tokio::test]
+async fn uppercase_html_entities_are_decoded_for_body_rules() {
+    let plugin = Waf::new(&json!({
+        "rule_modes": { "FE-XSS-001-B": "enforce" }
+    }))
+    .unwrap();
+    let mut ctx = ctx("POST", "/submit");
+    ctx.headers
+        .insert("content-type".into(), "text/html".into());
+    let headers = ctx.headers.clone();
+
+    let result = plugin
+        .on_final_request_body_with_context(
+            &mut ctx,
+            &headers,
+            b"&LT;script&GT;alert(1)&LT;/script&GT;",
+        )
+        .await;
+
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(
+        ctx.metadata
+            .get("waf.rule_hits")
+            .is_some_and(|hits| hits.contains("FE-XSS-001-B"))
     );
 }
 
