@@ -246,6 +246,57 @@ async fn test_xml_mismatched_tag_names_rejected() {
     assert_reject(result, Some(400));
 }
 
+// The unbalanced/mismatched tests above both land on the mismatched-tag
+// branch (pop returns a non-matching name). These pin the two other
+// structural error branches the parser introduces.
+
+#[tokio::test]
+async fn test_xml_unclosed_root_rejected() {
+    // Stack non-empty at EOF with no mismatch: `item` opens and closes
+    // cleanly, but `root` is never closed → "Unclosed XML tag".
+    let plugin = xml_plugin();
+    let mut ctx = make_xml_ctx("<root><item></item>");
+    let mut headers = make_xml_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(400));
+}
+
+#[tokio::test]
+async fn test_xml_unexpected_closing_tag_rejected() {
+    // A closing tag with an empty stack → "Unexpected closing tag".
+    let plugin = xml_plugin();
+    let mut ctx = make_xml_ctx("<a></a></a>");
+    let mut headers = make_xml_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(400));
+}
+
+// Buffered/late request-body path: when `before_proxy` could not validate
+// (body not yet in ctx.metadata), `on_final_request_body` must still enforce
+// required XML elements even when `validate_xml` is not set. Without this the
+// `has_xml_validation` gate could silently revert to `self.validate_xml` and
+// stop enforcing required elements on the buffered path.
+
+#[tokio::test]
+async fn test_on_final_request_body_enforces_xml_required_elements_without_validate_xml() {
+    let plugin = BodyValidator::new(&json!({"required_xml_elements": ["item"]})).unwrap();
+    let headers = make_xml_headers();
+    let result = plugin
+        .on_final_request_body(&headers, b"<root><other>x</other></root>")
+        .await;
+    assert_reject(result, Some(400));
+}
+
+#[tokio::test]
+async fn test_on_final_request_body_accepts_present_xml_required_elements_without_validate_xml() {
+    let plugin = BodyValidator::new(&json!({"required_xml_elements": ["item"]})).unwrap();
+    let headers = make_xml_headers();
+    let result = plugin
+        .on_final_request_body(&headers, b"<root><item>x</item></root>")
+        .await;
+    assert_continue(result);
+}
+
 // ─── CDATA Handling ────────────────────────────────────────────────────
 
 #[tokio::test]

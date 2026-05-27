@@ -602,7 +602,7 @@ impl BodyValidator {
                         return Err("Invalid XML: empty tag name".to_string());
                     };
                     for (idx, required) in required_xml_elements.iter().enumerate() {
-                        if name == required {
+                        if !required_found[idx] && name == *required {
                             required_found[idx] = true;
                         }
                     }
@@ -1351,7 +1351,7 @@ impl Plugin for BodyValidator {
                     self.json_schema.as_ref(),
                     &self.compiled_patterns,
                 )
-            } else if is_xml_like_content_type(content_type) && self.validate_xml {
+            } else if is_xml_like_content_type(content_type) && has_xml_validation {
                 Self::validate_xml_body(body_str, &self.required_xml_elements)
             } else {
                 Ok(())
