@@ -1613,6 +1613,15 @@ async fn start_dtls_frontend_listener(
                     tls_client_cert_chain_der: client_conn.tls_client_cert_chain_der.clone(),
                     sni_hostname: client_conn.sni_hostname.clone(),
                     mesh_direction: None,
+                    // UDP/DTLS stream accept loops do not wire a
+                    // NodeWaypointIdentityResolver, so per-pod policy
+                    // scoping is not available. When per_pod_policy_scoping
+                    // is enabled (node-waypoint topology), the authz plugin
+                    // falls back to mesh-wide policies only. This means
+                    // namespace- and selector-scoped policies are not
+                    // enforced for UDP streams (HTTP only). A scoped ALLOW
+                    // with no mesh-wide counterpart falls through to the
+                    // default-allow posture, not a closed posture.
                     node_waypoint_policy_scope: None,
                 };
                 let mut rejected = false;
@@ -2414,6 +2423,13 @@ async fn create_session(
         tls_client_cert_chain_der: None,
         sni_hostname,
         mesh_direction: None,
+        // UDP stream accept loops do not wire a NodeWaypointIdentityResolver,
+        // so per-pod policy scoping is not available. When per_pod_policy_scoping
+        // is enabled (node-waypoint topology), the authz plugin falls back to
+        // mesh-wide policies only. This means namespace- and selector-scoped
+        // policies are not enforced for UDP streams (HTTP only). A scoped ALLOW
+        // with no mesh-wide counterpart falls through to the default-allow
+        // posture, not a closed posture.
         node_waypoint_policy_scope: None,
     };
     for plugin in plugins.iter() {

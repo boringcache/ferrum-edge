@@ -11,6 +11,7 @@ use ferrum_edge::modes::mesh::config::{
     TrustBundleSet, Workload, WorkloadPort, WorkloadRef, WorkloadSelector, validate_mesh_config,
 };
 use std::collections::HashMap;
+use std::net::IpAddr;
 
 fn fresh_workload() -> Workload {
     let td = TrustDomain::new("prod.example.com").unwrap();
@@ -503,8 +504,8 @@ fn mesh_policy_rejects_malformed_source_negation_ip_blocks() {
     );
     let err = ParsedCidr::parse("::ffff:10.0.0.0/95").unwrap_err();
     assert!(
-        err.contains("::ffff:10.0.0.0/95"),
-        "expected IPv4-mapped error, got: {err}"
+        err.contains("::ffff:10.0.0.0/95") && err.contains("IPv4-mapped IPv6"),
+        "expected IPv4-mapped IPv6 error, got: {err}"
     );
 }
 
@@ -967,4 +968,98 @@ fn workload_ref_serializes_only_spiffe_id_field() {
     let s = serde_json::to_value(&r).unwrap();
     assert!(s.is_object());
     assert_eq!(s.as_object().unwrap().len(), 1);
+}
+
+// ── ParsedCidr::contains / canonicalization tests ─────────────────────────
+
+#[test]
+fn parsed_cidr_ipv4_slash8_contains_and_rejects() {
+    let cidr = ParsedCidr::parse("10.0.0.0/8").unwrap();
+    let inside: IpAddr = "10.1.2.3".parse().unwrap();
+    let outside: IpAddr = "11.0.0.1".parse().unwrap();
+    assert!(
+        cidr.contains(inside),
+        "10.1.2.3 should be inside 10.0.0.0/8"
+    );
+    assert!(
+        !cidr.contains(outside),
+        "11.0.0.1 should not be inside 10.0.0.0/8"
+    );
+}
+
+#[test]
+fn parsed_cidr_ipv4_slash32_host_route() {
+    let cidr = ParsedCidr::parse("192.168.1.5/32").unwrap();
+    let exact: IpAddr = "192.168.1.5".parse().unwrap();
+    let other: IpAddr = "192.168.1.6".parse().unwrap();
+    assert!(cidr.contains(exact), "/32 should match the exact IP");
+    assert!(!cidr.contains(other), "/32 should not match adjacent IP");
+}
+
+#[test]
+fn parsed_cidr_slash0_matches_everything() {
+    let cidr_v4 = ParsedCidr::parse("0.0.0.0/0").unwrap();
+    let any_v4: IpAddr = "1.2.3.4".parse().unwrap();
+    assert!(cidr_v4.contains(any_v4), "0.0.0.0/0 should match any IPv4");
+
+    let cidr_v6 = ParsedCidr::parse("::/0").unwrap();
+    let any_v6: IpAddr = "2001:db8::1".parse().unwrap();
+    assert!(cidr_v6.contains(any_v6), "::/0 should match any IPv6");
+}
+
+#[test]
+fn parsed_cidr_ipv4_mapped_ipv6_canonicalized_to_v4() {
+    // ::ffff:10.0.0.0/104 is IPv4-mapped and should canonicalize to 10.0.0.0/8.
+    let cidr = ParsedCidr::parse("::ffff:10.0.0.0/104").unwrap();
+    // A plain IPv4 address inside the block should match.
+    let inside_v4: IpAddr = "10.0.0.1".parse().unwrap();
+    assert!(
+        cidr.contains(inside_v4),
+        "10.0.0.1 should be inside ::ffff:10.0.0.0/104 (≡ 10.0.0.0/8)"
+    );
+    // A mapped IPv6 form of the same address should also match.
+    let inside_mapped: IpAddr = "::ffff:10.0.0.1".parse().unwrap();
+    assert!(
+        cidr.contains(inside_mapped),
+        "::ffff:10.0.0.1 should be inside the canonicalized block"
+    );
+    // An address outside the /8 should not match.
+    let outside: IpAddr = "11.0.0.1".parse().unwrap();
+    assert!(
+        !cidr.contains(outside),
+        "11.0.0.1 should not be inside 10.0.0.0/8"
+    );
+}
+
+#[test]
+fn parsed_cidr_family_mismatch_returns_false() {
+    let v4_cidr = ParsedCidr::parse("10.0.0.0/8").unwrap();
+    let v6_addr: IpAddr = "2001:db8::1".parse().unwrap();
+    assert!(
+        !v4_cidr.contains(v6_addr),
+        "IPv4 block should not match a non-mapped IPv6 address"
+    );
+
+    let v6_cidr = ParsedCidr::parse("2001:db8::/32").unwrap();
+    let v4_addr: IpAddr = "10.0.0.1".parse().unwrap();
+    assert!(
+        !v6_cidr.contains(v4_addr),
+        "IPv6 block should not match an IPv4 address"
+    );
+}
+
+#[test]
+fn parsed_cidr_parse_trims_surrounding_whitespace() {
+    let cidr = ParsedCidr::parse("  10.0.0.0/8  ").unwrap();
+    let inside: IpAddr = "10.1.2.3".parse().unwrap();
+    assert!(cidr.contains(inside));
+}
+
+#[test]
+fn parsed_cidr_bare_ip_treated_as_host_route() {
+    let cidr_v4 = ParsedCidr::parse("192.168.1.1").unwrap();
+    let exact: IpAddr = "192.168.1.1".parse().unwrap();
+    let other: IpAddr = "192.168.1.2".parse().unwrap();
+    assert!(cidr_v4.contains(exact));
+    assert!(!cidr_v4.contains(other));
 }

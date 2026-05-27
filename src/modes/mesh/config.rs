@@ -248,10 +248,15 @@ pub struct PrincipalMatch {
 /// `"192.168.1.1"` (treated as a host route). IPv4-mapped IPv6 addresses are
 /// canonicalized to IPv4 at parse time so `::ffff:10.0.0.0/104` becomes
 /// `10.0.0.0/8`. Serializes back to the canonical `network/prefix` form.
+///
+/// Fields are private so the invariant `prefix <= 32` (IPv4) / `prefix <= 128`
+/// (IPv6) cannot be bypassed by a direct struct literal. Use [`ParsedCidr::parse`]
+/// to construct values; [`ParsedCidr::contains`] relies on the invariant being
+/// upheld to avoid arithmetic overflow.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedCidr {
-    pub network: IpAddr,
-    pub prefix: u8,
+    network: IpAddr,
+    prefix: u8,
 }
 
 impl ParsedCidr {
@@ -273,7 +278,7 @@ impl ParsedCidr {
             .parse()
             .map_err(|_| format!("invalid IP in CIDR '{s}'"))?;
         let (network, prefix) =
-            Self::canonicalize(ip, prefix).ok_or_else(|| format!("invalid CIDR '{s}'"))?;
+            Self::canonicalize(ip, prefix).map_err(|reason| format!("{reason} in CIDR '{s}'"))?;
         let max = if network.is_ipv4() { 32 } else { 128 };
         if prefix > max {
             return Err(format!("prefix length {prefix} out of range in CIDR '{s}'"));
@@ -303,19 +308,23 @@ impl ParsedCidr {
         }
     }
 
-    fn canonicalize(ip: IpAddr, prefix: Option<u8>) -> Option<(IpAddr, u8)> {
+    fn canonicalize(ip: IpAddr, prefix: Option<u8>) -> Result<(IpAddr, u8), String> {
         match ip {
-            IpAddr::V4(v4) => Some((IpAddr::V4(v4), prefix.unwrap_or(32))),
+            IpAddr::V4(v4) => Ok((IpAddr::V4(v4), prefix.unwrap_or(32))),
             IpAddr::V6(v6) => {
                 if let Some(v4) = v6.to_ipv4_mapped() {
-                    let prefix = match prefix {
+                    let v4_prefix = match prefix {
                         Some(p) if p >= 96 => p - 96,
-                        Some(_) => return None,
+                        Some(p) => {
+                            return Err(format!(
+                                "IPv4-mapped IPv6 CIDR prefix {p} must be at least 96"
+                            ));
+                        }
                         None => 32,
                     };
-                    Some((IpAddr::V4(v4), prefix))
+                    Ok((IpAddr::V4(v4), v4_prefix))
                 } else {
-                    Some((IpAddr::V6(v6), prefix.unwrap_or(128)))
+                    Ok((IpAddr::V6(v6), prefix.unwrap_or(128)))
                 }
             }
         }
