@@ -21,6 +21,7 @@ use crate::k8s_controller::istio_status::{IstioStatusWriter, plan_istio_status_u
 use crate::k8s_controller::metrics::ControllerMetrics;
 use crate::k8s_controller::resource_store::ResourceStoreSet;
 use crate::k8s_controller::status::{GatewayApiStatusWriter, plan_gateway_api_status_updates};
+use crate::k8s_controller::watcher::namespaces_with_istio_root;
 
 const INITIAL_STORE_READINESS_TIMEOUT: Duration = Duration::from_secs(30);
 const GATEWAY_API_STATUS_UPDATES_PER_RECONCILE_CAP: usize = 256;
@@ -392,10 +393,12 @@ async fn do_reconcile(store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>, ctx:
     let resource_count = objects.len();
     debug!(resource_count, "Starting reconciliation");
 
+    let source_namespaces =
+        namespaces_with_istio_root(&ctx.watch_namespaces, &ctx.istio_root_namespace);
     let options = K8sTranslationOptions::new(ctx.namespace.clone(), ctx.trust_domain.clone())
         .with_cluster_domain(ctx.cluster_domain.clone())
         .with_istio_root_namespace(ctx.istio_root_namespace.clone())
-        .with_source_namespaces(ctx.watch_namespaces.clone())
+        .with_source_namespaces(source_namespaces)
         .with_pod_discovery_enabled(ctx.pod_discovery_enabled);
     let Some(translation) = translate_with_skip_retries(&objects, options.clone(), &ctx.metrics)
     else {
@@ -588,8 +591,12 @@ fn gateway_config_content_changed(new_config: &GatewayConfig, old_config: &Gatew
 
 const K8S_MANAGED_PROXY_ID_PREFIXES: &[&str] = &["gwapi-route-", "gwapi-l4-", "istio-vs-"];
 const K8S_MANAGED_UPSTREAM_ID_PREFIXES: &[&str] = &["gwapi-route-upstream-", "istio-vs-upstream-"];
-const K8S_MANAGED_PLUGIN_CONFIG_ID_PREFIXES: &[&str] =
-    &["istio-vs-fi-", "istio-vs-mrd-", "istio-vs-rt-"];
+const K8S_MANAGED_PLUGIN_CONFIG_ID_PREFIXES: &[&str] = &[
+    "istio-vs-fi-",
+    "istio-vs-mirror-",
+    "istio-vs-mrd-",
+    "istio-vs-rt-",
+];
 
 fn managed_k8s_namespaces(
     namespace: &str,
@@ -1052,6 +1059,10 @@ mod tests {
             "istio-vs-rt-ferrum-old-0",
             json!({"status_code": 404, "message": "unsupported Istio VirtualService match predicate"}),
         ));
+        active.plugin_configs.push(plugin_config(
+            "istio-vs-mirror-ferrum-old-0",
+            json!({"mirror_host": "old-mirror.internal", "mirror_port": 8080, "percentage": 100.0}),
+        ));
         active.known_namespaces.push("db".to_string());
 
         let mut k8s = GatewayConfig::default();
@@ -1064,6 +1075,10 @@ mod tests {
         k8s.plugin_configs.push(plugin_config(
             "istio-vs-mrd-ferrum-new-0",
             json!({"rules": [{"match": {"methods": ["GET"]}, "destination": {"upstream_id": "new"}}]}),
+        ));
+        k8s.plugin_configs.push(plugin_config(
+            "istio-vs-mirror-ferrum-new-0",
+            json!({"mirror_host": "new-mirror.internal", "mirror_port": 8080, "percentage": 100.0}),
         ));
         k8s.known_namespaces.push("k8s".to_string());
 
@@ -1112,6 +1127,18 @@ mod tests {
                 .plugin_configs
                 .iter()
                 .all(|plugin| plugin.id != "istio-vs-rt-ferrum-old-0")
+        );
+        assert!(
+            merged
+                .plugin_configs
+                .iter()
+                .any(|plugin| plugin.id == "istio-vs-mirror-ferrum-new-0")
+        );
+        assert!(
+            merged
+                .plugin_configs
+                .iter()
+                .all(|plugin| plugin.id != "istio-vs-mirror-ferrum-old-0")
         );
         assert!(merged.known_namespaces.contains(&"db".to_string()));
         assert!(merged.known_namespaces.contains(&"k8s".to_string()));

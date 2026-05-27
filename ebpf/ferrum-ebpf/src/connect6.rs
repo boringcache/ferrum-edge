@@ -9,11 +9,11 @@ use aya_ebpf::EbpfContext;
 
 use crate::maps::{
     FERRUM_BYPASS_UIDS, FERRUM_CAPTURE_CONFIG, FERRUM_CIDR_EXCLUDE6, FERRUM_CIDR_INCLUDE6,
-    FERRUM_INCLUDE_PORTS, FERRUM_ORIG_DST6, FERRUM_PORT_EXCLUDE,
+    FERRUM_INCLUDE_PORTS, FERRUM_ORIG_DST6, FERRUM_PORT_EXCLUDE, FERRUM_WORKLOAD_IDENTITY,
 };
 use ferrum_ebpf_common::{
-    CidrKey6, IncludePortsPolicy, OrigDst6, OrigDstKey, FERRUM_CAPTURE_CONFIG_KEY,
-    IPV6_LOOPBACK_NBO, OUTBOUND_CAPTURE_PORT,
+    CidrKey6, IncludePortsPolicy, OrigDst6, OrigDstKey, WorkloadIdentity,
+    FERRUM_CAPTURE_CONFIG_KEY, IPV6_LOOPBACK_NBO, OUTBOUND_CAPTURE_PORT,
 };
 
 #[cgroup_sock_addr(connect6)]
@@ -57,12 +57,15 @@ fn try_connect6(ctx: &SockAddrContext) -> Result<i32, i64> {
 
     let cookie = unsafe { aya_ebpf::helpers::bpf_get_socket_cookie(ctx.as_ptr()) };
     let key = OrigDstKey { cookie };
+    // Stamp the source pod's identity onto the orig-dst record (see connect4
+    // for the rationale). Absent entry → all-zero sentinel = fail-closed.
+    let identity = source_workload_identity();
     let orig = OrigDst6 {
         addr: dst_ip,
         port: dst_port as u32,
         _pad: 0,
-        pod_uid: [0; 16],
-        workload_spiffe_hash: 0,
+        pod_uid: identity.pod_uid,
+        workload_spiffe_hash: identity.workload_spiffe_hash,
     };
     let _ = FERRUM_ORIG_DST6.insert(&key, &orig, 0);
 
@@ -71,6 +74,18 @@ fn try_connect6(ctx: &SockAddrContext) -> Result<i32, i64> {
     sock_addr.user_port = outbound_capture_port() << 16;
 
     Ok(1)
+}
+
+/// Look up the source pod's identity for the current cgroup. See the connect4
+/// helper for the full rationale; returns the all-zero sentinel when the
+/// node-agent has not enrolled this cgroup.
+#[inline(always)]
+fn source_workload_identity() -> WorkloadIdentity {
+    let cgroup_id = unsafe { aya_ebpf::helpers::bpf_get_current_cgroup_id() };
+    match unsafe { FERRUM_WORKLOAD_IDENTITY.get(&cgroup_id) } {
+        Some(identity) => *identity,
+        None => WorkloadIdentity::unknown(),
+    }
 }
 
 #[inline(always)]

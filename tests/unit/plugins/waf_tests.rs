@@ -1,3 +1,4 @@
+use ferrum_edge::_test_support::clone_log_metadata;
 use ferrum_edge::plugins::waf::Waf;
 use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext, is_security_plugin};
 use serde_json::json;
@@ -68,6 +69,24 @@ async fn path_exemption_short_circuits_and_writes_no_waf_metadata() {
     .unwrap();
     let mut ctx = ctx("GET", "/healthz");
     ctx.set_raw_query_string("q=%27%20OR%201%3D1".into());
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!ctx.metadata.keys().any(|key| key.starts_with("waf.")));
+}
+
+#[tokio::test]
+async fn waf_clears_preexisting_reserved_metadata_before_evaluation() {
+    let plugin = Waf::new(&json!({})).unwrap();
+    let mut ctx = ctx("GET", "/search");
+    ctx.metadata
+        .insert("waf.rule_hits".to_string(), "SPOOFED".to_string());
+    ctx.metadata
+        .insert("waf.action".to_string(), "blocked".to_string());
+    ctx.metadata
+        .insert("waf.severity".to_string(), "critical".to_string());
+    ctx.set_raw_query_string("q=ordinary".into());
 
     let result = plugin.authorize(&mut ctx).await;
 
@@ -728,6 +747,41 @@ async fn oversized_body_skip_mode_does_not_scan_truncated_prefix() {
 
     assert!(matches!(result, PluginResult::Continue));
     assert!(!ctx.metadata.contains_key("waf.rule_hits"));
+}
+
+#[tokio::test]
+async fn clean_truncated_scan_preserves_owned_log_metadata() {
+    let plugin = Waf::new(&json!({
+        "include_default_rules": false,
+        "max_scan_bytes": 4,
+        "custom_rules": [{
+            "id": "CUSTOM-MISS",
+            "name": "missing body marker",
+            "category": "custom",
+            "severity": "low",
+            "target": "body_text",
+            "match_kind": "contains",
+            "pattern": "needle",
+            "action": "monitor"
+        }]
+    }))
+    .unwrap();
+    let mut ctx = ctx("POST", "/submit");
+    ctx.headers
+        .insert("content-type".into(), "text/plain".into());
+    let headers = ctx.headers.clone();
+
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, b"clean body")
+        .await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        clone_log_metadata(&ctx)
+            .get("waf.scan_truncated")
+            .map(String::as_str),
+        Some("true")
+    );
 }
 
 #[tokio::test]

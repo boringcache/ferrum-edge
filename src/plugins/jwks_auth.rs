@@ -29,7 +29,7 @@ use super::utils::token_extract::{
     extract_from_location, mark_original_token_stripping_metadata as mark_token_stripping_metadata,
     provider_locations_extract_token,
 };
-use super::{PluginResult, RequestContext};
+use super::{JwtAuthAttributeValue, PluginResult, RequestContext};
 
 /// Default JWKS refresh interval: 15 minutes.
 const DEFAULT_JWKS_REFRESH_INTERVAL_SECS: u64 = 900;
@@ -1383,7 +1383,18 @@ async fn discover_jwks_uri(
 }
 
 /// Set `mesh.request_principal` metadata to `{iss}/{sub}` when both claims are
-/// present.
+/// present, plus the JWT-derived attributes consumed by mesh
+/// `AuthorizationPolicy` `when:` conditions (`request.auth.audiences` and
+/// `request.auth.claims[...]`).
+///
+/// Only emitted when the auto-injected mesh `RequestAuthentication` plugin set
+/// `emit_mesh_request_principal_metadata`, so non-mesh `jwks_auth` instances
+/// pay nothing. Audience and claim attributes are stored on dedicated
+/// `RequestContext` fields, not generic metadata, so they do not flow into
+/// transaction logs. Claim fan-out is bounded by the number of string /
+/// string-array leaves in the already-validated token; nested object claims are
+/// materialized only at leaf paths so nested Istio condition keys remain
+/// addressable without serializing whole objects.
 fn set_mesh_request_principal_metadata(claims: &Value, ctx: &mut RequestContext) {
     if let (Some(iss), Some(sub)) = (
         claims.get("iss").and_then(|v| v.as_str()),
@@ -1391,6 +1402,84 @@ fn set_mesh_request_principal_metadata(claims: &Value, ctx: &mut RequestContext)
     ) {
         ctx.metadata
             .insert("mesh.request_principal".to_string(), format!("{iss}/{sub}"));
+    }
+
+    // `request.auth.audiences` — string or string-array form.
+    if let Some(aud) = claims.get("aud")
+        && let Some(audiences) = string_scalar_or_array(aud)
+    {
+        ctx.mesh_request_auth_audiences = audiences;
+    }
+
+    // `request.auth.claims[<name>]` — scalar claims and string arrays only.
+    // Nested objects are emitted with Istio's bracket path encoding, e.g.
+    // `request.auth.claims[realm_access][roles]` is stored under
+    // `realm_access][roles`. Claim-name segments containing bracket syntax
+    // are skipped so a top-level claim literally named `realm_access][roles`
+    // cannot masquerade as a nested path.
+    if let Some(obj) = claims.as_object() {
+        for (name, value) in obj {
+            if claim_path_segment_is_ambiguous(name) {
+                continue;
+            }
+            set_mesh_claim_attribute(name, value, ctx);
+        }
+    }
+}
+
+/// Render a single JWT claim leaf into the string form Istio uses for
+/// `request.auth.claims[...]` matching. String claims render directly; string
+/// arrays stay as lists so one item containing a comma does not broaden policy
+/// matching. Objects and non-string leaves are skipped by this leaf renderer;
+/// object traversal happens in [`set_mesh_claim_attribute`].
+fn render_claim_leaf_attribute_value(value: &Value) -> Option<JwtAuthAttributeValue> {
+    match value {
+        Value::String(s) => Some(JwtAuthAttributeValue::Scalar(s.clone())),
+        Value::Array(_) => string_scalar_or_array(value).map(JwtAuthAttributeValue::StringList),
+        Value::Bool(_) | Value::Number(_) | Value::Null | Value::Object(_) => None,
+    }
+}
+
+fn set_mesh_claim_attribute(path: &str, value: &Value, ctx: &mut RequestContext) {
+    if let Some(rendered) = render_claim_leaf_attribute_value(value) {
+        ctx.mesh_request_auth_claims
+            .insert(path.to_string(), rendered);
+        return;
+    }
+
+    let Value::Object(obj) = value else {
+        return;
+    };
+
+    for (name, nested) in obj {
+        if claim_path_segment_is_ambiguous(name) {
+            continue;
+        }
+        let mut nested_path = String::with_capacity(path.len() + name.len() + 2);
+        nested_path.push_str(path);
+        nested_path.push_str("][");
+        nested_path.push_str(name);
+        set_mesh_claim_attribute(&nested_path, nested, ctx);
+    }
+}
+
+fn claim_path_segment_is_ambiguous(segment: &str) -> bool {
+    segment.contains('[') || segment.contains(']')
+}
+
+/// Extract a JSON value that is either a single string scalar or an array of
+/// strings. Returns `None` for other shapes.
+fn string_scalar_or_array(value: &Value) -> Option<Vec<String>> {
+    match value {
+        Value::String(s) => Some(vec![s.clone()]),
+        Value::Array(items) => {
+            let parts: Vec<String> = items
+                .iter()
+                .map(|item| item.as_str().map(str::to_string))
+                .collect::<Option<Vec<_>>>()?;
+            if parts.is_empty() { None } else { Some(parts) }
+        }
+        _ => None,
     }
 }
 

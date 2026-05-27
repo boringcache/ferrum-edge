@@ -1149,6 +1149,16 @@ async fn run_tcp_accept_loop(
                         tls_client_cert_chain_der: None,
                         sni_hostname: None,
                         mesh_direction: None,
+                        // TCP stream accept loops do not wire a
+                        // NodeWaypointIdentityResolver, so per-pod policy
+                        // scoping is not available. When per_pod_policy_scoping
+                        // is enabled (node-waypoint topology), the authz plugin
+                        // falls back to mesh-wide policies only. This means
+                        // namespace- and selector-scoped policies are not
+                        // enforced for TCP streams (HTTP only). A scoped ALLOW
+                        // with no mesh-wide counterpart falls through to the
+                        // default-allow posture, not a closed posture.
+                        node_waypoint_policy_scope: None,
                     };
 
                     // `ArcSwap::load()` returns a `Guard` over `Arc<Option<Arc<...>>>`;
@@ -2097,6 +2107,11 @@ async fn handle_tcp_connection_inner(
         });
         stream_ctx.tls_client_cert_der = peer_cert_der;
         stream_ctx.tls_client_cert_chain_der = peer_chain_tail_der;
+        stream_ctx.sni_hostname = tls_stream
+            .get_ref()
+            .1
+            .server_name()
+            .map(str::to_ascii_lowercase);
 
         // Run on_stream_connect plugins after TLS handshake so client cert is available.
         if !plugins.is_empty() {

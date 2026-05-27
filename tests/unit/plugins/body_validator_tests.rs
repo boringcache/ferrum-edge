@@ -237,6 +237,67 @@ async fn test_xml_unbalanced_tags_rejected() {
     assert_reject(result, Some(400));
 }
 
+#[tokio::test]
+async fn test_xml_mismatched_tag_names_rejected() {
+    let plugin = xml_plugin();
+    let mut ctx = make_xml_ctx("<root><a></b></root>");
+    let mut headers = make_xml_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(400));
+}
+
+// The unbalanced/mismatched tests above both land on the mismatched-tag
+// branch (pop returns a non-matching name). These pin the two other
+// structural error branches the parser introduces.
+
+#[tokio::test]
+async fn test_xml_unclosed_root_rejected() {
+    // Stack non-empty at EOF with no mismatch: `item` opens and closes
+    // cleanly, but `root` is never closed → "Unclosed XML tag".
+    let plugin = xml_plugin();
+    let mut ctx = make_xml_ctx("<root><item></item>");
+    let mut headers = make_xml_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(400));
+}
+
+#[tokio::test]
+async fn test_xml_unexpected_closing_tag_rejected() {
+    // A closing tag with an empty stack → "Unexpected closing tag".
+    let plugin = xml_plugin();
+    let mut ctx = make_xml_ctx("<a></a></a>");
+    let mut headers = make_xml_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(400));
+}
+
+// Required-element enforcement — unified gate (has_xml_request_validation):
+// `on_final_request_body` is the authoritative gate for required-element
+// enforcement when `validate_xml` is unset. Both `before_proxy` and
+// `on_final_request_body` share the same `has_xml_request_validation` flag
+// (true when validate_xml is set OR required_xml_elements is non-empty), so
+// neither path can silently skip required-element checks.
+
+#[tokio::test]
+async fn test_on_final_request_body_enforces_xml_required_elements_without_validate_xml() {
+    let plugin = BodyValidator::new(&json!({"required_xml_elements": ["item"]})).unwrap();
+    let headers = make_xml_headers();
+    let result = plugin
+        .on_final_request_body(&headers, b"<root><other>x</other></root>")
+        .await;
+    assert_reject(result, Some(400));
+}
+
+#[tokio::test]
+async fn test_on_final_request_body_accepts_present_xml_required_elements_without_validate_xml() {
+    let plugin = BodyValidator::new(&json!({"required_xml_elements": ["item"]})).unwrap();
+    let headers = make_xml_headers();
+    let result = plugin
+        .on_final_request_body(&headers, b"<root><item>x</item></root>")
+        .await;
+    assert_continue(result);
+}
+
 // ─── CDATA Handling ────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -394,6 +455,36 @@ async fn test_xml_required_element_with_cdata() {
 async fn test_xml_required_element_missing() {
     let plugin = xml_plugin_with_required(vec!["missing"]);
     let body = "<root><item>content</item></root>";
+    let mut ctx = make_xml_ctx(body);
+    let mut headers = make_xml_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(400));
+}
+
+#[tokio::test]
+async fn test_xml_required_element_in_cdata_does_not_match() {
+    let plugin = xml_plugin_with_required(vec!["item"]);
+    let body = "<root><![CDATA[<item>fake</item>]]></root>";
+    let mut ctx = make_xml_ctx(body);
+    let mut headers = make_xml_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(400));
+}
+
+#[tokio::test]
+async fn test_xml_required_element_in_comment_does_not_match() {
+    let plugin = xml_plugin_with_required(vec!["item"]);
+    let body = "<root><!-- <item>fake</item> --></root>";
+    let mut ctx = make_xml_ctx(body);
+    let mut headers = make_xml_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(400));
+}
+
+#[tokio::test]
+async fn test_xml_required_element_in_processing_instruction_does_not_match() {
+    let plugin = xml_plugin_with_required(vec!["item"]);
+    let body = r#"<root><?fake <item>fake</item> ?></root>"#;
     let mut ctx = make_xml_ctx(body);
     let mut headers = make_xml_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
@@ -1311,6 +1402,42 @@ async fn test_response_xml_required_elements() {
             .on_final_response_body(&mut ctx, 200, &headers, body)
             .await,
         Some(502),
+    );
+}
+
+// Response-side required-element enforcement without response_validate_xml:
+// A config with `response_required_xml_elements` set but `response_validate_xml`
+// unset must still enforce required-element checks via has_xml_response_validation.
+// This mirrors the request-side fix and closes the silent-skip bug on responses.
+
+#[tokio::test]
+async fn test_on_final_response_body_enforces_xml_required_elements_without_response_validate_xml()
+{
+    let plugin =
+        BodyValidator::new(&json!({"response_required_xml_elements": ["result"]})).unwrap();
+    let mut ctx = make_response_ctx();
+    let headers = response_xml_headers();
+    let body = b"<root><data>text</data></root>";
+    assert_reject(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &headers, body)
+            .await,
+        Some(502),
+    );
+}
+
+#[tokio::test]
+async fn test_on_final_response_body_accepts_present_xml_required_elements_without_response_validate_xml()
+ {
+    let plugin =
+        BodyValidator::new(&json!({"response_required_xml_elements": ["result"]})).unwrap();
+    let mut ctx = make_response_ctx();
+    let headers = response_xml_headers();
+    let body = b"<root><result>ok</result></root>";
+    assert_continue(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &headers, body)
+            .await,
     );
 }
 

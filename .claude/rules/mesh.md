@@ -42,7 +42,8 @@ Full operator docs live in `docs/mesh.md`. Keep this file to implementation inva
 - All topologies share the normal proxy and plugin chain.
 - Mesh runtime state is `ArcSwap<Option<MeshSlice>>` in `runtime.rs`; slice apply is lock-free hot-swap like `GatewayConfig`.
 - `wait_for_first_slice()` blocks startup until the first valid slice arrives.
-- Native config consumption uses `MeshConfigSync.MeshSubscribe` gRPC. xDS uses ADS for CDS/EDS/LDS/RDS/SDS with 25 ms debounce.
+- Native config consumption uses `MeshConfigSync.MeshSubscribe` gRPC. xDS uses ADS for CDS/EDS/LDS/RDS/SDS/ECDS/RTDS with 25 ms debounce.
+- xDS is Ferrum-CP-to-Ferrum-DP, not stock-Envoy/Istio-interoperable: CDS/EDS/LDS/RDS are name-only (service-port discovery); all security/policy slice fields and selector context (authz, PeerAuth, JWT, ServiceEntry, trust bundles, ProxyConfig, workloads, effective labels, outbound policy, telemetry, multi-cluster, sidecar egress scope) ride ECDS as Ferrum mesh-slice carriers. `src/xds/carrier.rs` (`MeshSliceCarrier`) is the single encode/decode source of truth; the CP emits via `translate_mesh_slice_carriers` and the DP recovers in `reverse_translate`, requiring both reserved carrier resource name and matching inner type URL. An xDS-built slice must stay functionally equivalent to a native-built one.
 - Native and xDS clients use jittered exponential backoff from 1s to 30s, plus/minus 25%, multi-CP failover via `FERRUM_DP_CP_GRPC_URLS`, and JWT metadata.
 
 ## Scope And Policy Semantics
@@ -56,7 +57,7 @@ Full operator docs live in `docs/mesh.md`. Keep this file to implementation inva
 
 ## Mesh Plugin Injection
 
-- `inject_mesh_global_plugins()` auto-injects reserved-ID globals on slice apply: `__mesh_spiffe_identity` priority 940, `__mesh_authz` priority 2075, `__mesh_workload_metrics`, `__mesh_request_auth` only when JWT rules exist, and `__mesh_access_log`.
+- `inject_mesh_global_plugins()` auto-injects reserved-ID globals on slice apply: `__mesh_spiffe_identity` priority 940, `__mesh_authz` priority 2075, `__mesh_workload_metrics`, `__mesh_request_auth` only when JWT rules exist, and `__mesh_access_log` (a `stdout_logging` instance carrying the Telemetry `accessLogging` filter).
 - Operator-managed globals of the same type override mesh-injected plugins.
 - Mesh plugin injection must preserve normal plugin lifecycle ordering and transaction logging.
 
@@ -74,7 +75,9 @@ Full operator docs live in `docs/mesh.md`. Keep this file to implementation inva
 ## PeerAuthentication And TLS Reload
 
 - By default, inbound mesh mTLS mode resolves once from the initial slice.
-- With `FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED=true`, only resolved mTLS mode and frontend client CA verifier may hot-swap on slice apply.
+- When all three `FERRUM_GATEWAY_SVID_*` paths are set, the inbound mTLS/HBONE listener uses a SPIFFE client-cert verifier that validates the peer SAN's trust domain against the gateway SVID local bundle plus slice federated bundles; without SVID material it falls back to chain-only verification over `FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH`. STRICT requires a peer cert; PERMISSIVE trust-domain-validates an offered cert but still admits cert-less peers. The HBONE baggage trust-gate rests on this verified identity.
+- The mesh `RequestAuthentication` (`jwks_auth`) plugin requires the JWT `exp` claim by default (`FERRUM_MESH_REQUEST_AUTH_REQUIRE_EXP=true`); operators may relax it. Expiry validation (rejecting present-but-expired `exp`) is always on.
+- With `FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED=true`, only resolved mTLS mode, frontend client CA verifier, and the lock-free SPIFFE SVID bundle slot (federated trust domains) may hot-swap on slice apply.
 - Frontend cert/key paths remain restart-required inputs for mesh peer auth reload.
 - Coverage includes mesh HTTP/HBONE termination listeners and mesh-shared TCP+TLS / UDP+DTLS stream listeners.
 - `apply_mesh_inbound_tls_reload` publishes swapped `ServerConfig` into HBONE, shared stream TLS, and active `DtlsServer` frontend DTLS configs.
@@ -114,6 +117,8 @@ Full operator docs live in `docs/mesh.md`. Keep this file to implementation inva
 - `FERRUM_K8S_CONTROLLER_ENABLED` and `FERRUM_K8S_POD_DISCOVERY_ENABLED` default true inside pods detected by `KUBERNETES_SERVICE_HOST`; outside pods they default false.
 - Explicit operator `false` wins over pod detection.
 - If `FERRUM_K8S_WATCH_NAMESPACES` is unset, watch scope falls back to CP scope: `Single`/`Set` use namespaced watches, `All` uses cluster-wide.
-- Istio status writer patches `status.conditions[]` for AuthorizationPolicy, PeerAuthentication, and DestinationRule when `watch_istio == true`.
-- Status writer failures, such as missing `subresources.status`, warn and no-op.
-- VirtualService, ServiceEntry, RequestAuthentication, Sidecar, Telemetry, and WorkloadEntry status are deferred; do not imply they are implemented.
+- Istio status writer patches `status.conditions[]` (a `FerrumAccepted` condition plus a `status.ferrum.translation` detail block) for all nine translated Istio kinds when `watch_istio == true`: AuthorizationPolicy, PeerAuthentication, RequestAuthentication, DestinationRule, VirtualService, ServiceEntry, WorkloadEntry, Sidecar, and Telemetry. Successful translation writes `FerrumAccepted=True`; a `K8sTranslateError` writes `FerrumAccepted=False`/`Invalid` with the translator's reason so rejections are visible to `kubectl`.
+- Keep `istio_api_resource`/`is_supported_istio_kind` in `src/k8s_controller/istio_status.rs` in lock-step with `ISTIO_CRDS` in `src/k8s_controller/watcher.rs` (group + plural).
+- Parsed-but-unenforced fields are surfaced as `status.ferrum.translation.deferred_fields` rather than only logged: DestinationRule `portLevelSettings[].tls`, per-subset `connectionPool.tcp.connectTimeout`/`outlierDetection`, and `connectionPool.http.{http1MaxPendingRequests,maxRetries,h2UpgradePolicy}`; VirtualService `http[].corsPolicy` (the only remaining HTTP-route field that is parsed but not projected — `mirror`/`mirrorPercentage`, `redirect`, and `rewrite` are now fully translated); Sidecar `ingress[]`. VirtualService `spec.tcp[]` and `spec.tls[]` route blocks are **not** deferred — the translator rejects them fail-closed and they surface as `FerrumAccepted=False`/`Invalid` status, not as `deferred_fields`. The DR `connectionPool.http` deferred set is mirrored by a translator warning in `src/config_sources/k8s/istio.rs`; keep the two lists in sync.
+- Status writer failures, such as missing `subresources.status`, warn and no-op; they never abort reconcile.
+- `ProxyConfig` is translated but not watched (`ISTIO_CRDS`) and not surfaced by the status writer.

@@ -32,7 +32,7 @@ use ferrum_edge::modes::mesh::config::{
     WorkloadSelector,
 };
 use ferrum_edge::plugins::mesh::authz::MeshAuthz;
-use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
+use ferrum_edge::plugins::{JwtAuthAttributeValue, Plugin, PluginResult, RequestContext};
 use serde_json::json;
 
 use super::mesh_test_support::{
@@ -291,6 +291,7 @@ async fn negative_match_not_paths_blocks_subpath_but_admits_others() {
                 spiffe_id_pattern: Some(CLIENT_SPIFFE.to_string()),
                 namespace_pattern: None,
                 trust_domain: Some(TrustDomain::new(DEFAULT_TRUST_DOMAIN).expect("trust domain")),
+                trust_domain_pattern: None,
             }],
             to: vec![RequestMatch {
                 methods: vec!["GET".to_string()],
@@ -299,6 +300,8 @@ async fn negative_match_not_paths_blocks_subpath_but_admits_others() {
             }],
             when: Vec::new(),
             request_principals: Vec::new(),
+            not_request_principals: Vec::new(),
+            source_negation: Default::default(),
             never_matches: false,
             action: PolicyAction::Allow,
         }],
@@ -321,19 +324,6 @@ async fn negative_match_not_paths_blocks_subpath_but_admits_others() {
     );
 }
 
-// FIXME(mesh-authz-attributes): The `mesh_authz` plugin's `before_proxy` path
-// constructs `MeshAuthzRequest` with `attributes: BTreeMap::new()` and never
-// populates it from inbound headers. The policy evaluator looks up
-// `when[].key = "request.headers[X]"` against `MeshAuthzRequest.attributes`,
-// so condition matches on request headers always read `None` and ALLOW rules
-// gated on a header condition end up triggering implicit-deny.
-//
-// This test is correct as written and exercises real Istio
-// AuthorizationPolicy semantics; it stays here as a regression target. Mark
-// `#[ignore]` until the plugin is updated to materialize Istio attribute
-// keys (`request.headers[*]`, `request.auth.*`, `destination.port`, etc.)
-// onto the request before evaluation. See PR #857 follow-up.
-#[ignore = "mesh_authz does not yet populate request.headers[*] attributes"]
 #[tokio::test]
 async fn condition_match_on_request_header_enforces_match_and_no_match() {
     // `when[].key = request.headers[x-team]` only admits requests that
@@ -347,6 +337,7 @@ async fn condition_match_on_request_header_enforces_match_and_no_match() {
                 spiffe_id_pattern: Some(CLIENT_SPIFFE.to_string()),
                 namespace_pattern: None,
                 trust_domain: Some(TrustDomain::new(DEFAULT_TRUST_DOMAIN).expect("trust domain")),
+                trust_domain_pattern: None,
             }],
             to: Vec::new(),
             when: vec![ConditionMatch {
@@ -355,6 +346,8 @@ async fn condition_match_on_request_header_enforces_match_and_no_match() {
                 not_values: Vec::new(),
             }],
             request_principals: Vec::new(),
+            not_request_principals: Vec::new(),
+            source_negation: Default::default(),
             never_matches: false,
             action: PolicyAction::Allow,
         }],
@@ -384,6 +377,233 @@ async fn condition_match_on_request_header_enforces_match_and_no_match() {
 }
 
 #[tokio::test]
+async fn condition_match_on_connection_sni_enforces_match_and_no_match() {
+    let deny_sni = MeshPolicy {
+        name: "deny-admin-sni".to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        scope: PolicyScope::MeshWide,
+        rules: vec![MeshRule {
+            from: Vec::new(),
+            to: Vec::new(),
+            when: vec![ConditionMatch {
+                key: "connection.sni".to_string(),
+                values: vec!["admin.mesh.internal".to_string()],
+                not_values: Vec::new(),
+            }],
+            request_principals: Vec::new(),
+            not_request_principals: Vec::new(),
+            source_negation: Default::default(),
+            never_matches: false,
+            action: PolicyAction::Deny,
+        }],
+    };
+    let plugin = build_mesh_authz_for_workload(&[], vec![deny_sni]);
+
+    let mut matched_ctx = ctx_with_principal("GET", "/api", Some(CLIENT_SPIFFE));
+    matched_ctx.frontend_sni_hostname = Some("admin.mesh.internal".to_string());
+    assert!(
+        matches!(
+            plugin.authorize(&mut matched_ctx).await,
+            PluginResult::Reject { .. }
+        ),
+        "DENY policies gated on connection.sni must fire for HTTP TLS requests"
+    );
+
+    let mut other_ctx = ctx_with_principal("GET", "/api", Some(CLIENT_SPIFFE));
+    other_ctx.frontend_sni_hostname = Some("public.mesh.internal".to_string());
+    assert!(matches!(
+        plugin.authorize(&mut other_ctx).await,
+        PluginResult::Continue
+    ));
+
+    let mut missing_ctx = ctx_with_principal("GET", "/api", Some(CLIENT_SPIFFE));
+    assert!(matches!(
+        plugin.authorize(&mut missing_ctx).await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
+async fn condition_match_on_source_principal_uses_istio_format() {
+    let deny_client = MeshPolicy {
+        name: "deny-client-source-principal".to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        scope: PolicyScope::MeshWide,
+        rules: vec![MeshRule {
+            from: Vec::new(),
+            to: Vec::new(),
+            when: vec![ConditionMatch {
+                key: "source.principal".to_string(),
+                values: vec!["cluster.local/ns/default/sa/client".to_string()],
+                not_values: Vec::new(),
+            }],
+            request_principals: Vec::new(),
+            not_request_principals: Vec::new(),
+            source_negation: Default::default(),
+            never_matches: false,
+            action: PolicyAction::Deny,
+        }],
+    };
+    let plugin = build_mesh_authz_for_workload(&[], vec![deny_client]);
+
+    let mut client_ctx = ctx_with_principal("GET", "/api", Some(CLIENT_SPIFFE));
+    assert!(
+        matches!(
+            plugin.authorize(&mut client_ctx).await,
+            PluginResult::Reject { .. }
+        ),
+        "source.principal conditions should see Istio's trust-domain/ns/... form"
+    );
+
+    let mut rogue_ctx = ctx_with_principal("GET", "/api", Some(ROGUE_SPIFFE));
+    assert!(matches!(
+        plugin.authorize(&mut rogue_ctx).await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
+async fn condition_match_on_jwt_list_claim_preserves_item_boundaries() {
+    let allow_with_claim = MeshPolicy {
+        name: "allow-ops-group".to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        scope: PolicyScope::MeshWide,
+        rules: vec![MeshRule {
+            from: Vec::new(),
+            to: Vec::new(),
+            when: vec![ConditionMatch {
+                key: "request.auth.claims[groups]".to_string(),
+                values: vec!["ops".to_string()],
+                not_values: Vec::new(),
+            }],
+            request_principals: Vec::new(),
+            not_request_principals: Vec::new(),
+            source_negation: Default::default(),
+            never_matches: false,
+            action: PolicyAction::Allow,
+        }],
+    };
+    let plugin = build_mesh_authz_for_workload(&[], vec![allow_with_claim]);
+
+    let mut list_ctx = ctx_with_principal("GET", "/api", Some(CLIENT_SPIFFE));
+    list_ctx.mesh_request_auth_claims.insert(
+        "groups".to_string(),
+        JwtAuthAttributeValue::StringList(vec!["dev".to_string(), "ops".to_string()]),
+    );
+    assert!(matches!(
+        plugin.authorize(&mut list_ctx).await,
+        PluginResult::Continue
+    ));
+
+    let mut scalar_ctx = ctx_with_principal("GET", "/api", Some(CLIENT_SPIFFE));
+    scalar_ctx.mesh_request_auth_claims.insert(
+        "groups".to_string(),
+        JwtAuthAttributeValue::Scalar("dev,ops".to_string()),
+    );
+    assert!(
+        matches!(
+            plugin.authorize(&mut scalar_ctx).await,
+            PluginResult::Reject { .. }
+        ),
+        "scalar claim containing a comma must not be split into list items"
+    );
+}
+
+#[tokio::test]
+async fn condition_match_on_request_auth_presenter_uses_azp_claim() {
+    let allow_presenter = MeshPolicy {
+        name: "allow-presenter".to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        scope: PolicyScope::MeshWide,
+        rules: vec![MeshRule {
+            from: Vec::new(),
+            to: Vec::new(),
+            when: vec![ConditionMatch {
+                key: "request.auth.presenter".to_string(),
+                values: vec!["client-app".to_string()],
+                not_values: Vec::new(),
+            }],
+            request_principals: Vec::new(),
+            not_request_principals: Vec::new(),
+            source_negation: Default::default(),
+            never_matches: false,
+            action: PolicyAction::Allow,
+        }],
+    };
+    let plugin = build_mesh_authz_for_workload(&[], vec![allow_presenter]);
+
+    let mut presenter_ctx = ctx_with_principal("GET", "/api", Some(CLIENT_SPIFFE));
+    presenter_ctx.mesh_request_auth_claims.insert(
+        "azp".to_string(),
+        JwtAuthAttributeValue::Scalar("client-app".to_string()),
+    );
+    assert!(matches!(
+        plugin.authorize(&mut presenter_ctx).await,
+        PluginResult::Continue
+    ));
+
+    let mut list_ctx = ctx_with_principal("GET", "/api", Some(CLIENT_SPIFFE));
+    list_ctx.mesh_request_auth_claims.insert(
+        "azp".to_string(),
+        JwtAuthAttributeValue::StringList(vec!["client-app".to_string()]),
+    );
+    assert!(
+        matches!(
+            plugin.authorize(&mut list_ctx).await,
+            PluginResult::Reject { .. }
+        ),
+        "request.auth.presenter should use only a scalar azp claim"
+    );
+}
+
+#[tokio::test]
+async fn condition_match_on_nested_jwt_claim_uses_bracket_path() {
+    let deny_admin_role = MeshPolicy {
+        name: "deny-admin-role".to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        scope: PolicyScope::MeshWide,
+        rules: vec![MeshRule {
+            from: Vec::new(),
+            to: Vec::new(),
+            when: vec![ConditionMatch {
+                key: "request.auth.claims[realm_access][roles]".to_string(),
+                values: vec!["admin".to_string()],
+                not_values: Vec::new(),
+            }],
+            request_principals: Vec::new(),
+            not_request_principals: Vec::new(),
+            source_negation: Default::default(),
+            never_matches: false,
+            action: PolicyAction::Deny,
+        }],
+    };
+    let plugin = build_mesh_authz_for_workload(&[], vec![deny_admin_role]);
+
+    let mut admin_ctx = ctx_with_principal("GET", "/api", Some(CLIENT_SPIFFE));
+    admin_ctx.mesh_request_auth_claims.insert(
+        "realm_access][roles".to_string(),
+        JwtAuthAttributeValue::StringList(vec!["reader".to_string(), "admin".to_string()]),
+    );
+    assert!(
+        matches!(
+            plugin.authorize(&mut admin_ctx).await,
+            PluginResult::Reject { .. }
+        ),
+        "nested JWT claim list should be resolved for DENY conditions"
+    );
+
+    let mut reader_ctx = ctx_with_principal("GET", "/api", Some(CLIENT_SPIFFE));
+    reader_ctx.mesh_request_auth_claims.insert(
+        "realm_access][roles".to_string(),
+        JwtAuthAttributeValue::StringList(vec!["reader".to_string()]),
+    );
+    assert!(matches!(
+        plugin.authorize(&mut reader_ctx).await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
 async fn request_principal_match_from_jwks_auth_metadata() {
     // `jwks_auth` (when configured with `emit_mesh_request_principal_metadata`)
     // populates `metadata["mesh.request_principal"]` from the validated
@@ -407,6 +627,8 @@ async fn request_principal_match_from_jwks_auth_metadata() {
             to: Vec::new(),
             when: Vec::new(),
             request_principals: vec!["https://issuer.example.com/*".to_string()],
+            not_request_principals: Vec::new(),
+            source_negation: Default::default(),
             never_matches: false,
             action: PolicyAction::Allow,
         }],
@@ -448,10 +670,13 @@ async fn audit_action_does_not_block_request() {
                 spiffe_id_pattern: Some(CLIENT_SPIFFE.to_string()),
                 namespace_pattern: None,
                 trust_domain: Some(TrustDomain::new(DEFAULT_TRUST_DOMAIN).expect("trust domain")),
+                trust_domain_pattern: None,
             }],
             to: Vec::new(),
             when: Vec::new(),
             request_principals: Vec::new(),
+            not_request_principals: Vec::new(),
+            source_negation: Default::default(),
             never_matches: false,
             action: PolicyAction::Audit,
         }],
@@ -504,6 +729,8 @@ async fn istio_allow_without_rules_means_allow_nothing() {
             to: Vec::new(),
             when: Vec::new(),
             request_principals: Vec::new(),
+            not_request_principals: Vec::new(),
+            source_negation: Default::default(),
             never_matches: true,
             action: PolicyAction::Allow,
         }],
@@ -777,6 +1004,76 @@ async fn trust_domain_alias_accepts_baggage_principal_from_aliased_domain() {
             .contains_key("mesh_authz.ignored_baggage.trust_domain_mismatch"),
         "trust-domain alias must keep the baggage principal in scope, got metadata {:?}",
         ctx.metadata
+    );
+}
+
+#[tokio::test]
+async fn condition_not_values_on_jwt_claim_allows_absent_attribute() {
+    // DENY with `not_values: ["admin"]` on `request.auth.claims[role]`:
+    // the condition passes when the claim does NOT equal "admin", so the
+    // DENY fires for non-admins. Admins (role=admin) fail the condition
+    // and the DENY does not fire.
+    let deny_except_admin = MeshPolicy {
+        name: "deny-non-admin".to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        scope: PolicyScope::MeshWide,
+        rules: vec![MeshRule {
+            from: Vec::new(),
+            to: Vec::new(),
+            when: vec![ConditionMatch {
+                key: "request.auth.claims[role]".to_string(),
+                values: Vec::new(),
+                not_values: vec!["admin".to_string()],
+            }],
+            request_principals: Vec::new(),
+            not_request_principals: Vec::new(),
+            source_negation: Default::default(),
+            never_matches: false,
+            action: PolicyAction::Deny,
+        }],
+    };
+    let plugin = build_mesh_authz_for_workload(&[], vec![deny_except_admin]);
+
+    // Claim present and matches not_values -> condition fails -> DENY
+    // does NOT fire, so the admin is allowed through.
+    let mut admin_ctx = ctx_with_principal("GET", "/api", Some(CLIENT_SPIFFE));
+    admin_ctx.mesh_request_auth_claims.insert(
+        "role".to_string(),
+        JwtAuthAttributeValue::Scalar("admin".to_string()),
+    );
+    assert!(
+        matches!(
+            plugin.authorize(&mut admin_ctx).await,
+            PluginResult::Continue
+        ),
+        "claim matching not_values should make the DENY condition fail (admin passes)"
+    );
+
+    // Claim present but does NOT match not_values -> condition passes ->
+    // DENY fires, rejecting the non-admin.
+    let mut user_ctx = ctx_with_principal("GET", "/api", Some(CLIENT_SPIFFE));
+    user_ctx.mesh_request_auth_claims.insert(
+        "role".to_string(),
+        JwtAuthAttributeValue::Scalar("user".to_string()),
+    );
+    assert!(
+        matches!(
+            plugin.authorize(&mut user_ctx).await,
+            PluginResult::Reject { .. }
+        ),
+        "claim not matching not_values should make the DENY condition pass (user denied)"
+    );
+
+    // Claim absent on a DENY rule with an HTTP-only key: missing attribute
+    // returns true for the condition, so the DENY fires.
+    let mut absent_ctx = ctx_with_principal("GET", "/api", Some(CLIENT_SPIFFE));
+    absent_ctx.mesh_request_auth_claims.clear();
+    assert!(
+        matches!(
+            plugin.authorize(&mut absent_ctx).await,
+            PluginResult::Reject { .. }
+        ),
+        "absent claim on a DENY not_values-only condition should fire (fail-closed)"
     );
 }
 

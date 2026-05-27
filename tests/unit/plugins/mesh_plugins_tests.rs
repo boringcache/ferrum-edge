@@ -6,16 +6,14 @@ use ferrum_edge::config::types::{BackendScheme, Proxy};
 use ferrum_edge::identity::{SpiffeId, TrustDomain};
 use ferrum_edge::modes::mesh::MeshTrafficDirection;
 use ferrum_edge::modes::mesh::config::{
-    MeshConfig, MeshPolicy, MeshRule, PolicyAction, PolicyScope, PrincipalMatch, RequestMatch,
-    WorkloadSelector,
+    ConditionMatch, MeshConfig, MeshPolicy, MeshRule, PolicyAction, PolicyScope, PrincipalMatch,
+    RequestMatch, WorkloadSelector,
 };
-use ferrum_edge::plugins::access_log::AccessLog;
 use ferrum_edge::plugins::mesh::authz::MeshAuthz;
 use ferrum_edge::plugins::mesh::workload_metrics::WorkloadMetrics;
 use ferrum_edge::plugins::{
-    ALL_PROTOCOLS, Plugin, PluginResult, RequestContext, StreamConnectionContext,
-    TransactionSummary, available_plugins, create_plugin, is_security_plugin, priority,
-    validate_plugin_config,
+    Plugin, PluginResult, RequestContext, StreamConnectionContext, available_plugins,
+    create_plugin, is_security_plugin,
 };
 use serde_json::json;
 
@@ -31,10 +29,13 @@ fn allow_client_policy(action: PolicyAction) -> MeshPolicy {
                 spiffe_id_pattern: Some("spiffe://cluster.local/ns/default/sa/client".to_string()),
                 namespace_pattern: None,
                 trust_domain: Some(TrustDomain::new("cluster.local").expect("trust domain")),
+                trust_domain_pattern: None,
             }],
             to: Vec::new(),
             when: Vec::new(),
             request_principals: Vec::new(),
+            not_request_principals: Vec::new(),
+            source_negation: Default::default(),
             never_matches: false,
             action,
         }],
@@ -53,10 +54,13 @@ fn allow_ztunnel_policy() -> MeshPolicy {
                 spiffe_id_pattern: Some("spiffe://cluster.local/ns/default/sa/ztunnel".to_string()),
                 namespace_pattern: None,
                 trust_domain: Some(TrustDomain::new("cluster.local").expect("trust domain")),
+                trust_domain_pattern: None,
             }],
             to: Vec::new(),
             when: Vec::new(),
             request_principals: Vec::new(),
+            not_request_principals: Vec::new(),
+            source_negation: Default::default(),
             never_matches: false,
             action: PolicyAction::Allow,
         }],
@@ -78,6 +82,8 @@ fn allow_host_policy(host: &str) -> MeshPolicy {
             }],
             when: Vec::new(),
             request_principals: Vec::new(),
+            not_request_principals: Vec::new(),
+            source_negation: Default::default(),
             never_matches: false,
             action: PolicyAction::Allow,
         }],
@@ -88,6 +94,26 @@ fn request_context(source: Option<&str>) -> RequestContext {
     let mut ctx = RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
     ctx.peer_spiffe_id = source.map(|id| SpiffeId::new(id).expect("valid spiffe id"));
     ctx
+}
+
+fn stream_context() -> StreamConnectionContext {
+    StreamConnectionContext {
+        client_ip: "127.0.0.1".to_string(),
+        proxy_id: "tcp-proxy".to_string(),
+        proxy_name: None,
+        listen_port: 15443,
+        backend_scheme: BackendScheme::Tcps,
+        consumer_index: Arc::new(ConsumerIndex::new(&[])),
+        identified_consumer: None,
+        authenticated_identity: None,
+        auth_method: None,
+        metadata: None,
+        tls_client_cert_der: None,
+        tls_client_cert_chain_der: None,
+        sni_hostname: None,
+        mesh_direction: None,
+        node_waypoint_policy_scope: None,
+    }
 }
 
 #[test]
@@ -111,7 +137,6 @@ fn mesh_plugins_are_registered() {
     assert!(available.contains(&"mesh_authz"));
     assert!(available.contains(&"mesh_outbound_registry"));
     assert!(available.contains(&"workload_metrics"));
-    assert!(available.contains(&"access_log"));
     assert!(is_security_plugin("mesh_authz"));
     assert!(is_security_plugin("mesh_outbound_registry"));
     assert!(create_plugin("mesh_authz", &json!({})).unwrap().is_some());
@@ -125,7 +150,6 @@ fn mesh_plugins_are_registered() {
             .unwrap()
             .is_some()
     );
-    assert!(create_plugin("access_log", &json!({})).unwrap().is_some());
 }
 
 #[test]
@@ -165,6 +189,154 @@ fn mesh_authz_rejects_label_selector_direct_policy_without_labels() {
 
     assert!(err.contains("workload selector labels"));
     assert!(err.contains("proxy labels"));
+}
+
+#[test]
+fn mesh_authz_rejects_invalid_direct_source_ip_block() {
+    let err = match MeshAuthz::new(&json!({
+        "mesh_policies": [{
+            "name": "bad-cidr",
+            "namespace": "default",
+            "scope": { "kind": "workload_selector", "selector": {} },
+            "rules": [{
+                "action": "deny",
+                "source_negation": { "ip_blocks": ["10.0.0.0/40"] },
+                "never_matches": false
+            }]
+        }],
+    })) {
+        Ok(_) => panic!("direct mesh_policies with malformed ipBlocks must fail closed"),
+        Err(err) => err,
+    };
+
+    assert!(err.contains("10.0.0.0/40"), "error should name CIDR: {err}");
+}
+
+#[test]
+fn mesh_authz_rejects_invalid_mesh_slice_source_ip_block() {
+    let err = match MeshAuthz::new(&json!({
+        "mesh_slice": {
+            "namespace": "default",
+            "mesh_policies": [{
+                "name": "bad-cidr",
+                "namespace": "default",
+                "scope": { "kind": "workload_selector", "selector": {} },
+                "rules": [{
+                    "action": "deny",
+                    "source_negation": { "not_remote_ip_blocks": ["not-a-cidr"] },
+                    "never_matches": false
+                }]
+            }]
+        },
+    })) {
+        Ok(_) => panic!("mesh_slice with malformed notRemoteIpBlocks must fail closed"),
+        Err(err) => err,
+    };
+
+    assert!(err.contains("not-a-cidr"), "error should name CIDR: {err}");
+}
+
+#[test]
+fn mesh_authz_rejects_unsupported_direct_when_key() {
+    let mut policy = allow_client_policy(PolicyAction::Deny);
+    policy.rules[0].when.push(ConditionMatch {
+        key: "destination.labels[app]".to_string(),
+        values: vec!["payments".to_string()],
+        not_values: Vec::new(),
+    });
+
+    let err = match MeshAuthz::new(&json!({
+        "mesh_policies": [policy],
+    })) {
+        Ok(_) => panic!("direct mesh_policies with unsupported when key must fail closed"),
+        Err(err) => err,
+    };
+
+    assert!(
+        err.contains("destination.labels[app]"),
+        "error should name unsupported key: {err}"
+    );
+    assert!(
+        err.contains("unsupported"),
+        "error should say unsupported: {err}"
+    );
+}
+
+#[test]
+fn mesh_authz_rejects_direct_when_condition_without_values() {
+    let mut policy = allow_client_policy(PolicyAction::Deny);
+    policy.rules[0].when.push(ConditionMatch {
+        key: "connection.sni".to_string(),
+        values: Vec::new(),
+        not_values: Vec::new(),
+    });
+
+    let err = match MeshAuthz::new(&json!({
+        "mesh_policies": [policy],
+    })) {
+        Ok(_) => panic!("direct mesh_policies with empty when condition must fail closed"),
+        Err(err) => err,
+    };
+
+    assert!(err.contains("connection.sni"));
+    assert!(err.contains("values or notValues"));
+}
+
+#[test]
+fn mesh_authz_rejects_invalid_direct_when_ip_block() {
+    let mut policy = allow_client_policy(PolicyAction::Deny);
+    policy.rules[0].when.push(ConditionMatch {
+        key: "source.ip".to_string(),
+        values: vec!["10.0.0.0/40".to_string()],
+        not_values: Vec::new(),
+    });
+
+    let err = match MeshAuthz::new(&json!({
+        "mesh_policies": [policy],
+    })) {
+        Ok(_) => panic!("direct mesh_policies with malformed when source.ip must fail closed"),
+        Err(err) => err,
+    };
+
+    assert!(
+        err.contains("source.ip"),
+        "error should name condition: {err}"
+    );
+    assert!(err.contains("values"), "error should name field: {err}");
+    assert!(err.contains("10.0.0.0/40"), "error should name CIDR: {err}");
+}
+
+#[tokio::test]
+async fn mesh_authz_stream_connection_sni_denies_matching_sni() {
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [{
+            "name": "deny-admin-sni",
+            "namespace": "default",
+            "scope": {"kind": "mesh_wide"},
+            "rules": [{
+                "when": [{
+                    "key": "connection.sni",
+                    "values": ["admin.mesh.internal"]
+                }],
+                "action": "deny"
+            }]
+        }]
+    }))
+    .expect("plugin config");
+
+    let mut blocked = stream_context();
+    blocked.sni_hostname = Some("admin.mesh.internal".to_string());
+    assert!(matches!(
+        plugin.on_stream_connect(&mut blocked).await,
+        PluginResult::Reject { .. }
+    ));
+
+    let mut admitted = stream_context();
+    admitted.sni_hostname = Some("public.mesh.internal".to_string());
+    assert!(matches!(
+        plugin.on_stream_connect(&mut admitted).await,
+        PluginResult::Continue
+    ));
 }
 
 #[tokio::test]
@@ -1356,6 +1528,7 @@ async fn workload_metrics_on_stream_connect_adds_source_identity_metadata() {
         tls_client_cert_chain_der: None,
         sni_hostname: None,
         mesh_direction: None,
+        node_waypoint_policy_scope: None,
     };
 
     let result = plugin.on_stream_connect(&mut ctx).await;
@@ -1433,46 +1606,6 @@ async fn workload_metrics_rejects_invalid_trust_domain_alias() {
     );
 }
 
-#[tokio::test]
-async fn access_log_is_all_protocol_logging_plugin() {
-    let plugin = AccessLog::new(&json!({})).expect("plugin config");
-
-    assert_eq!(plugin.name(), "access_log");
-    assert_eq!(plugin.priority(), priority::ACCESS_LOG);
-    assert_eq!(plugin.supported_protocols(), ALL_PROTOCOLS);
-    plugin.log(&TransactionSummary::default()).await;
-}
-
-#[test]
-fn access_log_validation_path_rejects_invalid_filter() {
-    validate_plugin_config(
-        "access_log",
-        &json!({
-            "filter": {
-                "status_code_min": 400,
-                "status_code_max": 599,
-                "min_latency_ms": 250,
-                "errors_only": true
-            }
-        }),
-    )
-    .expect("valid access_log filter config should pass");
-
-    let err = validate_plugin_config(
-        "access_log",
-        &json!({
-            "filter": {
-                "min_latency_ms": "slow"
-            }
-        }),
-    )
-    .expect_err("invalid filter should fail through plugin registry validation");
-    assert!(
-        err.contains("filter.min_latency_ms must be an integer"),
-        "unexpected error: {err}"
-    );
-}
-
 // ── PolicyScope enforcement tests ────────────────────────────────────────────
 //
 // These tests pin the security-correctness contract that `mesh_authz`
@@ -1491,6 +1624,8 @@ fn policy_with_scope(name: &str, scope: PolicyScope, action: PolicyAction) -> Me
             to: Vec::new(),
             when: Vec::new(),
             request_principals: Vec::new(),
+            not_request_principals: Vec::new(),
+            source_negation: Default::default(),
             never_matches: false,
             action,
         }],
@@ -2239,6 +2374,99 @@ async fn mesh_authz_per_pod_scoping_disabled_path_preserves_construction_filter(
     );
 }
 
+// GAP-2M.4 (stream path) - on_stream_connect per-pod policy scoping.
+//
+// The `authorize` HTTP path is covered by the tests above. The stream path
+// (`on_stream_connect`) has an identical per-pod scoping branch and must
+// satisfy the same three guarantees:
+//   a. A namespace- or selector-scoped DENY is NOT applied when the stream's
+//      `node_waypoint_policy_scope` is None (scope missing = mesh-wide only).
+//   b. A MeshWide DENY fires and closes the stream connection.
+//   c. `mesh_authz.scope_missing` is stamped on the stream context when
+//      per_pod_policy_scoping is enabled and the scope is absent.
+
+#[tokio::test]
+async fn mesh_authz_on_stream_connect_scoped_deny_not_applied_when_scope_missing() {
+    // (a) Namespace-scoped DENY must NOT close the connection when the stream
+    // carry no `node_waypoint_policy_scope` (accept path hasn't enrolled the
+    // pod yet). Only mesh-wide policies are evaluated in that window.
+    let ns_deny = policy_with_scope(
+        "team-a-deny",
+        PolicyScope::Namespace {
+            namespace: "team-a".to_string(),
+        },
+        PolicyAction::Deny,
+    );
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [ns_deny],
+        "per_pod_policy_scoping": true,
+    }))
+    .expect("plugin config");
+
+    let mut ctx = stream_context();
+    // Intentionally do not set node_waypoint_policy_scope — scope is None.
+    let result = plugin.on_stream_connect(&mut ctx).await;
+
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "namespace-scoped DENY must not close stream when scope is None, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn mesh_authz_on_stream_connect_mesh_wide_deny_closes_connection() {
+    // (b) A MeshWide DENY always applies regardless of per-pod scoping —
+    // it is not gated on a pod scope cache and must close the stream.
+    let mesh_wide_deny =
+        policy_with_scope("mesh-wide-deny", PolicyScope::MeshWide, PolicyAction::Deny);
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [mesh_wide_deny],
+        "per_pod_policy_scoping": true,
+    }))
+    .expect("plugin config");
+
+    let mut ctx = stream_context();
+    // No scope set — only mesh-wide policies survive, and this one is DENY.
+    let result = plugin.on_stream_connect(&mut ctx).await;
+
+    assert!(
+        matches!(
+            result,
+            PluginResult::RejectBinary { .. } | PluginResult::Reject { .. }
+        ),
+        "MeshWide DENY must close stream connection, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn mesh_authz_on_stream_connect_scope_missing_metadata_stamped() {
+    // (c) When per_pod_policy_scoping is on and no scope cache is present,
+    // `mesh_authz.scope_missing` must appear in the stream connection
+    // metadata so operators can observe the race window in transaction logs.
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [policy_with_scope(
+            "mesh-wide-allow",
+            PolicyScope::MeshWide,
+            PolicyAction::Allow,
+        )],
+        "per_pod_policy_scoping": true,
+    }))
+    .expect("plugin config");
+
+    let mut ctx = stream_context();
+    // Intentionally do not set node_waypoint_policy_scope.
+    let _ = plugin.on_stream_connect(&mut ctx).await;
+
+    assert_eq!(
+        ctx.metadata
+            .as_ref()
+            .and_then(|m| m.get("mesh_authz.scope_missing"))
+            .map(String::as_str),
+        Some("true"),
+        "missing per-pod scope on stream must surface mesh_authz.scope_missing metadata"
+    );
+}
+
 #[tokio::test]
 async fn workload_metrics_inbound_listener_stamps_mesh_direction_inbound() {
     // GAP-3F: the mesh inbound listener stamps `ctx.mesh_direction = Inbound`
@@ -2307,6 +2535,7 @@ async fn workload_metrics_stream_inbound_listener_stamps_mesh_direction() {
         tls_client_cert_chain_der: None,
         sni_hostname: None,
         mesh_direction: Some(MeshTrafficDirection::Inbound),
+        node_waypoint_policy_scope: None,
     };
 
     let result = plugin.on_stream_connect(&mut ctx).await;

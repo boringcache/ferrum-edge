@@ -2,7 +2,8 @@
 
 use ferrum_edge::ConsumerIndex;
 use ferrum_edge::plugins::{
-    HTTP_FAMILY_PROTOCOLS, Plugin, PluginHttpClient, RequestContext, jwks_auth::JwksAuth, priority,
+    HTTP_FAMILY_PROTOCOLS, JwtAuthAttributeValue, Plugin, PluginHttpClient, RequestContext,
+    jwks_auth::JwksAuth, priority,
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -1816,6 +1817,127 @@ async fn test_jwks_auth_sets_request_principal_metadata() {
             .get("mesh.request_principal")
             .map(String::as_str),
         Some("https://auth.example.com/user-42")
+    );
+}
+
+#[tokio::test]
+async fn test_jwks_auth_emits_mesh_audiences_and_claims_outside_metadata() {
+    // The mesh RequestAuthentication plugin sets
+    // `emit_mesh_request_principal_metadata`, which must surface the JWT
+    // audiences and scalar/string-array claims so mesh authz `when:`
+    // conditions on `request.auth.audiences` / `request.auth.claims[...]`
+    // can be evaluated without serializing claims into transaction metadata.
+    let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+
+    let (_server, jwks_uri) = start_jwks_server(public_key_pem).await;
+    // Provider must accept the token's audiences for validation to succeed;
+    // the emitted `request.auth.audiences` metadata reflects the token's
+    // `aud` claim, not the provider's accepted list.
+    let config = json!({
+        "providers": [{
+            "jwks_uri": jwks_uri,
+            "audiences": ["api.default", "api.alt"]
+        }],
+        "emit_mesh_request_principal_metadata": true
+    });
+    let plugin = JwksAuth::new(&config, default_client()).unwrap();
+    plugin.warmup_jwks().await;
+
+    let consumer_index = ConsumerIndex::new(&[]);
+
+    let token = create_rs256_token(
+        &json!({
+            "sub": "user-42",
+            "iss": "https://auth.example.com",
+            "aud": ["api.default", "api.alt"],
+            "azp": "client-app",
+            "groups": ["dev", "ops"],
+            "mixed_groups": ["admin", 7],
+            "tier": "gold",
+            "realm_access][roles": "admin",
+            "level": 7,
+            "active": true,
+            "realm_access": {
+                "roles": ["admin", "writer"],
+                "level": 9,
+                "flags": {
+                    "privileged": true,
+                    "bad][path": "admin"
+                }
+            }
+        }),
+        private_key_pem,
+    );
+
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("authorization".to_string(), format!("Bearer {}", token));
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_continue(result);
+
+    assert_eq!(
+        ctx.mesh_request_auth_audiences,
+        vec!["api.default".to_string(), "api.alt".to_string()],
+        "array audiences should retain item boundaries"
+    );
+    assert_eq!(
+        ctx.mesh_request_auth_claims.get("groups"),
+        Some(&JwtAuthAttributeValue::StringList(vec![
+            "dev".to_string(),
+            "ops".to_string()
+        ])),
+        "string-array claim should retain item boundaries"
+    );
+    assert_eq!(
+        ctx.mesh_request_auth_claims.get("tier"),
+        Some(&JwtAuthAttributeValue::Scalar("gold".to_string()))
+    );
+    assert_eq!(
+        ctx.mesh_request_auth_claims.get("azp"),
+        Some(&JwtAuthAttributeValue::Scalar("client-app".to_string())),
+        "string azp claim should be available for request.auth.presenter"
+    );
+    assert!(
+        !ctx.mesh_request_auth_claims.contains_key("mixed_groups"),
+        "mixed-type arrays must not be narrowed to their string elements"
+    );
+    assert!(
+        !ctx.mesh_request_auth_claims.contains_key("level"),
+        "numeric claim should not be emitted for Istio request.auth.claims matching"
+    );
+    assert!(
+        !ctx.mesh_request_auth_claims.contains_key("active"),
+        "boolean claim should not be emitted for Istio request.auth.claims matching"
+    );
+    assert_eq!(
+        ctx.mesh_request_auth_claims.get("realm_access][roles"),
+        Some(&JwtAuthAttributeValue::StringList(vec![
+            "admin".to_string(),
+            "writer".to_string()
+        ])),
+        "nested string-array claim should retain item boundaries and not be overridden by a flat bracket-named claim"
+    );
+    assert!(
+        !ctx.mesh_request_auth_claims
+            .contains_key("realm_access][flags][bad][path"),
+        "nested claim names containing bracket syntax must not masquerade as deeper paths"
+    );
+    assert!(
+        !ctx.mesh_request_auth_claims
+            .contains_key("realm_access][level"),
+        "nested numeric claim should not be emitted"
+    );
+    assert!(
+        !ctx.mesh_request_auth_claims
+            .contains_key("realm_access][flags][privileged"),
+        "nested boolean claim should not be emitted"
+    );
+    assert!(
+        !ctx.metadata
+            .keys()
+            .any(|key| key.starts_with("mesh.request_auth.")),
+        "JWT audiences/claims must not be written to generic log metadata"
     );
 }
 

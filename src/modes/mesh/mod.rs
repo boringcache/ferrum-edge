@@ -323,6 +323,12 @@ pub struct MeshRuntimeConfig {
     /// `FERRUM_MESH_EGRESS_STREAM_ENABLED=true` after configuring alternative
     /// authentication for stream listeners.
     pub egress_stream_enabled: bool,
+    /// Whether the auto-injected mesh `RequestAuthentication` (`jwks_auth`)
+    /// plugin requires the JWT `exp` claim. Defaults to `true` (secure):
+    /// `exp`-less tokens are rejected so they cannot live forever. Sourced
+    /// from `FERRUM_MESH_REQUEST_AUTH_REQUIRE_EXP`. Present-but-expired tokens
+    /// are always rejected regardless of this flag.
+    pub request_auth_require_exp: bool,
 }
 
 impl MeshRuntimeConfig {
@@ -527,6 +533,7 @@ impl MeshRuntimeConfig {
             sidecar_enforced_dry_run: env_config.mesh_sidecar_enforced_dry_run,
             sidecar_identity_narrowing: env_config.mesh_sidecar_identity_narrowing,
             egress_stream_enabled: env_config.mesh_egress_stream_enabled,
+            request_auth_require_exp: env_config.mesh_request_auth_require_exp,
         })
     }
 
@@ -687,6 +694,30 @@ fn prepare_normalized_gateway_config_for_mesh(
     }
     config.normalize_fields();
     config.resolve_upstream_tls();
+
+    // Warn once per config-apply when all three conditions hold:
+    // (1) node-waypoint per-pod scoping is active,
+    // (2) at least one TCP/UDP stream proxy listener exists, and
+    // (3) the loaded policies include at least one namespace- or
+    //     selector-scoped entry.
+    // Stream accept loops always pass `node_waypoint_policy_scope: None`, so
+    // only MeshWide policies are evaluated on TCP/UDP connections — scoped
+    // DENY/ALLOW rules are silently withheld. See docs/mesh.md for details.
+    if runtime.topology == MeshTopology::NodeWaypoint
+        && config.proxies.iter().any(|p| p.dispatch_kind.is_stream())
+        && mesh_slice
+            .mesh_policies
+            .iter()
+            .any(|p| !matches!(p.scope, PolicyScope::MeshWide))
+    {
+        warn!(
+            topology = "node_waypoint",
+            "Namespace- and selector-scoped mesh policies are NOT enforced on TCP/UDP stream \
+             connections (stream accept loops pass no per-pod scope). Only MeshWide policies \
+             apply to stream traffic. See docs/mesh.md for details."
+        );
+    }
+
     Ok(config)
 }
 
@@ -2787,11 +2818,17 @@ fn inject_mesh_global_plugins(
 
     // Build access log config with optional filter from Telemetry CRD.
     // `None` means "access logging is explicitly disabled" — we retain-remove
-    // any existing mesh access_log plugin and skip injection, but we MUST NOT
+    // any existing mesh access-log plugin and skip injection, but we MUST NOT
     // short-circuit the rest of inject_mesh_global_plugins (e.g. the bpf_metrics
     // branch below). Earlier versions used `return;` here, which silently
     // skipped bpf_metrics injection/cleanup on NodeWaypoint topology whenever
     // Telemetry CRD disabled access logging.
+    //
+    // The injected sink is `stdout_logging`: it serializes the same
+    // transaction/stream summaries and honors the same `filter` config, and
+    // writes through the non-blocking stdout writer rather than the tracing
+    // fmt stack. The reserved ID stays `__mesh_access_log` so existing
+    // injected plugins are updated in place across upgrades.
     let access_log_config: Option<serde_json::Value> = match &merged_telemetry.access_logging {
         Some(al) if !al.enabled => {
             config
@@ -2809,7 +2846,7 @@ fn inject_mesh_global_plugins(
         ensure_global_plugin(
             config,
             MESH_ACCESS_LOG_PLUGIN_ID,
-            "access_log",
+            "stdout_logging",
             cfg,
             &runtime.namespace,
         );
@@ -3019,11 +3056,15 @@ fn inject_mesh_request_auth_plugin(
     // (ExtractedCredential::Missing -> PluginResult::Continue), which matches
     // Istio's permissive RequestAuthentication semantics. No extra flag needed.
     //
-    // Istio JWTs may omit the `exp` claim, so we disable the default
-    // `require_exp=true` that the non-mesh jwks_auth plugin enforces.
+    // `require_exp` defaults to the secure posture (true): tokens that omit
+    // `exp` are rejected so they cannot live forever, satisfying the
+    // "validate_exp = true" invariant. Some Istio issuers legitimately omit
+    // `exp`, so operators can relax this with
+    // `FERRUM_MESH_REQUEST_AUTH_REQUIRE_EXP=false`. Expiry *validation* stays
+    // on regardless — a present-but-expired `exp` is always rejected.
     let jwks_config = serde_json::json!({
         "providers": providers,
-        "require_exp": false,
+        "require_exp": runtime.request_auth_require_exp,
         "emit_mesh_request_principal_metadata": true,
     });
 
@@ -3339,6 +3380,23 @@ async fn serve_mesh_runtime(
         {
             mesh_background_handles.push(handle);
         }
+        // GAP-1b: spawn the orig-dst → identity bridge. It reads the pinned
+        // FERRUM_ORIG_DST4/6 maps the node-agent populated and mirrors each
+        // socket-cookie record into the resolver, giving record_orig_dst*
+        // their production caller. Without a node-agent / eBPF build the
+        // spawned task logs loudly and returns; the resolver stays empty and
+        // the accept path keeps failing closed.
+        //
+        // NOTE (staged): GAP-1b alone does NOT make node-waypoint resolution
+        // succeed end-to-end. The records it mirrors are keyed by the source
+        // pod's connect-side cookie, while the accept path looks up the
+        // accept-side cookie (see `orig_dst_bridge` docs and
+        // `src/socket_opts.rs`); the accept-side registrar (GAP-2M) is a
+        // required follow-up. Identity enrollment into `identities_by_pod_uid`
+        // from `initial_slice.workloads` is likewise a separate follow-up tier
+        // — the snapshot installed above seeds POLICY SCOPES, not identities.
+        // Until both land, node-waypoint cookie resolution fails closed.
+        mesh_background_handles.push(spawn_orig_dst_bridge_task(resolver.clone(), &shutdown_tx));
         proxy_state.with_node_waypoint_identity_resolver(resolver)
     } else {
         proxy_state
@@ -3474,6 +3532,13 @@ async fn serve_mesh_runtime(
     } else {
         None
     };
+    // SPIFFE inbound peer-verification slot (gateway SVID local bundle merged
+    // with the initial slice's federated bundles). `None` when no gateway SVID
+    // material is configured — the listener then keeps operator-CA chain
+    // verification. The slot is read live by the verifier and re-published on
+    // slice apply so federated trust changes propagate lock-free.
+    let mesh_inbound_spiffe_slot =
+        build_mesh_inbound_spiffe_slot(&env_config, initial_applied_mesh_slice.as_deref());
     let frontend_tls = load_mesh_frontend_tls(
         &env_config,
         &tls_policy,
@@ -3483,6 +3548,7 @@ async fn serve_mesh_runtime(
         initial_inbound_tls_snapshot
             .as_ref()
             .and_then(|snapshot| snapshot.client_ca_bundle.as_ref()),
+        mesh_inbound_spiffe_slot.as_ref(),
     )?;
     // Keep the slot populated with startup TLS even when live reload is
     // disabled. The flag controls which listener source is used; without live
@@ -3617,6 +3683,7 @@ async fn serve_mesh_runtime(
         MeshInboundTlsReloadState {
             server_identity: mesh_frontend_identity,
             last_snapshot: initial_inbound_tls_snapshot,
+            spiffe_bundle_slot: mesh_inbound_spiffe_slot,
         },
         shutdown_tx.subscribe(),
         dns_proxy_handle,
@@ -4060,6 +4127,186 @@ struct MeshInboundTlsReloadSnapshot {
 struct MeshInboundTlsReloadState {
     server_identity: Option<Arc<tls::MeshServerIdentity>>,
     last_snapshot: Option<MeshInboundTlsReloadSnapshot>,
+    /// Lock-free SVID bundle slot used to build the SPIFFE trust-domain
+    /// verifier for inbound peer certs. `None` when no gateway SVID material
+    /// is configured (falls back to operator-CA chain verification). When
+    /// present, the slot carries the gateway SVID's local trust bundle merged
+    /// with the slice's federated bundles; the verifier reads it live, and
+    /// slice apply re-publishes it so federated trust-domain changes take
+    /// effect without a listener restart (per the lock-free SVID slot model
+    /// in `.claude/rules/tls-security.md`).
+    spiffe_bundle_slot: Option<tls::SharedBundleSlot>,
+}
+
+/// Build the optional SPIFFE inbound trust-bundle slot from the gateway SVID
+/// file material, merging in the slice's federated trust bundles so inbound
+/// peer SANs from federated trust domains validate too. Returns `None` when no
+/// gateway SVID material is configured (the inbound listener then keeps the
+/// operator client-CA chain verification it has always used). A load failure
+/// is logged and treated as `None` so a misconfigured SVID path does not take
+/// the whole listener down — it degrades to the pre-existing chain-only check.
+fn build_mesh_inbound_spiffe_slot(
+    env_config: &EnvConfig,
+    slice: Option<&MeshSlice>,
+) -> Option<tls::SharedBundleSlot> {
+    let (cert_path, key_path, trust_bundle_path) = match (
+        env_config.gateway_svid_cert_path.as_deref(),
+        env_config.gateway_svid_key_path.as_deref(),
+        env_config.gateway_svid_trust_bundle_path.as_deref(),
+    ) {
+        (Some(cert), Some(key), Some(trust)) => (cert, key, trust),
+        _ => return None,
+    };
+
+    // F2 (accepted coupling, documented): `load_svid_bundle_from_files`
+    // validates the gateway SVID *leaf* (notBefore/notAfter, non-CA) as well as
+    // the trust-bundle CAs. An expired or mid-rotation gateway leaf therefore
+    // fails the whole load and we fall back to chain-only verification (no
+    // peer-SAN trust-domain check) with only a `warn!`, even though the trust
+    // *bundle* itself could still be valid. We intentionally do not load only
+    // the trust bundle here: the gateway leaf must also be currently valid for
+    // the listener to present a usable server identity, so an expired leaf is a
+    // real operational fault that the chain-only fallback degrades gracefully
+    // around rather than a reason to keep half-loading SVID material. Treating
+    // expired-leaf -> chain-only as the accepted current behavior.
+    let mut bundle = match crate::identity::file_loader::load_svid_bundle_from_files(
+        std::path::Path::new(cert_path),
+        std::path::Path::new(key_path),
+        std::path::Path::new(trust_bundle_path),
+        env_config.gateway_spiffe_id.as_deref(),
+    ) {
+        Ok(bundle) => bundle,
+        Err(error) => {
+            error!(
+                %error,
+                "Failed to load gateway SVID material for mesh inbound SPIFFE peer \
+                 verification; trust-domain enforcement is now DISABLED until SVID \
+                 material reloads — inbound peers are accepted via chain validation \
+                 only (no peer trust-domain check)"
+            );
+            return None;
+        }
+    };
+
+    merge_slice_federation_into_svid_bundle(&mut bundle, slice);
+
+    Some(Arc::new(arc_swap::ArcSwap::new(Arc::new(Some(bundle)))))
+}
+
+/// Overlay the slice's federated (and any extra local) trust bundles onto the
+/// gateway SVID bundle so the inbound SPIFFE verifier accepts peers from
+/// federated trust domains. The SVID's own local bundle (its trust domain's
+/// roots) is preserved; federated entries from the slice are added.
+///
+/// F3 (documented design choice): the CP-pushed slice is the SOLE authority for
+/// inbound trust domains. Unlike the backend/outbound path
+/// (`gateway_config_from_mesh_slice`), this does NOT overlay the federation
+/// poller store snapshot. A federation-poller-added trust domain therefore
+/// validates for outbound mTLS but is rejected for inbound until the CP pushes
+/// it in a slice. This is intentional: inbound peer trust is governed by mesh
+/// PeerAuthentication/slice config, while the poller's live cross-cluster
+/// bundles are an outbound-only freshness overlay.
+fn merge_slice_federation_into_svid_bundle(
+    bundle: &mut crate::identity::SvidBundle,
+    slice: Option<&MeshSlice>,
+) {
+    let Some(slice) = slice else {
+        return;
+    };
+    let Some(serialized) = slice.trust_bundles.as_ref() else {
+        return;
+    };
+    let runtime = match serialized.to_runtime() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            warn!(
+                %error,
+                "Ignoring malformed slice trust bundles when building mesh inbound \
+                 SPIFFE verifier; using gateway SVID local bundle only"
+            );
+            return;
+        }
+    };
+    // Add federated bundles from the slice. The local bundle stays anchored to
+    // the gateway SVID's own trust domain (we do not let the slice override the
+    // local roots the SVID itself chains to).
+    for (trust_domain, federated) in runtime.federated {
+        bundle
+            .trust_bundles
+            .federated
+            .entry(trust_domain)
+            .or_insert(federated);
+    }
+    // If the slice's local bundle is for a different trust domain than the
+    // SVID's, treat it as a federated peer trust domain so cross-trust peers
+    // still validate.
+    if runtime.local.trust_domain != bundle.trust_bundles.local.trust_domain {
+        bundle
+            .trust_bundles
+            .federated
+            .entry(runtime.local.trust_domain.clone())
+            .or_insert(runtime.local);
+    }
+}
+
+/// Rebuild the inbound SPIFFE trust-bundle from the gateway SVID files plus the
+/// current slice's federated bundles, returning it STAGED (not yet stored into
+/// the live slot). The caller publishes it into the live slot only after the
+/// candidate proxy config is accepted, so a rejected slice cannot leave new
+/// federated trust domains active for inbound handshakes. A rebuild failure
+/// returns `None` (logged) and the caller leaves the previous trust bundles in
+/// place — this never fails the slice.
+fn stage_mesh_inbound_spiffe_bundle(
+    slot: Option<&tls::SharedBundleSlot>,
+    env_config: &EnvConfig,
+    slice: &MeshSlice,
+) -> Option<StagedSpiffeBundle> {
+    let slot = slot?;
+    match build_mesh_inbound_spiffe_slot(env_config, Some(slice)) {
+        Some(rebuilt) => Some(StagedSpiffeBundle {
+            slot: slot.clone(),
+            bundle: rebuilt.load_full(),
+        }),
+        None => {
+            warn!(
+                mesh_slice_version = %slice.version,
+                "Unable to rebuild mesh inbound SPIFFE trust-bundle slot from slice; \
+                 keeping previous trust bundles"
+            );
+            None
+        }
+    }
+}
+
+/// Build the inbound SPIFFE client-cert verifier for the given mTLS mode and
+/// bundle slot. PERMISSIVE uses `peer_required = false` so a peer that offers
+/// no cert is still admitted (but an offered cert is trust-domain-validated);
+/// STRICT requires + validates a peer cert. Returns `None` when no slot is
+/// available or the mode is DISABLE.
+///
+/// `crls` is threaded into the verifier so inbound mesh peers get end-entity
+/// revocation checking, matching the operator-CA mTLS path. An empty CRL list
+/// disables revocation checking (the pre-CRL behavior).
+fn mesh_inbound_spiffe_verifier(
+    slot: Option<&tls::SharedBundleSlot>,
+    mtls_mode: config::MtlsMode,
+    crls: tls::CrlList,
+) -> Option<Arc<dyn rustls::server::danger::ClientCertVerifier>> {
+    let slot = slot?;
+    match mtls_mode {
+        config::MtlsMode::Strict => Some(tls::build_spiffe_client_cert_verifier(
+            slot.clone(),
+            true,
+            crls,
+        )),
+        config::MtlsMode::Permissive => Some(tls::build_spiffe_client_cert_verifier(
+            slot.clone(),
+            false,
+            crls,
+        )),
+        // DISABLE has no TLS; client-side DR modes never reach here.
+        _ => None,
+    }
 }
 
 fn mesh_inbound_tls_reload_snapshot(
@@ -4118,6 +4365,7 @@ fn load_mesh_frontend_tls(
     mtls_mode: config::MtlsMode,
     server_identity: Option<&tls::MeshServerIdentity>,
     client_ca_bundle: Option<&MeshInboundClientCaBundle>,
+    spiffe_bundle_slot: Option<&tls::SharedBundleSlot>,
 ) -> Result<Option<Arc<rustls::ServerConfig>>, anyhow::Error> {
     if mtls_mode == config::MtlsMode::Disable {
         info!(
@@ -4135,19 +4383,31 @@ fn load_mesh_frontend_tls(
         return Ok(None);
     };
 
+    // SPIFFE trust-domain verifier (validates peer SANs against local+federated
+    // bundles). Present only when gateway SVID material is configured. When
+    // present it drives client auth even without an operator client CA bundle,
+    // because it carries its own trust anchors from the SVID bundle. The
+    // gateway CRLs are threaded in so inbound mesh peers get the same
+    // end-entity revocation enforcement the operator-CA path already applies
+    // (empty CRLs => no revocation checking, unchanged behavior).
+    let spiffe_verifier =
+        mesh_inbound_spiffe_verifier(spiffe_bundle_slot, mtls_mode, Arc::new(crls.to_vec()));
+
     let client_ca_bundle_path = client_ca_bundle
         .map(|bundle| bundle.path.as_str())
         .or(env_config.frontend_tls_client_ca_bundle_path.as_deref());
     let client_auth = match mtls_mode {
         config::MtlsMode::Strict => tls::MeshClientAuth::Required,
-        config::MtlsMode::Permissive if client_ca_bundle_path.is_some() => {
+        config::MtlsMode::Permissive
+            if client_ca_bundle_path.is_some() || spiffe_verifier.is_some() =>
+        {
             tls::MeshClientAuth::Optional
         }
         config::MtlsMode::Permissive => {
             warn!(
                 "Mesh PeerAuthentication mTLS mode is PERMISSIVE but no \
-                 FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH is configured; \
-                 client certificates will not be requested or verified"
+                 FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH or gateway SVID material is \
+                 configured; client certificates will not be requested or verified"
             );
             tls::MeshClientAuth::None
         }
@@ -4167,6 +4427,19 @@ fn load_mesh_frontend_tls(
             tls::MeshClientAuth::None
         }
     };
+    // The SPIFFE verifier only applies when we actually request client certs.
+    let spiffe_verifier = if matches!(client_auth, tls::MeshClientAuth::None) {
+        None
+    } else {
+        spiffe_verifier
+    };
+    if spiffe_verifier.is_some() {
+        info!(
+            ?mtls_mode,
+            "Mesh inbound listener verifying peer SPIFFE SAN trust domains against \
+             local + federated SVID bundles"
+        );
+    }
 
     let mut tls_config = if let Some(bundle) = client_ca_bundle {
         tls::load_mesh_tls_config_with_identity_and_client_ca_bytes(
@@ -4179,6 +4452,7 @@ fn load_mesh_frontend_tls(
             tls_policy,
             env_config.tls_cert_expiry_warning_days,
             crls,
+            spiffe_verifier,
         )
     } else {
         tls::load_mesh_tls_config_with_identity(
@@ -4188,6 +4462,7 @@ fn load_mesh_frontend_tls(
             tls_policy,
             env_config.tls_cert_expiry_warning_days,
             crls,
+            spiffe_verifier,
         )
     }
     .map_err(|e| anyhow::anyhow!("Invalid mesh frontend TLS configuration: {}", e))?;
@@ -4254,11 +4529,33 @@ fn listener_tls_config_for_mtls_mode(
 }
 
 enum MeshInboundTlsReloadPlan {
-    Unchanged,
+    /// No listener TLS-config change is needed (mode + client CA bundle are
+    /// unchanged), but the SPIFFE federated trust-bundle may still need
+    /// publishing because the snapshot does not capture the slice's federated
+    /// trust domains. The staged bundle is published only after the proxy
+    /// config is accepted.
+    Unchanged {
+        staged_spiffe: Option<StagedSpiffeBundle>,
+    },
     Swap {
         snapshot: MeshInboundTlsReloadSnapshot,
         tls_config: Option<Arc<rustls::ServerConfig>>,
+        /// SPIFFE inbound trust-bundle staged during reload planning but NOT yet
+        /// stored into the live slot. It is published into the live slot only
+        /// when the proxy config is accepted (alongside the TLS swap), so a
+        /// rejected slice never leaves new federated trust domains live for
+        /// inbound handshakes. `None` when there is no SPIFFE slot (no gateway
+        /// SVID material) or the rebuild failed (the live slot is left intact).
+        staged_spiffe: Option<StagedSpiffeBundle>,
     },
+}
+
+/// A rebuilt inbound SPIFFE trust-bundle plus the live slot it should be stored
+/// into once the reload is accepted. Staging keeps the live verifier reading
+/// the previous trust bundles until the candidate proxy config is accepted.
+struct StagedSpiffeBundle {
+    slot: tls::SharedBundleSlot,
+    bundle: Arc<Option<crate::identity::SvidBundle>>,
 }
 
 fn plan_mesh_inbound_tls_reload(
@@ -4267,6 +4564,7 @@ fn plan_mesh_inbound_tls_reload(
     mtls_mode: config::MtlsMode,
     server_identity: Option<&tls::MeshServerIdentity>,
     last_snapshot: Option<&MeshInboundTlsReloadSnapshot>,
+    spiffe_bundle_slot: Option<&tls::SharedBundleSlot>,
 ) -> Option<MeshInboundTlsReloadPlan> {
     let next_snapshot = match mesh_inbound_tls_reload_snapshot(&proxy_state.env_config, mtls_mode) {
         Ok(snapshot) => snapshot,
@@ -4279,8 +4577,21 @@ fn plan_mesh_inbound_tls_reload(
             return None;
         }
     };
+    // Rebuild the SPIFFE inbound trust-bundle from the new slice's federated
+    // bundles, but STAGE it rather than storing it into the live slot here.
+    // Storing during planning would let a slice that is later rejected leave
+    // its federated trust domains active for new inbound handshakes (a rejected
+    // update could trust new peer domains or drop existing ones with no backing
+    // mesh config). The staged bundle is published into the live slot only after
+    // the candidate proxy config is accepted. The verifier reads the slot live,
+    // so this still propagates federated trust-domain changes lock-free even
+    // when the operator client CA bundle and mTLS mode are otherwise unchanged.
+    // Only the federated set is recomputed; the SVID local roots/cert/key stay
+    // the file-based startup inputs per the peer-auth reload invariant.
+    let staged_spiffe =
+        stage_mesh_inbound_spiffe_bundle(spiffe_bundle_slot, &proxy_state.env_config, slice);
     if last_snapshot == Some(&next_snapshot) {
-        return Some(MeshInboundTlsReloadPlan::Unchanged);
+        return Some(MeshInboundTlsReloadPlan::Unchanged { staged_spiffe });
     }
     let Some(tls_policy) = proxy_state.tls_policy.as_deref() else {
         error!(
@@ -4288,7 +4599,7 @@ fn plan_mesh_inbound_tls_reload(
             ?mtls_mode,
             "Mesh PeerAuthentication live reload requested but TLS policy is unavailable; this is a programming error. Applying proxy config only; the inbound TLS slot remains at its previous value until restart and will be re-evaluated on later slice applies."
         );
-        return Some(MeshInboundTlsReloadPlan::Unchanged);
+        return Some(MeshInboundTlsReloadPlan::Unchanged { staged_spiffe });
     };
     match load_mesh_frontend_tls(
         &proxy_state.env_config,
@@ -4297,10 +4608,12 @@ fn plan_mesh_inbound_tls_reload(
         mtls_mode,
         server_identity,
         next_snapshot.client_ca_bundle.as_ref(),
+        spiffe_bundle_slot,
     ) {
         Ok(tls_config) => Some(MeshInboundTlsReloadPlan::Swap {
             snapshot: next_snapshot,
             tls_config,
+            staged_spiffe,
         }),
         Err(error) => {
             warn!(
@@ -4308,6 +4621,8 @@ fn plan_mesh_inbound_tls_reload(
                 ?mtls_mode,
                 "Failed to rebuild mesh inbound TLS config from PeerAuthentication update: {error}; keeping previous TLS config"
             );
+            // Drop the staged SPIFFE bundle: the slice is being rejected, so the
+            // live slot must keep its previous trust bundles.
             None
         }
     }
@@ -4321,11 +4636,23 @@ async fn apply_mesh_inbound_tls_reload(
     last_snapshot: &mut Option<MeshInboundTlsReloadSnapshot>,
 ) {
     match plan {
-        MeshInboundTlsReloadPlan::Unchanged => {}
+        MeshInboundTlsReloadPlan::Unchanged { staged_spiffe } => {
+            // Listener TLS config is unchanged, but a federated trust-domain
+            // change may still need publishing. Now that the proxy config was
+            // accepted, store the staged SPIFFE bundle into the live slot.
+            publish_staged_spiffe_bundle(staged_spiffe);
+        }
         MeshInboundTlsReloadPlan::Swap {
             snapshot,
             tls_config,
+            staged_spiffe,
         } => {
+            // Publish the staged SPIFFE trust-bundle into the live slot first,
+            // then swap the listener TLS config. Both happen only post-accept so
+            // a rejected slice never alters inbound trust. The verifier reads
+            // the slot live; the new TLS config's verifier will observe the new
+            // bundle on its next handshake.
+            publish_staged_spiffe_bundle(staged_spiffe);
             proxy_state
                 .mesh_inbound_tls
                 .store(Arc::new(tls_config.clone()));
@@ -4451,6 +4778,17 @@ fn start_remote_cluster_discovery_reconcile_task(
     })
 }
 
+/// Publish a staged inbound SPIFFE trust-bundle into its live slot. Called only
+/// after the candidate proxy config is accepted, so the live verifier never
+/// trusts (or stops trusting) peer domains for a slice the runtime rejected.
+/// The verifier holds an `Arc` to this slot and observes the new bundle on its
+/// next handshake.
+fn publish_staged_spiffe_bundle(staged: Option<StagedSpiffeBundle>) {
+    if let Some(StagedSpiffeBundle { slot, bundle }) = staged {
+        slot.store(bundle);
+    }
+}
+
 fn start_mesh_slice_apply_task(
     mesh_state: MeshRuntimeState,
     proxy_state: ProxyState,
@@ -4509,6 +4847,7 @@ fn start_mesh_slice_apply_task(
                                 mtls_mode,
                                 inbound_tls_reload.server_identity.as_deref(),
                                 inbound_tls_reload.last_snapshot.as_ref(),
+                                inbound_tls_reload.spiffe_bundle_slot.as_ref(),
                             )
                             .map(|plan| (mtls_mode, plan))
                         })
@@ -4554,14 +4893,17 @@ fn start_mesh_slice_apply_task(
                                     } else {
                                         None
                                     };
-                                // The TLS reload plan is validated before config apply, but the
-                                // live slot is swapped only after proxy config acceptance. That
-                                // creates a tiny accept window where listeners may still see the
-                                // previous TLS config, and avoids pre-swapping TLS for a proxy
-                                // config that the runtime rejects. On a Permissive-to-Strict
-                                // escalation, an accepted connection in that window can enter the
-                                // new plugin chain without a peer principal; mesh authz still
-                                // fails closed for identity-required policy until the slot swaps.
+                                // The TLS reload plan (listener config + staged SPIFFE inbound
+                                // trust-bundle) is built before config apply, but both are
+                                // published only after proxy config acceptance inside
+                                // `apply_mesh_inbound_tls_reload`. This avoids pre-swapping TLS or
+                                // mutating inbound trust domains for a proxy config the runtime
+                                // rejects, at the cost of a tiny accept window where listeners may
+                                // still see the previous TLS config and the previous trust bundle.
+                                // On a Permissive-to-Strict escalation, an accepted connection in
+                                // that window can enter the new plugin chain without a peer
+                                // principal; mesh authz still fails closed for identity-required
+                                // policy until the slot swaps.
                                 let applied = proxy_state.update_config(config);
                                 let current_loaded_at = proxy_state.config.load_full().loaded_at;
                                 let accepted = mesh_proxy_update_was_accepted(
@@ -4834,6 +5176,25 @@ fn spawn_sock_ops_consumer_task(
         );
         None
     }
+}
+
+/// Spawn the node-waypoint orig-dst → identity bridge (GAP-1b). Always returns
+/// a handle: on non-eBPF / non-Linux builds the task logs once that no capture
+/// runs and returns, so the resolver stays empty and the accept path fails
+/// closed. The bridge owns the startup-race retry and node-agent-restart
+/// re-open logic in `crate::ebpf::orig_dst_bridge`.
+fn spawn_orig_dst_bridge_task(
+    resolver: std::sync::Arc<crate::modes::mesh::node_waypoint::NodeWaypointIdentityResolver>,
+    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+) -> tokio::task::JoinHandle<()> {
+    let shutdown_rx = shutdown_tx.subscribe();
+    tokio::spawn(async move {
+        if let Err(err) =
+            crate::ebpf::orig_dst_bridge::run_orig_dst_bridge(resolver, shutdown_rx).await
+        {
+            tracing::warn!(error = %err, "Node-waypoint orig-dst bridge task exited with error");
+        }
+    })
 }
 
 #[cfg(test)]
@@ -5410,6 +5771,7 @@ mod tests {
             sidecar_enforced_dry_run: false,
             sidecar_identity_narrowing: false,
             egress_stream_enabled: false,
+            request_auth_require_exp: true,
         };
         let config = prepare_gateway_config_for_mesh(GatewayConfig::default(), &runtime).unwrap();
         let mesh_state = MeshRuntimeState::new();
@@ -5510,6 +5872,7 @@ mod tests {
             sidecar_enforced_dry_run: false,
             sidecar_identity_narrowing: false,
             egress_stream_enabled: false,
+            request_auth_require_exp: true,
         }
     }
 
@@ -7137,8 +7500,9 @@ mod tests {
             .plugin_configs
             .iter()
             .find(|plugin| plugin.id == MESH_ACCESS_LOG_PLUGIN_ID)
-            .expect("access_log plugin injected");
+            .expect("mesh access-log (stdout_logging) plugin injected");
 
+        assert_eq!(access_log.plugin_name, "stdout_logging");
         assert_eq!(access_log.config["filter"]["status_code_min"], 500);
     }
 
@@ -8438,10 +8802,13 @@ mod tests {
                             ),
                             namespace_pattern: None,
                             trust_domain: None,
+                            trust_domain_pattern: None,
                         }],
                         to: Vec::new(),
                         when: Vec::new(),
                         request_principals: Vec::new(),
+                        not_request_principals: Vec::new(),
+                        source_negation: Default::default(),
                         never_matches: false,
                         action: PolicyAction::Allow,
                     }],
@@ -8485,7 +8852,10 @@ mod tests {
                     by_id(MESH_WORKLOAD_METRICS_PLUGIN_ID).plugin_name,
                     "workload_metrics"
                 );
-                assert_eq!(by_id(MESH_ACCESS_LOG_PLUGIN_ID).plugin_name, "access_log");
+                assert_eq!(
+                    by_id(MESH_ACCESS_LOG_PLUGIN_ID).plugin_name,
+                    "stdout_logging"
+                );
                 assert!(
                     prepared
                         .plugin_configs
@@ -8554,10 +8924,13 @@ mod tests {
                                 ),
                                 namespace_pattern: None,
                                 trust_domain: None,
+                                trust_domain_pattern: None,
                             }],
                             to: Vec::new(),
                             when: Vec::new(),
                             request_principals: Vec::new(),
+                            not_request_principals: Vec::new(),
+                            source_negation: Default::default(),
                             never_matches: false,
                             action: PolicyAction::Allow,
                         }],
@@ -8694,6 +9067,7 @@ mod tests {
             MeshInboundTlsReloadState {
                 server_identity: None,
                 last_snapshot: None,
+                spiffe_bundle_slot: None,
             },
             shutdown_rx,
             None,
@@ -8748,6 +9122,7 @@ mod tests {
             MeshInboundTlsReloadState {
                 server_identity: mesh_frontend_identity,
                 last_snapshot: Some(initial_snapshot),
+                spiffe_bundle_slot: None,
             },
             shutdown_rx,
             None,
@@ -8827,6 +9202,7 @@ mod tests {
             MeshInboundTlsReloadState {
                 server_identity: mesh_frontend_identity,
                 last_snapshot: Some(initial_snapshot),
+                spiffe_bundle_slot: None,
             },
             shutdown_rx,
             None,
@@ -8937,6 +9313,7 @@ mod tests {
             MeshInboundTlsReloadState {
                 server_identity: None,
                 last_snapshot: Some(initial_snapshot),
+                spiffe_bundle_slot: None,
             },
             shutdown_rx,
             None,
@@ -9428,10 +9805,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn mesh_runtime_request_auth_sets_require_exp_false() {
-        let runtime = test_mesh_runtime_config();
-        let config = GatewayConfig {
+    fn request_auth_config_for_require_exp() -> GatewayConfig {
+        GatewayConfig {
             mesh: Some(Box::new(MeshConfig {
                 request_authentications: vec![MeshRequestAuthentication {
                     name: "exp-test".to_string(),
@@ -9450,21 +9825,165 @@ mod tests {
                 ..MeshConfig::default()
             })),
             ..GatewayConfig::default()
-        };
+        }
+    }
 
-        let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+    #[test]
+    fn mesh_inbound_spiffe_slot_absent_without_gateway_svid_config() {
+        // No gateway SVID material → no SPIFFE slot → inbound listener keeps
+        // operator-CA chain verification (the pre-existing behavior).
+        let env = EnvConfig::default();
+        assert!(env.gateway_svid_cert_path.is_none());
+        assert!(build_mesh_inbound_spiffe_slot(&env, None).is_none());
+    }
+
+    #[test]
+    fn mesh_inbound_spiffe_verifier_respects_mode_and_slot() {
+        // No slot → no verifier regardless of mode.
+        assert!(
+            mesh_inbound_spiffe_verifier(None, config::MtlsMode::Strict, Arc::new(Vec::new()))
+                .is_none()
+        );
+
+        // A present (even empty) slot yields a verifier for STRICT/PERMISSIVE
+        // with the correct client-auth-mandatory posture, and none for DISABLE.
+        let slot: tls::SharedBundleSlot = Arc::new(arc_swap::ArcSwap::new(Arc::new(None)));
+        let strict = mesh_inbound_spiffe_verifier(
+            Some(&slot),
+            config::MtlsMode::Strict,
+            Arc::new(Vec::new()),
+        )
+        .expect("STRICT yields a verifier");
+        assert!(
+            rustls::server::danger::ClientCertVerifier::client_auth_mandatory(strict.as_ref()),
+            "STRICT must mandate client auth"
+        );
+        let permissive = mesh_inbound_spiffe_verifier(
+            Some(&slot),
+            config::MtlsMode::Permissive,
+            Arc::new(Vec::new()),
+        )
+        .expect("PERMISSIVE yields a verifier");
+        assert!(
+            !rustls::server::danger::ClientCertVerifier::client_auth_mandatory(permissive.as_ref()),
+            "PERMISSIVE must not mandate client auth"
+        );
+        assert!(
+            mesh_inbound_spiffe_verifier(
+                Some(&slot),
+                config::MtlsMode::Disable,
+                Arc::new(Vec::new())
+            )
+            .is_none(),
+            "DISABLE has no TLS, so no verifier"
+        );
+    }
+
+    #[test]
+    fn staged_spiffe_bundle_publishes_only_on_apply() {
+        // F4: a rebuilt inbound SPIFFE trust-bundle must NOT reach the live slot
+        // until the slice is accepted. `publish_staged_spiffe_bundle` is the
+        // post-accept publish step; until it runs the live slot keeps its
+        // previous value, and `None` (rejected/no-slot) leaves it untouched.
+        use crate::identity::{SvidBundle, TrustBundle, TrustBundleSet};
+
+        let td = TrustDomain::new("td.stage-test").unwrap();
+        let id = SpiffeId::from_parts(&td, "ns/foo/sa/bar").unwrap();
+        let original = Arc::new(Some(SvidBundle {
+            spiffe_id: id.clone(),
+            cert_chain_der: vec![vec![1, 2, 3]],
+            private_key_pkcs8_der: Vec::new(),
+            trust_bundles: TrustBundleSet::local_only(TrustBundle {
+                trust_domain: td.clone(),
+                x509_authorities: vec![vec![4, 5, 6]],
+                jwt_authorities: Vec::new(),
+                refresh_hint_seconds: None,
+            }),
+        }));
+        let slot: tls::SharedBundleSlot = Arc::new(arc_swap::ArcSwap::new(original.clone()));
+
+        // A `None` staged bundle (rejected slice or no SVID slot) is a no-op.
+        publish_staged_spiffe_bundle(None);
+        assert!(
+            Arc::ptr_eq(&slot.load_full(), &original),
+            "publishing None must leave the live slot untouched"
+        );
+
+        // Build a replacement bundle and stage it. Staging must NOT mutate the
+        // live slot.
+        let replacement = Arc::new(Some(SvidBundle {
+            spiffe_id: id,
+            cert_chain_der: vec![vec![7, 8, 9]],
+            private_key_pkcs8_der: Vec::new(),
+            trust_bundles: TrustBundleSet::local_only(TrustBundle {
+                trust_domain: td,
+                x509_authorities: vec![vec![10, 11, 12]],
+                jwt_authorities: Vec::new(),
+                refresh_hint_seconds: None,
+            }),
+        }));
+        let staged = Some(StagedSpiffeBundle {
+            slot: slot.clone(),
+            bundle: replacement.clone(),
+        });
+        assert!(
+            Arc::ptr_eq(&slot.load_full(), &original),
+            "merely holding a staged bundle must not change the live slot"
+        );
+
+        // Publishing (post-accept) swaps the slot to the staged bundle.
+        publish_staged_spiffe_bundle(staged);
+        assert!(
+            Arc::ptr_eq(&slot.load_full(), &replacement),
+            "publish must store the staged bundle into the live slot"
+        );
+    }
+
+    #[test]
+    fn mesh_runtime_request_auth_require_exp_defaults_secure() {
+        // Secure default: the auto-injected mesh request-auth plugin requires
+        // the JWT `exp` claim so `exp`-less tokens cannot live forever. This
+        // honors the "validate_exp = true" invariant.
+        let runtime = test_mesh_runtime_config();
+        assert!(
+            runtime.request_auth_require_exp,
+            "test runtime should carry the secure default"
+        );
+        let prepared =
+            prepare_gateway_config_for_mesh(request_auth_config_for_require_exp(), &runtime)
+                .expect("mesh config");
         let jwks = prepared
             .plugin_configs
             .iter()
             .find(|plugin| plugin.id == MESH_REQUEST_AUTH_PLUGIN_ID)
             .expect("jwks_auth plugin");
 
-        // Istio JWTs may omit `exp`, so mesh injection must disable
-        // the default require_exp=true behavior.
+        assert_eq!(
+            jwks.config.get("require_exp").and_then(|v| v.as_bool()),
+            Some(true),
+            "mesh request auth must default require_exp=true (secure)"
+        );
+    }
+
+    #[test]
+    fn mesh_runtime_request_auth_require_exp_can_be_relaxed() {
+        // Operators with Istio issuers that omit `exp` can opt out via
+        // FERRUM_MESH_REQUEST_AUTH_REQUIRE_EXP=false.
+        let mut runtime = test_mesh_runtime_config();
+        runtime.request_auth_require_exp = false;
+        let prepared =
+            prepare_gateway_config_for_mesh(request_auth_config_for_require_exp(), &runtime)
+                .expect("mesh config");
+        let jwks = prepared
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.id == MESH_REQUEST_AUTH_PLUGIN_ID)
+            .expect("jwks_auth plugin");
+
         assert_eq!(
             jwks.config.get("require_exp").and_then(|v| v.as_bool()),
             Some(false),
-            "mesh request auth must set require_exp=false for Istio compatibility"
+            "FERRUM_MESH_REQUEST_AUTH_REQUIRE_EXP=false must relax require_exp"
         );
     }
 
@@ -9592,9 +10111,16 @@ mod tests {
         let env = EnvConfig::default();
         let tls_policy = TlsPolicy::from_env_config(&env).expect("tls policy");
 
-        let err =
-            load_mesh_frontend_tls(&env, &tls_policy, &[], config::MtlsMode::Strict, None, None)
-                .expect_err("strict mTLS must require cert and key material");
+        let err = load_mesh_frontend_tls(
+            &env,
+            &tls_policy,
+            &[],
+            config::MtlsMode::Strict,
+            None,
+            None,
+            None,
+        )
+        .expect_err("strict mTLS must require cert and key material");
 
         assert!(
             err.to_string()
@@ -9612,6 +10138,7 @@ mod tests {
             &tls_policy,
             &[],
             config::MtlsMode::Permissive,
+            None,
             None,
             None,
         )
@@ -9639,6 +10166,7 @@ mod tests {
             &[],
             config::MtlsMode::Permissive,
             mesh_frontend_identity.as_deref(),
+            None,
             None,
         )
         .expect("permissive without CA bundle should succeed");
@@ -9677,6 +10205,7 @@ mod tests {
             config::MtlsMode::Strict,
             mesh_frontend_identity.as_deref(),
             None,
+            None,
         )
         .expect("strict rebuild should use cached server identity");
 
@@ -9710,6 +10239,7 @@ mod tests {
             config::MtlsMode::Strict,
             mesh_frontend_identity.as_deref(),
             snapshot.client_ca_bundle.as_ref(),
+            None,
         )
         .expect("strict rebuild should use snapshot CA bytes");
 
@@ -9927,6 +10457,7 @@ mod tests {
             &[],
             config::MtlsMode::Permissive,
             mesh_frontend_identity.as_deref(),
+            None,
             None,
         )
         .expect("TLS config builds")
@@ -11060,6 +11591,7 @@ mod tests {
         let runtime = MeshRuntimeConfig {
             topology: MeshTopology::EgressGateway,
             egress_stream_enabled: true,
+            request_auth_require_exp: true,
             ..test_mesh_runtime_config()
         };
         let config = GatewayConfig {

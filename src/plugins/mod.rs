@@ -16,7 +16,6 @@
 //! Non-security plugins that fail validation are skipped with a warning.
 
 pub mod access_control;
-pub mod access_log;
 pub mod ai_federation;
 pub mod ai_prompt_shield;
 pub mod ai_rate_limiter;
@@ -103,6 +102,12 @@ use crate::config::types::{
 };
 use crate::consumer_index::ConsumerIndex;
 use crate::modes::mesh::MeshTrafficDirection;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JwtAuthAttributeValue {
+    Scalar(String),
+    StringList(Vec<String>),
+}
 
 /// Protocol categories that plugins can declare support for.
 ///
@@ -274,13 +279,23 @@ pub struct WsDisconnectContext {
 /// inspect duplicate pairs that collapse in the parsed `HashMap`.
 #[derive(Debug, Clone)]
 pub struct RequestContext {
+    /// Gateway-resolved client IP used for request accounting and legacy
+    /// plugins. This may be rewritten from trusted forwarding headers after
+    /// the context is created.
     pub client_ip: String,
+    /// Immediate downstream socket peer IP captured before trusted-proxy
+    /// resolution. Mesh authz uses this for Istio `source.ip` so forwarded
+    /// `remote.ip` cannot masquerade as the direct peer.
+    pub direct_client_ip: String,
     pub method: String,
     pub path: String,
     /// Frontend listener port that accepted this HTTP-family request.
     /// HTTP proxy resources do not carry `listen_port`, so mesh authorization
     /// uses this to evaluate Istio `to.ports` matches for HTTP traffic.
     pub frontend_listen_port: Option<u16>,
+    /// SNI hostname from the frontend TLS/QUIC handshake for HTTP-family
+    /// requests. Populated only when the downstream client supplied SNI.
+    pub frontend_sni_hostname: Option<String>,
     /// Raw HTTP headers from the request. Stored at init time and consumed by
     /// `materialize_headers()`. Core proxy lookups (IP resolution, host
     /// extraction) read from this directly via `raw_header_get()` to avoid
@@ -320,6 +335,22 @@ pub struct RequestContext {
     pub timestamp_received: DateTime<Utc>,
     /// Extra metadata plugins can attach
     pub metadata: HashMap<String, String>,
+    /// Whether reserved `waf.*` metadata has been cleared for this request.
+    ///
+    /// `metadata` is intentionally public plugin scratch space. WAF-owned log
+    /// fields are mirrored there for compatibility, but the authoritative
+    /// copy lives in `waf_owned_metadata` so other plugins or inbound request
+    /// data cannot spoof WAF transaction-log fields.
+    pub(crate) waf_metadata_initialized: bool,
+    pub(crate) waf_owned_metadata: HashMap<String, String>,
+    /// JWT audiences emitted by mesh `jwks_auth` for Istio
+    /// `request.auth.audiences` conditions. Kept out of `metadata` so JWT
+    /// claim material does not flow into transaction logs.
+    pub mesh_request_auth_audiences: Vec<String>,
+    /// JWT scalar/string-array claims emitted by mesh `jwks_auth` for Istio
+    /// `request.auth.claims[...]` conditions. Kept structured so list claims
+    /// retain item boundaries and are not serialized into transaction logs.
+    pub mesh_request_auth_claims: HashMap<String, JwtAuthAttributeValue>,
     /// DER-encoded client certificate from mTLS handshake (first cert in chain).
     /// Populated when the connection used TLS with client certificate verification.
     /// Shared via Arc to avoid cloning cert bytes for each request on HTTP/2 connections.
@@ -416,6 +447,22 @@ pub struct RequestContext {
     /// after its own static header rules.
     pub route_override_response_transform:
         Option<Arc<Vec<utils::route_header_transform::RouteHeaderTransformRule>>>,
+    /// Plugin-set override for the request path forwarded to the backend.
+    /// Set by `mesh_route_dispatch` when a matching rule carries an Istio
+    /// `VirtualService.http[].rewrite.uri`. The proxy dispatch path rebases the
+    /// outgoing request line / backend URL to this value AFTER the
+    /// `before_proxy` phase (the original `ctx.path` stays intact for logging
+    /// and route selection, which already happened). `None` keeps the
+    /// request's own path. Honored on the H1/H2/gRPC/reqwest backend dispatch
+    /// path; VS-derived proxies never set `strip_listen_path`, so the override
+    /// is the literal forwarded path.
+    pub route_override_path: Option<String>,
+    /// Plugin-set override for the `Host` / `:authority` forwarded to the
+    /// backend. Set by `mesh_route_dispatch` for an Istio
+    /// `VirtualService.http[].rewrite.authority`. The proxy dispatch path
+    /// rewrites the forwarded `host` header to this value after `before_proxy`.
+    /// `None` preserves the request's own authority.
+    pub route_override_authority: Option<String>,
     /// In node-waypoint mesh topology, the Kubernetes pod UID resolved from
     /// the eBPF socket-cookie record at accept time. Set by the connection
     /// admit path alongside `peer_spiffe_id`; `None` for non-mesh
@@ -446,13 +493,27 @@ pub struct RequestContext {
     pub mesh_direction: Option<MeshTrafficDirection>,
 }
 
+fn merge_metadata_value(metadata: &mut HashMap<String, String>, key: &str, value: &str) {
+    metadata
+        .entry(key.to_string())
+        .and_modify(|existing| {
+            if !existing.is_empty() {
+                existing.push(',');
+            }
+            existing.push_str(value);
+        })
+        .or_insert_with(|| value.to_string());
+}
+
 impl RequestContext {
     pub fn new(client_ip: String, method: String, path: String) -> Self {
         Self {
+            direct_client_ip: client_ip.clone(),
             client_ip,
             method,
             path,
             frontend_listen_port: None,
+            frontend_sni_hostname: None,
             raw_headers: None,
             headers: HashMap::new(),
             raw_query_string: None,
@@ -465,6 +526,10 @@ impl RequestContext {
             auth_method: None,
             timestamp_received: Utc::now(),
             metadata: HashMap::new(),
+            waf_metadata_initialized: false,
+            waf_owned_metadata: HashMap::new(),
+            mesh_request_auth_audiences: Vec::new(),
+            mesh_request_auth_claims: HashMap::new(),
             tls_client_cert_der: None,
             tls_client_cert_chain_der: None,
             peer_spiffe_id: None,
@@ -481,6 +546,8 @@ impl RequestContext {
             route_override_retry: None,
             route_override_request_transform: None,
             route_override_response_transform: None,
+            route_override_path: None,
+            route_override_authority: None,
             node_waypoint_pod_uid: None,
             node_waypoint_policy_scope: None,
             mesh_direction: None,
@@ -495,9 +562,11 @@ impl RequestContext {
     pub(crate) fn clone_for_final_request_body_hooks(&self) -> Self {
         Self {
             client_ip: self.client_ip.clone(),
+            direct_client_ip: self.direct_client_ip.clone(),
             method: self.method.clone(),
             path: self.path.clone(),
             frontend_listen_port: self.frontend_listen_port,
+            frontend_sni_hostname: self.frontend_sni_hostname.clone(),
             raw_headers: None,
             headers: self.headers.clone(),
             raw_query_string: None,
@@ -510,6 +579,10 @@ impl RequestContext {
             auth_method: self.auth_method,
             timestamp_received: self.timestamp_received,
             metadata: self.metadata.clone(),
+            waf_metadata_initialized: self.waf_metadata_initialized,
+            waf_owned_metadata: self.waf_owned_metadata.clone(),
+            mesh_request_auth_audiences: self.mesh_request_auth_audiences.clone(),
+            mesh_request_auth_claims: self.mesh_request_auth_claims.clone(),
             tls_client_cert_der: self.tls_client_cert_der.clone(),
             tls_client_cert_chain_der: self.tls_client_cert_chain_der.clone(),
             peer_spiffe_id: self.peer_spiffe_id.clone(),
@@ -526,10 +599,63 @@ impl RequestContext {
             route_override_retry: self.route_override_retry.clone(),
             route_override_request_transform: self.route_override_request_transform.clone(),
             route_override_response_transform: self.route_override_response_transform.clone(),
+            route_override_path: self.route_override_path.clone(),
+            route_override_authority: self.route_override_authority.clone(),
             node_waypoint_pod_uid: self.node_waypoint_pod_uid,
             node_waypoint_policy_scope: self.node_waypoint_policy_scope.clone(),
             mesh_direction: self.mesh_direction,
         }
+    }
+
+    pub(crate) fn ensure_waf_metadata_initialized(&mut self) {
+        if self.waf_metadata_initialized {
+            return;
+        }
+        self.metadata.retain(|key, _| !key.starts_with("waf."));
+        self.waf_owned_metadata.clear();
+        self.waf_metadata_initialized = true;
+    }
+
+    pub(crate) fn set_waf_metadata(&mut self, key: &str, value: impl Into<String>) {
+        self.ensure_waf_metadata_initialized();
+        let value = value.into();
+        self.waf_owned_metadata
+            .insert(key.to_string(), value.clone());
+        self.metadata.insert(key.to_string(), value);
+    }
+
+    pub(crate) fn set_waf_metadata_if_absent(&mut self, key: &str, value: impl Into<String>) {
+        self.ensure_waf_metadata_initialized();
+        if self.waf_owned_metadata.contains_key(key) {
+            return;
+        }
+        self.set_waf_metadata(key, value);
+    }
+
+    pub(crate) fn merge_waf_metadata(&mut self, key: &str, value: &str) {
+        if value.is_empty() {
+            return;
+        }
+        self.ensure_waf_metadata_initialized();
+        merge_metadata_value(&mut self.waf_owned_metadata, key, value);
+        // `merge_metadata_value` always inserts or modifies the entry, so
+        // `get(key)` is guaranteed `Some` here; no fallback branch needed.
+        if let Some(owned_value) = self.waf_owned_metadata.get(key) {
+            self.metadata.insert(key.to_string(), owned_value.clone());
+        }
+    }
+
+    pub(crate) fn waf_metadata_value(&self, key: &str) -> Option<&str> {
+        self.waf_owned_metadata.get(key).map(String::as_str)
+    }
+
+    pub(crate) fn apply_waf_owned_log_metadata(&self, metadata: &mut HashMap<String, String>) {
+        metadata.retain(|key, _| !key.starts_with("waf."));
+        metadata.extend(
+            self.waf_owned_metadata
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
     }
 
     /// Effective upstream id for routing: plugin upstream override >
@@ -686,6 +812,14 @@ impl RequestContext {
             .route_override_retry
             .as_ref()
             .is_some_and(|retry| proxy.retry != *retry);
+        // An Istio `rewrite.authority` rebases the `Host`/`:authority` forwarded
+        // to the backend. The plugin already wrote the new authority into the
+        // request `host` header; flipping `preserve_host_header` on the
+        // effective proxy makes every backend-dispatch path (reqwest / H2 /
+        // gRPC / H3 / HBONE) forward that header verbatim instead of clobbering
+        // it with the backend's own host.
+        let preserve_host_changed =
+            self.route_override_authority.is_some() && !proxy.preserve_host_header;
 
         if !upstream_id_changed
             && !backend_host_changed
@@ -694,6 +828,7 @@ impl RequestContext {
             && !dispatch_port_overrides_changed
             && !backend_read_timeout_changed
             && !retry_changed
+            && !preserve_host_changed
         {
             return proxy;
         }
@@ -725,6 +860,9 @@ impl RequestContext {
         }
         if let Some(retry) = &self.route_override_retry {
             overridden.retry = retry.clone();
+        }
+        if preserve_host_changed {
+            overridden.preserve_host_header = true;
         }
         Arc::new(overridden)
     }
@@ -1320,14 +1458,18 @@ pub struct StreamConnectionContext {
     /// DER-encoded CA/intermediate certificates from the client's certificate chain.
     /// Contains all certificates after the peer cert (index 1+) sent during the handshake.
     pub tls_client_cert_chain_der: Option<Arc<Vec<Vec<u8>>>>,
-    /// SNI hostname extracted from the TLS/DTLS ClientHello during passthrough mode.
-    /// Populated only for proxies with `passthrough: true`. Available to plugins for
-    /// logging, routing, or access control without requiring TLS termination.
+    /// SNI hostname from the frontend TLS/DTLS ClientHello or terminated TLS
+    /// handshake when available. Available to plugins for logging, routing, or
+    /// access control.
     pub sni_hostname: Option<String>,
     /// Mesh traffic direction stamped by the stream listener that accepted this
     /// connection. Mirrors `RequestContext::mesh_direction`; `None` for stream
     /// proxies that are not part of a mesh listener.
     pub mesh_direction: Option<MeshTrafficDirection>,
+    /// Pre-resolved per-pod policy scope for node-waypoint topology.
+    /// Mirrors `RequestContext::node_waypoint_policy_scope`; `None` for
+    /// non-waypoint stream proxies.
+    pub node_waypoint_policy_scope: Option<Arc<crate::modes::mesh::runtime::PolicyScopeCache>>,
 }
 
 impl StreamConnectionContext {
@@ -1510,7 +1652,6 @@ pub mod priority {
     /// metric-emitter plugins so its `log` hook runs after all
     /// transaction-summary serialization.
     pub const MESH_BPF_METRICS: u16 = 9365;
-    pub const ACCESS_LOG: u16 = 9375;
     /// `transaction_log_schema` is a config-only plugin with no lifecycle
     /// hooks; its priority is irrelevant in practice but is kept at the
     /// top of the logging band so any future hook would run after all
@@ -2205,7 +2346,6 @@ pub fn create_plugin_with_http_client(
             };
             Ok(Some(Arc::new(plugin)))
         }
-        "access_log" => Ok(Some(Arc::new(access_log::AccessLog::new(config)?))),
         _ => {
             // Fall through to custom plugins registry
             let result = crate::custom_plugins::create_custom_plugin(name, config, http_client)?;
@@ -2344,7 +2484,6 @@ pub fn available_plugins() -> Vec<&'static str> {
         "workload_metrics",
         "__mesh_bpf_metrics",
         "fault_injection",
-        "access_log",
     ];
     plugins.extend(crate::custom_plugins::custom_plugin_names());
     plugins

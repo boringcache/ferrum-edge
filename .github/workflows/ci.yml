@@ -502,6 +502,7 @@ jobs:
               functional_grpc_plugins_test
               functional_logging_plugins_test
               functional_logging_test
+              functional_mesh_vs_traffic_mgmt_test
               functional_otel_ldap_test
               functional_plugin_extended_test
               functional_plugin_test

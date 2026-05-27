@@ -1254,6 +1254,7 @@ pub(crate) fn redact_request_body_from_log_metadata(metadata: &mut HashMap<Strin
 pub(crate) fn clone_log_metadata(ctx: &RequestContext) -> HashMap<String, String> {
     let mut metadata = ctx.metadata.clone();
     redact_request_body_from_log_metadata(&mut metadata);
+    ctx.apply_waf_owned_log_metadata(&mut metadata);
     metadata
 }
 
@@ -1721,6 +1722,7 @@ fn via_header_for_backend_response_body<'a>(
 #[derive(Clone, Default)]
 struct RequestConnectionMetadata {
     frontend_listen_port: Option<u16>,
+    frontend_sni_hostname: Option<String>,
     node_waypoint_identity: Option<Arc<NodeWaypointIdentity>>,
     /// Direction stamped at listener-spawn time for mesh listeners.
     /// `None` outside mesh mode.
@@ -5160,6 +5162,7 @@ async fn handle_connection(
         let addr = remote_addr;
         let connection_metadata = RequestConnectionMetadata {
             frontend_listen_port,
+            frontend_sni_hostname: None,
             node_waypoint_identity: node_waypoint_identity.clone(),
             mesh_direction,
         };
@@ -5278,6 +5281,11 @@ async fn handle_websocket_request_authenticated(
     requires_ws_frame_hooks: bool,
     query_string: String,
     strip_len: usize,
+    // The client-requested path before any VirtualService `rewrite.uri`
+    // was applied. Used for `request_path` in transaction logs so that
+    // access logs record what the client sent, not the backend-rewritten
+    // path stored in `ctx.path`.
+    original_request_path: String,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
     info!(
         "WebSocket upgrade request authenticated for proxy: {} from: {}",
@@ -5330,13 +5338,16 @@ async fn handle_websocket_request_authenticated(
                     websocket_limit = state.env_config.websocket_max_connections,
                     "Rejecting WebSocket upgrade: connection limit reached"
                 );
-                log_rejected_request(
+                // Use `original_request_path` — `ctx.path` may already be the
+                // VirtualService-rewritten backend path at this point.
+                log_rejected_request_with_path(
                     &plugins,
                     &ctx,
                     503,
                     start_time,
                     "websocket_connection_limit",
                     plugin_execution_ns,
+                    Some(&original_request_path),
                 )
                 .await;
                 record_request(&state, 503);
@@ -5546,7 +5557,9 @@ async fn handle_websocket_request_authenticated(
                             consumer_username: ctx.effective_identity().map(str::to_owned),
                             auth_method: ctx.auth_method,
                             http_method: ws_err_method.to_string(),
-                            request_path: ctx.path.clone(),
+                            // Record the path the client sent, not the
+                            // VirtualService-rewritten backend path in ctx.path.
+                            request_path: original_request_path.clone(),
                             proxy_id: Some(proxy.id.clone()),
                             proxy_name: proxy.name.clone(),
                             backend_target: Some(
@@ -5615,7 +5628,9 @@ async fn handle_websocket_request_authenticated(
         consumer_username: ctx.effective_identity().map(str::to_owned),
         auth_method: ctx.auth_method,
         http_method: ws_method.to_string(),
-        request_path: ctx.path.clone(),
+        // Record the path the client sent, not the VirtualService-rewritten
+        // backend path stored in ctx.path after the rewrite in the caller.
+        request_path: original_request_path.clone(),
         proxy_id: Some(proxy.id.clone()),
         proxy_name: proxy.name.clone(),
         backend_target: Some(strip_query_params(&current_backend_url).to_string()),
@@ -7616,6 +7631,11 @@ async fn handle_tls_connection(
     let client_cert_chain_der: Option<Arc<Vec<Vec<u8>>>> = peer_certs
         .filter(|certs| certs.len() > 1)
         .map(|certs| Arc::new(certs[1..].iter().map(|c| c.to_vec()).collect()));
+    let frontend_sni_hostname = tls_stream
+        .get_ref()
+        .1
+        .server_name()
+        .map(str::to_ascii_lowercase);
 
     // Convert TLS stream to TokioIo for hyper
     let io = hyper_util::rt::TokioIo::new(tls_stream);
@@ -7663,8 +7683,10 @@ async fn handle_tls_connection(
         let addr = remote_addr;
         let cert = client_cert_der.clone();
         let chain = client_cert_chain_der.clone();
+        let frontend_sni_hostname = frontend_sni_hostname.clone();
         let connection_metadata = RequestConnectionMetadata {
             frontend_listen_port: tls_connection_metadata.frontend_listen_port,
+            frontend_sni_hostname,
             node_waypoint_identity: tls_connection_metadata.node_waypoint_identity.clone(),
             mesh_direction: tls_connection_metadata.mesh_direction,
         };
@@ -7734,6 +7756,34 @@ pub async fn log_rejected_request(
     rejection_phase: &str,
     plugin_execution_ns: u64,
 ) {
+    log_rejected_request_with_path(
+        plugins,
+        ctx,
+        status_code,
+        start_time,
+        rejection_phase,
+        plugin_execution_ns,
+        None,
+    )
+    .await;
+}
+
+/// Like [`log_rejected_request`] but allows the caller to supply the
+/// original client-requested path when `ctx.path` has already been rebased
+/// to the VirtualService-rewritten backend path. When `request_path_override`
+/// is `Some`, it is recorded as `TransactionSummary.request_path` instead of
+/// `ctx.path`; `ctx.path` (the rewritten value) is still used for
+/// `backend_target` URL construction. Pass `None` at all sites that fire
+/// before the rewrite — they get the same behavior as `log_rejected_request`.
+pub(crate) async fn log_rejected_request_with_path(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &RequestContext,
+    status_code: u16,
+    start_time: Instant,
+    rejection_phase: &str,
+    plugin_execution_ns: u64,
+    request_path_override: Option<&str>,
+) {
     if plugins.is_empty() {
         return;
     }
@@ -7768,11 +7818,19 @@ pub async fn log_rejected_request(
         consumer_username: ctx.effective_identity().map(str::to_owned),
         auth_method: ctx.auth_method,
         http_method: ctx.method.clone(),
-        request_path: ctx.path.clone(),
+        // Use the caller-supplied original path when provided; otherwise fall
+        // back to `ctx.path`, which may be the rewritten backend path if the
+        // caller is after a VirtualService `rewrite.uri` application.
+        request_path: request_path_override
+            .map(str::to_owned)
+            .unwrap_or_else(|| ctx.path.clone()),
         proxy_id: proxy.map(|p| p.id.clone()),
         proxy_name: proxy.and_then(|p| p.name.clone()),
         backend_target: proxy.map(|p| {
             // Host-only proxies (listen_path None) have no prefix to strip.
+            // `ctx.path` is intentionally used here (not the override) because
+            // `backend_target` should reflect the rewritten path that would
+            // have been sent to the backend.
             let strip_len = p.listen_path.as_deref().map(str::len).unwrap_or(0);
             let url = build_backend_url(p, &ctx.path, "", strip_len);
             strip_query_params(&url).to_string()
@@ -8302,6 +8360,7 @@ async fn handle_proxy_request_inner(
             state.env_config.proxy_http_port
         },
     ));
+    ctx.frontend_sni_hostname = connection_metadata.frontend_sni_hostname;
     ctx.mesh_direction = connection_metadata.mesh_direction;
     ctx.tls_client_cert_der = tls_client_cert_der;
     ctx.tls_client_cert_chain_der = tls_client_cert_chain_der;
@@ -9174,6 +9233,31 @@ async fn handle_proxy_request_inner(
     let proxy = ctx.apply_route_overrides_with_upstreams(proxy, epoch.load_balancer.upstreams());
     ctx.matched_proxy = Some(Arc::clone(&proxy));
 
+    // Preserve the path the client actually requested for access logging. The
+    // documented contract (the `route_override_path` field doc and
+    // `docs/mesh.md`) is that transaction logs record the original request
+    // path, not the VirtualService-rewritten backend path; the rewrite below
+    // only affects backend URL building and `ctx.path` for dispatch. The
+    // transaction summaries built later in this function source `request_path`
+    // from this value, not the rebased `path`/`ctx.path`.
+    let original_request_path = path.clone();
+
+    // Istio `VirtualService.http[].rewrite.uri`: `mesh_route_dispatch` set
+    // `ctx.route_override_path` for the matched route. Rebase the request path
+    // used for backend URL building (reqwest / direct-H2 / gRPC paths read the
+    // local `path`; the WS / HBONE branches read `ctx.path`, so mirror the
+    // override onto `ctx.path` too). The original path was already used for
+    // route selection; VS-derived proxies never set `strip_listen_path`, so
+    // the rewritten value is the literal forwarded path. No allocation when no
+    // rewrite is set.
+    let path = match ctx.route_override_path.take() {
+        Some(rewritten) => {
+            ctx.path = rewritten.clone();
+            rewritten
+        }
+        None => path,
+    };
+
     // Resolve upstream target and hash key from the request epoch.
     let selection = backend_dispatch::select_upstream_target(
         &proxy,
@@ -9206,13 +9290,17 @@ async fn handle_proxy_request_inner(
                 )
                 .await;
                 apply_grpc_reject_metadata(&mut ctx, &reject);
-                log_rejected_request(
+                // Use `original_request_path` so the log records the path the
+                // client actually requested, not the VirtualService-rewritten
+                // backend path stored in `ctx.path` after the rewrite above.
+                log_rejected_request_with_path(
                     &plugins,
                     &ctx,
                     reject.http_status.as_u16(),
                     start_time,
                     "circuit_breaker_open",
                     plugin_execution_ns,
+                    Some(&original_request_path),
                 )
                 .await;
                 record_request(&state, reject.http_status.as_u16());
@@ -9285,6 +9373,7 @@ async fn handle_proxy_request_inner(
             requires_ws_frame_hooks,
             effective_query_string.to_string(),
             strip_len,
+            original_request_path.clone(),
         )
         .await;
     }
@@ -9420,6 +9509,8 @@ async fn handle_proxy_request_inner(
             .await;
             if let Some(body_hook_ctx) = body_hook_ctx {
                 ctx.metadata = body_hook_ctx.metadata;
+                ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
+                ctx.waf_owned_metadata = body_hook_ctx.waf_owned_metadata;
             }
             match final_body_result {
                 PluginResult::Continue => {}
@@ -9680,13 +9771,17 @@ async fn handle_proxy_request_inner(
                             true,
                         );
                         apply_grpc_reject_metadata(&mut ctx, &normalized);
-                        log_rejected_request(
+                        // Use `original_request_path` so the log records the
+                        // path the client actually requested, not the
+                        // VirtualService-rewritten backend path in `ctx.path`.
+                        log_rejected_request_with_path(
                             &plugins,
                             &ctx,
                             normalized.http_status.as_u16(),
                             start_time,
                             "after_proxy",
                             plugin_execution_ns,
+                            Some(&original_request_path),
                         )
                         .await;
                         record_request(&state, normalized.http_status.as_u16());
@@ -9771,7 +9866,7 @@ async fn handle_proxy_request_inner(
                         consumer_username: ctx.effective_identity().map(str::to_owned),
                         auth_method: ctx.auth_method,
                         http_method: method,
-                        request_path: path,
+                        request_path: original_request_path.clone(),
                         proxy_id: Some(proxy.id.clone()),
                         proxy_name: proxy.name.clone(),
                         backend_target: Some(strip_query_params(&grpc_backend_url).to_string()),
@@ -10099,7 +10194,7 @@ async fn handle_proxy_request_inner(
                         consumer_username: ctx.effective_identity().map(str::to_owned),
                         auth_method: ctx.auth_method,
                         http_method: method,
-                        request_path: path,
+                        request_path: original_request_path.clone(),
                         proxy_id: Some(proxy.id.clone()),
                         proxy_name: proxy.name.clone(),
                         backend_target: Some(strip_query_params(&grpc_backend_url).to_string()),
@@ -10249,7 +10344,7 @@ async fn handle_proxy_request_inner(
                             consumer_username: ctx.effective_identity().map(str::to_owned),
                             auth_method: ctx.auth_method,
                             http_method: ctx.method.clone(),
-                            request_path: ctx.path.clone(),
+                            request_path: original_request_path.clone(),
                             proxy_id: proxy_ref.map(|p| p.id.clone()),
                             proxy_name: proxy_ref.and_then(|p| p.name.clone()),
                             backend_target: proxy_ref.map(|p| {
@@ -10581,6 +10676,8 @@ async fn handle_proxy_request_inner(
         }
         if let Some(body_hook_ctx) = body_hook_ctx {
             ctx.metadata = body_hook_ctx.metadata;
+            ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
+            ctx.waf_owned_metadata = body_hook_ctx.waf_owned_metadata;
         }
         (result, current_cb_target_key)
     } else {
@@ -10614,6 +10711,8 @@ async fn handle_proxy_request_inner(
         .0;
         if let Some(body_hook_ctx) = body_hook_ctx {
             ctx.metadata = body_hook_ctx.metadata;
+            ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
+            ctx.waf_owned_metadata = body_hook_ctx.waf_owned_metadata;
         }
         (resp, cb_target_key.clone())
     };
@@ -10852,7 +10951,7 @@ async fn handle_proxy_request_inner(
                 consumer_username: ctx.effective_identity().map(str::to_owned),
                 auth_method: ctx.auth_method,
                 http_method: method,
-                request_path: path,
+                request_path: original_request_path.clone(),
                 proxy_id: Some(proxy.id.clone()),
                 proxy_name: proxy.name.clone(),
                 backend_target: Some(strip_query_params(&backend_url).to_string()),
@@ -15179,6 +15278,57 @@ mod tests {
         assert!(ids.contains(&"/certs/mesh-route.pem".to_string()));
         assert!(ids.contains(&"/keys/mesh-route.key".to_string()));
         assert!(ids.contains(&"/ca/mesh-route.pem".to_string()));
+    }
+
+    #[test]
+    fn clone_log_metadata_removes_body_and_unowned_waf_metadata() {
+        let mut ctx = RequestContext::new("203.0.113.10".into(), "GET".into(), "/search".into());
+        ctx.metadata
+            .insert("request_body".to_string(), "secret body".to_string());
+        ctx.metadata
+            .insert("waf.rule_hits".to_string(), "SPOOFED".to_string());
+        ctx.metadata
+            .insert("waf.action".to_string(), "blocked".to_string());
+
+        let metadata = clone_log_metadata(&ctx);
+
+        assert!(!metadata.contains_key("request_body"));
+        assert!(!metadata.contains_key("waf.rule_hits"));
+        assert!(!metadata.contains_key("waf.action"));
+
+        ctx.set_waf_metadata("waf.rule_hits", "FE-SQLI-001");
+        ctx.metadata
+            .insert("waf.action".to_string(), "blocked".to_string());
+
+        let metadata = clone_log_metadata(&ctx);
+
+        assert_eq!(
+            metadata.get("waf.rule_hits").map(String::as_str),
+            Some("FE-SQLI-001")
+        );
+        assert!(!metadata.contains_key("waf.action"));
+    }
+
+    #[test]
+    fn final_body_hook_context_preserves_waf_owned_log_metadata() {
+        let mut ctx = RequestContext::new("203.0.113.10".into(), "POST".into(), "/submit".into());
+        let mut hook_ctx = ctx.clone_for_final_request_body_hooks();
+        hook_ctx.set_waf_metadata("waf.rule_hits", "FE-XSS-001");
+        hook_ctx.set_waf_metadata("waf.action", "monitored");
+
+        ctx.metadata = hook_ctx.metadata;
+        ctx.waf_metadata_initialized = hook_ctx.waf_metadata_initialized;
+        ctx.waf_owned_metadata = hook_ctx.waf_owned_metadata;
+        let metadata = clone_log_metadata(&ctx);
+
+        assert_eq!(
+            metadata.get("waf.rule_hits").map(String::as_str),
+            Some("FE-XSS-001")
+        );
+        assert_eq!(
+            metadata.get("waf.action").map(String::as_str),
+            Some("monitored")
+        );
     }
 
     #[test]

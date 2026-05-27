@@ -324,6 +324,11 @@ pub(crate) async fn handle_h3_websocket(
     requires_ws_frame_hooks: bool,
     is_early_data: bool,
     strip_len: usize,
+    // The client-requested path before any VirtualService `rewrite.uri` was
+    // applied. Used for `request_path` in transaction logs so that access
+    // logs record what the client sent, not the backend-rewritten path in
+    // `ctx.path`.
+    original_request_path: String,
 ) -> Result<(), anyhow::Error> {
     // Defense in depth: dispatcher already checked this. If the flag
     // got toggled mid-flight, return 501 rather than half-bridging.
@@ -360,17 +365,20 @@ pub(crate) async fn handle_h3_websocket(
                 websocket_limit = state.env_config.websocket_max_connections,
                 "Rejecting H3 WebSocket upgrade: connection limit reached"
             );
-            // Log the rejection through the same `log_rejected_request`
+            // Log the rejection through the same `log_rejected_request_with_path`
             // helper the H1/H2 path uses so transaction logs are uniform
             // across frontends (rejection_phase = "websocket_connection_limit",
-            // metadata redaction, log_with_mirror, etc.).
-            crate::proxy::log_rejected_request(
+            // metadata redaction, log_with_mirror, etc.). Supply the original
+            // client path so the log records what the client requested, not the
+            // VirtualService-rewritten backend path stored in ctx.path.
+            crate::proxy::log_rejected_request_with_path(
                 &plugins,
                 &ctx,
                 503,
                 start_time,
                 "websocket_connection_limit",
                 plugin_execution_ns,
+                Some(&original_request_path),
             )
             .await;
             crate::proxy::record_request(&state, 503);
@@ -529,6 +537,7 @@ pub(crate) async fn handle_h3_websocket(
                         start_time,
                         &current_backend_url,
                         ws_error_class,
+                        &original_request_path,
                     )
                     .await;
                 }
@@ -657,6 +666,7 @@ pub(crate) async fn handle_h3_websocket(
         plugin_execution_ns,
         start_time,
         &current_backend_url,
+        &original_request_path,
     )
     .await;
 
@@ -767,7 +777,7 @@ pub(crate) async fn handle_h3_websocket(
         listen_port: h3_listen_port(&state),
         consumer_username: ctx.effective_identity().map(str::to_owned),
         auth_method: ctx.auth_method,
-        metadata: ctx.metadata.clone(),
+        metadata: crate::proxy::clone_log_metadata(&ctx),
         session_start: Utc::now(),
     };
 
@@ -873,6 +883,10 @@ async fn emit_successful_upgrade_summary(
     plugin_execution_ns: u64,
     start_time: Instant,
     backend_url: &str,
+    // The client-requested path before any VirtualService `rewrite.uri` was
+    // applied. Logged as `request_path` so access logs record what the client
+    // sent, not the backend-rewritten path in `ctx.path`.
+    original_request_path: &str,
 ) {
     if plugins.is_empty() {
         return;
@@ -903,7 +917,9 @@ async fn emit_successful_upgrade_summary(
         // RFC 9220 Extended CONNECT uses :method=CONNECT, mirroring the
         // H2 RFC 8441 path's "CONNECT" label.
         http_method: "CONNECT".to_string(),
-        request_path: ctx.path.clone(),
+        // Record the path the client sent, not the VirtualService-rewritten
+        // backend path stored in ctx.path after the rewrite in the caller.
+        request_path: original_request_path.to_owned(),
         proxy_id: Some(proxy.id.clone()),
         proxy_name: proxy.name.clone(),
         backend_target: Some(crate::proxy::strip_query_params(backend_url).to_string()),
@@ -917,7 +933,7 @@ async fn emit_successful_upgrade_summary(
         latency_plugin_external_io_ms: plugin_external_io_ms,
         latency_gateway_overhead_ms: gateway_overhead_ms,
         request_user_agent: proxy_headers.get("user-agent").cloned(),
-        metadata: ctx.metadata.clone(),
+        metadata: crate::proxy::clone_log_metadata(ctx),
         ..TransactionSummary::default()
     };
     crate::plugins::log_with_mirror(plugins, &summary, ctx).await;
@@ -943,6 +959,10 @@ async fn emit_failed_upgrade_summary(
     start_time: Instant,
     backend_url: &str,
     error_class: retry::ErrorClass,
+    // The client-requested path before any VirtualService `rewrite.uri` was
+    // applied. Logged as `request_path` so access logs record what the client
+    // sent, not the backend-rewritten path in `ctx.path`.
+    original_request_path: &str,
 ) {
     if plugins.is_empty() {
         return;
@@ -964,7 +984,7 @@ async fn emit_failed_upgrade_summary(
         .ok()
         .map(|ip| ip.to_string());
 
-    let mut metadata = ctx.metadata.clone();
+    let mut metadata = crate::proxy::clone_log_metadata(ctx);
     metadata.insert(
         "rejection_phase".to_string(),
         "websocket_backend_error".to_string(),
@@ -977,7 +997,9 @@ async fn emit_failed_upgrade_summary(
         consumer_username: ctx.effective_identity().map(str::to_owned),
         auth_method: ctx.auth_method,
         http_method: "CONNECT".to_string(),
-        request_path: ctx.path.clone(),
+        // Record the path the client sent, not the VirtualService-rewritten
+        // backend path stored in ctx.path after the rewrite in the caller.
+        request_path: original_request_path.to_owned(),
         proxy_id: Some(proxy.id.clone()),
         proxy_name: proxy.name.clone(),
         backend_target: Some(crate::proxy::strip_query_params(backend_url).to_string()),

@@ -148,7 +148,8 @@ async fn start_hbone_echo_server(
     let (baggage_tx, baggage_rx) = oneshot::channel();
 
     tokio::spawn(async move {
-        let inbound = build_spiffe_inbound_config(server_slot, true).expect("server config");
+        let inbound = build_spiffe_inbound_config(server_slot, true, Arc::new(Vec::new()))
+            .expect("server config");
         let acceptor = TlsAcceptor::from(inbound);
         let (tcp, _) = listener.accept().await.expect("accept hbone tcp");
         let tls = acceptor.accept(tcp).await.expect("accept spiffe tls");
@@ -209,7 +210,8 @@ async fn start_hbone_reject_server(
     let addr = listener.local_addr().expect("listener addr");
 
     tokio::spawn(async move {
-        let inbound = build_spiffe_inbound_config(server_slot, true).expect("server config");
+        let inbound = build_spiffe_inbound_config(server_slot, true, Arc::new(Vec::new()))
+            .expect("server config");
         let acceptor = TlsAcceptor::from(inbound);
         let (tcp, _) = listener.accept().await.expect("accept hbone tcp");
         let tls = acceptor.accept(tcp).await.expect("accept spiffe tls");

@@ -38,19 +38,21 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::identity::{SpiffeId, TrustDomain};
 use crate::modes::mesh::config::{
-    MeshPolicy, PolicyScope, normalize_request_match_host_pattern, policy_scope_applies_to_workload,
+    MeshPolicy, PolicyScope, is_mesh_condition_ip_key, is_supported_mesh_condition_key,
+    mesh_condition_has_values, normalize_request_match_host_pattern,
+    policy_scope_applies_to_workload, validate_mesh_condition_ip_block,
 };
 use crate::modes::mesh::hbone::{BAGGAGE_HEADER, HboneIdentity};
 use crate::modes::mesh::policy::{
-    MeshAuthzDecision, MeshAuthzRequest, evaluate_mesh_authorization,
-    evaluate_mesh_authorization_policies, mesh_policies_have_header_rules,
+    MeshAuthzAttribute, MeshAuthzDecision, MeshAuthzRequest, evaluate_mesh_authorization,
+    evaluate_mesh_authorization_policies, istio_source_principal, mesh_policies_have_header_rules,
     normalize_mesh_policy_header_names,
 };
 use crate::modes::mesh::policy_deny_log::{self, PolicyDenyEvent};
 use crate::modes::mesh::slice::MeshSlice;
 use crate::plugins::{
-    ALL_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext, StreamConnectionContext,
-    priority,
+    ALL_PROTOCOLS, JwtAuthAttributeValue, Plugin, PluginResult, ProxyProtocol, RequestContext,
+    StreamConnectionContext, priority,
 };
 
 pub struct MeshAuthz {
@@ -75,6 +77,154 @@ pub struct MeshAuthz {
     /// preserves the existing sidecar/ambient/east-west/egress-gateway
     /// behaviour (slice-level filter at construction).
     per_pod_policy_scoping: bool,
+    /// Precomputed set of Istio attribute keys referenced by `when:`
+    /// conditions across the loaded policies. The request hot path only
+    /// materializes attributes named here, so a policy set with no `when:`
+    /// conditions pays nothing and the common cases (a handful of keys)
+    /// avoid building the full attribute namespace per request.
+    condition_keys: ConditionAttributeKeys,
+}
+
+/// Which Istio `when:` attribute keys the loaded policies actually reference.
+///
+/// Built once at construction from `slice.mesh_policies`. Categorised so the
+/// request path can decide cheaply (a `bool` check) whether to touch a given
+/// source — e.g. only parse the peer SPIFFE namespace when some condition asks
+/// for `source.namespace`, only fetch headers/claims for the exact bracketed
+/// keys requested. The dynamic-key sets (`request.headers[...]`,
+/// `request.auth.claims[...]`) store the full bracketed key so lookup is a
+/// direct map/contains check with no per-request parsing.
+#[derive(Debug, Default, Clone)]
+struct ConditionAttributeKeys {
+    /// Any `when:` condition exists at all. When false the request path skips
+    /// attribute materialization entirely.
+    any: bool,
+    source_principal: bool,
+    source_namespace: bool,
+    source_ip: bool,
+    remote_ip: bool,
+    request_auth_principal: bool,
+    request_auth_presenter: bool,
+    request_auth_audiences: bool,
+    destination_port: bool,
+    connection_sni: bool,
+    /// Full `request.headers[<name>]` keys referenced.
+    header_keys: std::collections::BTreeSet<String>,
+    /// Full `request.auth.claims[<name>]` keys referenced.
+    claim_keys: std::collections::BTreeSet<String>,
+}
+
+// A condition on an attribute key the gateway does not source (or sources only
+// for one protocol, e.g. `request.headers[...]` on a stream) is intentionally
+// left out of the materialized map. The evaluator then treats it as absent,
+// which is the correct, fail-closed posture: a `values` condition on a missing
+// attribute never matches, and a `not_values`-only condition on a missing
+// attribute passes (Istio `not_rule` semantics). We never silently treat an
+// unknown key as a positive match.
+
+// ── Istio `when:` attribute key constants ────────────────────────────────
+const ATTR_SOURCE_PRINCIPAL: &str = "source.principal";
+const ATTR_SOURCE_NAMESPACE: &str = "source.namespace";
+const ATTR_SOURCE_IP: &str = "source.ip";
+const ATTR_REMOTE_IP: &str = "remote.ip";
+const ATTR_REQUEST_AUTH_PRINCIPAL: &str = "request.auth.principal";
+const ATTR_REQUEST_AUTH_PRESENTER: &str = "request.auth.presenter";
+const ATTR_REQUEST_AUTH_AUDIENCES: &str = "request.auth.audiences";
+const ATTR_DESTINATION_PORT: &str = "destination.port";
+const ATTR_CONNECTION_SNI: &str = "connection.sni";
+const ATTR_REQUEST_HEADERS_PREFIX: &str = "request.headers[";
+const ATTR_REQUEST_AUTH_CLAIMS_PREFIX: &str = "request.auth.claims[";
+
+impl ConditionAttributeKeys {
+    fn from_policies(policies: &[MeshPolicy]) -> Self {
+        let mut keys = ConditionAttributeKeys::default();
+        for policy in policies {
+            for rule in &policy.rules {
+                for condition in &rule.when {
+                    keys.note_key(&condition.key);
+                }
+            }
+        }
+        keys
+    }
+
+    fn note_key(&mut self, key: &str) {
+        self.any = true;
+        match key {
+            ATTR_SOURCE_PRINCIPAL => self.source_principal = true,
+            ATTR_SOURCE_NAMESPACE => self.source_namespace = true,
+            ATTR_SOURCE_IP => self.source_ip = true,
+            ATTR_REMOTE_IP => self.remote_ip = true,
+            ATTR_REQUEST_AUTH_PRINCIPAL => self.request_auth_principal = true,
+            ATTR_REQUEST_AUTH_PRESENTER => self.request_auth_presenter = true,
+            ATTR_REQUEST_AUTH_AUDIENCES => self.request_auth_audiences = true,
+            ATTR_DESTINATION_PORT => self.destination_port = true,
+            ATTR_CONNECTION_SNI => self.connection_sni = true,
+            _ => {
+                if bracketed_attribute_name(key, ATTR_REQUEST_HEADERS_PREFIX).is_some() {
+                    self.header_keys.insert(key.to_string());
+                } else if bracketed_attribute_name(key, ATTR_REQUEST_AUTH_CLAIMS_PREFIX).is_some() {
+                    self.claim_keys.insert(key.to_string());
+                }
+                // Other keys (unsourced or unknown) are deliberately not
+                // tracked; the evaluator treats them as absent (see note on
+                // `ConditionAttributeKeys`).
+            }
+        }
+    }
+}
+
+/// Extract `<name>` from an Istio bracketed attribute key
+/// (`request.headers[x-foo]` ⇒ `x-foo`). Returns `None` when `key` is not a
+/// `prefix...]` form.
+fn bracketed_attribute_name<'a>(key: &'a str, prefix: &str) -> Option<&'a str> {
+    key.strip_prefix(prefix)?.strip_suffix(']')
+}
+
+/// Resolve a `request.headers[<name>]` value. Reads the already-lowercased
+/// materialized `headers` map when header rules forced materialization;
+/// otherwise falls back to the raw header accessor so a `when:` header
+/// condition still works on a policy set whose `to.headers` were empty.
+/// Istio header names are matched case-insensitively, and the condition key
+/// name is lowercased to match the stored convention.
+fn http_header_attribute(
+    ctx: &RequestContext,
+    materialized_lowercased: &BTreeMap<String, String>,
+    name: &str,
+) -> Option<String> {
+    let lower = name.to_ascii_lowercase();
+    if let Some(value) = materialized_lowercased.get(&lower) {
+        return Some(value.clone());
+    }
+    if let Some(value) = ctx.headers.get(&lower).or_else(|| ctx.headers.get(name)) {
+        return Some(value.clone());
+    }
+    ctx.raw_header_get(&lower)
+        .or_else(|| ctx.raw_header_get(name))
+        .map(str::to_string)
+}
+
+/// Parse an IP string into an `IpAddr` for
+/// Istio `source.ip` / `remote.ip` matching. Returns `None` for an
+/// unparseable value so IP-block matchers fail closed.
+fn parse_client_ip(client_ip: &str) -> Option<std::net::IpAddr> {
+    client_ip.trim().parse().ok()
+}
+
+fn jwt_attribute_to_mesh_attribute(value: &JwtAuthAttributeValue) -> MeshAuthzAttribute {
+    match value {
+        JwtAuthAttributeValue::Scalar(value) => MeshAuthzAttribute::Scalar(value.clone()),
+        JwtAuthAttributeValue::StringList(values) => MeshAuthzAttribute::StringList(values.clone()),
+    }
+}
+
+fn jwt_scalar_attribute_to_mesh_attribute(
+    value: &JwtAuthAttributeValue,
+) -> Option<MeshAuthzAttribute> {
+    match value {
+        JwtAuthAttributeValue::Scalar(value) => Some(MeshAuthzAttribute::Scalar(value.clone())),
+        JwtAuthAttributeValue::StringList(_) => None,
+    }
 }
 
 /// Matching rule for the [`MeshAuthz::trusted_hbone_assertors`] allow-list.
@@ -146,6 +296,8 @@ impl MeshAuthz {
             slice.labels = labels;
         }
 
+        validate_policy_ip_inputs(&slice.mesh_policies)?;
+
         let per_pod_policy_scoping = config
             .get("per_pod_policy_scoping")
             .and_then(Value::as_bool)
@@ -181,13 +333,172 @@ impl MeshAuthz {
             }
         }
         let has_header_rules = mesh_policies_have_header_rules(&slice.mesh_policies);
+        let condition_keys = ConditionAttributeKeys::from_policies(&slice.mesh_policies);
         Ok(Self {
             slice,
             has_header_rules,
             trust_domain_aliases,
             trusted_hbone_assertors,
             per_pod_policy_scoping,
+            condition_keys,
         })
+    }
+
+    /// Build the Istio `when:` attribute map for an HTTP-family request,
+    /// materializing only the keys referenced by some loaded policy (see
+    /// [`ConditionAttributeKeys`]). Returns an empty map when no policy uses
+    /// `when:` conditions so the no-condition hot path allocates nothing
+    /// beyond the empty `BTreeMap` the request already needs.
+    ///
+    /// `source_principal` is the resolved authz principal (post-baggage
+    /// rewrite) so `source.principal` / `source.namespace` reflect the
+    /// identity the rule is actually evaluated against. `headers` are the
+    /// already-lowercased request headers built by the caller when header
+    /// rules exist; conditions on `request.headers[...]` reuse that map.
+    fn build_http_condition_attributes(
+        &self,
+        ctx: &RequestContext,
+        source_principal: Option<&SpiffeId>,
+        port: Option<u16>,
+        source_ip: Option<std::net::IpAddr>,
+        remote_ip: Option<std::net::IpAddr>,
+        headers: &BTreeMap<String, String>,
+    ) -> BTreeMap<String, MeshAuthzAttribute> {
+        let mut attributes = BTreeMap::new();
+        let keys = &self.condition_keys;
+        if !keys.any {
+            return attributes;
+        }
+        if keys.source_principal
+            && let Some(principal) = source_principal
+        {
+            attributes.insert(
+                ATTR_SOURCE_PRINCIPAL.to_string(),
+                istio_source_principal(principal).to_string().into(),
+            );
+        }
+        if keys.source_namespace
+            && let Some(namespace) = source_principal.and_then(|principal| principal.namespace())
+        {
+            attributes.insert(
+                ATTR_SOURCE_NAMESPACE.to_string(),
+                namespace.to_string().into(),
+            );
+        }
+        if keys.request_auth_principal
+            && let Some(principal) = ctx.metadata.get("mesh.request_principal")
+        {
+            attributes.insert(
+                ATTR_REQUEST_AUTH_PRINCIPAL.to_string(),
+                principal.clone().into(),
+            );
+        }
+        if keys.request_auth_presenter
+            && let Some(presenter) = ctx.mesh_request_auth_claims.get("azp")
+            && let Some(presenter) = jwt_scalar_attribute_to_mesh_attribute(presenter)
+        {
+            attributes.insert(ATTR_REQUEST_AUTH_PRESENTER.to_string(), presenter);
+        }
+        if keys.request_auth_audiences && !ctx.mesh_request_auth_audiences.is_empty() {
+            attributes.insert(
+                ATTR_REQUEST_AUTH_AUDIENCES.to_string(),
+                MeshAuthzAttribute::StringList(ctx.mesh_request_auth_audiences.clone()),
+            );
+        }
+        if keys.destination_port
+            && let Some(port) = port
+        {
+            attributes.insert(ATTR_DESTINATION_PORT.to_string(), port.to_string().into());
+        }
+        if keys.connection_sni
+            && let Some(sni) = ctx.frontend_sni_hostname.as_ref()
+        {
+            attributes.insert(ATTR_CONNECTION_SNI.to_string(), sni.clone().into());
+        }
+        // `source.ip` / `remote.ip` as string `when:` attributes. `source.ip`
+        // is the direct downstream peer, while `remote.ip` is the trusted
+        // forwarded/original client IP when one was resolved.
+        if keys.source_ip
+            && let Some(ip) = source_ip
+        {
+            attributes.insert(ATTR_SOURCE_IP.to_string(), ip.to_string().into());
+        }
+        if keys.remote_ip
+            && let Some(ip) = remote_ip
+        {
+            attributes.insert(ATTR_REMOTE_IP.to_string(), ip.to_string().into());
+        }
+        for header_key in &keys.header_keys {
+            if let Some(name) = bracketed_attribute_name(header_key, ATTR_REQUEST_HEADERS_PREFIX)
+                && let Some(value) = http_header_attribute(ctx, headers, name)
+            {
+                attributes.insert(header_key.clone(), value.into());
+            }
+        }
+        for claim_key in &keys.claim_keys {
+            if let Some(name) = bracketed_attribute_name(claim_key, ATTR_REQUEST_AUTH_CLAIMS_PREFIX)
+                && let Some(value) = ctx.mesh_request_auth_claims.get(name)
+            {
+                attributes.insert(claim_key.clone(), jwt_attribute_to_mesh_attribute(value));
+            }
+        }
+        attributes
+    }
+
+    /// Build the Istio `when:` attribute map for a stream (TCP/UDP)
+    /// connection. Only source identity, destination port, connection SNI,
+    /// and IP attributes are available on a stream — HTTP headers and JWT
+    /// claims are HTTP-only and are intentionally absent so a `when:`
+    /// condition on them fails closed (Istio values-check requires presence).
+    fn build_stream_condition_attributes(
+        &self,
+        ctx: &StreamConnectionContext,
+        source_principal: Option<&SpiffeId>,
+        resolved_ip: Option<std::net::IpAddr>,
+    ) -> BTreeMap<String, MeshAuthzAttribute> {
+        let mut attributes = BTreeMap::new();
+        let keys = &self.condition_keys;
+        if !keys.any {
+            return attributes;
+        }
+        if keys.source_principal
+            && let Some(principal) = source_principal
+        {
+            attributes.insert(
+                ATTR_SOURCE_PRINCIPAL.to_string(),
+                istio_source_principal(principal).to_string().into(),
+            );
+        }
+        if keys.source_namespace
+            && let Some(namespace) = source_principal.and_then(|principal| principal.namespace())
+        {
+            attributes.insert(
+                ATTR_SOURCE_NAMESPACE.to_string(),
+                namespace.to_string().into(),
+            );
+        }
+        if keys.destination_port {
+            attributes.insert(
+                ATTR_DESTINATION_PORT.to_string(),
+                ctx.listen_port.to_string().into(),
+            );
+        }
+        if keys.connection_sni
+            && let Some(sni) = ctx.sni_hostname.as_ref()
+        {
+            attributes.insert(ATTR_CONNECTION_SNI.to_string(), sni.clone().into());
+        }
+        if keys.source_ip
+            && let Some(ip) = resolved_ip
+        {
+            attributes.insert(ATTR_SOURCE_IP.to_string(), ip.to_string().into());
+        }
+        if keys.remote_ip
+            && let Some(ip) = resolved_ip
+        {
+            attributes.insert(ATTR_REMOTE_IP.to_string(), ip.to_string().into());
+        }
+        attributes
     }
 
     /// Predicate used by [`MeshAuthz::authorize`] to decide whether a
@@ -377,19 +688,40 @@ impl Plugin for MeshAuthz {
             BTreeMap::new()
         };
         let request_principal = ctx.metadata.get("mesh.request_principal").cloned();
+        let port = ctx.frontend_listen_port.or_else(|| {
+            ctx.matched_proxy
+                .as_ref()
+                .and_then(|proxy| proxy.listen_port)
+        });
+        // Istio source IP matchers. `source.ip` is the immediate downstream
+        // socket peer captured before trusted-proxy rewriting; `remote.ip` is
+        // the gateway-resolved client IP after XFF / real-IP resolution.
+        let source_ip = parse_client_ip(&ctx.direct_client_ip);
+        let remote_ip = parse_client_ip(&ctx.client_ip);
+        // Istio `when:` attributes. Built from the resolved authz principal
+        // (post-baggage rewrite) plus request metadata/headers, and only for
+        // the keys some loaded policy references (`condition_keys`). Without
+        // this, condition-gated DENY rules never fired and condition-gated
+        // ALLOW rules never matched — a fail-open hole this closes.
+        let attributes = self.build_http_condition_attributes(
+            ctx,
+            source_principal.as_ref(),
+            port,
+            source_ip,
+            remote_ip,
+            &headers,
+        );
         let request = MeshAuthzRequest {
             source_principal,
             request_principal,
             method: Some(ctx.method.clone()),
             path: Some(ctx.path.clone()),
             host,
-            port: ctx.frontend_listen_port.or_else(|| {
-                ctx.matched_proxy
-                    .as_ref()
-                    .and_then(|proxy| proxy.listen_port)
-            }),
+            port,
             headers,
-            attributes: BTreeMap::new(),
+            attributes,
+            source_ip,
+            remote_ip,
         };
         // GAP-2M.4: per-pod scoping for node-waypoint topology.
         //
@@ -473,16 +805,35 @@ impl Plugin for MeshAuthz {
                     .and_then(|value| SpiffeId::new(value).ok())
             });
         let source_for_log = source_principal.as_ref().map(|id| id.as_str().to_string());
+        // Istio `when:` attributes for stream (TCP/UDP) connections. No HTTP
+        // headers or JWT here, but source identity, destination port,
+        // connection SNI, and source/remote IP are all available.
+        let resolved_ip = parse_client_ip(&ctx.client_ip);
+        let attributes =
+            self.build_stream_condition_attributes(ctx, source_principal.as_ref(), resolved_ip);
         let request = MeshAuthzRequest {
             source_principal,
             port: Some(ctx.listen_port),
-            attributes: BTreeMap::new(),
+            attributes,
+            source_ip: resolved_ip,
+            remote_ip: resolved_ip,
             ..MeshAuthzRequest::default()
         };
-        let result = self.decision_to_result(
-            evaluate_mesh_authorization(&self.slice, &request),
-            &mut metadata,
-        );
+        let decision = if self.per_pod_policy_scoping {
+            let scope = ctx.node_waypoint_policy_scope.as_deref();
+            if scope.is_none() {
+                metadata.insert("mesh_authz.scope_missing".to_string(), "true".to_string());
+            }
+            let policies = self
+                .slice
+                .mesh_policies
+                .iter()
+                .filter(|policy| Self::policy_applies_to_pod(policy, scope));
+            evaluate_mesh_authorization_policies(policies, &request)
+        } else {
+            evaluate_mesh_authorization(&self.slice, &request)
+        };
+        let result = self.decision_to_result(decision, &mut metadata);
         if matches!(
             result,
             PluginResult::Reject { .. } | PluginResult::RejectBinary { .. }
@@ -580,6 +931,68 @@ enum BaggageOutcome {
     /// Nothing to surface — non-HBONE request, no baggage, or no authenticated
     /// peer.
     NoBaggageOrNonHbone,
+}
+
+fn validate_policy_ip_inputs(policies: &[MeshPolicy]) -> Result<(), String> {
+    for policy in policies {
+        for (rule_idx, rule) in policy.rules.iter().enumerate() {
+            // Source negation IP blocks are pre-validated at ParsedCidr
+            // parse/deserialization time. Only condition IP blocks (stored
+            // as strings) need runtime validation here.
+            for (condition_idx, condition) in rule.when.iter().enumerate() {
+                if !is_supported_mesh_condition_key(&condition.key) {
+                    return Err(format!(
+                        "mesh_authz: unsupported condition key in policy '{}'/{} rule {} when {}: '{}'",
+                        policy.namespace, policy.name, rule_idx, condition_idx, condition.key
+                    ));
+                }
+                if !mesh_condition_has_values(condition) {
+                    return Err(format!(
+                        "mesh_authz: condition in policy '{}'/{} rule {} when {} key '{}' must set values or notValues",
+                        policy.namespace, policy.name, rule_idx, condition_idx, condition.key
+                    ));
+                }
+                if is_mesh_condition_ip_key(&condition.key) {
+                    validate_condition_ip_blocks(
+                        policy,
+                        rule_idx,
+                        condition_idx,
+                        &condition.key,
+                        "values",
+                        &condition.values,
+                    )?;
+                    validate_condition_ip_blocks(
+                        policy,
+                        rule_idx,
+                        condition_idx,
+                        &condition.key,
+                        "notValues",
+                        &condition.not_values,
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_condition_ip_blocks(
+    policy: &MeshPolicy,
+    rule_idx: usize,
+    condition_idx: usize,
+    key: &str,
+    field: &str,
+    blocks: &[String],
+) -> Result<(), String> {
+    for block in blocks {
+        validate_mesh_condition_ip_block(block).map_err(|reason| {
+            format!(
+                "mesh_authz: invalid condition IP block in policy '{}'/{} rule {} when {} key '{}' field {}: '{}' is invalid: {}",
+                policy.namespace, policy.name, rule_idx, condition_idx, key, field, block, reason
+            )
+        })?;
+    }
+    Ok(())
 }
 
 pub(crate) fn parse_trust_domain_aliases(config: &Value) -> Result<Vec<TrustDomain>, String> {

@@ -55,6 +55,56 @@ pub struct PodInfo {
     pub _pad: u32,
 }
 
+/// Per-cgroup workload identity in the `FERRUM_WORKLOAD_IDENTITY` map, keyed by
+/// cgroup id (`bpf_get_current_cgroup_id`).
+///
+/// The node-agent writes one entry per enrolled pod cgroup so the connect
+/// hooks (which run in the pod's cgroup context) can stamp the original
+/// destination record with the source pod's identity. Without this, the
+/// connect programs hardcode `pod_uid: [0; 16]` / `workload_spiffe_hash: 0`
+/// and the node-waypoint resolver can never recover a real identity from the
+/// `FERRUM_ORIG_DST4/6` records.
+///
+/// Both fields zero means "node-agent has not enrolled this cgroup yet"; the
+/// connect program copies them through verbatim, and node-waypoint identity
+/// resolution treats an all-zero `pod_uid` as fail-closed.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WorkloadIdentity {
+    /// Kubernetes pod UID encoded as raw UUID bytes.
+    pub pod_uid: [u8; 16],
+    /// Stable first-eight-bytes SHA-256 hash of the workload SPIFFE ID.
+    pub workload_spiffe_hash: u64,
+    /// Reserved for future fields; keeps the struct 8-byte aligned for the
+    /// BPF verifier and leaves headroom without an ABI break.
+    pub _pad: u64,
+}
+
+impl WorkloadIdentity {
+    /// Construct an identity entry. `pod_uid` is the raw 16-byte UUID;
+    /// `workload_spiffe_hash` is the first-eight-bytes SHA-256 of the SPIFFE
+    /// ID (matching `OrigDst4::workload_spiffe_hash`).
+    pub const fn new(pod_uid: [u8; 16], workload_spiffe_hash: u64) -> Self {
+        Self {
+            pod_uid,
+            workload_spiffe_hash,
+            _pad: 0,
+        }
+    }
+
+    /// The all-zero sentinel the connect hooks fall back to when no entry
+    /// exists for the cgroup. Node-waypoint resolution treats this as
+    /// fail-closed (unknown identity).
+    pub const fn unknown() -> Self {
+        Self::new([0u8; 16], 0)
+    }
+
+    /// `true` when neither the pod UID nor the SPIFFE hash has been populated.
+    pub fn is_unknown(&self) -> bool {
+        self.workload_spiffe_hash == 0 && self.pod_uid == [0u8; 16]
+    }
+}
+
 /// Node-agent supplied capture settings in the `FERRUM_CAPTURE_CONFIG` map.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -265,6 +315,10 @@ mod tests {
         assert_eq!(mem::size_of::<OrigDst4>(), 32);
         assert_eq!(mem::size_of::<OrigDst6>(), 48);
         assert_eq!(mem::size_of::<PodInfo>(), 8);
+        // WorkloadIdentity: [u8;16] (16) + u64 (8) + u64 pad (8) = 32 bytes,
+        // 8-byte aligned for the BPF verifier.
+        assert_eq!(mem::size_of::<WorkloadIdentity>(), 32);
+        assert_eq!(mem::align_of::<WorkloadIdentity>(), 8);
         assert_eq!(mem::size_of::<BpfCaptureConfig>(), 8);
         assert_eq!(mem::size_of::<CidrKey4>(), 4);
         assert_eq!(mem::size_of::<CidrKey6>(), 16);
@@ -291,6 +345,26 @@ mod tests {
         assert_copy::<CidrKey6>();
         assert_copy::<IncludePortsPolicy>();
         assert_copy::<SockOpsRecord>();
+        assert_copy::<WorkloadIdentity>();
+    }
+
+    #[test]
+    fn workload_identity_unknown_sentinel() {
+        let unknown = WorkloadIdentity::unknown();
+        assert!(unknown.is_unknown());
+        assert_eq!(unknown.pod_uid, [0u8; 16]);
+        assert_eq!(unknown.workload_spiffe_hash, 0);
+    }
+
+    #[test]
+    fn workload_identity_populated_is_not_unknown() {
+        let identity = WorkloadIdentity::new([1u8; 16], 0x1122_3344_5566_7788);
+        assert!(!identity.is_unknown());
+        assert_eq!(identity.workload_spiffe_hash, 0x1122_3344_5566_7788);
+        // A pod UID with a zero hash is still "known" — the UID alone is a
+        // valid identity anchor (SPIFFE hash is supplementary).
+        let uid_only = WorkloadIdentity::new([2u8; 16], 0);
+        assert!(!uid_only.is_unknown());
     }
 
     #[test]
