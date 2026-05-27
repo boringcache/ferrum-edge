@@ -3549,7 +3549,15 @@ async fn serve_mesh_runtime(
                 &["https://remote-control-plane.invalid".to_string()],
                 "MeshRemoteDiscovery",
             )?,
-            plain_urls: build_dp_grpc_tls_config(&env_config, &[], "MeshRemoteDiscovery")?,
+            // The scheme is authoritative for plaintext remotes: a `grpc://` /
+            // `http://` control_plane_url must NOT get DP gRPC TLS material
+            // attached just because TLS env vars are set, or
+            // `fetch_remote_slice_endpoints` would attempt a TLS handshake
+            // against a plaintext port. (`build_dp_grpc_tls_config(.., &[], ..)`
+            // returns `Some(tls)` whenever any TLS env is set, independent of
+            // scheme — so force `None` here.) A `grpcs://` / `https://` remote
+            // uses `tls_urls` above.
+            plain_urls: None,
         };
         multicluster::RemoteDiscoveryConfig::new(
             env_config.mesh_remote_discovery_poll_interval_seconds,

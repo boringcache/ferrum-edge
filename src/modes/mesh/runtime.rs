@@ -254,9 +254,11 @@ impl MeshRuntimeState {
     }
 
     /// Returns the live remote-cluster endpoint store. Always present, even
-    /// when no discovery poller has been spawned — callers that need a "has
-    /// discovery populated anything" check should consult
-    /// [`RemoteEndpointStore::has_first_success`].
+    /// when no discovery poller has been spawned; in that case its snapshot is
+    /// simply empty. (Unlike `FederationStore`, no production "has discovery
+    /// populated anything" introspection is exposed yet — there is no
+    /// `/mesh/remote-clusters` admin surface, so `has_first_success` remains
+    /// test-only until one lands.)
     pub fn remote_endpoint_store(&self) -> &RemoteEndpointStore {
         &self.remote_endpoint_store
     }

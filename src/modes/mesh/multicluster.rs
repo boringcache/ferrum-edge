@@ -197,19 +197,18 @@ impl RemoteEndpointStore {
     ///
     /// When the endpoints are byte-identical to what is already stored, the
     /// revision is NOT bumped and the apply task is not woken (F2).
-    fn install(&self, entry: RemoteClusterEntry, task_generation: u64) {
+    ///
+    /// Returns `true` only when this call actually mutated the snapshot (a real
+    /// install), so callers can avoid logging "installed" on a deduped or
+    /// retired-cluster no-op.
+    fn install(&self, entry: RemoteClusterEntry, task_generation: u64) -> bool {
         let name = entry.cluster_name.clone();
-        // Generation check: bail out if the task's cluster slot was retired.
-        {
-            let gens = self.cluster_generation.load();
-            match gens.get(&name) {
-                Some(&g) if g == task_generation => {}
-                _ => {
-                    // Task is stale — its cluster was removed (or re-registered
-                    // at a higher generation) after the fetch started.
-                    return;
-                }
-            }
+        // Fast-path generation check: bail out early if the task's cluster slot
+        // was already retired, avoiding the dedup load + clone for stale tasks.
+        // This is re-validated atomically inside the rcu below — it is only an
+        // optimization, not the authoritative check.
+        if !self.cluster_generation_matches(&name, task_generation) {
+            return false;
         }
         // No-op dedup: skip the revision bump when the endpoints are unchanged.
         {
@@ -220,18 +219,48 @@ impl RemoteEndpointStore {
                 .is_some_and(|existing| existing.endpoints == entry.endpoints)
             {
                 // Endpoints are identical — do not wake the apply task.
-                return;
+                return false;
             }
         }
         // CAS loop so two concurrent successful polls (different clusters)
-        // cannot stomp each other's snapshot clone.
+        // cannot stomp each other's snapshot clone. The generation is re-checked
+        // INSIDE the closure so the check-and-insert is atomic with respect to
+        // `remove()`: `remove` retires the generation (in `cluster_generation`)
+        // BEFORE clearing endpoints (in `inner`). So if a `remove` races this
+        // mid-flight install, either (a) this rcu commits first and `remove`'s
+        // subsequent `inner` clear drops the endpoints, or (b) `remove`'s `inner`
+        // clear wins the CAS, this closure retries, re-reads the now-retired
+        // generation, and skips — never reintroducing endpoints for a removed
+        // cluster. Without the in-closure recheck, a stale task could insert
+        // after `remove` had already cleared the cluster (the F6 race, widened
+        // to the trust-withdrawal case).
+        let mut installed = false;
         self.inner.rcu(|current| {
+            if !self.cluster_generation_matches(&name, task_generation) {
+                installed = false;
+                return Arc::clone(current);
+            }
             let mut next = (**current).clone();
             next.clusters.insert(name.clone(), entry.clone());
+            installed = true;
             Arc::new(next)
         });
-        self.first_ready.store(true, Ordering::Release);
-        self.revision_tx.send_modify(|revision| *revision += 1);
+        if installed {
+            self.first_ready.store(true, Ordering::Release);
+            self.revision_tx.send_modify(|revision| *revision += 1);
+        }
+        installed
+    }
+
+    /// Whether `task_generation` still matches the cluster's registered
+    /// generation slot. Returns `false` once `remove()` has retired the slot (or
+    /// it was re-registered at a newer generation), which is how an in-flight
+    /// poll task for a removed/untrusted cluster is prevented from installing.
+    fn cluster_generation_matches(&self, cluster_name: &str, task_generation: u64) -> bool {
+        self.cluster_generation
+            .load()
+            .get(cluster_name)
+            .is_some_and(|&g| g == task_generation)
     }
 
     /// Remove a remote cluster's endpoints (slice no longer lists it or trust was
@@ -869,16 +898,35 @@ async fn remote_discovery_loop(
                     endpoints,
                     fetched_at_unix_seconds: now,
                 };
-                info!(
-                    cluster = %entry.cluster_name,
-                    trust_domain = %entry.trust_domain,
-                    network = entry.network.as_deref().unwrap_or(""),
-                    fetched_at_unix_seconds = entry.fetched_at_unix_seconds,
-                    control_plane = %url_for_logs,
-                    workloads = workload_count,
-                    "Installed remote-cluster endpoints"
-                );
-                store.install(entry, task_generation);
+                // Capture the summary fields before moving `entry` into
+                // `install`, so the log can fire on the actual install result.
+                let log_trust_domain = entry.trust_domain.clone();
+                let log_network = entry.network.clone();
+                let log_fetched_at = entry.fetched_at_unix_seconds;
+                let installed = store.install(entry, task_generation);
+                if installed {
+                    info!(
+                        cluster = %ctx.cluster_name,
+                        trust_domain = %log_trust_domain,
+                        network = log_network.as_deref().unwrap_or(""),
+                        fetched_at_unix_seconds = log_fetched_at,
+                        control_plane = %url_for_logs,
+                        workloads = workload_count,
+                        "Installed remote-cluster endpoints"
+                    );
+                } else {
+                    // Poll succeeded but the snapshot was unchanged — endpoints
+                    // identical (F2 dedup) or the cluster's generation was
+                    // retired mid-flight (removed / trust withdrawn). Not an
+                    // "installed" event; keep it at debug to avoid steady-state
+                    // INFO spam every poll interval.
+                    debug!(
+                        cluster = %ctx.cluster_name,
+                        control_plane = %url_for_logs,
+                        workloads = workload_count,
+                        "Remote-cluster poll succeeded with no endpoint change; not re-installing"
+                    );
+                }
                 backoff_secs = REMOTE_BACKOFF_INITIAL_SECS;
                 let elapsed = attempt_started_at.elapsed();
                 (true, ctx.config.poll_interval.saturating_sub(elapsed))
