@@ -3530,29 +3530,64 @@ async fn serve_mesh_runtime(
     // `RemoteCluster.control_plane_url`. This is fail-closed on trust: a remote
     // cluster is only dialed while a federated trust bundle for its trust domain
     // exists, and stale endpoints are removed when config or trust withdraws.
-    let remote_grpc_secret = env_config.cp_dp_grpc_jwt_secret.clone().map(|secret| {
-        crate::grpc::dp_client::GrpcJwtSecret::with_issuer(
-            secret,
-            env_config.cp_dp_grpc_jwt_issuer.clone(),
+    // Guard the entire TLS-build + discovery-config block: when the interval
+    // is 0 (the default — discovery is disabled), skip the TLS material clone,
+    // the build_dp_grpc_tls_config calls, and the associated log lines entirely.
+    // Previously these ran unconditionally, causing cert-file reads and a
+    // "MeshRemoteDiscovery gRPC TLS configured" log on every mesh startup even
+    // when discovery was never enabled (F4).
+    let remote_discovery_config = if env_config.mesh_remote_discovery_poll_interval_seconds != 0 {
+        let remote_grpc_secret = env_config.cp_dp_grpc_jwt_secret.clone().map(|secret| {
+            crate::grpc::dp_client::GrpcJwtSecret::with_issuer(
+                secret,
+                env_config.cp_dp_grpc_jwt_issuer.clone(),
+            )
+        });
+        let remote_grpc_tls = multicluster::RemoteDiscoveryTlsConfig {
+            tls_urls: build_dp_grpc_tls_config(
+                &env_config,
+                &["https://remote-control-plane.invalid".to_string()],
+                "MeshRemoteDiscovery",
+            )?,
+            plain_urls: build_dp_grpc_tls_config(&env_config, &[], "MeshRemoteDiscovery")?,
+        };
+        multicluster::RemoteDiscoveryConfig::new(
+            env_config.mesh_remote_discovery_poll_interval_seconds,
+            env_config.mesh_remote_discovery_poll_timeout_seconds,
+            remote_grpc_secret,
+            runtime.node_id.clone(),
+            runtime.namespace.clone(),
+            remote_grpc_tls,
         )
-    });
-    let remote_grpc_tls = multicluster::RemoteDiscoveryTlsConfig {
-        tls_urls: build_dp_grpc_tls_config(
-            &env_config,
-            &["https://remote-control-plane.invalid".to_string()],
-            "MeshRemoteDiscovery",
-        )?,
-        plain_urls: build_dp_grpc_tls_config(&env_config, &[], "MeshRemoteDiscovery")?,
+    } else {
+        None
     };
-    let remote_discovery_config = multicluster::RemoteDiscoveryConfig::new(
-        env_config.mesh_remote_discovery_poll_interval_seconds,
-        env_config.mesh_remote_discovery_poll_timeout_seconds,
-        remote_grpc_secret,
-        runtime.node_id.clone(),
-        runtime.namespace.clone(),
-        remote_grpc_tls,
-    );
     if let Some(remote_discovery_config) = remote_discovery_config {
+        // F1: warn when discovery is enabled but the local workload locality
+        // is absent. Without a source locality the priority-tier load balancer
+        // has no source region to prefer, so `target_locality_ranks` stays
+        // empty and ALL candidates (local + remote) are returned together —
+        // failing open rather than local-first. This is not a bug in the LB
+        // itself; it is the expected behavior when no locality is configured.
+        // However it is surprising to operators who enabled discovery expecting
+        // local-first failover. Emit a startup WARN so the misconfiguration is
+        // visible.
+        if initial_applied_mesh_slice
+            .as_deref()
+            .is_none_or(|slice| mesh_source_workload_locality(slice).is_none())
+        {
+            warn!(
+                poll_interval_seconds = env_config.mesh_remote_discovery_poll_interval_seconds,
+                "Cross-cluster endpoint discovery is enabled \
+                 (FERRUM_MESH_REMOTE_DISCOVERY_POLL_INTERVAL_SECONDS > 0) but the local \
+                 workload source locality is not set (topology.kubernetes.io/region+zone \
+                 labels missing or SPIFFE-matched workload has no locality). \
+                 The locality-aware priority-tier load balancer requires a source locality \
+                 to prefer local endpoints over remote ones; without it, local and remote \
+                 endpoints are selected together (fails open, not local-first). \
+                 See docs/mesh.md \"Cross-Cluster Endpoint Discovery\" for the precondition."
+            );
+        }
         let remote_discovery_manager = multicluster::RemoteDiscoveryManager::new(
             Some(remote_discovery_config),
             mesh_state.remote_endpoint_store().clone(),

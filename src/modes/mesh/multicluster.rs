@@ -48,7 +48,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
@@ -119,6 +119,16 @@ pub struct RemoteEndpointStore {
     /// re-runs even when the local CP config is unchanged (a remote cluster
     /// scaling up/down must re-materialize the aggregated upstream targets).
     revision_tx: Arc<watch::Sender<u64>>,
+    /// Monotonically-increasing generation counter. `RemoteDiscoveryManager`
+    /// stamps each poll task with the generation at launch; `install` checks
+    /// that the task's generation is still current before committing an update.
+    /// This prevents a task that was aborted during a mid-flight `fetch()` from
+    /// installing its (now stale) result after `remove()` has already cleared
+    /// the cluster — closing the abort→install race (F6).
+    generation: Arc<AtomicU64>,
+    /// Generation at which each cluster was last registered. Stored alongside
+    /// the snapshot so `install` can compare atomically.
+    cluster_generation: Arc<ArcSwap<HashMap<String, u64>>>,
 }
 
 impl Default for RemoteEndpointStore {
@@ -128,6 +138,8 @@ impl Default for RemoteEndpointStore {
             inner: Arc::new(ArcSwap::new(Arc::new(RemoteEndpointSnapshot::default()))),
             first_ready: Arc::new(AtomicBool::new(false)),
             revision_tx: Arc::new(revision_tx),
+            generation: Arc::new(AtomicU64::new(0)),
+            cluster_generation: Arc::new(ArcSwap::new(Arc::new(HashMap::new()))),
         }
     }
 }
@@ -153,10 +165,66 @@ impl RemoteEndpointStore {
         self.revision_tx.subscribe()
     }
 
-    fn install(&self, entry: RemoteClusterEntry) {
+    /// Test helper: register a cluster and immediately install its entry in one
+    /// step. Production code must use `register_cluster` + `install` so the
+    /// generation token is passed through the poll task.
+    #[cfg(test)]
+    pub fn install_for_test(&self, entry: RemoteClusterEntry) {
+        let new_gen = self.register_cluster(&entry.cluster_name);
+        self.install(entry, new_gen);
+    }
+
+    /// Register a newly-started poll task for `cluster_name` and return its
+    /// generation token. The task must pass this token back to `install`; if the
+    /// token no longer matches the cluster's current generation (because the
+    /// cluster was removed and re-added, or removed and not re-added) the
+    /// install is silently dropped, preventing the abort→install race (F6).
+    pub(crate) fn register_cluster(&self, cluster_name: &str) -> u64 {
+        let new_gen = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        self.cluster_generation.rcu(|current| {
+            let mut next = (**current).clone();
+            next.insert(cluster_name.to_string(), new_gen);
+            Arc::new(next)
+        });
+        new_gen
+    }
+
+    /// Install remote endpoints for a cluster **only** when `task_generation`
+    /// still matches the cluster's registered generation. A task whose cluster
+    /// was removed (or removed + re-started at a newer generation) while the
+    /// task was mid-`fetch` will find a mismatched generation and its result
+    /// is discarded — closing the abort→install race (F6).
+    ///
+    /// When the endpoints are byte-identical to what is already stored, the
+    /// revision is NOT bumped and the apply task is not woken (F2).
+    fn install(&self, entry: RemoteClusterEntry, task_generation: u64) {
+        let name = entry.cluster_name.clone();
+        // Generation check: bail out if the task's cluster slot was retired.
+        {
+            let gens = self.cluster_generation.load();
+            match gens.get(&name) {
+                Some(&g) if g == task_generation => {}
+                _ => {
+                    // Task is stale — its cluster was removed (or re-registered
+                    // at a higher generation) after the fetch started.
+                    return;
+                }
+            }
+        }
+        // No-op dedup: skip the revision bump when the endpoints are unchanged.
+        {
+            let current = self.inner.load();
+            if current
+                .clusters
+                .get(&name)
+                .is_some_and(|existing| existing.endpoints == entry.endpoints)
+            {
+                // Endpoints are identical — do not wake the apply task.
+                return;
+            }
+        }
         // CAS loop so two concurrent successful polls (different clusters)
         // cannot stomp each other's snapshot clone.
-        let name = entry.cluster_name.clone();
         self.inner.rcu(|current| {
             let mut next = (**current).clone();
             next.clusters.insert(name.clone(), entry.clone());
@@ -167,8 +235,20 @@ impl RemoteEndpointStore {
     }
 
     /// Remove a remote cluster's endpoints (slice no longer lists it or trust was
-    /// withdrawn). No-op if untracked.
+    /// withdrawn). Also retires the generation slot so any in-flight poll task
+    /// for this cluster sees a stale generation and cannot reinstall after removal.
+    /// No-op if untracked.
     pub fn remove(&self, cluster_name: &str) {
+        // Retire the cluster's generation so any in-flight task sees mismatch.
+        self.cluster_generation.rcu(|current| {
+            if current.contains_key(cluster_name) {
+                let mut next = (**current).clone();
+                next.remove(cluster_name);
+                Arc::new(next)
+            } else {
+                Arc::clone(current)
+            }
+        });
         let mut changed = false;
         self.inner.rcu(|current| {
             if current.clusters.contains_key(cluster_name) {
@@ -481,6 +561,11 @@ impl RemoteDiscoveryManager {
         };
         let source = (self.source_factory)(&ctx);
         let task_store = self.store.clone();
+        // Register a generation token *before* spawning so the task's first
+        // install can be validated. The generation is bumped again in `remove`,
+        // so a task aborted mid-fetch cannot reinstall after its cluster is
+        // removed (F6).
+        let task_generation = self.store.register_cluster(&target.cluster_name);
         let (cluster_shutdown_tx, cluster_shutdown_rx) = watch::channel(false);
         let url_for_logs = sanitize_url_for_logging(&target.control_plane_url);
         info!(
@@ -491,7 +576,14 @@ impl RemoteDiscoveryManager {
             "Spawning remote-cluster endpoint discovery"
         );
         let handle = tokio::spawn(async move {
-            remote_discovery_loop(ctx, source, task_store, cluster_shutdown_rx).await;
+            remote_discovery_loop(
+                ctx,
+                source,
+                task_store,
+                cluster_shutdown_rx,
+                task_generation,
+            )
+            .await;
         });
         self.running.insert(
             target.cluster_name.clone(),
@@ -529,11 +621,15 @@ pub struct RemoteDiscoveryTlsConfig {
 
 impl RemoteDiscoveryTlsConfig {
     fn for_control_plane_url(&self, url: &str) -> Option<DpGrpcTlsConfig> {
+        // URLs reaching this method are already normalized by
+        // `normalize_control_plane_url` (grpcs→https, grpc→http), so matching
+        // on `https` is sufficient. The `grpcs` arm is retained as belt-and-
+        // suspenders for any caller that passes a non-normalized URL.
         match reqwest::Url::parse(url)
             .ok()
             .map(|parsed| parsed.scheme().to_string())
         {
-            Some(scheme) if scheme == "https" => self.tls_urls.clone(),
+            Some(scheme) if scheme == "https" || scheme == "grpcs" => self.tls_urls.clone(),
             _ => self.plain_urls.clone(),
         }
     }
@@ -624,20 +720,48 @@ fn poll_targets_for_multi_cluster(
                 cluster_name: remote.name.clone(),
                 trust_domain: remote.trust_domain.clone(),
                 network: remote.network.clone(),
-                control_plane_url: url.to_string(),
+                // Normalize grpc:// → http:// and grpcs:// → https:// so the
+                // dialer and TLS-selection logic always see canonical schemes.
+                control_plane_url: normalize_control_plane_url(url),
             })
         })
         .collect()
 }
 
-/// Validate a `control_plane_url`: must parse, must be `http`/`https`/`grpc`,
-/// and must carry a host. Cloud-metadata / link-local hosts are rejected
-/// (SSRF defense), mirroring [`super::federation::validate_federation_endpoint`].
-/// Loopback is allowed for local development / integration-test control planes.
+/// Normalize a `control_plane_url` for dialing.
+///
+/// `grpc://` is normalized to `http://` and `grpcs://` to `https://` so that:
+/// - `tonic::Channel::from_shared` receives a scheme it understands (`http`/`https`).
+/// - TLS selection in [`RemoteDiscoveryTlsConfig::for_control_plane_url`] keys off
+///   `https` correctly: a `grpcs://` CP gets TLS; a `grpc://` CP gets plaintext.
+///
+/// `http`/`https` URLs are returned unchanged.
+pub(crate) fn normalize_control_plane_url(url: &str) -> String {
+    if let Some(rest) = url.strip_prefix("grpcs://") {
+        format!("https://{rest}")
+    } else if let Some(rest) = url.strip_prefix("grpc://") {
+        format!("http://{rest}")
+    } else {
+        url.to_string()
+    }
+}
+
+/// Validate a `control_plane_url`: must parse, must be
+/// `http`/`https`/`grpc`/`grpcs`, and must carry a host. Cloud-metadata /
+/// link-local hosts are rejected (SSRF defense), mirroring
+/// [`super::federation::validate_federation_endpoint`]. Loopback is allowed
+/// for local development / integration-test control planes.
+///
+/// `grpc://` and `grpcs://` are accepted and normalized to `http://` /
+/// `https://` by [`normalize_control_plane_url`] before dialing so that
+/// `tonic::Channel::from_shared` receives a scheme it understands.
 pub(crate) fn validate_control_plane_url(url: &str) -> Result<(), String> {
-    let parsed = reqwest::Url::parse(url).map_err(|e| format!("invalid control_plane_url: {e}"))?;
+    // Normalise before parsing so the scheme check is on the canonical form.
+    let normalized = normalize_control_plane_url(url);
+    let parsed =
+        reqwest::Url::parse(&normalized).map_err(|e| format!("invalid control_plane_url: {e}"))?;
     match parsed.scheme() {
-        "http" | "https" | "grpc" => {}
+        "http" | "https" => {}
         other => return Err(format!("unsupported control_plane_url scheme '{other}'")),
     }
     let Some(host) = parsed.host() else {
@@ -675,8 +799,9 @@ pub(crate) fn validate_control_plane_url(url: &str) -> Result<(), String> {
             }
         }
         url::Host::Domain(_) => {
-            // Hostnames resolve at dial time; the DNS layer enforces any
-            // operator-configured backend IP policy.
+            // Hostnames resolve at dial time. Domain-based SSRF defense relies
+            // on operator network controls; Ferrum does not resolve or validate
+            // the resulting IP for tonic-dialed remote CPs (see F5).
         }
     }
     Ok(())
@@ -716,6 +841,7 @@ async fn remote_discovery_loop(
     source: Arc<dyn RemoteServiceSource>,
     store: RemoteEndpointStore,
     mut shutdown_rx: watch::Receiver<bool>,
+    task_generation: u64,
 ) {
     let mut backoff_secs = REMOTE_BACKOFF_INITIAL_SECS;
     let url_for_logs = sanitize_url_for_logging(&ctx.control_plane_url);
@@ -752,7 +878,7 @@ async fn remote_discovery_loop(
                     workloads = workload_count,
                     "Installed remote-cluster endpoints"
                 );
-                store.install(entry);
+                store.install(entry, task_generation);
                 backoff_secs = REMOTE_BACKOFF_INITIAL_SECS;
                 let elapsed = attempt_started_at.elapsed();
                 (true, ctx.config.poll_interval.saturating_sub(elapsed))
@@ -1230,7 +1356,7 @@ mod tests {
         assert!(!store.has_first_success());
         assert!(store.snapshot().is_empty());
 
-        store.install(RemoteClusterEntry {
+        store.install_for_test(RemoteClusterEntry {
             cluster_name: "west".to_string(),
             trust_domain: td("remote.local"),
             network: None,
@@ -1316,7 +1442,7 @@ mod tests {
 
         manager.reconcile(Some(&mc), trusted);
         assert_eq!(manager.running_cluster_names(), vec!["west"]);
-        store.install(RemoteClusterEntry {
+        store.install_for_test(RemoteClusterEntry {
             cluster_name: "west".to_string(),
             trust_domain: td("remote.local"),
             network: None,
@@ -1345,10 +1471,58 @@ mod tests {
     #[test]
     fn validate_control_plane_url_rejects_metadata_and_bad_scheme() {
         assert!(validate_control_plane_url("https://cp.example:15010").is_ok());
+        assert!(validate_control_plane_url("http://cp.example:15010").is_ok());
+        // grpc:// and grpcs:// are normalized to http:// / https:// before
+        // validation (F3), so they must be accepted.
         assert!(validate_control_plane_url("grpc://cp.example:15010").is_ok());
+        assert!(validate_control_plane_url("grpcs://cp.example:15010").is_ok());
         assert!(validate_control_plane_url("ftp://cp.example").is_err());
         assert!(validate_control_plane_url("https://169.254.169.254/").is_err());
         assert!(validate_control_plane_url("not a url").is_err());
+    }
+
+    #[test]
+    fn normalize_control_plane_url_translates_grpc_schemes() {
+        assert_eq!(
+            normalize_control_plane_url("grpc://cp.example:15010"),
+            "http://cp.example:15010"
+        );
+        assert_eq!(
+            normalize_control_plane_url("grpcs://cp.example:15010"),
+            "https://cp.example:15010"
+        );
+        // http/https pass through unchanged.
+        assert_eq!(
+            normalize_control_plane_url("https://cp.example:15010"),
+            "https://cp.example:15010"
+        );
+        assert_eq!(
+            normalize_control_plane_url("http://cp.example:15010"),
+            "http://cp.example:15010"
+        );
+    }
+
+    #[test]
+    fn tls_selection_respects_grpcs_scheme() {
+        let tls_cfg = RemoteDiscoveryTlsConfig {
+            tls_urls: Some(DpGrpcTlsConfig {
+                no_verify: true,
+                ..DpGrpcTlsConfig::default()
+            }),
+            plain_urls: None,
+        };
+        // grpcs normalizes to https — must pick TLS config.
+        assert!(
+            tls_cfg
+                .for_control_plane_url("grpcs://cp.example:15010")
+                .is_some()
+        );
+        // grpc normalizes to http — must pick plain config (None here).
+        assert!(
+            tls_cfg
+                .for_control_plane_url("grpc://cp.example:15010")
+                .is_none()
+        );
     }
 
     #[test]
@@ -1445,8 +1619,9 @@ mod tests {
         };
 
         let task_store = store.clone();
+        let task_gen = store.register_cluster("west");
         let handle = tokio::spawn(async move {
-            remote_discovery_loop(ctx, source, task_store, shutdown_rx).await
+            remote_discovery_loop(ctx, source, task_store, shutdown_rx, task_gen).await
         });
 
         // Wait for the first successful install.
@@ -1488,5 +1663,83 @@ mod tests {
 
         let _ = shutdown_tx.send(true);
         let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
+
+    /// F6: a stale task whose cluster was removed (generation retired) cannot
+    /// reinstall endpoints after removal. Simulates the abort→install race:
+    /// task fetches successfully but `remove` runs before the task calls
+    /// `install`. With the generation guard the install must be a no-op.
+    #[test]
+    fn install_after_remove_is_blocked_by_generation_check() {
+        let store = RemoteEndpointStore::new();
+        // Register "west" and grab its generation (simulates start_cluster).
+        let stale_gen = store.register_cluster("west");
+        // Now remove the cluster (simulates trust withdrawal / reconcile remove).
+        store.remove("west");
+        // The stale task completes its fetch and tries to install.
+        let entry = RemoteClusterEntry {
+            cluster_name: "west".to_string(),
+            trust_domain: td("remote.local"),
+            network: None,
+            endpoints: RemoteClusterEndpoints {
+                workloads: vec![workload(
+                    "spiffe://remote.local/ns/default/sa/stale",
+                    "reviews",
+                    "10.2.0.99",
+                    None,
+                )],
+                services: vec![],
+            },
+            fetched_at_unix_seconds: 1,
+        };
+        // The install must be silently dropped — the generation slot is gone.
+        store.install(entry, stale_gen);
+        assert!(
+            store.snapshot().is_empty(),
+            "install with retired generation must not reinstate removed cluster"
+        );
+        assert!(
+            !store.has_first_success(),
+            "first_ready must not be set by a generation-blocked install"
+        );
+    }
+
+    /// F2: no-op polls (identical endpoints) must not bump the revision or
+    /// wake the slice-apply task.
+    #[test]
+    fn install_with_identical_endpoints_does_not_bump_revision() {
+        let store = RemoteEndpointStore::new();
+        let mut rx = store.subscribe();
+        let endpoints = RemoteClusterEndpoints {
+            workloads: vec![workload(
+                "spiffe://remote.local/ns/default/sa/a",
+                "reviews",
+                "10.2.0.1",
+                Some("remote-west"),
+            )],
+            services: vec![],
+        };
+        let entry = || RemoteClusterEntry {
+            cluster_name: "west".to_string(),
+            trust_domain: td("remote.local"),
+            network: None,
+            endpoints: endpoints.clone(),
+            fetched_at_unix_seconds: 1,
+        };
+        // First install: should bump the revision.
+        store.install_for_test(entry());
+        assert!(
+            rx.has_changed().unwrap(),
+            "first install must bump revision"
+        );
+        rx.mark_unchanged();
+        // Re-register to match the generation tracking (simulates the same
+        // task running its next poll with identical results).
+        let same_gen = store.register_cluster("west");
+        store.install(entry(), same_gen);
+        assert!(
+            !rx.has_changed().unwrap(),
+            "no-op poll with identical endpoints must not bump revision"
+        );
     }
 }
