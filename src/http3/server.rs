@@ -2042,8 +2042,14 @@ async fn handle_h3_request(
                     latency_gateway_overhead_ms: (gateway_processing_ms - plugin_execution_ms)
                         .max(0.0),
                     request_user_agent: proxy_headers.get("user-agent").cloned(),
-                    // Backend connection failed before any streaming began — the 502
-                    // response body is built and sent synchronously below.
+                    // Native H3 backend dispatch failed; the 502 response body is
+                    // built and sent synchronously below. This branch covers both
+                    // pre-wire failures (connect/handshake — zero request bytes
+                    // forwarded) and post-wire failures (send_data failed
+                    // mid-stream, or the client disconnected while sending the
+                    // request body), where request_body_bytes_seen is non-zero.
+                    // Loading it here reports the bytes actually forwarded before
+                    // the failure rather than assuming zero.
                     error_class: Some(h3_error_class),
                     bytes_sent: request_body_bytes_seen.load(std::sync::atomic::Ordering::Acquire),
                     metadata: crate::proxy::clone_log_metadata(&ctx),

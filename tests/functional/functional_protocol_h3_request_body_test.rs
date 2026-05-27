@@ -267,6 +267,25 @@ async fn functional_h3_request_body_zero_limit_forwards_large_post() {
     backend_task.abort();
 }
 
+/// Coverage scope (read before assuming this guards the native H3 byte
+/// plumbing): this test uses `backend_scheme: http`, which normalizes to
+/// `DispatchKind::HttpPool`, so an H3 frontend request takes the
+/// **cross-protocol bridge** to an HTTP/1.1 backend. On that path `bytes_sent`
+/// is sourced from the bridge's own counter (`http3/cross_protocol.rs`), so
+/// this exercises the bridge's request-byte accounting end to end.
+///
+/// It does NOT exercise the **native H3 backend pool** path — the
+/// `request_body_bytes_seen` / `bytes_seen.fetch_add(...)` plumbing in
+/// `http3/client.rs::do_request_streaming_body` and the native streaming block
+/// in `http3/server.rs`. That path runs only for `DispatchKind::HttpsPool`
+/// against an H3-capable backend (`backend_scheme: https` +
+/// `FERRUM_POOL_WARMUP_ENABLED=true` so the capability registry marks H3
+/// `Supported`). Adding native-pool byte-count coverage requires a scripted
+/// QUIC/H3 backend that consumes the request body and responds — see the
+/// `tests/functional/scripted_backend_h3_tests.rs` harness
+/// (`spawn_h3_harness_with_explicit_https_port`, `wait_for_capability_entry`)
+/// — and is tracked as a follow-up; it needs a body-consuming `ScriptedH3Backend`
+/// step the current capability-probe harness does not yet provide.
 #[ignore]
 #[tokio::test]
 async fn functional_h3_streaming_request_logs_request_body_bytes() {
