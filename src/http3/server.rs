@@ -1789,6 +1789,7 @@ async fn handle_h3_request(
             requires_ws_frame_hooks,
             is_early_data,
             strip_len,
+            original_request_path.clone(),
         )
         .await;
     }
