@@ -2175,6 +2175,41 @@ fn virtual_service_routes(
     object: &K8sObject,
     acc: &mut K8sAccumulator,
 ) -> Result<VsRouteResult, K8sTranslateError> {
+    // L4 routing (`spec.tcp[]` SNI/port → destination and `spec.tls[]` SNI →
+    // destination) is not yet materialized into Ferrum stream/SNI proxies.
+    // FAIL CLOSED rather than silently dropping these routes: a VirtualService
+    // that relies on L4 routing must not appear to translate cleanly while its
+    // TCP/TLS traffic is blackholed. Surface a warning for operator visibility
+    // and reject the resource (consistent with how EnvoyFilter is rejected).
+    let tcp_routes = object.spec.get("tcp").and_then(Value::as_array);
+    let tls_routes = object.spec.get("tls").and_then(Value::as_array);
+    let has_tcp = tcp_routes.is_some_and(|r| !r.is_empty());
+    let has_tls = tls_routes.is_some_and(|r| !r.is_empty());
+    if has_tcp || has_tls {
+        let mut kinds = Vec::with_capacity(2);
+        if has_tcp {
+            kinds.push("spec.tcp");
+        }
+        if has_tls {
+            kinds.push("spec.tls");
+        }
+        let kinds = kinds.join(" / ");
+        acc.warnings.push(format!(
+            "VirtualService '{}/{}' declares L4 routes ({}); Ferrum does not yet materialize \
+             VirtualService L4 (TCP/TLS-SNI) routing and fails closed rather than silently \
+             dropping them. Model L4 routing with an explicit stream Proxy / east-west gateway \
+             SNI passthrough instead.",
+            object.metadata.namespace, object.metadata.name, kinds
+        ));
+        return Err(invalid_resource(
+            object,
+            format!(
+                "VirtualService L4 routing ({kinds}) is not supported; remove the L4 routes or \
+                 model them as a stream Proxy. Failing closed to avoid silently dropping L4 traffic."
+            ),
+        ));
+    }
+
     let hosts = string_array(&object.spec, "hosts");
     let mut proxies = Vec::new();
     let mut upstreams = Vec::new();
@@ -2197,12 +2232,30 @@ fn virtual_service_routes(
             continue;
         }
 
+        // Per-http[] traffic-management actions projected onto every emitted
+        // dispatch rule (or, for mirror, attached as a proxy-scoped plugin).
+        // Extracted before the backend check because a `redirect` route is
+        // valid with NO backend — Istio forbids `route` + `redirect` together.
+        let route_rewrite_value = route_rewrite_value(http);
+        let route_redirect_value = route_redirect_value(object, http)?;
+
         let backends = route_backends(object, http, acc, index)?;
         if backends.is_empty() {
-            continue;
+            // A redirect answers the request itself, so a backend-less redirect
+            // route is materialized as a proxy whose dispatch rule short-
+            // circuits. Any other backend-less route (including a stray mirror
+            // with no primary `route`) is skipped as before — there is nothing
+            // to forward to.
+            if route_redirect_value.is_none() {
+                continue;
+            }
         };
 
-        let (backend_host, backend_port, upstream_id) = if backends.len() == 1 {
+        let (backend_host, backend_port, upstream_id) = if backends.is_empty() {
+            // Redirect-only route: no backend. The dispatch rule omits the
+            // destination and the redirect fires before backend dispatch.
+            (String::new(), 0, None)
+        } else if backends.len() == 1 {
             let Some(backend) = backends.into_iter().next() else {
                 continue;
             };
@@ -2230,7 +2283,7 @@ fn virtual_service_routes(
             route_candidates.into_iter().enumerate()
         {
             let is_uri_less_catch_all = listen_path.as_deref() == Some(URI_LESS_MATCH_LISTEN_PATH);
-            let route_plugins = Vec::new();
+            let mut route_plugins = Vec::new();
             let suffix = if match_count == 1 {
                 index.to_string()
             } else {
@@ -2242,6 +2295,17 @@ fn virtual_service_routes(
                 &object.metadata.name,
                 &suffix,
             );
+
+            // Istio `http[].mirror`: attach a proxy-scoped `request_mirror`
+            // plugin. Mirror is a per-route action; making it a route-local
+            // plugin means a route that must be collapsed with siblings fails
+            // closed (via `route_has_uncollapsible_local_policy`) rather than
+            // silently mirroring the siblings' traffic too. This reuses the
+            // battle-tested `request_mirror` plugin instead of duplicating its
+            // fire-and-forget task plumbing on the dispatch hot path.
+            if let Some(mirror_plugin) = route_mirror_plugin(object, http, acc, &proxy_id)? {
+                route_plugins.push(mirror_plugin);
+            }
 
             // Project the VirtualService `http[].fault` (if any) onto every
             // emitted dispatch rule rather than spinning up a separate
@@ -2285,6 +2349,8 @@ fn virtual_service_routes(
                     retry: retry.as_ref(),
                     retry_disabled: retry.is_none(),
                     fault: route_fault_value.as_ref(),
+                    rewrite: route_rewrite_value.as_ref(),
+                    redirect: route_redirect_value.as_ref(),
                 },
                 false,
             );
@@ -2340,7 +2406,7 @@ fn virtual_service_routes(
                 return Err(invalid_resource(
                     object,
                     format!(
-                        "VirtualService HTTP route {index} uses route-local fault policy on a route that must be merged with another route; Ferrum cannot apply that plugin per mesh_route_dispatch rule"
+                        "VirtualService HTTP route {index} uses a route-local plugin (e.g. traffic mirror) on a route that must be merged with another route; Ferrum cannot apply that proxy-scoped plugin per mesh_route_dispatch rule"
                     ),
                 ));
             }
@@ -2822,6 +2888,177 @@ fn retriable_status_codes(retries: &Value) -> impl Iterator<Item = u16> + '_ {
 fn route_timeout_ms(http: &Value) -> Option<u64> {
     let raw = string_field(http, "timeout")?;
     parse_istio_duration_ms(raw).map(|ms| ms.min(MAX_TIMEOUT_MS))
+}
+
+/// Project an Istio `VirtualService.http[].rewrite` block into the per-rule
+/// `RouteRewriteConfig` JSON shape consumed by `mesh_route_dispatch`.
+///
+/// Maps `rewrite.uri` -> `uri` and `rewrite.authority` -> `authority`. The
+/// `match_prefix` field is filled per emitted rule by
+/// `mesh_route_dispatch_rules_for_proxy` from each match entry's URI prefix —
+/// it is NOT derived here. Returns `None` when neither field is present so a
+/// `rewrite: {}` block does not emit an inert action.
+fn route_rewrite_value(http: &Value) -> Option<Value> {
+    let rewrite = http.get("rewrite")?.as_object()?;
+    let mut out = serde_json::Map::new();
+    if let Some(uri) = rewrite.get("uri").and_then(Value::as_str)
+        && !uri.is_empty()
+    {
+        out.insert("uri".to_string(), Value::String(uri.to_string()));
+    }
+    if let Some(authority) = rewrite.get("authority").and_then(Value::as_str)
+        && !authority.is_empty()
+    {
+        out.insert(
+            "authority".to_string(),
+            Value::String(authority.to_string()),
+        );
+    }
+    if out.is_empty() {
+        return None;
+    }
+    Some(Value::Object(out))
+}
+
+/// Project an Istio `VirtualService.http[].redirect` block into the per-rule
+/// `RouteRedirectConfig` JSON shape consumed by `mesh_route_dispatch`.
+///
+/// Maps `redirect.uri` -> `uri`, `redirect.authority` -> `authority`,
+/// `redirect.scheme` -> `scheme`, and `redirect.redirectCode` -> `redirect_code`
+/// (default 301). Istio's `redirect.port` / `derivePort` are NOT representable
+/// and are rejected fail-closed (the operator must express a target port via
+/// `redirect.authority` as `host:port`). Returns `None` when the block has no
+/// target-changing field so an inert `redirect: {}` does not short-circuit
+/// every request with an unchanged Location.
+fn route_redirect_value(
+    object: &K8sObject,
+    http: &Value,
+) -> Result<Option<Value>, K8sTranslateError> {
+    let Some(redirect) = http.get("redirect").and_then(Value::as_object) else {
+        return Ok(None);
+    };
+    // `redirect.port` and `redirect.derivePort` are not representable in the
+    // per-rule redirect projection: `derivePort` needs the request's port at
+    // runtime (FROM_REQUEST_PORT / FROM_PROTOCOL_DEFAULT) which the translator
+    // does not have, and an explicit `port` would need to be folded into the
+    // `Location` authority. Rather than silently emit a `Location` without the
+    // requested port — a wrong, query-/auth-breaking redirect — fail closed so
+    // the K8s status writer surfaces the limitation to `kubectl` instead of
+    // translating it incorrectly.
+    let has_port = redirect.get("port").is_some_and(|v| !v.is_null());
+    let has_derive_port = redirect.get("derivePort").is_some_and(|v| !v.is_null());
+    if has_port || has_derive_port {
+        return Err(invalid_resource(
+            object,
+            "VirtualService http[].redirect.port / derivePort is not supported; \
+             remove the field or set the target port via redirect.authority (host:port)",
+        ));
+    }
+    let mut out = serde_json::Map::new();
+    if let Some(uri) = redirect.get("uri").and_then(Value::as_str)
+        && !uri.is_empty()
+    {
+        out.insert("uri".to_string(), Value::String(uri.to_string()));
+    }
+    if let Some(authority) = redirect.get("authority").and_then(Value::as_str)
+        && !authority.is_empty()
+    {
+        out.insert(
+            "authority".to_string(),
+            Value::String(authority.to_string()),
+        );
+    }
+    if let Some(scheme) = redirect.get("scheme").and_then(Value::as_str)
+        && !scheme.is_empty()
+    {
+        out.insert("scheme".to_string(), Value::String(scheme.to_string()));
+    }
+    // `redirectCode` defaults to 301 in Istio. Carry it explicitly only when
+    // the operator set a value; the plugin defaults the field otherwise.
+    if let Some(code_value) = redirect.get("redirectCode") {
+        let Some(code) = code_value.as_u64() else {
+            return Err(invalid_resource(
+                object,
+                "VirtualService http[].redirect.redirectCode must be an integer in the 300-399 range",
+            ));
+        };
+        if !(300..=399).contains(&code) {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "VirtualService http[].redirect.redirectCode must be in the 300-399 range, got {code}"
+                ),
+            ));
+        }
+        out.insert("redirect_code".to_string(), serde_json::json!(code));
+    }
+    if out.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(Value::Object(out)))
+}
+
+/// Build a proxy-scoped `request_mirror` plugin config for an Istio
+/// `VirtualService.http[].mirror` (+ `mirrorPercentage` / legacy
+/// `mirrorPercent`). Returns `None` when no `mirror` destination is present.
+/// Returns `Err` when the mirror destination is malformed (missing host, or a
+/// `port.name` that does not resolve) so the bug is surfaced rather than the
+/// mirror silently dropped.
+fn route_mirror_plugin(
+    object: &K8sObject,
+    http: &Value,
+    acc: &K8sAccumulator,
+    proxy_id: &str,
+) -> Result<Option<PluginConfig>, K8sTranslateError> {
+    let Some(mirror) = http.get("mirror") else {
+        return Ok(None);
+    };
+    let Some(host) = string_field(mirror, "host") else {
+        return Err(invalid_resource(
+            object,
+            "VirtualService http[].mirror.host is required",
+        ));
+    };
+    let port = resolve_destination_port(object, mirror, host, acc)?.unwrap_or(80);
+
+    // `mirrorPercentage.value` is a float 0-100; the legacy `mirrorPercent` is
+    // an integer. Default (neither present) is 100% per Istio.
+    let percentage = if let Some(value) = http
+        .get("mirrorPercentage")
+        .and_then(|m| m.get("value"))
+        .and_then(Value::as_f64)
+    {
+        value.clamp(0.0, 100.0)
+    } else if let Some(percent) = http.get("mirrorPercent").and_then(Value::as_u64) {
+        percent.min(100) as f64
+    } else {
+        100.0
+    };
+
+    // A 0% mirror is a no-op; skip emitting the plugin entirely so the proxy
+    // does not carry an inert instance (and the route can still collapse).
+    if percentage == 0.0 {
+        return Ok(None);
+    }
+
+    let now = chrono::Utc::now();
+    Ok(Some(PluginConfig {
+        id: format!("istio-vs-mirror-{proxy_id}"),
+        plugin_name: "request_mirror".to_string(),
+        namespace: object.metadata.namespace.clone(),
+        config: serde_json::json!({
+            "mirror_host": host,
+            "mirror_port": port,
+            "percentage": percentage,
+        }),
+        scope: crate::config::types::PluginScope::Proxy,
+        proxy_id: Some(proxy_id.to_string()),
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: now,
+        updated_at: now,
+    }))
 }
 
 fn parse_istio_duration_secs(raw: &str) -> Option<u64> {
@@ -4975,7 +5212,7 @@ mod tests {
     }
 
     #[test]
-    fn virtual_service_without_route_does_not_emit_zero_weight_warning() {
+    fn virtual_service_redirect_route_materializes_proxy_without_zero_weight_warning() {
         let result = translate_k8s_objects(
             &[object(
                 "VirtualService",
@@ -4991,7 +5228,37 @@ mod tests {
         )
         .expect("translation succeeds");
 
-        assert!(result.config.proxies.is_empty());
+        // A redirect route has no `route[]` backend but is no longer silently
+        // dropped — it materializes a proxy carrying a mesh_route_dispatch
+        // redirect rule.
+        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(
+            result.config.proxies[0].listen_path.as_deref(),
+            Some("/old")
+        );
+        let dispatch = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|p| {
+                p.plugin_name == "mesh_route_dispatch"
+                    && p.proxy_id.as_deref() == Some(result.config.proxies[0].id.as_str())
+            })
+            .expect("redirect route emits a mesh_route_dispatch plugin");
+        let rules = dispatch.config["rules"].as_array().expect("rules array");
+        assert!(
+            rules.iter().any(|r| r
+                .get("redirect")
+                .and_then(|d| d.get("uri"))
+                .and_then(Value::as_str)
+                == Some("/new")),
+            "redirect rule must carry the rewritten uri: {rules:?}"
+        );
+        // The redirect rule must omit the backend destination (no `route[]`).
+        assert!(
+            rules.iter().all(|r| r.get("destination").is_none()),
+            "redirect-only route must not emit a backend destination: {rules:?}"
+        );
         assert!(
             !result
                 .warnings
@@ -7192,6 +7459,315 @@ extensionProviders:
             "expected subset outlierDetection warning, got {:?}",
             result.warnings
         );
+    }
+
+    // -- VirtualService mirror / rewrite / redirect / L4 -----------------
+
+    fn dispatch_plugin(result: &crate::config_sources::k8s::K8sTranslation) -> &PluginConfig {
+        result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|p| p.plugin_name == "mesh_route_dispatch")
+            .expect("mesh_route_dispatch plugin")
+    }
+
+    fn dispatch_rules(plugin: &PluginConfig) -> &Vec<Value> {
+        plugin
+            .config
+            .get("rules")
+            .and_then(Value::as_array)
+            .expect("rules array")
+    }
+
+    #[test]
+    fn virtual_service_mirror_emits_request_mirror_plugin() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/v1"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                        "mirror": {"host": "shadow.default.svc.cluster.local", "port": {"number": 9090}},
+                        "mirrorPercentage": {"value": 25.0}
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mirror = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|p| p.plugin_name == "request_mirror")
+            .expect("request_mirror plugin emitted for http[].mirror");
+        assert_eq!(
+            mirror.config["mirror_host"].as_str(),
+            Some("shadow.default.svc.cluster.local")
+        );
+        assert_eq!(mirror.config["mirror_port"].as_u64(), Some(9090));
+        assert_eq!(mirror.config["percentage"].as_f64(), Some(25.0));
+        // The mirror plugin is proxy-scoped to the route's proxy.
+        assert_eq!(
+            mirror.proxy_id.as_deref(),
+            Some(result.config.proxies[0].id.as_str())
+        );
+        // The mirror plugin config must construct cleanly.
+        crate::plugins::validate_plugin_config("request_mirror", &mirror.config)
+            .expect("emitted request_mirror config is valid");
+    }
+
+    #[test]
+    fn virtual_service_zero_percent_mirror_emits_no_plugin() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/v1"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                        "mirror": {"host": "shadow.default.svc.cluster.local", "port": {"number": 9090}},
+                        "mirrorPercentage": {"value": 0.0}
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+        assert!(
+            !result
+                .config
+                .plugin_configs
+                .iter()
+                .any(|p| p.plugin_name == "request_mirror"),
+            "0% mirror must not emit an inert plugin"
+        );
+    }
+
+    #[test]
+    fn virtual_service_mirror_missing_host_fails_closed() {
+        let err = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/v1"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                        "mirror": {"port": {"number": 9090}}
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("mirror without host must fail closed");
+        assert!(format!("{err}").contains("mirror.host"), "got: {err}");
+    }
+
+    #[test]
+    fn virtual_service_rewrite_uri_projects_onto_dispatch_rule() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/api"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                        "rewrite": {"uri": "/v2", "authority": "internal.example.com"}
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let plugin = dispatch_plugin(&result);
+        let rules = dispatch_rules(plugin);
+        let rewrite = rules
+            .iter()
+            .find_map(|r| r.get("rewrite"))
+            .expect("a rule carries the rewrite action");
+        assert_eq!(rewrite["uri"].as_str(), Some("/v2"));
+        assert_eq!(rewrite["authority"].as_str(), Some("internal.example.com"));
+        // The match was a prefix, so prefix-rewrite semantics apply.
+        assert_eq!(rewrite["match_prefix"].as_str(), Some("/api"));
+        // The emitted config must construct cleanly.
+        use crate::plugins::mesh_route_dispatch::MeshRouteDispatch;
+        MeshRouteDispatch::new(&plugin.config).expect("rewrite dispatch config is valid");
+    }
+
+    #[test]
+    fn virtual_service_rewrite_exact_match_replaces_whole_path() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"exact": "/legacy"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                        "rewrite": {"uri": "/v2"}
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let plugin = dispatch_plugin(&result);
+        let rules = dispatch_rules(plugin);
+        let rewrite = rules
+            .iter()
+            .find_map(|r| r.get("rewrite"))
+            .expect("rewrite action present");
+        // Exact match → no match_prefix → whole-path replacement.
+        assert!(
+            rewrite.get("match_prefix").is_none(),
+            "exact match must not carry a prefix: {rewrite:?}"
+        );
+    }
+
+    #[test]
+    fn virtual_service_redirect_projects_onto_dispatch_rule() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/old"}}],
+                        "redirect": {"uri": "/new", "redirectCode": 302}
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let plugin = dispatch_plugin(&result);
+        let rules = dispatch_rules(plugin);
+        let redirect = rules
+            .iter()
+            .find_map(|r| r.get("redirect"))
+            .expect("redirect action present");
+        assert_eq!(redirect["uri"].as_str(), Some("/new"));
+        assert_eq!(redirect["redirect_code"].as_u64(), Some(302));
+        use crate::plugins::mesh_route_dispatch::MeshRouteDispatch;
+        MeshRouteDispatch::new(&plugin.config).expect("redirect dispatch config is valid");
+    }
+
+    #[test]
+    fn virtual_service_redirect_rejects_out_of_range_redirect_code() {
+        let err = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/old"}}],
+                        "redirect": {"uri": "/new", "redirectCode": 404}
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("invalid redirectCode must fail closed");
+
+        assert!(
+            err.to_string()
+                .contains("redirectCode must be in the 300-399 range"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn virtual_service_redirect_rejects_port_field() {
+        let err = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/old"}}],
+                        "redirect": {"uri": "/new", "port": 8443}
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("redirect.port must fail closed");
+        assert!(
+            err.to_string()
+                .contains("redirect.port / derivePort is not supported"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn virtual_service_redirect_rejects_derive_port_field() {
+        let err = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/old"}}],
+                        "redirect": {"derivePort": "FROM_REQUEST_PORT"}
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("redirect.derivePort must fail closed");
+        assert!(
+            err.to_string()
+                .contains("redirect.port / derivePort is not supported"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn virtual_service_tcp_route_fails_closed() {
+        let err = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["db.example.com"],
+                    "tcp": [{
+                        "match": [{"port": 3306}],
+                        "route": [{"destination": {"host": "mysql.default.svc.cluster.local", "port": {"number": 3306}}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("VirtualService L4 tcp routing must fail closed");
+        assert!(format!("{err}").contains("L4 routing"), "got: {err}");
+    }
+
+    #[test]
+    fn virtual_service_tls_route_fails_closed() {
+        let err = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["secure.example.com"],
+                    "tls": [{
+                        "match": [{"sniHosts": ["secure.example.com"]}],
+                        "route": [{"destination": {"host": "backend.default.svc.cluster.local", "port": {"number": 443}}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("VirtualService L4 tls routing must fail closed");
+        assert!(format!("{err}").contains("spec.tls"), "got: {err}");
     }
 
     // -- VirtualService fault injection / retry / timeout ----------------

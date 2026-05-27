@@ -36,6 +36,7 @@ mod functional_load_stress_test;
 mod functional_logging_plugins_test;
 mod functional_logging_test;
 mod functional_mesh_mode_test;
+mod functional_mesh_vs_traffic_mgmt_test;
 mod functional_migrate_mode_test;
 mod functional_mongodb_test;
 mod functional_mtls_acl_test;

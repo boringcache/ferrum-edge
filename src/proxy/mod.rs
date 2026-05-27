@@ -5281,6 +5281,11 @@ async fn handle_websocket_request_authenticated(
     requires_ws_frame_hooks: bool,
     query_string: String,
     strip_len: usize,
+    // The client-requested path before any VirtualService `rewrite.uri`
+    // was applied. Used for `request_path` in transaction logs so that
+    // access logs record what the client sent, not the backend-rewritten
+    // path stored in `ctx.path`.
+    original_request_path: String,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
     info!(
         "WebSocket upgrade request authenticated for proxy: {} from: {}",
@@ -5333,13 +5338,16 @@ async fn handle_websocket_request_authenticated(
                     websocket_limit = state.env_config.websocket_max_connections,
                     "Rejecting WebSocket upgrade: connection limit reached"
                 );
-                log_rejected_request(
+                // Use `original_request_path` — `ctx.path` may already be the
+                // VirtualService-rewritten backend path at this point.
+                log_rejected_request_with_path(
                     &plugins,
                     &ctx,
                     503,
                     start_time,
                     "websocket_connection_limit",
                     plugin_execution_ns,
+                    Some(&original_request_path),
                 )
                 .await;
                 record_request(&state, 503);
@@ -5549,7 +5557,9 @@ async fn handle_websocket_request_authenticated(
                             consumer_username: ctx.effective_identity().map(str::to_owned),
                             auth_method: ctx.auth_method,
                             http_method: ws_err_method.to_string(),
-                            request_path: ctx.path.clone(),
+                            // Record the path the client sent, not the
+                            // VirtualService-rewritten backend path in ctx.path.
+                            request_path: original_request_path.clone(),
                             proxy_id: Some(proxy.id.clone()),
                             proxy_name: proxy.name.clone(),
                             backend_target: Some(
@@ -5618,7 +5628,9 @@ async fn handle_websocket_request_authenticated(
         consumer_username: ctx.effective_identity().map(str::to_owned),
         auth_method: ctx.auth_method,
         http_method: ws_method.to_string(),
-        request_path: ctx.path.clone(),
+        // Record the path the client sent, not the VirtualService-rewritten
+        // backend path stored in ctx.path after the rewrite in the caller.
+        request_path: original_request_path.clone(),
         proxy_id: Some(proxy.id.clone()),
         proxy_name: proxy.name.clone(),
         backend_target: Some(strip_query_params(&current_backend_url).to_string()),
@@ -7744,6 +7756,34 @@ pub async fn log_rejected_request(
     rejection_phase: &str,
     plugin_execution_ns: u64,
 ) {
+    log_rejected_request_with_path(
+        plugins,
+        ctx,
+        status_code,
+        start_time,
+        rejection_phase,
+        plugin_execution_ns,
+        None,
+    )
+    .await;
+}
+
+/// Like [`log_rejected_request`] but allows the caller to supply the
+/// original client-requested path when `ctx.path` has already been rebased
+/// to the VirtualService-rewritten backend path. When `request_path_override`
+/// is `Some`, it is recorded as `TransactionSummary.request_path` instead of
+/// `ctx.path`; `ctx.path` (the rewritten value) is still used for
+/// `backend_target` URL construction. Pass `None` at all sites that fire
+/// before the rewrite — they get the same behavior as `log_rejected_request`.
+pub(crate) async fn log_rejected_request_with_path(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &RequestContext,
+    status_code: u16,
+    start_time: Instant,
+    rejection_phase: &str,
+    plugin_execution_ns: u64,
+    request_path_override: Option<&str>,
+) {
     if plugins.is_empty() {
         return;
     }
@@ -7778,11 +7818,19 @@ pub async fn log_rejected_request(
         consumer_username: ctx.effective_identity().map(str::to_owned),
         auth_method: ctx.auth_method,
         http_method: ctx.method.clone(),
-        request_path: ctx.path.clone(),
+        // Use the caller-supplied original path when provided; otherwise fall
+        // back to `ctx.path`, which may be the rewritten backend path if the
+        // caller is after a VirtualService `rewrite.uri` application.
+        request_path: request_path_override
+            .map(str::to_owned)
+            .unwrap_or_else(|| ctx.path.clone()),
         proxy_id: proxy.map(|p| p.id.clone()),
         proxy_name: proxy.and_then(|p| p.name.clone()),
         backend_target: proxy.map(|p| {
             // Host-only proxies (listen_path None) have no prefix to strip.
+            // `ctx.path` is intentionally used here (not the override) because
+            // `backend_target` should reflect the rewritten path that would
+            // have been sent to the backend.
             let strip_len = p.listen_path.as_deref().map(str::len).unwrap_or(0);
             let url = build_backend_url(p, &ctx.path, "", strip_len);
             strip_query_params(&url).to_string()
@@ -9185,6 +9233,31 @@ async fn handle_proxy_request_inner(
     let proxy = ctx.apply_route_overrides_with_upstreams(proxy, epoch.load_balancer.upstreams());
     ctx.matched_proxy = Some(Arc::clone(&proxy));
 
+    // Preserve the path the client actually requested for access logging. The
+    // documented contract (the `route_override_path` field doc and
+    // `docs/mesh.md`) is that transaction logs record the original request
+    // path, not the VirtualService-rewritten backend path; the rewrite below
+    // only affects backend URL building and `ctx.path` for dispatch. The
+    // transaction summaries built later in this function source `request_path`
+    // from this value, not the rebased `path`/`ctx.path`.
+    let original_request_path = path.clone();
+
+    // Istio `VirtualService.http[].rewrite.uri`: `mesh_route_dispatch` set
+    // `ctx.route_override_path` for the matched route. Rebase the request path
+    // used for backend URL building (reqwest / direct-H2 / gRPC paths read the
+    // local `path`; the WS / HBONE branches read `ctx.path`, so mirror the
+    // override onto `ctx.path` too). The original path was already used for
+    // route selection; VS-derived proxies never set `strip_listen_path`, so
+    // the rewritten value is the literal forwarded path. No allocation when no
+    // rewrite is set.
+    let path = match ctx.route_override_path.take() {
+        Some(rewritten) => {
+            ctx.path = rewritten.clone();
+            rewritten
+        }
+        None => path,
+    };
+
     // Resolve upstream target and hash key from the request epoch.
     let selection = backend_dispatch::select_upstream_target(
         &proxy,
@@ -9217,13 +9290,17 @@ async fn handle_proxy_request_inner(
                 )
                 .await;
                 apply_grpc_reject_metadata(&mut ctx, &reject);
-                log_rejected_request(
+                // Use `original_request_path` so the log records the path the
+                // client actually requested, not the VirtualService-rewritten
+                // backend path stored in `ctx.path` after the rewrite above.
+                log_rejected_request_with_path(
                     &plugins,
                     &ctx,
                     reject.http_status.as_u16(),
                     start_time,
                     "circuit_breaker_open",
                     plugin_execution_ns,
+                    Some(&original_request_path),
                 )
                 .await;
                 record_request(&state, reject.http_status.as_u16());
@@ -9296,6 +9373,7 @@ async fn handle_proxy_request_inner(
             requires_ws_frame_hooks,
             effective_query_string.to_string(),
             strip_len,
+            original_request_path.clone(),
         )
         .await;
     }
@@ -9693,13 +9771,17 @@ async fn handle_proxy_request_inner(
                             true,
                         );
                         apply_grpc_reject_metadata(&mut ctx, &normalized);
-                        log_rejected_request(
+                        // Use `original_request_path` so the log records the
+                        // path the client actually requested, not the
+                        // VirtualService-rewritten backend path in `ctx.path`.
+                        log_rejected_request_with_path(
                             &plugins,
                             &ctx,
                             normalized.http_status.as_u16(),
                             start_time,
                             "after_proxy",
                             plugin_execution_ns,
+                            Some(&original_request_path),
                         )
                         .await;
                         record_request(&state, normalized.http_status.as_u16());
@@ -9784,7 +9866,7 @@ async fn handle_proxy_request_inner(
                         consumer_username: ctx.effective_identity().map(str::to_owned),
                         auth_method: ctx.auth_method,
                         http_method: method,
-                        request_path: path,
+                        request_path: original_request_path.clone(),
                         proxy_id: Some(proxy.id.clone()),
                         proxy_name: proxy.name.clone(),
                         backend_target: Some(strip_query_params(&grpc_backend_url).to_string()),
@@ -10112,7 +10194,7 @@ async fn handle_proxy_request_inner(
                         consumer_username: ctx.effective_identity().map(str::to_owned),
                         auth_method: ctx.auth_method,
                         http_method: method,
-                        request_path: path,
+                        request_path: original_request_path.clone(),
                         proxy_id: Some(proxy.id.clone()),
                         proxy_name: proxy.name.clone(),
                         backend_target: Some(strip_query_params(&grpc_backend_url).to_string()),
@@ -10262,7 +10344,7 @@ async fn handle_proxy_request_inner(
                             consumer_username: ctx.effective_identity().map(str::to_owned),
                             auth_method: ctx.auth_method,
                             http_method: ctx.method.clone(),
-                            request_path: ctx.path.clone(),
+                            request_path: original_request_path.clone(),
                             proxy_id: proxy_ref.map(|p| p.id.clone()),
                             proxy_name: proxy_ref.and_then(|p| p.name.clone()),
                             backend_target: proxy_ref.map(|p| {
@@ -10869,7 +10951,7 @@ async fn handle_proxy_request_inner(
                 consumer_username: ctx.effective_identity().map(str::to_owned),
                 auth_method: ctx.auth_method,
                 http_method: method,
-                request_path: path,
+                request_path: original_request_path.clone(),
                 proxy_id: Some(proxy.id.clone()),
                 proxy_name: proxy.name.clone(),
                 backend_target: Some(strip_query_params(&backend_url).to_string()),

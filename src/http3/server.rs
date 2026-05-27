@@ -1553,6 +1553,23 @@ async fn handle_h3_request(
     let proxy = ctx.apply_route_overrides_with_upstreams(proxy, epoch.load_balancer.upstreams());
     ctx.matched_proxy = Some(Arc::clone(&proxy));
 
+    // Preserve the client's original request path for access logging — the
+    // transaction summaries below source `request_path` from this, not the
+    // rewritten backend path. Mirrors `handle_proxy_request_inner`.
+    let original_request_path = path.clone();
+
+    // Istio `VirtualService.http[].rewrite.uri`: mirror the H1/H2 dispatch
+    // contract by rebasing the request path used to build the backend URL when
+    // `mesh_route_dispatch` set `ctx.route_override_path`. Keep in sync with
+    // `src/proxy/mod.rs::handle_proxy_request_inner`.
+    let path = match ctx.route_override_path.take() {
+        Some(rewritten) => {
+            ctx.path = rewritten.clone();
+            rewritten
+        }
+        None => path,
+    };
+
     // Enforce request body size limit via Content-Length fast path. Apply
     // the gRPC-specific ceiling to gRPC requests so H3 matches H1/H2.
     let content_length_limit = if matches!(http_flavor, HttpFlavor::Grpc) {
@@ -1772,6 +1789,7 @@ async fn handle_h3_request(
             requires_ws_frame_hooks,
             is_early_data,
             strip_len,
+            original_request_path.clone(),
         )
         .await;
     }
@@ -1861,7 +1879,7 @@ async fn handle_h3_request(
             consumer_username: ctx.effective_identity().map(str::to_owned),
             auth_method: ctx.auth_method,
             http_method: method.to_string(),
-            request_path: path.clone(),
+            request_path: original_request_path.clone(),
             proxy_id: Some(proxy.id.clone()),
             proxy_name: proxy.name.clone(),
             backend_target: outcome
@@ -2027,7 +2045,7 @@ async fn handle_h3_request(
                     consumer_username: ctx.effective_identity().map(str::to_owned),
                     auth_method: ctx.auth_method,
                     http_method: method.to_string(),
-                    request_path: path.clone(),
+                    request_path: original_request_path.clone(),
                     proxy_id: Some(proxy.id.clone()),
                     proxy_name: proxy.name.clone(),
                     backend_target: Some(strip_query_params(&backend_url).to_string()),
@@ -2395,7 +2413,7 @@ async fn handle_h3_request(
             consumer_username: ctx.effective_identity().map(str::to_owned),
             auth_method: ctx.auth_method,
             http_method: method.to_string(),
-            request_path: path.clone(),
+            request_path: original_request_path.clone(),
             proxy_id: Some(proxy.id.clone()),
             proxy_name: proxy.name.clone(),
             backend_target: Some(strip_query_params(&backend_url).to_string()),
@@ -2682,7 +2700,7 @@ async fn handle_h3_request(
             consumer_username: ctx.effective_identity().map(str::to_owned),
             auth_method: ctx.auth_method,
             http_method: method,
-            request_path: path,
+            request_path: original_request_path.clone(),
             proxy_id: Some(proxy.id.clone()),
             proxy_name: proxy.name.clone(),
             backend_target: Some(strip_query_params(&backend_url).to_string()),
@@ -3062,7 +3080,7 @@ async fn handle_h3_request(
             consumer_username: ctx.effective_identity().map(str::to_owned),
             auth_method: ctx.auth_method,
             http_method: method,
-            request_path: path,
+            request_path: original_request_path.clone(),
             proxy_id: Some(proxy.id.clone()),
             proxy_name: proxy.name.clone(),
             backend_target: Some(strip_query_params(&backend_url).to_string()),

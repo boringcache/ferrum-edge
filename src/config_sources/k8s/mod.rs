@@ -1056,6 +1056,16 @@ pub(crate) struct MeshRouteDispatchPolicy<'a> {
     /// (e.g., abort without `httpStatus`). Cloned per emitted rule via
     /// [`Value::clone`].
     pub fault: Option<&'a Value>,
+    /// Pre-shaped `rewrite` JSON (Istio `http[].rewrite`) projected onto every
+    /// emitted dispatch rule so a URI / authority rewrite follows the matched
+    /// route through route-collapse. `None` when the `http[]` entry has no
+    /// `rewrite` block. Cloned per emitted rule via [`Value::clone`].
+    pub rewrite: Option<&'a Value>,
+    /// Pre-shaped `redirect` JSON (Istio `http[].redirect`) projected onto
+    /// every emitted dispatch rule so a redirecting route short-circuits at
+    /// dispatch time. `None` when the `http[]` entry has no `redirect` block.
+    /// Cloned per emitted rule via [`Value::clone`].
+    pub redirect: Option<&'a Value>,
 }
 
 /// Translate a VirtualService `http[]` entry's `match[]` blocks into a
@@ -1169,16 +1179,18 @@ pub(crate) fn mesh_route_dispatch_rules_for_proxy(
     // `needs_catch_all` block below instead of being silently dropped.
     let route_request_transform = vs_route_header_transform_rules(http, "request");
     let route_response_transform = vs_route_header_transform_rules(http, "response");
-    let has_transforms_or_fault = !route_request_transform.is_empty()
+    let has_route_actions = !route_request_transform.is_empty()
         || !route_response_transform.is_empty()
-        || route_policy.fault.is_some();
+        || route_policy.fault.is_some()
+        || route_policy.rewrite.is_some()
+        || route_policy.redirect.is_some();
 
     let empty_matches = Vec::new();
     let matches = http
         .get("match")
         .and_then(Value::as_array)
         .unwrap_or(&empty_matches);
-    if matches.is_empty() && !has_transforms_or_fault {
+    if matches.is_empty() && !has_route_actions {
         return (Vec::new(), false);
     }
 
@@ -1399,23 +1411,14 @@ pub(crate) fn mesh_route_dispatch_rules_for_proxy(
             continue;
         }
 
-        let mut destination = serde_json::Map::new();
-        if let Some(uid) = route_destination.upstream_id {
-            destination.insert("upstream_id".to_string(), Value::String(uid.to_string()));
-        } else {
-            destination.insert(
-                "backend_host".to_string(),
-                Value::String(route_destination.backend_host.to_string()),
-            );
-            destination.insert(
-                "backend_port".to_string(),
-                serde_json::json!(route_destination.backend_port),
-            );
-        }
-
         let mut rule = serde_json::Map::new();
         rule.insert("match".to_string(), Value::Object(match_criteria));
-        rule.insert("destination".to_string(), Value::Object(destination));
+        // A redirect-only route carries no backend (`backend_host` empty,
+        // `upstream_id` none). Omit the destination so the plugin accepts the
+        // redirect rule; every other rule carries the route's destination.
+        if let Some(destination) = route_dispatch_destination_value(&route_destination) {
+            rule.insert("destination".to_string(), Value::Object(destination));
+        }
         if let Some(timeout_ms) = route_policy.timeout_ms {
             rule.insert("timeout_ms".to_string(), serde_json::json!(timeout_ms));
         } else if route_policy.timeout_disabled {
@@ -1444,6 +1447,15 @@ pub(crate) fn mesh_route_dispatch_rules_for_proxy(
         if let Some(fault) = route_policy.fault {
             rule.insert("fault".to_string(), fault.clone());
         }
+        if let Some(rewrite) = route_policy.rewrite {
+            rule.insert(
+                "rewrite".to_string(),
+                rewrite_value_with_match_prefix(rewrite, entry.get("uri")),
+            );
+        }
+        if let Some(redirect) = route_policy.redirect {
+            rule.insert("redirect".to_string(), redirect.clone());
+        }
         rules.push(Value::Object(rule));
     }
 
@@ -1463,24 +1475,15 @@ pub(crate) fn mesh_route_dispatch_rules_for_proxy(
     let needs_catch_all = has_uri_only_match
         && (!route_request_transform.is_empty()
             || !route_response_transform.is_empty()
-            || route_policy.fault.is_some());
+            || route_policy.fault.is_some()
+            || route_policy.rewrite.is_some()
+            || route_policy.redirect.is_some());
     if needs_catch_all {
-        let mut destination = serde_json::Map::new();
-        if let Some(uid) = route_destination.upstream_id {
-            destination.insert("upstream_id".to_string(), Value::String(uid.to_string()));
-        } else {
-            destination.insert(
-                "backend_host".to_string(),
-                Value::String(route_destination.backend_host.to_string()),
-            );
-            destination.insert(
-                "backend_port".to_string(),
-                serde_json::json!(route_destination.backend_port),
-            );
-        }
         let mut rule = serde_json::Map::new();
         rule.insert("match".to_string(), Value::Object(serde_json::Map::new()));
-        rule.insert("destination".to_string(), Value::Object(destination));
+        if let Some(destination) = route_dispatch_destination_value(&route_destination) {
+            rule.insert("destination".to_string(), Value::Object(destination));
+        }
         if let Some(timeout_ms) = route_policy.timeout_ms {
             rule.insert("timeout_ms".to_string(), serde_json::json!(timeout_ms));
         } else if route_policy.timeout_disabled {
@@ -1509,10 +1512,83 @@ pub(crate) fn mesh_route_dispatch_rules_for_proxy(
         if let Some(fault) = route_policy.fault {
             rule.insert("fault".to_string(), fault.clone());
         }
+        if let Some(rewrite) = route_policy.rewrite {
+            // The catch-all rule matches the proxy's whole `listen_path`. When
+            // that listen_path is a literal prefix, Istio prefix-rewrite
+            // semantics strip exactly that prefix; otherwise (exact / regex /
+            // root) the whole path is replaced.
+            rule.insert(
+                "rewrite".to_string(),
+                rewrite_value_with_match_prefix_from_listen_path(rewrite, listen_path),
+            );
+        }
+        if let Some(redirect) = route_policy.redirect {
+            rule.insert("redirect".to_string(), redirect.clone());
+        }
         rules.push(Value::Object(rule));
     }
 
     (rules, has_uri_only_match)
+}
+
+/// Clone a `rewrite` template JSON and fill in `match_prefix` from the source
+/// match entry's `uri.prefix`. Istio prefix-rewrite replaces only the matched
+/// prefix; exact / regex / URI-less matches replace the whole path, so
+/// `match_prefix` is omitted (the plugin replaces the full path).
+fn rewrite_value_with_match_prefix(rewrite: &Value, uri_match: Option<&Value>) -> Value {
+    let prefix = uri_match
+        .and_then(Value::as_object)
+        .and_then(|uri| uri.get("prefix"))
+        .and_then(Value::as_str);
+    rewrite_value_with_optional_prefix(rewrite, prefix)
+}
+
+/// Catch-all variant: derive the prefix from the proxy `listen_path`. Ferrum's
+/// listen_path encoding uses `~` for regex and `=` for exact; a bare value is a
+/// literal prefix. Only the literal-prefix form yields a `match_prefix`.
+fn rewrite_value_with_match_prefix_from_listen_path(
+    rewrite: &Value,
+    listen_path: Option<&str>,
+) -> Value {
+    let prefix = listen_path
+        .filter(|lp| !lp.starts_with('~') && !lp.starts_with('=') && !lp.is_empty() && *lp != "/");
+    rewrite_value_with_optional_prefix(rewrite, prefix)
+}
+
+/// Build the `destination` JSON for a dispatch rule from the route's resolved
+/// backend. Returns `None` for a redirect-only route (no upstream and an empty
+/// backend host) so the emitted rule omits the destination — the plugin
+/// accepts a destination-less rule only when it carries a redirect.
+fn route_dispatch_destination_value(
+    route_destination: &MeshRouteDispatchDestination<'_>,
+) -> Option<serde_json::Map<String, Value>> {
+    let mut destination = serde_json::Map::new();
+    if let Some(uid) = route_destination.upstream_id {
+        destination.insert("upstream_id".to_string(), Value::String(uid.to_string()));
+    } else if !route_destination.backend_host.is_empty() {
+        destination.insert(
+            "backend_host".to_string(),
+            Value::String(route_destination.backend_host.to_string()),
+        );
+        destination.insert(
+            "backend_port".to_string(),
+            serde_json::json!(route_destination.backend_port),
+        );
+    } else {
+        return None;
+    }
+    Some(destination)
+}
+
+fn rewrite_value_with_optional_prefix(rewrite: &Value, prefix: Option<&str>) -> Value {
+    let mut value = rewrite.clone();
+    if let (Some(prefix), Some(obj)) = (prefix, value.as_object_mut()) {
+        obj.insert(
+            "match_prefix".to_string(),
+            Value::String(prefix.to_string()),
+        );
+    }
+    value
 }
 
 fn uri_match_for_listen_path(listen_path: &str) -> Option<Value> {
