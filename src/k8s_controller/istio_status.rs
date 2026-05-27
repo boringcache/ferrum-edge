@@ -16,10 +16,10 @@
 //!   (UNSET → PERMISSIVE in Istio) and surfaces port-level overrides.
 //! - `DestinationRule` — status reports whether the rule's host could be
 //!   matched and which `connectionPool` knobs landed vs. were deferred.
-//! - `VirtualService` — status reports host/HTTP-route counts and flags
-//!   `tcp`/`tls` route blocks and HTTP `mirror`/`corsPolicy`/`redirect`/
-//!   `rewrite` fields as deferred (the translator only consumes `http`
-//!   routes).
+//! - `VirtualService` — status reports host/HTTP-route counts. `tcp`/`tls`
+//!   route blocks are rejected fail-closed (reported as `Invalid`); HTTP
+//!   `mirror`/`rewrite`/`redirect` are translated; only `corsPolicy` is
+//!   flagged as a deferred field.
 //! - `ServiceEntry` — status reports the resolved `resolution`/`location`
 //!   and host/endpoint/port counts.
 //! - `RequestAuthentication` — status reports the resolved scope and the
@@ -451,18 +451,7 @@ fn authorization_policy_status(
         }
     };
 
-    let conditions = vec![condition(
-        object,
-        Some(&object.status),
-        "FerrumAccepted",
-        accepted,
-        reason,
-        &message,
-    )];
-
-    let mut status = object.status.clone();
-    merge_status_conditions(&mut status, &["FerrumAccepted"], conditions);
-    (status, detail)
+    accepted_status(object, accepted, reason, &message, detail)
 }
 
 fn peer_authentication_status(
@@ -477,15 +466,7 @@ fn peer_authentication_status(
         .and_then(Value::as_str)
         .unwrap_or("UNSET")
         .to_string();
-    let scope = if object.spec.get("selector").is_some() {
-        "WorkloadSelector"
-    } else if object.metadata.namespace == istio_root_namespace
-        || object.metadata.namespace.is_empty()
-    {
-        "MeshWide"
-    } else {
-        "Namespace"
-    };
+    let scope = istio_policy_scope_label(object, istio_root_namespace);
     let port_overrides: Vec<String> = object
         .spec
         .get("portLevelMtls")
@@ -536,18 +517,7 @@ fn peer_authentication_status(
         }
     };
 
-    let conditions = vec![condition(
-        object,
-        Some(&object.status),
-        "FerrumAccepted",
-        accepted,
-        reason,
-        &message,
-    )];
-
-    let mut status = object.status.clone();
-    merge_status_conditions(&mut status, &["FerrumAccepted"], conditions);
-    (status, detail)
+    accepted_status(object, accepted, reason, &message, detail)
 }
 
 fn destination_rule_status(
@@ -615,18 +585,7 @@ fn destination_rule_status(
         }
     };
 
-    let conditions = vec![condition(
-        object,
-        Some(&object.status),
-        "FerrumAccepted",
-        accepted,
-        reason,
-        &message,
-    )];
-
-    let mut status = object.status.clone();
-    merge_status_conditions(&mut status, &["FerrumAccepted"], conditions);
-    (status, detail)
+    accepted_status(object, accepted, reason, &message, detail)
 }
 
 fn has_port_level_tls(spec: &Value) -> bool {
@@ -747,12 +706,12 @@ fn accepted_status(
     (status, detail)
 }
 
-/// Status for `VirtualService`. The translator only consumes `spec.http`
-/// routes; `spec.tcp` / `spec.tls` route blocks and several HTTP-route
-/// fields (`mirror` / `mirrorPercentage` / `corsPolicy` / `redirect` /
-/// `rewrite`) are parsed-shaped-but-dropped, so they are surfaced as
-/// deferred fields. A `K8sTranslateError` (unsupported match predicate,
-/// bad backend, etc.) flips the condition to `Invalid`.
+/// Status for `VirtualService`. The translator consumes `spec.http` routes
+/// including `mirror` / `rewrite` / `redirect`. `spec.tcp` / `spec.tls`
+/// route blocks are rejected fail-closed and surface through the `Invalid`
+/// arm (as does any `K8sTranslateError` for an unsupported match predicate,
+/// bad backend, etc.). The only HTTP-route field still parsed-but-dropped is
+/// `corsPolicy`, surfaced as a deferred field.
 fn virtual_service_status(
     object: &K8sObject,
     result: Result<&K8sTranslation, &K8sTranslateError>,
@@ -807,39 +766,23 @@ fn virtual_service_status(
     }
 }
 
-/// VirtualService fields the translator parses past but never projects.
-/// `tcp` / `tls` route arrays are ignored wholesale; the listed HTTP-route
-/// fields are not read by the route translator.
+/// VirtualService HTTP-route fields the translator parses past but never
+/// projects. `tcp` / `tls` route arrays are not listed here: they are
+/// rejected fail-closed by the translator and reported via the `Invalid`
+/// status arm. `corsPolicy` is the only remaining parsed-but-dropped field.
 fn virtual_service_deferred_fields(spec: &Value) -> Vec<&'static str> {
     let mut deferred: Vec<&'static str> = Vec::new();
-    if spec
-        .get("tcp")
-        .and_then(Value::as_array)
-        .is_some_and(|routes| !routes.is_empty())
-    {
-        deferred.push("tcp[] routes (not translated; only http routes are modeled)");
-    }
-    if spec
-        .get("tls")
-        .and_then(Value::as_array)
-        .is_some_and(|routes| !routes.is_empty())
-    {
-        deferred.push("tls[] routes (not translated; only http routes are modeled)");
-    }
+    // `spec.tcp[]` / `spec.tls[]` are NOT listed as deferred: the translator
+    // rejects them fail-closed with a `K8sTranslateError`, so they surface
+    // through the `Invalid` arm of `virtual_service_status`. `mirror` /
+    // `mirrorPercentage` / `redirect` / `rewrite` are now translated
+    // (request_mirror plugin + dispatch-rule rewrite/redirect), leaving
+    // `corsPolicy` as the only parsed-but-unprojected HTTP-route field.
     let http_routes = spec.get("http").and_then(Value::as_array);
-    for (field, label) in [
-        ("mirror", "http[].mirror (parsed but not projected)"),
-        (
-            "mirrorPercentage",
-            "http[].mirrorPercentage (parsed but not projected)",
-        ),
-        ("corsPolicy", "http[].corsPolicy (parsed but not projected)"),
-        ("redirect", "http[].redirect (parsed but not projected)"),
-        ("rewrite", "http[].rewrite (parsed but not projected)"),
-    ] {
-        if http_routes.is_some_and(|routes| routes.iter().any(|route| route.get(field).is_some())) {
-            deferred.push(label);
-        }
+    if http_routes
+        .is_some_and(|routes| routes.iter().any(|route| route.get("corsPolicy").is_some()))
+    {
+        deferred.push("http[].corsPolicy (parsed but not projected)");
     }
     deferred
 }
@@ -1940,7 +1883,9 @@ mod tests {
     }
 
     #[test]
-    fn virtual_service_tcp_routes_surface_deferred_field() {
+    fn virtual_service_tcp_routes_are_rejected() {
+        // Tier 3 makes `spec.tcp[]` / `spec.tls[]` fail-closed translator
+        // errors rather than silently-dropped (deferred) fields.
         let obj = object(
             "networking.istio.io/v1",
             "VirtualService",
@@ -1951,36 +1896,45 @@ mod tests {
             }),
         );
         let updates = plan_istio_status_updates(&[obj], options());
+        let c = find_condition(
+            updates[0].status["conditions"].as_array().unwrap(),
+            "FerrumAccepted",
+        );
+        assert_eq!(c["status"].as_str(), Some("False"));
+        assert_eq!(c["reason"].as_str(), Some("Invalid"));
         let detail = updates[0].ferrum_detail.as_ref().unwrap();
-        let deferred: Vec<&str> = detail["translation"]["deferred_fields"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(Value::as_str)
-            .collect();
+        let error = detail["translation"]["error"].as_str().unwrap();
         assert!(
-            deferred.iter().any(|f| f.contains("tcp[]")),
-            "tcp routes should be flagged as deferred, got {deferred:?}"
+            error.contains("tcp"),
+            "rejection error should mention tcp, got: {error}"
         );
     }
 
     #[test]
-    fn virtual_service_mirror_surfaces_deferred_field() {
+    fn virtual_service_cors_policy_deferred_but_mirror_is_not() {
+        // `mirror` is now translated (request_mirror plugin), so it must NOT
+        // be reported as deferred. `corsPolicy` is still parsed-but-dropped.
         let obj = object(
             "networking.istio.io/v1",
             "VirtualService",
-            "mirror-vs",
+            "cors-vs",
             json!({
                 "hosts": ["reviews.default.svc.cluster.local"],
                 "http": [
                     {
                         "route": [ { "destination": { "host": "reviews.default.svc.cluster.local" } } ],
-                        "mirror": { "host": "reviews-canary.default.svc.cluster.local" }
+                        "mirror": { "host": "reviews-canary.default.svc.cluster.local" },
+                        "corsPolicy": { "allowOrigins": [ { "exact": "https://example.com" } ] }
                     }
                 ]
             }),
         );
         let updates = plan_istio_status_updates(&[obj], options());
+        let c = find_condition(
+            updates[0].status["conditions"].as_array().unwrap(),
+            "FerrumAccepted",
+        );
+        assert_eq!(c["status"].as_str(), Some("True"));
         let detail = updates[0].ferrum_detail.as_ref().unwrap();
         let deferred: Vec<&str> = detail["translation"]["deferred_fields"]
             .as_array()
@@ -1989,8 +1943,12 @@ mod tests {
             .filter_map(Value::as_str)
             .collect();
         assert!(
-            deferred.iter().any(|f| f.contains("mirror")),
-            "http[].mirror should be flagged as deferred, got {deferred:?}"
+            deferred.iter().any(|f| f.contains("corsPolicy")),
+            "http[].corsPolicy should be flagged as deferred, got {deferred:?}"
+        );
+        assert!(
+            !deferred.iter().any(|f| f.contains("mirror")),
+            "http[].mirror is translated and must not be deferred, got {deferred:?}"
         );
     }
 

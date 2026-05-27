@@ -16,11 +16,11 @@ use aya_ebpf::EbpfContext;
 
 use crate::maps::{
     FERRUM_BYPASS_UIDS, FERRUM_CAPTURE_CONFIG, FERRUM_CIDR_EXCLUDE4, FERRUM_CIDR_INCLUDE4,
-    FERRUM_INCLUDE_PORTS, FERRUM_ORIG_DST4, FERRUM_PORT_EXCLUDE,
+    FERRUM_INCLUDE_PORTS, FERRUM_ORIG_DST4, FERRUM_PORT_EXCLUDE, FERRUM_WORKLOAD_IDENTITY,
 };
 use ferrum_ebpf_common::{
-    CidrKey4, IncludePortsPolicy, OrigDst4, OrigDstKey, FERRUM_CAPTURE_CONFIG_KEY,
-    IPV4_LOOPBACK_NBO, OUTBOUND_CAPTURE_PORT,
+    CidrKey4, IncludePortsPolicy, OrigDst4, OrigDstKey, WorkloadIdentity,
+    FERRUM_CAPTURE_CONFIG_KEY, IPV4_LOOPBACK_NBO, OUTBOUND_CAPTURE_PORT,
 };
 
 #[cgroup_sock_addr(connect4)]
@@ -64,11 +64,17 @@ fn try_connect4(ctx: &SockAddrContext) -> Result<i32, i64> {
 
     let cookie = unsafe { aya_ebpf::helpers::bpf_get_socket_cookie(ctx.as_ptr()) };
     let key = OrigDstKey { cookie };
+    // Stamp the source pod's identity onto the orig-dst record so the
+    // node-waypoint proxy can resolve it from the socket cookie. The connect
+    // hook runs in the calling pod's cgroup, so the cgroup id keys the
+    // node-agent-populated identity. Absent entry → all-zero sentinel, which
+    // node-waypoint resolution treats as fail-closed.
+    let identity = source_workload_identity();
     let orig = OrigDst4 {
         addr: dst_ip,
         port: dst_port as u32,
-        pod_uid: [0; 16],
-        workload_spiffe_hash: 0,
+        pod_uid: identity.pod_uid,
+        workload_spiffe_hash: identity.workload_spiffe_hash,
     };
     let _ = FERRUM_ORIG_DST4.insert(&key, &orig, 0);
 
@@ -77,6 +83,19 @@ fn try_connect4(ctx: &SockAddrContext) -> Result<i32, i64> {
     sock_addr.user_port = outbound_capture_port() << 16;
 
     Ok(1)
+}
+
+/// Look up the source pod's identity for the current cgroup. Returns the
+/// all-zero sentinel when the node-agent has not enrolled this cgroup yet
+/// (e.g. the connect raced pod enrollment); node-waypoint resolution treats
+/// the sentinel as fail-closed.
+#[inline(always)]
+fn source_workload_identity() -> WorkloadIdentity {
+    let cgroup_id = unsafe { aya_ebpf::helpers::bpf_get_current_cgroup_id() };
+    match unsafe { FERRUM_WORKLOAD_IDENTITY.get(&cgroup_id) } {
+        Some(identity) => *identity,
+        None => WorkloadIdentity::unknown(),
+    }
 }
 
 #[inline(always)]

@@ -58,8 +58,26 @@ pub fn detect_http_flavor<B>(req: &Request<B>) -> HttpFlavor {
     HttpFlavor::Plain
 }
 
+/// Classify a `content-type` value as native gRPC: `application/grpc`
+/// optionally followed by a `+`/`;` parameter or OWS (optional whitespace).
+/// Case-insensitive on the prefix; operates on raw bytes (no UTF-8 validation).
+///
+/// This is the canonical classifier for the H1/H2/H3 dispatch path and the
+/// early-reject path (`is_grpc_request` / `request_uses_grpc_content_type`).
+/// Plugin-local helpers in `body_validator` and `workload_metrics` use simpler
+/// prefix forms suited to their own contexts and are not governed by this
+/// function.
+///
+/// Accepted suffixes after `application/grpc`:
+/// - nothing (bare `application/grpc`)
+/// - `+<subtype>` (e.g. `application/grpc+proto`)
+/// - `;` or OWS then `;` (e.g. `application/grpc ;charset=utf-8`)
+/// - OWS at end-of-value (e.g. `application/grpc ` or `application/grpc\t`)
+///
+/// Rejected: `-` or alphanumeric next byte (e.g. `application/grpc-web`,
+/// `application/grpcfoo`).
 #[inline]
-fn is_native_grpc_content_type(value: &[u8]) -> bool {
+pub(crate) fn is_native_grpc_content_type(value: &[u8]) -> bool {
     const PREFIX: &[u8] = b"application/grpc";
     let Some(prefix) = value.get(..PREFIX.len()) else {
         return false;
@@ -72,11 +90,13 @@ fn is_native_grpc_content_type(value: &[u8]) -> bool {
         None => true,
         Some(b'+') | Some(b';') => true,
         Some(b' ' | b'\t') => {
-            value[PREFIX.len()..]
+            // Skip OWS run; accept if we reach end-of-value or a ';'.
+            let after_prefix = &value[PREFIX.len()..];
+            let non_ows = after_prefix
                 .iter()
                 .copied()
-                .find(|b| !matches!(b, b' ' | b'\t'))
-                == Some(b';')
+                .find(|b| !matches!(b, b' ' | b'\t'));
+            matches!(non_ows, None | Some(b';'))
         }
         _ => false,
     }

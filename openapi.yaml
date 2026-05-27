@@ -9523,6 +9523,18 @@ components:
             `PolicyScopeCache` attached to `RequestContext.node_waypoint_policy_scope`.
             Auto-set by mesh injection on `NodeWaypoint` topology where one
             listener serves many pods.
+        trusted_hbone_assertors:
+          type: array
+          items:
+            type: string
+          default: ["ztunnel", "waypoint"]
+          description: |
+            Allow-list of identity-asserting infrastructure components whose
+            HBONE baggage `source.principal` may rewrite the authz principal.
+            Bare service-account names match any peer whose SPIFFE path ends
+            with `/sa/<name>`; full SPIFFE IDs match exactly. Default is
+            `["ztunnel", "waypoint"]`. Explicit empty array disables all
+            baggage rewriting.
 
     MeshOutboundRegistryConfig:
       type: object
@@ -9601,7 +9613,13 @@ components:
           minItems: 1
           items:
             type: object
-            required: [destination]
+            description: |
+              One ordered route rule. `destination` is required unless the
+              rule carries a `redirect` (which answers the request itself and
+              needs no backend). First match wins.
+            anyOf:
+              - required: [destination]
+              - required: [redirect]
             properties:
               match:
                 type: object
@@ -9869,6 +9887,62 @@ components:
                       body:
                         type: [string, "null"]
                         description: Optional response body; empty when omitted.
+              rewrite:
+                type: object
+                description: |
+                  Optional per-rule URI / authority rewrite. Projects Istio
+                  `VirtualService.http[].rewrite` onto the matched dispatch
+                  rule so a rewriting route can be collapsed with sibling
+                  routes onto one Ferrum proxy without rewriting the siblings'
+                  traffic. At least one of `uri` / `authority` must be set.
+                  Applied when the rule matches and no `redirect` fires.
+                properties:
+                  uri:
+                    type: [string, "null"]
+                    description: |
+                      Replacement request path forwarded to the backend. When
+                      `match_prefix` is set (the source `match.uri` was a
+                      prefix) only that prefix is replaced; otherwise the whole
+                      path is replaced. CRLF is rejected at load time.
+                  authority:
+                    type: [string, "null"]
+                    description: |
+                      Replacement `Host` / `:authority` forwarded to the
+                      backend. CRLF / whitespace is rejected at load time.
+                  match_prefix:
+                    type: [string, "null"]
+                    description: |
+                      Literal path prefix the source `match.uri.prefix`
+                      matched. The plugin strips this prefix and prepends
+                      `uri` (Istio prefix-rewrite). Normally set by the
+                      VirtualService translator, not hand-authored.
+              redirect:
+                type: object
+                description: |
+                  Optional per-rule HTTP redirect. Projects Istio
+                  `VirtualService.http[].redirect`. When the rule matches the
+                  request is answered with a 3xx + `Location` and never reaches
+                  a backend; takes precedence over `rewrite` and the route
+                  override destination. At least one of `uri` / `authority` /
+                  `scheme` must be set. A rule carrying a `redirect` does not
+                  require a `destination`.
+                properties:
+                  uri:
+                    type: [string, "null"]
+                    description: Replacement path for the Location header; request path preserved when unset.
+                  authority:
+                    type: [string, "null"]
+                    description: Replacement authority (host[:port]) for the Location header; request authority preserved when unset.
+                  scheme:
+                    type: [string, "null"]
+                    enum: [http, https, null]
+                    description: Replacement scheme for the Location header; request scheme preserved when unset.
+                  redirect_code:
+                    type: integer
+                    minimum: 300
+                    maximum: 399
+                    default: 301
+                    description: HTTP redirect status code (Istio `redirectCode`). Defaults to 301.
         reject_unmatched:
           type: boolean
           default: false

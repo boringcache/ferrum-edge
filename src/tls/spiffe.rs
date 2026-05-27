@@ -26,7 +26,9 @@
 
 use arc_swap::ArcSwap;
 use rustls::client::WantsClientCert;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
+use rustls::pki_types::{
+    CertificateDer, CertificateRevocationListDer, PrivateKeyDer, ServerName, UnixTime,
+};
 use rustls::server::{WantsServerCert, WebPkiClientVerifier};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use std::collections::HashMap;
@@ -35,6 +37,7 @@ use tracing::{debug, warn};
 
 use crate::identity::spiffe::{SpiffeId, extract_spiffe_id_from_parsed};
 use crate::identity::{SvidBundle, TrustBundle, TrustBundleSet, TrustDomain};
+use crate::tls::CrlList;
 
 /// Errors raised by the SPIFFE TLS builders.
 #[derive(Debug, thiserror::Error)]
@@ -67,9 +70,13 @@ pub type SharedBundleSlot = Arc<ArcSwap<Option<SvidBundle>>>;
 /// `peer_required` controls whether the resulting config rejects clients
 /// that do not present a certificate (mesh-strict ⇒ `true`; permissive
 /// modes use the lower-level [`build_spiffe_inbound_resolver`] directly).
+///
+/// `crls` is threaded into the inbound peer-chain verifier for end-entity
+/// revocation; an empty list disables revocation checking (unchanged behavior).
 pub fn build_spiffe_inbound_config(
     bundle_slot: SharedBundleSlot,
     peer_required: bool,
+    crls: CrlList,
 ) -> Result<Arc<ServerConfig>, SpiffeTlsError> {
     let snapshot = bundle_slot.load_full();
     if snapshot.is_none() {
@@ -80,7 +87,7 @@ pub fn build_spiffe_inbound_config(
         .with_safe_default_protocol_versions()
         .map_err(|e| SpiffeTlsError::Rustls(e.to_string()))?;
 
-    let verifier = SpiffeClientCertVerifier::new(bundle_slot.clone(), peer_required);
+    let verifier = SpiffeClientCertVerifier::new(bundle_slot.clone(), peer_required, crls);
     let server_resolver = SpiffeServerCertResolver::new(bundle_slot);
 
     let builder: rustls::ConfigBuilder<ServerConfig, WantsServerCert> =
@@ -90,6 +97,39 @@ pub fn build_spiffe_inbound_config(
     // HTTP/2 over mTLS.
     cfg.alpn_protocols = vec![b"h2".to_vec()];
     Ok(Arc::new(cfg))
+}
+
+/// Build a [`rustls::server::danger::ClientCertVerifier`] that validates an
+/// inbound peer's SVID: chain-to-bundle plus the peer SAN's trust domain
+/// matching the local or a federated bundle in `bundle_slot`.
+///
+/// Unlike [`build_spiffe_inbound_config`], this returns only the *verifier*,
+/// so a caller can attach it to a `ServerConfig` that still presents the
+/// operator-supplied mesh server certificate and keeps its own ALPN, CRL,
+/// early-data, and session-resumption settings. The mesh inbound listener
+/// uses this so peer SPIFFE SANs are trust-domain-validated without changing
+/// server-cert presentation or forcing h2-only ALPN on the shared
+/// HBONE + mTLS-termination listener.
+///
+/// `peer_required` controls `client_auth_mandatory()`: `true` for STRICT
+/// (reject clients with no cert), `false` for PERMISSIVE (a presented cert is
+/// still trust-domain-validated, but a missing cert is allowed through so the
+/// PERMISSIVE listener can also serve plaintext-identity-less peers).
+///
+/// `crls` is threaded into the per-trust-domain peer-chain verifiers so inbound
+/// mesh peers are subject to end-entity revocation checks, matching the
+/// operator-CA path. An empty `crls` skips `.with_crls(...)`, preserving the
+/// pre-CRL behavior exactly.
+pub fn build_spiffe_client_cert_verifier(
+    bundle_slot: SharedBundleSlot,
+    peer_required: bool,
+    crls: CrlList,
+) -> Arc<dyn rustls::server::danger::ClientCertVerifier> {
+    Arc::new(SpiffeClientCertVerifier::new(
+        bundle_slot,
+        peer_required,
+        crls,
+    ))
 }
 
 // ── Outbound (client-side) ────────────────────────────────────────────────
@@ -209,15 +249,20 @@ impl rustls::client::ResolvesClientCert for SpiffeClientCertResolver {
 struct SpiffeClientCertVerifier {
     slot: SharedBundleSlot,
     peer_required: bool,
+    /// End-entity CRLs applied to inbound mesh peers. Empty when no CRL file is
+    /// configured, in which case revocation checking is skipped (matching the
+    /// operator-CA path).
+    crls: CrlList,
     schemes: Vec<rustls::SignatureScheme>,
     peer_verifier_cache: ArcSwap<Option<SpiffePeerVerifierCache>>,
 }
 
 impl SpiffeClientCertVerifier {
-    fn new(slot: SharedBundleSlot, peer_required: bool) -> Self {
+    fn new(slot: SharedBundleSlot, peer_required: bool, crls: CrlList) -> Self {
         Self {
             slot,
             peer_required,
+            crls,
             schemes: rustls::crypto::ring::default_provider()
                 .signature_verification_algorithms
                 .supported_schemes(),
@@ -254,6 +299,7 @@ impl rustls::server::danger::ClientCertVerifier for SpiffeClientCertVerifier {
             end_entity,
             intermediates,
             None,
+            &self.crls,
         )
         .map(|_| rustls::server::danger::ClientCertVerified::assertion())
         .map_err(|e| rustls::Error::General(format!("SPIFFE inbound verify: {e}")))
@@ -347,6 +393,11 @@ impl rustls::client::danger::ServerCertVerifier for SpiffeServerCertVerifier {
             end_entity,
             intermediates,
             self.expected_peer.as_ref(),
+            // Outbound/backend mesh CRL is intentionally unchanged here: the PR
+            // scopes revocation enforcement to inbound mesh peers. Passing an
+            // empty slice skips `.with_crls(...)`, so behavior is identical to
+            // before. Outbound CRL is a possible follow-up.
+            &[],
         )
         .map(|_| rustls::client::danger::ServerCertVerified::assertion())
         .map_err(|e| rustls::Error::General(format!("SPIFFE outbound verify: {e}")))
@@ -413,6 +464,7 @@ struct SpiffePeerVerifierCache {
 type PeerChainVerifier = Arc<dyn rustls::server::danger::ClientCertVerifier>;
 type PeerVerifierMap = HashMap<TrustDomain, PeerChainVerifier>;
 
+#[allow(clippy::too_many_arguments)]
 fn verify_peer_against_cached_snapshot(
     cache_slot: &ArcSwap<Option<SpiffePeerVerifierCache>>,
     source: Arc<Option<SvidBundle>>,
@@ -420,6 +472,7 @@ fn verify_peer_against_cached_snapshot(
     end_entity: &CertificateDer<'_>,
     intermediates: &[CertificateDer<'_>],
     expected_peer: Option<&SpiffeId>,
+    crls: &[CertificateRevocationListDer<'static>],
 ) -> Result<SpiffeId, String> {
     let peer_id = extract_and_check_peer_spiffe_id(end_entity, expected_peer)?;
     if trust_bundles.get(peer_id.trust_domain()).is_none() {
@@ -429,7 +482,7 @@ fn verify_peer_against_cached_snapshot(
         ));
     }
 
-    let cache_snapshot = peer_verifier_cache(cache_slot, source)?;
+    let cache_snapshot = peer_verifier_cache(cache_slot, source, crls)?;
     let cache = cache_snapshot
         .as_ref()
         .as_ref()
@@ -450,42 +503,54 @@ fn verify_peer_against_cached_snapshot(
 fn peer_verifier_cache(
     cache_slot: &ArcSwap<Option<SpiffePeerVerifierCache>>,
     source: Arc<Option<SvidBundle>>,
+    crls: &[CertificateRevocationListDer<'static>],
 ) -> Result<Arc<Option<SpiffePeerVerifierCache>>, String> {
     let cached = cache_slot.load_full();
     if let Some(cache) = cached.as_ref()
         && Arc::ptr_eq(&cache.source, &source)
     {
+        // The CRL set is fixed for the lifetime of a given verifier instance
+        // (it owns its `crls` and passes the same slice on every handshake),
+        // so an SVID-source match is sufficient to reuse the cached per-domain
+        // verifiers without re-checking CRL identity.
         return Ok(cached);
     }
 
-    let next = Arc::new(Some(SpiffePeerVerifierCache::build(source)?));
+    let next = Arc::new(Some(SpiffePeerVerifierCache::build(source, crls)?));
     cache_slot.store(next.clone());
     Ok(next)
 }
 
 impl SpiffePeerVerifierCache {
-    fn build(source: Arc<Option<SvidBundle>>) -> Result<Self, String> {
+    fn build(
+        source: Arc<Option<SvidBundle>>,
+        crls: &[CertificateRevocationListDer<'static>],
+    ) -> Result<Self, String> {
         let bundle = source
             .as_ref()
             .as_ref()
             .ok_or_else(|| "SPIFFE verifier cache: no SVID bundle yet".to_string())?;
         let mut verifiers = HashMap::new();
 
-        insert_trust_bundle_verifier(&mut verifiers, &bundle.trust_bundles.local);
+        insert_trust_bundle_verifier(&mut verifiers, &bundle.trust_bundles.local, crls);
         for trust_bundle in bundle.trust_bundles.federated.values() {
-            insert_trust_bundle_verifier(&mut verifiers, trust_bundle);
+            insert_trust_bundle_verifier(&mut verifiers, trust_bundle, crls);
         }
 
         Ok(Self { source, verifiers })
     }
 }
 
-fn insert_trust_bundle_verifier(verifiers: &mut PeerVerifierMap, trust_bundle: &TrustBundle) {
+fn insert_trust_bundle_verifier(
+    verifiers: &mut PeerVerifierMap,
+    trust_bundle: &TrustBundle,
+    crls: &[CertificateRevocationListDer<'static>],
+) {
     if verifiers.contains_key(&trust_bundle.trust_domain) {
         return;
     }
 
-    match build_peer_chain_verifier(trust_bundle) {
+    match build_peer_chain_verifier(trust_bundle, crls) {
         Ok(verifier) => {
             verifiers.insert(trust_bundle.trust_domain.clone(), verifier);
         }
@@ -497,7 +562,10 @@ fn insert_trust_bundle_verifier(verifiers: &mut PeerVerifierMap, trust_bundle: &
     }
 }
 
-fn build_peer_chain_verifier(trust_bundle: &TrustBundle) -> Result<PeerChainVerifier, String> {
+fn build_peer_chain_verifier(
+    trust_bundle: &TrustBundle,
+    crls: &[CertificateRevocationListDer<'static>],
+) -> Result<PeerChainVerifier, String> {
     let mut roots = RootCertStore::empty();
     let added = roots.add_parsable_certificates(
         trust_bundle
@@ -513,12 +581,23 @@ fn build_peer_chain_verifier(trust_bundle: &TrustBundle) -> Result<PeerChainVeri
     // SPIFFE URI SAN, not a DNS / IP name. `WebPkiClientVerifier` performs
     // the chain-up-to-trust-anchor check without server-name matching, which
     // is the desired behavior for both inbound and outbound mesh peers.
-    WebPkiClientVerifier::builder_with_provider(
+    let mut builder = WebPkiClientVerifier::builder_with_provider(
         Arc::new(roots),
         Arc::new(rustls::crypto::ring::default_provider()),
-    )
-    .build()
-    .map_err(|e| format!("webpki verifier build failed: {e}"))
+    );
+    // Mirror the operator-CA mesh path: when CRLs are configured, enforce
+    // end-entity revocation for inbound mesh peers. Empty CRLs skip this so
+    // behavior is unchanged for deployments without a CRL file (and for the
+    // outbound/non-cached callers that pass an empty slice).
+    if !crls.is_empty() {
+        builder = builder
+            .with_crls(crls.iter().cloned())
+            .allow_unknown_revocation_status()
+            .only_check_end_entity_revocation();
+    }
+    builder
+        .build()
+        .map_err(|e| format!("webpki verifier build failed: {e}"))
 }
 
 fn extract_and_check_peer_spiffe_id(
@@ -580,7 +659,11 @@ fn verify_peer_against_bundle(
         )
     })?;
 
-    let verifier = build_peer_chain_verifier(bundle)?;
+    // The uncached path is test-only direct validation; it intentionally does
+    // not apply CRLs (empty slice => `.with_crls(...)` skipped), preserving its
+    // existing behavior. Inbound CRL enforcement flows through the cached
+    // verifier path above.
+    let verifier = build_peer_chain_verifier(bundle, &[])?;
     verify_peer_chain(verifier.as_ref(), end_entity, intermediates)?;
     debug!(
         peer_id = %peer_id,
@@ -691,6 +774,82 @@ mod tests {
         }
     }
 
+    /// An empty CRL list (`Arc<Vec<_>>`) — the no-revocation-checking default.
+    fn empty_crls() -> CrlList {
+        Arc::new(Vec::new())
+    }
+
+    /// Issue a leaf SVID under `root` with a known serial so a CRL can revoke
+    /// it by serial. Mirrors [`issue_leaf`] otherwise.
+    fn issue_leaf_with_serial(
+        spiffe_id: &SpiffeId,
+        root_pem: &str,
+        root_key_pem: &str,
+        serial: &rcgen::SerialNumber,
+    ) -> Vec<u8> {
+        let issuer_kp = KeyPair::from_pem(root_key_pem).expect("re-parse root key");
+        let issuer: Issuer<'static, KeyPair> =
+            Issuer::from_ca_cert_pem(root_pem, issuer_kp).expect("issuer build");
+
+        let mut params = CertificateParams::default();
+        params.distinguished_name = DistinguishedName::new();
+        params
+            .subject_alt_names
+            .push(spiffe_id_to_san(spiffe_id).expect("spiffe SAN"));
+        params.serial_number = Some(serial.clone());
+        params.is_ca = IsCa::ExplicitNoCa;
+        params.key_usages = vec![
+            KeyUsagePurpose::DigitalSignature,
+            KeyUsagePurpose::KeyEncipherment,
+        ];
+        params.extended_key_usages = vec![
+            ExtendedKeyUsagePurpose::ServerAuth,
+            ExtendedKeyUsagePurpose::ClientAuth,
+        ];
+        let now = time::OffsetDateTime::now_utc();
+        params.not_before = now;
+        params.not_after = now + time::Duration::seconds(3600);
+
+        let leaf_kp = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("leaf keygen");
+        let cert = params.signed_by(&leaf_kp, &issuer).expect("sign leaf");
+        cert.der().to_vec()
+    }
+
+    /// Build a DER CRL signed by `root` revoking `serial`.
+    fn build_crl(root_pem: &str, root_key_pem: &str, serial: rcgen::SerialNumber) -> CrlList {
+        use rcgen::{
+            CertificateRevocationListParams, RevocationReason, RevokedCertParams, SerialNumber,
+        };
+        let issuer_kp = KeyPair::from_pem(root_key_pem).expect("re-parse root key");
+        let issuer: Issuer<'static, KeyPair> =
+            Issuer::from_ca_cert_pem(root_pem, issuer_kp).expect("issuer build");
+        let now = time::OffsetDateTime::now_utc();
+        let params = CertificateRevocationListParams {
+            this_update: now,
+            next_update: now + time::Duration::days(30),
+            crl_number: SerialNumber::from(1u64),
+            issuing_distribution_point: None,
+            revoked_certs: vec![RevokedCertParams {
+                serial_number: serial,
+                revocation_time: now,
+                reason_code: Some(RevocationReason::KeyCompromise),
+                invalidity_date: None,
+            }],
+            key_identifier_method: rcgen::KeyIdMethod::Sha256,
+        };
+        let crl_pem = params
+            .signed_by(&issuer)
+            .expect("sign CRL")
+            .pem()
+            .expect("CRL pem");
+        let crls: Vec<CertificateRevocationListDer<'static>> =
+            rustls_pemfile::crls(&mut crl_pem.as_bytes())
+                .filter_map(|r| r.ok())
+                .collect();
+        assert!(!crls.is_empty(), "should parse CRL from PEM");
+        Arc::new(crls)
+    }
+
     #[test]
     fn verifies_uri_san_only_svid() {
         let td = TrustDomain::new("td.verify-test").unwrap();
@@ -779,7 +938,7 @@ mod tests {
             leaf_a.clone(),
         )));
         let slot = Arc::new(ArcSwap::new(initial.clone()));
-        let verifier = SpiffeClientCertVerifier::new(slot.clone(), true);
+        let verifier = SpiffeClientCertVerifier::new(slot.clone(), true, empty_crls());
 
         rustls::server::danger::ClientCertVerifier::verify_client_cert(
             &verifier,
@@ -830,5 +989,127 @@ mod tests {
         assert!(!Arc::ptr_eq(&cache_a, &cache_b));
         assert!(Arc::ptr_eq(&cache_b_inner.source, &rotated));
         assert_eq!(cache_b_inner.verifiers.len(), 1);
+    }
+
+    #[test]
+    fn public_client_cert_verifier_validates_trust_domain() {
+        // `build_spiffe_client_cert_verifier` is the entry point the mesh
+        // inbound listener uses. It must reject a peer whose trust domain has
+        // no bundle (the gap PR-2b closes) and accept one that does.
+        let td = TrustDomain::new("td.inbound-verify").unwrap();
+        let id = SpiffeId::from_parts(&td, "ns/foo/sa/bar").unwrap();
+        let (root_der, root_pem, key_pem) = synthetic_root(&td);
+        let leaf = issue_leaf(&id, &root_pem, &key_pem, None);
+        let slot: SharedBundleSlot = Arc::new(ArcSwap::new(Arc::new(Some(svid_bundle_for(
+            id,
+            bundle_for(td, root_der),
+            leaf.clone(),
+        )))));
+
+        let verifier = build_spiffe_client_cert_verifier(slot, true, empty_crls());
+        // Known trust domain + valid chain → accepted.
+        rustls::server::danger::ClientCertVerifier::verify_client_cert(
+            verifier.as_ref(),
+            &CertificateDer::from(leaf),
+            &[],
+            UnixTime::now(),
+        )
+        .expect("peer in a known trust domain should verify");
+
+        // A peer from a foreign trust domain (its own root, not in the slot)
+        // must be rejected even though its chain is internally valid.
+        let foreign_td = TrustDomain::new("td.foreign-inbound").unwrap();
+        let foreign_id = SpiffeId::from_parts(&foreign_td, "ns/x/sa/y").unwrap();
+        let (_foreign_root_der, foreign_root_pem, foreign_key_pem) = synthetic_root(&foreign_td);
+        let foreign_leaf = issue_leaf(&foreign_id, &foreign_root_pem, &foreign_key_pem, None);
+        let err = rustls::server::danger::ClientCertVerifier::verify_client_cert(
+            verifier.as_ref(),
+            &CertificateDer::from(foreign_leaf),
+            &[],
+            UnixTime::now(),
+        )
+        .expect_err("peer from an untrusted trust domain must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("trust domain") || msg.contains("trust bundle"),
+            "rejection should cite the missing trust domain, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn public_client_cert_verifier_permissive_does_not_require_cert() {
+        // PERMISSIVE builds the verifier with `peer_required = false` so a peer
+        // that offers no cert is still admitted (rustls won't invoke
+        // verify_client_cert), while an offered cert is still validated.
+        let td = TrustDomain::new("td.permissive").unwrap();
+        let id = SpiffeId::from_parts(&td, "ns/foo/sa/bar").unwrap();
+        let (root_der, root_pem, key_pem) = synthetic_root(&td);
+        let leaf = issue_leaf(&id, &root_pem, &key_pem, None);
+        let slot: SharedBundleSlot = Arc::new(ArcSwap::new(Arc::new(Some(svid_bundle_for(
+            id,
+            bundle_for(td, root_der),
+            leaf,
+        )))));
+
+        let required = build_spiffe_client_cert_verifier(slot.clone(), true, empty_crls());
+        assert!(
+            rustls::server::danger::ClientCertVerifier::client_auth_mandatory(required.as_ref()),
+            "STRICT verifier must mandate client auth"
+        );
+        let permissive = build_spiffe_client_cert_verifier(slot, false, empty_crls());
+        assert!(
+            !rustls::server::danger::ClientCertVerifier::client_auth_mandatory(permissive.as_ref()),
+            "PERMISSIVE verifier must not mandate client auth"
+        );
+        assert!(
+            rustls::server::danger::ClientCertVerifier::offer_client_auth(permissive.as_ref()),
+            "PERMISSIVE verifier must still offer/request client auth so identity is recorded when present"
+        );
+    }
+
+    #[test]
+    fn inbound_verifier_rejects_revoked_peer_when_crls_configured() {
+        // PR-2b CRL parity: with a CRL revoking the peer's serial, the inbound
+        // SPIFFE verifier must reject the peer even though its chain and trust
+        // domain are otherwise valid. Without the CRL the same peer verifies,
+        // proving the rejection is the revocation check and not some other
+        // failure (i.e. an empty CRL list preserves pre-CRL behavior).
+        let td = TrustDomain::new("td.crl-revoke").unwrap();
+        let id = SpiffeId::from_parts(&td, "ns/foo/sa/bar").unwrap();
+        let (root_der, root_pem, key_pem) = synthetic_root(&td);
+        let serial = rcgen::SerialNumber::from_slice(&(1u8..=20).collect::<Vec<u8>>());
+        let leaf = issue_leaf_with_serial(&id, &root_pem, &key_pem, &serial);
+
+        let slot: SharedBundleSlot = Arc::new(ArcSwap::new(Arc::new(Some(svid_bundle_for(
+            id,
+            bundle_for(td, root_der),
+            leaf.clone(),
+        )))));
+
+        // Sanity: without CRLs, the leaf verifies.
+        let no_crl = build_spiffe_client_cert_verifier(slot.clone(), true, empty_crls());
+        rustls::server::danger::ClientCertVerifier::verify_client_cert(
+            no_crl.as_ref(),
+            &CertificateDer::from(leaf.clone()),
+            &[],
+            UnixTime::now(),
+        )
+        .expect("non-revoked peer should verify without a CRL");
+
+        // With a CRL revoking the leaf's serial, the verifier must reject it.
+        let crls = build_crl(&root_pem, &key_pem, serial);
+        let revoking = build_spiffe_client_cert_verifier(slot, true, crls);
+        let err = rustls::server::danger::ClientCertVerifier::verify_client_cert(
+            revoking.as_ref(),
+            &CertificateDer::from(leaf),
+            &[],
+            UnixTime::now(),
+        )
+        .expect_err("revoked peer must be rejected when a CRL is configured");
+        let msg = format!("{err}");
+        assert!(
+            msg.to_lowercase().contains("revok"),
+            "rejection should cite revocation, got: {msg}"
+        );
     }
 }

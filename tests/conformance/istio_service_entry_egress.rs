@@ -91,6 +91,7 @@ fn egress_runtime() -> MeshRuntimeConfig {
         sidecar_enforced_dry_run: false,
         sidecar_identity_narrowing: false,
         egress_stream_enabled: true,
+        request_auth_require_exp: true,
     }
 }
 

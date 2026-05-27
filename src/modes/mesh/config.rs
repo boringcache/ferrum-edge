@@ -242,6 +242,132 @@ pub struct PrincipalMatch {
 /// traffic through whenever a single negative-only entry "matched", which is
 /// the opposite of Istio's deny-listing intent (fail-open).
 ///
+/// Pre-parsed CIDR block for allocation-free hot-path IP matching.
+///
+/// Constructed from a CIDR string like `"10.0.0.0/8"` or a bare IP like
+/// `"192.168.1.1"` (treated as a host route). IPv4-mapped IPv6 addresses are
+/// canonicalized to IPv4 at parse time so `::ffff:10.0.0.0/104` becomes
+/// `10.0.0.0/8`. Serializes back to the canonical `network/prefix` form.
+///
+/// Fields are private so the invariant `prefix <= 32` (IPv4) / `prefix <= 128`
+/// (IPv6) cannot be bypassed by a direct struct literal. Use [`ParsedCidr::parse`]
+/// to construct values; [`ParsedCidr::contains`] relies on the invariant being
+/// upheld to avoid arithmetic overflow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedCidr {
+    network: IpAddr,
+    prefix: u8,
+}
+
+impl ParsedCidr {
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            return Err("IP block must not be empty".to_string());
+        }
+        let (network_str, prefix) = match trimmed.split_once('/') {
+            Some((net, plen)) => {
+                let prefix = plen
+                    .parse::<u8>()
+                    .map_err(|_| format!("invalid prefix length in CIDR '{s}'"))?;
+                (net, Some(prefix))
+            }
+            None => (trimmed, None),
+        };
+        let ip: IpAddr = network_str
+            .parse()
+            .map_err(|_| format!("invalid IP in CIDR '{s}'"))?;
+        let (network, prefix) =
+            Self::canonicalize(ip, prefix).map_err(|reason| format!("{reason} in CIDR '{s}'"))?;
+        let max = if network.is_ipv4() { 32 } else { 128 };
+        if prefix > max {
+            return Err(format!("prefix length {prefix} out of range in CIDR '{s}'"));
+        }
+        Ok(Self { network, prefix })
+    }
+
+    #[inline]
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        let ip = Self::canonicalize_ip(ip);
+        match (self.network, ip) {
+            (IpAddr::V4(net), IpAddr::V4(addr)) => {
+                if self.prefix == 0 {
+                    return true;
+                }
+                let mask = u32::MAX.checked_shl(32 - self.prefix as u32).unwrap_or(0);
+                (u32::from(net) & mask) == (u32::from(addr) & mask)
+            }
+            (IpAddr::V6(net), IpAddr::V6(addr)) => {
+                if self.prefix == 0 {
+                    return true;
+                }
+                let mask = u128::MAX.checked_shl(128 - self.prefix as u32).unwrap_or(0);
+                (u128::from(net) & mask) == (u128::from(addr) & mask)
+            }
+            _ => false,
+        }
+    }
+
+    fn canonicalize(ip: IpAddr, prefix: Option<u8>) -> Result<(IpAddr, u8), String> {
+        match ip {
+            IpAddr::V4(v4) => Ok((IpAddr::V4(v4), prefix.unwrap_or(32))),
+            IpAddr::V6(v6) => {
+                if let Some(v4) = v6.to_ipv4_mapped() {
+                    let v4_prefix = match prefix {
+                        Some(p) if p >= 96 => p - 96,
+                        Some(p) => {
+                            return Err(format!(
+                                "IPv4-mapped IPv6 CIDR prefix {p} must be at least 96"
+                            ));
+                        }
+                        None => 32,
+                    };
+                    Ok((IpAddr::V4(v4), v4_prefix))
+                } else {
+                    Ok((IpAddr::V6(v6), prefix.unwrap_or(128)))
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn canonicalize_ip(ip: IpAddr) -> IpAddr {
+        match ip {
+            IpAddr::V6(v6) => v6
+                .to_ipv4_mapped()
+                .map(IpAddr::V4)
+                .unwrap_or(IpAddr::V6(v6)),
+            other => other,
+        }
+    }
+}
+
+impl std::str::FromStr for ParsedCidr {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s)
+    }
+}
+
+impl fmt::Display for ParsedCidr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}", self.network, self.prefix)
+    }
+}
+
+impl Serialize for ParsedCidr {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for ParsedCidr {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        Self::parse(&s).map_err(serde::de::Error::custom)
+    }
+}
+
 /// IP fields are **fail-closed** when the corresponding request attribute is
 /// absent: a non-empty list with no value to test fails the match rather than
 /// admitting traffic the operator meant to gate. Negative identity and
@@ -266,26 +392,14 @@ pub struct SourceNegationMatch {
     /// succeeds.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub not_trust_domain_patterns: Vec<String>,
-    /// Istio `ipBlocks` — CIDR/IP allow-list over the direct connection peer
-    /// IP (`source.ip`). Non-empty ⇒ the source matches only when the peer
-    /// IP is inside one block. Non-empty + no source IP ⇒ fail-closed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub ip_blocks: Vec<String>,
-    /// Istio `notIpBlocks` — negative match over the direct connection peer
-    /// IP. Inside any block ⇒ fail. Non-empty + no source IP ⇒ fail-closed.
+    pub ip_blocks: Vec<ParsedCidr>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub not_ip_blocks: Vec<String>,
-    /// Istio `remoteIpBlocks` — CIDR/IP allow-list over the XFF-derived
-    /// remote client IP (`remote.ip`). Non-empty ⇒ the source matches only
-    /// when the remote IP is inside one block. Non-empty + no remote IP ⇒
-    /// fail-closed.
+    pub not_ip_blocks: Vec<ParsedCidr>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub remote_ip_blocks: Vec<String>,
-    /// Istio `notRemoteIpBlocks` — negative match over the XFF-derived
-    /// remote client IP. Inside any block ⇒ fail. Non-empty + no remote IP
-    /// ⇒ fail-closed.
+    pub remote_ip_blocks: Vec<ParsedCidr>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub not_remote_ip_blocks: Vec<String>,
+    pub not_remote_ip_blocks: Vec<ParsedCidr>,
 }
 
 impl SourceNegationMatch {
@@ -1980,34 +2094,6 @@ fn validate_mesh_config_internal(
                     }
                 }
             }
-            validate_mesh_source_negation_ip_values(
-                policy,
-                i,
-                "ip_blocks",
-                &rule.source_negation.ip_blocks,
-                &mut errors,
-            );
-            validate_mesh_source_negation_ip_values(
-                policy,
-                i,
-                "not_ip_blocks",
-                &rule.source_negation.not_ip_blocks,
-                &mut errors,
-            );
-            validate_mesh_source_negation_ip_values(
-                policy,
-                i,
-                "remote_ip_blocks",
-                &rule.source_negation.remote_ip_blocks,
-                &mut errors,
-            );
-            validate_mesh_source_negation_ip_values(
-                policy,
-                i,
-                "not_remote_ip_blocks",
-                &rule.source_negation.not_remote_ip_blocks,
-                &mut errors,
-            );
             for (j, condition) in rule.when.iter().enumerate() {
                 if !is_supported_mesh_condition_key(&condition.key) {
                     errors.push(format!(
@@ -2264,23 +2350,6 @@ fn validate_non_empty_string(context: String, value: &str, errors: &mut Vec<Stri
 fn validate_non_zero_port(context: String, port: u16, errors: &mut Vec<String>) {
     if port == 0 {
         errors.push(format!("{context}: port must be greater than 0"));
-    }
-}
-
-fn validate_mesh_source_negation_ip_values(
-    policy: &MeshPolicy,
-    rule_index: usize,
-    field: &str,
-    blocks: &[String],
-    errors: &mut Vec<String>,
-) {
-    for (block_index, block) in blocks.iter().enumerate() {
-        if let Err(error) = validate_mesh_condition_ip_block(block) {
-            errors.push(format!(
-                "MeshPolicy '{}'.rules[{}].source_negation.{}[{}] '{}': {}",
-                policy.name, rule_index, field, block_index, block, error
-            ));
-        }
     }
 }
 

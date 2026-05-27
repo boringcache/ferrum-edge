@@ -90,6 +90,78 @@ fn test_is_grpc_request_application_grpc_json() {
 }
 
 #[test]
+fn test_is_grpc_request_content_type_is_case_insensitive() {
+    let headers = headers_with_content_type("Application/Grpc+Proto");
+    assert!(grpc_proxy::is_grpc_content_type(&headers));
+}
+
+#[test]
+fn test_is_grpc_request_grpc_web_content_type_is_not_native_grpc() {
+    let headers = headers_with_content_type("Application/Grpc-Web+Proto");
+    assert!(!grpc_proxy::is_grpc_content_type(&headers));
+}
+
+#[test]
+fn test_is_grpc_request_grpc_prefix_token_is_not_native_grpc() {
+    for content_type in [
+        "application/grpcish",
+        "application/grpcx",
+        "application/grpc-webish",
+        "application/grpc -web",
+    ] {
+        let headers = headers_with_content_type(content_type);
+        assert!(
+            !grpc_proxy::is_grpc_content_type(&headers),
+            "{content_type} must not be treated as native gRPC"
+        );
+    }
+}
+
+#[test]
+fn test_is_grpc_request_allows_ows_before_parameters() {
+    let headers = headers_with_content_type("application/grpc ;charset=utf-8");
+    assert!(grpc_proxy::is_grpc_content_type(&headers));
+}
+
+#[test]
+fn test_is_grpc_request_allows_immediate_and_tab_ows_parameters() {
+    for content_type in [
+        "application/grpc;charset=utf-8",   // immediate ';' (Some(b';') arm)
+        "application/grpc\t;charset=utf-8", // tab OWS before ';'
+    ] {
+        let headers = headers_with_content_type(content_type);
+        assert!(
+            grpc_proxy::is_grpc_content_type(&headers),
+            "{content_type} should be treated as native gRPC"
+        );
+    }
+}
+
+#[test]
+fn test_is_grpc_request_trailing_ows_without_parameter_is_grpc() {
+    // Per the gRPC-over-HTTP/2 spec the content-type "begins with
+    // application/grpc"; trailing OWS is insignificant (trims to
+    // `application/grpc`) and must still classify as native gRPC.
+    for content_type in [
+        "application/grpc ",     // trailing space
+        "application/grpc\t",    // trailing tab
+        "application/grpc ;x=y", // OWS then ';' (existing behaviour, confirmed)
+    ] {
+        let headers = headers_with_content_type(content_type);
+        assert!(
+            grpc_proxy::is_grpc_content_type(&headers),
+            "{content_type:?} should be treated as native gRPC"
+        );
+    }
+}
+
+#[test]
+fn test_is_grpc_request_grpc_web_is_not_grpc() {
+    let headers = headers_with_content_type("application/grpc-web");
+    assert!(!grpc_proxy::is_grpc_content_type(&headers));
+}
+
+#[test]
 fn test_is_grpc_request_application_json_is_not_grpc() {
     let headers = headers_with_content_type("application/json");
     assert!(!grpc_proxy::is_grpc_content_type(&headers));

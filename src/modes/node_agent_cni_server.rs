@@ -354,6 +354,11 @@ pub fn pod_event_from_request<'a>(
         pod_uid: request.pod_uid.as_deref().unwrap_or(""),
         pod_name: request.pod_name.as_str(),
         namespace: request.pod_namespace.as_str(),
+        // CNI wire carries no service account; the production ADD path enriches
+        // identity from the Kubernetes API before enrollment. None here means
+        // the FERRUM_WORKLOAD_IDENTITY entry derives from the `default` SA
+        // until the kube-rs watcher reconciles the pod with its real SA.
+        service_account: None,
         labels,
         annotations,
         pod_ip_str: None,

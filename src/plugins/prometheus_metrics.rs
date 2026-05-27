@@ -1521,12 +1521,14 @@ impl MetricsRegistry {
             // metrics are registered so dashboards can pin "expected: 0"
             // even on healthy nodes. `reason` is a closed snake_case set
             // from KernelProbeResult::degradation_reason (kernel_too_old,
-            // cgroup_v1, bpffs_missing) plus a single "none" series on
-            // nominal nodes — total cardinality is bounded per node.
+            // cgroup_v1, bpffs_missing), plus ebpf_feature_disabled when the
+            // binary was built without `--features ebpf` and falls back to the
+            // mock backend (GAP-1b), plus a single "none" series on nominal
+            // nodes — total cardinality is bounded per node.
             output.push_str(
                 "# HELP ferrum_mesh_node_topology_degraded \
-                 Node-agent detected missing eBPF prerequisites. 1 with a reason label means \
-                 degraded, 0 with reason=\"none\" means nominal.\n",
+                 Node-agent detected missing eBPF prerequisites or a build without eBPF capture. \
+                 1 with a reason label means degraded, 0 with reason=\"none\" means nominal.\n",
             );
             output.push_str("# TYPE ferrum_mesh_node_topology_degraded gauge\n");
             let (reason, value) = match snapshot.topology_degraded_reason {

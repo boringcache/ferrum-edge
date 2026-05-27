@@ -383,6 +383,29 @@ impl NodeWaypointIdentityResolver {
         self.cookie_records.remove(&cookie);
     }
 
+    /// Drop every cookie record. Used by the orig-dst bridge (GAP-1b) when the
+    /// node-agent restarts and re-pins fresh BPF maps: the old cookie records
+    /// reference an evicted map generation and must not resolve to stale pods.
+    pub fn clear_cookie_records(&self) {
+        self.cookie_records.clear();
+    }
+
+    /// Retain only the cookies present in `live`, dropping the rest. The
+    /// orig-dst bridge calls this each poll so the resolver's cookie map ages
+    /// out cookies the kernel evicted from its LRU `FERRUM_ORIG_DST*` maps,
+    /// keeping the two maps in step instead of letting the resolver grow
+    /// unbounded relative to the BPF map.
+    pub fn retain_cookie_records(&self, live: &std::collections::HashSet<u64>) {
+        self.cookie_records
+            .retain(|cookie, _| live.contains(cookie));
+    }
+
+    /// Number of cookie records currently tracked. Cold-path test/diagnostic
+    /// helper; the accept path never calls this.
+    pub fn cookie_record_count(&self) -> usize {
+        self.cookie_records.len()
+    }
+
     pub fn upsert_identity(&self, identity: NodeWaypointIdentity) -> Arc<NodeWaypointIdentity> {
         let identity = Arc::new(identity);
         self.identities_by_pod_uid
@@ -1758,5 +1781,66 @@ mod tests {
             workload_spiffe_hash(&spiffe_id),
             u64::from_be_bytes(expected)
         );
+    }
+
+    // ── GAP-1b: orig-dst bridge support ──
+
+    #[test]
+    fn retain_cookie_records_ages_out_evicted_cookies() {
+        let resolver = NodeWaypointIdentityResolver::new(0);
+        let pod = [3u8; 16];
+        resolver.record_orig_dst4(1, orig_dst4(pod, 10));
+        resolver.record_orig_dst4(2, orig_dst4(pod, 10));
+        resolver.record_orig_dst6(3, orig_dst6(pod, 10));
+        assert_eq!(resolver.cookie_record_count(), 3);
+
+        // Simulate a bridge poll where only cookies 1 and 3 are still live in
+        // the BPF LRU map; cookie 2 was evicted by the kernel.
+        let live: std::collections::HashSet<u64> = [1u64, 3u64].into_iter().collect();
+        resolver.retain_cookie_records(&live);
+
+        assert_eq!(resolver.cookie_record_count(), 2);
+    }
+
+    #[test]
+    fn clear_cookie_records_drops_all_on_node_agent_restart() {
+        let resolver = NodeWaypointIdentityResolver::new(0);
+        let pod = [4u8; 16];
+        resolver.record_orig_dst4(1, orig_dst4(pod, 10));
+        resolver.record_orig_dst6(2, orig_dst6(pod, 10));
+        assert_eq!(resolver.cookie_record_count(), 2);
+
+        // Node-agent restart re-pins fresh maps; the bridge clears stale
+        // cookie records so an evicted-pod cookie can't resolve.
+        resolver.clear_cookie_records();
+        assert_eq!(resolver.cookie_record_count(), 0);
+    }
+
+    #[test]
+    fn bridge_recorded_cookie_resolves_to_identity() {
+        // Exercises the resolver's cookie→identity lookup mechanics IN
+        // ISOLATION: a record (as record_orig_dst4 would mirror it) plus a
+        // hand-enrolled identity under the same cookie resolves. This is NOT
+        // the production end-to-end accept path, which differs in two staged
+        // ways (see the `orig_dst_bridge` module docs): (1) the accept path
+        // looks up the *accept-side* socket cookie, not the connect-side cookie
+        // the bridge records (the GAP-2M registrar that bridges them is not yet
+        // implemented), and (2) `identities_by_pod_uid` is enrolled by hand
+        // here, whereas no production path yet populates it from slice
+        // workloads. The single cookie + manual enroll deliberately pin the
+        // resolver logic; this does not prove live resolution succeeds.
+        let resolver = NodeWaypointIdentityResolver::new(0);
+        let spiffe_id = spiffe("spiffe://td/ns/default/sa/api");
+        let pod_uid = [9u8; 16];
+        let hash = workload_spiffe_hash(&spiffe_id);
+
+        resolver.upsert_identity(NodeWaypointIdentity::new(pod_uid, spiffe_id.clone()));
+        // The bridge mirrors the BPF record (stamped with pod_uid + hash by
+        // the connect hook) into the resolver.
+        resolver.record_orig_dst4(77, orig_dst4(pod_uid, hash));
+
+        let resolved = resolver.resolve_cookie(77).expect("cookie resolves");
+        assert_eq!(resolved.pod_uid, pod_uid);
+        assert_eq!(resolved.spiffe_id, spiffe_id);
     }
 }

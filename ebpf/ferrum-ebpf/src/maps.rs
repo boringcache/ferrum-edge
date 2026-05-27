@@ -7,7 +7,7 @@ use aya_ebpf::macros::map;
 use aya_ebpf::maps::{HashMap, LpmTrie, LruHashMap, PerCpuArray, RingBuf};
 use ferrum_ebpf_common::{
     BpfCaptureConfig, CidrKey4, CidrKey6, IncludePortsPolicy, OrigDst4, OrigDst6, OrigDstKey,
-    PodInfo, SOCK_OPS_RINGBUF_DEFAULT_BYTES, SOCK_OPS_STATS_LEN,
+    PodInfo, WorkloadIdentity, SOCK_OPS_RINGBUF_DEFAULT_BYTES, SOCK_OPS_STATS_LEN,
 };
 
 /// Original IPv4 destination before connect rewrite, keyed by socket cookie.
@@ -63,6 +63,17 @@ pub static FERRUM_INCLUDE_PORTS: HashMap<u64, IncludePortsPolicy> =
 /// Singleton node-agent capture settings.
 #[map]
 pub static FERRUM_CAPTURE_CONFIG: HashMap<u32, BpfCaptureConfig> = HashMap::with_max_entries(1, 0);
+
+/// Per-cgroup source workload identity, keyed by cgroup id
+/// (`bpf_get_current_cgroup_id`). The node-agent writes one entry per enrolled
+/// pod cgroup; the connect hooks read it to stamp the original-destination
+/// record (`FERRUM_ORIG_DST4/6`) with the source pod's UID and SPIFFE hash.
+/// Absent entry → identity is unknown and the connect hook stores the all-zero
+/// sentinel, which node-waypoint resolution treats as fail-closed. Sized to
+/// match `FERRUM_INCLUDE_PORTS` (one entry per enrolled cgroup).
+#[map]
+pub static FERRUM_WORKLOAD_IDENTITY: HashMap<u64, WorkloadIdentity> =
+    HashMap::with_max_entries(4096, 0);
 
 /// SOCK_OPS event ringbuf. Sized at load time by the userspace loader from
 /// `FERRUM_BPF_SOCK_OPS_RINGBUF_BYTES`; the kernel default here

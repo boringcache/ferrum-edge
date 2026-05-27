@@ -57,6 +57,12 @@ pub struct NodeAgentConfig {
     pub fallback_mode: FallbackMode,
     pub excluded_namespaces: HashSet<String>,
     pub capture_contract: CaptureContract,
+    /// SPIFFE trust domain used to derive each enrolled pod's workload SPIFFE
+    /// ID (`spiffe://{trust_domain}/ns/{namespace}/sa/{service_account}`) for
+    /// the `FERRUM_WORKLOAD_IDENTITY` map (GAP-1b). Sourced from
+    /// `FERRUM_K8S_TRUST_DOMAIN` (default `cluster.local`) so it matches the
+    /// CP-side SPIFFE format that the node-waypoint resolver enrolls.
+    pub trust_domain: String,
 }
 
 /// CNI plugin listener configuration. Resolved from the env config in
@@ -126,6 +132,7 @@ impl NodeAgentConfig {
             fallback_mode,
             excluded_namespaces,
             capture_contract,
+            trust_domain: env_config.k8s_trust_domain.clone(),
         })
     }
 }
@@ -175,8 +182,9 @@ pub async fn run(
         )
         .await
     } else {
+        let backend = create_backend(&metrics);
         run_with_backend(
-            create_backend(),
+            backend,
             &config,
             metrics,
             &shutdown_tx,
@@ -343,14 +351,30 @@ fn decide_admin_bind_address(
     Ok(std::net::SocketAddr::new(configured_ip, port))
 }
 
-fn create_backend() -> Box<dyn EbpfBackend> {
+fn create_backend(metrics: &Arc<NodeAgentMetrics>) -> Box<dyn EbpfBackend> {
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
     {
+        let _ = metrics;
         Box::new(crate::ebpf::AyaEbpfBackend::new())
     }
     #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
     {
-        info!("ebpf feature not enabled, using mock backend");
+        // The kernel probe said this node CAN run eBPF capture, but THIS
+        // binary was built without the `ebpf` feature (or for a non-Linux
+        // target), so the mock backend attaches nothing. Capture does not
+        // happen. Surface this loudly and set the degraded gauge so the
+        // condition is observable instead of silently no-op'ing as if the
+        // node were healthy. This is the explicit fallback the build-out
+        // policy allows, not a recommended production posture.
+        metrics.set_topology_degraded("ebpf_feature_disabled");
+        warn!(
+            "Node-agent is using the MOCK eBPF backend: NO traffic capture occurs. \
+             The kernel supports eBPF, but this binary was built without `--features ebpf` \
+             (or for a non-Linux target). Pods will NOT be redirected through the mesh proxy. \
+             Set ferrum_mesh_node_topology_degraded{{reason=\"ebpf_feature_disabled\"}}=1. \
+             Rebuild with --features ebpf (Linux) and use the node-agent image that ships \
+             the ferrum-ebpf ELF to enable capture."
+        );
         Box::new(crate::ebpf::MockEbpfBackend::default())
     }
 }
@@ -638,10 +662,15 @@ fn apply_cni_add_from_pod(
         .status
         .as_ref()
         .and_then(|status| status.pod_ip.as_deref());
+    let service_account = pod
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.service_account_name.as_deref());
     let event = PodEvent {
         pod_uid: &api_uid,
         pod_name,
         namespace,
+        service_account,
         labels: &labels,
         annotations: &annotations,
         pod_ip_str: pod_ip,
@@ -878,6 +907,94 @@ fn apply_include_outbound_ports(
     }
 }
 
+/// Build the source workload identity for a pod and write it into the
+/// `FERRUM_WORKLOAD_IDENTITY` map (GAP-1b) so the connect hooks can stamp
+/// orig-dst records with it. The SPIFFE ID is
+/// `spiffe://{trust_domain}/ns/{namespace}/sa/{service_account}`, matching the
+/// CP-side format the node-waypoint resolver enrolls; the hash uses the same
+/// `workload_spiffe_hash` algorithm as the resolver so the two agree.
+///
+/// Best-effort: a bad pod UID, an un-buildable SPIFFE ID, a cgroup-id stat
+/// failure, or a BPF write error logs and returns `None` without aborting
+/// enrollment. When this is skipped the connect hooks fall back to the
+/// all-zero sentinel and node-waypoint resolution fails closed for that pod —
+/// the same posture as before identity stamping existed.
+fn apply_workload_identity(
+    backend: &mut dyn EbpfBackend,
+    config: &NodeAgentConfig,
+    pod_uid: &str,
+    namespace: &str,
+    service_account: Option<&str>,
+    cgroup_path: &str,
+) -> Option<u64> {
+    let identity = build_workload_identity(
+        pod_uid,
+        namespace,
+        service_account.unwrap_or("default"),
+        &config.trust_domain,
+    )?;
+    let cgroup_id = read_cgroup_id_for_pod(cgroup_path)?;
+    match backend.update_workload_identity(cgroup_id, &identity) {
+        Ok(()) => {
+            debug!(
+                pod_uid,
+                cgroup_id, "Wrote source workload identity to FERRUM_WORKLOAD_IDENTITY"
+            );
+            Some(cgroup_id)
+        }
+        Err(e) => {
+            warn!(
+                pod_uid,
+                cgroup_id,
+                error = %e,
+                "Failed to update FERRUM_WORKLOAD_IDENTITY for pod; node-waypoint identity \
+                 resolution will fail closed for traffic from this pod"
+            );
+            None
+        }
+    }
+}
+
+/// Construct the `WorkloadIdentity` for a pod from its UID and the derived
+/// SPIFFE ID. Returns `None` when the pod UID is not a valid UUID or the
+/// SPIFFE components are unusable.
+fn build_workload_identity(
+    pod_uid: &str,
+    namespace: &str,
+    service_account: &str,
+    trust_domain: &str,
+) -> Option<crate::ebpf::WorkloadIdentity> {
+    let uid_bytes = match crate::modes::mesh::node_waypoint::parse_pod_uid(pod_uid) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            warn!(pod_uid, error = %e, "Cannot derive workload identity: invalid pod UID");
+            return None;
+        }
+    };
+    let trust_domain = match crate::identity::spiffe::TrustDomain::new(trust_domain) {
+        Ok(td) => td,
+        Err(e) => {
+            warn!(trust_domain, error = %e, "Cannot derive workload identity: invalid trust domain");
+            return None;
+        }
+    };
+    let path = format!("ns/{namespace}/sa/{service_account}");
+    let spiffe_id = match crate::identity::spiffe::SpiffeId::from_parts(&trust_domain, &path) {
+        Ok(id) => id,
+        Err(e) => {
+            warn!(
+                namespace,
+                service_account,
+                error = %e,
+                "Cannot derive workload identity: invalid SPIFFE components"
+            );
+            return None;
+        }
+    };
+    let hash = crate::modes::mesh::node_waypoint::workload_spiffe_hash(&spiffe_id);
+    Some(crate::ebpf::WorkloadIdentity::new(uid_bytes, hash))
+}
+
 fn handle_kube_pod_applied(
     backend: &mut dyn EbpfBackend,
     pod_states: &DashMap<String, PodAttachmentState>,
@@ -910,10 +1027,15 @@ fn handle_kube_pod_applied(
         .status
         .as_ref()
         .and_then(|status| status.pod_ip.as_deref());
+    let service_account = pod
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.service_account_name.as_deref());
     let event = PodEvent {
         pod_uid: &pod_uid,
         pod_name: &pod_name,
         namespace: &namespace,
+        service_account,
         labels: &labels,
         annotations: &annotations,
         pod_ip_str: pod_ip,
@@ -929,6 +1051,10 @@ pub struct PodEvent<'a> {
     pub pod_uid: &'a str,
     pub pod_name: &'a str,
     pub namespace: &'a str,
+    /// Kubernetes `spec.serviceAccountName`. Used to derive the workload
+    /// SPIFFE ID for the `FERRUM_WORKLOAD_IDENTITY` map (GAP-1b). `None` (or
+    /// the kube default) maps to the `default` service account.
+    pub service_account: Option<&'a str>,
     pub labels: &'a HashMap<String, String>,
     pub annotations: &'a HashMap<String, String>,
     pub pod_ip_str: Option<&'a str>,
@@ -1014,6 +1140,7 @@ pub fn handle_pod_added(
         attached: false,
         include_ports_cgroup_id: None,
         include_ports_policy: None,
+        workload_identity_cgroup_id: None,
     };
 
     if let Some(ref cgroup) = cgroup_path {
@@ -1080,6 +1207,17 @@ pub fn handle_pod_added(
                 state.include_ports_cgroup_id = Some(applied.cgroup_id);
                 state.include_ports_policy = Some(applied.policy);
             }
+            // GAP-1b: write the source workload identity so connect hooks can
+            // stamp orig-dst records. Best-effort like include-ports; failure
+            // leaves node-waypoint resolution failing closed for this pod.
+            state.workload_identity_cgroup_id = apply_workload_identity(
+                backend,
+                config,
+                pod_uid,
+                namespace,
+                event.service_account,
+                cgroup,
+            );
             state.attached = true;
             metrics.pods_enrolled.fetch_add(1, Ordering::Relaxed);
             info!(
@@ -1088,6 +1226,7 @@ pub fn handle_pod_added(
                 namespace,
                 ?pod_ip,
                 include_ports_narrowing = state.include_ports_cgroup_id.is_some(),
+                workload_identity = state.workload_identity_cgroup_id.is_some(),
                 "Pod enrolled for eBPF capture"
             );
         } else if let Err(e) = backend.detach_pod(pod_uid) {
@@ -1348,6 +1487,18 @@ pub fn handle_pod_removed(
                 cgroup_id,
                 error = %e,
                 "Failed to remove pod includeOutboundPorts entry from BPF map"
+            );
+        }
+        // GAP-1b: pair with `apply_workload_identity`. Use the stashed cgroup
+        // id so we don't re-stat a possibly torn-down cgroup path.
+        if let Some(cgroup_id) = state.workload_identity_cgroup_id
+            && let Err(e) = backend.remove_workload_identity(cgroup_id)
+        {
+            warn!(
+                pod_uid,
+                cgroup_id,
+                error = %e,
+                "Failed to remove pod workload-identity entry from BPF map"
             );
         }
         metrics.pods_unenrolled.fetch_add(1, Ordering::Relaxed);
@@ -1778,6 +1929,7 @@ mod tests {
             fallback_mode: FallbackMode::Iptables,
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
         };
 
         let mut backend = MockEbpfBackend::default();
@@ -1805,6 +1957,7 @@ mod tests {
             fallback_mode: FallbackMode::Iptables,
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
         };
         config.capture_contract.proxy_mode = NodeAgentProxyMode::NodeWaypoint;
 
@@ -1827,6 +1980,7 @@ mod tests {
             fallback_mode: FallbackMode::Iptables,
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
         };
         let mut backend = MockEbpfBackend {
             fail_update_capture_config: true,
@@ -1857,6 +2011,7 @@ mod tests {
                 attached: true,
                 include_ports_cgroup_id: None,
                 include_ports_policy: None,
+                workload_identity_cgroup_id: None,
             },
         );
         pod_states.insert(
@@ -1871,6 +2026,7 @@ mod tests {
                 attached: false,
                 include_ports_cgroup_id: None,
                 include_ports_policy: None,
+                workload_identity_cgroup_id: None,
             },
         );
 
@@ -1905,6 +2061,7 @@ mod tests {
             fallback_mode: FallbackMode::Iptables,
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
         };
         let probe = kernel_probe::KernelProbeResult {
             kernel_release: "4.19.0".to_string(),
@@ -1975,6 +2132,7 @@ mod tests {
             fallback_mode: FallbackMode::Iptables,
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
         };
         let probe = kernel_probe::KernelProbeResult {
             kernel_release: "4.19.0".to_string(),
@@ -2089,6 +2247,7 @@ mod tests {
             fallback_mode: FallbackMode::Iptables,
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
         };
         let probe = kernel_probe::KernelProbeResult {
             kernel_release: "4.19.0".to_string(),
@@ -2161,12 +2320,14 @@ mod tests {
             fallback_mode: FallbackMode::Iptables,
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
         };
         let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
         let event = PodEvent {
             pod_uid: "pod-uid-1",
             pod_name: "test-pod",
             namespace: "default",
+            service_account: None,
             labels: &labels,
             annotations: &HashMap::new(),
             pod_ip_str: Some("10.0.0.5"),
@@ -2200,12 +2361,14 @@ mod tests {
             fallback_mode: FallbackMode::Iptables,
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
         };
         let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
         let event = PodEvent {
             pod_uid: "pod-uid-1",
             pod_name: "test-pod",
             namespace: "default",
+            service_account: None,
             labels: &labels,
             annotations: &HashMap::new(),
             pod_ip_str: Some("10.0.0.5"),
@@ -2232,11 +2395,13 @@ mod tests {
             fallback_mode: FallbackMode::Iptables,
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
         };
         let event = PodEvent {
             pod_uid: "pod-uid-2",
             pod_name: "no-mesh-pod",
             namespace: "default",
+            service_account: None,
             labels: &HashMap::new(),
             annotations: &HashMap::new(),
             pod_ip_str: None,
@@ -2267,6 +2432,7 @@ mod tests {
                 attached: true,
                 include_ports_cgroup_id: None,
                 include_ports_policy: None,
+                workload_identity_cgroup_id: None,
             },
         );
         let config = NodeAgentConfig {
@@ -2277,11 +2443,13 @@ mod tests {
             fallback_mode: FallbackMode::Iptables,
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
         };
         let event = PodEvent {
             pod_uid: "pod-uid-2",
             pod_name: "mesh-pod",
             namespace: "default",
+            service_account: None,
             labels: &HashMap::new(),
             annotations: &HashMap::new(),
             pod_ip_str: None,
@@ -2310,12 +2478,14 @@ mod tests {
             fallback_mode: FallbackMode::Iptables,
             excluded_namespaces: excluded,
             capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
         };
         let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
         let event = PodEvent {
             pod_uid: "pod-uid-3",
             pod_name: "system-pod",
             namespace: "kube-system",
+            service_account: None,
             labels: &labels,
             annotations: &HashMap::new(),
             pod_ip_str: None,
@@ -2347,6 +2517,7 @@ mod tests {
                 attached: true,
                 include_ports_cgroup_id: None,
                 include_ports_policy: None,
+                workload_identity_cgroup_id: None,
             },
         );
         backend
@@ -2397,6 +2568,7 @@ mod tests {
             fallback_mode: FallbackMode::Iptables,
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
         };
         let req = CniRpcRequest {
             verb: RpcVerb::Add,
@@ -2435,6 +2607,7 @@ mod tests {
             fallback_mode: FallbackMode::Iptables,
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
         };
         let ip = std::net::Ipv4Addr::new(10, 0, 0, 9);
         pod_states.insert(
@@ -2449,6 +2622,7 @@ mod tests {
                 veth_iface: None,
                 include_ports_cgroup_id: None,
                 include_ports_policy: None,
+                workload_identity_cgroup_id: None,
             },
         );
         let req = CniRpcRequest {
@@ -2488,6 +2662,7 @@ mod tests {
             fallback_mode: FallbackMode::Iptables,
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
         };
         let req = CniRpcRequest {
             verb: RpcVerb::Add,
@@ -2527,6 +2702,7 @@ mod tests {
             fallback_mode: FallbackMode::Iptables,
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
         };
         // Pre-populate as if the watcher had already enrolled the pod.
         pod_states.insert(
@@ -2541,6 +2717,7 @@ mod tests {
                 attached: true,
                 include_ports_cgroup_id: None,
                 include_ports_policy: None,
+                workload_identity_cgroup_id: None,
             },
         );
         let req = CniRpcRequest {
@@ -2593,6 +2770,7 @@ mod tests {
             fallback_mode: FallbackMode::Iptables,
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
         };
 
         // Untracked pod: CHECK is Rejected.
@@ -2628,6 +2806,7 @@ mod tests {
                 attached: true,
                 include_ports_cgroup_id: None,
                 include_ports_policy: None,
+                workload_identity_cgroup_id: None,
             },
         );
         let resp = apply_cni_request(&mut backend, &pod_states, &config, &metrics, &req);
@@ -2647,6 +2826,7 @@ mod tests {
             fallback_mode: FallbackMode::Iptables,
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
         };
         let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
 
@@ -2662,6 +2842,7 @@ mod tests {
                 attached: true,
                 include_ports_cgroup_id: None,
                 include_ports_policy: None,
+                workload_identity_cgroup_id: None,
             },
         );
 
@@ -2669,6 +2850,7 @@ mod tests {
             pod_uid: "pod-uid-1",
             pod_name: "duplicate",
             namespace: "default",
+            service_account: None,
             labels: &labels,
             annotations: &HashMap::new(),
             pod_ip_str: None,
@@ -2697,6 +2879,7 @@ mod tests {
             fallback_mode: FallbackMode::Iptables,
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
         };
         let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
 
@@ -2712,6 +2895,7 @@ mod tests {
                 attached: true,
                 include_ports_cgroup_id: None,
                 include_ports_policy: None,
+                workload_identity_cgroup_id: None,
             },
         );
 
@@ -2719,6 +2903,7 @@ mod tests {
             pod_uid: "pod-uid-1",
             pod_name: "sandbox-recreated",
             namespace: "default",
+            service_account: None,
             labels: &labels,
             annotations: &HashMap::new(),
             pod_ip_str: Some("10.0.0.9"),
@@ -2753,6 +2938,7 @@ mod tests {
             fallback_mode: FallbackMode::Iptables,
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
         };
         let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
 
@@ -2768,6 +2954,7 @@ mod tests {
                 attached: true,
                 include_ports_cgroup_id: None,
                 include_ports_policy: None,
+                workload_identity_cgroup_id: None,
             },
         );
 
@@ -2775,6 +2962,7 @@ mod tests {
             pod_uid: "pod-uid-1",
             pod_name: "existing",
             namespace: "default",
+            service_account: None,
             labels: &labels,
             annotations: &HashMap::new(),
             pod_ip_str: Some("10.0.0.8"),
@@ -2800,6 +2988,7 @@ mod tests {
             fallback_mode: FallbackMode::Fail,
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
         };
         let probe = kernel_probe::KernelProbeResult {
             kernel_release: "4.19.0".to_string(),
@@ -2849,6 +3038,7 @@ mod tests {
             fallback_mode: FallbackMode::Iptables,
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
         };
         let probe = kernel_probe::KernelProbeResult {
             kernel_release: "6.1.0".to_string(),
@@ -3190,6 +3380,7 @@ mod tests {
             fallback_mode: FallbackMode::Iptables,
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
         };
         let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
         let annotations =
@@ -3198,6 +3389,7 @@ mod tests {
             pod_uid: "pod-uid-1",
             pod_name: "test-pod",
             namespace: "default",
+            service_account: None,
             labels: &labels,
             annotations: &annotations,
             pod_ip_str: Some("10.0.0.5"),
@@ -3239,6 +3431,7 @@ mod tests {
             fallback_mode: FallbackMode::Iptables,
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
         };
         let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
         let annotations =
@@ -3247,6 +3440,7 @@ mod tests {
             pod_uid: "pod-uid-1",
             pod_name: "test-pod",
             namespace: "default",
+            service_account: None,
             labels: &labels,
             annotations: &annotations,
             pod_ip_str: Some("10.0.0.5"),
@@ -3288,12 +3482,14 @@ mod tests {
             fallback_mode: FallbackMode::Iptables,
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
         };
         let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
         let event = PodEvent {
             pod_uid: "pod-uid-1",
             pod_name: "test-pod",
             namespace: "default",
+            service_account: None,
             labels: &labels,
             annotations: &HashMap::new(),
             pod_ip_str: Some("10.0.0.5"),
@@ -3334,6 +3530,7 @@ mod tests {
             fallback_mode: FallbackMode::Iptables,
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
         };
         let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
         let annotations =
@@ -3342,6 +3539,7 @@ mod tests {
             pod_uid: "pod-uid-1",
             pod_name: "test-pod",
             namespace: "default",
+            service_account: None,
             labels: &labels,
             annotations: &annotations,
             pod_ip_str: Some("10.0.0.5"),
@@ -3377,6 +3575,7 @@ mod tests {
             fallback_mode: FallbackMode::Iptables,
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
         };
         let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
         let annotations =
@@ -3385,6 +3584,7 @@ mod tests {
             pod_uid: "pod-uid-1",
             pod_name: "test-pod",
             namespace: "default",
+            service_account: None,
             labels: &labels,
             annotations: &annotations,
             pod_ip_str: Some("10.0.0.5"),
@@ -3428,6 +3628,7 @@ mod tests {
             fallback_mode: FallbackMode::Iptables,
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
         };
         (cgroup_root, config)
     }
@@ -3445,6 +3646,7 @@ mod tests {
             pod_uid,
             pod_name: "test-pod",
             namespace: "default",
+            service_account: None,
             labels,
             annotations,
             pod_ip_str: Some("10.0.0.5"),
@@ -3887,5 +4089,79 @@ mod tests {
                 .load(Ordering::Relaxed),
             0
         );
+    }
+
+    /// GAP-1b: on a build without `--features ebpf`, `create_backend` must set
+    /// the degraded gauge to `ebpf_feature_disabled` so the "no capture
+    /// occurs" condition is observable instead of a silent mock no-op. On
+    /// eBPF builds the kernel-probe path owns degradation, so this assertion
+    /// only applies to the non-eBPF fallback.
+    #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
+    #[test]
+    fn create_backend_sets_degraded_gauge_without_ebpf_feature() {
+        let metrics = Arc::new(NodeAgentMetrics::default());
+        assert_eq!(metrics.snapshot().topology_degraded_reason, None);
+
+        let _backend = create_backend(&metrics);
+
+        assert_eq!(
+            metrics.snapshot().topology_degraded_reason,
+            Some("ebpf_feature_disabled"),
+            "mock-backend fallback must mark the node topology degraded"
+        );
+    }
+
+    /// GAP-1b: the workload identity the node-agent writes to
+    /// `FERRUM_WORKLOAD_IDENTITY` must hash to the SAME value the
+    /// node-waypoint resolver computes for the corresponding SPIFFE ID,
+    /// otherwise the connect-stamped record never matches the enrolled
+    /// identity and resolution always fails closed. This pins the
+    /// producer/consumer agreement without needing a kernel.
+    #[test]
+    fn build_workload_identity_hash_matches_resolver() {
+        use crate::identity::spiffe::{SpiffeId, TrustDomain};
+        use crate::modes::mesh::node_waypoint::workload_spiffe_hash;
+
+        let pod_uid = "11111111-2222-3333-4444-555555555555";
+        let identity = build_workload_identity(pod_uid, "prod", "api", "cluster.local")
+            .expect("identity should build for valid inputs");
+
+        // Independently derive the expected hash exactly as the CP/resolver do.
+        let td = TrustDomain::new("cluster.local").expect("trust domain");
+        let spiffe = SpiffeId::from_parts(&td, "ns/prod/sa/api").expect("spiffe id");
+        assert_eq!(identity.workload_spiffe_hash, workload_spiffe_hash(&spiffe));
+        assert_ne!(identity.workload_spiffe_hash, 0);
+
+        // Pod UID bytes match the parsed UUID.
+        let expected_uid =
+            crate::modes::mesh::node_waypoint::parse_pod_uid(pod_uid).expect("parse uid");
+        assert_eq!(identity.pod_uid, expected_uid);
+    }
+
+    #[test]
+    fn build_workload_identity_rejects_bad_pod_uid() {
+        assert!(build_workload_identity("not-a-uuid", "prod", "api", "cluster.local").is_none());
+    }
+
+    /// A missing `serviceAccountName` defaults to the `default` SA, matching
+    /// Kubernetes semantics, so resolution still works for pods that don't set
+    /// one explicitly.
+    #[test]
+    fn build_workload_identity_defaults_service_account_via_caller() {
+        use crate::identity::spiffe::{SpiffeId, TrustDomain};
+        use crate::modes::mesh::node_waypoint::workload_spiffe_hash;
+
+        // `apply_workload_identity` passes `service_account.unwrap_or("default")`,
+        // so build_workload_identity is called with "default" here.
+        let identity = build_workload_identity(
+            "11111111-2222-3333-4444-555555555555",
+            "prod",
+            "default",
+            "cluster.local",
+        )
+        .expect("identity builds");
+        let td = TrustDomain::new("cluster.local").expect("trust domain");
+        let spiffe = SpiffeId::from_parts(&td, "ns/prod/sa/default").expect("spiffe id");
+        assert_eq!(identity.workload_spiffe_hash, workload_spiffe_hash(&spiffe));
     }
 }

@@ -1,3 +1,4 @@
+use ferrum_edge::_test_support::clone_log_metadata;
 use ferrum_edge::plugins::waf::Waf;
 use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext, is_security_plugin};
 use serde_json::json;
@@ -1137,6 +1138,41 @@ async fn oversized_body_skip_mode_does_not_scan_truncated_prefix() {
 
     assert!(matches!(result, PluginResult::Continue));
     assert!(!ctx.metadata.contains_key("waf.rule_hits"));
+}
+
+#[tokio::test]
+async fn clean_truncated_scan_preserves_owned_log_metadata() {
+    let plugin = Waf::new(&json!({
+        "include_default_rules": false,
+        "max_scan_bytes": 4,
+        "custom_rules": [{
+            "id": "CUSTOM-MISS",
+            "name": "missing body marker",
+            "category": "custom",
+            "severity": "low",
+            "target": "body_text",
+            "match_kind": "contains",
+            "pattern": "needle",
+            "action": "monitor"
+        }]
+    }))
+    .unwrap();
+    let mut ctx = ctx("POST", "/submit");
+    ctx.headers
+        .insert("content-type".into(), "text/plain".into());
+    let headers = ctx.headers.clone();
+
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, b"clean body")
+        .await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        clone_log_metadata(&ctx)
+            .get("waf.scan_truncated")
+            .map(String::as_str),
+        Some("true")
+    );
 }
 
 #[tokio::test]

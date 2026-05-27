@@ -9,6 +9,7 @@
 // allowance scoped to dead code only; unused imports should still be caught.
 #![allow(dead_code)]
 
+pub mod carrier;
 pub mod conformance;
 pub mod nonce;
 pub mod server;
@@ -41,6 +42,16 @@ pub mod runtime_proto {
 #[allow(unused_imports)]
 pub use crate::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
 #[allow(unused_imports)]
+pub use carrier::{
+    FERRUM_ECDS_LABELS_TYPE_URL, FERRUM_ECDS_MESH_POLICIES_TYPE_URL,
+    FERRUM_ECDS_MULTI_CLUSTER_TYPE_URL, FERRUM_ECDS_OUTBOUND_POLICY_TYPE_URL,
+    FERRUM_ECDS_PEER_AUTH_TYPE_URL, FERRUM_ECDS_PROXY_CONFIGS_TYPE_URL,
+    FERRUM_ECDS_REQUEST_AUTH_TYPE_URL, FERRUM_ECDS_SERVICE_ENTRIES_TYPE_URL,
+    FERRUM_ECDS_SERVICES_TYPE_URL, FERRUM_ECDS_SIDECAR_EGRESS_SCOPE_TYPE_URL,
+    FERRUM_ECDS_TELEMETRY_TYPE_URL, FERRUM_ECDS_TRUST_BUNDLES_TYPE_URL,
+    FERRUM_ECDS_WORKLOADS_TYPE_URL, MeshSliceCarrier, apply_carrier, build_slice_carriers,
+};
+#[allow(unused_imports)]
 pub use nonce::{AckOutcome, XdsNonceTracker};
 pub use server::XdsAdsServer;
 #[allow(unused_imports)]
@@ -48,6 +59,6 @@ pub use snapshot::{XdsResource, XdsSnapshot, XdsSnapshotCache};
 #[allow(unused_imports)]
 pub use translator::{
     CDS_TYPE_URL, ECDS_TYPE_URL, EDS_TYPE_URL, FERRUM_ECDS_DESTINATION_RULE_TYPE_URL, LDS_TYPE_URL,
-    RDS_TYPE_URL, RTDS_TYPE_URL, SDS_TYPE_URL, XDS_TYPE_URLS, translate_mesh_slice_to_snapshot,
-    translate_rtds_layer,
+    RDS_TYPE_URL, RTDS_TYPE_URL, SDS_TYPE_URL, XDS_TYPE_URLS, translate_destination_rule_carriers,
+    translate_mesh_slice_to_snapshot, translate_rtds_layer,
 };

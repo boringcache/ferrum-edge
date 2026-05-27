@@ -26,7 +26,8 @@ use tracing::{debug, info, warn};
 use super::maps::BpfMaps;
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 use super::{
-    BPF_MAP_SOCK_OPS_EVENTS, BPF_MAP_SOCK_OPS_STATS, BPF_PROGRAM_SOCK_OPS,
+    BPF_MAP_ORIG_DST4, BPF_MAP_ORIG_DST6, BPF_MAP_SOCK_OPS_EVENTS, BPF_MAP_SOCK_OPS_STATS,
+    BPF_ORIG_DST4_PIN_PATH, BPF_ORIG_DST6_PIN_PATH, BPF_PROGRAM_SOCK_OPS,
     BPF_SOCK_OPS_EVENTS_PIN_PATH, BPF_SOCK_OPS_STATS_PIN_PATH, EbpfBackend, IncludePortsPolicy,
     PodInfo,
 };
@@ -171,6 +172,21 @@ impl EbpfBackend for AyaEbpfBackend {
         }
 
         self.maps = Some(BpfMaps::from_ebpf(&bpf)?);
+
+        // GAP-1b: pin the original-destination maps so the node-waypoint
+        // mesh-proxy can open them by path through the orig-dst bridge.
+        // Best-effort: a pin failure (older ELF without the maps, bpffs
+        // issue) only costs node-waypoint source-identity resolution — the
+        // resolver fails closed on unknown cookies — so capture itself still
+        // works. Mirrors the SOCK_OPS pin's non-fatal contract.
+        if let Err(e) = pin_orig_dst_maps(&mut bpf) {
+            warn!(
+                error = %e,
+                "Failed to pin original-destination maps; node-waypoint source-identity \
+                 resolution will be unavailable (unknown cookies fail closed)"
+            );
+        }
+
         self.bpf = Some(bpf);
 
         info!("All BPF programs loaded successfully");
@@ -290,6 +306,20 @@ impl EbpfBackend for AyaEbpfBackend {
         maps.remove_include_ports(cgroup_id)
     }
 
+    fn update_workload_identity(
+        &mut self,
+        cgroup_id: u64,
+        identity: &ferrum_ebpf_common::WorkloadIdentity,
+    ) -> Result<(), String> {
+        let maps = self.maps.as_ref().ok_or("BPF maps not initialized")?;
+        maps.insert_workload_identity(cgroup_id, identity)
+    }
+
+    fn remove_workload_identity(&mut self, cgroup_id: u64) -> Result<(), String> {
+        let maps = self.maps.as_ref().ok_or("BPF maps not initialized")?;
+        maps.remove_workload_identity(cgroup_id)
+    }
+
     fn attach_sock_ops(&mut self, cgroup_root: &str) -> Result<(), String> {
         if self.sock_ops_link_id.is_some() {
             // Already attached — idempotent, no-op.
@@ -359,10 +389,12 @@ impl EbpfBackend for AyaEbpfBackend {
         self.sock_ops_link_id = None;
         self.maps = None;
         self.bpf = None;
-        // Best-effort: unpin the SOCK_OPS maps so a stale pin doesn't
-        // mislead a future mesh-proxy start. Missing pin is fine.
+        // Best-effort: unpin the SOCK_OPS and orig-dst maps so a stale pin
+        // doesn't mislead a future mesh-proxy start. Missing pin is fine.
         let _ = fs::remove_file(BPF_SOCK_OPS_EVENTS_PIN_PATH);
         let _ = fs::remove_file(BPF_SOCK_OPS_STATS_PIN_PATH);
+        let _ = fs::remove_file(BPF_ORIG_DST4_PIN_PATH);
+        let _ = fs::remove_file(BPF_ORIG_DST6_PIN_PATH);
         info!("BPF programs and maps cleaned up");
         Ok(())
     }
@@ -414,6 +446,24 @@ fn resolve_sock_ops_ringbuf_bytes() -> u32 {
             SOCK_OPS_RINGBUF_DEFAULT_BYTES
         }
     }
+}
+
+/// Pin the original-destination maps at their well-known paths so the
+/// node-waypoint mesh-proxy can open them by path (GAP-1b). Creates the
+/// `/sys/fs/bpf/ferrum` parent if needed; bpffs must already be mounted.
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+fn pin_orig_dst_maps(bpf: &mut Ebpf) -> Result<(), String> {
+    if let Some(parent) = std::path::Path::new(BPF_ORIG_DST4_PIN_PATH).parent()
+        && let Err(e) = fs::create_dir_all(parent)
+    {
+        return Err(format!(
+            "Failed to create pin parent dir '{}': {e}",
+            parent.display()
+        ));
+    }
+    pin_map_at(bpf, BPF_MAP_ORIG_DST4, BPF_ORIG_DST4_PIN_PATH)?;
+    pin_map_at(bpf, BPF_MAP_ORIG_DST6, BPF_ORIG_DST6_PIN_PATH)?;
+    Ok(())
 }
 
 #[cfg(all(feature = "ebpf", target_os = "linux"))]

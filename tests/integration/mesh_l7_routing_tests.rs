@@ -2170,3 +2170,203 @@ async fn matchless_virtualservice_preserves_header_transforms() {
         "remove transform must strip X-Strip header"
     );
 }
+
+// ── Tier 3: mirror / rewrite / redirect / L4 ──────────────────────────────
+
+/// A VirtualService `http[].mirror` translates to a proxy-scoped
+/// `request_mirror` plugin whose config drives an actual fire-and-forget
+/// mirror against the configured target.
+#[tokio::test]
+async fn mesh_tier3_mirror_vs_emits_working_request_mirror_plugin() {
+    use ferrum_edge::plugins::create_plugin;
+
+    let result = translate_k8s_objects(
+        &[object(
+            "VirtualService",
+            serde_json::json!({
+                "hosts": ["api.example.com"],
+                "http": [{
+                    "match": [{"uri": {"prefix": "/v1"}}],
+                    "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                    "mirror": {"host": "shadow.default.svc.cluster.local", "port": {"number": 9090}},
+                    "mirrorPercentage": {"value": 100.0}
+                }]
+            }),
+        )],
+        options(),
+    )
+    .expect("translation succeeds");
+
+    let mirror = result
+        .config
+        .plugin_configs
+        .iter()
+        .find(|p| p.plugin_name == "request_mirror")
+        .expect("request_mirror plugin emitted for http[].mirror");
+    assert_eq!(
+        mirror.config["mirror_host"].as_str(),
+        Some("shadow.default.svc.cluster.local")
+    );
+    assert_eq!(mirror.config["mirror_port"].as_u64(), Some(9090));
+
+    // The emitted config builds into a real plugin instance, and a 100%
+    // mirror sets up a mirror result channel on the request context.
+    let plugin = create_plugin("request_mirror", &mirror.config)
+        .expect("plugin builds")
+        .expect("plugin is Some");
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/v1/widgets".to_string(),
+    );
+    // A matched_proxy is required so the mirror can derive its timeout budget.
+    ctx.matched_proxy = Some(Arc::new(result.config.proxies[0].clone()));
+    let mut headers = HashMap::new();
+    let res = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(res, PluginResult::Continue));
+    assert!(
+        ctx.mirror_result_rx.is_some(),
+        "a 100% mirror must arm the mirror result channel (request was mirrored)"
+    );
+}
+
+/// A VirtualService `http[].rewrite.uri` rewrites the path forwarded to the
+/// backend; with a prefix match, only the matched prefix is replaced.
+#[tokio::test]
+async fn mesh_tier3_rewrite_vs_rewrites_backend_path_and_authority() {
+    let result = translate_k8s_objects(
+        &[object(
+            "VirtualService",
+            serde_json::json!({
+                "hosts": ["api.example.com"],
+                "http": [{
+                    "match": [{"uri": {"prefix": "/api"}}],
+                    "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                    "rewrite": {"uri": "/internal", "authority": "internal.example.com"}
+                }]
+            }),
+        )],
+        options(),
+    )
+    .expect("translation succeeds");
+
+    let proxy = result
+        .config
+        .proxies
+        .iter()
+        .find(|p| p.listen_path.as_deref() == Some("/api"))
+        .expect("proxy for /api");
+    let plugin_config = dispatch_plugin_for_proxy(&result.config, proxy);
+    let dispatch = MeshRouteDispatch::new(&plugin_config.config).expect("plugin config");
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api/users/42".to_string(),
+    );
+    let mut headers = HashMap::from([("host".to_string(), "public.example.com".to_string())]);
+    assert!(matches!(
+        dispatch.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    // Prefix-rewrite: `/api` → `/internal`, tail `/users/42` preserved.
+    assert_eq!(
+        ctx.route_override_path.as_deref(),
+        Some("/internal/users/42")
+    );
+    // Authority rewrite rebases the forwarded Host header.
+    assert_eq!(
+        headers.get("host").map(String::as_str),
+        Some("internal.example.com")
+    );
+    assert_eq!(
+        ctx.route_override_authority.as_deref(),
+        Some("internal.example.com")
+    );
+
+    // The effective proxy honors the authority rewrite by preserving the
+    // (rewritten) Host header instead of clobbering it with the backend host.
+    // This route uses a direct backend (no upstream_id), so an empty upstream
+    // map is sufficient to rebuild the effective proxy.
+    let upstreams: HashMap<String, Arc<ferrum_edge::config::types::Upstream>> = HashMap::new();
+    let effective = ctx.apply_route_overrides_with_upstreams(Arc::new(proxy.clone()), &upstreams);
+    assert!(
+        effective.preserve_host_header,
+        "authority rewrite must flip preserve_host_header on the effective proxy"
+    );
+}
+
+/// A VirtualService `http[].redirect` answers the request with a 3xx +
+/// Location and never reaches a backend.
+#[tokio::test]
+async fn mesh_tier3_redirect_vs_returns_redirect_response() {
+    let result = translate_k8s_objects(
+        &[object(
+            "VirtualService",
+            serde_json::json!({
+                "hosts": ["api.example.com"],
+                "http": [{
+                    "match": [{"uri": {"prefix": "/old"}}],
+                    "redirect": {"uri": "/new", "authority": "api.example.com", "redirectCode": 308}
+                }]
+            }),
+        )],
+        options(),
+    )
+    .expect("translation succeeds");
+
+    // No backend upstream is materialized for a redirect-only route.
+    let proxy = result
+        .config
+        .proxies
+        .iter()
+        .find(|p| p.listen_path.as_deref() == Some("/old"))
+        .expect("proxy for /old redirect");
+    let plugin_config = dispatch_plugin_for_proxy(&result.config, proxy);
+    let dispatch = MeshRouteDispatch::new(&plugin_config.config).expect("plugin config");
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/old/page".to_string(),
+    );
+    ctx.metadata
+        .insert("ferrum.frontend_scheme".to_string(), "https".to_string());
+    let mut headers = HashMap::new();
+    match dispatch.before_proxy(&mut ctx, &mut headers).await {
+        PluginResult::Reject {
+            status_code,
+            headers,
+            ..
+        } => {
+            assert_eq!(status_code, 308);
+            assert_eq!(
+                headers.get("location").map(String::as_str),
+                Some("https://api.example.com/new")
+            );
+        }
+        other => panic!("expected redirect Reject, got {other:?}"),
+    }
+}
+
+/// VirtualService L4 routing (`spec.tcp` / `spec.tls`) fails closed with a
+/// translator error + warning rather than silently dropping the routes.
+#[test]
+fn mesh_tier3_l4_virtual_service_fails_closed() {
+    let err = translate_k8s_objects(
+        &[object(
+            "VirtualService",
+            serde_json::json!({
+                "hosts": ["db.example.com"],
+                "tcp": [{
+                    "match": [{"port": 3306}],
+                    "route": [{"destination": {"host": "mysql.default.svc.cluster.local", "port": {"number": 3306}}}]
+                }]
+            }),
+        )],
+        options(),
+    )
+    .expect_err("VirtualService L4 routing must fail closed, not silently drop");
+    let msg = format!("{err}");
+    assert!(msg.contains("L4 routing"), "got: {msg}");
+}

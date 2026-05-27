@@ -1007,6 +1007,76 @@ async fn trust_domain_alias_accepts_baggage_principal_from_aliased_domain() {
     );
 }
 
+#[tokio::test]
+async fn condition_not_values_on_jwt_claim_allows_absent_attribute() {
+    // DENY with `not_values: ["admin"]` on `request.auth.claims[role]`:
+    // the condition passes when the claim does NOT equal "admin", so the
+    // DENY fires for non-admins. Admins (role=admin) fail the condition
+    // and the DENY does not fire.
+    let deny_except_admin = MeshPolicy {
+        name: "deny-non-admin".to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        scope: PolicyScope::MeshWide,
+        rules: vec![MeshRule {
+            from: Vec::new(),
+            to: Vec::new(),
+            when: vec![ConditionMatch {
+                key: "request.auth.claims[role]".to_string(),
+                values: Vec::new(),
+                not_values: vec!["admin".to_string()],
+            }],
+            request_principals: Vec::new(),
+            not_request_principals: Vec::new(),
+            source_negation: Default::default(),
+            never_matches: false,
+            action: PolicyAction::Deny,
+        }],
+    };
+    let plugin = build_mesh_authz_for_workload(&[], vec![deny_except_admin]);
+
+    // Claim present and matches not_values -> condition fails -> DENY
+    // does NOT fire, so the admin is allowed through.
+    let mut admin_ctx = ctx_with_principal("GET", "/api", Some(CLIENT_SPIFFE));
+    admin_ctx.mesh_request_auth_claims.insert(
+        "role".to_string(),
+        JwtAuthAttributeValue::Scalar("admin".to_string()),
+    );
+    assert!(
+        matches!(
+            plugin.authorize(&mut admin_ctx).await,
+            PluginResult::Continue
+        ),
+        "claim matching not_values should make the DENY condition fail (admin passes)"
+    );
+
+    // Claim present but does NOT match not_values -> condition passes ->
+    // DENY fires, rejecting the non-admin.
+    let mut user_ctx = ctx_with_principal("GET", "/api", Some(CLIENT_SPIFFE));
+    user_ctx.mesh_request_auth_claims.insert(
+        "role".to_string(),
+        JwtAuthAttributeValue::Scalar("user".to_string()),
+    );
+    assert!(
+        matches!(
+            plugin.authorize(&mut user_ctx).await,
+            PluginResult::Reject { .. }
+        ),
+        "claim not matching not_values should make the DENY condition pass (user denied)"
+    );
+
+    // Claim absent on a DENY rule with an HTTP-only key: missing attribute
+    // returns true for the condition, so the DENY fires.
+    let mut absent_ctx = ctx_with_principal("GET", "/api", Some(CLIENT_SPIFFE));
+    absent_ctx.mesh_request_auth_claims.clear();
+    assert!(
+        matches!(
+            plugin.authorize(&mut absent_ctx).await,
+            PluginResult::Reject { .. }
+        ),
+        "absent claim on a DENY not_values-only condition should fire (fail-closed)"
+    );
+}
+
 #[allow(dead_code)]
 fn _construct_mesh_config_with_explicit_root_ns() -> MeshConfig {
     // Documents that MeshConfig::default uses "istio-system" as
