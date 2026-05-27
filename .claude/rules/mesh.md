@@ -54,6 +54,8 @@ Full operator docs live in `docs/mesh.md`. Keep this file to implementation inva
 - Authorization evaluation is DENY first, then ALLOW. Any ALLOW rule with no match causes implicit deny.
 - `RequestMatch` negative fields (`not_methods`, `not_paths`, `not_hosts`, `not_ports`) are conjunctive with positive fields in one rule. Do not split them into separate deny policies.
 - Istio empty-rule translation must preserve action semantics: ALLOW with no `rules` is allow-nothing via a never-matching rule; DENY and AUDIT with no `rules` are no-ops.
+- NodeWaypoint per-pod policy scoping (`per_pod_policy_scoping`) is resolved per request from `node_waypoint_policy_scope`. The HTTP/HBONE accept path populates it from the resolver (`proxy/mod.rs`); the TCP/UDP stream accept loops always pass `None`, so only `MeshWide` policies are evaluated on streams. A config-apply that has stream proxies + scoped policies in NodeWaypoint topology must keep emitting the one-shot warning. Do not silently start enforcing scoped stream policies without wiring the resolver end-to-end and updating `docs/mesh.md`.
+- Mesh authz `source.ip`/`ipBlocks` uses `RequestContext::direct_client_ip` (immediate peer) and `remote.ip`/`remoteIpBlocks` uses `client_ip` (XFF-resolved) on the HTTP path; the stream path (`on_stream_connect`) has only `client_ip`, so both collapse to it. IP-block matchers fail closed when the tested IP is absent.
 
 ## Mesh Plugin Injection
 
