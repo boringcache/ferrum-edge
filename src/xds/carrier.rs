@@ -162,19 +162,19 @@ impl MeshSliceCarrier {
     /// JSON-encode the carried field group into the inner `Any.value` bytes.
     pub fn encode_value(&self) -> Result<Vec<u8>, serde_json::Error> {
         match self {
-            MeshSliceCarrier::Services(value) => serde_json::to_vec(value),
-            MeshSliceCarrier::Workloads(value) => serde_json::to_vec(value),
-            MeshSliceCarrier::WorkloadLabels(value) => serde_json::to_vec(value),
-            MeshSliceCarrier::MeshPolicies(value) => serde_json::to_vec(value),
-            MeshSliceCarrier::PeerAuthentications(value) => serde_json::to_vec(value),
-            MeshSliceCarrier::RequestAuthentications(value) => serde_json::to_vec(value),
-            MeshSliceCarrier::ServiceEntries(value) => serde_json::to_vec(value),
-            MeshSliceCarrier::TelemetryResources(value) => serde_json::to_vec(value),
-            MeshSliceCarrier::ProxyConfigs(value) => serde_json::to_vec(value),
-            MeshSliceCarrier::TrustBundles(value) => serde_json::to_vec(value),
-            MeshSliceCarrier::OutboundTrafficPolicy(value) => serde_json::to_vec(value),
-            MeshSliceCarrier::MultiCluster(value) => serde_json::to_vec(value),
-            MeshSliceCarrier::SidecarEgressScope(value) => serde_json::to_vec(value),
+            MeshSliceCarrier::Services(value) => encode(value),
+            MeshSliceCarrier::Workloads(value) => encode(value),
+            MeshSliceCarrier::WorkloadLabels(value) => encode(value),
+            MeshSliceCarrier::MeshPolicies(value) => encode(value),
+            MeshSliceCarrier::PeerAuthentications(value) => encode(value),
+            MeshSliceCarrier::RequestAuthentications(value) => encode(value),
+            MeshSliceCarrier::ServiceEntries(value) => encode(value),
+            MeshSliceCarrier::TelemetryResources(value) => encode(value),
+            MeshSliceCarrier::ProxyConfigs(value) => encode(value),
+            MeshSliceCarrier::TrustBundles(value) => encode(value),
+            MeshSliceCarrier::OutboundTrafficPolicy(value) => encode(value),
+            MeshSliceCarrier::MultiCluster(value) => encode(value),
+            MeshSliceCarrier::SidecarEgressScope(value) => encode(value),
         }
     }
 
@@ -183,9 +183,14 @@ impl MeshSliceCarrier {
     /// Returns `Ok(None)` for any `type_url` that is not a Ferrum slice
     /// carrier — this keeps unrelated ECDS payloads (e.g. the
     /// DestinationRule carrier, or operator-defined extension configs) from
-    /// erroring the decode loop. A recognized carrier whose JSON fails to
-    /// parse returns `Err` so the caller can warn and skip that one carrier
-    /// without failing the whole slice.
+    /// erroring the decode loop.
+    ///
+    /// A recognized carrier whose JSON fails to parse returns `Err` — this is
+    /// FAIL-CLOSED behavior: the caller (`recover_slice_carriers`) propagates
+    /// the error up through `try_build_mesh_slice`, which causes
+    /// `handle_ads_response` to NACK the ECDS response and restore the
+    /// previous accumulator snapshot, retaining the last accepted slice
+    /// instead of applying a partial or cleared one.
     pub fn decode(type_url: &str, value: &[u8]) -> Result<Option<Self>, serde_json::Error> {
         let carrier = match type_url {
             FERRUM_ECDS_SERVICES_TYPE_URL => MeshSliceCarrier::Services(decode_json(value)?),

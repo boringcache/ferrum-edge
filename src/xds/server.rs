@@ -1423,6 +1423,27 @@ fn subscription_resources_changed(
     !resources_equal_ignoring_version(&previous_resources, &next_resources)
 }
 
+/// SOTW-only version-coherence check. When the aggregate snapshot version
+/// changes (e.g. a policy-only ECDS update that does not change any
+/// CDS/EDS/LDS/RDS resource bytes), all required mesh-slice types are forced
+/// to re-send so the DP's coherent-version gate (`has_coherent_required_versions`)
+/// re-satisfies on the same version string.
+///
+/// **SOTW assumption**: this refresh is intentionally absent from the delta
+/// path (`subscription_resources_changed` / `delta_responses_for_*`). A delta
+/// client using the same coherent-version gate would not rebuild on a
+/// policy-only update because the delta path compares individual resource bytes,
+/// not aggregate version. Today the Ferrum DP uses SOTW
+/// (`stream_aggregated_resources`), so the delta path is not hit; but the
+/// coupling is implicit — any future delta-mode adoption must add an equivalent
+/// mechanism.
+///
+/// **Wire-cost tradeoff**: every policy-only ECDS change causes CDS/EDS/LDS/RDS
+/// resources to re-send to every connected DP even though their bytes are
+/// unchanged. This is a justified consequence of the aggregate-version coherence
+/// model and is NOT a regression — name-only CDS/EDS/LDS/RDS resources are
+/// cheap to retransmit and the alternative (partial version state on the DP)
+/// would stall slice application indefinitely.
 fn sotw_subscription_resources_changed(
     previous: Option<&XdsSnapshot>,
     snapshot: &XdsSnapshot,
