@@ -745,7 +745,7 @@ behavior is fail-closed regardless of the flag (verification only succeeds
 against the last-good cached bundle). Endpoints are validated at slice apply
 for SSRF (link-local / loopback / cloud metadata IPs are rejected) and must
 use `https://`; response bodies are capped at 2 MiB and parsed bundles are
-capped at 256 X.509 + 256 JWT authorities.
+capped at 256 X.509 + 256 JWT authorities. Federation-poller trust bundles are **outbound-only**: a poller-added trust domain validates outbound mTLS but is rejected inbound until the CP pushes it in a slice (inbound trust is governed solely by the CP slice's trust-domain set).
 
 Two on-the-wire formats are accepted:
 

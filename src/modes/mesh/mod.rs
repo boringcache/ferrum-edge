@@ -4025,10 +4025,12 @@ fn build_mesh_inbound_spiffe_slot(
     ) {
         Ok(bundle) => bundle,
         Err(error) => {
-            warn!(
+            error!(
                 %error,
-                "Unable to load gateway SVID material for mesh inbound SPIFFE peer \
-                 verification; falling back to operator client-CA chain verification"
+                "Failed to load gateway SVID material for mesh inbound SPIFFE peer \
+                 verification; trust-domain enforcement is now DISABLED until SVID \
+                 material reloads — inbound peers are accepted via chain validation \
+                 only (no peer trust-domain check)"
             );
             return None;
         }
@@ -9561,8 +9563,7 @@ mod tests {
         );
     }
 
-    fn request_auth_config_for_require_exp(require_exp: bool) -> GatewayConfig {
-        let _ = require_exp;
+    fn request_auth_config_for_require_exp() -> GatewayConfig {
         GatewayConfig {
             mesh: Some(Box::new(MeshConfig {
                 request_authentications: vec![MeshRequestAuthentication {
@@ -9707,7 +9708,7 @@ mod tests {
             "test runtime should carry the secure default"
         );
         let prepared =
-            prepare_gateway_config_for_mesh(request_auth_config_for_require_exp(true), &runtime)
+            prepare_gateway_config_for_mesh(request_auth_config_for_require_exp(), &runtime)
                 .expect("mesh config");
         let jwks = prepared
             .plugin_configs
@@ -9729,7 +9730,7 @@ mod tests {
         let mut runtime = test_mesh_runtime_config();
         runtime.request_auth_require_exp = false;
         let prepared =
-            prepare_gateway_config_for_mesh(request_auth_config_for_require_exp(false), &runtime)
+            prepare_gateway_config_for_mesh(request_auth_config_for_require_exp(), &runtime)
                 .expect("mesh config");
         let jwks = prepared
             .plugin_configs
