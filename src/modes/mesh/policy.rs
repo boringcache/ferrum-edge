@@ -761,47 +761,6 @@ fn matches_prefix_u128(network: u128, addr: u128, prefix_len: u8) -> bool {
     (network & mask) == (addr & mask)
 }
 
-/// Validate a CIDR / bare-IP string for an Istio source IP block at config
-/// translation time. Returns `Err` with a human-readable reason so the
-/// resource can be rejected (fail-closed) instead of silently never matching.
-pub fn validate_source_ip_block(cidr: &str) -> Result<(), String> {
-    let trimmed = cidr.trim();
-    if trimmed.is_empty() {
-        return Err("IP block must not be empty".to_string());
-    }
-    match trimmed.split_once('/') {
-        Some((net, prefix_str)) => {
-            let ip = net
-                .parse::<IpAddr>()
-                .map_err(|_| format!("invalid IP in CIDR '{cidr}'"))?;
-            let prefix = prefix_str
-                .parse::<u8>()
-                .map_err(|_| format!("invalid prefix length in CIDR '{cidr}'"))?;
-            let max = match ip {
-                IpAddr::V4(_) => 32,
-                IpAddr::V6(v6) => {
-                    if v6.to_ipv4_mapped().is_some() && prefix < 96 {
-                        return Err(format!(
-                            "IPv4-mapped IPv6 CIDR prefix {prefix} must be at least 96 in CIDR '{cidr}'"
-                        ));
-                    }
-                    128
-                }
-            };
-            if prefix > max {
-                return Err(format!(
-                    "prefix length {prefix} out of range in CIDR '{cidr}'"
-                ));
-            }
-            Ok(())
-        }
-        None => trimmed
-            .parse::<IpAddr>()
-            .map(|_| ())
-            .map_err(|_| format!("invalid IP address '{cidr}'")),
-    }
-}
-
 fn wildcard_match(pattern: &str, value: &str) -> bool {
     if pattern == "*" {
         return true;
@@ -4144,21 +4103,5 @@ mod tests {
         // Malformed CIDR never matches.
         assert!(!cidr_contains("not-a-cidr", "10.0.0.1".parse().unwrap()));
         assert!(!cidr_contains("10.0.0.0/40", "10.0.0.1".parse().unwrap()));
-    }
-
-    #[test]
-    fn validate_source_ip_block_accepts_valid_rejects_invalid() {
-        assert!(validate_source_ip_block("10.0.0.0/8").is_ok());
-        assert!(validate_source_ip_block(" 10.0.0.0/8 ").is_ok());
-        assert!(validate_source_ip_block("192.168.1.1").is_ok());
-        assert!(validate_source_ip_block("2001:db8::/32").is_ok());
-        assert!(validate_source_ip_block("::1").is_ok());
-        assert!(validate_source_ip_block("::ffff:10.0.0.0/104").is_ok());
-        assert!(validate_source_ip_block("").is_err());
-        assert!(validate_source_ip_block("10.0.0.0/40").is_err());
-        assert!(validate_source_ip_block("2001:db8::/200").is_err());
-        assert!(validate_source_ip_block("::ffff:10.0.0.0/95").is_err());
-        assert!(validate_source_ip_block("not-an-ip").is_err());
-        assert!(validate_source_ip_block("10.0.0.0/abc").is_err());
     }
 }

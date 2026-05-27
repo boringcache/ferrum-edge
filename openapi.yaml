@@ -9526,6 +9526,7 @@ components:
           type: array
           items:
             type: string
+          default: ["ztunnel", "waypoint"]
           description: |
             Allow-list of identity-asserting infrastructure components whose
             HBONE baggage `source.principal` may rewrite the authz principal.

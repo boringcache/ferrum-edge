@@ -2374,6 +2374,99 @@ async fn mesh_authz_per_pod_scoping_disabled_path_preserves_construction_filter(
     );
 }
 
+// GAP-2M.4 (stream path) - on_stream_connect per-pod policy scoping.
+//
+// The `authorize` HTTP path is covered by the tests above. The stream path
+// (`on_stream_connect`) has an identical per-pod scoping branch and must
+// satisfy the same three guarantees:
+//   a. A namespace- or selector-scoped DENY is NOT applied when the stream's
+//      `node_waypoint_policy_scope` is None (scope missing = mesh-wide only).
+//   b. A MeshWide DENY fires and closes the stream connection.
+//   c. `mesh_authz.scope_missing` is stamped on the stream context when
+//      per_pod_policy_scoping is enabled and the scope is absent.
+
+#[tokio::test]
+async fn mesh_authz_on_stream_connect_scoped_deny_not_applied_when_scope_missing() {
+    // (a) Namespace-scoped DENY must NOT close the connection when the stream
+    // carry no `node_waypoint_policy_scope` (accept path hasn't enrolled the
+    // pod yet). Only mesh-wide policies are evaluated in that window.
+    let ns_deny = policy_with_scope(
+        "team-a-deny",
+        PolicyScope::Namespace {
+            namespace: "team-a".to_string(),
+        },
+        PolicyAction::Deny,
+    );
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [ns_deny],
+        "per_pod_policy_scoping": true,
+    }))
+    .expect("plugin config");
+
+    let mut ctx = stream_context();
+    // Intentionally do not set node_waypoint_policy_scope — scope is None.
+    let result = plugin.on_stream_connect(&mut ctx).await;
+
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "namespace-scoped DENY must not close stream when scope is None, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn mesh_authz_on_stream_connect_mesh_wide_deny_closes_connection() {
+    // (b) A MeshWide DENY always applies regardless of per-pod scoping —
+    // it is not gated on a pod scope cache and must close the stream.
+    let mesh_wide_deny =
+        policy_with_scope("mesh-wide-deny", PolicyScope::MeshWide, PolicyAction::Deny);
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [mesh_wide_deny],
+        "per_pod_policy_scoping": true,
+    }))
+    .expect("plugin config");
+
+    let mut ctx = stream_context();
+    // No scope set — only mesh-wide policies survive, and this one is DENY.
+    let result = plugin.on_stream_connect(&mut ctx).await;
+
+    assert!(
+        matches!(
+            result,
+            PluginResult::RejectBinary { .. } | PluginResult::Reject { .. }
+        ),
+        "MeshWide DENY must close stream connection, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn mesh_authz_on_stream_connect_scope_missing_metadata_stamped() {
+    // (c) When per_pod_policy_scoping is on and no scope cache is present,
+    // `mesh_authz.scope_missing` must appear in the stream connection
+    // metadata so operators can observe the race window in transaction logs.
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [policy_with_scope(
+            "mesh-wide-allow",
+            PolicyScope::MeshWide,
+            PolicyAction::Allow,
+        )],
+        "per_pod_policy_scoping": true,
+    }))
+    .expect("plugin config");
+
+    let mut ctx = stream_context();
+    // Intentionally do not set node_waypoint_policy_scope.
+    let _ = plugin.on_stream_connect(&mut ctx).await;
+
+    assert_eq!(
+        ctx.metadata
+            .as_ref()
+            .and_then(|m| m.get("mesh_authz.scope_missing"))
+            .map(String::as_str),
+        Some("true"),
+        "missing per-pod scope on stream must surface mesh_authz.scope_missing metadata"
+    );
+}
+
 #[tokio::test]
 async fn workload_metrics_inbound_listener_stamps_mesh_direction_inbound() {
     // GAP-3F: the mesh inbound listener stamps `ctx.mesh_direction = Inbound`
