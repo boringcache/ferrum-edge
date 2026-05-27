@@ -811,6 +811,17 @@ pub struct EnvConfig {
     /// successful poll). When `false` (the default), missing bundles cause
     /// cross-cluster mTLS verifications to fail closed.
     pub mesh_federation_fail_open: bool,
+    /// Cross-cluster endpoint discovery polling interval in seconds. Each
+    /// `RemoteCluster.control_plane_url` is dialed on this cadence to fetch the
+    /// remote cluster's service endpoints, which are aggregated into local
+    /// upstream targets (tagged with remote locality) for local→remote
+    /// failover. `0` disables remote-cluster endpoint discovery entirely
+    /// (multi-cluster then remains east-west SNI passthrough + federated trust
+    /// only). Discovery is additionally fail-closed on trust: a remote cluster
+    /// is only dialed when a federated trust bundle for its trust domain exists.
+    pub mesh_remote_discovery_poll_interval_seconds: u64,
+    /// Per-poll timeout for the remote-cluster MeshSubscribe fetch, in seconds.
+    pub mesh_remote_discovery_poll_timeout_seconds: u64,
     /// Node-waypoint cgroup-inode lifecycle sweep interval (seconds).
     /// Identities enrolled with a cgroup v2 path are evicted when the
     /// cgroup is gone or its inode/fingerprint changes (pod restart,
@@ -1679,6 +1690,8 @@ impl Default for EnvConfig {
             mesh_federation_poll_interval_seconds: 300,
             mesh_federation_poll_timeout_seconds: 30,
             mesh_federation_fail_open: false,
+            mesh_remote_discovery_poll_interval_seconds: 0,
+            mesh_remote_discovery_poll_timeout_seconds: 30,
             mesh_node_waypoint_cgroup_sweep_interval_secs: 30,
             mesh_svid_rotation_drain_seconds: 0,
             mesh_policy_deny_log_capacity: crate::modes::mesh::policy_deny_log::DEFAULT_CAPACITY,
@@ -2021,6 +2034,8 @@ impl EnvConfig {
             mesh_federation_poll_interval_seconds: u64 = "FERRUM_MESH_FEDERATION_POLL_INTERVAL_SECONDS" => 300u64;
             mesh_federation_poll_timeout_seconds: u64 = "FERRUM_MESH_FEDERATION_POLL_TIMEOUT_SECONDS" => 30u64;
             mesh_federation_fail_open: bool = "FERRUM_MESH_FEDERATION_FAIL_OPEN" => false;
+            mesh_remote_discovery_poll_interval_seconds: u64 = "FERRUM_MESH_REMOTE_DISCOVERY_POLL_INTERVAL_SECONDS" => 0u64;
+            mesh_remote_discovery_poll_timeout_seconds: u64 = "FERRUM_MESH_REMOTE_DISCOVERY_POLL_TIMEOUT_SECONDS" => 30u64;
             mesh_node_waypoint_cgroup_sweep_interval_secs: u64 = "FERRUM_MESH_NODE_WAYPOINT_CGROUP_SWEEP_INTERVAL_SECS" => 30u64;
             mesh_svid_rotation_drain_seconds: u64 = "FERRUM_MESH_SVID_ROTATION_DRAIN_SECONDS" => 0u64;
             mesh_policy_deny_log_capacity: usize = "FERRUM_MESH_POLICY_DENY_LOG_CAPACITY" => crate::modes::mesh::policy_deny_log::DEFAULT_CAPACITY;
@@ -2597,6 +2612,8 @@ impl EnvConfig {
             mesh_federation_poll_interval_seconds,
             mesh_federation_poll_timeout_seconds,
             mesh_federation_fail_open,
+            mesh_remote_discovery_poll_interval_seconds,
+            mesh_remote_discovery_poll_timeout_seconds,
             mesh_node_waypoint_cgroup_sweep_interval_secs,
             mesh_svid_rotation_drain_seconds,
             mesh_policy_deny_log_capacity,
