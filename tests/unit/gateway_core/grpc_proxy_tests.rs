@@ -124,6 +124,29 @@ fn test_is_grpc_request_allows_ows_before_parameters() {
 }
 
 #[test]
+fn test_is_grpc_request_allows_immediate_and_tab_ows_parameters() {
+    for content_type in [
+        "application/grpc;charset=utf-8",   // immediate ';' (Some(b';') arm)
+        "application/grpc\t;charset=utf-8", // tab OWS before ';'
+    ] {
+        let headers = headers_with_content_type(content_type);
+        assert!(
+            grpc_proxy::is_grpc_content_type(&headers),
+            "{content_type} should be treated as native gRPC"
+        );
+    }
+}
+
+#[test]
+fn test_is_grpc_request_trailing_ows_without_parameter_is_not_grpc() {
+    // OWS not followed by a ';' is rejected: the canonical classifier requires
+    // a parameter separator after any trailing whitespace. (Behavior change vs.
+    // the old `starts_with` form, which accepted a bare trailing space.)
+    let headers = headers_with_content_type("application/grpc ");
+    assert!(!grpc_proxy::is_grpc_content_type(&headers));
+}
+
+#[test]
 fn test_is_grpc_request_application_json_is_not_grpc() {
     let headers = headers_with_content_type("application/json");
     assert!(!grpc_proxy::is_grpc_content_type(&headers));

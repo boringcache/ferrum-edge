@@ -58,8 +58,12 @@ pub fn detect_http_flavor<B>(req: &Request<B>) -> HttpFlavor {
     HttpFlavor::Plain
 }
 
+/// Classify a `content-type` value as native gRPC: `application/grpc`
+/// optionally followed by a `+`/`;` parameter or OWS-then-`;`. Case-insensitive
+/// on the prefix, operates on raw bytes (no UTF-8 validation). This is the
+/// single source of truth shared with `grpc_proxy::is_grpc_content_type`.
 #[inline]
-fn is_native_grpc_content_type(value: &[u8]) -> bool {
+pub(crate) fn is_native_grpc_content_type(value: &[u8]) -> bool {
     const PREFIX: &[u8] = b"application/grpc";
     let Some(prefix) = value.get(..PREFIX.len()) else {
         return false;
