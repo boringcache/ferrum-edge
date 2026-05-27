@@ -2025,11 +2025,11 @@ impl Http3ConnectionPool {
             if len == 0 {
                 continue;
             }
-            bytes_seen.fetch_add(len as u64, Ordering::Release);
             backend_stream
                 .send_data(chunk.copy_to_bytes(len))
                 .await
                 .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("send_data failed: {}", e)))?;
+            bytes_seen.fetch_add(len as u64, Ordering::Release);
         }
         backend_stream
             .finish()

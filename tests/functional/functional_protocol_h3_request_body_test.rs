@@ -288,7 +288,7 @@ async fn functional_h3_request_body_zero_limit_forwards_large_post() {
 /// step the current capability-probe harness does not yet provide.
 #[ignore]
 #[tokio::test]
-async fn functional_h3_streaming_request_logs_request_body_bytes() {
+async fn functional_h3_streaming_request_logs_request_body_bytes_via_cross_protocol_bridge() {
     let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     let backend_task = tokio::spawn(start_body_count_backend(backend_listener));
