@@ -493,6 +493,31 @@ fn peer_authentication_port_level_overrides_visible_in_detail() {
     assert!(overrides[0].as_str().unwrap().contains("PERMISSIVE"));
 }
 
+#[test]
+fn root_namespace_peer_authentication_resolves_to_mesh_wide_scope() {
+    let mut obj = object(
+        "security.istio.io/v1",
+        "PeerAuthentication",
+        "root-strict",
+        json!({ "mtls": { "mode": "STRICT" } }),
+    );
+    obj.metadata.namespace = "istio-system".to_string();
+    let updates = plan_istio_status_updates(&[obj], options());
+    assert_eq!(updates.len(), 1);
+    let update = &updates[0];
+    let c = find_condition(
+        update.status["conditions"].as_array().unwrap(),
+        "FerrumAccepted",
+    );
+    assert_eq!(c["status"].as_str(), Some("True"));
+    assert!(
+        c["message"].as_str().unwrap().contains("scope: MeshWide"),
+        "root-namespace PA should resolve to MeshWide scope"
+    );
+    let detail = update.ferrum_detail.as_ref().unwrap();
+    assert_eq!(detail["translation"]["scope"].as_str(), Some("MeshWide"),);
+}
+
 /// DestinationRule deferred-fields tracking: when an operator uses
 /// `portLevelSettings[].tls`, the detail block surfaces this as a
 /// deferred field so they know Ferrum parsed but didn't enforce it.

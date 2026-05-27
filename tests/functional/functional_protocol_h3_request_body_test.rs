@@ -41,6 +41,54 @@ fn build_config(backend_port: u16) -> String {
     )
 }
 
+fn build_config_with_stdout_logging(backend_port: u16) -> String {
+    format!(
+        "version: \"1\"\nproxies:\n\
+         \x20 - id: \"h3-request-body\"\n\
+         \x20   listen_path: \"/\"\n\
+         \x20   backend_scheme: http\n\
+         \x20   backend_host: \"127.0.0.1\"\n\
+         \x20   backend_port: {backend_port}\n\
+         \x20   strip_listen_path: false\n\
+         \x20   backend_connect_timeout_ms: 60000\n\
+         \x20   backend_read_timeout_ms: 60000\n\
+         \x20   backend_write_timeout_ms: 60000\n\
+         consumers: []\n\
+         plugin_configs:\n\
+         \x20 - id: \"access-log\"\n\
+         \x20   plugin_name: \"stdout_logging\"\n\
+         \x20   scope: \"global\"\n\
+         \x20   enabled: true\n\
+         \x20   config: {{}}\n",
+    )
+}
+
+async fn wait_for_access_log_bytes_sent(gateway: &TestGateway, expected: u64) -> Option<Value> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let latest = gateway.read_combined_captured_output().unwrap_or_default();
+        if let Some(entry) = latest
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|entry| {
+                entry.get("proxy_id").and_then(Value::as_str) == Some("h3-request-body")
+                    && entry.get("bytes_sent").and_then(Value::as_u64) == Some(expected)
+            })
+        {
+            return Some(entry);
+        }
+        if Instant::now() >= deadline {
+            return latest
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .find(|entry| {
+                    entry.get("proxy_id").and_then(Value::as_str) == Some("h3-request-body")
+                });
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
 async fn start_body_count_backend(listener: TcpListener) {
     loop {
         let Ok((stream, _)) = listener.accept().await else {
@@ -213,6 +261,77 @@ async fn functional_h3_request_body_zero_limit_forwards_large_post() {
         parsed["received_body_bytes"].as_u64(),
         Some(BODY_BYTES as u64),
         "backend should receive the full H3 request body when request limit is disabled"
+    );
+
+    gateway.shutdown();
+    backend_task.abort();
+}
+
+/// Coverage scope (read before assuming this guards the native H3 byte
+/// plumbing): this test uses `backend_scheme: http`, which normalizes to
+/// `DispatchKind::HttpPool`, so an H3 frontend request takes the
+/// **cross-protocol bridge** to an HTTP/1.1 backend. On that path `bytes_sent`
+/// is sourced from the bridge's own counter (`http3/cross_protocol.rs`), so
+/// this exercises the bridge's request-byte accounting end to end.
+///
+/// It does NOT exercise the **native H3 backend pool** path — the
+/// `request_body_bytes_seen` / `bytes_seen.fetch_add(...)` plumbing in
+/// `http3/client.rs::do_request_streaming_body` and the native streaming block
+/// in `http3/server.rs`. That path runs only for `DispatchKind::HttpsPool`
+/// against an H3-capable backend (`backend_scheme: https` +
+/// `FERRUM_POOL_WARMUP_ENABLED=true` so the capability registry marks H3
+/// `Supported`). Adding native-pool byte-count coverage requires a scripted
+/// QUIC/H3 backend that consumes the request body and responds — see the
+/// `tests/functional/scripted_backend_h3_tests.rs` harness
+/// (`spawn_h3_harness_with_explicit_https_port`, `wait_for_capability_entry`)
+/// — and is tracked as a follow-up; it needs a body-consuming `ScriptedH3Backend`
+/// step the current capability-probe harness does not yet provide.
+#[ignore]
+#[tokio::test]
+async fn functional_h3_streaming_request_logs_request_body_bytes_via_cross_protocol_bridge() {
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    let backend_task = tokio::spawn(start_body_count_backend(backend_listener));
+    sleep(Duration::from_millis(150)).await;
+
+    let https_reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let https_port = https_reservation.local_addr().unwrap().port();
+    drop(https_reservation);
+
+    let mut gateway = TestGateway::builder()
+        .mode_file(build_config_with_stdout_logging(backend_port))
+        .log_level("warn")
+        .capture_output()
+        .env("FERRUM_ENABLE_HTTP3", "true")
+        .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
+        .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
+        .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key")
+        .env("FERRUM_MAX_REQUEST_BODY_SIZE_BYTES", "0")
+        .spawn()
+        .await
+        .expect("start gateway");
+
+    let url = format!("https://localhost:{https_port}/upload");
+    let body = Bytes::from(vec![b'b'; 128 * 1024]);
+    let (status, body_bytes) = h3_post_bytes(&url, body.clone()).await.expect("h3 post");
+
+    assert_eq!(status.as_u16(), 200);
+    let parsed: Value = serde_json::from_slice(&body_bytes).expect("json response");
+    assert_eq!(
+        parsed["received_body_bytes"].as_u64(),
+        Some(body.len() as u64)
+    );
+
+    let access_log = wait_for_access_log_bytes_sent(&gateway, body.len() as u64)
+        .await
+        .unwrap_or_else(|| {
+            let logs = gateway.read_combined_captured_output().unwrap_or_default();
+            panic!("stdout_logging did not emit h3 access log; captured logs:\n{logs}")
+        });
+    assert_eq!(
+        access_log.get("bytes_sent").and_then(Value::as_u64),
+        Some(body.len() as u64),
+        "access log should report the streamed H3 request body bytes"
     );
 
     gateway.shutdown();

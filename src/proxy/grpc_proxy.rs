@@ -1790,12 +1790,17 @@ pub fn is_grpc_request(req: &Request<Incoming>) -> bool {
     is_grpc_content_type(req.headers())
 }
 
-/// Check if headers indicate a gRPC request (content-type starts with "application/grpc").
+/// Check if headers indicate a native gRPC request.
+///
+/// Delegates to the canonical [`super::backend_dispatch::is_native_grpc_content_type`]
+/// classifier so the H1/H2 dispatch path and this helper can never diverge. The
+/// shared helper works on raw bytes, so a malformed value such as
+/// `application/grpc+\xff` classifies identically in both places, and we avoid a
+/// per-request `to_str()` UTF-8 scan on the hot path.
 pub fn is_grpc_content_type(headers: &hyper::HeaderMap) -> bool {
     headers
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|ct| ct.starts_with("application/grpc"))
+        .get(hyper::header::CONTENT_TYPE)
+        .is_some_and(|v| super::backend_dispatch::is_native_grpc_content_type(v.as_bytes()))
 }
 
 /// Parse the `grpc-timeout` header value into milliseconds.

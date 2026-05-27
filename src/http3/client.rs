@@ -1836,6 +1836,7 @@ impl Http3ConnectionPool {
     /// rejection is post-wire because we cannot abort the stream cleanly
     /// after dispatch — the H3 server callers translate this back into a
     /// 413 status which is intentionally not a transport-class failure.
+    #[allow(clippy::too_many_arguments)]
     async fn do_request_streaming_body(
         send_request: &mut H3SendRequest,
         proxy: &Proxy,
@@ -1847,6 +1848,7 @@ impl Http3ConnectionPool {
             bytes::Bytes,
         >,
         max_request_body_size: usize,
+        bytes_seen: Arc<AtomicU64>,
     ) -> H3PoolResult<H3StreamingResponse> {
         let uri: http::Uri = backend_url
             .parse()
@@ -1901,10 +1903,14 @@ impl Http3ConnectionPool {
                     )));
                 }
             }
+            if len == 0 {
+                continue;
+            }
             backend_stream
                 .send_data(chunk.copy_to_bytes(len))
                 .await
                 .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("send_data failed: {}", e)))?;
+            bytes_seen.fetch_add(len as u64, Ordering::Release);
         }
         backend_stream
             .finish()
@@ -2019,11 +2025,11 @@ impl Http3ConnectionPool {
             if len == 0 {
                 continue;
             }
-            bytes_seen.fetch_add(len as u64, Ordering::Release);
             backend_stream
                 .send_data(chunk.copy_to_bytes(len))
                 .await
                 .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("send_data failed: {}", e)))?;
+            bytes_seen.fetch_add(len as u64, Ordering::Release);
         }
         backend_stream
             .finish()
@@ -2083,6 +2089,7 @@ impl Http3ConnectionPool {
             bytes::Bytes,
         >,
         max_request_body_size: usize,
+        bytes_seen: Arc<AtomicU64>,
         tls_config_fn: impl FnOnce() -> Result<Arc<rustls::ClientConfig>, anyhow::Error>,
     ) -> H3PoolResult<H3StreamingResponse> {
         let conns_per_backend = proxy
@@ -2109,6 +2116,7 @@ impl Http3ConnectionPool {
                 headers,
                 frontend_stream,
                 max_request_body_size,
+                Arc::clone(&bytes_seen),
             )
             .await
             {
@@ -2145,6 +2153,7 @@ impl Http3ConnectionPool {
             headers,
             frontend_stream,
             max_request_body_size,
+            bytes_seen,
         )
         .await
     }
@@ -2242,6 +2251,7 @@ impl Http3ConnectionPool {
             bytes::Bytes,
         >,
         max_request_body_size: usize,
+        bytes_seen: Arc<AtomicU64>,
         tls_config_fn: impl FnOnce() -> Result<Arc<rustls::ClientConfig>, anyhow::Error>,
     ) -> H3PoolResult<H3StreamingResponse> {
         let conns_per_backend = proxy
@@ -2266,6 +2276,7 @@ impl Http3ConnectionPool {
                 headers,
                 frontend_stream,
                 max_request_body_size,
+                Arc::clone(&bytes_seen),
             )
             .await
             {
@@ -2309,6 +2320,7 @@ impl Http3ConnectionPool {
             headers,
             frontend_stream,
             max_request_body_size,
+            bytes_seen,
         )
         .await
     }

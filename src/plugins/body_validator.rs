@@ -40,8 +40,6 @@ pub struct BodyValidator {
     json_schema: Option<Value>,
     /// Required JSON fields (simple validation without full JSON Schema).
     required_fields: Vec<String>,
-    /// Whether to validate XML request bodies are well-formed.
-    validate_xml: bool,
     /// Required XML elements in request bodies.
     required_xml_elements: Vec<String>,
     /// Content types to validate for requests (empty = validate all).
@@ -54,8 +52,6 @@ pub struct BodyValidator {
     response_json_schema: Option<Value>,
     /// Required JSON fields in response bodies.
     response_required_fields: Vec<String>,
-    /// Whether to validate XML response bodies are well-formed.
-    response_validate_xml: bool,
     /// Required XML elements in response bodies.
     response_required_xml_elements: Vec<String>,
     /// Content types to validate for responses.
@@ -89,6 +85,10 @@ pub struct BodyValidator {
     has_protobuf_response_validation: bool,
     /// Whether request validation must run in before_proxy (JSON/XML only).
     has_pre_proxy_request_validation: bool,
+    /// Whether XML request validation is active (validate_xml OR required_xml_elements non-empty).
+    has_xml_request_validation: bool,
+    /// Whether XML response validation is active (response_validate_xml OR response_required_xml_elements non-empty).
+    has_xml_response_validation: bool,
 }
 
 impl BodyValidator {
@@ -138,14 +138,15 @@ impl BodyValidator {
                 .values()
                 .any(|e| e.response.is_some());
 
-        let has_json_xml_request = json_schema.is_some()
-            || !required_fields.is_empty()
-            || validate_xml
-            || !required_xml_elements.is_empty();
+        let has_xml_request_validation = validate_xml || !required_xml_elements.is_empty();
+        let has_xml_response_validation =
+            response_validate_xml || !response_required_xml_elements.is_empty();
+
+        let has_json_xml_request =
+            json_schema.is_some() || !required_fields.is_empty() || has_xml_request_validation;
         let has_json_xml_response = response_json_schema.is_some()
             || !response_required_fields.is_empty()
-            || response_validate_xml
-            || !response_required_xml_elements.is_empty();
+            || has_xml_response_validation;
 
         let has_request_validation = has_json_xml_request || has_protobuf_request_validation;
         let has_response_validation = has_json_xml_response || has_protobuf_response_validation;
@@ -174,13 +175,11 @@ impl BodyValidator {
         Ok(Self {
             json_schema,
             required_fields,
-            validate_xml,
             required_xml_elements,
             content_types,
             compiled_patterns,
             response_json_schema,
             response_required_fields,
-            response_validate_xml,
             response_required_xml_elements,
             response_content_types,
             response_compiled_patterns,
@@ -195,6 +194,8 @@ impl BodyValidator {
             has_protobuf_request_validation,
             has_protobuf_response_validation,
             has_pre_proxy_request_validation: has_json_xml_request,
+            has_xml_request_validation,
+            has_xml_response_validation,
         })
     }
 
@@ -505,18 +506,12 @@ impl BodyValidator {
             return Err("Invalid XML: must start with '<'".to_string());
         }
 
-        // Check for required elements
-        for element in required_xml_elements {
-            if !contains_xml_open_tag(trimmed, element) {
-                return Err(format!("Missing required XML element: {}", element));
-            }
-        }
-
         // Tag balance check with proper handling of CDATA, comments,
         // processing instructions, and DOCTYPE declarations.
         let bytes = trimmed.as_bytes();
         let len = bytes.len();
-        let mut depth: i32 = 0;
+        let mut stack: Vec<&str> = Vec::new();
+        let mut required_found = vec![false; required_xml_elements.len()];
         let mut i = 0;
 
         while i < len {
@@ -577,7 +572,19 @@ impl BodyValidator {
             if remaining.len() >= 2 && remaining[1] == b'/' {
                 match find_byte(&bytes[i + 2..], b'>') {
                     Some(end) => {
-                        depth -= 1;
+                        let tag_end = i + 2 + end;
+                        let Some(name) = xml_tag_name(trimmed, i + 2, tag_end) else {
+                            return Err("Invalid XML: empty closing tag".to_string());
+                        };
+                        let Some(open_name) = stack.pop() else {
+                            return Err(format!("Unexpected closing tag: {}", name));
+                        };
+                        if open_name != name {
+                            return Err(format!(
+                                "Mismatched XML closing tag: expected </{}>, got </{}>",
+                                open_name, name
+                            ));
+                        }
                         i = i + 2 + end + 1;
                         continue;
                     }
@@ -592,9 +599,17 @@ impl BodyValidator {
                     // attributes and the slash, e.g., <name attr="v" />). Walk
                     // backward from `>` skipping XML whitespace per W3C XML 1.0 §2.3.
                     let tag_end = i + 1 + end;
+                    let Some(name) = xml_tag_name(trimmed, i + 1, tag_end) else {
+                        return Err("Invalid XML: empty tag name".to_string());
+                    };
+                    for (idx, required) in required_xml_elements.iter().enumerate() {
+                        if !required_found[idx] && name == *required {
+                            required_found[idx] = true;
+                        }
+                    }
                     let self_closing = is_self_closing_tag(bytes, i + 1, tag_end);
                     if !self_closing {
-                        depth += 1;
+                        stack.push(name);
                     }
                     i = tag_end + 1;
                 }
@@ -602,8 +617,14 @@ impl BodyValidator {
             }
         }
 
-        if depth != 0 {
-            return Err(format!("Unbalanced XML tags (depth {})", depth));
+        if let Some(unclosed) = stack.last() {
+            return Err(format!("Unclosed XML tag: {}", unclosed));
+        }
+
+        for (idx, element) in required_xml_elements.iter().enumerate() {
+            if !required_found[idx] {
+                return Err(format!("Missing required XML element: {}", element));
+            }
         }
 
         Ok(())
@@ -892,27 +913,6 @@ fn ascii_contains_ignore_case(haystack: &str, needle: &str) -> bool {
     false
 }
 
-fn contains_xml_open_tag(body: &str, element: &str) -> bool {
-    let body = body.as_bytes();
-    let element = element.as_bytes();
-    if element.is_empty() {
-        return false;
-    }
-    // Need: '<' + element + one delimiter byte ('>', '/', or whitespace per XML spec).
-    let window_size = element.len() + 2;
-    if body.len() < window_size {
-        return false;
-    }
-    body.windows(window_size).any(|window| {
-        window[0] == b'<'
-            && &window[1..1 + element.len()] == element
-            && matches!(
-                window[1 + element.len()],
-                b'>' | b'/' | b' ' | b'\t' | b'\r' | b'\n'
-            )
-    })
-}
-
 /// Load protobuf validation config from the plugin config JSON.
 ///
 /// Reads `protobuf_descriptor_path`, resolves message types from
@@ -1065,6 +1065,25 @@ fn find_byte(haystack: &[u8], needle: u8) -> Option<usize> {
     haystack.iter().position(|&b| b == needle)
 }
 
+fn xml_tag_name(body: &str, start_inclusive: usize, tag_end_exclusive: usize) -> Option<&str> {
+    let bytes = body.as_bytes();
+    let mut start = start_inclusive;
+    while start < tag_end_exclusive && is_xml_whitespace(bytes[start]) {
+        start += 1;
+    }
+    let mut end = start;
+    while end < tag_end_exclusive
+        && !is_xml_whitespace(bytes[end])
+        && !matches!(bytes[end], b'/' | b'>')
+    {
+        end += 1;
+    }
+    if end == start {
+        return None;
+    }
+    body.get(start..end)
+}
+
 /// Returns true if the bytes between `start_inclusive` (first byte after `<`)
 /// and `tag_end_exclusive` (position of the `>`) form a self-closing XML tag
 /// (i.e., end with `/`, optionally followed by XML whitespace before the `>`).
@@ -1087,6 +1106,10 @@ fn is_self_closing_tag(bytes: &[u8], start_inclusive: usize, tag_end_exclusive: 
         }
     }
     false
+}
+
+fn is_xml_whitespace(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\r' | b'\n')
 }
 
 /// Validate common string formats (subset of JSON Schema format vocabulary).
@@ -1255,7 +1278,7 @@ impl Plugin for BodyValidator {
                 self.json_schema.as_ref(),
                 &self.compiled_patterns,
             )
-        } else if is_xml_like_content_type(content_type) && self.validate_xml {
+        } else if is_xml_like_content_type(content_type) && self.has_xml_request_validation {
             Self::validate_xml_body(body, &self.required_xml_elements)
         } else {
             Ok(())
@@ -1305,8 +1328,7 @@ impl Plugin for BodyValidator {
             // mis-treat a non-gRPC payload as malformed JSON.
             let has_json_validation =
                 self.json_schema.is_some() || !self.required_fields.is_empty();
-            let has_xml_validation = self.validate_xml || !self.required_xml_elements.is_empty();
-            if !has_json_validation && !has_xml_validation {
+            if !has_json_validation && !self.has_xml_request_validation {
                 return PluginResult::Continue;
             }
 
@@ -1329,7 +1351,7 @@ impl Plugin for BodyValidator {
                     self.json_schema.as_ref(),
                     &self.compiled_patterns,
                 )
-            } else if is_xml_like_content_type(content_type) && self.validate_xml {
+            } else if is_xml_like_content_type(content_type) && self.has_xml_request_validation {
                 Self::validate_xml_body(body_str, &self.required_xml_elements)
             } else {
                 Ok(())
@@ -1471,7 +1493,7 @@ impl Plugin for BodyValidator {
                 self.response_json_schema.as_ref(),
                 &self.response_compiled_patterns,
             )
-        } else if is_xml_like_content_type(content_type) && self.response_validate_xml {
+        } else if is_xml_like_content_type(content_type) && self.has_xml_response_validation {
             Self::validate_xml_body(body_str, &self.response_required_xml_elements)
         } else {
             Ok(())

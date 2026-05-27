@@ -1920,6 +1920,7 @@ async fn handle_h3_request(
             ctx.is_early_data,
         );
         let tls_config_fn = || state.connection_pool.get_tls_config_for_backend(&proxy);
+        let request_body_bytes_seen = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
         let streaming_resp = if let Some(target) = upstream_target.as_deref() {
             state
@@ -1933,6 +1934,7 @@ async fn handle_h3_request(
                     &h3_headers,
                     &mut stream,
                     state.max_request_body_size_bytes,
+                    Arc::clone(&request_body_bytes_seen),
                     tls_config_fn,
                 )
                 .await
@@ -1946,6 +1948,7 @@ async fn handle_h3_request(
                     &h3_headers,
                     &mut stream,
                     state.max_request_body_size_bytes,
+                    Arc::clone(&request_body_bytes_seen),
                     tls_config_fn,
                 )
                 .await
@@ -2039,9 +2042,16 @@ async fn handle_h3_request(
                     latency_gateway_overhead_ms: (gateway_processing_ms - plugin_execution_ms)
                         .max(0.0),
                     request_user_agent: proxy_headers.get("user-agent").cloned(),
-                    // Backend connection failed before any streaming began — the 502
-                    // response body is built and sent synchronously below.
+                    // Native H3 backend dispatch failed; the 502 response body is
+                    // built and sent synchronously below. This branch covers both
+                    // pre-wire failures (connect/handshake — zero request bytes
+                    // forwarded) and post-wire failures (send_data failed
+                    // mid-stream, or the client disconnected while sending the
+                    // request body), where request_body_bytes_seen is non-zero.
+                    // Loading it here reports the bytes actually forwarded before
+                    // the failure rather than assuming zero.
                     error_class: Some(h3_error_class),
+                    bytes_sent: request_body_bytes_seen.load(std::sync::atomic::Ordering::Acquire),
                     metadata: crate::proxy::clone_log_metadata(&ctx),
                     ..TransactionSummary::default()
                 };
@@ -2077,7 +2087,13 @@ async fn handle_h3_request(
                 upstream_balancer.as_ref(),
                 upstream_target.as_deref(),
                 cb_target_key.as_deref(),
-                502,
+                // The backend did respond (headers received) before we found
+                // the body too large; CB/passive-health must see the real
+                // backend status, not the gateway-synthesized 502. Mirrors the
+                // buffered/streamed-response path in
+                // `proxy_to_backend_h3_streaming` so the same scenario can't
+                // penalize the backend on one native-H3 path but not the other.
+                response_status,
                 false,
                 None,
                 cb_is_half_open_probe,
@@ -2088,15 +2104,97 @@ async fn handle_h3_request(
             return Ok(());
         }
 
-        // after_proxy hooks (run before streaming begins so headers can be modified)
+        // after_proxy hooks run before streaming begins so headers can be
+        // modified or the response rejected before any downstream bytes are
+        // committed. A reject here (e.g. a WAF response-header-inspection
+        // reject, which does not buffer the body) MUST be honored on this
+        // native-H3 streaming path exactly as on the buffered/H1/H2 paths —
+        // this is the default native-H3 path, so discarding the reject would
+        // silently bypass response-policy plugins for the common case.
+        if let Some(reject) = run_h3_streaming_after_proxy_hooks(
+            &plugins,
+            &mut ctx,
+            response_status,
+            &mut response_headers,
+            &mut plugin_execution_ns,
+        )
+        .await
         {
-            let phase_start = std::time::Instant::now();
-            for plugin in plugins.iter() {
-                let _ = plugin
-                    .after_proxy(&mut ctx, response_status, &mut response_headers)
-                    .await;
-            }
-            plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+            let reject_status =
+                StatusCode::from_u16(reject.status_code).unwrap_or(StatusCode::BAD_GATEWAY);
+            let reject_sent =
+                send_h3_reject_response(&mut stream, reject_status, &reject.body, &reject.headers)
+                    .await
+                    .is_ok();
+
+            // CB / passive-health must see the TRUE backend status: the plugin
+            // override is a gateway policy decision and must neither penalize a
+            // healthy backend nor mask a real backend failure.
+            crate::proxy::backend_dispatch::record_backend_outcome(
+                &state,
+                &proxy,
+                &epoch.load_balancer,
+                upstream_balancer.as_ref(),
+                upstream_target.as_deref(),
+                cb_target_key.as_deref(),
+                response_status,
+                false,
+                None,
+                cb_is_half_open_probe,
+                false,
+                backend_start.elapsed(),
+            );
+
+            let backend_total_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
+            let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+            let plugin_execution_ms = plugin_execution_ns as f64 / 1_000_000.0;
+            let plugin_external_io_ms =
+                ctx.plugin_http_call_ns
+                    .load(std::sync::atomic::Ordering::Relaxed) as f64
+                    / 1_000_000.0;
+            let gateway_processing_ms = total_ms - backend_total_ms;
+            let gateway_overhead_ms = (total_ms - backend_total_ms - plugin_execution_ms).max(0.0);
+
+            let summary = TransactionSummary {
+                namespace: proxy.namespace.clone(),
+                timestamp_received: ctx.timestamp_received.to_rfc3339(),
+                client_ip: ctx.client_ip.clone(),
+                consumer_username: ctx.effective_identity().map(str::to_owned),
+                auth_method: ctx.auth_method,
+                http_method: method.to_string(),
+                request_path: path.clone(),
+                proxy_id: Some(proxy.id.clone()),
+                proxy_name: proxy.name.clone(),
+                backend_target: Some(strip_query_params(&backend_url).to_string()),
+                backend_resolved_ip: backend_resolved_ip.clone(),
+                // Client-facing status is the plugin's reject status, not the
+                // backend's (which CB/health recorded above).
+                response_status_code: reject.status_code,
+                latency_total_ms: total_ms,
+                latency_gateway_processing_ms: gateway_processing_ms,
+                latency_backend_ttfb_ms: backend_total_ms,
+                latency_backend_total_ms: backend_total_ms,
+                latency_plugin_execution_ms: plugin_execution_ms,
+                latency_plugin_external_io_ms: plugin_external_io_ms,
+                latency_gateway_overhead_ms: gateway_overhead_ms,
+                request_user_agent: proxy_headers.get("user-agent").cloned(),
+                response_streamed: true,
+                client_disconnected: !reject_sent,
+                error_class: None,
+                body_error_class: None,
+                body_completed: reject_sent,
+                bytes_sent: 0,
+                bytes_received: if reject_sent {
+                    reject.body.len() as u64
+                } else {
+                    0
+                },
+                mirror: false,
+                metadata: crate::proxy::clone_log_metadata(&ctx),
+            };
+            crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
+            record_request(&state, reject.status_code);
+            return Ok(());
         }
 
         // Sticky session cookie injection
@@ -2320,13 +2418,7 @@ async fn handle_h3_request(
             error_class: None,
             body_error_class,
             body_completed,
-            // Request body was streamed frame-by-frame via the H3 pool
-            // (`request_streaming_body`) — the exact byte count is not
-            // currently surfaced back from the pool. Populating this would
-            // require threading an `Arc<AtomicU64>` through the H3 request
-            // API; deferred to a follow-up. For streaming-request flows,
-            // `bytes_sent` may be 0 even when a non-empty body was sent.
-            bytes_sent: 0,
+            bytes_sent: request_body_bytes_seen.load(std::sync::atomic::Ordering::Acquire),
             // Response bytes delivered to the client — tracked by the
             // streaming loop above as `bytes_streamed`.
             bytes_received: bytes_streamed,
@@ -2494,6 +2586,10 @@ async fn handle_h3_request(
         };
 
         let response_status = h3_stream_result.status;
+        // True backend status for CB / passive-health (diverges from
+        // `response_status` only on an after_proxy reject or size-limit
+        // rejection, where `response_status` is the gateway's policy status).
+        let backend_status = h3_stream_result.backend_status;
         let h3_error_class = h3_stream_result.error_class;
 
         // Record outcome across CB, passive health, latency, and connection
@@ -2559,7 +2655,7 @@ async fn handle_h3_request(
             upstream_balancer.as_ref(),
             upstream_target.as_deref(),
             cb_target_key.as_deref(),
-            response_status,
+            backend_status,
             connection_error,
             h3_error_class,
             cb_is_half_open_probe,
@@ -3318,7 +3414,18 @@ fn h3_streaming_body_failure_outcome(
 /// re-derivation of latency fields is needed because the "now" at summary
 /// construction time already coincides with body completion.
 struct H3StreamResult {
+    /// Client-facing HTTP status (what was/will be sent downstream). On an
+    /// `after_proxy` reject or a gateway-side size-limit rejection this is the
+    /// gateway's policy status, NOT the backend's — use [`Self::backend_status`]
+    /// for circuit-breaker / passive-health accounting.
     status: u16,
+    /// True backend response status (or the synthesized status when no backend
+    /// response was received). Circuit-breaker and passive-health accounting
+    /// must key off this, never `status`: a plugin rejecting a healthy 200 with
+    /// a 5xx must not penalize the backend, and a plugin masking a backend 503
+    /// behind a 4xx must not hide the failure. Mirrors the buffered/H1/H2 paths,
+    /// which record the backend status before applying the after-proxy override.
+    backend_status: u16,
     error_class: Option<crate::retry::ErrorClass>,
     body_completed: bool,
     bytes_streamed: u64,
@@ -3339,6 +3446,19 @@ struct H3StreamResult {
     /// reset can string-classify as `ConnectionReset` even though no
     /// request reached the backend).
     request_on_wire: bool,
+}
+
+async fn run_h3_streaming_after_proxy_hooks(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    response_status: u16,
+    response_headers: &mut HashMap<String, String>,
+    plugin_execution_ns: &mut u64,
+) -> Option<crate::proxy::AfterProxyReject> {
+    let phase_start = std::time::Instant::now();
+    let reject = run_after_proxy_hooks(plugins, ctx, response_status, response_headers).await;
+    *plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+    reject
 }
 
 /// Streaming proxy path: sends backend response chunks directly to the H3 client
@@ -3426,6 +3546,9 @@ async fn proxy_to_backend_h3_streaming(
             send_h3_response(h3_stream, StatusCode::BAD_GATEWAY, h3_error_body).await?;
             return Ok(H3StreamResult {
                 status: 502,
+                // No backend response was received (pre-headers dispatch
+                // failure); there is no true backend status to report.
+                backend_status: 502,
                 error_class: Some(h3_error_class),
                 body_completed: false,
                 bytes_streamed: 0,
@@ -3455,18 +3578,27 @@ async fn proxy_to_backend_h3_streaming(
             "Backend response body ({} bytes) exceeds limit ({} bytes)",
             len, state.max_response_body_size_bytes
         );
-        send_h3_response(
+        // Same connection-accounting contract as the after_proxy reject below:
+        // never propagate a send error, or the caller's `record_backend_outcome`
+        // is skipped and the LB active-connection count leaks for a client that
+        // disconnected during the reject write.
+        let size_reject_sent = send_h3_response(
             h3_stream,
             StatusCode::BAD_GATEWAY,
             r#"{"error":"Backend response body exceeds maximum size"}"#,
         )
-        .await?;
+        .await
+        .is_ok();
         return Ok(H3StreamResult {
             status: 502,
+            // The backend did respond (headers received) before we found the
+            // body too large; CB/passive-health should see the real backend
+            // status, not the gateway-synthesized 502.
+            backend_status: response_status,
             error_class: Some(crate::retry::ErrorClass::ResponseBodyTooLarge),
             body_completed: false,
             bytes_streamed: 0,
-            client_disconnected: false,
+            client_disconnected: !size_reject_sent,
             body_error_class: None,
             // Headers were already received from the backend before we
             // discovered the body exceeded our limit, so the request
@@ -3476,15 +3608,51 @@ async fn proxy_to_backend_h3_streaming(
         });
     }
 
-    // after_proxy hooks (run before streaming begins so headers can be modified)
+    // after_proxy hooks run before streaming begins so headers can be modified
+    // or the response can be rejected before any downstream bytes are committed.
+    if let Some(reject) = run_h3_streaming_after_proxy_hooks(
+        plugins,
+        ctx,
+        response_status,
+        &mut response_headers,
+        plugin_execution_ns,
+    )
+    .await
     {
-        let phase_start = std::time::Instant::now();
-        for plugin in plugins.iter() {
-            let _ = plugin
-                .after_proxy(ctx, response_status, &mut response_headers)
-                .await;
-        }
-        *plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+        let reject_status =
+            StatusCode::from_u16(reject.status_code).unwrap_or(StatusCode::BAD_GATEWAY);
+        // Do NOT propagate a send error here: this path already started
+        // least-connections LB tracking before dispatch, so returning `Err`
+        // would skip the caller's `record_backend_outcome` and leak the
+        // active-connection count for the selected target. Report the
+        // disconnect in the result so the caller still records the (true
+        // backend) outcome and releases the connection.
+        let reject_sent =
+            send_h3_reject_response(h3_stream, reject_status, &reject.body, &reject.headers)
+                .await
+                .is_ok();
+        return Ok(H3StreamResult {
+            status: reject.status_code,
+            // The backend already returned `response_status`; the after_proxy
+            // plugin override is a gateway policy decision. CB/passive-health
+            // must see the true backend status so a plugin neither penalizes a
+            // healthy backend nor masks a real backend failure.
+            backend_status: response_status,
+            error_class: None,
+            body_completed: reject_sent,
+            bytes_streamed: if reject_sent {
+                reject.body.len() as u64
+            } else {
+                0
+            },
+            client_disconnected: !reject_sent,
+            body_error_class: if reject_sent {
+                None
+            } else {
+                Some(crate::retry::ErrorClass::ClientDisconnect)
+            },
+            request_on_wire: true,
+        });
     }
 
     // Sticky session cookie injection
@@ -3518,6 +3686,7 @@ async fn proxy_to_backend_h3_streaming(
         // Client QUIC stream is already gone — nothing streamed.
         return Ok(H3StreamResult {
             status: response_status,
+            backend_status: response_status,
             error_class: None,
             body_completed: false,
             bytes_streamed: 0,
@@ -3678,6 +3847,7 @@ async fn proxy_to_backend_h3_streaming(
 
     Ok(H3StreamResult {
         status: response_status,
+        backend_status: response_status,
         error_class: terminal_error_class,
         body_completed,
         bytes_streamed,
@@ -3864,15 +4034,32 @@ async fn send_h3_response(
 
 /// Send an HTTP/3 rejection response with custom headers. Same recv-half
 /// halt contract as `send_h3_response`.
+/// Whether an `after_proxy` reject already carries a `Content-Type` header
+/// (case-insensitive). When it does, `send_h3_reject_response` must not add its
+/// own default, because `http::response::Builder::header` *appends* rather than
+/// replaces — a second `content-type` would be a duplicate header, which is
+/// undefined for clients. Pulled out as a pure function so the dedup decision is
+/// unit-testable without a live QUIC stream.
+fn reject_response_sets_content_type(headers: &HashMap<String, String>) -> bool {
+    headers
+        .keys()
+        .any(|k| k.eq_ignore_ascii_case("content-type"))
+}
+
 async fn send_h3_reject_response(
     stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     status: StatusCode,
     body: &[u8],
     headers: &HashMap<String, String>,
 ) -> Result<(), anyhow::Error> {
-    let mut builder = Response::builder()
-        .status(status)
-        .header("content-type", "application/json");
+    let mut builder = Response::builder().status(status);
+    // Only default the content-type when the reject didn't supply its own
+    // (e.g. a WAF response-inspection reject using the configured
+    // reject_content_type). Mirrors the buffered H3 path's
+    // `entry("content-type").or_insert_with(..)`.
+    if !reject_response_sets_content_type(headers) {
+        builder = builder.header("content-type", "application/json");
+    }
     for (k, v) in headers {
         if let (Ok(name), Ok(val)) = (
             hyper::header::HeaderName::from_bytes(k.as_bytes()),
@@ -4201,6 +4388,142 @@ mod h3_proxy_header_tests {
             ctx.headers.get("content-type").map(String::as_str),
             Some("application/json")
         );
+    }
+}
+
+#[cfg(test)]
+mod h3_streaming_after_proxy_tests {
+    use super::run_h3_streaming_after_proxy_hooks;
+    use crate::plugins::{Plugin, PluginResult, RequestContext};
+    use async_trait::async_trait;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    struct RejectingAfterProxy;
+
+    #[async_trait]
+    impl Plugin for RejectingAfterProxy {
+        fn name(&self) -> &str {
+            "rejecting_after_proxy"
+        }
+
+        async fn after_proxy(
+            &self,
+            _ctx: &mut RequestContext,
+            _status_code: u16,
+            _response_headers: &mut HashMap<String, String>,
+        ) -> PluginResult {
+            PluginResult::Reject {
+                status_code: 451,
+                body: "blocked by response policy".to_string(),
+                headers: HashMap::from([("x-policy".to_string(), "blocked".to_string())]),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_after_proxy_returns_reject_before_downstream_commit() {
+        let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(RejectingAfterProxy)];
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/stream".to_string(),
+        );
+        let mut response_headers =
+            HashMap::from([("content-type".to_string(), "text/plain".to_string())]);
+        let mut plugin_execution_ns = 0;
+
+        let reject = run_h3_streaming_after_proxy_hooks(
+            &plugins,
+            &mut ctx,
+            200,
+            &mut response_headers,
+            &mut plugin_execution_ns,
+        )
+        .await
+        .expect("after_proxy rejection should be surfaced");
+
+        assert_eq!(reject.status_code, 451);
+        assert_eq!(reject.body, b"blocked by response policy");
+        assert_eq!(
+            reject.headers.get("x-policy").map(String::as_str),
+            Some("blocked")
+        );
+        // The wrapper's sole job beyond delegating is to accumulate elapsed
+        // plugin time; pin that it actually does so.
+        assert!(
+            plugin_execution_ns > 0,
+            "after_proxy hook execution time must be accumulated"
+        );
+    }
+
+    struct ContinuingAfterProxy;
+
+    #[async_trait]
+    impl Plugin for ContinuingAfterProxy {
+        fn name(&self) -> &str {
+            "continuing_after_proxy"
+        }
+
+        async fn after_proxy(
+            &self,
+            _ctx: &mut RequestContext,
+            _status_code: u16,
+            _response_headers: &mut HashMap<String, String>,
+        ) -> PluginResult {
+            PluginResult::Continue
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_after_proxy_continue_returns_none_and_times_hooks() {
+        let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(ContinuingAfterProxy)];
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/stream".to_string(),
+        );
+        let mut response_headers = HashMap::new();
+        let mut plugin_execution_ns = 0;
+
+        let result = run_h3_streaming_after_proxy_hooks(
+            &plugins,
+            &mut ctx,
+            200,
+            &mut response_headers,
+            &mut plugin_execution_ns,
+        )
+        .await;
+
+        assert!(
+            result.is_none(),
+            "a Continue from every after_proxy hook must not surface a reject"
+        );
+        assert!(
+            plugin_execution_ns > 0,
+            "hook execution time must be accumulated even when no plugin rejects"
+        );
+    }
+
+    #[test]
+    fn reject_default_content_type_only_added_when_absent() {
+        // `send_h3_reject_response` defaults Content-Type only when the reject
+        // didn't supply one — otherwise `Builder::header` (which appends) would
+        // emit a duplicate. Pin the dedup decision as a pure unit.
+        let empty: HashMap<String, String> = HashMap::new();
+        assert!(
+            !super::reject_response_sets_content_type(&empty),
+            "no reject-supplied content-type → caller must add the default"
+        );
+
+        for key in ["content-type", "Content-Type", "CONTENT-TYPE"] {
+            let headers = HashMap::from([(key.to_string(), "application/grpc".to_string())]);
+            assert!(
+                super::reject_response_sets_content_type(&headers),
+                "{key:?}: a reject-supplied content-type must suppress the default \
+                 so no duplicate Content-Type header is emitted"
+            );
+        }
     }
 }
 

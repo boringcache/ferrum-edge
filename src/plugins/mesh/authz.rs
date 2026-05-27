@@ -46,7 +46,7 @@ use crate::modes::mesh::hbone::{BAGGAGE_HEADER, HboneIdentity};
 use crate::modes::mesh::policy::{
     MeshAuthzAttribute, MeshAuthzDecision, MeshAuthzRequest, evaluate_mesh_authorization,
     evaluate_mesh_authorization_policies, istio_source_principal, mesh_policies_have_header_rules,
-    normalize_mesh_policy_header_names, validate_source_ip_block,
+    normalize_mesh_policy_header_names,
 };
 use crate::modes::mesh::policy_deny_log::{self, PolicyDenyEvent};
 use crate::modes::mesh::slice::MeshSlice;
@@ -819,10 +819,21 @@ impl Plugin for MeshAuthz {
             remote_ip: resolved_ip,
             ..MeshAuthzRequest::default()
         };
-        let result = self.decision_to_result(
-            evaluate_mesh_authorization(&self.slice, &request),
-            &mut metadata,
-        );
+        let decision = if self.per_pod_policy_scoping {
+            let scope = ctx.node_waypoint_policy_scope.as_deref();
+            if scope.is_none() {
+                metadata.insert("mesh_authz.scope_missing".to_string(), "true".to_string());
+            }
+            let policies = self
+                .slice
+                .mesh_policies
+                .iter()
+                .filter(|policy| Self::policy_applies_to_pod(policy, scope));
+            evaluate_mesh_authorization_policies(policies, &request)
+        } else {
+            evaluate_mesh_authorization(&self.slice, &request)
+        };
+        let result = self.decision_to_result(decision, &mut metadata);
         if matches!(
             result,
             PluginResult::Reject { .. } | PluginResult::RejectBinary { .. }
@@ -925,30 +936,9 @@ enum BaggageOutcome {
 fn validate_policy_ip_inputs(policies: &[MeshPolicy]) -> Result<(), String> {
     for policy in policies {
         for (rule_idx, rule) in policy.rules.iter().enumerate() {
-            validate_source_ip_blocks(
-                policy,
-                rule_idx,
-                "ipBlocks",
-                &rule.source_negation.ip_blocks,
-            )?;
-            validate_source_ip_blocks(
-                policy,
-                rule_idx,
-                "notIpBlocks",
-                &rule.source_negation.not_ip_blocks,
-            )?;
-            validate_source_ip_blocks(
-                policy,
-                rule_idx,
-                "remoteIpBlocks",
-                &rule.source_negation.remote_ip_blocks,
-            )?;
-            validate_source_ip_blocks(
-                policy,
-                rule_idx,
-                "notRemoteIpBlocks",
-                &rule.source_negation.not_remote_ip_blocks,
-            )?;
+            // Source negation IP blocks are pre-validated at ParsedCidr
+            // parse/deserialization time. Only condition IP blocks (stored
+            // as strings) need runtime validation here.
             for (condition_idx, condition) in rule.when.iter().enumerate() {
                 if !is_supported_mesh_condition_key(&condition.key) {
                     return Err(format!(
@@ -982,23 +972,6 @@ fn validate_policy_ip_inputs(policies: &[MeshPolicy]) -> Result<(), String> {
                 }
             }
         }
-    }
-    Ok(())
-}
-
-fn validate_source_ip_blocks(
-    policy: &MeshPolicy,
-    rule_idx: usize,
-    field: &str,
-    blocks: &[String],
-) -> Result<(), String> {
-    for block in blocks {
-        validate_source_ip_block(block).map_err(|reason| {
-            format!(
-                "mesh_authz: invalid source IP block in policy '{}'/{} rule {} field {}: '{}' is invalid: {}",
-                policy.namespace, policy.name, rule_idx, field, block, reason
-            )
-        })?;
     }
     Ok(())
 }

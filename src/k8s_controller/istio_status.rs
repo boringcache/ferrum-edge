@@ -451,18 +451,7 @@ fn authorization_policy_status(
         }
     };
 
-    let conditions = vec![condition(
-        object,
-        Some(&object.status),
-        "FerrumAccepted",
-        accepted,
-        reason,
-        &message,
-    )];
-
-    let mut status = object.status.clone();
-    merge_status_conditions(&mut status, &["FerrumAccepted"], conditions);
-    (status, detail)
+    accepted_status(object, accepted, reason, &message, detail)
 }
 
 fn peer_authentication_status(
@@ -477,15 +466,7 @@ fn peer_authentication_status(
         .and_then(Value::as_str)
         .unwrap_or("UNSET")
         .to_string();
-    let scope = if object.spec.get("selector").is_some() {
-        "WorkloadSelector"
-    } else if object.metadata.namespace == istio_root_namespace
-        || object.metadata.namespace.is_empty()
-    {
-        "MeshWide"
-    } else {
-        "Namespace"
-    };
+    let scope = istio_policy_scope_label(object, istio_root_namespace);
     let port_overrides: Vec<String> = object
         .spec
         .get("portLevelMtls")
@@ -536,18 +517,7 @@ fn peer_authentication_status(
         }
     };
 
-    let conditions = vec![condition(
-        object,
-        Some(&object.status),
-        "FerrumAccepted",
-        accepted,
-        reason,
-        &message,
-    )];
-
-    let mut status = object.status.clone();
-    merge_status_conditions(&mut status, &["FerrumAccepted"], conditions);
-    (status, detail)
+    accepted_status(object, accepted, reason, &message, detail)
 }
 
 fn destination_rule_status(
@@ -615,18 +585,7 @@ fn destination_rule_status(
         }
     };
 
-    let conditions = vec![condition(
-        object,
-        Some(&object.status),
-        "FerrumAccepted",
-        accepted,
-        reason,
-        &message,
-    )];
-
-    let mut status = object.status.clone();
-    merge_status_conditions(&mut status, &["FerrumAccepted"], conditions);
-    (status, detail)
+    accepted_status(object, accepted, reason, &message, detail)
 }
 
 fn has_port_level_tls(spec: &Value) -> bool {
