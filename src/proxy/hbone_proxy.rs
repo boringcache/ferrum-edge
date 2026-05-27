@@ -26,7 +26,7 @@ use crate::config::EnvConfig;
 use crate::config::env_config::OperatingMode;
 use crate::config::types::{Proxy, UpstreamTarget};
 use crate::load_balancer::LoadBalancerCache;
-use crate::plugins::{DisconnectCause, Plugin, RequestContext, TransactionSummary};
+use crate::plugins::{Direction, DisconnectCause, Plugin, RequestContext, TransactionSummary};
 use crate::request_epoch::RequestEpoch;
 use crate::retry;
 
@@ -170,6 +170,10 @@ fn build_hbone_relay_summary(
         // body_completed + body_error_class capture relay outcomes; log/alert
         // consumers should use those fields, not this status, to detect failures.
         response_status_code: StatusCode::OK.as_u16(),
+        // latency_total_ms and latency_backend_total_ms measure full tunnel
+        // lifetime (tunnel open → close), not request-processing time.  Filter
+        // latency dashboards on response_streamed=true or
+        // request_protocol=hbone to avoid mixing these with per-request values.
         latency_total_ms: total_ms,
         latency_gateway_processing_ms: gateway_processing_ms,
         latency_backend_ttfb_ms: backend_connect_ms,
@@ -497,7 +501,6 @@ pub(super) async fn handle_hbone_request(
     let backend_target = backend.target_url.clone();
     let backend_resolved_ip = backend.resolved_ip.clone();
     let bytes_sent_observed = Arc::clone(&ctx.bytes_sent_observed);
-    let relay_proxy_id = proxy.id.clone();
     let relay_plugins: Vec<Arc<dyn Plugin>> = plugins.to_vec();
     let relay_ctx = ctx.clone();
     let relay_proxy = proxy.clone();
@@ -508,9 +511,8 @@ pub(super) async fn handle_hbone_request(
     let relay_backend_start = backend_start;
     let relay_backend_connect_ms = backend_elapsed.as_secs_f64() * 1000.0;
     let relay_plugin_execution_ns = plugin_execution_ns;
-    let relay_buffer_proxy_id = proxy.id.clone();
     let adaptive_buffer = Arc::clone(&state.adaptive_buffer);
-    let relay_buffer_size = adaptive_buffer.get_buffer_size(&relay_buffer_proxy_id);
+    let relay_buffer_size = adaptive_buffer.get_buffer_size(&proxy.id);
     let relay_idle_timeout = proxy_idle_timeout(proxy, &state.env_config);
     let relay_half_close_cap = proxy_half_close_cap(&state.env_config);
     let relay_read_timeout = backend_read_timeout(proxy);
@@ -535,16 +537,16 @@ pub(super) async fn handle_hbone_request(
                 .await;
                 bytes_sent_observed.fetch_add(result.bytes_client_to_backend, Ordering::Release);
                 adaptive_buffer.record_connection(
-                    &relay_buffer_proxy_id,
+                    &relay_proxy.id,
                     result
                         .bytes_client_to_backend
                         .saturating_add(result.bytes_backend_to_client),
                 );
                 if let Some((direction, class, side, message)) = result.first_failure.as_ref() {
                     crate::plugins::prometheus_metrics::global_registry()
-                        .record_hbone_relay_failure(&relay_proxy_id, *direction, *class);
+                        .record_hbone_relay_failure(&relay_proxy.id, *direction, *class);
                     warn!(
-                        proxy_id = %relay_proxy_id,
+                        proxy_id = %relay_proxy.id,
                         direction = ?direction,
                         io_side = ?side,
                         error_kind = retry::error_class_log_kind(*class),
@@ -571,6 +573,11 @@ pub(super) async fn handle_hbone_request(
                     client_disconnected,
                     body_error_class,
                 );
+                // Release the LB connection guard before the (potentially slow)
+                // log/mirror await so the upstream's active-connection counter
+                // reflects the closed tunnel rather than skewing
+                // least-connections target selection during log hooks.
+                drop(_lb_guard);
                 // log_with_mirror runs unconditionally so runtime transaction
                 // metrics are always recorded regardless of whether logging
                 // plugins are configured (empty-plugin loop is a no-op).
@@ -579,7 +586,7 @@ pub(super) async fn handle_hbone_request(
             Err(err) => {
                 let error_class = retry::classify_boxed_error(&err);
                 warn!(
-                    proxy_id = %relay_proxy_id,
+                    proxy_id = %relay_proxy.id,
                     error = %err,
                     "HBONE client upgrade failed"
                 );
@@ -589,11 +596,11 @@ pub(super) async fn handle_hbone_request(
                 // completes, which maps to IdleTimeout, not RecvError).
                 let client_disconnected = matches!(
                     tcp_proxy::disconnect_cause_for_failure(
-                        crate::plugins::Direction::ClientToBackend,
+                        Direction::ClientToBackend,
                         &error_class,
                         Some(tcp_proxy::StreamIoSide::Read),
                     ),
-                    crate::plugins::DisconnectCause::RecvError
+                    DisconnectCause::RecvError
                 );
                 let summary = build_hbone_relay_summary(
                     &relay_proxy,
@@ -611,6 +618,11 @@ pub(super) async fn handle_hbone_request(
                     client_disconnected,
                     Some(error_class),
                 );
+                // Release the LB connection guard before the (potentially slow)
+                // log/mirror await so the upstream's active-connection counter
+                // reflects the closed tunnel rather than skewing
+                // least-connections target selection during log hooks.
+                drop(_lb_guard);
                 // log_with_mirror runs unconditionally so runtime transaction
                 // metrics are always recorded regardless of whether logging
                 // plugins are configured (empty-plugin loop is a no-op).
