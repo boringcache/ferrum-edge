@@ -9,12 +9,29 @@
 //! well-known paths.
 //!
 //! This bridge runs inside the **mesh-proxy** (node-waypoint topology). It
-//! opens the pinned maps by path and mirrors their cookie→identity records
-//! into the [`NodeWaypointIdentityResolver`] so the accept path's
-//! `resolve_stream`/`resolve_cookie` can answer with a real identity. Before
-//! this bridge existed, `record_orig_dst4`/`record_orig_dst6` had ZERO
-//! production callers and the resolver's cookie map was always empty — every
-//! node-waypoint accept failed closed.
+//! opens the pinned maps by path and mirrors their records into the
+//! [`NodeWaypointIdentityResolver`], giving `record_orig_dst4`/
+//! `record_orig_dst6` their first production caller (before this they had no
+//! caller and the resolver's cookie map was always empty).
+//!
+//! ## Staging: connect-side vs accept-side cookie (GAP-2M required)
+//!
+//! This bridge is the **connect-side half** of node-waypoint resolution and is
+//! NOT sufficient on its own to make the accept path resolve identities.
+//! `connect4`/`connect6` key each record by the *source pod's
+//! connecting-socket* cookie (`bpf_get_socket_cookie` on the connect socket).
+//! The proxy accept path, however, resolves by the *accepted server-side
+//! socket's* `SO_COOKIE` (`resolve_stream` → `socket_cookie(accepted_stream)`),
+//! which is a different kernel socket with a different cookie — see the
+//! invariant documented in `src/socket_opts.rs`. Registering records under the
+//! accept-side cookie is the job of the **GAP-2M sockops/sk_lookup bridge,
+//! which is not yet implemented**. Until GAP-2M lands, the records mirrored
+//! here are not the ones the accept path looks up, so node-waypoint cookie
+//! resolution still **fails closed** (the safe default). Pod-identity
+//! enrollment into `identities_by_pod_uid` from the slice workloads is a
+//! separate remaining tier. In short: this module ships the GAP-1b plumbing
+//! and exercises `record_orig_dst*`, but does not by itself make end-to-end
+//! node-waypoint resolution succeed on a live kernel.
 //!
 //! ## Why polling
 //!
@@ -24,6 +41,17 @@
 //! (sockets the kernel evicted from the LRU, or closed connections) are aged
 //! out of the resolver so its map cannot grow unboundedly relative to the BPF
 //! map.
+//!
+//! Two known limitations of this staged polling design, to be addressed when
+//! the GAP-2M accept-side path is wired:
+//! - **Full re-sync cost.** Each tick currently re-scans both maps in full
+//!   (≈2 syscalls per LRU entry) and re-inserts every record; on a busy node
+//!   this should become an incremental or ringbuf-driven sync.
+//! - **Between-tick freshness.** A connection accepted in the window between
+//!   the source pod's `connect()` and the next poll tick can be dropped
+//!   fail-closed even though its record already exists in the kernel map; the
+//!   accept path should be able to synchronously consult the pinned map for a
+//!   fresh unknown cookie rather than wait for the next poll.
 //!
 //! ## Startup race and node-agent restart
 //!

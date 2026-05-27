@@ -3324,6 +3324,16 @@ async fn serve_mesh_runtime(
         // their production caller. Without a node-agent / eBPF build the
         // spawned task logs loudly and returns; the resolver stays empty and
         // the accept path keeps failing closed.
+        //
+        // NOTE (staged): GAP-1b alone does NOT make node-waypoint resolution
+        // succeed end-to-end. The records it mirrors are keyed by the source
+        // pod's connect-side cookie, while the accept path looks up the
+        // accept-side cookie (see `orig_dst_bridge` docs and
+        // `src/socket_opts.rs`); the accept-side registrar (GAP-2M) is a
+        // required follow-up. Identity enrollment into `identities_by_pod_uid`
+        // from `initial_slice.workloads` is likewise a separate follow-up tier
+        // — the snapshot installed above seeds POLICY SCOPES, not identities.
+        // Until both land, node-waypoint cookie resolution fails closed.
         mesh_background_handles.push(spawn_orig_dst_bridge_task(resolver.clone(), &shutdown_tx));
         proxy_state.with_node_waypoint_identity_resolver(resolver)
     } else {

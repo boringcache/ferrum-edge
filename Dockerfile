@@ -5,6 +5,18 @@
 # node-agent / ambient-mesh capture image, which also COPYs the compiled
 # ferrum-ebpf ELF into the runtime image (see the ebpf-builder stage and the
 # FERRUM_NODE_AGENT_BPF_ELF_PATH default below).
+#
+# KNOWN COUPLING (follow-up): the runtime stage's `COPY --from=ebpf-builder`
+# is unconditional, so EVERY image build — including the default cloud-secrets
+# image, which does not use the ELF — depends on the `ebpf-builder` stage
+# (nightly + bpf-linker + `-Z build-std`). This adds build time and a new
+# failure mode (nightly/bpf-linker availability) to the default image that it
+# did not previously have. Decoupling the ELF copy (e.g. an ARG-selected
+# source stage, or a dedicated capture image/target) so the default image does
+# not require the eBPF toolchain — plus a CI job that actually builds the
+# ebpf-builder stage so it stays verified — is a recommended follow-up. It is
+# deliberately not done here because it changes the capture-image build
+# interface and must be validated against the release/CI image-build scripts.
 ARG FEATURES=cloud-secrets
 
 # --- eBPF build stage (nightly, Linux only) ---
@@ -13,8 +25,13 @@ ARG FEATURES=cloud-secrets
 # COPY'd into the runtime image and loaded by node_agent / node-waypoint mesh
 # mode at startup via aya. Linking requires `bpf-linker` (installed below).
 #
-# The ebpf/ workspace pins its own nightly via ebpf/rust-toolchain.toml; we run
-# cargo from /build/ebpf so that toolchain file takes effect. core-only
+# The ebpf/ workspace pins a nightly via ebpf/rust-toolchain.toml, but the
+# `cargo +nightly` invocations below explicitly select the latest installed
+# nightly — the `+nightly` override takes precedence over the toolchain file,
+# so the pin is NOT what is used here. Both resolve to a nightly toolchain so
+# the build works today; if the eBPF crate ever requires a *specific* pinned
+# nightly, drop `+nightly` from the build below so the rust-toolchain.toml pin
+# is honored (and install rust-src on that pinned toolchain). core-only
 # build-std matches the crate's `#![no_std]` + `panic = "abort"`.
 FROM rust:latest AS ebpf-builder
 RUN rustup toolchain install nightly --component rust-src \

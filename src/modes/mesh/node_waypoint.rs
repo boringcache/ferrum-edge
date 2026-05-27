@@ -1818,10 +1818,17 @@ mod tests {
 
     #[test]
     fn bridge_recorded_cookie_resolves_to_identity() {
-        // End-to-end of the bridge contract WITHOUT the kernel: a record the
-        // bridge would have mirrored in (via record_orig_dst4) resolves to a
-        // real identity once the matching identity is enrolled — exactly what
-        // the accept path does after the bridge populates the cookie map.
+        // Exercises the resolver's cookie→identity lookup mechanics IN
+        // ISOLATION: a record (as record_orig_dst4 would mirror it) plus a
+        // hand-enrolled identity under the same cookie resolves. This is NOT
+        // the production end-to-end accept path, which differs in two staged
+        // ways (see the `orig_dst_bridge` module docs): (1) the accept path
+        // looks up the *accept-side* socket cookie, not the connect-side cookie
+        // the bridge records (the GAP-2M registrar that bridges them is not yet
+        // implemented), and (2) `identities_by_pod_uid` is enrolled by hand
+        // here, whereas no production path yet populates it from slice
+        // workloads. The single cookie + manual enroll deliberately pin the
+        // resolver logic; this does not prove live resolution succeeds.
         let resolver = NodeWaypointIdentityResolver::new(0);
         let spiffe_id = spiffe("spiffe://td/ns/default/sa/api");
         let pod_uid = [9u8; 16];
