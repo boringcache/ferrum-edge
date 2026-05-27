@@ -1190,10 +1190,29 @@ fn is_non_canonical_numeric_host(host: &str) -> bool {
     if host.bytes().all(|b| b.is_ascii_digit()) {
         return true;
     }
-    host.contains('.')
-        && host
-            .split('.')
-            .all(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+    if !host.contains('.') {
+        return false;
+    }
+    let mut saw_non_decimal_segment = false;
+    let all_numeric_like = host.split('.').all(|segment| {
+        if segment.is_empty() {
+            return false;
+        }
+        if segment.bytes().all(|b| b.is_ascii_digit()) {
+            return true;
+        }
+        if let Some(hex) = segment
+            .strip_prefix("0x")
+            .or_else(|| segment.strip_prefix("0X"))
+            && !hex.is_empty()
+            && hex.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            saw_non_decimal_segment = true;
+            return true;
+        }
+        false
+    });
+    all_numeric_like && (saw_non_decimal_segment || host.matches('.').count() != 3)
 }
 
 /// Enforces SSRF policy on an operator-supplied ACME `directory_url` before any
@@ -2376,6 +2395,9 @@ mod tests {
             "https://0177.0.0.1/dir", // octal = 127.0.0.1 on glibc
             "https://127.1/dir",      // abbreviated = 127.0.0.1
             "https://0x7f.0.0.1/dir", // hex-prefixed = 127.0.0.1
+            "https://127.0.0x1/dir",  // mixed-base dotted = 127.0.0.1
+            "https://127.0x1/dir",    // mixed-base abbreviated = 127.0.0.1
+            "https://1.2.3.0x4/dir",  // mixed-base full dotted
             "https://0x7f000001/dir", // hex integer = 127.0.0.1
             "https://0xA9FEA9FE/dir", // hex integer = 169.254.169.254
         ] {
@@ -2393,6 +2415,9 @@ mod tests {
             ("0x7f000001", true),         // hex integer
             ("0XA9FEA9FE", true),         // hex integer uppercase prefix
             ("0x7f.0.0.1", true),         // hex-dotted
+            ("127.0.0x1", true),          // mixed-base dotted
+            ("127.0x1", true),            // mixed-base abbreviated
+            ("1.2.3.0x4", true),          // mixed-base 4-segment
             ("0177.0.0.1", true),         // octal-dotted
             ("127.1", true),              // abbreviated dotted
             ("192.168.1", true),          // abbreviated 3-segment
