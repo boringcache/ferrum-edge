@@ -1254,6 +1254,7 @@ pub(crate) fn redact_request_body_from_log_metadata(metadata: &mut HashMap<Strin
 pub(crate) fn clone_log_metadata(ctx: &RequestContext) -> HashMap<String, String> {
     let mut metadata = ctx.metadata.clone();
     redact_request_body_from_log_metadata(&mut metadata);
+    ctx.apply_waf_owned_log_metadata(&mut metadata);
     metadata
 }
 
@@ -9430,6 +9431,8 @@ async fn handle_proxy_request_inner(
             .await;
             if let Some(body_hook_ctx) = body_hook_ctx {
                 ctx.metadata = body_hook_ctx.metadata;
+                ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
+                ctx.waf_owned_metadata = body_hook_ctx.waf_owned_metadata;
             }
             match final_body_result {
                 PluginResult::Continue => {}
@@ -10591,6 +10594,8 @@ async fn handle_proxy_request_inner(
         }
         if let Some(body_hook_ctx) = body_hook_ctx {
             ctx.metadata = body_hook_ctx.metadata;
+            ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
+            ctx.waf_owned_metadata = body_hook_ctx.waf_owned_metadata;
         }
         (result, current_cb_target_key)
     } else {
@@ -10624,6 +10629,8 @@ async fn handle_proxy_request_inner(
         .0;
         if let Some(body_hook_ctx) = body_hook_ctx {
             ctx.metadata = body_hook_ctx.metadata;
+            ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
+            ctx.waf_owned_metadata = body_hook_ctx.waf_owned_metadata;
         }
         (resp, cb_target_key.clone())
     };
@@ -15189,6 +15196,57 @@ mod tests {
         assert!(ids.contains(&"/certs/mesh-route.pem".to_string()));
         assert!(ids.contains(&"/keys/mesh-route.key".to_string()));
         assert!(ids.contains(&"/ca/mesh-route.pem".to_string()));
+    }
+
+    #[test]
+    fn clone_log_metadata_removes_body_and_unowned_waf_metadata() {
+        let mut ctx = RequestContext::new("203.0.113.10".into(), "GET".into(), "/search".into());
+        ctx.metadata
+            .insert("request_body".to_string(), "secret body".to_string());
+        ctx.metadata
+            .insert("waf.rule_hits".to_string(), "SPOOFED".to_string());
+        ctx.metadata
+            .insert("waf.action".to_string(), "blocked".to_string());
+
+        let metadata = clone_log_metadata(&ctx);
+
+        assert!(!metadata.contains_key("request_body"));
+        assert!(!metadata.contains_key("waf.rule_hits"));
+        assert!(!metadata.contains_key("waf.action"));
+
+        ctx.set_waf_metadata("waf.rule_hits", "FE-SQLI-001");
+        ctx.metadata
+            .insert("waf.action".to_string(), "blocked".to_string());
+
+        let metadata = clone_log_metadata(&ctx);
+
+        assert_eq!(
+            metadata.get("waf.rule_hits").map(String::as_str),
+            Some("FE-SQLI-001")
+        );
+        assert!(!metadata.contains_key("waf.action"));
+    }
+
+    #[test]
+    fn final_body_hook_context_preserves_waf_owned_log_metadata() {
+        let mut ctx = RequestContext::new("203.0.113.10".into(), "POST".into(), "/submit".into());
+        let mut hook_ctx = ctx.clone_for_final_request_body_hooks();
+        hook_ctx.set_waf_metadata("waf.rule_hits", "FE-XSS-001");
+        hook_ctx.set_waf_metadata("waf.action", "monitored");
+
+        ctx.metadata = hook_ctx.metadata;
+        ctx.waf_metadata_initialized = hook_ctx.waf_metadata_initialized;
+        ctx.waf_owned_metadata = hook_ctx.waf_owned_metadata;
+        let metadata = clone_log_metadata(&ctx);
+
+        assert_eq!(
+            metadata.get("waf.rule_hits").map(String::as_str),
+            Some("FE-XSS-001")
+        );
+        assert_eq!(
+            metadata.get("waf.action").map(String::as_str),
+            Some("monitored")
+        );
     }
 
     #[test]

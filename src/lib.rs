@@ -453,6 +453,10 @@ pub mod _test_support {
         crate::proxy::insert_grpc_error_metadata(metadata, grpc_status, grpc_message)
     }
 
+    pub fn clone_log_metadata(ctx: &crate::plugins::RequestContext) -> HashMap<String, String> {
+        crate::proxy::clone_log_metadata(ctx)
+    }
+
     // ── WebSocket tunnel-mode disconnect hook ────────────────────────────────
     //
     // Tunnel mode bypasses WebSocket frame parsing and does raw TCP bidirectional
