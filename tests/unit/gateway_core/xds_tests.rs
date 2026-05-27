@@ -76,6 +76,8 @@ fn mesh_config() -> MeshConfig {
                     to: Vec::new(),
                     when: Vec::new(),
                     request_principals: Vec::new(),
+                    not_request_principals: Vec::new(),
+                    source_negation: Default::default(),
                     never_matches: false,
                     action: PolicyAction::Allow,
                 }],
@@ -134,8 +136,9 @@ fn mesh_slice_is_per_namespace_and_policy_scoped() {
     assert_eq!(slice.namespace, "default");
     assert_eq!(slice.workloads.len(), 2);
     assert_eq!(slice.services.len(), 1);
-    assert_eq!(slice.mesh_policies.len(), 1);
+    assert_eq!(slice.mesh_policies.len(), 2);
     assert_eq!(slice.mesh_policies[0].name, "api-only");
+    assert_eq!(slice.mesh_policies[1].name, "other-namespace");
     assert_eq!(slice.peer_authentications.len(), 1);
     assert_eq!(slice.labels.get("app").map(String::as_str), Some("api"));
 }

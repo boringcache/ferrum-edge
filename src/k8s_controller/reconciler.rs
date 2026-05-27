@@ -21,6 +21,7 @@ use crate::k8s_controller::istio_status::{IstioStatusWriter, plan_istio_status_u
 use crate::k8s_controller::metrics::ControllerMetrics;
 use crate::k8s_controller::resource_store::ResourceStoreSet;
 use crate::k8s_controller::status::{GatewayApiStatusWriter, plan_gateway_api_status_updates};
+use crate::k8s_controller::watcher::namespaces_with_istio_root;
 
 const INITIAL_STORE_READINESS_TIMEOUT: Duration = Duration::from_secs(30);
 const GATEWAY_API_STATUS_UPDATES_PER_RECONCILE_CAP: usize = 256;
@@ -392,10 +393,12 @@ async fn do_reconcile(store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>, ctx:
     let resource_count = objects.len();
     debug!(resource_count, "Starting reconciliation");
 
+    let source_namespaces =
+        namespaces_with_istio_root(&ctx.watch_namespaces, &ctx.istio_root_namespace);
     let options = K8sTranslationOptions::new(ctx.namespace.clone(), ctx.trust_domain.clone())
         .with_cluster_domain(ctx.cluster_domain.clone())
         .with_istio_root_namespace(ctx.istio_root_namespace.clone())
-        .with_source_namespaces(ctx.watch_namespaces.clone())
+        .with_source_namespaces(source_namespaces)
         .with_pod_discovery_enabled(ctx.pod_discovery_enabled);
     let Some(translation) = translate_with_skip_retries(&objects, options.clone(), &ctx.metrics)
     else {

@@ -566,10 +566,9 @@ impl MeshSlice {
             .mesh_policies
             .iter()
             .filter(|policy| {
-                policy.namespace == namespace
-                    && policy_candidate_labels.iter().any(|labels| {
-                        policy_scope_applies_to_workload(policy, effective_namespace, *labels)
-                    })
+                policy_candidate_labels.iter().any(|labels| {
+                    policy_scope_applies_to_workload(policy, effective_namespace, *labels)
+                })
             })
             .cloned()
             .collect();
@@ -2131,6 +2130,8 @@ mod tests {
                 to: Vec::new(),
                 when: Vec::new(),
                 request_principals: Vec::new(),
+                not_request_principals: Vec::new(),
+                source_negation: Default::default(),
                 never_matches: false,
                 action: PolicyAction::Allow,
             }],
@@ -2532,19 +2533,15 @@ mod tests {
     }
 
     #[test]
-    fn from_gateway_config_policy_mesh_wide_excluded_when_policy_namespace_differs() {
-        // MeshWide scope applies to any workload, but the policy's own
-        // namespace field must match the request namespace to be included.
+    fn from_gateway_config_policy_mesh_wide_included_when_policy_namespace_differs() {
         let mesh = MeshConfig {
             mesh_policies: vec![make_policy("global", "other-ns", PolicyScope::MeshWide)],
             ..MeshConfig::default()
         };
         let config = config_with_mesh(mesh);
         let slice = MeshSlice::from_gateway_config(&config, slice_request("alpha"));
-        assert!(
-            slice.mesh_policies.is_empty(),
-            "policy from a different namespace should not be included"
-        );
+        assert_eq!(slice.mesh_policies.len(), 1);
+        assert_eq!(slice.mesh_policies[0].name, "global");
     }
 
     #[test]

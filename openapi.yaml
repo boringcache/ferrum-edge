@@ -8975,6 +8975,10 @@ components:
           type: string
           default: ","
           description: Separator for array claim header values
+        emit_mesh_request_principal_metadata:
+          type: boolean
+          default: false
+          description: Emits mesh.request_principal plus mesh JWT claim/audience metadata for direct mesh_authz request-principal and when-condition evaluation
         require_exp:
           type: boolean
           default: true
@@ -9434,6 +9438,34 @@ components:
         ambient mTLS streams. DENY rules are evaluated first (first match
         wins); the presence of any ALLOW rule with no match triggers an
         implicit deny.
+
+        Source matching enforces both the positive identity matchers
+        (`principals` in Istio `<trust-domain>/ns/.../sa/...` form,
+        `serviceAccounts`, `namespaces`, `trustDomains`,
+        `requestPrincipals`) and the conjunctive negative and IP-block
+        matchers (`notPrincipals`/`notServiceAccounts`/`notNamespaces`/
+        `notTrustDomains`/`notRequestPrincipals`/`ipBlocks`/`notIpBlocks`/
+        `remoteIpBlocks`/`notRemoteIpBlocks`). `when:` conditions are
+        evaluated against
+        request attributes (`source.principal`, `source.namespace`,
+        `request.auth.principal`, `request.auth.presenter`,
+        `request.auth.audiences`,
+        `request.auth.claims[...]` string or string-list values including
+        nested claim leaf paths,
+        `request.headers[...]`,
+        `destination.port`, `connection.sni`, `source.ip`, `remote.ip`).
+        Unsupported `when:` keys are rejected during translation/config
+        validation so DENY conditions cannot silently fail open.
+        DENY rules treat missing HTTP-only operation/condition attributes as
+        matches, matching Istio's TCP behavior for policies that mention HTTP
+        fields.
+        Negative identity matchers reject only when the source/JWT identity
+        is present and matches an excluded pattern; absent identities satisfy
+        the negative matcher so DENY policies such as `notPrincipals: ["*"]`
+        and `notRequestPrincipals: ["*"]` catch anonymous traffic. IP-block
+        matchers fail closed when the IP they test is absent, and malformed
+        CIDRs reject translated resources or direct plugin config. See
+        `docs/mesh.md`.
 
         Auto-injected by mesh mode on every applicable topology; reserved
         plugin id `__mesh_authz`. PolicyScope filtering (`MeshWide` /

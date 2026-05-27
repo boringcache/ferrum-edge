@@ -1721,6 +1721,7 @@ fn via_header_for_backend_response_body<'a>(
 #[derive(Clone, Default)]
 struct RequestConnectionMetadata {
     frontend_listen_port: Option<u16>,
+    frontend_sni_hostname: Option<String>,
     node_waypoint_identity: Option<Arc<NodeWaypointIdentity>>,
     /// Direction stamped at listener-spawn time for mesh listeners.
     /// `None` outside mesh mode.
@@ -5160,6 +5161,7 @@ async fn handle_connection(
         let addr = remote_addr;
         let connection_metadata = RequestConnectionMetadata {
             frontend_listen_port,
+            frontend_sni_hostname: None,
             node_waypoint_identity: node_waypoint_identity.clone(),
             mesh_direction,
         };
@@ -7616,6 +7618,11 @@ async fn handle_tls_connection(
     let client_cert_chain_der: Option<Arc<Vec<Vec<u8>>>> = peer_certs
         .filter(|certs| certs.len() > 1)
         .map(|certs| Arc::new(certs[1..].iter().map(|c| c.to_vec()).collect()));
+    let frontend_sni_hostname = tls_stream
+        .get_ref()
+        .1
+        .server_name()
+        .map(str::to_ascii_lowercase);
 
     // Convert TLS stream to TokioIo for hyper
     let io = hyper_util::rt::TokioIo::new(tls_stream);
@@ -7663,8 +7670,10 @@ async fn handle_tls_connection(
         let addr = remote_addr;
         let cert = client_cert_der.clone();
         let chain = client_cert_chain_der.clone();
+        let frontend_sni_hostname = frontend_sni_hostname.clone();
         let connection_metadata = RequestConnectionMetadata {
             frontend_listen_port: tls_connection_metadata.frontend_listen_port,
+            frontend_sni_hostname,
             node_waypoint_identity: tls_connection_metadata.node_waypoint_identity.clone(),
             mesh_direction: tls_connection_metadata.mesh_direction,
         };
@@ -8302,6 +8311,7 @@ async fn handle_proxy_request_inner(
             state.env_config.proxy_http_port
         },
     ));
+    ctx.frontend_sni_hostname = connection_metadata.frontend_sni_hostname;
     ctx.mesh_direction = connection_metadata.mesh_direction;
     ctx.tls_client_cert_der = tls_client_cert_der;
     ctx.tls_client_cert_chain_der = tls_client_cert_chain_der;
