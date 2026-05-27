@@ -1092,7 +1092,22 @@ fn reverse_translate(
         namespace: config.namespace.clone(),
         workload_spiffe_id: config.workload_spiffe_id.clone(),
         waypoint_name: config.waypoint_name.clone(),
-        labels: recovered.labels.unwrap_or_else(|| config.labels.clone()),
+        // A non-empty WorkloadLabels carrier is authoritative — the CP computed
+        // real effective labels for this workload. An EMPTY carrier is NOT
+        // treated as authoritative: a Ferrum CP always emits this carrier, and
+        // it is empty whenever the CP could not compute labels for this DP (the
+        // default non-SPIFFE `FERRUM_MESH_NODE_ID=HOSTNAME` plus the empty
+        // `Node.metadata` the client sends give the CP nothing to derive from).
+        // Overriding with an uninformed empty map would silently wipe the DP's
+        // explicit `FERRUM_MESH_WORKLOAD_LABELS`, letting the workload evade
+        // every selector-scoped PeerAuthentication / authz / telemetry policy
+        // (a selector DENY or Strict-mTLS rule keyed on those labels would stop
+        // matching). So fall back to the local labels when the carrier is empty
+        // or absent; only a non-empty carrier replaces them.
+        labels: recovered
+            .labels
+            .filter(|l| !l.is_empty())
+            .unwrap_or_else(|| config.labels.clone()),
         version: accumulator
             .versions_by_type
             .get(CDS_TYPE_URL)
@@ -3260,9 +3275,15 @@ mod tests {
     }
 
     #[test]
-    fn xds_round_trip_preserves_empty_effective_labels_over_client_labels() {
+    fn xds_round_trip_empty_carrier_labels_fall_back_to_local_dp_labels() {
         use crate::modes::mesh::config::{MtlsMode, PeerAuthentication, WorkloadSelector};
 
+        // An empty WorkloadLabels carrier is NOT authoritative: a Ferrum CP
+        // always emits the carrier, and it is empty whenever the CP could not
+        // compute labels for this DP (default non-SPIFFE node id + empty
+        // `Node.metadata`). Recovery must therefore keep the DP's explicit
+        // local labels rather than wiping them, so selector-scoped policies
+        // keep matching the workload's real labels.
         let native = MeshSlice {
             node_id: "node-a".to_string(),
             namespace: "default".to_string(),
@@ -3294,11 +3315,67 @@ mod tests {
             .expect("reverse translate succeeds")
             .expect("all required types present");
 
-        assert!(recovered.labels.is_empty());
+        assert_eq!(
+            recovered.labels,
+            BTreeMap::from([("app".to_string(), "api".to_string())]),
+            "an empty (uninformed) CP carrier must not wipe the DP's explicit local labels"
+        );
         assert_eq!(
             recovered.resolve_effective_mtls_mode(8080),
-            MtlsMode::Permissive,
-            "empty CP-computed labels must override local DP labels so selector policy does not start matching after xDS recovery"
+            MtlsMode::Strict,
+            "the DP's retained local labels must keep matching the selector-scoped PeerAuthentication"
+        );
+    }
+
+    #[test]
+    fn xds_round_trip_nonempty_carrier_labels_override_local_dp_labels() {
+        use crate::modes::mesh::config::{MtlsMode, PeerAuthentication, WorkloadSelector};
+
+        // A non-empty carrier IS authoritative: the CP computed real labels for
+        // this workload, so they replace the DP's local labels. Here the carrier
+        // labels (`app=web`) differ from the DP's local labels (`app=api`); the
+        // selector-strict policy keyed on `app=web` must match the carrier
+        // labels, proving the carrier — not the local config — won.
+        let native = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "v1".to_string(),
+            labels: BTreeMap::from([("app".to_string(), "web".to_string())]),
+            peer_authentications: vec![PeerAuthentication {
+                name: "selector-strict".to_string(),
+                namespace: "default".to_string(),
+                scope: None,
+                selector: Some(WorkloadSelector {
+                    labels: HashMap::from([("app".to_string(), "web".to_string())]),
+                    namespace: None,
+                }),
+                mtls_mode: MtlsMode::Strict,
+                port_overrides: HashMap::new(),
+            }],
+            ..MeshSlice::default()
+        };
+        let snapshot = translate_mesh_slice_to_snapshot(&native);
+        let accumulator = accumulator_from_snapshot(&snapshot);
+
+        let mut config = test_config();
+        config.node_id = native.node_id.clone();
+        config.namespace = native.namespace.clone();
+        config.labels = BTreeMap::from([("app".to_string(), "api".to_string())]);
+
+        let recovered = accumulator
+            .try_build_mesh_slice(&config)
+            .expect("reverse translate succeeds")
+            .expect("all required types present");
+
+        assert_eq!(
+            recovered.labels,
+            BTreeMap::from([("app".to_string(), "web".to_string())]),
+            "a non-empty carrier is authoritative and must override the local DP labels"
+        );
+        assert_eq!(
+            recovered.resolve_effective_mtls_mode(8080),
+            MtlsMode::Strict,
+            "the authoritative carrier labels must match the selector-scoped PeerAuthentication"
         );
     }
 
