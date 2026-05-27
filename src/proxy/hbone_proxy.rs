@@ -166,6 +166,9 @@ fn build_hbone_relay_summary(
         proxy_name: proxy.name.clone(),
         backend_target: Some(backend_target),
         backend_resolved_ip,
+        // 200 OK was already written to the client to accept the CONNECT.
+        // body_completed + body_error_class capture relay outcomes; log/alert
+        // consumers should use those fields, not this status, to detect failures.
         response_status_code: StatusCode::OK.as_u16(),
         latency_total_ms: total_ms,
         latency_gateway_processing_ms: gateway_processing_ms,
@@ -550,27 +553,28 @@ pub(super) async fn handle_hbone_request(
                         "HBONE tunnel relay failed"
                     );
                 }
-                if !relay_plugins.is_empty() {
-                    let (body_completed, client_disconnected, body_error_class) =
-                        hbone_relay_body_outcome(result.first_failure.as_ref());
-                    let summary = build_hbone_relay_summary(
-                        &relay_proxy,
-                        &relay_ctx,
-                        &relay_method,
-                        relay_backend_target,
-                        relay_backend_resolved_ip,
-                        relay_start_time,
-                        relay_backend_start,
-                        relay_backend_connect_ms,
-                        relay_plugin_execution_ns,
-                        result.bytes_client_to_backend,
-                        result.bytes_backend_to_client,
-                        body_completed,
-                        client_disconnected,
-                        body_error_class,
-                    );
-                    crate::plugins::log_with_mirror(&relay_plugins, &summary, &relay_ctx).await;
-                }
+                let (body_completed, client_disconnected, body_error_class) =
+                    hbone_relay_body_outcome(result.first_failure.as_ref());
+                let summary = build_hbone_relay_summary(
+                    &relay_proxy,
+                    &relay_ctx,
+                    &relay_method,
+                    relay_backend_target,
+                    relay_backend_resolved_ip,
+                    relay_start_time,
+                    relay_backend_start,
+                    relay_backend_connect_ms,
+                    relay_plugin_execution_ns,
+                    result.bytes_client_to_backend,
+                    result.bytes_backend_to_client,
+                    body_completed,
+                    client_disconnected,
+                    body_error_class,
+                );
+                // log_with_mirror runs unconditionally so runtime transaction
+                // metrics are always recorded regardless of whether logging
+                // plugins are configured (empty-plugin loop is a no-op).
+                crate::plugins::log_with_mirror(&relay_plugins, &summary, &relay_ctx).await;
             }
             Err(err) => {
                 let error_class = retry::classify_boxed_error(&err);
@@ -579,25 +583,38 @@ pub(super) async fn handle_hbone_request(
                     error = %err,
                     "HBONE client upgrade failed"
                 );
-                if !relay_plugins.is_empty() {
-                    let summary = build_hbone_relay_summary(
-                        &relay_proxy,
-                        &relay_ctx,
-                        &relay_method,
-                        relay_backend_target,
-                        relay_backend_resolved_ip,
-                        relay_start_time,
-                        relay_backend_start,
-                        relay_backend_connect_ms,
-                        relay_plugin_execution_ns,
-                        0,
-                        0,
-                        false,
-                        true,
-                        Some(error_class),
-                    );
-                    crate::plugins::log_with_mirror(&relay_plugins, &summary, &relay_ctx).await;
-                }
+                // Derive client_disconnected from the error class rather than
+                // assuming client fault: an OnUpgrade error can be a local/
+                // hyper-side failure (e.g. idle timeout fires before the upgrade
+                // completes, which maps to IdleTimeout, not RecvError).
+                let client_disconnected = matches!(
+                    tcp_proxy::disconnect_cause_for_failure(
+                        crate::plugins::Direction::ClientToBackend,
+                        &error_class,
+                        Some(tcp_proxy::StreamIoSide::Read),
+                    ),
+                    crate::plugins::DisconnectCause::RecvError
+                );
+                let summary = build_hbone_relay_summary(
+                    &relay_proxy,
+                    &relay_ctx,
+                    &relay_method,
+                    relay_backend_target,
+                    relay_backend_resolved_ip,
+                    relay_start_time,
+                    relay_backend_start,
+                    relay_backend_connect_ms,
+                    relay_plugin_execution_ns,
+                    0,
+                    0,
+                    false,
+                    client_disconnected,
+                    Some(error_class),
+                );
+                // log_with_mirror runs unconditionally so runtime transaction
+                // metrics are always recorded regardless of whether logging
+                // plugins are configured (empty-plugin loop is a no-op).
+                crate::plugins::log_with_mirror(&relay_plugins, &summary, &relay_ctx).await;
             }
         }
     });
@@ -668,6 +685,49 @@ mod tests {
             hbone_relay_body_outcome(Some(&failure)),
             (false, false, Some(ErrorClass::ConnectionReset))
         );
+    }
+
+    /// `ReadWriteTimeout` (idle timeout) is never attributed to the client —
+    /// it fires when neither side sends data, so `client_disconnected` must
+    /// be `false`.
+    #[test]
+    fn hbone_relay_body_outcome_idle_timeout_not_client_disconnected() {
+        let failure: StreamFirstFailure = (
+            Direction::ClientToBackend,
+            ErrorClass::ReadWriteTimeout,
+            None,
+            "idle timeout".to_string(),
+        );
+
+        let (body_completed, client_disconnected, body_error_class) =
+            hbone_relay_body_outcome(Some(&failure));
+        assert!(!body_completed);
+        assert!(
+            !client_disconnected,
+            "idle timeout must not be attributed to the client"
+        );
+        assert_eq!(body_error_class, Some(ErrorClass::ReadWriteTimeout));
+    }
+
+    /// `BackendToClient` + `Write` means we could not write to the client —
+    /// the client is gone, so `client_disconnected` must be `true`.
+    #[test]
+    fn hbone_relay_body_outcome_backend_to_client_write_is_client_disconnected() {
+        let failure: StreamFirstFailure = (
+            Direction::BackendToClient,
+            ErrorClass::ConnectionReset,
+            Some(StreamIoSide::Write),
+            "write to client failed".to_string(),
+        );
+
+        let (body_completed, client_disconnected, body_error_class) =
+            hbone_relay_body_outcome(Some(&failure));
+        assert!(!body_completed);
+        assert!(
+            client_disconnected,
+            "BackendToClient+Write means the client is gone"
+        );
+        assert_eq!(body_error_class, Some(ErrorClass::ConnectionReset));
     }
 
     #[test]
