@@ -1332,12 +1332,17 @@ async fn handle_h3_request(
     )
     .await
     {
-        record_request(&state, status_code);
         apply_after_proxy_hooks_to_rejection(&plugins, &mut ctx, status_code, &mut headers).await;
         plugin_execution_ns += auth_phase_start.elapsed().as_nanos() as u64;
         let http_status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::UNAUTHORIZED);
         let log_status_code =
             h3_reject_log_status_and_metadata(&mut ctx, http_flavor, http_status, &body, &headers);
+        // Record the normalized wire status: gRPC rejects go out as HTTP 200 +
+        // grpc-status, so recording the raw `status_code` (e.g. 401/403) here
+        // would make /metrics/runtime disagree with the logged and served
+        // status. Must run AFTER `h3_reject_log_status_and_metadata`, matching
+        // every other H3 reject phase.
+        record_request(&state, log_status_code);
         log_rejected_request(
             &plugins,
             &ctx,
