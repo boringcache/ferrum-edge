@@ -823,6 +823,15 @@ impl Plugin for MeshAuthz {
             let scope = ctx.node_waypoint_policy_scope.as_deref();
             if scope.is_none() {
                 metadata.insert("mesh_authz.scope_missing".to_string(), "true".to_string());
+                metadata.insert(
+                    "mesh_authz.deny_policy".to_string(),
+                    "scope_missing".to_string(),
+                );
+                ctx.metadata = (!metadata.is_empty()).then_some(metadata);
+                return PluginResult::RejectBinary {
+                    status: 403,
+                    message: b"stream denied: missing per-pod policy scope".to_vec(),
+                };
             }
             let policies = self
                 .slice
