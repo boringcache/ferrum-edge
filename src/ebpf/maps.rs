@@ -19,6 +19,7 @@ use aya::maps::{HashMap as BpfHashMap, LpmTrie, MapData};
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 use ferrum_ebpf_common::{
     BpfCaptureConfig, FERRUM_CAPTURE_CONFIG_KEY, IncludePortsPolicy, PodInfo as BpfPodInfo,
+    WorkloadIdentity,
 };
 use ferrum_ebpf_common::{CidrKey4, CidrKey6};
 
@@ -36,6 +37,7 @@ pub struct BpfMaps {
     port_exclude: BpfHashMap<MapData, u16, u8>,
     capture_config: Option<BpfHashMap<MapData, u32, BpfCaptureConfig>>,
     include_ports: Option<BpfHashMap<MapData, u64, IncludePortsPolicy>>,
+    workload_identity: Option<BpfHashMap<MapData, u64, WorkloadIdentity>>,
 }
 
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
@@ -122,6 +124,23 @@ impl BpfMaps {
             }
         };
 
+        // Older BPF ELFs predate the GAP-1b per-cgroup identity map. Tolerate
+        // the missing map so the node-agent still boots; the connect hooks
+        // fall back to the all-zero sentinel, which node-waypoint resolution
+        // treats as fail-closed (the prior behavior).
+        let workload_identity = match bpf.map(super::BPF_MAP_WORKLOAD_IDENTITY) {
+            Some(map) => Some(
+                BpfHashMap::try_from(map.clone())
+                    .map_err(|e| format!("FERRUM_WORKLOAD_IDENTITY type mismatch: {e}"))?,
+            ),
+            None => {
+                tracing::warn!(
+                    "FERRUM_WORKLOAD_IDENTITY map not found; node-waypoint source-identity stamping disabled (eBPF ELF predates GAP-1b)"
+                );
+                None
+            }
+        };
+
         Ok(Self {
             pod_ips,
             bypass_uids,
@@ -132,6 +151,7 @@ impl BpfMaps {
             port_exclude,
             capture_config,
             include_ports,
+            workload_identity,
         })
     }
 
@@ -237,6 +257,36 @@ impl BpfMaps {
             // that to a debug log because pods that were never annotated
             // legitimately have no entry.
             tracing::debug!(cgroup_id, error = %e, "remove_include_ports: entry missing");
+        }
+        Ok(())
+    }
+
+    /// Insert (or replace) a per-cgroup source workload identity (GAP-1b).
+    /// Absent map (older ELF) is a no-op so the node agent boots even when
+    /// the new map is unavailable.
+    pub fn insert_workload_identity(
+        &self,
+        cgroup_id: u64,
+        identity: &WorkloadIdentity,
+    ) -> Result<(), String> {
+        let Some(workload_identity) = self.workload_identity.as_ref() else {
+            return Ok(());
+        };
+        let mut map = workload_identity.clone();
+        map.insert(cgroup_id, *identity, 0)
+            .map_err(|e| format!("Failed to insert workload identity for cgroup {cgroup_id}: {e}"))
+    }
+
+    /// Remove a per-cgroup workload identity entry, e.g. on pod
+    /// un-enrollment. Absent map (older ELF) is a no-op; absent key is
+    /// tolerated because the connect hooks fail-open to the unknown sentinel.
+    pub fn remove_workload_identity(&self, cgroup_id: u64) -> Result<(), String> {
+        let Some(workload_identity) = self.workload_identity.as_ref() else {
+            return Ok(());
+        };
+        let mut map = workload_identity.clone();
+        if let Err(e) = map.remove(&cgroup_id) {
+            tracing::debug!(cgroup_id, error = %e, "remove_workload_identity: entry missing");
         }
         Ok(())
     }
