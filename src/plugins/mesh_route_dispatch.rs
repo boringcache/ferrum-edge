@@ -1615,12 +1615,20 @@ fn rewrite_request_path(
     let Some(prefix) = match_prefix else {
         return replacement.to_string();
     };
-    // Only strip when the request path actually starts with the literal
-    // prefix. The proxy `listen_path` already gated the request to this
-    // prefix, so this is the steady state; the `else` arm is defensive for a
-    // case-folded (`ignoreUriCase`) listen_path where the byte prefix differs.
-    let Some(tail) = original_path.strip_prefix(prefix) else {
-        return replacement.to_string();
+    // Strip the matched prefix and keep the remainder. The proxy `listen_path`
+    // already gated the request to this prefix, so the literal `strip_prefix`
+    // is the steady state. If it fails, the request can only have reached this
+    // rule via a case-folded (`ignoreUriCase`) match where the byte prefix
+    // differs in ASCII case — fall back to a case-insensitive length-strip so
+    // the path tail is preserved (e.g. a `/Api` prefix-rewrite of `/api/users`
+    // yields `/v2/users`, not a bare `/v2`). Only a genuine non-match (no
+    // case-insensitive prefix either) collapses to `replacement`.
+    let tail = match original_path.strip_prefix(prefix) {
+        Some(tail) => tail,
+        None => match original_path.get(..prefix.len()) {
+            Some(head) if head.eq_ignore_ascii_case(prefix) => &original_path[prefix.len()..],
+            _ => return replacement.to_string(),
+        },
     };
     // Join `replacement` + `tail` without doubling or dropping a `/`.
     let mut out = String::with_capacity(replacement.len() + tail.len() + 1);
@@ -1665,12 +1673,27 @@ fn build_redirect_response(
     });
     let path = redirect.uri.as_deref().unwrap_or(ctx.path.as_str());
 
+    // Istio/Envoy preserve the original request query string on redirect by
+    // default (Envoy `RedirectAction.strip_query` defaults to `false`), unless
+    // the redirect URI supplies its own query. Mirror that so query-dependent
+    // redirects (auth callbacks, etc.) keep their parameters — without this a
+    // request to `/old?token=abc` would redirect to `/new`, losing `?token=abc`.
+    let query_suffix = if path.contains('?') {
+        // The redirect URI carried its own query — respect it, don't duplicate.
+        String::new()
+    } else {
+        match ctx.raw_query_string() {
+            Some(q) if !q.is_empty() => format!("?{q}"),
+            _ => String::new(),
+        }
+    };
+
     // Build an absolute Location when we know the authority; otherwise fall
     // back to a path-only (origin-relative) redirect, which every compliant
     // user agent resolves against the request URL.
     let location = match authority {
-        Some(authority) => format!("{scheme}://{authority}{path}"),
-        None => path.to_string(),
+        Some(authority) => format!("{scheme}://{authority}{path}{query_suffix}"),
+        None => format!("{path}{query_suffix}"),
     };
 
     let mut reject_headers = HashMap::with_capacity(1);
@@ -4833,6 +4856,23 @@ mod tests {
         assert_eq!(rewrite_request_path("/api", "/v2", Some("/api")), "/v2");
     }
 
+    #[test]
+    fn rewrite_request_path_case_insensitive_prefix_preserves_tail() {
+        // ignoreUriCase: the proxy matched `/api/users` to a `/Api` prefix
+        // rule, so the byte prefix differs only in ASCII case. The tail must be
+        // preserved (Istio prefix-rewrite → `/v2/users`), not collapsed to a
+        // bare `/v2`.
+        assert_eq!(
+            rewrite_request_path("/api/users", "/v2", Some("/Api")),
+            "/v2/users"
+        );
+        // A genuine non-match (not even case-insensitive) still replaces whole.
+        assert_eq!(
+            rewrite_request_path("/other/users", "/v2", Some("/Api")),
+            "/v2"
+        );
+    }
+
     #[tokio::test]
     async fn rewrite_uri_sets_route_override_path() {
         let plugin = MeshRouteDispatch::new(&json!({
@@ -4946,6 +4986,60 @@ mod tests {
         }
         // A redirect must not leave a route override behind.
         assert!(ctx.route_override_upstream_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn redirect_preserves_original_query_string() {
+        // Istio/Envoy keep the request query on redirect unless the redirect
+        // URI supplies its own. `/old?token=abc` -> `/new?token=abc`.
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "redirect": {"uri": "/new", "authority": "elsewhere.example.com"}
+            }]
+        }))
+        .unwrap();
+        let mut ctx = ctx_with("GET", "/old");
+        ctx.set_raw_query_string("token=abc".to_string());
+        ctx.metadata
+            .insert("ferrum.frontend_scheme".to_string(), "https".to_string());
+        let mut headers = HashMap::new();
+        match plugin.before_proxy(&mut ctx, &mut headers).await {
+            PluginResult::Reject { headers, .. } => {
+                assert_eq!(
+                    headers.get("location").map(String::as_str),
+                    Some("https://elsewhere.example.com/new?token=abc")
+                );
+            }
+            other => panic!("expected redirect Reject, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn redirect_uri_query_takes_precedence_over_request_query() {
+        // When the redirect URI carries its own query, the original request
+        // query is NOT appended (no duplicate `?`).
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "redirect": {"uri": "/new?x=1", "authority": "elsewhere.example.com"}
+            }]
+        }))
+        .unwrap();
+        let mut ctx = ctx_with("GET", "/old");
+        ctx.set_raw_query_string("token=abc".to_string());
+        ctx.metadata
+            .insert("ferrum.frontend_scheme".to_string(), "https".to_string());
+        let mut headers = HashMap::new();
+        match plugin.before_proxy(&mut ctx, &mut headers).await {
+            PluginResult::Reject { headers, .. } => {
+                assert_eq!(
+                    headers.get("location").map(String::as_str),
+                    Some("https://elsewhere.example.com/new?x=1")
+                );
+            }
+            other => panic!("expected redirect Reject, got {other:?}"),
+        }
     }
 
     #[tokio::test]

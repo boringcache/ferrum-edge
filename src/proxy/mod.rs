@@ -9184,14 +9184,23 @@ async fn handle_proxy_request_inner(
     let proxy = ctx.apply_route_overrides_with_upstreams(proxy, epoch.load_balancer.upstreams());
     ctx.matched_proxy = Some(Arc::clone(&proxy));
 
+    // Preserve the path the client actually requested for access logging. The
+    // documented contract (the `route_override_path` field doc and
+    // `docs/mesh.md`) is that transaction logs record the original request
+    // path, not the VirtualService-rewritten backend path; the rewrite below
+    // only affects backend URL building and `ctx.path` for dispatch. The
+    // transaction summaries built later in this function source `request_path`
+    // from this value, not the rebased `path`/`ctx.path`.
+    let original_request_path = path.clone();
+
     // Istio `VirtualService.http[].rewrite.uri`: `mesh_route_dispatch` set
     // `ctx.route_override_path` for the matched route. Rebase the request path
     // used for backend URL building (reqwest / direct-H2 / gRPC paths read the
     // local `path`; the WS / HBONE branches read `ctx.path`, so mirror the
     // override onto `ctx.path` too). The original path was already used for
-    // route selection and logging; VS-derived proxies never set
-    // `strip_listen_path`, so the rewritten value is the literal forwarded
-    // path. No allocation when no rewrite is set.
+    // route selection; VS-derived proxies never set `strip_listen_path`, so
+    // the rewritten value is the literal forwarded path. No allocation when no
+    // rewrite is set.
     let path = match ctx.route_override_path.take() {
         Some(rewritten) => {
             ctx.path = rewritten.clone();
@@ -9797,7 +9806,7 @@ async fn handle_proxy_request_inner(
                         consumer_username: ctx.effective_identity().map(str::to_owned),
                         auth_method: ctx.auth_method,
                         http_method: method,
-                        request_path: path,
+                        request_path: original_request_path.clone(),
                         proxy_id: Some(proxy.id.clone()),
                         proxy_name: proxy.name.clone(),
                         backend_target: Some(strip_query_params(&grpc_backend_url).to_string()),
@@ -10125,7 +10134,7 @@ async fn handle_proxy_request_inner(
                         consumer_username: ctx.effective_identity().map(str::to_owned),
                         auth_method: ctx.auth_method,
                         http_method: method,
-                        request_path: path,
+                        request_path: original_request_path.clone(),
                         proxy_id: Some(proxy.id.clone()),
                         proxy_name: proxy.name.clone(),
                         backend_target: Some(strip_query_params(&grpc_backend_url).to_string()),
@@ -10275,7 +10284,7 @@ async fn handle_proxy_request_inner(
                             consumer_username: ctx.effective_identity().map(str::to_owned),
                             auth_method: ctx.auth_method,
                             http_method: ctx.method.clone(),
-                            request_path: ctx.path.clone(),
+                            request_path: original_request_path.clone(),
                             proxy_id: proxy_ref.map(|p| p.id.clone()),
                             proxy_name: proxy_ref.and_then(|p| p.name.clone()),
                             backend_target: proxy_ref.map(|p| {
@@ -10878,7 +10887,7 @@ async fn handle_proxy_request_inner(
                 consumer_username: ctx.effective_identity().map(str::to_owned),
                 auth_method: ctx.auth_method,
                 http_method: method,
-                request_path: path,
+                request_path: original_request_path.clone(),
                 proxy_id: Some(proxy.id.clone()),
                 proxy_name: proxy.name.clone(),
                 backend_target: Some(strip_query_params(&backend_url).to_string()),

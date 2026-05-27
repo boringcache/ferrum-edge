@@ -2923,8 +2923,9 @@ fn route_rewrite_value(http: &Value) -> Option<Value> {
 ///
 /// Maps `redirect.uri` -> `uri`, `redirect.authority` -> `authority`,
 /// `redirect.scheme` -> `scheme`, and `redirect.redirectCode` -> `redirect_code`
-/// (default 301). Istio's `derivePort` / port rewrite is not represented (the
-/// authority carries any explicit port). Returns `None` when the block has no
+/// (default 301). Istio's `redirect.port` / `derivePort` are NOT representable
+/// and are rejected fail-closed (the operator must express a target port via
+/// `redirect.authority` as `host:port`). Returns `None` when the block has no
 /// target-changing field so an inert `redirect: {}` does not short-circuit
 /// every request with an unchanged Location.
 fn route_redirect_value(
@@ -2934,6 +2935,23 @@ fn route_redirect_value(
     let Some(redirect) = http.get("redirect").and_then(Value::as_object) else {
         return Ok(None);
     };
+    // `redirect.port` and `redirect.derivePort` are not representable in the
+    // per-rule redirect projection: `derivePort` needs the request's port at
+    // runtime (FROM_REQUEST_PORT / FROM_PROTOCOL_DEFAULT) which the translator
+    // does not have, and an explicit `port` would need to be folded into the
+    // `Location` authority. Rather than silently emit a `Location` without the
+    // requested port — a wrong, query-/auth-breaking redirect — fail closed so
+    // the K8s status writer surfaces the limitation to `kubectl` instead of
+    // translating it incorrectly.
+    let has_port = redirect.get("port").is_some_and(|v| !v.is_null());
+    let has_derive_port = redirect.get("derivePort").is_some_and(|v| !v.is_null());
+    if has_port || has_derive_port {
+        return Err(invalid_resource(
+            object,
+            "VirtualService http[].redirect.port / derivePort is not supported; \
+             remove the field or set the target port via redirect.authority (host:port)",
+        ));
+    }
     let mut out = serde_json::Map::new();
     if let Some(uri) = redirect.get("uri").and_then(Value::as_str)
         && !uri.is_empty()
@@ -7661,6 +7679,52 @@ extensionProviders:
         assert!(
             err.to_string()
                 .contains("redirectCode must be in the 300-399 range"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn virtual_service_redirect_rejects_port_field() {
+        let err = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/old"}}],
+                        "redirect": {"uri": "/new", "port": 8443}
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("redirect.port must fail closed");
+        assert!(
+            err.to_string()
+                .contains("redirect.port / derivePort is not supported"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn virtual_service_redirect_rejects_derive_port_field() {
+        let err = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/old"}}],
+                        "redirect": {"derivePort": "FROM_REQUEST_PORT"}
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("redirect.derivePort must fail closed");
+        assert!(
+            err.to_string()
+                .contains("redirect.port / derivePort is not supported"),
             "unexpected error: {err}"
         );
     }
