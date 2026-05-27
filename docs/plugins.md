@@ -2682,6 +2682,8 @@ scanning the parsed key/value map and a best-effort reconstructed URL.
 | `reject_content_type` | string | `application/json` | Content-Type header for enforced rejects. |
 | `reject_body` | string | `{"error":"Forbidden"}` | Body returned for enforced rejects. |
 
+> **Reserved log-metadata namespace:** the `waf.` prefix in `TransactionSummary.metadata` is owned by the WAF plugin. `clone_log_metadata` (called on every transaction-log emission path) strips all `waf.*` keys that were not written by the WAF plugin itself and re-applies only the WAF-owned values. This prevents other plugins or inbound request data from spoofing WAF transaction-log fields. As a result, any `waf.`-prefixed key inserted into `ctx.metadata` by a custom plugin or operator-side code will be silently dropped from transaction logs on every proxy, regardless of whether a WAF plugin is active. Use a different prefix for custom metadata that should coexist with WAF output.
+
 **Custom rule fields:**
 
 | Field | Type | Default | Description |

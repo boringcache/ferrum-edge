@@ -618,10 +618,11 @@ impl RequestContext {
         }
         self.ensure_waf_metadata_initialized();
         merge_metadata_value(&mut self.waf_owned_metadata, key, value);
-        let Some(owned_value) = self.waf_owned_metadata.get(key).cloned() else {
-            return;
-        };
-        self.metadata.insert(key.to_string(), owned_value);
+        // `merge_metadata_value` always inserts or modifies the entry, so
+        // `get(key)` is guaranteed `Some` here; no fallback branch needed.
+        if let Some(owned_value) = self.waf_owned_metadata.get(key) {
+            self.metadata.insert(key.to_string(), owned_value.clone());
+        }
     }
 
     pub(crate) fn waf_metadata_value(&self, key: &str) -> Option<&str> {
