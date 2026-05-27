@@ -341,8 +341,9 @@ Service / namespace names embedded in destination hosts are matched case-sensiti
 | `FERRUM_INJECTOR_INIT_MEMORY_REQUEST` | No | `32Mi` | Memory request injected for the iptables init container |
 | `FERRUM_INJECTOR_INIT_CPU_LIMIT` | No | `100m` | CPU limit injected for the iptables init container |
 | `FERRUM_INJECTOR_INIT_MEMORY_LIMIT` | No | `128Mi` | Memory limit injected for the iptables init container |
-| `FERRUM_INJECTOR_TLS_CERT_PATH` | Kubernetes webhook deployments | — | TLS certificate presented by the injector webhook server |
-| `FERRUM_INJECTOR_TLS_KEY_PATH` | Kubernetes webhook deployments | — | TLS private key for `FERRUM_INJECTOR_TLS_CERT_PATH` |
+| `FERRUM_INJECTOR_TLS_CERT_PATH` | Kubernetes webhook deployments | — | TLS certificate presented by the injector webhook server. Required together with the key unless `FERRUM_INJECTOR_ALLOW_PLAINTEXT=true` |
+| `FERRUM_INJECTOR_TLS_KEY_PATH` | Kubernetes webhook deployments | — | TLS private key for `FERRUM_INJECTOR_TLS_CERT_PATH`. Required together with the cert unless `FERRUM_INJECTOR_ALLOW_PLAINTEXT=true` |
+| `FERRUM_INJECTOR_ALLOW_PLAINTEXT` | No | `false` | Dev-only escape hatch for plaintext HTTP serving. Kubernetes mandates HTTPS for admission webhooks, so the injector refuses to start without `FERRUM_INJECTOR_TLS_CERT_PATH`+`FERRUM_INJECTOR_TLS_KEY_PATH` when this is `false` (default). Set `true` only for local development; the injector serves plaintext HTTP and logs a startup warning |
 | `FERRUM_MESH_IP6TABLES_ENABLED` | No | `auto` | IPv6 iptables fan-out for injected init containers and capture fallback: `auto` probes and skips IPv6 rules when `ip6tables` is unavailable, `true` requires it whenever IPv6 CIDRs are configured and fails all capture setup before IPv4 rules if unavailable, `false` emits IPv4-only capture rules |
 
 The injector copies non-secret mesh sidecar control-plane env vars from its own environment into injected containers when set: `FERRUM_DP_CP_GRPC_URLS`, `FERRUM_CP_DP_GRPC_JWT_ISSUER`, DP gRPC TLS vars, and `FERRUM_MESH_CONFIG_PROTOCOL`. It does not copy plaintext `FERRUM_CP_DP_GRPC_JWT_SECRET`; set `FERRUM_INJECTOR_JWT_SECRET_REF_NAME` and `FERRUM_INJECTOR_JWT_SECRET_REF_KEY` to inject that variable via `valueFrom.secretKeyRef`.
