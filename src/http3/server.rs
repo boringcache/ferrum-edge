@@ -1215,7 +1215,6 @@ async fn handle_h3_request(
                     .await?;
                     return Ok(());
                 };
-                record_request(&state, reject.status_code);
                 let mut headers = reject.headers;
                 apply_after_proxy_hooks_to_rejection(
                     &plugins,
@@ -1234,6 +1233,11 @@ async fn handle_h3_request(
                     &reject.body,
                     &headers,
                 );
+                // Record the normalized wire status: a gRPC reject is sent as
+                // HTTP 200 + grpc-status, so runtime status metrics must match
+                // the logged/served status (not the plugin's HTTP-style code),
+                // consistent across every H3 reject phase.
+                record_request(&state, log_status_code);
                 log_rejected_request(
                     &plugins,
                     &ctx,
@@ -1370,7 +1374,6 @@ async fn handle_h3_request(
                         .await?;
                         return Ok(());
                     };
-                    record_request(&state, reject.status_code);
                     let mut headers = reject.headers;
                     apply_after_proxy_hooks_to_rejection(
                         &plugins,
@@ -1389,6 +1392,10 @@ async fn handle_h3_request(
                         &reject.body,
                         &headers,
                     );
+                    // Record the normalized wire status (gRPC rejects go out as
+                    // HTTP 200 + grpc-status); keeps runtime metrics consistent
+                    // with the logged/served status across every H3 reject phase.
+                    record_request(&state, log_status_code);
                     log_rejected_request(
                         &plugins,
                         &ctx,
@@ -1486,7 +1493,6 @@ async fn handle_h3_request(
                         .await?;
                         return Ok(());
                     };
-                    record_request(&state, reject.status_code);
                     let mut headers = reject.headers;
                     apply_after_proxy_hooks_to_rejection(
                         &plugins,
@@ -1505,6 +1511,10 @@ async fn handle_h3_request(
                         &reject.body,
                         &headers,
                     );
+                    // Record the normalized wire status (gRPC rejects go out as
+                    // HTTP 200 + grpc-status); keeps runtime metrics consistent
+                    // with the logged/served status across every H3 reject phase.
+                    record_request(&state, log_status_code);
                     log_rejected_request(
                         &plugins,
                         &ctx,
@@ -1553,7 +1563,6 @@ async fn handle_h3_request(
                         return Ok(());
                     };
                     ctx.headers = tmp_headers;
-                    record_request(&state, reject.status_code);
                     let mut headers = reject.headers;
                     apply_after_proxy_hooks_to_rejection(
                         &plugins,
@@ -1572,6 +1581,10 @@ async fn handle_h3_request(
                         &reject.body,
                         &headers,
                     );
+                    // Record the normalized wire status (gRPC rejects go out as
+                    // HTTP 200 + grpc-status); keeps runtime metrics consistent
+                    // with the logged/served status across every H3 reject phase.
+                    record_request(&state, log_status_code);
                     log_rejected_request(
                         &plugins,
                         &ctx,

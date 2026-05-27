@@ -887,17 +887,23 @@ fn check_xml_entity_expansion(
     let bytes = body.as_bytes();
     let needle = b"<!ENTITY";
     let mut count = 0usize;
-    let mut parameter_entities: Vec<(String, String)> = Vec::new();
+    // Store the precomputed entity-declaration count per parameter entity, not
+    // the raw value: a `%name;` reference may appear many times (bounded only by
+    // body length), and recomputing `entity_declaration_count(value)` on each
+    // reference is O(refs x |value|) — quadratic in body size, a DoS in the very
+    // guard meant to prevent one. Compute the count once at declaration time so
+    // each reference is O(1).
+    let mut parameter_entities: Vec<(String, usize)> = Vec::new();
     let mut i = 0usize;
     while i < bytes.len() {
         if bytes[i] == b'%'
             && let Some((name, end)) = parameter_entity_reference_at(body, i)
         {
-            if let Some((_, value)) = parameter_entities
+            if let Some((_, expanded_entities)) = parameter_entities
                 .iter()
                 .find(|(entity_name, _)| entity_name == name)
             {
-                let expanded_entities = entity_declaration_count(value);
+                let expanded_entities = *expanded_entities;
                 if expanded_entities > 0 {
                     if reject_nested {
                         return Err(
@@ -961,7 +967,9 @@ fn check_xml_entity_expansion(
                 );
             }
             if let Some((name, value)) = parameter_entity_declaration(&body[i..decl_end]) {
-                parameter_entities.push((name.to_string(), value.to_string()));
+                // Count nested entity declarations once, at declaration time, so
+                // each later `%name;` reference is an O(1) lookup.
+                parameter_entities.push((name.to_string(), entity_declaration_count(value)));
             }
             i = decl_end.saturating_add(1);
         } else {
