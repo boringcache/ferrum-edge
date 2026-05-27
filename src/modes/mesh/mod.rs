@@ -4006,6 +4006,17 @@ fn build_mesh_inbound_spiffe_slot(
         _ => return None,
     };
 
+    // F2 (accepted coupling, documented): `load_svid_bundle_from_files`
+    // validates the gateway SVID *leaf* (notBefore/notAfter, non-CA) as well as
+    // the trust-bundle CAs. An expired or mid-rotation gateway leaf therefore
+    // fails the whole load and we fall back to chain-only verification (no
+    // peer-SAN trust-domain check) with only a `warn!`, even though the trust
+    // *bundle* itself could still be valid. We intentionally do not load only
+    // the trust bundle here: the gateway leaf must also be currently valid for
+    // the listener to present a usable server identity, so an expired leaf is a
+    // real operational fault that the chain-only fallback degrades gracefully
+    // around rather than a reason to keep half-loading SVID material. Treating
+    // expired-leaf -> chain-only as the accepted current behavior.
     let mut bundle = match crate::identity::file_loader::load_svid_bundle_from_files(
         std::path::Path::new(cert_path),
         std::path::Path::new(key_path),
@@ -4032,6 +4043,15 @@ fn build_mesh_inbound_spiffe_slot(
 /// gateway SVID bundle so the inbound SPIFFE verifier accepts peers from
 /// federated trust domains. The SVID's own local bundle (its trust domain's
 /// roots) is preserved; federated entries from the slice are added.
+///
+/// F3 (documented design choice): the CP-pushed slice is the SOLE authority for
+/// inbound trust domains. Unlike the backend/outbound path
+/// (`gateway_config_from_mesh_slice`), this does NOT overlay the federation
+/// poller store snapshot. A federation-poller-added trust domain therefore
+/// validates for outbound mTLS but is rejected for inbound until the CP pushes
+/// it in a slice. This is intentional: inbound peer trust is governed by mesh
+/// PeerAuthentication/slice config, while the poller's live cross-cluster
+/// bundles are an outbound-only freshness overlay.
 fn merge_slice_federation_into_svid_bundle(
     bundle: &mut crate::identity::SvidBundle,
     slice: Option<&MeshSlice>,
@@ -4075,33 +4095,31 @@ fn merge_slice_federation_into_svid_bundle(
     }
 }
 
-/// Re-publish the inbound SPIFFE trust-bundle slot from the gateway SVID files
-/// plus the current slice's federated bundles. Called on slice apply (live
-/// reload only) so federated trust-domain changes propagate to the verifier
-/// without a listener restart. A reload failure keeps the previous slot value
-/// (logged) rather than clearing trust — never fails the slice.
-fn refresh_mesh_inbound_spiffe_slot(
+/// Rebuild the inbound SPIFFE trust-bundle from the gateway SVID files plus the
+/// current slice's federated bundles, returning it STAGED (not yet stored into
+/// the live slot). The caller publishes it into the live slot only after the
+/// candidate proxy config is accepted, so a rejected slice cannot leave new
+/// federated trust domains active for inbound handshakes. A rebuild failure
+/// returns `None` (logged) and the caller leaves the previous trust bundles in
+/// place — this never fails the slice.
+fn stage_mesh_inbound_spiffe_bundle(
     slot: Option<&tls::SharedBundleSlot>,
     env_config: &EnvConfig,
     slice: &MeshSlice,
-) {
-    let Some(slot) = slot else {
-        return;
-    };
+) -> Option<StagedSpiffeBundle> {
+    let slot = slot?;
     match build_mesh_inbound_spiffe_slot(env_config, Some(slice)) {
-        Some(rebuilt) => {
-            // Move the freshly built bundle into the existing shared slot so
-            // the live verifier (which holds an `Arc` to this slot) observes
-            // the new federated set on its next handshake.
-            let bundle = rebuilt.load_full();
-            slot.store(bundle);
-        }
+        Some(rebuilt) => Some(StagedSpiffeBundle {
+            slot: slot.clone(),
+            bundle: rebuilt.load_full(),
+        }),
         None => {
             warn!(
                 mesh_slice_version = %slice.version,
                 "Unable to rebuild mesh inbound SPIFFE trust-bundle slot from slice; \
                  keeping previous trust bundles"
             );
+            None
         }
     }
 }
@@ -4111,18 +4129,27 @@ fn refresh_mesh_inbound_spiffe_slot(
 /// no cert is still admitted (but an offered cert is trust-domain-validated);
 /// STRICT requires + validates a peer cert. Returns `None` when no slot is
 /// available or the mode is DISABLE.
+///
+/// `crls` is threaded into the verifier so inbound mesh peers get end-entity
+/// revocation checking, matching the operator-CA mTLS path. An empty CRL list
+/// disables revocation checking (the pre-CRL behavior).
 fn mesh_inbound_spiffe_verifier(
     slot: Option<&tls::SharedBundleSlot>,
     mtls_mode: config::MtlsMode,
+    crls: tls::CrlList,
 ) -> Option<Arc<dyn rustls::server::danger::ClientCertVerifier>> {
     let slot = slot?;
     match mtls_mode {
-        config::MtlsMode::Strict => {
-            Some(tls::build_spiffe_client_cert_verifier(slot.clone(), true))
-        }
-        config::MtlsMode::Permissive => {
-            Some(tls::build_spiffe_client_cert_verifier(slot.clone(), false))
-        }
+        config::MtlsMode::Strict => Some(tls::build_spiffe_client_cert_verifier(
+            slot.clone(),
+            true,
+            crls,
+        )),
+        config::MtlsMode::Permissive => Some(tls::build_spiffe_client_cert_verifier(
+            slot.clone(),
+            false,
+            crls,
+        )),
         // DISABLE has no TLS; client-side DR modes never reach here.
         _ => None,
     }
@@ -4205,8 +4232,12 @@ fn load_mesh_frontend_tls(
     // SPIFFE trust-domain verifier (validates peer SANs against local+federated
     // bundles). Present only when gateway SVID material is configured. When
     // present it drives client auth even without an operator client CA bundle,
-    // because it carries its own trust anchors from the SVID bundle.
-    let spiffe_verifier = mesh_inbound_spiffe_verifier(spiffe_bundle_slot, mtls_mode);
+    // because it carries its own trust anchors from the SVID bundle. The
+    // gateway CRLs are threaded in so inbound mesh peers get the same
+    // end-entity revocation enforcement the operator-CA path already applies
+    // (empty CRLs => no revocation checking, unchanged behavior).
+    let spiffe_verifier =
+        mesh_inbound_spiffe_verifier(spiffe_bundle_slot, mtls_mode, Arc::new(crls.to_vec()));
 
     let client_ca_bundle_path = client_ca_bundle
         .map(|bundle| bundle.path.as_str())
@@ -4344,11 +4375,33 @@ fn listener_tls_config_for_mtls_mode(
 }
 
 enum MeshInboundTlsReloadPlan {
-    Unchanged,
+    /// No listener TLS-config change is needed (mode + client CA bundle are
+    /// unchanged), but the SPIFFE federated trust-bundle may still need
+    /// publishing because the snapshot does not capture the slice's federated
+    /// trust domains. The staged bundle is published only after the proxy
+    /// config is accepted.
+    Unchanged {
+        staged_spiffe: Option<StagedSpiffeBundle>,
+    },
     Swap {
         snapshot: MeshInboundTlsReloadSnapshot,
         tls_config: Option<Arc<rustls::ServerConfig>>,
+        /// SPIFFE inbound trust-bundle staged during reload planning but NOT yet
+        /// stored into the live slot. It is published into the live slot only
+        /// when the proxy config is accepted (alongside the TLS swap), so a
+        /// rejected slice never leaves new federated trust domains live for
+        /// inbound handshakes. `None` when there is no SPIFFE slot (no gateway
+        /// SVID material) or the rebuild failed (the live slot is left intact).
+        staged_spiffe: Option<StagedSpiffeBundle>,
     },
+}
+
+/// A rebuilt inbound SPIFFE trust-bundle plus the live slot it should be stored
+/// into once the reload is accepted. Staging keeps the live verifier reading
+/// the previous trust bundles until the candidate proxy config is accepted.
+struct StagedSpiffeBundle {
+    slot: tls::SharedBundleSlot,
+    bundle: Arc<Option<crate::identity::SvidBundle>>,
 }
 
 fn plan_mesh_inbound_tls_reload(
@@ -4370,16 +4423,21 @@ fn plan_mesh_inbound_tls_reload(
             return None;
         }
     };
-    // Re-publish the SPIFFE inbound trust-bundle slot from the new slice's
-    // federated bundles before deciding whether the listener config changed.
-    // The verifier reads the slot live, so this lets federated trust-domain
-    // changes take effect lock-free even when the operator client CA bundle
-    // and mTLS mode are otherwise unchanged. Only the federated set is
-    // recomputed; the SVID local roots/cert/key stay the file-based startup
-    // inputs per the peer-auth reload invariant.
-    refresh_mesh_inbound_spiffe_slot(spiffe_bundle_slot, &proxy_state.env_config, slice);
+    // Rebuild the SPIFFE inbound trust-bundle from the new slice's federated
+    // bundles, but STAGE it rather than storing it into the live slot here.
+    // Storing during planning would let a slice that is later rejected leave
+    // its federated trust domains active for new inbound handshakes (a rejected
+    // update could trust new peer domains or drop existing ones with no backing
+    // mesh config). The staged bundle is published into the live slot only after
+    // the candidate proxy config is accepted. The verifier reads the slot live,
+    // so this still propagates federated trust-domain changes lock-free even
+    // when the operator client CA bundle and mTLS mode are otherwise unchanged.
+    // Only the federated set is recomputed; the SVID local roots/cert/key stay
+    // the file-based startup inputs per the peer-auth reload invariant.
+    let staged_spiffe =
+        stage_mesh_inbound_spiffe_bundle(spiffe_bundle_slot, &proxy_state.env_config, slice);
     if last_snapshot == Some(&next_snapshot) {
-        return Some(MeshInboundTlsReloadPlan::Unchanged);
+        return Some(MeshInboundTlsReloadPlan::Unchanged { staged_spiffe });
     }
     let Some(tls_policy) = proxy_state.tls_policy.as_deref() else {
         error!(
@@ -4387,7 +4445,7 @@ fn plan_mesh_inbound_tls_reload(
             ?mtls_mode,
             "Mesh PeerAuthentication live reload requested but TLS policy is unavailable; this is a programming error. Applying proxy config only; the inbound TLS slot remains at its previous value until restart and will be re-evaluated on later slice applies."
         );
-        return Some(MeshInboundTlsReloadPlan::Unchanged);
+        return Some(MeshInboundTlsReloadPlan::Unchanged { staged_spiffe });
     };
     match load_mesh_frontend_tls(
         &proxy_state.env_config,
@@ -4401,6 +4459,7 @@ fn plan_mesh_inbound_tls_reload(
         Ok(tls_config) => Some(MeshInboundTlsReloadPlan::Swap {
             snapshot: next_snapshot,
             tls_config,
+            staged_spiffe,
         }),
         Err(error) => {
             warn!(
@@ -4408,6 +4467,8 @@ fn plan_mesh_inbound_tls_reload(
                 ?mtls_mode,
                 "Failed to rebuild mesh inbound TLS config from PeerAuthentication update: {error}; keeping previous TLS config"
             );
+            // Drop the staged SPIFFE bundle: the slice is being rejected, so the
+            // live slot must keep its previous trust bundles.
             None
         }
     }
@@ -4421,11 +4482,23 @@ async fn apply_mesh_inbound_tls_reload(
     last_snapshot: &mut Option<MeshInboundTlsReloadSnapshot>,
 ) {
     match plan {
-        MeshInboundTlsReloadPlan::Unchanged => {}
+        MeshInboundTlsReloadPlan::Unchanged { staged_spiffe } => {
+            // Listener TLS config is unchanged, but a federated trust-domain
+            // change may still need publishing. Now that the proxy config was
+            // accepted, store the staged SPIFFE bundle into the live slot.
+            publish_staged_spiffe_bundle(staged_spiffe);
+        }
         MeshInboundTlsReloadPlan::Swap {
             snapshot,
             tls_config,
+            staged_spiffe,
         } => {
+            // Publish the staged SPIFFE trust-bundle into the live slot first,
+            // then swap the listener TLS config. Both happen only post-accept so
+            // a rejected slice never alters inbound trust. The verifier reads
+            // the slot live; the new TLS config's verifier will observe the new
+            // bundle on its next handshake.
+            publish_staged_spiffe_bundle(staged_spiffe);
             proxy_state
                 .mesh_inbound_tls
                 .store(Arc::new(tls_config.clone()));
@@ -4500,6 +4573,17 @@ async fn apply_mesh_inbound_tls_reload(
                 "Mesh inbound PeerAuthentication TLS config reloaded"
             );
         }
+    }
+}
+
+/// Publish a staged inbound SPIFFE trust-bundle into its live slot. Called only
+/// after the candidate proxy config is accepted, so the live verifier never
+/// trusts (or stops trusting) peer domains for a slice the runtime rejected.
+/// The verifier holds an `Arc` to this slot and observes the new bundle on its
+/// next handshake.
+fn publish_staged_spiffe_bundle(staged: Option<StagedSpiffeBundle>) {
+    if let Some(StagedSpiffeBundle { slot, bundle }) = staged {
+        slot.store(bundle);
     }
 }
 
@@ -4600,14 +4684,17 @@ fn start_mesh_slice_apply_task(
                                     } else {
                                         None
                                     };
-                                // The TLS reload plan is validated before config apply, but the
-                                // live slot is swapped only after proxy config acceptance. That
-                                // creates a tiny accept window where listeners may still see the
-                                // previous TLS config, and avoids pre-swapping TLS for a proxy
-                                // config that the runtime rejects. On a Permissive-to-Strict
-                                // escalation, an accepted connection in that window can enter the
-                                // new plugin chain without a peer principal; mesh authz still
-                                // fails closed for identity-required policy until the slot swaps.
+                                // The TLS reload plan (listener config + staged SPIFFE inbound
+                                // trust-bundle) is built before config apply, but both are
+                                // published only after proxy config acceptance inside
+                                // `apply_mesh_inbound_tls_reload`. This avoids pre-swapping TLS or
+                                // mutating inbound trust domains for a proxy config the runtime
+                                // rejects, at the cost of a tiny accept window where listeners may
+                                // still see the previous TLS config and the previous trust bundle.
+                                // On a Permissive-to-Strict escalation, an accepted connection in
+                                // that window can enter the new plugin chain without a peer
+                                // principal; mesh authz still fails closed for identity-required
+                                // policy until the slot swaps.
                                 let applied = proxy_state.update_config(config);
                                 let current_loaded_at = proxy_state.config.load_full().loaded_at;
                                 let accepted = mesh_proxy_update_was_accepted(
@@ -9510,26 +9597,102 @@ mod tests {
     #[test]
     fn mesh_inbound_spiffe_verifier_respects_mode_and_slot() {
         // No slot → no verifier regardless of mode.
-        assert!(mesh_inbound_spiffe_verifier(None, config::MtlsMode::Strict).is_none());
+        assert!(
+            mesh_inbound_spiffe_verifier(None, config::MtlsMode::Strict, Arc::new(Vec::new()))
+                .is_none()
+        );
 
         // A present (even empty) slot yields a verifier for STRICT/PERMISSIVE
         // with the correct client-auth-mandatory posture, and none for DISABLE.
         let slot: tls::SharedBundleSlot = Arc::new(arc_swap::ArcSwap::new(Arc::new(None)));
-        let strict = mesh_inbound_spiffe_verifier(Some(&slot), config::MtlsMode::Strict)
-            .expect("STRICT yields a verifier");
+        let strict = mesh_inbound_spiffe_verifier(
+            Some(&slot),
+            config::MtlsMode::Strict,
+            Arc::new(Vec::new()),
+        )
+        .expect("STRICT yields a verifier");
         assert!(
             rustls::server::danger::ClientCertVerifier::client_auth_mandatory(strict.as_ref()),
             "STRICT must mandate client auth"
         );
-        let permissive = mesh_inbound_spiffe_verifier(Some(&slot), config::MtlsMode::Permissive)
-            .expect("PERMISSIVE yields a verifier");
+        let permissive = mesh_inbound_spiffe_verifier(
+            Some(&slot),
+            config::MtlsMode::Permissive,
+            Arc::new(Vec::new()),
+        )
+        .expect("PERMISSIVE yields a verifier");
         assert!(
             !rustls::server::danger::ClientCertVerifier::client_auth_mandatory(permissive.as_ref()),
             "PERMISSIVE must not mandate client auth"
         );
         assert!(
-            mesh_inbound_spiffe_verifier(Some(&slot), config::MtlsMode::Disable).is_none(),
+            mesh_inbound_spiffe_verifier(
+                Some(&slot),
+                config::MtlsMode::Disable,
+                Arc::new(Vec::new())
+            )
+            .is_none(),
             "DISABLE has no TLS, so no verifier"
+        );
+    }
+
+    #[test]
+    fn staged_spiffe_bundle_publishes_only_on_apply() {
+        // F4: a rebuilt inbound SPIFFE trust-bundle must NOT reach the live slot
+        // until the slice is accepted. `publish_staged_spiffe_bundle` is the
+        // post-accept publish step; until it runs the live slot keeps its
+        // previous value, and `None` (rejected/no-slot) leaves it untouched.
+        use crate::identity::{SvidBundle, TrustBundle, TrustBundleSet};
+
+        let td = TrustDomain::new("td.stage-test").unwrap();
+        let id = SpiffeId::from_parts(&td, "ns/foo/sa/bar").unwrap();
+        let original = Arc::new(Some(SvidBundle {
+            spiffe_id: id.clone(),
+            cert_chain_der: vec![vec![1, 2, 3]],
+            private_key_pkcs8_der: Vec::new(),
+            trust_bundles: TrustBundleSet::local_only(TrustBundle {
+                trust_domain: td.clone(),
+                x509_authorities: vec![vec![4, 5, 6]],
+                jwt_authorities: Vec::new(),
+                refresh_hint_seconds: None,
+            }),
+        }));
+        let slot: tls::SharedBundleSlot = Arc::new(arc_swap::ArcSwap::new(original.clone()));
+
+        // A `None` staged bundle (rejected slice or no SVID slot) is a no-op.
+        publish_staged_spiffe_bundle(None);
+        assert!(
+            Arc::ptr_eq(&slot.load_full(), &original),
+            "publishing None must leave the live slot untouched"
+        );
+
+        // Build a replacement bundle and stage it. Staging must NOT mutate the
+        // live slot.
+        let replacement = Arc::new(Some(SvidBundle {
+            spiffe_id: id,
+            cert_chain_der: vec![vec![7, 8, 9]],
+            private_key_pkcs8_der: Vec::new(),
+            trust_bundles: TrustBundleSet::local_only(TrustBundle {
+                trust_domain: td,
+                x509_authorities: vec![vec![10, 11, 12]],
+                jwt_authorities: Vec::new(),
+                refresh_hint_seconds: None,
+            }),
+        }));
+        let staged = Some(StagedSpiffeBundle {
+            slot: slot.clone(),
+            bundle: replacement.clone(),
+        });
+        assert!(
+            Arc::ptr_eq(&slot.load_full(), &original),
+            "merely holding a staged bundle must not change the live slot"
+        );
+
+        // Publishing (post-accept) swaps the slot to the staged bundle.
+        publish_staged_spiffe_bundle(staged);
+        assert!(
+            Arc::ptr_eq(&slot.load_full(), &replacement),
+            "publish must store the staged bundle into the live slot"
         );
     }
 

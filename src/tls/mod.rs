@@ -911,8 +911,11 @@ pub(crate) fn load_mesh_tls_config_with_identity_and_client_ca_bytes(
             // SVID trust bundle AND the peer SAN's trust domain against
             // local/federated bundles — the actual mesh identity check Istio
             // relies on. It already encodes the STRICT-vs-PERMISSIVE
-            // `peer_required` behavior. CRL still applies to the operator-CA
-            // path below for deployments without gateway SVID material.
+            // `peer_required` behavior. The caller builds this verifier with the
+            // gateway CRLs (see `mesh_inbound_spiffe_verifier`), so inbound mesh
+            // peers get the same end-entity revocation enforcement as the
+            // operator-CA path below; the `crls` arg here applies only to that
+            // operator-CA fallback for deployments without gateway SVID material.
             if let Some(verifier) = spiffe_client_verifier {
                 info!(
                     mesh_client_auth = ?client_auth,
