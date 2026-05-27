@@ -14,7 +14,8 @@ use std::collections::HashMap;
 use ferrum_edge::identity::spiffe::TrustDomain;
 use ferrum_edge::modes::mesh::config::OutboundTrafficPolicy;
 use ferrum_edge::modes::mesh::hbone::{
-    BAGGAGE_HEADER, HboneIdentity, baggage_header_for_source, is_hbone_connect,
+    BAGGAGE_HEADER, HboneIdentity, baggage_header_for_source, is_authenticated_hbone_connect,
+    is_hbone_connect,
 };
 use ferrum_edge::modes::mesh::{
     MESH_ACCESS_LOG_PLUGIN_ID, MESH_AUTHZ_PLUGIN_ID, MESH_BPF_METRICS_PLUGIN_ID,
@@ -371,9 +372,11 @@ fn baggage_parser_ignores_keys_outside_the_documented_principal_alias_set() {
 
 #[test]
 fn is_hbone_connect_accepts_plain_http2_connect_without_marker_header() {
-    // Istio's HBONE definition is "HTTP/2 CONNECT over mTLS"; we
-    // therefore accept plain H2 CONNECT as HBONE-eligible without
-    // requiring an `x-ferrum-mesh-protocol` marker.
+    // `is_hbone_connect` is the wire-*shape* detector: Istio's HBONE
+    // definition is "HTTP/2 CONNECT over mTLS", so a plain H2 CONNECT is
+    // HBONE-shaped without an `x-ferrum-mesh-protocol` marker. Shape alone
+    // does NOT authorize relaying — that requires an authenticated peer via
+    // `is_authenticated_hbone_connect` (see below).
     let headers = HeaderMap::new();
     assert!(is_hbone_connect(
         &Method::CONNECT,
@@ -418,6 +421,60 @@ fn is_hbone_connect_accepts_explicit_marker_when_value_is_hbone() {
         Version::HTTP_2,
         &headers
     ));
+}
+
+// ── HBONE relay trust boundary (mesh audit finding #2) ──────────────────
+
+#[test]
+fn is_authenticated_hbone_connect_rejects_bare_connect_without_peer() {
+    // The finding: a marker-less HTTP/2 CONNECT with no authenticated peer is
+    // HBONE-shaped but must NOT be authorized for relay as a transparent TCP
+    // tunnel.
+    let headers = HeaderMap::new();
+    assert!(
+        is_hbone_connect(&Method::CONNECT, Version::HTTP_2, &headers),
+        "precondition: bare H2 CONNECT is HBONE-shaped"
+    );
+    assert!(
+        !is_authenticated_hbone_connect(&Method::CONNECT, Version::HTTP_2, &headers, None),
+        "bare CONNECT with no authenticated peer must not be relayed as HBONE"
+    );
+}
+
+#[test]
+fn is_authenticated_hbone_connect_admits_authenticated_peer() {
+    // A verified mTLS peer (the steady state for real ztunnel/waypoint HBONE)
+    // is authorized for relay, with or without an explicit marker header.
+    let peer = SpiffeId::new("spiffe://cluster.local/ns/default/sa/client").expect("spiffe id");
+
+    let bare = HeaderMap::new();
+    assert!(is_authenticated_hbone_connect(
+        &Method::CONNECT,
+        Version::HTTP_2,
+        &bare,
+        Some(&peer),
+    ));
+
+    let mut marker = HeaderMap::new();
+    marker.insert("x-istio-protocol", HeaderValue::from_static("hbone"));
+    assert!(is_authenticated_hbone_connect(
+        &Method::CONNECT,
+        Version::HTTP_2,
+        &marker,
+        Some(&peer),
+    ));
+}
+
+#[test]
+fn is_authenticated_hbone_connect_marker_does_not_bypass_peer_requirement() {
+    // The explicit-marker path is not a back door: a CONNECT that merely
+    // asserts `x-istio-protocol: hbone` without a verified peer is rejected.
+    let mut headers = HeaderMap::new();
+    headers.insert("x-istio-protocol", HeaderValue::from_static("hbone"));
+    assert!(
+        !is_authenticated_hbone_connect(&Method::CONNECT, Version::HTTP_2, &headers, None),
+        "marker header must not authorize an unauthenticated peer"
+    );
 }
 
 // ── Trust-domain alias plumbing on MeshRuntimeConfig ─────────────────────

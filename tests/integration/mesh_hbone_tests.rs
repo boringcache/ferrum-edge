@@ -3,6 +3,7 @@ use chrono::Utc;
 use hyper::{Method, Request, StatusCode};
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
@@ -154,6 +155,184 @@ fn hmac_auth_plugin_config() -> PluginConfig {
     }
 }
 
+/// Proxy-scoped `spiffe_identity` plugin. The real Ambient/HBONE listener
+/// auto-injects `__mesh_spiffe_identity`; these `RequestContext`-level tests
+/// build the proxy directly, so they add it explicitly to populate
+/// `ctx.peer_spiffe_id` from the verified mTLS peer cert.
+fn spiffe_identity_plugin_config(proxy_id: &str) -> PluginConfig {
+    PluginConfig {
+        id: "spiffe-identity".to_string(),
+        plugin_name: "spiffe_identity".to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        config: json!({}),
+        scope: PluginScope::Proxy,
+        proxy_id: Some(proxy_id.to_string()),
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+/// SPIFFE-shaped cert material for the inbound HBONE mTLS handshake: a CA, a
+/// server leaf SVID (with a `127.0.0.1` SAN so rustls accepts the listener),
+/// and a client leaf SVID whose URI SAN is the source workload identity that
+/// `spiffe_identity` extracts into `ctx.peer_spiffe_id`.
+struct HboneMtlsCerts {
+    ca_der: rustls::pki_types::CertificateDer<'static>,
+    server_cert_der: rustls::pki_types::CertificateDer<'static>,
+    server_key_der: rustls::pki_types::PrivateKeyDer<'static>,
+    client_cert_der: rustls::pki_types::CertificateDer<'static>,
+    client_key_der: rustls::pki_types::PrivateKeyDer<'static>,
+}
+
+fn generate_hbone_mtls_certs(client_spiffe: &str) -> HboneMtlsCerts {
+    use rcgen::{
+        BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer,
+        KeyPair, KeyUsagePurpose, SanType, string::Ia5String,
+    };
+
+    let ca_key = KeyPair::generate().expect("ca key");
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).expect("ca params");
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params
+        .distinguished_name
+        .push(DnType::CommonName, "hbone-test CA");
+    ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    let ca_cert = ca_params.self_signed(&ca_key).expect("self-signed ca");
+    let ca_der = ca_cert.der().clone();
+    // `Issuer::new` consumes the params + key, so capture the CA DER first.
+    let issuer = Issuer::new(ca_params, ca_key);
+
+    // Server leaf: 127.0.0.1 SAN so the test client's rustls IP check passes.
+    let server_key = KeyPair::generate().expect("server key");
+    let mut server_params = CertificateParams::new(vec!["localhost".to_string()]).expect("server");
+    server_params
+        .subject_alt_names
+        .push(SanType::IpAddress(std::net::IpAddr::V4(
+            std::net::Ipv4Addr::new(127, 0, 0, 1),
+        )));
+    server_params.key_usages = vec![
+        KeyUsagePurpose::DigitalSignature,
+        KeyUsagePurpose::KeyEncipherment,
+    ];
+    server_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    let server_cert = server_params
+        .signed_by(&server_key, &issuer)
+        .expect("server leaf");
+
+    // Client leaf: carries the SPIFFE URI SAN as its identity.
+    let client_key = KeyPair::generate().expect("client key");
+    let mut client_params = CertificateParams::new(Vec::<String>::new()).expect("client");
+    client_params.subject_alt_names.push(SanType::URI(
+        Ia5String::try_from(client_spiffe.to_string()).expect("spiffe uri san"),
+    ));
+    client_params.key_usages = vec![
+        KeyUsagePurpose::DigitalSignature,
+        KeyUsagePurpose::KeyEncipherment,
+    ];
+    client_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+    let client_cert = client_params
+        .signed_by(&client_key, &issuer)
+        .expect("client leaf");
+
+    HboneMtlsCerts {
+        ca_der,
+        server_cert_der: server_cert.der().clone(),
+        server_key_der: rustls::pki_types::PrivateKeyDer::try_from(server_key.serialize_der())
+            .expect("server key der"),
+        client_cert_der: client_cert.der().clone(),
+        client_key_der: rustls::pki_types::PrivateKeyDer::try_from(client_key.serialize_der())
+            .expect("client key der"),
+    }
+}
+
+/// Server-side `ServerConfig` for the inbound HBONE listener: requires and
+/// verifies a client cert against the test CA and negotiates `h2` via ALPN so
+/// the HBONE CONNECT arrives as HTTP/2.
+fn hbone_server_config(certs: &HboneMtlsCerts) -> Arc<rustls::ServerConfig> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(certs.ca_der.clone()).expect("add ca");
+    let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+        .build()
+        .expect("client verifier");
+    let mut cfg = rustls::ServerConfig::builder()
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(
+            vec![certs.server_cert_der.clone()],
+            certs.server_key_der.clone_key(),
+        )
+        .expect("server config");
+    cfg.alpn_protocols = vec![b"h2".to_vec()];
+    Arc::new(cfg)
+}
+
+/// Client-side `ClientConfig` presenting the SPIFFE client cert. ALPN `h2`.
+fn hbone_client_config(certs: &HboneMtlsCerts) -> Arc<rustls::ClientConfig> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(certs.ca_der.clone()).expect("add ca");
+    let mut cfg = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_client_auth_cert(
+            vec![certs.client_cert_der.clone()],
+            certs.client_key_der.clone_key(),
+        )
+        .expect("client config");
+    cfg.alpn_protocols = vec![b"h2".to_vec()];
+    Arc::new(cfg)
+}
+
+async fn start_gateway_mtls(
+    state: ProxyState,
+    server_config: Arc<rustls::ServerConfig>,
+) -> (std::net::SocketAddr, watch::Sender<bool>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind gateway");
+    let addr = listener.local_addr().expect("gateway local addr");
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    tokio::spawn(async move {
+        let _ = start_proxy_listener_with_bound_listener(
+            listener,
+            state,
+            shutdown_rx,
+            Some(server_config),
+        )
+        .await;
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    (addr, shutdown_tx)
+}
+
+/// Open an mTLS HTTP/2 connection to the gateway and return the h2 request
+/// sender plus the driver task handle.
+async fn connect_hbone_h2_mtls(
+    gateway_addr: std::net::SocketAddr,
+    client_config: Arc<rustls::ClientConfig>,
+) -> (
+    h2::client::SendRequest<Bytes>,
+    tokio::task::JoinHandle<Result<(), h2::Error>>,
+) {
+    let tcp = tokio::net::TcpStream::connect(gateway_addr)
+        .await
+        .expect("connect gateway");
+    let _ = tcp.set_nodelay(true);
+    let connector = tokio_rustls::TlsConnector::from(client_config);
+    let server_name = rustls::pki_types::ServerName::IpAddress(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)).into(),
+    );
+    let tls = connector
+        .connect(server_name, tcp)
+        .await
+        .expect("client tls handshake");
+    let (sender, conn) = h2::client::handshake(tls).await.expect("h2 handshake");
+    let conn_task = tokio::spawn(conn);
+    (sender, conn_task)
+}
+
 async fn start_gateway(state: ProxyState) -> (std::net::SocketAddr, watch::Sender<bool>) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -270,16 +449,21 @@ fn mesh_route_dispatch_connect_timeout_plugin(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn hbone_connect_relays_data_frames_to_tcp_backend() {
+    // A real HBONE peer terminates mTLS and presents a SPIFFE client cert, so
+    // `spiffe_identity` populates `ctx.peer_spiffe_id` and the relay trust
+    // gate admits the tunnel.
+    let certs = generate_hbone_mtls_certs("spiffe://cluster.local/ns/default/sa/client");
     let (backend_addr, backend_handle) = start_echo_backend().await;
-    let state = create_mesh_proxy_state(create_mesh_proxy(backend_addr.port()));
-    let (gateway_addr, shutdown_tx) = start_gateway(state).await;
+    let mut proxy = create_mesh_proxy(backend_addr.port());
+    let spiffe_plugin = spiffe_identity_plugin_config(&proxy.id);
+    proxy.plugins.push(PluginAssociation {
+        plugin_config_id: spiffe_plugin.id.clone(),
+    });
+    let state = create_mesh_proxy_state_with_config(proxy, vec![], vec![spiffe_plugin]);
+    let (gateway_addr, shutdown_tx) = start_gateway_mtls(state, hbone_server_config(&certs)).await;
 
-    let stream = tokio::net::TcpStream::connect(gateway_addr)
-        .await
-        .expect("connect gateway");
-    let _ = stream.set_nodelay(true);
-    let (mut sender, conn) = h2::client::handshake(stream).await.expect("h2 handshake");
-    let conn_task = tokio::spawn(conn);
+    let (mut sender, conn_task) =
+        connect_hbone_h2_mtls(gateway_addr, hbone_client_config(&certs)).await;
 
     let req = Request::builder()
         .method(Method::CONNECT)
@@ -309,6 +493,44 @@ async fn hbone_connect_relays_data_frames_to_tcp_backend() {
 
     shutdown_tx.send(true).expect("shutdown gateway");
     backend_handle.await.expect("backend task");
+    conn_task.abort();
+}
+
+/// Security regression (mesh audit finding #2): a bare HTTP/2 CONNECT with no
+/// authenticated mesh peer must NOT be relayed as a transparent HBONE tunnel.
+/// Here the gateway listens in plaintext (no mTLS), so `ctx.peer_spiffe_id` is
+/// never populated; the relay trust gate rejects the CONNECT with 403 and
+/// never dials the backend.
+#[tokio::test(flavor = "multi_thread")]
+async fn hbone_connect_without_authenticated_peer_is_rejected() {
+    let (backend_addr, backend_handle) = start_echo_backend().await;
+    let state = create_mesh_proxy_state(create_mesh_proxy(backend_addr.port()));
+    let (gateway_addr, shutdown_tx) = start_gateway(state).await;
+
+    let stream = tokio::net::TcpStream::connect(gateway_addr)
+        .await
+        .expect("connect gateway");
+    let _ = stream.set_nodelay(true);
+    let (mut sender, conn) = h2::client::handshake(stream).await.expect("h2 handshake");
+    let conn_task = tokio::spawn(conn);
+
+    let req = Request::builder()
+        .method(Method::CONNECT)
+        .uri("orders.default.svc.cluster.local:8080")
+        .body(())
+        .expect("connect request");
+    let (response_fut, _request_body) = sender.send_request(req, false).expect("send CONNECT");
+    let resp = response_fut.await.expect("CONNECT response");
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "bare CONNECT with no authenticated peer must be rejected, not relayed"
+    );
+
+    shutdown_tx.send(true).expect("shutdown gateway");
+    // The relay never dials the backend on the rejection path, so the echo
+    // backend's `accept()` would hang forever — abort it rather than await.
+    backend_handle.abort();
     conn_task.abort();
 }
 
@@ -386,6 +608,7 @@ async fn hbone_connect_with_body_auth_plugin_is_rejected() {
 /// dropped on the HBONE path and the relay stays open until the test bails.
 #[tokio::test(flavor = "multi_thread")]
 async fn hbone_connect_mesh_route_dispatch_override_drives_relay_timeout() {
+    let certs = generate_hbone_mtls_certs("spiffe://cluster.local/ns/default/sa/client");
     let (backend_addr, backend_handle, backend_stop) = start_quiet_backend().await;
     let mut proxy = create_mesh_proxy(backend_addr.port());
     // Defaults that would keep the relay open well past the assertion window
@@ -400,21 +623,21 @@ async fn hbone_connect_mesh_route_dispatch_override_drives_relay_timeout() {
         backend_addr.port(),
         500,
     );
+    let spiffe_plugin = spiffe_identity_plugin_config(&proxy_id);
     // Proxy-scoped plugins are wired into the proxy's plugin chain via the
     // association list (see `PluginCache::build_cache`); without this, the
     // route-dispatch plugin would never run.
     proxy.plugins.push(PluginAssociation {
         plugin_config_id: plugin.id.clone(),
     });
-    let state = create_mesh_proxy_state_with_config(proxy, vec![], vec![plugin]);
-    let (gateway_addr, shutdown_tx) = start_gateway(state).await;
+    proxy.plugins.push(PluginAssociation {
+        plugin_config_id: spiffe_plugin.id.clone(),
+    });
+    let state = create_mesh_proxy_state_with_config(proxy, vec![], vec![plugin, spiffe_plugin]);
+    let (gateway_addr, shutdown_tx) = start_gateway_mtls(state, hbone_server_config(&certs)).await;
 
-    let stream = tokio::net::TcpStream::connect(gateway_addr)
-        .await
-        .expect("connect gateway");
-    let _ = stream.set_nodelay(true);
-    let (mut sender, conn) = h2::client::handshake(stream).await.expect("h2 handshake");
-    let conn_task = tokio::spawn(conn);
+    let (mut sender, conn_task) =
+        connect_hbone_h2_mtls(gateway_addr, hbone_client_config(&certs)).await;
 
     let req = Request::builder()
         .method(Method::CONNECT)
@@ -451,20 +674,21 @@ async fn hbone_connect_mesh_route_dispatch_override_drives_relay_timeout() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn hbone_connect_closes_idle_tunnel() {
+    let certs = generate_hbone_mtls_certs("spiffe://cluster.local/ns/default/sa/client");
     let (backend_addr, backend_handle) = start_idle_backend().await;
     let mut proxy = create_mesh_proxy(backend_addr.port());
     proxy.tcp_idle_timeout_seconds = Some(1);
     proxy.backend_read_timeout_ms = 0;
     proxy.backend_write_timeout_ms = 0;
-    let state = create_mesh_proxy_state(proxy);
-    let (gateway_addr, shutdown_tx) = start_gateway(state).await;
+    let spiffe_plugin = spiffe_identity_plugin_config(&proxy.id);
+    proxy.plugins.push(PluginAssociation {
+        plugin_config_id: spiffe_plugin.id.clone(),
+    });
+    let state = create_mesh_proxy_state_with_config(proxy, vec![], vec![spiffe_plugin]);
+    let (gateway_addr, shutdown_tx) = start_gateway_mtls(state, hbone_server_config(&certs)).await;
 
-    let stream = tokio::net::TcpStream::connect(gateway_addr)
-        .await
-        .expect("connect gateway");
-    let _ = stream.set_nodelay(true);
-    let (mut sender, conn) = h2::client::handshake(stream).await.expect("h2 handshake");
-    let conn_task = tokio::spawn(conn);
+    let (mut sender, conn_task) =
+        connect_hbone_h2_mtls(gateway_addr, hbone_client_config(&certs)).await;
 
     let req = Request::builder()
         .method(Method::CONNECT)

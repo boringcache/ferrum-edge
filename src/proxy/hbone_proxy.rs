@@ -336,6 +336,51 @@ pub(super) async fn handle_hbone_request(
     let proxy: &Arc<Proxy> = &proxy_arc;
     ctx.matched_proxy = Some(Arc::clone(proxy));
 
+    // HBONE relay trust boundary. The relay byte-copies this CONNECT stream
+    // straight to the backend as a transparent TCP tunnel, so it must only
+    // accept HBONE peers that the mTLS/HBONE listener authenticated. The
+    // inbound mesh listener publishes the trust-domain-verified peer identity
+    // into `ctx.peer_spiffe_id` (via the `spiffe_identity` plugin during
+    // `on_request_received`, or the node-waypoint identity path) before this
+    // branch runs, so a present `peer_spiffe_id` is exactly "a verified mesh
+    // peer terminated mTLS on this listener". A bare (marker-less) CONNECT
+    // with no authenticated peer — and equally a CONNECT that merely asserts
+    // an `x-*-protocol: hbone` marker without a verified peer — is not a valid
+    // HBONE tunnel; reject it here, before dialing or circuit-breaking any
+    // backend, rather than silently relaying it. Tier 2b already verifies the
+    // peer's trust domain at TLS time; this gate ensures the relay never opens
+    // a tunnel for an unauthenticated peer.
+    if ctx.peer_spiffe_id.is_none() {
+        warn!(
+            proxy_id = %proxy.id,
+            "Rejected HBONE CONNECT with no authenticated peer identity"
+        );
+        ctx.metadata.insert(
+            "mesh_authz.deny_policy".to_string(),
+            "hbone_unauthenticated_peer".to_string(),
+        );
+        let reject = finalize_reject_response_with_after_proxy_hooks(
+            plugins,
+            ctx,
+            StatusCode::FORBIDDEN,
+            br#"{"error":"HBONE tunnel requires an authenticated mesh peer"}"#,
+            HashMap::new(),
+            false,
+        )
+        .await;
+        log_rejected_request(
+            plugins,
+            ctx,
+            reject.http_status.as_u16(),
+            start_time,
+            "hbone_unauthenticated_peer",
+            plugin_execution_ns,
+        )
+        .await;
+        record_request(state, reject.http_status.as_u16());
+        return build_response_from_normalized_reject(reject);
+    }
+
     let selection =
         backend_dispatch::select_upstream_target(proxy, state, epoch, &ctx.client_ip, &ctx.headers);
     let upstream_target = selection.target;
