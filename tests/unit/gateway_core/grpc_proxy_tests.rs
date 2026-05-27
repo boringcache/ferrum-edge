@@ -138,11 +138,26 @@ fn test_is_grpc_request_allows_immediate_and_tab_ows_parameters() {
 }
 
 #[test]
-fn test_is_grpc_request_trailing_ows_without_parameter_is_not_grpc() {
-    // OWS not followed by a ';' is rejected: the canonical classifier requires
-    // a parameter separator after any trailing whitespace. (Behavior change vs.
-    // the old `starts_with` form, which accepted a bare trailing space.)
-    let headers = headers_with_content_type("application/grpc ");
+fn test_is_grpc_request_trailing_ows_without_parameter_is_grpc() {
+    // Per the gRPC-over-HTTP/2 spec the content-type "begins with
+    // application/grpc"; trailing OWS is insignificant (trims to
+    // `application/grpc`) and must still classify as native gRPC.
+    for content_type in [
+        "application/grpc ",     // trailing space
+        "application/grpc\t",    // trailing tab
+        "application/grpc ;x=y", // OWS then ';' (existing behaviour, confirmed)
+    ] {
+        let headers = headers_with_content_type(content_type);
+        assert!(
+            grpc_proxy::is_grpc_content_type(&headers),
+            "{content_type:?} should be treated as native gRPC"
+        );
+    }
+}
+
+#[test]
+fn test_is_grpc_request_grpc_web_is_not_grpc() {
+    let headers = headers_with_content_type("application/grpc-web");
     assert!(!grpc_proxy::is_grpc_content_type(&headers));
 }
 
