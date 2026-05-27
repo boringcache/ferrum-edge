@@ -697,14 +697,18 @@ fn prepare_normalized_gateway_config_for_mesh(
 
     // Warn once per config-apply when all three conditions hold:
     // (1) node-waypoint per-pod scoping is active,
-    // (2) at least one TCP/UDP stream proxy listener exists, and
+    // (2) at least one *UDP/DTLS* stream proxy listener exists, and
     // (3) the loaded policies include at least one namespace- or
     //     selector-scoped entry.
-    // Stream accept loops always pass `node_waypoint_policy_scope: None`, so
-    // only MeshWide policies are evaluated on TCP/UDP connections — scoped
-    // DENY/ALLOW rules are silently withheld. See docs/mesh.md for details.
+    // TCP/TcpTls stream accept loops now resolve the connection's source pod
+    // identity and stamp the per-pod `PolicyScopeCache`, so scoped DENY/ALLOW
+    // rules ARE enforced on TCP streams (parity with HTTP/HBONE). UDP/DTLS
+    // remains mesh-wide-only: node-waypoint capture keys identity by the
+    // per-connection TCP socket cookie, and a shared UDP frontend socket has no
+    // per-source-pod cookie to resolve. Scoped policies are therefore still
+    // withheld on UDP/DTLS streams. See docs/mesh.md for details.
     if runtime.topology == MeshTopology::NodeWaypoint
-        && config.proxies.iter().any(|p| p.dispatch_kind.is_stream())
+        && config.proxies.iter().any(|p| p.dispatch_kind.is_udp())
         && mesh_slice
             .mesh_policies
             .iter()
@@ -712,9 +716,10 @@ fn prepare_normalized_gateway_config_for_mesh(
     {
         warn!(
             topology = "node_waypoint",
-            "Namespace- and selector-scoped mesh policies are NOT enforced on TCP/UDP stream \
-             connections (stream accept loops pass no per-pod scope). Only MeshWide policies \
-             apply to stream traffic. See docs/mesh.md for details."
+            "Namespace- and selector-scoped mesh policies are NOT enforced on UDP/DTLS stream \
+             connections (a shared UDP frontend socket carries no per-source-pod cookie, and \
+             node-waypoint capture is TCP-connection scoped). Only MeshWide policies apply to \
+             UDP stream traffic; TCP streams are scoped per source pod. See docs/mesh.md for details."
         );
     }
 
@@ -3424,6 +3429,22 @@ async fn serve_mesh_runtime(
     proxy_state
         .stream_listener_manager
         .set_global_shutdown_rx(shutdown_tx.subscribe());
+
+    // Share the node-waypoint identity resolver with the stream listener
+    // manager so TCP stream accept loops resolve each connection's source pod
+    // identity and stamp the per-pod `PolicyScopeCache`, giving scoped
+    // (Namespace/WorkloadSelector) mesh policies the same enforcement on raw
+    // TCP streams that the HTTP/HBONE path already gets. Injected here, after
+    // `with_node_waypoint_identity_resolver` populated the field on
+    // `proxy_state`, and BEFORE `initial_reconcile_stream_listeners()` below so
+    // listeners binding on startup observe it. `None` (and thus a no-op) in
+    // every non-NodeWaypoint topology. UDP/DTLS listeners deliberately do not
+    // consume the resolver — see `StreamListenerManager::set_node_waypoint_identity_resolver`.
+    if let Some(resolver) = proxy_state.node_waypoint_identity_resolver.as_ref() {
+        proxy_state
+            .stream_listener_manager
+            .set_node_waypoint_identity_resolver(resolver.clone());
+    }
 
     // Install the initial mesh outbound enforcement slot (T5-B). The
     // slice-apply loop refreshes this on every subsequent accepted slice,

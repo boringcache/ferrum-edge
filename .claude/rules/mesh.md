@@ -72,6 +72,14 @@ Full operator docs live in `docs/mesh.md`. Keep this file to implementation inva
 - Explicit empty `trusted_hbone_assertors: []` disables baggage rewriting entirely.
 - Keep fallback baggage key aliases in `HboneIdentity::from_headers()` in sync with tests.
 
+## Node-Waypoint Per-Pod Policy Scope
+
+- One node-waypoint listener serves many pods; source pod identity comes from the eBPF `connect4`/`connect6` cgroup-stamped `SO_COOKIE` record, resolved through `NodeWaypointIdentityResolver`.
+- HBONE/HTTP and raw **TCP** stream accept paths both resolve the connection's pod identity and stamp `node_waypoint_policy_scope` (HTTP: `RequestContext`, TCP: `StreamConnectionContext`) via `policy_scope_for_pod(pod_uid)`, so `mesh_authz` enforces Namespace/WorkloadSelector-scoped policies per source pod. The TCP path threads the resolver `ProxyState` → `StreamListenerManager::set_node_waypoint_identity_resolver` (injected before the first stream reconcile) → `TcpListenerConfig` → accept loop (`resolve_node_waypoint_stream_scope`).
+- An unresolved scope keeps **mesh-wide-only** policies and sets `mesh_authz.scope_missing=true`. Unlike the HBONE listener (which drops on unresolved identity), TCP streams fail-closed-soft — downgrade to mesh-wide, do not refuse the connection.
+- **UDP/DTLS** stream proxies stay mesh-wide-only and pass `node_waypoint_policy_scope: None`: a shared UDP frontend socket carries one cookie for all clients and there are no UDP capture hooks, so there is no per-source-pod cookie to resolve. Do not "fix" this by resolving the listener socket's cookie — that misattributes every session to one identity.
+- Only `NodeWaypoint` topology installs the resolver. Sidecar/Ambient/east-west/egress and non-mesh stream proxies pass `None` and are unchanged.
+
 ## PeerAuthentication And TLS Reload
 
 - By default, inbound mesh mTLS mode resolves once from the initial slice.

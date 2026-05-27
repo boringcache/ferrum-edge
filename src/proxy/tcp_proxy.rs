@@ -38,6 +38,65 @@ pub(crate) fn classify_stream_error(error: &anyhow::Error) -> crate::retry::Erro
     crate::retry::classify_boxed_error(error.as_ref())
 }
 
+/// Resolve a node-waypoint TCP connection's source pod identity to a per-pod
+/// authorization scope, mirroring the HTTP/HBONE admit path in
+/// `src/proxy/mod.rs`.
+///
+/// Returns `(policy_scope, peer_spiffe_id)`:
+/// - `policy_scope` is stamped onto `StreamConnectionContext.node_waypoint_policy_scope`
+///   so `mesh_authz` enforces Namespace/WorkloadSelector-scoped policies for the
+///   resolved source pod rather than treating every stream as mesh-wide.
+/// - `peer_spiffe_id` is the resolved pod's SPIFFE ID, stamped into stream
+///   metadata as the authenticated source principal (parity with
+///   `RequestContext.peer_spiffe_id`).
+///
+/// Behavior:
+/// - `resolver` is `None` outside `NodeWaypoint` topology and for non-mesh TCP
+///   proxies → returns `(None, None)`; the stream is mesh-wide-only with no
+///   per-pod scope consulted (unchanged pre-fix behavior).
+/// - When the connection's `SO_COOKIE` cannot be resolved to an enrolled pod
+///   (no node-agent enrollment yet, non-Linux, unknown cookie, identity race),
+///   returns `(None, None)`. `mesh_authz` then evaluates mesh-wide policies only
+///   and stamps `mesh_authz.scope_missing=true` — the same safe default the HTTP
+///   path uses for an unresolved per-pod scope.
+///
+/// Fail-closed-soft, deliberately unlike the HBONE listener which drops a
+/// connection without a resolved identity: raw TCP stream proxies in
+/// node-waypoint topology may legitimately carry non-captured traffic, so an
+/// unresolved cookie downgrades to mesh-wide enforcement rather than refusing
+/// the stream. The scope itself (`PolicyScopeCache`) may still be `None` even
+/// when the identity resolves — a slice/identity enrollment race — which also
+/// yields mesh-wide-only via the same `mesh_authz` fallback.
+fn resolve_node_waypoint_stream_scope(
+    resolver: Option<&crate::modes::mesh::node_waypoint::NodeWaypointIdentityResolver>,
+    stream: &TcpStream,
+    proxy_id: &str,
+    client_ip: &str,
+) -> (
+    Option<Arc<crate::modes::mesh::runtime::PolicyScopeCache>>,
+    Option<String>,
+) {
+    let Some(resolver) = resolver else {
+        return (None, None);
+    };
+    match resolver.resolve_stream(stream) {
+        Ok(identity) => (
+            resolver.policy_scope_for_pod(&identity.pod_uid),
+            Some(identity.spiffe_id.as_str().to_string()),
+        ),
+        Err(error) => {
+            debug!(
+                proxy_id = %proxy_id,
+                client = %client_ip,
+                error = %error,
+                "Node-waypoint TCP stream: no resolved pod identity; \
+                 falling back to mesh-wide authorization"
+            );
+            (None, None)
+        }
+    }
+}
+
 /// Decide whether a write-side error can be treated as the tail of a graceful
 /// shutdown rather than a genuine transport failure.
 ///
@@ -850,6 +909,15 @@ pub struct TcpListenerConfig {
     /// are dropped with no backend connect and no circuit-breaker hit.
     pub mesh_outbound_enforcement:
         crate::modes::mesh::outbound_enforcement::SharedMeshOutboundEnforcement,
+    /// Node-waypoint identity resolver. `Some` only in `NodeWaypoint`
+    /// topology, where each accepted connection's `SO_COOKIE` is resolved to a
+    /// source pod identity so the per-pod `PolicyScopeCache` can be stamped
+    /// onto `StreamConnectionContext.node_waypoint_policy_scope` (parity with
+    /// the HTTP/HBONE admit path in `src/proxy/mod.rs`). `None` for every other
+    /// topology and for non-mesh TCP proxies — those pass no per-pod scope and
+    /// `mesh_authz` (when present) evaluates mesh-wide policies only.
+    pub node_waypoint_identity_resolver:
+        Option<Arc<crate::modes::mesh::node_waypoint::NodeWaypointIdentityResolver>>,
 }
 
 #[derive(Clone)]
@@ -877,6 +945,8 @@ struct TcpAcceptLoopState {
     record_mesh_mtls_metric: bool,
     mesh_outbound_enforcement:
         crate::modes::mesh::outbound_enforcement::SharedMeshOutboundEnforcement,
+    node_waypoint_identity_resolver:
+        Option<Arc<crate::modes::mesh::node_waypoint::NodeWaypointIdentityResolver>>,
 }
 
 /// Start a TCP proxy listener on the given port.
@@ -918,6 +988,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         io_uring_splice_enabled,
         record_mesh_mtls_metric,
         mesh_outbound_enforcement,
+        node_waypoint_identity_resolver,
     } = cfg;
     let addr = SocketAddr::new(bind_addr, port);
     let backlog = tcp_listen_backlog as i32;
@@ -1002,6 +1073,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         io_uring_splice_enabled,
         record_mesh_mtls_metric,
         mesh_outbound_enforcement,
+        node_waypoint_identity_resolver,
     };
 
     // Bind all extra sockets before spawning any accept loops. If one bind
@@ -1112,6 +1184,12 @@ async fn run_tcp_accept_loop(
                 let io_uring_splice_enabled = state.io_uring_splice_enabled;
                 let record_mesh_mtls_metric = state.record_mesh_mtls_metric;
                 let mesh_outbound_enforcement = state.mesh_outbound_enforcement.clone();
+                // `Some` only in NodeWaypoint topology; used below to resolve
+                // this connection's source pod identity for per-pod policy
+                // scoping. Cheap `Option<Arc>` clone per accept; `None`
+                // everywhere else short-circuits with zero syscalls.
+                let node_waypoint_identity_resolver =
+                    state.node_waypoint_identity_resolver.clone();
 
                 tokio::spawn(async move {
                     // Track this connection for global overload accounting and graceful drain.
@@ -1121,6 +1199,26 @@ async fn run_tcp_accept_loop(
                     let connected_at = Instant::now();
                     let connected_wall_at = chrono::Utc::now();
                     let client_ip = remote_addr.ip().to_string();
+
+                    // Node-waypoint per-pod policy scoping (parity with the
+                    // HTTP/HBONE admit path in `src/proxy/mod.rs`). When this
+                    // listener carries a `NodeWaypointIdentityResolver`
+                    // (NodeWaypoint topology only), resolve the accepted
+                    // connection's `SO_COOKIE` to its source pod identity, then
+                    // look up that pod's `PolicyScopeCache`. The resolved scope
+                    // and SPIFFE principal are stamped onto the
+                    // `StreamConnectionContext` below so `mesh_authz` enforces
+                    // namespace/selector-scoped policies for the correct source
+                    // pod instead of treating every stream as mesh-wide. See
+                    // [`resolve_node_waypoint_stream_scope`] for the fail-closed
+                    // semantics.
+                    let (node_waypoint_policy_scope, node_waypoint_peer_spiffe_id) =
+                        resolve_node_waypoint_stream_scope(
+                            node_waypoint_identity_resolver.as_deref(),
+                            &stream,
+                            &proxy_id,
+                            &client_ip,
+                        );
                     let epoch = request_epoch.load();
                     let base_proxy = epoch
                         .config
@@ -1149,17 +1247,26 @@ async fn run_tcp_accept_loop(
                         tls_client_cert_chain_der: None,
                         sni_hostname: None,
                         mesh_direction: None,
-                        // TCP stream accept loops do not wire a
-                        // NodeWaypointIdentityResolver, so per-pod policy
-                        // scoping is not available. When per_pod_policy_scoping
-                        // is enabled (node-waypoint topology), the authz plugin
-                        // falls back to mesh-wide policies only. This means
-                        // namespace- and selector-scoped policies are not
-                        // enforced for TCP streams (HTTP only). A scoped ALLOW
-                        // with no mesh-wide counterpart falls through to the
-                        // default-allow posture, not a closed posture.
-                        node_waypoint_policy_scope: None,
+                        // Populated above from the node-waypoint resolver in
+                        // NodeWaypoint topology so `mesh_authz` enforces
+                        // namespace/selector-scoped policies per source pod
+                        // (parity with the HTTP/HBONE path). `None` for every
+                        // other topology and non-mesh TCP proxies, and when the
+                        // connection's source pod identity cannot be resolved
+                        // (mesh-wide-only fallback + `mesh_authz.scope_missing`).
+                        node_waypoint_policy_scope,
                     };
+                    // In node-waypoint topology the resolved pod SPIFFE ID is
+                    // the authenticated source principal for this connection
+                    // (mirrors `RequestContext.peer_spiffe_id` on the HTTP
+                    // path). Stamp it into stream metadata so `mesh_authz`'s
+                    // stream path consumes the pod identity for
+                    // source-principal-matched policies. Only stamped when the
+                    // resolver produced an identity; otherwise the stream keeps
+                    // whatever a stream auth plugin establishes.
+                    if let Some(peer_spiffe_id) = node_waypoint_peer_spiffe_id {
+                        stream_ctx.insert_metadata("peer_spiffe_id".to_string(), peer_spiffe_id);
+                    }
 
                     // `ArcSwap::load()` returns a `Guard` over `Arc<Option<Arc<...>>>`;
                     // pull the inner `Option<Arc<...>>` so the borrow is decoupled from
@@ -5957,5 +6064,109 @@ mod backend_inflight_tests {
             BackendInflightGuard::try_acquire(&counters, "h", 1, 0).expect_err("cap 0 rejects");
         assert!(err.to_string().contains("cap 0"));
         assert_eq!(counters.inflight("h", 1), 0);
+    }
+}
+
+#[cfg(test)]
+mod node_waypoint_stream_scope_tests {
+    //! Unit tests for [`resolve_node_waypoint_stream_scope`], the TCP stream
+    //! accept-path helper that maps a connection to its source pod's
+    //! per-pod authorization scope (parity with the HTTP/HBONE admit path).
+
+    use super::resolve_node_waypoint_stream_scope;
+
+    /// Non-node-waypoint topologies (and non-mesh TCP proxies) pass no resolver,
+    /// so the accept path stamps no per-pod scope — behavior is unchanged.
+    /// `stream` is never touched on this path, so a real socket is unnecessary.
+    #[tokio::test]
+    async fn none_resolver_yields_no_scope_and_no_principal() {
+        // Bind+connect so we have a genuine `TcpStream` to pass; the helper
+        // short-circuits on `None` before reading it.
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let connect = tokio::spawn(async move { tokio::net::TcpStream::connect(addr).await });
+        let (accepted, _peer) = listener.accept().await.expect("accept");
+        let _client = connect.await.expect("join").expect("connect");
+
+        let (scope, principal) =
+            resolve_node_waypoint_stream_scope(None, &accepted, "proxy", "127.0.0.1");
+        assert!(scope.is_none(), "no resolver must yield no per-pod scope");
+        assert!(principal.is_none(), "no resolver must yield no principal");
+    }
+
+    /// Full resolution against a real accepted socket: the helper reads the
+    /// connection's `SO_COOKIE`, resolves it to the enrolled pod, and returns
+    /// that pod's installed `PolicyScopeCache` plus its SPIFFE principal —
+    /// exactly what the accept loop stamps onto the stream context. Linux-only
+    /// because `SO_COOKIE` is a Linux socket option.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn resolver_maps_real_socket_to_installed_scope() {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        use ferrum_ebpf_common::OrigDst4;
+
+        use crate::identity::SpiffeId;
+        use crate::modes::mesh::node_waypoint::{
+            NodeWaypointIdentity, NodeWaypointIdentityResolver, parse_pod_uid,
+        };
+        use crate::modes::mesh::runtime::PolicyScopeCache;
+
+        let resolver = Arc::new(NodeWaypointIdentityResolver::new(0));
+        let pod = parse_pod_uid("11111111-1111-1111-1111-111111111111").unwrap();
+        let spiffe = SpiffeId::new("spiffe://cluster.local/ns/team-a/sa/api").unwrap();
+        let identity = NodeWaypointIdentity::new(pod, spiffe.clone());
+        let hash = identity.workload_spiffe_hash;
+        resolver.upsert_identity(identity);
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let connect = tokio::spawn(async move { tokio::net::TcpStream::connect(addr).await });
+        let (accepted, _peer) = listener.accept().await.expect("accept");
+        let _client = connect.await.expect("join").expect("connect");
+
+        // Register the orig-dst record under the *accepted* socket's real
+        // cookie (the accept-side registrar contract) and install the pod scope.
+        let cookie = crate::socket_opts::socket_cookie(&accepted).expect("SO_COOKIE");
+        resolver.record_orig_dst4(
+            cookie,
+            OrigDst4 {
+                addr: 0x0a00_0001,
+                port: 8080,
+                pod_uid: pod,
+                workload_spiffe_hash: hash,
+            },
+        );
+        let mut scopes = HashMap::new();
+        scopes.insert(
+            pod,
+            Arc::new(PolicyScopeCache::new(
+                spiffe.clone(),
+                "team-a",
+                HashMap::new(),
+            )),
+        );
+        resolver.install_policy_scopes(scopes);
+
+        let (scope, principal) = resolve_node_waypoint_stream_scope(
+            Some(resolver.as_ref()),
+            &accepted,
+            "proxy",
+            "127.0.0.1",
+        );
+        assert!(
+            scope.is_some(),
+            "resolved pod with an installed scope must yield Some(scope)"
+        );
+        assert_eq!(
+            principal.as_deref(),
+            Some("spiffe://cluster.local/ns/team-a/sa/api"),
+            "resolved pod SPIFFE ID must be returned as the source principal"
+        );
     }
 }

@@ -9519,8 +9519,12 @@ components:
           default: false
           description: |
             When `true`, the construction-time slice-level scope filter is
-            skipped and policies are filtered per-request using the
-            `PolicyScopeCache` attached to `RequestContext.node_waypoint_policy_scope`.
+            skipped and policies are filtered per-connection using the
+            `PolicyScopeCache` attached to `RequestContext.node_waypoint_policy_scope`
+            (HTTP/HBONE) or `StreamConnectionContext.node_waypoint_policy_scope`
+            (raw TCP streams). A connection with no resolved per-pod scope falls
+            back to mesh-wide-only policies and records `mesh_authz.scope_missing`.
+            UDP/DTLS streams remain mesh-wide-only (no per-source-pod cookie).
             Auto-set by mesh injection on `NodeWaypoint` topology where one
             listener serves many pods.
         trusted_hbone_assertors:
