@@ -1889,12 +1889,38 @@ where
                     }
                 }
             }
+            // A response-body transform like grpc_web reads the gRPC status from
+            // the headers map it is handed (the H2 buffered path merges trailers
+            // into headers as Trailers-Only before this hook). On this H3 path
+            // the gRPC trailers (grpc-status / grpc-message) are kept separate in
+            // `response_trailers` so plain gRPC-over-H3 can send real H3 trailers
+            // — but that hides grpc-status from grpc_web, which then synthesizes
+            // UNKNOWN(2) for an otherwise-successful response. Hand the transform
+            // a merged headers+trailers VIEW (built only when trailers exist; a
+            // trailer never overrides a real header) so the true status is
+            // embedded, while leaving the wire `response_headers` /
+            // `response_trailers` untouched — plain gRPC must keep real trailers,
+            // not Trailers-Only.
+            let transform_headers_with_trailers = (!response_trailers.is_empty()).then(|| {
+                let mut merged = response_headers.clone();
+                for (key, value) in &response_trailers {
+                    merged.entry(key.clone()).or_insert_with(|| value.clone());
+                }
+                merged
+            });
             for plugin in plugins.iter() {
+                // Re-borrow per iteration so the immutable view ends before the
+                // `response_headers` mutation below (content-length is the only
+                // field mutated here; trailers — and thus grpc-status — are
+                // immutable, so the merged view stays correct across iterations).
+                let transform_headers = transform_headers_with_trailers
+                    .as_ref()
+                    .unwrap_or(&response_headers);
                 if let Some(transformed) = plugin
                     .transform_response_body(
                         &response_body,
                         content_type_of(&response_headers),
-                        &response_headers,
+                        transform_headers,
                     )
                     .await
                 {

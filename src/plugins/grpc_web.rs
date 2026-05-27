@@ -189,11 +189,17 @@ pub(crate) fn build_trailer_frame(response_headers: &HashMap<String, String>) ->
                 // (`grpc-status: abc`) value is malformed — skip forwarding it
                 // so the synthesized UNKNOWN (grpc-status: 2) below is emitted
                 // instead of passing a bogus status (or duplicating it).
-                if value.trim().parse::<u32>().is_ok() {
-                    has_grpc_status = true;
-                } else {
+                let Ok(code) = value.trim().parse::<u32>() else {
                     continue;
-                }
+                };
+                has_grpc_status = true;
+                // Emit the normalized (parsed) value, not the raw header, so the
+                // forwarded frame is self-consistent with what was validated
+                // (e.g. any surrounding OWS is dropped).
+                trailer_payload.extend_from_slice(b"grpc-status: ");
+                trailer_payload.extend_from_slice(code.to_string().as_bytes());
+                trailer_payload.extend_from_slice(b"\r\n");
+                continue;
             }
             trailer_payload.extend_from_slice(header_name.as_str().as_bytes());
             trailer_payload.extend_from_slice(b": ");
