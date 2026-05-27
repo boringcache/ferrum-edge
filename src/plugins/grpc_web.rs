@@ -184,7 +184,16 @@ pub(crate) fn build_trailer_frame(response_headers: &HashMap<String, String>) ->
             && is_valid_trailer_value(value)
         {
             if header_name.as_str() == "grpc-status" {
-                has_grpc_status = true;
+                // Only a present, numeric grpc-status is a valid terminal
+                // status. An empty (`grpc-status:`) or non-numeric
+                // (`grpc-status: abc`) value is malformed — skip forwarding it
+                // so the synthesized UNKNOWN (grpc-status: 2) below is emitted
+                // instead of passing a bogus status (or duplicating it).
+                if value.trim().parse::<u32>().is_ok() {
+                    has_grpc_status = true;
+                } else {
+                    continue;
+                }
             }
             trailer_payload.extend_from_slice(header_name.as_str().as_bytes());
             trailer_payload.extend_from_slice(b": ");
@@ -193,9 +202,9 @@ pub(crate) fn build_trailer_frame(response_headers: &HashMap<String, String>) ->
         }
     }
 
-    // A backend response without a valid grpc-status is malformed. Native gRPC
-    // clients treat HTTP 200 without grpc-status as UNKNOWN; gRPC-Web must not
-    // silently report OK.
+    // A backend response without a present, numeric grpc-status is malformed.
+    // Native gRPC clients treat HTTP 200 without grpc-status as UNKNOWN;
+    // gRPC-Web must not silently report OK.
     if !has_grpc_status {
         trailer_payload.extend_from_slice(b"grpc-status: 2\r\n");
     }
