@@ -50,6 +50,7 @@ fn runtime() -> MeshRuntimeConfig {
         workload_svid_key_path: None,
         workload_svid_trust_bundle_path: None,
         egress_stream_enabled: false,
+        request_auth_require_exp: true,
     }
 }
 

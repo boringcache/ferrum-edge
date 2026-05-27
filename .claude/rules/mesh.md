@@ -75,7 +75,9 @@ Full operator docs live in `docs/mesh.md`. Keep this file to implementation inva
 ## PeerAuthentication And TLS Reload
 
 - By default, inbound mesh mTLS mode resolves once from the initial slice.
-- With `FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED=true`, only resolved mTLS mode and frontend client CA verifier may hot-swap on slice apply.
+- When all three `FERRUM_GATEWAY_SVID_*` paths are set, the inbound mTLS/HBONE listener uses a SPIFFE client-cert verifier that validates the peer SAN's trust domain against the gateway SVID local bundle plus slice federated bundles; without SVID material it falls back to chain-only verification over `FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH`. STRICT requires a peer cert; PERMISSIVE trust-domain-validates an offered cert but still admits cert-less peers. The HBONE baggage trust-gate rests on this verified identity.
+- The mesh `RequestAuthentication` (`jwks_auth`) plugin requires the JWT `exp` claim by default (`FERRUM_MESH_REQUEST_AUTH_REQUIRE_EXP=true`); operators may relax it. Expiry validation (rejecting present-but-expired `exp`) is always on.
+- With `FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED=true`, only resolved mTLS mode, frontend client CA verifier, and the lock-free SPIFFE SVID bundle slot (federated trust domains) may hot-swap on slice apply.
 - Frontend cert/key paths remain restart-required inputs for mesh peer auth reload.
 - Coverage includes mesh HTTP/HBONE termination listeners and mesh-shared TCP+TLS / UDP+DTLS stream listeners.
 - `apply_mesh_inbound_tls_reload` publishes swapped `ServerConfig` into HBONE, shared stream TLS, and active `DtlsServer` frontend DTLS configs.

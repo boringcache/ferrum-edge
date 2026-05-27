@@ -98,6 +98,7 @@ fn test_runtime() -> MeshRuntimeConfig {
         sidecar_enforced_dry_run: false,
         sidecar_identity_narrowing: false,
         egress_stream_enabled: false,
+        request_auth_require_exp: true,
     }
 }
 
