@@ -271,11 +271,12 @@ async fn test_xml_unexpected_closing_tag_rejected() {
     assert_reject(result, Some(400));
 }
 
-// Buffered/late request-body path: when `before_proxy` could not validate
-// (body not yet in ctx.metadata), `on_final_request_body` must still enforce
-// required XML elements even when `validate_xml` is not set. Without this the
-// `has_xml_validation` gate could silently revert to `self.validate_xml` and
-// stop enforcing required elements on the buffered path.
+// Required-element enforcement — unified gate (has_xml_request_validation):
+// `on_final_request_body` is the authoritative gate for required-element
+// enforcement when `validate_xml` is unset. Both `before_proxy` and
+// `on_final_request_body` share the same `has_xml_request_validation` flag
+// (true when validate_xml is set OR required_xml_elements is non-empty), so
+// neither path can silently skip required-element checks.
 
 #[tokio::test]
 async fn test_on_final_request_body_enforces_xml_required_elements_without_validate_xml() {
@@ -1401,6 +1402,42 @@ async fn test_response_xml_required_elements() {
             .on_final_response_body(&mut ctx, 200, &headers, body)
             .await,
         Some(502),
+    );
+}
+
+// Response-side required-element enforcement without response_validate_xml:
+// A config with `response_required_xml_elements` set but `response_validate_xml`
+// unset must still enforce required-element checks via has_xml_response_validation.
+// This mirrors the request-side fix and closes the silent-skip bug on responses.
+
+#[tokio::test]
+async fn test_on_final_response_body_enforces_xml_required_elements_without_response_validate_xml()
+{
+    let plugin =
+        BodyValidator::new(&json!({"response_required_xml_elements": ["result"]})).unwrap();
+    let mut ctx = make_response_ctx();
+    let headers = response_xml_headers();
+    let body = b"<root><data>text</data></root>";
+    assert_reject(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &headers, body)
+            .await,
+        Some(502),
+    );
+}
+
+#[tokio::test]
+async fn test_on_final_response_body_accepts_present_xml_required_elements_without_response_validate_xml()
+ {
+    let plugin =
+        BodyValidator::new(&json!({"response_required_xml_elements": ["result"]})).unwrap();
+    let mut ctx = make_response_ctx();
+    let headers = response_xml_headers();
+    let body = b"<root><result>ok</result></root>";
+    assert_continue(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &headers, body)
+            .await,
     );
 }
 

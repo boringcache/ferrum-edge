@@ -40,8 +40,6 @@ pub struct BodyValidator {
     json_schema: Option<Value>,
     /// Required JSON fields (simple validation without full JSON Schema).
     required_fields: Vec<String>,
-    /// Whether to validate XML request bodies are well-formed.
-    validate_xml: bool,
     /// Required XML elements in request bodies.
     required_xml_elements: Vec<String>,
     /// Content types to validate for requests (empty = validate all).
@@ -54,8 +52,6 @@ pub struct BodyValidator {
     response_json_schema: Option<Value>,
     /// Required JSON fields in response bodies.
     response_required_fields: Vec<String>,
-    /// Whether to validate XML response bodies are well-formed.
-    response_validate_xml: bool,
     /// Required XML elements in response bodies.
     response_required_xml_elements: Vec<String>,
     /// Content types to validate for responses.
@@ -89,6 +85,10 @@ pub struct BodyValidator {
     has_protobuf_response_validation: bool,
     /// Whether request validation must run in before_proxy (JSON/XML only).
     has_pre_proxy_request_validation: bool,
+    /// Whether XML request validation is active (validate_xml OR required_xml_elements non-empty).
+    has_xml_request_validation: bool,
+    /// Whether XML response validation is active (response_validate_xml OR response_required_xml_elements non-empty).
+    has_xml_response_validation: bool,
 }
 
 impl BodyValidator {
@@ -138,14 +138,15 @@ impl BodyValidator {
                 .values()
                 .any(|e| e.response.is_some());
 
-        let has_json_xml_request = json_schema.is_some()
-            || !required_fields.is_empty()
-            || validate_xml
-            || !required_xml_elements.is_empty();
+        let has_xml_request_validation = validate_xml || !required_xml_elements.is_empty();
+        let has_xml_response_validation =
+            response_validate_xml || !response_required_xml_elements.is_empty();
+
+        let has_json_xml_request =
+            json_schema.is_some() || !required_fields.is_empty() || has_xml_request_validation;
         let has_json_xml_response = response_json_schema.is_some()
             || !response_required_fields.is_empty()
-            || response_validate_xml
-            || !response_required_xml_elements.is_empty();
+            || has_xml_response_validation;
 
         let has_request_validation = has_json_xml_request || has_protobuf_request_validation;
         let has_response_validation = has_json_xml_response || has_protobuf_response_validation;
@@ -174,13 +175,11 @@ impl BodyValidator {
         Ok(Self {
             json_schema,
             required_fields,
-            validate_xml,
             required_xml_elements,
             content_types,
             compiled_patterns,
             response_json_schema,
             response_required_fields,
-            response_validate_xml,
             response_required_xml_elements,
             response_content_types,
             response_compiled_patterns,
@@ -195,6 +194,8 @@ impl BodyValidator {
             has_protobuf_request_validation,
             has_protobuf_response_validation,
             has_pre_proxy_request_validation: has_json_xml_request,
+            has_xml_request_validation,
+            has_xml_response_validation,
         })
     }
 
@@ -1277,7 +1278,7 @@ impl Plugin for BodyValidator {
                 self.json_schema.as_ref(),
                 &self.compiled_patterns,
             )
-        } else if is_xml_like_content_type(content_type) && self.validate_xml {
+        } else if is_xml_like_content_type(content_type) && self.has_xml_request_validation {
             Self::validate_xml_body(body, &self.required_xml_elements)
         } else {
             Ok(())
@@ -1327,8 +1328,7 @@ impl Plugin for BodyValidator {
             // mis-treat a non-gRPC payload as malformed JSON.
             let has_json_validation =
                 self.json_schema.is_some() || !self.required_fields.is_empty();
-            let has_xml_validation = self.validate_xml || !self.required_xml_elements.is_empty();
-            if !has_json_validation && !has_xml_validation {
+            if !has_json_validation && !self.has_xml_request_validation {
                 return PluginResult::Continue;
             }
 
@@ -1351,7 +1351,7 @@ impl Plugin for BodyValidator {
                     self.json_schema.as_ref(),
                     &self.compiled_patterns,
                 )
-            } else if is_xml_like_content_type(content_type) && has_xml_validation {
+            } else if is_xml_like_content_type(content_type) && self.has_xml_request_validation {
                 Self::validate_xml_body(body_str, &self.required_xml_elements)
             } else {
                 Ok(())
@@ -1493,7 +1493,7 @@ impl Plugin for BodyValidator {
                 self.response_json_schema.as_ref(),
                 &self.response_compiled_patterns,
             )
-        } else if is_xml_like_content_type(content_type) && self.response_validate_xml {
+        } else if is_xml_like_content_type(content_type) && self.has_xml_response_validation {
             Self::validate_xml_body(body_str, &self.response_required_xml_elements)
         } else {
             Ok(())
