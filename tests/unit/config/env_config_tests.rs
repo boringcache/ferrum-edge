@@ -145,9 +145,11 @@ fn test_xds_enabled_defaults_false() {
         || {
             remove_var("FERRUM_XDS_ENABLED");
             remove_var("FERRUM_XDS_STREAM_CHANNEL_CAPACITY");
+            remove_var("FERRUM_XDS_MAX_STREAMS_PER_NODE");
             let config = EnvConfig::from_env().unwrap();
             assert!(!config.xds_enabled);
             assert_eq!(config.xds_stream_channel_capacity, 32);
+            assert_eq!(config.xds_max_streams_per_node, 4);
         },
     );
 }
@@ -160,11 +162,13 @@ fn test_xds_enabled_parsed_from_env() {
             ("FERRUM_FILE_CONFIG_PATH", "/path/to/config.yaml"),
             ("FERRUM_XDS_ENABLED", "true"),
             ("FERRUM_XDS_STREAM_CHANNEL_CAPACITY", "64"),
+            ("FERRUM_XDS_MAX_STREAMS_PER_NODE", "8"),
         ],
         || {
             let config = EnvConfig::from_env().unwrap();
             assert!(config.xds_enabled);
             assert_eq!(config.xds_stream_channel_capacity, 64);
+            assert_eq!(config.xds_max_streams_per_node, 8);
         },
     );
 }

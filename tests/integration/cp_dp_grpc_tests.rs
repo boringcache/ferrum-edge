@@ -899,6 +899,111 @@ async fn test_xds_ads_stream_returns_lds_snapshot() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_xds_ads_per_node_stream_cap_rejects_excess_streams() {
+    use ferrum_edge::xds::proto::aggregated_discovery_service_client::AggregatedDiscoveryServiceClient;
+    use ferrum_edge::xds::proto::{DiscoveryRequest, Node};
+
+    let config_arc = Arc::new(ArcSwap::new(Arc::new(create_test_mesh_config())));
+    let (_cp_server, update_tx) =
+        CpGrpcServer::new(config_arc.clone(), TEST_JWT_SECRET.to_string());
+    // Cap concurrent ADS streams per node id at 1.
+    let xds_server = XdsAdsServer::new(
+        config_arc,
+        update_tx,
+        TEST_JWT_SECRET.to_string(),
+        ferrum_edge::grpc::cp_server::DEFAULT_CP_DP_JWT_ISSUER.to_string(),
+        "ferrum".to_string(),
+        32,
+    )
+    .with_max_streams_per_node(1);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+    let _server_handle = tokio::spawn(async move {
+        Server::builder()
+            .add_service(xds_server.into_service())
+            .serve_with_incoming(incoming)
+            .await
+            .expect("xDS server failed");
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let url = format!("http://127.0.0.1:{}", addr.port());
+    let token = dp_client::generate_dp_jwt(TEST_JWT_SECRET, "capped-node").unwrap();
+    let bearer =
+        move || tonic::metadata::MetadataValue::try_from(format!("Bearer {token}")).unwrap();
+    let lds_request = || DiscoveryRequest {
+        version_info: String::new(),
+        node: Some(Node {
+            id: "capped-node".to_string(),
+            cluster: String::new(),
+            metadata: Vec::new(),
+        }),
+        resource_names: vec!["*".to_string()],
+        type_url: LDS_TYPE_URL.to_string(),
+        response_nonce: String::new(),
+        error_detail: None,
+    };
+
+    // First stream: keep the request sender alive so the stream stays open.
+    let channel_one = tonic::transport::Channel::from_shared(url.clone())
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut client_one = AggregatedDiscoveryServiceClient::new(channel_one);
+    let (req_tx_one, req_rx_one) = tokio::sync::mpsc::channel::<DiscoveryRequest>(4);
+    req_tx_one.send(lds_request()).await.unwrap();
+    let mut request_one =
+        tonic::Request::new(tokio_stream::wrappers::ReceiverStream::new(req_rx_one));
+    request_one.metadata_mut().insert("authorization", bearer());
+    let mut stream_one = client_one
+        .stream_aggregated_resources(request_one)
+        .await
+        .unwrap()
+        .into_inner();
+    // Drain the first response so the server has registered the node stream.
+    let first = stream_one.message().await.unwrap().unwrap();
+    assert_eq!(first.type_url, LDS_TYPE_URL);
+
+    // Second concurrent stream for the SAME node id must be rejected once its
+    // first request resolves the node id and trips the per-node ceiling.
+    let channel_two = tonic::transport::Channel::from_shared(url)
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut client_two = AggregatedDiscoveryServiceClient::new(channel_two);
+    let (req_tx_two, req_rx_two) = tokio::sync::mpsc::channel::<DiscoveryRequest>(4);
+    req_tx_two.send(lds_request()).await.unwrap();
+    let mut request_two =
+        tonic::Request::new(tokio_stream::wrappers::ReceiverStream::new(req_rx_two));
+    request_two.metadata_mut().insert("authorization", bearer());
+    let mut stream_two = client_two
+        .stream_aggregated_resources(request_two)
+        .await
+        .unwrap()
+        .into_inner();
+    let rejection = timeout(Duration::from_secs(5), stream_two.message())
+        .await
+        .expect("second stream resolves quickly")
+        .expect_err("second concurrent stream for the node must be rejected");
+    assert_eq!(rejection.code(), tonic::Code::ResourceExhausted);
+    assert!(
+        rejection
+            .message()
+            .contains("per-node concurrent stream limit"),
+        "unexpected rejection message: {}",
+        rejection.message()
+    );
+
+    // Keep the first stream's sender alive until the assertion completes so the
+    // ceiling is genuinely exercised against a live concurrent stream.
+    drop(req_tx_one);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_dp_receives_config_updates() {
     // Start CP server with initial config of 1 proxy
     let cp_config = create_test_config(1);

@@ -33,6 +33,12 @@ use crate::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
 
 const MAX_SUBSCRIPTIONS_PER_STREAM: usize = 32;
 const MAX_RESOURCE_NAMES_PER_REQUEST: usize = 1024;
+/// Default per-node concurrent ADS stream ceiling when the operator does not
+/// set `FERRUM_XDS_MAX_STREAMS_PER_NODE`. A healthy DP keeps a single ADS
+/// stream; the small headroom tolerates brief overlap during a client
+/// reconnect (old stream draining while the new one establishes) without
+/// admitting a stream-exhaustion flood.
+pub const DEFAULT_XDS_MAX_STREAMS_PER_NODE: usize = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct XdsSubscription {
@@ -96,27 +102,50 @@ pub struct XdsAdsServer {
     cluster_domain: String,
 }
 
-#[derive(Default)]
 struct XdsStreamRegistry {
     // ADS stream counts are outside the proxy hot path and exist only when
     // FERRUM_XDS_ENABLED=true, so default DashMap sharding is intentional here.
     counts: DashMap<String, usize>,
+    // Per-node concurrent ADS stream ceiling. `0` disables the cap (unbounded,
+    // back-compat with the historical count-only behavior). A misbehaving or
+    // hostile DP that opens many authenticated streams under one node id can
+    // otherwise pin server memory (one snapshot/nonce/subscription set per
+    // stream), so this is a DoS guard for `FERRUM_XDS_ENABLED=true` fleets.
+    max_streams_per_node: usize,
 }
 
 impl XdsStreamRegistry {
-    fn register(&self, node_id: &str) {
-        // TODO(Phase C): enforce a per-node ADS stream ceiling once mesh
-        // listeners can create large fleets of authenticated xDS clients.
-        // Phase B keeps xDS opt-in/off by default and only tracks counts so
-        // final stream teardown can drop per-node cache/nonce state.
+    fn new(max_streams_per_node: usize) -> Self {
+        Self {
+            counts: DashMap::new(),
+            max_streams_per_node,
+        }
+    }
+
+    /// Increment the per-node ADS stream count, rejecting registration when the
+    /// node is already at its concurrent-stream ceiling.
+    ///
+    /// On `Err` the caller must NOT treat the stream as registered (the count
+    /// is left untouched), so no matching `unregister` is owed.
+    #[allow(clippy::result_large_err)]
+    fn register(&self, node_id: &str) -> Result<(), Status> {
         match self.counts.entry(node_id.to_string()) {
             Entry::Occupied(mut entry) => {
+                if self.max_streams_per_node != 0 && *entry.get() >= self.max_streams_per_node {
+                    return Err(Status::resource_exhausted(format!(
+                        "xDS per-node concurrent stream limit exceeded (max {} per node id)",
+                        self.max_streams_per_node
+                    )));
+                }
                 *entry.get_mut() += 1;
             }
             Entry::Vacant(entry) => {
+                // First stream for this node is always admitted (a cap of 1
+                // still allows exactly one stream).
                 entry.insert(1);
             }
         }
+        Ok(())
     }
 
     fn unregister(&self, node_id: &str) -> bool {
@@ -156,13 +185,15 @@ impl XdsStreamGuard {
         }
     }
 
-    fn set_node_id(&mut self, node_id: &str) {
+    #[allow(clippy::result_large_err)]
+    fn set_node_id(&mut self, node_id: &str) -> Result<(), Status> {
         if self.node_id.as_deref() == Some(node_id) {
-            return;
+            return Ok(());
         }
         self.clear_current();
-        self.active_streams.register(node_id);
+        self.active_streams.register(node_id)?;
         self.node_id = Some(node_id.to_string());
+        Ok(())
     }
 
     fn clear_current(&mut self) {
@@ -220,7 +251,7 @@ impl XdsAdsServer {
             stream_channel_capacity: stream_channel_capacity.max(1),
             snapshot_cache: Arc::new(XdsSnapshotCache::new()),
             nonce_tracker: Arc::new(XdsNonceTracker::new()),
-            active_streams: Arc::new(XdsStreamRegistry::default()),
+            active_streams: Arc::new(XdsStreamRegistry::new(DEFAULT_XDS_MAX_STREAMS_PER_NODE)),
             sidecar_enforced,
             sidecar_enforced_dry_run: false,
             sidecar_identity_narrowing: false,
@@ -240,6 +271,14 @@ impl XdsAdsServer {
 
     pub fn with_cluster_domain(mut self, cluster_domain: String) -> Self {
         self.cluster_domain = cluster_domain;
+        self
+    }
+
+    /// Override the per-node concurrent ADS stream ceiling. `0` disables the
+    /// cap (unbounded). Replaces the registry, so call this during setup
+    /// before any stream is served.
+    pub fn with_max_streams_per_node(mut self, max_streams_per_node: usize) -> Self {
+        self.active_streams = Arc::new(XdsStreamRegistry::new(max_streams_per_node));
         self
     }
 
@@ -1099,7 +1138,18 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                             }
                         };
                         if node_id.is_none() {
-                            stream_guard.set_node_id(&current_node_id);
+                            if let Err(status) = stream_guard.set_node_id(&current_node_id) {
+                                warn!(
+                                    node_id = %current_node_id,
+                                    error = %status.message(),
+                                    "Rejecting xDS ADS stream: per-node stream ceiling exceeded"
+                                );
+                                crate::plugins::mesh::prometheus_helpers::increment_xds_stream_rejected(
+                                    &current_node_id,
+                                );
+                                let _ = tx.send(Err(status)).await;
+                                return;
+                            }
                             node_id = Some(current_node_id.clone());
                         };
 
@@ -1239,7 +1289,18 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                             }
                         };
                         if node_id.is_none() {
-                            stream_guard.set_node_id(&current_node_id);
+                            if let Err(status) = stream_guard.set_node_id(&current_node_id) {
+                                warn!(
+                                    node_id = %current_node_id,
+                                    error = %status.message(),
+                                    "Rejecting xDS delta ADS stream: per-node stream ceiling exceeded"
+                                );
+                                crate::plugins::mesh::prometheus_helpers::increment_xds_stream_rejected(
+                                    &current_node_id,
+                                );
+                                let _ = tx.send(Err(status)).await;
+                                return;
+                            }
                             node_id = Some(current_node_id.clone());
                         };
 
@@ -1868,6 +1929,106 @@ mod tests {
             super::super::translator::ECDS_TYPE_URL,
         ));
         subscriptions
+    }
+
+    #[test]
+    fn stream_registry_caps_concurrent_streams_per_node() {
+        let registry = XdsStreamRegistry::new(2);
+        assert!(registry.register("node-a").is_ok());
+        assert!(registry.register("node-a").is_ok());
+        // Third concurrent stream for the same node exceeds the ceiling.
+        let err = registry
+            .register("node-a")
+            .expect_err("third stream must be rejected");
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+        assert!(err.message().contains("per-node concurrent stream limit"));
+
+        // A different node id is unaffected by node-a's count.
+        assert!(registry.register("node-b").is_ok());
+
+        // Dropping a node-a stream frees one slot.
+        assert!(!registry.unregister("node-a"));
+        assert!(
+            registry.register("node-a").is_ok(),
+            "a freed slot admits a new stream"
+        );
+    }
+
+    #[test]
+    fn stream_registry_cap_of_one_allows_single_stream() {
+        let registry = XdsStreamRegistry::new(1);
+        assert!(registry.register("solo").is_ok());
+        assert!(
+            registry.register("solo").is_err(),
+            "a cap of 1 admits exactly one concurrent stream"
+        );
+    }
+
+    #[test]
+    fn stream_registry_zero_cap_is_unbounded() {
+        let registry = XdsStreamRegistry::new(0);
+        for _ in 0..1000 {
+            assert!(
+                registry.register("flood").is_ok(),
+                "cap of 0 disables the ceiling"
+            );
+        }
+    }
+
+    #[test]
+    fn stream_registry_unregister_returns_true_on_last_stream() {
+        let registry = XdsStreamRegistry::new(4);
+        assert!(registry.register("node-a").is_ok());
+        assert!(registry.register("node-a").is_ok());
+        // First unregister leaves one stream → not the last.
+        assert!(!registry.unregister("node-a"));
+        // Second unregister removes the last stream → caller drops per-node state.
+        assert!(registry.unregister("node-a"));
+        // Unregistering an absent node is a no-op that reports "last".
+        assert!(registry.unregister("never-seen"));
+    }
+
+    #[test]
+    fn stream_guard_set_node_id_propagates_ceiling_error() {
+        let snapshot_cache = Arc::new(XdsSnapshotCache::new());
+        let nonce_tracker = Arc::new(XdsNonceTracker::new());
+        let active_streams = Arc::new(XdsStreamRegistry::new(1));
+
+        let mut first = XdsStreamGuard::new(
+            snapshot_cache.clone(),
+            nonce_tracker.clone(),
+            active_streams.clone(),
+        );
+        first
+            .set_node_id("node-a")
+            .expect("first stream for node admitted");
+
+        let mut second = XdsStreamGuard::new(
+            snapshot_cache.clone(),
+            nonce_tracker.clone(),
+            active_streams.clone(),
+        );
+        let err = second
+            .set_node_id("node-a")
+            .expect_err("second concurrent stream rejected by guard");
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+
+        // The rejected guard never registered, so dropping it must not free the
+        // first stream's slot.
+        drop(second);
+        assert_eq!(
+            active_streams.counts.get("node-a").map(|c| *c),
+            Some(1),
+            "a failed registration must neither consume nor free a slot"
+        );
+
+        // Releasing the first (registered) guard frees the only slot.
+        drop(first);
+        let mut third = XdsStreamGuard::new(snapshot_cache, nonce_tracker, active_streams.clone());
+        assert!(
+            third.set_node_id("node-a").is_ok(),
+            "after the registered stream drops, the slot is available"
+        );
     }
 
     #[test]
@@ -2829,7 +2990,7 @@ mod tests {
 
         {
             let mut guard = server.stream_guard();
-            guard.set_node_id("node-a");
+            guard.set_node_id("node-a").expect("stream registers");
             assert!(server.snapshot_cache.get("node-a").is_some());
             assert_eq!(server.nonce_tracker.len(), 1);
         }
@@ -2848,9 +3009,11 @@ mod tests {
             .issue_nonce("node-a", super::super::translator::CDS_TYPE_URL, "v1");
 
         let mut first = server.stream_guard();
-        first.set_node_id("node-a");
+        first.set_node_id("node-a").expect("first stream registers");
         let mut second = server.stream_guard();
-        second.set_node_id("node-a");
+        second
+            .set_node_id("node-a")
+            .expect("second stream within default cap registers");
 
         drop(first);
         assert!(server.snapshot_cache.get("node-a").is_some());

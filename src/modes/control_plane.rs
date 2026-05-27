@@ -793,7 +793,8 @@ pub async fn run(
             )
             .with_sidecar_enforcement_dry_run(env_config.mesh_sidecar_enforced_dry_run)
             .with_sidecar_identity_narrowing(env_config.mesh_sidecar_identity_narrowing)
-            .with_cluster_domain(env_config.k8s_cluster_domain.clone()),
+            .with_cluster_domain(env_config.k8s_cluster_domain.clone())
+            .with_max_streams_per_node(env_config.xds_max_streams_per_node),
         )
     } else {
         None
