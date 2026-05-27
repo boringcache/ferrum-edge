@@ -2494,6 +2494,10 @@ async fn handle_h3_request(
         };
 
         let response_status = h3_stream_result.status;
+        // True backend status for CB / passive-health (diverges from
+        // `response_status` only on an after_proxy reject or size-limit
+        // rejection, where `response_status` is the gateway's policy status).
+        let backend_status = h3_stream_result.backend_status;
         let h3_error_class = h3_stream_result.error_class;
 
         // Record outcome across CB, passive health, latency, and connection
@@ -2559,7 +2563,7 @@ async fn handle_h3_request(
             upstream_balancer.as_ref(),
             upstream_target.as_deref(),
             cb_target_key.as_deref(),
-            response_status,
+            backend_status,
             connection_error,
             h3_error_class,
             cb_is_half_open_probe,
@@ -3318,7 +3322,18 @@ fn h3_streaming_body_failure_outcome(
 /// re-derivation of latency fields is needed because the "now" at summary
 /// construction time already coincides with body completion.
 struct H3StreamResult {
+    /// Client-facing HTTP status (what was/will be sent downstream). On an
+    /// `after_proxy` reject or a gateway-side size-limit rejection this is the
+    /// gateway's policy status, NOT the backend's — use [`Self::backend_status`]
+    /// for circuit-breaker / passive-health accounting.
     status: u16,
+    /// True backend response status (or the synthesized status when no backend
+    /// response was received). Circuit-breaker and passive-health accounting
+    /// must key off this, never `status`: a plugin rejecting a healthy 200 with
+    /// a 5xx must not penalize the backend, and a plugin masking a backend 503
+    /// behind a 4xx must not hide the failure. Mirrors the buffered/H1/H2 paths,
+    /// which record the backend status before applying the after-proxy override.
+    backend_status: u16,
     error_class: Option<crate::retry::ErrorClass>,
     body_completed: bool,
     bytes_streamed: u64,
@@ -3439,6 +3454,9 @@ async fn proxy_to_backend_h3_streaming(
             send_h3_response(h3_stream, StatusCode::BAD_GATEWAY, h3_error_body).await?;
             return Ok(H3StreamResult {
                 status: 502,
+                // No backend response was received (pre-headers dispatch
+                // failure); there is no true backend status to report.
+                backend_status: 502,
                 error_class: Some(h3_error_class),
                 body_completed: false,
                 bytes_streamed: 0,
@@ -3476,6 +3494,10 @@ async fn proxy_to_backend_h3_streaming(
         .await?;
         return Ok(H3StreamResult {
             status: 502,
+            // The backend did respond (headers received) before we found the
+            // body too large; CB/passive-health should see the real backend
+            // status, not the gateway-synthesized 502.
+            backend_status: response_status,
             error_class: Some(crate::retry::ErrorClass::ResponseBodyTooLarge),
             body_completed: false,
             bytes_streamed: 0,
@@ -3505,6 +3527,11 @@ async fn proxy_to_backend_h3_streaming(
         send_h3_reject_response(h3_stream, reject_status, &reject.body, &reject.headers).await?;
         return Ok(H3StreamResult {
             status: reject.status_code,
+            // The backend already returned `response_status`; the after_proxy
+            // plugin override is a gateway policy decision. CB/passive-health
+            // must see the true backend status so a plugin neither penalizes a
+            // healthy backend nor masks a real backend failure.
+            backend_status: response_status,
             error_class: None,
             body_completed: true,
             bytes_streamed: reject.body.len() as u64,
@@ -3545,6 +3572,7 @@ async fn proxy_to_backend_h3_streaming(
         // Client QUIC stream is already gone — nothing streamed.
         return Ok(H3StreamResult {
             status: response_status,
+            backend_status: response_status,
             error_class: None,
             body_completed: false,
             bytes_streamed: 0,
@@ -3705,6 +3733,7 @@ async fn proxy_to_backend_h3_streaming(
 
     Ok(H3StreamResult {
         status: response_status,
+        backend_status: response_status,
         error_class: terminal_error_class,
         body_completed,
         bytes_streamed,
@@ -3897,9 +3926,19 @@ async fn send_h3_reject_response(
     body: &[u8],
     headers: &HashMap<String, String>,
 ) -> Result<(), anyhow::Error> {
-    let mut builder = Response::builder()
-        .status(status)
-        .header("content-type", "application/json");
+    let mut builder = Response::builder().status(status);
+    // Only default the content-type when the reject didn't supply its own.
+    // `Builder::header` appends rather than replaces, so adding it
+    // unconditionally would emit a duplicate Content-Type whenever an
+    // after_proxy reject sets one (e.g. a WAF response-inspection reject using
+    // the configured reject_content_type) — undefined behavior for clients.
+    // Mirrors the buffered H3 path's `entry("content-type").or_insert_with(..)`.
+    let reject_sets_content_type = headers
+        .keys()
+        .any(|k| k.eq_ignore_ascii_case("content-type"));
+    if !reject_sets_content_type {
+        builder = builder.header("content-type", "application/json");
+    }
     for (k, v) in headers {
         if let (Ok(name), Ok(val)) = (
             hyper::header::HeaderName::from_bytes(k.as_bytes()),
@@ -4288,6 +4327,60 @@ mod h3_streaming_after_proxy_tests {
         assert_eq!(
             reject.headers.get("x-policy").map(String::as_str),
             Some("blocked")
+        );
+        // The wrapper's sole job beyond delegating is to accumulate elapsed
+        // plugin time; pin that it actually does so.
+        assert!(
+            plugin_execution_ns > 0,
+            "after_proxy hook execution time must be accumulated"
+        );
+    }
+
+    struct ContinuingAfterProxy;
+
+    #[async_trait]
+    impl Plugin for ContinuingAfterProxy {
+        fn name(&self) -> &str {
+            "continuing_after_proxy"
+        }
+
+        async fn after_proxy(
+            &self,
+            _ctx: &mut RequestContext,
+            _status_code: u16,
+            _response_headers: &mut HashMap<String, String>,
+        ) -> PluginResult {
+            PluginResult::Continue
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_after_proxy_continue_returns_none_and_times_hooks() {
+        let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(ContinuingAfterProxy)];
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/stream".to_string(),
+        );
+        let mut response_headers = HashMap::new();
+        let mut plugin_execution_ns = 0;
+
+        let result = run_h3_streaming_after_proxy_hooks(
+            &plugins,
+            &mut ctx,
+            200,
+            &mut response_headers,
+            &mut plugin_execution_ns,
+        )
+        .await;
+
+        assert!(
+            result.is_none(),
+            "a Continue from every after_proxy hook must not surface a reject"
+        );
+        assert!(
+            plugin_execution_ns > 0,
+            "hook execution time must be accumulated even when no plugin rejects"
         );
     }
 }
