@@ -44,6 +44,8 @@ Operators inspect the currently enrolled pod identities via the JWT-authenticate
 
 Per-pod authorization scope is published only after a mesh slice is accepted by the proxy config apply path. Slice apply stages the workload SPIFFE scope index, then rebuilds the pod UID scope map from the resolver's current identities under the scope-update lock so rejected slices and identity churn during apply do not leave policy scopes out of sync.
 
+**Stream limitation**: TCP and UDP stream connections through a node-waypoint proxy are always scoped mesh-wide for authorization purposes. The per-pod policy scoping (namespace-scoped and selector-scoped `AuthorizationPolicy`) that applies to HTTP/HBONE traffic is not yet enforced for raw TCP or UDP streams — the stream accept loops do not wire a `NodeWaypointIdentityResolver`. Operators who rely on namespace- or selector-scoped ALLOW or DENY policies for stream traffic in node-waypoint topology should be aware that those scoped policies are silently skipped; only mesh-wide policies are evaluated.
+
 #### BPF SOCK_OPS observability (GAP-SC3)
 
 The `__mesh_bpf_metrics` plugin is auto-injected on `NodeWaypoint` topology only and surfaces the TCP-layer counters published by the `BPF_PROG_TYPE_SOCK_OPS` program. The userspace consumer (`src/ebpf/event_consumer.rs::SockOpsConsumer`) drains the per-CPU ringbuf and increments a shared `BpfMetricsState` that the plugin reads on each `/metrics` scrape. Metrics emitted (Prometheus text format):

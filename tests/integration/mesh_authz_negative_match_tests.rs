@@ -14,8 +14,8 @@
 //! semantics is validated together.
 use ferrum_edge::identity::{SpiffeId, TrustDomain};
 use ferrum_edge::modes::mesh::config::{
-    ConditionMatch, MeshPolicy, MeshRule, PolicyAction, PolicyScope, PrincipalMatch, RequestMatch,
-    SourceNegationMatch, WorkloadSelector,
+    ConditionMatch, MeshPolicy, MeshRule, ParsedCidr, PolicyAction, PolicyScope, PrincipalMatch,
+    RequestMatch, SourceNegationMatch, WorkloadSelector,
 };
 use ferrum_edge::plugins::mesh::authz::MeshAuthz;
 use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
@@ -301,7 +301,7 @@ async fn allow_with_remote_ip_blocks_enforced_through_plugin() {
         },
         rules: vec![MeshRule {
             source_negation: SourceNegationMatch {
-                remote_ip_blocks: vec!["203.0.113.0/24".to_string()],
+                remote_ip_blocks: vec![ParsedCidr::parse("203.0.113.0/24").unwrap()],
                 ..SourceNegationMatch::default()
             },
             action: PolicyAction::Allow,
@@ -351,7 +351,7 @@ async fn source_ip_blocks_use_direct_peer_not_forwarded_client_ip() {
         },
         rules: vec![MeshRule {
             source_negation: SourceNegationMatch {
-                ip_blocks: vec!["10.0.0.0/8".to_string()],
+                ip_blocks: vec![ParsedCidr::parse("10.0.0.0/8").unwrap()],
                 ..SourceNegationMatch::default()
             },
             action: PolicyAction::Allow,
@@ -383,7 +383,7 @@ async fn source_ip_blocks_use_direct_peer_not_forwarded_client_ip() {
         },
         rules: vec![MeshRule {
             source_negation: SourceNegationMatch {
-                ip_blocks: vec!["203.0.113.0/24".to_string()],
+                ip_blocks: vec![ParsedCidr::parse("203.0.113.0/24").unwrap()],
                 ..SourceNegationMatch::default()
             },
             action: PolicyAction::Allow,

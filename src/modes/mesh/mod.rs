@@ -686,6 +686,30 @@ fn prepare_normalized_gateway_config_for_mesh(
     }
     config.normalize_fields();
     config.resolve_upstream_tls();
+
+    // Warn once per config-apply when all three conditions hold:
+    // (1) node-waypoint per-pod scoping is active,
+    // (2) at least one TCP/UDP stream proxy listener exists, and
+    // (3) the loaded policies include at least one namespace- or
+    //     selector-scoped entry.
+    // Stream accept loops always pass `node_waypoint_policy_scope: None`, so
+    // only MeshWide policies are evaluated on TCP/UDP connections — scoped
+    // DENY/ALLOW rules are silently withheld. See docs/mesh.md for details.
+    if runtime.topology == MeshTopology::NodeWaypoint
+        && config.proxies.iter().any(|p| p.dispatch_kind.is_stream())
+        && mesh_slice
+            .mesh_policies
+            .iter()
+            .any(|p| !matches!(p.scope, PolicyScope::MeshWide))
+    {
+        warn!(
+            topology = "node_waypoint",
+            "Namespace- and selector-scoped mesh policies are NOT enforced on TCP/UDP stream \
+             connections (stream accept loops pass no per-pod scope). Only MeshWide policies \
+             apply to stream traffic. See docs/mesh.md for details."
+        );
+    }
+
     Ok(config)
 }
 
