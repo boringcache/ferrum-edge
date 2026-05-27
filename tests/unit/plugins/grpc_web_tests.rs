@@ -950,13 +950,14 @@ fn test_build_trailer_frame() {
 }
 
 #[test]
-fn test_build_trailer_frame_default_status() {
+fn test_build_trailer_frame_missing_status_defaults_to_unknown() {
     use ferrum_edge::_test_support::{GRPC_FRAME_TRAILER, build_trailer_frame};
     let headers = HashMap::new();
     let frame = build_trailer_frame(&headers);
     assert_eq!(frame[0], GRPC_FRAME_TRAILER);
     let trailer_str = String::from_utf8_lossy(&frame[5..]);
-    assert!(trailer_str.contains("grpc-status: 0"));
+    assert!(trailer_str.contains("grpc-status: 2"));
+    assert!(!trailer_str.contains("grpc-status: 0"));
 }
 
 #[test]
@@ -971,7 +972,71 @@ fn test_build_trailer_frame_skips_invalid_trailer_lines() {
     let trailer_str = String::from_utf8_lossy(&frame[5..]);
     assert!(!trailer_str.contains("x-bad"));
     assert!(!trailer_str.contains("bad header"));
+    assert!(trailer_str.contains("grpc-status: 2"));
     assert!(trailer_str.contains("grpc-message: OK"));
+}
+
+#[test]
+fn test_build_trailer_frame_empty_status_reports_unknown() {
+    use ferrum_edge::_test_support::build_trailer_frame;
+    let mut headers = HashMap::new();
+    headers.insert("grpc-status".to_string(), String::new());
+
+    let frame = build_trailer_frame(&headers);
+    let trailer_str = String::from_utf8_lossy(&frame[5..]);
+    // The malformed (empty) status must not be forwarded; only the synthesized
+    // UNKNOWN remains.
+    assert!(trailer_str.contains("grpc-status: 2"));
+    assert_eq!(trailer_str.matches("grpc-status:").count(), 1);
+}
+
+#[test]
+fn test_build_trailer_frame_non_numeric_status_reports_unknown() {
+    use ferrum_edge::_test_support::build_trailer_frame;
+    let mut headers = HashMap::new();
+    headers.insert("grpc-status".to_string(), "abc".to_string());
+
+    let frame = build_trailer_frame(&headers);
+    let trailer_str = String::from_utf8_lossy(&frame[5..]);
+    assert!(trailer_str.contains("grpc-status: 2"));
+    assert!(!trailer_str.contains("abc"));
+    assert_eq!(trailer_str.matches("grpc-status:").count(), 1);
+}
+
+#[test]
+fn test_build_trailer_frame_valid_nonzero_status_passthrough() {
+    use ferrum_edge::_test_support::build_trailer_frame;
+    let mut headers = HashMap::new();
+    headers.insert("grpc-status".to_string(), "5".to_string());
+
+    let frame = build_trailer_frame(&headers);
+    let trailer_str = String::from_utf8_lossy(&frame[5..]);
+    // A present, numeric status is preserved verbatim and not overridden.
+    assert!(trailer_str.contains("grpc-status: 5"));
+    assert!(!trailer_str.contains("grpc-status: 2"));
+    assert_eq!(trailer_str.matches("grpc-status:").count(), 1);
+}
+
+#[tokio::test]
+async fn test_transform_response_body_missing_grpc_status_reports_unknown() {
+    let plugin = create_plugin_default();
+    let body = b"";
+    let mut response_headers = HashMap::new();
+    response_headers.insert(
+        "content-type".to_string(),
+        "application/grpc-web".to_string(),
+    );
+
+    let output = plugin
+        .transform_response_body(body, Some("application/grpc-web"), &response_headers)
+        .await
+        .expect("gRPC-Web response body should be transformed");
+
+    assert_eq!(output[0], 0x80);
+    let trailer_len = u32::from_be_bytes([output[1], output[2], output[3], output[4]]) as usize;
+    let trailer_str = String::from_utf8_lossy(&output[5..5 + trailer_len]);
+    assert!(trailer_str.contains("grpc-status: 2"));
+    assert!(!trailer_str.contains("grpc-status: 0"));
 }
 
 #[test]
