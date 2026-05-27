@@ -353,6 +353,7 @@ where
                     return write_final_body_reject(
                         stream,
                         flavor,
+                        plugins,
                         ctx,
                         reject,
                         backend_start,
@@ -1342,21 +1343,15 @@ where
                     PluginResult::Continue => {}
                     reject @ PluginResult::Reject { .. }
                     | reject @ PluginResult::RejectBinary { .. } => {
-                        let Some(reject) = crate::proxy::plugin_result_into_reject_parts(reject)
-                        else {
-                            warn!(
-                                "plugin reject arm returned a non-reject result in on_response_body"
-                            );
-                            continue;
-                        };
-                        response_status = reject.status_code;
-                        response_headers.clear();
-                        response_headers
-                            .insert("content-type".to_string(), "application/json".to_string());
-                        for (k, v) in reject.headers {
-                            response_headers.insert(k, v);
-                        }
-                        response_body = reject.body;
+                        apply_buffered_plain_plugin_reject(
+                            plugins,
+                            ctx,
+                            reject,
+                            &mut response_status,
+                            &mut response_headers,
+                            &mut response_body,
+                        )
+                        .await;
                         break;
                     }
                 }
@@ -1385,21 +1380,15 @@ where
                     PluginResult::Continue => {}
                     reject @ PluginResult::Reject { .. }
                     | reject @ PluginResult::RejectBinary { .. } => {
-                        let Some(reject) = crate::proxy::plugin_result_into_reject_parts(reject)
-                        else {
-                            warn!(
-                                "plugin reject arm returned a non-reject result in on_final_response_body"
-                            );
-                            continue;
-                        };
-                        response_status = reject.status_code;
-                        response_headers.clear();
-                        response_headers
-                            .insert("content-type".to_string(), "application/json".to_string());
-                        for (k, v) in reject.headers {
-                            response_headers.insert(k, v);
-                        }
-                        response_body = reject.body;
+                        apply_buffered_plain_plugin_reject(
+                            plugins,
+                            ctx,
+                            reject,
+                            &mut response_status,
+                            &mut response_headers,
+                            &mut response_body,
+                        )
+                        .await;
                         break;
                     }
                 }
@@ -1823,6 +1812,7 @@ where
                 let mut outcome = write_final_body_reject(
                     stream,
                     HttpFlavor::Grpc,
+                    plugins,
                     ctx,
                     PluginResult::RejectBinary {
                         status_code: reject.status_code,
@@ -1878,13 +1868,15 @@ where
                             "Plugin rejected buffered H3 gRPC response body"
                         );
                         apply_buffered_grpc_plugin_reject(
+                            plugins,
                             ctx,
                             reject,
                             &mut response_status,
                             &mut response_headers,
                             &mut response_body,
                             &mut response_trailers,
-                        );
+                        )
+                        .await;
                         break;
                     }
                 }
@@ -1942,13 +1934,15 @@ where
                             "Plugin rejected finalized buffered H3 gRPC response body"
                         );
                         apply_buffered_grpc_plugin_reject(
+                            plugins,
                             ctx,
                             reject,
                             &mut response_status,
                             &mut response_headers,
                             &mut response_body,
                             &mut response_trailers,
-                        );
+                        )
+                        .await;
                         break;
                     }
                 }
@@ -2028,6 +2022,7 @@ where
                 let mut outcome = write_final_body_reject(
                     stream,
                     HttpFlavor::Grpc,
+                    plugins,
                     ctx,
                     PluginResult::RejectBinary {
                         status_code: reject.status_code,
@@ -2182,7 +2177,39 @@ where
     }
 }
 
-fn apply_buffered_grpc_plugin_reject(
+async fn apply_buffered_plain_plugin_reject(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    reject: PluginResult,
+    response_status: &mut u16,
+    response_headers: &mut HashMap<String, String>,
+    response_body: &mut Vec<u8>,
+) {
+    let Some(reject) = crate::proxy::plugin_result_into_reject_parts(reject) else {
+        warn!("buffered plain reject helper received a non-reject plugin result");
+        return;
+    };
+    let mut headers = reject.headers;
+    crate::proxy::apply_after_proxy_hooks_to_rejection(
+        plugins,
+        ctx,
+        reject.status_code,
+        &mut headers,
+    )
+    .await;
+    if !headers
+        .keys()
+        .any(|key| key.eq_ignore_ascii_case("content-type"))
+    {
+        headers.insert("content-type".to_string(), "application/json".to_string());
+    }
+    *response_status = reject.status_code;
+    *response_headers = headers;
+    *response_body = reject.body;
+}
+
+async fn apply_buffered_grpc_plugin_reject(
+    plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
     reject: PluginResult,
     response_status: &mut u16,
@@ -2194,10 +2221,18 @@ fn apply_buffered_grpc_plugin_reject(
         warn!("buffered gRPC reject helper received a non-reject plugin result");
         return;
     };
+    let mut headers = reject.headers;
+    crate::proxy::apply_after_proxy_hooks_to_rejection(
+        plugins,
+        ctx,
+        reject.status_code,
+        &mut headers,
+    )
+    .await;
     let normalized = normalize_h3_grpc_reject(
         StatusCode::from_u16(reject.status_code).unwrap_or(StatusCode::BAD_GATEWAY),
         &reject.body,
-        &reject.headers,
+        &headers,
     );
     apply_h3_grpc_reject_metadata(ctx, &normalized);
     *response_status = normalized.http_status.as_u16();
@@ -2753,6 +2788,7 @@ where
 async fn write_final_body_reject<S>(
     stream: &mut RequestStream<S, Bytes>,
     flavor: HttpFlavor,
+    plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
     reject: PluginResult,
     backend_start: Instant,
@@ -2784,8 +2820,16 @@ where
         };
     };
     let http_status = StatusCode::from_u16(parts.status_code).unwrap_or(StatusCode::BAD_REQUEST);
+    let mut headers = parts.headers;
+    crate::proxy::apply_after_proxy_hooks_to_rejection(
+        plugins,
+        ctx,
+        http_status.as_u16(),
+        &mut headers,
+    )
+    .await;
     if matches!(flavor, HttpFlavor::Grpc) {
-        let normalized = normalize_h3_grpc_reject(http_status, &parts.body, &parts.headers);
+        let normalized = normalize_h3_grpc_reject(http_status, &parts.body, &headers);
         apply_h3_grpc_reject_metadata(ctx, &normalized);
         write_normalized_grpc_reject(stream, &normalized, backend_start, bytes_sent).await
     } else {
@@ -2793,7 +2837,7 @@ where
             stream,
             http_status,
             &parts.body,
-            &parts.headers,
+            &headers,
             backend_start,
             bytes_sent,
         )
@@ -3002,17 +3046,18 @@ fn should_skip_cross_protocol_backend_header(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     use super::{
-        apply_buffered_grpc_plugin_reject, apply_h3_grpc_reject_metadata,
-        build_plain_request_builder, normalize_h3_grpc_reject, reject_body_as_h3_grpc_message,
-        sanitize_h3_grpc_message_for_header, should_finish_h3_stream_without_trailers,
-        should_skip_cross_protocol_backend_header,
+        apply_buffered_grpc_plugin_reject, apply_buffered_plain_plugin_reject,
+        apply_h3_grpc_reject_metadata, build_plain_request_builder, normalize_h3_grpc_reject,
+        reject_body_as_h3_grpc_message, sanitize_h3_grpc_message_for_header,
+        should_finish_h3_stream_without_trailers, should_skip_cross_protocol_backend_header,
     };
     use crate::config::EnvConfig;
     use crate::config::types::{GatewayConfig, Proxy};
     use crate::dns::{DnsCache, DnsConfig};
-    use crate::plugins::{PluginResult, RequestContext};
+    use crate::plugins::{Plugin, PluginResult, RequestContext, security_headers::SecurityHeaders};
     use crate::proxy::ProxyState;
     use hyper::{HeaderMap, StatusCode};
 
@@ -3081,8 +3126,9 @@ mod tests {
         assert!(!should_finish_h3_stream_without_trailers(Some(&non_empty)));
     }
 
-    #[test]
-    fn buffered_grpc_plugin_reject_normalizes_and_clears_backend_trailers() {
+    #[tokio::test]
+    async fn buffered_grpc_plugin_reject_normalizes_and_clears_backend_trailers() {
+        let plugins: Vec<Arc<dyn Plugin>> = Vec::new();
         let mut ctx = RequestContext::new(
             "127.0.0.1".to_string(),
             "POST".to_string(),
@@ -3095,6 +3141,7 @@ mod tests {
         let mut response_trailers = HashMap::from([("grpc-status".to_string(), "0".to_string())]);
 
         apply_buffered_grpc_plugin_reject(
+            &plugins,
             &mut ctx,
             PluginResult::Reject {
                 status_code: 429,
@@ -3105,7 +3152,8 @@ mod tests {
             &mut response_headers,
             &mut response_body,
             &mut response_trailers,
-        );
+        )
+        .await;
 
         assert_eq!(response_status, 200);
         assert!(response_body.is_empty());
@@ -3141,6 +3189,109 @@ mod tests {
         assert_eq!(
             ctx.metadata.get("grpc_message").map(|value| value.as_str()),
             Some("Rate limit exceeded")
+        );
+    }
+
+    #[tokio::test]
+    async fn buffered_grpc_plugin_reject_runs_reject_aware_security_headers() {
+        let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(
+            SecurityHeaders::new(&serde_json::json!({})).unwrap(),
+        )];
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "POST".to_string(),
+            "/grpc.Service/Method".to_string(),
+        );
+        let mut response_status = 200;
+        let mut response_headers =
+            HashMap::from([("content-type".to_string(), "application/grpc".to_string())]);
+        let mut response_body = b"backend-body".to_vec();
+        let mut response_trailers = HashMap::from([("grpc-status".to_string(), "0".to_string())]);
+
+        apply_buffered_grpc_plugin_reject(
+            &plugins,
+            &mut ctx,
+            PluginResult::Reject {
+                status_code: 403,
+                body: r#"{"error":"Forbidden"}"#.to_string(),
+                headers: HashMap::new(),
+            },
+            &mut response_status,
+            &mut response_headers,
+            &mut response_body,
+            &mut response_trailers,
+        )
+        .await;
+
+        assert_eq!(response_status, 200);
+        assert_eq!(
+            response_headers
+                .get("x-content-type-options")
+                .map(|value| value.as_str()),
+            Some("nosniff")
+        );
+        assert_eq!(
+            response_headers
+                .get("x-frame-options")
+                .map(|value| value.as_str()),
+            Some("SAMEORIGIN")
+        );
+        assert_eq!(
+            response_headers
+                .get("grpc-status")
+                .map(|value| value.as_str()),
+            Some("7")
+        );
+    }
+
+    #[tokio::test]
+    async fn buffered_plain_plugin_reject_runs_reject_aware_security_headers() {
+        let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(
+            SecurityHeaders::new(&serde_json::json!({})).unwrap(),
+        )];
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/plain".to_string(),
+        );
+        let mut response_status = 200;
+        let mut response_headers =
+            HashMap::from([("content-type".to_string(), "text/plain".to_string())]);
+        let mut response_body = b"backend-body".to_vec();
+
+        apply_buffered_plain_plugin_reject(
+            &plugins,
+            &mut ctx,
+            PluginResult::Reject {
+                status_code: 403,
+                body: r#"{"error":"Forbidden"}"#.to_string(),
+                headers: HashMap::new(),
+            },
+            &mut response_status,
+            &mut response_headers,
+            &mut response_body,
+        )
+        .await;
+
+        assert_eq!(response_status, 403);
+        assert_eq!(response_body, br#"{"error":"Forbidden"}"#);
+        assert_eq!(
+            response_headers
+                .get("content-type")
+                .map(|value| value.as_str()),
+            Some("application/json")
+        );
+        assert_eq!(
+            response_headers
+                .get("x-content-type-options")
+                .map(|value| value.as_str()),
+            Some("nosniff")
+        );
+        assert_eq!(
+            response_headers
+                .get("x-frame-options")
+                .map(|value| value.as_str()),
+            Some("SAMEORIGIN")
         );
     }
 

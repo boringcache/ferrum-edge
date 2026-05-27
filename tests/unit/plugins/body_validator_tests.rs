@@ -401,6 +401,16 @@ async fn test_xml_doctype_declaration() {
     assert_continue(result);
 }
 
+#[tokio::test]
+async fn test_xml_entity_declaration_quoted_gt_does_not_hide_nested_reference() {
+    let plugin = xml_plugin();
+    let body = r#"<!DOCTYPE root [<!ENTITY a "lol"><!ENTITY b ">&a;&a;">]><root>&b;</root>"#;
+    let mut ctx = make_xml_ctx(body);
+    let mut headers = make_xml_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(400));
+}
+
 // ─── Combined / Mixed Content ──────────────────────────────────────────
 
 #[tokio::test]
@@ -2231,4 +2241,133 @@ async fn test_on_final_request_body_validates_json_when_before_proxy_cannot() {
         .await;
 
     assert_reject(result, Some(400));
+}
+
+#[tokio::test]
+async fn billion_laughs_nested_entities_are_rejected() {
+    let plugin = xml_plugin();
+    let body = r#"<?xml version="1.0"?><!DOCTYPE lolz [<!ENTITY lol "lol"><!ENTITY lol2 "&lol;&lol;&lol;"><!ENTITY lol3 "&lol2;&lol2;&lol2;">]><lolz>&lol3;</lolz>"#;
+    let mut ctx = make_xml_ctx(body);
+    let mut headers = make_xml_headers();
+
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+#[tokio::test]
+async fn parameter_entity_reference_in_entity_value_is_rejected() {
+    let plugin = xml_plugin();
+    let body = r#"<!DOCTYPE r [<!ENTITY % a "lol"><!ENTITY b "%a;%a;">]><r>&b;</r>"#;
+    let mut ctx = make_xml_ctx(body);
+    let mut headers = make_xml_headers();
+
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+#[tokio::test]
+async fn numeric_ampersand_entity_reference_in_entity_value_is_rejected() {
+    let plugin = xml_plugin();
+    let body = r#"<!DOCTYPE r [<!ENTITY a "lol"><!ENTITY b "&#38;a;&#38;a;"><!ENTITY c "&#x26;b;&#x26;b;">]><r>&c;</r>"#;
+    let mut ctx = make_xml_ctx(body);
+    let mut headers = make_xml_headers();
+
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+#[tokio::test]
+async fn numeric_encoded_entity_reference_semicolons_are_rejected() {
+    let plugin = xml_plugin();
+    let body = r#"<!DOCTYPE r [<!ENTITY a "lol"><!ENTITY b "&#38;a&#59;&#x26;a&#x3b;"><!ENTITY c "&#38;b&#59;&#x26;b&#x3b;">]><r>&c;</r>"#;
+    let mut ctx = make_xml_ctx(body);
+    let mut headers = make_xml_headers();
+
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+#[tokio::test]
+async fn numeric_encoded_parameter_entity_references_are_rejected() {
+    let plugin = xml_plugin();
+    let body =
+        r#"<!DOCTYPE r [<!ENTITY % a "lol"><!ENTITY b "&#37;a&#59;&#x25;a&#x3b;">]><r>&b;</r>"#;
+    let mut ctx = make_xml_ctx(body);
+    let mut headers = make_xml_headers();
+
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+#[tokio::test]
+async fn long_xml_entity_names_are_checked_for_nested_references() {
+    let plugin = xml_plugin();
+    let long_name = "a".repeat(40);
+    let long_ref = format!("&{long_name};");
+    let body = format!(
+        r#"<!DOCTYPE r [<!ENTITY {long_name} "lol"><!ENTITY b "{long_ref}{long_ref}">]><r>&b;</r>"#
+    );
+    let mut ctx = make_xml_ctx(&body);
+    let mut headers = make_xml_headers();
+
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+#[tokio::test]
+async fn parameter_entity_expanding_entity_declarations_is_rejected() {
+    let plugin = BodyValidator::new(&json!({
+        "validate_xml": true,
+        "xml_max_entities": 1
+    }))
+    .unwrap();
+    let body = r#"<!DOCTYPE r [<!ENTITY % many "<!ENTITY a 'x'><!ENTITY b 'y'>">%many;]><r/>"#;
+    let mut ctx = make_xml_ctx(body);
+    let mut headers = make_xml_headers();
+
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+#[tokio::test]
+async fn too_many_xml_entities_are_rejected() {
+    let plugin = BodyValidator::new(&json!({
+        "validate_xml": true,
+        "xml_max_entities": 2
+    }))
+    .unwrap();
+    let body = r#"<!DOCTYPE r [<!ENTITY a "x"><!ENTITY b "y"><!ENTITY c "z">]><r>ok</r>"#;
+    let mut ctx = make_xml_ctx(body);
+    let mut headers = make_xml_headers();
+
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+#[tokio::test]
+async fn benign_doctype_without_nested_entities_is_allowed() {
+    let plugin = xml_plugin();
+    let body = r#"<!DOCTYPE r [<!ENTITY a "hello">]><r>world</r>"#;
+    let mut ctx = make_xml_ctx(body);
+    let mut headers = make_xml_headers();
+
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+}
+
+#[tokio::test]
+async fn entity_literal_inside_cdata_is_not_treated_as_declaration() {
+    let plugin = xml_plugin();
+    let body = r#"<root><![CDATA[<!ENTITY x "&y;">]]></root>"#;
+    let mut ctx = make_xml_ctx(body);
+    let mut headers = make_xml_headers();
+
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+}
+
+#[tokio::test]
+async fn nested_entity_rejection_can_be_disabled() {
+    let plugin = BodyValidator::new(&json!({
+        "validate_xml": true,
+        "xml_reject_nested_entities": false
+    }))
+    .unwrap();
+    // Same nesting as the billion-laughs body, but under the count cap and with
+    // the nested-reference check disabled — allowed through.
+    let body = r#"<?xml version="1.0"?><!DOCTYPE lolz [<!ENTITY lol "lol"><!ENTITY lol2 "&lol;&lol;&lol;">]><lolz>&lol2;</lolz>"#;
+    let mut ctx = make_xml_ctx(body);
+    let mut headers = make_xml_headers();
+
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
 }

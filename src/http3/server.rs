@@ -32,8 +32,9 @@ use crate::proxy::headers::{
     parse_connection_listed_from_str_map,
 };
 use crate::proxy::{
-    ProxyState, apply_after_proxy_hooks_to_rejection, plugin_result_into_reject_parts,
-    run_after_proxy_hooks, run_authentication_phase,
+    ProxyState, apply_after_proxy_hooks_to_rejection, apply_plugin_rejection_response,
+    log_rejected_request, plugin_result_into_reject_parts, run_after_proxy_hooks,
+    run_authentication_phase,
 };
 use crate::tls::{CrlList, TlsPolicy};
 
@@ -1214,7 +1215,6 @@ async fn handle_h3_request(
                     .await?;
                     return Ok(());
                 };
-                record_request(&state, reject.status_code);
                 let mut headers = reject.headers;
                 apply_after_proxy_hooks_to_rejection(
                     &plugins,
@@ -1223,8 +1223,30 @@ async fn handle_h3_request(
                     &mut headers,
                 )
                 .await;
+                plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
                 let http_status = StatusCode::from_u16(reject.status_code)
                     .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                let log_status_code = h3_reject_log_status_and_metadata(
+                    &mut ctx,
+                    http_flavor,
+                    http_status,
+                    &reject.body,
+                    &headers,
+                );
+                // Record the normalized wire status: a gRPC reject is sent as
+                // HTTP 200 + grpc-status, so runtime status metrics must match
+                // the logged/served status (not the plugin's HTTP-style code),
+                // consistent across every H3 reject phase.
+                record_request(&state, log_status_code);
+                log_rejected_request(
+                    &plugins,
+                    &ctx,
+                    log_status_code,
+                    start_time,
+                    "on_request_received",
+                    plugin_execution_ns,
+                )
+                .await;
                 send_h3_reject_flavor_aware(
                     &mut stream,
                     http_flavor,
@@ -1310,9 +1332,26 @@ async fn handle_h3_request(
     )
     .await
     {
-        record_request(&state, status_code);
         apply_after_proxy_hooks_to_rejection(&plugins, &mut ctx, status_code, &mut headers).await;
+        plugin_execution_ns += auth_phase_start.elapsed().as_nanos() as u64;
         let http_status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::UNAUTHORIZED);
+        let log_status_code =
+            h3_reject_log_status_and_metadata(&mut ctx, http_flavor, http_status, &body, &headers);
+        // Record the normalized wire status: gRPC rejects go out as HTTP 200 +
+        // grpc-status, so recording the raw `status_code` (e.g. 401/403) here
+        // would make /metrics/runtime disagree with the logged and served
+        // status. Must run AFTER `h3_reject_log_status_and_metadata`, matching
+        // every other H3 reject phase.
+        record_request(&state, log_status_code);
+        log_rejected_request(
+            &plugins,
+            &ctx,
+            log_status_code,
+            start_time,
+            "authenticate",
+            plugin_execution_ns,
+        )
+        .await;
         send_h3_reject_flavor_aware(&mut stream, http_flavor, http_status, &body, &headers).await?;
         return Ok(());
     }
@@ -1327,9 +1366,19 @@ async fn handle_h3_request(
                 PluginResult::Continue => {}
                 reject @ PluginResult::Reject { .. }
                 | reject @ PluginResult::RejectBinary { .. } => {
-                    let reject = plugin_result_into_reject_parts(reject)
-                        .expect("reject result should convert to rejection parts");
-                    record_request(&state, reject.status_code);
+                    let Some(reject) = plugin_result_into_reject_parts(reject) else {
+                        tracing::error!("Plugin result could not be converted to rejection parts");
+                        record_request(&state, 500);
+                        send_h3_reject_flavor_aware(
+                            &mut stream,
+                            http_flavor,
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            b"Internal Server Error",
+                            &HashMap::new(),
+                        )
+                        .await?;
+                        return Ok(());
+                    };
                     let mut headers = reject.headers;
                     apply_after_proxy_hooks_to_rejection(
                         &plugins,
@@ -1338,8 +1387,29 @@ async fn handle_h3_request(
                         &mut headers,
                     )
                     .await;
+                    plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
                     let http_status =
                         StatusCode::from_u16(reject.status_code).unwrap_or(StatusCode::FORBIDDEN);
+                    let log_status_code = h3_reject_log_status_and_metadata(
+                        &mut ctx,
+                        http_flavor,
+                        http_status,
+                        &reject.body,
+                        &headers,
+                    );
+                    // Record the normalized wire status (gRPC rejects go out as
+                    // HTTP 200 + grpc-status); keeps runtime metrics consistent
+                    // with the logged/served status across every H3 reject phase.
+                    record_request(&state, log_status_code);
+                    log_rejected_request(
+                        &plugins,
+                        &ctx,
+                        log_status_code,
+                        start_time,
+                        "authorize",
+                        plugin_execution_ns,
+                    )
+                    .await;
                     send_h3_reject_flavor_aware(
                         &mut stream,
                         http_flavor,
@@ -1428,7 +1498,6 @@ async fn handle_h3_request(
                         .await?;
                         return Ok(());
                     };
-                    record_request(&state, reject.status_code);
                     let mut headers = reject.headers;
                     apply_after_proxy_hooks_to_rejection(
                         &plugins,
@@ -1437,8 +1506,29 @@ async fn handle_h3_request(
                         &mut headers,
                     )
                     .await;
+                    plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
                     let http_status = StatusCode::from_u16(reject.status_code)
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                    let log_status_code = h3_reject_log_status_and_metadata(
+                        &mut ctx,
+                        http_flavor,
+                        http_status,
+                        &reject.body,
+                        &headers,
+                    );
+                    // Record the normalized wire status (gRPC rejects go out as
+                    // HTTP 200 + grpc-status); keeps runtime metrics consistent
+                    // with the logged/served status across every H3 reject phase.
+                    record_request(&state, log_status_code);
+                    log_rejected_request(
+                        &plugins,
+                        &ctx,
+                        log_status_code,
+                        start_time,
+                        "before_proxy",
+                        plugin_execution_ns,
+                    )
+                    .await;
                     send_h3_reject_flavor_aware(
                         &mut stream,
                         http_flavor,
@@ -1478,7 +1568,6 @@ async fn handle_h3_request(
                         return Ok(());
                     };
                     ctx.headers = tmp_headers;
-                    record_request(&state, reject.status_code);
                     let mut headers = reject.headers;
                     apply_after_proxy_hooks_to_rejection(
                         &plugins,
@@ -1487,8 +1576,29 @@ async fn handle_h3_request(
                         &mut headers,
                     )
                     .await;
+                    plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
                     let http_status = StatusCode::from_u16(reject.status_code)
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                    let log_status_code = h3_reject_log_status_and_metadata(
+                        &mut ctx,
+                        http_flavor,
+                        http_status,
+                        &reject.body,
+                        &headers,
+                    );
+                    // Record the normalized wire status (gRPC rejects go out as
+                    // HTTP 200 + grpc-status); keeps runtime metrics consistent
+                    // with the logged/served status across every H3 reject phase.
+                    record_request(&state, log_status_code);
+                    log_rejected_request(
+                        &plugins,
+                        &ctx,
+                        log_status_code,
+                        start_time,
+                        "before_proxy",
+                        plugin_execution_ns,
+                    )
+                    .await;
                     send_h3_reject_flavor_aware(
                         &mut stream,
                         http_flavor,
@@ -2533,7 +2643,6 @@ async fn handle_h3_request(
                 .await?;
                 return Ok(());
             };
-            record_request(&state, reject.status_code);
             let mut headers = reject.headers;
             apply_after_proxy_hooks_to_rejection(
                 &plugins,
@@ -2542,9 +2651,29 @@ async fn handle_h3_request(
                 &mut headers,
             )
             .await;
-            send_h3_reject_response(
+            let http_status =
+                StatusCode::from_u16(reject.status_code).unwrap_or(StatusCode::PAYLOAD_TOO_LARGE);
+            let log_status_code = h3_reject_log_status_and_metadata(
+                &mut ctx,
+                http_flavor,
+                http_status,
+                &reject.body,
+                &headers,
+            );
+            record_request(&state, log_status_code);
+            log_rejected_request(
+                &plugins,
+                &ctx,
+                log_status_code,
+                start_time,
+                "on_final_request_body",
+                plugin_execution_ns,
+            )
+            .await;
+            send_h3_reject_flavor_aware(
                 &mut stream,
-                StatusCode::from_u16(reject.status_code).unwrap_or(StatusCode::PAYLOAD_TOO_LARGE),
+                http_flavor,
+                http_status,
                 &reject.body,
                 &headers,
             )
@@ -2955,6 +3084,7 @@ async fn handle_h3_request(
         // Mirrors the HTTP/1.1 path in proxy/mod.rs.
         if !after_proxy_rejected && !plugins.is_empty() {
             let phase_start = std::time::Instant::now();
+            let mut response_body_reject = None;
             for plugin in plugins.iter() {
                 let result = plugin
                     .on_response_body(&mut ctx, response_status, &response_headers, &response_body)
@@ -2979,17 +3109,20 @@ async fn handle_h3_request(
                             status_code = reject.status_code,
                             "Plugin rejected response body (HTTP/3)"
                         );
-                        response_status = reject.status_code;
-                        response_headers.clear();
-                        response_headers
-                            .insert("content-type".to_string(), "application/json".to_string());
-                        for (k, v) in reject.headers {
-                            response_headers.insert(k, v);
-                        }
-                        response_body = reject.body;
+                        response_body_reject = Some(reject);
                         break;
                     }
                 }
+            }
+            if let Some(reject) = response_body_reject {
+                response_body = apply_plugin_rejection_response(
+                    &plugins,
+                    &mut ctx,
+                    &mut response_status,
+                    &mut response_headers,
+                    reject,
+                )
+                .await;
             }
             plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
         }
@@ -3014,6 +3147,7 @@ async fn handle_h3_request(
 
         if !after_proxy_rejected && !plugins.is_empty() {
             let phase_start = std::time::Instant::now();
+            let mut response_body_reject = None;
             for plugin in plugins.iter() {
                 let result = plugin
                     .on_final_response_body(
@@ -3043,17 +3177,20 @@ async fn handle_h3_request(
                             status_code = reject.status_code,
                             "Plugin rejected finalized response body (HTTP/3)"
                         );
-                        response_status = reject.status_code;
-                        response_headers.clear();
-                        response_headers
-                            .insert("content-type".to_string(), "application/json".to_string());
-                        for (k, v) in reject.headers {
-                            response_headers.insert(k, v);
-                        }
-                        response_body = reject.body;
+                        response_body_reject = Some(reject);
                         break;
                     }
                 }
+            }
+            if let Some(reject) = response_body_reject {
+                response_body = apply_plugin_rejection_response(
+                    &plugins,
+                    &mut ctx,
+                    &mut response_status,
+                    &mut response_headers,
+                    reject,
+                )
+                .await;
             }
             plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
         }
@@ -4161,8 +4298,7 @@ async fn send_h3_reject_flavor_aware(
     }
 
     // gRPC flavor only — derive signalling now.
-    let grpc_status = h3_http_status_to_grpc_status(http_status);
-    let grpc_message = reject_body_as_grpc_message(http_body, http_status);
+    let (grpc_status, grpc_message) = h3_grpc_reject_signal(http_status, http_body, headers);
 
     // Build a trailers-only gRPC error that preserves any custom headers
     // the plugin attached (e.g., rate-limit metadata), while forcing the
@@ -4195,6 +4331,41 @@ async fn send_h3_reject_flavor_aware(
     stream.finish().await?;
     crate::http3::stream_util::halt_request_body(stream);
     Ok(())
+}
+
+fn h3_reject_log_status_and_metadata(
+    ctx: &mut RequestContext,
+    flavor: HttpFlavor,
+    http_status: StatusCode,
+    http_body: &[u8],
+    headers: &HashMap<String, String>,
+) -> u16 {
+    if !matches!(flavor, HttpFlavor::Grpc) {
+        return http_status.as_u16();
+    }
+
+    let (grpc_status, grpc_message) = h3_grpc_reject_signal(http_status, http_body, headers);
+    crate::proxy::insert_grpc_error_metadata(&mut ctx.metadata, grpc_status, grpc_message.as_ref());
+    StatusCode::OK.as_u16()
+}
+
+fn h3_grpc_reject_signal(
+    http_status: StatusCode,
+    http_body: &[u8],
+    headers: &HashMap<String, String>,
+) -> (u32, std::borrow::Cow<'static, str>) {
+    let grpc_status = headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("grpc-status"))
+        .and_then(|(_, value)| value.parse::<u32>().ok())
+        .unwrap_or_else(|| h3_http_status_to_grpc_status(http_status));
+    let grpc_message: std::borrow::Cow<'static, str> = headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("grpc-message"))
+        .map(|(_, value)| std::borrow::Cow::<str>::Owned(sanitize_grpc_message(value)))
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| reject_body_as_grpc_message(http_body, http_status));
+    (grpc_status, grpc_message)
 }
 
 /// Extract a grpc-message string from a plugin/auth reject body, which is
@@ -4809,9 +4980,14 @@ mod h3_streaming_outcome_tests {
 
 #[cfg(test)]
 mod h3_plugin_protocol_tests {
-    use super::h3_plugin_protocol_for_flavor;
+    use super::{
+        h3_grpc_reject_signal, h3_plugin_protocol_for_flavor, h3_reject_log_status_and_metadata,
+    };
     use crate::config::types::HttpFlavor;
     use crate::plugins::ProxyProtocol;
+    use crate::plugins::RequestContext;
+    use http::StatusCode;
+    use std::collections::HashMap;
 
     #[test]
     fn maps_websocket_flavor_to_websocket_plugin_protocol() {
@@ -4835,6 +5011,102 @@ mod h3_plugin_protocol_tests {
             h3_plugin_protocol_for_flavor(HttpFlavor::Plain),
             ProxyProtocol::Http
         );
+    }
+
+    #[test]
+    fn grpc_reject_logging_uses_wire_status_and_grpc_metadata() {
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "POST".to_string(),
+            "/pkg.Service/Call".to_string(),
+        );
+
+        let log_status = h3_reject_log_status_and_metadata(
+            &mut ctx,
+            HttpFlavor::Grpc,
+            StatusCode::UNAUTHORIZED,
+            br#"{"error":"missing token"}"#,
+            &HashMap::new(),
+        );
+
+        assert_eq!(log_status, StatusCode::OK.as_u16());
+        assert_eq!(
+            ctx.metadata.get("grpc_status").map(String::as_str),
+            Some("16")
+        );
+        assert_eq!(
+            ctx.metadata.get("grpc_message").map(String::as_str),
+            Some("missing token")
+        );
+    }
+
+    #[test]
+    fn grpc_reject_logging_prefers_explicit_grpc_headers() {
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "POST".to_string(),
+            "/pkg.Service/Call".to_string(),
+        );
+        let headers = HashMap::from([
+            ("grpc-status".to_string(), "9".to_string()),
+            (
+                "grpc-message".to_string(),
+                "failed precondition".to_string(),
+            ),
+        ]);
+
+        let log_status = h3_reject_log_status_and_metadata(
+            &mut ctx,
+            HttpFlavor::Grpc,
+            StatusCode::BAD_REQUEST,
+            b"ignored",
+            &headers,
+        );
+
+        assert_eq!(log_status, StatusCode::OK.as_u16());
+        assert_eq!(
+            ctx.metadata.get("grpc_status").map(String::as_str),
+            Some("9")
+        );
+        assert_eq!(
+            ctx.metadata.get("grpc_message").map(String::as_str),
+            Some("failed precondition")
+        );
+    }
+
+    #[test]
+    fn grpc_reject_signal_prefers_explicit_headers_for_wire_and_logs() {
+        let headers = HashMap::from([
+            ("grpc-status".to_string(), "4".to_string()),
+            ("grpc-message".to_string(), "deadline exceeded".to_string()),
+        ]);
+
+        let (grpc_status, grpc_message) =
+            h3_grpc_reject_signal(StatusCode::OK, b"ignored", &headers);
+
+        assert_eq!(grpc_status, 4);
+        assert_eq!(grpc_message.as_ref(), "deadline exceeded");
+    }
+
+    #[test]
+    fn plain_reject_logging_keeps_http_status_without_grpc_metadata() {
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/api".to_string(),
+        );
+
+        let log_status = h3_reject_log_status_and_metadata(
+            &mut ctx,
+            HttpFlavor::Plain,
+            StatusCode::FORBIDDEN,
+            br#"{"error":"blocked"}"#,
+            &HashMap::new(),
+        );
+
+        assert_eq!(log_status, StatusCode::FORBIDDEN.as_u16());
+        assert!(!ctx.metadata.contains_key("grpc_status"));
+        assert!(!ctx.metadata.contains_key("grpc_message"));
     }
 }
 

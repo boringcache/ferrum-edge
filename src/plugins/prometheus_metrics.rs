@@ -58,6 +58,14 @@ pub struct StreamCounterKey {
     pub protocol: Arc<str>,
 }
 
+/// Composite key for the WAF request-outcome counter: (action, highest
+/// severity). Both dimensions are bounded enumerations, never request input.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct WafRequestKey {
+    pub action: Arc<str>,
+    pub severity: Arc<str>,
+}
+
 /// Composite key for the HTTP-family client-disconnect counter.
 ///
 /// Populated whenever a `TransactionSummary` is logged with
@@ -352,6 +360,11 @@ pub struct MetricsRegistry {
     /// idle timeouts from genuine errors and see which side initiated the
     /// disconnect.
     pub stream_disconnect_counter: DashMap<StreamDisconnectKey, TimestampedCounter>,
+    /// WAF rule matches keyed by rule id. Bounded by the built-in pack plus any
+    /// configured custom rules — never attacker-controlled.
+    pub waf_rule_hit_counter: DashMap<Arc<str>, TimestampedCounter>,
+    /// WAF-evaluated requests keyed by (action, highest severity).
+    pub waf_request_counter: DashMap<WafRequestKey, TimestampedCounter>,
     /// Mesh DNS upstream transaction-ID exhaustion events. This is process-wide
     /// because the transparent mesh DNS proxy uses one shared upstream socket.
     pub mesh_dns_upstream_id_exhaustions: AtomicU64,
@@ -429,6 +442,8 @@ impl MetricsRegistry {
             stream_duration_buckets: DashMap::new(),
             client_disconnect_counter: DashMap::new(),
             stream_disconnect_counter: DashMap::new(),
+            waf_rule_hit_counter: DashMap::new(),
+            waf_request_counter: DashMap::new(),
             mesh_dns_upstream_id_exhaustions: AtomicU64::new(0),
             hbone_relay_failure_counter: DashMap::new(),
             mesh_outbound_registry_decisions: DashMap::new(),
@@ -770,7 +785,44 @@ impl MetricsRegistry {
                 .increment(self.epoch);
         }
 
+        self.record_waf(&summary.metadata);
+
         self.maybe_invalidate_cache();
+    }
+
+    /// Record WAF activity from the `waf.*` metadata the WAF plugin attaches to
+    /// the transaction. Decoupled by design — the WAF owns detection, this
+    /// owns observability. All label values are bounded enumerations (rule
+    /// ids, action, severity), so /metrics cardinality stays bounded under
+    /// hostile traffic.
+    fn record_waf(&self, metadata: &std::collections::HashMap<String, String>) {
+        let action = metadata.get("waf.action");
+        let rule_hits = metadata.get("waf.rule_hits");
+        if action.is_none() && rule_hits.is_none() {
+            return; // WAF did not evaluate this request.
+        }
+        if let Some(hits) = rule_hits {
+            for rule in hits.split(',').filter(|rule| !rule.is_empty()) {
+                self.waf_rule_hit_counter
+                    .entry(Arc::from(rule))
+                    .or_insert_with(|| TimestampedCounter::new(self.epoch))
+                    .increment(self.epoch);
+            }
+        }
+        if let Some(action) = action {
+            let severity = metadata
+                .get("waf.severity")
+                .map(String::as_str)
+                .unwrap_or("none");
+            let key = WafRequestKey {
+                action: Arc::from(action.as_str()),
+                severity: Arc::from(severity),
+            };
+            self.waf_request_counter
+                .entry(key)
+                .or_insert_with(|| TimestampedCounter::new(self.epoch))
+                .increment(self.epoch);
+        }
     }
 
     /// Invalidate the render cache only if it's older than the configured
@@ -877,6 +929,22 @@ impl MetricsRegistry {
         });
 
         self.hbone_relay_failure_counter.retain(|_, v| {
+            let keep = v.nanos_since_update(self.epoch) < ttl_nanos;
+            if !keep {
+                evicted += 1;
+            }
+            keep
+        });
+
+        self.waf_rule_hit_counter.retain(|_, v| {
+            let keep = v.nanos_since_update(self.epoch) < ttl_nanos;
+            if !keep {
+                evicted += 1;
+            }
+            keep
+        });
+
+        self.waf_request_counter.retain(|_, v| {
             let keep = v.nanos_since_update(self.epoch) < ttl_nanos;
             if !keep {
                 evicted += 1;
@@ -997,6 +1065,38 @@ impl MetricsRegistry {
                 "ferrum_requests_total{{proxy_id=\"{}\",method=\"{}\",status_code=\"{}\"{}}} {}\n",
                 proxy_id, method, key.status_code, ns_label, count
             ));
+        }
+
+        // WAF metrics — present only when a `waf` plugin evaluated requests.
+        if !self.waf_rule_hit_counter.is_empty() {
+            output.push_str("# HELP ferrum_waf_rule_hits_total WAF rule matches by rule id.\n");
+            output.push_str("# TYPE ferrum_waf_rule_hits_total counter\n");
+            for entry in self.waf_rule_hit_counter.iter() {
+                let count = entry.value().value.load(Ordering::Relaxed);
+                output.push_str(&format!(
+                    "ferrum_waf_rule_hits_total{{rule=\"{}\"{}}} {}\n",
+                    escape_label_value(entry.key()),
+                    ns_label,
+                    count
+                ));
+            }
+        }
+        if !self.waf_request_counter.is_empty() {
+            output.push_str(
+                "# HELP ferrum_waf_requests_total WAF-evaluated requests by action and highest severity.\n",
+            );
+            output.push_str("# TYPE ferrum_waf_requests_total counter\n");
+            for entry in self.waf_request_counter.iter() {
+                let key = entry.key();
+                let count = entry.value().value.load(Ordering::Relaxed);
+                output.push_str(&format!(
+                    "ferrum_waf_requests_total{{action=\"{}\",severity=\"{}\"{}}} {}\n",
+                    escape_label_value(&key.action),
+                    escape_label_value(&key.severity),
+                    ns_label,
+                    count
+                ));
+            }
         }
 
         // Request duration histogram
@@ -1615,6 +1715,56 @@ mod tests {
     use crate::tls::inventory::{
         TlsInventory, TlsInventoryEntry, TlsInventorySource, TlsInventoryState, TlsInventoryUsage,
     };
+
+    #[test]
+    fn renders_waf_rule_hits_and_request_outcomes() {
+        let registry = MetricsRegistry::new();
+        let metadata = std::collections::HashMap::from([
+            (
+                "waf.rule_hits".to_string(),
+                "FE-SQLI-001,FE-XSS-001".to_string(),
+            ),
+            ("waf.action".to_string(), "blocked".to_string()),
+            ("waf.severity".to_string(), "high".to_string()),
+        ]);
+        registry.record_waf(&metadata);
+        registry.record_waf(&metadata);
+
+        let output = registry.render_uncached();
+        assert!(output.contains("ferrum_waf_rule_hits_total{rule=\"FE-SQLI-001\"} 2"));
+        assert!(output.contains("ferrum_waf_rule_hits_total{rule=\"FE-XSS-001\"} 2"));
+        assert!(
+            output.contains("ferrum_waf_requests_total{action=\"blocked\",severity=\"high\"} 2")
+        );
+    }
+
+    #[test]
+    fn record_waf_is_noop_without_waf_metadata() {
+        let registry = MetricsRegistry::new();
+        registry.record_waf(&std::collections::HashMap::new());
+        assert!(!registry.render_uncached().contains("ferrum_waf_"));
+    }
+
+    #[test]
+    fn evict_stale_removes_waf_metrics() {
+        let registry = MetricsRegistry::new();
+        let metadata = std::collections::HashMap::from([
+            ("waf.rule_hits".to_string(), "FE-SQLI-001".to_string()),
+            ("waf.action".to_string(), "blocked".to_string()),
+            ("waf.severity".to_string(), "high".to_string()),
+        ]);
+        registry.record_waf(&metadata);
+
+        assert!(!registry.waf_rule_hit_counter.is_empty());
+        assert!(!registry.waf_request_counter.is_empty());
+
+        let evicted = registry.evict_stale(0);
+
+        assert!(evicted >= 2);
+        assert!(registry.waf_rule_hit_counter.is_empty());
+        assert!(registry.waf_request_counter.is_empty());
+        assert!(!registry.render_uncached().contains("ferrum_waf_"));
+    }
 
     #[test]
     fn renders_tls_certificate_inventory_gauges() {

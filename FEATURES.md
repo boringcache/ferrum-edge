@@ -83,7 +83,7 @@ Ferrum supports dynamic upstream target discovery through four providers, config
 
 ## Plugin System
 
-- 65 built-in plugins with lifecycle hooks (request received, authenticate, authorize, before proxy, after proxy, on final request/response body, on response body, on WebSocket frame, on UDP datagram, log)
+- 66 built-in plugins with lifecycle hooks (request received, authenticate, authorize, before proxy, after proxy, on final request/response body, on response body, on WebSocket frame, on UDP datagram, log)
 - Priority-ordered execution with protocol-aware filtering (HTTP, gRPC, WebSocket, TCP, UDP)
 - Multiple instances of the same plugin type per proxy (e.g., two `http_logging` for Splunk and Datadog) with optional `priority_override` for execution order control
 - Three plugin scopes: **global** (all proxies), **proxy** (single proxy), **proxy_group** (shared across a subset of proxies) — scoped plugins replace global plugins of the same name. Proxy-group plugins share a single instance across all associated proxies, so stateful plugins (e.g., rate_limiting) share counters across the group
@@ -115,9 +115,10 @@ Ferrum supports dynamic upstream target discovery through four providers, config
 - **Rate Limiting** — per-IP or per-consumer with configurable windows and optional header exposure; supports centralized Redis-backed mode (`sync_mode: "redis"`) for coordinated rate limiting across multiple data plane instances. Compatible with any RESP-protocol server (Redis, Valkey, DragonflyDB, KeyDB, Garnet). TLS uses gateway-level `FERRUM_TLS_CA_BUNDLE_PATH` and `FERRUM_TLS_NO_VERIFY`
 - **Request Size Limiting** — per-proxy request body size limits (lower than global default), Content-Length fast path + buffered body check
 - **Response Size Limiting** — per-proxy response body size limits (lower than global default), Content-Length fast path + optional buffered body check
-- **WAF** — OWASP-style SQLi, XSS, command injection, traversal, SSRF, disclosure, and data-leakage detection for HTTP-family traffic with monitor/enforce modes
+- **WAF** — content-pattern threat detection for HTTP-family traffic: SQLi, NoSQLi, XSS, command/template injection, JNDI/Log4Shell, Spring4Shell, path traversal, LFI/RFI, SSRF, XXE, deserialization, prototype pollution, plus response-side disclosure and data-leak rules. Body decode/normalization (unicode/HTML-entity/percent) defeats encoding evasion; tunable via paranoia levels, per-rule overrides and false-positive filters, exemptions, and monitor/enforce posture with bulk (`default_rule_action`) enforcement. See [docs/waf.md](docs/waf.md)
 - **Bot Detection** — User-Agent pattern blocking with allow-list support
 - **CORS** — preflight handling with origin, method, and header validation
+- **Security Headers** — injects response security headers with secure defaults (X-Content-Type-Options, X-Frame-Options, Referrer-Policy) plus opt-in HSTS, CSP, and Permissions-Policy, and strips fingerprinting headers (Server, X-Powered-By); arbitrary set/remove with CRLF-injection-safe values
 - **Body Validator** — JSON Schema, XML, and gRPC protobuf validation
 - **OpenAPI Validator** — request/response JSON contract enforcement generated from attached OpenAPI/Swagger specs via `x-ferrum-validate`, with block/log-only/disabled modes and emergency bypasses
 - **Request Deduplication** — idempotency key-based deduplication for POST/PUT/PATCH requests with local in-memory and centralized Redis storage backends

@@ -42,6 +42,13 @@ pub struct BodyValidator {
     required_fields: Vec<String>,
     /// Required XML elements in request bodies.
     required_xml_elements: Vec<String>,
+    /// Max `<!ENTITY` declarations allowed in an XML DOCTYPE before the body is
+    /// rejected as a possible entity-expansion (billion-laughs) attack. Applies
+    /// to both request and response XML when well-formedness validation runs.
+    xml_max_entities: usize,
+    /// Reject XML whose entity definitions reference other general entities —
+    /// the billion-laughs expansion signature.
+    xml_reject_nested_entities: bool,
     /// Content types to validate for requests (empty = validate all).
     content_types: Vec<String>,
     /// Pre-compiled regexes for JSON Schema `pattern` constraints (request).
@@ -102,6 +109,9 @@ impl BodyValidator {
         let validate_xml = optional_bool(config, "validate_xml")?.unwrap_or(false);
         let required_xml_elements =
             optional_string_vec(config, "required_xml_elements")?.unwrap_or_default();
+        let xml_max_entities = optional_usize(config, "xml_max_entities")?.unwrap_or(100);
+        let xml_reject_nested_entities =
+            optional_bool(config, "xml_reject_nested_entities")?.unwrap_or(true);
         let content_types =
             optional_content_types(config, "content_types")?.unwrap_or_else(default_content_types);
 
@@ -176,6 +186,8 @@ impl BodyValidator {
             json_schema,
             required_fields,
             required_xml_elements,
+            xml_max_entities,
+            xml_reject_nested_entities,
             content_types,
             compiled_patterns,
             response_json_schema,
@@ -496,7 +508,12 @@ impl BodyValidator {
         Ok(())
     }
 
-    fn validate_xml_body(body: &str, required_xml_elements: &[String]) -> Result<(), String> {
+    fn validate_xml_body(
+        body: &str,
+        required_xml_elements: &[String],
+        max_entities: usize,
+        reject_nested: bool,
+    ) -> Result<(), String> {
         // Basic well-formedness check: must start with < and have matching tags
         let trimmed = body.trim();
         if trimmed.is_empty() {
@@ -505,6 +522,13 @@ impl BodyValidator {
         if !trimmed.starts_with('<') {
             return Err("Invalid XML: must start with '<'".to_string());
         }
+
+        // Reject entity-expansion bombs at the edge (Ferrum does not expand
+        // entities, but backends do). Required-element presence is enforced
+        // below via the parsed start-tag stack (`required_found`), which is
+        // CDATA/comment-spoof-proof — so the old `contains_xml_open_tag` scan
+        // from the WAF-hardening branch is intentionally dropped here.
+        check_xml_entity_expansion(trimmed, max_entities, reject_nested)?;
 
         // Tag balance check with proper handling of CDATA, comments,
         // processing instructions, and DOCTYPE declarations.
@@ -872,6 +896,333 @@ fn content_type_matches(configured: &[String], content_type: &str) -> bool {
 
 fn is_grpc_content_type(content_type: &str) -> bool {
     ascii_starts_with_ignore_case(content_type, "application/grpc")
+}
+
+/// Reject XML whose DOCTYPE declares an entity-expansion bomb ("billion
+/// laughs"). Ferrum does not expand entities; this protects backends that do.
+/// `max_entities` caps the number of `<!ENTITY` declarations; when
+/// `reject_nested` is set, any entity whose value references another
+/// general entity (the exponential-expansion signature) is rejected outright.
+fn check_xml_entity_expansion(
+    body: &str,
+    max_entities: usize,
+    reject_nested: bool,
+) -> Result<(), String> {
+    let bytes = body.as_bytes();
+    let needle = b"<!ENTITY";
+    let mut count = 0usize;
+    // Store the precomputed entity-declaration count per parameter entity, not
+    // the raw value: a `%name;` reference may appear many times (bounded only by
+    // body length), and recomputing `entity_declaration_count(value)` on each
+    // reference is O(refs x |value|) — quadratic in body size, a DoS in the very
+    // guard meant to prevent one. Compute the count once at declaration time so
+    // each reference is O(1).
+    let mut parameter_entities: Vec<(String, usize)> = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && let Some((name, end)) = parameter_entity_reference_at(body, i)
+        {
+            if let Some((_, expanded_entities)) = parameter_entities
+                .iter()
+                .find(|(entity_name, _)| entity_name == name)
+            {
+                let expanded_entities = *expanded_entities;
+                if expanded_entities > 0 {
+                    if reject_nested {
+                        return Err(
+                            "XML parameter entity expands to entity declarations (billion-laughs protection)"
+                                .to_string(),
+                        );
+                    }
+                    count = count.saturating_add(expanded_entities);
+                    if count > max_entities {
+                        return Err(format!(
+                            "XML declares more than {max_entities} entities after parameter entity expansion (possible entity-expansion attack)"
+                        ));
+                    }
+                }
+            }
+            i = end;
+            continue;
+        }
+        if bytes[i] != b'<' {
+            i += 1;
+            continue;
+        }
+        let remaining = &bytes[i..];
+        if remaining.starts_with(b"<![CDATA[") {
+            let Some(end) = find_subsequence(&bytes[i + 9..], b"]]>") else {
+                return Ok(());
+            };
+            i = i + 9 + end + 3;
+            continue;
+        }
+        if remaining.starts_with(b"<!--") {
+            let Some(end) = find_subsequence(&bytes[i + 4..], b"-->") else {
+                return Ok(());
+            };
+            i = i + 4 + end + 3;
+            continue;
+        }
+        if remaining.len() >= 2 && remaining[1] == b'?' {
+            let Some(end) = find_subsequence(&bytes[i + 2..], b"?>") else {
+                return Ok(());
+            };
+            i = i + 2 + end + 2;
+            continue;
+        }
+        if i + needle.len() <= bytes.len()
+            && bytes[i..i + needle.len()].eq_ignore_ascii_case(needle)
+        {
+            count += 1;
+            if count > max_entities {
+                return Err(format!(
+                    "XML declares more than {max_entities} entities (possible entity-expansion attack)"
+                ));
+            }
+            let decl_end = find_xml_declaration_end(&bytes[i..])
+                .map(|end| i + end)
+                .unwrap_or(bytes.len());
+            if reject_nested && entity_value_references_nested_entity(&body[i..decl_end]) {
+                return Err(
+                    "XML entity definition references another entity (billion-laughs protection)"
+                        .to_string(),
+                );
+            }
+            if let Some((name, value)) = parameter_entity_declaration(&body[i..decl_end]) {
+                // Count nested entity declarations once, at declaration time, so
+                // each later `%name;` reference is an O(1) lookup.
+                parameter_entities.push((name.to_string(), entity_declaration_count(value)));
+            }
+            i = decl_end.saturating_add(1);
+        } else {
+            i += 1;
+        }
+    }
+    Ok(())
+}
+
+fn find_xml_declaration_end(bytes: &[u8]) -> Option<usize> {
+    let mut quote = None;
+    for (idx, byte) in bytes.iter().copied().enumerate() {
+        match quote {
+            Some(current) if byte == current => quote = None,
+            Some(_) => {}
+            None if matches!(byte, b'"' | b'\'') => quote = Some(byte),
+            None if byte == b'>' => return Some(idx),
+            None => {}
+        }
+    }
+    None
+}
+
+fn parameter_entity_declaration(decl: &str) -> Option<(&str, &str)> {
+    let bytes = decl.as_bytes();
+    let needle = b"<!ENTITY";
+    if bytes.len() < needle.len() || !bytes[..needle.len()].eq_ignore_ascii_case(needle) {
+        return None;
+    }
+    let mut i = needle.len();
+    i = skip_xml_space(bytes, i);
+    if bytes.get(i) != Some(&b'%') {
+        return None;
+    }
+    i += 1;
+    i = skip_xml_space(bytes, i);
+    let name_start = i;
+    while i < bytes.len()
+        && (bytes[i].is_ascii_alphanumeric() || matches!(bytes[i], b'_' | b'-' | b'.'))
+    {
+        i += 1;
+    }
+    if i == name_start {
+        return None;
+    }
+    let name_end = i;
+    i = skip_xml_space(bytes, i);
+    let quote = *bytes.get(i)?;
+    if !matches!(quote, b'\'' | b'"') {
+        return None;
+    }
+    i += 1;
+    let value_start = i;
+    while i < bytes.len() && bytes[i] != quote {
+        i += 1;
+    }
+    if i >= bytes.len() {
+        return None;
+    }
+    Some((&decl[name_start..name_end], &decl[value_start..i]))
+}
+
+fn parameter_entity_reference_at(body: &str, start: usize) -> Option<(&str, usize)> {
+    let bytes = body.as_bytes();
+    if bytes.get(start) != Some(&b'%') {
+        return None;
+    }
+    let mut i = start + 1;
+    let name_start = i;
+    while i < bytes.len()
+        && (bytes[i].is_ascii_alphanumeric() || matches!(bytes[i], b'_' | b'-' | b'.'))
+    {
+        i += 1;
+    }
+    if i == name_start || bytes.get(i) != Some(&b';') {
+        return None;
+    }
+    Some((&body[name_start..i], i + 1))
+}
+
+fn entity_declaration_count(text: &str) -> usize {
+    let bytes = text.as_bytes();
+    let needle = b"<!ENTITY";
+    if bytes.len() < needle.len() {
+        return 0;
+    }
+    bytes
+        .windows(needle.len())
+        .filter(|window| window.eq_ignore_ascii_case(needle))
+        .count()
+}
+
+fn skip_xml_space(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\r' | b'\n') {
+        i += 1;
+    }
+    i
+}
+
+/// True if an `<!ENTITY ...>` declaration's value references another entity.
+/// General entity refs (`&name;`) and parameter entity refs (`%name;`) can both
+/// create expansion chains. Numeric character refs are normalized first because
+/// XML resolves them inside entity replacement text before expansion.
+fn entity_value_references_nested_entity(decl: &str) -> bool {
+    let Some(value) = entity_declaration_value(decl) else {
+        return false;
+    };
+    let decoded = decode_xml_numeric_char_refs(value);
+    entity_replacement_text_references_entity(decoded.as_ref())
+}
+
+fn entity_declaration_value(decl: &str) -> Option<&str> {
+    let bytes = decl.as_bytes();
+    let needle = b"<!ENTITY";
+    if bytes.len() < needle.len() || !bytes[..needle.len()].eq_ignore_ascii_case(needle) {
+        return None;
+    }
+    let mut i = needle.len();
+    i = skip_xml_space(bytes, i);
+    if bytes.get(i) == Some(&b'%') {
+        i += 1;
+        i = skip_xml_space(bytes, i);
+    }
+    let name_start = i;
+    while i < bytes.len()
+        && (bytes[i].is_ascii_alphanumeric() || matches!(bytes[i], b'_' | b'-' | b'.'))
+    {
+        i += 1;
+    }
+    if i == name_start {
+        return None;
+    }
+    i = skip_xml_space(bytes, i);
+    let quote = *bytes.get(i)?;
+    if !matches!(quote, b'\'' | b'"') {
+        return None;
+    }
+    i += 1;
+    let value_start = i;
+    while i < bytes.len() && bytes[i] != quote {
+        i += 1;
+    }
+    if i >= bytes.len() {
+        return None;
+    }
+    Some(&decl[value_start..i])
+}
+
+fn decode_xml_numeric_char_refs(value: &str) -> std::borrow::Cow<'_, str> {
+    let bytes = value.as_bytes();
+    let mut i = 0usize;
+    let mut out: Option<String> = None;
+    while i < bytes.len() {
+        if bytes[i] == b'&'
+            && bytes.get(i + 1) == Some(&b'#')
+            && let Some((cp, end)) = numeric_char_ref_at(bytes, i)
+            && let Some(ch) = char::from_u32(cp)
+        {
+            let output = out.get_or_insert_with(|| value[..i].to_string());
+            output.push(ch);
+            i = end;
+            continue;
+        }
+        let Some(ch) = value[i..].chars().next() else {
+            break;
+        };
+        if let Some(output) = &mut out {
+            output.push(ch);
+        }
+        i += ch.len_utf8();
+    }
+    match out {
+        Some(decoded) => std::borrow::Cow::Owned(decoded),
+        None => std::borrow::Cow::Borrowed(value),
+    }
+}
+
+fn entity_replacement_text_references_entity(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if matches!(bytes[i], b'&' | b'%') {
+            let marker = bytes[i];
+            let mut j = i + 1;
+            while j < bytes.len()
+                && (bytes[j].is_ascii_alphanumeric() || matches!(bytes[j], b'_' | b'-' | b'.'))
+            {
+                j += 1;
+            }
+            if j > i + 1 && bytes.get(j) == Some(&b';') {
+                let name = &value[i + 1..j];
+                if marker == b'%' || !matches!(name, "lt" | "gt" | "amp" | "quot" | "apos") {
+                    return true;
+                }
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
+fn numeric_char_ref_at(bytes: &[u8], start: usize) -> Option<(u32, usize)> {
+    if bytes.get(start) != Some(&b'&') || bytes.get(start + 1) != Some(&b'#') {
+        return None;
+    }
+    let mut i = start + 2;
+    let radix = if matches!(bytes.get(i), Some(b'x' | b'X')) {
+        i += 1;
+        16
+    } else {
+        10
+    };
+    let digits_start = i;
+    while i < bytes.len()
+        && match radix {
+            16 => bytes[i].is_ascii_hexdigit(),
+            _ => bytes[i].is_ascii_digit(),
+        }
+    {
+        i += 1;
+    }
+    if i == digits_start || bytes.get(i) != Some(&b';') {
+        return None;
+    }
+    let digits = std::str::from_utf8(&bytes[digits_start..i]).ok()?;
+    let cp = u32::from_str_radix(digits, radix).ok()?;
+    Some((cp, i + 1))
 }
 
 fn is_json_like_content_type(content_type: &str) -> bool {
@@ -1279,7 +1630,12 @@ impl Plugin for BodyValidator {
                 &self.compiled_patterns,
             )
         } else if is_xml_like_content_type(content_type) && self.has_xml_request_validation {
-            Self::validate_xml_body(body, &self.required_xml_elements)
+            Self::validate_xml_body(
+                body,
+                &self.required_xml_elements,
+                self.xml_max_entities,
+                self.xml_reject_nested_entities,
+            )
         } else {
             Ok(())
         };
@@ -1352,7 +1708,12 @@ impl Plugin for BodyValidator {
                     &self.compiled_patterns,
                 )
             } else if is_xml_like_content_type(content_type) && self.has_xml_request_validation {
-                Self::validate_xml_body(body_str, &self.required_xml_elements)
+                Self::validate_xml_body(
+                    body_str,
+                    &self.required_xml_elements,
+                    self.xml_max_entities,
+                    self.xml_reject_nested_entities,
+                )
             } else {
                 Ok(())
             };
@@ -1494,7 +1855,12 @@ impl Plugin for BodyValidator {
                 &self.response_compiled_patterns,
             )
         } else if is_xml_like_content_type(content_type) && self.has_xml_response_validation {
-            Self::validate_xml_body(body_str, &self.response_required_xml_elements)
+            Self::validate_xml_body(
+                body_str,
+                &self.response_required_xml_elements,
+                self.xml_max_entities,
+                self.xml_reject_nested_entities,
+            )
         } else {
             Ok(())
         };

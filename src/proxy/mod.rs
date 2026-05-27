@@ -7896,6 +7896,23 @@ pub(crate) async fn apply_after_proxy_hooks_to_rejection(
     }
 }
 
+pub(crate) async fn apply_plugin_rejection_response(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    response_status: &mut u16,
+    response_headers: &mut HashMap<String, String>,
+    reject: RejectedResponseParts,
+) -> Vec<u8> {
+    *response_status = reject.status_code;
+    response_headers.clear();
+    response_headers.insert("content-type".to_string(), "application/json".to_string());
+    for (key, value) in reject.headers {
+        response_headers.insert(key, value);
+    }
+    apply_after_proxy_hooks_to_rejection(plugins, ctx, *response_status, response_headers).await;
+    reject.body
+}
+
 pub(crate) struct AfterProxyReject {
     pub status_code: u16,
     pub body: Vec<u8>,
@@ -8096,6 +8113,25 @@ fn apply_grpc_reject_metadata(ctx: &mut RequestContext, reject: &NormalizedRejec
             reject.grpc_message.as_deref().unwrap_or(""),
         );
     }
+}
+
+pub(crate) async fn normalize_grpc_plugin_rejection_with_after_proxy_hooks(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    reject: RejectedResponseParts,
+) -> NormalizedRejectResponse {
+    let status = StatusCode::from_u16(reject.status_code).unwrap_or(StatusCode::BAD_GATEWAY);
+    let normalized = finalize_reject_response_with_after_proxy_hooks(
+        plugins,
+        ctx,
+        status,
+        &reject.body,
+        reject.headers,
+        true,
+    )
+    .await;
+    apply_grpc_reject_metadata(ctx, &normalized);
+    normalized
 }
 
 fn build_response_from_normalized_reject(reject: NormalizedRejectResponse) -> Response<ProxyBody> {
@@ -9511,30 +9547,24 @@ async fn handle_proxy_request_inner(
                 ctx.metadata = body_hook_ctx.metadata;
                 ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
                 ctx.waf_owned_metadata = body_hook_ctx.waf_owned_metadata;
+                ctx.waf_score = body_hook_ctx.waf_score;
             }
             match final_body_result {
                 PluginResult::Continue => {}
                 reject @ PluginResult::Reject { .. }
                 | reject @ PluginResult::RejectBinary { .. } => {
-                    let (status, body, headers) = match reject {
-                        PluginResult::Reject {
-                            status_code,
-                            body,
-                            headers,
-                        } => (status_code, body.into_bytes(), headers),
-                        PluginResult::RejectBinary {
-                            status_code,
-                            body,
-                            headers,
-                        } => (status_code, body.to_vec(), headers),
-                        _ => unreachable!(),
+                    let Some(reject) = plugin_result_into_reject_parts(reject) else {
+                        warn!("reject plugin result could not be converted to response parts");
+                        record_request(&state, StatusCode::INTERNAL_SERVER_ERROR.as_u16());
+                        return Ok(build_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Internal Server Error",
+                        ));
                     };
-                    let normalized = normalize_reject_response(
-                        StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST),
-                        &body,
-                        &headers,
-                        true, // is_grpc_request
-                    );
+                    let normalized = normalize_grpc_plugin_rejection_with_after_proxy_hooks(
+                        &plugins, &mut ctx, reject,
+                    )
+                    .await;
                     record_request(&state, normalized.http_status.as_u16());
                     return Ok(build_response_from_normalized_reject(normalized));
                 }
@@ -10081,14 +10111,11 @@ async fn handle_proxy_request_inner(
                                     status_code = reject.status_code,
                                     "Plugin rejected gRPC response body"
                                 );
-                                let normalized = normalize_reject_response(
-                                    StatusCode::from_u16(reject.status_code)
-                                        .unwrap_or(StatusCode::BAD_GATEWAY),
-                                    &reject.body,
-                                    &reject.headers,
-                                    true,
-                                );
-                                apply_grpc_reject_metadata(&mut ctx, &normalized);
+                                let normalized =
+                                    normalize_grpc_plugin_rejection_with_after_proxy_hooks(
+                                        &plugins, &mut ctx, reject,
+                                    )
+                                    .await;
                                 response_status = normalized.http_status.as_u16();
                                 response_headers = normalized.headers;
                                 response_body = normalized.body;
@@ -10140,14 +10167,11 @@ async fn handle_proxy_request_inner(
                                     status_code = reject.status_code,
                                     "Plugin rejected finalized gRPC response body"
                                 );
-                                let normalized = normalize_reject_response(
-                                    StatusCode::from_u16(reject.status_code)
-                                        .unwrap_or(StatusCode::BAD_GATEWAY),
-                                    &reject.body,
-                                    &reject.headers,
-                                    true,
-                                );
-                                apply_grpc_reject_metadata(&mut ctx, &normalized);
+                                let normalized =
+                                    normalize_grpc_plugin_rejection_with_after_proxy_hooks(
+                                        &plugins, &mut ctx, reject,
+                                    )
+                                    .await;
                                 response_status = normalized.http_status.as_u16();
                                 response_headers = normalized.headers;
                                 response_body = normalized.body;
@@ -10678,6 +10702,7 @@ async fn handle_proxy_request_inner(
             ctx.metadata = body_hook_ctx.metadata;
             ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
             ctx.waf_owned_metadata = body_hook_ctx.waf_owned_metadata;
+            ctx.waf_score = body_hook_ctx.waf_score;
         }
         (result, current_cb_target_key)
     } else {
@@ -10713,6 +10738,7 @@ async fn handle_proxy_request_inner(
             ctx.metadata = body_hook_ctx.metadata;
             ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
             ctx.waf_owned_metadata = body_hook_ctx.waf_owned_metadata;
+            ctx.waf_score = body_hook_ctx.waf_score;
         }
         (resp, cb_target_key.clone())
     };
@@ -10796,6 +10822,7 @@ async fn handle_proxy_request_inner(
         && let ResponseBody::Buffered(ref data) = response_body
     {
         let phase_start = Instant::now();
+        let mut response_body_reject = None;
         for plugin in plugins.iter() {
             let result = plugin
                 .on_response_body(&mut ctx, response_status, &response_headers, data)
@@ -10811,17 +10838,21 @@ async fn handle_proxy_request_inner(
                         status_code = reject.status_code,
                         "Plugin rejected response body"
                     );
-                    response_status = reject.status_code;
-                    response_headers.clear();
-                    response_headers
-                        .insert("content-type".to_string(), "application/json".to_string());
-                    for (k, v) in reject.headers {
-                        response_headers.insert(k, v);
-                    }
-                    response_body = ResponseBody::Buffered(reject.body);
+                    response_body_reject = Some(reject);
                     break;
                 }
             }
+        }
+        if let Some(reject) = response_body_reject {
+            let body = apply_plugin_rejection_response(
+                &plugins,
+                &mut ctx,
+                &mut response_status,
+                &mut response_headers,
+                reject,
+            )
+            .await;
+            response_body = ResponseBody::Buffered(body);
         }
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     }
@@ -10858,6 +10889,7 @@ async fn handle_proxy_request_inner(
         && let ResponseBody::Buffered(ref data) = response_body
     {
         let phase_start = Instant::now();
+        let mut response_body_reject = None;
         for plugin in plugins.iter() {
             let result = plugin
                 .on_final_response_body(&mut ctx, response_status, &response_headers, data)
@@ -10873,17 +10905,21 @@ async fn handle_proxy_request_inner(
                         status_code = reject.status_code,
                         "Plugin rejected finalized response body"
                     );
-                    response_status = reject.status_code;
-                    response_headers.clear();
-                    response_headers
-                        .insert("content-type".to_string(), "application/json".to_string());
-                    for (k, v) in reject.headers {
-                        response_headers.insert(k, v);
-                    }
-                    response_body = ResponseBody::Buffered(reject.body);
+                    response_body_reject = Some(reject);
                     break;
                 }
             }
+        }
+        if let Some(reject) = response_body_reject {
+            let body = apply_plugin_rejection_response(
+                &plugins,
+                &mut ctx,
+                &mut response_status,
+                &mut response_headers,
+                reject,
+            )
+            .await;
+            response_body = ResponseBody::Buffered(body);
         }
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     }
@@ -15163,6 +15199,7 @@ fn canonicalize_client_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plugins::security_headers::SecurityHeaders;
     use async_trait::async_trait;
     use http::header::HeaderValue;
     use serde_json::json;
@@ -15170,6 +15207,8 @@ mod tests {
     struct ResponseBufferPlugin {
         should_buffer: bool,
     }
+
+    struct RejectHeaderPlugin;
 
     #[async_trait]
     impl Plugin for ResponseBufferPlugin {
@@ -15186,6 +15225,33 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl Plugin for RejectHeaderPlugin {
+        fn name(&self) -> &str {
+            "reject_header_plugin"
+        }
+
+        fn applies_after_proxy_on_reject(&self) -> bool {
+            true
+        }
+
+        async fn after_proxy(
+            &self,
+            ctx: &mut RequestContext,
+            _response_status: u16,
+            response_headers: &mut HashMap<String, String>,
+        ) -> PluginResult {
+            if ctx
+                .metadata
+                .get(REJECTION_RESPONSE_METADATA_KEY)
+                .is_some_and(|value| value == "true")
+            {
+                response_headers.insert("x-after-reject".to_string(), "applied".to_string());
+            }
+            PluginResult::Continue
+        }
+    }
+
     fn test_proxy(response_body_mode: ResponseBodyMode) -> Proxy {
         serde_json::from_value(json!({
             "backend_host": "example.com",
@@ -15196,6 +15262,117 @@ mod tests {
             }
         }))
         .expect("test proxy should deserialize")
+    }
+
+    #[tokio::test]
+    async fn plugin_rejection_response_runs_after_proxy_reject_hooks() {
+        let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(RejectHeaderPlugin)];
+        let mut ctx = RequestContext::new("203.0.113.10".into(), "GET".into(), "/body".into());
+        let mut response_status = 200;
+        let mut response_headers =
+            HashMap::from([("content-type".to_string(), "text/plain".to_string())]);
+        let reject = RejectedResponseParts {
+            status_code: 502,
+            body: br#"{"error":"blocked"}"#.to_vec(),
+            headers: HashMap::new(),
+        };
+
+        let body = apply_plugin_rejection_response(
+            &plugins,
+            &mut ctx,
+            &mut response_status,
+            &mut response_headers,
+            reject,
+        )
+        .await;
+
+        assert_eq!(response_status, 502);
+        assert_eq!(
+            response_headers.get("content-type").map(String::as_str),
+            Some("application/json")
+        );
+        assert_eq!(
+            response_headers.get("x-after-reject").map(String::as_str),
+            Some("applied")
+        );
+        assert_eq!(body, br#"{"error":"blocked"}"#);
+        assert!(!ctx.metadata.contains_key(REJECTION_RESPONSE_METADATA_KEY));
+    }
+
+    #[tokio::test]
+    async fn plugin_rejection_response_runs_security_headers() {
+        let plugins: Vec<Arc<dyn Plugin>> =
+            vec![Arc::new(SecurityHeaders::new(&json!({})).unwrap())];
+        let mut ctx = RequestContext::new("203.0.113.10".into(), "GET".into(), "/body".into());
+        let mut response_status = 200;
+        let mut response_headers = HashMap::new();
+        let reject = RejectedResponseParts {
+            status_code: 403,
+            body: br#"{"error":"blocked"}"#.to_vec(),
+            headers: HashMap::new(),
+        };
+
+        let body = apply_plugin_rejection_response(
+            &plugins,
+            &mut ctx,
+            &mut response_status,
+            &mut response_headers,
+            reject,
+        )
+        .await;
+
+        assert_eq!(response_status, 403);
+        assert_eq!(
+            response_headers
+                .get("x-content-type-options")
+                .map(String::as_str),
+            Some("nosniff")
+        );
+        assert_eq!(
+            response_headers.get("x-frame-options").map(String::as_str),
+            Some("SAMEORIGIN")
+        );
+        assert_eq!(body, br#"{"error":"blocked"}"#);
+    }
+
+    #[tokio::test]
+    async fn grpc_plugin_rejection_response_runs_security_headers() {
+        let plugins: Vec<Arc<dyn Plugin>> =
+            vec![Arc::new(SecurityHeaders::new(&json!({})).unwrap())];
+        let mut ctx = RequestContext::new(
+            "203.0.113.10".into(),
+            "POST".into(),
+            "/grpc.Service/Method".into(),
+        );
+        let reject = RejectedResponseParts {
+            status_code: 403,
+            body: br#"{"error":"Forbidden"}"#.to_vec(),
+            headers: HashMap::new(),
+        };
+
+        let normalized =
+            normalize_grpc_plugin_rejection_with_after_proxy_hooks(&plugins, &mut ctx, reject)
+                .await;
+
+        assert_eq!(normalized.http_status, StatusCode::OK);
+        assert_eq!(
+            normalized.grpc_status,
+            Some(grpc_proxy::grpc_status::PERMISSION_DENIED)
+        );
+        assert_eq!(
+            normalized
+                .headers
+                .get("x-content-type-options")
+                .map(String::as_str),
+            Some("nosniff")
+        );
+        assert_eq!(
+            normalized
+                .headers
+                .get("x-frame-options")
+                .map(String::as_str),
+            Some("SAMEORIGIN")
+        );
     }
 
     #[test]
@@ -15319,6 +15496,7 @@ mod tests {
         ctx.metadata = hook_ctx.metadata;
         ctx.waf_metadata_initialized = hook_ctx.waf_metadata_initialized;
         ctx.waf_owned_metadata = hook_ctx.waf_owned_metadata;
+        ctx.waf_score = hook_ctx.waf_score;
         let metadata = clone_log_metadata(&ctx);
 
         assert_eq!(

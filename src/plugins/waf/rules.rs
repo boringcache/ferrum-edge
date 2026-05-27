@@ -211,6 +211,9 @@ pub(super) struct WafRule {
     pub(super) action: RuleAction,
     pub(super) fp_filters: Vec<String>,
     pub(super) paranoia_min: u8,
+    /// Anomaly-score contribution when scoring is enabled. `None` falls back to
+    /// the configured per-severity weight.
+    pub(super) score: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -224,6 +227,7 @@ pub(super) struct CompiledRule {
     conditions: Option<CompiledConditions>,
     fp_filters: Option<RegexSet>,
     pub(super) cidr: Option<IpCidr>,
+    pub(super) score: Option<u32>,
 }
 
 impl CompiledRule {
@@ -385,6 +389,8 @@ pub(super) fn compile_rules(
     mut rules: Vec<(WafRule, bool)>,
     disabled_default_rules: &HashSet<String>,
     rule_modes: &HashMap<String, RuleAction>,
+    default_rule_action: Option<RuleAction>,
+    rule_overrides: &HashMap<String, RuleOverride>,
     paranoia_level: u8,
 ) -> Result<CompiledRules, String> {
     let mut seen = HashSet::new();
@@ -400,8 +406,37 @@ pub(super) fn compile_rules(
         if is_default {
             seen_default.insert(rule.id.clone());
         }
+        // Per-rule overrides apply to built-ins and custom rules alike, and
+        // before the paranoia gate so an override can raise/lower visibility.
+        if let Some(ov) = rule_overrides.get(&rule.id) {
+            if let Some(paranoia_min) = ov.paranoia_min {
+                rule.paranoia_min = paranoia_min;
+            }
+            if let Some(severity) = ov.severity {
+                rule.severity = severity;
+            }
+            if let Some(fp_filters) = &ov.fp_filters {
+                rule.fp_filters = fp_filters.clone();
+            }
+            if let Some(conditions) = &ov.conditions {
+                rule.conditions = Some(conditions.clone());
+            }
+            if let Some(score) = ov.score {
+                rule.score = Some(score);
+            }
+        }
         if rule.paranoia_min > paranoia_level {
             continue;
+        }
+        // Bulk action for built-ins; an explicit per-rule `rule_modes` entry
+        // (applied next) still wins.
+        if is_default && let Some(action) = default_rule_action {
+            rule.action = action;
+        }
+        if let Some(ov) = rule_overrides.get(&rule.id)
+            && let Some(action) = ov.action
+        {
+            rule.action = action;
         }
         if is_default && disabled_default_rules.contains(&rule.id) {
             continue;
@@ -443,6 +478,7 @@ pub(super) fn compile_rules(
             conditions: compiled_conditions,
             fp_filters,
             cidr,
+            score: rule.score,
         };
         builders.add_rule(rule_index, &rule)?;
         compiled_rules.push(compiled);
@@ -474,6 +510,21 @@ pub(super) fn compile_rules(
         return Err(format!(
             "waf: 'rule_modes' references unknown rule id(s): {}",
             unknown.join(", ")
+        ));
+    }
+
+    // Same loud-failure contract for rule_overrides: a typo'd id must not
+    // silently leave the intended tuning unapplied.
+    let mut unknown_overrides: Vec<&str> = rule_overrides
+        .keys()
+        .filter(|id| !seen.contains(id.as_str()))
+        .map(String::as_str)
+        .collect();
+    if !unknown_overrides.is_empty() {
+        unknown_overrides.sort_unstable();
+        return Err(format!(
+            "waf: 'rule_overrides' references unknown rule id(s): {}",
+            unknown_overrides.join(", ")
         ));
     }
 
@@ -760,6 +811,82 @@ pub(super) fn parse_rule_action(raw: &str, field: &str) -> Result<RuleAction, St
     }
 }
 
+/// Operator tuning applied to an existing rule by id, including built-ins.
+/// Lets operators attach false-positive filters, scope to paths, raise
+/// paranoia, or change severity without forking the rule pack.
+#[derive(Debug, Default)]
+pub(super) struct RuleOverride {
+    pub(super) action: Option<RuleAction>,
+    pub(super) paranoia_min: Option<u8>,
+    pub(super) severity: Option<Severity>,
+    pub(super) fp_filters: Option<Vec<String>>,
+    pub(super) conditions: Option<Conditions>,
+    pub(super) score: Option<u32>,
+}
+
+pub(super) fn parse_rule_overrides(
+    value: Option<&Value>,
+) -> Result<HashMap<String, RuleOverride>, String> {
+    match value {
+        None | Some(Value::Null) => Ok(HashMap::new()),
+        Some(Value::Object(map)) => {
+            let mut out = HashMap::with_capacity(map.len());
+            for (id, raw) in map {
+                let object = raw
+                    .as_object()
+                    .ok_or_else(|| format!("waf: rule_overrides['{id}'] must be an object"))?;
+                for key in object.keys() {
+                    if !matches!(
+                        key.as_str(),
+                        "action"
+                            | "paranoia_min"
+                            | "severity"
+                            | "fp_filters"
+                            | "conditions"
+                            | "score"
+                    ) {
+                        return Err(format!(
+                            "waf: rule_overrides['{id}'] contains unsupported field '{key}'"
+                        ));
+                    }
+                }
+                let action = optional_string(object, "action")?
+                    .map(|raw| parse_rule_action(&raw, "rule_overrides.action"))
+                    .transpose()?;
+                let paranoia_min = optional_u8(object, "paranoia_min")?;
+                if let Some(p) = paranoia_min
+                    && !(1..=4).contains(&p)
+                {
+                    return Err(format!(
+                        "waf: rule_overrides['{id}'].paranoia_min must be from 1 to 4"
+                    ));
+                }
+                let severity = optional_string(object, "severity")?
+                    .map(|raw| parse_severity(&raw))
+                    .transpose()?;
+                let fp_filters = optional_string_vec(object, "fp_filters")?;
+                let conditions = object.get("conditions").map(parse_conditions).transpose()?;
+                let score = optional_u32(object, "score")?;
+                out.insert(
+                    id.clone(),
+                    RuleOverride {
+                        action,
+                        paranoia_min,
+                        severity,
+                        fp_filters,
+                        conditions,
+                        score,
+                    },
+                );
+            }
+            Ok(out)
+        }
+        Some(other) => Err(format!(
+            "waf: 'rule_overrides' must be an object, got {other}"
+        )),
+    }
+}
+
 pub(super) fn parse_custom_rule(
     value: &Value,
     default_action: RuleAction,
@@ -792,6 +919,7 @@ pub(super) fn parse_custom_rule(
         .unwrap_or(default_action);
     let fp_filters = optional_string_vec(object, "fp_filters")?.unwrap_or_default();
     let paranoia_min = optional_u8(object, "paranoia_min")?.unwrap_or(1);
+    let score = optional_u32(object, "score")?;
     let conditions = object.get("conditions").map(parse_conditions).transpose()?;
 
     Ok(WafRule {
@@ -806,6 +934,7 @@ pub(super) fn parse_custom_rule(
         action,
         fp_filters,
         paranoia_min,
+        score,
     })
 }
 
@@ -954,6 +1083,18 @@ fn optional_u8(object: &serde_json::Map<String, Value>, key: &str) -> Result<Opt
     }
 }
 
+fn optional_u32(object: &serde_json::Map<String, Value>, key: &str) -> Result<Option<u32>, String> {
+    match object.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(value)) => value
+            .as_u64()
+            .and_then(|v| u32::try_from(v).ok())
+            .map(Some)
+            .ok_or_else(|| format!("waf: '{key}' must be a non-negative integer")),
+        Some(other) => Err(format!("waf: '{key}' must be an integer, got {other}")),
+    }
+}
+
 fn optional_string_vec(
     object: &serde_json::Map<String, Value>,
     key: &str,
@@ -1063,9 +1204,17 @@ mod tests {
             action: RuleAction::Monitor,
             fp_filters: vec![],
             paranoia_min: 1,
+            score: None,
         };
-        let compiled = compile_rules(vec![(rule, false)], &HashSet::new(), &HashMap::new(), 1)
-            .expect("compile");
+        let compiled = compile_rules(
+            vec![(rule, false)],
+            &HashSet::new(),
+            &HashMap::new(),
+            None,
+            &HashMap::new(),
+            1,
+        )
+        .expect("compile");
         assert!(compiled.method.as_ref().unwrap().set.is_match("PROPFIND"));
         assert!(!compiled.method.as_ref().unwrap().set.is_match("XPROPFIND"));
     }
@@ -1084,12 +1233,21 @@ mod tests {
             action: RuleAction::Monitor,
             fp_filters: vec![],
             paranoia_min: 1,
+            score: None,
         };
         let mut modes = HashMap::new();
         modes.insert("R-TYPO".to_string(), RuleAction::Enforce);
         modes.insert("ALSO-WRONG".to_string(), RuleAction::Enforce);
         modes.insert("R1".to_string(), RuleAction::Enforce);
-        let err = compile_rules(vec![(rule, false)], &HashSet::new(), &modes, 1).unwrap_err();
+        let err = compile_rules(
+            vec![(rule, false)],
+            &HashSet::new(),
+            &modes,
+            None,
+            &HashMap::new(),
+            1,
+        )
+        .unwrap_err();
         assert!(err.contains("unknown rule id"));
         assert!(err.contains("R-TYPO"));
         assert!(err.contains("ALSO-WRONG"));
@@ -1111,11 +1269,20 @@ mod tests {
             action: RuleAction::Monitor,
             fp_filters: vec![],
             paranoia_min: 4,
+            score: None,
         };
         let mut modes = HashMap::new();
         modes.insert("R1".to_string(), RuleAction::Enforce);
         // R1 is filtered out by paranoia_level=1 but is still a known ID, so
         // the override is a no-op rather than an error.
-        compile_rules(vec![(rule, false)], &HashSet::new(), &modes, 1).expect("compile");
+        compile_rules(
+            vec![(rule, false)],
+            &HashSet::new(),
+            &modes,
+            None,
+            &HashMap::new(),
+            1,
+        )
+        .expect("compile");
     }
 }

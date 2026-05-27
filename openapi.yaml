@@ -3392,6 +3392,7 @@ paths:
                 - mesh_outbound_registry
                 - compression
                 - cors
+                - security_headers
                 - access_control
                 - tcp_connection_throttle
                 - ip_restriction
@@ -5964,7 +5965,7 @@ components:
             Security plugins (key_auth, basic_auth, jwt_auth, jwks_auth,
             oauth2_introspection, oidc_relying_party, hmac_auth, ldap_auth,
             mtls_auth, access_control,
-            tcp_connection_throttle, ip_restriction, waf, mesh_authz, opa,
+            tcp_connection_throttle, ip_restriction, waf, security_headers, mesh_authz, opa,
             mesh_outbound_registry, openapi_validator) are validation-fatal: invalid config blocks
             gateway startup in file mode, and on DB/CP polling the new config
             snapshot is rejected as a whole (the gateway keeps serving the
@@ -10731,6 +10732,71 @@ components:
             translator on routes carrying `headers.response.{set,add,remove}`
             that have no operator-configured `response_transformer`.
 
+    SecurityHeadersConfig:
+      type: object
+      description: "Plugin: security_headers — Injects response security headers (secure defaults) and strips fingerprinting headers in after_proxy."
+      properties:
+        content_type_options:
+          oneOf:
+            - type: boolean
+            - type: string
+            - type: "null"
+          default: nosniff
+          description: "X-Content-Type-Options. true = nosniff (default); a string sets a custom value; false/null disables."
+        frame_options:
+          oneOf:
+            - type: boolean
+            - type: string
+            - type: "null"
+          default: SAMEORIGIN
+          description: "X-Frame-Options. Default SAMEORIGIN; string overrides; false disables."
+        referrer_policy:
+          oneOf:
+            - type: boolean
+            - type: string
+            - type: "null"
+          default: strict-origin-when-cross-origin
+          description: "Referrer-Policy. Default strict-origin-when-cross-origin; string overrides; false disables."
+        hsts:
+          description: "Strict-Transport-Security (opt-in). true = max-age=31536000; includeSubDomains; a string is used verbatim; an object {max_age, include_subdomains, preload} builds the value."
+          oneOf:
+            - type: boolean
+            - type: string
+            - type: "null"
+            - type: object
+              properties:
+                max_age:
+                  type: integer
+                  minimum: 0
+                  default: 31536000
+                include_subdomains:
+                  type: boolean
+                  default: true
+                preload:
+                  type: boolean
+                  default: false
+        content_security_policy:
+          type: [string, "null"]
+          description: "Content-Security-Policy value (opt-in; application-specific)."
+        permissions_policy:
+          type: [string, "null"]
+          description: "Permissions-Policy value (opt-in)."
+        set:
+          type: [object, "null"]
+          additionalProperties:
+            type: string
+          description: "Arbitrary response headers to set (name -> value). Values must not contain CR, LF, or NUL."
+        remove:
+          type: [array, "null"]
+          items:
+            type: string
+          default: [server, x-powered-by]
+          description: "Response header names to strip (case-insensitive). Defaults to Server and X-Powered-By; set [] to strip nothing."
+        override_existing:
+          type: boolean
+          default: true
+          description: "When false, only add a header the backend did not already set."
+
     CompressionConfig:
       type: object
       description: "Plugin: compression — On-the-fly response compression (gzip, brotli) and optional request decompression."
@@ -10984,6 +11050,14 @@ components:
           type: string
           enum: [enforce, monitor, disabled]
           default: enforce
+        default_rule_action:
+          type: string
+          enum: [enforce, monitor, disabled]
+          description: >-
+            Bulk action applied to every built-in rule. Unset leaves the pack
+            monitor-only; per-rule rule_modes entries still take precedence.
+            Combine with paranoia_level to enforce only the low-false-positive
+            core of the rule pack.
         paranoia_level:
           type: integer
           minimum: 1
@@ -11019,8 +11093,12 @@ components:
           default: log_and_allow
         on_body_too_large:
           type: string
-          enum: [scan_truncated, skip]
+          enum: [scan_truncated, skip, block]
           default: scan_truncated
+          description: >-
+            Behavior when a body exceeds max_scan_bytes. scan_truncated scans
+            the prefix; skip scans nothing; block rejects (fail closed) when
+            mode is enforce, otherwise scans the prefix.
         include_default_rules:
           type: boolean
           default: true
@@ -11034,11 +11112,94 @@ components:
           additionalProperties:
             type: string
             enum: [enforce, monitor, disabled]
+        rule_overrides:
+          type: object
+          description: >-
+            Per-rule tuning by rule id (built-in or custom): attach fp_filters,
+            scope via conditions, raise/lower paranoia_min, change severity, or
+            set action without forking the rule pack. Unknown rule ids and
+            unsupported fields are rejected.
+          additionalProperties:
+            type: object
+            additionalProperties: false
+            properties:
+              action:
+                type: string
+                enum: [enforce, monitor, disabled]
+              paranoia_min:
+                type: integer
+                minimum: 1
+                maximum: 4
+              severity:
+                type: string
+                enum: [info, low, medium, high, critical]
+              score:
+                type: integer
+                minimum: 0
+              fp_filters:
+                type: array
+                items:
+                  type: string
+              conditions:
+                type: object
+                properties:
+                  paths:
+                    type: array
+                    items:
+                      type: string
+                  methods:
+                    type: array
+                    items:
+                      type: string
+                  headers:
+                    type: object
+                    additionalProperties:
+                      type: [string, "null"]
+                  consumers:
+                    type: array
+                    items:
+                      type: string
         custom_rules:
           type: array
           items:
             $ref: "#/components/schemas/WafRule"
           default: []
+        scoring:
+          type: object
+          description: >-
+            Anomaly scoring. When enabled, every matched rule contributes its
+            severity weight (or per-rule score) to a cumulative transaction
+            score; the request is rejected when the score reaches
+            block_threshold and mode is enforce, even when no individual rule
+            is set to enforce. The running total is exposed as waf.score.
+          properties:
+            enabled:
+              type: boolean
+              default: true
+            block_threshold:
+              type: integer
+              minimum: 1
+              default: 7
+            weights:
+              type: object
+              description: Per-severity weights; defaults info=0 low=2 medium=3 high=5 critical=10.
+              additionalProperties: false
+              properties:
+                info:
+                  type: integer
+                  minimum: 0
+                low:
+                  type: integer
+                  minimum: 0
+                medium:
+                  type: integer
+                  minimum: 0
+                high:
+                  type: integer
+                  minimum: 0
+                critical:
+                  type: integer
+                  minimum: 0
         global_exemptions:
           $ref: "#/components/schemas/WafExemptions"
         body_methods:
@@ -11170,6 +11331,10 @@ components:
           minimum: 1
           maximum: 4
           default: 1
+        score:
+          type: integer
+          minimum: 0
+          description: Anomaly-score contribution when scoring is enabled; defaults to the per-severity weight.
         conditions:
           type: object
           properties:
@@ -11320,6 +11485,21 @@ components:
             type: string
           default: []
           description: Required XML element names
+        xml_max_entities:
+          type: integer
+          format: uint64
+          default: 100
+          description: >-
+            Max <!ENTITY declarations allowed in an XML DOCTYPE before the body
+            is rejected as a possible entity-expansion (billion-laughs) attack.
+            Applies to request and response XML when well-formedness validation
+            runs.
+        xml_reject_nested_entities:
+          type: boolean
+          default: true
+          description: >-
+            Reject XML whose entity definitions reference other general
+            entities (the billion-laughs expansion signature).
         content_types:
           type: array
           items:

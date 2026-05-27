@@ -1,0 +1,272 @@
+# Web Application Firewall (WAF)
+
+The `waf` plugin performs content-pattern threat detection on HTTP-family
+traffic (HTTP/1.1, HTTP/2, HTTP/3, gRPC-over-HTTP). It inspects request
+metadata and bodies — and, optionally, responses — against a curated rule pack
+plus any custom rules you supply.
+
+## Scope: what the WAF does and does not do
+
+The WAF is deliberately scoped to **payload and metadata inspection**. Other
+concerns are handled by dedicated layers and the WAF does not duplicate them:
+
+| Concern | Handled by |
+| --- | --- |
+| Request smuggling (CL/TE conflicts, duplicate Content-Length) | core proxy `check_protocol_headers()` + hyper strict parsing |
+| Header/URI/body size limits | `FERRUM_MAX_*` env vars, `request_size_limiting` |
+| Authentication / authorization | auth plugins, `access_control`, `mesh_authz`, `opa` |
+| Rate limiting / flooding | `rate_limiting`, `*_rate_limiting` |
+| Schema / contract validation | `body_validator`, `openapi_validator` |
+| Bot / IP / geo filtering | `bot_detection`, `ip_restriction`, `geo_restriction` |
+| Backend SSRF allow/deny | `FERRUM_BACKEND_ALLOW_IPS` |
+| Response security headers | `security_headers` |
+
+The WAF focuses on injection and disclosure signatures: SQLi, NoSQLi, command
+injection, XSS, SSTI, JNDI/Log4Shell, path traversal, LFI, RFI, SSRF, XXE,
+deserialization, prototype pollution, and (response-side) sensitive-data
+leakage.
+
+## Operating modes and enforcement posture
+
+Two independent controls decide whether a matched rule **blocks** or only
+**logs**:
+
+- `mode` — the global switch: `enforce`, `monitor`, or `disabled`.
+- per-rule **action** — `enforce`, `monitor`, or `disabled`.
+
+A request is rejected only when a matched rule's effective action is `enforce`
+**and** the global mode is `enforce`.
+
+### Default rules ship monitor-only — and how to enforce them
+
+The built-in rule pack ships with every rule set to `monitor`. This is a safe
+default: deploy the WAF, watch what it flags, then enforce deliberately. It
+also means `mode: enforce` **alone does not block anything** — you must opt
+rules into enforcement. There are three ways:
+
+1. **`default_rule_action`** — bulk-set the action of every built-in rule.
+   `default_rule_action: "enforce"` enforces the whole pack (still subject to
+   `paranoia_level`; see below). `rule_modes` overrides still win per rule.
+2. **`rule_modes`** — set the action of individual rules by id:
+   `{"FE-SQLI-001": "enforce"}`.
+3. **anomaly scoring** — keep rules in `monitor` and block on the aggregate
+   score (see [Anomaly scoring](#anomaly-scoring)).
+
+Because the loud/broad rules are gated behind `paranoia_level >= 2` (see
+below), the recommended starting posture for active blocking is:
+
+```json
+{ "mode": "enforce", "default_rule_action": "enforce", "paranoia_level": 1 }
+```
+
+This enforces only the low-false-positive core of the rule pack.
+
+## Paranoia levels
+
+`paranoia_level` (1–4, default 1) gates which rules are active. Each rule has a
+`paranoia_min`; rules above the configured level are compiled out entirely.
+Higher levels add broader, noisier signatures that catch more attacks at the
+cost of more false positives. Loud rules retuned to `paranoia_min: 2` or `3`
+(see below) are inactive at the default level 1.
+
+## Decode / normalization
+
+Attackers hide payloads behind encodings a raw-byte scan never sees. Before
+matching request and response bodies, the WAF also scans **decoded variants**:
+
+- JSON / JavaScript unicode escapes — `\uXXXX`, `\u{...}`, `\xXX`
+- HTML entities — `&lt;`, `&#60;`, `&#x3c;`
+- Percent-encoding and `+`-as-space (form bodies)
+- a fully layered decode for stacked encodings
+
+So a `<script>` written as `<script>`, `&lt;script&gt;`, or
+`%3Cscript%3E` in a body is still caught by the script-tag rule. Decoding is
+content-type-agnostic (an attacker controls the declared `Content-Type`), and
+bounded to a small number of variants. Query values are percent-decoded before
+matching as well.
+
+## Rule targets
+
+A rule's `target` selects what it inspects:
+
+`header_names`, `header_values` (optionally scoped to specific header `names`),
+`query_keys`, `query_values`, `cookies`, `url_path`, `full_url`, `method`,
+`body_text`, `body_json_path` (a specific JSON field by dotted `path`),
+`response_headers`, `response_body`.
+
+`match_kind` is one of `regex` (default), `literal`, `contains`, `equals`,
+`luhn` (credit-card checksum; body targets only), or `cidr` (IP membership).
+
+## Built-in rule pack
+
+Rule ids are stable; reference them in `rule_modes`, `disabled_default_rules`,
+and `rule_overrides`. Categories:
+
+| Category | Rules | Notes |
+| --- | --- | --- |
+| `sqli` | FE-SQLI-001..005 | UNION/tautology/stacked are level 1; comment-token (004) and SQLSTATE (005) are level 2 |
+| `nosqli` | FE-NOSQL-001 (operator key), FE-NOSQL-002 (bracket operator, L2) | |
+| `command_injection` | FE-CMD-001..003 | shell-substitution (003) is level 2 |
+| `jndi_injection` | FE-JNDI-001-{B,Q,H}, FE-JNDI-002-{B,Q,H} | **Log4Shell**; direct lookup is Critical/level 1 across body, query, and header; nested-obfuscation is level 2 |
+| `rce` | FE-SPRING4SHELL-001-{B,Q} | class-loader manipulation (CVE-2022-22965) |
+| `prototype_pollution` | FE-PROTO-001 (`__proto__`), FE-PROTO-002 (`constructor.prototype`, L2) | |
+| `ldap_injection` | FE-LDAP-001..002 | |
+| `xpath_injection` | FE-XPATH-001, FE-XPATH-002 (L3, low value) | |
+| `ssti` | FE-SSTI-001 (broad, L2), FE-SSTI-002 (arithmetic probe, L1), FE-SSTI-003 (Java/Spring EL, L2) | |
+| `xss` | FE-XSS-001..005 plus `-B`/`-Q` body/query mirrors | script-tag and js-URL now cover both query and body |
+| `path_traversal` | FE-PATHTRAV-001..003, FE-PATHTRAV-001-B | now covers request bodies, not just the URL |
+| `lfi` / `rfi` | FE-LFI-001(+ -B), FE-RFI-001 (L2) | |
+| `ssrf` | FE-SSRF-001(+ -Q), FE-SSRF-002(+ -Q) | metadata/private-IP and dangerous schemes across body and query |
+| `xxe` | FE-XXE-001 | external-entity markers; no longer trips on `<!DOCTYPE html>` |
+| `deserialization` | FE-DESER-001..003 | Java / .NET / PHP markers |
+| `header_anomaly` | FE-HEADER-001..003 | control chars, method-override, header-borne injection (L2) |
+| `cookie_attack` | FE-COOKIE-001, FE-COOKIE-002 (Info, L3) | |
+| `encoding_evasion` / `parameter_pollution` / `method_abuse` | FE-ENCODING-001..002, FE-HPP-001, FE-METHOD-001 | |
+| stack trace / db error / source / fingerprint disclosure | FE-RESP-* | response-side; requires `response_inspection` |
+| `data_leak` | FE-DATA-LEAK-001..006 | credit card (Luhn), AWS/Stripe/GitHub keys, JWT (L2), private key |
+
+Disable the whole pack with `include_default_rules: false`, or selected rules
+with `disabled_default_rules: ["FE-..."]`.
+
+## Anomaly scoring
+
+Per-rule enforcement is binary, which makes broad rules unsafe to enforce
+individually. Scoring lets weak signals accumulate and block in aggregate while
+each rule stays `monitor`:
+
+```json
+{
+  "scoring": {
+    "enabled": true,
+    "block_threshold": 7,
+    "weights": { "info": 0, "low": 2, "medium": 3, "high": 5, "critical": 10 }
+  }
+}
+```
+
+When enabled, every matched rule contributes its severity weight (or a per-rule
+`score` override) to a request total. If the total reaches `block_threshold`
+and the global mode is `enforce`, the request is rejected with
+`waf.block_reason = "score"`. Hard per-rule `enforce` still blocks immediately
+when the global mode is `enforce`.
+The total is recorded in `waf.score` metadata regardless of mode.
+
+## Per-rule overrides and exemptions
+
+`rule_overrides` tunes individual rules — **including built-ins** — without
+forking the rule pack. Attach false-positive filters, scope to paths, raise
+paranoia, change severity/score, or set a per-rule `action`:
+
+```json
+{
+  "rule_overrides": {
+    "FE-RFI-001": { "fp_filters": ["^https://cdn\\.example\\.com/"], "paranoia_min": 1 },
+    "FE-SQLI-001": { "action": "enforce" },
+    "FE-XSS-001": { "conditions": { "paths": ["/api/*"] } }
+  }
+}
+```
+
+Per-rule `action: "enforce"` only blocks when global `mode` is also
+`enforce`; with `mode: "monitor"` the match is logged but allowed.
+
+`global_exemptions` short-circuits the entire WAF for matching requests:
+
+- `paths` — exact, `prefix*`, or `~regex`
+- `methods`, `consumers`, `ips` (CIDR)
+- `header_present` — suppress rules when a header is present/equal
+- `fp_capture_filters` — suppress any matched value matching these patterns
+
+## Custom rules
+
+```json
+{
+  "custom_rules": [
+    {
+      "id": "ACME-1",
+      "category": "custom",
+      "severity": "high",
+      "target": { "type": "body_json_path", "path": "user.bio" },
+      "match_kind": "contains",
+      "pattern": "<script",
+      "action": "enforce",
+      "paranoia_min": 1,
+      "fp_filters": ["<script type=\"application/ld\\+json\">"],
+      "conditions": { "methods": ["POST"], "paths": ["/profile*"] }
+    }
+  ]
+}
+```
+
+## Body and response inspection
+
+Request-body inspection is on by default for `POST`/`PUT`/`PATCH` with an
+inspectable `Content-Type` (`body_methods`, `body_content_types`). Multipart and
+binary bodies are opt-in (`inspect_multipart`, `inspect_binary_body`).
+
+Response inspection is **off by default**. Enable `response_inspection` (and
+`response_body_inspection` for body rules) to run the disclosure and
+data-leak rules.
+
+`max_scan_bytes` (default 1 MiB) bounds how much of a body is scanned.
+`on_body_too_large` decides what happens when a body exceeds it:
+
+- `scan_truncated` (default) — scan the first `max_scan_bytes`, flag truncation
+- `skip` — do not scan
+- `block` — reject when enforcing (fail closed; for high-assurance routes set
+  `max_scan_bytes` at or above `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES`)
+
+`scan_budget_ms` bounds total scan time; `on_scan_timeout` (`allow`, `block`,
+`log_and_allow`) decides the outcome when the budget is exceeded.
+
+## Observability
+
+When `log_to_metadata` is true (default), matches populate request metadata:
+`waf.rule_hits`, `waf.target`, `waf.severity`, `waf.score`, `waf.action`,
+`waf.first_blocking_rule`, `waf.paranoia`, plus `waf.scan_truncated` /
+`waf.scan_timed_out`. `log_to_stdout` emits a structured `warn!` per hit.
+
+Prometheus metrics (exposed at `/metrics` when the `prometheus_metrics` plugin
+is enabled, derived from the `waf.*` metadata above):
+
+- `ferrum_waf_rule_hits_total{rule}` — matches per rule id.
+- `ferrum_waf_requests_total{action,severity}` — evaluated requests by outcome
+  (`blocked` / `monitored` / `clean`) and highest severity. Blocked volume is
+  the `action="blocked"` series.
+
+The per-request anomaly score is carried in the `waf.score` metadata
+(transaction logs), not a metric. Run in `monitor` first, watch these, then
+enforce.
+
+## Configuration reference
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `mode` | enum | `enforce` | `enforce` / `monitor` / `disabled` |
+| `default_rule_action` | enum | _(unset)_ | bulk action for built-ins; `rule_modes` overrides win |
+| `paranoia_level` | int 1–4 | `1` | activate rules with `paranoia_min <= level` |
+| `request_inspection` | bool | `true` | scan request metadata |
+| `request_body_inspection` | bool | `true` | scan request bodies |
+| `response_inspection` | bool | `false` | scan response headers |
+| `response_body_inspection` | bool | `false` | scan response bodies |
+| `include_default_rules` | bool | `true` | load the built-in pack |
+| `disabled_default_rules` | string[] | `[]` | built-in ids to drop |
+| `rule_modes` | map | `{}` | per-rule action by id |
+| `rule_overrides` | map | `{}` | per-rule fp_filters/conditions/paranoia_min/severity/score/action |
+| `custom_rules` | object[] | `[]` | additional rules |
+| `scoring` | object | _(off)_ | anomaly scoring (see above) |
+| `global_exemptions` | object | _(none)_ | request short-circuits |
+| `scan_budget_ms` | int | `50` | total scan-time budget (0 = unbounded) |
+| `on_scan_timeout` | enum | `log_and_allow` | `allow` / `block` / `log_and_allow` |
+| `max_scan_bytes` | int | `1048576` | body scan cap |
+| `on_body_too_large` | enum | `scan_truncated` | `scan_truncated` / `skip` / `block` |
+| `body_methods` | string[] | `[POST,PUT,PATCH]` | methods whose bodies are scanned |
+| `body_content_types` | string[] | see code | inspectable content types |
+| `inspect_multipart` | bool | `false` | scan multipart bodies |
+| `inspect_binary_body` | bool | `false` | scan bodies with unknown/binary type |
+| `disallowed_methods` | string[] | `[]` | methods flagged by FE-METHOD-001 |
+| `reject_status_code` | int 400–599 | `403` | status for blocked requests |
+| `reject_content_type` | string | `application/json` | blocked-response content type |
+| `reject_body` | string | `{"error":"Forbidden"}` | blocked-response body |
+| `log_to_metadata` | bool | `true` | write `waf.*` metadata |
+| `log_to_stdout` | bool | `false` | structured per-hit warning |

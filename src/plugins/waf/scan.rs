@@ -6,6 +6,7 @@ use percent_encoding::percent_decode_str;
 
 use super::Waf;
 use super::decode;
+use super::normalize;
 use super::rules::{
     BytesRuleSet, JsonPathMatcher, JsonPathRule, JsonPathSegment, RuleHit, RuleRef, RuleTarget,
     TextRuleSet, extract_ip_tokens,
@@ -202,10 +203,34 @@ impl Waf {
         let mut outcome = ScanOutcome::default();
         self.scan_bytes_set(&mut outcome, self.compiled.body_bytes.as_ref(), body, ctx);
         self.scan_json_path_rules(&mut outcome, body, ctx);
-        if let Ok(text) = std::str::from_utf8(body) {
-            self.scan_luhn_rules(&mut outcome, text, &self.compiled.body_luhn_rules, ctx);
-            self.scan_cidr_rules(&mut outcome, text, &self.compiled.body_cidr_rules, ctx);
+        let text = String::from_utf8_lossy(body);
+        // Re-scan decoded forms so payloads hidden behind JSON `\uXXXX`,
+        // HTML entities, or percent-encoding cannot evade the raw-byte set.
+        // Lossy UTF-8 keeps one hostile byte from disabling text decoding for
+        // the rest of an otherwise inspectable body.
+        for variant in normalize::decoded_variants(text.as_ref()) {
+            self.scan_json_path_rules(&mut outcome, variant.as_bytes(), ctx);
+            self.scan_bytes_set(
+                &mut outcome,
+                self.compiled.body_bytes.as_ref(),
+                variant.as_bytes(),
+                ctx,
+            );
+            self.scan_luhn_rules(&mut outcome, &variant, &self.compiled.body_luhn_rules, ctx);
+            self.scan_cidr_rules(&mut outcome, &variant, &self.compiled.body_cidr_rules, ctx);
         }
+        self.scan_luhn_rules(
+            &mut outcome,
+            text.as_ref(),
+            &self.compiled.body_luhn_rules,
+            ctx,
+        );
+        self.scan_cidr_rules(
+            &mut outcome,
+            text.as_ref(),
+            &self.compiled.body_cidr_rules,
+            ctx,
+        );
         outcome
     }
 
@@ -250,10 +275,39 @@ impl Waf {
             body,
             ctx,
         );
-        if let Ok(text) = std::str::from_utf8(body) {
-            self.scan_luhn_rules(&mut outcome, text, &self.compiled.response_luhn_rules, ctx);
-            self.scan_cidr_rules(&mut outcome, text, &self.compiled.response_cidr_rules, ctx);
+        let text = String::from_utf8_lossy(body);
+        for variant in normalize::decoded_variants(text.as_ref()) {
+            self.scan_bytes_set(
+                &mut outcome,
+                self.compiled.response_body_bytes.as_ref(),
+                variant.as_bytes(),
+                ctx,
+            );
+            self.scan_luhn_rules(
+                &mut outcome,
+                &variant,
+                &self.compiled.response_luhn_rules,
+                ctx,
+            );
+            self.scan_cidr_rules(
+                &mut outcome,
+                &variant,
+                &self.compiled.response_cidr_rules,
+                ctx,
+            );
         }
+        self.scan_luhn_rules(
+            &mut outcome,
+            text.as_ref(),
+            &self.compiled.response_luhn_rules,
+            ctx,
+        );
+        self.scan_cidr_rules(
+            &mut outcome,
+            text.as_ref(),
+            &self.compiled.response_cidr_rules,
+            ctx,
+        );
         outcome
     }
 
@@ -466,7 +520,7 @@ impl Waf {
                 || decode::has_percent_null_byte(value)
                 || decode::has_overlong_utf8_marker(value))
         {
-            self.push_special(outcome, rule_index, ctx);
+            self.push_special(outcome, rule_index, value, ctx);
         }
     }
 
@@ -474,7 +528,7 @@ impl Waf {
         if let Some(rule_index) = self.specials.hpp
             && decode::has_conflicting_duplicate_query_key(raw_query)
         {
-            self.push_special(outcome, rule_index, ctx);
+            self.push_special(outcome, rule_index, raw_query, ctx);
         }
     }
 
@@ -486,7 +540,7 @@ impl Waf {
                 .iter()
                 .any(|configured| configured.eq_ignore_ascii_case(method))
         {
-            self.push_special(outcome, rule_index, ctx);
+            self.push_special(outcome, rule_index, method, ctx);
         }
     }
 
@@ -500,13 +554,23 @@ impl Waf {
             && let Some(override_method) = headers.get("x-http-method-override")
             && !override_method.eq_ignore_ascii_case(&ctx.method)
         {
-            self.push_special(outcome, rule_index, ctx);
+            self.push_special(outcome, rule_index, override_method, ctx);
         }
     }
 
-    fn push_special(&self, outcome: &mut ScanOutcome, rule_index: usize, ctx: &RequestContext) {
+    fn push_special(
+        &self,
+        outcome: &mut ScanOutcome,
+        rule_index: usize,
+        value: &str,
+        ctx: &RequestContext,
+    ) {
         let rule = &self.compiled.rules[rule_index];
-        if rule.matches_conditions(ctx) && !self.exemptions.suppresses_rule_for_request(ctx) {
+        if rule.matches_conditions(ctx)
+            && !self.exemptions.suppresses_rule_for_request(ctx)
+            && !self.exemptions.suppresses_value(value)
+            && !rule.suppresses_text(value)
+        {
             outcome.push(RuleHit {
                 rule_index,
                 target_name: rule.target.log_target(),

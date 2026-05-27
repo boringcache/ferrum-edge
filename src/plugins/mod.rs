@@ -1,4 +1,4 @@
-//! Plugin system — 65 built-in plugins with a trait-based architecture.
+//! Plugin system — 66 built-in plugins with a trait-based architecture.
 //!
 //! Plugins execute in priority order (lower number = runs first) through
 //! lifecycle phases: `on_request_received` → `authenticate` → `authorize` →
@@ -68,6 +68,7 @@ pub mod response_caching;
 pub mod response_mock;
 pub mod response_size_limiting;
 pub mod response_transformer;
+pub mod security_headers;
 pub mod serverless_function;
 pub mod soap_ws_security;
 pub mod spec_expose;
@@ -343,6 +344,7 @@ pub struct RequestContext {
     /// data cannot spoof WAF transaction-log fields.
     pub(crate) waf_metadata_initialized: bool,
     pub(crate) waf_owned_metadata: HashMap<String, String>,
+    pub(crate) waf_score: u32,
     /// JWT audiences emitted by mesh `jwks_auth` for Istio
     /// `request.auth.audiences` conditions. Kept out of `metadata` so JWT
     /// claim material does not flow into transaction logs.
@@ -528,6 +530,7 @@ impl RequestContext {
             metadata: HashMap::new(),
             waf_metadata_initialized: false,
             waf_owned_metadata: HashMap::new(),
+            waf_score: 0,
             mesh_request_auth_audiences: Vec::new(),
             mesh_request_auth_claims: HashMap::new(),
             tls_client_cert_der: None,
@@ -581,6 +584,7 @@ impl RequestContext {
             metadata: self.metadata.clone(),
             waf_metadata_initialized: self.waf_metadata_initialized,
             waf_owned_metadata: self.waf_owned_metadata.clone(),
+            waf_score: self.waf_score,
             mesh_request_auth_audiences: self.mesh_request_auth_audiences.clone(),
             mesh_request_auth_claims: self.mesh_request_auth_claims.clone(),
             tls_client_cert_der: self.tls_client_cert_der.clone(),
@@ -1566,8 +1570,8 @@ pub struct StreamTransactionSummary {
 /// | AuthN     | 950–1999    | Authentication / identity verification    | mtls_auth (950), jwks_auth (1000), oauth2_introspection (1050), oidc_relying_party (1075), jwt_auth (1100), key_auth (1200), ldap_auth (1250), basic_auth (1300), hmac_auth (1400), soap_ws_security (1500) |
 /// | AuthZ     | 2000–2999   | Authorization and admission control       | access_control (2000), tcp_connection_throttle (2050), mesh_authz (2075), opa (2080), request_size_limiting (2800), graphql (2850), rate_limiting (2900), ai_prompt_shield (2925), waf (2930), body_validator (2950), openapi_validator (2960), ai_request_guard (2975), ai_federation (2985) |
 /// | Transform | 3000–3999   | Request shaping and response buffering    | request_transformer (3000), serverless_function (3025), response_mock (3030), grpc_deadline (3050), request_mirror (3075), response_size_limiting (3490), response_caching (3500) |
-/// | Response  | 4000–4999   | Response transformation and AI accounting | response_transformer (4000), ai_token_metrics (4100), ai_rate_limiter (4200) |
-/// | Logging   | 9000–9999   | Observability and frame logging           | stdout_logging (9000), ws_frame_logging (9050), statsd_logging (9075), http_logging (9100), tcp_logging (9125), kafka_logging (9150), loki_logging (9155), udp_logging (9160), ws_logging (9175), transaction_debugger (9200), prometheus_metrics (9300), api_chargeback (9350), api_chargeback_sink (9351), workload_metrics (9360), __mesh_bpf_metrics (9365), access_log (9375) |
+/// | Response  | 4000–4999   | Response transformation, security headers, and AI accounting | response_transformer (4000), security_headers (4080), ai_token_metrics (4100), ai_rate_limiter (4200) |
+/// | Logging   | 9000–9999   | Observability and frame logging           | stdout_logging (9000), ws_frame_logging (9050), statsd_logging (9075), http_logging (9100), tcp_logging (9125), kafka_logging (9150), loki_logging (9155), udp_logging (9160), ws_logging (9175), transaction_debugger (9200), prometheus_metrics (9300), api_chargeback (9350), api_chargeback_sink (9351), workload_metrics (9360), __mesh_bpf_metrics (9365) |
 #[allow(dead_code)]
 pub mod priority {
     pub const OTEL_TRACING: u16 = 25;
@@ -1630,6 +1634,11 @@ pub mod priority {
     pub const RESPONSE_TRANSFORMER: u16 = 4000;
     pub const COMPRESSION: u16 = 4050;
     pub const AI_RESPONSE_GUARD: u16 = 4075;
+    /// `security_headers`: injects response security headers and strips
+    /// fingerprinting headers in `after_proxy`. Runs late in the response band
+    /// so it is authoritative over `response_transformer` (4000) and
+    /// `compression` (4050) header changes.
+    pub const SECURITY_HEADERS: u16 = 4080;
     pub const AI_TOKEN_METRICS: u16 = 4100;
     pub const AI_RATE_LIMITER: u16 = 4200;
     pub const STDOUT_LOGGING: u16 = 9000;
@@ -2189,6 +2198,9 @@ pub fn create_plugin_with_http_client(
         )?))),
         "compression" => Ok(Some(Arc::new(compression::CompressionPlugin::new(config)?))),
         "cors" => Ok(Some(Arc::new(cors::CorsPlugin::new(config)?))),
+        "security_headers" => Ok(Some(Arc::new(security_headers::SecurityHeaders::new(
+            config,
+        )?))),
         "access_control" => Ok(Some(Arc::new(access_control::AccessControl::new(config)?))),
         "tcp_connection_throttle" => Ok(Some(Arc::new(
             tcp_connection_throttle::TcpConnectionThrottle::new(config)?,
@@ -2396,6 +2408,7 @@ pub fn is_security_plugin(name: &str) -> bool {
             | "rate_limiting"
             | "ip_restriction"
             | "waf"
+            | "security_headers"
             | "openapi_validator"
             | "soap_ws_security"
     )
@@ -2433,6 +2446,7 @@ pub fn available_plugins() -> Vec<&'static str> {
         "mesh_outbound_registry",
         "compression",
         "cors",
+        "security_headers",
         "access_control",
         "tcp_connection_throttle",
         "ip_restriction",
