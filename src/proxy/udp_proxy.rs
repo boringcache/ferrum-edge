@@ -1613,15 +1613,19 @@ async fn start_dtls_frontend_listener(
                     tls_client_cert_chain_der: client_conn.tls_client_cert_chain_der.clone(),
                     sni_hostname: client_conn.sni_hostname.clone(),
                     mesh_direction: None,
-                    // UDP/DTLS stream accept loops do not wire a
-                    // NodeWaypointIdentityResolver, so per-pod policy
-                    // scoping is not available. When per_pod_policy_scoping
-                    // is enabled (node-waypoint topology), the authz plugin
-                    // falls back to mesh-wide policies only. This means
-                    // namespace- and selector-scoped policies are not
-                    // enforced for UDP streams (HTTP only). A scoped ALLOW
-                    // with no mesh-wide counterpart falls through to the
-                    // default-allow posture, not a closed posture.
+                    // Node-waypoint per-pod policy scoping is intentionally not
+                    // wired for UDP/DTLS and cannot be without a new capture
+                    // path. Identity is keyed by the per-connection socket
+                    // cookie (`SO_COOKIE`), which node-agent eBPF stamps from
+                    // the source pod via the `connect4`/`connect6` cgroup hooks;
+                    // there are no UDP capture hooks, and a UDP stream proxy
+                    // serves all clients from one shared frontend socket with a
+                    // single cookie, so there is no per-source-pod cookie to
+                    // resolve here. With `per_pod_policy_scoping` on
+                    // (node-waypoint topology), `mesh_authz` therefore evaluates
+                    // mesh-wide policies only and stamps `mesh_authz.scope_missing`.
+                    // Namespace/selector-scoped DENY/ALLOW rules are not enforced
+                    // for DTLS streams (TCP and HTTP/HBONE are). See docs/mesh.md.
                     node_waypoint_policy_scope: None,
                 };
                 let mut rejected = false;
@@ -2423,13 +2427,17 @@ async fn create_session(
         tls_client_cert_chain_der: None,
         sni_hostname,
         mesh_direction: None,
-        // UDP stream accept loops do not wire a NodeWaypointIdentityResolver,
-        // so per-pod policy scoping is not available. When per_pod_policy_scoping
-        // is enabled (node-waypoint topology), the authz plugin falls back to
-        // mesh-wide policies only. This means namespace- and selector-scoped
-        // policies are not enforced for UDP streams (HTTP only). A scoped ALLOW
-        // with no mesh-wide counterpart falls through to the default-allow
-        // posture, not a closed posture.
+        // Node-waypoint per-pod policy scoping is intentionally not wired for
+        // plain UDP and cannot be without a new capture path. Identity is keyed
+        // by the per-connection socket cookie (`SO_COOKIE`) that node-agent
+        // eBPF stamps from the source pod via the `connect4`/`connect6` cgroup
+        // hooks; there are no UDP capture hooks, and this UDP proxy demultiplexes
+        // every client off one shared frontend socket with a single cookie, so
+        // there is no per-source-pod cookie to resolve here. With
+        // `per_pod_policy_scoping` on (node-waypoint topology), `mesh_authz`
+        // evaluates mesh-wide policies only and stamps `mesh_authz.scope_missing`.
+        // Namespace/selector-scoped DENY/ALLOW rules are not enforced for UDP
+        // streams (TCP and HTTP/HBONE are). See docs/mesh.md.
         node_waypoint_policy_scope: None,
     };
     for plugin in plugins.iter() {

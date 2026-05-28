@@ -67,6 +67,18 @@ impl Plugin for SpiffeIdentity {
     }
 
     async fn on_stream_connect(&self, ctx: &mut StreamConnectionContext) -> PluginResult {
+        // A pre-stamped peer identity (e.g. the node-waypoint eBPF-attested pod
+        // SPIFFE ID set by the stream accept loop) must win over peer-cert
+        // derivation here, mirroring the on_request_received guard. Otherwise a
+        // TcpTls peer cert would clobber the kernel-attested pod principal that
+        // mesh_authz uses for source-principal matching.
+        if ctx
+            .metadata
+            .as_ref()
+            .is_some_and(|m| m.contains_key("peer_spiffe_id"))
+        {
+            return PluginResult::Continue;
+        }
         if let Some(der) = ctx.tls_client_cert_der.as_ref() {
             match crate::identity::spiffe::try_extract_spiffe_id(der.as_ref()) {
                 Ok(Some(id)) => {

@@ -284,6 +284,7 @@ async fn try_spawn_tcp_listener(
         io_uring_splice_enabled: false,
         record_mesh_mtls_metric: false,
         mesh_outbound_enforcement: enforcement,
+        node_waypoint_identity_resolver: None,
     };
     let join = tokio::spawn(async move {
         let _ = start_tcp_listener(cfg).await;

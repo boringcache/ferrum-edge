@@ -15,6 +15,7 @@ use tracing::{error, info, warn};
 use crate::circuit_breaker::CircuitBreakerCache;
 use crate::config::types::{BackendScheme, GatewayConfig};
 use crate::dns::DnsCache;
+use crate::modes::mesh::node_waypoint::NodeWaypointIdentityResolver;
 use crate::request_epoch::RequestEpochStore;
 use crate::tls::TlsPolicy;
 
@@ -168,6 +169,24 @@ pub struct StreamListenerManager {
     /// — readers short-circuit on the contained `Option::None`.
     mesh_outbound_enforcement:
         crate::modes::mesh::outbound_enforcement::SharedMeshOutboundEnforcement,
+    /// Node-waypoint identity resolver shared with `ProxyState`. Present only
+    /// in `NodeWaypoint` topology; `None` everywhere else. When set, each
+    /// spawned **TCP** stream accept loop resolves the accepted connection's
+    /// socket cookie to a source pod identity and stamps the per-pod
+    /// `PolicyScopeCache` onto `StreamConnectionContext.node_waypoint_policy_scope`
+    /// so `mesh_authz` enforces namespace/selector-scoped policies per source
+    /// pod (parity with the HTTP/HBONE path in `src/proxy/mod.rs`).
+    ///
+    /// Stored in `ArcSwap` because it is injected after construction by
+    /// [`Self::set_node_waypoint_identity_resolver`] — the manager is built
+    /// inside `ProxyState::new()` (synchronous) while the resolver is created
+    /// later in the mesh runtime, before the first `reconcile()`.
+    ///
+    /// UDP/DTLS listeners deliberately do NOT consume this: node-waypoint
+    /// capture is socket-cookie based on per-connection TCP sockets
+    /// (`connect4`/`connect6` cgroup hooks), and a shared UDP frontend socket
+    /// has no per-source-pod cookie. See [`Self::set_node_waypoint_identity_resolver`].
+    node_waypoint_identity_resolver: arc_swap::ArcSwap<Option<Arc<NodeWaypointIdentityResolver>>>,
 }
 
 impl StreamListenerManager {
@@ -372,6 +391,7 @@ impl StreamListenerManager {
             udp_pktinfo_enabled,
             global_shutdown_rx: arc_swap::ArcSwap::new(Arc::new(None)),
             mesh_outbound_enforcement,
+            node_waypoint_identity_resolver: arc_swap::ArcSwap::new(Arc::new(None)),
         }
     }
 
@@ -386,6 +406,34 @@ impl StreamListenerManager {
     /// the `ArcSwap` load.
     pub fn set_global_shutdown_rx(&self, rx: watch::Receiver<bool>) {
         self.global_shutdown_rx.store(Arc::new(Some(rx)));
+    }
+
+    /// Inject the node-waypoint identity resolver shared with `ProxyState`.
+    ///
+    /// Mesh `NodeWaypoint` runtime calls this once after building the resolver
+    /// and BEFORE the first stream-listener `reconcile()`, so TCP listeners
+    /// that bind on initial startup already see it; listeners spawned by later
+    /// reconciles also pick it up via the `ArcSwap` load. Cloning the resolved
+    /// `Arc` into each TCP accept loop lets that loop resolve the accepted
+    /// connection's `SO_COOKIE` to a source pod identity and stamp the per-pod
+    /// `PolicyScopeCache`, mirroring the HTTP/HBONE admit path.
+    ///
+    /// Scope is strictly `NodeWaypoint`: only that topology installs a
+    /// resolver, so Sidecar/Ambient/east-west/egress and non-mesh stream
+    /// proxies continue to pass `node_waypoint_policy_scope: None` and behave
+    /// exactly as before.
+    ///
+    /// Deliberately TCP-only. Node-waypoint capture keys identity by the
+    /// per-connection TCP socket cookie (`connect4`/`connect6` cgroup hooks
+    /// stamp the source pod into `FERRUM_ORIG_DST4/6`, looked up at accept time
+    /// via `getsockopt(SO_COOKIE)`). A UDP stream proxy has a single shared
+    /// frontend socket with one cookie for every client, and there are no UDP
+    /// capture hooks, so there is no per-source-pod cookie to resolve. UDP/DTLS
+    /// node-waypoint streams therefore remain mesh-wide-only (the existing
+    /// fail-closed default) — see `src/proxy/udp_proxy.rs` and `docs/mesh.md`.
+    pub fn set_node_waypoint_identity_resolver(&self, resolver: Arc<NodeWaypointIdentityResolver>) {
+        self.node_waypoint_identity_resolver
+            .store(Arc::new(Some(resolver)));
     }
 
     /// Update the frontend TLS configuration used for TCP stream proxies with `frontend_tls: true`.
@@ -917,6 +965,16 @@ impl StreamListenerManager {
                 let record_mesh_mtls_metric = self.record_mesh_mtls_metric;
                 let global_shutdown_for_listener = global_shutdown.clone();
                 let mesh_outbound_enforcement = self.mesh_outbound_enforcement.clone();
+                // Snapshot the node-waypoint resolver slot once per listener
+                // spawn. `None` outside NodeWaypoint topology; when present the
+                // accept loop resolves each connection's source pod identity to
+                // stamp the per-pod policy scope (TCP only — see
+                // `set_node_waypoint_identity_resolver`).
+                let node_waypoint_identity_resolver = self
+                    .node_waypoint_identity_resolver
+                    .load_full()
+                    .as_ref()
+                    .clone();
                 let join_handle = tokio::spawn(async move {
                     if let Err(e) = super::tcp_proxy::start_tcp_listener(TcpListenerConfig {
                         port: port_val,
@@ -949,6 +1007,7 @@ impl StreamListenerManager {
                         io_uring_splice_enabled,
                         record_mesh_mtls_metric,
                         mesh_outbound_enforcement,
+                        node_waypoint_identity_resolver,
                     })
                     .await
                     {

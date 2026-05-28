@@ -1,0 +1,347 @@
+//! Node-waypoint per-pod policy scoping on the TCP stream accept path.
+//!
+//! Finding #3 (re-scoped): PR #1358 plumbed `node_waypoint_policy_scope` onto
+//! `StreamConnectionContext` and made `mesh_authz::on_stream_connect` read it,
+//! but the TCP/UDP accept loops still hard-passed `None`, so scoped
+//! (Namespace/WorkloadSelector) DENY/ALLOW mesh policies were inert on stream
+//! traffic in node-waypoint topology. This suite proves the TCP stream accept
+//! path now resolves the connection's source pod identity from its socket
+//! cookie and stamps the per-pod `PolicyScopeCache`, mirroring the HTTP/HBONE
+//! admit path in `src/proxy/mod.rs`.
+//!
+//! Coverage:
+//!   - The exact production chain the accept loop uses — `resolve_stream`
+//!     against a *real accepted TCP socket*, then `policy_scope_for_pod` — maps
+//!     a connection to its source pod's scope (Linux-only: `SO_COOKIE`).
+//!   - A Namespace-scoped and a WorkloadSelector-scoped policy each apply to the
+//!     matching source pod and NOT to an unrelated pod (the per-pod filter
+//!     `PolicyScopeCache::policy_applies` that `mesh_authz` consumes).
+//!   - An unresolved connection (cookie not enrolled) yields no scope, so
+//!     `mesh_authz` retains mesh-wide-only policies — the documented
+//!     fail-closed-soft default. The plugin-side `mesh_authz.scope_missing`
+//!     stamping for `None` scope is covered in
+//!     `tests/unit/plugins/mesh_plugins_tests.rs`.
+//!   - Non-node-waypoint stream proxies are unchanged: with no resolver
+//!     installed the accept path stamps `None` and no per-pod scope is consulted.
+//!
+//! UDP/DTLS stream scoping is intentionally out of scope: node-waypoint capture
+//! is keyed by the per-connection TCP socket cookie (`connect4`/`connect6`
+//! cgroup hooks), and a shared UDP frontend socket has no per-source-pod
+//! cookie. See `docs/mesh.md` and the comments in `src/proxy/udp_proxy.rs`.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use ferrum_ebpf_common::OrigDst4;
+use ferrum_edge::identity::SpiffeId;
+use ferrum_edge::modes::mesh::config::{
+    MeshPolicy, MeshRule, PolicyAction, PolicyScope, WorkloadSelector,
+};
+use ferrum_edge::modes::mesh::node_waypoint::{
+    NodeWaypointIdentity, NodeWaypointIdentityResolver, parse_pod_uid,
+};
+
+const POD_A: &str = "11111111-1111-1111-1111-111111111111";
+const POD_B: &str = "22222222-2222-2222-2222-222222222222";
+const SPIFFE_A: &str = "spiffe://cluster.local/ns/team-a/sa/api";
+const SPIFFE_B: &str = "spiffe://cluster.local/ns/team-b/sa/api";
+
+fn spiffe(raw: &str) -> SpiffeId {
+    SpiffeId::new(raw).expect("valid test SPIFFE ID")
+}
+
+fn labels(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+    pairs
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+
+fn policy_with_scope(name: &str, scope: PolicyScope, action: PolicyAction) -> MeshPolicy {
+    MeshPolicy {
+        name: name.to_string(),
+        namespace: "team-a".to_string(),
+        scope,
+        rules: vec![MeshRule {
+            from: Vec::new(),
+            to: Vec::new(),
+            when: Vec::new(),
+            request_principals: Vec::new(),
+            not_request_principals: Vec::new(),
+            source_negation: Default::default(),
+            never_matches: false,
+            action,
+        }],
+    }
+}
+
+/// Enroll pod A (ns `team-a`, labels `app=api,tier=web`) and pod B (ns
+/// `team-b`, labels `app=api`) into a fresh resolver, mapping `cookie_a`→A and
+/// `cookie_b`→B, and install per-pod policy scopes derived from their
+/// workload metadata.
+fn resolver_with_two_pods(cookie_a: u64, cookie_b: u64) -> Arc<NodeWaypointIdentityResolver> {
+    let resolver = Arc::new(NodeWaypointIdentityResolver::new(0));
+    let pod_a = parse_pod_uid(POD_A).unwrap();
+    let pod_b = parse_pod_uid(POD_B).unwrap();
+    let id_a = NodeWaypointIdentity::new(pod_a, spiffe(SPIFFE_A));
+    let id_b = NodeWaypointIdentity::new(pod_b, spiffe(SPIFFE_B));
+    let hash_a = id_a.workload_spiffe_hash;
+    let hash_b = id_b.workload_spiffe_hash;
+    resolver.upsert_identity(id_a);
+    resolver.upsert_identity(id_b);
+    resolver.record_orig_dst4(
+        cookie_a,
+        OrigDst4 {
+            addr: 0x0a00_0001,
+            port: 8080,
+            pod_uid: pod_a,
+            workload_spiffe_hash: hash_a,
+        },
+    );
+    resolver.record_orig_dst4(
+        cookie_b,
+        OrigDst4 {
+            addr: 0x0a00_0002,
+            port: 8081,
+            pod_uid: pod_b,
+            workload_spiffe_hash: hash_b,
+        },
+    );
+
+    // Install per-pod scopes the way slice apply would: pod A in team-a with
+    // labels app=api,tier=web; pod B in team-b with app=api.
+    let mut scopes = HashMap::new();
+    scopes.insert(
+        pod_a,
+        Arc::new(ferrum_edge::modes::mesh::runtime::PolicyScopeCache::new(
+            spiffe(SPIFFE_A),
+            "team-a",
+            labels(&[("app", "api"), ("tier", "web")]),
+        )),
+    );
+    scopes.insert(
+        pod_b,
+        Arc::new(ferrum_edge::modes::mesh::runtime::PolicyScopeCache::new(
+            spiffe(SPIFFE_B),
+            "team-b",
+            labels(&[("app", "api")]),
+        )),
+    );
+    resolver.install_policy_scopes(scopes);
+    resolver
+}
+
+/// A Namespace-scoped policy resolves through the per-pod scope to apply to the
+/// pod in that namespace and NOT to a pod in a different namespace. This is the
+/// `PolicyScopeCache::policy_applies` filter that `mesh_authz` runs once the
+/// accept loop stamps `node_waypoint_policy_scope`.
+#[test]
+fn namespace_scoped_policy_applies_only_to_matching_pod() {
+    let resolver = resolver_with_two_pods(11, 12);
+    let pod_a = parse_pod_uid(POD_A).unwrap();
+    let pod_b = parse_pod_uid(POD_B).unwrap();
+
+    let team_a_deny = policy_with_scope(
+        "team-a-deny",
+        PolicyScope::Namespace {
+            namespace: "team-a".to_string(),
+        },
+        PolicyAction::Deny,
+    );
+
+    let scope_a = resolver
+        .policy_scope_for_pod(&pod_a)
+        .expect("pod A scope installed");
+    let scope_b = resolver
+        .policy_scope_for_pod(&pod_b)
+        .expect("pod B scope installed");
+
+    assert!(
+        scope_a.policy_applies(&team_a_deny),
+        "team-a namespace DENY must apply to a pod in team-a"
+    );
+    assert!(
+        !scope_b.policy_applies(&team_a_deny),
+        "team-a namespace DENY must NOT apply to a pod in team-b — \
+         pre-fix the stream path treated every connection as mesh-wide and \
+         this scoped policy was silently skipped"
+    );
+}
+
+/// A WorkloadSelector-scoped policy resolves through the per-pod scope to apply
+/// only to the pod whose labels match the selector.
+#[test]
+fn workload_selector_scoped_policy_applies_only_to_matching_pod() {
+    let resolver = resolver_with_two_pods(21, 22);
+    let pod_a = parse_pod_uid(POD_A).unwrap();
+    let pod_b = parse_pod_uid(POD_B).unwrap();
+
+    // Selector requires tier=web; only pod A carries it.
+    let tier_web_deny = policy_with_scope(
+        "tier-web-deny",
+        PolicyScope::WorkloadSelector {
+            selector: WorkloadSelector {
+                labels: labels(&[("tier", "web")]),
+                namespace: Some("team-a".to_string()),
+            },
+        },
+        PolicyAction::Deny,
+    );
+
+    let scope_a = resolver.policy_scope_for_pod(&pod_a).unwrap();
+    let scope_b = resolver.policy_scope_for_pod(&pod_b).unwrap();
+
+    assert!(
+        scope_a.policy_applies(&tier_web_deny),
+        "tier=web selector DENY must apply to pod A (tier=web)"
+    );
+    assert!(
+        !scope_b.policy_applies(&tier_web_deny),
+        "tier=web selector DENY must NOT apply to pod B (no tier label)"
+    );
+}
+
+/// A MeshWide policy applies to any pod regardless of the per-pod scope — it is
+/// never filtered out, matching the mesh-wide-only fallback semantics.
+#[test]
+fn mesh_wide_policy_applies_to_every_pod() {
+    let resolver = resolver_with_two_pods(31, 32);
+    let pod_a = parse_pod_uid(POD_A).unwrap();
+    let pod_b = parse_pod_uid(POD_B).unwrap();
+
+    let mesh_wide_deny =
+        policy_with_scope("mesh-wide-deny", PolicyScope::MeshWide, PolicyAction::Deny);
+
+    let scope_a = resolver.policy_scope_for_pod(&pod_a).unwrap();
+    let scope_b = resolver.policy_scope_for_pod(&pod_b).unwrap();
+
+    assert!(scope_a.policy_applies(&mesh_wide_deny));
+    assert!(scope_b.policy_applies(&mesh_wide_deny));
+}
+
+/// An unenrolled cookie fails closed: `resolve_cookie` errors, so the accept
+/// loop stamps no scope. `mesh_authz` then retains mesh-wide-only policies and
+/// stamps `mesh_authz.scope_missing` (plugin behavior covered in unit tests).
+#[test]
+fn unresolved_cookie_yields_no_scope() {
+    let resolver = resolver_with_two_pods(41, 42);
+
+    let unknown = resolver.resolve_cookie(999);
+    assert!(
+        unknown.is_err(),
+        "an unenrolled cookie must fail closed so the accept path stamps no \
+         per-pod scope (mesh-wide-only fallback)"
+    );
+}
+
+/// Sanity: a pod whose identity is enrolled but whose workload had no scope
+/// installed (slice/identity race) yields `None` from `policy_scope_for_pod`,
+/// which the accept loop forwards as `node_waypoint_policy_scope: None`.
+#[test]
+fn enrolled_pod_without_installed_scope_yields_none() {
+    let resolver = Arc::new(NodeWaypointIdentityResolver::new(0));
+    let pod_a = parse_pod_uid(POD_A).unwrap();
+    let id_a = NodeWaypointIdentity::new(pod_a, spiffe(SPIFFE_A));
+    let hash_a = id_a.workload_spiffe_hash;
+    resolver.upsert_identity(id_a);
+    resolver.record_orig_dst4(
+        7,
+        OrigDst4 {
+            addr: 0x0a00_0001,
+            port: 8080,
+            pod_uid: pod_a,
+            workload_spiffe_hash: hash_a,
+        },
+    );
+    // No install_policy_scopes call — scope index is empty.
+    let resolved = resolver.resolve_cookie(7).expect("identity resolves");
+    assert_eq!(resolved.pod_uid, pod_a);
+    assert!(
+        resolver.policy_scope_for_pod(&resolved.pod_uid).is_none(),
+        "no installed scope must surface as None so mesh_authz falls back to \
+         mesh-wide-only and stamps scope_missing"
+    );
+}
+
+/// End-to-end production chain on a REAL accepted TCP socket: read the
+/// accepted server-side socket's `SO_COOKIE`, register an orig-dst record under
+/// exactly that cookie (what the GAP-2M accept-side bridge would do), then run
+/// the precise resolution the TCP accept loop runs —
+/// `resolve_stream(&accepted_stream)` followed by `policy_scope_for_pod`. This
+/// pins the wiring: the accept loop maps a live connection to its source pod's
+/// scope. Linux-only because `SO_COOKIE` is a Linux socket option; on other
+/// platforms node-waypoint resolution fails closed by design.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn resolve_stream_against_real_accepted_socket_maps_to_pod_scope() {
+    use tokio::net::{TcpListener, TcpStream};
+
+    let resolver = Arc::new(NodeWaypointIdentityResolver::new(0));
+    let pod_a = parse_pod_uid(POD_A).unwrap();
+    let id_a = NodeWaypointIdentity::new(pod_a, spiffe(SPIFFE_A));
+    let hash_a = id_a.workload_spiffe_hash;
+    resolver.upsert_identity(id_a);
+
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind ephemeral listener");
+    let addr = listener.local_addr().expect("listener addr");
+
+    // Connect a client and accept the server-side stream — this is the socket
+    // the production accept loop holds and reads `SO_COOKIE` from.
+    let connect = tokio::spawn(async move { TcpStream::connect(addr).await });
+    let (accepted, _peer) = listener.accept().await.expect("accept connection");
+    let _client = connect
+        .await
+        .expect("join connect")
+        .expect("client connect");
+
+    // Read the accepted socket's actual cookie and register the orig-dst record
+    // under it, mirroring the accept-side registrar contract.
+    let cookie = ferrum_edge::socket_opts::socket_cookie(&accepted).expect("SO_COOKIE on Linux");
+    resolver.record_orig_dst4(
+        cookie,
+        OrigDst4 {
+            addr: 0x0a00_0001,
+            port: 8080,
+            pod_uid: pod_a,
+            workload_spiffe_hash: hash_a,
+        },
+    );
+    resolver.install_policy_scopes({
+        let mut scopes = HashMap::new();
+        scopes.insert(
+            pod_a,
+            Arc::new(ferrum_edge::modes::mesh::runtime::PolicyScopeCache::new(
+                spiffe(SPIFFE_A),
+                "team-a",
+                labels(&[("app", "api"), ("tier", "web")]),
+            )),
+        );
+        scopes
+    });
+
+    // The exact chain the TCP accept loop now runs.
+    let identity = resolver
+        .resolve_stream(&accepted)
+        .expect("accepted socket resolves to enrolled pod identity");
+    assert_eq!(identity.pod_uid, pod_a);
+    assert_eq!(identity.spiffe_id.as_str(), SPIFFE_A);
+
+    let scope = resolver
+        .policy_scope_for_pod(&identity.pod_uid)
+        .expect("resolved pod has an installed policy scope");
+
+    let team_a_deny = policy_with_scope(
+        "team-a-deny",
+        PolicyScope::Namespace {
+            namespace: "team-a".to_string(),
+        },
+        PolicyAction::Deny,
+    );
+    assert!(
+        scope.policy_applies(&team_a_deny),
+        "the scope resolved from the live connection must apply the team-a \
+         namespace policy to the source pod"
+    );
+}
