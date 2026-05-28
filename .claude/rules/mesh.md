@@ -64,6 +64,8 @@ Full operator docs live in `docs/mesh.md`. Keep this file to implementation inva
 ## HBONE Identity Boundary
 
 - HBONE is HTTP/2 CONNECT over mTLS on port 15008.
+- `is_hbone_connect()` only detects the wire shape (H2 CONNECT + optional `x-ferrum-mesh-protocol`/`x-istio-protocol: hbone` marker); it does not imply authentication and is only safe for non-relay decisions (path normalization, metadata tagging, body-buffering branch).
+- Relaying a CONNECT as an HBONE tunnel requires an authenticated, trust-domain-verified peer (`ctx.peer_spiffe_id.is_some()`, i.e. `is_authenticated_hbone_connect()`). `handle_hbone_request` rejects a peerless CONNECT — bare or marker-bearing — with `403 Forbidden` before dialing/circuit-breaking any backend, stamping `mesh_authz.deny_policy=hbone_unauthenticated_peer`. The explicit marker path is not a bypass. This is separate from (and additive to) TLS-time trust-bundle peer verification.
 - Baggage `source.principal` rewrites the authz principal only when the authenticated peer is in `mesh_authz.trusted_hbone_assertors` and the baggage trust domain matches the peer cert or `FERRUM_MESH_TRUST_DOMAIN_ALIASES`.
 - Untrusted assertors keep their own peer-cert identity even when baggage is present.
 - Dropped baggage must surface in transaction metadata as `mesh_authz.ignored_baggage.untrusted_assertor=true`; denied requests contribute `mesh_authz.deny_policy=untrusted_assertor`.

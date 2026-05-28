@@ -80,11 +80,24 @@ pub fn baggage_header_for_source(source: &SpiffeId) -> String {
     format!("source.principal={encoded}")
 }
 
-/// Detect an HBONE CONNECT stream from request parts.
+/// Detect an HBONE-*shaped* CONNECT stream from request parts.
 ///
-/// Ferrum accepts plain HTTP/2 CONNECT as HBONE because Istio describes HBONE
-/// as HTTP/2 CONNECT plus mTLS, while still recognizing explicit marker
-/// headers used by early clients and tests.
+/// HBONE is HTTP/2 CONNECT plus mTLS. This predicate only checks the wire
+/// shape: an HTTP/2 CONNECT, optionally carrying an explicit
+/// `x-ferrum-mesh-protocol`/`x-istio-protocol: hbone` marker used by early
+/// clients and tests. It deliberately says nothing about the authenticated
+/// peer — a bare HTTP/2 CONNECT looks identical on the wire whether or not the
+/// mTLS handshake produced a SPIFFE peer identity.
+///
+/// Shape detection alone MUST NOT authorize relaying a CONNECT as an HBONE
+/// tunnel: relaying byte-copies the stream straight to a backend, so a
+/// marker-less CONNECT with no authenticated peer would otherwise become an
+/// unauthenticated transparent TCP tunnel. Gate the relay on
+/// [`is_authenticated_hbone_connect`] (or equivalently, require
+/// `peer_spiffe_id.is_some()` at the relay site) — this function is only safe
+/// for shape-dependent, non-relay decisions such as request-path normalization,
+/// metadata tagging, and the body-buffering branch that preserves the upgrade
+/// handle.
 pub fn is_hbone_connect(method: &Method, version: Version, headers: &HeaderMap) -> bool {
     if method != Method::CONNECT || version != Version::HTTP_2 {
         return false;
@@ -94,6 +107,39 @@ pub fn is_hbone_connect(method: &Method, version: Version, headers: &HeaderMap) 
         .or_else(|| headers.get("x-istio-protocol"))
         .and_then(|value| value.to_str().ok());
     protocol.is_none_or(|value| value.eq_ignore_ascii_case(HBONE_PROTOCOL))
+}
+
+/// Predicate combining the [`is_hbone_connect`] wire shape **and** an
+/// authenticated, trust-domain-verified peer SPIFFE identity
+/// (`peer_spiffe_id.is_some()`).
+///
+/// This encodes the HBONE-relay authorization invariant but is **not** itself
+/// the runtime gate. The relay enforces the authenticated-peer half inline in
+/// `handle_hbone_request` (`src/proxy/hbone_proxy.rs`, the
+/// `ctx.peer_spiffe_id.is_none()` reject); by the time the relay runs, the wire
+/// shape has already been validated at dispatch (`is_hbone_connect_request`).
+/// This function combines both halves in one place and is exercised at the
+/// dispatch/test layer — keep it in sync with that inline relay check.
+///
+/// The mesh inbound mTLS/HBONE listener populates `peer_spiffe_id` (via the
+/// `spiffe_identity` plugin or the node-waypoint identity path) only after the
+/// peer cert's SAN trust domain has been validated against the local SVID
+/// bundle plus federated bundles, so a present `peer_spiffe_id` is exactly "a
+/// verified mesh peer terminated mTLS on this listener".
+///
+/// A bare (marker-less) CONNECT with no authenticated peer is **not** a valid
+/// HBONE tunnel and must be rejected rather than silently relayed; an explicit
+/// HBONE marker does not bypass this — a marker-bearing CONNECT from an
+/// unauthenticated peer is rejected too. Honoring the marker without a verified
+/// peer would let any client that can reach the listener assert "I am HBONE"
+/// and obtain a transparent TCP tunnel.
+pub fn is_authenticated_hbone_connect(
+    method: &Method,
+    version: Version,
+    headers: &HeaderMap,
+    peer_spiffe_id: Option<&SpiffeId>,
+) -> bool {
+    peer_spiffe_id.is_some() && is_hbone_connect(method, version, headers)
 }
 
 pub fn parse_baggage(headers: &HeaderMap) -> BTreeMap<String, String> {
@@ -1200,6 +1246,101 @@ mod tests {
             &Method::CONNECT,
             Version::HTTP_2,
             &headers
+        ));
+    }
+
+    // ---------------------------------------------------------------
+    // is_authenticated_hbone_connect tests (relay trust boundary)
+    // ---------------------------------------------------------------
+
+    fn peer() -> SpiffeId {
+        SpiffeId::new("spiffe://cluster.local/ns/default/sa/client").expect("valid spiffe id")
+    }
+
+    #[test]
+    fn authenticated_hbone_bare_connect_with_peer_is_authorized() {
+        let headers = HeaderMap::new();
+        let peer = peer();
+        assert!(is_authenticated_hbone_connect(
+            &Method::CONNECT,
+            Version::HTTP_2,
+            &headers,
+            Some(&peer),
+        ));
+    }
+
+    #[test]
+    fn authenticated_hbone_bare_connect_without_peer_is_rejected() {
+        // The core finding: a marker-less HTTP/2 CONNECT with no authenticated
+        // peer must NOT be authorized as an HBONE tunnel even though it is
+        // HBONE-shaped.
+        let headers = HeaderMap::new();
+        assert!(is_hbone_connect(
+            &Method::CONNECT,
+            Version::HTTP_2,
+            &headers
+        ));
+        assert!(!is_authenticated_hbone_connect(
+            &Method::CONNECT,
+            Version::HTTP_2,
+            &headers,
+            None,
+        ));
+    }
+
+    #[test]
+    fn authenticated_hbone_marker_connect_with_peer_is_authorized() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-istio-protocol", "hbone".parse().unwrap());
+        let peer = peer();
+        assert!(is_authenticated_hbone_connect(
+            &Method::CONNECT,
+            Version::HTTP_2,
+            &headers,
+            Some(&peer),
+        ));
+    }
+
+    #[test]
+    fn authenticated_hbone_marker_connect_without_peer_is_rejected() {
+        // The explicit-marker path does not bypass the authenticated-peer
+        // requirement: a marker-bearing CONNECT from an unauthenticated peer
+        // is still rejected.
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ferrum-mesh-protocol", "hbone".parse().unwrap());
+        assert!(!is_authenticated_hbone_connect(
+            &Method::CONNECT,
+            Version::HTTP_2,
+            &headers,
+            None,
+        ));
+    }
+
+    #[test]
+    fn authenticated_hbone_non_hbone_shape_with_peer_is_rejected() {
+        // A verified peer does not turn a non-HBONE-shaped request into a
+        // tunnel: GET, H1 CONNECT, and a non-hbone marker all stay rejected.
+        let headers = HeaderMap::new();
+        let peer = peer();
+        assert!(!is_authenticated_hbone_connect(
+            &Method::GET,
+            Version::HTTP_2,
+            &headers,
+            Some(&peer),
+        ));
+        assert!(!is_authenticated_hbone_connect(
+            &Method::CONNECT,
+            Version::HTTP_11,
+            &headers,
+            Some(&peer),
+        ));
+        let mut tcp_headers = HeaderMap::new();
+        tcp_headers.insert("x-ferrum-mesh-protocol", "tcp".parse().unwrap());
+        assert!(!is_authenticated_hbone_connect(
+            &Method::CONNECT,
+            Version::HTTP_2,
+            &tcp_headers,
+            Some(&peer),
         ));
     }
 
