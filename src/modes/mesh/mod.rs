@@ -702,11 +702,15 @@ fn prepare_normalized_gateway_config_for_mesh(
     //     selector-scoped entry.
     // TCP/TcpTls stream accept loops now resolve the connection's source pod
     // identity and stamp the per-pod `PolicyScopeCache`, so scoped DENY/ALLOW
-    // rules ARE enforced on TCP streams (parity with HTTP/HBONE). UDP/DTLS
-    // remains mesh-wide-only: node-waypoint capture keys identity by the
-    // per-connection TCP socket cookie, and a shared UDP frontend socket has no
-    // per-source-pod cookie to resolve. Scoped policies are therefore still
-    // withheld on UDP/DTLS streams. See docs/mesh.md for details.
+    // rules are *wired* to be enforced on TCP streams once the GAP-2M
+    // accept-side cookie bridge ships (parity with the HBONE/HTTP path, which
+    // shares the same staging dependency — until then both paths resolve
+    // `None` and TCP downgrades to mesh-wide-only via the documented
+    // fail-closed-soft fallback). UDP/DTLS is a structurally different story:
+    // node-waypoint capture keys identity by the per-connection TCP socket
+    // cookie, and a shared UDP frontend socket has no per-source-pod cookie to
+    // resolve, so scoped policies stay permanently withheld on UDP/DTLS until
+    // an entirely new capture path lands. See docs/mesh.md for details.
     if runtime.topology == MeshTopology::NodeWaypoint
         && config.proxies.iter().any(|p| p.dispatch_kind.is_udp())
         && mesh_slice
@@ -719,7 +723,8 @@ fn prepare_normalized_gateway_config_for_mesh(
             "Namespace- and selector-scoped mesh policies are NOT enforced on UDP/DTLS stream \
              connections (a shared UDP frontend socket carries no per-source-pod cookie, and \
              node-waypoint capture is TCP-connection scoped). Only MeshWide policies apply to \
-             UDP stream traffic; TCP streams are scoped per source pod. See docs/mesh.md for details."
+             UDP stream traffic; TCP streams share the HBONE/HTTP per-pod scoping wiring \
+             (gated on GAP-2M). See docs/mesh.md for details."
         );
     }
 

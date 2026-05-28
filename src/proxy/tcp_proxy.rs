@@ -55,10 +55,22 @@ pub(crate) fn classify_stream_error(error: &anyhow::Error) -> crate::retry::Erro
 ///   proxies → returns `(None, None)`; the stream is mesh-wide-only with no
 ///   per-pod scope consulted (unchanged pre-fix behavior).
 /// - When the connection's `SO_COOKIE` cannot be resolved to an enrolled pod
-///   (no node-agent enrollment yet, non-Linux, unknown cookie, identity race),
-///   returns `(None, None)`. `mesh_authz` then evaluates mesh-wide policies only
-///   and stamps `mesh_authz.scope_missing=true` — the same safe default the HTTP
-///   path uses for an unresolved per-pod scope.
+///   (GAP-2M caveat below, no node-agent enrollment yet, non-Linux, unknown
+///   cookie, identity race), returns `(None, None)`. `mesh_authz` then
+///   evaluates mesh-wide policies only and stamps
+///   `mesh_authz.scope_missing=true` — the same safe default the HTTP path
+///   uses for an unresolved per-pod scope.
+///
+/// **GAP-2M staging caveat**: today the resolver's cookie records are
+/// populated by the connect-side `orig_dst_bridge`, but the accept path looks
+/// up the accept-side `SO_COOKIE` — a different kernel socket with a different
+/// cookie (see `src/socket_opts.rs` and `src/ebpf/orig_dst_bridge.rs`). Until
+/// the GAP-2M sockops/sk_lookup bridge registers accept-side cookies, this
+/// helper returns `(None, None)` on every production connection and the stream
+/// downgrades to mesh-wide enforcement. The HBONE/HTTP path has the same
+/// staging dependency and currently fails closed at the same point. The
+/// per-pod scoping wiring is in place so once GAP-2M ships scoped enforcement
+/// starts on both paths without changes to this accept-path helper.
 ///
 /// Fail-closed-soft, deliberately unlike the HBONE listener which drops a
 /// connection without a resolved identity: raw TCP stream proxies in
