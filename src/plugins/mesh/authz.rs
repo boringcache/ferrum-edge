@@ -77,6 +77,13 @@ pub struct MeshAuthz {
     /// preserves the existing sidecar/ambient/east-west/egress-gateway
     /// behaviour (slice-level filter at construction).
     per_pod_policy_scoping: bool,
+    /// Precomputed: whether any namespace/selector-scoped (non-mesh-wide)
+    /// policy is loaded. The stream path uses this to fail closed when the
+    /// per-pod scope is missing but scoped policies exist (they can't be
+    /// evaluated without the scope), while letting mesh-wide-only meshes fall
+    /// through to mesh-wide evaluation. Only meaningful when
+    /// `per_pod_policy_scoping` is true.
+    has_scoped_policies: bool,
     /// Precomputed set of Istio attribute keys referenced by `when:`
     /// conditions across the loaded policies. The request hot path only
     /// materializes attributes named here, so a policy set with no `when:`
@@ -334,12 +341,21 @@ impl MeshAuthz {
         }
         let has_header_rules = mesh_policies_have_header_rules(&slice.mesh_policies);
         let condition_keys = ConditionAttributeKeys::from_policies(&slice.mesh_policies);
+        // Whether any namespace/selector-scoped (non-mesh-wide) policy is loaded.
+        // The stream path fails closed on a missing per-pod scope only when such
+        // policies exist; otherwise mesh-wide-only evaluation is complete.
+        let has_scoped_policies = per_pod_policy_scoping
+            && slice
+                .mesh_policies
+                .iter()
+                .any(|policy| !matches!(policy.scope, PolicyScope::MeshWide));
         Ok(Self {
             slice,
             has_header_rules,
             trust_domain_aliases,
             trusted_hbone_assertors,
             per_pod_policy_scoping,
+            has_scoped_policies,
             condition_keys,
         })
     }
@@ -823,6 +839,26 @@ impl Plugin for MeshAuthz {
             let scope = ctx.node_waypoint_policy_scope.as_deref();
             if scope.is_none() {
                 metadata.insert("mesh_authz.scope_missing".to_string(), "true".to_string());
+                // Fail closed ONLY when namespace/selector-scoped policies exist:
+                // without the per-pod scope we cannot prove they don't apply, so
+                // rejecting is the safe default. A mesh with only mesh-wide
+                // policies is fully evaluable, so fall through to mesh-wide-only
+                // evaluation (matching the HTTP path) instead of rejecting all
+                // stream traffic. `Reject` is the variant the stream accept loops
+                // honor; `RejectBinary` would be silently dropped by them.
+                if self.has_scoped_policies {
+                    metadata.insert(
+                        "mesh_authz.deny_policy".to_string(),
+                        "scope_missing".to_string(),
+                    );
+                    self.record_policy_deny(&metadata, source_for_log.as_deref());
+                    ctx.metadata = (!metadata.is_empty()).then_some(metadata);
+                    return PluginResult::Reject {
+                        status_code: 403,
+                        body: r#"{"error":"stream denied: missing per-pod policy scope"}"#.into(),
+                        headers: HashMap::new(),
+                    };
+                }
             }
             let policies = self
                 .slice
