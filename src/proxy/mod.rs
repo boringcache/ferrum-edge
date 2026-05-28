@@ -1693,6 +1693,20 @@ pub struct ProxyState {
     /// retained as a lifetime anchor and observability surface.
     #[allow(dead_code)]
     pub bpf_metrics_state: Option<Arc<crate::ebpf::bpf_metrics::BpfMetricsState>>,
+    /// Per-destination open-connection limiter enforcing DestinationRule
+    /// `connectionPool.tcp.maxConnections` for the HTTP-family WebSocket
+    /// dispatch path (H1/H2 here and H3 in `src/http3/websocket.rs`). A
+    /// proxied WebSocket session opens one dedicated, non-pooled backend
+    /// connection whose lifetime equals the session, so an RAII
+    /// [`crate::backend_conn_limit::BackendConnectionGuard`] held for the
+    /// session bounds concurrent open connections per `(host, port)` —
+    /// matching Envoy `maxConnections` semantics and the raw-TCP path's
+    /// `BackendInflightGuard`. The pooled, multiplexed HTTP-family
+    /// transports (reqwest H1/H2, direct H2, gRPC, H3, HBONE) do not
+    /// consume this limiter; see `docs/mesh.md` and the module docs in
+    /// `src/backend_conn_limit.rs` for why their pool-internal connection
+    /// lifecycle makes a request-keyed counter the wrong control.
+    pub backend_conn_limit: Arc<crate::backend_conn_limit::BackendConnectionLimiter>,
 }
 
 #[inline]
@@ -3139,6 +3153,11 @@ impl ProxyState {
             backend_svid_rotation_tx,
             backend_svid_generation,
             bpf_metrics_state,
+            backend_conn_limit: Arc::new(
+                crate::backend_conn_limit::BackendConnectionLimiter::with_shard_amount(
+                    pool_shard_amount,
+                ),
+            ),
         };
         if let Some(handle) =
             state.start_gateway_svid_file_rotation_task(health_check_restart_rx.clone())
@@ -5391,7 +5410,56 @@ async fn handle_websocket_request_authenticated(
     let mut current_target = upstream_target;
     let mut ws_attempt = 0u32;
 
+    // The backend WebSocket connection acquired below is held for the full
+    // session lifetime (moved into the spawned task), so this guard's slot is
+    // released exactly when the dedicated backend connection closes. Captured
+    // out of the loop alongside the handshake.
+    let backend_conn_guard;
     let backend_handshake = loop {
+        // Enforce DestinationRule `connectionPool.tcp.maxConnections` for this
+        // destination port BEFORE dialing. A proxied WebSocket opens one
+        // dedicated backend connection, so capping concurrent open connections
+        // per `(host, port)` here matches Envoy `maxConnections` semantics. No
+        // cap configured => `Ok(None)`, a single check with no map touch.
+        let (ws_dial_host, ws_dial_port) = match &current_target {
+            Some(target) => (target.host.as_str(), target.port),
+            None => (proxy.backend_host.as_str(), proxy.backend_port),
+        };
+        let ws_max_connections = resolve_backend_max_connections(&proxy, ws_dial_port);
+        let conn_slot = match state.backend_conn_limit.try_acquire(
+            ws_dial_host,
+            ws_dial_port,
+            ws_max_connections,
+        ) {
+            Ok(slot) => slot,
+            Err(limit) => {
+                warn!(
+                    proxy_id = %proxy.id,
+                    client_ip = %ctx.client_ip,
+                    backend_host = %ws_dial_host,
+                    backend_port = ws_dial_port,
+                    open_connections = limit.current,
+                    max_connections = limit.cap,
+                    "Rejecting WebSocket upgrade: DestinationRule maxConnections reached for backend"
+                );
+                log_rejected_request_with_path(
+                    &plugins,
+                    &ctx,
+                    503,
+                    start_time,
+                    "backend_max_connections",
+                    plugin_execution_ns,
+                    Some(&original_request_path),
+                )
+                .await;
+                record_request(&state, 503);
+                return Ok(build_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    r#"{"error":"Backend connection limit exceeded"}"#,
+                ));
+            }
+        };
+
         match connect_websocket_backend(
             &current_backend_url,
             &proxy,
@@ -5404,8 +5472,15 @@ async fn handle_websocket_request_authenticated(
         )
         .await
         {
-            Ok(handshake) => break handshake,
+            Ok(handshake) => {
+                backend_conn_guard = conn_slot;
+                break handshake;
+            }
             Err(e) => {
+                // Connect/handshake failed: free this destination's slot before
+                // a retry so a rotated target acquires its own slot and a
+                // failed attempt never leaks a count.
+                drop(conn_slot);
                 // `connect_websocket_backend` covers more than TCP+TLS setup:
                 // `connect_async_tls_with_config` ALSO sends the WebSocket
                 // upgrade request and reads the backend's response. A failure
@@ -5798,6 +5873,11 @@ async fn handle_websocket_request_authenticated(
         // every exit path (upgrade failure, run_websocket_proxy completion or
         // error), decrementing `active_connections` exactly once.
         let _ws_session_guard = ws_session_guard;
+        // Hold the per-destination backend-connection slot (DestinationRule
+        // `maxConnections`) for the same session lifetime. `Option`: `None`
+        // when no cap is configured for the destination port. Dropping it on
+        // any session-end path releases the slot exactly once — no leak.
+        let _backend_conn_guard = backend_conn_guard;
         match on_upgrade.await {
             Ok(upgraded) => {
                 // H1/H2 frontends adapt hyper's `Upgraded` (which is
@@ -11564,6 +11644,27 @@ pub(crate) fn resolve_effective_proxy_for_target<'a>(
         owned.pool_max_requests_per_connection = Some(n);
     }
     std::borrow::Cow::Owned(owned)
+}
+
+/// Resolve the DestinationRule `connectionPool.tcp.maxConnections` cap for the
+/// destination port a backend dial will target.
+///
+/// Returns `None` (no cap) in the common case: the proxy has no
+/// `dispatch_port_overrides`, the resolved port has no override, or the
+/// override carries no `max_connections`. Hot-path discipline matches
+/// [`resolve_effective_proxy_for_target`]: a single field read on the
+/// precomputed `Proxy.dispatch_port_overrides` map, no `ArcSwap` load.
+///
+/// `dispatch_port` is the port the dial will actually use: the LB-selected
+/// `UpstreamTarget.port` for upstream proxies, or `proxy.backend_port` for a
+/// direct-backend proxy with no upstream. This mirrors how the raw-TCP path
+/// reads the same field via `ResolvedPortOverride.max_connections`.
+pub(crate) fn resolve_backend_max_connections(proxy: &Proxy, dispatch_port: u16) -> Option<u32> {
+    proxy
+        .dispatch_port_overrides
+        .as_ref()
+        .and_then(|overrides| overrides.get(&dispatch_port))
+        .and_then(|override_config| override_config.max_connections)
 }
 
 /// Resolve the per-port retry lane after a concrete target has failed.
@@ -18735,6 +18836,75 @@ mod tests {
         assert_eq!(effective.backend_connect_timeout_ms, 750);
         // Original is untouched — only the returned Cow carries the override.
         assert_eq!(proxy.backend_connect_timeout_ms, 5000);
+    }
+
+    // ── DestinationRule per-port maxConnections resolution ───────────────
+    //
+    // `resolve_backend_max_connections` is the projection seam the WebSocket
+    // dispatch path reads to enforce `connectionPool.tcp.maxConnections` for
+    // HTTP-family backends. These tests pin the contract: the cap surfaces
+    // only for the matching destination port, and the no-override / no-cap /
+    // wrong-port cases all return `None` (unbounded).
+
+    fn proxy_with_max_connections_override(port: u16, cap: Option<u32>) -> Proxy {
+        let mut proxy: Proxy = serde_json::from_value(json!({
+            "id": "p-maxconn",
+            "backend_host": "backend.local",
+            "backend_port": 8080,
+            "upstream_id": "u1",
+        }))
+        .expect("test proxy should deserialize");
+        proxy.dispatch_port_overrides = Some(HashMap::from([(
+            port,
+            crate::config::types::ResolvedPortOverride {
+                max_connections: cap,
+                ..Default::default()
+            },
+        )]));
+        proxy
+    }
+
+    #[test]
+    fn resolve_backend_max_connections_returns_cap_for_matching_port() {
+        let proxy = proxy_with_max_connections_override(8080, Some(4));
+        assert_eq!(
+            resolve_backend_max_connections(&proxy, 8080),
+            Some(4),
+            "cap must surface for the matching destination port"
+        );
+    }
+
+    #[test]
+    fn resolve_backend_max_connections_none_for_other_port() {
+        let proxy = proxy_with_max_connections_override(8080, Some(4));
+        assert_eq!(
+            resolve_backend_max_connections(&proxy, 9090),
+            None,
+            "a port without an override must be unbounded"
+        );
+    }
+
+    #[test]
+    fn resolve_backend_max_connections_none_when_no_overrides() {
+        // No dispatch_port_overrides at all (common non-mesh proxy).
+        let proxy = proxy_with_port_overrides_for_test(5000, &[]);
+        assert_eq!(
+            resolve_backend_max_connections(&proxy, 8080),
+            None,
+            "a proxy with no port overrides must be unbounded"
+        );
+    }
+
+    #[test]
+    fn resolve_backend_max_connections_none_when_override_lacks_cap() {
+        // Override present for the port but `max_connections` unset (e.g. only
+        // a connect-timeout override) → still unbounded.
+        let proxy = proxy_with_max_connections_override(8080, None);
+        assert_eq!(
+            resolve_backend_max_connections(&proxy, 8080),
+            None,
+            "an override without max_connections must be unbounded"
+        );
     }
 
     #[test]
