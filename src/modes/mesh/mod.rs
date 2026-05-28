@@ -4354,6 +4354,75 @@ fn load_mesh_frontend_server_identity(
     }
 }
 
+/// Outcome of resolving a PeerAuthentication mTLS mode into an inbound
+/// rustls client-auth posture, given which trust anchors are available.
+///
+/// Kept separate from [`tls::MeshClientAuth`] so the caller can emit a single
+/// loud warning for the one degraded case (PERMISSIVE with no trust anchor at
+/// all) without that warning living inside an otherwise-pure decision that
+/// tests want to assert on directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MeshClientAuthDecision {
+    /// A concrete client-auth posture was resolved.
+    Resolved(tls::MeshClientAuth),
+    /// PERMISSIVE was requested but neither an operator client-CA bundle nor a
+    /// gateway SVID trust anchor exists, so a presented peer cert cannot be
+    /// verified and no SPIFFE identity can be recorded. Resolves to
+    /// [`tls::MeshClientAuth::None`] (no CertificateRequest), and the caller is
+    /// expected to warn once.
+    PermissiveNoTrustAnchor,
+}
+
+impl MeshClientAuthDecision {
+    /// The rustls client-auth posture this decision maps to.
+    fn client_auth(self) -> tls::MeshClientAuth {
+        match self {
+            MeshClientAuthDecision::Resolved(auth) => auth,
+            MeshClientAuthDecision::PermissiveNoTrustAnchor => tls::MeshClientAuth::None,
+        }
+    }
+}
+
+/// Resolve the inbound rustls client-auth posture for a PeerAuthentication mTLS
+/// mode, given whether an operator client-CA bundle and/or a gateway SVID
+/// trust-domain verifier are available.
+///
+/// This is the security-critical decision behind mesh inbound mTLS:
+/// - `STRICT` → `Required`: a peer cert is mandatory and verified.
+/// - `PERMISSIVE` with **any** trust anchor (SVID verifier preferred, else the
+///   operator client-CA bundle) → `Optional`: the listener requests a client
+///   cert and verifies it when offered, but cert-less peers are still admitted.
+///   This is what lets PERMISSIVE record `peer_spiffe_id` for a peer that
+///   presents a valid SVID instead of silently treating it as anonymous.
+/// - `PERMISSIVE` with **no** trust anchor → [`MeshClientAuthDecision::PermissiveNoTrustAnchor`]:
+///   no CertificateRequest is sent because a presented cert could not be
+///   verified anyway. The caller emits a single loud warning.
+/// - `DISABLE` never reaches here (handled by the plaintext-listener early
+///   return in [`load_mesh_frontend_tls`]).
+/// - `Simple` / `Mutual` / `IstioMutual` are client-side `DestinationRule.tls`
+///   modes that must never reach this server-side resolver; they fall back to
+///   no client auth so a mistranslation cannot crash a running data plane.
+fn resolve_mesh_inbound_client_auth(
+    mtls_mode: config::MtlsMode,
+    has_client_ca_bundle: bool,
+    has_spiffe_verifier: bool,
+) -> MeshClientAuthDecision {
+    match mtls_mode {
+        config::MtlsMode::Strict => MeshClientAuthDecision::Resolved(tls::MeshClientAuth::Required),
+        config::MtlsMode::Permissive if has_client_ca_bundle || has_spiffe_verifier => {
+            MeshClientAuthDecision::Resolved(tls::MeshClientAuth::Optional)
+        }
+        config::MtlsMode::Permissive => MeshClientAuthDecision::PermissiveNoTrustAnchor,
+        // DISABLE has no TLS and is handled before this resolver runs.
+        config::MtlsMode::Disable => MeshClientAuthDecision::Resolved(tls::MeshClientAuth::None),
+        // `Simple` / `Mutual` / `IstioMutual` are client-side `DestinationRule`
+        // modes; they never apply to a server-side PeerAuthentication listener.
+        config::MtlsMode::Simple | config::MtlsMode::Mutual | config::MtlsMode::IstioMutual => {
+            MeshClientAuthDecision::Resolved(tls::MeshClientAuth::None)
+        }
+    }
+}
+
 /// Build the mesh frontend TLS configuration respecting the resolved mTLS mode.
 ///
 /// - `Strict` / `Permissive`: Load TLS with the appropriate client-auth mode.
@@ -4396,35 +4465,41 @@ fn load_mesh_frontend_tls(
     let client_ca_bundle_path = client_ca_bundle
         .map(|bundle| bundle.path.as_str())
         .or(env_config.frontend_tls_client_ca_bundle_path.as_deref());
-    let client_auth = match mtls_mode {
-        config::MtlsMode::Strict => tls::MeshClientAuth::Required,
-        config::MtlsMode::Permissive
-            if client_ca_bundle_path.is_some() || spiffe_verifier.is_some() =>
-        {
-            tls::MeshClientAuth::Optional
+    let client_auth = match resolve_mesh_inbound_client_auth(
+        mtls_mode,
+        client_ca_bundle_path.is_some(),
+        spiffe_verifier.is_some(),
+    ) {
+        MeshClientAuthDecision::Resolved(auth) => {
+            // A client-side `DestinationRule.tls` mode reaching this server-side
+            // resolver is a translator bug; surface it loudly. The resolver
+            // already maps it to no client auth so a mistranslation cannot crash
+            // a running data plane.
+            if matches!(
+                mtls_mode,
+                config::MtlsMode::Simple | config::MtlsMode::Mutual | config::MtlsMode::IstioMutual
+            ) {
+                warn!(
+                    mode = ?mtls_mode,
+                    "Mesh PeerAuthentication received a client-side DR.tls mode; \
+                     falling back to no client auth (this is a programming error \
+                     in the K8s translator if observed)"
+                );
+            }
+            auth
         }
-        config::MtlsMode::Permissive => {
+        decision @ MeshClientAuthDecision::PermissiveNoTrustAnchor => {
+            // Loud, single warning: PERMISSIVE with no trust anchor at all means
+            // a presented peer cert cannot be verified and no SPIFFE identity
+            // can be recorded. We do not silently pretend to do mTLS — we make
+            // the missing-anchor degradation explicit.
             warn!(
                 "Mesh PeerAuthentication mTLS mode is PERMISSIVE but no \
                  FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH or gateway SVID material is \
-                 configured; client certificates will not be requested or verified"
+                 configured; client certificates will not be requested or verified and \
+                 no peer SPIFFE identity will be recorded for inbound connections"
             );
-            tls::MeshClientAuth::None
-        }
-        config::MtlsMode::Disable => unreachable!("handled above"),
-        // `Simple` / `Mutual` / `IstioMutual` are client-side modes from
-        // `DestinationRule.trafficPolicy.tls` and never reach this
-        // server-side PeerAuthentication resolver. Treat as a programming
-        // error: warn and fall back to no client auth so we don't crash a
-        // running data plane.
-        config::MtlsMode::Simple | config::MtlsMode::Mutual | config::MtlsMode::IstioMutual => {
-            warn!(
-                mode = ?mtls_mode,
-                "Mesh PeerAuthentication received a client-side DR.tls mode; \
-                 falling back to no client auth (this is a programming error \
-                 in the K8s translator if observed)"
-            );
-            tls::MeshClientAuth::None
+            decision.client_auth()
         }
     };
     // The SPIFFE verifier only applies when we actually request client certs.
@@ -10174,6 +10249,176 @@ mod tests {
         assert!(
             tls_config.is_some(),
             "TLS config should be built (no client auth, but server TLS active)"
+        );
+    }
+
+    #[test]
+    fn resolve_mesh_inbound_client_auth_matrix() {
+        use config::MtlsMode;
+        use tls::MeshClientAuth;
+
+        // STRICT always requires a peer cert, regardless of trust anchors.
+        for (has_ca, has_spiffe) in [(false, false), (true, false), (false, true), (true, true)] {
+            assert_eq!(
+                resolve_mesh_inbound_client_auth(MtlsMode::Strict, has_ca, has_spiffe),
+                MeshClientAuthDecision::Resolved(MeshClientAuth::Required),
+                "STRICT must require a peer cert"
+            );
+        }
+
+        // PERMISSIVE with any trust anchor → Optional (request + verify-if-offered,
+        // still admit cert-less peers). This is the finding's core fix: identity
+        // is recorded when a cert is offered instead of degrading to anonymous.
+        for (has_ca, has_spiffe) in [(true, false), (false, true), (true, true)] {
+            assert_eq!(
+                resolve_mesh_inbound_client_auth(MtlsMode::Permissive, has_ca, has_spiffe),
+                MeshClientAuthDecision::Resolved(MeshClientAuth::Optional),
+                "PERMISSIVE with a trust anchor (ca={has_ca}, spiffe={has_spiffe}) must request \
+                 and verify-if-offered, not skip client auth"
+            );
+        }
+
+        // PERMISSIVE with NO trust anchor → the explicit degraded decision (the
+        // caller warns once); it maps to no client auth.
+        let no_anchor = resolve_mesh_inbound_client_auth(MtlsMode::Permissive, false, false);
+        assert_eq!(no_anchor, MeshClientAuthDecision::PermissiveNoTrustAnchor);
+        assert_eq!(no_anchor.client_auth(), MeshClientAuth::None);
+
+        // Client-side DR.tls modes must never request client auth on a
+        // server-side listener even if anchors happen to exist.
+        for mode in [MtlsMode::Simple, MtlsMode::Mutual, MtlsMode::IstioMutual] {
+            assert_eq!(
+                resolve_mesh_inbound_client_auth(mode, true, true),
+                MeshClientAuthDecision::Resolved(MeshClientAuth::None),
+                "client-side DR.tls mode {mode:?} must not request client auth"
+            );
+        }
+
+        // DISABLE never reaches the resolver in production (early return in
+        // load_mesh_frontend_tls), but the defensive mapping that replaced the
+        // former unreachable!() must stay no-client-auth and never panic.
+        assert_eq!(
+            resolve_mesh_inbound_client_auth(MtlsMode::Disable, true, true),
+            MeshClientAuthDecision::Resolved(MeshClientAuth::None),
+            "DISABLE must map to no client auth, never panic"
+        );
+    }
+
+    /// Build a populated inbound SPIFFE bundle slot for tests that only need the
+    /// slot to be present (so `mesh_inbound_spiffe_verifier` yields a verifier).
+    /// The DER bytes are synthetic — these tests assert client-auth *wiring*, not
+    /// peer-chain verification, which is covered in `tls::spiffe` tests.
+    fn populated_spiffe_slot() -> tls::SharedBundleSlot {
+        use crate::identity::{SvidBundle, TrustBundle, TrustBundleSet};
+        let td = TrustDomain::new("td.permissive-wiring").unwrap();
+        let id = SpiffeId::from_parts(&td, "ns/foo/sa/bar").unwrap();
+        let bundle = SvidBundle {
+            spiffe_id: id,
+            cert_chain_der: vec![vec![1, 2, 3]],
+            private_key_pkcs8_der: Vec::new(),
+            trust_bundles: TrustBundleSet::local_only(TrustBundle {
+                trust_domain: td,
+                x509_authorities: vec![vec![4, 5, 6]],
+                jwt_authorities: Vec::new(),
+                refresh_hint_seconds: None,
+            }),
+        };
+        Arc::new(arc_swap::ArcSwap::new(Arc::new(Some(bundle))))
+    }
+
+    #[test]
+    fn permissive_with_spiffe_slot_records_identity_via_optional_client_auth() {
+        // The finding: in PERMISSIVE, when a gateway SVID trust anchor exists the
+        // listener must request + verify-if-offered (so a peer's SVID identity is
+        // recorded) rather than silently skip client auth. With an SVID slot and
+        // NO operator client CA bundle, `load_mesh_frontend_tls` must still build
+        // a TLS config wired to the SPIFFE trust-domain verifier in Optional mode.
+        ensure_crypto_provider();
+        let env = EnvConfig {
+            frontend_tls_cert_path: Some("tests/certs/server.crt".to_string()),
+            frontend_tls_key_path: Some("tests/certs/server.key".to_string()),
+            frontend_tls_client_ca_bundle_path: None,
+            ..EnvConfig::default()
+        };
+        let tls_policy = TlsPolicy::from_env_config(&env).expect("tls policy");
+        let mesh_frontend_identity =
+            load_mesh_frontend_server_identity(&env).expect("mesh frontend identity");
+        let slot = populated_spiffe_slot();
+
+        // The verifier built for this slot in PERMISSIVE must request but not
+        // mandate client auth — that is exactly what records identity when a
+        // cert is offered while still admitting cert-less peers.
+        let verifier = mesh_inbound_spiffe_verifier(
+            Some(&slot),
+            config::MtlsMode::Permissive,
+            Arc::new(Vec::new()),
+        )
+        .expect("PERMISSIVE with an SVID slot must yield a verifier");
+        assert!(
+            rustls::server::danger::ClientCertVerifier::offer_client_auth(verifier.as_ref()),
+            "PERMISSIVE must still request a client cert so identity is recorded when present"
+        );
+        assert!(
+            !rustls::server::danger::ClientCertVerifier::client_auth_mandatory(verifier.as_ref()),
+            "PERMISSIVE must not require a client cert"
+        );
+
+        let tls_config = load_mesh_frontend_tls(
+            &env,
+            &tls_policy,
+            &[],
+            config::MtlsMode::Permissive,
+            mesh_frontend_identity.as_deref(),
+            None,
+            Some(&slot),
+        )
+        .expect("permissive with an SVID slot should build a TLS config")
+        .expect("TLS config present (server TLS + optional SPIFFE client auth)");
+        // ALPN proves we built a real mesh frontend ServerConfig, not a plaintext
+        // fallback (`Disable` returns None and never reaches here).
+        assert!(
+            tls_config.alpn_protocols.contains(&b"h2".to_vec()),
+            "mesh frontend TLS must advertise h2"
+        );
+    }
+
+    #[test]
+    fn permissive_with_operator_ca_uses_optional_client_auth_without_spiffe_slot() {
+        // Fallback trust anchor: no gateway SVID material, but an operator client
+        // CA bundle is configured. PERMISSIVE must request + verify-if-offered via
+        // the operator CA (WebPki `allow_unauthenticated`), not skip client auth.
+        ensure_crypto_provider();
+        let env = EnvConfig {
+            frontend_tls_cert_path: Some("tests/certs/server.crt".to_string()),
+            frontend_tls_key_path: Some("tests/certs/server.key".to_string()),
+            // Reuse the server cert as a stand-in client CA bundle (valid PEM).
+            frontend_tls_client_ca_bundle_path: Some("tests/certs/server.crt".to_string()),
+            ..EnvConfig::default()
+        };
+        let tls_policy = TlsPolicy::from_env_config(&env).expect("tls policy");
+        let mesh_frontend_identity =
+            load_mesh_frontend_server_identity(&env).expect("mesh frontend identity");
+
+        assert_eq!(
+            resolve_mesh_inbound_client_auth(config::MtlsMode::Permissive, true, false),
+            MeshClientAuthDecision::Resolved(tls::MeshClientAuth::Optional),
+            "PERMISSIVE with only an operator CA bundle must resolve to Optional"
+        );
+
+        let tls_config = load_mesh_frontend_tls(
+            &env,
+            &tls_policy,
+            &[],
+            config::MtlsMode::Permissive,
+            mesh_frontend_identity.as_deref(),
+            None,
+            None,
+        )
+        .expect("permissive with operator CA should build a TLS config")
+        .expect("TLS config present (server TLS + optional operator-CA client auth)");
+        assert!(
+            tls_config.alpn_protocols.contains(&b"h2".to_vec()),
+            "mesh frontend TLS must advertise h2"
         );
     }
 
