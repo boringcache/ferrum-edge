@@ -1122,7 +1122,16 @@ The access log is injected as a `stdout_logging` global under the reserved id `_
 
 ### Webhook Setup
 
-The injector listens on `FERRUM_INJECTOR_LISTEN_ADDR` (default `0.0.0.0:9443`) and handles `POST /mutate`. AdmissionReview request bodies are capped before JSON parsing by `FERRUM_INJECTOR_ADMISSION_REVIEW_MAX_BODY_SIZE_MIB` (default `4`, max `64`). TLS is configured via `FERRUM_INJECTOR_TLS_CERT_PATH` and `FERRUM_INJECTOR_TLS_KEY_PATH` (both required for HTTPS, which Kubernetes mandates for admission webhooks).
+The injector listens on `FERRUM_INJECTOR_LISTEN_ADDR` (default `0.0.0.0:9443`) and handles `POST /mutate`. AdmissionReview request bodies are capped before JSON parsing by `FERRUM_INJECTOR_ADMISSION_REVIEW_MAX_BODY_SIZE_MIB` (default `4`, max `64`).
+
+**TLS is required and fail-closed.** Kubernetes calls admission webhooks over HTTPS, so the injector requires both `FERRUM_INJECTOR_TLS_CERT_PATH` and `FERRUM_INJECTOR_TLS_KEY_PATH` and **refuses to start** when neither is set. For local development only, set `FERRUM_INJECTOR_ALLOW_PLAINTEXT=true` to serve plaintext HTTP; the injector logs a loud warning at startup in that mode. Setting only one of the cert/key pair is always a configuration error.
+
+**Request validation (fail-closed on injection).** The injector validates each AdmissionReview before injecting:
+
+- **Pod-kind check:** the request must target a core (`apiGroup: ""`) `Pod` — confirmed via `request.kind` (a `GroupVersionKind`) or, when `kind` is absent, the core `pods` `request.resource`. A mis-scoped `MutatingWebhookConfiguration` that routes other kinds (or a request carrying no kind/resource metadata) is **admitted with `allowed: true` and no patch**, and a warning is logged. The injector never patches an unknown kind.
+- **`dryRun`:** the patch-only webhook has no side effects, so a `dryRun: true` request returns the identical computed patch without implying any side effect.
+
+These complement the existing boundary checks: the body-size limit (returns `413`), reserved-container-name conflicts (`ferrum-edge` / `ferrum-edge-init`) refuse injection, and invalid port/CIDR annotations are rejected with a webhook error that names the offending annotation.
 
 Register with Kubernetes:
 
@@ -1707,8 +1716,9 @@ Mesh-specific environment variables are listed below. For the full reference of 
 | `FERRUM_INJECTOR_ADMISSION_REVIEW_MAX_BODY_SIZE_MIB` | `4` | Maximum AdmissionReview request body size, in MiB, accepted before JSON parsing. Values must be 1..64 |
 | `FERRUM_INJECTOR_SIDECAR_IMAGE` | `ferrum-edge:latest` | Sidecar container image |
 | `FERRUM_INJECTOR_REQUIRE_ANNOTATION` | `true` | Require opt-in annotation |
-| `FERRUM_INJECTOR_TLS_CERT_PATH` | (none) | Webhook TLS certificate |
-| `FERRUM_INJECTOR_TLS_KEY_PATH` | (none) | Webhook TLS private key |
+| `FERRUM_INJECTOR_TLS_CERT_PATH` | (none) | Webhook TLS certificate. Required (with the key) unless `FERRUM_INJECTOR_ALLOW_PLAINTEXT=true` |
+| `FERRUM_INJECTOR_TLS_KEY_PATH` | (none) | Webhook TLS private key. Required (with the cert) unless `FERRUM_INJECTOR_ALLOW_PLAINTEXT=true` |
+| `FERRUM_INJECTOR_ALLOW_PLAINTEXT` | `false` | Dev-only escape hatch. When `false` (default) the injector refuses to start without TLS cert+key, since Kubernetes mandates HTTPS for admission webhooks. Set `true` to serve plaintext HTTP for local development (logs a startup warning) |
 | `FERRUM_INJECTOR_TRUST_DOMAIN` | `cluster.local` | SPIFFE trust domain for ID derivation |
 | `FERRUM_MESH_CAPTURE_MODE` | `explicit` | Traffic capture mode: `explicit`, `iptables`, `ebpf` |
 | `FERRUM_MESH_PROXY_UID` | `1337` | Proxy user ID in injected sidecars |

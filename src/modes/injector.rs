@@ -124,6 +124,11 @@ pub struct InjectorConfig {
     pub trust_domain: String,
     pub tls_cert_path: Option<String>,
     pub tls_key_path: Option<String>,
+    /// Dev-only escape hatch. Kubernetes mandates HTTPS for admission webhooks,
+    /// so production must serve TLS. When `false` (default) the injector refuses
+    /// to start without a cert+key. Setting `FERRUM_INJECTOR_ALLOW_PLAINTEXT=true`
+    /// permits plaintext HTTP for local development with a loud startup warning.
+    pub allow_plaintext: bool,
     pub tls_handshake_timeout_seconds: u64,
     pub admission_review_max_body_bytes: usize,
 }
@@ -183,21 +188,14 @@ impl InjectorConfig {
             )?;
         let tls_cert_path = resolve_ferrum_var("FERRUM_INJECTOR_TLS_CERT_PATH");
         let tls_key_path = resolve_ferrum_var("FERRUM_INJECTOR_TLS_KEY_PATH");
-        match (&tls_cert_path, &tls_key_path) {
-            (Some(_), Some(_)) | (None, None) => {}
-            (Some(_), None) => {
-                return Err(
-                    "FERRUM_INJECTOR_TLS_CERT_PATH requires FERRUM_INJECTOR_TLS_KEY_PATH"
-                        .to_string(),
-                );
-            }
-            (None, Some(_)) => {
-                return Err(
-                    "FERRUM_INJECTOR_TLS_KEY_PATH requires FERRUM_INJECTOR_TLS_CERT_PATH"
-                        .to_string(),
-                );
-            }
-        }
+        let allow_plaintext = resolve_ferrum_var("FERRUM_INJECTOR_ALLOW_PLAINTEXT")
+            .and_then(|value| value.trim().parse::<bool>().ok())
+            .unwrap_or(false);
+        validate_injector_tls_serving(
+            tls_cert_path.as_deref(),
+            tls_key_path.as_deref(),
+            allow_plaintext,
+        )?;
 
         Ok(Self {
             listen_addr,
@@ -218,6 +216,7 @@ impl InjectorConfig {
             trust_domain,
             tls_cert_path,
             tls_key_path,
+            allow_plaintext,
             tls_handshake_timeout_seconds: env_config.frontend_tls_handshake_timeout_seconds,
             admission_review_max_body_bytes,
         })
@@ -268,6 +267,41 @@ fn validate_injector_trust_domain(value: &str) -> Result<(), String> {
     TrustDomain::new(value.to_string())
         .map(|_| ())
         .map_err(|e| format!("Invalid FERRUM_INJECTOR_TRUST_DOMAIN: {e}"))
+}
+
+/// Validate the injector's TLS serving inputs, fail-closed for production.
+///
+/// Kubernetes calls admission webhooks over HTTPS, so a production injector must
+/// serve TLS. Both the cert and key are required together. When neither is set,
+/// plaintext serving is refused unless `allow_plaintext` (the
+/// `FERRUM_INJECTOR_ALLOW_PLAINTEXT` dev-only escape hatch) is explicitly set.
+fn validate_injector_tls_serving(
+    tls_cert_path: Option<&str>,
+    tls_key_path: Option<&str>,
+    allow_plaintext: bool,
+) -> Result<(), String> {
+    match (tls_cert_path, tls_key_path) {
+        (Some(_), Some(_)) => Ok(()),
+        (None, None) => {
+            if allow_plaintext {
+                Ok(())
+            } else {
+                Err(
+                    "injector requires TLS: set FERRUM_INJECTOR_TLS_CERT_PATH and \
+                     FERRUM_INJECTOR_TLS_KEY_PATH (Kubernetes admission webhooks must use \
+                     HTTPS). For local development only, set FERRUM_INJECTOR_ALLOW_PLAINTEXT=true \
+                     to serve plaintext HTTP."
+                        .to_string(),
+                )
+            }
+        }
+        (Some(_), None) => {
+            Err("FERRUM_INJECTOR_TLS_CERT_PATH requires FERRUM_INJECTOR_TLS_KEY_PATH".to_string())
+        }
+        (None, Some(_)) => {
+            Err("FERRUM_INJECTOR_TLS_KEY_PATH requires FERRUM_INJECTOR_TLS_CERT_PATH".to_string())
+        }
+    }
 }
 
 fn parse_port_list(raw: Option<&str>) -> Result<Vec<u16>, String> {
@@ -448,7 +482,97 @@ struct AdmissionReview {
 struct AdmissionRequest {
     uid: String,
     namespace: Option<String>,
+    /// `GroupVersionKind` of the admitted object. Kubernetes always populates
+    /// this for object-carrying admission requests. Optional here so a
+    /// malformed/absent value is handled explicitly rather than failing
+    /// deserialization of the whole review.
+    #[serde(default)]
+    kind: Option<GroupVersionKind>,
+    /// `GroupVersionResource` of the admitted object. Used as a secondary
+    /// confirmation that the request targets the core `pods` resource.
+    #[serde(default)]
+    resource: Option<GroupVersionResource>,
+    /// When `true`, Kubernetes is performing a dry-run admission. A patch-only
+    /// webhook has no side effects, so we return the identical patch; we honor
+    /// the flag by never implying a side effect and by recording it for
+    /// observability.
+    #[serde(rename = "dryRun", default)]
+    dry_run: Option<bool>,
     object: Value,
+}
+
+/// Kubernetes `meta/v1` GroupVersionKind. The core API group is the empty
+/// string, so `group` defaults to empty when the field is absent.
+#[derive(Debug, Default, Deserialize)]
+struct GroupVersionKind {
+    #[serde(default)]
+    group: String,
+    #[serde(default)]
+    version: String,
+    #[serde(default)]
+    kind: String,
+}
+
+/// Kubernetes `meta/v1` GroupVersionResource. The core API group is the empty
+/// string, so `group` defaults to empty when the field is absent.
+#[derive(Debug, Default, Deserialize)]
+struct GroupVersionResource {
+    #[serde(default)]
+    group: String,
+    #[serde(default)]
+    version: String,
+    #[serde(default)]
+    resource: String,
+}
+
+/// Outcome of validating that an `AdmissionRequest` targets a core-group Pod.
+///
+/// Any core-group (`apiGroup ""`) Pod version is accepted — the check is
+/// intentionally version-agnostic for forward compatibility, not gated to `v1`.
+enum PodKindCheck {
+    /// The request targets a Pod and injection logic may proceed.
+    Pod,
+    /// The request targets something else (mis-scoped webhook). Carries a
+    /// human-readable descriptor of the observed group/version/kind for logs.
+    NotPod(String),
+}
+
+/// Validate that the admitted object is a core (`apiGroup ""`) Pod.
+///
+/// Kubernetes populates `request.kind` (a `GroupVersionKind`) for every
+/// object-carrying admission request, and `request.resource` (a
+/// `GroupVersionResource`) as well. A correctly-scoped `MutatingWebhookConfiguration`
+/// only routes `pods` `CREATE`, but a mis-scoped configuration could send other
+/// kinds. We accept the request only when the core group's `Pod` kind (or the
+/// core `pods` resource) is present, and refuse to inject into anything else.
+fn classify_pod_kind(request: &AdmissionRequest) -> PodKindCheck {
+    // `kind` is authoritative when present. Core group is the empty string.
+    if let Some(gvk) = &request.kind {
+        if gvk.group.is_empty() && gvk.kind == "Pod" {
+            return PodKindCheck::Pod;
+        }
+        // `kind` present but not a core Pod: this is a mis-scoped webhook.
+        return PodKindCheck::NotPod(format!(
+            "kind={{group:{:?},version:{:?},kind:{:?}}}",
+            gvk.group, gvk.version, gvk.kind
+        ));
+    }
+
+    // No `kind` block. Fall back to the `resource` block: core `pods`.
+    if let Some(gvr) = &request.resource {
+        if gvr.group.is_empty() && gvr.resource == "pods" {
+            return PodKindCheck::Pod;
+        }
+        return PodKindCheck::NotPod(format!(
+            "resource={{group:{:?},version:{:?},resource:{:?}}}",
+            gvr.group, gvr.version, gvr.resource
+        ));
+    }
+
+    // Neither `kind` nor `resource` present. A real Kubernetes apiserver always
+    // sends at least one, so an admission request carrying neither is malformed
+    // and we fail closed on injection (allow, but never inject).
+    PodKindCheck::NotPod("no kind or resource metadata".to_string())
 }
 
 pub async fn run(
@@ -466,6 +590,13 @@ pub async fn run(
         None
     };
     let listener = TcpListener::bind(config.listen_addr).await?;
+    if tls_acceptor.is_none() {
+        warn!(
+            listen_addr = %config.listen_addr,
+            "Ferrum injector serving PLAINTEXT HTTP (FERRUM_INJECTOR_ALLOW_PLAINTEXT=true). \
+             Kubernetes requires HTTPS for admission webhooks; this is for local development only"
+        );
+    }
     info!(
         listen_addr = %config.listen_addr,
         namespace = %config.namespace,
@@ -640,6 +771,11 @@ pub fn admission_response(body: &[u8], config: &InjectorConfig) -> Result<Value,
     let Some(request) = review.request else {
         return Err("AdmissionReview.request is required".to_string());
     };
+    // `dryRun` carries no side-effect semantics for a patch-only webhook: the
+    // computed JSON patch is byte-for-byte identical whether or not the
+    // apiserver is performing a dry run, and the webhook never mutates external
+    // state. We still surface it for observability.
+    let dry_run = request.dry_run.unwrap_or(false);
     let mut response = json!({
         "apiVersion": api_version,
         "kind": kind,
@@ -648,6 +784,25 @@ pub fn admission_response(body: &[u8], config: &InjectorConfig) -> Result<Value,
             "allowed": true
         }
     });
+
+    // Boundary validation: a mutating webhook scoped to `pods` must never inject
+    // into a non-Pod object. A mis-scoped `MutatingWebhookConfiguration` could
+    // route other kinds here; admit them (allowed=true) but emit no patch.
+    if let PodKindCheck::NotPod(observed) = classify_pod_kind(&request) {
+        warn!(
+            uid = %request.uid,
+            observed = %observed,
+            dry_run,
+            "Injector AdmissionReview targets a non-Pod object; admitting without injection (check MutatingWebhookConfiguration rules)"
+        );
+        return Ok(response);
+    }
+
+    debug!(
+        uid = %request.uid,
+        dry_run,
+        "Injector processing Pod AdmissionReview"
+    );
 
     let patches = match build_sidecar_patch_for_namespace(
         &request.object,
@@ -1146,10 +1301,56 @@ mod tests {
             trust_domain: "cluster.local".to_string(),
             tls_cert_path: None,
             tls_key_path: None,
+            // Tests drive plaintext loopback servers; production fail-closed
+            // behavior is covered separately via `from_env_config`.
+            allow_plaintext: true,
             tls_handshake_timeout_seconds: 10,
             admission_review_max_body_bytes: DEFAULT_INJECTOR_ADMISSION_REVIEW_MAX_BODY_SIZE_MIB
                 * MIB_BYTES,
         }
+    }
+
+    // `from_env_config` reads process-global env vars via `resolve_ferrum_var`.
+    // Tests that exercise it serialise through this lock and restore the prior
+    // state so they do not race sibling tests in the same process.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Restores captured env state on drop so a panic inside the test body
+    /// (e.g. a failing assertion) cannot leak process-global env into sibling
+    /// tests. `ENV_LOCK` outlives this guard, so the restore stays serialised.
+    struct EnvRestore(Vec<(String, Option<String>)>);
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (key, value) in &self.0 {
+                // SAFETY: ENV_LOCK is held for this guard's lifetime.
+                unsafe {
+                    match value {
+                        Some(v) => std::env::set_var(key, v),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+    }
+
+    fn with_injector_env_lock<F: FnOnce()>(vars: &[(&str, Option<&str>)], f: F) {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _restore = EnvRestore(
+            vars.iter()
+                .map(|(key, _)| ((*key).to_string(), std::env::var(key).ok()))
+                .collect(),
+        );
+        for (key, value) in vars {
+            // SAFETY: ENV_LOCK serialises test access to the process-global env.
+            unsafe {
+                match value {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+        f();
     }
 
     async fn spawn_injector_test_server(config: InjectorConfig) -> (SocketAddr, JoinHandle<()>) {
@@ -1661,6 +1862,8 @@ mod tests {
             "request": {
                 "uid": "bad-ports",
                 "namespace": "payments",
+                "kind": {"group": "", "version": "v1", "kind": "Pod"},
+                "resource": {"group": "", "version": "v1", "resource": "pods"},
                 "object": {
                     "metadata": {
                         "labels": {"ferrum.io/mesh": "enabled"},
@@ -1699,6 +1902,8 @@ mod tests {
             "request": {
                 "uid": "bad-include-ports",
                 "namespace": "payments",
+                "kind": {"group": "", "version": "v1", "kind": "Pod"},
+                "resource": {"group": "", "version": "v1", "resource": "pods"},
                 "object": {
                     "metadata": {
                         "labels": {"ferrum.io/mesh": "enabled"},
@@ -1847,6 +2052,8 @@ mod tests {
             "request": {
                 "uid": "abc",
                 "namespace": "payments",
+                "kind": {"group": "", "version": "v1", "kind": "Pod"},
+                "resource": {"group": "", "version": "v1", "resource": "pods"},
                 "object": {
                     "metadata": {"labels": {"ferrum.io/mesh": "enabled"}},
                     "spec": {"containers": []}
@@ -1896,6 +2103,187 @@ mod tests {
     }
 
     #[test]
+    fn admission_response_includes_pod_gvk_and_still_injects() {
+        // A correctly-scoped webhook sends `kind` + `resource` for a core Pod.
+        let review = json!({
+            "apiVersion": "admission.k8s.io/v1",
+            "kind": "AdmissionReview",
+            "request": {
+                "uid": "abc",
+                "namespace": "payments",
+                "kind": {"group": "", "version": "v1", "kind": "Pod"},
+                "resource": {"group": "", "version": "v1", "resource": "pods"},
+                "object": {
+                    "metadata": {"labels": {"ferrum.io/mesh": "enabled"}},
+                    "spec": {"containers": []}
+                }
+            }
+        });
+        let response = admission_response(
+            review.to_string().as_bytes(),
+            &test_config(true, CaptureMode::Explicit),
+        )
+        .expect("admission response");
+
+        assert_eq!(
+            response.pointer("/response/allowed"),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(
+            response.pointer("/response/patchType"),
+            Some(&Value::String("JSONPatch".to_string()))
+        );
+        assert!(
+            response.pointer("/response/patch").is_some(),
+            "a core v1 Pod must still be injected"
+        );
+    }
+
+    #[test]
+    fn admission_response_does_not_inject_non_pod_kind() {
+        // Mis-scoped MutatingWebhookConfiguration routes a Deployment here. The
+        // injector must admit it (allowed=true) without producing a patch.
+        let review = json!({
+            "apiVersion": "admission.k8s.io/v1",
+            "kind": "AdmissionReview",
+            "request": {
+                "uid": "deploy-1",
+                "namespace": "payments",
+                "kind": {"group": "apps", "version": "v1", "kind": "Deployment"},
+                "resource": {"group": "apps", "version": "v1", "resource": "deployments"},
+                "object": {
+                    "metadata": {"labels": {"ferrum.io/mesh": "enabled"}},
+                    "spec": {"template": {"spec": {"containers": []}}}
+                }
+            }
+        });
+        let response = admission_response(
+            review.to_string().as_bytes(),
+            &test_config(true, CaptureMode::Iptables),
+        )
+        .expect("admission response");
+
+        assert_eq!(
+            response.pointer("/response/allowed"),
+            Some(&Value::Bool(true)),
+            "non-Pod objects must be admitted, never blocked"
+        );
+        assert_eq!(
+            response.pointer("/response/patch"),
+            None,
+            "non-Pod objects must never be patched/injected"
+        );
+        assert_eq!(response.pointer("/response/patchType"), None);
+    }
+
+    #[test]
+    fn admission_response_injects_pod_when_only_resource_present() {
+        // Some apiserver paths populate `resource` but not `kind`; the core
+        // `pods` resource is sufficient to confirm a Pod.
+        let review = json!({
+            "apiVersion": "admission.k8s.io/v1",
+            "kind": "AdmissionReview",
+            "request": {
+                "uid": "abc",
+                "namespace": "payments",
+                "resource": {"group": "", "version": "v1", "resource": "pods"},
+                "object": {
+                    "metadata": {"labels": {"ferrum.io/mesh": "enabled"}},
+                    "spec": {"containers": []}
+                }
+            }
+        });
+        let response = admission_response(
+            review.to_string().as_bytes(),
+            &test_config(true, CaptureMode::Explicit),
+        )
+        .expect("admission response");
+
+        assert!(
+            response.pointer("/response/patch").is_some(),
+            "core pods resource must be treated as a Pod"
+        );
+    }
+
+    #[test]
+    fn admission_response_does_not_inject_when_kind_and_resource_absent() {
+        // A malformed request carrying neither `kind` nor `resource` must fail
+        // closed on injection: admit, but never patch an unknown object.
+        let review = json!({
+            "apiVersion": "admission.k8s.io/v1",
+            "kind": "AdmissionReview",
+            "request": {
+                "uid": "abc",
+                "namespace": "payments",
+                "object": {
+                    "metadata": {"labels": {"ferrum.io/mesh": "enabled"}},
+                    "spec": {"containers": []}
+                }
+            }
+        });
+        let response = admission_response(
+            review.to_string().as_bytes(),
+            &test_config(true, CaptureMode::Explicit),
+        )
+        .expect("admission response");
+
+        assert_eq!(
+            response.pointer("/response/allowed"),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(
+            response.pointer("/response/patch"),
+            None,
+            "object with no kind/resource metadata must not be injected"
+        );
+    }
+
+    #[test]
+    fn admission_response_honors_dry_run_with_identical_patch() {
+        // A patch-only webhook has no side effects, so a dryRun request must
+        // return the exact same patch as the non-dryRun request.
+        let object = json!({
+            "metadata": {"labels": {"ferrum.io/mesh": "enabled"}},
+            "spec": {
+                "serviceAccountName": "api",
+                "containers": [{"name": "app", "image": "app:test"}]
+            }
+        });
+        let make_review = |dry_run: bool| {
+            json!({
+                "apiVersion": "admission.k8s.io/v1",
+                "kind": "AdmissionReview",
+                "request": {
+                    "uid": "abc",
+                    "namespace": "payments",
+                    "kind": {"group": "", "version": "v1", "kind": "Pod"},
+                    "resource": {"group": "", "version": "v1", "resource": "pods"},
+                    "dryRun": dry_run,
+                    "object": object.clone()
+                }
+            })
+        };
+        let config = test_config(true, CaptureMode::Iptables);
+
+        let live = admission_response(make_review(false).to_string().as_bytes(), &config)
+            .expect("live response");
+        let dry = admission_response(make_review(true).to_string().as_bytes(), &config)
+            .expect("dry-run response");
+
+        // Both admit and carry a patch.
+        assert_eq!(live.pointer("/response/allowed"), Some(&Value::Bool(true)));
+        assert_eq!(dry.pointer("/response/allowed"), Some(&Value::Bool(true)));
+        // The encoded patch is byte-for-byte identical and the response implies
+        // no side effects beyond the returned patch in either case.
+        assert_eq!(
+            live.pointer("/response/patch"),
+            dry.pointer("/response/patch"),
+            "dryRun must not change the computed patch"
+        );
+        assert!(dry.pointer("/response/patch").is_some());
+    }
+
+    #[test]
     fn patch_ebpf_mode_skips_init_container() {
         let pod = json!({
             "metadata": {"labels": {"ferrum.io/mesh": "enabled"}},
@@ -1936,13 +2324,66 @@ mod tests {
 
     #[test]
     fn injector_config_defaults_parse_from_env_config() {
-        let env = EnvConfig::default();
-        let config = InjectorConfig::from_env_config(&env).expect("injector config");
-        assert_eq!(config.listen_addr.port(), 9443);
-        assert_eq!(config.capture_mode, CaptureMode::Explicit);
-        assert_eq!(config.ip6tables_mode, Ip6TablesMode::Auto);
-        assert_eq!(config.trust_domain, DEFAULT_INJECTOR_TRUST_DOMAIN);
-        assert!(config.tls_cert_path.is_none());
+        // No TLS material is configured here, so the dev-only plaintext opt-in
+        // must be present for `from_env_config` to succeed (fail-closed default).
+        with_injector_env_lock(
+            &[
+                ("FERRUM_INJECTOR_TLS_CERT_PATH", None),
+                ("FERRUM_INJECTOR_TLS_KEY_PATH", None),
+                ("FERRUM_INJECTOR_ALLOW_PLAINTEXT", Some("true")),
+            ],
+            || {
+                let env = EnvConfig::default();
+                let config = InjectorConfig::from_env_config(&env).expect("injector config");
+                assert_eq!(config.listen_addr.port(), 9443);
+                assert_eq!(config.capture_mode, CaptureMode::Explicit);
+                assert_eq!(config.ip6tables_mode, Ip6TablesMode::Auto);
+                assert_eq!(config.trust_domain, DEFAULT_INJECTOR_TRUST_DOMAIN);
+                assert!(config.tls_cert_path.is_none());
+                assert!(config.allow_plaintext);
+            },
+        );
+    }
+
+    #[test]
+    fn injector_config_requires_tls_or_explicit_plaintext_opt_in() {
+        // Fail-closed: no cert/key and no opt-in must refuse to start.
+        with_injector_env_lock(
+            &[
+                ("FERRUM_INJECTOR_TLS_CERT_PATH", None),
+                ("FERRUM_INJECTOR_TLS_KEY_PATH", None),
+                ("FERRUM_INJECTOR_ALLOW_PLAINTEXT", None),
+            ],
+            || {
+                let env = EnvConfig::default();
+                let err = InjectorConfig::from_env_config(&env)
+                    .expect_err("plaintext must be refused without explicit opt-in");
+                assert!(err.contains("FERRUM_INJECTOR_TLS_CERT_PATH"));
+                assert!(err.contains("FERRUM_INJECTOR_ALLOW_PLAINTEXT"));
+            },
+        );
+    }
+
+    #[test]
+    fn injector_tls_serving_validation_is_fail_closed() {
+        // cert + key present: TLS serving, always allowed.
+        assert!(validate_injector_tls_serving(Some("/tls.crt"), Some("/tls.key"), false).is_ok());
+        assert!(validate_injector_tls_serving(Some("/tls.crt"), Some("/tls.key"), true).is_ok());
+
+        // Neither present: refused unless plaintext explicitly allowed.
+        let err = validate_injector_tls_serving(None, None, false)
+            .expect_err("plaintext refused by default");
+        assert!(err.contains("injector requires TLS"));
+        assert!(err.contains("FERRUM_INJECTOR_ALLOW_PLAINTEXT"));
+        assert!(validate_injector_tls_serving(None, None, true).is_ok());
+
+        // Half-configured TLS is always an error regardless of the opt-in.
+        let cert_only = validate_injector_tls_serving(Some("/tls.crt"), None, true)
+            .expect_err("cert without key is invalid");
+        assert!(cert_only.contains("requires FERRUM_INJECTOR_TLS_KEY_PATH"));
+        let key_only = validate_injector_tls_serving(None, Some("/tls.key"), true)
+            .expect_err("key without cert is invalid");
+        assert!(key_only.contains("requires FERRUM_INJECTOR_TLS_CERT_PATH"));
     }
 
     #[test]
