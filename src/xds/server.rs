@@ -1144,9 +1144,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                                     error = %status.message(),
                                     "Rejecting xDS ADS stream: per-node stream ceiling exceeded"
                                 );
-                                crate::plugins::mesh::prometheus_helpers::increment_xds_stream_rejected(
-                                    &current_node_id,
-                                );
+                                crate::plugins::mesh::prometheus_helpers::increment_xds_stream_rejected();
                                 let _ = tx.send(Err(status)).await;
                                 return;
                             }
@@ -1295,9 +1293,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                                     error = %status.message(),
                                     "Rejecting xDS delta ADS stream: per-node stream ceiling exceeded"
                                 );
-                                crate::plugins::mesh::prometheus_helpers::increment_xds_stream_rejected(
-                                    &current_node_id,
-                                );
+                                crate::plugins::mesh::prometheus_helpers::increment_xds_stream_rejected();
                                 let _ = tx.send(Err(status)).await;
                                 return;
                             }

@@ -1458,7 +1458,7 @@ impl MetricsRegistry {
             }
         }
 
-        prometheus_helpers::render_mesh_cert_metrics(&mut output);
+        prometheus_helpers::render_mesh_observability_metrics(&mut output);
 
         let node_agent_metrics = self.node_agent_metrics.load_full();
         if let Some(metrics) = node_agent_metrics.as_ref() {

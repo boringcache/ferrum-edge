@@ -33,7 +33,7 @@ static MESH_FEDERATION_POLL_FAILURES: LazyLock<DashMap<MeshFederationPollFailure
     LazyLock::new(DashMap::new);
 static MESH_FEDERATION_LAST_SUCCESS: LazyLock<DashMap<Arc<str>, AtomicU64>> =
     LazyLock::new(DashMap::new);
-static XDS_STREAMS_REJECTED: LazyLock<DashMap<Arc<str>, AtomicU64>> = LazyLock::new(DashMap::new);
+static XDS_STREAMS_REJECTED: AtomicU64 = AtomicU64::new(0);
 static XDS_FIRST_SLICE_NACKS: LazyLock<DashMap<XdsFirstSliceNackKey, AtomicU64>> =
     LazyLock::new(DashMap::new);
 
@@ -288,15 +288,14 @@ pub fn increment_mesh_mtls_handshake_failure(reason: impl AsRef<str>) {
         .fetch_add(1, Ordering::Relaxed);
 }
 
-/// Count an ADS stream the CP rejected because the node id is already at its
+/// Count an ADS stream the CP rejected because a node is already at its
 /// per-node concurrent-stream ceiling (`FERRUM_XDS_MAX_STREAMS_PER_NODE`).
-/// Surfaces a per-node DoS / misconfigured-client signal that the plain gRPC
-/// `RESOURCE_EXHAUSTED` status alone does not expose to scraping.
-pub fn increment_xds_stream_rejected(node_id: impl AsRef<str>) {
-    XDS_STREAMS_REJECTED
-        .entry(Arc::from(node_id.as_ref()))
-        .or_insert_with(|| AtomicU64::new(0))
-        .fetch_add(1, Ordering::Relaxed);
+/// Aggregated (no per-node label) to avoid an unbounded, client-controlled
+/// `node_id` metric dimension; the offending node id is still logged at `warn!`
+/// at the reject site. Surfaces a DoS / misconfigured-client signal the plain
+/// gRPC `RESOURCE_EXHAUSTED` status alone does not expose to scraping.
+pub fn increment_xds_stream_rejected() {
+    XDS_STREAMS_REJECTED.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Count a NACK of a required mesh-slice type that occurred while the DP is
@@ -315,7 +314,7 @@ pub fn increment_xds_first_slice_nack(namespace: impl AsRef<str>, type_url: impl
         .fetch_add(1, Ordering::Relaxed);
 }
 
-pub fn render_mesh_cert_metrics(output: &mut String) {
+pub fn render_mesh_observability_metrics(output: &mut String) {
     let now = unix_now_seconds();
     maybe_evict_stale_mesh_cert_expiry_series(now);
 
@@ -451,18 +450,15 @@ pub fn render_mesh_cert_metrics(output: &mut String) {
         }
     }
 
-    if !XDS_STREAMS_REJECTED.is_empty() {
+    let xds_streams_rejected = XDS_STREAMS_REJECTED.load(Ordering::Relaxed);
+    if xds_streams_rejected > 0 {
         output.push_str(
             "# HELP ferrum_xds_streams_rejected_total ADS streams rejected for exceeding the per-node concurrent-stream ceiling.\n",
         );
         output.push_str("# TYPE ferrum_xds_streams_rejected_total counter\n");
-        for entry in XDS_STREAMS_REJECTED.iter() {
-            output.push_str(&format!(
-                "ferrum_xds_streams_rejected_total{{node_id=\"{}\"}} {}\n",
-                escape_label_value(entry.key()),
-                entry.value().load(Ordering::Relaxed)
-            ));
-        }
+        output.push_str(&format!(
+            "ferrum_xds_streams_rejected_total {xds_streams_rejected}\n"
+        ));
     }
 
     if !XDS_FIRST_SLICE_NACKS.is_empty() {
@@ -706,14 +702,11 @@ pub fn mesh_label_fragment(key: &MeshRequestKey, le: Option<&str>) -> String {
     labels
 }
 
-/// Current value of the per-node ADS stream rejection counter. Test-only
+/// Current value of the aggregate ADS stream rejection counter. Test-only
 /// accessor so the cap can be asserted without scraping the full metrics text.
 #[cfg(test)]
-pub fn xds_streams_rejected_count(node_id: &str) -> u64 {
-    XDS_STREAMS_REJECTED
-        .get(node_id)
-        .map(|entry| entry.load(Ordering::Relaxed))
-        .unwrap_or(0)
+pub fn xds_streams_rejected_count() -> u64 {
+    XDS_STREAMS_REJECTED.load(Ordering::Relaxed)
 }
 
 /// Current value of the first-slice NACK counter for a `(namespace, type_url)`
@@ -735,7 +728,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn render_mesh_cert_metrics_evicts_stale_expired_series() {
+    fn render_mesh_observability_metrics_evicts_stale_expired_series() {
         let now = unix_now_seconds();
         let suffix = format!("{}-{}", std::process::id(), now);
         let stale_id = format!("spiffe://cluster.local/ns/default/sa/stale-{suffix}");
@@ -756,7 +749,7 @@ mod tests {
         MESH_CERT_EXPIRY_LAST_EVICTION_UNIX_SECONDS.store(0, Ordering::Relaxed);
 
         let mut output = String::new();
-        render_mesh_cert_metrics(&mut output);
+        render_mesh_observability_metrics(&mut output);
 
         assert!(
             !output.contains(&stale_id),
@@ -771,29 +764,28 @@ mod tests {
     #[test]
     fn render_emits_xds_stream_rejection_and_first_slice_nack_metrics() {
         let suffix = format!("{}-{}", std::process::id(), line!());
-        let node_id = format!("spiffe://cluster.local/ns/prod/sa/api-{suffix}");
         let namespace = format!("ns-{suffix}");
         let type_url = "type.googleapis.com/envoy.config.cluster.v3.Cluster";
 
-        increment_xds_stream_rejected(&node_id);
-        increment_xds_stream_rejected(&node_id);
+        let before = xds_streams_rejected_count();
+        increment_xds_stream_rejected();
+        increment_xds_stream_rejected();
         increment_xds_first_slice_nack(&namespace, type_url);
 
-        assert_eq!(xds_streams_rejected_count(&node_id), 2);
+        assert_eq!(xds_streams_rejected_count() - before, 2);
         assert_eq!(xds_first_slice_nack_count(&namespace, type_url), 1);
 
+        let total = xds_streams_rejected_count();
         let mut output = String::new();
-        render_mesh_cert_metrics(&mut output);
+        render_mesh_observability_metrics(&mut output);
 
         assert!(
             output.contains("# TYPE ferrum_xds_streams_rejected_total counter"),
             "rejection counter TYPE line missing: {output}"
         );
         assert!(
-            output.contains(&format!(
-                "ferrum_xds_streams_rejected_total{{node_id=\"{node_id}\"}} 2"
-            )),
-            "rejection counter series missing: {output}"
+            output.contains(&format!("ferrum_xds_streams_rejected_total {total}\n")),
+            "aggregate rejection counter value line missing: {output}"
         );
         assert!(
             output.contains("# TYPE ferrum_xds_first_slice_nacks_total counter"),
