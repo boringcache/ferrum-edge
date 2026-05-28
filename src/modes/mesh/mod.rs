@@ -700,9 +700,11 @@ fn prepare_normalized_gateway_config_for_mesh(
     // (2) at least one TCP/UDP stream proxy listener exists, and
     // (3) the loaded policies include at least one namespace- or
     //     selector-scoped entry.
-    // Stream accept loops always pass `node_waypoint_policy_scope: None`, so
-    // only MeshWide policies are evaluated on TCP/UDP connections — scoped
-    // DENY/ALLOW rules are silently withheld. See docs/mesh.md for details.
+    // Stream accept loops pass no per-pod scope (`node_waypoint_policy_scope:
+    // None`), so namespace- and selector-scoped policies cannot be evaluated on
+    // TCP/UDP connections. When such scoped policies exist, mesh_authz fails
+    // closed and REJECTS stream connections rather than risk allowing traffic a
+    // scoped policy might deny; mesh-wide policies still apply. See docs/mesh.md.
     if runtime.topology == MeshTopology::NodeWaypoint
         && config.proxies.iter().any(|p| p.dispatch_kind.is_stream())
         && mesh_slice
@@ -712,9 +714,10 @@ fn prepare_normalized_gateway_config_for_mesh(
     {
         warn!(
             topology = "node_waypoint",
-            "Namespace- and selector-scoped mesh policies are NOT enforced on TCP/UDP stream \
-             connections (stream accept loops pass no per-pod scope). Only MeshWide policies \
-             apply to stream traffic. See docs/mesh.md for details."
+            "Namespace- and selector-scoped mesh policies cannot be evaluated on TCP/UDP stream \
+             connections (stream accept loops pass no per-pod scope); such connections are \
+             REJECTED (fail-closed) while scoped policies are configured. MeshWide policies still \
+             apply. See docs/mesh.md for details."
         );
     }
 
