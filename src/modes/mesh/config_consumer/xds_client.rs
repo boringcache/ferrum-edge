@@ -108,14 +108,17 @@ struct TypeSubscription {
     last_received_version: Option<String>,
     last_received_nonce: Option<String>,
     /// Nonce of the most recent response the client fully processed (ACKed or
-    /// NACKed) for this type URL. Mirrors the server-side
-    /// `XdsNonceTracker::last_acked_nonce`: a fresh server response always
-    /// carries a server-issued opaque nonce distinct from this one, so an
-    /// incoming response whose nonce equals `last_processed_nonce` is a stale
-    /// retransmit (reconnect race / buggy CP) and must be ignored so we do not
-    /// re-apply or re-ACK already-acted-on bytes. Server nonces are opaque
-    /// (`n1:<sha256>`), so duplicate detection — not numeric ordering — is the
-    /// available staleness signal on the receiving side.
+    /// NACKed) for this type URL on the current ADS stream. Server nonces are
+    /// opaque (`n1:<sha256>`) and stream-scoped per the xDS spec, so duplicate
+    /// detection — not numeric ordering — is the available staleness signal,
+    /// and the signal is only meaningful within a single stream. An incoming
+    /// response whose nonce equals `last_processed_nonce` is a stale retransmit
+    /// (in-stream race / buggy CP) and must be ignored so we do not re-apply
+    /// or re-ACK already-acted-on bytes. Cleared by
+    /// `ClientSubscriptionState::reset_processed_nonces` at the start of every
+    /// new ADS stream so a deterministic-nonce CP (e.g. one that resets its
+    /// sequence counter on restart) is not blocked from delivering the first
+    /// response of the new stream.
     last_processed_nonce: Option<String>,
     has_initial_response: bool,
 }
@@ -206,6 +209,20 @@ impl ClientSubscriptionState {
         }
     }
 
+    /// Clear `last_processed_nonce` on every type URL. xDS nonces are
+    /// stream-scoped, so the duplicate-detection baseline must not carry across
+    /// stream boundaries: a CP that resets its sequence counter on restart (or
+    /// a load-balanced reconnect to a peer replica) can legitimately reissue a
+    /// previously seen opaque nonce on a new stream, and the DP must accept it
+    /// rather than treating the first response of the new stream as stale.
+    /// `last_acked_version` is intentionally left alone so the new stream
+    /// resumes the subscription from the last acknowledged version.
+    fn reset_processed_nonces(&mut self) {
+        for subscription in self.subscriptions.values_mut() {
+            subscription.last_processed_nonce = None;
+        }
+    }
+
     fn build_ack(&self, type_url: &str) -> DiscoveryRequest {
         let subscription = self.subscriptions.get(type_url);
         DiscoveryRequest {
@@ -277,6 +294,16 @@ impl XdsStreamState {
         self.subscriptions = ClientSubscriptionState::new();
         self.accumulator = ResourceAccumulator::new();
         self.nack_circuit_breaker = NackCircuitBreaker::default();
+    }
+
+    /// Reset stream-scoped state that must not carry across ADS stream
+    /// boundaries: today, the per-type `last_processed_nonce` duplicate-
+    /// detection baseline. `last_acked_version`, the resource accumulator, and
+    /// the NACK circuit breaker intentionally persist so the new stream
+    /// resumes the subscription from the last acknowledged state instead of
+    /// re-flowing every resource from scratch on every reconnect.
+    fn reset_for_new_stream(&mut self) {
+        self.subscriptions.reset_processed_nonces();
     }
 }
 
@@ -655,6 +682,16 @@ async fn run_ads_stream_with_auth(
         .stream_aggregated_resources(request_stream)
         .await?
         .into_inner();
+
+    // Nonce dedup is stream-scoped (per xDS spec). Clear the
+    // per-type `last_processed_nonce` baseline so a deterministic-nonce CP
+    // — one whose sequence counter resets on restart, or a load-balanced
+    // reconnect to a peer replica — can legitimately reissue a previously
+    // seen opaque nonce on this fresh stream without the DP discarding the
+    // first response as a stale duplicate. `last_acked_version` and the
+    // resource accumulator are intentionally NOT reset so the subscription
+    // resumes from the last acknowledged state.
+    stream_state.reset_for_new_stream();
 
     for request in stream_state
         .subscriptions
@@ -2466,6 +2503,76 @@ mod tests {
         assert_eq!(
             state.record_response(CDS_TYPE_URL, "v2", "n3"),
             ResponseNonceOutcome::Fresh
+        );
+    }
+
+    #[test]
+    fn reset_processed_nonces_clears_dedup_baseline_per_stream() {
+        let mut state = XdsStreamState::default();
+
+        // First stream: process a response and mark its nonce as processed.
+        assert_eq!(
+            state
+                .subscriptions
+                .record_response(CDS_TYPE_URL, "v1", "n1"),
+            ResponseNonceOutcome::Fresh
+        );
+        state.subscriptions.mark_processed(CDS_TYPE_URL);
+        // Same-stream retransmit of `n1` is still detected as a stale duplicate.
+        assert_eq!(
+            state
+                .subscriptions
+                .record_response(CDS_TYPE_URL, "v1", "n1"),
+            ResponseNonceOutcome::StaleDuplicate {
+                nonce: "n1".to_string()
+            }
+        );
+
+        // New stream: the CP legitimately reissues `n1` for the same node/type/
+        // version (e.g. its sequence counter reset on restart, or this is a
+        // load-balanced reconnect to a peer replica). `reset_for_new_stream`
+        // must clear the dedup baseline so the response is processed.
+        state.reset_for_new_stream();
+        assert_eq!(
+            state
+                .subscriptions
+                .record_response(CDS_TYPE_URL, "v1", "n1"),
+            ResponseNonceOutcome::Fresh,
+            "first response on a new stream must not be suppressed by a \
+             stream-scoped nonce from a previous stream"
+        );
+
+        // The new stream still benefits from intra-stream dedup once the new
+        // response is marked processed.
+        state.subscriptions.mark_processed(CDS_TYPE_URL);
+        assert_eq!(
+            state
+                .subscriptions
+                .record_response(CDS_TYPE_URL, "v1", "n1"),
+            ResponseNonceOutcome::StaleDuplicate {
+                nonce: "n1".to_string()
+            }
+        );
+
+        // `last_acked_version` (subscription resume baseline) is preserved
+        // across `reset_for_new_stream` so the new stream does not have to
+        // re-flow every resource from version 0.
+        let mut state = XdsStreamState::default();
+        state
+            .subscriptions
+            .record_response(CDS_TYPE_URL, "v7", "n7");
+        state.subscriptions.mark_acked(CDS_TYPE_URL);
+        state.reset_for_new_stream();
+        let initial = state
+            .subscriptions
+            .build_initial_requests("node-a", "default");
+        let cds = initial
+            .iter()
+            .find(|r| r.type_url == CDS_TYPE_URL)
+            .expect("initial CDS request");
+        assert_eq!(
+            cds.version_info, "v7",
+            "subscription resume version must survive stream reset"
         );
     }
 
