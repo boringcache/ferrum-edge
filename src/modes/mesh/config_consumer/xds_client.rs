@@ -107,7 +107,31 @@ struct TypeSubscription {
     last_acked_version: Option<String>,
     last_received_version: Option<String>,
     last_received_nonce: Option<String>,
+    /// Nonce of the most recent response the client fully processed (ACKed or
+    /// NACKed) for this type URL on the current ADS stream. Server nonces are
+    /// opaque (`n1:<sha256>`) and stream-scoped per the xDS spec, so duplicate
+    /// detection — not numeric ordering — is the available staleness signal,
+    /// and the signal is only meaningful within a single stream. An incoming
+    /// response whose nonce equals `last_processed_nonce` is a stale retransmit
+    /// (in-stream race / buggy CP) and must be ignored so we do not re-apply
+    /// or re-ACK already-acted-on bytes. Cleared by
+    /// `ClientSubscriptionState::reset_processed_nonces` at the start of every
+    /// new ADS stream so a deterministic-nonce CP (e.g. one that resets its
+    /// sequence counter on restart) is not blocked from delivering the first
+    /// response of the new stream.
+    last_processed_nonce: Option<String>,
     has_initial_response: bool,
+}
+
+/// Outcome of recording a received SotW response against the per-type nonce
+/// state. Mirrors the receiving half of the server-side nonce machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ResponseNonceOutcome {
+    /// First response carrying this nonce; process it normally.
+    Fresh,
+    /// The nonce matches the last fully-processed response for this type URL —
+    /// a stale/duplicate retransmit that must be ignored.
+    StaleDuplicate { nonce: String },
 }
 
 impl ClientSubscriptionState {
@@ -146,11 +170,57 @@ impl ClientSubscriptionState {
             .collect()
     }
 
-    fn record_response(&mut self, type_url: &str, version_info: &str, nonce: &str) {
+    /// Record a received response's version/nonce and classify it as fresh or
+    /// a stale duplicate of the last fully-processed response.
+    ///
+    /// A non-empty nonce equal to `last_processed_nonce` means the server
+    /// re-sent a response we already ACKed/NACKed (a reconnect race or buggy
+    /// CP). Such a response is reported as `StaleDuplicate` and the caller
+    /// ignores it; the received version/nonce are intentionally NOT overwritten
+    /// so the next genuine response is still compared against the correct
+    /// baseline. An empty nonce is treated as fresh (the server chose not to
+    /// supply one) and recorded normally.
+    fn record_response(
+        &mut self,
+        type_url: &str,
+        version_info: &str,
+        nonce: &str,
+    ) -> ResponseNonceOutcome {
         let subscription = self.subscriptions.entry(type_url.to_string()).or_default();
+        if !nonce.is_empty() && subscription.last_processed_nonce.as_deref() == Some(nonce) {
+            return ResponseNonceOutcome::StaleDuplicate {
+                nonce: nonce.to_string(),
+            };
+        }
         subscription.last_received_version = Some(version_info.to_string());
         subscription.last_received_nonce = Some(nonce.to_string());
         subscription.has_initial_response = true;
+        ResponseNonceOutcome::Fresh
+    }
+
+    /// Mark the most recently received nonce for `type_url` as fully processed
+    /// (ACKed or NACKed), so a subsequent response carrying the same nonce is
+    /// detected as a stale duplicate.
+    fn mark_processed(&mut self, type_url: &str) {
+        if let Some(subscription) = self.subscriptions.get_mut(type_url) {
+            subscription
+                .last_processed_nonce
+                .clone_from(&subscription.last_received_nonce);
+        }
+    }
+
+    /// Clear `last_processed_nonce` on every type URL. xDS nonces are
+    /// stream-scoped, so the duplicate-detection baseline must not carry across
+    /// stream boundaries: a CP that resets its sequence counter on restart (or
+    /// a load-balanced reconnect to a peer replica) can legitimately reissue a
+    /// previously seen opaque nonce on a new stream, and the DP must accept it
+    /// rather than treating the first response of the new stream as stale.
+    /// `last_acked_version` is intentionally left alone so the new stream
+    /// resumes the subscription from the last acknowledged version.
+    fn reset_processed_nonces(&mut self) {
+        for subscription in self.subscriptions.values_mut() {
+            subscription.last_processed_nonce = None;
+        }
     }
 
     fn build_ack(&self, type_url: &str) -> DiscoveryRequest {
@@ -224,6 +294,16 @@ impl XdsStreamState {
         self.subscriptions = ClientSubscriptionState::new();
         self.accumulator = ResourceAccumulator::new();
         self.nack_circuit_breaker = NackCircuitBreaker::default();
+    }
+
+    /// Reset stream-scoped state that must not carry across ADS stream
+    /// boundaries: today, the per-type `last_processed_nonce` duplicate-
+    /// detection baseline. `last_acked_version`, the resource accumulator, and
+    /// the NACK circuit breaker intentionally persist so the new stream
+    /// resumes the subscription from the last acknowledged state instead of
+    /// re-flowing every resource from scratch on every reconnect.
+    fn reset_for_new_stream(&mut self) {
+        self.subscriptions.reset_processed_nonces();
     }
 }
 
@@ -603,6 +683,16 @@ async fn run_ads_stream_with_auth(
         .await?
         .into_inner();
 
+    // Nonce dedup is stream-scoped (per xDS spec). Clear the
+    // per-type `last_processed_nonce` baseline so a deterministic-nonce CP
+    // — one whose sequence counter resets on restart, or a load-balanced
+    // reconnect to a peer replica — can legitimately reissue a previously
+    // seen opaque nonce on this fresh stream without the DP discarding the
+    // first response as a stale duplicate. `last_acked_version` and the
+    // resource accumulator are intentionally NOT reset so the subscription
+    // resumes from the last acknowledged state.
+    stream_state.reset_for_new_stream();
+
     for request in stream_state
         .subscriptions
         .build_initial_requests(&config.node_id, &config.cluster)
@@ -774,7 +864,22 @@ async fn handle_ads_response(
         "Received xDS ADS response"
     );
 
-    subscriptions.record_response(&type_url, &response.version_info, &response.nonce);
+    // Per-type nonce machine: ignore a server retransmit of a response we
+    // already ACKed/NACKed instead of re-applying it and emitting a redundant
+    // ACK (which the server would then treat as ACKing a stale nonce). This
+    // mirrors the server-side `XdsNonceTracker` staleness handling on the
+    // receiving side.
+    if let ResponseNonceOutcome::StaleDuplicate { nonce } =
+        subscriptions.record_response(&type_url, &response.version_info, &response.nonce)
+    {
+        debug!(
+            node_id = %config.node_id,
+            type_url = %type_url,
+            nonce = %nonce,
+            "Ignoring stale/duplicate xDS ADS response (nonce already processed)"
+        );
+        return Ok(None);
+    }
     let snapshot = accumulator.clone();
     let apply_result =
         accumulator.apply_sotw_response(&type_url, &response.resources, &response.version_info);
@@ -784,6 +889,7 @@ async fn handle_ads_response(
         Ok(Some(slice)) => {
             send_ads_request(tx, subscriptions.build_ack(&type_url)).await?;
             subscriptions.mark_acked(&type_url);
+            subscriptions.mark_processed(&type_url);
             nack_circuit_breaker.record_ack(&type_url);
             Ok(Some(PendingXdsSlice {
                 slice,
@@ -794,6 +900,7 @@ async fn handle_ads_response(
         Ok(None) => {
             send_ads_request(tx, subscriptions.build_ack(&type_url)).await?;
             subscriptions.mark_acked(&type_url);
+            subscriptions.mark_processed(&type_url);
             nack_circuit_breaker.record_ack(&type_url);
             debug!(
                 node_id = %config.node_id,
@@ -804,13 +911,39 @@ async fn handle_ads_response(
         }
         Err(e) => {
             *accumulator = snapshot;
-            warn!(
-                node_id = %config.node_id,
-                type_url = %type_url,
-                error = %e,
-                "NACKing invalid xDS ADS response"
-            );
-            let nack = subscriptions.build_nack(&type_url, e);
+            let nack = subscriptions.build_nack(&type_url, e.clone());
+            // First-slice NACK visibility: if a REQUIRED type is being NACKed
+            // while the slice has not yet converged (the DP is still inside
+            // `wait_for_first_slice()`), surface a clear operator signal. A
+            // persistently malformed required type otherwise wedges startup
+            // silently until the NACK circuit breaker trips.
+            let blocking_first_slice =
+                is_required_mesh_slice_type(&type_url) && !accumulator.has_required_types();
+            let consecutive_after = nack_circuit_breaker.consecutive_nacks(&type_url) + 1;
+            if blocking_first_slice {
+                warn!(
+                    node_id = %config.node_id,
+                    namespace = %config.namespace,
+                    type_url = %type_url,
+                    consecutive_nacks = consecutive_after,
+                    nack_limit = XDS_CONSECUTIVE_NACK_LIMIT,
+                    error = %e,
+                    "First mesh slice blocked: NACKing a required xDS type before initial convergence; \
+                     repeated NACKs will trip the circuit breaker and force CP failover/reconnect"
+                );
+                crate::plugins::mesh::prometheus_helpers::increment_xds_first_slice_nack(
+                    &config.namespace,
+                    &type_url,
+                );
+            } else {
+                warn!(
+                    node_id = %config.node_id,
+                    type_url = %type_url,
+                    error = %e,
+                    "NACKing invalid xDS ADS response"
+                );
+            }
+            subscriptions.mark_processed(&type_url);
             let circuit_result =
                 trip_nack_circuit_if_needed(config, nack_circuit_breaker, &type_url);
             send_ads_request(tx, nack).await?;
@@ -818,6 +951,10 @@ async fn handle_ads_response(
             Ok(None)
         }
     }
+}
+
+fn is_required_mesh_slice_type(type_url: &str) -> bool {
+    REQUIRED_MESH_SLICE_TYPE_URLS.contains(&type_url)
 }
 
 fn trip_nack_circuit_if_needed(
@@ -2335,6 +2472,333 @@ mod tests {
             nack_count += 1;
         }
         assert_eq!(nack_count, XDS_CONSECUTIVE_NACK_LIMIT);
+    }
+
+    #[test]
+    fn record_response_classifies_fresh_then_stale_duplicate() {
+        let mut state = ClientSubscriptionState::new();
+
+        assert_eq!(
+            state.record_response(CDS_TYPE_URL, "v1", "n1"),
+            ResponseNonceOutcome::Fresh
+        );
+        // A different nonce is always fresh, even before marking processed.
+        assert_eq!(
+            state.record_response(CDS_TYPE_URL, "v1", "n2"),
+            ResponseNonceOutcome::Fresh
+        );
+
+        // Once the most-recent nonce is marked processed, a retransmit carrying
+        // the same nonce is detected as a stale duplicate.
+        state.mark_processed(CDS_TYPE_URL);
+        assert_eq!(
+            state.record_response(CDS_TYPE_URL, "v1", "n2"),
+            ResponseNonceOutcome::StaleDuplicate {
+                nonce: "n2".to_string()
+            }
+        );
+
+        // A stale duplicate must not advance the received baseline: the next
+        // genuine (new) nonce is still classified fresh.
+        assert_eq!(
+            state.record_response(CDS_TYPE_URL, "v2", "n3"),
+            ResponseNonceOutcome::Fresh
+        );
+    }
+
+    #[test]
+    fn reset_processed_nonces_clears_dedup_baseline_per_stream() {
+        let mut state = XdsStreamState::default();
+
+        // First stream: process a response and mark its nonce as processed.
+        assert_eq!(
+            state
+                .subscriptions
+                .record_response(CDS_TYPE_URL, "v1", "n1"),
+            ResponseNonceOutcome::Fresh
+        );
+        state.subscriptions.mark_processed(CDS_TYPE_URL);
+        // Same-stream retransmit of `n1` is still detected as a stale duplicate.
+        assert_eq!(
+            state
+                .subscriptions
+                .record_response(CDS_TYPE_URL, "v1", "n1"),
+            ResponseNonceOutcome::StaleDuplicate {
+                nonce: "n1".to_string()
+            }
+        );
+
+        // New stream: the CP legitimately reissues `n1` for the same node/type/
+        // version (e.g. its sequence counter reset on restart, or this is a
+        // load-balanced reconnect to a peer replica). `reset_for_new_stream`
+        // must clear the dedup baseline so the response is processed.
+        state.reset_for_new_stream();
+        assert_eq!(
+            state
+                .subscriptions
+                .record_response(CDS_TYPE_URL, "v1", "n1"),
+            ResponseNonceOutcome::Fresh,
+            "first response on a new stream must not be suppressed by a \
+             stream-scoped nonce from a previous stream"
+        );
+
+        // The new stream still benefits from intra-stream dedup once the new
+        // response is marked processed.
+        state.subscriptions.mark_processed(CDS_TYPE_URL);
+        assert_eq!(
+            state
+                .subscriptions
+                .record_response(CDS_TYPE_URL, "v1", "n1"),
+            ResponseNonceOutcome::StaleDuplicate {
+                nonce: "n1".to_string()
+            }
+        );
+
+        // `last_acked_version` (subscription resume baseline) is preserved
+        // across `reset_for_new_stream` so the new stream does not have to
+        // re-flow every resource from version 0.
+        let mut state = XdsStreamState::default();
+        state
+            .subscriptions
+            .record_response(CDS_TYPE_URL, "v7", "n7");
+        state.subscriptions.mark_acked(CDS_TYPE_URL);
+        state.reset_for_new_stream();
+        let initial = state
+            .subscriptions
+            .build_initial_requests("node-a", "default");
+        let cds = initial
+            .iter()
+            .find(|r| r.type_url == CDS_TYPE_URL)
+            .expect("initial CDS request");
+        assert_eq!(
+            cds.version_info, "v7",
+            "subscription resume version must survive stream reset"
+        );
+    }
+
+    #[test]
+    fn empty_nonce_response_is_always_fresh() {
+        let mut state = ClientSubscriptionState::new();
+        assert_eq!(
+            state.record_response(CDS_TYPE_URL, "v1", ""),
+            ResponseNonceOutcome::Fresh
+        );
+        state.mark_processed(CDS_TYPE_URL);
+        // An empty processed nonce must never match a later empty nonce as a
+        // "duplicate" — empty means the server supplied none.
+        assert_eq!(
+            state.record_response(CDS_TYPE_URL, "v1", ""),
+            ResponseNonceOutcome::Fresh
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_duplicate_response_is_ignored_without_reack() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut state = ClientSubscriptionState::new();
+        let mut accumulator = ResourceAccumulator::new();
+        let mut nack_circuit_breaker = NackCircuitBreaker::default();
+
+        // First valid CDS response: ACKed and marked processed.
+        let first = handle_ads_response(
+            discovery_response(
+                CDS_TYPE_URL,
+                "v1",
+                "n1",
+                vec![any_resource(CDS_TYPE_URL, "cluster/default/api/8080")],
+            ),
+            &test_config(),
+            &tx,
+            &mut state,
+            &mut accumulator,
+            &mut nack_circuit_breaker,
+        )
+        .await
+        .expect("first CDS response is processed");
+        assert!(first.is_none(), "single CDS type cannot build a full slice");
+        let ack = rx.recv().await.expect("ACK sent for first response");
+        assert_eq!(ack.type_url, CDS_TYPE_URL);
+        assert_eq!(ack.response_nonce, "n1");
+        assert!(ack.error_detail.is_none());
+
+        // Server retransmits the SAME nonce (reconnect race / buggy CP). The
+        // client must ignore it: no re-ACK, accumulator untouched.
+        let resources_before = accumulator.resources(CDS_TYPE_URL).to_vec();
+        let duplicate = handle_ads_response(
+            discovery_response(
+                CDS_TYPE_URL,
+                "v1",
+                "n1",
+                vec![any_resource(CDS_TYPE_URL, "cluster/default/api/8080")],
+            ),
+            &test_config(),
+            &tx,
+            &mut state,
+            &mut accumulator,
+            &mut nack_circuit_breaker,
+        )
+        .await
+        .expect("stale duplicate is ignored, not an error");
+        assert!(duplicate.is_none());
+        assert!(
+            rx.try_recv().is_err(),
+            "stale duplicate response must not emit a second ACK"
+        );
+        assert_eq!(
+            accumulator.resources(CDS_TYPE_URL),
+            resources_before.as_slice(),
+            "stale duplicate must not mutate accumulated resources"
+        );
+    }
+
+    #[tokio::test]
+    async fn required_type_nack_before_first_slice_emits_visibility_signal() {
+        use crate::xds::carrier::{
+            FERRUM_ECDS_PEER_AUTH_TYPE_URL, carrier_resource_name_for_type_url,
+        };
+
+        // Unique namespace so the process-global counter assertion is immune to
+        // other tests incrementing the same series in parallel.
+        let namespace = format!("nack-vis-{}-{}", std::process::id(), line!());
+        let config = XdsClientConfig {
+            namespace: namespace.clone(),
+            ..test_config()
+        };
+        let before = crate::plugins::mesh::prometheus_helpers::xds_first_slice_nack_count(
+            &namespace,
+            ECDS_TYPE_URL,
+        );
+
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut state = ClientSubscriptionState::new();
+        let mut accumulator = ResourceAccumulator::new();
+        let mut nack_circuit_breaker = NackCircuitBreaker::default();
+        let carrier_name =
+            carrier_resource_name_for_type_url(FERRUM_ECDS_PEER_AUTH_TYPE_URL).expect("name");
+
+        // A malformed reserved ECDS carrier fails at ingestion. ECDS is a
+        // required mesh-slice type and no required type has converged, so this
+        // is a first-slice-blocking NACK.
+        let result = handle_ads_response(
+            discovery_response(
+                ECDS_TYPE_URL,
+                "v1",
+                "n1",
+                vec![typed_extension_resource(
+                    carrier_name,
+                    FERRUM_ECDS_PEER_AUTH_TYPE_URL,
+                    b"{not valid json}".to_vec(),
+                )],
+            ),
+            &config,
+            &tx,
+            &mut state,
+            &mut accumulator,
+            &mut nack_circuit_breaker,
+        )
+        .await
+        .expect("first-slice NACK does not close the stream below the breaker limit");
+
+        assert!(result.is_none());
+        let nack = rx.recv().await.expect("NACK sent");
+        assert_eq!(nack.type_url, ECDS_TYPE_URL);
+        assert!(nack.error_detail.is_some());
+
+        let after = crate::plugins::mesh::prometheus_helpers::xds_first_slice_nack_count(
+            &namespace,
+            ECDS_TYPE_URL,
+        );
+        assert_eq!(
+            after,
+            before + 1,
+            "a required-type NACK before first-slice convergence must increment the visibility counter"
+        );
+    }
+
+    #[tokio::test]
+    async fn nack_after_convergence_does_not_emit_first_slice_signal() {
+        use crate::xds::carrier::{
+            FERRUM_ECDS_PEER_AUTH_TYPE_URL, carrier_resource_name_for_type_url,
+        };
+
+        // Build a fully-converged accumulator (all required types present), so a
+        // later NACK is a steady-state NACK, not a first-slice block.
+        let namespace = format!("nack-conv-{}-{}", std::process::id(), line!());
+        let config = XdsClientConfig {
+            namespace: namespace.clone(),
+            ..test_config()
+        };
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut state = ClientSubscriptionState::new();
+        let mut accumulator = ResourceAccumulator::new();
+        let mut nack_circuit_breaker = NackCircuitBreaker::default();
+
+        accumulator
+            .apply_sotw_response(
+                CDS_TYPE_URL,
+                &[any_resource(CDS_TYPE_URL, "cluster/default/api/8080")],
+                "v1",
+            )
+            .expect("CDS applies");
+        accumulator
+            .apply_sotw_response(
+                RDS_TYPE_URL,
+                &[any_resource(RDS_TYPE_URL, "route/default/api")],
+                "v1",
+            )
+            .expect("RDS applies");
+        // Includes a valid (empty) ECDS so every required type has converged.
+        apply_all_empty(&mut accumulator);
+        assert!(
+            accumulator.has_required_types(),
+            "precondition: all required types converged"
+        );
+
+        let before = crate::plugins::mesh::prometheus_helpers::xds_first_slice_nack_count(
+            &namespace,
+            ECDS_TYPE_URL,
+        );
+
+        // A subsequent malformed ECDS update NACKs, but convergence already
+        // happened (the prior ECDS version survives the rollback), so the
+        // first-slice signal must NOT fire.
+        let carrier_name =
+            carrier_resource_name_for_type_url(FERRUM_ECDS_PEER_AUTH_TYPE_URL).expect("name");
+        let result = handle_ads_response(
+            discovery_response(
+                ECDS_TYPE_URL,
+                "v2",
+                "n2",
+                vec![typed_extension_resource(
+                    carrier_name,
+                    FERRUM_ECDS_PEER_AUTH_TYPE_URL,
+                    b"{not valid json}".to_vec(),
+                )],
+            ),
+            &config,
+            &tx,
+            &mut state,
+            &mut accumulator,
+            &mut nack_circuit_breaker,
+        )
+        .await
+        .expect("steady-state NACK below breaker limit");
+        assert!(result.is_none());
+        let nack = rx.recv().await.expect("NACK sent");
+        assert_eq!(nack.type_url, ECDS_TYPE_URL);
+        assert!(
+            accumulator.has_required_types(),
+            "the prior ECDS version survives the NACK rollback"
+        );
+
+        let after = crate::plugins::mesh::prometheus_helpers::xds_first_slice_nack_count(
+            &namespace,
+            ECDS_TYPE_URL,
+        );
+        assert_eq!(
+            after, before,
+            "a post-convergence NACK must not increment the first-slice visibility counter"
+        );
     }
 
     #[test]

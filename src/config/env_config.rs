@@ -722,6 +722,11 @@ pub struct EnvConfig {
     /// Capacity of the per-ADS-stream response queue between the request
     /// reader task and tonic response stream. Default: 32.
     pub xds_stream_channel_capacity: usize,
+    /// Maximum concurrent ADS streams the CP admits per node id. A DP keeps a
+    /// single stream; the default headroom tolerates brief reconnect overlap.
+    /// `0` disables the cap. Only meaningful when `xds_enabled` is true.
+    /// Default: 4.
+    pub xds_max_streams_per_node: usize,
     /// Mesh CA backend. `internal` uses Ferrum's own CA (root cert+key on
     /// disk); `spire` delegates to a SPIRE Agent over UDS; `none` (default)
     /// disables mesh identity features.
@@ -1672,6 +1677,7 @@ impl Default for EnvConfig {
             cp_require_namespace_claim: false,
             xds_enabled: false,
             xds_stream_channel_capacity: 32,
+            xds_max_streams_per_node: 4,
             mesh_ca_backend: "none".to_string(),
             mesh_spire_agent_socket: "/run/spire/sockets/agent.sock".to_string(),
             mesh_cert_ttl_seconds: 3600,
@@ -2016,6 +2022,7 @@ impl EnvConfig {
             cp_require_namespace_claim: bool = "FERRUM_CP_REQUIRE_NAMESPACE_CLAIM" => false;
             xds_enabled: bool = "FERRUM_XDS_ENABLED" => false;
             xds_stream_channel_capacity: usize = "FERRUM_XDS_STREAM_CHANNEL_CAPACITY" => 32usize;
+            xds_max_streams_per_node: usize = "FERRUM_XDS_MAX_STREAMS_PER_NODE" => 4usize;
             mesh_ca_backend: String = "FERRUM_MESH_CA_BACKEND" => "none".to_string();
             mesh_spire_agent_socket: String = "FERRUM_MESH_SPIRE_AGENT_SOCKET" => "/run/spire/sockets/agent.sock".to_string();
             mesh_cert_ttl_seconds: u64 = "FERRUM_MESH_CERT_TTL_SECONDS" => 3600u64;
@@ -2594,6 +2601,7 @@ impl EnvConfig {
             cp_require_namespace_claim,
             xds_enabled,
             xds_stream_channel_capacity,
+            xds_max_streams_per_node,
             mesh_ca_backend,
             mesh_spire_agent_socket,
             mesh_cert_ttl_seconds,
