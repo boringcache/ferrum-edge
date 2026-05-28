@@ -109,16 +109,23 @@ pub fn is_hbone_connect(method: &Method, version: Version, headers: &HeaderMap) 
     protocol.is_none_or(|value| value.eq_ignore_ascii_case(HBONE_PROTOCOL))
 }
 
-/// Authorize relaying a CONNECT stream as an HBONE tunnel.
+/// Predicate combining the [`is_hbone_connect`] wire shape **and** an
+/// authenticated, trust-domain-verified peer SPIFFE identity
+/// (`peer_spiffe_id.is_some()`).
 ///
-/// This is the trust boundary for the HBONE relay: it is the [`is_hbone_connect`]
-/// wire shape **and** an authenticated, trust-domain-verified peer SPIFFE
-/// identity (`peer_spiffe_id.is_some()`). The mesh inbound mTLS/HBONE listener
-/// populates `peer_spiffe_id` (via the `spiffe_identity` plugin or the
-/// node-waypoint identity path) only after the peer cert's SAN trust domain has
-/// been validated against the local SVID bundle plus federated bundles, so a
-/// present `peer_spiffe_id` is exactly "a verified mesh peer terminated mTLS on
-/// this listener".
+/// This encodes the HBONE-relay authorization invariant but is **not** itself
+/// the runtime gate. The relay enforces the authenticated-peer half inline in
+/// `handle_hbone_request` (`src/proxy/hbone_proxy.rs`, the
+/// `ctx.peer_spiffe_id.is_none()` reject); by the time the relay runs, the wire
+/// shape has already been validated at dispatch (`is_hbone_connect_request`).
+/// This function combines both halves in one place and is exercised at the
+/// dispatch/test layer — keep it in sync with that inline relay check.
+///
+/// The mesh inbound mTLS/HBONE listener populates `peer_spiffe_id` (via the
+/// `spiffe_identity` plugin or the node-waypoint identity path) only after the
+/// peer cert's SAN trust domain has been validated against the local SVID
+/// bundle plus federated bundles, so a present `peer_spiffe_id` is exactly "a
+/// verified mesh peer terminated mTLS on this listener".
 ///
 /// A bare (marker-less) CONNECT with no authenticated peer is **not** a valid
 /// HBONE tunnel and must be rejected rather than silently relayed; an explicit
