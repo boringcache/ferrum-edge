@@ -1193,8 +1193,7 @@ fn is_non_canonical_numeric_host(host: &str) -> bool {
     if !host.contains('.') {
         return false;
     }
-    let mut saw_non_decimal_segment = false;
-    let all_numeric_like = host.split('.').all(|segment| {
+    host.split('.').all(|segment| {
         if segment.is_empty() {
             return false;
         }
@@ -1207,12 +1206,10 @@ fn is_non_canonical_numeric_host(host: &str) -> bool {
             && !hex.is_empty()
             && hex.bytes().all(|b| b.is_ascii_hexdigit())
         {
-            saw_non_decimal_segment = true;
             return true;
         }
         false
-    });
-    all_numeric_like && (saw_non_decimal_segment || host.matches('.').count() != 3)
+    })
 }
 
 /// Enforces SSRF policy on an operator-supplied ACME `directory_url` before any
