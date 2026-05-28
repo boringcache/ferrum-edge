@@ -525,7 +525,10 @@ struct GroupVersionResource {
     resource: String,
 }
 
-/// Outcome of validating that an `AdmissionRequest` targets a core `v1` Pod.
+/// Outcome of validating that an `AdmissionRequest` targets a core-group Pod.
+///
+/// Any core-group (`apiGroup ""`) Pod version is accepted — the check is
+/// intentionally version-agnostic for forward compatibility, not gated to `v1`.
 enum PodKindCheck {
     /// The request targets a Pod and injection logic may proceed.
     Pod,
@@ -1312,12 +1315,32 @@ mod tests {
     // state so they do not race sibling tests in the same process.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Restores captured env state on drop so a panic inside the test body
+    /// (e.g. a failing assertion) cannot leak process-global env into sibling
+    /// tests. `ENV_LOCK` outlives this guard, so the restore stays serialised.
+    struct EnvRestore(Vec<(String, Option<String>)>);
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (key, value) in &self.0 {
+                // SAFETY: ENV_LOCK is held for this guard's lifetime.
+                unsafe {
+                    match value {
+                        Some(v) => std::env::set_var(key, v),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+    }
+
     fn with_injector_env_lock<F: FnOnce()>(vars: &[(&str, Option<&str>)], f: F) {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let previous: Vec<(String, Option<String>)> = vars
-            .iter()
-            .map(|(key, _)| ((*key).to_string(), std::env::var(key).ok()))
-            .collect();
+        let _restore = EnvRestore(
+            vars.iter()
+                .map(|(key, _)| ((*key).to_string(), std::env::var(key).ok()))
+                .collect(),
+        );
         for (key, value) in vars {
             // SAFETY: ENV_LOCK serialises test access to the process-global env.
             unsafe {
@@ -1328,15 +1351,6 @@ mod tests {
             }
         }
         f();
-        for (key, value) in previous {
-            // SAFETY: ENV_LOCK still held; restore the captured prior state.
-            unsafe {
-                match value {
-                    Some(v) => std::env::set_var(&key, v),
-                    None => std::env::remove_var(&key),
-                }
-            }
-        }
     }
 
     async fn spawn_injector_test_server(config: InjectorConfig) -> (SocketAddr, JoinHandle<()>) {
