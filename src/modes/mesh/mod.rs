@@ -10293,6 +10293,15 @@ mod tests {
                 "client-side DR.tls mode {mode:?} must not request client auth"
             );
         }
+
+        // DISABLE never reaches the resolver in production (early return in
+        // load_mesh_frontend_tls), but the defensive mapping that replaced the
+        // former unreachable!() must stay no-client-auth and never panic.
+        assert_eq!(
+            resolve_mesh_inbound_client_auth(MtlsMode::Disable, true, true),
+            MeshClientAuthDecision::Resolved(MeshClientAuth::None),
+            "DISABLE must map to no client auth, never panic"
+        );
     }
 
     /// Build a populated inbound SPIFFE bundle slot for tests that only need the
