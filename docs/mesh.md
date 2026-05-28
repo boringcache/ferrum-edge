@@ -4,6 +4,197 @@ Ferrum Edge runs as a service mesh data plane when `FERRUM_MODE=mesh`. In this m
 
 Concepts map directly to the Istio service mesh model: `Workload` corresponds to a pod or VM identity, `MeshPolicy` to `AuthorizationPolicy`, `PeerAuthentication` to per-port mTLS modes, `ServiceEntry` to external service registration, and `MeshRequestAuthentication` to `RequestAuthentication` JWT declarations. The Ferrum mesh layer adds multi-cluster east-west gateways, egress gateway materialization, node-waypoint operation for sidecarless pod capture, service-scoped Ambient waypoints, a transparent DNS proxy for `ServiceEntry` resolution, and a Kubernetes sidecar injector.
 
+## Table of Contents
+
+- [Maturity and Support Status](#maturity-and-support-status)
+- [Limitations and Not Supported](#limitations-and-not-supported)
+- [Failure-Mode Runbook](#failure-mode-runbook)
+- [Observability and Troubleshooting Quick Reference](#observability-and-troubleshooting-quick-reference)
+- [Topologies](#topologies)
+- [Configuration Consumption](#configuration-consumption)
+  - [Native MeshSubscribe (default)](#native-meshsubscribe-default)
+  - [xDS ADS](#xds-ads)
+  - [Ferrum mesh-slice ECDS carriers (full parity over xDS)](#ferrum-mesh-slice-ecds-carriers-full-parity-over-xds)
+  - [ECDS DestinationRule carrier (full DR semantics over xDS)](#ecds-destinationrule-carrier-full-dr-semantics-over-xds)
+  - [Bootstrap Behavior](#bootstrap-behavior)
+- [Mesh Data Model](#mesh-data-model)
+- [MeshSlice](#meshslice)
+- [Authorization](#authorization)
+  - [PolicyScope Filtering](#policyscope-filtering)
+  - [Evaluation Semantics](#evaluation-semantics)
+  - [Rule Matching](#rule-matching)
+  - [SPIFFE Identity](#spiffe-identity)
+  - [HBONE Protocol](#hbone-protocol)
+  - [Trust Domain Aliasing](#trust-domain-aliasing)
+  - [Trusted HBONE Assertors](#trusted-hbone-assertors)
+- [RequestAuthentication](#requestauthentication)
+- [PeerAuthentication](#peerauthentication)
+- [Transparent DNS Proxy](#transparent-dns-proxy)
+- [Multi-Cluster](#multi-cluster)
+  - [Trust Federation](#trust-federation)
+  - [Cross-Cluster Endpoint Discovery](#cross-cluster-endpoint-discovery)
+- [Egress Gateway](#egress-gateway)
+- [Sidecar Egress Scoping](#sidecar-egress-scoping)
+- [Config Drift Introspection](#config-drift-introspection)
+- [DestinationRule](#destinationrule)
+- [Observability](#observability)
+- [Kubernetes Injector](#kubernetes-injector)
+- [Control Plane Integration](#control-plane-integration)
+- [Gateway-to-Mesh Bridge](#gateway-to-mesh-bridge)
+- [Mesh Identity](#mesh-identity)
+  - [SPIRE Agent CA](#spire-agent-ca)
+  - [Internal Dev CA and Production Guardrails](#internal-dev-ca-and-production-guardrails)
+- [Node Agent Mode](#node-agent-mode)
+- [VirtualService Translation](#virtualservice-translation)
+- [Gateway API Status](#gateway-api-status)
+- [Istio CRD Status](#istio-crd-status)
+- [Locality-Aware Load Balancing](#locality-aware-load-balancing)
+- [xDS ADS Compatibility](#xds-ads-compatibility)
+- [Istio Compatibility Gaps](#istio-compatibility-gaps)
+- [Environment Variables](#environment-variables)
+
+## Maturity and Support Status
+
+Ferrum's mesh subsystem is in active build-out. The paths below ship in one binary and share the same proxy/plugin chain, but they are at very different maturity levels. Use this matrix to decide what to rely on in production. Labels:
+
+- **Stable** — exercised end-to-end (functional/integration tests against a live data path), production-suitable.
+- **Beta** — feature-complete and tested, but with a documented sharp edge or a verification step still owed (see [Limitations](#limitations-and-not-supported)).
+- **Experimental** — usable but with a safety-relevant caveat (plaintext, unauthenticated, or partial enforcement); opt-in and not recommended without compensating controls.
+- **Dev-only** — gated behind a build feature or an explicit dev opt-in; not present in the published image's default behavior.
+
+### Config-source maturity
+
+| Capability | Status | Notes |
+|---|---|---|
+| Native `MeshSubscribe` (Ferrum CP → Ferrum DP) | **Stable** | Default protocol. Full slice (authz, PeerAuth, JWT, ServiceEntry, trust bundles, ProxyConfig, workloads, telemetry, multi-cluster) is pushed directly. The most mature and recommended config path. |
+| xDS ADS (Ferrum CP → Ferrum DP) | **Beta** | Functionally equivalent to native via Ferrum-specific ECDS carriers (`ferrum.config.extension.v3.*`). **NOT stock-Envoy / third-party-Istio interop** — a non-Ferrum CP emits only name-only CDS/EDS/LDS/RDS and no carriers, so it cannot drive a protected Ferrum mesh and may be NACKed. `ProxyConfig` is native-only. RTDS layers are authored by the operator's CP (Ferrum's xDS server does not originate Runtime resources). |
+| Stock Envoy / third-party Istio xDS interop | **Not supported** | See [Limitations](#limitations-and-not-supported). Use native or a Ferrum CP. |
+
+### Topology maturity
+
+| Topology | Status | Notes |
+|---|---|---|
+| `Sidecar` + native config | **Stable** | The most mature path: inbound 15006 mTLS + outbound 15001 capture, SPIFFE-verified peers, full authz/JWT/DR enforcement. Recommended for production. |
+| `Ambient` (HBONE 15008) | **Beta** | HBONE termination over mTLS is implemented and SPIFFE-trust-domain-verified. Requires eBPF ambient capture (or iptables) to actually intercept traffic — see capture maturity below. |
+| `EastWestGateway` (SNI passthrough 15443) | **Beta** | TCP/SNI passthrough for multi-cluster; no TLS termination. Cross-cluster *endpoint* discovery (vs SNI passthrough) is separate and Experimental — see below. |
+| `EgressGateway` — HTTP-family (15090 mTLS) | **Beta** | mTLS-terminating egress for `mesh_external` ServiceEntries with `outboundTrafficPolicy` enforcement. |
+| `EgressGateway` — stream-family (TCP/UDP) | **Experimental** | Opt-in via `FERRUM_MESH_EGRESS_STREAM_ENABLED=true`. **Per-port stream listeners are plaintext and unauthenticated** (`mesh_authz` cannot verify SPIFFE identity without mTLS). Default-off; enable only with compensating network controls. |
+| `ServiceWaypoint` (GAMMA) | **Beta** | Service-scoped Ambient waypoint; CP narrows resources to the named binding. Needs the eBPF/ambient capture caveats of node-waypoint when fronting captured pods. |
+| `NodeWaypoint` (sidecarless capture) | **Experimental** | HBONE listener is implemented, but end-to-end socket-cookie identity resolution **fails closed** until the GAP-2M accept-side sockops/sk_lookup bridge lands (the orig-dst bridge only covers the connect side). **TCP** stream authz scopes per source pod via the connect-side resolver when capture is loaded; **UDP/DTLS** stream authz is mesh-wide-only by architectural blocker (eBPF capture is `connect()`-hooked and TCP-only). With scoped policies present, missing scope (UDP, or TCP unresolved) fails closed with 403; with only mesh-wide policies, both fall through to mesh-wide-only evaluation. Requires a `--features ebpf` capture build. |
+
+### Capture / data-path maturity
+
+| Capability | Status | Notes |
+|---|---|---|
+| iptables capture (injector init container) | **Beta** | Requires `NET_ADMIN`/`NET_RAW`; rules applied at pod admission, restart needed to pick up new annotations. |
+| eBPF ambient capture | **Dev-only** | Requires a build with `--features ebpf` (the **default published image uses a no-op mock backend** that attaches nothing and sets `ferrum_mesh_node_topology_degraded`). The aya kernel loader compiles on Linux only; the **live-kernel datapath is unverified on a real node** (built/CI-tested on macOS/CI). Inbound TC redirect is deferred; the iptables fallback is node-global and needs a custom runtime image with `/bin/sh` + `iptables`. |
+| orig-dst → proxy identity bridge (node-waypoint) | **Dev-only / incomplete** | `src/ebpf/orig_dst_bridge.rs` mirrors connect-side socket-cookie records into the resolver, but the **accept-side cookie bridge (GAP-2M) is not implemented**, so node-waypoint cookie resolution fails closed even on a `--features ebpf` build. |
+
+### Identity / CA maturity
+
+| Capability | Status | Notes |
+|---|---|---|
+| SPIRE Agent CA (`spire_agent`) | **Stable** | Recommended production identity path — delegates SVID issuance to a separately operated SPIRE installation over the Workload API. |
+| Internal self-signed CA (`internal`) | **Dev-only** | Self-signed root generated by the bootstrap helper; gated behind `FERRUM_MESH_CA_BOOTSTRAP_DEV=true` and refused when `FERRUM_MESH_PRODUCTION_MODE=true`. Lab/test only — see [Internal Dev CA and Production Guardrails](#internal-dev-ca-and-production-guardrails). |
+| SPIFFE inbound/HBONE peer trust-domain verification | **Stable** | When gateway SVID material is configured, inbound mTLS/HBONE peers are SPIFFE-trust-domain-verified against the local + federated bundles (not just chain-validated). |
+| Trust-bundle federation poller | **Beta** | Fetches `RemoteCluster.federation_endpoint` bundles; outbound-only (a poller-added trust domain is rejected inbound until the CP pushes it). `FERRUM_MESH_FEDERATION_FAIL_OPEN` is inert. |
+
+### Cross-cluster maturity
+
+| Capability | Status | Notes |
+|---|---|---|
+| East-west SNI passthrough + trust federation | **Beta** | See `EastWestGateway` above and [Trust Federation](#trust-federation). |
+| Cross-cluster endpoint discovery (local→remote failover) | **Experimental** | `FERRUM_MESH_REMOTE_DISCOVERY_POLL_INTERVAL_SECONDS>0` dials each `RemoteCluster.control_plane_url`. Aggregation + locality failover are integration-tested with a mockable source; the **live two-control-plane round trip is not yet verified**. Requires source locality to be set for local-first preference. |
+
+## Limitations and Not Supported
+
+This section consolidates every known residual gap so operators do not have to reconstruct them from the prose. Items are grouped by area; each is enforced or deferred as described against the merged code.
+
+### Not interoperable / not planned
+
+- **Stock Envoy / third-party Istio xDS interop** — Ferrum's `FERRUM_MESH_CONFIG_PROTOCOL=xds` is a **Ferrum-CP-to-Ferrum-DP** path. It follows the Envoy ADS gRPC contract, but CDS/EDS/LDS/RDS are name-only with Ferrum-shaped resource names, and all security/policy fields ride Ferrum-defined ECDS carriers. A stock Envoy/Istio CP does not emit these, so pointing Ferrum's xDS client at a non-Ferrum CP is unsupported and may be NACKed. Use native, or a Ferrum CP over xDS.
+- **`EnvoyFilter`** — not planned. Use Ferrum custom plugins (`custom_plugins/`).
+- **`WasmPlugin`** — not planned. Use Ferrum custom plugins.
+- **xDS client resource warming** — the ADS state machine supports SotW and delta subscriptions but does **not** implement Envoy-style resource warming (make-before-break across types). The per-node ADS stream ceiling is now implemented as `FERRUM_XDS_MAX_STREAMS_PER_NODE` (default `4`, `0`=unbounded); excess streams are rejected with gRPC `RESOURCE_EXHAUSTED` and counted by `ferrum_xds_streams_rejected_total`.
+
+### Capture / node-waypoint (see also the Maturity matrix)
+
+- **eBPF capture is a build feature** — the published image ships a no-op mock backend; real capture needs `--features ebpf` on Linux, and the live-kernel datapath is unverified on a real node.
+- **Node-waypoint identity fails closed** — the accept-side socket-cookie bridge (GAP-2M) is not implemented; cookie resolution fails closed even with `--features ebpf`.
+- **Node-waypoint UDP/DTLS stream authz is mesh-wide-only** — TCP stream connections through a node-waypoint proxy now scope per source pod via `resolve_node_waypoint_stream_scope()` (socket-cookie → pod identity → `PolicyScopeCache`); when the connect-side resolver returns no identity, the connection fails closed with 403 if any namespace/selector-scoped `AuthorizationPolicy` exists in the mesh (else falls through to mesh-wide-only evaluation). **UDP/DTLS** scope is unresolvable by architecture — eBPF capture is `connect()`-hooked and TCP-only, and a UDP proxy demuxes all clients off one shared frontend socket — so UDP node-waypoint authz is always mesh-wide-only; with scoped policies present, UDP fails closed with 403.
+- **Inbound TC redirect deferred; iptables fallback is node-global** — and requires a custom runtime image with `/bin/sh` + `iptables` (+ `ip6tables` for IPv6).
+
+### Authorization
+
+- **`ipBlocks` / `remoteIpBlocks` on the stream path collapse to one IP** — on the HTTP request path the two are distinguished (`ipBlocks`/`source.ip` = the immediate downstream socket peer via `direct_client_ip`; `remoteIpBlocks`/`remote.ip` = the gateway-resolved, XFF-aware `client_ip`). On the **TCP/UDP stream path** (`on_stream_connect`) both `source.ip` and `remote.ip` derive from the single gateway-resolved `client_ip` — there is no direct-vs-XFF distinction for streams. IP-block matchers fail closed when the IP they test is absent.
+- **DENY rules treat missing HTTP-only attributes as matches** — Istio semantics. Port-scope DENY rules that mention HTTP fields and can see TCP traffic, or they may over-match.
+
+### DestinationRule (parsed but inert / approximated / deferred)
+
+- **`connectionPool.http.maxRequestsPerConnection`** — wire-projected end-to-end but **inert at runtime**: hyper lacks a stable close-after-N-requests builder knob. Activates automatically once hyper grows the knob.
+- **`connectionPool.tcp.maxConnections`** — enforced for **stream-family (TCP)** and **HTTP-family WebSocket** (H1/H2/H3) via an RAII guard on `ProxyState.backend_conn_limit`. The pooled multiplexed transports (reqwest H1/H2, direct H2, gRPC, H3, HBONE) do **not** enforce it because their backend-connection lifecycle is pool-internal (reuse, sharding, idle eviction) and a request-keyed counter would measure request concurrency rather than open connections — use `http2MaxRequests` / `h2_max_concurrent_streams` for HTTP/2-family concurrency instead. Full rationale in [DestinationRule `maxConnections` enforcement scope](#destinationrule-maxconnections-enforcement-scope).
+- **`connectionPool.http.{http1MaxPendingRequests, maxRetries, h2UpgradePolicy}`** — parsed, warned, and surfaced in `status.ferrum.translation.deferred_fields`; not enforced.
+- **Per-subset `connectionPool` / `outlierDetection`** — parsed and warned, not applied per subset (top-level `trafficPolicy` is the only path to per-upstream connect timeout / passive health).
+- **`portLevelSettings[].tls`** — parsed but deferred (surfaced as a deferred field); top-level / per-subset `trafficPolicy.tls` is enforced.
+- **`loadBalancer.simple = PASSTHROUGH`** — approximated as `ROUND_ROBIN` (warns); Ferrum cannot preserve the original destination IP. `MAGLEV` is a hard reject.
+- Stream-family (TCP/UDP/DTLS) upstreams use upstream-level LB / passive / locality policy only — per-port `loadBalancer` / `outlierDetection` / `localityLbSetting` apply to HTTP-family / gRPC / WebSocket / HBONE dispatch.
+
+### VirtualService
+
+- **`spec.tcp[]` / `spec.tls[]` L4 routing** — **rejected fail-closed** (translator error + warning, surfaces as `FerrumAccepted=False`/`Invalid`), not deferred. Model L4 with an explicit stream `Proxy` or east-west SNI passthrough. (`mirror`, `mirrorPercentage`, `redirect`, and `rewrite` are fully translated.)
+- **`http[].corsPolicy`** — parsed but dropped; the only remaining VS HTTP-route field surfaced as a `deferred_fields` entry. Use the `cors` plugin instead.
+- **Per-rule fault percentages are not RTDS-tunable** — the GAP-3E RTDS fault keys apply only to `fault_injection` plugin instances with `runtime_overlay_scope`, not to per-route VS faults.
+
+### mTLS / HBONE operator cautions
+
+- **PERMISSIVE with no client CA degrades to no-auth** — if `PeerAuthentication` resolves to `PERMISSIVE` but neither `FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH` nor gateway SVID material is configured, client certificates are **not requested or verified** (logged at startup as a `warn!`; resolved through the explicit `PermissiveNoTrustAnchor` decision in `resolve_mesh_inbound_client_auth`). The listener admits unauthenticated peers and no peer SPIFFE identity is recorded. Configure a client CA or SVID material, or use STRICT, when you need PERMISSIVE to actually capture identity.
+
+### Federation / multi-cluster
+
+- **`FERRUM_MESH_FEDERATION_FAIL_OPEN` is inert** — recorded in poll-failure logs only; verifier behavior is always fail-closed (verifies against the last-good cached bundle).
+- **Federation-poller bundles are outbound-only** — a poller-added trust domain validates outbound mTLS but is rejected inbound until the CP pushes it in a slice.
+- **Live two-CP discovery round trip is mock-tested only** — see [Cross-Cluster Endpoint Discovery](#cross-cluster-endpoint-discovery).
+
+## Failure-Mode Runbook
+
+Where to look, and what to expect, when the mesh data plane misbehaves. All slice state lives in an `ArcSwap<Option<MeshSlice>>` (lock-free hot-swap); in-flight requests always see a complete old-or-new slice, never a partial one.
+
+| Symptom | What happens | Where to look / what to do |
+|---|---|---|
+| **CP unreachable at startup** | `wait_for_initial_mesh_config` blocks (via `wait_for_first_slice`) until the first valid slice arrives — the DP does not serve traffic with an empty/unprotected config. The native/xDS client retries with jittered exponential backoff (1s → 30s, ±25%) across all `FERRUM_DP_CP_GRPC_URLS`. | Confirm `FERRUM_DP_CP_GRPC_URLS`, the `FERRUM_CP_DP_GRPC_JWT_SECRET`, and DP↔CP TLS. Startup logs show the connection/backoff attempts. The DP stays NotReady until converged. |
+| **CP goes down after startup** | The last-good slice is retained (ArcSwap snapshot keeps serving). No new slices arrive; the client backs off and reconnects. | `GET /mesh/config-drift` shows `slice.last_received_at` / `age_seconds` going stale; alert on `ferrum_mesh_config_last_received_timestamp_seconds`. **SVID interaction:** while disconnected, SVID rotation still proceeds via the CA backend (SPIRE Agent / internal); the federation poller and CP-pushed trust bundles do not update, so a *new* federated trust domain will not appear until the CP returns. Existing identities and bundles remain valid until their own TTLs expire. |
+| **Slice rejected (invalid update)** | The update is logged (`Ignoring invalid mesh slice update` / `Ignoring invalid initial mesh slice`) and dropped; the last accepted slice keeps serving. A rejected slice never advances `config-drift` `last_received_at`/fingerprint and never alters inbound trust (staged SPIFFE bundle is dropped on rejection). Over xDS, a malformed mesh-slice carrier causes the DP to NACK the whole ECDS response and retain the previous slice. | Search logs for `Ignoring invalid` and the `mesh_slice_version` + `error`. Compare `slice.fingerprint` across DPs via `GET /mesh/config-drift` to spot split-brain. |
+| **eBPF capture unavailable** | The node-agent probes kernel ≥ 5.7 + cgroup v2 + bpffs once at startup. On a miss it sets `ferrum_mesh_node_topology_degraded{reason}` to `1` (reason ∈ `kernel_too_old` / `cgroup_v1` / `bpffs_missing`) and, with the default `FERRUM_NODE_AGENT_FALLBACK_MODE=fail`, refuses to start. `=iptables` falls back to host iptables capture (needs a custom image with `/bin/sh` + `iptables`). On a build without `--features ebpf`, the orig-dst bridge logs once and exits and node-waypoint accept fails closed. | Alert on `ferrum_mesh_node_topology_degraded == 1` and node-agent readiness. See [Node Agent Mode](#node-agent-mode) and [docs/node_agent.md](node_agent.md#kernel-fallback) for the per-reason remediation table. The rest of the data plane (slice apply, `mesh_authz`, `workload_metrics`, HBONE) is unaffected by node-level capture degradation. |
+| **Requests denied unexpectedly** | `mesh_authz` evaluated DENY-first then implicit-deny-on-no-ALLOW-match. | `GET /mesh/policy-denies/recent` (JWT) groups recent denies by `(rule, source, destination, reason)`; correlate with `ferrum_mesh_requests_total{response_code="403"}`. Transaction logs carry `mesh_authz.deny_policy` (e.g. `untrusted_assertor`, `trust_domain_mismatch`, `unauthenticated_baggage`) and `mesh_authz.scope_missing` (node-waypoint per-pod scope not yet enrolled). |
+| **mTLS / HBONE handshake failures** | Peer cert chain or SPIFFE trust-domain validation failed, or a plaintext peer hit a STRICT listener. | `ferrum_mesh_mtls_handshake_failures_total{reason}` (`timeout` / `error`). Check that gateway SVID material (`FERRUM_GATEWAY_SVID_*`) and the slice trust bundles cover the peer's trust domain; for HBONE baggage rewrites, confirm the assertor is on `FERRUM_MESH_TRUSTED_HBONE_ASSERTORS`. Remember PERMISSIVE-with-no-client-CA admits unauthenticated peers (see [Limitations](#limitations-and-not-supported)). |
+| **Cert / CA health** | SVID rotation or CA backend problems. | `ferrum_mesh_cert_expiry_seconds`, `ferrum_mesh_cert_rotation_failures_total`, `ferrum_mesh_ca_health{ca_type}`, `ferrum_mesh_trust_bundle_version`. |
+
+## Observability and Troubleshooting Quick Reference
+
+### Admin introspection endpoints (all JWT-authenticated; 404 outside mesh mode / wrong topology)
+
+| Endpoint | Purpose | Diagnose |
+|---|---|---|
+| `GET /mesh/config-drift` (`?include_overlay=false`) | Per-DP "where is this DP vs the CP's last push" — `slice.last_received_at`, `version`, per-kind `resources` counts, `fingerprint`, `source_protocol`/`source_cp_url`, RTDS `runtime_overlay`. | Stuck DP (stale `last_received_at`), split-brain (fingerprint divergence), cross-cluster endpoint discovery (workload/service resource counts), RTDS drift. |
+| `GET /mesh/federation` | Trust-bundle federation snapshot: per-trust-domain `bundle_age_seconds` + authority counts. | Stale / missing federated bundles for cross-cluster mTLS. |
+| `GET /mesh/runtime-overlay` | Live RTDS overlay (fault percentages, transformer gates, log level). | RTDS knob propagation. |
+| `GET /mesh/service-graph` | Node-local source/destination edge graph from `workload_metrics`. | Who is talking to whom (per DP; aggregate in the backend). |
+| `GET /mesh/policy-denies/recent` (`?window=`, `?limit=`) | Aggregated recent `mesh_authz` denies grouped by `(rule, source, destination, reason)`. | Misconfigured `AuthorizationPolicy` / unexpected denies. |
+| `GET /mesh/egress-scope` + `POST /mesh/egress-scope/test` | Resolved Sidecar egress scope: admitted/denied services + outbound-registry destinations; dry-run host/port check. | Sidecar egress narrowing before/after enabling enforcement. |
+| `GET /node-waypoint/identities` (NodeWaypoint only) | Currently enrolled pod identities. | Node-waypoint enrollment / cookie resolution. |
+| `GET /service-waypoint/services` (ServiceWaypoint only) | Services bound to this waypoint in the active slice. | GAMMA waypoint binding resolution. |
+
+There is no dedicated remote-cluster discovery admin endpoint; observe cross-cluster endpoint discovery through `GET /mesh/config-drift` resource counts and the locality-aware LB behavior.
+
+### Key metrics (`/metrics`, unauthenticated — restrict scraper reachability)
+
+- RED: `ferrum_mesh_requests_total`, `ferrum_mesh_request_duration_ms` (carry SPIFFE identity + `connection_security_policy` labels).
+- Config freshness: `ferrum_mesh_config_last_received_timestamp_seconds{namespace}`.
+- Identity: `ferrum_mesh_cert_expiry_seconds`, `ferrum_mesh_cert_rotation_failures_total`, `ferrum_mesh_ca_health{ca_type}`, `ferrum_mesh_trust_bundle_version`, `ferrum_mesh_mtls_handshake_failures_total{reason}`.
+- Federation: `ferrum_mesh_federation_poll_failures_total`, `ferrum_mesh_federation_last_success_timestamp_seconds`, `ferrum_mesh_federation_bundle_age_seconds`.
+- Outbound policy: `ferrum_mesh_outbound_registry_decisions_total`, `ferrum_mesh_outbound_registry_stream_decisions_total{protocol, decision}`.
+- Node capture: `ferrum_mesh_node_topology_degraded{reason}`, `ferrum_node_agent_pods_enrolled_total`, `ferrum_node_agent_attach_errors_total`; BPF TCP-layer counters via `__mesh_bpf_metrics` (NodeWaypoint only).
+
 ## Topologies
 
 Mesh mode supports six topologies selected by `FERRUM_MESH_TOPOLOGY`. Each topology determines which listeners are created and how traffic is handled.
@@ -1247,7 +1438,7 @@ The container runs as `FERRUM_MESH_PROXY_UID` (default 1337) with `allowPrivileg
 |---|---|
 | `explicit` (default) | No automatic capture; applications must explicitly route to the proxy |
 | `iptables` | Inject init container with `NET_ADMIN`/`NET_RAW` capabilities that sets up iptables rules to redirect traffic through the sidecar (inbound to 15006, outbound to 15001) |
-| `ebpf` | eBPF-based capture handled by a node-level agent (requires kernel 5.7+). The injector does not inject a privileged init container for this mode -- the node agent's DaemonSet manages eBPF program attachment. Capture planning infrastructure (`EbpfPlan` with iptables fallback for pre-5.7 kernels) is available in `src/capture/mod.rs` for the node agent path |
+| `ebpf` | eBPF-based capture handled by a node-level agent (requires kernel 5.7+). The injector does not inject a privileged init container for this mode -- the node agent's DaemonSet manages eBPF program attachment. Capture planning infrastructure (`EbpfPlan` with iptables fallback for pre-5.7 kernels) is available in `src/capture/mod.rs` for the node agent path. **Build requirement:** real eBPF attachment needs a binary built with the Cargo `ebpf` feature (`cargo build --features ebpf`, Linux only; Docker `--build-arg FEATURES=cloud-secrets,ebpf`). The **default published image uses a no-op mock backend** (`MockEbpfBackend`) that attaches nothing and sets `ferrum_mesh_node_topology_degraded` — see [Maturity and Support Status](#maturity-and-support-status) |
 
 ## Control Plane Integration
 
@@ -1323,6 +1514,20 @@ Identity baggage from the client request is stripped from tunneled inner HBONE r
 | `FERRUM_MESH_CERT_TTL_SECONDS` | `3600` | Requested certificate TTL for issued SVIDs |
 
 The SPIRE backend is the recommended production path for mesh identity. `internal` is intended for development and testing only -- it generates a self-signed root CA at startup with no external trust anchor.
+
+### Internal Dev CA and Production Guardrails
+
+The `internal` CA backend is backed by a self-signed root produced by the dev bootstrap helper in `src/identity/ca/bootstrap.rs`. To make it impossible to accidentally run a production mesh on an unanchored self-signed root, the helper is protected by two environment guardrails, both read directly at the time the helper is invoked (they are **not** parsed into `EnvConfig`):
+
+| Variable | Default | Semantics |
+|---|---|---|
+| `FERRUM_MESH_PRODUCTION_MODE` | `false` | Master kill-switch for all dev-only identity shortcuts. When `true`, the self-signed CA bootstrap is **refused unconditionally**, and so is construction of the dev-only static attestor (`FERRUM_MESH_ALLOW_STATIC_ID`). Set this in every production deployment. |
+| `FERRUM_MESH_CA_BOOTSTRAP_DEV` | `false` | Explicit opt-in to generate a self-signed mesh root. The helper refuses unless this is `true`. When it runs it emits a loud `warn!` (`DEV-ONLY, never use in production`). |
+| `FERRUM_MESH_ALLOW_STATIC_ID` | `false` | Sibling guardrail (not CA-specific): the dev-only `StaticAttestor`, which returns a hard-coded SPIFFE ID for any peer, refuses to construct unless this is `true` and `FERRUM_MESH_PRODUCTION_MODE` is not `true`. |
+
+Both gates must agree before a self-signed root is minted: `FERRUM_MESH_CA_BOOTSTRAP_DEV=true` **and** `FERRUM_MESH_PRODUCTION_MODE` not `true`. Anything else fails closed.
+
+For production mesh identity, run the SPIRE Agent backend (`FERRUM_MESH_CA_BACKEND=spire_agent`) so SVID issuance and trust-bundle distribution are anchored to a separately operated trust root. There is no `FERRUM_MESH_CA_CERT_PATH` / `FERRUM_MESH_CA_KEY_PATH` env var today — those names appear only in the bootstrap helper's refusal message as guidance for a future externally-provided-root path and are not currently read by any code path.
 
 ## Node Agent Mode
 
@@ -1673,8 +1878,15 @@ Mesh-specific environment variables are listed below. For the full reference of 
 | `FERRUM_MESH_SIDECAR_IDENTITY_NARROWING` | `false` | When `true` and `FERRUM_MESH_SIDECAR_ENFORCED=true`, filters `workloads` to SPIFFE identities referenced by services admitted by the applicable Sidecar. Default-off for rollout; trust-bundle mTLS validation and HBONE trust-domain aliasing do not depend on this list |
 | `FERRUM_MESH_EGRESS_STREAM_ENABLED` | `false` | Opt-in for stream-family (TCP / UDP) egress proxy materialization in `EgressGateway` topology. Default-off because stream egress listeners are plaintext and `mesh_authz` cannot verify SPIFFE peer identity without mTLS. HTTP-family egress is unaffected |
 | `FERRUM_MESH_NODE_WAYPOINT_CGROUP_SWEEP_INTERVAL_SECS` | `30` | NodeWaypoint cgroup-inode lifecycle sweep interval. Set to `0` to disable |
+| `FERRUM_MESH_REQUEST_AUTH_REQUIRE_EXP` | `true` | Whether the auto-injected mesh `RequestAuthentication` (`jwks_auth`) plugin requires the JWT `exp` claim. Secure default `true` rejects `exp`-less tokens. Set `false` only for issuers that legitimately omit `exp`; a present-but-expired `exp` is always rejected regardless |
+| `FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED` | `false` | Opt in to live reload of the PeerAuthentication-derived inbound mTLS mode, client CA verifier, and federated SVID bundle slot on slice apply. Does not rotate frontend cert/key material (use `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED`) |
+| `FERRUM_MESH_SVID_ROTATION_DRAIN_SECONDS` | `0` | Seconds to wait after a backend client SVID rotation before force-draining old-generation backend pool entries. `0` keeps existing connections until normal idle/health cleanup |
+| `FERRUM_MESH_FEDERATION_POLL_INTERVAL_SECONDS` | `300` | SPIFFE trust-bundle federation poll interval (fetches `RemoteCluster.federation_endpoint` and overlays `TrustBundleSet.federated`). `0` disables; bundles then come only from the CP slice |
+| `FERRUM_MESH_FEDERATION_POLL_TIMEOUT_SECONDS` | `30` | Per-request HTTP timeout for a single federation bundle fetch |
+| `FERRUM_MESH_FEDERATION_FAIL_OPEN` | `false` | **Inert** — recorded in poll-failure logs only; verifier behavior is always fail-closed (verifies against the last-good cached bundle) regardless of this value |
 | `FERRUM_MESH_REMOTE_DISCOVERY_POLL_INTERVAL_SECONDS` | `0` | Cross-cluster endpoint discovery polling interval. `0` disables (multi-cluster stays east-west SNI passthrough + federated trust only). When `> 0`, each `RemoteCluster.control_plane_url` is dialed on this cadence to fetch remote service endpoints aggregated into local upstream targets (tagged with remote locality) for local→remote failover. Fail-closed on trust: only clusters with a federated trust bundle are dialed. See [Cross-Cluster Endpoint Discovery](#cross-cluster-endpoint-discovery) |
 | `FERRUM_MESH_REMOTE_DISCOVERY_POLL_TIMEOUT_SECONDS` | `30` | Per-poll timeout for the remote-cluster `MeshSubscribe` fetch |
+| `FERRUM_MESH_POLICY_DENY_LOG_CAPACITY` | `10000` | Ring capacity of the in-memory `mesh_authz` deny recorder behind `GET /mesh/policy-denies/recent`. `0` disables the recorder (endpoint still serves an empty `grouped` array) |
 
 ### Listeners
 
@@ -1703,9 +1915,12 @@ Mesh-specific environment variables are listed below. For the full reference of 
 
 | Variable | Default | Description |
 |---|---|---|
-| `FERRUM_MESH_CA_BACKEND` | `none` | CA backend for mesh SVID issuance: `none`, `internal`, `spire_agent` |
+| `FERRUM_MESH_CA_BACKEND` | `none` | CA backend for mesh SVID issuance: `none`, `internal` (dev-only self-signed root), `spire_agent` (SPIRE Workload API). `spire` / `spire-agent` are accepted aliases for `spire_agent` |
 | `FERRUM_MESH_SPIRE_AGENT_SOCKET` | `/run/spire/sockets/agent.sock` | SPIRE Agent Workload API socket path |
 | `FERRUM_MESH_CERT_TTL_SECONDS` | `3600` | Requested certificate TTL |
+| `FERRUM_MESH_PRODUCTION_MODE` | `false` | Master production guardrail. When `true`, the dev-only self-signed CA bootstrap and the dev-only static attestor are refused unconditionally. Read directly by the identity helpers (not parsed into `EnvConfig`). Set in every production deployment. See [Internal Dev CA and Production Guardrails](#internal-dev-ca-and-production-guardrails) |
+| `FERRUM_MESH_CA_BOOTSTRAP_DEV` | `false` | Dev-only opt-in to mint a self-signed mesh root for the `internal` CA backend. The bootstrap helper refuses unless this is `true` **and** `FERRUM_MESH_PRODUCTION_MODE` is not `true`. Lab/test only |
+| `FERRUM_MESH_ALLOW_STATIC_ID` | `false` | Dev-only opt-in for the `StaticAttestor` (hard-coded SPIFFE ID for any peer). Refused unless `true` and `FERRUM_MESH_PRODUCTION_MODE` is not `true`. Lab/test only |
 
 ### xDS
 

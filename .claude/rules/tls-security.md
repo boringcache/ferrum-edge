@@ -99,3 +99,4 @@ paths:
 - SVID rotation must not mix stale cert/key material with new trust bundles.
 - Gateway SVID pool-key generation uses the SVID generation marker to prevent pool poisoning across rotations.
 - kTLS paths must zeroize secret material on drop and must not consume the TLS stream before kernel install is confirmed.
+- Dev-only identity shortcuts stay double-gated. The self-signed CA bootstrap (`bootstrap_dev_root`) requires `FERRUM_MESH_CA_BOOTSTRAP_DEV=true`, and the `StaticAttestor` requires `FERRUM_MESH_ALLOW_STATIC_ID=true`; both are refused unconditionally when `FERRUM_MESH_PRODUCTION_MODE=true`. These env vars are read directly in `src/identity/` (not parsed into `EnvConfig`). Do not relax either gate or collapse them to a single flag.
