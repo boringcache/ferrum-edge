@@ -998,9 +998,9 @@ Pool keys for the reqwest, direct-H2, and gRPC backends intentionally exclude po
 
 ### DestinationRule `maxConnections` enforcement scope
 
-`connectionPool.tcp.maxConnections` caps **concurrent open backend connections per destination** — Envoy's semantics. Ferrum enforces it everywhere it owns the backend connection's lifecycle and that lifecycle maps onto an open-connection count:
+`connectionPool.tcp.maxConnections` caps **concurrent open backend connections per destination** — Envoy's semantics. Keying is per resolved `(host, port)` endpoint, not per logical cluster, so a destination with N endpoint hosts sharing one port has an effective ceiling of N×cap rather than Envoy's per-cluster total (the two are equivalent for the typical single-host mesh destination). Ferrum enforces it everywhere it owns the backend connection's lifecycle and that lifecycle maps onto an open-connection count:
 
-- **Stream-family (TCP / TCP+TLS / TCP-passthrough)**: each accepted stream dials one dedicated backend socket whose lifetime equals the relay session. Enforced at dial with an RAII counter (`src/proxy/tcp_proxy.rs`, `BackendInflightGuard`).
+- **Stream-family (TCP / TCP+TLS / TCP-passthrough)**: each accepted stream dials one dedicated backend socket whose lifetime equals the relay session. Enforced at dial with an RAII counter on the shared `BackendConnectionLimiter` (`src/backend_conn_limit.rs`), the same primitive the WebSocket path uses, held on `TcpProxyMetrics.backend_inflight` (`src/proxy/tcp_proxy.rs`).
 - **HTTP-family WebSocket (H1/H2/H3)**: a proxied WebSocket opens one dedicated, non-pooled backend TCP/TLS connection whose lifetime equals the session. Enforced at the backend dial with an RAII counter on the shared `ProxyState.backend_conn_limit` (`src/backend_conn_limit.rs`), acquired in the WebSocket connect loop (so a failed/rotated connect attempt frees its slot before retry) and held for the session. Over the cap, the upgrade is rejected with `503` before dialing.
 
 The **pooled, multiplexed HTTP-family transports do not enforce it**, by design, because their backend connection lifecycle is not observable as an open-connection count on the request path:

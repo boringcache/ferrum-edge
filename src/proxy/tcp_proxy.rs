@@ -18,6 +18,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
+use crate::backend_conn_limit::{
+    BackendConnectionGuard, BackendConnectionLimitExceeded, BackendConnectionLimiter,
+};
 use crate::circuit_breaker::CircuitBreakerCache;
 use crate::tls::TlsPolicy;
 use crate::tls::backend::BackendTlsConfigBuilder;
@@ -594,169 +597,16 @@ pub struct TcpProxyMetrics {
     /// Bytes transferred via splice(2) zero-copy (Linux only, plaintext paths).
     /// When non-zero, indicates splice was used instead of userspace copy.
     pub splice_bytes_transferred: AtomicU64,
-    /// Per-backend-target inflight TCP connection counters used to enforce
-    /// DestinationRule `connectionPool.tcp.maxConnections`. Lazily created on
-    /// first hit per `(host, port)` target. The counters are
-    /// [`crossbeam_utils::CachePadded`] so the read-mostly inflight count
-    /// doesn't share a cache line with the hotter listener-level
-    /// `active_backend_connections` field — at high stream-proxy QPS, false
-    /// sharing turned every cmpxchg into a coherence stall.
-    ///
-    /// Key components cannot contain `|` because hostnames are admission-
-    /// validated and ports are `u16` — see `crate::config::types`
-    /// normalisation rules.
-    pub backend_inflight: BackendInflightCounters,
+    /// Per-backend-target open-connection limiter used to enforce
+    /// DestinationRule `connectionPool.tcp.maxConnections`. Backed by the
+    /// shared lock-free `BackendConnectionLimiter` (`src/backend_conn_limit.rs`),
+    /// the same primitive the HTTP-family WebSocket dispatch path uses, so the
+    /// stream-family and WebSocket paths can never drift apart. Counters are
+    /// lazily created per `(host, port)` target and `CachePadded` so the
+    /// read-mostly inflight count doesn't false-share with the hotter
+    /// listener-level `active_backend_connections` field.
+    pub backend_inflight: BackendConnectionLimiter,
 }
-
-/// Lazy per-target inflight counter map. Wrapped in its own struct so we can
-/// implement `Default` (DashMap doesn't derive it for us with custom shard
-/// sizing) and so future callers (HTTP-family follow-on) can extend the API
-/// without touching every `TcpProxyMetrics` initialiser.
-#[derive(Clone)]
-pub struct BackendInflightCounters {
-    inner: Arc<dashmap::DashMap<BackendInflightKey, Arc<crossbeam_utils::CachePadded<AtomicU64>>>>,
-}
-
-/// `(host, port)` key for per-backend-target inflight counters. Owned host
-/// `String` so the key survives across DNS-cache-refreshed connect attempts
-/// and the host doesn't have to be reborrowed from the proxy struct on every
-/// connect.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct BackendInflightKey {
-    host: String,
-    port: u16,
-}
-
-impl Default for BackendInflightCounters {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl BackendInflightCounters {
-    pub fn new() -> Self {
-        // Conservative cardinality: a single TCP proxy maps to one upstream
-        // group, typically 1–10 backend targets. We still go through
-        // `pool_shard_amount` for consistency with the rest of the hot-path
-        // map sizing — a 0 override means "auto" (`max(64, num_cpus * 16)`).
-        let shards = crate::util::sharding::pool_shard_amount(0);
-        Self {
-            inner: Arc::new(dashmap::DashMap::with_shard_amount(shards)),
-        }
-    }
-
-    /// Look up or insert the counter for the given target, returning a cheap
-    /// `Arc` handle so the guard can hold the same counter even if the
-    /// DashMap entry is concurrently evicted later (cleanup is currently a
-    /// non-feature — counters stick around for the listener's lifetime — so
-    /// this is forward-compatible).
-    fn counter_for(&self, host: &str, port: u16) -> Arc<crossbeam_utils::CachePadded<AtomicU64>> {
-        // Two-phase: cheap read first, fall back to entry-API only when the
-        // key is missing. Hot path is always cache-hit because steady-state
-        // traffic reuses the same target set.
-        if let Some(existing) = self.inner.get(&BackendInflightKey {
-            host: host.to_string(),
-            port,
-        }) {
-            return existing.clone();
-        }
-        let key = BackendInflightKey {
-            host: host.to_string(),
-            port,
-        };
-        self.inner
-            .entry(key)
-            .or_insert_with(|| Arc::new(crossbeam_utils::CachePadded::new(AtomicU64::new(0))))
-            .clone()
-    }
-
-    /// Read the current inflight count for a target. Test- and metrics-only
-    /// access — the production hot path uses `counter_for` directly.
-    #[allow(dead_code)]
-    pub fn inflight(&self, host: &str, port: u16) -> u64 {
-        self.inner
-            .get(&BackendInflightKey {
-                host: host.to_string(),
-                port,
-            })
-            .map(|c| c.load(Ordering::Relaxed))
-            .unwrap_or(0)
-    }
-}
-
-/// RAII guard that increments a per-target inflight counter on construction
-/// and decrements on drop. Held alongside the per-listener
-/// `TcpBackendSessionGuard` so both the global and per-target totals stay in
-/// sync across all relay exits (graceful close, idle timeout, error).
-#[derive(Debug)]
-struct BackendInflightGuard {
-    counter: Arc<crossbeam_utils::CachePadded<AtomicU64>>,
-}
-
-impl BackendInflightGuard {
-    /// Acquire a slot, returning `Ok(guard)` if under the cap or `Err` when
-    /// the cap is already reached. The `cap` is `Option<u32>` so callers
-    /// pass `None` for "no cap configured" (the hot path then skips the
-    /// counter entirely and avoids the inflight DashMap lookup).
-    fn try_acquire(
-        counters: &BackendInflightCounters,
-        host: &str,
-        port: u16,
-        cap: u32,
-    ) -> Result<Self, BackendInflightAcquireError> {
-        let counter = counters.counter_for(host, port);
-        let cap_u64 = u64::from(cap);
-        loop {
-            let current = counter.load(Ordering::Relaxed);
-            if current >= cap_u64 {
-                return Err(BackendInflightAcquireError {
-                    current,
-                    cap: cap_u64,
-                });
-            }
-            // Use compare-exchange-weak in a CAS loop so two concurrent
-            // accepting threads can never both squeak past `cap - 1`. A
-            // `fetch_add + check + rollback` race-free shape is harder to
-            // read and gives the same throughput on uncontended paths.
-            match counter.compare_exchange_weak(
-                current,
-                current + 1,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return Ok(Self { counter }),
-                Err(_) => continue,
-            }
-        }
-    }
-}
-
-impl Drop for BackendInflightGuard {
-    fn drop(&mut self) {
-        // `saturating_sub` would mask a counter underflow bug — use the
-        // straight `fetch_sub` and rely on the test suite to catch any
-        // missing-guard regression.
-        self.counter.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct BackendInflightAcquireError {
-    current: u64,
-    cap: u64,
-}
-
-impl std::fmt::Display for BackendInflightAcquireError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "backend max_connections reached: {} inflight (cap {})",
-            self.current, self.cap
-        )
-    }
-}
-
-impl std::error::Error for BackendInflightAcquireError {}
 
 struct TcpBackendSessionGuard<'a> {
     metrics: &'a TcpProxyMetrics,
@@ -2785,12 +2635,6 @@ fn try_next_target(
     Some((next.host.clone(), next.port))
 }
 
-/// Try to acquire a per-target inflight slot for DR
-/// `connectionPool.tcp.maxConnections`. Returns:
-///   * `Ok(None)` when no cap is configured (hot path: zero overhead).
-///   * `Ok(Some(guard))` when a slot was acquired. The guard's `Drop` impl
-///     decrements the counter.
-///   * `Err(BackendInflightAcquireError)` when the cap is already reached.
 fn resolve_port_override(
     params: &TcpConnParams,
     port: u16,
@@ -2801,18 +2645,22 @@ fn resolve_port_override(
         .and_then(|m| m.get(&port))
 }
 
+/// Try to acquire a per-target open-connection slot for DR
+/// `connectionPool.tcp.maxConnections`, delegating to the shared
+/// `BackendConnectionLimiter`. Returns:
+///   * `Ok(None)` when no cap is configured (hot path: zero overhead, no
+///     `DashMap` touch).
+///   * `Ok(Some(guard))` when a slot was acquired. The guard's `Drop` impl
+///     decrements the counter.
+///   * `Err(BackendConnectionLimitExceeded)` when the cap is already reached.
 fn acquire_backend_inflight_slot(
     port_override: Option<&crate::config::types::ResolvedPortOverride>,
     metrics: &TcpProxyMetrics,
     host: &str,
     port: u16,
-) -> Result<Option<BackendInflightGuard>, BackendInflightAcquireError> {
-    let Some(cap) = port_override.and_then(|override_config| override_config.max_connections)
-    else {
-        return Ok(None);
-    };
-    let guard = BackendInflightGuard::try_acquire(&metrics.backend_inflight, host, port, cap)?;
-    Ok(Some(guard))
+) -> Result<Option<BackendConnectionGuard>, BackendConnectionLimitExceeded> {
+    let cap = port_override.and_then(|override_config| override_config.max_connections);
+    metrics.backend_inflight.try_acquire(host, port, cap)
 }
 
 /// Apply DestinationRule `connectionPool.tcp.tcpKeepalive` on a freshly
@@ -5854,108 +5702,5 @@ mod cause_direction_tests {
             pre_copy_disconnect_direction(&e, &ErrorClass::RequestError),
             Direction::BackendToClient
         );
-    }
-}
-
-#[cfg(test)]
-mod backend_inflight_tests {
-    //! Unit tests for the per-backend-target inflight counter used by
-    //! DestinationRule `connectionPool.tcp.maxConnections` enforcement.
-
-    use super::{BackendInflightCounters, BackendInflightGuard};
-    use std::sync::Arc;
-    use std::thread;
-
-    #[test]
-    fn guard_increments_and_decrements_counter() {
-        let counters = BackendInflightCounters::new();
-        assert_eq!(counters.inflight("backend", 8080), 0);
-        {
-            let _guard =
-                BackendInflightGuard::try_acquire(&counters, "backend", 8080, 5).expect("acquire");
-            assert_eq!(counters.inflight("backend", 8080), 1);
-        }
-        assert_eq!(counters.inflight("backend", 8080), 0, "drop must decrement");
-    }
-
-    #[test]
-    fn guards_for_different_targets_do_not_share_a_counter() {
-        let counters = BackendInflightCounters::new();
-        let _g1 =
-            BackendInflightGuard::try_acquire(&counters, "backend-a", 80, 2).expect("acquire a");
-        let _g2 =
-            BackendInflightGuard::try_acquire(&counters, "backend-b", 80, 2).expect("acquire b");
-        assert_eq!(counters.inflight("backend-a", 80), 1);
-        assert_eq!(counters.inflight("backend-b", 80), 1);
-    }
-
-    #[test]
-    fn cap_is_enforced_and_release_lets_next_acquire_succeed() {
-        let counters = BackendInflightCounters::new();
-        let g1 = BackendInflightGuard::try_acquire(&counters, "h", 7777, 1).expect("first slot");
-        let err = BackendInflightGuard::try_acquire(&counters, "h", 7777, 1).expect_err("cap hit");
-        // The displayed error includes the current count and cap so logs
-        // surface the right context. Don't byte-match the wording — just
-        // sanity-check the cap value is in there.
-        let msg = err.to_string();
-        assert!(msg.contains("cap 1"), "unexpected error wording: {msg}");
-        drop(g1);
-        // Re-acquire works once the slot is released.
-        let _g2 = BackendInflightGuard::try_acquire(&counters, "h", 7777, 1)
-            .expect("re-acquire after release");
-        assert_eq!(counters.inflight("h", 7777), 1);
-    }
-
-    #[test]
-    fn concurrent_acquire_release_never_goes_negative_or_exceeds_cap() {
-        let counters = Arc::new(BackendInflightCounters::new());
-        let cap: u32 = 32;
-        let threads = 8usize;
-        let ops_per_thread = 5_000usize;
-
-        let mut handles = Vec::with_capacity(threads);
-        for _ in 0..threads {
-            let counters = Arc::clone(&counters);
-            handles.push(thread::spawn(move || {
-                let mut acquired_at_least_once = false;
-                for _ in 0..ops_per_thread {
-                    if let Ok(guard) = BackendInflightGuard::try_acquire(&counters, "h", 9090, cap)
-                    {
-                        acquired_at_least_once = true;
-                        // Hold the slot briefly so the inflight count
-                        // exercises the cap boundary across threads.
-                        std::hint::spin_loop();
-                        drop(guard);
-                    }
-                }
-                acquired_at_least_once
-            }));
-        }
-        let mut at_least_one_success = false;
-        for h in handles {
-            at_least_one_success |= h.join().expect("thread join");
-        }
-        assert!(
-            at_least_one_success,
-            "at least one thread should have acquired the slot during the stress run"
-        );
-        let final_inflight = counters.inflight("h", 9090);
-        assert_eq!(
-            final_inflight, 0,
-            "after every guard is dropped the counter must be exactly zero \
-             (was {final_inflight}); negative values would have wrapped to u64::MAX"
-        );
-    }
-
-    #[test]
-    fn cap_zero_rejects_everything() {
-        // `max_connections == 0` is rejected at translate time, but the
-        // guard helper must still behave sanely if a caller ever passes
-        // `0` through (defence-in-depth).
-        let counters = BackendInflightCounters::new();
-        let err =
-            BackendInflightGuard::try_acquire(&counters, "h", 1, 0).expect_err("cap 0 rejects");
-        assert!(err.to_string().contains("cap 0"));
-        assert_eq!(counters.inflight("h", 1), 0);
     }
 }

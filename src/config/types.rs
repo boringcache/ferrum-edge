@@ -275,7 +275,11 @@ pub struct UpstreamPortOverride {
     /// stream-family (TCP / TCP+TLS) backend dispatch and by the HTTP-family
     /// **WebSocket** dispatch path (H1/H2 and H3), each of which opens one
     /// dedicated backend connection per session/relay whose lifetime an RAII
-    /// guard can bound — matching Envoy `maxConnections` semantics.
+    /// guard can bound — matching Envoy `maxConnections` semantics. The cap is
+    /// keyed per resolved `(host, port)` endpoint, not per logical cluster, so
+    /// an upstream with N endpoint hosts on one port has an effective ceiling
+    /// of N×cap (equivalent to Envoy's per-cluster total for a single-host
+    /// destination).
     ///
     /// The pooled, multiplexed HTTP-family transports (reqwest H1/H2, direct
     /// H2, gRPC, HTTP/3, HBONE) do **not** enforce this field: their backend

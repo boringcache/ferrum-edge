@@ -14,7 +14,11 @@
 //! held for the session duration bounds concurrent *open* connections per
 //! destination target — the same semantics Envoy gives `maxConnections`,
 //! and the same RAII pattern the raw-TCP path uses in
-//! `src/proxy/tcp_proxy.rs` (`BackendInflightGuard`).
+//! `src/proxy/tcp_proxy.rs` (now sharing this same primitive). Keying is per
+//! resolved `(host, port)` endpoint, not per logical cluster — a destination
+//! with N endpoint hosts sharing one port has an effective ceiling of N×cap,
+//! which diverges from Envoy's per-cluster total. For the typical single-host
+//! mesh destination the two are equivalent.
 //!
 //! The pooled, multiplexed HTTP-family transports (reqwest H1/H2, direct
 //! H2, gRPC, HTTP/3, HBONE) do NOT consume this limiter. Their backend
