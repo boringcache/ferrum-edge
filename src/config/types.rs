@@ -270,10 +270,24 @@ pub struct UpstreamPortOverride {
     /// the upstream-level `Upstream.locality_lb_setting`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub locality_lb_setting: Option<UpstreamLocalityLbSetting>,
-    /// Per-port cap on inflight backend TCP connections, mapped from
-    /// DestinationRule `connectionPool.tcp.maxConnections`. Currently enforced
-    /// only by stream-family (TCP / TCP+TLS) backend dispatch; HTTP-family
-    /// dispatch ignores the field (tracked as a follow-on PR).
+    /// Per-port cap on concurrent open backend connections, mapped from
+    /// DestinationRule `connectionPool.tcp.maxConnections`. Enforced by
+    /// stream-family (TCP / TCP+TLS) backend dispatch and by the HTTP-family
+    /// **WebSocket** dispatch path (H1/H2 and H3), each of which opens one
+    /// dedicated backend connection per session/relay whose lifetime an RAII
+    /// guard can bound — matching Envoy `maxConnections` semantics. The cap is
+    /// keyed per resolved `(host, port)` endpoint, not per logical cluster, so
+    /// an upstream with N endpoint hosts on one port has an effective ceiling
+    /// of N×cap (equivalent to Envoy's per-cluster total for a single-host
+    /// destination).
+    ///
+    /// The pooled, multiplexed HTTP-family transports (reqwest H1/H2, direct
+    /// H2, gRPC, HTTP/3, HBONE) do **not** enforce this field: their backend
+    /// connections are created and reused inside connection pools, so "open a
+    /// new backend connection" is decoupled from the request hot path by pool
+    /// reuse, sharding, and idle eviction, and a request-keyed counter would
+    /// measure request concurrency rather than open connections. See
+    /// `docs/mesh.md` and `src/backend_conn_limit.rs` for the rationale.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_connections: Option<u32>,
     /// Per-port TCP keepalive overrides, mapped from DestinationRule

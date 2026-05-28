@@ -72,7 +72,7 @@ Plugin rejects for `application/grpc` must become trailers-only gRPC errors.
 - Empty `WorkloadSelector` intentionally matches any workload.
 - Node-waypoint topology is the exception: construction filter is skipped with `per_pod_policy_scoping: true`.
 - Node-waypoint request path uses `ctx.node_waypoint_policy_scope` and `PolicyScopeCache::policy_applies`.
-- Missing node-waypoint scope retains mesh-wide policies only and sets `ctx.metadata["mesh_authz.scope_missing"] = "true"`.
+- Missing node-waypoint scope retains mesh-wide policies only and sets `ctx.metadata["mesh_authz.scope_missing"] = "true"`. On stream (TCP/UDP) connections, a missing scope additionally **fails closed** (Reject 403, `mesh_authz.deny_policy = scope_missing`) when any namespace/selector-scoped policy is configured; the HTTP path stays fail-open to mesh-wide.
 - Slice apply stages workload SPIFFE scope index before validation and publishes only after `proxy_state.update_config` accepts the plugin cache.
 - Istio empty-rule semantics apply here too: ALLOW with no rules is allow-nothing; DENY/AUDIT with no rules are no-ops.
 

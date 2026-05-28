@@ -64,6 +64,8 @@ Full operator docs live in `docs/mesh.md`. Keep this file to implementation inva
 ## HBONE Identity Boundary
 
 - HBONE is HTTP/2 CONNECT over mTLS on port 15008.
+- `is_hbone_connect()` only detects the wire shape (H2 CONNECT + optional `x-ferrum-mesh-protocol`/`x-istio-protocol: hbone` marker); it does not imply authentication and is only safe for non-relay decisions (path normalization, metadata tagging, body-buffering branch).
+- Relaying a CONNECT as an HBONE tunnel requires an authenticated, trust-domain-verified peer (`ctx.peer_spiffe_id.is_some()`, i.e. `is_authenticated_hbone_connect()`). `handle_hbone_request` rejects a peerless CONNECT — bare or marker-bearing — with `403 Forbidden` before dialing/circuit-breaking any backend, stamping `mesh_authz.deny_policy=hbone_unauthenticated_peer`. The explicit marker path is not a bypass. This is separate from (and additive to) TLS-time trust-bundle peer verification.
 - Baggage `source.principal` rewrites the authz principal only when the authenticated peer is in `mesh_authz.trusted_hbone_assertors` and the baggage trust domain matches the peer cert or `FERRUM_MESH_TRUST_DOMAIN_ALIASES`.
 - Untrusted assertors keep their own peer-cert identity even when baggage is present.
 - Dropped baggage must surface in transaction metadata as `mesh_authz.ignored_baggage.untrusted_assertor=true`; denied requests contribute `mesh_authz.deny_policy=untrusted_assertor`.
@@ -100,8 +102,9 @@ Full operator docs live in `docs/mesh.md`. Keep this file to implementation inva
 - `connectionPool.http.maxRequestsPerConnection`, `idleTimeout`, and `http2MaxRequests` land on `http_max_requests_per_connection`, `http_idle_timeout_ms`, and `h2_max_concurrent_streams`.
 - Dispatch projects port overrides through `resolve_effective_proxy_for_target()` onto the owned `Proxy` clone; direct H2 and gRPC builders consume H2 caps through `max_concurrent_streams` and `initial_max_send_streams`.
 - `http_max_requests_per_connection` is wire-projected but currently inert at runtime because hyper lacks a close-after-N knob.
-- `connectionPool.tcp.maxConnections` and `tcpKeepalive` land on `max_connections` and `tcp_keepalive`; TCP-family dispatch enforces them today.
-- `maxConnections` exhaustion returns `StreamSetupKind::BackendMaxConnectionsExceeded`; keepalive setsockopt failures warn and continue.
+- `connectionPool.tcp.maxConnections` and `tcpKeepalive` land on `max_connections` and `tcp_keepalive`. `maxConnections` is enforced by stream-family (TCP/TCP+TLS) dispatch AND by HTTP-family WebSocket dispatch (H1/H2 in `proxy/mod.rs`, H3 in `http3/websocket.rs`): a WebSocket session opens one dedicated backend connection, so an RAII `backend_conn_limit::BackendConnectionGuard` on `ProxyState.backend_conn_limit` (keyed `(host, port)`, acquired in the WS connect loop, held for the session) bounds concurrent open connections and rejects over-cap upgrades with 503. `tcpKeepalive` stays stream-family only.
+- `maxConnections` is NOT enforced for the pooled multiplexed HTTP transports (reqwest H1/H2, direct H2, gRPC, H3, HBONE): their connection lifecycle is pool-internal (reuse/sharding/idle eviction), so a request-keyed counter would measure request concurrency (`http2MaxRequests` territory, already wired via `h2_max_concurrent_streams`) not open connections, and would risk leaking a count through the shared `GenericPool` evict/replace paths. Do not add such a counter; use `h2_max_concurrent_streams` for H2/gRPC concurrency. See `docs/mesh.md` "DestinationRule `maxConnections` enforcement scope" and `src/backend_conn_limit.rs`.
+- `maxConnections` exhaustion returns `StreamSetupKind::BackendMaxConnectionsExceeded` on stream-family and a 503 (`rejection_phase=backend_max_connections`) on WebSocket; keepalive setsockopt failures warn and continue.
 - TCP/UDP/DTLS stream proxies enforce only connect timeout, max connections, and tcp keepalive per port; they use upstream-level LB/passive policy.
 - Phantom DestinationRule ports are skipped with a warning.
 - Admin API POST/PUT of `Upstream.port_overrides` is rejected; DestinationRule is canonical.

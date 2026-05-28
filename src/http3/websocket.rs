@@ -424,7 +424,60 @@ pub(crate) async fn handle_h3_websocket(
     let mut current_cb_target_key = cb_target_key;
     let mut ws_attempt = 0u32;
 
+    // The backend WebSocket connection acquired below is held for the full
+    // session lifetime (the inline relay below, until this function returns),
+    // so this guard's slot releases exactly when the dedicated backend
+    // connection closes. Captured out of the loop alongside the handshake.
+    let backend_conn_guard;
     let backend_handshake = loop {
+        // Enforce DestinationRule `connectionPool.tcp.maxConnections` for this
+        // destination port BEFORE dialing — same semantics and ordering as the
+        // H1/H2 path in `src/proxy/mod.rs`. No cap => `Ok(None)`, a single
+        // check with no map touch.
+        let (ws_dial_host, ws_dial_port) = match &current_target {
+            Some(target) => (target.host.as_str(), target.port),
+            None => (proxy.backend_host.as_str(), proxy.backend_port),
+        };
+        let ws_max_connections =
+            crate::proxy::resolve_backend_max_connections(&proxy, ws_dial_port);
+        let conn_slot = match state.backend_conn_limit.try_acquire(
+            ws_dial_host,
+            ws_dial_port,
+            ws_max_connections,
+        ) {
+            Ok(slot) => slot,
+            Err(limit) => {
+                warn!(
+                    proxy_id = %proxy.id,
+                    client_ip = %ctx.client_ip,
+                    backend_host = %ws_dial_host,
+                    backend_port = ws_dial_port,
+                    open_connections = limit.current,
+                    max_connections = limit.cap,
+                    "Rejecting H3 WebSocket upgrade: DestinationRule maxConnections reached for backend"
+                );
+                crate::proxy::log_rejected_request_with_path(
+                    &plugins,
+                    &ctx,
+                    503,
+                    start_time,
+                    "backend_max_connections",
+                    plugin_execution_ns,
+                    Some(&original_request_path),
+                )
+                .await;
+                crate::proxy::record_request(&state, 503);
+                send_h3_error_body(
+                    &mut stream,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    r#"{"error":"Backend connection limit exceeded"}"#,
+                )
+                .await;
+                drop(ws_connection_permit);
+                return Ok(());
+            }
+        };
+
         match crate::proxy::connect_websocket_backend(
             &current_backend_url,
             &proxy,
@@ -437,8 +490,15 @@ pub(crate) async fn handle_h3_websocket(
         )
         .await
         {
-            Ok(handshake) => break handshake,
+            Ok(handshake) => {
+                backend_conn_guard = conn_slot;
+                break handshake;
+            }
             Err(e) => {
+                // Connect/handshake failed: free this destination's slot before
+                // a retry so a rotated target acquires its own slot and a
+                // failed attempt never leaks a count.
+                drop(conn_slot);
                 // `connect_websocket_backend` covers more than TCP+TLS setup:
                 // it ALSO sends the WebSocket upgrade request and reads the
                 // backend's response. Use the same unified
@@ -849,9 +909,13 @@ pub(crate) async fn handle_h3_websocket(
 
     // Drop guards explicitly so their `Drop` impl runs before the
     // info!() below — keeps the "session ended" log adjacent to the
-    // accounting release in interleaved tracing output.
+    // accounting release in interleaved tracing output. The backend
+    // connection slot (DestinationRule `maxConnections`) releases here too,
+    // exactly when the dedicated backend connection closes — `None` when no
+    // cap is configured for the destination port.
     drop(ws_session_guard);
     drop(ws_lb_guard);
+    drop(backend_conn_guard);
 
     info!(
         proxy_id = %proxy.id,

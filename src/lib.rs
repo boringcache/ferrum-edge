@@ -10,6 +10,7 @@ pub const FERRUM_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub mod adaptive_buffer;
 pub mod admin;
+pub mod backend_conn_limit;
 pub mod capture;
 pub mod circuit_breaker;
 pub mod cli;
@@ -86,6 +87,18 @@ pub mod _test_support {
     // ── proxy/tcp_proxy ──────────────────────────────────────────────────────
     pub fn classify_stream_error(error: &anyhow::Error) -> crate::retry::ErrorClass {
         crate::proxy::tcp_proxy::classify_stream_error(error)
+    }
+
+    /// Resolve the DestinationRule `connectionPool.tcp.maxConnections` cap a
+    /// backend dial to `dispatch_port` would enforce. Exposes the
+    /// `pub(crate)` hot-path helper the WebSocket dispatch path reads so
+    /// integration tests can assert the DR → `dispatch_port_overrides`
+    /// projection that feeds `ProxyState.backend_conn_limit`.
+    pub fn resolve_backend_max_connections(
+        proxy: &crate::config::types::Proxy,
+        dispatch_port: u16,
+    ) -> Option<u32> {
+        crate::proxy::resolve_backend_max_connections(proxy, dispatch_port)
     }
 
     pub use crate::proxy::tcp_proxy::{StreamCopyResult, StreamIoSide};

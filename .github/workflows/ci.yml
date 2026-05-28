@@ -221,6 +221,7 @@ jobs:
               integration::mesh_destination_rule_tls_tests
               integration::mesh_destination_rule_locality_lb_tests
               integration::mesh_destination_rule_port_policy_tests
+              integration::mesh_destination_rule_max_connections_tests
               integration::mesh_dr_service_entry_e2e_tests
               integration::mesh_sidecar_e2e_tests
           - shard: mesh-platform
@@ -242,6 +243,7 @@ jobs:
               integration::mesh_k8s_pod_discovery_tests
               integration::mesh_hbone_tests
               integration::cni_tests
+              integration::injector_admission_tests
           - shard: protocols-data-plane
             # Protocol / TLS / connection-pool / CP-DP gRPC / DB poll /
             # graceful-shutdown / SVID identity. The CP-DP file alone has

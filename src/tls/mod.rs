@@ -750,12 +750,16 @@ pub enum MeshClientAuth {
     Required,
     /// Request a client certificate but accept TLS connections without one
     /// (Permissive). When the client presents a cert, it is verified against
-    /// the client CA bundle.
+    /// the gateway SVID trust-domain verifier when present, otherwise the
+    /// operator client CA bundle. A cert-less peer is still admitted.
     Optional,
     /// Do not request client certificates at all. Selected when
-    /// PeerAuthentication is Permissive but no `FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH`
-    /// is configured — the server still terminates TLS, but never asks the
-    /// client to authenticate.
+    /// PeerAuthentication is Permissive but there is no trust anchor at all —
+    /// neither `FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH` nor gateway SVID
+    /// material. The server still terminates TLS, but never asks the client to
+    /// authenticate, so no peer identity can be verified or recorded. When
+    /// either trust anchor exists, Permissive uses [`MeshClientAuth::Optional`]
+    /// instead so an offered cert is verified and its SPIFFE identity recorded.
     None,
 }
 

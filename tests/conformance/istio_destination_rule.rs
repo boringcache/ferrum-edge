@@ -83,7 +83,7 @@ fn dr_connection_pool_tcp_max_connections() {
         category = CATEGORY,
         feature = "trafficPolicy.connectionPool.tcp.maxConnections",
         status = Status::Supported,
-        notes = "T1-D (PR #897): translated to MeshConnectionPoolTcp.max_connections; enforced by stream-family dispatch.",
+        notes = "T1-D (PR #897): translated to MeshConnectionPoolTcp.max_connections; enforced by stream-family (TCP/TCP+TLS) dispatch and by HTTP-family WebSocket dispatch (one dedicated backend connection per session). Pooled multiplexed HTTP transports (reqwest H1/H2, direct H2, gRPC, H3, HBONE) do not enforce it — see docs/mesh.md.",
     );
     let dr = translated(json!({
         "host": "echo.default.svc.cluster.local",
