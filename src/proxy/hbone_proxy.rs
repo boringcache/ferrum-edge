@@ -618,11 +618,6 @@ pub(super) async fn handle_hbone_request(
                     client_disconnected,
                     Some(error_class),
                 );
-                // Release the LB connection guard before the (potentially slow)
-                // log/mirror await so the upstream's active-connection counter
-                // reflects the closed tunnel rather than skewing
-                // least-connections target selection during log hooks.
-                drop(_lb_guard);
                 // log_with_mirror runs unconditionally so runtime transaction
                 // metrics are always recorded regardless of whether logging
                 // plugins are configured (empty-plugin loop is a no-op).
