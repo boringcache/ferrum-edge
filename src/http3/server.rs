@@ -2094,6 +2094,27 @@ async fn handle_h3_request(
                         r#"{"error":"Request body exceeds maximum size"}"#,
                     )
                     .await?;
+                    // Balance the record_connection_start above. This early
+                    // return was the only exit from this branch that did not
+                    // flow through record_backend_outcome, so the
+                    // least-connections gauge leaked one count for the selected
+                    // target on every oversized streaming upload. An oversized
+                    // client body is client-caused, so skip the circuit breaker
+                    // (do not poison backend health).
+                    crate::proxy::backend_dispatch::record_backend_outcome(
+                        &state,
+                        &proxy,
+                        &epoch.load_balancer,
+                        upstream_balancer.as_ref(),
+                        upstream_target.as_deref(),
+                        cb_target_key.as_deref(),
+                        413,
+                        false,
+                        Some(crate::retry::ErrorClass::ClientDisconnect),
+                        cb_is_half_open_probe,
+                        true,
+                        backend_start.elapsed(),
+                    );
                     return Ok(());
                 }
                 error!("Backend request failed (HTTP/3 streaming body): {}", e);

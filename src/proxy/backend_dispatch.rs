@@ -453,8 +453,83 @@ pub(crate) fn record_backend_outcome(
     skip_circuit_breaker_record: bool,
     backend_elapsed: Duration,
 ) {
-    // End connection tracking for least-connections
-    if let (Some(target), Some(balancer)) = (upstream_target, selected_balancer) {
+    record_backend_outcome_inner(
+        state,
+        proxy,
+        lb_snapshot,
+        selected_balancer,
+        upstream_target,
+        final_cb_target_key,
+        response_status,
+        connection_error,
+        error_class,
+        is_half_open_probe,
+        skip_circuit_breaker_record,
+        backend_elapsed,
+        true,
+    );
+}
+
+/// Like [`record_backend_outcome`] but records everything EXCEPT ending
+/// least-connections connection tracking.
+///
+/// Use on dispatch paths where a `LoadBalancerConnectionGuard` already owns the
+/// connection-end (so it is correctly deferred until a streaming response body
+/// completes), or where the path never issued a matching
+/// `record_connection_start`. This prevents the double-decrement that occurs
+/// when both a guard and this function end the same connection — which silently
+/// undercounts active connections and biases least-connections balancing.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_backend_outcome_no_conn_end(
+    state: &ProxyState,
+    proxy: &Proxy,
+    lb_snapshot: &LoadBalancerCacheInner,
+    selected_balancer: Option<&Arc<LoadBalancer>>,
+    upstream_target: Option<&UpstreamTarget>,
+    final_cb_target_key: Option<&str>,
+    response_status: u16,
+    connection_error: bool,
+    error_class: Option<ErrorClass>,
+    is_half_open_probe: bool,
+    skip_circuit_breaker_record: bool,
+    backend_elapsed: Duration,
+) {
+    record_backend_outcome_inner(
+        state,
+        proxy,
+        lb_snapshot,
+        selected_balancer,
+        upstream_target,
+        final_cb_target_key,
+        response_status,
+        connection_error,
+        error_class,
+        is_half_open_probe,
+        skip_circuit_breaker_record,
+        backend_elapsed,
+        false,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_backend_outcome_inner(
+    state: &ProxyState,
+    proxy: &Proxy,
+    lb_snapshot: &LoadBalancerCacheInner,
+    selected_balancer: Option<&Arc<LoadBalancer>>,
+    upstream_target: Option<&UpstreamTarget>,
+    final_cb_target_key: Option<&str>,
+    response_status: u16,
+    connection_error: bool,
+    error_class: Option<ErrorClass>,
+    is_half_open_probe: bool,
+    skip_circuit_breaker_record: bool,
+    backend_elapsed: Duration,
+    end_connection: bool,
+) {
+    // End connection tracking for least-connections. Skipped when a
+    // LoadBalancerConnectionGuard owns the end, or when no start was issued.
+    if end_connection && let (Some(target), Some(balancer)) = (upstream_target, selected_balancer) {
         balancer.record_connection_end(target);
     }
 
@@ -954,6 +1029,109 @@ mod tests {
         assert_eq!(
             selection.target.as_ref().map(|target| target.port),
             Some(9090)
+        );
+    }
+
+    #[tokio::test]
+    async fn record_backend_outcome_no_conn_end_preserves_active_connection_count() {
+        // F06 regression: the HTTP dispatch path holds a
+        // LoadBalancerConnectionGuard (start in ctor, end on drop) AND used to
+        // call record_backend_outcome, which ALSO ended the connection -- so
+        // the least-connections gauge was decremented twice per request.
+        // record_backend_outcome_no_conn_end must record CB/health/latency
+        // WITHOUT ending the connection (the guard owns that); the full
+        // record_backend_outcome must still end it.
+        let mut config: crate::config::types::GatewayConfig =
+            serde_json::from_value(serde_json::json!({
+                "version": "1",
+                "consumers": [],
+                "plugin_configs": [],
+                "proxies": [{
+                    "id": "lc-proxy",
+                    "listen_path": "/",
+                    "backend_scheme": "http",
+                    "backend_host": "unused.local",
+                    "backend_port": 0,
+                    "upstream_id": "lc-upstream"
+                }],
+                "upstreams": [{
+                    "id": "lc-upstream",
+                    "targets": [{"host": "10.0.0.1", "port": 8080}],
+                    "algorithm": "least_connections"
+                }]
+            }))
+            .expect("test config should deserialize");
+        config.normalize_fields();
+        let dns_cache = crate::dns::DnsCache::new(crate::dns::DnsConfig::default());
+        let env_config = crate::config::env_config::EnvConfig::default();
+        let (state, _) = crate::proxy::ProxyState::new(config, dns_cache, env_config, None, None)
+            .expect("test proxy state should build");
+        let epoch = state.request_epoch.load();
+        let proxy = &epoch.config.proxies[0];
+
+        let selection =
+            select_upstream_target(proxy, &state, &epoch, "192.0.2.10", &HashMap::new());
+        let balancer = selection
+            .balancer
+            .clone()
+            .expect("least-connections upstream proxy should resolve a balancer");
+        let target = selection
+            .target
+            .clone()
+            .expect("a target should be selected");
+
+        let active = || {
+            balancer
+                .active_connections
+                .iter()
+                .map(|entry| entry.value().load(std::sync::atomic::Ordering::Relaxed))
+                .sum::<i64>()
+        };
+
+        // The guard's constructor would do this start.
+        balancer.record_connection_start(target.as_ref());
+        assert_eq!(active(), 1, "record_connection_start increments the gauge");
+
+        // no_conn_end must NOT decrement -- the guard owns the end.
+        record_backend_outcome_no_conn_end(
+            &state,
+            proxy,
+            &epoch.load_balancer,
+            Some(&balancer),
+            Some(target.as_ref()),
+            None,
+            200,
+            false,
+            None,
+            false,
+            true,
+            std::time::Duration::ZERO,
+        );
+        assert_eq!(
+            active(),
+            1,
+            "record_backend_outcome_no_conn_end must not end the connection"
+        );
+
+        // The full variant DOES end it (used by the bare-start H3 paths).
+        record_backend_outcome(
+            &state,
+            proxy,
+            &epoch.load_balancer,
+            Some(&balancer),
+            Some(target.as_ref()),
+            None,
+            200,
+            false,
+            None,
+            false,
+            true,
+            std::time::Duration::ZERO,
+        );
+        assert_eq!(
+            active(),
+            0,
+            "record_backend_outcome must end the connection"
         );
     }
 }
