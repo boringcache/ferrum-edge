@@ -800,12 +800,22 @@ impl NodeWaypointIdentityResolver {
         } = snapshot;
         let policy_scopes_by_pod_uid =
             self.build_per_pod_scopes_from_workload_index(&workload_policy_scopes_by_spiffe);
+        // Publish the fail-closed gate (`workload_identities_by_hash`) FIRST.
+        // The three maps are separate `ArcSwap`s, so a lock-free reader during
+        // the (sub-microsecond) install can observe a mix; ordering the gate
+        // first makes that mix fail closed: for a *removed* workload the hash is
+        // already gone before the scopes move, so `resolve_record` rejects it
+        // instead of admitting it against a stale index. (Publishing the gate
+        // last — the previous order — left a window that admitted removed
+        // workloads. For an *added* workload the gate goes live before its
+        // scope, which only yields a brief mesh-wide fallback, never an admit
+        // of something that should be denied.)
+        self.workload_identities_by_hash
+            .store(Arc::new(workload_identities_by_hash));
         self.workload_policy_scopes_by_spiffe
             .store(Arc::new(workload_policy_scopes_by_spiffe));
         self.policy_scopes_by_pod_uid
             .store(Arc::new(policy_scopes_by_pod_uid));
-        self.workload_identities_by_hash
-            .store(Arc::new(workload_identities_by_hash));
     }
 
     pub fn build_per_pod_scopes_from_workloads<'a, I>(

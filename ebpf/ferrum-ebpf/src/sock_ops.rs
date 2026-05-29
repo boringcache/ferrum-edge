@@ -154,10 +154,13 @@ fn handle_sock_ops(ctx: &SockOpsContext) {
             });
         }
         BPF_SOCK_OPS_STATE_CB => {
-            // args[0] = new_state, args[1] = old_state. Apply the
-            // transition table.
-            let new_state = ctx.arg(0);
-            let old_state = ctx.arg(1);
+            // The kernel passes args[0] = old_state, args[1] = new_state
+            // (`tcp_set_state` → `tcp_call_bpf_2arg(sk, STATE_CB, oldstate,
+            // state)`). Reading them in the other order both reverses the
+            // FIN/RST transition metrics AND means the TCP_CLOSE cleanup below
+            // never fires on a real close (it would test old_state).
+            let old_state = ctx.arg(0);
+            let new_state = ctx.arg(1);
             // On terminal close, drop this socket's orig-dst record so a closed
             // connection's cookie does not linger in FERRUM_ORIG_DST4/6 until
             // LRU pressure evicts it. The node-waypoint resolver mirrors these
@@ -170,9 +173,13 @@ fn handle_sock_ops(ctx: &SockOpsContext) {
             emit_state_transition(old_state, new_state);
         }
         BPF_SOCK_OPS_RTT_CB => {
-            // args[0] = SRTT (microseconds) in modern kernels.
-            // args[1] = RTT variance (unused here).
-            let srtt_us = ctx.arg(0) as u64;
+            // The kernel passes args[0] = the latest *measured* RTT sample
+            // (mrtt_us) and args[1] = the updated *smoothed* RTT (`srtt_us >> 3`)
+            // (`tcp_call_bpf_2arg(sk, RTT_CB, mrtt_us, tp->srtt_us >> 3)`). The
+            // userspace metric is the smoothed RTT (`srtt_sample_*`), so emit
+            // args[1]; reading args[0] would feed per-sample RTT into an SRTT
+            // metric and mislead dashboards.
+            let srtt_us = ctx.arg(1) as u64;
             if srtt_us > 0 {
                 emit(SockOpsRecord {
                     event_type: SOCK_OPS_EVENT_RTT_SAMPLE,

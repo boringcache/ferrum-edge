@@ -5037,16 +5037,29 @@ fn start_mesh_slice_apply_task(
                                     current_loaded_at,
                                     candidate_loaded_at,
                                 );
+                                // Publish the node-waypoint resolver snapshot the
+                                // instant the proxy config is accepted — before
+                                // recording the apply result or reloading TLS — so
+                                // the window where the new config is live but the
+                                // resolver still resolves removed workloads against
+                                // the old identity index is the minimum possible.
+                                // (Config and resolver are independent ArcSwaps, so
+                                // they cannot swap atomically; staging-until-accept
+                                // keeps a rejected slice side-effect-free, which
+                                // precludes pre-swapping the resolver before the
+                                // config. install_policy_scope_snapshot publishes
+                                // the fail-closed gate first, so within that window
+                                // a removed workload fails closed.)
+                                if accepted && let Some((resolver, snapshot)) = staged_policy_scopes
+                                {
+                                    resolver.install_policy_scope_snapshot(snapshot);
+                                }
                                 record_mesh_slice_apply_result(
                                     &mesh_state,
                                     &mut last_applied_slice,
                                     slice,
                                     accepted,
                                 );
-                                if accepted && let Some((resolver, snapshot)) = staged_policy_scopes
-                                {
-                                    resolver.install_policy_scope_snapshot(snapshot);
-                                }
                                 if accepted && let Some((mtls_mode, plan)) = live_reload {
                                     apply_mesh_inbound_tls_reload(
                                         &proxy_state,
