@@ -10093,6 +10093,18 @@ async fn handle_proxy_request_inner(
                     body
                 };
 
+                // Keep the per-IP concurrent-request guard alive for the full
+                // streaming-body lifetime, matching the HTTP streaming path
+                // (body.with_per_ip_request_guard). per_ip_guard is a
+                // function-scope local that would otherwise drop when this
+                // handler returns at header flush — releasing the per-IP slot
+                // while the gRPC body and trailers are still streaming, which
+                // lets a client evade the per-IP concurrency limit on
+                // long-lived streaming RPCs.
+                if let Some(guard) = per_ip_guard {
+                    body = body.with_per_ip_request_guard(guard);
+                }
+
                 // Detach the deferred logger before handing the body to
                 // `resp_builder.body(...)`. If the build fails (e.g. plugin/
                 // header mutations left the builder in an error state), the
