@@ -795,40 +795,6 @@ fn parse_pod_include_outbound_ports(
     }
 }
 
-/// Read the cgroup id (kernel inode number) of a single cgroup directory.
-///
-/// Note the connect hooks key per-cgroup maps by `bpf_get_current_cgroup_id()`,
-/// which is the *container leaf* cgroup the calling task lives in — a child of
-/// the pod cgroup on every Kubernetes cgroup driver. So this returns a key the
-/// hook matches only when the connecting task runs directly in `cgroup_path`.
-/// The workload-identity map enrolls the whole pod cgroup subtree to cover the
-/// container leaves (see `apply_workload_identity` /
-/// `cgroup::collect_cgroup_tree_inodes`); `FERRUM_INCLUDE_PORTS` still keys by
-/// the pod inode alone and shares this leaf-vs-pod limitation (it fails open, so
-/// per-pod port narrowing simply does not engage rather than failing closed).
-///
-/// Returns `None` on stat error so the node-agent can warn and continue without
-/// aborting enrollment — a graceful degradation, not a fatal condition.
-#[cfg(unix)]
-fn read_cgroup_id_for_pod(cgroup_path: &str) -> Option<u64> {
-    use std::os::unix::fs::MetadataExt;
-    match std::fs::metadata(cgroup_path) {
-        Ok(meta) => Some(meta.ino()),
-        Err(e) => {
-            debug!(cgroup_path, error = %e, "Failed to stat cgroup for includeOutboundPorts; per-pod narrowing skipped");
-            None
-        }
-    }
-}
-
-#[cfg(not(unix))]
-fn read_cgroup_id_for_pod(_cgroup_path: &str) -> Option<u64> {
-    // The node-agent only ships on Linux; this stub keeps non-Unix builds
-    // (developer macOS / Windows for tests) compiling without pulling in
-    // platform-specific deps.
-    None
-}
-
 /// Convert a parsed pod-level [`IncludeOutboundPorts`] into the BPF wire
 /// shape. Emits a `warn!` when the explicit-port list overflows the BPF
 /// map's per-entry cap; the resulting policy still narrows traffic but to
@@ -856,23 +822,30 @@ fn include_outbound_ports_to_policy(
 /// Outcome of writing (or attempting to write) a pod's parsed
 /// `includeOutboundPorts` annotation into the BPF map.
 ///
-/// Carries both the cgroup id the entry is keyed on (so removal can use
-/// it without re-statting the cgroup) and the [`IncludePortsPolicy`]
-/// actually written, so the watcher can diff against this baseline on
-/// the next Modified event and skip BPF map churn when the parsed value
-/// has not changed.
+/// Carries the cgroup ids the entry was written under — the pod cgroup inode
+/// plus every descendant container-cgroup inode (`connect4`/`connect6` look up
+/// `FERRUM_INCLUDE_PORTS` by the *leaf* cgroup, so the policy must live under
+/// the whole subtree, not just the pod inode) — so removal can drop every entry
+/// without re-statting the cgroup tree, and the [`IncludePortsPolicy`] actually
+/// written, so the watcher can diff against this baseline on the next Modified
+/// event and skip BPF map churn when the parsed value has not changed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AppliedIncludePorts {
-    cgroup_id: u64,
+    cgroup_ids: Vec<u64>,
     policy: IncludePortsPolicy,
 }
 
-/// Push the parsed per-pod include-port policy into the BPF map. Returns
-/// the cgroup id and policy we wrote so callers can stash both on
-/// `PodAttachmentState`: the cgroup id is the removal key, the policy is
-/// the diff baseline for mid-life Modified events. Returns `None` when
-/// there's nothing to write (no annotation, malformed annotation, or
-/// cgroup-id stat failed) — none of which should abort enrollment.
+/// Push the parsed per-pod include-port policy into the BPF map. Returns the
+/// cgroup ids and policy we wrote so callers can stash both on
+/// `PodAttachmentState`: the ids are the removal keys, the policy is the diff
+/// baseline for mid-life Modified events. The policy is written under the pod
+/// cgroup inode AND every descendant container-cgroup inode, because the
+/// `connect4`/`connect6` gate keys `FERRUM_INCLUDE_PORTS` by
+/// `bpf_get_current_cgroup_id()` (the container leaf cgroup) — writing only the
+/// pod inode would never match the hook's key and the narrowing would silently
+/// not engage. Returns `None` when there's nothing to write (no annotation,
+/// malformed annotation, no readable cgroup inode, or every write failing) —
+/// none of which should abort enrollment.
 fn apply_include_outbound_ports(
     backend: &mut dyn EbpfBackend,
     pod_uid: &str,
@@ -891,29 +864,48 @@ fn apply_include_outbound_ports(
             return None;
         }
     };
-    let cgroup_id = read_cgroup_id_for_pod(cgroup_path)?;
+    let cgroup_ids = cgroup::collect_cgroup_tree_inodes(std::path::Path::new(cgroup_path));
+    if cgroup_ids.is_empty() {
+        warn!(
+            pod_uid,
+            cgroup_path,
+            "Could not read any cgroup inode for pod; includeOutboundPorts narrowing will not engage"
+        );
+        return None;
+    }
     let policy = include_outbound_ports_to_policy(pod_uid, &include);
-    match backend.update_pod_include_ports(cgroup_id, &policy) {
-        Ok(()) => {
-            debug!(
-                pod_uid,
-                cgroup_id,
-                all_ports = policy.is_all_ports(),
-                port_count = policy.port_count,
-                "Wrote per-pod includeOutboundPorts entry to BPF map"
-            );
-            Some(AppliedIncludePorts { cgroup_id, policy })
-        }
-        Err(e) => {
-            warn!(
-                pod_uid,
-                cgroup_id,
-                error = %e,
-                "Failed to update FERRUM_INCLUDE_PORTS for pod; capture will not narrow"
-            );
-            None
+    let mut written = Vec::with_capacity(cgroup_ids.len());
+    for cgroup_id in cgroup_ids {
+        match backend.update_pod_include_ports(cgroup_id, &policy) {
+            Ok(()) => written.push(cgroup_id),
+            Err(e) => {
+                warn!(
+                    pod_uid,
+                    cgroup_id,
+                    error = %e,
+                    "Failed to write FERRUM_INCLUDE_PORTS for a pod cgroup inode; that cgroup's capture will not narrow"
+                );
+            }
         }
     }
+    if written.is_empty() {
+        warn!(
+            pod_uid,
+            "No FERRUM_INCLUDE_PORTS entries written for pod; capture will not narrow"
+        );
+        return None;
+    }
+    debug!(
+        pod_uid,
+        cgroup_ids = written.len(),
+        all_ports = policy.is_all_ports(),
+        port_count = policy.port_count,
+        "Wrote per-pod includeOutboundPorts entries across pod cgroup tree"
+    );
+    Some(AppliedIncludePorts {
+        cgroup_ids: written,
+        policy,
+    })
 }
 
 /// Build the source workload identity for a pod and write it into the
@@ -1185,7 +1177,7 @@ pub fn handle_pod_added(
         cgroup_path: cgroup_path.clone(),
         veth_iface: veth_iface.clone(),
         attached: false,
-        include_ports_cgroup_id: None,
+        include_ports_cgroup_ids: Vec::new(),
         include_ports_policy: None,
         workload_identity_cgroup_ids: Vec::new(),
     };
@@ -1251,7 +1243,7 @@ pub fn handle_pod_added(
             if let Some(applied) =
                 apply_include_outbound_ports(backend, pod_uid, cgroup, event.annotations)
             {
-                state.include_ports_cgroup_id = Some(applied.cgroup_id);
+                state.include_ports_cgroup_ids = applied.cgroup_ids;
                 state.include_ports_policy = Some(applied.policy);
             }
             // GAP-1b: write the source workload identity so connect hooks can
@@ -1272,7 +1264,7 @@ pub fn handle_pod_added(
                 pod_name,
                 namespace,
                 ?pod_ip,
-                include_ports_narrowing = state.include_ports_cgroup_id.is_some(),
+                include_ports_cgroups = state.include_ports_cgroup_ids.len(),
                 workload_identity_cgroups = state.workload_identity_cgroup_ids.len(),
                 "Pod enrolled for eBPF capture"
             );
@@ -1376,111 +1368,119 @@ fn reconcile_existing_pod_include_ports(
 
     // Hot-path diff-skip: most Modified events are unrelated to capture
     // annotations (status updates, container restart counts, etc.). The
-    // `Option<IncludePortsPolicy>` derives `PartialEq`, so this is a
-    // cheap structural compare — no allocations, no syscalls.
+    // `Option<IncludePortsPolicy>` derives `PartialEq`, so this is a cheap
+    // structural compare — no allocations, no syscalls. Unlike the
+    // workload-identity reconcile (which re-walks the cgroup tree on every
+    // event because a missed leaf fails *closed*), include-ports re-walks only
+    // on a policy change: a container that restarts under an unchanged policy
+    // keeps capturing all ports until the next policy change or pod removal,
+    // which is fail-*open* (over-capture, never an authz gap), so it doesn't
+    // warrant a per-event tree walk.
     if desired == state.include_ports_policy {
         return;
     }
 
-    // Identity for removal/replace lookups. Prefer the cgroup id stashed
-    // at enrollment (still valid even if the cgroup path was rotated
-    // out from under us); fall back to re-statting the path only when
-    // we have no prior id (the pod was previously unannotated and is
-    // newly transitioning into having a policy).
-    let cgroup_id_for_lookup = state.include_ports_cgroup_id.or_else(|| {
-        state
-            .cgroup_path
-            .as_deref()
-            .and_then(read_cgroup_id_for_pod)
-    });
-
-    match (desired, cgroup_id_for_lookup) {
-        (Some(new_policy), Some(cgroup_id)) => {
-            // Add or replace. `update_pod_include_ports` is an insert-or-
-            // overwrite on the BPF HashMap; the kernel does not require
-            // explicit removal before re-insertion.
-            match backend.update_pod_include_ports(cgroup_id, &new_policy) {
-                Ok(()) => {
-                    let prev_summary = describe_policy(state.include_ports_policy.as_ref());
-                    let new_summary = describe_policy(Some(&new_policy));
-                    info!(
-                        pod_uid,
-                        cgroup_id,
-                        prev_policy = %prev_summary,
-                        new_policy = %new_summary,
-                        "Re-applied mid-life pod includeOutboundPorts annotation update to BPF map"
-                    );
-                    state.include_ports_cgroup_id = Some(cgroup_id);
-                    state.include_ports_policy = Some(new_policy);
-                    metrics
-                        .pod_annotation_updates_applied
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                Err(e) => {
+    match desired {
+        Some(new_policy) => {
+            // Write the new policy across the whole pod cgroup subtree: the
+            // `connect4`/`connect6` gate keys `FERRUM_INCLUDE_PORTS` by the
+            // container *leaf* cgroup, so the pod inode alone never matches and
+            // narrowing would silently not engage.
+            let current = state
+                .cgroup_path
+                .as_deref()
+                .map(|path| cgroup::collect_cgroup_tree_inodes(std::path::Path::new(path)))
+                .unwrap_or_default();
+            if current.is_empty() {
+                // No readable cgroup inode yet (the Pod object reached the
+                // watcher before kubelet created the cgroup). Skip and let a
+                // future event retry; operationally normal, not a failure.
+                debug!(
+                    pod_uid,
+                    "Mid-life includeOutboundPorts update deferred: no cgroup inode available"
+                );
+                return;
+            }
+            // Drop entries for inodes that left the tree (a restarted
+            // container's old leaf) so they don't linger in the fixed-size map.
+            let current_set: HashSet<u64> = current.iter().copied().collect();
+            for cgroup_id in &state.include_ports_cgroup_ids {
+                if !current_set.contains(cgroup_id)
+                    && let Err(e) = backend.remove_pod_include_ports(*cgroup_id)
+                {
                     warn!(
+                        pod_uid,
+                        cgroup_id = *cgroup_id,
+                        error = %e,
+                        "Failed to remove stale includeOutboundPorts entry for a departed cgroup inode"
+                    );
+                }
+            }
+            let mut written = Vec::with_capacity(current.len());
+            for cgroup_id in current {
+                match backend.update_pod_include_ports(cgroup_id, &new_policy) {
+                    Ok(()) => written.push(cgroup_id),
+                    Err(e) => warn!(
                         pod_uid,
                         cgroup_id,
                         error = %e,
-                        "Failed to re-apply mid-life pod includeOutboundPorts update; keeping previous policy"
-                    );
-                    metrics
-                        .pod_annotation_updates_failed
-                        .fetch_add(1, Ordering::Relaxed);
+                        "Failed to write mid-life includeOutboundPorts update for a cgroup inode"
+                    ),
                 }
             }
-        }
-        (None, Some(cgroup_id)) => {
-            // The pod removed its annotation entirely → drop the BPF
-            // entry so the gate fail-opens back to "capture everything"
-            // for this pod, matching pre-enrollment behavior.
-            match backend.remove_pod_include_ports(cgroup_id) {
-                Ok(()) => {
-                    let prev_summary = describe_policy(state.include_ports_policy.as_ref());
-                    info!(
-                        pod_uid,
-                        cgroup_id,
-                        prev_policy = %prev_summary,
-                        "Mid-life pod removed includeOutboundPorts annotation; dropped BPF map entry"
-                    );
-                    state.include_ports_cgroup_id = None;
-                    state.include_ports_policy = None;
-                    metrics
-                        .pod_annotation_updates_applied
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                Err(e) => {
-                    warn!(
-                        pod_uid,
-                        cgroup_id,
-                        error = %e,
-                        "Failed to drop mid-life pod includeOutboundPorts BPF entry; keeping previous policy"
-                    );
-                    metrics
-                        .pod_annotation_updates_failed
-                        .fetch_add(1, Ordering::Relaxed);
-                }
+            if written.is_empty() {
+                metrics
+                    .pod_annotation_updates_failed
+                    .fetch_add(1, Ordering::Relaxed);
+                return;
             }
-        }
-        (Some(_), None) => {
-            // We want to write a new entry but have no cgroup id — most
-            // likely the pod was enrolled before its cgroup path
-            // existed (Kubernetes Pod object reaches the watcher before
-            // kubelet finishes creating the cgroup). Skip and let a
-            // future event retry; do NOT count this as a failure because
-            // it is operationally normal.
-            debug!(
+            let prev_summary = describe_policy(state.include_ports_policy.as_ref());
+            let new_summary = describe_policy(Some(&new_policy));
+            info!(
                 pod_uid,
-                "Mid-life includeOutboundPorts update deferred: cgroup id unavailable"
+                cgroup_ids = written.len(),
+                prev_policy = %prev_summary,
+                new_policy = %new_summary,
+                "Re-applied mid-life pod includeOutboundPorts annotation update across cgroup tree"
             );
+            state.include_ports_cgroup_ids = written;
+            state.include_ports_policy = Some(new_policy);
+            metrics
+                .pod_annotation_updates_applied
+                .fetch_add(1, Ordering::Relaxed);
         }
-        (None, None) => {
-            // Nothing to write and nothing to remove. Reachable only if
-            // `desired` flipped from `None` to `None` in a way that
-            // disagreed with `state.include_ports_policy` (e.g. the
-            // baseline was `Some(_)` but the cgroup id was unknown when
-            // it was stashed). Clear the baseline so future diffs are
-            // consistent.
+        None => {
+            // The pod removed its annotation entirely → drop every entry so the
+            // gate fail-opens back to "capture everything" for this pod. Use the
+            // stashed ids (the cgroup tree may already be gone); ENOENT-tolerant.
+            if state.include_ports_cgroup_ids.is_empty() {
+                // Nothing was written (e.g. enrolled before the cgroup existed)
+                // but the baseline disagreed; just clear it for future diffs.
+                state.include_ports_policy = None;
+                return;
+            }
+            for cgroup_id in &state.include_ports_cgroup_ids {
+                if let Err(e) = backend.remove_pod_include_ports(*cgroup_id) {
+                    warn!(
+                        pod_uid,
+                        cgroup_id = *cgroup_id,
+                        error = %e,
+                        "Failed to drop mid-life pod includeOutboundPorts BPF entry"
+                    );
+                }
+            }
+            let prev_summary = describe_policy(state.include_ports_policy.as_ref());
+            info!(
+                pod_uid,
+                cgroup_ids = state.include_ports_cgroup_ids.len(),
+                prev_policy = %prev_summary,
+                "Mid-life pod removed includeOutboundPorts annotation; dropped BPF map entries"
+            );
+            state.include_ports_cgroup_ids.clear();
             state.include_ports_policy = None;
+            metrics
+                .pod_annotation_updates_applied
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -1615,19 +1615,19 @@ pub fn handle_pod_removed(
         {
             warn!(pod_uid, %ip, error = %e, "Failed to remove pod IP from map");
         }
-        // Pair with `apply_include_outbound_ports` — only annotated pods
-        // ever carried an entry. Use the stashed cgroup id so we don't
-        // re-stat the cgroup path, which may already have been torn down
-        // by kubelet.
-        if let Some(cgroup_id) = state.include_ports_cgroup_id
-            && let Err(e) = backend.remove_pod_include_ports(cgroup_id)
-        {
-            warn!(
-                pod_uid,
-                cgroup_id,
-                error = %e,
-                "Failed to remove pod includeOutboundPorts entry from BPF map"
-            );
+        // Pair with `apply_include_outbound_ports` — only annotated pods ever
+        // carried entries. Use the stashed cgroup ids (pod inode + descendant
+        // container-cgroup inodes) so we don't re-stat a possibly torn-down
+        // cgroup tree. Tolerates ENOENT per entry.
+        for cgroup_id in &state.include_ports_cgroup_ids {
+            if let Err(e) = backend.remove_pod_include_ports(*cgroup_id) {
+                warn!(
+                    pod_uid,
+                    cgroup_id = *cgroup_id,
+                    error = %e,
+                    "Failed to remove pod includeOutboundPorts entry from BPF map"
+                );
+            }
         }
         // GAP-1b: pair with `apply_workload_identity`. Use the stashed cgroup
         // ids (pod inode + descendant container-cgroup inodes) so we don't
@@ -2192,7 +2192,7 @@ mod tests {
                 cgroup_path: None,
                 veth_iface: Some("veth-mock".to_string()),
                 attached: true,
-                include_ports_cgroup_id: None,
+                include_ports_cgroup_ids: Vec::new(),
                 include_ports_policy: None,
                 workload_identity_cgroup_ids: Vec::new(),
             },
@@ -2207,7 +2207,7 @@ mod tests {
                 cgroup_path: None,
                 veth_iface: None,
                 attached: false,
-                include_ports_cgroup_id: None,
+                include_ports_cgroup_ids: Vec::new(),
                 include_ports_policy: None,
                 workload_identity_cgroup_ids: Vec::new(),
             },
@@ -2764,7 +2764,7 @@ mod tests {
                 cgroup_path: Some("/sys/fs/cgroup/kubepods/poduid2".to_string()),
                 veth_iface: None,
                 attached: true,
-                include_ports_cgroup_id: None,
+                include_ports_cgroup_ids: Vec::new(),
                 include_ports_policy: None,
                 workload_identity_cgroup_ids: Vec::new(),
             },
@@ -2849,7 +2849,7 @@ mod tests {
                 cgroup_path: Some("/sys/fs/cgroup/kubepods/poduid1".to_string()),
                 veth_iface: Some("veth123".to_string()),
                 attached: true,
-                include_ports_cgroup_id: None,
+                include_ports_cgroup_ids: Vec::new(),
                 include_ports_policy: None,
                 workload_identity_cgroup_ids: Vec::new(),
             },
@@ -2954,7 +2954,7 @@ mod tests {
                 pod_ip: Some(ip),
                 cgroup_path: None,
                 veth_iface: None,
-                include_ports_cgroup_id: None,
+                include_ports_cgroup_ids: Vec::new(),
                 include_ports_policy: None,
                 workload_identity_cgroup_ids: Vec::new(),
             },
@@ -3049,7 +3049,7 @@ mod tests {
                 cgroup_path: Some("/sys/fs/cgroup/kubepods/poduid1".to_string()),
                 veth_iface: Some("veth123".to_string()),
                 attached: true,
-                include_ports_cgroup_id: None,
+                include_ports_cgroup_ids: Vec::new(),
                 include_ports_policy: None,
                 workload_identity_cgroup_ids: Vec::new(),
             },
@@ -3138,7 +3138,7 @@ mod tests {
                 cgroup_path: None,
                 veth_iface: None,
                 attached: true,
-                include_ports_cgroup_id: None,
+                include_ports_cgroup_ids: Vec::new(),
                 include_ports_policy: None,
                 workload_identity_cgroup_ids: Vec::new(),
             },
@@ -3174,7 +3174,7 @@ mod tests {
                 cgroup_path: None,
                 veth_iface: Some("veth-mock".to_string()),
                 attached: true,
-                include_ports_cgroup_id: None,
+                include_ports_cgroup_ids: Vec::new(),
                 include_ports_policy: None,
                 workload_identity_cgroup_ids: Vec::new(),
             },
@@ -3227,7 +3227,7 @@ mod tests {
                 cgroup_path: Some(cgroup_path.to_string_lossy().to_string()),
                 veth_iface: Some("veth-old".to_string()),
                 attached: true,
-                include_ports_cgroup_id: None,
+                include_ports_cgroup_ids: Vec::new(),
                 include_ports_policy: None,
                 workload_identity_cgroup_ids: Vec::new(),
             },
@@ -3286,7 +3286,7 @@ mod tests {
                 cgroup_path: None,
                 veth_iface: Some("veth-mock".to_string()),
                 attached: true,
-                include_ports_cgroup_id: None,
+                include_ports_cgroup_ids: Vec::new(),
                 include_ports_policy: None,
                 workload_identity_cgroup_ids: Vec::new(),
             },
@@ -3673,25 +3673,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn read_cgroup_id_returns_inode_for_real_path() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().to_string_lossy().to_string();
-        // Both calls should return the same value because the directory is
-        // the same; we only assert the helper returns *something* truthy and
-        // is stable across reads. Exact inode value depends on filesystem.
-        let id1 = read_cgroup_id_for_pod(&path).expect("real path stats");
-        let id2 = read_cgroup_id_for_pod(&path).expect("repeat stats");
-        assert_eq!(id1, id2);
-        assert!(id1 > 0);
-    }
-
-    #[test]
-    fn read_cgroup_id_returns_none_on_missing_path() {
-        assert!(read_cgroup_id_for_pod("/nonexistent/cgroup/path/here").is_none());
-    }
-
     #[test]
     fn handle_pod_added_writes_include_ports_for_annotated_pod() {
         let _veth_guard = crate::ebpf::veth::tests::TestOverrideGuard::new("veth_test");
@@ -3735,7 +3716,9 @@ mod tests {
 
         let state = pod_states.get("pod-uid-1").expect("pod enrolled");
         let cgroup_id = state
-            .include_ports_cgroup_id
+            .include_ports_cgroup_ids
+            .first()
+            .copied()
             .expect("cgroup id stashed for annotated pod");
         let policy = backend
             .include_ports
@@ -3744,6 +3727,72 @@ mod tests {
         assert!(!policy.is_all_ports());
         assert_eq!(policy.port_count, 2);
         assert_eq!(&policy.ports[..2], &[5432, 8080]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handle_pod_added_writes_include_ports_under_container_cgroup_leaves() {
+        use std::os::unix::fs::MetadataExt;
+
+        // Finding-1 regression: the connect4/connect6 gate looks up
+        // FERRUM_INCLUDE_PORTS by `bpf_get_current_cgroup_id()` (the container
+        // leaf cgroup), so the policy must be written under the container
+        // cgroup inodes, not only the pod inode, or per-pod port narrowing
+        // silently never engages on real pods.
+        let _veth_guard = crate::ebpf::veth::tests::TestOverrideGuard::new("veth_test");
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+
+        let cgroup_root = tempfile::tempdir().unwrap();
+        let pod_uid = "pod-uid-1";
+        let pod_cgroup = cgroup_root.path().join(format!("kubepods/pod{pod_uid}"));
+        let container_cgroup = pod_cgroup.join("crio-abc123.scope");
+        std::fs::create_dir_all(&container_cgroup).unwrap();
+
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: cgroup_root.path().to_string_lossy().to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+        };
+        let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+        let annotations =
+            annotations_with(&[("traffic.sidecar.istio.io/includeOutboundPorts", "5432,8080")]);
+        let event = PodEvent {
+            pod_uid,
+            pod_name: "test-pod",
+            namespace: "default",
+            service_account: None,
+            labels: &labels,
+            annotations: &annotations,
+            pod_ip_str: Some("10.0.0.5"),
+            pod_pid: None,
+            veth_iface_override: Some("veth-mock"),
+        };
+
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+
+        let pod_ino = std::fs::metadata(&pod_cgroup).unwrap().ino();
+        let container_ino = std::fs::metadata(&container_cgroup).unwrap().ino();
+
+        // The container leaf inode — the id the gate actually looks up — must
+        // carry the narrowing policy, alongside the pod inode.
+        let leaf_policy = backend
+            .include_ports
+            .get(&container_ino)
+            .expect("includeOutboundPorts must be written under the container leaf inode");
+        assert_eq!(leaf_policy.port_count, 2);
+        assert!(backend.include_ports.contains_key(&pod_ino));
+
+        let state = pod_states.get(pod_uid).unwrap();
+        assert!(state.include_ports_cgroup_ids.contains(&container_ino));
+        assert!(state.include_ports_cgroup_ids.contains(&pod_ino));
     }
 
     #[test]
@@ -3786,7 +3835,9 @@ mod tests {
 
         let state = pod_states.get("pod-uid-1").expect("pod enrolled");
         let cgroup_id = state
-            .include_ports_cgroup_id
+            .include_ports_cgroup_ids
+            .first()
+            .copied()
             .expect("cgroup id stashed for wildcard annotation");
         let policy = backend
             .include_ports
@@ -3835,7 +3886,7 @@ mod tests {
 
         let state = pod_states.get("pod-uid-1").expect("pod enrolled");
         assert!(
-            state.include_ports_cgroup_id.is_none(),
+            state.include_ports_cgroup_ids.is_empty(),
             "unannotated pod must not stash a cgroup id"
         );
         assert!(
@@ -3886,7 +3937,7 @@ mod tests {
         let state = pod_states.get("pod-uid-1").expect("pod still enrolls");
         assert!(state.attached);
         assert!(
-            state.include_ports_cgroup_id.is_none(),
+            state.include_ports_cgroup_ids.is_empty(),
             "malformed annotation must not write a BPF entry"
         );
         assert!(backend.include_ports.is_empty());
@@ -4072,7 +4123,9 @@ mod tests {
         let cgroup_id = pod_states
             .get("pod-uid-1")
             .expect("pod enrolled")
-            .include_ports_cgroup_id
+            .include_ports_cgroup_ids
+            .first()
+            .copied()
             .expect("cgroup id stashed");
         assert_eq!(backend.include_ports.get(&cgroup_id).unwrap().port_count, 1);
 
@@ -4141,7 +4194,9 @@ mod tests {
         let cgroup_id = pod_states
             .get("pod-uid-1")
             .unwrap()
-            .include_ports_cgroup_id
+            .include_ports_cgroup_ids
+            .first()
+            .copied()
             .unwrap();
         let entry = backend.include_ports.get(&cgroup_id).unwrap();
         assert!(
@@ -4180,7 +4235,9 @@ mod tests {
         let cgroup_id_before = pod_states
             .get("pod-uid-1")
             .unwrap()
-            .include_ports_cgroup_id
+            .include_ports_cgroup_ids
+            .first()
+            .copied()
             .unwrap();
         assert!(backend.include_ports.contains_key(&cgroup_id_before));
 
@@ -4201,7 +4258,7 @@ mod tests {
         );
         let state = pod_states.get("pod-uid-1").unwrap();
         assert!(
-            state.include_ports_cgroup_id.is_none(),
+            state.include_ports_cgroup_ids.is_empty(),
             "state must forget the cgroup id when the entry is removed"
         );
         assert!(state.include_ports_policy.is_none());
@@ -4249,7 +4306,9 @@ mod tests {
 
         let state = pod_states.get("pod-uid-1").unwrap();
         let cgroup_id = state
-            .include_ports_cgroup_id
+            .include_ports_cgroup_ids
+            .first()
+            .copied()
             .expect("mid-life add must stash a cgroup id");
         let entry = backend
             .include_ports
@@ -4385,7 +4444,9 @@ mod tests {
         let cgroup_id = pod_states
             .get("pod-uid-1")
             .unwrap()
-            .include_ports_cgroup_id
+            .include_ports_cgroup_ids
+            .first()
+            .copied()
             .unwrap();
         let before = *backend.include_ports.get(&cgroup_id).unwrap();
 
@@ -4404,9 +4465,8 @@ mod tests {
             "malformed annotation must NOT rewrite the BPF entry"
         );
         let state = pod_states.get("pod-uid-1").unwrap();
-        assert_eq!(
-            state.include_ports_cgroup_id,
-            Some(cgroup_id),
+        assert!(
+            state.include_ports_cgroup_ids.contains(&cgroup_id),
             "previous cgroup id must be retained"
         );
         assert!(state.include_ports_policy.is_some());

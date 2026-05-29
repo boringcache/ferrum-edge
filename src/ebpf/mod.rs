@@ -381,14 +381,17 @@ pub struct PodAttachmentState {
     pub cgroup_path: Option<String>,
     pub veth_iface: Option<String>,
     pub attached: bool,
-    /// Set when this pod has an active `includeOutboundPorts` entry in
-    /// `FERRUM_INCLUDE_PORTS`. The cgroup id is the BPF lookup key
-    /// (matches `bpf_get_current_cgroup_id`), captured at enrollment so
-    /// un-enrollment can remove the entry without re-statting the
-    /// cgroup path (which may already be gone by the time the pod is
-    /// deleted). `None` when the pod is unannotated or the cgroup id
-    /// could not be read.
-    pub include_ports_cgroup_id: Option<u64>,
+    /// Cgroup ids carrying this pod's `includeOutboundPorts` entries in
+    /// `FERRUM_INCLUDE_PORTS`: the pod cgroup inode plus every descendant
+    /// container-cgroup inode (`cgroup::collect_cgroup_tree_inodes`). The
+    /// `connect4`/`connect6` gate keys this map by `bpf_get_current_cgroup_id()`
+    /// — the container leaf cgroup, a child of the pod cgroup — so the policy
+    /// must live under the leaf inodes, not just the pod inode, or narrowing
+    /// never engages. Captured at enrollment as the removal keys so
+    /// un-enrollment drops every entry without re-statting a possibly-gone
+    /// cgroup tree. Empty when the pod is unannotated or no cgroup inode could
+    /// be read.
+    pub include_ports_cgroup_ids: Vec<u64>,
     /// Last `IncludePortsPolicy` applied to the BPF map for this pod, or
     /// `None` when the pod has no `includeOutboundPorts` annotation in
     /// effect. Used as the diff baseline on Kubernetes `Apply` (modify)

@@ -524,12 +524,18 @@ impl NodeWaypointIdentityResolver {
     /// 2. **idle-unreferenced** — for identities *without* a cgroup binding (the
     ///    production lazy hash-join enrollment binds none, and nothing calls
     ///    `remove_identity` for them), evict those whose `pod_uid` is no longer
-    ///    referenced by any live cookie record. A dead pod's accept-side cookies
+    ///    referenced by any live cookie record *and* whose identity `Arc` has no
+    ///    other holder (`strong_count == 1`). A dead pod's accept-side cookies
     ///    age out of `cookie_records` (mirrored from the BPF LRU by the orig-dst
     ///    bridge), so this reclaims churned pods that would otherwise stay cached
-    ///    forever and bloat the rebuilt per-pod scope maps; an evicted-but-still-
-    ///    live pod simply re-enrolls on its next connection (fail-closed safe,
-    ///    and in-flight connections keep their already-resolved scope).
+    ///    forever and bloat the rebuilt per-pod scope maps. The `strong_count`
+    ///    guard is load-bearing: HTTP/HBONE connections store the resolved
+    ///    identity `Arc` for their whole lifetime and re-query the per-pod scope
+    ///    on every request, so if the BPF LRU evicts a live connection's cookie
+    ///    the cookie-reference check alone would wrongly drop its scope and
+    ///    downgrade later streams to mesh-wide — holding an `Arc` ref keeps the
+    ///    pod un-evictable until the connection closes. An evicted-but-still-live
+    ///    idle pod simply re-enrolls on its next connection (fail-closed safe).
     ///
     /// Also clears policy scope entries for evicted pods so a stale
     /// PolicyScopeCache from a previous incarnation cannot apply to a
@@ -664,12 +670,27 @@ impl NodeWaypointIdentityResolver {
             .filter(|pod_uid| !referenced.contains(pod_uid))
             .collect();
         for pod_uid in idle_candidates {
-            // Re-check "still unbound" under the shard lock so a concurrent
-            // cgroup enrollment is never reclaimed by the idle path.
             let removed = self
                 .identities_by_pod_uid
                 .remove_if(&pod_uid, |_, identity| {
-                    identity.cgroup_path.is_none() || identity.cgroup_inode.is_none()
+                    // Re-check "still unbound" under the shard lock so a
+                    // concurrent cgroup enrollment is never reclaimed here.
+                    if identity.cgroup_path.is_some() && identity.cgroup_inode.is_some() {
+                        return false;
+                    }
+                    // Skip if an open connection still holds this identity Arc.
+                    // The HTTP/HBONE accept path stores the resolved
+                    // `Arc<NodeWaypointIdentity>` on the connection for its whole
+                    // lifetime and re-queries the per-pod scope on every request
+                    // (`proxy/mod.rs`), so the BPF LRU evicting this pod's cookie
+                    // mid-connection must NOT let the sweep drop its scope — that
+                    // would downgrade later streams to mesh-wide. `strong_count
+                    // == 1` means only this map entry references the identity, so
+                    // no connection holds it; `> 1` means at least one open
+                    // connection does, so keep it. (The cookie-reference check
+                    // above already covers TCP, whose scope is resolved once at
+                    // accept and never re-queried.)
+                    Arc::strong_count(identity) == 1
                 });
             if removed.is_some() {
                 report.evicted_idle_unreferenced += 1;
@@ -1700,6 +1721,44 @@ mod tests {
             resolver.policy_scope_for_pod(&pod_uid).is_none(),
             "evicting the identity must clear its per-pod policy scope"
         );
+    }
+
+    #[test]
+    fn sweep_keeps_unbound_identity_held_by_open_connection() {
+        // Finding-2 regression: HTTP/HBONE connections hold the resolved
+        // identity Arc for their lifetime and re-query the per-pod scope on
+        // every request. If the BPF LRU evicts a live connection's cookie, the
+        // cookie-reference signal goes stale — but the sweep must NOT evict the
+        // pod (else later streams on that connection lose per-pod scoping). An
+        // outstanding Arc ref (strong_count > 1) keeps it un-evictable.
+        let resolver = NodeWaypointIdentityResolver::new(0);
+        let pod_uid = parse_pod_uid("88888888-8888-8888-8888-888888888888").unwrap();
+        let spiffe_id = spiffe("spiffe://td/ns/default/sa/web");
+        let hash = workload_spiffe_hash(&spiffe_id);
+
+        vouch_for_workloads(&resolver, &["spiffe://td/ns/default/sa/web"]);
+        resolver.record_orig_dst4(7, orig_dst4(pod_uid, hash));
+        // Simulate an open connection: resolve and HOLD the returned Arc, the
+        // way the accept path stores it on the connection for its lifetime.
+        let conn_identity = resolver.resolve_cookie(7).expect("resolves and enrolls");
+
+        // The connection's cookie ages out of the mirror (BPF LRU eviction)
+        // while the connection is still open.
+        resolver.retain_cookie_records(&std::collections::HashSet::new());
+
+        let report = resolver.sweep_cgroup_stale_identities();
+        assert_eq!(
+            report.evicted_idle_unreferenced, 0,
+            "a pod whose identity an open connection still holds must not be evicted"
+        );
+        assert!(resolver.identities_by_pod_uid.contains_key(&pod_uid));
+        assert!(resolver.policy_scope_for_pod(&pod_uid).is_some());
+
+        // Once the connection closes (Arc dropped), the next sweep reclaims it.
+        drop(conn_identity);
+        let report = resolver.sweep_cgroup_stale_identities();
+        assert_eq!(report.evicted_idle_unreferenced, 1);
+        assert!(!resolver.identities_by_pod_uid.contains_key(&pod_uid));
     }
 
     #[cfg(unix)]
