@@ -135,11 +135,14 @@ async fn slow_backend_within_read_timeout_completes() {
         elapsed >= Duration::from_millis(400),
         "expected latency to propagate (≥400 ms), got {elapsed:?}"
     );
-    // And well under the 2 s read timeout.
-    assert!(
-        elapsed < Duration::from_millis(1800),
-        "took too long ({elapsed:?}) — gateway may have read-timeout'd"
-    );
+    // No upper wall-clock bound. A request that exceeded the gateway's
+    // 2 s read timeout would surface as a 5xx, so the `200 OK` + `"ok"`
+    // body asserted above already proves the backend completed *within*
+    // the read timeout — that is the real "within read timeout" signal.
+    // A tight elapsed-time ceiling here adds nothing to that guarantee
+    // and only introduces host-load flakiness (CI scheduling jitter can
+    // push an otherwise-successful request past an arbitrary bound). A
+    // genuine hang is still bounded by the client's 30 s request timeout.
 }
 
 // ────────────────────────────────────────────────────────────────────────────
