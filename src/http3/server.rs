@@ -2336,15 +2336,8 @@ async fn handle_h3_request(
 
         // Send response headers on the H3 stream
         let status_code = StatusCode::from_u16(response_status).unwrap_or(StatusCode::BAD_GATEWAY);
-        let mut resp_builder = Response::builder().status(status_code);
-        for (k, v) in &response_headers {
-            if let (Ok(name), Ok(val)) = (
-                hyper::header::HeaderName::from_bytes(k.as_bytes()),
-                hyper::header::HeaderValue::from_str(v),
-            ) {
-                resp_builder = resp_builder.header(name, val);
-            }
-        }
+        let mut resp_builder =
+            apply_response_headers(Response::builder().status(status_code), &response_headers);
         if !response_headers.contains_key("content-type") {
             resp_builder = resp_builder.header("content-type", "application/json");
         }
@@ -3244,16 +3237,8 @@ async fn handle_h3_request(
 
         // Build and send buffered response
         let status = StatusCode::from_u16(response_status).unwrap_or(StatusCode::BAD_GATEWAY);
-        let mut resp_builder = Response::builder().status(status);
-
-        for (k, v) in &response_headers {
-            if let (Ok(name), Ok(val)) = (
-                hyper::header::HeaderName::from_bytes(k.as_bytes()),
-                hyper::header::HeaderValue::from_str(v),
-            ) {
-                resp_builder = resp_builder.header(name, val);
-            }
-        }
+        let mut resp_builder =
+            apply_response_headers(Response::builder().status(status), &response_headers);
 
         if !response_headers.contains_key("content-type") {
             resp_builder = resp_builder.header("content-type", "application/json");
@@ -3821,15 +3806,8 @@ async fn proxy_to_backend_h3_streaming(
 
     // Send response headers on the H3 stream
     let status = StatusCode::from_u16(response_status).unwrap_or(StatusCode::BAD_GATEWAY);
-    let mut resp_builder = Response::builder().status(status);
-    for (k, v) in &response_headers {
-        if let (Ok(name), Ok(val)) = (
-            hyper::header::HeaderName::from_bytes(k.as_bytes()),
-            hyper::header::HeaderValue::from_str(v),
-        ) {
-            resp_builder = resp_builder.header(name, val);
-        }
-    }
+    let mut resp_builder =
+        apply_response_headers(Response::builder().status(status), &response_headers);
     if !response_headers.contains_key("content-type") {
         resp_builder = resp_builder.header("content-type", "application/json");
     }
@@ -4201,6 +4179,37 @@ fn reject_response_sets_content_type(headers: &HashMap<String, String>) -> bool 
         .any(|k| k.eq_ignore_ascii_case("content-type"))
 }
 
+/// Apply a response-header map onto a builder, emitting each newline-separated
+/// `set-cookie` value as its own header line.
+///
+/// `Set-Cookie` must not be folded into one value (RFC 6265), so the proxy keeps
+/// multiple cookies newline-joined in the response-header map (see
+/// `proxy::collect_response_headers_generic` and the sticky-session and OIDC
+/// rolling-session appends). `HeaderValue::from_str` rejects the embedded
+/// newline, so without this split the entire `set-cookie` header is dropped on
+/// H3 — losing backend cookies and the OIDC rolling/refresh cookie. Mirrors the
+/// HTTP/1 response path in `proxy`.
+fn apply_response_headers(
+    mut builder: http::response::Builder,
+    headers: &HashMap<String, String>,
+) -> http::response::Builder {
+    for (k, v) in headers {
+        if k == "set-cookie" {
+            for cookie_val in v.split('\n') {
+                if let Ok(val) = hyper::header::HeaderValue::from_str(cookie_val) {
+                    builder = builder.header(hyper::header::SET_COOKIE, val);
+                }
+            }
+        } else if let (Ok(name), Ok(val)) = (
+            hyper::header::HeaderName::from_bytes(k.as_bytes()),
+            hyper::header::HeaderValue::from_str(v),
+        ) {
+            builder = builder.header(name, val);
+        }
+    }
+    builder
+}
+
 async fn send_h3_reject_response(
     stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     status: StatusCode,
@@ -4215,14 +4224,7 @@ async fn send_h3_reject_response(
     if !reject_response_sets_content_type(headers) {
         builder = builder.header("content-type", "application/json");
     }
-    for (k, v) in headers {
-        if let (Ok(name), Ok(val)) = (
-            hyper::header::HeaderName::from_bytes(k.as_bytes()),
-            hyper::header::HeaderValue::from_str(v),
-        ) {
-            builder = builder.header(name, val);
-        }
-    }
+    builder = apply_response_headers(builder, headers);
     let resp = builder
         .body(())
         .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 reject response: {}", e))?;
@@ -4313,6 +4315,15 @@ async fn send_h3_reject_flavor_aware(
             || k.eq_ignore_ascii_case("grpc-status")
             || k.eq_ignore_ascii_case("grpc-message")
         {
+            continue;
+        }
+        if k.eq_ignore_ascii_case("set-cookie") {
+            // Newline-separated cookies must each become their own header line.
+            for cookie_val in v.split('\n') {
+                if let Ok(val) = hyper::header::HeaderValue::from_str(cookie_val) {
+                    builder = builder.header(hyper::header::SET_COOKIE, val);
+                }
+            }
             continue;
         }
         if let (Ok(name), Ok(val)) = (
@@ -4713,6 +4724,37 @@ mod h3_streaming_after_proxy_tests {
                  so no duplicate Content-Type header is emitted"
             );
         }
+    }
+
+    #[test]
+    fn apply_response_headers_splits_newline_joined_set_cookie() {
+        // The proxy stores multiple Set-Cookie values newline-joined; on H3 they
+        // must be emitted as separate header lines, otherwise `from_str` rejects
+        // the embedded newline and the whole header (incl. the OIDC rolling
+        // cookie) is dropped.
+        let headers = HashMap::from([
+            (
+                "set-cookie".to_string(),
+                "backend=1; Path=/\nferrum_session=abc; HttpOnly".to_string(),
+            ),
+            ("x-other".to_string(), "v".to_string()),
+        ]);
+        let resp = super::apply_response_headers(http::Response::builder(), &headers)
+            .body(())
+            .expect("response builds");
+        let cookies: Vec<&str> = resp
+            .headers()
+            .get_all(http::header::SET_COOKIE)
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(cookies.len(), 2, "each cookie must be its own header line");
+        assert!(cookies.contains(&"backend=1; Path=/"));
+        assert!(cookies.contains(&"ferrum_session=abc; HttpOnly"));
+        assert_eq!(
+            resp.headers().get("x-other").and_then(|v| v.to_str().ok()),
+            Some("v")
+        );
     }
 }
 
