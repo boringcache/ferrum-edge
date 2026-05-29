@@ -344,28 +344,32 @@ impl Oauth2Introspection {
         token: &str,
         provider_indices: &[usize],
     ) -> Result<(Arc<Value>, usize), (u16, String)> {
+        // A token may be validatable by any of the candidate providers
+        // (multi-IdP routing), so a non-first provider's `active:false`,
+        // issuer/audience mismatch, or transport failure must not short-circuit
+        // a provider that would accept it. Try every candidate, accept the first
+        // success, and fall back to the first provider's verdict when none
+        // succeed — which keeps single-provider behavior byte-for-byte unchanged.
+        let mut first_error: Option<(u16, String)> = None;
         for &idx in provider_indices {
             let Some(provider) = self.providers.get(idx) else {
                 continue;
             };
             match self.introspect_with_provider(token, provider, idx).await {
                 Ok(claims) => return Ok((claims, idx)),
-                Err(IntrospectionDecision::Inactive) => {
-                    return Err((401, r#"{"error":"Inactive token"}"#.to_string()));
-                }
-                Err(IntrospectionDecision::Unauthorized(body)) => return Err((401, body)),
-                Err(IntrospectionDecision::Unavailable) => {
-                    return Err((
-                        401,
-                        r#"{"error":"Token introspection unavailable"}"#.to_string(),
-                    ));
+                Err(decision) => {
+                    if first_error.is_none() {
+                        first_error = Some(decision.into_rejection());
+                    }
                 }
             }
         }
-        Err((
-            401,
-            r#"{"error":"Invalid or unrecognized token"}"#.to_string(),
-        ))
+        Err(first_error.unwrap_or_else(|| {
+            (
+                401,
+                r#"{"error":"Invalid or unrecognized token"}"#.to_string(),
+            )
+        }))
     }
 
     async fn introspect_with_provider(
@@ -670,6 +674,21 @@ enum IntrospectionDecision {
     Inactive,
     Unauthorized(String),
     Unavailable,
+}
+
+impl IntrospectionDecision {
+    /// Map a per-provider failure to the `(status, body)` returned to the client
+    /// when no candidate provider accepts the token.
+    fn into_rejection(self) -> (u16, String) {
+        match self {
+            Self::Inactive => (401, r#"{"error":"Inactive token"}"#.to_string()),
+            Self::Unauthorized(body) => (401, body),
+            Self::Unavailable => (
+                401,
+                r#"{"error":"Token introspection unavailable"}"#.to_string(),
+            ),
+        }
+    }
 }
 
 trait FormBodyExt {

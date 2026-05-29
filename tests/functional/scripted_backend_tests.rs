@@ -457,20 +457,26 @@ async fn tls_expired_cert_produces_tls_error_not_generic_502() {
         .expect("response");
     assert_eq!(resp.status, StatusCode::BAD_GATEWAY, "expected 502");
 
-    let logs = require_logs(&harness);
     // Look for cert/TLS-specific tokens. We deliberately avoid a bare `"tls"`
     // substring match — crate and module paths contain "tls" nearly
     // everywhere, which would turn this assertion into a no-op.
-    let has_tls_signal = logs.contains("TlsError")
-        || logs.contains("expired")
-        || logs.contains("notAfter")
-        || logs.contains("NotValidYet")
-        || logs.contains("certificate")
-        || logs.contains("CertificateError")
-        || logs.contains("InvalidCertificate")
-        || logs.contains("handshake");
+    let has_tls_signal = |logs: &str| {
+        logs.contains("TlsError")
+            || logs.contains("expired")
+            || logs.contains("notAfter")
+            || logs.contains("NotValidYet")
+            || logs.contains("certificate")
+            || logs.contains("CertificateError")
+            || logs.contains("InvalidCertificate")
+            || logs.contains("handshake")
+    };
+    // Poll: the TLS handshake error logs flush through the non-blocking writer
+    // after the client already sees the 502, so a single snapshot can race it.
+    let logs = harness
+        .wait_for_log_contains(&has_tls_signal, Duration::from_secs(5))
+        .await;
     assert!(
-        has_tls_signal,
+        has_tls_signal(&logs),
         "expected TLS/cert error signal in logs, got:\n{logs}"
     );
 }

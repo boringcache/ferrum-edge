@@ -1396,7 +1396,12 @@ fn is_browser_request(ctx: &RequestContext, behavior: &BehaviorConfig) -> bool {
 fn cookie_value<'a>(ctx: &'a RequestContext, name: &str) -> Option<&'a str> {
     let cookie = ctx.headers.get("cookie")?;
     for part in cookie.split(';') {
-        let (cookie_name, value) = part.trim().split_once('=')?;
+        // Skip segments without '=' (valueless cookies, trailing separators)
+        // instead of aborting the scan: a sibling cookie lacking '=' before the
+        // session cookie would otherwise hide it and trigger a spurious re-auth.
+        let Some((cookie_name, value)) = part.trim().split_once('=') else {
+            continue;
+        };
         if cookie_name == name {
             return Some(value);
         }
@@ -1725,5 +1730,25 @@ mod tests {
             original_url(&ctx, &behavior),
             "https://app.example.com/protected"
         );
+    }
+
+    #[test]
+    fn cookie_value_skips_segments_without_equals() {
+        let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
+        // A valueless sibling cookie precedes the session cookie; it must not
+        // abort the scan.
+        ctx.headers.insert(
+            "cookie".to_string(),
+            "consent; ferrum_session=abc123; theme=dark".to_string(),
+        );
+        assert_eq!(cookie_value(&ctx, "ferrum_session"), Some("abc123"));
+    }
+
+    #[test]
+    fn cookie_value_absent_returns_none() {
+        let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
+        ctx.headers
+            .insert("cookie".to_string(), "theme=dark; consent".to_string());
+        assert_eq!(cookie_value(&ctx, "ferrum_session"), None);
     }
 }

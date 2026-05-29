@@ -110,7 +110,7 @@ use serde_json::{Value, json};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -853,6 +853,90 @@ impl GatewayHarness {
                 std::io::ErrorKind::Unsupported,
                 "captured_combined() is only available in binary mode",
             )),
+        }
+    }
+
+    /// Re-read the captured gateway output until `predicate` matches a
+    /// snapshot or `timeout` elapses, then return the final snapshot (so the
+    /// caller's assertion message still shows what WAS logged on timeout).
+    ///
+    /// Necessary because the gateway routes logs through `tracing-appender`'s
+    /// non-blocking writer, whose worker thread lags the client-visible
+    /// response by tens of ms; a single `captured_combined()` snapshot races
+    /// that flush and intermittently misses a log line that the gateway has
+    /// already emitted. Polling is strictly safer than a one-shot read: it can
+    /// only turn a flush-race miss into a hit, never a hit into a miss (if the
+    /// line never appears the predicate stays false and the caller fails just
+    /// as it would have). **Binary mode only** — in-process mode has no
+    /// capture, so the snapshot is always empty and the predicate never matches.
+    pub async fn wait_for_log_contains<F>(&self, predicate: F, timeout: Duration) -> String
+    where
+        F: Fn(&str) -> bool,
+    {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let logs = self.captured_combined().unwrap_or_default();
+            if predicate(&logs) || Instant::now() >= deadline {
+                return logs;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Poll the captured gateway output until `counter` reports at least
+    /// `at_least` matches, then keep polling through a short stabilization
+    /// window and return the final count (returning early once `timeout`
+    /// elapses).
+    ///
+    /// The exact-count companion to [`Self::wait_for_log_contains`]. Use it
+    /// for assertions that pin an EXACT line count rather than a presence
+    /// substring. A bare poll-until-`at_least` would return the instant the
+    /// target line flushes through `tracing-appender`'s non-blocking writer —
+    /// but if a *spurious* extra line were still buffered, that early return
+    /// would miss it and silently mask an over-count regression. Reaching the
+    /// target clears the flush-race under-count; the stabilization re-read
+    /// keeps the over-count ceiling intact, so the caller's `== N` assertion
+    /// stays honest in both directions.
+    ///
+    /// `captured_combined()` is append-only, so the observed count never
+    /// decreases — any change during the settle window is a late-flushing
+    /// extra line, which restarts the window. **Binary mode only** —
+    /// in-process mode has no capture, so the count is always 0.
+    pub async fn wait_for_stable_log_count<F>(
+        &self,
+        counter: F,
+        at_least: usize,
+        timeout: Duration,
+    ) -> usize
+    where
+        F: Fn(&str) -> usize,
+    {
+        let deadline = Instant::now() + timeout;
+        // Phase 1 — reach the target, clearing the flush-race under-count.
+        let mut count = counter(&self.captured_combined().unwrap_or_default());
+        while count < at_least && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            count = counter(&self.captured_combined().unwrap_or_default());
+        }
+        // Phase 2 — stabilize. Re-read until the count holds steady for
+        // `STABILIZE` (or the deadline passes); a late extra line restarts
+        // the window. This preserves the over-count ceiling that a bare
+        // poll-until-`at_least` would mask. `STABILIZE` sits comfortably
+        // above the non-blocking writer's tens-of-ms flush lag.
+        const STABILIZE: Duration = Duration::from_millis(300);
+        let mut last_change = Instant::now();
+        loop {
+            if Instant::now() >= deadline {
+                return count;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let n = counter(&self.captured_combined().unwrap_or_default());
+            if n != count {
+                count = n;
+                last_change = Instant::now();
+            } else if last_change.elapsed() >= STABILIZE {
+                return count;
+            }
         }
     }
 

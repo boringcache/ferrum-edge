@@ -425,11 +425,16 @@ pub(super) fn compile_rules(
                 rule.score = Some(score);
             }
         }
-        if rule.paranoia_min > paranoia_level {
+        // An explicit `rule_modes: enforce` entry force-compiles a rule even
+        // when its `paranoia_min` exceeds the active paranoia level; a Monitor
+        // or Disabled entry never resurrects a paranoia-filtered rule.
+        if rule.paranoia_min > paranoia_level
+            && rule_modes.get(&rule.id) != Some(&RuleAction::Enforce)
+        {
             continue;
         }
         // Bulk action for built-ins; an explicit per-rule `rule_modes` entry
-        // (applied next) still wins.
+        // (applied below) still wins.
         if is_default && let Some(action) = default_rule_action {
             rule.action = action;
         }
@@ -1256,7 +1261,7 @@ mod tests {
     }
 
     #[test]
-    fn known_rule_modes_id_filtered_by_paranoia_still_accepted() {
+    fn rule_modes_can_force_compile_above_paranoia_level() {
         let rule = WafRule {
             id: "R1".into(),
             name: "test".into(),
@@ -1273,9 +1278,7 @@ mod tests {
         };
         let mut modes = HashMap::new();
         modes.insert("R1".to_string(), RuleAction::Enforce);
-        // R1 is filtered out by paranoia_level=1 but is still a known ID, so
-        // the override is a no-op rather than an error.
-        compile_rules(
+        let compiled = compile_rules(
             vec![(rule, false)],
             &HashSet::new(),
             &modes,
@@ -1284,5 +1287,6 @@ mod tests {
             1,
         )
         .expect("compile");
+        assert!(compiled.method.as_ref().unwrap().set.is_match("PROPFIND"));
     }
 }
