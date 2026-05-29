@@ -27,6 +27,7 @@ fn make_ctx(client_ip: &str, datagram_size: usize) -> UdpDatagramContext<'static
         // udp_rate_limiting keys off datagram_size, not payload bytes.
         payload: &[],
         payload_kind: StreamBytesKind::PlaintextWire,
+        metadata_sink: None,
     }
 }
 

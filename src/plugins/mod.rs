@@ -202,6 +202,55 @@ pub struct UdpDatagramContext<'a> {
     pub payload: &'a [u8],
     /// Nature of `payload`.
     pub payload_kind: StreamBytesKind,
+    /// Optional sink for recording session-scoped metadata (e.g. WAF signature
+    /// hits) onto the UDP/DTLS stream transaction summary. The per-datagram
+    /// context is immutable and short-lived, so a plugin that wants its findings
+    /// logged writes them here; the proxy backs it with the session metadata map
+    /// that `build_udp_stream_summary` / `build_dtls_stream_summary` read at
+    /// disconnect. `None` when there is no session map to attach to (or in tests).
+    pub metadata_sink: Option<UdpMetadataSink<'a>>,
+}
+
+/// Sink for recording session-scoped metadata from the per-datagram UDP/DTLS
+/// hook (see [`UdpDatagramContext::metadata_sink`]).
+///
+/// `on_udp_datagram` receives an immutable, per-datagram context, so unlike the
+/// TCP `on_stream_connect` path it cannot mutate a `StreamConnectionContext` to
+/// attach `waf.*` fields. This sink bridges that gap: the proxy backs it with the
+/// session's metadata map, so a recorded field rides the stream transaction
+/// summary out to every logging sink at disconnect — independent of
+/// `log_to_stdout`, matching the TCP behavior.
+#[derive(Clone, Copy)]
+pub struct UdpMetadataSink<'a> {
+    map: &'a std::sync::Mutex<HashMap<String, String>>,
+}
+
+impl<'a> UdpMetadataSink<'a> {
+    /// Wrap a session metadata map as a sink.
+    pub fn new(map: &'a std::sync::Mutex<HashMap<String, String>>) -> Self {
+        Self { map }
+    }
+
+    /// Insert or overwrite a metadata field.
+    pub fn record(&self, key: &str, value: &str) {
+        let mut map = self
+            .map
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        map.insert(key.to_string(), value.to_string());
+    }
+
+    /// Insert a metadata field only if it is not already set. Used for fields
+    /// that must not be downgraded across a session's datagrams — e.g. a
+    /// `blocked` action must not be overwritten by a later `monitored` one.
+    pub fn record_if_absent(&self, key: &str, value: &str) {
+        let mut map = self
+            .map
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        map.entry(key.to_string())
+            .or_insert_with(|| value.to_string());
+    }
 }
 
 /// Verdict from a per-datagram UDP plugin hook.

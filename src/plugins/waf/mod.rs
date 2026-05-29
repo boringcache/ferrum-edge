@@ -769,7 +769,9 @@ impl Plugin for Waf {
 
     /// Inspect a UDP/DTLS datagram payload. Encrypted passthrough datagrams are
     /// skipped (not L7-inspectable). A block is a silent `Drop` (standard UDP
-    /// behavior); per-datagram blocks are surfaced via `log_to_stdout`.
+    /// behavior). Hits (blocked or monitored) ride the session transaction
+    /// summary via `ctx.metadata_sink` (`waf.*`, default-on through
+    /// `log_to_metadata`) and are additionally logged when `log_to_stdout` is set.
     async fn on_udp_datagram(&self, ctx: &UdpDatagramContext<'_>) -> UdpDatagramVerdict {
         let Some(stream) = self.stream.as_ref() else {
             return UdpDatagramVerdict::Forward;
@@ -788,7 +790,28 @@ impl Plugin for Waf {
         if hits.is_empty() {
             return UdpDatagramVerdict::Forward;
         }
-        let (block, _severity, _ids) = self.stream_decision(&hits);
+        let (block, severity, ids) = self.stream_decision(&hits);
+        // Record the hit on the session transaction summary so a UDP/DTLS match
+        // is observable by default — parity with the TCP `on_stream_connect` path,
+        // not only when `log_to_stdout` is enabled. The per-datagram context is
+        // immutable, so this rides the proxy-provided session metadata sink.
+        if self.config.log_to_metadata
+            && let Some(sink) = ctx.metadata_sink
+        {
+            if !ids.is_empty() {
+                sink.record("waf.rule_hits", &ids);
+            }
+            sink.record("waf.target", "udp_stream");
+            sink.record("waf.severity", severity.as_str());
+            if block {
+                // A `blocked` action must win over any earlier `monitored` one
+                // recorded for this session, so overwrite it unconditionally.
+                sink.record("waf.action", "blocked");
+                sink.record_if_absent("waf.block_reason", "signature");
+            } else {
+                sink.record_if_absent("waf.action", "monitored");
+            }
+        }
         self.warn_stream_hits(&ctx.proxy_id, &ctx.client_ip, "udp", &hits, block);
         if block {
             UdpDatagramVerdict::Drop

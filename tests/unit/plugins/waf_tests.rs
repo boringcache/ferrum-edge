@@ -1983,7 +1983,7 @@ use ferrum_edge::ConsumerIndex;
 use ferrum_edge::config::types::BackendScheme;
 use ferrum_edge::plugins::{
     ProxyProtocol, StreamBytesKind, StreamConnectionContext, UdpDatagramContext,
-    UdpDatagramDirection, UdpDatagramVerdict,
+    UdpDatagramDirection, UdpDatagramVerdict, UdpMetadataSink,
 };
 use std::sync::Arc;
 
@@ -2020,6 +2020,7 @@ fn udp_ctx(payload: &[u8], kind: StreamBytesKind) -> UdpDatagramContext<'_> {
         direction: UdpDatagramDirection::ClientToBackend,
         payload,
         payload_kind: kind,
+        metadata_sink: None,
     }
 }
 
@@ -2283,6 +2284,78 @@ fn stream_waf_first_bytes_min_len_only_set_for_tls_shape_guard() {
     assert_eq!(
         Waf::new(&json!({})).unwrap().stream_first_bytes_min_len(),
         0
+    );
+}
+
+#[tokio::test]
+async fn stream_waf_udp_monitor_hit_records_metadata_via_sink() {
+    // A UDP signature match must record `waf.*` onto the session metadata sink so
+    // the hit rides the stream transaction summary by default (log_to_metadata is
+    // on), not only when log_to_stdout is enabled — parity with the TCP path.
+    let plugin = sig_waf("monitor");
+    let meta = std::sync::Mutex::new(std::collections::HashMap::new());
+    let mut ctx = udp_ctx(b"q=1 union select 1", StreamBytesKind::PlaintextWire);
+    ctx.metadata_sink = Some(UdpMetadataSink::new(&meta));
+
+    let verdict = plugin.on_udp_datagram(&ctx).await;
+    assert_eq!(verdict, UdpDatagramVerdict::Forward); // monitor mode forwards
+
+    let recorded = meta.lock().unwrap();
+    assert_eq!(
+        recorded.get("waf.target").map(String::as_str),
+        Some("udp_stream")
+    );
+    assert_eq!(
+        recorded.get("waf.action").map(String::as_str),
+        Some("monitored")
+    );
+    assert_eq!(
+        recorded.get("waf.severity").map(String::as_str),
+        Some("high")
+    );
+    assert!(
+        recorded.contains_key("waf.rule_hits"),
+        "matched rule ids should be recorded"
+    );
+}
+
+#[tokio::test]
+async fn stream_waf_udp_enforce_hit_records_blocked_metadata() {
+    // An enforced UDP hit drops the datagram AND records a `blocked` action with
+    // a block reason, so the drop is not silent in the transaction log.
+    let plugin = sig_waf("enforce");
+    let meta = std::sync::Mutex::new(std::collections::HashMap::new());
+    let mut ctx = udp_ctx(b"q=1 union select 1", StreamBytesKind::PlaintextWire);
+    ctx.metadata_sink = Some(UdpMetadataSink::new(&meta));
+
+    let verdict = plugin.on_udp_datagram(&ctx).await;
+    assert_eq!(verdict, UdpDatagramVerdict::Drop);
+
+    let recorded = meta.lock().unwrap();
+    assert_eq!(
+        recorded.get("waf.action").map(String::as_str),
+        Some("blocked")
+    );
+    assert_eq!(
+        recorded.get("waf.block_reason").map(String::as_str),
+        Some("signature")
+    );
+}
+
+#[tokio::test]
+async fn stream_waf_udp_clean_datagram_records_no_metadata() {
+    // No hit → nothing recorded, so clean UDP traffic does not pollute the
+    // transaction summary with WAF fields.
+    let plugin = sig_waf("monitor");
+    let meta = std::sync::Mutex::new(std::collections::HashMap::new());
+    let mut ctx = udp_ctx(b"perfectly benign payload", StreamBytesKind::PlaintextWire);
+    ctx.metadata_sink = Some(UdpMetadataSink::new(&meta));
+
+    let verdict = plugin.on_udp_datagram(&ctx).await;
+    assert_eq!(verdict, UdpDatagramVerdict::Forward);
+    assert!(
+        meta.lock().unwrap().is_empty(),
+        "a clean datagram must record no metadata"
     );
 }
 

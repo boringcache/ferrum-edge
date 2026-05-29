@@ -275,11 +275,23 @@ Limitations and behavior to know:
   incompatible with the kTLS-splice fast path, so a TLS-terminating TCP proxy
   with stream inspection falls back to a userspace relay for inspected
   connections. Plain-TCP proxies are peeked non-destructively and keep splice.
-- **First bytes only.** TCP scanning inspects the opening bytes of the stream
-  (up to 4 KiB), not the full byte stream. UDP scanning is per-datagram.
+- **First bytes only — best-effort, evadable by splitting.** TCP scanning
+  inspects the opening segment the client sends (the first readable chunk, up to
+  4 KiB) once, before the backend is dialed — not the full byte stream. A
+  determined attacker can therefore evade a signature by splitting the payload:
+  send a benign prefix, wait for the gateway to forward it and connect, then send
+  the malicious remainder, which is relayed without a rescan. Waiting for more
+  bytes cannot close this — the attacker just delays past any bounded window, and
+  blocking on a fuller buffer would stall server-first protocols that send
+  nothing until greeted. Treat stream signatures as a cheap opening-payload
+  filter for opportunistic/automated probes, not a replacement for inspection at
+  the backend. UDP scanning is per-datagram (each datagram is scanned whole).
 - **TCP blocks** reject before any backend is dialed and ride the stream
   transaction summary as `waf.action=blocked`. **UDP blocks** are a silent
-  datagram `Drop` (standard UDP behavior); enable `log_to_stdout` to see them.
+  datagram `Drop` (standard UDP behavior). Both transports record `waf.*` on the
+  stream transaction summary for every hit — blocked or monitored — via
+  `log_to_metadata` (on by default), so monitor-mode matches are observable in
+  the transaction log without enabling `log_to_stdout`.
 - By default only client→backend traffic is inspected; set `inspect_response`
   to also scan backend→client datagrams.
 
