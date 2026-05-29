@@ -2417,6 +2417,48 @@ paths:
                         description: |
                           Stable hash of the full typed overlay values so
                           same-key/different-value RTDS drift is visible.
+                  convergence:
+                    type: object
+                    description: |
+                      xDS resource-warming convergence state. Present only in
+                      xDS mode after the first ADS response; omitted in native
+                      mode. Surfaced here (JWT-authenticated) rather than on the
+                      unauthenticated `/metrics` surface because the per-type
+                      version strings embed config-change timestamps and content
+                      digests.
+                    required:
+                      - per_type_versions
+                      - missing_required_types
+                      - converged
+                      - version_skew
+                    properties:
+                      per_type_versions:
+                        type: object
+                        additionalProperties:
+                          type: string
+                        description: |
+                          Received `version_info` per subscribed resource type,
+                          keyed by short name (`cds`/`eds`/`lds`/`rds`/`sds`/
+                          `ecds`/`rtds`).
+                      missing_required_types:
+                        type: array
+                        items:
+                          type: string
+                        description: |
+                          Required mesh-slice types (short names) that have not
+                          yet delivered an initial response. Empty once the first
+                          slice can build.
+                      converged:
+                        type: boolean
+                        description: |
+                          True once every required type has delivered a response
+                          (the first slice can build).
+                      version_skew:
+                        type: boolean
+                        description: |
+                          True when the converged required-type versions are not
+                          all identical — normal under resource warming after an
+                          incremental (e.g. policy/workload-only ECDS) update.
               examples:
                 config-drift-populated:
                   value:
@@ -2445,6 +2487,16 @@ paths:
                         - ferrum.fault.sample
                         - ferrum.log.level
                       fingerprint: "sha256-3f786850e387550fdab836ed7e6dc881de23001b48c2fb5e7d8f4d1c2a0b9e8f"
+                    convergence:
+                      per_type_versions:
+                        cds: "2026-05-18T00:00:00Z:9f86d0818840"
+                        eds: "2026-05-18T00:00:00Z:9f86d0818840"
+                        lds: "2026-05-18T00:00:00Z:9f86d0818840"
+                        rds: "2026-05-18T00:00:00Z:9f86d0818840"
+                        ecds: "2026-05-18T19:32:00Z:3f786850e387"
+                      missing_required_types: []
+                      converged: true
+                      version_skew: true
                 config-drift-pre-convergence:
                   summary: Mesh mode active but no slice accepted yet
                   value:

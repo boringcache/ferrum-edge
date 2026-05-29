@@ -22,6 +22,7 @@
 //! for the operator playbook.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -29,6 +30,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::modes::mesh::config::MeshRuntimeOverlay;
+use crate::modes::mesh::runtime::XdsConvergenceSnapshot;
 use crate::modes::mesh::slice::MeshSlice;
 
 /// Per-resource-kind counts shipped on the `slice.resources` block. Each
@@ -159,6 +161,13 @@ pub struct MeshConfigDriftResponse {
     pub slice: MeshSliceDriftView,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime_overlay: Option<MeshRuntimeOverlayDriftView>,
+    /// xDS resource-warming convergence (per-type `version_info`, still-missing
+    /// required types, `converged`/`version_skew` flags). Present only in xDS
+    /// mode after the first ADS response; omitted in native mode. Surfaced here
+    /// (JWT-authenticated) rather than on `/metrics` because the per-type
+    /// version strings embed config-change timestamps and content digests.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub convergence: Option<XdsConvergenceSnapshot>,
 }
 
 /// Inputs for the response builder. Kept as a struct so the unit tests
@@ -184,6 +193,11 @@ pub struct MeshConfigDriftInputs<'a> {
     /// When `true`, include the `runtime_overlay` block. When `false`,
     /// the block is omitted regardless of slice content.
     pub include_overlay: bool,
+    /// xDS warming-convergence snapshot from
+    /// [`crate::modes::mesh::runtime::MeshRuntimeState::xds_convergence`].
+    /// `None` in native mode / before the first ADS response — the
+    /// `convergence` block is then omitted from the response.
+    pub convergence: Option<Arc<XdsConvergenceSnapshot>>,
 }
 
 /// Build the response from staged inputs. Pure function — no I/O, no
@@ -233,6 +247,7 @@ pub fn build_response(inputs: MeshConfigDriftInputs<'_>) -> MeshConfigDriftRespo
     MeshConfigDriftResponse {
         slice: slice_view,
         runtime_overlay: overlay_view,
+        convergence: inputs.convergence.map(|snapshot| snapshot.as_ref().clone()),
     }
 }
 
@@ -400,6 +415,7 @@ mod tests {
             source_protocol: "native",
             source_cp_url: "grpc://cp.local:50051",
             include_overlay: true,
+            convergence: None,
         });
 
         assert!(resp.slice.last_received_at.is_none());
@@ -425,6 +441,7 @@ mod tests {
             source_protocol: "xds",
             source_cp_url: "grpcs://cp.svc:50051",
             include_overlay: true,
+            convergence: None,
         });
 
         assert_eq!(resp.slice.namespace.as_deref(), Some("alpha"));
@@ -547,6 +564,7 @@ mod tests {
             source_protocol: "native",
             source_cp_url: "",
             include_overlay: false,
+            convergence: None,
         });
         assert!(resp.runtime_overlay.is_none());
         // Slice block is still populated — the overlay flag only gates
@@ -568,6 +586,7 @@ mod tests {
             source_protocol: "native",
             source_cp_url: "",
             include_overlay: true,
+            convergence: None,
         });
         let overlay = resp
             .runtime_overlay
@@ -591,6 +610,7 @@ mod tests {
             source_protocol: "native",
             source_cp_url: "",
             include_overlay: true,
+            convergence: None,
         });
         assert_eq!(resp.slice.age_seconds, Some(0));
     }
@@ -616,5 +636,62 @@ mod tests {
         assert!(!parse_include_overlay(Some(
             "include_overlay=false&include_overlay=true"
         )));
+    }
+
+    #[test]
+    fn convergence_block_included_when_provided() {
+        let slice = slice_with("alpha", "v1");
+        let snapshot = XdsConvergenceSnapshot {
+            per_type_versions: BTreeMap::from([
+                ("cds".to_string(), "v1".to_string()),
+                ("ecds".to_string(), "v2".to_string()),
+            ]),
+            missing_required_types: Vec::new(),
+            converged: true,
+            version_skew: true,
+        };
+        let resp = build_response(MeshConfigDriftInputs {
+            slice: Some(&slice),
+            last_install_at: Some(install_time()),
+            now: now_after_install(1),
+            source_protocol: "xds",
+            source_cp_url: "",
+            include_overlay: false,
+            convergence: Some(Arc::new(snapshot)),
+        });
+
+        let convergence = resp.convergence.expect("convergence block present");
+        assert!(convergence.converged);
+        assert!(convergence.version_skew);
+        assert!(convergence.missing_required_types.is_empty());
+        assert_eq!(
+            convergence
+                .per_type_versions
+                .get("ecds")
+                .map(String::as_str),
+            Some("v2")
+        );
+    }
+
+    #[test]
+    fn convergence_block_omitted_when_absent() {
+        // Native mode (no xDS convergence) → the block is omitted entirely, not
+        // serialized as null, so dashboards can distinguish xDS from native DPs.
+        let slice = slice_with("alpha", "v1");
+        let resp = build_response(MeshConfigDriftInputs {
+            slice: Some(&slice),
+            last_install_at: Some(install_time()),
+            now: now_after_install(1),
+            source_protocol: "native",
+            source_cp_url: "",
+            include_overlay: false,
+            convergence: None,
+        });
+        assert!(resp.convergence.is_none());
+        let value = serde_json::to_value(&resp).expect("serialize");
+        assert!(
+            value.get("convergence").is_none(),
+            "convergence key must be absent when None"
+        );
     }
 }
