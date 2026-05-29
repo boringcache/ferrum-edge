@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use ferrum_edge::plugins::{
-    Plugin, PluginHttpClient, ProxyProtocol, UDP_ONLY_PROTOCOLS, UdpDatagramContext,
-    UdpDatagramDirection, UdpDatagramVerdict,
+    Plugin, PluginHttpClient, ProxyProtocol, StreamBytesKind, UDP_ONLY_PROTOCOLS,
+    UdpDatagramContext, UdpDatagramDirection, UdpDatagramVerdict,
 };
 use serde_json::json;
 
@@ -16,7 +16,7 @@ fn make_plugin(
     .unwrap()
 }
 
-fn make_ctx(client_ip: &str, datagram_size: usize) -> UdpDatagramContext {
+fn make_ctx(client_ip: &str, datagram_size: usize) -> UdpDatagramContext<'static> {
     UdpDatagramContext {
         client_ip: Arc::from(client_ip),
         proxy_id: Arc::from("proxy-1"),
@@ -24,6 +24,9 @@ fn make_ctx(client_ip: &str, datagram_size: usize) -> UdpDatagramContext {
         listen_port: 5353,
         datagram_size,
         direction: UdpDatagramDirection::ClientToBackend,
+        // udp_rate_limiting keys off datagram_size, not payload bytes.
+        payload: &[],
+        payload_kind: StreamBytesKind::PlaintextWire,
     }
 }
 

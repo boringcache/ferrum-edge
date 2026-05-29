@@ -213,7 +213,7 @@ impl Plugin for PriorityOverridePlugin {
     fn requires_udp_datagram_hooks(&self) -> bool {
         self.inner.requires_udp_datagram_hooks()
     }
-    async fn on_udp_datagram(&self, ctx: &UdpDatagramContext) -> UdpDatagramVerdict {
+    async fn on_udp_datagram(&self, ctx: &UdpDatagramContext<'_>) -> UdpDatagramVerdict {
         self.inner.on_udp_datagram(ctx).await
     }
     fn requires_ws_disconnect_hooks(&self) -> bool {

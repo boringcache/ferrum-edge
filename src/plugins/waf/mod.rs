@@ -18,6 +18,7 @@ mod exemptions;
 mod normalize;
 mod rules;
 mod scan;
+mod stream;
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -32,8 +33,13 @@ use self::rules::{
     parse_rule_action, parse_rule_overrides,
 };
 use self::scan::ScanOutcome;
+use self::stream::{StreamWafConfig, looks_like_tls_client_hello, parse_stream_config};
 use super::utils::sse::is_sse_request;
-use super::{HTTP_FAMILY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext};
+use super::{
+    ALL_PROTOCOLS, HTTP_FAMILY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext,
+    StreamBytesKind, StreamConnectionContext, UdpDatagramContext, UdpDatagramDirection,
+    UdpDatagramVerdict,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GlobalMode {
@@ -111,6 +117,12 @@ pub struct Waf {
     exemptions: CompiledExemptions,
     specials: SpecialRuleIndices,
     active: bool,
+    /// Optional raw-stream (TCP/UDP) inspection. `None` keeps the plugin
+    /// HTTP-only and untouched.
+    stream: Option<StreamWafConfig>,
+    /// Protocols this instance attaches to. Includes the stream protocols only
+    /// when `stream` inspection is configured, so HTTP-only WAFs are unchanged.
+    supported_protocols: &'static [ProxyProtocol],
 }
 
 impl Waf {
@@ -171,14 +183,18 @@ impl Waf {
         let custom_rules = parse_custom_rules(object.get("custom_rules"), default_action)?;
         let exemptions = CompiledExemptions::from_config(object.get("global_exemptions"))?;
 
+        // Parse optional raw-stream (TCP/UDP) inspection up front so a
+        // stream-only WAF (no HTTP rule pack) is still a valid configuration.
+        let stream = parse_stream_config(object)?;
+
         let mut all_rules: Vec<(WafRule, bool)> = Vec::new();
         if include_default_rules {
             all_rules.extend(default_rules().into_iter().map(|rule| (rule, true)));
         }
         all_rules.extend(custom_rules.into_iter().map(|rule| (rule, false)));
-        if all_rules.is_empty() {
+        if all_rules.is_empty() && stream.is_none() {
             return Err(
-                "waf: no rules configured — enable default rules or provide custom_rules"
+                "waf: no rules configured — enable default rules, provide custom_rules, or configure stream inspection"
                     .to_string(),
             );
         }
@@ -190,7 +206,7 @@ impl Waf {
             &rule_overrides,
             paranoia_level,
         )?;
-        if compiled.is_empty() && mode != GlobalMode::Disabled {
+        if compiled.is_empty() && stream.is_none() && mode != GlobalMode::Disabled {
             return Err(
                 "waf: all configured rules are disabled or above paranoia_level".to_string(),
             );
@@ -243,13 +259,23 @@ impl Waf {
             method: compiled.find_rule_index("FE-METHOD-001"),
             method_override: compiled.find_rule_index("FE-HEADER-002"),
         };
-        let active = config.mode != GlobalMode::Disabled && !compiled.is_empty();
+        // A stream-only WAF (no HTTP rule pack, but stream signatures or the
+        // TLS-shape guard) is still active for its stream proxies.
+        let active =
+            config.mode != GlobalMode::Disabled && (!compiled.is_empty() || stream.is_some());
+        let supported_protocols = if active && stream.is_some() {
+            ALL_PROTOCOLS
+        } else {
+            HTTP_FAMILY_PROTOCOLS
+        };
         Ok(Self {
             config,
             compiled,
             exemptions,
             specials,
             active,
+            stream,
+            supported_protocols,
         })
     }
 
@@ -358,6 +384,9 @@ impl Waf {
     }
 
     /// Build the configured rejection response (status, content-type, body).
+    /// On TCP/UDP stream paths the proxy ignores the status/body and simply
+    /// drops the connection or datagram; the `Reject` variant is what triggers
+    /// that drop.
     fn reject(&self) -> PluginResult {
         PluginResult::Reject {
             status_code: self.config.reject_status_code,
@@ -366,6 +395,77 @@ impl Waf {
                 "content-type".to_string(),
                 self.config.reject_content_type.clone(),
             )]),
+        }
+    }
+
+    /// Aggregate matched stream signatures into a `(block, highest_severity,
+    /// comma_joined_ids)` decision. Blocks only when enforcing globally and at
+    /// least one matched signature is itself set to enforce.
+    fn stream_decision(&self, hits: &[&stream::StreamSignatureMeta]) -> (bool, Severity, String) {
+        let mut highest = Severity::Info;
+        let mut any_enforce = false;
+        let mut ids = Vec::with_capacity(hits.len());
+        for hit in hits {
+            highest = highest.max(hit.severity);
+            any_enforce |= hit.action == RuleAction::Enforce;
+            ids.push(hit.id.as_str());
+        }
+        let block = any_enforce && self.config.mode == GlobalMode::Enforce;
+        (block, highest, ids.join(","))
+    }
+
+    /// Record stream WAF decision fields on a TCP `StreamConnectionContext` so
+    /// they ride the stream transaction summary out to every logging sink.
+    fn record_stream_metadata(
+        &self,
+        ctx: &mut StreamConnectionContext,
+        rule_hits: &str,
+        severity: Severity,
+        blocked: bool,
+        block_reason: &str,
+    ) {
+        if !self.config.log_to_metadata {
+            return;
+        }
+        if !rule_hits.is_empty() {
+            ctx.insert_metadata("waf.rule_hits".to_string(), rule_hits.to_string());
+        }
+        ctx.insert_metadata("waf.target".to_string(), "tcp_stream".to_string());
+        ctx.insert_metadata("waf.severity".to_string(), severity.as_str().to_string());
+        ctx.insert_metadata(
+            "waf.action".to_string(),
+            if blocked { "blocked" } else { "monitored" }.to_string(),
+        );
+        if blocked {
+            ctx.insert_metadata("waf.block_reason".to_string(), block_reason.to_string());
+        }
+    }
+
+    /// Emit one structured `warn!` per matched stream signature when
+    /// `log_to_stdout` is configured.
+    fn warn_stream_hits(
+        &self,
+        proxy_id: &str,
+        client_ip: &str,
+        transport: &str,
+        hits: &[&stream::StreamSignatureMeta],
+        blocked: bool,
+    ) {
+        if !self.config.log_to_stdout {
+            return;
+        }
+        for hit in hits {
+            warn!(
+                target: "waf",
+                proxy = %proxy_id,
+                rule = %hit.id,
+                severity = %hit.severity.as_str(),
+                action = %hit.action.as_event_action(),
+                transport = %transport,
+                client_ip = %client_ip,
+                blocked = blocked,
+                "WAF stream signature matched"
+            );
         }
     }
 
@@ -550,7 +650,107 @@ impl Plugin for Waf {
     }
 
     fn supported_protocols(&self) -> &'static [ProxyProtocol] {
-        HTTP_FAMILY_PROTOCOLS
+        self.supported_protocols
+    }
+
+    fn requires_stream_first_bytes(&self) -> bool {
+        self.active
+            && self
+                .stream
+                .as_ref()
+                .is_some_and(|s| s.needs_tcp_first_bytes())
+    }
+
+    fn requires_udp_datagram_hooks(&self) -> bool {
+        self.active
+            && self
+                .stream
+                .as_ref()
+                .is_some_and(|s| s.needs_udp_datagrams())
+    }
+
+    /// Inspect the opening bytes of a TCP stream. Runs before backend dispatch
+    /// so a block never dials an upstream. The bytes were captured into
+    /// `ctx.first_bytes` by the TCP proxy (raw peek for plaintext/passthrough,
+    /// decrypted prefix for TLS-terminated frontends).
+    async fn on_stream_connect(&self, ctx: &mut StreamConnectionContext) -> PluginResult {
+        let Some(stream) = self.stream.as_ref() else {
+            return PluginResult::Continue;
+        };
+        if !self.active {
+            return PluginResult::Continue;
+        }
+        let Some(bytes) = ctx.first_bytes.clone() else {
+            return PluginResult::Continue;
+        };
+        let kind = ctx
+            .first_bytes_kind
+            .unwrap_or(StreamBytesKind::PlaintextWire);
+
+        // Transport-shape guard: raw wire bytes that don't begin a TLS
+        // ClientHello on a TLS-required port. No-op once TLS is terminated.
+        if stream.tcp_require_tls && kind.is_raw_wire() && !looks_like_tls_client_hello(&bytes) {
+            let blocked = self.config.mode == GlobalMode::Enforce;
+            self.record_stream_metadata(ctx, "", Severity::High, blocked, "tcp_require_tls");
+            if self.config.log_to_stdout {
+                warn!(
+                    target: "waf",
+                    proxy = %ctx.proxy_id,
+                    client_ip = %ctx.client_ip,
+                    transport = "tcp",
+                    blocked = blocked,
+                    "WAF: non-TLS traffic on tcp_require_tls port"
+                );
+            }
+            if blocked {
+                return self.reject();
+            }
+            return PluginResult::Continue;
+        }
+
+        // L7 signature scan over plaintext / decrypted opening bytes only.
+        if stream.inspect_tcp && kind.is_l7_inspectable() {
+            let hits = stream.signatures.matches(&bytes);
+            if !hits.is_empty() {
+                let (block, severity, ids) = self.stream_decision(&hits);
+                self.record_stream_metadata(ctx, &ids, severity, block, "signature");
+                self.warn_stream_hits(&ctx.proxy_id, &ctx.client_ip, "tcp", &hits, block);
+                if block {
+                    return self.reject();
+                }
+            }
+        }
+        PluginResult::Continue
+    }
+
+    /// Inspect a UDP/DTLS datagram payload. Encrypted passthrough datagrams are
+    /// skipped (not L7-inspectable). A block is a silent `Drop` (standard UDP
+    /// behavior); per-datagram blocks are surfaced via `log_to_stdout`.
+    async fn on_udp_datagram(&self, ctx: &UdpDatagramContext<'_>) -> UdpDatagramVerdict {
+        let Some(stream) = self.stream.as_ref() else {
+            return UdpDatagramVerdict::Forward;
+        };
+        if !self.active || !stream.inspect_udp {
+            return UdpDatagramVerdict::Forward;
+        }
+        if !ctx.payload_kind.is_l7_inspectable() {
+            return UdpDatagramVerdict::Forward;
+        }
+        // Inspect client→backend by default; responses only when opted in.
+        if ctx.direction == UdpDatagramDirection::BackendToClient && !stream.inspect_response {
+            return UdpDatagramVerdict::Forward;
+        }
+        let hits = stream.signatures.matches(ctx.payload);
+        if hits.is_empty() {
+            return UdpDatagramVerdict::Forward;
+        }
+        let (block, _severity, _ids) = self.stream_decision(&hits);
+        self.warn_stream_hits(&ctx.proxy_id, &ctx.client_ip, "udp", &hits, block);
+        if block {
+            UdpDatagramVerdict::Drop
+        } else {
+            UdpDatagramVerdict::Forward
+        }
     }
 
     async fn authorize(&self, ctx: &mut RequestContext) -> PluginResult {

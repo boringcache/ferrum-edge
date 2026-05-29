@@ -11244,6 +11244,60 @@ components:
         reject_body:
           type: string
           default: '{"error":"Forbidden"}'
+        stream:
+          $ref: "#/components/schemas/WafStreamConfig"
+
+    WafStreamConfig:
+      type: object
+      description: >
+        Optional raw TCP/UDP inspection. When present the WAF also attaches to
+        stream proxies. L7 signature scanning runs over plaintext application
+        bytes (plain TCP opening segment, decrypted TLS/DTLS payloads); encrypted
+        passthrough traffic is never L7-scanned. Governed by the global `mode`.
+      properties:
+        tcp_require_tls:
+          type: boolean
+          default: false
+          description: >
+            Reject a TCP connection whose opening bytes are not a TLS/DTLS
+            ClientHello. Applies to plain/passthrough proxies; a no-op once TLS
+            is terminated.
+        inspect_tcp:
+          type: boolean
+          default: true
+          description: Run signatures over the opening bytes of TCP streams.
+        inspect_udp:
+          type: boolean
+          default: true
+          description: Run signatures over UDP/DTLS datagram payloads.
+        inspect_response:
+          type: boolean
+          default: false
+          description: Also scan backend→client datagrams (client→backend only by default).
+        signatures:
+          type: array
+          items:
+            $ref: "#/components/schemas/WafStreamSignature"
+          default: []
+
+    WafStreamSignature:
+      type: object
+      required: [id, pattern]
+      properties:
+        id:
+          type: string
+          description: Stable identifier, surfaced in logs and `waf.rule_hits`.
+        pattern:
+          type: string
+          description: Byte regex matched against the stream/datagram payload.
+        severity:
+          type: string
+          enum: [info, low, medium, high, critical]
+          default: medium
+        action:
+          type: string
+          enum: [enforce, monitor, disabled]
+          default: enforce
 
     WafRule:
       type: object

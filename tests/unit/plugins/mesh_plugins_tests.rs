@@ -113,6 +113,8 @@ fn stream_context() -> StreamConnectionContext {
         sni_hostname: None,
         mesh_direction: None,
         node_waypoint_policy_scope: None,
+        first_bytes: None,
+        first_bytes_kind: None,
     }
 }
 
@@ -1529,6 +1531,8 @@ async fn workload_metrics_on_stream_connect_adds_source_identity_metadata() {
         sni_hostname: None,
         mesh_direction: None,
         node_waypoint_policy_scope: None,
+        first_bytes: None,
+        first_bytes_kind: None,
     };
 
     let result = plugin.on_stream_connect(&mut ctx).await;
@@ -2571,6 +2575,8 @@ async fn workload_metrics_stream_inbound_listener_stamps_mesh_direction() {
         sni_hostname: None,
         mesh_direction: Some(MeshTrafficDirection::Inbound),
         node_waypoint_policy_scope: None,
+        first_bytes: None,
+        first_bytes_kind: None,
     };
 
     let result = plugin.on_stream_connect(&mut ctx).await;

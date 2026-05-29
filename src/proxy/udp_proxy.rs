@@ -28,7 +28,7 @@ use crate::consumer_index::ConsumerIndex;
 use crate::dns::DnsCache;
 use crate::load_balancer::{LoadBalancerCache, LoadBalancerCacheInner};
 use crate::plugins::{
-    Direction, Plugin, PluginResult, ProxyProtocol, StreamConnectionContext,
+    Direction, Plugin, PluginResult, ProxyProtocol, StreamBytesKind, StreamConnectionContext,
     StreamTransactionSummary, UdpDatagramContext, UdpDatagramDirection, UdpDatagramVerdict,
 };
 use crate::proxy::stream_error::{StreamSetupError, StreamSetupKind, find_stream_setup_error};
@@ -98,6 +98,11 @@ struct UdpSession {
     /// Plugins and proxy metadata resolved from the RequestEpoch used to create this session.
     plugins: Arc<Vec<Arc<dyn Plugin>>>,
     datagram_plugins: Arc<[Arc<dyn Plugin>]>,
+    /// Nature of the per-datagram payloads this (plain-UDP-frontend) session
+    /// hands to `on_udp_datagram`: `PlaintextWire` for plain UDP, or
+    /// `EncryptedWire` for passthrough proxies that forward ciphertext. The
+    /// DTLS-terminating frontend path reports `DecryptedApp` inline instead.
+    datagram_payload_kind: StreamBytesKind,
     proxy_id: String,
     proxy_name: Option<String>,
     proxy_namespace: String,
@@ -190,13 +195,15 @@ fn resolve_udp_session_epoch_view(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn udp_datagram_allowed(
     datagram_plugins: &[Arc<dyn Plugin>],
     client_addr: SocketAddr,
     proxy_id: &str,
     proxy_name: Option<&str>,
     listen_port: u16,
-    datagram_size: usize,
+    payload: &[u8],
+    payload_kind: StreamBytesKind,
     direction: UdpDatagramDirection,
 ) -> bool {
     if datagram_plugins.is_empty() {
@@ -208,8 +215,10 @@ async fn udp_datagram_allowed(
         proxy_id: Arc::from(proxy_id),
         proxy_name: proxy_name.map(Arc::from),
         listen_port,
-        datagram_size,
+        datagram_size: payload.len(),
         direction,
+        payload,
+        payload_kind,
     };
     for plugin in datagram_plugins {
         if matches!(plugin.on_udp_datagram(&ctx).await, UdpDatagramVerdict::Drop) {
@@ -1177,7 +1186,8 @@ async fn process_datagram(
             &session.proxy_id,
             session.proxy_name.as_deref(),
             session.listen_port,
-            data.len(),
+            data,
+            session.datagram_payload_kind,
             UdpDatagramDirection::ClientToBackend,
         )
         .await
@@ -1195,7 +1205,12 @@ async fn process_datagram(
             &view.proxy.id,
             view.proxy.name.as_deref(),
             listen_port,
-            data.len(),
+            data,
+            if view.proxy.passthrough {
+                StreamBytesKind::EncryptedWire
+            } else {
+                StreamBytesKind::PlaintextWire
+            },
             UdpDatagramDirection::ClientToBackend,
         )
         .await
@@ -1627,6 +1642,10 @@ async fn start_dtls_frontend_listener(
                     // Namespace/selector-scoped DENY/ALLOW rules are not enforced
                     // for DTLS streams (TCP and HTTP/HBONE are). See docs/mesh.md.
                     node_waypoint_policy_scope: None,
+                    // UDP inspects payload per-datagram via on_udp_datagram, not
+                    // via first_bytes (which is a TCP-stream concept).
+                    first_bytes: None,
+                    first_bytes_kind: None,
                 };
                 let mut rejected = false;
                 for plugin in plugins.iter() {
@@ -2237,6 +2256,9 @@ async fn handle_dtls_client_inner(
                     listen_port: dgram_listen_port,
                     datagram_size: len,
                     direction: UdpDatagramDirection::ClientToBackend,
+                    // DTLS-terminating frontend: `data` is decrypted plaintext.
+                    payload: &data,
+                    payload_kind: StreamBytesKind::DecryptedApp,
                 };
                 let mut dropped = false;
                 for plugin in dgram_plugins.iter() {
@@ -2333,6 +2355,9 @@ async fn handle_dtls_client_inner(
                     listen_port,
                     datagram_size: len,
                     direction: UdpDatagramDirection::BackendToClient,
+                    // DTLS-terminating frontend: `data` is decrypted plaintext.
+                    payload: &data,
+                    payload_kind: StreamBytesKind::DecryptedApp,
                 };
                 let mut drop = false;
                 for plugin in dgram_plugins_rev.iter() {
@@ -2439,6 +2464,10 @@ async fn create_session(
         // Namespace/selector-scoped DENY/ALLOW rules are not enforced for UDP
         // streams (TCP and HTTP/HBONE are). See docs/mesh.md.
         node_waypoint_policy_scope: None,
+        // UDP inspects payload per-datagram via on_udp_datagram, not via
+        // first_bytes (which is a TCP-stream concept).
+        first_bytes: None,
+        first_bytes_kind: None,
     };
     for plugin in plugins.iter() {
         if let PluginResult::Reject { .. } = plugin.on_stream_connect(&mut stream_ctx).await {
@@ -2649,6 +2678,11 @@ async fn create_session(
         local_addr: std::sync::OnceLock::new(),
         plugins: Arc::clone(&plugins),
         datagram_plugins: Arc::clone(&datagram_plugins),
+        datagram_payload_kind: if is_passthrough {
+            StreamBytesKind::EncryptedWire
+        } else {
+            StreamBytesKind::PlaintextWire
+        },
         proxy_id: proxy_id.to_string(),
         proxy_name: proxy_name.clone(),
         proxy_namespace: proxy_namespace.clone(),
@@ -2863,6 +2897,8 @@ async fn create_session(
                     listen_port: reply_listen_port,
                     datagram_size: len,
                     direction: UdpDatagramDirection::BackendToClient,
+                    payload: send_data,
+                    payload_kind: reply_session.datagram_payload_kind,
                 };
                 let mut drop = false;
                 for plugin in reply_datagram_plugins.iter() {
@@ -2967,6 +3003,8 @@ async fn create_session(
                                     listen_port: reply_listen_port,
                                     datagram_size: len2,
                                     direction: UdpDatagramDirection::BackendToClient,
+                                    payload: &buf[..len2],
+                                    payload_kind: reply_session.datagram_payload_kind,
                                 };
                                 let mut drop = false;
                                 for plugin in reply_datagram_plugins.iter() {
@@ -3319,6 +3357,7 @@ mod tests {
             local_addr: std::sync::OnceLock::new(),
             plugins: Arc::new(Vec::new()),
             datagram_plugins: Arc::from([]),
+            datagram_payload_kind: crate::plugins::StreamBytesKind::PlaintextWire,
             proxy_id: "udp-proxy".to_string(),
             proxy_name: Some("UDP Proxy".to_string()),
             proxy_namespace: "ferrum".to_string(),
@@ -3592,6 +3631,7 @@ mod tests {
             local_addr: std::sync::OnceLock::new(),
             plugins: Arc::new(Vec::new()),
             datagram_plugins: Arc::from([]),
+            datagram_payload_kind: crate::plugins::StreamBytesKind::PlaintextWire,
             proxy_id: "udp-proxy".to_string(),
             proxy_name: Some("UDP Proxy".to_string()),
             proxy_namespace: "ferrum".to_string(),

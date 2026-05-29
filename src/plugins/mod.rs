@@ -186,13 +186,22 @@ pub enum UdpDatagramDirection {
 /// directions: client→backend (before forwarding) and backend→client (before
 /// relaying the response to the client).
 #[allow(dead_code)]
-pub struct UdpDatagramContext {
+pub struct UdpDatagramContext<'a> {
     pub client_ip: Arc<str>,
     pub proxy_id: Arc<str>,
     pub proxy_name: Option<Arc<str>>,
     pub listen_port: u16,
     pub datagram_size: usize,
     pub direction: UdpDatagramDirection,
+    /// Datagram payload bytes, borrowed for the duration of the hook call so
+    /// there is no per-datagram allocation. For plain UDP these are the raw
+    /// wire bytes; for DTLS-terminated sessions they are the decrypted
+    /// application plaintext; for passthrough they are the encrypted wire
+    /// bytes. `payload_kind` disambiguates so content-inspecting plugins know
+    /// whether L7 scanning is meaningful.
+    pub payload: &'a [u8],
+    /// Nature of `payload`.
+    pub payload_kind: StreamBytesKind,
 }
 
 /// Verdict from a per-datagram UDP plugin hook.
@@ -205,6 +214,42 @@ pub enum UdpDatagramVerdict {
     Forward,
     /// Silently drop the datagram (standard UDP flood mitigation).
     Drop,
+}
+
+/// Nature of the opening stream bytes (TCP) or datagram payload (UDP) handed to
+/// a stream-aware inspection plugin such as the WAF.
+///
+/// Content inspection (L7 signature scanning) is only meaningful on plaintext
+/// application bytes — either raw plaintext on the wire, or bytes the proxy
+/// recovered after terminating TLS/DTLS. Passthrough proxies forward ciphertext
+/// the gateway never decrypts, so only transport-shape checks (e.g. validating a
+/// TLS ClientHello) are possible there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamBytesKind {
+    /// Plaintext application bytes observed directly on the wire (plain TCP /
+    /// plain UDP). Both L7-inspectable and representative of the raw client
+    /// bytes, so transport-shape checks also apply.
+    PlaintextWire,
+    /// Encrypted wire bytes from a passthrough (non-terminating) proxy. Suitable
+    /// only for transport-shape checks (e.g. TLS/DTLS ClientHello), never L7.
+    EncryptedWire,
+    /// Application bytes recovered after the proxy terminated TLS/DTLS. These are
+    /// L7-inspectable; the transport was already proven to be TLS/DTLS by the
+    /// completed handshake.
+    DecryptedApp,
+}
+
+impl StreamBytesKind {
+    /// Whether L7 signature scanning of these bytes is meaningful.
+    pub fn is_l7_inspectable(self) -> bool {
+        matches!(self, Self::PlaintextWire | Self::DecryptedApp)
+    }
+
+    /// Whether these bytes are raw wire bytes suitable for transport-shape
+    /// checks such as `tcp_require_tls` (i.e. the proxy did not decrypt them).
+    pub fn is_raw_wire(self) -> bool {
+        matches!(self, Self::PlaintextWire | Self::EncryptedWire)
+    }
 }
 
 /// Direction of a WebSocket frame being proxied.
@@ -1474,6 +1519,14 @@ pub struct StreamConnectionContext {
     /// Mirrors `RequestContext::node_waypoint_policy_scope`; `None` for
     /// non-waypoint stream proxies.
     pub node_waypoint_policy_scope: Option<Arc<crate::modes::mesh::runtime::PolicyScopeCache>>,
+    /// Opening client bytes captured for stream-aware inspection plugins (e.g.
+    /// the WAF). Populated by the stream proxy only when some plugin opts in via
+    /// `requires_stream_first_bytes()`, before `on_stream_connect` runs; `None`
+    /// otherwise. `first_bytes_kind` describes whether these are plaintext,
+    /// encrypted passthrough, or post-termination decrypted bytes.
+    pub first_bytes: Option<bytes::Bytes>,
+    /// Nature of `first_bytes`. `None` when `first_bytes` is `None`.
+    pub first_bytes_kind: Option<StreamBytesKind>,
 }
 
 impl StreamConnectionContext {
@@ -2062,6 +2115,20 @@ pub trait Plugin: Send + Sync {
         false
     }
 
+    /// Returns `true` if this plugin needs the opening client bytes of a TCP
+    /// stream captured into `StreamConnectionContext.first_bytes` before
+    /// `on_stream_connect` runs. Zero overhead when `false` (default) — the TCP
+    /// proxy skips the capture entirely, preserving the splice/kTLS fast paths.
+    ///
+    /// Capturing decrypted application bytes from a TLS-terminating frontend
+    /// requires reading them in userspace, which is incompatible with kTLS
+    /// splice; the proxy therefore falls back to a userspace relay for that
+    /// connection. Plaintext and passthrough frontends are peeked
+    /// non-destructively and keep their fast paths.
+    fn requires_stream_first_bytes(&self) -> bool {
+        false
+    }
+
     /// Returns `true` if this plugin needs notification when a WebSocket
     /// session ends. Zero overhead when `false` (default) — the relay teardown
     /// path skips constructing the context and iterating plugins.
@@ -2094,7 +2161,7 @@ pub trait Plugin: Send + Sync {
     /// `requires_udp_datagram_hooks()`. Return `UdpDatagramVerdict::Drop` to
     /// silently discard the datagram (standard UDP flood mitigation).
     /// Use `ctx.direction` to distinguish client→backend from backend→client.
-    async fn on_udp_datagram(&self, _ctx: &UdpDatagramContext) -> UdpDatagramVerdict {
+    async fn on_udp_datagram(&self, _ctx: &UdpDatagramContext<'_>) -> UdpDatagramVerdict {
         UdpDatagramVerdict::Forward
     }
 

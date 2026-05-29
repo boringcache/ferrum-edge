@@ -1976,3 +1976,274 @@ async fn per_rule_score_override_drives_blocking() {
         Some("score")
     );
 }
+
+// ── Stream (TCP/UDP) WAF ─────────────────────────────────────────────────
+
+use ferrum_edge::ConsumerIndex;
+use ferrum_edge::config::types::BackendScheme;
+use ferrum_edge::plugins::{
+    ProxyProtocol, StreamBytesKind, StreamConnectionContext, UdpDatagramContext,
+    UdpDatagramDirection, UdpDatagramVerdict,
+};
+use std::sync::Arc;
+
+fn stream_ctx(first_bytes: &[u8], kind: StreamBytesKind) -> StreamConnectionContext {
+    StreamConnectionContext {
+        client_ip: "203.0.113.10".to_string(),
+        proxy_id: "tcp-proxy".to_string(),
+        proxy_name: Some("TCP Proxy".to_string()),
+        listen_port: 9000,
+        backend_scheme: BackendScheme::Tcp,
+        consumer_index: Arc::new(ConsumerIndex::new(&[])),
+        identified_consumer: None,
+        authenticated_identity: None,
+        auth_method: None,
+        metadata: None,
+        tls_client_cert_der: None,
+        tls_client_cert_chain_der: None,
+        sni_hostname: None,
+        mesh_direction: None,
+        node_waypoint_policy_scope: None,
+        // `.into()` infers `bytes::Bytes` from the field type — no extra dep.
+        first_bytes: Some(first_bytes.to_vec().into()),
+        first_bytes_kind: Some(kind),
+    }
+}
+
+fn udp_ctx(payload: &[u8], kind: StreamBytesKind) -> UdpDatagramContext<'_> {
+    UdpDatagramContext {
+        client_ip: Arc::from("203.0.113.10"),
+        proxy_id: Arc::from("udp-proxy"),
+        proxy_name: Some(Arc::from("UDP Proxy")),
+        listen_port: 9000,
+        datagram_size: payload.len(),
+        direction: UdpDatagramDirection::ClientToBackend,
+        payload,
+        payload_kind: kind,
+    }
+}
+
+fn sig_waf(mode: &str) -> Waf {
+    Waf::new(&json!({
+        "mode": mode,
+        "include_default_rules": false,
+        "stream": {
+            "signatures": [{
+                "id": "STREAM-SQLI-1",
+                "pattern": "(?i)union\\s+select",
+                "severity": "high",
+                "action": "enforce"
+            }]
+        }
+    }))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn stream_waf_signature_blocks_plaintext_tcp() {
+    let plugin = sig_waf("enforce");
+    let mut sctx = stream_ctx(
+        b"id=1 UNION SELECT password FROM users",
+        StreamBytesKind::PlaintextWire,
+    );
+
+    let result = plugin.on_stream_connect(&mut sctx).await;
+
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    let md = sctx.metadata.as_ref().expect("metadata set on block");
+    assert_eq!(md.get("waf.action").map(String::as_str), Some("blocked"));
+    assert_eq!(
+        md.get("waf.block_reason").map(String::as_str),
+        Some("signature")
+    );
+    assert_eq!(
+        md.get("waf.rule_hits").map(String::as_str),
+        Some("STREAM-SQLI-1")
+    );
+    assert_eq!(md.get("waf.target").map(String::as_str), Some("tcp_stream"));
+}
+
+#[tokio::test]
+async fn stream_waf_signature_monitor_mode_records_but_allows() {
+    let plugin = sig_waf("monitor");
+    let mut sctx = stream_ctx(b"id=1 union select 1", StreamBytesKind::PlaintextWire);
+
+    let result = plugin.on_stream_connect(&mut sctx).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    let md = sctx.metadata.as_ref().expect("metadata set on monitor");
+    assert_eq!(md.get("waf.action").map(String::as_str), Some("monitored"));
+    assert!(!md.contains_key("waf.block_reason"));
+}
+
+#[tokio::test]
+async fn stream_waf_scans_decrypted_tls_payload() {
+    // DecryptedApp = bytes recovered after the proxy terminated TLS. These are
+    // L7-inspectable, so a signature still fires.
+    let plugin = sig_waf("enforce");
+    let mut sctx = stream_ctx(b"q=1 union select 2", StreamBytesKind::DecryptedApp);
+
+    let result = plugin.on_stream_connect(&mut sctx).await;
+
+    assert!(matches!(result, PluginResult::Reject { .. }));
+}
+
+#[tokio::test]
+async fn stream_waf_skips_encrypted_passthrough_payload() {
+    // EncryptedWire = ciphertext the gateway never decrypts; L7 scanning is
+    // meaningless and must not run (no false-positive on encrypted bytes).
+    let plugin = sig_waf("enforce");
+    let mut sctx = stream_ctx(b"id=1 union select 1", StreamBytesKind::EncryptedWire);
+
+    let result = plugin.on_stream_connect(&mut sctx).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(sctx.metadata.is_none());
+}
+
+#[tokio::test]
+async fn stream_waf_clean_payload_is_allowed() {
+    let plugin = sig_waf("enforce");
+    let mut sctx = stream_ctx(b"GET /health HTTP/1.1\r\n", StreamBytesKind::PlaintextWire);
+
+    let result = plugin.on_stream_connect(&mut sctx).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+}
+
+#[tokio::test]
+async fn stream_waf_tcp_require_tls_blocks_non_tls() {
+    let plugin = Waf::new(&json!({
+        "mode": "enforce",
+        "include_default_rules": false,
+        "stream": { "tcp_require_tls": true }
+    }))
+    .unwrap();
+    let mut sctx = stream_ctx(b"GET / HTTP/1.1\r\n", StreamBytesKind::PlaintextWire);
+
+    let result = plugin.on_stream_connect(&mut sctx).await;
+
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    let md = sctx.metadata.as_ref().expect("metadata");
+    assert_eq!(
+        md.get("waf.block_reason").map(String::as_str),
+        Some("tcp_require_tls")
+    );
+}
+
+#[tokio::test]
+async fn stream_waf_tcp_require_tls_allows_client_hello() {
+    let plugin = Waf::new(&json!({
+        "mode": "enforce",
+        "include_default_rules": false,
+        "stream": { "tcp_require_tls": true }
+    }))
+    .unwrap();
+    // TLS record: handshake (0x16), version 0x0301.
+    let mut sctx = stream_ctx(
+        &[0x16, 0x03, 0x01, 0x00, 0x10, 0x01, 0x00, 0x00, 0x0c],
+        StreamBytesKind::PlaintextWire,
+    );
+
+    let result = plugin.on_stream_connect(&mut sctx).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+}
+
+#[tokio::test]
+async fn stream_waf_tcp_require_tls_is_noop_after_termination() {
+    // On a TLS-terminating frontend the bytes are DecryptedApp; the handshake
+    // already proved TLS, so the shape guard must not fire.
+    let plugin = Waf::new(&json!({
+        "mode": "enforce",
+        "include_default_rules": false,
+        "stream": { "tcp_require_tls": true }
+    }))
+    .unwrap();
+    let mut sctx = stream_ctx(b"GET / HTTP/1.1\r\n", StreamBytesKind::DecryptedApp);
+
+    let result = plugin.on_stream_connect(&mut sctx).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+}
+
+#[tokio::test]
+async fn stream_waf_udp_drops_matching_datagram() {
+    let plugin = sig_waf("enforce");
+    let verdict = plugin
+        .on_udp_datagram(&udp_ctx(
+            b"q=1 union select 1",
+            StreamBytesKind::PlaintextWire,
+        ))
+        .await;
+    assert_eq!(verdict, UdpDatagramVerdict::Drop);
+}
+
+#[tokio::test]
+async fn stream_waf_udp_forwards_clean_datagram() {
+    let plugin = sig_waf("enforce");
+    let verdict = plugin
+        .on_udp_datagram(&udp_ctx(b"hello world", StreamBytesKind::PlaintextWire))
+        .await;
+    assert_eq!(verdict, UdpDatagramVerdict::Forward);
+}
+
+#[tokio::test]
+async fn stream_waf_udp_skips_encrypted_passthrough() {
+    let plugin = sig_waf("enforce");
+    let verdict = plugin
+        .on_udp_datagram(&udp_ctx(
+            b"q=1 union select 1",
+            StreamBytesKind::EncryptedWire,
+        ))
+        .await;
+    assert_eq!(verdict, UdpDatagramVerdict::Forward);
+}
+
+#[test]
+fn stream_waf_attaches_to_stream_protocols_when_configured() {
+    let plugin = sig_waf("enforce");
+    let protocols = plugin.supported_protocols();
+    assert!(protocols.contains(&ProxyProtocol::Tcp));
+    assert!(protocols.contains(&ProxyProtocol::Udp));
+    assert!(protocols.contains(&ProxyProtocol::Http));
+    assert!(plugin.requires_stream_first_bytes());
+    assert!(plugin.requires_udp_datagram_hooks());
+}
+
+#[test]
+fn http_only_waf_does_not_attach_to_stream_protocols() {
+    let plugin = Waf::new(&json!({})).unwrap();
+    let protocols = plugin.supported_protocols();
+    assert!(!protocols.contains(&ProxyProtocol::Tcp));
+    assert!(!protocols.contains(&ProxyProtocol::Udp));
+    assert!(!plugin.requires_stream_first_bytes());
+    assert!(!plugin.requires_udp_datagram_hooks());
+}
+
+#[test]
+fn stream_waf_rejects_invalid_signature_pattern() {
+    let err = Waf::new(&json!({
+        "stream": {
+            "signatures": [{ "id": "BAD", "pattern": "(unclosed" }]
+        }
+    }))
+    .unwrap_err();
+    assert!(
+        err.contains("BAD"),
+        "error should name the signature: {err}"
+    );
+}
+
+#[test]
+fn stream_waf_require_tls_only_needs_first_bytes_not_udp() {
+    let plugin = Waf::new(&json!({
+        "mode": "enforce",
+        "include_default_rules": false,
+        "stream": { "tcp_require_tls": true }
+    }))
+    .unwrap();
+    assert!(plugin.requires_stream_first_bytes());
+    // No signatures → nothing to scan per datagram.
+    assert!(!plugin.requires_udp_datagram_hooks());
+}

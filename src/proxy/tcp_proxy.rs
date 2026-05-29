@@ -30,7 +30,7 @@ use crate::consumer_index::ConsumerIndex;
 use crate::dns::DnsCache;
 use crate::load_balancer::{LoadBalancerCache, LoadBalancerCacheInner};
 use crate::plugins::{
-    Direction, Plugin, PluginResult, ProxyProtocol, StreamConnectionContext,
+    Direction, Plugin, PluginResult, ProxyProtocol, StreamBytesKind, StreamConnectionContext,
     StreamTransactionSummary,
 };
 use crate::proxy::stream_error::{StreamSetupError, StreamSetupKind, find_stream_setup_error};
@@ -1117,6 +1117,11 @@ async fn run_tcp_accept_loop(
                         // connection's source pod identity cannot be resolved
                         // (mesh-wide-only fallback + `mesh_authz.scope_missing`).
                         node_waypoint_policy_scope,
+                        // Populated later (after frontend handshake / peek, before
+                        // on_stream_connect) when a plugin opts into first-bytes
+                        // inspection via requires_stream_first_bytes().
+                        first_bytes: None,
+                        first_bytes_kind: None,
                     };
                     // In node-waypoint topology the resolved pod SPIFFE ID is
                     // the authenticated source principal for this connection
@@ -1593,6 +1598,57 @@ async fn run_tcp_stream_connect_plugins(
     Ok(())
 }
 
+/// Maximum number of opening client bytes captured for stream first-bytes
+/// inspection (e.g. the WAF). Bounds the hot-path capture buffer; inspecting
+/// plugins scan up to this many bytes of the first TCP segment (plaintext or
+/// passthrough) or the first decrypted application chunk (terminated TLS).
+const STREAM_FIRST_BYTES_CAP: usize = 4096;
+
+/// Non-destructively peek up to [`STREAM_FIRST_BYTES_CAP`] bytes from a raw TCP
+/// stream for first-bytes inspection. Peeking leaves the bytes in the socket
+/// buffer, so the relay — including splice — still forwards them intact and the
+/// fast path is preserved. Returns `None` when nothing was readable in time.
+async fn peek_tcp_first_bytes(
+    stream: &TcpStream,
+    timeout: Option<Duration>,
+) -> Option<bytes::Bytes> {
+    let mut buf = vec![0u8; STREAM_FIRST_BYTES_CAP];
+    let peek = stream.peek(&mut buf);
+    let n = match timeout {
+        Some(d) => tokio::time::timeout(d, peek).await.ok()?.ok()?,
+        None => peek.await.ok()?,
+    };
+    if n == 0 {
+        return None;
+    }
+    buf.truncate(n);
+    Some(bytes::Bytes::from(buf))
+}
+
+/// Read up to [`STREAM_FIRST_BYTES_CAP`] decrypted application bytes from a
+/// TLS-terminated client stream for first-bytes inspection. Unlike the raw peek
+/// this *consumes* the bytes from the TLS session, so the caller must forward the
+/// returned prefix to the backend before relaying the remainder and must not use
+/// kTLS splice for the connection. Returns an empty vec on timeout/EOF (treated
+/// as "nothing to inspect", fail-open).
+async fn read_decrypted_first_bytes<S>(stream: &mut S, timeout: Option<Duration>) -> Vec<u8>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let mut buf = vec![0u8; STREAM_FIRST_BYTES_CAP];
+    let read = stream.read(&mut buf);
+    let n = match timeout {
+        Some(d) => match tokio::time::timeout(d, read).await {
+            Ok(Ok(n)) => n,
+            _ => 0,
+        },
+        None => read.await.unwrap_or(0),
+    };
+    buf.truncate(n);
+    buf
+}
+
 /// Inner implementation of TCP connection handling that can use `?` for early returns
 /// while the caller always receives backend info for logging.
 #[allow(clippy::too_many_arguments, unused_variables)]
@@ -1793,6 +1849,11 @@ async fn handle_tcp_connection_inner(
         .plugin_cache
         .get_plugins_for_protocol(proxy_id, ProxyProtocol::Tcp);
 
+    // Whether any plugin (e.g. the WAF) wants the opening client bytes captured
+    // into `stream_ctx.first_bytes` before `on_stream_connect` runs. Computed
+    // once; when false the splice/kTLS fast paths are left completely untouched.
+    let scan_first_bytes = plugins.iter().any(|p| p.requires_stream_first_bytes());
+
     // ----- Passthrough mode: forward encrypted bytes without TLS termination -----
     if params.passthrough {
         // Peek at the ClientHello to extract SNI for logging/routing.
@@ -1800,6 +1861,17 @@ async fn handle_tcp_connection_inner(
         if stream_ctx.sni_hostname.is_none() {
             stream_ctx.sni_hostname =
                 super::sni::extract_sni_from_tcp_stream(&client_stream, sni_peek_timeout).await;
+        }
+
+        // Passthrough forwards ciphertext the gateway never decrypts, so the
+        // captured bytes are only good for transport-shape checks (e.g.
+        // validating a TLS ClientHello), never L7 — hence `EncryptedWire`.
+        if scan_first_bytes {
+            stream_ctx.first_bytes = peek_tcp_first_bytes(&client_stream, sni_peek_timeout).await;
+            stream_ctx.first_bytes_kind = stream_ctx
+                .first_bytes
+                .as_ref()
+                .map(|_| StreamBytesKind::EncryptedWire);
         }
 
         // Run on_stream_connect plugins (they see SNI but not decrypted data).
@@ -2029,6 +2101,11 @@ async fn handle_tcp_connection_inner(
     // handshakes on clients that fail frontend TLS or are rejected by
     // stream-connect plugins, matching the conservative enterprise proxy
     // ordering for TLS-terminating TCP listeners.
+    // Carries the decrypted opening bytes consumed from a TLS-terminated client
+    // so they can be forwarded to the backend before the relay starts. `Some`
+    // (even when empty) means we read plaintext from the TLS session and must
+    // therefore use a userspace relay (kTLS splice is no longer possible).
+    let mut client_first_bytes_forward: Option<Vec<u8>> = None;
     let client_stream = if let Some(tls_config) = frontend_tls_config {
         let acceptor = tokio_rustls::TlsAcceptor::from(tls_config.clone());
         // Frontend TLS failures return before any backend dispatch — no backend
@@ -2038,7 +2115,7 @@ async fn handle_tcp_connection_inner(
         // `StreamSetupKind::FrontendTlsHandshake`, no string match. The accept
         // helper bounds the handshake under the configured timeout so a stalled
         // peer cannot wedge a frontend slot indefinitely.
-        let tls_stream = crate::tls::accept_with_optional_timeout(
+        let mut tls_stream = crate::tls::accept_with_optional_timeout(
             &acceptor,
             client_stream,
             frontend_tls_handshake_timeout_seconds,
@@ -2082,6 +2159,20 @@ async fn handle_tcp_connection_inner(
             .server_name()
             .map(str::to_ascii_lowercase);
 
+        // Capture the opening *decrypted* application bytes for L7 inspection
+        // before on_stream_connect runs, so a plugin can reject before any
+        // backend is dialed. This consumes the bytes from the TLS session, so
+        // we forward them to the backend below and fall back to a userspace
+        // relay (kTLS splice needs the raw, undisturbed TLS record stream).
+        if scan_first_bytes {
+            let prefix = read_decrypted_first_bytes(&mut tls_stream, sni_peek_timeout).await;
+            if !prefix.is_empty() {
+                stream_ctx.first_bytes = Some(bytes::Bytes::copy_from_slice(&prefix));
+                stream_ctx.first_bytes_kind = Some(StreamBytesKind::DecryptedApp);
+            }
+            client_first_bytes_forward = Some(prefix);
+        }
+
         // Run on_stream_connect plugins after TLS handshake so client cert is available.
         if !plugins.is_empty() {
             run_tcp_stream_connect_plugins(
@@ -2097,6 +2188,16 @@ async fn handle_tcp_connection_inner(
 
         ClientRelayStream::Tls(Box::new(tls_stream))
     } else {
+        // Plaintext client: peek (non-destructively) the opening bytes. These are
+        // the application bytes on the wire, so they are fully L7-inspectable and
+        // the relay (including splice) still forwards them unchanged.
+        if scan_first_bytes {
+            stream_ctx.first_bytes = peek_tcp_first_bytes(&client_stream, sni_peek_timeout).await;
+            stream_ctx.first_bytes_kind = stream_ctx
+                .first_bytes
+                .as_ref()
+                .map(|_| StreamBytesKind::PlaintextWire);
+        }
         if !plugins.is_empty() {
             run_tcp_stream_connect_plugins(
                 plugins.as_ref(),
@@ -2380,9 +2481,29 @@ async fn handle_tcp_connection_inner(
             }
         }
     };
-    let (_backend_socket_addr, backend_stream, _backend_inflight_guard) = backend_addr;
+    let (_backend_socket_addr, mut backend_stream, _backend_inflight_guard) = backend_addr;
     let _ = last_connect_err; // consumed by retry loop logging
     let _backend_session_guard = TcpBackendSessionGuard::new(metrics);
+
+    // If first-bytes inspection consumed a decrypted opening prefix from a
+    // TLS-terminated client, forward it to the backend now — re-encrypting when
+    // the backend leg is TLS — before the relay starts, so no application bytes
+    // are lost. Reading plaintext also rules out the zero-copy kTLS splice path,
+    // so force the userspace relay for this connection.
+    let forwarded_prefix_len = match client_first_bytes_forward.as_deref() {
+        Some(prefix) if !prefix.is_empty() => {
+            use tokio::io::AsyncWriteExt;
+            let write_res = match &mut backend_stream {
+                BackendStream::Tls(bs) => bs.write_all(prefix).await,
+                BackendStream::Plain(bs) => bs.write_all(prefix).await,
+            };
+            write_res.map_err(|e| {
+                anyhow::anyhow!("failed forwarding inspected first bytes to backend: {e}")
+            })?;
+            prefix.len() as u64
+        }
+        _ => 0,
+    };
 
     // Start bidirectional copy. From here, no retries — bytes may be exchanged.
     let mut used_splice = false;
@@ -2408,9 +2529,12 @@ async fn handle_tcp_connection_inner(
                     // so splice(2) can handle encrypted traffic without userspace copies.
                     // backend_{read,write}_timeout are enforced inside the splice loop
                     // via per-direction watermarks; no eligibility gate required.
+                    // Skip kTLS when first-bytes inspection consumed a decrypted
+                    // prefix: those plaintext bytes have already left the TLS
+                    // session, so the userspace relay must carry the remainder.
                     #[cfg(target_os = "linux")]
                     {
-                        if ktls_enabled {
+                        if ktls_enabled && client_first_bytes_forward.is_none() {
                             match try_ktls_splice(
                                 tls_stream,
                                 bs,
@@ -2590,7 +2714,11 @@ async fn handle_tcp_connection_inner(
     }
 
     Ok(TcpConnectionSuccess {
-        bytes_in: copy_result.bytes_client_to_backend,
+        // Include the inspected prefix forwarded out-of-band above so the
+        // client→backend byte count in the transaction summary stays accurate.
+        bytes_in: copy_result
+            .bytes_client_to_backend
+            .saturating_add(forwarded_prefix_len),
         bytes_out: copy_result.bytes_backend_to_client,
         duration: start.elapsed(),
         splice_used: used_splice,
