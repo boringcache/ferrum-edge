@@ -1010,13 +1010,21 @@ fn write_hbone_pool_key(
 }
 
 fn write_pool_config_key(buf: &mut String, pool_config: &PoolConfig) {
+    // Pool-MANAGEMENT policy is intentionally excluded from the key: it does
+    // not change the h2-over-mTLS connection's identity or wire behavior, and
+    // including it fragmented the pool (two proxies targeting the same sidecar
+    // with the same SVID but different idle-timeout / per-host caps could not
+    // share an established mTLS connection). Specifically:
+    //   - idle_timeout_seconds is tracked per HbonePoolEntry for idle pruning;
+    //   - http2_connections_per_host is applied as a max-entries cap at insert.
+    // Only fields that affect the actual connection (protocol selection,
+    // keepalive, and h2 SETTINGS) remain — mirroring the direct-H2 pool key,
+    // per the "never add policy fields to pool keys" invariant.
     let _ = write!(
         buf,
-        "|pool={},{},{},{},{},{},{},{},{},{},{}",
-        pool_config.idle_timeout_seconds,
+        "|pool={},{},{},{},{},{},{},{},{}",
         u8::from(pool_config.enable_http_keep_alive),
         u8::from(pool_config.enable_http2),
-        pool_config.http2_connections_per_host,
         pool_config.tcp_keepalive_seconds,
         pool_config.http2_keep_alive_interval_seconds,
         pool_config.http2_keep_alive_timeout_seconds,
@@ -1270,7 +1278,7 @@ mod tests {
         );
         assert_eq!(
             key,
-            "hbone|orders.default.svc.cluster.local|8080|15008|10.0.0.2|0123456789abcdef|pool=12,0,1,3,22,33,44,65535,131072,0,16384,none"
+            "hbone|orders.default.svc.cluster.local|8080|15008|10.0.0.2|0123456789abcdef|pool=0,1,22,33,44,65535,131072,0,16384,none"
         );
     }
 
@@ -1278,7 +1286,9 @@ mod tests {
     fn pool_key_changes_when_per_proxy_pool_overrides_change() {
         let base_config = PoolConfig::default();
         let overridden_config = PoolConfig {
-            http2_connections_per_host: base_config.http2_connections_per_host + 1,
+            // A genuine connection-affecting H2 setting (still part of the key
+            // after pool-management policy was dropped from it).
+            http2_initial_stream_window_size: base_config.http2_initial_stream_window_size + 1,
             ..base_config.clone()
         };
 
@@ -1302,6 +1312,40 @@ mod tests {
         assert_ne!(
             base_key, overridden_key,
             "HBONE pools with different effective per-proxy H2 sizing must not share senders"
+        );
+    }
+
+    #[test]
+    fn pool_key_ignores_pool_management_policy() {
+        // F19: idle_timeout_seconds and http2_connections_per_host are
+        // pool-management policy, not connection identity. Two proxies that
+        // differ ONLY in those must produce the SAME key so they can share an
+        // established mTLS connection to the same sidecar.
+        let base_config = PoolConfig::default();
+        let policy_only_config = PoolConfig {
+            idle_timeout_seconds: base_config.idle_timeout_seconds + 100,
+            http2_connections_per_host: base_config.http2_connections_per_host + 5,
+            ..base_config.clone()
+        };
+        let base_key = pool_key_owned(
+            "orders.default.svc.cluster.local",
+            8080,
+            15008,
+            None,
+            "fingerprint",
+            &base_config,
+        );
+        let policy_only_key = pool_key_owned(
+            "orders.default.svc.cluster.local",
+            8080,
+            15008,
+            None,
+            "fingerprint",
+            &policy_only_config,
+        );
+        assert_eq!(
+            base_key, policy_only_key,
+            "HBONE pool key must not be fragmented by idle-timeout / per-host-cap policy"
         );
     }
 
