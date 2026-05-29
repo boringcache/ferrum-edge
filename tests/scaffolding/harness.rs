@@ -110,7 +110,7 @@ use serde_json::{Value, json};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -853,6 +853,33 @@ impl GatewayHarness {
                 std::io::ErrorKind::Unsupported,
                 "captured_combined() is only available in binary mode",
             )),
+        }
+    }
+
+    /// Re-read the captured gateway output until `predicate` matches a
+    /// snapshot or `timeout` elapses, then return the final snapshot (so the
+    /// caller's assertion message still shows what WAS logged on timeout).
+    ///
+    /// Necessary because the gateway routes logs through `tracing-appender`'s
+    /// non-blocking writer, whose worker thread lags the client-visible
+    /// response by tens of ms; a single `captured_combined()` snapshot races
+    /// that flush and intermittently misses a log line that the gateway has
+    /// already emitted. Polling is strictly safer than a one-shot read: it can
+    /// only turn a flush-race miss into a hit, never a hit into a miss (if the
+    /// line never appears the predicate stays false and the caller fails just
+    /// as it would have). **Binary mode only** — in-process mode has no
+    /// capture, so the snapshot is always empty and the predicate never matches.
+    pub async fn wait_for_log_contains<F>(&self, predicate: F, timeout: Duration) -> String
+    where
+        F: Fn(&str) -> bool,
+    {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let logs = self.captured_combined().unwrap_or_default();
+            if predicate(&logs) || Instant::now() >= deadline {
+                return logs;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
 
