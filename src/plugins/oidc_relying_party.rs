@@ -884,13 +884,36 @@ impl OidcRelyingParty {
         // the same subject, nonce only if carried) and adopt its claims so
         // scope/role checks and claim headers track current authorization.
         if let Some(id_token) = token.id_token.as_deref() {
-            let claims = self
+            let id_claims = self
                 .verify_refreshed_id_token(id_token, &payload.sub, &payload.nonce)
                 .await?;
+            // Re-merge UserInfo with the new access token, mirroring the login
+            // callback, so non-protected claims that only come from the UserInfo
+            // endpoint (e.g. an `email` used in `claim_headers`) survive a refresh
+            // instead of being reduced to ID-token-only claims.
+            let merged = if let Some(userinfo_endpoint) = &discovery.userinfo_endpoint {
+                match self
+                    .fetch_userinfo(userinfo_endpoint, &token.access_token)
+                    .await
+                {
+                    Ok(Some(userinfo)) => merge_claims(id_claims, userinfo, &self.provider)?,
+                    Ok(None) => id_claims,
+                    Err(error) => {
+                        warn!(
+                            plugin = "oidc_relying_party",
+                            error = %error,
+                            "OIDC userinfo fetch failed during refresh; keeping refreshed ID token claims"
+                        );
+                        id_claims
+                    }
+                }
+            } else {
+                id_claims
+            };
             payload.sub =
-                extract_claim_string(&claims, "sub").unwrap_or_else(|| payload.sub.clone());
+                extract_claim_string(&merged, "sub").unwrap_or_else(|| payload.sub.clone());
             payload.id_token_b64 = id_token.to_string();
-            payload.claims = claims;
+            payload.claims = merged;
         }
         payload.access_token_b64 = token.access_token;
         if let Some(rotated) = token.refresh_token {
@@ -2228,5 +2251,177 @@ mod tests {
         assert!(value.contains('\n'), "cookies must be newline-joined");
         // Metadata is consumed so it does not linger into logging.
         assert!(!ctx.metadata.contains_key(SESSION_SET_COOKIE_METADATA_KEY));
+    }
+
+    fn sign_rs256(claims: &Value) -> String {
+        use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some("test-key-1".to_string());
+        encode(
+            &header,
+            claims,
+            &EncodingKey::from_rsa_pem(include_bytes!("../../tests/fixtures/test_rsa_private.pem"))
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// Build an RS256 JWKS document from an SPKI public-key PEM fixture so the
+    /// refresh path can validate a freshly signed ID token without a live IdP.
+    fn rsa_jwks_from_public_pem(pem: &[u8]) -> Value {
+        use base64::Engine;
+        use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+        let pem = std::str::from_utf8(pem).unwrap();
+        let der: Vec<u8> = STANDARD
+            .decode(
+                pem.lines()
+                    .filter(|line| !line.starts_with("-----"))
+                    .collect::<String>(),
+            )
+            .unwrap();
+        let (n, e) = rsa_spki_modulus_exponent(&der);
+        json!({"keys": [{
+            "kty": "RSA",
+            "kid": "test-key-1",
+            "use": "sig",
+            "alg": "RS256",
+            "n": URL_SAFE_NO_PAD.encode(&n),
+            "e": URL_SAFE_NO_PAD.encode(&e),
+        }]})
+    }
+
+    fn rsa_spki_modulus_exponent(der: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        fn asn1_len(d: &[u8]) -> (usize, usize) {
+            if d[0] < 0x80 {
+                (d[0] as usize, 1)
+            } else {
+                let nb = (d[0] & 0x7f) as usize;
+                let mut len = 0usize;
+                for &b in &d[1..=nb] {
+                    len = (len << 8) | b as usize;
+                }
+                (len, 1 + nb)
+            }
+        }
+        let mut p = 0;
+        assert_eq!(der[p], 0x30); // outer SEQUENCE
+        p += 1;
+        let (_, c) = asn1_len(&der[p..]);
+        p += c;
+        assert_eq!(der[p], 0x30); // AlgorithmIdentifier SEQUENCE
+        p += 1;
+        let (algo, c) = asn1_len(&der[p..]);
+        p += c + algo;
+        assert_eq!(der[p], 0x03); // BIT STRING
+        p += 1;
+        let (_, c) = asn1_len(&der[p..]);
+        p += c + 1; // skip the unused-bits byte
+        assert_eq!(der[p], 0x30); // RSAPublicKey SEQUENCE
+        p += 1;
+        let (_, c) = asn1_len(&der[p..]);
+        p += c;
+        assert_eq!(der[p], 0x02); // modulus INTEGER
+        p += 1;
+        let (n_len, c) = asn1_len(&der[p..]);
+        p += c;
+        let mut n = der[p..p + n_len].to_vec();
+        p += n_len;
+        if n.first() == Some(&0) {
+            n.remove(0); // drop the ASN.1 sign byte
+        }
+        assert_eq!(der[p], 0x02); // exponent INTEGER
+        p += 1;
+        let (e_len, c) = asn1_len(&der[p..]);
+        p += c;
+        let e = der[p..p + e_len].to_vec();
+        (n, e)
+    }
+
+    #[tokio::test]
+    async fn refresh_re_merges_userinfo_claims() {
+        // Regression: a refresh that returns a new ID token must not drop claims
+        // that only come from UserInfo (e.g. an `email` used in claim_headers).
+        let now = chrono::Utc::now().timestamp();
+        let jwks =
+            rsa_jwks_from_public_pem(include_bytes!("../../tests/fixtures/test_rsa_public.pem"));
+        let id_token = sign_rs256(&json!({
+            "iss": "https://idp.example.com",
+            "aud": "client-1",
+            "sub": "user-1",
+            "exp": now + 3600,
+        }));
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "new-at",
+                "token_type": "Bearer",
+                "refresh_token": "rt-2",
+                "expires_in": 3600,
+                "id_token": id_token,
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(jwks))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/userinfo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "sub": "user-1",
+                "email": "refreshed@example.com",
+            })))
+            .mount(&server)
+            .await;
+
+        let plugin = OidcRelyingParty::new(
+            &json!({
+                "providers": [{
+                    "issuer": "https://idp.example.com",
+                    "client_id": "client-1",
+                    "authorization_endpoint": "https://idp.example.com/authorize",
+                    "token_endpoint": format!("{}/token", server.uri()),
+                    "jwks_uri": format!("{}/jwks", server.uri()),
+                    "userinfo_endpoint": format!("{}/userinfo", server.uri()),
+                    "scopes": ["openid", "offline_access"],
+                    "redirect_uri": "https://app.example.com/oauth/callback",
+                    "callback_path": "/oauth/callback",
+                    "client_auth": {"method": "client_secret_basic", "client_secret": "shhh"},
+                    "claim_headers": {"email": "X-User-Email"}
+                }],
+                "session": {
+                    "encryption_secret": "0123456789012345678901234567890123",
+                    "ttl_secs": 3600,
+                    "idle_ttl_secs": 1800
+                }
+            }),
+            PluginHttpClient::default(),
+        )
+        .expect("oidc plugin config is valid");
+
+        // Session with no UserInfo claim yet and refresh due.
+        let payload = session_payload(now - 100, now - 100, Some("rt-1"), now - 10);
+        let mut ctx = ctx_with_session(&plugin, &payload);
+        assert!(matches!(
+            plugin
+                .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+                .await,
+            PluginResult::Continue
+        ));
+        let mut response_headers = HashMap::new();
+        plugin
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await;
+        let refreshed = emitted_session_payload(&plugin, &response_headers)
+            .expect("refreshed session cookie emitted");
+        assert_eq!(
+            refreshed.claims.get("email").and_then(Value::as_str),
+            Some("refreshed@example.com"),
+            "UserInfo-only claim must survive a token refresh"
+        );
+        assert_eq!(refreshed.access_token_b64, "new-at");
     }
 }
