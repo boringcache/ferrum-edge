@@ -8216,15 +8216,10 @@ pub(crate) async fn normalize_grpc_plugin_rejection_with_after_proxy_hooks(
 
 fn build_response_from_normalized_reject(reject: NormalizedRejectResponse) -> Response<ProxyBody> {
     let is_grpc_error = reject.grpc_status.is_some();
-    let mut builder = Response::builder().status(reject.http_status);
-    for (key, value) in &reject.headers {
-        if let (Ok(name), Ok(val)) = (
-            hyper::header::HeaderName::from_bytes(key.as_bytes()),
-            hyper::header::HeaderValue::from_str(value),
-        ) {
-            builder = builder.header(name, val);
-        }
-    }
+    let builder = headers_mod::apply_response_headers(
+        Response::builder().status(reject.http_status),
+        &reject.headers,
+    );
 
     let body = if reject.body.is_empty() {
         ProxyBody::empty()
@@ -10031,16 +10026,13 @@ async fn handle_proxy_request_inner(
 
                 // Build the response with the live Incoming body — hyper will forward
                 // DATA frames and TRAILERS to the downstream client as they arrive.
-                let mut resp_builder = Response::builder()
-                    .status(StatusCode::from_u16(grpc_streaming.status).unwrap_or(StatusCode::OK));
-                for (k, v) in &response_headers {
-                    if let (Ok(name), Ok(val)) = (
-                        hyper::header::HeaderName::from_bytes(k.as_bytes()),
-                        hyper::header::HeaderValue::from_str(v),
-                    ) {
-                        resp_builder = resp_builder.header(name, val);
-                    }
-                }
+                // Split any newline-joined Set-Cookie into separate header lines.
+                let resp_builder = headers_mod::apply_response_headers(
+                    Response::builder().status(
+                        StatusCode::from_u16(grpc_streaming.status).unwrap_or(StatusCode::OK),
+                    ),
+                    &response_headers,
+                );
                 // For bidi/client-streaming RPCs where the request body is still
                 // sending: GrpcBody::Streaming returns an error when exceeded,
                 // which causes hyper to RST_STREAM the request. The backend then
@@ -10365,17 +10357,13 @@ async fn handle_proxy_request_inner(
 
                 record_request(&state, response_status);
 
-                // Build gRPC response with headers and trailers
-                let mut resp_builder = Response::builder()
-                    .status(StatusCode::from_u16(response_status).unwrap_or(StatusCode::OK));
-                for (k, v) in &response_headers {
-                    if let (Ok(name), Ok(val)) = (
-                        hyper::header::HeaderName::from_bytes(k.as_bytes()),
-                        hyper::header::HeaderValue::from_str(v),
-                    ) {
-                        resp_builder = resp_builder.header(name, val);
-                    }
-                }
+                // Build gRPC response with headers and trailers (splitting any
+                // newline-joined Set-Cookie into separate header lines).
+                let resp_builder = headers_mod::apply_response_headers(
+                    Response::builder()
+                        .status(StatusCode::from_u16(response_status).unwrap_or(StatusCode::OK)),
+                    &response_headers,
+                );
 
                 return Ok(resp_builder
                     .body(ProxyBody::full(Bytes::from(response_body)))
@@ -11153,22 +11141,9 @@ async fn handle_proxy_request_inner(
     let mut resp_builder = Response::builder()
         .status(StatusCode::from_u16(response_status).unwrap_or(StatusCode::BAD_GATEWAY));
 
-    for (k, v) in &response_headers {
-        if k == "set-cookie" {
-            // Set-Cookie values were stored newline-separated to avoid RFC-violating
-            // comma folding. Emit each value as a separate header line.
-            for cookie_val in v.split('\n') {
-                if let Ok(val) = hyper::header::HeaderValue::from_str(cookie_val) {
-                    resp_builder = resp_builder.header("set-cookie", val);
-                }
-            }
-        } else if let (Ok(name), Ok(val)) = (
-            hyper::header::HeaderName::from_bytes(k.as_bytes()),
-            hyper::header::HeaderValue::from_str(v),
-        ) {
-            resp_builder = resp_builder.header(name, val);
-        }
-    }
+    // Apply backend/plugin response headers, splitting newline-joined Set-Cookie
+    // into separate header lines (RFC 6265).
+    resp_builder = headers_mod::apply_response_headers(resp_builder, &response_headers);
 
     // Add gateway error categorization headers so clients and ops teams
     // can distinguish different failure modes:
@@ -13079,7 +13054,9 @@ pub(crate) fn query_string_after_plugin_strips<'a>(
         .metadata
         .keys()
         .filter_map(|key| {
-            key.strip_prefix(crate::plugins::jwks_auth::STRIP_QUERY_PARAM_METADATA_PREFIX)
+            key.strip_prefix(
+                crate::plugins::utils::token_extract::STRIP_QUERY_PARAM_METADATA_PREFIX,
+            )
         })
         .collect();
     if strip_names.is_empty() {
@@ -16191,7 +16168,7 @@ mod tests {
         ctx.metadata.insert(
             format!(
                 "{}{}",
-                crate::plugins::jwks_auth::STRIP_QUERY_PARAM_METADATA_PREFIX,
+                crate::plugins::utils::token_extract::STRIP_QUERY_PARAM_METADATA_PREFIX,
                 "access_token"
             ),
             "true".to_string(),
@@ -16199,7 +16176,7 @@ mod tests {
         ctx.metadata.insert(
             format!(
                 "{}{}",
-                crate::plugins::jwks_auth::STRIP_QUERY_PARAM_METADATA_PREFIX,
+                crate::plugins::utils::token_extract::STRIP_QUERY_PARAM_METADATA_PREFIX,
                 "encoded token"
             ),
             "true".to_string(),

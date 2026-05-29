@@ -33,6 +33,14 @@ use super::{PluginResult, RequestContext};
 
 const CLAIM_HEADER_METADATA_PREFIX: &str = "oidc_rp.claim_header.";
 const DEFAULT_JWKS_REFRESH_INTERVAL: Duration = Duration::from_secs(900);
+/// Carries a re-sealed rolling-session cookie from `authenticate` to
+/// `after_proxy`, which appends it as `Set-Cookie` on the proxied response. The
+/// key contains "cookie" so transaction-log metadata redaction masks its value.
+const SESSION_SET_COOKIE_METADATA_KEY: &str = "oidc_rp.session_set_cookie";
+/// On refresh failure, defer the next attempt by this many seconds so a flaky
+/// token endpoint is not retried on every request until the session reaches its
+/// ttl/idle bound.
+const REFRESH_RETRY_BACKOFF_SECS: i64 = 30;
 
 pub struct OidcRelyingParty {
     provider: Arc<ProviderRuntime>,
@@ -164,6 +172,21 @@ struct SessionPayload {
 struct TokenResponse {
     access_token: String,
     id_token: String,
+    token_type: String,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    expires_in: Option<i64>,
+}
+
+/// Token endpoint response for `grant_type=refresh_token`. Unlike the
+/// authorization-code response, the `id_token` is optional (OIDC Core 12.2: a
+/// provider MAY omit it) and a rotated `refresh_token` MAY be returned.
+#[derive(Deserialize)]
+struct RefreshTokenResponse {
+    access_token: String,
+    #[serde(default)]
+    id_token: Option<String>,
     token_type: String,
     #[serde(default)]
     refresh_token: Option<String>,
@@ -517,7 +540,11 @@ impl OidcRelyingParty {
             access_token_b64: token.access_token,
             refresh_token_b64: token.refresh_token,
             expires_at_unix: expires_at,
-            refresh_after_unix: expires_at - self.behavior.refresh_skew.as_secs() as i64,
+            refresh_after_unix: next_refresh_after(
+                expires_at,
+                now,
+                self.behavior.refresh_skew.as_secs() as i64,
+            ),
             issued_at_unix: now,
             last_touch_unix: now,
             nonce: flow.nonce,
@@ -540,7 +567,7 @@ impl OidcRelyingParty {
         code: &str,
         code_verifier: &str,
     ) -> Result<TokenResponse, String> {
-        let mut params = vec![
+        let params = vec![
             ("grant_type".to_string(), "authorization_code".to_string()),
             ("code".to_string(), code.to_string()),
             (
@@ -550,11 +577,37 @@ impl OidcRelyingParty {
             ("client_id".to_string(), self.provider.client_id.clone()),
             ("code_verifier".to_string(), code_verifier.to_string()),
         ];
+        let response = self
+            .post_token_endpoint(&discovery.token_endpoint, params)
+            .await
+            .map_err(|_| r#"{"error":"Token exchange failed"}"#.to_string())?;
+        if !response.status().is_success() {
+            return Err(r#"{"error":"Token exchange failed"}"#.to_string());
+        }
+        let token: TokenResponse = response
+            .json()
+            .await
+            .map_err(|_| r#"{"error":"Token response parse failed"}"#.to_string())?;
+        if !token.token_type.eq_ignore_ascii_case("bearer") {
+            return Err(r#"{"error":"Invalid token type"}"#.to_string());
+        }
+        Ok(token)
+    }
+
+    /// POST `application/x-www-form-urlencoded` `params` to the token endpoint,
+    /// applying the configured client authentication. Shared by the
+    /// authorization-code exchange and the refresh-token grant so both stay in
+    /// lockstep on client-auth handling.
+    async fn post_token_endpoint(
+        &self,
+        token_endpoint: &str,
+        mut params: Vec<(String, String)>,
+    ) -> Result<reqwest::Response, String> {
         let mut request = self
             .provider
             .http_client
             .get()
-            .post(&discovery.token_endpoint)
+            .post(token_endpoint)
             .timeout(Duration::from_secs(10));
         match &self.provider.client_auth {
             OidcClientAuth::Basic { client_secret } => {
@@ -574,7 +627,7 @@ impl OidcRelyingParty {
             } => {
                 let assertion = build_client_assertion(
                     &self.provider.client_id,
-                    &discovery.token_endpoint,
+                    token_endpoint,
                     encoding_key,
                     *alg,
                     kid,
@@ -587,26 +640,16 @@ impl OidcRelyingParty {
             }
             OidcClientAuth::None => {}
         }
-        let response = self
-            .provider
+        self.provider
             .http_client
             .execute(with_form_body(request, &params), "oidc_rp_token")
             .await
-            .map_err(|_| r#"{"error":"Token exchange failed"}"#.to_string())?;
-        if !response.status().is_success() {
-            return Err(r#"{"error":"Token exchange failed"}"#.to_string());
-        }
-        let token: TokenResponse = response
-            .json()
-            .await
-            .map_err(|_| r#"{"error":"Token response parse failed"}"#.to_string())?;
-        if !token.token_type.eq_ignore_ascii_case("bearer") {
-            return Err(r#"{"error":"Invalid token type"}"#.to_string());
-        }
-        Ok(token)
+            .map_err(|_| r#"{"error":"Token endpoint request failed"}"#.to_string())
     }
 
-    async fn verify_id_token(&self, id_token: &str, nonce: &str) -> Result<Value, String> {
+    /// Validate an ID token's signature and `iss`/`aud`/`exp` against the
+    /// provider JWKS. Nonce and subject binding are layered on by the callers.
+    async fn verify_id_token_jwks(&self, id_token: &str) -> Result<Value, String> {
         let guard = self.provider.jwks_store.load();
         let Some(store) = guard.as_ref().as_ref().cloned() else {
             return Err(r#"{"error":"JWKS unavailable"}"#.to_string());
@@ -622,7 +665,7 @@ impl OidcRelyingParty {
         } else {
             self.provider.audiences.clone()
         };
-        let Some(claims) = verify_jwt_with_jwks(
+        verify_jwt_with_jwks(
             id_token,
             &store,
             &JwtVerifyParams {
@@ -634,15 +677,43 @@ impl OidcRelyingParty {
             },
         )
         .await
-        else {
-            return Err(r#"{"error":"Invalid ID token"}"#.to_string());
-        };
+        .ok_or_else(|| r#"{"error":"Invalid ID token"}"#.to_string())
+    }
+
+    async fn verify_id_token(&self, id_token: &str, nonce: &str) -> Result<Value, String> {
+        let claims = self.verify_id_token_jwks(id_token).await?;
         let token_nonce = claims
             .get("nonce")
             .and_then(Value::as_str)
             .ok_or_else(|| r#"{"error":"Invalid ID token nonce"}"#.to_string())?;
         if !constant_time_eq(token_nonce.as_bytes(), nonce.as_bytes()) {
             return Err(r#"{"error":"Invalid ID token nonce"}"#.to_string());
+        }
+        Ok(claims)
+    }
+
+    /// Validate an ID token returned by a refresh-token grant. Per OIDC Core
+    /// 12.2 the refreshed ID token (when present) MUST bind to the same subject,
+    /// and if it carries a `nonce` it MUST equal the original. It is NOT required
+    /// to carry a nonce, so absence is accepted.
+    async fn verify_refreshed_id_token(
+        &self,
+        id_token: &str,
+        expected_sub: &str,
+        expected_nonce: &str,
+    ) -> Result<Value, String> {
+        let claims = self.verify_id_token_jwks(id_token).await?;
+        let sub = claims
+            .get("sub")
+            .and_then(Value::as_str)
+            .ok_or_else(|| r#"{"error":"Refreshed ID token missing subject"}"#.to_string())?;
+        if !constant_time_eq(sub.as_bytes(), expected_sub.as_bytes()) {
+            return Err(r#"{"error":"Refreshed ID token subject mismatch"}"#.to_string());
+        }
+        if let Some(token_nonce) = claims.get("nonce").and_then(Value::as_str)
+            && !constant_time_eq(token_nonce.as_bytes(), expected_nonce.as_bytes())
+        {
+            return Err(r#"{"error":"Refreshed ID token nonce mismatch"}"#.to_string());
         }
         Ok(claims)
     }
@@ -675,7 +746,7 @@ impl OidcRelyingParty {
             .map_err(|error| format!("userinfo parse failed: {error}"))
     }
 
-    fn authenticate_session(
+    async fn run_session_auth(
         &self,
         ctx: &mut RequestContext,
         consumer_index: &ConsumerIndex,
@@ -683,7 +754,7 @@ impl OidcRelyingParty {
         let Some(cookie_value) = cookie_value(ctx, &self.session.cookie_name) else {
             return self.challenge(ctx, false);
         };
-        let Some(payload) = self.open_session(cookie_value) else {
+        let Some(mut payload) = self.open_session(cookie_value) else {
             return self.challenge(ctx, true);
         };
         let now = chrono::Utc::now().timestamp();
@@ -692,6 +763,29 @@ impl OidcRelyingParty {
         {
             return self.challenge(ctx, true);
         }
+
+        // Keep the session live: refresh tokens when due (which also re-derives
+        // claims from any new ID token), then slide the idle window. Any change
+        // is re-sealed and emitted as a `Set-Cookie` by `after_proxy`.
+        let mut mutated = self.maybe_refresh_session(&mut payload, now).await;
+        mutated |= self.maybe_slide_session(&mut payload, now);
+        if mutated {
+            match self.seal_session_cookie(&payload) {
+                Ok(cookie) => {
+                    ctx.metadata
+                        .insert(SESSION_SET_COOKIE_METADATA_KEY.to_string(), cookie);
+                }
+                Err(error) => {
+                    warn!(
+                        plugin = "oidc_relying_party",
+                        error = %error,
+                        "failed to re-seal rolling session cookie; serving with the existing session"
+                    );
+                }
+            }
+        }
+
+        // Authorize against the effective (possibly refreshed) claims.
         if let Err((status, body)) = scope_role_check::check(
             &payload.claims,
             &ScopeRoleRequirements {
@@ -707,6 +801,133 @@ impl OidcRelyingParty {
         emit_claim_headers_to_metadata(ctx, &payload.claims, &self.provider.claim_headers, ",");
         let outcome = self.resolve_identity(&payload.claims, consumer_index);
         apply_verify_outcome(ctx, outcome)
+    }
+
+    /// Advance the sliding idle window. To keep the response `Set-Cookie` (and the
+    /// re-seal cost) off the per-request hot path, `last_touch` advances only once
+    /// half the idle window has elapsed since the last update — so an active
+    /// session re-seals at most ~twice per idle window while a session idle for
+    /// `idle_ttl` still expires. The absolute `ttl` cap is enforced separately.
+    fn maybe_slide_session(&self, payload: &mut SessionPayload, now: i64) -> bool {
+        let idle = self.session.idle_ttl.as_secs() as i64;
+        if idle <= 0 {
+            return false;
+        }
+        let touch_interval = (idle / 2).max(1);
+        if now - payload.last_touch_unix >= touch_interval {
+            payload.last_touch_unix = now;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Refresh the access/ID tokens via `grant_type=refresh_token` once the access
+    /// token is within `refresh_skew` of expiry. Returns whether the payload
+    /// changed (and therefore needs re-sealing). Failures are non-fatal: the
+    /// existing session stays valid by its own ttl/idle bounds and the next
+    /// attempt is deferred by `REFRESH_RETRY_BACKOFF_SECS` so a flaky token
+    /// endpoint is not retried on every request.
+    async fn maybe_refresh_session(&self, payload: &mut SessionPayload, now: i64) -> bool {
+        if now < payload.refresh_after_unix {
+            return false;
+        }
+        let Some(refresh_token) = payload.refresh_token_b64.clone() else {
+            return false;
+        };
+        let Some(discovery) = self.provider.discovery.load().as_ref().as_ref().cloned() else {
+            return false;
+        };
+        match self
+            .refresh_tokens(&discovery, &refresh_token, payload, now)
+            .await
+        {
+            Ok(()) => true,
+            Err(error) => {
+                warn!(
+                    plugin = "oidc_relying_party",
+                    error = %error,
+                    "OIDC token refresh failed; serving with the existing session until ttl/idle"
+                );
+                payload.refresh_after_unix = now + REFRESH_RETRY_BACKOFF_SECS;
+                true
+            }
+        }
+    }
+
+    async fn refresh_tokens(
+        &self,
+        discovery: &DiscoveryDoc,
+        refresh_token: &str,
+        payload: &mut SessionPayload,
+        now: i64,
+    ) -> Result<(), String> {
+        let params = vec![
+            ("grant_type".to_string(), "refresh_token".to_string()),
+            ("refresh_token".to_string(), refresh_token.to_string()),
+            ("client_id".to_string(), self.provider.client_id.clone()),
+        ];
+        let response = self
+            .post_token_endpoint(&discovery.token_endpoint, params)
+            .await?;
+        if !response.status().is_success() {
+            return Err(r#"{"error":"Token refresh failed"}"#.to_string());
+        }
+        let token: RefreshTokenResponse = response
+            .json()
+            .await
+            .map_err(|_| r#"{"error":"Token refresh response parse failed"}"#.to_string())?;
+        if !token.token_type.eq_ignore_ascii_case("bearer") {
+            return Err(r#"{"error":"Invalid refresh token type"}"#.to_string());
+        }
+        // A refreshed ID token is optional; when present, re-validate it (bound to
+        // the same subject, nonce only if carried) and adopt its claims so
+        // scope/role checks and claim headers track current authorization.
+        if let Some(id_token) = token.id_token.as_deref() {
+            let id_claims = self
+                .verify_refreshed_id_token(id_token, &payload.sub, &payload.nonce)
+                .await?;
+            // Re-merge UserInfo with the new access token, mirroring the login
+            // callback, so non-protected claims that only come from the UserInfo
+            // endpoint (e.g. an `email` used in `claim_headers`) survive a refresh
+            // instead of being reduced to ID-token-only claims.
+            let merged = if let Some(userinfo_endpoint) = &discovery.userinfo_endpoint {
+                match self
+                    .fetch_userinfo(userinfo_endpoint, &token.access_token)
+                    .await
+                {
+                    Ok(Some(userinfo)) => merge_claims(id_claims, userinfo, &self.provider)?,
+                    Ok(None) => id_claims,
+                    Err(error) => {
+                        warn!(
+                            plugin = "oidc_relying_party",
+                            error = %error,
+                            "OIDC userinfo fetch failed during refresh; keeping refreshed ID token claims"
+                        );
+                        id_claims
+                    }
+                }
+            } else {
+                id_claims
+            };
+            payload.sub =
+                extract_claim_string(&merged, "sub").unwrap_or_else(|| payload.sub.clone());
+            payload.id_token_b64 = id_token.to_string();
+            payload.claims = merged;
+        }
+        payload.access_token_b64 = token.access_token;
+        if let Some(rotated) = token.refresh_token {
+            payload.refresh_token_b64 = Some(rotated);
+        }
+        let expires_at = now
+            + token
+                .expires_in
+                .unwrap_or(self.session.ttl.as_secs() as i64);
+        payload.expires_at_unix = expires_at;
+        payload.refresh_after_unix =
+            next_refresh_after(expires_at, now, self.behavior.refresh_skew.as_secs() as i64);
+        payload.last_touch_unix = now;
+        Ok(())
     }
 
     fn resolve_identity(&self, claims: &Value, consumer_index: &ConsumerIndex) -> VerifyOutcome {
@@ -900,7 +1121,7 @@ impl super::Plugin for OidcRelyingParty {
         ctx: &mut RequestContext,
         consumer_index: &ConsumerIndex,
     ) -> PluginResult {
-        self.authenticate_session(ctx, consumer_index)
+        self.run_session_auth(ctx, consumer_index).await
     }
     fn modifies_request_headers(&self) -> bool {
         !self.provider.claim_headers.is_empty()
@@ -912,6 +1133,32 @@ impl super::Plugin for OidcRelyingParty {
     ) -> PluginResult {
         apply_claim_headers_from_metadata(ctx, headers, CLAIM_HEADER_METADATA_PREFIX);
         PluginResult::Continue
+    }
+    async fn after_proxy(
+        &self,
+        ctx: &mut RequestContext,
+        _response_status: u16,
+        response_headers: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        // Emit the rolling-session cookie re-sealed during `authenticate`.
+        // Appended (newline-joined) so a backend `Set-Cookie` is preserved; the
+        // downstream response builder splits these back into separate headers.
+        if let Some(cookie) = ctx.metadata.remove(SESSION_SET_COOKIE_METADATA_KEY) {
+            response_headers
+                .entry("set-cookie".to_string())
+                .and_modify(|existing| {
+                    existing.push('\n');
+                    existing.push_str(&cookie);
+                })
+                .or_insert(cookie);
+        }
+        PluginResult::Continue
+    }
+    fn applies_after_proxy_on_reject(&self) -> bool {
+        // A token refresh may have rotated the upstream refresh token before a
+        // later plugin rejected the request; the client must still receive the
+        // re-sealed cookie so it does not keep replaying a now-invalid token.
+        true
     }
     fn warmup_hostnames(&self) -> Vec<String> {
         let mut hosts = self.provider.warmup_hostnames.clone();
@@ -1383,6 +1630,14 @@ fn encoded_session_cookie_len(plaintext_len: usize) -> usize {
     sealed_len.div_ceil(3) * 4
 }
 
+/// Schedule the next proactive refresh `refresh_skew` before access-token expiry,
+/// but never sooner than `REFRESH_RETRY_BACKOFF_SECS` from now. The floor stops a
+/// refresh storm when a provider issues very short-lived access tokens (so
+/// `expires_at - refresh_skew` would already be in the past).
+fn next_refresh_after(expires_at_unix: i64, now: i64, refresh_skew_secs: i64) -> i64 {
+    (expires_at_unix - refresh_skew_secs).max(now + REFRESH_RETRY_BACKOFF_SECS)
+}
+
 fn is_browser_request(ctx: &RequestContext, behavior: &BehaviorConfig) -> bool {
     matches!(ctx.method.as_str(), "GET" | "HEAD")
         && ctx.headers.get("accept").is_some_and(|accept| {
@@ -1642,7 +1897,12 @@ async fn fetch_discovery(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::consumer_index::ConsumerIndex;
+    use crate::plugins::Plugin;
     use serde_json::json;
+    use std::collections::HashMap;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
     fn userinfo_cannot_override_reserved_id_token_claims() {
@@ -1750,5 +2010,420 @@ mod tests {
         ctx.headers
             .insert("cookie".to_string(), "theme=dark; consent".to_string());
         assert_eq!(cookie_value(&ctx, "ferrum_session"), None);
+    }
+
+    #[test]
+    fn next_refresh_after_floors_at_backoff() {
+        // Normal: refresh `refresh_skew` before expiry.
+        assert_eq!(next_refresh_after(4600, 1000, 30), 4570);
+        // Very short-lived token: floored at now + backoff to avoid a refresh storm.
+        assert_eq!(
+            next_refresh_after(1005, 1000, 30),
+            1000 + REFRESH_RETRY_BACKOFF_SECS
+        );
+    }
+
+    fn build_plugin(token_endpoint: &str) -> OidcRelyingParty {
+        OidcRelyingParty::new(
+            &json!({
+                "providers": [{
+                    "issuer": "https://idp.example.com",
+                    "client_id": "client-1",
+                    "authorization_endpoint": "https://idp.example.com/authorize",
+                    "token_endpoint": token_endpoint,
+                    "jwks_uri": "https://idp.example.com/jwks",
+                    "scopes": ["openid", "offline_access"],
+                    "redirect_uri": "https://app.example.com/oauth/callback",
+                    "callback_path": "/oauth/callback",
+                    "client_auth": {"method": "client_secret_basic", "client_secret": "shhh"}
+                }],
+                "session": {
+                    "encryption_secret": "0123456789012345678901234567890123",
+                    "ttl_secs": 3600,
+                    "idle_ttl_secs": 1800
+                }
+            }),
+            PluginHttpClient::default(),
+        )
+        .expect("oidc plugin config is valid")
+    }
+
+    fn session_payload(
+        issued: i64,
+        last_touch: i64,
+        refresh_token: Option<&str>,
+        refresh_after: i64,
+    ) -> SessionPayload {
+        SessionPayload {
+            version: 1,
+            sub: "user-1".to_string(),
+            id_token_b64: "old-id".to_string(),
+            access_token_b64: "old-at".to_string(),
+            refresh_token_b64: refresh_token.map(str::to_string),
+            expires_at_unix: refresh_after + 30,
+            refresh_after_unix: refresh_after,
+            issued_at_unix: issued,
+            last_touch_unix: last_touch,
+            nonce: "nonce-1".to_string(),
+            claims: json!({"sub": "user-1"}),
+        }
+    }
+
+    fn ctx_with_session(plugin: &OidcRelyingParty, payload: &SessionPayload) -> RequestContext {
+        let set_cookie = plugin.seal_session_cookie(payload).expect("seal session");
+        // "name=value; attrs..." -> request "Cookie: name=value".
+        let cookie_pair = set_cookie.split(';').next().unwrap().to_string();
+        let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/app".into());
+        ctx.headers.insert("cookie".to_string(), cookie_pair);
+        ctx
+    }
+
+    fn emitted_session_payload(
+        plugin: &OidcRelyingParty,
+        response_headers: &HashMap<String, String>,
+    ) -> Option<SessionPayload> {
+        let set_cookie = response_headers.get("set-cookie")?;
+        let cookie = set_cookie
+            .split('\n')
+            .find(|c| c.trim_start().starts_with("ferrum_session="))?;
+        let value = cookie.split(';').next()?.split_once('=')?.1;
+        plugin.open_session(value)
+    }
+
+    // tokio runtime required: building the plugin spawns the background JWKS
+    // refresh task even though maybe_slide_session itself is synchronous.
+    #[tokio::test]
+    async fn maybe_slide_respects_touch_interval() {
+        // idle_ttl 1800 -> touch_interval 900.
+        let plugin = build_plugin("https://idp.example.com/token");
+        let now = 100_000;
+        let mut stale = session_payload(now - 2000, now - 1000, None, now + 100_000);
+        assert!(plugin.maybe_slide_session(&mut stale, now));
+        assert_eq!(stale.last_touch_unix, now);
+
+        let mut fresh = session_payload(now - 2000, now - 100, None, now + 100_000);
+        assert!(!plugin.maybe_slide_session(&mut fresh, now));
+        assert_eq!(fresh.last_touch_unix, now - 100);
+    }
+
+    #[tokio::test]
+    async fn active_session_slides_and_emits_rolling_cookie() {
+        let plugin = build_plugin("https://idp.example.com/token");
+        let now = chrono::Utc::now().timestamp();
+        // last_touch 1000s ago (> touch_interval 900) but within idle/absolute ttl;
+        // no refresh token so only the slide path runs.
+        let payload = session_payload(now - 1000, now - 1000, None, now + 100_000);
+        let mut ctx = ctx_with_session(&plugin, &payload);
+        assert!(matches!(
+            plugin
+                .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+                .await,
+            PluginResult::Continue
+        ));
+        let mut response_headers = HashMap::new();
+        plugin
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await;
+        let rolled = emitted_session_payload(&plugin, &response_headers)
+            .expect("rolling session cookie emitted");
+        assert!(rolled.last_touch_unix >= now);
+    }
+
+    #[tokio::test]
+    async fn fresh_session_is_not_re_sealed() {
+        let plugin = build_plugin("https://idp.example.com/token");
+        let now = chrono::Utc::now().timestamp();
+        let payload = session_payload(now - 100, now - 100, None, now + 100_000);
+        let mut ctx = ctx_with_session(&plugin, &payload);
+        assert!(matches!(
+            plugin
+                .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+                .await,
+            PluginResult::Continue
+        ));
+        let mut response_headers = HashMap::new();
+        plugin
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await;
+        assert!(!response_headers.contains_key("set-cookie"));
+    }
+
+    #[tokio::test]
+    async fn idle_expired_session_challenges() {
+        let plugin = build_plugin("https://idp.example.com/token");
+        let now = chrono::Utc::now().timestamp();
+        // last_touch 2000s ago > idle_ttl 1800 -> re-auth. Non-browser request -> 401.
+        let payload = session_payload(now - 2500, now - 2000, None, now + 100_000);
+        let mut ctx = ctx_with_session(&plugin, &payload);
+        match plugin
+            .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+            .await
+        {
+            PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 401),
+            other => panic!("expected challenge reject, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn due_refresh_updates_tokens_and_re_seals() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "new-at",
+                "token_type": "Bearer",
+                "refresh_token": "rt-2",
+                "expires_in": 3600
+            })))
+            .mount(&server)
+            .await;
+        let plugin = build_plugin(&format!("{}/token", server.uri()));
+        let now = chrono::Utc::now().timestamp();
+        // refresh_after in the past -> due; refresh token present; session live.
+        let payload = session_payload(now - 100, now - 100, Some("rt-1"), now - 10);
+        let mut ctx = ctx_with_session(&plugin, &payload);
+        assert!(matches!(
+            plugin
+                .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+                .await,
+            PluginResult::Continue
+        ));
+        let mut response_headers = HashMap::new();
+        plugin
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await;
+        let refreshed = emitted_session_payload(&plugin, &response_headers)
+            .expect("refreshed session cookie emitted");
+        assert_eq!(refreshed.access_token_b64, "new-at");
+        assert_eq!(refreshed.refresh_token_b64.as_deref(), Some("rt-2"));
+        assert!(refreshed.refresh_after_unix > now);
+    }
+
+    #[tokio::test]
+    async fn failed_refresh_keeps_session_and_backs_off() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(
+                ResponseTemplate::new(400).set_body_json(json!({"error":"invalid_grant"})),
+            )
+            .mount(&server)
+            .await;
+        let plugin = build_plugin(&format!("{}/token", server.uri()));
+        let now = chrono::Utc::now().timestamp();
+        let payload = session_payload(now - 100, now - 100, Some("rt-1"), now - 10);
+        let mut ctx = ctx_with_session(&plugin, &payload);
+        // Refresh failure is non-fatal: the existing session still authenticates.
+        assert!(matches!(
+            plugin
+                .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+                .await,
+            PluginResult::Continue
+        ));
+        let mut response_headers = HashMap::new();
+        plugin
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await;
+        let after = emitted_session_payload(&plugin, &response_headers)
+            .expect("session re-sealed with deferred refresh");
+        // Tokens unchanged, next refresh deferred so the IdP is not hammered.
+        assert_eq!(after.access_token_b64, "old-at");
+        assert_eq!(after.refresh_token_b64.as_deref(), Some("rt-1"));
+        assert!(after.refresh_after_unix >= now + REFRESH_RETRY_BACKOFF_SECS - 5);
+    }
+
+    #[tokio::test]
+    async fn after_proxy_preserves_backend_set_cookie() {
+        let plugin = build_plugin("https://idp.example.com/token");
+        let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/app".into());
+        ctx.metadata.insert(
+            SESSION_SET_COOKIE_METADATA_KEY.to_string(),
+            "ferrum_session=rolled; Path=/; HttpOnly".to_string(),
+        );
+        let mut response_headers =
+            HashMap::from([("set-cookie".to_string(), "backend=1; Path=/".to_string())]);
+        plugin
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await;
+        let value = response_headers
+            .get("set-cookie")
+            .expect("set-cookie present");
+        assert!(value.contains("backend=1"));
+        assert!(value.contains("ferrum_session=rolled"));
+        assert!(value.contains('\n'), "cookies must be newline-joined");
+        // Metadata is consumed so it does not linger into logging.
+        assert!(!ctx.metadata.contains_key(SESSION_SET_COOKIE_METADATA_KEY));
+    }
+
+    fn sign_rs256(claims: &Value) -> String {
+        use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some("test-key-1".to_string());
+        encode(
+            &header,
+            claims,
+            &EncodingKey::from_rsa_pem(include_bytes!("../../tests/fixtures/test_rsa_private.pem"))
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// Build an RS256 JWKS document from an SPKI public-key PEM fixture so the
+    /// refresh path can validate a freshly signed ID token without a live IdP.
+    fn rsa_jwks_from_public_pem(pem: &[u8]) -> Value {
+        use base64::Engine;
+        use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+        let pem = std::str::from_utf8(pem).unwrap();
+        let der: Vec<u8> = STANDARD
+            .decode(
+                pem.lines()
+                    .filter(|line| !line.starts_with("-----"))
+                    .collect::<String>(),
+            )
+            .unwrap();
+        let (n, e) = rsa_spki_modulus_exponent(&der);
+        json!({"keys": [{
+            "kty": "RSA",
+            "kid": "test-key-1",
+            "use": "sig",
+            "alg": "RS256",
+            "n": URL_SAFE_NO_PAD.encode(&n),
+            "e": URL_SAFE_NO_PAD.encode(&e),
+        }]})
+    }
+
+    fn rsa_spki_modulus_exponent(der: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        fn asn1_len(d: &[u8]) -> (usize, usize) {
+            if d[0] < 0x80 {
+                (d[0] as usize, 1)
+            } else {
+                let nb = (d[0] & 0x7f) as usize;
+                let mut len = 0usize;
+                for &b in &d[1..=nb] {
+                    len = (len << 8) | b as usize;
+                }
+                (len, 1 + nb)
+            }
+        }
+        let mut p = 0;
+        assert_eq!(der[p], 0x30); // outer SEQUENCE
+        p += 1;
+        let (_, c) = asn1_len(&der[p..]);
+        p += c;
+        assert_eq!(der[p], 0x30); // AlgorithmIdentifier SEQUENCE
+        p += 1;
+        let (algo, c) = asn1_len(&der[p..]);
+        p += c + algo;
+        assert_eq!(der[p], 0x03); // BIT STRING
+        p += 1;
+        let (_, c) = asn1_len(&der[p..]);
+        p += c + 1; // skip the unused-bits byte
+        assert_eq!(der[p], 0x30); // RSAPublicKey SEQUENCE
+        p += 1;
+        let (_, c) = asn1_len(&der[p..]);
+        p += c;
+        assert_eq!(der[p], 0x02); // modulus INTEGER
+        p += 1;
+        let (n_len, c) = asn1_len(&der[p..]);
+        p += c;
+        let mut n = der[p..p + n_len].to_vec();
+        p += n_len;
+        if n.first() == Some(&0) {
+            n.remove(0); // drop the ASN.1 sign byte
+        }
+        assert_eq!(der[p], 0x02); // exponent INTEGER
+        p += 1;
+        let (e_len, c) = asn1_len(&der[p..]);
+        p += c;
+        let e = der[p..p + e_len].to_vec();
+        (n, e)
+    }
+
+    #[tokio::test]
+    async fn refresh_re_merges_userinfo_claims() {
+        // Regression: a refresh that returns a new ID token must not drop claims
+        // that only come from UserInfo (e.g. an `email` used in claim_headers).
+        let now = chrono::Utc::now().timestamp();
+        let jwks =
+            rsa_jwks_from_public_pem(include_bytes!("../../tests/fixtures/test_rsa_public.pem"));
+        let id_token = sign_rs256(&json!({
+            "iss": "https://idp.example.com",
+            "aud": "client-1",
+            "sub": "user-1",
+            "exp": now + 3600,
+        }));
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "new-at",
+                "token_type": "Bearer",
+                "refresh_token": "rt-2",
+                "expires_in": 3600,
+                "id_token": id_token,
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(jwks))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/userinfo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "sub": "user-1",
+                "email": "refreshed@example.com",
+            })))
+            .mount(&server)
+            .await;
+
+        let plugin = OidcRelyingParty::new(
+            &json!({
+                "providers": [{
+                    "issuer": "https://idp.example.com",
+                    "client_id": "client-1",
+                    "authorization_endpoint": "https://idp.example.com/authorize",
+                    "token_endpoint": format!("{}/token", server.uri()),
+                    "jwks_uri": format!("{}/jwks", server.uri()),
+                    "userinfo_endpoint": format!("{}/userinfo", server.uri()),
+                    "scopes": ["openid", "offline_access"],
+                    "redirect_uri": "https://app.example.com/oauth/callback",
+                    "callback_path": "/oauth/callback",
+                    "client_auth": {"method": "client_secret_basic", "client_secret": "shhh"},
+                    "claim_headers": {"email": "X-User-Email"}
+                }],
+                "session": {
+                    "encryption_secret": "0123456789012345678901234567890123",
+                    "ttl_secs": 3600,
+                    "idle_ttl_secs": 1800
+                }
+            }),
+            PluginHttpClient::default(),
+        )
+        .expect("oidc plugin config is valid");
+
+        // Session with no UserInfo claim yet and refresh due.
+        let payload = session_payload(now - 100, now - 100, Some("rt-1"), now - 10);
+        let mut ctx = ctx_with_session(&plugin, &payload);
+        assert!(matches!(
+            plugin
+                .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+                .await,
+            PluginResult::Continue
+        ));
+        let mut response_headers = HashMap::new();
+        plugin
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await;
+        let refreshed = emitted_session_payload(&plugin, &response_headers)
+            .expect("refreshed session cookie emitted");
+        assert_eq!(
+            refreshed.claims.get("email").and_then(Value::as_str),
+            Some("refreshed@example.com"),
+            "UserInfo-only claim must survive a token refresh"
+        );
+        assert_eq!(refreshed.access_token_b64, "new-at");
     }
 }

@@ -2,6 +2,14 @@ use crate::plugins::RequestContext;
 
 use super::auth_flow::ExtractedCredential;
 
+/// Metadata-key prefix marking a query parameter that carried the auth token and
+/// must be stripped from the URL forwarded upstream. It is shared by every auth
+/// plugin that supports query-param token locations and is consumed by the proxy
+/// (`query_string_after_plugin_strips`), which is the only place that can rewrite
+/// the forwarded query string. Per-plugin prefixes would be silently ignored
+/// there, leaking the token to the backend.
+pub(crate) const STRIP_QUERY_PARAM_METADATA_PREFIX: &str = "auth.strip_query_param.";
+
 #[derive(Clone)]
 pub struct TokenHeaderLocation {
     pub name: String,
@@ -23,7 +31,12 @@ pub fn extract_authorization_bearer(ctx: &RequestContext) -> ExtractedCredential
     match ctx.headers.get("authorization") {
         None => ExtractedCredential::Missing,
         Some(value) if value.starts_with("Bearer ") || value.starts_with("bearer ") => {
-            ExtractedCredential::BearerToken(value[7..].to_string())
+            let token = &value[7..];
+            if token.is_empty() {
+                ExtractedCredential::InvalidFormat(r#"{"error":"Empty bearer token"}"#.to_string())
+            } else {
+                ExtractedCredential::BearerToken(token.to_string())
+            }
         }
         Some(_) => {
             ExtractedCredential::InvalidFormat(r#"{"error":"Missing Bearer token"}"#.to_string())
