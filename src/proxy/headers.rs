@@ -253,6 +253,19 @@ pub fn strip_backend_request_headers_for_grpc(headers: &mut http::HeaderMap) {
     headers.insert(http::header::TE, http::HeaderValue::from_static("trailers"));
 }
 
+/// Remove reserved gateway-asserted consumer-identity headers from a request
+/// `HeaderMap`.
+///
+/// `x-consumer-username` / `x-consumer-custom-id` are injected by the gateway
+/// only after a principal is resolved and are documented as "never trusted
+/// from clients". `HeaderMap::remove` clears every value for the
+/// case-insensitive name, so any client-supplied casing or duplication is
+/// dropped.
+fn strip_reserved_consumer_identity_headers(headers: &mut http::HeaderMap) {
+    headers.remove("x-consumer-username");
+    headers.remove("x-consumer-custom-id");
+}
+
 /// Merge plugin/proxy headers on top of `headers` and then run the
 /// gRPC-specific backend strip on the union. This is the canonical
 /// order for gRPC dispatch — stripping BEFORE the merge would let any
@@ -262,6 +275,18 @@ pub fn strip_backend_request_headers_for_grpc(headers: &mut http::HeaderMap) {
 /// `proxy-connection`, `te`, `trailer`, `transfer-encoding`,
 /// `content-length`, etc. straight back into the outbound map.
 ///
+/// Reserved gateway-identity headers (`x-consumer-username` /
+/// `x-consumer-custom-id`) are stripped from the raw base map FIRST,
+/// before the merge. The native gRPC path uses the raw inbound
+/// `HeaderMap` as its merge base (unlike the reqwest / direct-H2 /
+/// WebSocket paths, which build the outbound map from the sanitised
+/// `ctx.headers`), so a forged client value would otherwise survive when
+/// no principal is resolved — `proxy_headers` then carries no
+/// `x-consumer-*` key to overwrite it. Removing them before the merge
+/// closes the spoof while still letting a genuinely gateway-asserted
+/// value (present in `proxy_headers` only after successful auth) layer
+/// back on and reach the backend.
+///
 /// Encapsulating the merge-then-strip dance in one helper means both
 /// gRPC entry points (`proxy_grpc_request_streaming` and
 /// `proxy_grpc_request_core`) share a single tested implementation;
@@ -270,6 +295,11 @@ pub fn merge_proxy_headers_and_strip_for_grpc(
     headers: &mut http::HeaderMap,
     proxy_headers: &std::collections::HashMap<String, String>,
 ) {
+    // Drop client-supplied reserved identity headers from the raw base BEFORE
+    // the merge, so a verified gateway value carried in `proxy_headers`
+    // (post-auth) is layered back on and preserved.
+    strip_reserved_consumer_identity_headers(headers);
+
     for (k, v) in proxy_headers {
         if let (Ok(name), Ok(val)) = (
             http::HeaderName::from_bytes(k.as_bytes()),
@@ -578,6 +608,76 @@ mod tests {
         assert_eq!(
             headers.get(http::header::TE),
             Some(&http::HeaderValue::from_static("trailers"))
+        );
+    }
+
+    #[test]
+    fn grpc_merge_drops_client_consumer_identity_when_no_principal() {
+        // Security regression (consumer-identity spoofing): the native gRPC
+        // path uses the RAW inbound HeaderMap as its merge base. A client can
+        // forge `x-consumer-username` / `x-consumer-custom-id`; when no
+        // principal is resolved, `proxy_headers` carries no such key, so
+        // without a pre-merge strip the forged value would reach the gRPC
+        // backend verbatim and be treated as a gateway-asserted principal.
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("application/grpc"),
+        );
+        headers.insert(
+            http::HeaderName::from_static("x-consumer-username"),
+            http::HeaderValue::from_static("admin"),
+        );
+        headers.insert(
+            http::HeaderName::from_static("x-consumer-custom-id"),
+            http::HeaderValue::from_static("0001"),
+        );
+
+        // No principal resolved -> proxy_headers has no identity keys.
+        let proxy_headers: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+
+        merge_proxy_headers_and_strip_for_grpc(&mut headers, &proxy_headers);
+
+        assert!(
+            headers.get("x-consumer-username").is_none(),
+            "client-supplied x-consumer-username must not reach the gRPC backend"
+        );
+        assert!(
+            headers.get("x-consumer-custom-id").is_none(),
+            "client-supplied x-consumer-custom-id must not reach the gRPC backend"
+        );
+    }
+
+    #[test]
+    fn grpc_merge_replaces_client_consumer_identity_with_gateway_value() {
+        // When a principal IS resolved, the gateway-asserted identity is
+        // carried in `proxy_headers` and must layer on top of (replace) any
+        // client-supplied value — never the forged one.
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::HeaderName::from_static("x-consumer-username"),
+            http::HeaderValue::from_static("spoofed"),
+        );
+        headers.insert(
+            http::HeaderName::from_static("x-consumer-custom-id"),
+            http::HeaderValue::from_static("spoofed-id"),
+        );
+
+        let mut proxy_headers = std::collections::HashMap::new();
+        proxy_headers.insert("x-consumer-username".to_string(), "real-user".to_string());
+        proxy_headers.insert("x-consumer-custom-id".to_string(), "real-id".to_string());
+
+        merge_proxy_headers_and_strip_for_grpc(&mut headers, &proxy_headers);
+
+        assert_eq!(
+            headers.get("x-consumer-username"),
+            Some(&http::HeaderValue::from_static("real-user")),
+            "gateway-asserted identity must replace the client value"
+        );
+        assert_eq!(
+            headers.get("x-consumer-custom-id"),
+            Some(&http::HeaderValue::from_static("real-id"))
         );
     }
 
