@@ -1817,7 +1817,19 @@ fn write_private_file_atomically(
             tmp_path.display(),
             final_path.display()
         )
-    })
+    })?;
+    // Durably persist the rename itself: the file contents were fsynced above,
+    // but the directory entry that points at them is only guaranteed after an
+    // fsync of the containing directory. Without it a crash right after rename
+    // can lose the spooled batch on some filesystems. Directory fsync is a Unix
+    // concept and best-effort; failure here does not invalidate the written data.
+    #[cfg(unix)]
+    if let Some(parent) = final_path.parent()
+        && let Ok(dir) = File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
+    Ok(())
 }
 
 fn ensure_private_dir(path: &Path) -> Result<(), String> {

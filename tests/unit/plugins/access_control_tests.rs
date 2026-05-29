@@ -29,6 +29,8 @@ fn create_stream_context(
         sni_hostname: None,
         mesh_direction: None,
         node_waypoint_policy_scope: None,
+        first_bytes: None,
+        first_bytes_kind: None,
     }
 }
 
