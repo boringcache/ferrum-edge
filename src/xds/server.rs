@@ -588,11 +588,7 @@ impl XdsAdsServer {
         previous: Option<&XdsSnapshot>,
     ) -> (Arc<XdsSnapshot>, Vec<DiscoveryResponse>) {
         let snapshot = self.snapshot_for_config_with_fingerprint(node_id, config, fingerprint);
-        let force_required_refresh = required_mesh_slice_subscriptions_need_version_refresh(
-            previous,
-            &snapshot,
-            subscriptions.values(),
-        );
+        let force_required_refresh = required_mesh_slice_resources_changed(previous, &snapshot);
         let responses = subscriptions
             .values()
             .filter(|subscription| {
@@ -1463,28 +1459,46 @@ fn previous_resources_indexed<'a>(
         .unwrap_or_default()
 }
 
+/// SotW type URLs that make up a coherent mesh slice on the DP. Mirrors the DP
+/// client's `REQUIRED_MESH_SLICE_TYPE_URLS`; keep the two in sync.
+const REQUIRED_MESH_SLICE_SOTW_TYPE_URLS: [&str; 5] = [
+    super::translator::CDS_TYPE_URL,
+    super::translator::EDS_TYPE_URL,
+    super::translator::LDS_TYPE_URL,
+    super::translator::RDS_TYPE_URL,
+    super::translator::ECDS_TYPE_URL,
+];
+
 fn is_required_mesh_slice_sotw_type_url(type_url: &str) -> bool {
-    matches!(
-        type_url,
-        super::translator::CDS_TYPE_URL
-            | super::translator::EDS_TYPE_URL
-            | super::translator::LDS_TYPE_URL
-            | super::translator::RDS_TYPE_URL
-            | super::translator::ECDS_TYPE_URL
-    )
+    REQUIRED_MESH_SLICE_SOTW_TYPE_URLS.contains(&type_url)
 }
 
-fn required_mesh_slice_subscriptions_need_version_refresh<'a>(
+/// True when any required mesh-slice type's resources changed between the
+/// previous and current snapshot, regardless of which types the DP currently
+/// subscribes to.
+///
+/// Coherence is a property of the snapshot, not of the current subscription
+/// set. A policy-only ECDS change — or any required-type change that lands
+/// during a startup/reconnect race before the DP has registered its full
+/// required subscription set — must still force every subscribed required type
+/// to be re-sent at the new snapshot version. Filtering to the currently
+/// subscribed types would miss an ECDS-only change while the DP has only CDS
+/// subscribed, leaving the DP's coherent required-version gate stuck (e.g.
+/// CDS=vN while a later ECDS request lands ECDS=vN+1) until an unrelated change
+/// or reconnect, hanging `wait_for_first_slice()`.
+fn required_mesh_slice_resources_changed(
     previous: Option<&XdsSnapshot>,
     snapshot: &XdsSnapshot,
-    subscriptions: impl Iterator<Item = &'a XdsSubscription>,
 ) -> bool {
     let Some(previous) = previous else {
         return false;
     };
-    subscriptions
-        .filter(|subscription| is_required_mesh_slice_sotw_type_url(&subscription.type_url))
-        .any(|subscription| subscription_resources_changed(Some(previous), snapshot, subscription))
+    REQUIRED_MESH_SLICE_SOTW_TYPE_URLS.iter().any(|type_url| {
+        !resources_equal_ignoring_version(
+            previous.resources(type_url),
+            snapshot.resources(type_url),
+        )
+    })
 }
 
 fn subscription_resources_changed(
@@ -2088,13 +2102,21 @@ mod tests {
     fn sotw_policy_only_update_resends_unchanged_required_cds_for_coherence() {
         // ECDS carries mesh security policy. When a policy-only update changes
         // ECDS, subscribed required core resources are force-re-sent with the
-        // same snapshot version so the DP never applies a mixed routing/policy
+        // new snapshot version so the DP never applies a mixed routing/policy
         // slice.
+        //
+        // This also covers the startup/reconnect race: the DP here has only
+        // subscribed to CDS (its ECDS request has not landed yet), so the change
+        // detection must inspect the whole snapshot, not just the current
+        // subscription set. If CDS were left at the old version, a later initial
+        // ECDS response at the new version would strand the DP at CDS=old/
+        // ECDS=new and hang `wait_for_first_slice()` until an unrelated change.
         let server = test_server(gateway_config_with_service(true, 0));
         let subscriptions = cds_subscription();
 
         let initial = server.sotw_responses_for_subscriptions("node-a", &subscriptions);
         assert_eq!(initial.len(), 1);
+        let initial_version = initial[0].version_info.clone();
 
         server
             .config
@@ -2105,6 +2127,11 @@ mod tests {
         assert_eq!(
             refreshed[0].type_url,
             super::super::translator::CDS_TYPE_URL
+        );
+        assert_ne!(
+            refreshed[0].version_info, initial_version,
+            "force-re-sent CDS must advance to the new snapshot version so a \
+             later ECDS at that version converges coherently"
         );
     }
 
