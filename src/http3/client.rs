@@ -586,6 +586,7 @@ impl H3PoolError {
     /// only driven by PRE-WIRE failures and the fresh-connect setup errors are
     /// genuinely pre-wire. This method is retained as a utility for combining a
     /// prior on-wire observation with a later pre-wire error.
+    #[allow(dead_code)] // Retained public utility for combining a prior on-wire observation with a later pre-wire error.
     pub fn promote_on_wire_if(mut self, condition: bool) -> Self {
         if condition {
             self.request_on_wire = true;
