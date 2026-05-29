@@ -226,6 +226,13 @@ pub struct DnsCache {
 }
 
 impl DnsCache {
+    /// Upper bound for every TTL-derived `Duration` (override, min, stale,
+    /// error, and the effective record TTL). Matches the per-proxy
+    /// `dns_cache_ttl` ceiling (1 day) so unbounded `FERRUM_DNS_*` env-var
+    /// seconds cannot overflow the `Instant + Duration` / `Duration * u32`
+    /// arithmetic on the resolution hot path (a reachable panic).
+    const MAX_TTL: Duration = Duration::from_secs(86_400);
+
     /// Expose the configured backend IP allowlist policy for non-DNS
     /// backend target validation paths (for example, service discovery).
     /// Cloned because `BackendAllowIps` is no longer `Copy`.
@@ -251,10 +258,12 @@ impl DnsCache {
             global_overrides,
             resolver: Arc::new(resolver),
             dns_order,
-            ttl_override: config.ttl_override_seconds.map(Duration::from_secs),
-            min_ttl: Duration::from_secs(config.min_ttl_seconds),
-            stale_ttl: Duration::from_secs(config.stale_ttl_seconds),
-            error_ttl: Duration::from_secs(config.error_ttl_seconds),
+            ttl_override: config
+                .ttl_override_seconds
+                .map(|s| Duration::from_secs(s).min(Self::MAX_TTL)),
+            min_ttl: Duration::from_secs(config.min_ttl_seconds).min(Self::MAX_TTL),
+            stale_ttl: Duration::from_secs(config.stale_ttl_seconds).min(Self::MAX_TTL),
+            error_ttl: Duration::from_secs(config.error_ttl_seconds).min(Self::MAX_TTL),
             max_cache_size: config.max_cache_size,
             refreshing: Arc::new(DashMap::with_shard_amount(shards)),
             refresh_semaphore: Arc::new(Semaphore::new(config.max_concurrent_refreshes.max(1))),
@@ -309,6 +318,11 @@ impl DnsCache {
         // This is the single success insertion path for foreground resolves,
         // stale refreshes, proactive background refreshes, and failed-retry
         // recovery. Cache reads intentionally trust entries accepted here.
+        //
+        // Clamp the effective TTL so an unbounded override / record TTL cannot
+        // overflow the `Instant + Duration` arithmetic below (or the
+        // `Duration * u32` threshold in the proactive refresh loop).
+        let ttl = ttl.min(Self::MAX_TTL);
         self.check_backend_addresses_policy(&addresses, hostname)?;
         let cache_key = dns_hostname_key(hostname);
 
@@ -1468,6 +1482,44 @@ mod tests {
         assert!(
             cache.cache.get("metadata.internal").is_none(),
             "Denied DNS answers must not be inserted for foreground or background refresh paths"
+        );
+    }
+
+    #[test]
+    fn cache_success_entry_clamps_unbounded_ttl_without_panicking() {
+        // F20: huge TTLs (from an unbounded FERRUM_DNS_* env var, or an absurd
+        // record TTL) must not overflow the `Instant + Duration` /
+        // `Duration * u32` arithmetic on the resolution path. Build a cache
+        // whose env-derived TTLs are enormous AND pass an enormous per-call
+        // TTL; the call must succeed (no panic) and the stored TTL must be
+        // clamped to the 1-day ceiling.
+        let cache = DnsCache::new(DnsConfig {
+            ttl_override_seconds: Some(u64::MAX),
+            stale_ttl_seconds: u64::MAX,
+            min_ttl_seconds: u64::MAX,
+            error_ttl_seconds: u64::MAX,
+            ..DnsConfig::default()
+        });
+
+        let result = cache.cache_success_entry(
+            "example.internal",
+            vec!["8.8.8.8".parse().unwrap()],
+            Some(CachedRecordType::A),
+            Duration::from_secs(u64::MAX),
+            None,
+        );
+
+        assert!(
+            result.is_ok(),
+            "an unbounded TTL must not panic the resolution path"
+        );
+        let entry = cache
+            .cache
+            .get("example.internal")
+            .expect("entry should be cached");
+        assert!(
+            entry.applied_ttl <= DnsCache::MAX_TTL,
+            "stored TTL must be clamped to the ceiling"
         );
     }
 
