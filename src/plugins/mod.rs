@@ -2115,17 +2115,28 @@ pub trait Plugin: Send + Sync {
         false
     }
 
-    /// Returns `true` if this plugin needs the opening client bytes of a TCP
-    /// stream captured into `StreamConnectionContext.first_bytes` before
-    /// `on_stream_connect` runs. Zero overhead when `false` (default) — the TCP
-    /// proxy skips the capture entirely, preserving the splice/kTLS fast paths.
-    ///
-    /// Capturing decrypted application bytes from a TLS-terminating frontend
-    /// requires reading them in userspace, which is incompatible with kTLS
-    /// splice; the proxy therefore falls back to a userspace relay for that
-    /// connection. Plaintext and passthrough frontends are peeked
-    /// non-destructively and keep their fast paths.
+    /// Returns `true` if this plugin needs the opening client bytes of a
+    /// plain/passthrough TCP stream captured into
+    /// `StreamConnectionContext.first_bytes` before `on_stream_connect` runs.
+    /// These are obtained with a non-destructive peek, so the splice fast path
+    /// is preserved. Zero overhead when `false` (default) — the proxy skips the
+    /// capture entirely.
     fn requires_stream_first_bytes(&self) -> bool {
+        false
+    }
+
+    /// Returns `true` if this plugin needs the opening *decrypted* application
+    /// bytes of a TLS-terminating TCP frontend captured into
+    /// `StreamConnectionContext.first_bytes` before `on_stream_connect` runs.
+    ///
+    /// Separate from [`Self::requires_stream_first_bytes`] because recovering
+    /// decrypted bytes requires a *consuming* read that blocks until the client
+    /// sends data and disables the kTLS-splice fast path. That cost is only
+    /// worth paying when the bytes will actually be inspected (e.g. signature
+    /// matching) — not for transport-shape guards (`tcp_require_tls`) that the
+    /// completed TLS handshake already satisfies. Returning `true` here for a
+    /// guard-only config would needlessly stall server-first protocols.
+    fn requires_stream_first_bytes_decrypted(&self) -> bool {
         false
     }
 

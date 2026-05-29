@@ -2208,6 +2208,8 @@ fn stream_waf_attaches_to_stream_protocols_when_configured() {
     assert!(protocols.contains(&ProxyProtocol::Udp));
     assert!(protocols.contains(&ProxyProtocol::Http));
     assert!(plugin.requires_stream_first_bytes());
+    // Signatures need decrypted bytes scanned on TLS-terminating frontends.
+    assert!(plugin.requires_stream_first_bytes_decrypted());
     assert!(plugin.requires_udp_datagram_hooks());
 }
 
@@ -2236,14 +2238,18 @@ fn stream_waf_rejects_invalid_signature_pattern() {
 }
 
 #[test]
-fn stream_waf_require_tls_only_needs_first_bytes_not_udp() {
+fn stream_waf_require_tls_only_needs_raw_peek_not_decrypted_read() {
     let plugin = Waf::new(&json!({
         "mode": "enforce",
         "include_default_rules": false,
         "stream": { "tcp_require_tls": true }
     }))
     .unwrap();
+    // Needs the cheap raw peek (to shape-check plain/passthrough bytes)...
     assert!(plugin.requires_stream_first_bytes());
+    // ...but NOT the consuming decrypted read: tcp_require_tls is a no-op after
+    // TLS termination, so it must not stall a server-first TLS backend.
+    assert!(!plugin.requires_stream_first_bytes_decrypted());
     // No signatures → nothing to scan per datagram.
     assert!(!plugin.requires_udp_datagram_hooks());
 }

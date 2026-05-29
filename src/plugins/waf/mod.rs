@@ -661,6 +661,14 @@ impl Plugin for Waf {
                 .is_some_and(|s| s.needs_tcp_first_bytes())
     }
 
+    fn requires_stream_first_bytes_decrypted(&self) -> bool {
+        self.active
+            && self
+                .stream
+                .as_ref()
+                .is_some_and(|s| s.needs_tcp_decrypted_first_bytes())
+    }
+
     fn requires_udp_datagram_hooks(&self) -> bool {
         self.active
             && self

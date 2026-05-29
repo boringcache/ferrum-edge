@@ -1852,7 +1852,16 @@ async fn handle_tcp_connection_inner(
     // Whether any plugin (e.g. the WAF) wants the opening client bytes captured
     // into `stream_ctx.first_bytes` before `on_stream_connect` runs. Computed
     // once; when false the splice/kTLS fast paths are left completely untouched.
+    //
+    // Two tiers: the cheap non-destructive peek (plain/passthrough) vs. the
+    // consuming decrypted read after TLS termination, which blocks until the
+    // client speaks and disables kTLS splice. Keeping them separate means a
+    // guard-only config (`tcp_require_tls`, a no-op post-handshake) never stalls
+    // a TLS-terminating, server-first backend for inspection it won't perform.
     let scan_first_bytes = plugins.iter().any(|p| p.requires_stream_first_bytes());
+    let scan_first_bytes_decrypted = plugins
+        .iter()
+        .any(|p| p.requires_stream_first_bytes_decrypted());
 
     // ----- Passthrough mode: forward encrypted bytes without TLS termination -----
     if params.passthrough {
@@ -2164,7 +2173,11 @@ async fn handle_tcp_connection_inner(
         // backend is dialed. This consumes the bytes from the TLS session, so
         // we forward them to the backend below and fall back to a userspace
         // relay (kTLS splice needs the raw, undisturbed TLS record stream).
-        if scan_first_bytes {
+        //
+        // Gated on the decrypted-specific signal: a transport-shape guard like
+        // `tcp_require_tls` is already satisfied by the completed handshake, so
+        // it must not trigger this blocking read on a server-first backend.
+        if scan_first_bytes_decrypted {
             let prefix = read_decrypted_first_bytes(&mut tls_stream, sni_peek_timeout).await;
             if !prefix.is_empty() {
                 stream_ctx.first_bytes = Some(bytes::Bytes::copy_from_slice(&prefix));

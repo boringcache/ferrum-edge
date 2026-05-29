@@ -73,9 +73,18 @@ pub(super) struct StreamWafConfig {
 
 impl StreamWafConfig {
     /// Whether the TCP proxy must capture the opening client bytes for this
-    /// config — either to signature-scan them or to run the TLS-shape guard.
+    /// config via a non-destructive peek (plain/passthrough) — either to
+    /// signature-scan them or to run the TLS-shape guard.
     pub(super) fn needs_tcp_first_bytes(&self) -> bool {
         self.tcp_require_tls || (self.inspect_tcp && !self.signatures.is_empty())
+    }
+
+    /// Whether the TCP proxy must capture the opening *decrypted* bytes of a
+    /// TLS-terminating frontend (a consuming read that disables kTLS splice).
+    /// Only signature scanning needs this; `tcp_require_tls` is a no-op once the
+    /// TLS handshake has completed, so a guard-only config must not trigger it.
+    pub(super) fn needs_tcp_decrypted_first_bytes(&self) -> bool {
+        self.inspect_tcp && !self.signatures.is_empty()
     }
 
     /// Whether per-datagram UDP hooks are needed for this config.
