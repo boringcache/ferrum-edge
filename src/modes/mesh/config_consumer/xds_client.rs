@@ -428,28 +428,56 @@ impl ResourceAccumulator {
             .all(|type_url| self.versions_by_type.contains_key(*type_url))
     }
 
-    fn has_coherent_required_versions(&self) -> bool {
-        let Some(first_version) = REQUIRED_MESH_SLICE_TYPE_URLS
-            .iter()
-            .filter_map(|type_url| self.versions_by_type.get(*type_url))
-            .next()
-        else {
-            return false;
-        };
-        REQUIRED_MESH_SLICE_TYPE_URLS
-            .iter()
-            .all(|type_url| self.versions_by_type.get(*type_url) == Some(first_version))
-    }
-
+    /// Build a slice under Envoy-style resource warming (make-before-break).
+    ///
+    /// The DP no longer requires the required types to share one coherent
+    /// `version_info` before building — xDS versions are per-type and move
+    /// independently (an EDS/ECDS-only update never re-stamps CDS/LDS/RDS), so
+    /// demanding a single coherent version stalled application whenever the CP
+    /// versioned types independently. Instead the gate is:
+    ///
+    /// 1. every required type (CDS, EDS, LDS, RDS, ECDS) has delivered at least
+    ///    one response. ECDS is required so the first slice can never apply the
+    ///    name-only, unprotected view before the security/policy carriers
+    ///    arrive (fail-closed); see `docs/mesh.md` "Ferrum mesh-slice ECDS
+    ///    carriers".
+    /// 2. `reverse_translate` succeeds, which enforces the cross-type
+    ///    consistency that matters in Ferrum's name-only model (every RDS route
+    ///    references a service exposed by some CDS/EDS/LDS resource).
+    ///
+    /// Make-before-break is provided by the caller: the live slice keeps
+    /// serving through the runtime `ArcSwap` until this returns `Ok(Some)`, so
+    /// an incomplete or transiently-skewed set never tears down the working
+    /// slice or blackholes traffic. A genuine structural error (`Err`) is
+    /// NACKed and rolls the accumulator back to the last accepted state.
     fn try_build_mesh_slice(&self, config: &XdsClientConfig) -> Result<Option<MeshSlice>, String> {
         if !self.has_required_types() {
             return Ok(None);
         }
-        if !self.has_coherent_required_versions() {
-            return Ok(None);
-        }
         reverse_translate(self, config).map(Some)
     }
+}
+
+/// Compose the slice version from the per-type versions of the required
+/// mesh-slice types under resource warming.
+///
+/// With per-type independent versions there is no single "the" version. The
+/// Ferrum CP stamps every resource in a snapshot with one content-derived
+/// aggregate version (`{loaded_at_rfc3339}:{digest16}`) and only re-sends the
+/// types whose bytes changed, so the lexicographically-greatest per-type
+/// version is the newest snapshot's version and best represents the converged
+/// slice content. Returns empty when no required type has a version yet.
+///
+/// Observability-only: `MeshSlice.version` is never used for change detection
+/// (`MeshSlice::content_eq` ignores it) and `install_slice` never dedupes by
+/// it, so a non-RFC3339 version from a non-Ferrum CP at worst orders oddly.
+fn composite_required_version(accumulator: &ResourceAccumulator) -> String {
+    REQUIRED_MESH_SLICE_TYPE_URLS
+        .iter()
+        .filter_map(|type_url| accumulator.versions_by_type.get(*type_url))
+        .max()
+        .cloned()
+        .unwrap_or_default()
 }
 
 /// Maintain a live xDS ADS stream with simple multi-CP failover.
@@ -1245,11 +1273,11 @@ fn reverse_translate(
             .labels
             .filter(|l| !l.is_empty())
             .unwrap_or_else(|| config.labels.clone()),
-        version: accumulator
-            .versions_by_type
-            .get(CDS_TYPE_URL)
-            .cloned()
-            .unwrap_or_default(),
+        // Resource warming: per-type versions are independent, so derive a
+        // single observability version from the converged set rather than
+        // pinning to CDS (which a policy/workload-only ECDS update never
+        // re-stamps).
+        version: composite_required_version(accumulator),
         // GAP-1a: workloads/endpoints recovered from the Workloads carrier.
         // Empty only when the CP emitted no carrier (older Ferrum-shaped xDS
         // CP) or the slice genuinely has no workloads.
@@ -2099,7 +2127,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mismatched_required_versions_wait_instead_of_applying_mixed_slice() {
+    async fn mixed_required_versions_apply_under_resource_warming() {
+        // Resource warming (make-before-break): once every required type has
+        // delivered an initial response, the DP applies the converged set even
+        // when per-type versions differ. The legacy coherent-version gate would
+        // have stalled here (CDS on v2 while ECDS/EDS/LDS/RDS stay on v1); under
+        // warming the skew applies, which is the Envoy-compatible behavior.
         let (tx, mut rx) = mpsc::channel(4);
         let mut state = ClientSubscriptionState::new();
         let mut accumulator = ResourceAccumulator::new();
@@ -2135,12 +2168,13 @@ mod tests {
             &mut nack_circuit_breaker,
         )
         .await
-        .expect("valid but incomplete version set should ACK");
+        .expect("valid converged set with mixed versions should build a slice");
 
-        assert!(
-            pending.is_none(),
-            "CDS v2 must not build a slice while ECDS and the other required types remain on v1"
-        );
+        let pending = pending
+            .expect("CDS v2 with the other required types on v1 must build a slice under warming");
+        // The slice version reflects the newest per-type version (max), not a
+        // requirement that all types agree.
+        assert_eq!(pending.slice.version, "v2");
         let ack = rx.recv().await.expect("ACK sent");
         assert_eq!(ack.type_url, CDS_TYPE_URL);
         assert_eq!(ack.version_info, "v2");
@@ -2151,6 +2185,93 @@ mod tests {
         assert_eq!(
             accumulator.versions_by_type.get(ECDS_TYPE_URL).unwrap(),
             "v1"
+        );
+    }
+
+    #[tokio::test]
+    async fn ecds_only_update_applies_without_re_sending_other_types() {
+        // After convergence, an ECDS-only update (the common Ferrum churn case
+        // for policy/workload changes) applies on its own: the CP re-sends only
+        // ECDS at a new version and the DP rebuilds from the persisted
+        // CDS/EDS/LDS/RDS without needing them re-stamped to a matching version.
+        // This is what the CP forced-resend used to paper over for the
+        // coherent-version gate.
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut state = ClientSubscriptionState::new();
+        let mut accumulator = ResourceAccumulator::new();
+        let mut nack_circuit_breaker = NackCircuitBreaker::default();
+
+        // Converge all required types at v1 with a real service.
+        accumulator
+            .apply_sotw_response(
+                CDS_TYPE_URL,
+                &[any_resource(CDS_TYPE_URL, "cluster/default/api/8080")],
+                "v1",
+            )
+            .expect("CDS applies");
+        apply_all_empty(&mut accumulator);
+        assert!(accumulator.has_required_types());
+
+        // ECDS-only update at a newer version. Only ECDS moves to v2;
+        // CDS/EDS/LDS/RDS stay at v1 (they were not re-sent).
+        let pending = handle_ads_response(
+            discovery_response(
+                ECDS_TYPE_URL,
+                "v2",
+                "n2",
+                vec![any_resource(ECDS_TYPE_URL, "ecds-extension")],
+            ),
+            &test_config(),
+            &tx,
+            &mut state,
+            &mut accumulator,
+            &mut nack_circuit_breaker,
+        )
+        .await
+        .expect("ECDS-only update is valid")
+        .expect("ECDS-only update builds a slice without other types re-sending");
+
+        assert_eq!(pending.type_url, ECDS_TYPE_URL);
+        assert_eq!(pending.slice.version, "v2");
+        // The service from the persisted v1 CDS is still present in the rebuilt
+        // slice — the other types did not need to re-send.
+        assert_eq!(pending.slice.services.len(), 1);
+        assert_eq!(pending.slice.services[0].name, "api");
+        assert_eq!(
+            accumulator.versions_by_type.get(CDS_TYPE_URL).unwrap(),
+            "v1"
+        );
+        let ack = rx.recv().await.expect("ACK sent");
+        assert_eq!(ack.type_url, ECDS_TYPE_URL);
+        assert_eq!(ack.version_info, "v2");
+    }
+
+    #[test]
+    fn composite_required_version_uses_newest_per_type_version() {
+        let mut accumulator = ResourceAccumulator::new();
+        // No required type seen yet → empty.
+        assert_eq!(composite_required_version(&accumulator), "");
+
+        accumulator
+            .apply_sotw_response(CDS_TYPE_URL, &[], "2026-05-01T00:00:00Z:aaaa")
+            .expect("CDS applies");
+        accumulator
+            .apply_sotw_response(EDS_TYPE_URL, &[], "2026-05-01T00:00:00Z:aaaa")
+            .expect("EDS applies");
+        accumulator
+            .apply_sotw_response(LDS_TYPE_URL, &[], "2026-05-01T00:00:00Z:aaaa")
+            .expect("LDS applies");
+        accumulator
+            .apply_sotw_response(RDS_TYPE_URL, &[], "2026-05-01T00:00:00Z:aaaa")
+            .expect("RDS applies");
+        // ECDS moved to a newer snapshot version (lexicographically greater).
+        accumulator
+            .apply_sotw_response(ECDS_TYPE_URL, &[], "2026-05-02T00:00:00Z:bbbb")
+            .expect("ECDS applies");
+
+        assert_eq!(
+            composite_required_version(&accumulator),
+            "2026-05-02T00:00:00Z:bbbb"
         );
     }
 
