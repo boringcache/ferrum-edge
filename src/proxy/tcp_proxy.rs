@@ -2168,6 +2168,15 @@ async fn handle_tcp_connection_inner(
             .server_name()
             .map(str::to_ascii_lowercase);
 
+        // Mark the connection as TLS-terminated for any first-bytes-aware
+        // plugin, even when we don't read application bytes below. This lets a
+        // transport-shape guard like `tcp_require_tls` recognize the stream as
+        // already-TLS (the handshake proved it) instead of failing closed on the
+        // absent bytes.
+        if scan_first_bytes {
+            stream_ctx.first_bytes_kind = Some(StreamBytesKind::DecryptedApp);
+        }
+
         // Capture the opening *decrypted* application bytes for L7 inspection
         // before on_stream_connect runs, so a plugin can reject before any
         // backend is dialed. This consumes the bytes from the TLS session, so
@@ -2181,7 +2190,6 @@ async fn handle_tcp_connection_inner(
             let prefix = read_decrypted_first_bytes(&mut tls_stream, sni_peek_timeout).await;
             if !prefix.is_empty() {
                 stream_ctx.first_bytes = Some(bytes::Bytes::copy_from_slice(&prefix));
-                stream_ctx.first_bytes_kind = Some(StreamBytesKind::DecryptedApp);
             }
             client_first_bytes_forward = Some(prefix);
         }

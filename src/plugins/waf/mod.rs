@@ -40,6 +40,7 @@ use super::{
     StreamBytesKind, StreamConnectionContext, UdpDatagramContext, UdpDatagramDirection,
     UdpDatagramVerdict,
 };
+use crate::config::types::BackendScheme;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GlobalMode {
@@ -688,43 +689,56 @@ impl Plugin for Waf {
         if !self.active {
             return PluginResult::Continue;
         }
-        let Some(bytes) = ctx.first_bytes.clone() else {
-            return PluginResult::Continue;
-        };
-        let kind = ctx
-            .first_bytes_kind
-            .unwrap_or(StreamBytesKind::PlaintextWire);
 
-        // Transport-shape guard: raw wire bytes that don't begin a TLS
-        // ClientHello on a TLS-required port. No-op once TLS is terminated.
-        if stream.tcp_require_tls && kind.is_raw_wire() && !looks_like_tls_client_hello(&bytes) {
-            let blocked = self.config.mode == GlobalMode::Enforce;
-            self.record_stream_metadata(ctx, "", Severity::High, blocked, "tcp_require_tls");
-            if self.config.log_to_stdout {
-                warn!(
-                    target: "waf",
-                    proxy = %ctx.proxy_id,
-                    client_ip = %ctx.client_ip,
-                    transport = "tcp",
-                    blocked = blocked,
-                    "WAF: non-TLS traffic on tcp_require_tls port"
-                );
+        // Transport-shape guard (TCP only). A TLS-terminating frontend has
+        // already proven the transport (the proxy marks it `DecryptedApp`), so
+        // the guard is satisfied. On a raw TCP connection the opening bytes must
+        // begin a TLS ClientHello — and missing bytes (idle peek timeout / EOF)
+        // fail closed, so a client cannot stall the peek and then send plaintext.
+        if stream.tcp_require_tls
+            && matches!(ctx.backend_scheme, BackendScheme::Tcp | BackendScheme::Tcps)
+        {
+            let terminated = matches!(ctx.first_bytes_kind, Some(StreamBytesKind::DecryptedApp));
+            let presents_tls = ctx
+                .first_bytes
+                .as_ref()
+                .is_some_and(|b| looks_like_tls_client_hello(b));
+            if !terminated && !presents_tls {
+                let blocked = self.config.mode == GlobalMode::Enforce;
+                self.record_stream_metadata(ctx, "", Severity::High, blocked, "tcp_require_tls");
+                if self.config.log_to_stdout {
+                    warn!(
+                        target: "waf",
+                        proxy = %ctx.proxy_id,
+                        client_ip = %ctx.client_ip,
+                        transport = "tcp",
+                        blocked = blocked,
+                        "WAF: non-TLS traffic on tcp_require_tls port"
+                    );
+                }
+                if blocked {
+                    return self.reject();
+                }
+                return PluginResult::Continue;
             }
-            if blocked {
-                return self.reject();
-            }
-            return PluginResult::Continue;
         }
 
         // L7 signature scan over plaintext / decrypted opening bytes only.
-        if stream.inspect_tcp && kind.is_l7_inspectable() {
-            let hits = stream.signatures.matches(&bytes);
-            if !hits.is_empty() {
-                let (block, severity, ids) = self.stream_decision(&hits);
-                self.record_stream_metadata(ctx, &ids, severity, block, "signature");
-                self.warn_stream_hits(&ctx.proxy_id, &ctx.client_ip, "tcp", &hits, block);
-                if block {
-                    return self.reject();
+        if stream.inspect_tcp
+            && let Some(bytes) = ctx.first_bytes.clone()
+        {
+            let kind = ctx
+                .first_bytes_kind
+                .unwrap_or(StreamBytesKind::PlaintextWire);
+            if kind.is_l7_inspectable() {
+                let hits = stream.signatures.matches(&bytes);
+                if !hits.is_empty() {
+                    let (block, severity, ids) = self.stream_decision(&hits);
+                    self.record_stream_metadata(ctx, &ids, severity, block, "signature");
+                    self.warn_stream_hits(&ctx.proxy_id, &ctx.client_ip, "tcp", &hits, block);
+                    if block {
+                        return self.reject();
+                    }
                 }
             }
         }

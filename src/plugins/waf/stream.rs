@@ -168,6 +168,12 @@ fn compile_stream_signatures(
                 Some(a) => parse_rule_action(&a, "stream.signatures.action")?,
                 None => RuleAction::Enforce,
             };
+            // Drop disabled signatures from the active set (parity with HTTP WAF
+            // rules) so a temporarily disabled rule produces no matches, no
+            // `waf.rule_hits` metadata, and no stdout events while it is off.
+            if action == RuleAction::Disabled {
+                continue;
+            }
             patterns.push(pattern);
             meta.push(StreamSignatureMeta {
                 id,
@@ -185,18 +191,28 @@ fn compile_stream_signatures(
     Ok(CompiledStreamSignatures { set, meta })
 }
 
-/// Heuristic: do these raw wire bytes look like the start of a TLS or DTLS
-/// ClientHello handshake record? Backs `tcp_require_tls`.
+/// Whether these raw TCP wire bytes begin a TLS ClientHello handshake record.
+/// Backs `tcp_require_tls`, which runs only on raw (non-terminated) TCP, so this
+/// validates a TLS record specifically (DTLS is UDP and out of scope here).
 ///
-/// A (D)TLS record begins with content-type `0x16` (handshake) followed by a
-/// two-byte legacy record version: `0x03 0x0n` for TLS 1.x, or `0xfe 0xfd` /
-/// `0xfe 0xff` for DTLS 1.2 / 1.0.
+/// A TLS record is `content_type(0x16 handshake) | version(2) | length(2) |
+/// handshake_message...`, and the handshake message's first byte is its type —
+/// `0x01` for ClientHello. Requiring that type (not just the record header)
+/// stops a non-TLS client from prefixing `0x16 0x03 0xNN` to arbitrary plaintext
+/// to slip past the guard.
 pub(super) fn looks_like_tls_client_hello(data: &[u8]) -> bool {
-    if data.len() < 3 || data[0] != 0x16 {
+    // type(1) + version(2) + length(2) + handshake type(1) = 6 bytes minimum.
+    if data.len() < 6 || data[0] != 0x16 {
         return false;
     }
-    matches!(
-        (data[1], data[2]),
-        (0x03, 0x00..=0x04) | (0xfe, 0xfd) | (0xfe, 0xff)
-    )
+    // TLS 1.x legacy record version (TLS 1.3 still uses 0x0301/0x0303 here).
+    if data[1] != 0x03 || !(0x00..=0x04).contains(&data[2]) {
+        return false;
+    }
+    // Record length must at least cover a 4-byte handshake header.
+    if u16::from_be_bytes([data[3], data[4]]) < 4 {
+        return false;
+    }
+    // Handshake message type: ClientHello.
+    data[5] == 0x01
 }

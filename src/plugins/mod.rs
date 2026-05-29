@@ -244,12 +244,6 @@ impl StreamBytesKind {
     pub fn is_l7_inspectable(self) -> bool {
         matches!(self, Self::PlaintextWire | Self::DecryptedApp)
     }
-
-    /// Whether these bytes are raw wire bytes suitable for transport-shape
-    /// checks such as `tcp_require_tls` (i.e. the proxy did not decrypt them).
-    pub fn is_raw_wire(self) -> bool {
-        matches!(self, Self::PlaintextWire | Self::EncryptedWire)
-    }
 }
 
 /// Direction of a WebSocket frame being proxied.
@@ -1525,7 +1519,12 @@ pub struct StreamConnectionContext {
     /// otherwise. `first_bytes_kind` describes whether these are plaintext,
     /// encrypted passthrough, or post-termination decrypted bytes.
     pub first_bytes: Option<bytes::Bytes>,
-    /// Nature of `first_bytes`. `None` when `first_bytes` is `None`.
+    /// Nature of `first_bytes`. Usually `None` when `first_bytes` is `None`, with
+    /// one deliberate exception: a TLS/DTLS-terminating frontend sets this to
+    /// `DecryptedApp` to record that the transport was terminated even when it
+    /// did not read any application bytes (e.g. a guard-only config). That lets a
+    /// transport-shape guard like `tcp_require_tls` recognize the connection as
+    /// already-TLS without forcing a blocking read.
     pub first_bytes_kind: Option<StreamBytesKind>,
 }
 

@@ -2039,6 +2039,24 @@ fn sig_waf(mode: &str) -> Waf {
     .unwrap()
 }
 
+/// A raw TCP `StreamConnectionContext` with no captured first bytes — models a
+/// peek that timed out or hit EOF before the client sent anything.
+fn stream_ctx_absent() -> StreamConnectionContext {
+    let mut ctx = stream_ctx(b"", StreamBytesKind::PlaintextWire);
+    ctx.first_bytes = None;
+    ctx.first_bytes_kind = None;
+    ctx
+}
+
+fn require_tls_waf(mode: &str) -> Waf {
+    Waf::new(&json!({
+        "mode": mode,
+        "include_default_rules": false,
+        "stream": { "tcp_require_tls": true }
+    }))
+    .unwrap()
+}
+
 #[tokio::test]
 async fn stream_waf_signature_blocks_plaintext_tcp() {
     let plugin = sig_waf("enforce");
@@ -2239,12 +2257,7 @@ fn stream_waf_rejects_invalid_signature_pattern() {
 
 #[test]
 fn stream_waf_require_tls_only_needs_raw_peek_not_decrypted_read() {
-    let plugin = Waf::new(&json!({
-        "mode": "enforce",
-        "include_default_rules": false,
-        "stream": { "tcp_require_tls": true }
-    }))
-    .unwrap();
+    let plugin = require_tls_waf("enforce");
     // Needs the cheap raw peek (to shape-check plain/passthrough bytes)...
     assert!(plugin.requires_stream_first_bytes());
     // ...but NOT the consuming decrypted read: tcp_require_tls is a no-op after
@@ -2252,4 +2265,86 @@ fn stream_waf_require_tls_only_needs_raw_peek_not_decrypted_read() {
     assert!(!plugin.requires_stream_first_bytes_decrypted());
     // No signatures → nothing to scan per datagram.
     assert!(!plugin.requires_udp_datagram_hooks());
+}
+
+#[tokio::test]
+async fn stream_waf_tcp_require_tls_fails_closed_when_no_bytes() {
+    // A client that idles until the peek times out (no first bytes) must not
+    // slip past a tcp_require_tls port and then send plaintext.
+    let plugin = require_tls_waf("enforce");
+    let mut sctx = stream_ctx_absent();
+
+    let result = plugin.on_stream_connect(&mut sctx).await;
+
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    let md = sctx.metadata.as_ref().expect("metadata");
+    assert_eq!(
+        md.get("waf.block_reason").map(String::as_str),
+        Some("tcp_require_tls")
+    );
+}
+
+#[tokio::test]
+async fn stream_waf_tcp_require_tls_monitor_allows_but_records_when_no_bytes() {
+    let plugin = require_tls_waf("monitor");
+    let mut sctx = stream_ctx_absent();
+
+    let result = plugin.on_stream_connect(&mut sctx).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        sctx.metadata
+            .as_ref()
+            .and_then(|m| m.get("waf.action"))
+            .map(String::as_str),
+        Some("monitored")
+    );
+}
+
+#[tokio::test]
+async fn stream_waf_tcp_require_tls_rejects_forged_tls_prefix() {
+    // 0x16 0x03 0x01 record header but handshake type 0x02 (ServerHello), not
+    // ClientHello (0x01) — a non-TLS client must not pass by prefixing the bytes.
+    let plugin = require_tls_waf("enforce");
+    let mut sctx = stream_ctx(
+        &[0x16, 0x03, 0x01, 0x00, 0x10, 0x02, 0x00, 0x00, 0x0c],
+        StreamBytesKind::PlaintextWire,
+    );
+
+    let result = plugin.on_stream_connect(&mut sctx).await;
+
+    assert!(matches!(result, PluginResult::Reject { .. }));
+}
+
+#[tokio::test]
+async fn stream_waf_disabled_signature_is_dropped() {
+    let plugin = Waf::new(&json!({
+        "mode": "enforce",
+        "include_default_rules": false,
+        "stream": {
+            "signatures": [
+                { "id": "ON", "pattern": "(?i)attack", "action": "enforce" },
+                { "id": "OFF", "pattern": "(?i)union\\s+select", "action": "disabled" }
+            ]
+        }
+    }))
+    .unwrap();
+
+    // Matches only the disabled signature → no block, no WAF event.
+    let mut sctx = stream_ctx(b"id=1 union select 2", StreamBytesKind::PlaintextWire);
+    assert!(matches!(
+        plugin.on_stream_connect(&mut sctx).await,
+        PluginResult::Continue
+    ));
+    assert!(
+        sctx.metadata.is_none(),
+        "disabled signature must not emit WAF events"
+    );
+
+    // The enabled signature still blocks.
+    let mut sctx2 = stream_ctx(b"this is an attack", StreamBytesKind::PlaintextWire);
+    assert!(matches!(
+        plugin.on_stream_connect(&mut sctx2).await,
+        PluginResult::Reject { .. }
+    ));
 }

@@ -230,10 +230,13 @@ attaches to stream proxies. Two capabilities, both governed by the global
 `mode` (`enforce` blocks, `monitor` records only):
 
 - **`tcp_require_tls`** — reject a TCP connection whose opening bytes are not a
-  TLS/DTLS ClientHello. A transport-shape guard for ports that must only carry
-  TLS. It inspects raw wire bytes, so it applies to plain TCP and `passthrough`
-  proxies; on TLS-terminating frontends the completed handshake already proved
-  the transport, so it is a no-op there.
+  TLS ClientHello (validated down to the handshake message type, not just the
+  record header). A transport-shape guard for ports that must only carry TLS. It
+  inspects raw wire bytes, so it applies to plain TCP and `passthrough` proxies;
+  on TLS-terminating frontends the completed handshake already proved the
+  transport, so it is a no-op there. It **fails closed**: if no opening bytes
+  arrive (idle peek timeout / EOF) the connection is rejected in `enforce`, so a
+  client cannot stall the peek and then send plaintext.
 - **`signatures`** — byte-pattern (regex) matching over **plaintext application
   bytes**. Each signature has an `id`, a `pattern`, and optional `severity`
   (default `medium`) and `action` (`enforce` default / `monitor` / `disabled`).
