@@ -58,17 +58,6 @@ fn ttfb_test_config(backend_port: u16) -> String {
     serde_yaml::to_string(&config).expect("serialize yaml")
 }
 
-fn require_logs(harness: &GatewayHarness) -> String {
-    let logs = harness
-        .captured_combined()
-        .expect("read captured gateway logs");
-    assert!(
-        !logs.trim().is_empty(),
-        "gateway logs were empty — did you forget .capture_output() on the builder?"
-    );
-    logs
-}
-
 // ────────────────────────────────────────────────────────────────────────────
 // Test 1 — slow backend (within the gateway's read timeout) completes OK.
 // ────────────────────────────────────────────────────────────────────────────
@@ -294,17 +283,23 @@ async fn backend_bandwidth_below_budget_triggers_write_timeout() {
     // drops the connection once its per-request `.timeout(400ms)`
     // fires, which shows up as a decode error in the streaming body
     // reader). Both indicate the gateway gave up on the backend.
-    let logs = require_logs(&harness);
-    let saw_timeout_signal = logs.contains("read_timeout")
-        || logs.contains("Timeout")
-        || logs.contains("timeout")
-        || logs.contains("GatewayTimeout")
-        || logs.contains("502")
-        || logs.contains("Backend request failed")
-        || logs.contains("Failed to read backend response body")
-        || logs.contains("error decoding response body");
+    let saw_timeout_signal = |logs: &str| {
+        logs.contains("read_timeout")
+            || logs.contains("Timeout")
+            || logs.contains("timeout")
+            || logs.contains("GatewayTimeout")
+            || logs.contains("502")
+            || logs.contains("Backend request failed")
+            || logs.contains("Failed to read backend response body")
+            || logs.contains("error decoding response body")
+    };
+    // Poll: the failure signal flushes through the non-blocking writer after
+    // the client's per-request timeout fires, so a single snapshot races it.
+    let logs = harness
+        .wait_for_log_contains(&saw_timeout_signal, Duration::from_secs(5))
+        .await;
     assert!(
-        saw_timeout_signal,
+        saw_timeout_signal(&logs),
         "expected timeout/502 or body-read-failure signal in gateway logs:\n{logs}"
     );
 }
