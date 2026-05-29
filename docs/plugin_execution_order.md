@@ -282,7 +282,7 @@ Given all built-in plugins enabled, the execution order is:
 | 34 | `ws_rate_limiting` | 2910 | on_ws_frame |
 | 35 | `udp_rate_limiting` | 2915 | on_udp_datagram |
 | 36 | `ai_prompt_shield` | 2925 | before_proxy, transform_request_body |
-| 37 | `waf` | 2930 | authorize, on_final_request_body, after_proxy, on_final_response_body |
+| 37 | `waf` | 2930 | authorize, on_final_request_body, after_proxy, on_final_response_body, on_stream_connect, on_udp_datagram |
 | 38 | `fault_injection` | 2940 | before_proxy, on_stream_connect |
 | 39 | `body_validator` | 2950 | before_proxy, on_final_request_body, on_final_response_body |
 | 40 | `openapi_validator` | 2960 | before_proxy, on_final_request_body, on_final_response_body |
@@ -520,7 +520,7 @@ TLS/DTLS are transport-layer concerns, not separate protocols. A plugin that sup
 | `graphql` | ✓ | | | | | GraphQL is HTTP-only (JSON body parsing) |
 | `request_size_limiting` | ✓ | ✓ | | | | Enforces per-proxy request body size limits |
 | `rate_limiting` | ✓ | ✓ | ✓ | ✓ | ✓ | Connection/session rate applies everywhere |
-| `waf` | ✓ | ✓ | ✓ | | | Content-pattern threat detection for HTTP-family traffic |
+| `waf` | ✓ | ✓ | ✓ | ✓ | ✓ | HTTP-family always; TCP/UDP first-bytes and datagram inspection when a `stream` block is configured |
 | `fault_injection` | ✓ | ✓ | ✓ | ✓ | ✓ | Probabilistic aborts and delays for chaos testing |
 | `request_transformer` | ✓ | ✓ | | | | Modifies HTTP headers/query/body |
 | `request_mirror` | ✓ | ✓ | | | | Duplicates traffic to a shadow destination for validation |

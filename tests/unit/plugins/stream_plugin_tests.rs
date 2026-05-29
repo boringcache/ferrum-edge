@@ -275,6 +275,8 @@ async fn test_ip_restriction_stream_connect_allowed() {
         sni_hostname: None,
         mesh_direction: None,
         node_waypoint_policy_scope: None,
+        first_bytes: None,
+        first_bytes_kind: None,
     };
 
     let result = plugin.on_stream_connect(&mut ctx).await;
@@ -305,6 +307,8 @@ async fn test_ip_restriction_stream_connect_denied() {
         sni_hostname: None,
         mesh_direction: None,
         node_waypoint_policy_scope: None,
+        first_bytes: None,
+        first_bytes_kind: None,
     };
 
     let result = plugin.on_stream_connect(&mut ctx).await;
@@ -336,6 +340,8 @@ fn make_stream_ctx() -> StreamConnectionContext {
         sni_hostname: None,
         mesh_direction: None,
         node_waypoint_policy_scope: None,
+        first_bytes: None,
+        first_bytes_kind: None,
     }
 }
 

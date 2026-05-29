@@ -186,13 +186,66 @@ pub enum UdpDatagramDirection {
 /// directions: client→backend (before forwarding) and backend→client (before
 /// relaying the response to the client).
 #[allow(dead_code)]
-pub struct UdpDatagramContext {
+pub struct UdpDatagramContext<'a> {
     pub client_ip: Arc<str>,
     pub proxy_id: Arc<str>,
     pub proxy_name: Option<Arc<str>>,
     pub listen_port: u16,
     pub datagram_size: usize,
     pub direction: UdpDatagramDirection,
+    /// Datagram payload bytes, borrowed for the duration of the hook call so
+    /// there is no per-datagram allocation. For plain UDP these are the raw
+    /// wire bytes; for DTLS-terminated sessions they are the decrypted
+    /// application plaintext; for passthrough they are the encrypted wire
+    /// bytes. `payload_kind` disambiguates so content-inspecting plugins know
+    /// whether L7 scanning is meaningful.
+    pub payload: &'a [u8],
+    /// Nature of `payload`.
+    pub payload_kind: StreamBytesKind,
+    /// Optional sink for recording session-scoped metadata (e.g. WAF signature
+    /// hits) onto the UDP/DTLS stream transaction summary. The per-datagram
+    /// context is immutable and short-lived, so a plugin that wants its findings
+    /// logged writes them here; the proxy backs it with the session metadata map
+    /// that `build_udp_stream_summary` / `build_dtls_stream_summary` read at
+    /// disconnect. `None` when there is no session map to attach to (or in tests).
+    pub metadata_sink: Option<UdpMetadataSink<'a>>,
+}
+
+/// Sink for recording session-scoped metadata from the per-datagram UDP/DTLS
+/// hook (see [`UdpDatagramContext::metadata_sink`]).
+///
+/// `on_udp_datagram` receives an immutable, per-datagram context, so unlike the
+/// TCP `on_stream_connect` path it cannot mutate a `StreamConnectionContext` to
+/// attach `waf.*` fields. This sink bridges that gap: the proxy backs it with the
+/// session's metadata map, so a recorded field rides the stream transaction
+/// summary out to every logging sink at disconnect — independent of
+/// `log_to_stdout`, matching the TCP behavior.
+#[derive(Clone, Copy)]
+pub struct UdpMetadataSink<'a> {
+    map: &'a std::sync::Mutex<HashMap<String, String>>,
+}
+
+impl<'a> UdpMetadataSink<'a> {
+    /// Wrap a session metadata map as a sink.
+    pub fn new(map: &'a std::sync::Mutex<HashMap<String, String>>) -> Self {
+        Self { map }
+    }
+
+    /// Atomically read-modify-write the session metadata map under one lock.
+    ///
+    /// Inspecting plugins use this to *merge* per-datagram findings across a
+    /// session rather than overwrite them — e.g. union the matched rule ids and
+    /// keep the highest severity seen — so a later, lower-severity datagram
+    /// cannot erase earlier hits (last-write-wins). Holding the lock across the
+    /// whole read-modify-write also keeps the concurrent bidirectional datagram
+    /// tasks from racing on the same key.
+    pub fn update<F: FnOnce(&mut HashMap<String, String>)>(&self, f: F) {
+        let mut map = self
+            .map
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        f(&mut map);
+    }
 }
 
 /// Verdict from a per-datagram UDP plugin hook.
@@ -205,6 +258,36 @@ pub enum UdpDatagramVerdict {
     Forward,
     /// Silently drop the datagram (standard UDP flood mitigation).
     Drop,
+}
+
+/// Nature of the opening stream bytes (TCP) or datagram payload (UDP) handed to
+/// a stream-aware inspection plugin such as the WAF.
+///
+/// Content inspection (L7 signature scanning) is only meaningful on plaintext
+/// application bytes — either raw plaintext on the wire, or bytes the proxy
+/// recovered after terminating TLS/DTLS. Passthrough proxies forward ciphertext
+/// the gateway never decrypts, so only transport-shape checks (e.g. validating a
+/// TLS ClientHello) are possible there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamBytesKind {
+    /// Plaintext application bytes observed directly on the wire (plain TCP /
+    /// plain UDP). Both L7-inspectable and representative of the raw client
+    /// bytes, so transport-shape checks also apply.
+    PlaintextWire,
+    /// Encrypted wire bytes from a passthrough (non-terminating) proxy. Suitable
+    /// only for transport-shape checks (e.g. TLS/DTLS ClientHello), never L7.
+    EncryptedWire,
+    /// Application bytes recovered after the proxy terminated TLS/DTLS. These are
+    /// L7-inspectable; the transport was already proven to be TLS/DTLS by the
+    /// completed handshake.
+    DecryptedApp,
+}
+
+impl StreamBytesKind {
+    /// Whether L7 signature scanning of these bytes is meaningful.
+    pub fn is_l7_inspectable(self) -> bool {
+        matches!(self, Self::PlaintextWire | Self::DecryptedApp)
+    }
 }
 
 /// Direction of a WebSocket frame being proxied.
@@ -1474,6 +1557,19 @@ pub struct StreamConnectionContext {
     /// Mirrors `RequestContext::node_waypoint_policy_scope`; `None` for
     /// non-waypoint stream proxies.
     pub node_waypoint_policy_scope: Option<Arc<crate::modes::mesh::runtime::PolicyScopeCache>>,
+    /// Opening client bytes captured for stream-aware inspection plugins (e.g.
+    /// the WAF). Populated by the stream proxy only when some plugin opts in via
+    /// `requires_stream_first_bytes()`, before `on_stream_connect` runs; `None`
+    /// otherwise. `first_bytes_kind` describes whether these are plaintext,
+    /// encrypted passthrough, or post-termination decrypted bytes.
+    pub first_bytes: Option<bytes::Bytes>,
+    /// Nature of `first_bytes`. Usually `None` when `first_bytes` is `None`, with
+    /// one deliberate exception: a TLS/DTLS-terminating frontend sets this to
+    /// `DecryptedApp` to record that the transport was terminated even when it
+    /// did not read any application bytes (e.g. a guard-only config). That lets a
+    /// transport-shape guard like `tcp_require_tls` recognize the connection as
+    /// already-TLS without forcing a blocking read.
+    pub first_bytes_kind: Option<StreamBytesKind>,
 }
 
 impl StreamConnectionContext {
@@ -2062,6 +2158,48 @@ pub trait Plugin: Send + Sync {
         false
     }
 
+    /// Returns `true` if this plugin needs the opening client bytes of a
+    /// plain/passthrough TCP stream captured into
+    /// `StreamConnectionContext.first_bytes` before `on_stream_connect` runs.
+    /// These are obtained with a non-destructive peek, so the splice fast path
+    /// is preserved. Zero overhead when `false` (default) — the proxy skips the
+    /// capture entirely.
+    fn requires_stream_first_bytes(&self) -> bool {
+        false
+    }
+
+    /// Returns `true` if this plugin needs the opening *decrypted* application
+    /// bytes of a TLS-terminating TCP frontend captured into
+    /// `StreamConnectionContext.first_bytes` before `on_stream_connect` runs.
+    ///
+    /// Separate from [`Self::requires_stream_first_bytes`] because recovering
+    /// decrypted bytes requires a *consuming* read that blocks until the client
+    /// sends data and disables the kTLS-splice fast path. That cost is only
+    /// worth paying when the bytes will actually be inspected (e.g. signature
+    /// matching) — not for transport-shape guards (`tcp_require_tls`) that the
+    /// completed TLS handshake already satisfies. Returning `true` here for a
+    /// guard-only config would needlessly stall server-first protocols.
+    fn requires_stream_first_bytes_decrypted(&self) -> bool {
+        false
+    }
+
+    /// The smallest number of opening client bytes this plugin needs captured
+    /// into [`StreamConnectionContext::first_bytes`] before it can classify a
+    /// plain/passthrough TCP stream. A transport-shape guard that inspects the
+    /// leading TLS record header, for example, needs the whole header present —
+    /// not just the first byte the socket happens to deliver.
+    ///
+    /// The TCP proxy keeps peeking (non-destructively, so the splice fast path
+    /// stays intact) until at least this many bytes are buffered or the
+    /// handshake deadline expires, so a ClientHello split across TCP segments is
+    /// not misread as a short non-TLS chunk and falsely rejected. `0` (default)
+    /// means "the first readable chunk is enough" and preserves the single-peek
+    /// behavior. Only consulted when [`Self::requires_stream_first_bytes`] is
+    /// `true`.
+    fn stream_first_bytes_min_len(&self) -> usize {
+        0
+    }
+
     /// Returns `true` if this plugin needs notification when a WebSocket
     /// session ends. Zero overhead when `false` (default) — the relay teardown
     /// path skips constructing the context and iterating plugins.
@@ -2094,7 +2232,7 @@ pub trait Plugin: Send + Sync {
     /// `requires_udp_datagram_hooks()`. Return `UdpDatagramVerdict::Drop` to
     /// silently discard the datagram (standard UDP flood mitigation).
     /// Use `ctx.direction` to distinguish client→backend from backend→client.
-    async fn on_udp_datagram(&self, _ctx: &UdpDatagramContext) -> UdpDatagramVerdict {
+    async fn on_udp_datagram(&self, _ctx: &UdpDatagramContext<'_>) -> UdpDatagramVerdict {
         UdpDatagramVerdict::Forward
     }
 
