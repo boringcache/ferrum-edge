@@ -516,6 +516,7 @@ pub struct MockEbpfBackend {
     pub detached_pods: Vec<String>,
     pub cleaned_up: bool,
     pub fail_update_capture_config: bool,
+    pub fail_attach_sock_ops: bool,
     pub sock_ops_attached_cgroup_root: Option<String>,
 }
 
@@ -625,6 +626,9 @@ impl EbpfBackend for MockEbpfBackend {
     }
 
     fn attach_sock_ops(&mut self, cgroup_root: &str) -> Result<(), String> {
+        if self.fail_attach_sock_ops {
+            return Err("sock_ops attach failed".to_string());
+        }
         self.sock_ops_attached_cgroup_root = Some(cgroup_root.to_string());
         Ok(())
     }

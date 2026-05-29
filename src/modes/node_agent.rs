@@ -387,7 +387,7 @@ async fn run_with_backend(
     startup_ready: Arc<AtomicBool>,
     cni_config: CniListenerConfig,
 ) -> Result<(), anyhow::Error> {
-    initialize_backend(backend.as_mut(), config)?;
+    initialize_backend(backend.as_mut(), config, metrics.as_ref())?;
 
     let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
 
@@ -1769,6 +1769,7 @@ async fn execute_iptables_commands(commands: &[String], phase: &str) -> Result<(
 fn initialize_backend(
     backend: &mut dyn EbpfBackend,
     config: &NodeAgentConfig,
+    metrics: &NodeAgentMetrics,
 ) -> Result<(), anyhow::Error> {
     backend.load_programs().map_err(anyhow::Error::msg)?;
     backend
@@ -1802,14 +1803,24 @@ fn initialize_backend(
     // UID bypass).
 
     if config.capture_contract.proxy_mode == NodeAgentProxyMode::NodeWaypoint {
-        // Best-effort SOCK_OPS attach at cgroup root for TCP-layer
-        // observability in node-waypoint mode. A failure here only loses
-        // telemetry; capture (cgroup_sockaddr / tc) continues to operate.
+        // SOCK_OPS at the cgroup root carries BOTH TCP-layer telemetry AND the
+        // GAP-2M accept-side cookie bridge that node-waypoint per-pod identity
+        // resolution depends on. A failure here is therefore not merely lost
+        // counters: with no accept-side cookie stamping, every node-waypoint
+        // connection resolves `UnknownCookie` and scoped authz fails closed.
+        // Surface it as topology degradation (gauge + error) — not a quiet
+        // telemetry warning — so operators see identity resolution is down even
+        // though cgroup/tc capture continues.
         if let Err(e) = backend.attach_sock_ops(&config.cgroup_root) {
-            warn!(
+            metrics.set_topology_degraded("node_waypoint_sock_ops_unavailable");
+            error!(
                 cgroup_root = %config.cgroup_root,
                 error = %e,
-                "Failed to attach SOCK_OPS program; mesh-proxy will see zero TCP-layer counters"
+                "Failed to attach SOCK_OPS in node-waypoint mode: the GAP-2M accept-side \
+                 cookie bridge is not running, so per-pod source-identity resolution is \
+                 disabled and scoped node-waypoint authz will fail closed (TCP-layer \
+                 telemetry is also lost). cgroup/tc capture continues. Set \
+                 ferrum_mesh_node_topology_degraded{{reason=\"node_waypoint_sock_ops_unavailable\"}}=1."
             );
         }
     }
@@ -1933,7 +1944,7 @@ mod tests {
         };
 
         let mut backend = MockEbpfBackend::default();
-        initialize_backend(&mut backend, &config).unwrap();
+        initialize_backend(&mut backend, &config, &NodeAgentMetrics::default()).unwrap();
 
         assert!(backend.programs_loaded);
         assert_eq!(backend.bypass_uids, vec![1337]);
@@ -1962,11 +1973,42 @@ mod tests {
         config.capture_contract.proxy_mode = NodeAgentProxyMode::NodeWaypoint;
 
         let mut backend = MockEbpfBackend::default();
-        initialize_backend(&mut backend, &config).unwrap();
+        initialize_backend(&mut backend, &config, &NodeAgentMetrics::default()).unwrap();
 
         assert_eq!(
             backend.sock_ops_attached_cgroup_root.as_deref(),
             Some("/sys/fs/cgroup")
+        );
+    }
+
+    #[test]
+    fn initialize_backend_node_waypoint_sock_ops_failure_marks_degraded() {
+        let mut config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: "/sys/fs/cgroup".to_string(),
+            bpf_fs_path: "/sys/fs/bpf".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+        };
+        config.capture_contract.proxy_mode = NodeAgentProxyMode::NodeWaypoint;
+        let mut backend = MockEbpfBackend {
+            fail_attach_sock_ops: true,
+            ..MockEbpfBackend::default()
+        };
+        let metrics = NodeAgentMetrics::default();
+
+        // Init still succeeds — cgroup/tc capture is unaffected — but the
+        // SOCK_OPS failure (which carries the GAP-2M identity bridge) must
+        // surface as topology degradation, not a silent telemetry warning.
+        initialize_backend(&mut backend, &config, &metrics).unwrap();
+
+        assert!(backend.sock_ops_attached_cgroup_root.is_none());
+        assert_eq!(
+            metrics.snapshot().topology_degraded_reason,
+            Some("node_waypoint_sock_ops_unavailable")
         );
     }
 
@@ -1987,7 +2029,7 @@ mod tests {
             ..MockEbpfBackend::default()
         };
 
-        let err = initialize_backend(&mut backend, &config)
+        let err = initialize_backend(&mut backend, &config, &NodeAgentMetrics::default())
             .expect_err("capture-config failure should abort initialization");
 
         assert!(err.to_string().contains("capture config update failed"));
