@@ -996,6 +996,11 @@ async fn run_tcp_accept_loop(
     mut global_shutdown_rx: Option<watch::Receiver<bool>>,
     accept_loop_id: usize,
 ) -> Result<(), anyhow::Error> {
+    // See `run_accept_loop` in proxy/mod.rs: under fd exhaustion (EMFILE/ENFILE)
+    // accept() re-fails without consuming the backlog, busy-looping CPU + logs.
+    // Back off (capped at 100ms) only on repeated consecutive failures so
+    // isolated transient errors (e.g. ECONNABORTED) are not penalized.
+    let mut consecutive_accept_errors: u32 = 0;
     loop {
         tokio::select! {
             result = listener.accept() => {
@@ -1008,9 +1013,16 @@ async fn run_tcp_accept_loop(
                             "TCP accept error: {}",
                             e
                         );
+                        consecutive_accept_errors = consecutive_accept_errors.saturating_add(1);
+                        if consecutive_accept_errors > 1 {
+                            let backoff_ms = (consecutive_accept_errors as u64 * 10).min(100);
+                            tokio::time::sleep(std::time::Duration::from_millis(backoff_ms))
+                                .await;
+                        }
                         continue;
                     }
                 };
+                consecutive_accept_errors = 0;
 
                 // Reject new connections under critical overload (same as HTTP proxy).
                 if state.overload.reject_new_connections.load(Ordering::Relaxed) {
