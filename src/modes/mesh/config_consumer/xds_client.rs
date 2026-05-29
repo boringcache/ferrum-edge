@@ -441,9 +441,12 @@ impl ResourceAccumulator {
     ///    name-only, unprotected view before the security/policy carriers
     ///    arrive (fail-closed); see `docs/mesh.md` "Ferrum mesh-slice ECDS
     ///    carriers".
-    /// 2. `reverse_translate` succeeds, which enforces the cross-type
-    ///    consistency that matters in Ferrum's name-only model (every RDS route
-    ///    references a service exposed by some CDS/EDS/LDS resource).
+    /// 2. `reverse_translate` succeeds. A malformed ECDS carrier is a genuine
+    ///    structural error and NACKs, but a route referencing a service not yet
+    ///    present in CDS/EDS/LDS is skipped (not fatal): xDS types arrive as
+    ///    independent responses, so a route can legitimately land before its
+    ///    cluster — NACKing it would drop the route and the CP would not resend
+    ///    it until a reconnect.
     ///
     /// Make-before-break is provided by the caller: the live slice keeps
     /// serving through the runtime `ArcSwap` until this returns `Ok(Some)`, so
@@ -1142,10 +1145,28 @@ fn reverse_translate(
     for resource in accumulator.resources(RDS_TYPE_URL) {
         let parsed = parse_route_resource_name(&resource.name)?;
         if !service_ports.contains_key(&(parsed.namespace.clone(), parsed.service.clone())) {
-            return Err(format!(
-                "route resource '{}' references service '{}/{}' with no cluster/listener resource",
-                resource.name, parsed.namespace, parsed.service
-            ));
+            // Resource warming: xDS types arrive as independent responses, so a
+            // route can legitimately land before the CDS/EDS/LDS response that
+            // introduces its service. Treat a route referencing a not-yet-present
+            // service as non-functional-for-now and SKIP it, rather than a
+            // structural error. NACKing here would roll the accumulator back and
+            // drop the new RDS — and the CP does not resend a NACKed SotW
+            // resource until a reconnect or another RDS change, so the route
+            // would be lost. Skipping keeps the RDS in the accumulator so it
+            // validates cleanly once its service arrives; in Ferrum's name-only
+            // model the route adds no slice content either way (services come
+            // from CDS/EDS/LDS names or the ECDS Services carrier), so a
+            // genuinely dangling route is simply inert (Envoy-aligned: a route
+            // to an unknown cluster is ACKed, not NACKed) and never wedges
+            // slice application for unrelated updates.
+            debug!(
+                node_id = %config.node_id,
+                resource_name = %resource.name,
+                namespace = %parsed.namespace,
+                service = %parsed.service,
+                "Skipping xDS route referencing a service not yet present in CDS/EDS/LDS (resource warming)"
+            );
+            continue;
         }
     }
 
@@ -2140,7 +2161,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_cross_type_update_rolls_back_accumulator() {
+    async fn dependency_skewed_route_is_skipped_not_nacked() {
+        // Resource warming: a route referencing a service not present in the
+        // current CDS/EDS/LDS — a transient arrival-ordering skew, or a route
+        // whose cluster has not shipped — must NOT be NACKed. NACK + rollback
+        // would drop the new RDS, and the CP does not resend a NACKed SotW
+        // resource until a reconnect or another RDS change, so the route would
+        // be lost. Instead the route is skipped, the RDS is retained in the
+        // accumulator, and an ACK is sent.
         let (tx, mut rx) = mpsc::channel(4);
         let mut state = ClientSubscriptionState::new();
         let mut accumulator = ResourceAccumulator::new();
@@ -2181,21 +2209,112 @@ mod tests {
             &mut nack_circuit_breaker,
         )
         .await
-        .expect("invalid cross-type update should NACK");
+        .expect("a dependency-skewed route must not error the stream");
 
-        assert!(result.is_none());
+        assert!(
+            result.is_some(),
+            "the slice still builds; the dependency-skewed route is skipped, not fatal"
+        );
+        // The new RDS is RETAINED (not rolled back) so it validates once its
+        // service arrives.
         assert_eq!(
             accumulator.resources(RDS_TYPE_URL)[0].name,
-            "route/default/api"
+            "route/default/missing"
         );
         assert_eq!(
             accumulator.versions_by_type.get(RDS_TYPE_URL).unwrap(),
-            "v1"
+            "v2"
         );
-        let nack = rx.recv().await.expect("NACK sent");
-        assert_eq!(nack.type_url, RDS_TYPE_URL);
-        assert_eq!(nack.version_info, "");
-        assert!(nack.error_detail.is_some());
+        // ACK, not NACK — and nothing counted toward the circuit breaker.
+        let ack = rx.recv().await.expect("ACK sent");
+        assert_eq!(ack.type_url, RDS_TYPE_URL);
+        assert_eq!(ack.version_info, "v2");
+        assert!(ack.error_detail.is_none());
+        assert_eq!(nack_circuit_breaker.consecutive_nacks(RDS_TYPE_URL), 0);
+    }
+
+    #[tokio::test]
+    async fn route_arriving_before_its_service_converges_when_service_arrives() {
+        // The reviewer's end-to-end scenario: in a multi-type change the RDS for
+        // a new service arrives before the matching CDS. The route is skipped
+        // (no NACK) and retained; when the CDS for that service arrives, the
+        // route validates and the service is in the slice.
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut state = ClientSubscriptionState::new();
+        let mut accumulator = ResourceAccumulator::new();
+        let mut nack_circuit_breaker = NackCircuitBreaker::default();
+
+        // Converge at v1 with one service (api).
+        accumulator
+            .apply_sotw_response(
+                CDS_TYPE_URL,
+                &[any_resource(CDS_TYPE_URL, "cluster/default/api/8080")],
+                "v1",
+            )
+            .expect("CDS applies");
+        apply_all_empty(&mut accumulator);
+
+        // RDS v2 adds a route for a NEW service (web) whose CDS has not arrived.
+        let rds_first = handle_ads_response(
+            discovery_response(
+                RDS_TYPE_URL,
+                "v2",
+                "n-rds",
+                vec![
+                    any_resource(RDS_TYPE_URL, "route/default/api"),
+                    any_resource(RDS_TYPE_URL, "route/default/web"),
+                ],
+            ),
+            &test_config(),
+            &tx,
+            &mut state,
+            &mut accumulator,
+            &mut nack_circuit_breaker,
+        )
+        .await
+        .expect("RDS-before-CDS must not error");
+        assert!(rds_first.is_some(), "slice still builds; route/web skipped");
+        let ack = rx.recv().await.expect("ACK for RDS");
+        assert_eq!(ack.type_url, RDS_TYPE_URL);
+        assert!(ack.error_detail.is_none());
+
+        // Now CDS v2 introduces the web service.
+        let cds_after = handle_ads_response(
+            discovery_response(
+                CDS_TYPE_URL,
+                "v2",
+                "n-cds",
+                vec![
+                    any_resource(CDS_TYPE_URL, "cluster/default/api/8080"),
+                    any_resource(CDS_TYPE_URL, "cluster/default/web/8080"),
+                ],
+            ),
+            &test_config(),
+            &tx,
+            &mut state,
+            &mut accumulator,
+            &mut nack_circuit_breaker,
+        )
+        .await
+        .expect("CDS arrival must not error")
+        .expect("slice builds with the new service");
+
+        // route/web is retained and now references a present service.
+        let route_names: Vec<&str> = accumulator
+            .resources(RDS_TYPE_URL)
+            .iter()
+            .map(|resource| resource.name.as_str())
+            .collect();
+        assert!(route_names.contains(&"route/default/web"));
+        let services = service_port_map(&cds_after.slice);
+        assert!(
+            services.contains_key(&("default".to_string(), "web".to_string())),
+            "web service is present in the slice once its CDS arrives"
+        );
+        let ack = rx.recv().await.expect("ACK for CDS");
+        assert_eq!(ack.type_url, CDS_TYPE_URL);
+        assert!(ack.error_detail.is_none());
+        assert_eq!(nack_circuit_breaker.consecutive_nacks(RDS_TYPE_URL), 0);
     }
 
     #[tokio::test]
