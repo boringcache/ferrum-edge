@@ -1926,6 +1926,33 @@ async fn handle_h3_request(
                             "Request body exceeds maximum size",
                         )
                         .await?;
+                        // The circuit-breaker check above may have admitted this
+                        // request as a half-open probe (cb_is_half_open_probe),
+                        // reserving a slot. This cross-protocol prebuffering
+                        // early return bypasses cross_protocol::run (which would
+                        // release it) and no record_connection_start was issued
+                        // on this path, so use the no-conn-end variant to release
+                        // the probe slot without touching the least-connections
+                        // gauge. Without it, a single oversized upload during
+                        // HALF_OPEN permanently wedges the breaker (same leak
+                        // class as the native-H3 streaming path). Client-caused:
+                        // connection_error=true skips the latency sample / phantom
+                        // passive success; ClientDisconnect routes to the
+                        // state-neutral record_neutral().
+                        crate::proxy::backend_dispatch::record_backend_outcome_no_conn_end(
+                            &state,
+                            &proxy,
+                            &epoch.load_balancer,
+                            upstream_balancer.as_ref(),
+                            upstream_target.as_deref(),
+                            cb_target_key.as_deref(),
+                            413,
+                            true,
+                            Some(crate::retry::ErrorClass::ClientDisconnect),
+                            cb_is_half_open_probe,
+                            false,
+                            backend_start.elapsed(),
+                        );
                         return Ok(());
                     }
                     body_data.extend_from_slice(bytes);
@@ -2094,13 +2121,29 @@ async fn handle_h3_request(
                         r#"{"error":"Request body exceeds maximum size"}"#,
                     )
                     .await?;
-                    // Balance the record_connection_start above. This early
+                    // Balance the record_connection_start above: this early
                     // return was the only exit from this branch that did not
                     // flow through record_backend_outcome, so the
                     // least-connections gauge leaked one count for the selected
                     // target on every oversized streaming upload. An oversized
-                    // client body is client-caused, so skip the circuit breaker
-                    // (do not poison backend health).
+                    // client body is client-caused, which drives the two flags
+                    // below:
+                    //   * connection_error=true — the request body never
+                    //     reached the backend application layer, so the
+                    //     least-latency TTFB sample is suppressed (a synthetic
+                    //     413 reflects no real backend latency) and passive
+                    //     health does not see a phantom <500 success that would
+                    //     reset failure tracking and re-admit an unhealthy
+                    //     target. It records a conservative failure instead,
+                    //     matching the sibling 502 client-disconnect path below.
+                    //   * skip_circuit_breaker_record=false — release any
+                    //     half-open probe slot via the state-neutral
+                    //     record_neutral() (ErrorClass::ClientDisconnect takes
+                    //     that arm before connection_error is considered, so the
+                    //     breaker is never tripped) instead of leaking the slot
+                    //     and permanently wedging the breaker. Mirrors the
+                    //     sibling 502 / oversized-response / after_proxy-reject
+                    //     early returns below.
                     crate::proxy::backend_dispatch::record_backend_outcome(
                         &state,
                         &proxy,
@@ -2109,10 +2152,10 @@ async fn handle_h3_request(
                         upstream_target.as_deref(),
                         cb_target_key.as_deref(),
                         413,
-                        false,
+                        true,
                         Some(crate::retry::ErrorClass::ClientDisconnect),
                         cb_is_half_open_probe,
-                        true,
+                        false,
                         backend_start.elapsed(),
                     );
                     return Ok(());
