@@ -499,3 +499,102 @@ fn pin_map_at(bpf: &mut Ebpf, map_name: &str, pin_path: &str) -> Result<(), Stri
     map.pin(pin_path)
         .map_err(|e| format!("Failed to pin '{map_name}' at '{pin_path}': {e}"))
 }
+
+/// Live-kernel verification (GAP-2M / connect-side datapath).
+///
+/// These tests need a real Linux >= 5.7 kernel with cgroup v2 + bpffs and
+/// `CAP_BPF`/root, so they are `#[ignore]`d and only run via the dedicated
+/// `ebpf-live` CI job (`sudo cargo test --features ebpf --lib -- --ignored`).
+/// They self-skip (pass) when the kernel lacks the prerequisites so the job is
+/// green on best-effort runners and only red on a genuine load/attach failure.
+#[cfg(test)]
+mod live_kernel_tests {
+    use super::AyaEbpfBackend;
+    use crate::ebpf::EbpfBackend;
+    use crate::ebpf::kernel_probe::probe_kernel;
+    use ferrum_ebpf_common::WorkloadIdentity;
+    use std::fs;
+    use std::os::unix::fs::MetadataExt;
+    use std::path::PathBuf;
+
+    const CGROUP_ROOT: &str = "/sys/fs/cgroup";
+    const BPF_FS: &str = "/sys/fs/bpf";
+
+    /// A scratch cgroup v2 node, removed on drop. Attaching the
+    /// `cgroup_sock_addr` / `sock_ops` programs here (rather than the cgroup
+    /// root) keeps the test from perturbing the whole runner.
+    struct ScratchCgroup {
+        path: PathBuf,
+    }
+
+    impl ScratchCgroup {
+        fn create() -> std::io::Result<Self> {
+            let path =
+                PathBuf::from(CGROUP_ROOT).join(format!("ferrum-ebpf-live-{}", std::process::id()));
+            fs::create_dir_all(&path)?;
+            Ok(Self { path })
+        }
+
+        fn path_str(&self) -> String {
+            self.path.to_string_lossy().into_owned()
+        }
+
+        /// The kernel cgroup id equals the inode of the cgroup v2 directory.
+        fn cgroup_id(&self) -> u64 {
+            fs::metadata(&self.path).map(|m| m.ino()).unwrap_or(0)
+        }
+    }
+
+    impl Drop for ScratchCgroup {
+        fn drop(&mut self) {
+            // cgroup v2 dirs are removed with rmdir once empty.
+            let _ = fs::remove_dir(&self.path);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires root + real Linux >= 5.7 kernel (cgroup v2 + bpffs); run via the ebpf-live CI job"]
+    fn programs_load_verify_attach_and_map_round_trip() {
+        let probe = probe_kernel(CGROUP_ROOT, BPF_FS);
+        if !probe.supports_ebpf() {
+            eprintln!(
+                "SKIP live-kernel eBPF test: prerequisites unmet (release={}, reason={:?})",
+                probe.kernel_release,
+                probe.degradation_reason()
+            );
+            return;
+        }
+
+        let mut backend = AyaEbpfBackend::new();
+        // Loading runs the in-kernel BPF verifier over every program in the
+        // ELF — connect4/6, getpeername4/6, tc_inbound, and the GAP-2M
+        // sock_ops cookie bridge. Success here is the core live validation
+        // that the (blind-built) kernel code is accepted by a real verifier.
+        backend
+            .load_programs()
+            .expect("load + verify BPF programs on the running kernel");
+
+        let cgroup = ScratchCgroup::create().expect("create scratch cgroup v2 node");
+
+        backend
+            .attach_cgroup("live-test", &cgroup.path_str(), "ferrum_connect4")
+            .expect("attach connect4 to scratch cgroup");
+        backend
+            .attach_sock_ops(&cgroup.path_str())
+            .expect("attach sock_ops (incl. GAP-2M bridge) to scratch cgroup");
+
+        // Exercise the workload-identity map RW path the connect hooks read to
+        // stamp pod_uid — the connect-side half of the node-waypoint identity
+        // flow.
+        let cgroup_id = cgroup.cgroup_id();
+        let identity = WorkloadIdentity::new([7u8; 16], 0xdead_beef_cafe_f00d);
+        backend
+            .update_workload_identity(cgroup_id, &identity)
+            .expect("write workload identity to FERRUM_WORKLOAD_IDENTITY");
+        backend
+            .remove_workload_identity(cgroup_id)
+            .expect("remove workload identity");
+
+        backend.cleanup_all().expect("cleanup BPF state");
+    }
+}

@@ -17,6 +17,19 @@
 //! `FERRUM_SOCK_OPS_STATS[SOCK_OPS_STATS_EVENTS_DROPPED]` so the userspace
 //! consumer can detect overrun without per-event log spam.
 //!
+//! ## GAP-2M accept-side cookie bridge
+//!
+//! The `ACTIVE_ESTABLISHED` and `PASSIVE_ESTABLISHED` callbacks also drive the
+//! node-waypoint cookie bridge. `connect4`/`connect6` stamp the original
+//! destination into `FERRUM_ORIG_DST4/6` keyed by the *connecting* socket's
+//! cookie, but the proxy resolves by the *accepted* socket's cookie. At
+//! active-established (local port now assigned) the connect-side record is
+//! re-keyed by the connection 4-tuple into `FERRUM_ORIG_DST_BY_TUPLE4/6`; at
+//! passive-established the mirror tuple is looked up and the record re-stamped
+//! under the accept-side cookie. See [`bridge_active_established`] /
+//! [`bridge_passive_established`]. A byte-order or tuple mismatch only leaves
+//! resolution fail-closed (unchanged from pre-GAP-2M), never misattributed.
+//!
 //! ## RST attribution caveat
 //!
 //! `BPF_SOCK_OPS_STATE_CB` reports state transitions but does not directly
@@ -30,13 +43,20 @@ use aya_ebpf::macros::sock_ops;
 use aya_ebpf::programs::SockOpsContext;
 use aya_ebpf::EbpfContext;
 use ferrum_ebpf_common::{
-    SockOpsRecord, SOCK_OPS_DIRECTION_RECEIVED, SOCK_OPS_DIRECTION_SENT,
-    SOCK_OPS_EVENT_ACCEPT_ESTABLISHED, SOCK_OPS_EVENT_CONNECT, SOCK_OPS_EVENT_FIN,
-    SOCK_OPS_EVENT_RST, SOCK_OPS_EVENT_RTT_SAMPLE, SOCK_OPS_EVENT_SYN_TO_ACK_LATENCY,
-    SOCK_OPS_STATS_EVENTS_DROPPED,
+    ConnTuple4, ConnTuple6, OrigDstKey, SockOpsRecord, SOCK_OPS_DIRECTION_RECEIVED,
+    SOCK_OPS_DIRECTION_SENT, SOCK_OPS_EVENT_ACCEPT_ESTABLISHED, SOCK_OPS_EVENT_CONNECT,
+    SOCK_OPS_EVENT_FIN, SOCK_OPS_EVENT_RST, SOCK_OPS_EVENT_RTT_SAMPLE,
+    SOCK_OPS_EVENT_SYN_TO_ACK_LATENCY, SOCK_OPS_STATS_EVENTS_DROPPED,
 };
 
-use crate::maps::{FERRUM_SOCK_OPS_CONNECT_TS, FERRUM_SOCK_OPS_EVENTS, FERRUM_SOCK_OPS_STATS};
+use crate::maps::{
+    FERRUM_ORIG_DST4, FERRUM_ORIG_DST6, FERRUM_ORIG_DST_BY_TUPLE4, FERRUM_ORIG_DST_BY_TUPLE6,
+    FERRUM_SOCK_OPS_CONNECT_TS, FERRUM_SOCK_OPS_EVENTS, FERRUM_SOCK_OPS_STATS,
+};
+
+// Address families from <bits/socket.h>; `bpf_sock_ops.family` carries these.
+const AF_INET: u32 = 2;
+const AF_INET6: u32 = 10;
 
 // Operation discriminants — values from `include/uapi/linux/bpf.h`
 // (`bpf_sock_ops_op`). aya-ebpf does not re-export these, so we mirror them
@@ -89,6 +109,9 @@ fn handle_sock_ops(ctx: &SockOpsContext) {
         }
         BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB => {
             let _ = ctx.set_cb_flags(ALL_SOCK_OPS_CB_FLAGS);
+            // GAP-2M: the connecting socket now has its local port; re-key its
+            // connect-side orig-dst record by the connection 4-tuple.
+            bridge_active_established(ctx);
             if let Some(syn_to_ack_us) = drain_connect_ts(ctx) {
                 emit(SockOpsRecord {
                     event_type: SOCK_OPS_EVENT_SYN_TO_ACK_LATENCY,
@@ -103,6 +126,9 @@ fn handle_sock_ops(ctx: &SockOpsContext) {
             // Server side accepted the connection; enable callbacks so we
             // capture FIN/RST/RTT for inbound connections too.
             let _ = ctx.set_cb_flags(ALL_SOCK_OPS_CB_FLAGS);
+            // GAP-2M: re-stamp the orig-dst record under this accept-side
+            // socket's cookie so the node-waypoint proxy can resolve it.
+            bridge_passive_established(ctx);
             emit(SockOpsRecord {
                 event_type: SOCK_OPS_EVENT_ACCEPT_ESTABLISHED,
                 direction: 0,
@@ -194,6 +220,96 @@ fn socket_cookie(ctx: &SockOpsContext) -> u64 {
     // pointer comes from `EbpfContext::as_ptr`, which is the sock_ops
     // context the program runs on.
     unsafe { aya_ebpf::helpers::bpf_get_socket_cookie(ctx.as_ptr()) }
+}
+
+/// Convert a `bpf_sock_ops` peer port to host byte order.
+///
+/// `remote_port` is the connection's `__be16` peer port zero-extended into a
+/// `u32` (network byte order); `local_port` is already host byte order. The
+/// bridge normalizes every port to host order so the active and passive
+/// callbacks compute an identical [`ConnTuple4`] / [`ConnTuple6`] key.
+#[inline(always)]
+fn peer_port_host_order(remote_port: u32) -> u16 {
+    u16::from_be(remote_port as u16)
+}
+
+/// GAP-2M (active side). The connecting (client) socket has reached
+/// ESTABLISHED, so its ephemeral local port is now assigned. Look up the
+/// connect-side original-destination record (stamped by `connect4`/`connect6`
+/// under this socket's cookie) and re-key it by the connection 4-tuple so the
+/// proxy's accept-side socket can recover it in
+/// [`bridge_passive_established`]. All steps are best-effort: a miss leaves
+/// node-waypoint resolution fail-closed, exactly as before GAP-2M.
+#[inline(always)]
+fn bridge_active_established(ctx: &SockOpsContext) {
+    let cookie = socket_cookie(ctx);
+    match ctx.family() {
+        AF_INET => {
+            // Active side: local socket addr/port is the client, the rewritten
+            // remote addr/port is the loopback capture endpoint (the server).
+            if let Some(orig) = unsafe { FERRUM_ORIG_DST4.get(&OrigDstKey { cookie }) }.copied() {
+                let tuple = ConnTuple4::new(
+                    ctx.local_ip4(),
+                    ctx.local_port() as u16,
+                    ctx.remote_ip4(),
+                    peer_port_host_order(ctx.remote_port()),
+                );
+                let _ = FERRUM_ORIG_DST_BY_TUPLE4.insert(&tuple, &orig, 0);
+            }
+        }
+        AF_INET6 => {
+            if let Some(orig) = unsafe { FERRUM_ORIG_DST6.get(&OrigDstKey { cookie }) }.copied() {
+                let tuple = ConnTuple6::new(
+                    ctx.local_ip6(),
+                    ctx.local_port() as u16,
+                    ctx.remote_ip6(),
+                    peer_port_host_order(ctx.remote_port()),
+                );
+                let _ = FERRUM_ORIG_DST_BY_TUPLE6.insert(&tuple, &orig, 0);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// GAP-2M (passive side). The accepted (server-side) socket now exists with
+/// the cookie the node-waypoint proxy reads via `getsockopt(SO_COOKIE)`.
+/// Recover the original-destination record by the mirror connection 4-tuple
+/// and re-stamp it under this accept-side cookie, so the proxy's existing
+/// `FERRUM_ORIG_DST4`/`FERRUM_ORIG_DST6` lookup resolves the source identity.
+/// The tuple entry is consumed on a hit.
+#[inline(always)]
+fn bridge_passive_established(ctx: &SockOpsContext) {
+    let cookie = socket_cookie(ctx);
+    match ctx.family() {
+        AF_INET => {
+            // Passive side mirrors the active tuple: the remote socket addr/port
+            // is the client, the local addr/port is the loopback server.
+            let tuple = ConnTuple4::new(
+                ctx.remote_ip4(),
+                peer_port_host_order(ctx.remote_port()),
+                ctx.local_ip4(),
+                ctx.local_port() as u16,
+            );
+            if let Some(orig) = unsafe { FERRUM_ORIG_DST_BY_TUPLE4.get(&tuple) }.copied() {
+                let _ = FERRUM_ORIG_DST4.insert(&OrigDstKey { cookie }, &orig, 0);
+                let _ = FERRUM_ORIG_DST_BY_TUPLE4.remove(&tuple);
+            }
+        }
+        AF_INET6 => {
+            let tuple = ConnTuple6::new(
+                ctx.remote_ip6(),
+                peer_port_host_order(ctx.remote_port()),
+                ctx.local_ip6(),
+                ctx.local_port() as u16,
+            );
+            if let Some(orig) = unsafe { FERRUM_ORIG_DST_BY_TUPLE6.get(&tuple) }.copied() {
+                let _ = FERRUM_ORIG_DST6.insert(&OrigDstKey { cookie }, &orig, 0);
+                let _ = FERRUM_ORIG_DST_BY_TUPLE6.remove(&tuple);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[inline(always)]

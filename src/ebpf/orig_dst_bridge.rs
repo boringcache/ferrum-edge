@@ -14,24 +14,31 @@
 //! `record_orig_dst6` their first production caller (before this they had no
 //! caller and the resolver's cookie map was always empty).
 //!
-//! ## Staging: connect-side vs accept-side cookie (GAP-2M required)
+//! ## Connect-side vs accept-side cookie (GAP-2M bridge)
 //!
-//! This bridge is the **connect-side half** of node-waypoint resolution and is
-//! NOT sufficient on its own to make the accept path resolve identities.
 //! `connect4`/`connect6` key each record by the *source pod's
 //! connecting-socket* cookie (`bpf_get_socket_cookie` on the connect socket).
 //! The proxy accept path, however, resolves by the *accepted server-side
 //! socket's* `SO_COOKIE` (`resolve_stream` → `socket_cookie(accepted_stream)`),
 //! which is a different kernel socket with a different cookie — see the
-//! invariant documented in `src/socket_opts.rs`. Registering records under the
-//! accept-side cookie is the job of the **GAP-2M sockops/sk_lookup bridge,
-//! which is not yet implemented**. Until GAP-2M lands, the records mirrored
-//! here are not the ones the accept path looks up, so node-waypoint cookie
-//! resolution still **fails closed** (the safe default). Pod-identity
-//! enrollment into `identities_by_pod_uid` from the slice workloads is a
-//! separate remaining tier. In short: this module ships the GAP-1b plumbing
-//! and exercises `record_orig_dst*`, but does not by itself make end-to-end
-//! node-waypoint resolution succeed on a live kernel.
+//! invariant documented in `src/socket_opts.rs`.
+//!
+//! The **GAP-2M accept-side bridge is now implemented in the kernel `sock_ops`
+//! program** (`ebpf/ferrum-ebpf/src/sock_ops.rs`): at active-established it
+//! re-keys the connect-side record by the connection 4-tuple, and at
+//! passive-established it re-stamps that record into `FERRUM_ORIG_DST4`/
+//! `FERRUM_ORIG_DST6` under the *accept-side* cookie. This bridge therefore
+//! mirrors accept-side-cookie records too, so the accept path's `SO_COOKIE`
+//! lookup resolves the source identity without any change to this module.
+//!
+//! **Verification status:** CI compile-checks the kernel program
+//! (`build-ebpf`) and loads + attaches it on a real ≥5.7 kernel (`ebpf-live`).
+//! The full connect→capture→accept datapath (which would confirm the tuple
+//! byte-order and end-to-end resolution) is not exercised by CI and remains a
+//! live multi-pod-node verification step. A tuple/byte-order mismatch fails
+//! closed (no accept-side record written), never misattributes identity, so
+//! the unverified path is safe-by-construction. Pod-identity enrollment into
+//! `identities_by_pod_uid` from the slice workloads is a separate tier.
 //!
 //! ## Why polling
 //!
