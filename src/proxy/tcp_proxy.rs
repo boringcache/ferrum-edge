@@ -5866,11 +5866,11 @@ mod node_waypoint_stream_scope_tests {
 
         use ferrum_ebpf_common::OrigDst4;
 
-        use crate::identity::SpiffeId;
+        use crate::identity::{SpiffeId, TrustDomain};
+        use crate::modes::mesh::config::{Workload, WorkloadSelector};
         use crate::modes::mesh::node_waypoint::{
             NodeWaypointIdentity, NodeWaypointIdentityResolver, parse_pod_uid,
         };
-        use crate::modes::mesh::runtime::PolicyScopeCache;
 
         let resolver = Arc::new(NodeWaypointIdentityResolver::new(0));
         let pod = parse_pod_uid("11111111-1111-1111-1111-111111111111").unwrap();
@@ -5888,7 +5888,7 @@ mod node_waypoint_stream_scope_tests {
         let _client = connect.await.expect("join").expect("connect");
 
         // Register the orig-dst record under the *accepted* socket's real
-        // cookie (the accept-side registrar contract) and install the pod scope.
+        // cookie (the accept-side registrar contract).
         let cookie = crate::socket_opts::socket_cookie(&accepted).expect("SO_COOKIE");
         resolver.record_orig_dst4(
             cookie,
@@ -5899,16 +5899,28 @@ mod node_waypoint_stream_scope_tests {
                 workload_spiffe_hash: hash,
             },
         );
-        let mut scopes = HashMap::new();
-        scopes.insert(
-            pod,
-            Arc::new(PolicyScopeCache::new(
-                spiffe.clone(),
-                "team-a",
-                HashMap::new(),
-            )),
-        );
-        resolver.install_policy_scopes(scopes);
+        // Install the pod's scope the way production does — from the slice's
+        // workload set. This also seeds `workload_identities_by_hash`, which
+        // `resolve_record` re-validates against so a cached identity resolves
+        // only while its workload is still in the slice.
+        let workload = Workload {
+            spiffe_id: spiffe.clone(),
+            selector: WorkloadSelector {
+                labels: HashMap::new(),
+                namespace: Some("team-a".to_string()),
+            },
+            service_name: "api".to_string(),
+            addresses: Vec::new(),
+            ports: Vec::new(),
+            trust_domain: TrustDomain::new("cluster.local").expect("trust domain"),
+            namespace: "team-a".to_string(),
+            network: None,
+            cluster: None,
+            weight: None,
+            locality: None,
+            service_account: None,
+        };
+        resolver.install_policy_scopes_from_workloads(&[workload]);
 
         let (scope, principal) = resolve_node_waypoint_stream_scope(
             Some(resolver.as_ref()),

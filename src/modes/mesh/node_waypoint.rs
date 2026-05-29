@@ -15,7 +15,12 @@
 //! 2. One `DashMap::get` against the unified cookie record map (returns
 //!    `(pod_uid, workload_spiffe_hash)`).
 //! 3. One `DashMap::get` against the identity map (returns `Arc<NodeWaypointIdentity>`).
-//! 4. One `Arc::clone` (~5 ns) to hand the identity to the connection task.
+//! 4. One `ArcSwap::load` + `HashMap` lookup against the slice's
+//!    `workload_spiffe_hash` index, re-validating that the control plane still
+//!    vouches for the resolved workload (fail closed if it was removed). No
+//!    allocation; the same loaded snapshot serves the cached and lazy-enrollment
+//!    branches.
+//! 5. One `Arc::clone` (~5 ns) to hand the identity to the connection task.
 //!
 //! Both hot-path DashMaps are sized via `crate::util::sharding::pool_shard_amount`
 //! so contention scales with `num_cpus`. New accept-path atomics (per-reason
@@ -929,6 +934,13 @@ impl NodeWaypointIdentityResolver {
             return Err(NodeWaypointIdentityError::MissingWorkloadHash { cookie, pod_uid });
         }
 
+        // The current slice's authoritative `workload_spiffe_hash` set. A pod
+        // may resolve only while the slice still vouches for its workload hash.
+        // Loaded once and consulted by BOTH branches below so the cached and
+        // lazy-enrollment paths fail closed identically when the control plane
+        // removes a workload.
+        let workload_identities = self.workload_identities_by_hash.load();
+
         if let Some(identity) = self.identities_by_pod_uid.get(&pod_uid) {
             let identity = identity.clone();
             if identity.workload_spiffe_hash != expected_hash {
@@ -937,6 +949,22 @@ impl NodeWaypointIdentityResolver {
                     expected: expected_hash,
                     actual: identity.workload_spiffe_hash,
                 });
+            }
+            // Re-validate the cached identity against the *current* slice.
+            // Enrollment (below) only happens when the hash is present in the
+            // slice index, but later slice updates replace that index without
+            // touching `identities_by_pod_uid`. If the control plane has since
+            // removed this workload (its hash left the index) while the pod keeps
+            // stamping the old `(pod_uid, hash)`, fail closed instead of serving
+            // the now-orphaned identity — matching the lazy branch's
+            // no-matching-slice behavior. In production every enrolled identity's
+            // hash was in the index at enroll time, so this rejects only genuinely
+            // removed/re-keyed workloads, never a still-valid one. The stale cache
+            // entry is left in place: it never resolves while its hash is absent,
+            // is re-validated for free if the workload returns, and is reclaimed by
+            // the cgroup-inode sweep when the pod exits.
+            if !workload_identities.contains_key(&expected_hash) {
+                return Err(NodeWaypointIdentityError::UnknownPod(pod_uid));
             }
             return Ok(identity);
         }
@@ -949,12 +977,7 @@ impl NodeWaypointIdentityResolver {
         // matching slice workload → `UnknownPod` (fail-closed, unchanged). The
         // enrolled identity's hash equals `expected_hash` by construction, so no
         // re-check is needed.
-        if let Some(spiffe_id) = self
-            .workload_identities_by_hash
-            .load()
-            .get(&expected_hash)
-            .cloned()
-        {
+        if let Some(spiffe_id) = workload_identities.get(&expected_hash).cloned() {
             return Ok(self.upsert_identity(NodeWaypointIdentity::new(pod_uid, spiffe_id)));
         }
 
@@ -1124,6 +1147,21 @@ mod tests {
         }
     }
 
+    /// Make the resolver's slice index vouch for `spiffe_ids` so
+    /// `resolve_record`'s current-slice re-validation passes. Production enrolls
+    /// identities only through the slice (lazy hash-join), so a still-valid
+    /// identity's hash is always present in `workload_identities_by_hash`. These
+    /// older unit tests pre-seed `identities_by_pod_uid` directly via
+    /// `upsert_identity` for brevity, so they must also seed the slice the
+    /// resolver now revalidates against.
+    fn vouch_for_workloads(resolver: &NodeWaypointIdentityResolver, spiffe_ids: &[&str]) {
+        let workloads: Vec<Workload> = spiffe_ids
+            .iter()
+            .map(|spiffe_id| workload(spiffe_id, "default", "app", HashMap::new()))
+            .collect();
+        resolver.install_policy_scopes_from_workloads(&workloads);
+    }
+
     #[test]
     fn resolve_cookie_returns_enrolled_identity() {
         let resolver = NodeWaypointIdentityResolver::new(0);
@@ -1131,6 +1169,7 @@ mod tests {
         let identity = NodeWaypointIdentity::new(pod_uid, spiffe("spiffe://td/ns/default/sa/api"));
         let hash = identity.workload_spiffe_hash;
         resolver.upsert_identity(identity);
+        vouch_for_workloads(&resolver, &["spiffe://td/ns/default/sa/api"]);
         resolver.record_orig_dst4(7, orig_dst4(pod_uid, hash));
 
         let resolved = resolver.resolve_cookie(7).expect("identity resolves");
@@ -1179,6 +1218,53 @@ mod tests {
     }
 
     #[test]
+    fn cached_identity_fails_closed_after_slice_drops_its_workload() {
+        // GAP-2M fail-closed regression: once a pod is lazily enrolled it is
+        // cached in `identities_by_pod_uid`. A later slice that removes its
+        // workload replaces `workload_identities_by_hash` but does not touch the
+        // cache, so the cached-identity branch must re-validate against the
+        // current slice and fail closed — otherwise a decommissioned workload
+        // keeps resolving as long as the pod stamps the old (pod_uid, hash).
+        let resolver = NodeWaypointIdentityResolver::new(0);
+        let pod_uid = parse_pod_uid("55555555-5555-5555-5555-555555555555").unwrap();
+        let spiffe_id = spiffe("spiffe://td/ns/default/sa/web");
+        let hash = workload_spiffe_hash(&spiffe_id);
+
+        // Slice vouches for the workload; the pod enrolls lazily on first resolve.
+        vouch_for_workloads(&resolver, &["spiffe://td/ns/default/sa/web"]);
+        resolver.record_orig_dst4(7, orig_dst4(pod_uid, hash));
+        let resolved = resolver
+            .resolve_cookie(7)
+            .expect("resolves while the workload is in the slice");
+        assert_eq!(resolved.pod_uid, pod_uid);
+        assert!(
+            resolver.identities_by_pod_uid.contains_key(&pod_uid),
+            "first resolve must cache the enrolled identity"
+        );
+
+        // The control plane removes that workload (the slice now carries a
+        // different one), so its hash leaves the index.
+        vouch_for_workloads(&resolver, &["spiffe://td/ns/default/sa/other"]);
+
+        // The pod keeps stamping the old (pod_uid, hash). The cached-identity
+        // branch must fail closed rather than serve the orphaned identity.
+        assert_eq!(
+            resolver
+                .resolve_cookie(7)
+                .expect_err("a removed workload must fail closed even when cached"),
+            NodeWaypointIdentityError::UnknownPod(pod_uid)
+        );
+
+        // If the workload returns, the cached identity is re-validated for free
+        // (no eviction, no re-enrollment): resolution succeeds again.
+        vouch_for_workloads(&resolver, &["spiffe://td/ns/default/sa/web"]);
+        let reresolved = resolver
+            .resolve_cookie(7)
+            .expect("a returning workload re-validates the cached identity");
+        assert_eq!(reresolved.spiffe_id, spiffe_id);
+    }
+
+    #[test]
     fn resolve_cookie_fails_closed_for_unknown_cookie() {
         let resolver = NodeWaypointIdentityResolver::new(0);
 
@@ -1196,6 +1282,7 @@ mod tests {
             NodeWaypointIdentity::new(pod_uid, spiffe("spiffe://td/ns/default/sa/reviews"));
         let hash = identity.workload_spiffe_hash;
         resolver.upsert_identity(identity);
+        vouch_for_workloads(&resolver, &["spiffe://td/ns/default/sa/reviews"]);
 
         // `cookie_records` is empty — simulates the 200ms orig-dst poll not
         // having mirrored the just-stamped accept cookie yet. The injected
@@ -1234,6 +1321,7 @@ mod tests {
         let identity = NodeWaypointIdentity::new(pod_uid, spiffe("spiffe://td/ns/default/sa/api"));
         let hash = identity.workload_spiffe_hash;
         resolver.upsert_identity(identity);
+        vouch_for_workloads(&resolver, &["spiffe://td/ns/default/sa/api"]);
         resolver.record_orig_dst6(7, orig_dst6(pod_uid, hash));
 
         let resolved = resolver.resolve_cookie(7).expect("IPv6 identity resolves");
@@ -1887,11 +1975,13 @@ mod tests {
         // Regression guard for the documented hot-path contract:
         // - 1x cookie_records.get
         // - 1x identities_by_pod_uid.get
+        // - 1x workload_identities_by_hash.load + HashMap lookup (slice
+        //   re-validation; no allocation)
         // - 0 allocations on success
         //
-        // We assert the structural shape (two DashMaps, one Arc clone) by
-        // making the same call twice and confirming both arms hit warm
-        // entries without re-inserting anything. If a future refactor adds
+        // We assert the structural shape (two DashMaps, one ArcSwap load, one
+        // Arc clone) by making the same call twice and confirming both arms hit
+        // warm entries without re-inserting anything. If a future refactor adds
         // a third DashMap probe or an alloc, this test still passes, but the
         // module-level rustdoc is the source of truth and any change here that
         // adds work must update that contract.
@@ -1900,6 +1990,7 @@ mod tests {
         let identity = NodeWaypointIdentity::new(pod_uid, spiffe("spiffe://td/ns/default/sa/api"));
         let hash = identity.workload_spiffe_hash;
         let stored = resolver.upsert_identity(identity);
+        vouch_for_workloads(&resolver, &["spiffe://td/ns/default/sa/api"]);
         resolver.record_orig_dst4(7, orig_dst4(pod_uid, hash));
 
         let first = resolver.resolve_cookie(7).expect("warm v4 cookie");
@@ -1921,6 +2012,7 @@ mod tests {
         let identity = NodeWaypointIdentity::new(pod_uid, spiffe("spiffe://td/ns/default/sa/api"));
         let hash = identity.workload_spiffe_hash;
         resolver.upsert_identity(identity);
+        vouch_for_workloads(&resolver, &["spiffe://td/ns/default/sa/api"]);
         resolver.record_orig_dst6(42, orig_dst6(pod_uid, hash));
 
         let resolved = resolver
@@ -1985,21 +2077,20 @@ mod tests {
     fn bridge_recorded_cookie_resolves_to_identity() {
         // Exercises the resolver's cookie→identity lookup mechanics IN
         // ISOLATION: a record (as record_orig_dst4 would mirror it) plus a
-        // hand-enrolled identity under the same cookie resolves. This is NOT
-        // the production end-to-end accept path, which differs in two staged
-        // ways (see the `orig_dst_bridge` module docs): (1) the accept path
-        // looks up the *accept-side* socket cookie, not the connect-side cookie
-        // the bridge records (the GAP-2M registrar that bridges them is not yet
-        // implemented), and (2) `identities_by_pod_uid` is enrolled by hand
-        // here, whereas no production path yet populates it from slice
-        // workloads. The single cookie + manual enroll deliberately pin the
-        // resolver logic; this does not prove live resolution succeeds.
+        // pre-enrolled identity under the same cookie resolves. Production now
+        // resolves the *accept-side* socket cookie bridged by the GAP-2M
+        // sock_ops program and enrolls identities through the lazy hash-join at
+        // resolve time; here we seed both sides by hand (the slice index via
+        // `vouch_for_workloads`, the identity via `upsert_identity`) and a single
+        // cookie record, so this pins the resolver logic rather than proving the
+        // live end-to-end datapath.
         let resolver = NodeWaypointIdentityResolver::new(0);
         let spiffe_id = spiffe("spiffe://td/ns/default/sa/api");
         let pod_uid = [9u8; 16];
         let hash = workload_spiffe_hash(&spiffe_id);
 
         resolver.upsert_identity(NodeWaypointIdentity::new(pod_uid, spiffe_id.clone()));
+        vouch_for_workloads(&resolver, &["spiffe://td/ns/default/sa/api"]);
         // The bridge mirrors the BPF record (stamped with pod_uid + hash by
         // the connect hook) into the resolver.
         resolver.record_orig_dst4(77, orig_dst4(pod_uid, hash));

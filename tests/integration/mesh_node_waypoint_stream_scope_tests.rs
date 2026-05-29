@@ -234,11 +234,18 @@ fn unresolved_cookie_yields_no_scope() {
     );
 }
 
-/// Sanity: a pod whose identity is enrolled but whose workload had no scope
-/// installed (slice/identity race) yields `None` from `policy_scope_for_pod`,
-/// which the accept loop forwards as `node_waypoint_policy_scope: None`.
+/// An enrolled identity whose workload is absent from the current slice fails
+/// closed on resolve. Enrollment is now slice-driven (lazy hash-join), so an
+/// identity outlives its workload only when the control plane removed it;
+/// `resolve_record` re-validates the cached identity against the live slice
+/// index (`workload_identities_by_hash`) and fails closed rather than resolving
+/// to a now-orphaned identity. The stream accept loop then stamps no per-pod
+/// scope (mesh-wide-only fallback, see `resolve_node_waypoint_stream_scope`);
+/// the HBONE accept loop drops the connection. (Pre-fix this surfaced as
+/// "resolves but no scope", which slice-coupled enrollment made unreachable: a
+/// vouched workload always contributes both its hash and its scope.)
 #[test]
-fn enrolled_pod_without_installed_scope_yields_none() {
+fn enrolled_pod_whose_workload_is_absent_from_slice_fails_closed() {
     let resolver = Arc::new(NodeWaypointIdentityResolver::new(0));
     let pod_a = parse_pod_uid(POD_A).unwrap();
     let id_a = NodeWaypointIdentity::new(pod_a, spiffe(SPIFFE_A));
@@ -253,13 +260,17 @@ fn enrolled_pod_without_installed_scope_yields_none() {
             workload_spiffe_hash: hash_a,
         },
     );
-    // No install_policy_scopes call — scope index is empty.
-    let resolved = resolver.resolve_cookie(7).expect("identity resolves");
-    assert_eq!(resolved.pod_uid, pod_a);
+    // No workload in the current slice vouches for this identity's hash (the
+    // index is empty), so resolution fails closed even though the identity is
+    // cached in `identities_by_pod_uid`.
     assert!(
-        resolver.policy_scope_for_pod(&resolved.pod_uid).is_none(),
-        "no installed scope must surface as None so mesh_authz falls back to \
-         mesh-wide-only and stamps scope_missing"
+        resolver.resolve_cookie(7).is_err(),
+        "an identity whose workload is not in the current slice must fail \
+         closed, not resolve to a stale identity"
+    );
+    assert!(
+        resolver.policy_scope_for_pod(&pod_a).is_none(),
+        "and with no installed scope the per-pod lookup stays None"
     );
 }
 
@@ -274,6 +285,8 @@ fn enrolled_pod_without_installed_scope_yields_none() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn resolve_stream_against_real_accepted_socket_maps_to_pod_scope() {
+    use ferrum_edge::identity::TrustDomain;
+    use ferrum_edge::modes::mesh::config::Workload;
     use tokio::net::{TcpListener, TcpStream};
 
     let resolver = Arc::new(NodeWaypointIdentityResolver::new(0));
@@ -308,18 +321,27 @@ async fn resolve_stream_against_real_accepted_socket_maps_to_pod_scope() {
             workload_spiffe_hash: hash_a,
         },
     );
-    resolver.install_policy_scopes({
-        let mut scopes = HashMap::new();
-        scopes.insert(
-            pod_a,
-            Arc::new(ferrum_edge::modes::mesh::runtime::PolicyScopeCache::new(
-                spiffe(SPIFFE_A),
-                "team-a",
-                labels(&[("app", "api"), ("tier", "web")]),
-            )),
-        );
-        scopes
-    });
+    // Install the pod's scope the production way — from the slice's workload
+    // set — which also seeds `workload_identities_by_hash` so `resolve_record`'s
+    // current-slice re-validation passes for the resolved identity.
+    let workload = Workload {
+        spiffe_id: spiffe(SPIFFE_A),
+        selector: WorkloadSelector {
+            labels: labels(&[("app", "api"), ("tier", "web")]),
+            namespace: Some("team-a".to_string()),
+        },
+        service_name: "api".to_string(),
+        addresses: Vec::new(),
+        ports: Vec::new(),
+        trust_domain: TrustDomain::new("cluster.local").expect("valid trust domain"),
+        namespace: "team-a".to_string(),
+        network: None,
+        cluster: None,
+        weight: None,
+        locality: None,
+        service_account: None,
+    };
+    resolver.install_policy_scopes_from_workloads(&[workload]);
 
     // The exact chain the TCP accept loop now runs.
     let identity = resolver
