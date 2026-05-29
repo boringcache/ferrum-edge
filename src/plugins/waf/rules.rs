@@ -425,14 +425,16 @@ pub(super) fn compile_rules(
                 rule.score = Some(score);
             }
         }
-        if let Some(action) = rule_modes.get(&rule.id) {
-            rule.action = *action;
-        }
-        if rule.paranoia_min > paranoia_level && !rule_modes.contains_key(&rule.id) {
+        // An explicit `rule_modes: enforce` entry force-compiles a rule even
+        // when its `paranoia_min` exceeds the active paranoia level; a Monitor
+        // or Disabled entry never resurrects a paranoia-filtered rule.
+        if rule.paranoia_min > paranoia_level
+            && rule_modes.get(&rule.id) != Some(&RuleAction::Enforce)
+        {
             continue;
         }
         // Bulk action for built-ins; an explicit per-rule `rule_modes` entry
-        // (applied next) still wins.
+        // (applied below) still wins.
         if is_default && let Some(action) = default_rule_action {
             rule.action = action;
         }
@@ -443,6 +445,9 @@ pub(super) fn compile_rules(
         }
         if is_default && disabled_default_rules.contains(&rule.id) {
             continue;
+        }
+        if let Some(action) = rule_modes.get(&rule.id) {
+            rule.action = *action;
         }
         if rule.action == RuleAction::Disabled {
             continue;
