@@ -343,6 +343,21 @@ pub const IPV4_LOOPBACK_NBO: u32 = u32::from_ne_bytes([127, 0, 0, 1]);
 /// IPv6 loopback `[::1]` stored as the kernel's `user_ip6` expects (NBO).
 pub const IPV6_LOOPBACK_NBO: [u32; 4] = [0, 0, 0, u32::from_ne_bytes([0, 0, 0, 1])];
 
+/// Convert a `bpf_sock_ops.remote_port` value to a host-byte-order port.
+///
+/// `remote_port` is the peer port in network byte order, but the kernel does
+/// **not** store it in the low 16 bits: on little-endian kernels the sock_ops
+/// ctx rewrite stores it as `(__be16 dport) << 16`, so the real port sits in
+/// the upper half. The canonical decode (matching the kernel's own
+/// `bpf_ntohl(skops->remote_port)` samples) is a full 32-bit
+/// network-to-host swap, then truncate — `u32::from_be(remote_port) as u16`.
+/// Truncating first (`remote_port as u16`) would read the always-zero low half
+/// on LE and yield `0`. `bpf_sock_ops.local_port`, by contrast, is already in
+/// host byte order and needs no conversion.
+pub const fn sock_ops_peer_port_host_order(remote_port: u32) -> u16 {
+    u32::from_be(remote_port) as u16
+}
+
 impl CidrKey4 {
     /// Build an LPM key payload from a network-byte-order IPv4 address.
     pub const fn new(addr_nbo: u32) -> Self {
@@ -550,6 +565,19 @@ mod tests {
     fn ipv4_loopback_constant() {
         let bytes = IPV4_LOOPBACK_NBO.to_ne_bytes();
         assert_eq!(bytes, [127, 0, 0, 1]);
+    }
+
+    #[test]
+    fn sock_ops_peer_port_decodes_be_high_half() {
+        // bpf_sock_ops.remote_port on little-endian = (__be16 dport) << 16.
+        // Port 8080 (0x1F90 host): network bytes [0x1F, 0x90] → 16-bit LE load
+        // 0x901F → << 16 = 0x901F_0000.
+        assert_eq!(sock_ops_peer_port_host_order(0x901F_0000), 8080);
+        // Port 80 (0x0050 host): network bytes [0x00, 0x50] → 0x5000 → << 16.
+        assert_eq!(sock_ops_peer_port_host_order(0x5000_0000), 80);
+        // The previous bug (`remote_port as u16` first) read the zero low half
+        // and returned 0 for both of these.
+        assert_ne!(sock_ops_peer_port_host_order(0x901F_0000), 0);
     }
 
     #[test]

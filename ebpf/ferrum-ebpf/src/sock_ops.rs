@@ -49,10 +49,10 @@ use aya_ebpf::macros::sock_ops;
 use aya_ebpf::programs::SockOpsContext;
 use aya_ebpf::EbpfContext;
 use ferrum_ebpf_common::{
-    ConnTuple4, OrigDstKey, SockOpsRecord, SOCK_OPS_DIRECTION_RECEIVED, SOCK_OPS_DIRECTION_SENT,
-    SOCK_OPS_EVENT_ACCEPT_ESTABLISHED, SOCK_OPS_EVENT_CONNECT, SOCK_OPS_EVENT_FIN,
-    SOCK_OPS_EVENT_RST, SOCK_OPS_EVENT_RTT_SAMPLE, SOCK_OPS_EVENT_SYN_TO_ACK_LATENCY,
-    SOCK_OPS_STATS_EVENTS_DROPPED,
+    sock_ops_peer_port_host_order, ConnTuple4, OrigDstKey, SockOpsRecord,
+    SOCK_OPS_DIRECTION_RECEIVED, SOCK_OPS_DIRECTION_SENT, SOCK_OPS_EVENT_ACCEPT_ESTABLISHED,
+    SOCK_OPS_EVENT_CONNECT, SOCK_OPS_EVENT_FIN, SOCK_OPS_EVENT_RST, SOCK_OPS_EVENT_RTT_SAMPLE,
+    SOCK_OPS_EVENT_SYN_TO_ACK_LATENCY, SOCK_OPS_STATS_EVENTS_DROPPED,
 };
 
 use crate::maps::{
@@ -232,17 +232,6 @@ fn socket_cookie(ctx: &SockOpsContext) -> u64 {
     unsafe { aya_ebpf::helpers::bpf_get_socket_cookie(ctx.as_ptr()) }
 }
 
-/// Convert a `bpf_sock_ops` peer port to host byte order.
-///
-/// `remote_port` is the connection's `__be16` peer port zero-extended into a
-/// `u32` (network byte order); `local_port` is already host byte order. The
-/// bridge normalizes every port to host order so the active and passive
-/// callbacks compute an identical [`ConnTuple4`] / [`ConnTuple6`] key.
-#[inline(always)]
-fn peer_port_host_order(remote_port: u32) -> u16 {
-    u16::from_be(remote_port as u16)
-}
-
 /// GAP-2M (active side). The connecting (client) socket has reached
 /// ESTABLISHED, so its ephemeral local port is now assigned. Look up the
 /// connect-side original-destination record (stamped by `connect4`/`connect6`
@@ -263,7 +252,7 @@ fn bridge_active_established(ctx: &SockOpsContext) {
             ctx.local_ip4(),
             ctx.local_port() as u16,
             ctx.remote_ip4(),
-            peer_port_host_order(ctx.remote_port()),
+            sock_ops_peer_port_host_order(ctx.remote_port()),
         );
         let _ = FERRUM_ORIG_DST_BY_TUPLE4.insert(&tuple, &orig, 0);
     }
@@ -285,7 +274,7 @@ fn bridge_passive_established(ctx: &SockOpsContext) {
     // client, the local addr/port is the loopback server.
     let tuple = ConnTuple4::new(
         ctx.remote_ip4(),
-        peer_port_host_order(ctx.remote_port()),
+        sock_ops_peer_port_host_order(ctx.remote_port()),
         ctx.local_ip4(),
         ctx.local_port() as u16,
     );
