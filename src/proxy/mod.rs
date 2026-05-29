@@ -1209,7 +1209,21 @@ async fn buffer_request_body_for_before_proxy(
         limited
             .collect()
             .await
-            .map_err(|_| RequestBodyBufferError::TooLarge)?
+            .map_err(|e| {
+                // Limited::collect() returns either a LengthLimitError (the body
+                // actually exceeded the cap -> 413) or the underlying transport
+                // error (the client dropped the connection mid-upload -> 499).
+                // Distinguish them so a client disconnect is not misreported and
+                // logged as "Request body exceeds maximum size", mirroring the
+                // unlimited branch below.
+                if e.downcast_ref::<http_body_util::LengthLimitError>()
+                    .is_some()
+                {
+                    RequestBodyBufferError::TooLarge
+                } else {
+                    RequestBodyBufferError::ClientDisconnected(e.to_string())
+                }
+            })?
             .to_bytes()
             .to_vec()
     } else {
