@@ -6072,6 +6072,13 @@ fn is_websocket_backend_strip_header(name: &str) -> bool {
             | "sec-websocket-key"
             | "sec-websocket-version"
             | "sec-websocket-accept"
+            // The gateway's WebSocket bridge (tungstenite) cannot encode or
+            // decode permessage-deflate, so the client's extension OFFER must
+            // not reach the backend: a deflate-capable backend would accept it,
+            // set rsv1 on data frames, and the bridge would tear the session
+            // down with a protocol error. Strip the offer so no extension is
+            // ever negotiated end to end.
+            | "sec-websocket-extensions"
             | "x-consumer-username"
             | "x-consumer-custom-id"
     )
