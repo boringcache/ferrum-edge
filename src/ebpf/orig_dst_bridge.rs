@@ -122,7 +122,7 @@ mod production {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use aya::maps::{HashMap as BpfHashMap, MapData};
+    use aya::maps::{HashMap as BpfHashMap, Map, MapData};
     use ferrum_ebpf_common::{OrigDst4, OrigDst6, OrigDstKey};
     use tracing::{debug, info, warn};
 
@@ -292,11 +292,11 @@ mod production {
 
     fn open_pinned_maps() -> Option<(OpenMaps, MapInodes)> {
         let v4_data = MapData::from_pin(BPF_ORIG_DST4_PIN_PATH).ok()?;
-        let orig_dst4 = OrigDst4Map::try_from(v4_data)
+        let orig_dst4 = OrigDst4Map::try_from(Map::LruHashMap(v4_data))
             .map_err(|e| warn!(error = %e, "FERRUM_ORIG_DST4 pin type mismatch"))
             .ok()?;
         let v6_data = MapData::from_pin(BPF_ORIG_DST6_PIN_PATH).ok()?;
-        let orig_dst6 = OrigDst6Map::try_from(v6_data)
+        let orig_dst6 = OrigDst6Map::try_from(Map::LruHashMap(v6_data))
             .map_err(|e| warn!(error = %e, "FERRUM_ORIG_DST6 pin type mismatch"))
             .ok()?;
         let inodes = MapInodes::read();

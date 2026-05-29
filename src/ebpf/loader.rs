@@ -177,7 +177,7 @@ impl EbpfBackend for AyaEbpfBackend {
             );
         }
 
-        self.maps = Some(BpfMaps::from_ebpf(&bpf)?);
+        self.maps = Some(BpfMaps::from_ebpf(&mut bpf)?);
 
         // GAP-1b: pin the original-destination maps so the node-waypoint
         // mesh-proxy can open them by path through the orig-dst bridge.
@@ -200,7 +200,7 @@ impl EbpfBackend for AyaEbpfBackend {
     }
 
     fn update_capture_config(&mut self, config: &BpfCaptureConfig) -> Result<(), String> {
-        let maps = self.maps.as_ref().ok_or("BPF maps not initialized")?;
+        let maps = self.maps.as_mut().ok_or("BPF maps not initialized")?;
         maps.update_capture_config(config)
     }
 
@@ -269,32 +269,32 @@ impl EbpfBackend for AyaEbpfBackend {
     }
 
     fn update_pod_ip(&mut self, ip: Ipv4Addr, info: &PodInfo) -> Result<(), String> {
-        let maps = self.maps.as_ref().ok_or("BPF maps not initialized")?;
+        let maps = self.maps.as_mut().ok_or("BPF maps not initialized")?;
         maps.insert_pod_ip(ip, info)
     }
 
     fn remove_pod_ip(&mut self, ip: Ipv4Addr) -> Result<(), String> {
-        let maps = self.maps.as_ref().ok_or("BPF maps not initialized")?;
+        let maps = self.maps.as_mut().ok_or("BPF maps not initialized")?;
         maps.remove_pod_ip(ip)
     }
 
     fn update_bypass_uid(&mut self, uid: u32) -> Result<(), String> {
-        let maps = self.maps.as_ref().ok_or("BPF maps not initialized")?;
+        let maps = self.maps.as_mut().ok_or("BPF maps not initialized")?;
         maps.insert_bypass_uid(uid)
     }
 
     fn update_cidr_exclude(&mut self, cidr: &str) -> Result<(), String> {
-        let maps = self.maps.as_ref().ok_or("BPF maps not initialized")?;
+        let maps = self.maps.as_mut().ok_or("BPF maps not initialized")?;
         maps.insert_cidr_exclude(cidr)
     }
 
     fn update_cidr_include(&mut self, cidr: &str) -> Result<(), String> {
-        let maps = self.maps.as_ref().ok_or("BPF maps not initialized")?;
+        let maps = self.maps.as_mut().ok_or("BPF maps not initialized")?;
         maps.insert_cidr_include(cidr)
     }
 
     fn update_port_exclude(&mut self, port: u16) -> Result<(), String> {
-        let maps = self.maps.as_ref().ok_or("BPF maps not initialized")?;
+        let maps = self.maps.as_mut().ok_or("BPF maps not initialized")?;
         maps.insert_port_exclude(port)
     }
 
@@ -303,12 +303,12 @@ impl EbpfBackend for AyaEbpfBackend {
         cgroup_id: u64,
         policy: &IncludePortsPolicy,
     ) -> Result<(), String> {
-        let maps = self.maps.as_ref().ok_or("BPF maps not initialized")?;
+        let maps = self.maps.as_mut().ok_or("BPF maps not initialized")?;
         maps.insert_include_ports(cgroup_id, policy)
     }
 
     fn remove_pod_include_ports(&mut self, cgroup_id: u64) -> Result<(), String> {
-        let maps = self.maps.as_ref().ok_or("BPF maps not initialized")?;
+        let maps = self.maps.as_mut().ok_or("BPF maps not initialized")?;
         maps.remove_include_ports(cgroup_id)
     }
 
@@ -317,12 +317,12 @@ impl EbpfBackend for AyaEbpfBackend {
         cgroup_id: u64,
         identity: &ferrum_ebpf_common::WorkloadIdentity,
     ) -> Result<(), String> {
-        let maps = self.maps.as_ref().ok_or("BPF maps not initialized")?;
+        let maps = self.maps.as_mut().ok_or("BPF maps not initialized")?;
         maps.insert_workload_identity(cgroup_id, identity)
     }
 
     fn remove_workload_identity(&mut self, cgroup_id: u64) -> Result<(), String> {
-        let maps = self.maps.as_ref().ok_or("BPF maps not initialized")?;
+        let maps = self.maps.as_mut().ok_or("BPF maps not initialized")?;
         maps.remove_workload_identity(cgroup_id)
     }
 

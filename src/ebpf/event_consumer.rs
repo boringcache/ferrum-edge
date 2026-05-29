@@ -248,7 +248,7 @@ impl SockOpsConsumer {
 pub mod production {
     use std::os::fd::AsRawFd;
 
-    use aya::maps::{MapData, PerCpuArray, RingBuf};
+    use aya::maps::{Map, MapData, PerCpuArray, RingBuf};
     use ferrum_ebpf_common::{SOCK_OPS_STATS_EVENTS_DROPPED, SockOpsRecord};
     use tokio::io::Interest;
     use tokio::io::unix::AsyncFd;
@@ -475,7 +475,7 @@ pub mod production {
     /// errors (type mismatch on pinned map).
     fn open_pinned_maps_quiet() -> Option<(RingBuf<MapData>, PerCpuArray<MapData, u64>)> {
         let events_map = MapData::from_pin(BPF_SOCK_OPS_EVENTS_PIN_PATH).ok()?;
-        let ring_buf = match RingBuf::try_from(events_map) {
+        let ring_buf = match RingBuf::try_from(Map::RingBuf(events_map)) {
             Ok(rb) => rb,
             Err(e) => {
                 warn!(
@@ -488,7 +488,9 @@ pub mod production {
         };
 
         let stats_map = MapData::from_pin(BPF_SOCK_OPS_STATS_PIN_PATH).ok()?;
-        let stats: PerCpuArray<MapData, u64> = match PerCpuArray::try_from(stats_map) {
+        let stats: PerCpuArray<MapData, u64> = match PerCpuArray::try_from(Map::PerCpuArray(
+            stats_map,
+        )) {
             Ok(a) => a,
             Err(e) => {
                 warn!(
@@ -516,7 +518,7 @@ pub mod production {
                 return None;
             }
         };
-        let ring_buf = match RingBuf::try_from(events_map) {
+        let ring_buf = match RingBuf::try_from(Map::RingBuf(events_map)) {
             Ok(rb) => rb,
             Err(e) => {
                 warn!(
@@ -543,7 +545,9 @@ pub mod production {
                 return None;
             }
         };
-        let stats: PerCpuArray<MapData, u64> = match PerCpuArray::try_from(stats_map) {
+        let stats: PerCpuArray<MapData, u64> = match PerCpuArray::try_from(Map::PerCpuArray(
+            stats_map,
+        )) {
             Ok(a) => a,
             Err(e) => {
                 warn!(

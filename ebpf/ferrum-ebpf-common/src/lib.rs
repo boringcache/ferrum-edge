@@ -378,6 +378,40 @@ impl BpfCaptureConfig {
     }
 }
 
+/// `aya::Pod` marks a type as plain-old-data that is safe to copy byte-for-byte
+/// in and out of BPF maps. It is implemented for the shared map key/value types
+/// only under the `userspace` feature (the aya userspace loader); the kernel
+/// (bpfel) build never links aya. The orphan rule requires these impls to live
+/// in this crate, where the types are defined.
+///
+/// Safety: every type below is `#[repr(C)]` and `Copy`, contains only
+/// fixed-width integers / byte arrays (no padding that aliases invalid bit
+/// patterns, no pointers), and matches the kernel-side map definition exactly.
+#[cfg(feature = "userspace")]
+mod userspace_pod {
+    use super::*;
+
+    macro_rules! impl_pod {
+        ($($t:ty),+ $(,)?) => {
+            $(unsafe impl aya::Pod for $t {})+
+        };
+    }
+
+    impl_pod!(
+        OrigDstKey,
+        OrigDst4,
+        OrigDst6,
+        ConnTuple4,
+        ConnTuple6,
+        PodInfo,
+        WorkloadIdentity,
+        BpfCaptureConfig,
+        IncludePortsPolicy,
+        CidrKey4,
+        CidrKey6,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
