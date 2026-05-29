@@ -399,11 +399,17 @@ pub struct PodAttachmentState {
     /// or, worse, ignore live edits to `traffic.sidecar.istio.io/includeOutboundPorts`
     /// (the GAP-2K mid-life update gap this field closes).
     pub include_ports_policy: Option<IncludePortsPolicy>,
-    /// Set when this pod has an active `FERRUM_WORKLOAD_IDENTITY` entry
-    /// (GAP-1b). The cgroup id is the removal key, captured at enrollment so
-    /// un-enrollment can drop the entry without re-statting a possibly-gone
-    /// cgroup path. `None` when the identity could not be derived or written.
-    pub workload_identity_cgroup_id: Option<u64>,
+    /// Cgroup ids carrying this pod's `FERRUM_WORKLOAD_IDENTITY` entries
+    /// (GAP-1b): the pod cgroup inode plus every descendant container-cgroup
+    /// inode (see `cgroup::collect_cgroup_tree_inodes`). The connect hooks read
+    /// `bpf_get_current_cgroup_id()`, which is the *container* leaf cgroup —
+    /// a child of the pod cgroup on every Kubernetes cgroup driver — so the
+    /// identity must be written under those leaf inodes, not just the pod inode,
+    /// or the hook's lookup misses and resolution fails closed. Captured at
+    /// enrollment as the removal keys so un-enrollment drops every entry without
+    /// re-statting a possibly-gone cgroup path. Empty when the identity could
+    /// not be derived or no cgroup inode could be read.
+    pub workload_identity_cgroup_ids: Vec<u64>,
 }
 
 /// Fallback behavior when the kernel does not support eBPF capture.

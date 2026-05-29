@@ -795,11 +795,20 @@ fn parse_pod_include_outbound_ports(
     }
 }
 
-/// Read the cgroup id (kernel inode number, which is what
-/// `bpf_get_current_cgroup_id` returns) for an enrolled pod's cgroup path.
-/// Returns `None` on stat error so the node-agent can warn and continue
-/// without aborting enrollment — losing per-pod narrowing is a graceful
-/// degradation, not a fatal condition.
+/// Read the cgroup id (kernel inode number) of a single cgroup directory.
+///
+/// Note the connect hooks key per-cgroup maps by `bpf_get_current_cgroup_id()`,
+/// which is the *container leaf* cgroup the calling task lives in — a child of
+/// the pod cgroup on every Kubernetes cgroup driver. So this returns a key the
+/// hook matches only when the connecting task runs directly in `cgroup_path`.
+/// The workload-identity map enrolls the whole pod cgroup subtree to cover the
+/// container leaves (see `apply_workload_identity` /
+/// `cgroup::collect_cgroup_tree_inodes`); `FERRUM_INCLUDE_PORTS` still keys by
+/// the pod inode alone and shares this leaf-vs-pod limitation (it fails open, so
+/// per-pod port narrowing simply does not engage rather than failing closed).
+///
+/// Returns `None` on stat error so the node-agent can warn and continue without
+/// aborting enrollment — a graceful degradation, not a fatal condition.
 #[cfg(unix)]
 fn read_cgroup_id_for_pod(cgroup_path: &str) -> Option<u64> {
     use std::os::unix::fs::MetadataExt;
@@ -914,11 +923,19 @@ fn apply_include_outbound_ports(
 /// CP-side format the node-waypoint resolver enrolls; the hash uses the same
 /// `workload_spiffe_hash` algorithm as the resolver so the two agree.
 ///
-/// Best-effort: a bad pod UID, an un-buildable SPIFFE ID, a cgroup-id stat
-/// failure, or a BPF write error logs and returns `None` without aborting
-/// enrollment. When this is skipped the connect hooks fall back to the
-/// all-zero sentinel and node-waypoint resolution fails closed for that pod —
-/// the same posture as before identity stamping existed.
+/// The identity is written under the pod cgroup inode AND every descendant
+/// container-cgroup inode (`cgroup::collect_cgroup_tree_inodes`). The connect
+/// hooks look the identity up by `bpf_get_current_cgroup_id()`, which is the
+/// *container* leaf cgroup — a child of the pod cgroup on every Kubernetes
+/// cgroup driver — so writing only the pod inode would never match the hook's
+/// key and resolution would silently fail closed in real pods.
+///
+/// Returns the cgroup inodes successfully written (the un-enrollment keys), or
+/// an empty Vec on any total failure (bad pod UID, un-buildable SPIFFE ID, no
+/// readable cgroup inode, or every BPF write failing). Best-effort: an empty
+/// return logs and does not abort enrollment — the connect hooks then fall back
+/// to the all-zero sentinel and node-waypoint resolution fails closed for that
+/// pod, the same posture as before identity stamping existed.
 fn apply_workload_identity(
     backend: &mut dyn EbpfBackend,
     config: &NodeAgentConfig,
@@ -926,33 +943,55 @@ fn apply_workload_identity(
     namespace: &str,
     service_account: Option<&str>,
     cgroup_path: &str,
-) -> Option<u64> {
-    let identity = build_workload_identity(
+) -> Vec<u64> {
+    let Some(identity) = build_workload_identity(
         pod_uid,
         namespace,
         service_account.unwrap_or("default"),
         &config.trust_domain,
-    )?;
-    let cgroup_id = read_cgroup_id_for_pod(cgroup_path)?;
-    match backend.update_workload_identity(cgroup_id, &identity) {
-        Ok(()) => {
-            debug!(
-                pod_uid,
-                cgroup_id, "Wrote source workload identity to FERRUM_WORKLOAD_IDENTITY"
-            );
-            Some(cgroup_id)
-        }
-        Err(e) => {
-            warn!(
-                pod_uid,
-                cgroup_id,
-                error = %e,
-                "Failed to update FERRUM_WORKLOAD_IDENTITY for pod; node-waypoint identity \
-                 resolution will fail closed for traffic from this pod"
-            );
-            None
+    ) else {
+        return Vec::new();
+    };
+    let cgroup_ids = cgroup::collect_cgroup_tree_inodes(std::path::Path::new(cgroup_path));
+    if cgroup_ids.is_empty() {
+        warn!(
+            pod_uid,
+            cgroup_path,
+            "Could not read any cgroup inode for pod; node-waypoint identity resolution will \
+             fail closed for traffic from this pod"
+        );
+        return Vec::new();
+    }
+
+    let mut written = Vec::with_capacity(cgroup_ids.len());
+    for cgroup_id in cgroup_ids {
+        match backend.update_workload_identity(cgroup_id, &identity) {
+            Ok(()) => written.push(cgroup_id),
+            Err(e) => {
+                warn!(
+                    pod_uid,
+                    cgroup_id,
+                    error = %e,
+                    "Failed to write FERRUM_WORKLOAD_IDENTITY for a pod cgroup inode; \
+                     traffic from that cgroup will fail closed"
+                );
+            }
         }
     }
+    if written.is_empty() {
+        warn!(
+            pod_uid,
+            "No FERRUM_WORKLOAD_IDENTITY entries written for pod; node-waypoint identity \
+             resolution will fail closed for traffic from this pod"
+        );
+    } else {
+        debug!(
+            pod_uid,
+            cgroup_ids = written.len(),
+            "Wrote source workload identity to FERRUM_WORKLOAD_IDENTITY across pod cgroup tree"
+        );
+    }
+    written
 }
 
 /// Construct the `WorkloadIdentity` for a pod from its UID and the derived
@@ -1125,6 +1164,14 @@ pub fn handle_pod_added(
                 event.annotations,
                 &mut state,
             );
+            reconcile_existing_pod_workload_identity(
+                backend,
+                config,
+                pod_uid,
+                namespace,
+                event.service_account,
+                &mut state,
+            );
             debug!(pod_uid, pod_name, "Pod already enrolled, reconciled state");
             return;
         }
@@ -1140,7 +1187,7 @@ pub fn handle_pod_added(
         attached: false,
         include_ports_cgroup_id: None,
         include_ports_policy: None,
-        workload_identity_cgroup_id: None,
+        workload_identity_cgroup_ids: Vec::new(),
     };
 
     if let Some(ref cgroup) = cgroup_path {
@@ -1210,7 +1257,7 @@ pub fn handle_pod_added(
             // GAP-1b: write the source workload identity so connect hooks can
             // stamp orig-dst records. Best-effort like include-ports; failure
             // leaves node-waypoint resolution failing closed for this pod.
-            state.workload_identity_cgroup_id = apply_workload_identity(
+            state.workload_identity_cgroup_ids = apply_workload_identity(
                 backend,
                 config,
                 pod_uid,
@@ -1226,7 +1273,7 @@ pub fn handle_pod_added(
                 namespace,
                 ?pod_ip,
                 include_ports_narrowing = state.include_ports_cgroup_id.is_some(),
-                workload_identity = state.workload_identity_cgroup_id.is_some(),
+                workload_identity_cgroups = state.workload_identity_cgroup_ids.len(),
                 "Pod enrolled for eBPF capture"
             );
         } else if let Err(e) = backend.detach_pod(pod_uid) {
@@ -1438,6 +1485,62 @@ fn reconcile_existing_pod_include_ports(
     }
 }
 
+/// Re-walk an already-enrolled pod's cgroup tree on reconcile and write the
+/// source workload identity under any cgroup inode not yet enrolled.
+///
+/// Container cgroups appear *after* the pod cgroup (containers start once the
+/// pod object exists) and rotate to fresh inodes on restart, so the leaf
+/// cgroups the connect hook reads via `bpf_get_current_cgroup_id()` may not
+/// have existed at initial enrollment. Kubernetes emits many Modified events
+/// over a pod's lifecycle (readiness, container statuses, IP), so re-walking
+/// here enrolls a newly-started container's cgroup within seconds. Only
+/// newly-observed inodes are written — a pod's SPIFFE identity is stable for
+/// its lifetime, so existing entries are left untouched to avoid churning the
+/// BPF map on every status update. Best-effort: failures log and continue.
+fn reconcile_existing_pod_workload_identity(
+    backend: &mut dyn EbpfBackend,
+    config: &NodeAgentConfig,
+    pod_uid: &str,
+    namespace: &str,
+    service_account: Option<&str>,
+    state: &mut PodAttachmentState,
+) {
+    let Some(cgroup_path) = state.cgroup_path.clone() else {
+        return;
+    };
+    let Some(identity) = build_workload_identity(
+        pod_uid,
+        namespace,
+        service_account.unwrap_or("default"),
+        &config.trust_domain,
+    ) else {
+        return;
+    };
+    for cgroup_id in cgroup::collect_cgroup_tree_inodes(std::path::Path::new(&cgroup_path)) {
+        if state.workload_identity_cgroup_ids.contains(&cgroup_id) {
+            continue;
+        }
+        match backend.update_workload_identity(cgroup_id, &identity) {
+            Ok(()) => {
+                debug!(
+                    pod_uid,
+                    cgroup_id,
+                    "Enrolled newly-observed pod cgroup inode into FERRUM_WORKLOAD_IDENTITY"
+                );
+                state.workload_identity_cgroup_ids.push(cgroup_id);
+            }
+            Err(e) => {
+                warn!(
+                    pod_uid,
+                    cgroup_id,
+                    error = %e,
+                    "Failed to write FERRUM_WORKLOAD_IDENTITY for a newly-observed pod cgroup inode"
+                );
+            }
+        }
+    }
+}
+
 /// Render an `Option<&IncludePortsPolicy>` as a short structured string
 /// for logging. Only invoked from the success/error arms of
 /// `reconcile_existing_pod_include_ports` — never on the diff-skip
@@ -1490,16 +1593,17 @@ pub fn handle_pod_removed(
             );
         }
         // GAP-1b: pair with `apply_workload_identity`. Use the stashed cgroup
-        // id so we don't re-stat a possibly torn-down cgroup path.
-        if let Some(cgroup_id) = state.workload_identity_cgroup_id
-            && let Err(e) = backend.remove_workload_identity(cgroup_id)
-        {
-            warn!(
-                pod_uid,
-                cgroup_id,
-                error = %e,
-                "Failed to remove pod workload-identity entry from BPF map"
-            );
+        // ids (pod inode + descendant container-cgroup inodes) so we don't
+        // re-stat a possibly torn-down cgroup tree. Tolerates ENOENT per entry.
+        for cgroup_id in &state.workload_identity_cgroup_ids {
+            if let Err(e) = backend.remove_workload_identity(*cgroup_id) {
+                warn!(
+                    pod_uid,
+                    cgroup_id = *cgroup_id,
+                    error = %e,
+                    "Failed to remove pod workload-identity entry from BPF map"
+                );
+            }
         }
         metrics.pods_unenrolled.fetch_add(1, Ordering::Relaxed);
         info!(pod_uid, pod_name = %state.pod_name, "Pod unenrolled from eBPF capture");
@@ -2053,7 +2157,7 @@ mod tests {
                 attached: true,
                 include_ports_cgroup_id: None,
                 include_ports_policy: None,
-                workload_identity_cgroup_id: None,
+                workload_identity_cgroup_ids: Vec::new(),
             },
         );
         pod_states.insert(
@@ -2068,7 +2172,7 @@ mod tests {
                 attached: false,
                 include_ports_cgroup_id: None,
                 include_ports_policy: None,
-                workload_identity_cgroup_id: None,
+                workload_identity_cgroup_ids: Vec::new(),
             },
         );
 
@@ -2389,6 +2493,78 @@ mod tests {
         assert_eq!(metrics.pods_enrolled.load(Ordering::Relaxed), 1);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn handle_pod_added_enrolls_identity_under_container_cgroup_leaves() {
+        use std::os::unix::fs::MetadataExt;
+
+        // Regression for the leaf-vs-pod cgroup bug (P1): the connect hook reads
+        // `bpf_get_current_cgroup_id()`, which is the *container* leaf cgroup —
+        // a child of the pod cgroup — so the node-agent must write
+        // FERRUM_WORKLOAD_IDENTITY under the container cgroup inodes, not only
+        // the pod cgroup inode, or the hook's lookup misses and node-waypoint
+        // resolution fails closed in real pods.
+        let _veth_guard = crate::ebpf::veth::tests::TestOverrideGuard::new("veth_test");
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+
+        let cgroup_root = tempfile::tempdir().unwrap();
+        // A valid UUID so the SPIFFE identity builds; cgroupfs driver layout.
+        let pod_uid = "11111111-1111-1111-1111-111111111111";
+        let pod_cgroup = cgroup_root.path().join(format!("kubepods/pod{pod_uid}"));
+        let container_cgroup = pod_cgroup.join("crio-abc123.scope");
+        std::fs::create_dir_all(&container_cgroup).unwrap();
+
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: cgroup_root.path().to_string_lossy().to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+        };
+        let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+        let event = PodEvent {
+            pod_uid,
+            pod_name: "test-pod",
+            namespace: "default",
+            service_account: Some("api"),
+            labels: &labels,
+            annotations: &HashMap::new(),
+            pod_ip_str: Some("10.0.0.5"),
+            pod_pid: None,
+            veth_iface_override: Some("veth-mock"),
+        };
+
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+
+        let pod_ino = std::fs::metadata(&pod_cgroup).unwrap().ino();
+        let container_ino = std::fs::metadata(&container_cgroup).unwrap().ino();
+
+        // The container leaf inode — the id the connect hook actually looks up —
+        // must carry the identity, alongside the pod inode.
+        assert!(
+            backend.workload_identities.contains_key(&container_ino),
+            "identity must be enrolled under the container (leaf) cgroup inode"
+        );
+        assert!(
+            backend.workload_identities.contains_key(&pod_ino),
+            "identity must also be enrolled under the pod cgroup inode"
+        );
+        // It is a real derived identity, not the all-zero fail-closed sentinel.
+        let identity = backend.workload_identities.get(&container_ino).unwrap();
+        assert_ne!(identity.pod_uid, [0u8; 16]);
+        assert_ne!(identity.workload_spiffe_hash, 0);
+
+        let state = pod_states.get(pod_uid).unwrap();
+        assert!(state.workload_identity_cgroup_ids.contains(&container_ino));
+        assert!(state.workload_identity_cgroup_ids.contains(&pod_ino));
+    }
+
     #[test]
     fn handle_pod_added_missing_cgroup_does_not_poison_state() {
         let mut backend = MockEbpfBackend::default();
@@ -2474,7 +2650,7 @@ mod tests {
                 attached: true,
                 include_ports_cgroup_id: None,
                 include_ports_policy: None,
-                workload_identity_cgroup_id: None,
+                workload_identity_cgroup_ids: Vec::new(),
             },
         );
         let config = NodeAgentConfig {
@@ -2559,7 +2735,7 @@ mod tests {
                 attached: true,
                 include_ports_cgroup_id: None,
                 include_ports_policy: None,
-                workload_identity_cgroup_id: None,
+                workload_identity_cgroup_ids: Vec::new(),
             },
         );
         backend
@@ -2664,7 +2840,7 @@ mod tests {
                 veth_iface: None,
                 include_ports_cgroup_id: None,
                 include_ports_policy: None,
-                workload_identity_cgroup_id: None,
+                workload_identity_cgroup_ids: Vec::new(),
             },
         );
         let req = CniRpcRequest {
@@ -2759,7 +2935,7 @@ mod tests {
                 attached: true,
                 include_ports_cgroup_id: None,
                 include_ports_policy: None,
-                workload_identity_cgroup_id: None,
+                workload_identity_cgroup_ids: Vec::new(),
             },
         );
         let req = CniRpcRequest {
@@ -2848,7 +3024,7 @@ mod tests {
                 attached: true,
                 include_ports_cgroup_id: None,
                 include_ports_policy: None,
-                workload_identity_cgroup_id: None,
+                workload_identity_cgroup_ids: Vec::new(),
             },
         );
         let resp = apply_cni_request(&mut backend, &pod_states, &config, &metrics, &req);
@@ -2884,7 +3060,7 @@ mod tests {
                 attached: true,
                 include_ports_cgroup_id: None,
                 include_ports_policy: None,
-                workload_identity_cgroup_id: None,
+                workload_identity_cgroup_ids: Vec::new(),
             },
         );
 
@@ -2937,7 +3113,7 @@ mod tests {
                 attached: true,
                 include_ports_cgroup_id: None,
                 include_ports_policy: None,
-                workload_identity_cgroup_id: None,
+                workload_identity_cgroup_ids: Vec::new(),
             },
         );
 
@@ -2996,7 +3172,7 @@ mod tests {
                 attached: true,
                 include_ports_cgroup_id: None,
                 include_ports_policy: None,
-                workload_identity_cgroup_id: None,
+                workload_identity_cgroup_ids: Vec::new(),
             },
         );
 
