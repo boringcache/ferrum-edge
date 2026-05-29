@@ -42,10 +42,14 @@ thread_local! {
     static HBONE_POOL_KEY_BUF: RefCell<String> = RefCell::new(String::with_capacity(160));
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct HbonePoolEntry {
     sender: SendRequest<Bytes>,
-    last_used_at: Instant,
+    /// Unix seconds of the last checkout. Stored atomically so the shared-lock
+    /// fast path (`try_cached_sender_read`) can refresh recency without taking
+    /// the exclusive shard write lock — a busy connection must not be pruned as
+    /// idle merely because it is only ever served by the fast path.
+    last_used_at: AtomicU64,
     idle_timeout_seconds: u64,
 }
 
@@ -426,7 +430,7 @@ impl HboneConnectionPool {
                 record_hbone_evictions(prune_pool_entries(entries));
                 entries.push(HbonePoolEntry {
                     sender: sender.clone(),
-                    last_used_at: Instant::now(),
+                    last_used_at: AtomicU64::new(unix_secs()),
                     idle_timeout_seconds: pool_config.idle_timeout_seconds,
                 });
                 let max_entries = pool_config.http2_connections_per_host.max(1);
@@ -439,7 +443,7 @@ impl HboneConnectionPool {
             .or_insert_with(|| {
                 vec![HbonePoolEntry {
                     sender: sender.clone(),
-                    last_used_at: Instant::now(),
+                    last_used_at: AtomicU64::new(unix_secs()),
                     idle_timeout_seconds: pool_config.idle_timeout_seconds,
                 }]
             });
@@ -461,7 +465,7 @@ impl HboneConnectionPool {
             let sender = entry.sender.clone();
             match sender.clone().ready().now_or_never() {
                 Some(Ok(ready)) => {
-                    entry.last_used_at = Instant::now();
+                    entry.last_used_at.store(unix_secs(), Ordering::Relaxed);
                     return Some(CachedSender::Ready(ready));
                 }
                 Some(Err(_)) => {
@@ -482,7 +486,7 @@ impl HboneConnectionPool {
             if let Some(idx) = pending_idx
                 && let Some(entry) = entries.get_mut(idx)
             {
-                entry.last_used_at = Instant::now();
+                entry.last_used_at.store(unix_secs(), Ordering::Relaxed);
             }
             pending.map(CachedSender::Pending)
         } else {
@@ -498,14 +502,21 @@ impl HboneConnectionPool {
     /// `maybe_prune_idle_entries` running on the next write-path call.
     fn try_cached_sender_read(&self, key: &str) -> Option<SendRequest<Bytes>> {
         let entries = self.entries.get(key)?;
-        let now = Instant::now();
+        let now = unix_secs();
         for entry in entries.value().iter() {
-            if entry_idle_expired(entry.last_used_at, entry.idle_timeout_seconds, now) {
+            let last_used = entry.last_used_at.load(Ordering::Relaxed);
+            if entry_idle_expired(last_used, entry.idle_timeout_seconds, now) {
                 continue;
             }
             let sender = entry.sender.clone();
             match sender.ready().now_or_never() {
-                Some(Ok(ready)) => return Some(ready),
+                Some(Ok(ready)) => {
+                    // Refresh recency on the shared-lock fast path so a busy
+                    // connection is not pruned as idle. This is the whole point
+                    // of this path existing: avoid the exclusive write lock.
+                    entry.last_used_at.store(now, Ordering::Relaxed);
+                    return Some(ready);
+                }
                 _ => continue,
             }
         }
@@ -913,11 +924,12 @@ fn current_svid_identity(
 
 fn prune_pool_entries(entries: &mut Vec<HbonePoolEntry>) -> usize {
     let before = entries.len();
+    let now = unix_secs();
     entries.retain(|entry| {
         !entry_idle_expired(
-            entry.last_used_at,
+            entry.last_used_at.load(Ordering::Relaxed),
             entry.idle_timeout_seconds,
-            Instant::now(),
+            now,
         )
     });
     before.saturating_sub(entries.len())
@@ -928,9 +940,8 @@ fn record_hbone_evictions(count: usize) {
         .record_pool_evictions(crate::runtime_metrics::PoolKind::Hbone, count as u64);
 }
 
-fn entry_idle_expired(last_used_at: Instant, idle_timeout_seconds: u64, now: Instant) -> bool {
-    idle_timeout_seconds > 0
-        && now.saturating_duration_since(last_used_at) > Duration::from_secs(idle_timeout_seconds)
+fn entry_idle_expired(last_used_secs: u64, idle_timeout_seconds: u64, now_secs: u64) -> bool {
+    idle_timeout_seconds > 0 && now_secs.saturating_sub(last_used_secs) > idle_timeout_seconds
 }
 
 fn unix_secs() -> u64 {
@@ -1423,10 +1434,10 @@ mod tests {
 
     #[test]
     fn idle_expiration_uses_last_used_time() {
-        let now = Instant::now();
+        let now: u64 = 1_000_000;
 
         assert!(
-            entry_idle_expired(now - Duration::from_secs(2), 1, now),
+            entry_idle_expired(now - 2, 1, now),
             "entries idle longer than the timeout should expire"
         );
         assert!(
@@ -1434,7 +1445,7 @@ mod tests {
             "freshly used entries should stay in the pool"
         );
         assert!(
-            !entry_idle_expired(now - Duration::from_secs(60), 0, now),
+            !entry_idle_expired(now - 60, 0, now),
             "zero idle timeout disables idle pruning"
         );
     }
