@@ -2067,14 +2067,33 @@ where
 
             let mut final_body_completed = body_completed;
             let mut final_client_disconnected = client_disconnected;
-            if body_completed
-                && let Some(trailers) = trailers
-                && !trailers.is_empty()
-                && let Err(e) = stream.send_trailers(trailers).await
-            {
-                warn!("H3 gRPC streaming send_trailers failed: {}", e);
-                final_client_disconnected = true;
-                final_body_completed = false;
+            if body_completed && let Some(mut trailers) = trailers {
+                // Strip RFC 9110 §7.6.1 response-direction hop-by-hop names
+                // (and any Connection-listed names) from the backend gRPC
+                // trailers before forwarding to the H3 client, matching the
+                // buffered path (collect_buffered_grpc_trailers). Otherwise a
+                // misbehaving/malicious backend can leak `trailer` /
+                // `proxy-authenticate` / `connection` / `keep-alive` etc. to the
+                // client through the TRAILERS frame.
+                let connection_listed = parse_connection_listed_headers(&trailers);
+                let to_remove: Vec<http::HeaderName> = trailers
+                    .keys()
+                    .filter(|name| {
+                        is_backend_response_strip_header(name.as_str())
+                            || connection_listed.iter().any(|n| n == *name)
+                    })
+                    .cloned()
+                    .collect();
+                for name in to_remove {
+                    trailers.remove(&name);
+                }
+                if !trailers.is_empty()
+                    && let Err(e) = stream.send_trailers(trailers).await
+                {
+                    warn!("H3 gRPC streaming send_trailers failed: {}", e);
+                    final_client_disconnected = true;
+                    final_body_completed = false;
+                }
             }
 
             record_backend_outcome(
