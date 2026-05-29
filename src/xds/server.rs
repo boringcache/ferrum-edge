@@ -20,10 +20,7 @@ use super::proto::{
     DiscoveryResponse,
 };
 use super::snapshot::{XdsConfigFingerprint, XdsSnapshot, XdsSnapshotCache};
-use super::translator::{
-    CDS_TYPE_URL, ECDS_TYPE_URL, EDS_TYPE_URL, LDS_TYPE_URL, RDS_TYPE_URL,
-    translate_mesh_slice_to_snapshot,
-};
+use super::translator::translate_mesh_slice_to_snapshot;
 use crate::FERRUM_VERSION;
 use crate::config::incremental_apply::apply_incremental_to_config_snapshot;
 use crate::config::types::GatewayConfig;
@@ -591,10 +588,14 @@ impl XdsAdsServer {
         previous: Option<&XdsSnapshot>,
     ) -> (Arc<XdsSnapshot>, Vec<DiscoveryResponse>) {
         let snapshot = self.snapshot_for_config_with_fingerprint(node_id, config, fingerprint);
+        // Resource warming: the DP applies per-type independent versions, so the
+        // CP only re-sends the types whose resource bytes actually changed. An
+        // ECDS-only (policy/workload) update no longer drags the name-only
+        // CDS/EDS/LDS/RDS resources along for version coherence.
         let responses = subscriptions
             .values()
             .filter(|subscription| {
-                sotw_subscription_resources_changed(previous, &snapshot, subscription)
+                subscription_resources_changed(previous, &snapshot, subscription)
             })
             .map(|subscription| self.sotw_response(&snapshot, subscription))
             .collect();
@@ -1480,94 +1481,6 @@ fn subscription_resources_changed(
     !resources_equal_ignoring_version(&previous_resources, &next_resources)
 }
 
-/// SOTW-only version-coherence check. When the mesh-content digest of the
-/// aggregate snapshot version changes (e.g. a policy-only ECDS update that does
-/// not change any CDS/EDS/LDS/RDS resource bytes), all required mesh-slice types
-/// are forced to re-send so the DP's coherent-version gate
-/// (`has_coherent_required_versions`) re-satisfies on the same version string.
-/// The trigger keys on the content digest (not the whole timestamped version),
-/// so a bare `loaded_at` re-stamp with byte-identical config — e.g. a no-op DB
-/// re-poll — does NOT force a re-send (see
-/// `required_mesh_slice_type_needs_version_refresh`).
-///
-/// **SOTW assumption**: this refresh is intentionally absent from the delta
-/// path (`subscription_resources_changed` / `delta_responses_for_*`). A delta
-/// client using the same coherent-version gate would not rebuild on a
-/// policy-only update because the delta path compares individual resource bytes,
-/// not aggregate version. Today the Ferrum DP uses SOTW
-/// (`stream_aggregated_resources`), so the delta path is not hit; but the
-/// coupling is implicit — any future delta-mode adoption must add an equivalent
-/// mechanism.
-///
-/// **Wire-cost tradeoff**: any content change that bumps the digest (e.g. a
-/// policy-only ECDS update, but also an unrelated proxy/plugin edit that alters
-/// resource bytes) re-sends the name-only CDS/EDS/LDS/RDS resources to every
-/// connected DP even though those particular bytes may be unchanged, to keep
-/// the aggregate version coherent. This is a justified consequence of the
-/// aggregate-version coherence model and is NOT a regression — name-only
-/// CDS/EDS/LDS/RDS resources are cheap to retransmit and the alternative
-/// (partial version state on the DP) would stall slice application
-/// indefinitely. Fully isolating mesh-content changes from unrelated config
-/// edits would require a mesh-carrier-only digest and is a possible follow-up.
-fn sotw_subscription_resources_changed(
-    previous: Option<&XdsSnapshot>,
-    snapshot: &XdsSnapshot,
-    subscription: &XdsSubscription,
-) -> bool {
-    if let Some(previous) = previous
-        && required_mesh_slice_type_needs_version_refresh(
-            previous,
-            snapshot,
-            &subscription.type_url,
-        )
-    {
-        return true;
-    }
-    subscription_resources_changed(previous, snapshot, subscription)
-}
-
-fn required_mesh_slice_type_needs_version_refresh(
-    previous: &XdsSnapshot,
-    snapshot: &XdsSnapshot,
-    type_url: &str,
-) -> bool {
-    // Key the forced refresh on the CONTENT digest, not the whole version
-    // string. `content_version` is `"{base_version}:{digest16}"` where
-    // `base_version` is `config.loaded_at.to_rfc3339()`. `loaded_at` is
-    // re-stamped on every config (re)load — including DB re-polls that produce
-    // byte-identical config — so comparing the whole version forced a full
-    // SOTW re-send of all required mesh-slice types (incl. the large
-    // workloads/services ECDS carriers) to every connected DP even when the
-    // mesh resource bytes were unchanged. Comparing the digest suffix re-sends
-    // only when the content actually changed. Coherence still holds: a digest
-    // change re-sends all required types at the new full version; an unchanged
-    // digest sends nothing and leaves them coherent at the prior version.
-    is_required_mesh_slice_sotw_type_url(type_url)
-        && mesh_content_digest(&previous.version) != mesh_content_digest(&snapshot.version)
-}
-
-/// Extract the content-digest suffix of a `content_version` string
-/// (`"{base_version}:{digest16}"`). The digest is the segment after the FINAL
-/// `:` — `base_version` is an RFC3339 timestamp that itself contains `:`, so
-/// split on the last one. Falls back to the whole string if no `:` is present
-/// (defensive; `content_version` always appends one).
-fn mesh_content_digest(version: &str) -> &str {
-    version
-        .rsplit_once(':')
-        .map_or(version, |(_, digest)| digest)
-}
-
-// Keep this set in sync with the DP-side `REQUIRED_MESH_SLICE_TYPE_URLS` in
-// `src/modes/mesh/config_consumer/xds_client.rs` — both enumerate the five
-// type URLs that must be coherent for a mesh slice rebuild, and they must not
-// drift apart.
-fn is_required_mesh_slice_sotw_type_url(type_url: &str) -> bool {
-    matches!(
-        type_url,
-        CDS_TYPE_URL | EDS_TYPE_URL | LDS_TYPE_URL | RDS_TYPE_URL | ECDS_TYPE_URL
-    )
-}
-
 fn subscription_change_affects_resources(
     snapshot: &XdsSnapshot,
     previous: Option<&XdsSubscription>,
@@ -2123,10 +2036,10 @@ mod tests {
     #[test]
     fn sotw_update_skips_resend_when_only_loaded_at_changes() {
         // A bare `loaded_at` re-stamp with byte-identical mesh content (e.g. a
-        // no-op DB re-poll) leaves the content digest unchanged, so the forced
-        // mesh-slice refresh must NOT fire — the DP stays coherent at the prior
-        // version and no redundant SOTW response (incl. the large
-        // workloads/services ECDS carriers) is re-sent.
+        // no-op DB re-poll) leaves every resource's bytes unchanged, so
+        // content-based change detection sends nothing — no redundant SOTW
+        // response (incl. the large workloads/services ECDS carriers) is
+        // re-sent.
         let server = test_server(gateway_config_with_service(true, 0));
         let subscriptions = cds_subscription();
 
@@ -2145,12 +2058,12 @@ mod tests {
     }
 
     #[test]
-    fn sotw_update_refreshes_required_types_when_mesh_content_digest_changes() {
-        // When mesh content actually changes (the aggregate digest differs), the
-        // forced refresh re-sends ALL required mesh-slice types — even one whose
-        // own bytes are unchanged (CDS clusters here) — so the DP rebuilds a
-        // coherent slice at the new version. Adding a PeerAuthentication bumps
-        // the digest without altering the CDS clusters.
+    fn sotw_policy_only_update_does_not_resend_unchanged_cds() {
+        // Under resource warming the CP re-sends only the types whose resource
+        // bytes changed. Adding a PeerAuthentication changes the ECDS carriers
+        // but leaves the name-only CDS clusters byte-identical, so a CDS-only
+        // subscriber receives nothing — the legacy forced coherent re-send (kept
+        // only to satisfy the DP's old coherent-version gate) is gone.
         let server = test_server(gateway_config_with_service(true, 0));
         let subscriptions = cds_subscription();
 
@@ -2162,13 +2075,10 @@ mod tests {
             .store(Arc::new(gateway_config_with_service_and_peer_auth(1)));
         let refreshed = server.sotw_responses_for_subscriptions("node-a", &subscriptions);
 
-        assert_eq!(
-            refreshed.len(),
-            1,
-            "a mesh content (digest) change must force the unchanged CDS type to re-send for coherence"
+        assert!(
+            refreshed.is_empty(),
+            "a policy-only (ECDS) change must not re-send byte-identical CDS clusters"
         );
-        assert_eq!(cluster_names(&refreshed[0]), cluster_names(&initial[0]));
-        assert_ne!(refreshed[0].version_info, initial[0].version_info);
     }
 
     #[test]
@@ -2189,7 +2099,11 @@ mod tests {
     }
 
     #[test]
-    fn sotw_policy_only_update_refreshes_required_core_type_versions() {
+    fn sotw_policy_only_update_resends_only_ecds() {
+        // A policy-only change re-sends ECDS (the carrier that actually changed)
+        // and leaves the unchanged name-only CDS untouched. The DP warms the new
+        // ECDS version against its persisted CDS, so no coherent re-send of CDS
+        // is needed.
         let server = test_server(gateway_config_with_service(true, 0));
         let subscriptions = required_core_and_ecds_subscriptions();
 
@@ -2201,18 +2115,20 @@ mod tests {
             .store(Arc::new(gateway_config_with_service_and_peer_auth(1)));
         let refreshed = server.sotw_responses_for_subscriptions("node-a", &subscriptions);
 
-        let cds = refreshed
-            .iter()
-            .find(|response| response.type_url == super::super::translator::CDS_TYPE_URL)
-            .expect("CDS version refresh should be sent");
-        let ecds = refreshed
-            .iter()
-            .find(|response| response.type_url == super::super::translator::ECDS_TYPE_URL)
-            .expect("ECDS policy update should be sent");
-        assert_eq!(cluster_names(cds), vec!["cluster/default/api/8080"]);
+        assert_eq!(
+            refreshed.len(),
+            1,
+            "only the changed ECDS carrier should re-send on a policy-only update"
+        );
+        let ecds = &refreshed[0];
+        assert_eq!(ecds.type_url, super::super::translator::ECDS_TYPE_URL);
         assert!(!ecds.resources.is_empty());
-        assert_ne!(cds.version_info, initial[0].version_info);
-        assert_eq!(cds.version_info, ecds.version_info);
+        assert!(
+            refreshed
+                .iter()
+                .all(|response| response.type_url != super::super::translator::CDS_TYPE_URL),
+            "byte-identical CDS must not be force-re-sent for version coherence"
+        );
     }
 
     #[test]

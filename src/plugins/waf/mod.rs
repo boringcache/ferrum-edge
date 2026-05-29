@@ -345,16 +345,22 @@ impl Waf {
             return PluginResult::Continue;
         }
 
-        let should_block = self.record_hits(ctx, &outcome, !outcome.timed_out);
+        let should_block = self.record_hits(ctx, &outcome, true);
+        if should_block {
+            // An over-budget cheap/body scan still ran to completion and
+            // produced real matches, so a confirmed enforcing hit (or score
+            // block) must reject regardless of `timed_out`. The block path
+            // bypasses `finish_timeout`, so record the timeout flag here for
+            // observability and to keep `on_scan_timeout` metadata intact.
+            if outcome.timed_out && self.config.log_to_metadata {
+                ctx.set_waf_metadata("waf.scan_timed_out", "true");
+            }
+            return self.reject();
+        }
         if outcome.timed_out {
             return self.finish_timeout(ctx);
         }
-
-        if should_block {
-            self.reject()
-        } else {
-            PluginResult::Continue
-        }
+        PluginResult::Continue
     }
 
     /// Build the configured rejection response (status, content-type, body).
@@ -948,7 +954,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scan_budget_timeout_preserves_hits_for_metadata() {
+    async fn scan_budget_timeout_enforced_hits_still_reject() {
         let plugin = Waf::new(&json!({
             "include_default_rules": false,
             "scan_budget_ms": 1,
@@ -981,7 +987,7 @@ mod tests {
         assert!(outcome.timed_out);
         let result = plugin.finish_scan(&mut ctx, outcome);
 
-        assert!(matches!(result, PluginResult::Continue));
+        assert!(matches!(result, PluginResult::Reject { .. }));
         assert_eq!(
             ctx.metadata.get("waf.rule_hits").map(String::as_str),
             Some("CUSTOM-SLOW")
@@ -992,7 +998,7 @@ mod tests {
         );
         assert_eq!(
             ctx.metadata.get("waf.action").map(String::as_str),
-            Some("monitored")
+            Some("blocked")
         );
     }
 

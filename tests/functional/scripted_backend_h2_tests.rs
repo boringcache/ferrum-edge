@@ -29,19 +29,6 @@ use bytes::Bytes;
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
 
-/// Fetch captured gateway logs, failing the test if they are empty — the
-/// harness returns an empty string if `capture_output()` was not called.
-fn require_logs(harness: &GatewayHarness) -> String {
-    let logs = harness
-        .captured_combined()
-        .expect("read captured gateway logs");
-    assert!(
-        !logs.trim().is_empty(),
-        "gateway logs were empty — did you forget .capture_output() on the builder?"
-    );
-    logs
-}
-
 /// Test-side signals proving the gateway took the gRPC backend-error
 /// path. The assertion below is satisfied when ANY of these appear in
 /// the captured log; each is a structured marker tied to a specific
@@ -722,17 +709,24 @@ async fn h2_window_stall_triggers_backend_read_timeout_on_grpc() {
         "timed out too slowly: {elapsed:?} > ceiling {ceiling:?} (timeout was {read_timeout_ms}ms)"
     );
 
-    let logs = require_logs(&harness);
-    let has_timeout_signal = logs.contains("timeout")
-        || logs.contains("Timeout")
-        || logs.contains("read_write_timeout")
-        || logs.contains("DEADLINE_EXCEEDED")
-        || logs.contains("BackendTimeout")
-        || logs.contains("Backend timeout")
-        || logs.contains("write timeout")
-        || logs.contains("read timeout");
+    let has_timeout_signal = |logs: &str| {
+        logs.contains("timeout")
+            || logs.contains("Timeout")
+            || logs.contains("read_write_timeout")
+            || logs.contains("DEADLINE_EXCEEDED")
+            || logs.contains("BackendTimeout")
+            || logs.contains("Backend timeout")
+            || logs.contains("write timeout")
+            || logs.contains("read timeout")
+    };
+    // Poll the captured logs: the gateway emits the timeout line through
+    // tracing-appender's non-blocking writer, which lags the client-visible
+    // response, so a single snapshot races the flush.
+    let logs = harness
+        .wait_for_log_contains(&has_timeout_signal, Duration::from_secs(5))
+        .await;
     assert!(
-        has_timeout_signal,
+        has_timeout_signal(&logs),
         "expected timeout signal in gateway logs; elapsed={elapsed:?}, logs:\n{logs}"
     );
 }

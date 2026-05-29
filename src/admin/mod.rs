@@ -1638,6 +1638,8 @@ async fn handle_mesh_config_drift_get(
         source_protocol: &source_protocol,
         source_cp_url: &source_cp_url,
         include_overlay,
+        // xDS-mode only; native mode leaves this `None` and the block is omitted.
+        convergence: mesh_runtime.xds_convergence(),
     });
 
     // `MeshConfigDriftResponse` is fully serde-derived; treat a serialize

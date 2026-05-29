@@ -19,7 +19,7 @@ use crate::grpc::dp_client::{
 use crate::modes::mesh::config::{
     AppProtocol, MeshDestinationRule, MeshRuntimeOverlay, MeshService, ServicePort,
 };
-use crate::modes::mesh::runtime::MeshRuntimeState;
+use crate::modes::mesh::runtime::{MeshRuntimeState, XdsConvergenceSnapshot};
 use crate::modes::mesh::slice::{MeshEgressScopeSnapshot, MeshSlice};
 use crate::xds::proto::aggregated_discovery_service_client::AggregatedDiscoveryServiceClient;
 use crate::xds::proto::{self, DiscoveryRequest, Node, Status};
@@ -428,28 +428,95 @@ impl ResourceAccumulator {
             .all(|type_url| self.versions_by_type.contains_key(*type_url))
     }
 
-    fn has_coherent_required_versions(&self) -> bool {
-        let Some(first_version) = REQUIRED_MESH_SLICE_TYPE_URLS
-            .iter()
-            .filter_map(|type_url| self.versions_by_type.get(*type_url))
-            .next()
-        else {
-            return false;
-        };
-        REQUIRED_MESH_SLICE_TYPE_URLS
-            .iter()
-            .all(|type_url| self.versions_by_type.get(*type_url) == Some(first_version))
-    }
-
+    /// Build a slice under Envoy-style resource warming (make-before-break).
+    ///
+    /// The DP no longer requires the required types to share one coherent
+    /// `version_info` before building — xDS versions are per-type and move
+    /// independently (an EDS/ECDS-only update never re-stamps CDS/LDS/RDS), so
+    /// demanding a single coherent version stalled application whenever the CP
+    /// versioned types independently. Instead the gate is:
+    ///
+    /// 1. every required type (CDS, EDS, LDS, RDS, ECDS) has delivered at least
+    ///    one response. ECDS is required so the first slice can never apply the
+    ///    name-only, unprotected view before the security/policy carriers
+    ///    arrive (fail-closed); see `docs/mesh.md` "Ferrum mesh-slice ECDS
+    ///    carriers".
+    /// 2. `reverse_translate` succeeds. A malformed ECDS carrier is a genuine
+    ///    structural error and NACKs, but a route referencing a service not yet
+    ///    present in CDS/EDS/LDS is skipped (not fatal): xDS types arrive as
+    ///    independent responses, so a route can legitimately land before its
+    ///    cluster — NACKing it would drop the route and the CP would not resend
+    ///    it until a reconnect.
+    ///
+    /// Make-before-break is provided by the caller: the live slice keeps
+    /// serving through the runtime `ArcSwap` until this returns `Ok(Some)`, so
+    /// an incomplete or transiently-skewed set never tears down the working
+    /// slice or blackholes traffic. A genuine structural error (`Err`) is
+    /// NACKed and rolls the accumulator back to the last accepted state.
     fn try_build_mesh_slice(&self, config: &XdsClientConfig) -> Result<Option<MeshSlice>, String> {
         if !self.has_required_types() {
             return Ok(None);
         }
-        if !self.has_coherent_required_versions() {
-            return Ok(None);
-        }
         reverse_translate(self, config).map(Some)
     }
+
+    /// True once all required types are present AND their per-type versions are
+    /// not all identical — the steady state under resource warming after an
+    /// incremental (e.g. policy/workload-only ECDS) update. False while still
+    /// converging or when the converged set shares one version.
+    fn required_versions_skewed(&self) -> bool {
+        let versions: Vec<&String> = REQUIRED_MESH_SLICE_TYPE_URLS
+            .iter()
+            .filter_map(|type_url| self.versions_by_type.get(*type_url))
+            .collect();
+        versions.len() == REQUIRED_MESH_SLICE_TYPE_URLS.len()
+            && versions.windows(2).any(|pair| pair[0] != pair[1])
+    }
+
+    /// Build the convergence snapshot surfaced (JWT-authenticated) on
+    /// `/mesh/config-drift`. Derived from the accumulator alone so a NACK that
+    /// rolls back `versions_by_type` is correctly reflected as "type still
+    /// missing" rather than prematurely converged.
+    fn convergence_snapshot(&self) -> XdsConvergenceSnapshot {
+        let per_type_versions = self
+            .versions_by_type
+            .iter()
+            .map(|(type_url, version)| (xds_type_short_name(type_url).to_string(), version.clone()))
+            .collect();
+        let missing_required_types = REQUIRED_MESH_SLICE_TYPE_URLS
+            .iter()
+            .filter(|type_url| !self.versions_by_type.contains_key(**type_url))
+            .map(|type_url| xds_type_short_name(type_url).to_string())
+            .collect::<Vec<_>>();
+        XdsConvergenceSnapshot {
+            per_type_versions,
+            converged: missing_required_types.is_empty(),
+            missing_required_types,
+            version_skew: self.required_versions_skewed(),
+        }
+    }
+}
+
+/// Compose the slice version from the per-type versions of the required
+/// mesh-slice types under resource warming.
+///
+/// With per-type independent versions there is no single "the" version. The
+/// Ferrum CP stamps every resource in a snapshot with one content-derived
+/// aggregate version (`{loaded_at_rfc3339}:{digest16}`) and only re-sends the
+/// types whose bytes changed, so the lexicographically-greatest per-type
+/// version is the newest snapshot's version and best represents the converged
+/// slice content. Returns empty when no required type has a version yet.
+///
+/// Observability-only: `MeshSlice.version` is never used for change detection
+/// (`MeshSlice::content_eq` ignores it) and `install_slice` never dedupes by
+/// it, so a non-RFC3339 version from a non-Ferrum CP at worst orders oddly.
+fn composite_required_version(accumulator: &ResourceAccumulator) -> String {
+    REQUIRED_MESH_SLICE_TYPE_URLS
+        .iter()
+        .filter_map(|type_url| accumulator.versions_by_type.get(*type_url))
+        .max()
+        .cloned()
+        .unwrap_or_default()
 }
 
 /// Maintain a live xDS ADS stream with simple multi-CP failover.
@@ -769,6 +836,14 @@ async fn run_ads_stream_with_auth(
                         );
                     }
                 }
+                // Publish live warming-convergence state (per-type versions and
+                // still-missing required types) for the JWT-authenticated
+                // `/mesh/config-drift` endpoint. Reflects the accumulator after
+                // this response, including a NACK rollback. The `Err` arms above
+                // return before reaching here (the stream is being torn down).
+                consumer
+                    .state()
+                    .set_xds_convergence(stream_state.accumulator.convergence_snapshot());
             }
             _ = &mut debounce, if debounce_active => {
                 if let Some(pending) = pending_slice.take() {
@@ -831,6 +906,10 @@ struct PendingXdsSlice {
     slice: MeshSlice,
     type_url: String,
     all_types_ready: bool,
+    /// True when this slice was built from a partial per-type update (required
+    /// versions not all identical). Drives the `ferrum_xds_warming_partial_
+    /// applies_total` counter at apply time.
+    version_skew: bool,
 }
 
 async fn handle_ads_response(
@@ -895,6 +974,7 @@ async fn handle_ads_response(
                 slice,
                 type_url,
                 all_types_ready: subscriptions.required_types_have_initial_response(),
+                version_skew: accumulator.required_versions_skewed(),
             }))
         }
         Ok(None) => {
@@ -981,6 +1061,12 @@ fn apply_pending_xds_slice(
     pending: PendingXdsSlice,
 ) {
     let version = pending.slice.version.clone();
+    let version_skew = pending.version_skew;
+    if version_skew {
+        crate::plugins::mesh::prometheus_helpers::increment_xds_warming_partial_apply(
+            &config.namespace,
+        );
+    }
     consumer.apply_slice(pending.slice);
     info!(
         node_id = %config.node_id,
@@ -988,6 +1074,7 @@ fn apply_pending_xds_slice(
         version = %version,
         type_url = %pending.type_url,
         all_types_ready = pending.all_types_ready,
+        version_skew = version_skew,
         "Applied debounced xDS ADS update"
     );
 }
@@ -1058,10 +1145,28 @@ fn reverse_translate(
     for resource in accumulator.resources(RDS_TYPE_URL) {
         let parsed = parse_route_resource_name(&resource.name)?;
         if !service_ports.contains_key(&(parsed.namespace.clone(), parsed.service.clone())) {
-            return Err(format!(
-                "route resource '{}' references service '{}/{}' with no cluster/listener resource",
-                resource.name, parsed.namespace, parsed.service
-            ));
+            // Resource warming: xDS types arrive as independent responses, so a
+            // route can legitimately land before the CDS/EDS/LDS response that
+            // introduces its service. Treat a route referencing a not-yet-present
+            // service as non-functional-for-now and SKIP it, rather than a
+            // structural error. NACKing here would roll the accumulator back and
+            // drop the new RDS — and the CP does not resend a NACKed SotW
+            // resource until a reconnect or another RDS change, so the route
+            // would be lost. Skipping keeps the RDS in the accumulator so it
+            // validates cleanly once its service arrives; in Ferrum's name-only
+            // model the route adds no slice content either way (services come
+            // from CDS/EDS/LDS names or the ECDS Services carrier), so a
+            // genuinely dangling route is simply inert (Envoy-aligned: a route
+            // to an unknown cluster is ACKed, not NACKed) and never wedges
+            // slice application for unrelated updates.
+            debug!(
+                node_id = %config.node_id,
+                resource_name = %resource.name,
+                namespace = %parsed.namespace,
+                service = %parsed.service,
+                "Skipping xDS route referencing a service not yet present in CDS/EDS/LDS (resource warming)"
+            );
+            continue;
         }
     }
 
@@ -1245,11 +1350,11 @@ fn reverse_translate(
             .labels
             .filter(|l| !l.is_empty())
             .unwrap_or_else(|| config.labels.clone()),
-        version: accumulator
-            .versions_by_type
-            .get(CDS_TYPE_URL)
-            .cloned()
-            .unwrap_or_default(),
+        // Resource warming: per-type versions are independent, so derive a
+        // single observability version from the converged set rather than
+        // pinning to CDS (which a policy/workload-only ECDS update never
+        // re-stamps).
+        version: composite_required_version(accumulator),
         // GAP-1a: workloads/endpoints recovered from the Workloads carrier.
         // Empty only when the CP emitted no carrier (older Ferrum-shaped xDS
         // CP) or the slice genuinely has no workloads.
@@ -1708,6 +1813,22 @@ fn is_known_type_url(type_url: &str) -> bool {
     XDS_TYPE_URLS.contains(&type_url)
 }
 
+/// Short, operator-friendly label for an xDS type URL, used as the key in the
+/// convergence snapshot (`cds`/`eds`/`lds`/`rds`/`sds`/`ecds`/`rtds`). Falls
+/// back to the full type URL for an unrecognized type.
+fn xds_type_short_name(type_url: &str) -> &str {
+    match type_url {
+        CDS_TYPE_URL => "cds",
+        EDS_TYPE_URL => "eds",
+        LDS_TYPE_URL => "lds",
+        RDS_TYPE_URL => "rds",
+        SDS_TYPE_URL => "sds",
+        ECDS_TYPE_URL => "ecds",
+        RTDS_TYPE_URL => "rtds",
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2040,7 +2161,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_cross_type_update_rolls_back_accumulator() {
+    async fn dependency_skewed_route_is_skipped_not_nacked() {
+        // Resource warming: a route referencing a service not present in the
+        // current CDS/EDS/LDS — a transient arrival-ordering skew, or a route
+        // whose cluster has not shipped — must NOT be NACKed. NACK + rollback
+        // would drop the new RDS, and the CP does not resend a NACKed SotW
+        // resource until a reconnect or another RDS change, so the route would
+        // be lost. Instead the route is skipped, the RDS is retained in the
+        // accumulator, and an ACK is sent.
         let (tx, mut rx) = mpsc::channel(4);
         let mut state = ClientSubscriptionState::new();
         let mut accumulator = ResourceAccumulator::new();
@@ -2081,25 +2209,121 @@ mod tests {
             &mut nack_circuit_breaker,
         )
         .await
-        .expect("invalid cross-type update should NACK");
+        .expect("a dependency-skewed route must not error the stream");
 
-        assert!(result.is_none());
+        assert!(
+            result.is_some(),
+            "the slice still builds; the dependency-skewed route is skipped, not fatal"
+        );
+        // The new RDS is RETAINED (not rolled back) so it validates once its
+        // service arrives.
         assert_eq!(
             accumulator.resources(RDS_TYPE_URL)[0].name,
-            "route/default/api"
+            "route/default/missing"
         );
         assert_eq!(
             accumulator.versions_by_type.get(RDS_TYPE_URL).unwrap(),
-            "v1"
+            "v2"
         );
-        let nack = rx.recv().await.expect("NACK sent");
-        assert_eq!(nack.type_url, RDS_TYPE_URL);
-        assert_eq!(nack.version_info, "");
-        assert!(nack.error_detail.is_some());
+        // ACK, not NACK — and nothing counted toward the circuit breaker.
+        let ack = rx.recv().await.expect("ACK sent");
+        assert_eq!(ack.type_url, RDS_TYPE_URL);
+        assert_eq!(ack.version_info, "v2");
+        assert!(ack.error_detail.is_none());
+        assert_eq!(nack_circuit_breaker.consecutive_nacks(RDS_TYPE_URL), 0);
     }
 
     #[tokio::test]
-    async fn mismatched_required_versions_wait_instead_of_applying_mixed_slice() {
+    async fn route_arriving_before_its_service_converges_when_service_arrives() {
+        // The reviewer's end-to-end scenario: in a multi-type change the RDS for
+        // a new service arrives before the matching CDS. The route is skipped
+        // (no NACK) and retained; when the CDS for that service arrives, the
+        // route validates and the service is in the slice.
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut state = ClientSubscriptionState::new();
+        let mut accumulator = ResourceAccumulator::new();
+        let mut nack_circuit_breaker = NackCircuitBreaker::default();
+
+        // Converge at v1 with one service (api).
+        accumulator
+            .apply_sotw_response(
+                CDS_TYPE_URL,
+                &[any_resource(CDS_TYPE_URL, "cluster/default/api/8080")],
+                "v1",
+            )
+            .expect("CDS applies");
+        apply_all_empty(&mut accumulator);
+
+        // RDS v2 adds a route for a NEW service (web) whose CDS has not arrived.
+        let rds_first = handle_ads_response(
+            discovery_response(
+                RDS_TYPE_URL,
+                "v2",
+                "n-rds",
+                vec![
+                    any_resource(RDS_TYPE_URL, "route/default/api"),
+                    any_resource(RDS_TYPE_URL, "route/default/web"),
+                ],
+            ),
+            &test_config(),
+            &tx,
+            &mut state,
+            &mut accumulator,
+            &mut nack_circuit_breaker,
+        )
+        .await
+        .expect("RDS-before-CDS must not error");
+        assert!(rds_first.is_some(), "slice still builds; route/web skipped");
+        let ack = rx.recv().await.expect("ACK for RDS");
+        assert_eq!(ack.type_url, RDS_TYPE_URL);
+        assert!(ack.error_detail.is_none());
+
+        // Now CDS v2 introduces the web service.
+        let cds_after = handle_ads_response(
+            discovery_response(
+                CDS_TYPE_URL,
+                "v2",
+                "n-cds",
+                vec![
+                    any_resource(CDS_TYPE_URL, "cluster/default/api/8080"),
+                    any_resource(CDS_TYPE_URL, "cluster/default/web/8080"),
+                ],
+            ),
+            &test_config(),
+            &tx,
+            &mut state,
+            &mut accumulator,
+            &mut nack_circuit_breaker,
+        )
+        .await
+        .expect("CDS arrival must not error")
+        .expect("slice builds with the new service");
+
+        // route/web is retained and now references a present service.
+        let route_names: Vec<&str> = accumulator
+            .resources(RDS_TYPE_URL)
+            .iter()
+            .map(|resource| resource.name.as_str())
+            .collect();
+        assert!(route_names.contains(&"route/default/web"));
+        let services = service_port_map(&cds_after.slice);
+        assert!(
+            services.contains_key(&("default".to_string(), "web".to_string())),
+            "web service is present in the slice once its CDS arrives"
+        );
+        let ack = rx.recv().await.expect("ACK for CDS");
+        assert_eq!(ack.type_url, CDS_TYPE_URL);
+        assert!(ack.error_detail.is_none());
+        assert_eq!(nack_circuit_breaker.consecutive_nacks(RDS_TYPE_URL), 0);
+    }
+
+    #[tokio::test]
+    async fn mixed_required_versions_apply_under_resource_warming() {
+        // Resource warming (make-before-break): once every required type has
+        // delivered an initial response, the DP applies the converged set even
+        // when per-type versions differ. The legacy coherent-version gate would
+        // have stalled here (CDS on v2 while ECDS/EDS/LDS/RDS stay on v1); under
+        // warming the skew applies, which is the Envoy-compatible behavior.
         let (tx, mut rx) = mpsc::channel(4);
         let mut state = ClientSubscriptionState::new();
         let mut accumulator = ResourceAccumulator::new();
@@ -2135,12 +2359,13 @@ mod tests {
             &mut nack_circuit_breaker,
         )
         .await
-        .expect("valid but incomplete version set should ACK");
+        .expect("valid converged set with mixed versions should build a slice");
 
-        assert!(
-            pending.is_none(),
-            "CDS v2 must not build a slice while ECDS and the other required types remain on v1"
-        );
+        let pending = pending
+            .expect("CDS v2 with the other required types on v1 must build a slice under warming");
+        // The slice version reflects the newest per-type version (max), not a
+        // requirement that all types agree.
+        assert_eq!(pending.slice.version, "v2");
         let ack = rx.recv().await.expect("ACK sent");
         assert_eq!(ack.type_url, CDS_TYPE_URL);
         assert_eq!(ack.version_info, "v2");
@@ -2151,6 +2376,201 @@ mod tests {
         assert_eq!(
             accumulator.versions_by_type.get(ECDS_TYPE_URL).unwrap(),
             "v1"
+        );
+    }
+
+    #[tokio::test]
+    async fn ecds_only_update_applies_without_re_sending_other_types() {
+        // After convergence, an ECDS-only update (the common Ferrum churn case
+        // for policy/workload changes) applies on its own: the CP re-sends only
+        // ECDS at a new version and the DP rebuilds from the persisted
+        // CDS/EDS/LDS/RDS without needing them re-stamped to a matching version.
+        // This is what the CP forced-resend used to paper over for the
+        // coherent-version gate.
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut state = ClientSubscriptionState::new();
+        let mut accumulator = ResourceAccumulator::new();
+        let mut nack_circuit_breaker = NackCircuitBreaker::default();
+
+        // Converge all required types at v1 with a real service.
+        accumulator
+            .apply_sotw_response(
+                CDS_TYPE_URL,
+                &[any_resource(CDS_TYPE_URL, "cluster/default/api/8080")],
+                "v1",
+            )
+            .expect("CDS applies");
+        apply_all_empty(&mut accumulator);
+        assert!(accumulator.has_required_types());
+
+        // ECDS-only update at a newer version. Only ECDS moves to v2;
+        // CDS/EDS/LDS/RDS stay at v1 (they were not re-sent).
+        let pending = handle_ads_response(
+            discovery_response(
+                ECDS_TYPE_URL,
+                "v2",
+                "n2",
+                vec![any_resource(ECDS_TYPE_URL, "ecds-extension")],
+            ),
+            &test_config(),
+            &tx,
+            &mut state,
+            &mut accumulator,
+            &mut nack_circuit_breaker,
+        )
+        .await
+        .expect("ECDS-only update is valid")
+        .expect("ECDS-only update builds a slice without other types re-sending");
+
+        assert_eq!(pending.type_url, ECDS_TYPE_URL);
+        assert_eq!(pending.slice.version, "v2");
+        // The service from the persisted v1 CDS is still present in the rebuilt
+        // slice — the other types did not need to re-send.
+        assert_eq!(pending.slice.services.len(), 1);
+        assert_eq!(pending.slice.services[0].name, "api");
+        assert_eq!(
+            accumulator.versions_by_type.get(CDS_TYPE_URL).unwrap(),
+            "v1"
+        );
+        let ack = rx.recv().await.expect("ACK sent");
+        assert_eq!(ack.type_url, ECDS_TYPE_URL);
+        assert_eq!(ack.version_info, "v2");
+    }
+
+    #[test]
+    fn composite_required_version_uses_newest_per_type_version() {
+        let mut accumulator = ResourceAccumulator::new();
+        // No required type seen yet → empty.
+        assert_eq!(composite_required_version(&accumulator), "");
+
+        accumulator
+            .apply_sotw_response(CDS_TYPE_URL, &[], "2026-05-01T00:00:00Z:aaaa")
+            .expect("CDS applies");
+        accumulator
+            .apply_sotw_response(EDS_TYPE_URL, &[], "2026-05-01T00:00:00Z:aaaa")
+            .expect("EDS applies");
+        accumulator
+            .apply_sotw_response(LDS_TYPE_URL, &[], "2026-05-01T00:00:00Z:aaaa")
+            .expect("LDS applies");
+        accumulator
+            .apply_sotw_response(RDS_TYPE_URL, &[], "2026-05-01T00:00:00Z:aaaa")
+            .expect("RDS applies");
+        // ECDS moved to a newer snapshot version (lexicographically greater).
+        accumulator
+            .apply_sotw_response(ECDS_TYPE_URL, &[], "2026-05-02T00:00:00Z:bbbb")
+            .expect("ECDS applies");
+
+        assert_eq!(
+            composite_required_version(&accumulator),
+            "2026-05-02T00:00:00Z:bbbb"
+        );
+    }
+
+    #[test]
+    fn convergence_snapshot_reports_missing_then_converged_with_skew() {
+        let mut accumulator = ResourceAccumulator::new();
+        // Only CDS so far → not converged; ECDS/EDS/LDS/RDS still missing.
+        accumulator
+            .apply_sotw_response(CDS_TYPE_URL, &[], "v1")
+            .expect("CDS applies");
+        let snap = accumulator.convergence_snapshot();
+        assert!(!snap.converged);
+        assert!(snap.missing_required_types.contains(&"ecds".to_string()));
+        assert!(snap.missing_required_types.contains(&"eds".to_string()));
+        assert!(
+            !snap.version_skew,
+            "skew is undefined/false until all required types are present"
+        );
+        assert_eq!(
+            snap.per_type_versions.get("cds").map(String::as_str),
+            Some("v1")
+        );
+
+        // Bring the rest in at v1, ECDS at a newer v2 → converged with skew.
+        for type_url in [EDS_TYPE_URL, LDS_TYPE_URL, RDS_TYPE_URL] {
+            accumulator
+                .apply_sotw_response(type_url, &[], "v1")
+                .expect("applies");
+        }
+        accumulator
+            .apply_sotw_response(ECDS_TYPE_URL, &[], "v2")
+            .expect("applies");
+        let snap = accumulator.convergence_snapshot();
+        assert!(snap.converged);
+        assert!(snap.missing_required_types.is_empty());
+        assert!(snap.version_skew, "ecds=v2 while others=v1 is skew");
+        assert_eq!(
+            snap.per_type_versions.get("ecds").map(String::as_str),
+            Some("v2")
+        );
+    }
+
+    #[test]
+    fn convergence_snapshot_no_skew_when_all_required_versions_equal() {
+        let mut accumulator = ResourceAccumulator::new();
+        for type_url in REQUIRED_MESH_SLICE_TYPE_URLS {
+            accumulator
+                .apply_sotw_response(type_url, &[], "v9")
+                .expect("applies");
+        }
+        let snap = accumulator.convergence_snapshot();
+        assert!(snap.converged);
+        assert!(!snap.version_skew);
+        assert!(snap.missing_required_types.is_empty());
+    }
+
+    #[test]
+    fn skewed_apply_increments_partial_metric_only_when_skewed() {
+        use crate::plugins::mesh::prometheus_helpers::xds_warming_partial_apply_count;
+
+        // Unique namespace so the namespaced counter is isolated from parallel
+        // tests touching the same metric.
+        let namespace = format!("warm-apply-{}-{}", std::process::id(), line!());
+        let config = XdsClientConfig {
+            namespace: namespace.clone(),
+            ..test_config()
+        };
+        let state = MeshRuntimeState::new();
+        let consumer = XdsConfigConsumer::new(config.clone(), state);
+
+        assert_eq!(xds_warming_partial_apply_count(&namespace), 0);
+        apply_pending_xds_slice(
+            &consumer,
+            &config,
+            PendingXdsSlice {
+                slice: MeshSlice {
+                    version: "v2".to_string(),
+                    ..MeshSlice::default()
+                },
+                type_url: ECDS_TYPE_URL.to_string(),
+                all_types_ready: true,
+                version_skew: true,
+            },
+        );
+        assert_eq!(
+            xds_warming_partial_apply_count(&namespace),
+            1,
+            "a skewed (incremental) apply must increment the partial-apply counter"
+        );
+
+        // A coherent (non-skewed) apply must NOT increment the counter.
+        apply_pending_xds_slice(
+            &consumer,
+            &config,
+            PendingXdsSlice {
+                slice: MeshSlice {
+                    version: "v3".to_string(),
+                    ..MeshSlice::default()
+                },
+                type_url: CDS_TYPE_URL.to_string(),
+                all_types_ready: true,
+                version_skew: false,
+            },
+        );
+        assert_eq!(
+            xds_warming_partial_apply_count(&namespace),
+            1,
+            "a coherent apply must not increment the partial-apply counter"
         );
     }
 
@@ -2234,6 +2654,7 @@ mod tests {
             },
             type_url: CDS_TYPE_URL.to_string(),
             all_types_ready: true,
+            version_skew: false,
         });
         let carrier_name =
             carrier_resource_name_for_type_url(FERRUM_ECDS_PEER_AUTH_TYPE_URL).expect("name");
@@ -2813,6 +3234,7 @@ mod tests {
             },
             type_url: CDS_TYPE_URL.to_string(),
             all_types_ready: true,
+            version_skew: false,
         });
 
         let err = flush_pending_xds_slice_before_error(
