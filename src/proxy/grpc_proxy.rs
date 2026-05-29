@@ -1617,11 +1617,18 @@ pub(crate) async fn proxy_grpc_request_core(
             )
         }
     };
-    let response = if let Some(timeout_ms) = effective_timeout_ms {
-        let read_timeout = Duration::from_millis(timeout_ms);
-        tokio::time::timeout(read_timeout, send_fut)
+    // Apply the client deadline as a SINGLE end-to-end budget spanning BOTH the
+    // response-header wait AND the body+trailers collection below. Computing one
+    // absolute deadline (now + timeout) and sharing it via timeout_at prevents
+    // the prior behavior where each phase got a fresh full timeout, letting a
+    // slow backend consume up to ~2x the client's gRPC deadline.
+    let deadline =
+        effective_timeout_ms.map(|ms| tokio::time::Instant::now() + Duration::from_millis(ms));
+    let response = if let Some(deadline) = deadline {
+        tokio::time::timeout_at(deadline, send_fut)
             .await
             .map_err(|_| {
+                let timeout_ms = effective_timeout_ms.unwrap_or_default();
                 warn!(
                     "gRPC: read timeout ({}ms) waiting for backend response",
                     timeout_ms
@@ -1728,17 +1735,20 @@ pub(crate) async fn proxy_grpc_request_core(
         Ok(())
     };
 
-    if let Some(timeout_ms) = effective_timeout_ms {
-        tokio::time::timeout(Duration::from_millis(timeout_ms), body_collection)
+    if let Some(deadline) = deadline {
+        // Same end-to-end deadline as the header wait above — the header wait
+        // and body collection share one budget, not two.
+        tokio::time::timeout_at(deadline, body_collection)
             .await
             .map_err(|_| {
+                let timeout_ms = effective_timeout_ms.unwrap_or_default();
                 warn!(
-                    "gRPC: read timeout ({}ms) while collecting response body",
+                    "gRPC: read timeout ({}ms, end-to-end) while collecting response body",
                     timeout_ms
                 );
                 GrpcProxyError::BackendTimeout {
                     kind: GrpcTimeoutKind::Read,
-                    message: format!("Body read timeout after {}ms", timeout_ms),
+                    message: format!("Body read timeout after {}ms (end-to-end)", timeout_ms),
                 }
             })??;
     } else {
