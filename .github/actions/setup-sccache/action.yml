@@ -12,6 +12,13 @@ description: >-
   doesn't try to exec a binary that isn't installed. Build still proceeds,
   just without the cache.
 
+  The server idle timeout is disabled (`SCCACHE_IDLE_TIMEOUT=0`). The release
+  build compiles the large `ferrum-edge` crate as one long rustc invocation
+  that can exceed sccache's 600s default; with no new compile requests
+  arriving while it runs, the server would otherwise shut down mid-compile —
+  on the slower Windows runner this surfaced as "connection forcibly closed
+  (os error 10054)" and a failed `ferrum-edge` lib build.
+
 runs:
   using: composite
   steps:
@@ -22,10 +29,23 @@ runs:
     - name: Configure sccache
       shell: bash
       run: |
+        # Disable the sccache server idle timeout (default 600s). The release
+        # build compiles the large `ferrum-edge` lib crate as a single rustc
+        # invocation (fat LTO, codegen-units=1) that hovers right around 600s
+        # on the slower Windows runner. No new compile requests arrive while it
+        # runs, so the server idle-times-out and exits mid-compile; the client
+        # then dies with "connection forcibly closed (os error 10054)". 0 = run
+        # until the ephemeral runner is torn down.
+        export SCCACHE_IDLE_TIMEOUT=0
+        # Restart any server a prior step started so it adopts the timeout above
+        # (a server that's already running keeps the value it started with).
+        command -v sccache &> /dev/null && sccache --stop-server > /dev/null 2>&1 || true
         if command -v sccache &> /dev/null && sccache --start-server 2>/dev/null; then
           echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
           echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
-          echo "sccache enabled"
+          # Persist for build steps in case sccache lazily re-spawns a server.
+          echo "SCCACHE_IDLE_TIMEOUT=0" >> "$GITHUB_ENV"
+          echo "sccache enabled (idle timeout disabled)"
         else
           echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
           echo "CARGO_BUILD_RUSTC_WRAPPER=" >> "$GITHUB_ENV"
