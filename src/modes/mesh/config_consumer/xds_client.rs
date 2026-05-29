@@ -19,7 +19,7 @@ use crate::grpc::dp_client::{
 use crate::modes::mesh::config::{
     AppProtocol, MeshDestinationRule, MeshRuntimeOverlay, MeshService, ServicePort,
 };
-use crate::modes::mesh::runtime::MeshRuntimeState;
+use crate::modes::mesh::runtime::{MeshRuntimeState, XdsConvergenceSnapshot};
 use crate::modes::mesh::slice::{MeshEgressScopeSnapshot, MeshSlice};
 use crate::xds::proto::aggregated_discovery_service_client::AggregatedDiscoveryServiceClient;
 use crate::xds::proto::{self, DiscoveryRequest, Node, Status};
@@ -456,6 +456,42 @@ impl ResourceAccumulator {
         }
         reverse_translate(self, config).map(Some)
     }
+
+    /// True once all required types are present AND their per-type versions are
+    /// not all identical — the steady state under resource warming after an
+    /// incremental (e.g. policy/workload-only ECDS) update. False while still
+    /// converging or when the converged set shares one version.
+    fn required_versions_skewed(&self) -> bool {
+        let versions: Vec<&String> = REQUIRED_MESH_SLICE_TYPE_URLS
+            .iter()
+            .filter_map(|type_url| self.versions_by_type.get(*type_url))
+            .collect();
+        versions.len() == REQUIRED_MESH_SLICE_TYPE_URLS.len()
+            && versions.windows(2).any(|pair| pair[0] != pair[1])
+    }
+
+    /// Build the convergence snapshot surfaced (JWT-authenticated) on
+    /// `/mesh/config-drift`. Derived from the accumulator alone so a NACK that
+    /// rolls back `versions_by_type` is correctly reflected as "type still
+    /// missing" rather than prematurely converged.
+    fn convergence_snapshot(&self) -> XdsConvergenceSnapshot {
+        let per_type_versions = self
+            .versions_by_type
+            .iter()
+            .map(|(type_url, version)| (xds_type_short_name(type_url).to_string(), version.clone()))
+            .collect();
+        let missing_required_types = REQUIRED_MESH_SLICE_TYPE_URLS
+            .iter()
+            .filter(|type_url| !self.versions_by_type.contains_key(**type_url))
+            .map(|type_url| xds_type_short_name(type_url).to_string())
+            .collect::<Vec<_>>();
+        XdsConvergenceSnapshot {
+            per_type_versions,
+            converged: missing_required_types.is_empty(),
+            missing_required_types,
+            version_skew: self.required_versions_skewed(),
+        }
+    }
 }
 
 /// Compose the slice version from the per-type versions of the required
@@ -797,6 +833,14 @@ async fn run_ads_stream_with_auth(
                         );
                     }
                 }
+                // Publish live warming-convergence state (per-type versions and
+                // still-missing required types) for the JWT-authenticated
+                // `/mesh/config-drift` endpoint. Reflects the accumulator after
+                // this response, including a NACK rollback. The `Err` arms above
+                // return before reaching here (the stream is being torn down).
+                consumer
+                    .state()
+                    .set_xds_convergence(stream_state.accumulator.convergence_snapshot());
             }
             _ = &mut debounce, if debounce_active => {
                 if let Some(pending) = pending_slice.take() {
@@ -859,6 +903,10 @@ struct PendingXdsSlice {
     slice: MeshSlice,
     type_url: String,
     all_types_ready: bool,
+    /// True when this slice was built from a partial per-type update (required
+    /// versions not all identical). Drives the `ferrum_xds_warming_partial_
+    /// applies_total` counter at apply time.
+    version_skew: bool,
 }
 
 async fn handle_ads_response(
@@ -923,6 +971,7 @@ async fn handle_ads_response(
                 slice,
                 type_url,
                 all_types_ready: subscriptions.required_types_have_initial_response(),
+                version_skew: accumulator.required_versions_skewed(),
             }))
         }
         Ok(None) => {
@@ -1009,6 +1058,12 @@ fn apply_pending_xds_slice(
     pending: PendingXdsSlice,
 ) {
     let version = pending.slice.version.clone();
+    let version_skew = pending.version_skew;
+    if version_skew {
+        crate::plugins::mesh::prometheus_helpers::increment_xds_warming_partial_apply(
+            &config.namespace,
+        );
+    }
     consumer.apply_slice(pending.slice);
     info!(
         node_id = %config.node_id,
@@ -1016,6 +1071,7 @@ fn apply_pending_xds_slice(
         version = %version,
         type_url = %pending.type_url,
         all_types_ready = pending.all_types_ready,
+        version_skew = version_skew,
         "Applied debounced xDS ADS update"
     );
 }
@@ -1736,6 +1792,22 @@ fn is_known_type_url(type_url: &str) -> bool {
     XDS_TYPE_URLS.contains(&type_url)
 }
 
+/// Short, operator-friendly label for an xDS type URL, used as the key in the
+/// convergence snapshot (`cds`/`eds`/`lds`/`rds`/`sds`/`ecds`/`rtds`). Falls
+/// back to the full type URL for an unrecognized type.
+fn xds_type_short_name(type_url: &str) -> &str {
+    match type_url {
+        CDS_TYPE_URL => "cds",
+        EDS_TYPE_URL => "eds",
+        LDS_TYPE_URL => "lds",
+        RDS_TYPE_URL => "rds",
+        SDS_TYPE_URL => "sds",
+        ECDS_TYPE_URL => "ecds",
+        RTDS_TYPE_URL => "rtds",
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2275,6 +2347,114 @@ mod tests {
         );
     }
 
+    #[test]
+    fn convergence_snapshot_reports_missing_then_converged_with_skew() {
+        let mut accumulator = ResourceAccumulator::new();
+        // Only CDS so far → not converged; ECDS/EDS/LDS/RDS still missing.
+        accumulator
+            .apply_sotw_response(CDS_TYPE_URL, &[], "v1")
+            .expect("CDS applies");
+        let snap = accumulator.convergence_snapshot();
+        assert!(!snap.converged);
+        assert!(snap.missing_required_types.contains(&"ecds".to_string()));
+        assert!(snap.missing_required_types.contains(&"eds".to_string()));
+        assert!(
+            !snap.version_skew,
+            "skew is undefined/false until all required types are present"
+        );
+        assert_eq!(
+            snap.per_type_versions.get("cds").map(String::as_str),
+            Some("v1")
+        );
+
+        // Bring the rest in at v1, ECDS at a newer v2 → converged with skew.
+        for type_url in [EDS_TYPE_URL, LDS_TYPE_URL, RDS_TYPE_URL] {
+            accumulator
+                .apply_sotw_response(type_url, &[], "v1")
+                .expect("applies");
+        }
+        accumulator
+            .apply_sotw_response(ECDS_TYPE_URL, &[], "v2")
+            .expect("applies");
+        let snap = accumulator.convergence_snapshot();
+        assert!(snap.converged);
+        assert!(snap.missing_required_types.is_empty());
+        assert!(snap.version_skew, "ecds=v2 while others=v1 is skew");
+        assert_eq!(
+            snap.per_type_versions.get("ecds").map(String::as_str),
+            Some("v2")
+        );
+    }
+
+    #[test]
+    fn convergence_snapshot_no_skew_when_all_required_versions_equal() {
+        let mut accumulator = ResourceAccumulator::new();
+        for type_url in REQUIRED_MESH_SLICE_TYPE_URLS {
+            accumulator
+                .apply_sotw_response(type_url, &[], "v9")
+                .expect("applies");
+        }
+        let snap = accumulator.convergence_snapshot();
+        assert!(snap.converged);
+        assert!(!snap.version_skew);
+        assert!(snap.missing_required_types.is_empty());
+    }
+
+    #[test]
+    fn skewed_apply_increments_partial_metric_only_when_skewed() {
+        use crate::plugins::mesh::prometheus_helpers::xds_warming_partial_apply_count;
+
+        // Unique namespace so the namespaced counter is isolated from parallel
+        // tests touching the same metric.
+        let namespace = format!("warm-apply-{}-{}", std::process::id(), line!());
+        let config = XdsClientConfig {
+            namespace: namespace.clone(),
+            ..test_config()
+        };
+        let state = MeshRuntimeState::new();
+        let consumer = XdsConfigConsumer::new(config.clone(), state);
+
+        assert_eq!(xds_warming_partial_apply_count(&namespace), 0);
+        apply_pending_xds_slice(
+            &consumer,
+            &config,
+            PendingXdsSlice {
+                slice: MeshSlice {
+                    version: "v2".to_string(),
+                    ..MeshSlice::default()
+                },
+                type_url: ECDS_TYPE_URL.to_string(),
+                all_types_ready: true,
+                version_skew: true,
+            },
+        );
+        assert_eq!(
+            xds_warming_partial_apply_count(&namespace),
+            1,
+            "a skewed (incremental) apply must increment the partial-apply counter"
+        );
+
+        // A coherent (non-skewed) apply must NOT increment the counter.
+        apply_pending_xds_slice(
+            &consumer,
+            &config,
+            PendingXdsSlice {
+                slice: MeshSlice {
+                    version: "v3".to_string(),
+                    ..MeshSlice::default()
+                },
+                type_url: CDS_TYPE_URL.to_string(),
+                all_types_ready: true,
+                version_skew: false,
+            },
+        );
+        assert_eq!(
+            xds_warming_partial_apply_count(&namespace),
+            1,
+            "a coherent apply must not increment the partial-apply counter"
+        );
+    }
+
     #[tokio::test]
     async fn malformed_reserved_slice_carrier_is_nacked_and_rolled_back() {
         use crate::xds::carrier::{
@@ -2355,6 +2535,7 @@ mod tests {
             },
             type_url: CDS_TYPE_URL.to_string(),
             all_types_ready: true,
+            version_skew: false,
         });
         let carrier_name =
             carrier_resource_name_for_type_url(FERRUM_ECDS_PEER_AUTH_TYPE_URL).expect("name");
@@ -2934,6 +3115,7 @@ mod tests {
             },
             type_url: CDS_TYPE_URL.to_string(),
             all_types_ready: true,
+            version_skew: false,
         });
 
         let err = flush_pending_xds_slice_before_error(

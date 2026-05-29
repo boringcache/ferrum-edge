@@ -165,6 +165,32 @@ impl PolicyScopeCache {
     }
 }
 
+/// Snapshot of the DP's xDS resource-warming convergence state.
+///
+/// Published by the xDS client on every ADS response and surfaced
+/// (JWT-authenticated) under `convergence` on `GET /mesh/config-drift`. It
+/// carries the per-type `version_info` strings and which required types are
+/// still missing — detail intentionally kept off the unauthenticated
+/// `/metrics` surface because version strings embed config-change timestamps
+/// plus content digests. `None` on [`MeshRuntimeState`] in native mode (there
+/// are no per-type xDS versions to report) and before the first ADS response.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct XdsConvergenceSnapshot {
+    /// Received `version_info` per subscribed resource type, keyed by short
+    /// name (`cds`/`eds`/`lds`/`rds`/`sds`/`ecds`/`rtds`).
+    pub per_type_versions: std::collections::BTreeMap<String, String>,
+    /// Required mesh-slice types (short names) that have not yet delivered an
+    /// initial response. Empty once the first slice can build.
+    pub missing_required_types: Vec<String>,
+    /// True once every required type has delivered a response (the first slice
+    /// can build).
+    pub converged: bool,
+    /// True when the converged required-type versions are not all identical —
+    /// normal under resource warming after an incremental (e.g. policy/workload-
+    /// only ECDS) update.
+    pub version_skew: bool,
+}
+
 /// Lock-free holder for the current Layer 2 mesh slice.
 #[derive(Clone)]
 pub struct MeshRuntimeState {
@@ -187,6 +213,9 @@ pub struct MeshRuntimeState {
     egress_scope: Arc<MeshEgressScopeState>,
     federation_store: FederationStore,
     remote_endpoint_store: RemoteEndpointStore,
+    /// Latest xDS resource-warming convergence snapshot, published by the xDS
+    /// client. `None` in native mode and before the first ADS response.
+    xds_convergence: Arc<ArcSwap<Option<Arc<XdsConvergenceSnapshot>>>>,
 }
 
 impl MeshRuntimeState {
@@ -203,7 +232,22 @@ impl MeshRuntimeState {
             egress_scope: Arc::new(MeshEgressScopeState::new()),
             federation_store: FederationStore::new(),
             remote_endpoint_store: RemoteEndpointStore::new(),
+            xds_convergence: Arc::new(ArcSwap::new(Arc::new(None))),
         }
+    }
+
+    /// Publish the latest xDS resource-warming convergence snapshot. Called by
+    /// the xDS client on every ADS response (xDS mode only); read
+    /// JWT-authenticated by the `/mesh/config-drift` admin handler.
+    pub fn set_xds_convergence(&self, snapshot: XdsConvergenceSnapshot) {
+        self.xds_convergence
+            .store(Arc::new(Some(Arc::new(snapshot))));
+    }
+
+    /// Latest xDS convergence snapshot, or `None` in native mode / before the
+    /// first ADS response.
+    pub fn xds_convergence(&self) -> Option<Arc<XdsConvergenceSnapshot>> {
+        self.xds_convergence.load_full().as_ref().clone()
     }
 
     /// Return the latest mesh slice snapshot.
@@ -321,6 +365,31 @@ mod tests {
 
     fn install_slice_for_test(state: &MeshRuntimeState, slice: MeshSlice) {
         state.install_slice(slice);
+    }
+
+    #[test]
+    fn xds_convergence_round_trips_and_defaults_none() {
+        let state = MeshRuntimeState::new();
+        // Native mode / pre-first-response: no snapshot published.
+        assert!(state.xds_convergence().is_none());
+
+        state.set_xds_convergence(XdsConvergenceSnapshot {
+            per_type_versions: std::collections::BTreeMap::from([(
+                "ecds".to_string(),
+                "v2".to_string(),
+            )]),
+            missing_required_types: vec!["eds".to_string()],
+            converged: false,
+            version_skew: false,
+        });
+
+        let snapshot = state.xds_convergence().expect("snapshot published");
+        assert!(!snapshot.converged);
+        assert_eq!(snapshot.missing_required_types, vec!["eds".to_string()]);
+        assert_eq!(
+            snapshot.per_type_versions.get("ecds").map(String::as_str),
+            Some("v2")
+        );
     }
 
     #[tokio::test]
