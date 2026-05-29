@@ -1454,17 +1454,23 @@ fn spawn_session_cleanup(
             tokio::select! {
                 _ = interval.tick() => {
                     let now = coarse_epoch_millis();
-                    let mut expired = Vec::new();
+                    let mut expired: Vec<(SocketAddr, Arc<UdpSession>)> = Vec::new();
 
                     for entry in sessions.iter() {
                         let last = entry.value().last_activity.load(Ordering::Relaxed);
                         if now.saturating_sub(last) > entry.value().idle_timeout_ms {
-                            expired.push(*entry.key());
+                            // Capture the Arc so removal below is identity-aware:
+                            // a session re-created at the same client address
+                            // between this scan and the remove must NOT be
+                            // evicted by us (it is a newer, still-live session).
+                            expired.push((*entry.key(), entry.value().clone()));
                         }
                     }
 
-                    for addr in &expired {
-                        if let Some((_, session)) = sessions.remove(addr) {
+                    for (addr, expired_session) in &expired {
+                        if let Some((_, session)) =
+                            sessions.remove_if(addr, |_, v| Arc::ptr_eq(v, expired_session))
+                        {
                             // Mark the session expired BEFORE we let go of
                             // any reference. The recv-loop fast path may
                             // hold a `last_client` Arc to this session
@@ -3139,7 +3145,10 @@ async fn create_session(
                                 if let Some(ref dtls) = reply_dtls {
                                     dtls.close().await;
                                 }
-                                if reply_sessions.remove(&client_addr).is_some() {
+                                if reply_sessions
+                                    .remove_if(&client_addr, |_, v| Arc::ptr_eq(v, &reply_session))
+                                    .is_some()
+                                {
                                     reply_metrics
                                         .active_sessions
                                         .fetch_sub(1, Ordering::Relaxed);
@@ -3266,9 +3275,14 @@ async fn create_session(
         if let Some(ref dtls) = reply_dtls {
             dtls.close().await;
         }
-        // Only decrement active_sessions if we actually removed the session
-        // (the cleanup task may have already removed and decremented it).
-        if reply_sessions.remove(&client_addr).is_some() {
+        // Only decrement active_sessions if we actually removed THIS session
+        // (the cleanup task may have already removed and decremented it, or a
+        // newer session may have been re-created at the same client address —
+        // identity-aware removal must not evict that newer generation).
+        if reply_sessions
+            .remove_if(&client_addr, |_, v| Arc::ptr_eq(v, &reply_session))
+            .is_some()
+        {
             reply_metrics
                 .active_sessions
                 .fetch_sub(1, Ordering::Relaxed);
