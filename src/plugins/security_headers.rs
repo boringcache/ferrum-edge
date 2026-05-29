@@ -39,28 +39,15 @@ impl SecurityHeaders {
         // `false`/`null` or customized with an explicit value.
         let mut set: Vec<(String, String)> = Vec::new();
 
-        if let Some(value) = header_value(
-            object,
-            "content_type_options",
-            "x-content-type-options",
-            "nosniff",
-            true,
-        )? {
+        if let Some(value) = header_value(object, "content_type_options", "nosniff", true)? {
             set.push(("x-content-type-options".to_string(), value));
         }
-        if let Some(value) = header_value(
-            object,
-            "frame_options",
-            "x-frame-options",
-            "SAMEORIGIN",
-            true,
-        )? {
+        if let Some(value) = header_value(object, "frame_options", "SAMEORIGIN", true)? {
             set.push(("x-frame-options".to_string(), value));
         }
         if let Some(value) = header_value(
             object,
             "referrer_policy",
-            "referrer-policy",
             "strict-origin-when-cross-origin",
             true,
         )? {
@@ -167,7 +154,6 @@ fn remove_header_ci(headers: &mut HashMap<String, String>, name: &str) {
 fn header_value(
     object: &serde_json::Map<String, Value>,
     key: &str,
-    _header_name: &str,
     default_value: &str,
     default_on: bool,
 ) -> Result<Option<String>, String> {

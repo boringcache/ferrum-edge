@@ -97,7 +97,10 @@ async fn active_token_sets_authenticated_identity_when_no_consumer_match() {
     let endpoint = format!("{}/introspect", server.uri());
     let plugin = Oauth2Introspection::new(&config(&endpoint), PluginHttpClient::default()).unwrap();
     assert_eq!(plugin.priority(), priority::OAUTH2_INTROSPECTION);
-    let mut ctx = make_ctx("opaque-token");
+    // Unique token per test: the introspection cache is process-global and keyed
+    // by endpoint, and wiremock reuses freed ports across tests, so a shared
+    // token string could yield a cross-test cache hit.
+    let mut ctx = make_ctx("active-opaque-token");
     let result = plugin
         .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
         .await;
@@ -117,7 +120,7 @@ async fn inactive_token_rejects_with_401() {
 
     let endpoint = format!("{}/introspect", server.uri());
     let plugin = Oauth2Introspection::new(&config(&endpoint), PluginHttpClient::default()).unwrap();
-    let mut ctx = make_ctx("opaque-token");
+    let mut ctx = make_ctx("inactive-opaque-token");
     let result = plugin
         .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
         .await;
@@ -210,7 +213,7 @@ async fn claims_to_headers_and_forward_original_false_strip_authorization() {
         PluginHttpClient::default(),
     )
     .unwrap();
-    let mut ctx = make_ctx("opaque-token");
+    let mut ctx = make_ctx("claims-opaque-token");
     let result = plugin
         .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
         .await;
@@ -218,7 +221,7 @@ async fn claims_to_headers_and_forward_original_false_strip_authorization() {
 
     let mut headers = HashMap::from([(
         "authorization".to_string(),
-        "Bearer opaque-token".to_string(),
+        "Bearer claims-opaque-token".to_string(),
     )]);
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
@@ -275,4 +278,45 @@ async fn multi_provider_falls_through_to_provider_that_accepts_token() {
     assert_continue(result);
     assert_eq!(ctx.authenticated_identity.as_deref(), Some("user-from-b"));
     assert_eq!(ctx.auth_method, Some("oauth2_introspection"));
+}
+
+#[tokio::test]
+async fn query_param_token_marks_shared_strip_prefix_for_proxy() {
+    // forward_original_token=false on a query-param token must mark the param for
+    // stripping with the shared `auth.strip_query_param.` prefix the proxy honors.
+    // oauth2 previously used a private prefix the proxy ignored, leaking the token
+    // to the backend.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/introspect"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"active": true, "username": "u"})),
+        )
+        .mount(&server)
+        .await;
+    let plugin = Oauth2Introspection::new(
+        &json!({
+            "providers": [{
+                "introspection_endpoint": format!("{}/introspect", server.uri()),
+                "client_auth": {"method": "none"},
+                "from_params": ["access_token"],
+                "forward_original_token": false
+            }]
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/test".into());
+    ctx.query_params
+        .insert("access_token".to_string(), "qp-opaque-token".to_string());
+    assert_continue(
+        plugin
+            .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+            .await,
+    );
+    assert!(
+        ctx.metadata
+            .contains_key("auth.strip_query_param.access_token")
+    );
+    assert!(!ctx.query_params.contains_key("access_token"));
 }

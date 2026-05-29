@@ -137,6 +137,8 @@ fn create_stream_ctx_with_cert(
         sni_hostname: None,
         mesh_direction: None,
         node_waypoint_policy_scope: None,
+        first_bytes: None,
+        first_bytes_kind: None,
     }
 }
 
@@ -972,6 +974,8 @@ fn create_udp_stream_ctx_with_cert(
         sni_hostname: None,
         mesh_direction: None,
         node_waypoint_policy_scope: None,
+        first_bytes: None,
+        first_bytes_kind: None,
     }
 }
 
@@ -992,6 +996,8 @@ fn create_udp_stream_ctx_no_cert(consumers: Vec<Consumer>) -> StreamConnectionCo
         sni_hostname: None,
         mesh_direction: None,
         node_waypoint_policy_scope: None,
+        first_bytes: None,
+        first_bytes_kind: None,
     }
 }
 
@@ -1055,6 +1061,8 @@ async fn test_mtls_auth_dtls_with_allowed_issuer() {
         sni_hostname: None,
         mesh_direction: None,
         node_waypoint_policy_scope: None,
+        first_bytes: None,
+        first_bytes_kind: None,
     };
 
     let result = plugin.on_stream_connect(&mut ctx).await;
@@ -1088,6 +1096,8 @@ async fn test_mtls_auth_dtls_allowed_issuer_rejects_mismatch() {
         sni_hostname: None,
         mesh_direction: None,
         node_waypoint_policy_scope: None,
+        first_bytes: None,
+        first_bytes_kind: None,
     };
 
     let result = plugin.on_stream_connect(&mut ctx).await;

@@ -37,6 +37,8 @@ fn make_ctx(proxy_id: &str, ip: &str, consumer: Option<&str>) -> StreamConnectio
         sni_hostname: None,
         mesh_direction: None,
         node_waypoint_policy_scope: None,
+        first_bytes: None,
+        first_bytes_kind: None,
     }
 }
 
