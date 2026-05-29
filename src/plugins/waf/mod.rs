@@ -347,6 +347,14 @@ impl Waf {
 
         let should_block = self.record_hits(ctx, &outcome, true);
         if should_block {
+            // An over-budget cheap/body scan still ran to completion and
+            // produced real matches, so a confirmed enforcing hit (or score
+            // block) must reject regardless of `timed_out`. The block path
+            // bypasses `finish_timeout`, so record the timeout flag here for
+            // observability and to keep `on_scan_timeout` metadata intact.
+            if outcome.timed_out && self.config.log_to_metadata {
+                ctx.set_waf_metadata("waf.scan_timed_out", "true");
+            }
             return self.reject();
         }
         if outcome.timed_out {
