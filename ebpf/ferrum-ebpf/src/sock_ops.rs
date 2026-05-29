@@ -246,6 +246,30 @@ fn socket_netns_cookie(ctx: &SockOpsContext) -> u64 {
     unsafe { aya_ebpf::helpers::bpf_get_netns_cookie(ctx.as_ptr()) }
 }
 
+// `bpf_sock_ops` field byte offsets (uapi/linux/bpf.h). Each must be read as an
+// independent 4-byte ctx access; the verifier rejects a wider load. aya's
+// scalar accessors normally emit standalone loads, but reading several adjacent
+// fields together (the bridge tuple needs remote_ip4@24, local_ip4@28,
+// remote_port@64, local_port@68) lets LLVM coalesce neighbors into an 8-byte
+// load the verifier refuses ("invalid bpf_context access off=24 size=8").
+const SK_OPS_REMOTE_IP4_OFF: usize = 24;
+const SK_OPS_LOCAL_IP4_OFF: usize = 28;
+const SK_OPS_REMOTE_PORT_OFF: usize = 64;
+const SK_OPS_LOCAL_PORT_OFF: usize = 68;
+
+/// Read one `u32` `bpf_sock_ops` ctx field with a **volatile** load.
+///
+/// Volatile loads cannot be widened or coalesced by LLVM, so each field stays a
+/// standalone `*(u32*)(ctx + off)` access the verifier rewrites per field. The
+/// offset is a compile-time constant, so it folds into the load instruction
+/// (not a modified-ctx-ptr dereference).
+#[inline(always)]
+fn read_ctx_u32(ctx: &SockOpsContext, byte_off: usize) -> u32 {
+    // Safety: `byte_off` is a valid `bpf_sock_ops` field offset (4-byte aligned,
+    // within bounds); the verifier validates the ctx access at load time.
+    unsafe { core::ptr::read_volatile((ctx.as_ptr() as *const u8).add(byte_off) as *const u32) }
+}
+
 /// GAP-2M (active side). The connecting (client) socket has reached
 /// ESTABLISHED, so its ephemeral local port is now assigned. Look up the
 /// connect-side original-destination record (stamped by `connect4`/`connect6`
@@ -265,10 +289,10 @@ fn bridge_active_established(ctx: &SockOpsContext) {
     if let Some(orig) = unsafe { FERRUM_ORIG_DST4.get(&OrigDstKey { cookie }) }.copied() {
         let tuple = ConnTuple4::new(
             socket_netns_cookie(ctx),
-            ctx.local_ip4(),
-            ctx.local_port() as u16,
-            ctx.remote_ip4(),
-            sock_ops_peer_port_host_order(ctx.remote_port()),
+            read_ctx_u32(ctx, SK_OPS_LOCAL_IP4_OFF),
+            read_ctx_u32(ctx, SK_OPS_LOCAL_PORT_OFF) as u16,
+            read_ctx_u32(ctx, SK_OPS_REMOTE_IP4_OFF),
+            sock_ops_peer_port_host_order(read_ctx_u32(ctx, SK_OPS_REMOTE_PORT_OFF)),
         );
         let _ = FERRUM_ORIG_DST_BY_TUPLE4.insert(&tuple, &orig, 0);
     }
@@ -291,10 +315,10 @@ fn bridge_passive_established(ctx: &SockOpsContext) {
     // the same as the active side for a same-netns connection.
     let tuple = ConnTuple4::new(
         socket_netns_cookie(ctx),
-        ctx.remote_ip4(),
-        sock_ops_peer_port_host_order(ctx.remote_port()),
-        ctx.local_ip4(),
-        ctx.local_port() as u16,
+        read_ctx_u32(ctx, SK_OPS_REMOTE_IP4_OFF),
+        sock_ops_peer_port_host_order(read_ctx_u32(ctx, SK_OPS_REMOTE_PORT_OFF)),
+        read_ctx_u32(ctx, SK_OPS_LOCAL_IP4_OFF),
+        read_ctx_u32(ctx, SK_OPS_LOCAL_PORT_OFF) as u16,
     );
     if let Some(orig) = unsafe { FERRUM_ORIG_DST_BY_TUPLE4.get(&tuple) }.copied() {
         let _ = FERRUM_ORIG_DST4.insert(&OrigDstKey { cookie }, &orig, 0);
