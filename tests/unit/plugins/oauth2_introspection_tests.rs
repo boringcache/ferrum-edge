@@ -228,3 +228,51 @@ async fn claims_to_headers_and_forward_original_false_strip_authorization() {
         Some("user@example.com")
     );
 }
+
+#[tokio::test]
+async fn multi_provider_falls_through_to_provider_that_accepts_token() {
+    // Two providers share the default Authorization-bearer token location (the
+    // common multi-IdP setup). The first provider does not recognize the token
+    // (active:false); the second does. Routing must try the second provider
+    // instead of rejecting on the first provider's verdict.
+    let provider_a = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/introspect"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"active": false})))
+        .mount(&provider_a)
+        .await;
+    let provider_b = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/introspect"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "active": true,
+            "username": "user-from-b"
+        })))
+        .mount(&provider_b)
+        .await;
+
+    let plugin = Oauth2Introspection::new(
+        &json!({
+            "providers": [
+                {
+                    "introspection_endpoint": format!("{}/introspect", provider_a.uri()),
+                    "client_auth": {"method": "none"}
+                },
+                {
+                    "introspection_endpoint": format!("{}/introspect", provider_b.uri()),
+                    "client_auth": {"method": "none"}
+                }
+            ]
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = make_ctx("token-owned-by-provider-b");
+    let result = plugin
+        .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+        .await;
+    assert_continue(result);
+    assert_eq!(ctx.authenticated_identity.as_deref(), Some("user-from-b"));
+    assert_eq!(ctx.auth_method, Some("oauth2_introspection"));
+}
