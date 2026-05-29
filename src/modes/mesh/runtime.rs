@@ -180,14 +180,15 @@ pub struct XdsConvergenceSnapshot {
     /// name (`cds`/`eds`/`lds`/`rds`/`sds`/`ecds`/`rtds`).
     pub per_type_versions: std::collections::BTreeMap<String, String>,
     /// Required mesh-slice types (short names) that have not yet delivered an
-    /// initial response. Empty once the first slice can build.
+    /// initial response. Empty once all required types are present; `converged`
+    /// still remains false if those types carry different versions.
     pub missing_required_types: Vec<String>,
-    /// True once every required type has delivered a response (the first slice
-    /// can build).
+    /// True once every required type has delivered the same version (the first
+    /// slice can build).
     pub converged: bool,
-    /// True when the converged required-type versions are not all identical —
-    /// normal under resource warming after an incremental (e.g. policy/workload-
-    /// only ECDS) update.
+    /// True when all required types are present but their versions are not
+    /// identical. This indicates the DP is waiting for coherent required-type
+    /// refresh before applying.
     pub version_skew: bool,
 }
 
