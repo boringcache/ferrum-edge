@@ -20,15 +20,21 @@
 //! ## GAP-2M accept-side cookie bridge
 //!
 //! The `ACTIVE_ESTABLISHED` and `PASSIVE_ESTABLISHED` callbacks also drive the
-//! node-waypoint cookie bridge. `connect4`/`connect6` stamp the original
-//! destination into `FERRUM_ORIG_DST4/6` keyed by the *connecting* socket's
-//! cookie, but the proxy resolves by the *accepted* socket's cookie. At
-//! active-established (local port now assigned) the connect-side record is
-//! re-keyed by the connection 4-tuple into `FERRUM_ORIG_DST_BY_TUPLE4/6`; at
+//! node-waypoint cookie bridge (IPv4 only — see below). `connect4` stamps the
+//! original destination into `FERRUM_ORIG_DST4` keyed by the *connecting*
+//! socket's cookie, but the proxy resolves by the *accepted* socket's cookie.
+//! At active-established (local port now assigned) the connect-side record is
+//! re-keyed by the connection 4-tuple into `FERRUM_ORIG_DST_BY_TUPLE4`; at
 //! passive-established the mirror tuple is looked up and the record re-stamped
 //! under the accept-side cookie. See [`bridge_active_established`] /
 //! [`bridge_passive_established`]. A byte-order or tuple mismatch only leaves
 //! resolution fail-closed (unchanged from pre-GAP-2M), never misattributed.
+//!
+//! IPv6 is intentionally not bridged: aya's SockOpsContext `local_ip6`/
+//! `remote_ip6` accessors copy the whole `[u32; 4]` out of the ctx, which the
+//! BPF verifier rejects as a modified-ctx-ptr dereference. IPv6 node-waypoint
+//! cookie resolution therefore stays fail-closed (its pre-GAP-2M behavior)
+//! until a verifier-safe per-element v6 read is wired.
 //!
 //! ## RST attribution caveat
 //!
@@ -43,20 +49,24 @@ use aya_ebpf::macros::sock_ops;
 use aya_ebpf::programs::SockOpsContext;
 use aya_ebpf::EbpfContext;
 use ferrum_ebpf_common::{
-    ConnTuple4, ConnTuple6, OrigDstKey, SockOpsRecord, SOCK_OPS_DIRECTION_RECEIVED,
-    SOCK_OPS_DIRECTION_SENT, SOCK_OPS_EVENT_ACCEPT_ESTABLISHED, SOCK_OPS_EVENT_CONNECT,
-    SOCK_OPS_EVENT_FIN, SOCK_OPS_EVENT_RST, SOCK_OPS_EVENT_RTT_SAMPLE,
-    SOCK_OPS_EVENT_SYN_TO_ACK_LATENCY, SOCK_OPS_STATS_EVENTS_DROPPED,
+    ConnTuple4, OrigDstKey, SockOpsRecord, SOCK_OPS_DIRECTION_RECEIVED, SOCK_OPS_DIRECTION_SENT,
+    SOCK_OPS_EVENT_ACCEPT_ESTABLISHED, SOCK_OPS_EVENT_CONNECT, SOCK_OPS_EVENT_FIN,
+    SOCK_OPS_EVENT_RST, SOCK_OPS_EVENT_RTT_SAMPLE, SOCK_OPS_EVENT_SYN_TO_ACK_LATENCY,
+    SOCK_OPS_STATS_EVENTS_DROPPED,
 };
 
 use crate::maps::{
-    FERRUM_ORIG_DST4, FERRUM_ORIG_DST6, FERRUM_ORIG_DST_BY_TUPLE4, FERRUM_ORIG_DST_BY_TUPLE6,
-    FERRUM_SOCK_OPS_CONNECT_TS, FERRUM_SOCK_OPS_EVENTS, FERRUM_SOCK_OPS_STATS,
+    FERRUM_ORIG_DST4, FERRUM_ORIG_DST_BY_TUPLE4, FERRUM_SOCK_OPS_CONNECT_TS,
+    FERRUM_SOCK_OPS_EVENTS, FERRUM_SOCK_OPS_STATS,
 };
 
-// Address families from <bits/socket.h>; `bpf_sock_ops.family` carries these.
+// Address family from <bits/socket.h>; `bpf_sock_ops.family` carries it. The
+// GAP-2M cookie bridge handles IPv4 only: aya's SockOpsContext IPv6 accessors
+// (local_ip6/remote_ip6) emit a whole-`[u32; 4]` ctx copy the BPF verifier
+// rejects ("dereference of modified ctx ptr"), so IPv6 node-waypoint cookie
+// resolution stays fail-closed (unchanged from pre-GAP-2M) pending a
+// verifier-safe per-element v6 read.
 const AF_INET: u32 = 2;
-const AF_INET6: u32 = 10;
 
 // Operation discriminants — values from `include/uapi/linux/bpf.h`
 // (`bpf_sock_ops_op`). aya-ebpf does not re-export these, so we mirror them
@@ -242,33 +252,20 @@ fn peer_port_host_order(remote_port: u32) -> u16 {
 /// node-waypoint resolution fail-closed, exactly as before GAP-2M.
 #[inline(always)]
 fn bridge_active_established(ctx: &SockOpsContext) {
+    if ctx.family() != AF_INET {
+        return;
+    }
     let cookie = socket_cookie(ctx);
-    match ctx.family() {
-        AF_INET => {
-            // Active side: local socket addr/port is the client, the rewritten
-            // remote addr/port is the loopback capture endpoint (the server).
-            if let Some(orig) = unsafe { FERRUM_ORIG_DST4.get(&OrigDstKey { cookie }) }.copied() {
-                let tuple = ConnTuple4::new(
-                    ctx.local_ip4(),
-                    ctx.local_port() as u16,
-                    ctx.remote_ip4(),
-                    peer_port_host_order(ctx.remote_port()),
-                );
-                let _ = FERRUM_ORIG_DST_BY_TUPLE4.insert(&tuple, &orig, 0);
-            }
-        }
-        AF_INET6 => {
-            if let Some(orig) = unsafe { FERRUM_ORIG_DST6.get(&OrigDstKey { cookie }) }.copied() {
-                let tuple = ConnTuple6::new(
-                    ctx.local_ip6(),
-                    ctx.local_port() as u16,
-                    ctx.remote_ip6(),
-                    peer_port_host_order(ctx.remote_port()),
-                );
-                let _ = FERRUM_ORIG_DST_BY_TUPLE6.insert(&tuple, &orig, 0);
-            }
-        }
-        _ => {}
+    // Active side: the local socket addr/port is the client, the rewritten
+    // remote addr/port is the loopback capture endpoint (the server).
+    if let Some(orig) = unsafe { FERRUM_ORIG_DST4.get(&OrigDstKey { cookie }) }.copied() {
+        let tuple = ConnTuple4::new(
+            ctx.local_ip4(),
+            ctx.local_port() as u16,
+            ctx.remote_ip4(),
+            peer_port_host_order(ctx.remote_port()),
+        );
+        let _ = FERRUM_ORIG_DST_BY_TUPLE4.insert(&tuple, &orig, 0);
     }
 }
 
@@ -280,35 +277,21 @@ fn bridge_active_established(ctx: &SockOpsContext) {
 /// The tuple entry is consumed on a hit.
 #[inline(always)]
 fn bridge_passive_established(ctx: &SockOpsContext) {
+    if ctx.family() != AF_INET {
+        return;
+    }
     let cookie = socket_cookie(ctx);
-    match ctx.family() {
-        AF_INET => {
-            // Passive side mirrors the active tuple: the remote socket addr/port
-            // is the client, the local addr/port is the loopback server.
-            let tuple = ConnTuple4::new(
-                ctx.remote_ip4(),
-                peer_port_host_order(ctx.remote_port()),
-                ctx.local_ip4(),
-                ctx.local_port() as u16,
-            );
-            if let Some(orig) = unsafe { FERRUM_ORIG_DST_BY_TUPLE4.get(&tuple) }.copied() {
-                let _ = FERRUM_ORIG_DST4.insert(&OrigDstKey { cookie }, &orig, 0);
-                let _ = FERRUM_ORIG_DST_BY_TUPLE4.remove(&tuple);
-            }
-        }
-        AF_INET6 => {
-            let tuple = ConnTuple6::new(
-                ctx.remote_ip6(),
-                peer_port_host_order(ctx.remote_port()),
-                ctx.local_ip6(),
-                ctx.local_port() as u16,
-            );
-            if let Some(orig) = unsafe { FERRUM_ORIG_DST_BY_TUPLE6.get(&tuple) }.copied() {
-                let _ = FERRUM_ORIG_DST6.insert(&OrigDstKey { cookie }, &orig, 0);
-                let _ = FERRUM_ORIG_DST_BY_TUPLE6.remove(&tuple);
-            }
-        }
-        _ => {}
+    // Passive side mirrors the active tuple: the remote socket addr/port is the
+    // client, the local addr/port is the loopback server.
+    let tuple = ConnTuple4::new(
+        ctx.remote_ip4(),
+        peer_port_host_order(ctx.remote_port()),
+        ctx.local_ip4(),
+        ctx.local_port() as u16,
+    );
+    if let Some(orig) = unsafe { FERRUM_ORIG_DST_BY_TUPLE4.get(&tuple) }.copied() {
+        let _ = FERRUM_ORIG_DST4.insert(&OrigDstKey { cookie }, &orig, 0);
+        let _ = FERRUM_ORIG_DST_BY_TUPLE4.remove(&tuple);
     }
 }
 
