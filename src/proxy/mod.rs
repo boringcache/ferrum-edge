@@ -5916,6 +5916,25 @@ async fn handle_websocket_request_authenticated(
                     "Failed to upgrade WebSocket connection for {}: {}",
                     proxy_id, e
                 );
+                // The handshake response (101 for H1, 200 for H2) was already
+                // sent to the client, so a plugin that opted into
+                // on_ws_disconnect must still observe a disconnect even though
+                // the upgrade handoff failed before any frames flowed.
+                // run_websocket_proxy (the only other site that fires these
+                // hooks) never runs on this path, so fire them here directly
+                // with zero frame/byte counts and an upgrade-failure tag,
+                // reusing the same construction as the tunnel/frame paths.
+                fire_ws_tunnel_disconnect_hooks(
+                    &ws_disconnect_plugins,
+                    &proxy_id,
+                    &session_meta,
+                    Some((
+                        crate::plugins::Direction::Unknown,
+                        retry::ErrorClass::ConnectionClosed,
+                        None,
+                    )),
+                )
+                .await;
             }
         }
     });
