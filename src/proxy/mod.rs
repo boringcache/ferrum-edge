@@ -16020,6 +16020,102 @@ mod tests {
     }
 
     #[test]
+    fn backend_url_prefix_route_encoded_slash_in_prefix_strips_to_remainder() {
+        // F03 regression (prefix route, NON-EMPTY remainder): listen_path
+        // "/a/b", raw "/a%2fb/c" normalizes to "/a/b/c". A prefix route reports
+        // matched_prefix_len = listen_path.len() = 4, an offset into the
+        // NORMALIZED path. The old raw-path slice `&"/a%2fb/c"[4..]` forwarded
+        // "fb/c" (a routing-vs-forwarding desync); slicing the normalized path
+        // yields "/c". `strip_len` is hardcoded to the prefix length here (not
+        // recomputed via `normalize_encoded_slashes`) so the test locks the
+        // router→builder coordinate contract rather than the helper's own math.
+        let mut proxy = test_proxy(ResponseBodyMode::Stream);
+        proxy.dispatch_kind = DispatchKind::HttpPool;
+        proxy.backend_path = None;
+        proxy.strip_listen_path = true;
+
+        let incoming_path = "/a%2fb/c";
+        let strip_len = "/a/b".len();
+
+        let url = build_backend_url_with_target(
+            &proxy,
+            incoming_path,
+            "",
+            "backend.local",
+            8080,
+            strip_len,
+            None,
+        );
+        assert_eq!(url, "http://backend.local:8080/c");
+    }
+
+    #[test]
+    fn router_to_backend_url_contract_strips_encoded_slash_prefix() {
+        // End-to-end contract: derive `strip_len` from the REAL router so the
+        // builder is exercised against the exact offset `find_proxy` emits, not
+        // a locally recomputed one. Guards against future drift in the
+        // `matched_prefix_len` coordinate system (the desync this PR fixes).
+        // listen_path "/api"; raw "/api/files/a%2fb" normalizes to
+        // "/api/files/a/b"; the prefix match strips "/api" and forwards
+        // "/files/a/b" (the old raw-slice forwarded a corrupted tail).
+        let mut routed = test_proxy(ResponseBodyMode::Stream);
+        routed.dispatch_kind = DispatchKind::HttpPool;
+        routed.backend_path = None;
+        routed.listen_path = Some("/api".to_string());
+        routed.strip_listen_path = true;
+
+        let config = GatewayConfig {
+            proxies: vec![routed],
+            ..GatewayConfig::default()
+        };
+        let cache = crate::router_cache::RouterCache::new(&config, 100);
+
+        let incoming_path = "/api/files/a%2fb";
+        let rm = cache
+            .find_proxy(None, incoming_path)
+            .expect("prefix route should match the normalized path");
+
+        let url = build_backend_url_with_target(
+            rm.proxy.as_ref(),
+            incoming_path,
+            "",
+            "backend.local",
+            8080,
+            rm.matched_prefix_len,
+            None,
+        );
+        assert_eq!(url, "http://backend.local:8080/files/a/b");
+    }
+
+    #[test]
+    fn websocket_backend_url_encoded_slash_strip_is_coordinate_correct() {
+        // F03 regression for the WebSocket builder (mirrors the HTTP builder
+        // tests above; the WS builder got the identical normalize-then-slice
+        // fix but had no encoded-slash coverage). Raw "/ws/a%2fb" normalizes to
+        // "/ws/a/b"; prefix "/ws" strips to "/a/b". The old raw-path slice
+        // forwarded "/a%2fb" (a 2-byte offset skew) and could panic mid-
+        // codepoint; slicing the normalized path is correct.
+        let mut proxy = test_proxy(ResponseBodyMode::Stream);
+        proxy.backend_scheme = Some(BackendScheme::Http);
+        proxy.listen_path = Some("/ws".to_string());
+        proxy.strip_listen_path = true;
+
+        let incoming_path = "/ws/a%2fb";
+        let strip_len = "/ws".len();
+
+        let url = build_websocket_backend_url_with_target(
+            &proxy,
+            incoming_path,
+            "",
+            "backend.local",
+            8080,
+            strip_len,
+            None,
+        );
+        assert_eq!(url, "ws://backend.local:8080/a/b");
+    }
+
+    #[test]
     fn websocket_forwardable_headers_use_sanitized_proxy_headers() {
         let mut headers = HashMap::new();
         headers.insert("host".to_string(), "edge.example".to_string());
