@@ -33,7 +33,18 @@ fn try_connect6(ctx: &SockAddrContext) -> Result<i32, i64> {
         return Ok(1);
     }
 
-    let dst_ip = sock_addr.user_ip6;
+    // Read the IPv6 destination element-by-element. The cgroup/connect6 ctx
+    // (`bpf_sock_addr`) only permits direct scalar field loads at constant
+    // offsets; copying `user_ip6` as a whole `[u32; 4]` makes LLVM take the
+    // array base (ctx+8) into a register, and the verifier rejects the
+    // resulting "modified ctx ptr" dereference. Per-element reads fold the
+    // offset into each load (ctx+8/12/16/20), which the verifier accepts.
+    let dst_ip = [
+        sock_addr.user_ip6[0],
+        sock_addr.user_ip6[1],
+        sock_addr.user_ip6[2],
+        sock_addr.user_ip6[3],
+    ];
     let dst_port = (sock_addr.user_port >> 16) as u16;
 
     if unsafe { FERRUM_PORT_EXCLUDE.get(&dst_port) }.is_some() {
@@ -70,7 +81,11 @@ fn try_connect6(ctx: &SockAddrContext) -> Result<i32, i64> {
     let _ = FERRUM_ORIG_DST6.insert(&key, &orig, 0);
 
     let sock_addr = unsafe { &mut *ctx.sock_addr };
-    sock_addr.user_ip6 = IPV6_LOOPBACK_NBO;
+    // Per-element store for the same verifier reason as the read above.
+    sock_addr.user_ip6[0] = IPV6_LOOPBACK_NBO[0];
+    sock_addr.user_ip6[1] = IPV6_LOOPBACK_NBO[1];
+    sock_addr.user_ip6[2] = IPV6_LOOPBACK_NBO[2];
+    sock_addr.user_ip6[3] = IPV6_LOOPBACK_NBO[3];
     sock_addr.user_port = outbound_capture_port() << 16;
 
     Ok(1)

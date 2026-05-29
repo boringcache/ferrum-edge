@@ -24,7 +24,13 @@ fn try_getpeername6(ctx: &SockAddrContext) -> Result<i32, i64> {
 
     if let Some(orig) = unsafe { FERRUM_ORIG_DST6.get(&key) } {
         let sock_addr = unsafe { &mut *ctx.sock_addr };
-        sock_addr.user_ip6 = orig.addr;
+        // Per-element store: the cgroup/getpeername6 ctx only allows direct
+        // scalar field stores at constant offsets, not a whole-array `[u32; 4]`
+        // copy (which the verifier rejects as a modified-ctx-ptr dereference).
+        sock_addr.user_ip6[0] = orig.addr[0];
+        sock_addr.user_ip6[1] = orig.addr[1];
+        sock_addr.user_ip6[2] = orig.addr[2];
+        sock_addr.user_ip6[3] = orig.addr[3];
         sock_addr.user_port = (orig.port as u32) << 16;
     }
 
