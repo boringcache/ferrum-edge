@@ -13079,7 +13079,9 @@ pub(crate) fn query_string_after_plugin_strips<'a>(
         .metadata
         .keys()
         .filter_map(|key| {
-            key.strip_prefix(crate::plugins::jwks_auth::STRIP_QUERY_PARAM_METADATA_PREFIX)
+            key.strip_prefix(
+                crate::plugins::utils::token_extract::STRIP_QUERY_PARAM_METADATA_PREFIX,
+            )
         })
         .collect();
     if strip_names.is_empty() {
@@ -16191,7 +16193,7 @@ mod tests {
         ctx.metadata.insert(
             format!(
                 "{}{}",
-                crate::plugins::jwks_auth::STRIP_QUERY_PARAM_METADATA_PREFIX,
+                crate::plugins::utils::token_extract::STRIP_QUERY_PARAM_METADATA_PREFIX,
                 "access_token"
             ),
             "true".to_string(),
@@ -16199,7 +16201,7 @@ mod tests {
         ctx.metadata.insert(
             format!(
                 "{}{}",
-                crate::plugins::jwks_auth::STRIP_QUERY_PARAM_METADATA_PREFIX,
+                crate::plugins::utils::token_extract::STRIP_QUERY_PARAM_METADATA_PREFIX,
                 "encoded token"
             ),
             "true".to_string(),

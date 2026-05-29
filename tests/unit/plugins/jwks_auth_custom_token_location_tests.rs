@@ -276,7 +276,7 @@ async fn custom_query_token_marks_param_for_backend_strip() {
     assert_eq!(ctx.authenticated_identity.as_deref(), Some("query-user"));
     assert!(
         ctx.metadata
-            .contains_key("jwks_auth.strip_query_param.access_token")
+            .contains_key("auth.strip_query_param.access_token")
     );
     assert!(
         !ctx.query_params.contains_key("access_token"),

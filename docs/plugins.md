@@ -1398,7 +1398,7 @@ config:
 
 ### `oidc_relying_party`
 
-Runs a browser-oriented OpenID Connect relying party flow with authorization code + PKCE, encrypted gateway sessions, ID token validation through provider JWKS, optional UserInfo merge, scope/role checks, claim header fan-out, and RP-initiated logout.
+Runs a browser-oriented OpenID Connect relying party flow with authorization code + PKCE, encrypted gateway sessions with a sliding idle window and proactive refresh-token rotation, ID token validation through provider JWKS, optional UserInfo merge, scope/role checks, claim header fan-out, and RP-initiated logout.
 
 **Priority:** 1075
 
