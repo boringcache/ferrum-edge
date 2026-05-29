@@ -135,11 +135,14 @@ async fn slow_backend_within_read_timeout_completes() {
         elapsed >= Duration::from_millis(400),
         "expected latency to propagate (≥400 ms), got {elapsed:?}"
     );
-    // And well under the 2 s read timeout.
-    assert!(
-        elapsed < Duration::from_millis(1800),
-        "took too long ({elapsed:?}) — gateway may have read-timeout'd"
-    );
+    // No upper wall-clock bound. A request that exceeded the gateway's
+    // 2 s read timeout would surface as a 5xx, so the `200 OK` + `"ok"`
+    // body asserted above already proves the backend completed *within*
+    // the read timeout — that is the real "within read timeout" signal.
+    // A tight elapsed-time ceiling here adds nothing to that guarantee
+    // and only introduces host-load flakiness (CI scheduling jitter can
+    // push an otherwise-successful request past an arbitrary bound). A
+    // genuine hang is still bounded by the client's 30 s request timeout.
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -403,12 +406,11 @@ async fn high_latency_preserves_first_byte_latency_metrics() {
         "expected ≥300 ms round trip on the first request, got {first_elapsed:?}"
     );
 
-    // Send the remaining requests to flood the gateway's stdout
-    // buffer so the access_log entries are flushed by the time we
-    // read. The Rust stdout used by `tracing_appender::non_blocking`
-    // is line-buffered when connected to a terminal but block-
-    // buffered when piped to a file; without enough volume a single
-    // access_log entry can sit in the buffer past the test deadline.
+    // Send the remaining requests so several `TransactionSummary`
+    // entries are emitted; the poll below reads whichever flushes first.
+    // Request volume is no longer load-bearing for the flush — the
+    // bounded poll, not the count, absorbs the non-blocking appender's
+    // lag.
     for _ in 1..REQUEST_COUNT {
         let resp = client
             .get(&harness.proxy_url("/api/ttfb"))
@@ -417,16 +419,23 @@ async fn high_latency_preserves_first_byte_latency_metrics() {
         assert_eq!(resp.status, StatusCode::OK);
     }
 
-    // Let the non-blocking tracing appender drain. Matches the
-    // pattern used in `tests/functional/functional_logging_test.rs`.
-    tokio::time::sleep(Duration::from_secs(1)).await;
-
     // Mandatory TTFB assertion on the structured access log.
     // `stdout_logging` emits `TransactionSummary` as a JSON line on
     // stdout; `latency_backend_ttfb_ms` is the purpose-built field for
     // this signal (vs. `latency_total_ms`, which also includes plugin
     // post-processing).
-    let logs = harness.captured_combined().expect("capture");
+    //
+    // Poll until the field flushes through tracing-appender's
+    // non-blocking writer instead of reading once after a fixed sleep:
+    // the access-log line lags the client-visible response, so a single
+    // snapshot races the flush and intermittently misses an
+    // already-emitted entry. Polling can only turn that miss into a hit.
+    let logs = harness
+        .wait_for_log_contains(
+            &|logs: &str| extract_f64_field(logs, "latency_backend_ttfb_ms").is_some(),
+            Duration::from_secs(5),
+        )
+        .await;
     let ttfb_ms = extract_f64_field(&logs, "latency_backend_ttfb_ms").unwrap_or_else(|| {
         panic!(
             "expected a `latency_backend_ttfb_ms` entry from stdout_logging; \

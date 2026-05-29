@@ -600,22 +600,31 @@ async fn retry_on_connect_failure_fires_with_empty_methods_and_statuses() {
         "gateway must return 502 after exhausting retries; got {resp:?}"
     );
 
-    // Give the gateway time to flush its log after the final retry attempt.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
     // Each retry attempt logs `"Backend request failed"` (initial) or
     // `"Backend retry request failed"` — count both. With max_retries=3,
     // we expect 4 lines total: 1 initial + 3 retries. Anything other
     // than 4 means the retry boundary regressed.
-    let combined = harness.captured_combined().expect("captured logs");
-    let attempts = combined
-        .lines()
-        .filter(|l| {
-            l.contains("Backend request failed") || l.contains("Backend retry request failed")
-        })
-        .count();
+    let count_attempts = |logs: &str| {
+        logs.lines()
+            .filter(|l| {
+                l.contains("Backend request failed") || l.contains("Backend retry request failed")
+            })
+            .count()
+    };
+
+    // The gateway emits every attempt line before the client's 502 returns,
+    // but they flush through tracing-appender's non-blocking writer
+    // afterward, so a single post-response snapshot races that flush and can
+    // under-count. Poll until the 4 expected lines land, then stabilize: a
+    // bare poll-until-≥4 would return the instant the 4th line flushed and
+    // could miss a spurious 5th still buffered — masking the over-count
+    // (> 4) regression this test also guards against.
+    let attempts = harness
+        .wait_for_stable_log_count(&count_attempts, 4, Duration::from_secs(5))
+        .await;
 
     if attempts != 4 {
+        let combined = harness.captured_combined().unwrap_or_default();
         eprintln!(
             "--- gateway logs (matching backend-failure lines) ---\n{}",
             combined
