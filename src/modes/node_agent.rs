@@ -1366,26 +1366,23 @@ fn reconcile_existing_pod_include_ports(
         }
     };
 
-    // Hot-path diff-skip: most Modified events are unrelated to capture
-    // annotations (status updates, container restart counts, etc.). The
-    // `Option<IncludePortsPolicy>` derives `PartialEq`, so this is a cheap
-    // structural compare — no allocations, no syscalls. Unlike the
-    // workload-identity reconcile (which re-walks the cgroup tree on every
-    // event because a missed leaf fails *closed*), include-ports re-walks only
-    // on a policy change: a container that restarts under an unchanged policy
-    // keeps capturing all ports until the next policy change or pod removal,
-    // which is fail-*open* (over-capture, never an authz gap), so it doesn't
-    // warrant a per-event tree walk.
-    if desired == state.include_ports_policy {
+    // Cheap fast path for unannotated pods (the common case): no policy now and
+    // none before → nothing to reconcile, and crucially no cgroup-tree walk.
+    // Most Modified events (status updates, restart counts) hit this.
+    if desired.is_none() && state.include_ports_policy.is_none() {
         return;
     }
 
     match desired {
         Some(new_policy) => {
-            // Write the new policy across the whole pod cgroup subtree: the
-            // `connect4`/`connect6` gate keys `FERRUM_INCLUDE_PORTS` by the
-            // container *leaf* cgroup, so the pod inode alone never matches and
-            // narrowing would silently not engage.
+            // Re-walk the whole pod cgroup subtree on every event (not just on a
+            // policy change): the `connect4`/`connect6` gate keys
+            // `FERRUM_INCLUDE_PORTS` by the container *leaf* cgroup, and
+            // container leaves start (and restart under fresh inodes) after the
+            // initial pod event — so a leaf that appears later must still pick up
+            // the policy or narrowing silently never engages for it. (The
+            // workload-identity reconcile re-walks for the same reason; here the
+            // per-event read_dir is paid only for annotated pods.)
             let current = state
                 .cgroup_path
                 .as_deref()
@@ -1401,9 +1398,17 @@ fn reconcile_existing_pod_include_ports(
                 );
                 return;
             }
+            let current_set: HashSet<u64> = current.iter().copied().collect();
+            let enrolled_set: HashSet<u64> =
+                state.include_ports_cgroup_ids.iter().copied().collect();
+            // Diff-skip: same policy AND same enrolled cgroup set → no map work.
+            if state.include_ports_policy.as_ref() == Some(&new_policy)
+                && current_set == enrolled_set
+            {
+                return;
+            }
             // Drop entries for inodes that left the tree (a restarted
             // container's old leaf) so they don't linger in the fixed-size map.
-            let current_set: HashSet<u64> = current.iter().copied().collect();
             for cgroup_id in &state.include_ports_cgroup_ids {
                 if !current_set.contains(cgroup_id)
                     && let Err(e) = backend.remove_pod_include_ports(*cgroup_id)
@@ -3790,6 +3795,81 @@ mod tests {
         assert_eq!(leaf_policy.port_count, 2);
         assert!(backend.include_ports.contains_key(&pod_ino));
 
+        let state = pod_states.get(pod_uid).unwrap();
+        assert!(state.include_ports_cgroup_ids.contains(&container_ino));
+        assert!(state.include_ports_cgroup_ids.contains(&pod_ino));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconcile_enrolls_late_container_include_ports_under_unchanged_policy() {
+        use std::os::unix::fs::MetadataExt;
+
+        // Finding regression: a container leaf cgroup that appears AFTER the
+        // initial pod event (the common case — containers start once the pod
+        // cgroup exists) must pick up the includeOutboundPorts policy even
+        // though the annotation is unchanged. The reconcile re-walks the tree on
+        // every event, so a later Modified event enrolls the new leaf.
+        let _veth_guard = crate::ebpf::veth::tests::TestOverrideGuard::new("veth_test");
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+
+        let cgroup_root = tempfile::tempdir().unwrap();
+        let pod_uid = "pod-uid-1";
+        let pod_cgroup = cgroup_root.path().join(format!("kubepods/pod{pod_uid}"));
+        // Only the pod cgroup exists at the initial event — no container yet.
+        std::fs::create_dir_all(&pod_cgroup).unwrap();
+
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: cgroup_root.path().to_string_lossy().to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+        };
+        let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+        let annotations =
+            annotations_with(&[("traffic.sidecar.istio.io/includeOutboundPorts", "5432,8080")]);
+        let event = PodEvent {
+            pod_uid,
+            pod_name: "test-pod",
+            namespace: "default",
+            service_account: None,
+            labels: &labels,
+            annotations: &annotations,
+            pod_ip_str: Some("10.0.0.5"),
+            pod_pid: None,
+            veth_iface_override: Some("veth-mock"),
+        };
+
+        // Initial enrollment: only the pod inode is present.
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+        let pod_ino = std::fs::metadata(&pod_cgroup).unwrap().ino();
+        assert!(backend.include_ports.contains_key(&pod_ino));
+
+        // A container starts AFTER enrollment, creating its leaf cgroup.
+        let container_cgroup = pod_cgroup.join("crio-late.scope");
+        std::fs::create_dir_all(&container_cgroup).unwrap();
+        let container_ino = std::fs::metadata(&container_cgroup).unwrap().ino();
+        assert!(
+            !backend.include_ports.contains_key(&container_ino),
+            "the late container leaf is not enrolled until the next reconcile"
+        );
+
+        // A subsequent Modified event with the SAME annotation must still enroll
+        // the new leaf (the reconcile re-walks despite the unchanged policy).
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+
+        let leaf_policy = backend
+            .include_ports
+            .get(&container_ino)
+            .expect("late container leaf must be enrolled on reconcile under unchanged policy");
+        assert_eq!(leaf_policy.port_count, 2);
         let state = pod_states.get(pod_uid).unwrap();
         assert!(state.include_ports_cgroup_ids.contains(&container_ino));
         assert!(state.include_ports_cgroup_ids.contains(&pod_ino));

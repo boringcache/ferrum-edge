@@ -62,7 +62,7 @@ use ferrum_ebpf_common::{
 };
 
 use crate::maps::{
-    FERRUM_ORIG_DST4, FERRUM_ORIG_DST_BY_TUPLE4, FERRUM_SOCK_OPS_CONNECT_TS,
+    FERRUM_ORIG_DST4, FERRUM_ORIG_DST6, FERRUM_ORIG_DST_BY_TUPLE4, FERRUM_SOCK_OPS_CONNECT_TS,
     FERRUM_SOCK_OPS_EVENTS, FERRUM_SOCK_OPS_STATS,
 };
 
@@ -158,6 +158,15 @@ fn handle_sock_ops(ctx: &SockOpsContext) {
             // transition table.
             let new_state = ctx.arg(0);
             let old_state = ctx.arg(1);
+            // On terminal close, drop this socket's orig-dst record so a closed
+            // connection's cookie does not linger in FERRUM_ORIG_DST4/6 until
+            // LRU pressure evicts it. The node-waypoint resolver mirrors these
+            // maps and treats a present cookie as a live connection, so a stale
+            // record would keep a removed pod's lazy identity (and policy scope)
+            // pinned indefinitely on a low-churn node where the LRU never fills.
+            if new_state == TCP_CLOSE {
+                cleanup_orig_dst_on_close(ctx);
+            }
             emit_state_transition(old_state, new_state);
         }
         BPF_SOCK_OPS_RTT_CB => {
@@ -323,6 +332,28 @@ fn bridge_passive_established(ctx: &SockOpsContext) {
     if let Some(orig) = unsafe { FERRUM_ORIG_DST_BY_TUPLE4.get(&tuple) }.copied() {
         let _ = FERRUM_ORIG_DST4.insert(&OrigDstKey { cookie }, &orig, 0);
         let _ = FERRUM_ORIG_DST_BY_TUPLE4.remove(&tuple);
+    }
+}
+
+/// Remove this socket's original-destination record from
+/// `FERRUM_ORIG_DST4`/`FERRUM_ORIG_DST6` on terminal close. Records inserted on
+/// connect (`connect4`/`connect6`) and re-stamped on accept
+/// ([`bridge_passive_established`]) otherwise outlive the connection and are
+/// evicted only under LRU pressure, so on a low-churn node the node-waypoint
+/// resolver — which mirrors these maps and treats a present cookie as a live
+/// connection — keeps a removed pod's lazy identity and policy scope pinned.
+/// Best-effort and ENOENT-tolerant: sockets that never carried a record
+/// (non-captured traffic) simply miss. The socket cookie is globally unique
+/// across address families, so only the family-matching map can hold it.
+#[inline(always)]
+fn cleanup_orig_dst_on_close(ctx: &SockOpsContext) {
+    let key = OrigDstKey {
+        cookie: socket_cookie(ctx),
+    };
+    if ctx.family() == AF_INET {
+        let _ = FERRUM_ORIG_DST4.remove(&key);
+    } else {
+        let _ = FERRUM_ORIG_DST6.remove(&key);
     }
 }
 
