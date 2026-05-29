@@ -588,14 +588,17 @@ impl XdsAdsServer {
         previous: Option<&XdsSnapshot>,
     ) -> (Arc<XdsSnapshot>, Vec<DiscoveryResponse>) {
         let snapshot = self.snapshot_for_config_with_fingerprint(node_id, config, fingerprint);
-        // Resource warming: the DP applies per-type independent versions, so the
-        // CP only re-sends the types whose resource bytes actually changed. An
-        // ECDS-only (policy/workload) update no longer drags the name-only
-        // CDS/EDS/LDS/RDS resources along for version coherence.
+        let force_required_refresh = required_mesh_slice_subscriptions_need_version_refresh(
+            previous,
+            &snapshot,
+            subscriptions.values(),
+        );
         let responses = subscriptions
             .values()
             .filter(|subscription| {
                 subscription_resources_changed(previous, &snapshot, subscription)
+                    || (force_required_refresh
+                        && is_required_mesh_slice_sotw_type_url(&subscription.type_url))
             })
             .map(|subscription| self.sotw_response(&snapshot, subscription))
             .collect();
@@ -1460,6 +1463,30 @@ fn previous_resources_indexed<'a>(
         .unwrap_or_default()
 }
 
+fn is_required_mesh_slice_sotw_type_url(type_url: &str) -> bool {
+    matches!(
+        type_url,
+        super::translator::CDS_TYPE_URL
+            | super::translator::EDS_TYPE_URL
+            | super::translator::LDS_TYPE_URL
+            | super::translator::RDS_TYPE_URL
+            | super::translator::ECDS_TYPE_URL
+    )
+}
+
+fn required_mesh_slice_subscriptions_need_version_refresh<'a>(
+    previous: Option<&XdsSnapshot>,
+    snapshot: &XdsSnapshot,
+    subscriptions: impl Iterator<Item = &'a XdsSubscription>,
+) -> bool {
+    let Some(previous) = previous else {
+        return false;
+    };
+    subscriptions
+        .filter(|subscription| is_required_mesh_slice_sotw_type_url(&subscription.type_url))
+        .any(|subscription| subscription_resources_changed(Some(previous), snapshot, subscription))
+}
+
 fn subscription_resources_changed(
     previous: Option<&XdsSnapshot>,
     snapshot: &XdsSnapshot,
@@ -2058,12 +2085,11 @@ mod tests {
     }
 
     #[test]
-    fn sotw_policy_only_update_does_not_resend_unchanged_cds() {
-        // Under resource warming the CP re-sends only the types whose resource
-        // bytes changed. Adding a PeerAuthentication changes the ECDS carriers
-        // but leaves the name-only CDS clusters byte-identical, so a CDS-only
-        // subscriber receives nothing — the legacy forced coherent re-send (kept
-        // only to satisfy the DP's old coherent-version gate) is gone.
+    fn sotw_policy_only_update_resends_unchanged_required_cds_for_coherence() {
+        // ECDS carries mesh security policy. When a policy-only update changes
+        // ECDS, subscribed required core resources are force-re-sent with the
+        // same snapshot version so the DP never applies a mixed routing/policy
+        // slice.
         let server = test_server(gateway_config_with_service(true, 0));
         let subscriptions = cds_subscription();
 
@@ -2075,9 +2101,10 @@ mod tests {
             .store(Arc::new(gateway_config_with_service_and_peer_auth(1)));
         let refreshed = server.sotw_responses_for_subscriptions("node-a", &subscriptions);
 
-        assert!(
-            refreshed.is_empty(),
-            "a policy-only (ECDS) change must not re-send byte-identical CDS clusters"
+        assert_eq!(refreshed.len(), 1);
+        assert_eq!(
+            refreshed[0].type_url,
+            super::super::translator::CDS_TYPE_URL
         );
     }
 
@@ -2099,11 +2126,7 @@ mod tests {
     }
 
     #[test]
-    fn sotw_policy_only_update_resends_only_ecds() {
-        // A policy-only change re-sends ECDS (the carrier that actually changed)
-        // and leaves the unchanged name-only CDS untouched. The DP warms the new
-        // ECDS version against its persisted CDS, so no coherent re-send of CDS
-        // is needed.
+    fn sotw_policy_only_update_resends_required_core_and_ecds() {
         let server = test_server(gateway_config_with_service(true, 0));
         let subscriptions = required_core_and_ecds_subscriptions();
 
@@ -2117,18 +2140,20 @@ mod tests {
 
         assert_eq!(
             refreshed.len(),
-            1,
-            "only the changed ECDS carrier should re-send on a policy-only update"
+            2,
+            "policy changes must refresh subscribed required types for coherent DP apply"
         );
-        let ecds = &refreshed[0];
-        assert_eq!(ecds.type_url, super::super::translator::ECDS_TYPE_URL);
-        assert!(!ecds.resources.is_empty());
         assert!(
             refreshed
                 .iter()
-                .all(|response| response.type_url != super::super::translator::CDS_TYPE_URL),
-            "byte-identical CDS must not be force-re-sent for version coherence"
+                .any(|response| response.type_url == super::super::translator::ECDS_TYPE_URL)
         );
+        assert!(
+            refreshed
+                .iter()
+                .any(|response| response.type_url == super::super::translator::CDS_TYPE_URL)
+        );
+        assert_eq!(refreshed[0].version_info, refreshed[1].version_info);
     }
 
     #[test]
