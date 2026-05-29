@@ -1485,18 +1485,26 @@ fn reconcile_existing_pod_include_ports(
     }
 }
 
-/// Re-walk an already-enrolled pod's cgroup tree on reconcile and write the
-/// source workload identity under any cgroup inode not yet enrolled.
+/// Re-walk an already-enrolled pod's cgroup tree on reconcile and reconcile the
+/// `FERRUM_WORKLOAD_IDENTITY` entries against it: write the source workload
+/// identity under newly-observed cgroup inodes and drop entries for inodes that
+/// have left the tree.
 ///
 /// Container cgroups appear *after* the pod cgroup (containers start once the
 /// pod object exists) and rotate to fresh inodes on restart, so the leaf
 /// cgroups the connect hook reads via `bpf_get_current_cgroup_id()` may not
 /// have existed at initial enrollment. Kubernetes emits many Modified events
 /// over a pod's lifecycle (readiness, container statuses, IP), so re-walking
-/// here enrolls a newly-started container's cgroup within seconds. Only
-/// newly-observed inodes are written — a pod's SPIFFE identity is stable for
-/// its lifetime, so existing entries are left untouched to avoid churning the
-/// BPF map on every status update. Best-effort: failures log and continue.
+/// here enrolls a newly-started container's cgroup within seconds.
+///
+/// A restarted container's old leaf `.scope` is deleted and recreated under a
+/// fresh inode, so this also removes entries whose inode has left the tree —
+/// otherwise every restart would leak one entry into the fixed-size (4096)
+/// `FERRUM_WORKLOAD_IDENTITY` map until pod deletion, eventually exhausting it
+/// and failing identity writes (hence node-waypoint resolution) for other pods.
+/// An empty walk means the pod cgroup itself is gone (pod teardown); leave that
+/// to `handle_pod_removed` rather than flushing live entries on a transient or
+/// teardown read. Best-effort: failures log and continue.
 fn reconcile_existing_pod_workload_identity(
     backend: &mut dyn EbpfBackend,
     config: &NodeAgentConfig,
@@ -1508,6 +1516,35 @@ fn reconcile_existing_pod_workload_identity(
     let Some(cgroup_path) = state.cgroup_path.clone() else {
         return;
     };
+    let current = cgroup::collect_cgroup_tree_inodes(std::path::Path::new(&cgroup_path));
+    if current.is_empty() {
+        return;
+    }
+    let current_set: HashSet<u64> = current.iter().copied().collect();
+
+    // Drop entries no longer present in the tree (e.g. a restarted container's
+    // old leaf cgroup) from both the BPF map and our tracking set.
+    state.workload_identity_cgroup_ids.retain(|cgroup_id| {
+        if current_set.contains(cgroup_id) {
+            return true;
+        }
+        match backend.remove_workload_identity(*cgroup_id) {
+            Ok(()) => debug!(
+                pod_uid,
+                cgroup_id = *cgroup_id,
+                "Removed stale (restarted-container) cgroup inode from FERRUM_WORKLOAD_IDENTITY"
+            ),
+            Err(e) => warn!(
+                pod_uid,
+                cgroup_id = *cgroup_id,
+                error = %e,
+                "Failed to remove stale pod cgroup inode from FERRUM_WORKLOAD_IDENTITY"
+            ),
+        }
+        false
+    });
+
+    // Write the identity for newly-observed leaves.
     let Some(identity) = build_workload_identity(
         pod_uid,
         namespace,
@@ -1516,7 +1553,7 @@ fn reconcile_existing_pod_workload_identity(
     ) else {
         return;
     };
-    for cgroup_id in cgroup::collect_cgroup_tree_inodes(std::path::Path::new(&cgroup_path)) {
+    for cgroup_id in current {
         if state.workload_identity_cgroup_ids.contains(&cgroup_id) {
             continue;
         }
@@ -2563,6 +2600,85 @@ mod tests {
         let state = pod_states.get(pod_uid).unwrap();
         assert!(state.workload_identity_cgroup_ids.contains(&container_ino));
         assert!(state.workload_identity_cgroup_ids.contains(&pod_ino));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconcile_removes_stale_container_cgroup_identity_on_restart() {
+        use std::os::unix::fs::MetadataExt;
+
+        // Regression: a container restart replaces its leaf cgroup with a fresh
+        // inode. Reconcile must drop the old leaf's FERRUM_WORKLOAD_IDENTITY
+        // entry (from both the BPF map and state) and not just append the new
+        // one, or stale entries accumulate in the fixed-size map across restarts
+        // and eventually fail other pods' enrollments.
+        let _veth_guard = crate::ebpf::veth::tests::TestOverrideGuard::new("veth_test");
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+
+        let cgroup_root = tempfile::tempdir().unwrap();
+        let pod_uid = "11111111-1111-1111-1111-111111111111";
+        let pod_cgroup = cgroup_root.path().join(format!("kubepods/pod{pod_uid}"));
+        let container1 = pod_cgroup.join("crio-aaaa.scope");
+        std::fs::create_dir_all(&container1).unwrap();
+
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: cgroup_root.path().to_string_lossy().to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+        };
+        let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+        let event = PodEvent {
+            pod_uid,
+            pod_name: "test-pod",
+            namespace: "default",
+            service_account: Some("api"),
+            labels: &labels,
+            annotations: &HashMap::new(),
+            pod_ip_str: Some("10.0.0.5"),
+            pod_pid: None,
+            veth_iface_override: Some("veth-mock"),
+        };
+
+        // Initial enrollment writes the pod inode + container1's leaf inode.
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+        let container1_ino = std::fs::metadata(&container1).unwrap().ino();
+        let pod_ino = std::fs::metadata(&pod_cgroup).unwrap().ino();
+        assert!(backend.workload_identities.contains_key(&container1_ino));
+
+        // Container restarts: a new leaf cgroup appears. Create it *before*
+        // removing the old one so the two inodes are guaranteed distinct (a
+        // freed inode can be reused immediately by the next mkdir).
+        let container2 = pod_cgroup.join("crio-bbbb.scope");
+        std::fs::create_dir_all(&container2).unwrap();
+        let container2_ino = std::fs::metadata(&container2).unwrap().ino();
+        assert_ne!(container1_ino, container2_ino);
+        std::fs::remove_dir(&container1).unwrap();
+
+        // Same pod cgroup path → the reconcile branch runs.
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+
+        // The new leaf is enrolled and the pod inode kept; the stale leaf is gone
+        // from both the BPF map and the tracked id set.
+        assert!(
+            backend.workload_identities.contains_key(&container2_ino),
+            "the restarted container's new leaf cgroup must be enrolled"
+        );
+        assert!(backend.workload_identities.contains_key(&pod_ino));
+        assert!(
+            !backend.workload_identities.contains_key(&container1_ino),
+            "the restarted container's stale leaf cgroup entry must be removed"
+        );
+        let state = pod_states.get(pod_uid).unwrap();
+        assert!(state.workload_identity_cgroup_ids.contains(&container2_ino));
+        assert!(!state.workload_identity_cgroup_ids.contains(&container1_ino));
     }
 
     #[test]
