@@ -234,9 +234,12 @@ attaches to stream proxies. Two capabilities, both governed by the global
   record header). A transport-shape guard for ports that must only carry TLS. It
   inspects raw wire bytes, so it applies to plain TCP and `passthrough` proxies;
   on TLS-terminating frontends the completed handshake already proved the
-  transport, so it is a no-op there. It **fails closed**: if no opening bytes
-  arrive (idle peek timeout / EOF) the connection is rejected in `enforce`, so a
-  client cannot stall the peek and then send plaintext.
+  transport, so it is a no-op there. The opening TLS record + handshake-type
+  prefix is reassembled across fragmented reads (non-destructively, bounded by
+  `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS`), so a ClientHello split across
+  TCP segments still classifies correctly. It **fails closed**: if the prefix
+  never completes before the deadline (idle peek timeout / EOF) the connection is
+  rejected in `enforce`, so a client cannot stall the peek and then send plaintext.
 - **`signatures`** — byte-pattern (regex) matching over **plaintext application
   bytes**. Each signature has an `id`, a `pattern`, and optional `severity`
   (default `medium`) and `action` (`enforce` default / `monitor` / `disabled`).

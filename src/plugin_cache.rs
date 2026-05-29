@@ -219,6 +219,9 @@ impl Plugin for PriorityOverridePlugin {
     fn requires_stream_first_bytes_decrypted(&self) -> bool {
         self.inner.requires_stream_first_bytes_decrypted()
     }
+    fn stream_first_bytes_min_len(&self) -> usize {
+        self.inner.stream_first_bytes_min_len()
+    }
     async fn on_udp_datagram(&self, ctx: &UdpDatagramContext<'_>) -> UdpDatagramVerdict {
         self.inner.on_udp_datagram(ctx).await
     }

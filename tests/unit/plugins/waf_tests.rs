@@ -2265,6 +2265,25 @@ fn stream_waf_require_tls_only_needs_raw_peek_not_decrypted_read() {
     assert!(!plugin.requires_stream_first_bytes_decrypted());
     // No signatures → nothing to scan per datagram.
     assert!(!plugin.requires_udp_datagram_hooks());
+    // The shape guard inspects the leading TLS record + handshake-type bytes, so
+    // it asks the proxy to reassemble that whole prefix before classifying —
+    // otherwise a ClientHello split across TCP segments would be misread as a
+    // short non-TLS chunk and rejected in enforce mode.
+    assert_eq!(plugin.stream_first_bytes_min_len(), 6);
+}
+
+#[test]
+fn stream_waf_first_bytes_min_len_only_set_for_tls_shape_guard() {
+    // Signature scanning has no minimum prefix (it matches whatever opening
+    // bytes arrive), so a guard-less stream config keeps the cheap single-peek
+    // behavior — a non-zero minimum would needlessly stall protocols whose
+    // legitimate opening message is shorter than a TLS record header.
+    assert_eq!(sig_waf("enforce").stream_first_bytes_min_len(), 0);
+    // An HTTP-only WAF never captures stream first bytes at all.
+    assert_eq!(
+        Waf::new(&json!({})).unwrap().stream_first_bytes_min_len(),
+        0
+    );
 }
 
 #[tokio::test]

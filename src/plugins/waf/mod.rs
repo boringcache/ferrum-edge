@@ -33,7 +33,9 @@ use self::rules::{
     parse_rule_action, parse_rule_overrides,
 };
 use self::scan::ScanOutcome;
-use self::stream::{StreamWafConfig, looks_like_tls_client_hello, parse_stream_config};
+use self::stream::{
+    StreamWafConfig, TLS_CLIENT_HELLO_MIN_PREFIX, looks_like_tls_client_hello, parse_stream_config,
+};
 use super::utils::sse::is_sse_request;
 use super::{
     ALL_PROTOCOLS, HTTP_FAMILY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext,
@@ -674,6 +676,20 @@ impl Plugin for Waf {
                 .stream
                 .as_ref()
                 .is_some_and(|s| s.needs_tcp_decrypted_first_bytes())
+    }
+
+    fn stream_first_bytes_min_len(&self) -> usize {
+        // Only the TLS-shape guard needs a complete prefix: it inspects the
+        // leading TLS record + handshake-type bytes, so a fragmented ClientHello
+        // must be reassembled to at least that length before classification, or a
+        // legitimately split hello would be rejected in enforce mode. Signature
+        // scanning has no minimum (it matches whatever opening bytes arrive), so
+        // a guard-less config keeps the cheap single-peek behavior.
+        if self.active && self.stream.as_ref().is_some_and(|s| s.tcp_require_tls) {
+            TLS_CLIENT_HELLO_MIN_PREFIX
+        } else {
+            0
+        }
     }
 
     fn requires_udp_datagram_hooks(&self) -> bool {

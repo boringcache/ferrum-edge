@@ -2139,6 +2139,23 @@ pub trait Plugin: Send + Sync {
         false
     }
 
+    /// The smallest number of opening client bytes this plugin needs captured
+    /// into [`StreamConnectionContext::first_bytes`] before it can classify a
+    /// plain/passthrough TCP stream. A transport-shape guard that inspects the
+    /// leading TLS record header, for example, needs the whole header present —
+    /// not just the first byte the socket happens to deliver.
+    ///
+    /// The TCP proxy keeps peeking (non-destructively, so the splice fast path
+    /// stays intact) until at least this many bytes are buffered or the
+    /// handshake deadline expires, so a ClientHello split across TCP segments is
+    /// not misread as a short non-TLS chunk and falsely rejected. `0` (default)
+    /// means "the first readable chunk is enough" and preserves the single-peek
+    /// behavior. Only consulted when [`Self::requires_stream_first_bytes`] is
+    /// `true`.
+    fn stream_first_bytes_min_len(&self) -> usize {
+        0
+    }
+
     /// Returns `true` if this plugin needs notification when a WebSocket
     /// session ends. Zero overhead when `false` (default) — the relay teardown
     /// path skips constructing the context and iterating plugins.

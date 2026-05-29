@@ -1604,24 +1604,78 @@ async fn run_tcp_stream_connect_plugins(
 /// passthrough) or the first decrypted application chunk (terminated TLS).
 const STREAM_FIRST_BYTES_CAP: usize = 4096;
 
+/// Poll interval for completing a short first-bytes peek. Only used on the cold
+/// path where the opening TCP segment arrives fragmented (fewer bytes than an
+/// inspecting plugin needs to classify the stream); a normal ClientHello fills
+/// the buffer on the first peek and never sleeps. `peek()` is level-triggered —
+/// the buffered bytes keep the socket readable, so re-awaiting it would spin —
+/// hence a brief sleep between peeks, always bounded by the caller's deadline.
+const STREAM_FIRST_BYTES_PEEK_RETRY_INTERVAL: Duration = Duration::from_millis(5);
+
 /// Non-destructively peek up to [`STREAM_FIRST_BYTES_CAP`] bytes from a raw TCP
 /// stream for first-bytes inspection. Peeking leaves the bytes in the socket
 /// buffer, so the relay — including splice — still forwards them intact and the
-/// fast path is preserved. Returns `None` when nothing was readable in time.
+/// fast path is preserved.
+///
+/// `min_len` is the smallest opening prefix an inspecting plugin needs to
+/// classify the stream (e.g. the 6-byte TLS record + handshake-type prefix the
+/// `tcp_require_tls` shape guard checks; see `Plugin::stream_first_bytes_min_len`).
+/// A single `peek()` returns as soon as *any* bytes are buffered, which can be
+/// fewer than `min_len` when the client's first TCP segment is fragmented — that
+/// would make the guard misread a legitimately split ClientHello as a short
+/// non-TLS chunk and reject it in enforce mode. So when a deadline is set we
+/// keep peeking (the bytes stay in the socket buffer, untouched by the relay)
+/// until at least `min_len` bytes are available, the buffer fills, the peer
+/// closes, or the deadline expires. Without a deadline we take a single peek and
+/// never loop, so a stalled peer cannot park the task waiting for a prefix that
+/// never completes — failing closed on the short prefix is the caller's job.
+///
+/// Returns `None` when nothing was readable in time.
 async fn peek_tcp_first_bytes(
     stream: &TcpStream,
     timeout: Option<Duration>,
+    min_len: usize,
 ) -> Option<bytes::Bytes> {
+    let want = min_len.clamp(1, STREAM_FIRST_BYTES_CAP);
+    let deadline = timeout.map(|d| tokio::time::Instant::now() + d);
     let mut buf = vec![0u8; STREAM_FIRST_BYTES_CAP];
-    let peek = stream.peek(&mut buf);
-    let n = match timeout {
-        Some(d) => tokio::time::timeout(d, peek).await.ok()?.ok()?,
-        None => peek.await.ok()?,
-    };
-    if n == 0 {
+    let mut have = 0usize;
+    loop {
+        let peek = stream.peek(&mut buf);
+        let n = match deadline {
+            // On deadline-elapsed or peek error, stop and use whatever prefix we
+            // observed on an earlier iteration (still intact in `buf`/`have`).
+            Some(dl) => match tokio::time::timeout_at(dl, peek).await {
+                Ok(Ok(n)) => n,
+                _ => break,
+            },
+            None => match peek.await {
+                Ok(n) => n,
+                Err(_) => break,
+            },
+        };
+        if n == 0 {
+            // EOF: peer closed the write half without sending (more) bytes.
+            break;
+        }
+        have = n;
+        if have >= want || have >= STREAM_FIRST_BYTES_CAP {
+            break;
+        }
+        // Not enough yet. Only wait for more when a deadline bounds the wait;
+        // otherwise return what we have rather than risk parking indefinitely.
+        let Some(dl) = deadline else { break };
+        let now = tokio::time::Instant::now();
+        if now >= dl {
+            break;
+        }
+        let wake = (now + STREAM_FIRST_BYTES_PEEK_RETRY_INTERVAL).min(dl);
+        tokio::time::sleep_until(wake).await;
+    }
+    if have == 0 {
         return None;
     }
-    buf.truncate(n);
+    buf.truncate(have);
     Some(bytes::Bytes::from(buf))
 }
 
@@ -1863,6 +1917,23 @@ async fn handle_tcp_connection_inner(
         .iter()
         .any(|p| p.requires_stream_first_bytes_decrypted());
 
+    // Smallest opening-byte prefix any first-bytes-aware plugin needs to classify
+    // a plain/passthrough stream (e.g. the 6-byte TLS record+handshake prefix the
+    // `tcp_require_tls` shape guard checks). The non-destructive peek below keeps
+    // reading the socket buffer until at least this many bytes are available (or
+    // the handshake deadline fires), so a ClientHello split across TCP segments
+    // is not misread as non-TLS. `0` for signature-only configs preserves the
+    // single-peek behavior. Only computed when a peek will actually happen.
+    let first_bytes_min_len = if scan_first_bytes {
+        plugins
+            .iter()
+            .map(|p| p.stream_first_bytes_min_len())
+            .max()
+            .unwrap_or(0)
+    } else {
+        0
+    };
+
     // ----- Passthrough mode: forward encrypted bytes without TLS termination -----
     if params.passthrough {
         // Peek at the ClientHello to extract SNI for logging/routing.
@@ -1876,7 +1947,8 @@ async fn handle_tcp_connection_inner(
         // captured bytes are only good for transport-shape checks (e.g.
         // validating a TLS ClientHello), never L7 — hence `EncryptedWire`.
         if scan_first_bytes {
-            stream_ctx.first_bytes = peek_tcp_first_bytes(&client_stream, sni_peek_timeout).await;
+            stream_ctx.first_bytes =
+                peek_tcp_first_bytes(&client_stream, sni_peek_timeout, first_bytes_min_len).await;
             stream_ctx.first_bytes_kind = stream_ctx
                 .first_bytes
                 .as_ref()
@@ -2213,7 +2285,8 @@ async fn handle_tcp_connection_inner(
         // the application bytes on the wire, so they are fully L7-inspectable and
         // the relay (including splice) still forwards them unchanged.
         if scan_first_bytes {
-            stream_ctx.first_bytes = peek_tcp_first_bytes(&client_stream, sni_peek_timeout).await;
+            stream_ctx.first_bytes =
+                peek_tcp_first_bytes(&client_stream, sni_peek_timeout, first_bytes_min_len).await;
             stream_ctx.first_bytes_kind = stream_ctx
                 .first_bytes
                 .as_ref()
@@ -6074,5 +6147,117 @@ mod node_waypoint_stream_scope_tests {
             Some("spiffe://cluster.local/ns/team-a/sa/api"),
             "resolved pod SPIFFE ID must be returned as the source principal"
         );
+    }
+}
+
+#[cfg(test)]
+mod first_bytes_peek_tests {
+    //! Coverage for `peek_tcp_first_bytes`, which captures the opening client
+    //! bytes for stream-aware plugins (e.g. the WAF `tcp_require_tls` guard)
+    //! without consuming them from the socket buffer.
+
+    use std::time::Duration;
+
+    use tokio::io::AsyncWriteExt;
+
+    use super::peek_tcp_first_bytes;
+
+    /// Bind a loopback listener and return it with its address.
+    async fn listener() -> (tokio::net::TcpListener, std::net::SocketAddr) {
+        let l = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind");
+        let addr = l.local_addr().expect("addr");
+        (l, addr)
+    }
+
+    /// A first TCP segment shorter than `min_len` must be reassembled by further
+    /// non-destructive peeks until the full prefix is buffered — so a TLS
+    /// ClientHello split across segments is not misread as a short non-TLS chunk.
+    /// This is the regression test for the single-`peek()` classification bug.
+    #[tokio::test]
+    async fn accumulates_fragmented_prefix_up_to_min_len() {
+        let (l, addr) = listener().await;
+        let writer = tokio::spawn(async move {
+            let mut c = tokio::net::TcpStream::connect(addr).await.expect("connect");
+            // First segment carries fewer than `min_len` (6) bytes...
+            c.write_all(&[0x16, 0x03, 0x01]).await.expect("write1");
+            c.flush().await.expect("flush1");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            // ...the rest of the record + handshake header arrives later.
+            c.write_all(&[0x00, 0x05, 0x01]).await.expect("write2");
+            c.flush().await.expect("flush2");
+            // Hold the connection so the peeked bytes stay buffered.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            drop(c);
+        });
+        let (accepted, _) = l.accept().await.expect("accept");
+
+        let bytes = peek_tcp_first_bytes(&accepted, Some(Duration::from_secs(5)), 6)
+            .await
+            .expect("should observe the reassembled prefix, not None");
+        assert!(
+            bytes.len() >= 6,
+            "expected the full >= 6-byte prefix, got {}",
+            bytes.len()
+        );
+        assert_eq!(&bytes[..6], &[0x16, 0x03, 0x01, 0x00, 0x05, 0x01]);
+
+        writer.await.expect("writer task");
+    }
+
+    /// The peek must not consume bytes: they stay in the socket buffer so the
+    /// relay (and the Linux splice fast path) still forwards them intact. Two
+    /// peeks in a row therefore observe the same opening bytes.
+    #[tokio::test]
+    async fn peek_does_not_consume_bytes() {
+        let (l, addr) = listener().await;
+        let writer = tokio::spawn(async move {
+            let mut c = tokio::net::TcpStream::connect(addr).await.expect("connect");
+            c.write_all(b"hello-world").await.expect("write");
+            c.flush().await.expect("flush");
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            drop(c);
+        });
+        let (accepted, _) = l.accept().await.expect("accept");
+
+        let first = peek_tcp_first_bytes(&accepted, Some(Duration::from_secs(5)), 1)
+            .await
+            .expect("first peek");
+        let second = peek_tcp_first_bytes(&accepted, Some(Duration::from_secs(5)), 1)
+            .await
+            .expect("second peek");
+        assert_eq!(&first[..], b"hello-world");
+        assert_eq!(&second[..], b"hello-world", "peek must not consume bytes");
+
+        writer.await.expect("writer task");
+    }
+
+    /// When the client stalls below `min_len`, the deadline caps the reassembly
+    /// wait: the function returns the short prefix it managed to observe (so the
+    /// WAF can fail closed on it) instead of hanging forever.
+    #[tokio::test]
+    async fn returns_short_prefix_when_deadline_expires() {
+        let (l, addr) = listener().await;
+        let writer = tokio::spawn(async move {
+            let mut c = tokio::net::TcpStream::connect(addr).await.expect("connect");
+            // Two bytes that never complete the 6-byte prefix.
+            c.write_all(&[0x16, 0x03]).await.expect("write");
+            c.flush().await.expect("flush");
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            drop(c);
+        });
+        let (accepted, _) = l.accept().await.expect("accept");
+
+        let bytes = peek_tcp_first_bytes(&accepted, Some(Duration::from_millis(200)), 6)
+            .await
+            .expect("should return the short prefix, not None");
+        assert_eq!(
+            &bytes[..],
+            &[0x16, 0x03],
+            "returns exactly what arrived before the deadline"
+        );
+
+        writer.await.expect("writer task");
     }
 }

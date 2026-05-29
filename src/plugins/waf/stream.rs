@@ -191,6 +191,14 @@ fn compile_stream_signatures(
     Ok(CompiledStreamSignatures { set, meta })
 }
 
+/// Smallest TLS handshake-record prefix needed to classify a ClientHello:
+/// `content_type(1) + version(2) + length(2) + handshake type(1)`. The TCP proxy
+/// reads `stream_first_bytes_min_len()` to know it must reassemble at least this
+/// many opening bytes before running the `tcp_require_tls` guard, so a
+/// ClientHello fragmented across TCP segments is not misread as a short non-TLS
+/// chunk and rejected.
+pub(super) const TLS_CLIENT_HELLO_MIN_PREFIX: usize = 6;
+
 /// Whether these raw TCP wire bytes begin a TLS ClientHello handshake record.
 /// Backs `tcp_require_tls`, which runs only on raw (non-terminated) TCP, so this
 /// validates a TLS record specifically (DTLS is UDP and out of scope here).
@@ -202,7 +210,7 @@ fn compile_stream_signatures(
 /// to slip past the guard.
 pub(super) fn looks_like_tls_client_hello(data: &[u8]) -> bool {
     // type(1) + version(2) + length(2) + handshake type(1) = 6 bytes minimum.
-    if data.len() < 6 || data[0] != 0x16 {
+    if data.len() < TLS_CLIENT_HELLO_MIN_PREFIX || data[0] != 0x16 {
         return false;
     }
     // TLS 1.x legacy record version (TLS 1.3 still uses 0x0301/0x0303 here).
