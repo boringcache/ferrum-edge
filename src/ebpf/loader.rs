@@ -561,6 +561,14 @@ mod live_kernel_tests {
     #[test]
     #[ignore = "requires root + real Linux >= 5.7 kernel (cgroup v2 + bpffs); run via the ebpf-live CI job"]
     fn programs_load_verify_attach_and_map_round_trip() {
+        // Surface loader warnings — including the best-effort SOCK_OPS load,
+        // whose error carries the BPF verifier log — in `--nocapture` output so
+        // a load/verify failure is diagnosable straight from the CI job log.
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_test_writer()
+            .try_init();
+
         let probe = probe_kernel(CGROUP_ROOT, BPF_FS);
         if !probe.supports_ebpf() {
             eprintln!(
