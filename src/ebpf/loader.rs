@@ -16,7 +16,13 @@ use std::net::Ipv4Addr;
 use std::os::fd::AsFd;
 
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
-use aya::programs::{CgroupSockAddr, SchedClassifier, SockOps, SockOpsLinkId, TcAttachType};
+use aya::programs::cgroup_sock_addr::CgroupSockAddrLinkId;
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+use aya::programs::sock_ops::SockOpsLinkId;
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+use aya::programs::tc::SchedClassifierLinkId;
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+use aya::programs::{CgroupAttachMode, CgroupSockAddr, SchedClassifier, SockOps, TcAttachType};
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 use aya::{Ebpf, EbpfLoader};
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
@@ -54,8 +60,8 @@ const TC_PROGRAM: &str = "ferrum_tc_inbound";
 /// Tracks per-pod attachment state for cleanup.
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 struct PodLinks {
-    cgroup_link_ids: Vec<aya::programs::CgroupSockAddrLinkId>,
-    tc_link_ids: Vec<aya::programs::SchedClassifierLinkId>,
+    cgroup_link_ids: Vec<CgroupSockAddrLinkId>,
+    tc_link_ids: Vec<SchedClassifierLinkId>,
 }
 
 /// Real aya-backed eBPF loader. Only available on Linux with `--features ebpf`.
@@ -215,7 +221,7 @@ impl EbpfBackend for AyaEbpfBackend {
             .map_err(|e| format!("'{program}' type mismatch: {e}"))?;
 
         let link_id = prog
-            .attach(cgroup_fd.as_fd())
+            .attach(cgroup_fd.as_fd(), CgroupAttachMode::Single)
             .map_err(|e| format!("Failed to attach '{program}' to '{cgroup_path}': {e}"))?;
 
         let links = self
@@ -344,7 +350,7 @@ impl EbpfBackend for AyaEbpfBackend {
             .map_err(|e| format!("'{BPF_PROGRAM_SOCK_OPS}' is not a SockOps program: {e}"))?;
 
         let link_id = prog
-            .attach(cgroup_fd.as_fd())
+            .attach(cgroup_fd.as_fd(), CgroupAttachMode::Single)
             .map_err(|e| format!("Failed to attach SOCK_OPS to '{cgroup_root}': {e}"))?;
 
         // Pin BEFORE storing link_id so a pinning failure can detach the
