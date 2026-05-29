@@ -575,36 +575,18 @@ impl H3PoolError {
     /// - When `condition` is `false`, this is a NO-OP — the existing flag
     ///   is preserved, never demoted from `true` back to `false`.
     ///
-    /// This asymmetry is deliberate: the pool's internal retry chain
-    /// tracks `any_request_on_wire` across attempts, and threads that
-    /// boolean through `?` exits via `e.promote_on_wire_if(any_request_on_wire)`.
-    /// A `false` value just means "no earlier attempt committed the
-    /// body" — it must NOT clobber a `true` flag that an earlier
-    /// `H3PoolError::post_wire(...)` constructor set.
+    /// A `false` value just means "no earlier attempt committed the body" — it
+    /// must NOT clobber a `true` flag that an earlier
+    /// `H3PoolError::post_wire(...)` constructor set. `graceful_close` is
+    /// preserved verbatim — promotion only affects the body-on-wire signal.
     ///
-    /// `graceful_close` is preserved verbatim — promotion only affects
-    /// the body-on-wire signal.
-    ///
-    /// **Streaming-body callers do not use this method.** The four
-    /// `request_*streaming_body` / `request_*streaming_incoming_body`
-    /// entry points are single-attempt by construction (the frontend
-    /// stream / `Incoming` body is consumed mid-attempt, so a fallback
-    /// chain over multiple pool entries cannot replay it). With no
-    /// fallback chain, no prior post-wire attempt can exist whose flag
-    /// would need to be carried forward — every error originates from
-    /// the one and only attempt, and `H3PoolError::pre_wire(e)` /
-    /// `H3PoolError::post_wire(e)` carry the correct flag directly.
-    /// **If you ever add a fallback / fresh-connect chain to a
-    /// streaming-body entry point, you MUST mirror the buffered
-    /// `request` / `request_with_target` pattern: track
-    /// `any_request_on_wire` across internal attempts and apply
-    /// `.promote_on_wire_if(any_request_on_wire)` to every `?` exit
-    /// in the fresh-connect setup section (`tls_config_fn` and
-    /// `create_or_get_*_sender`). Without this, a post-wire first
-    /// attempt followed by a fresh-connect TLS / sender setup failure
-    /// would surface as `request_on_wire=false` and the gateway would
-    /// silently replay a non-idempotent request via
-    /// `retry_on_connect_failure`.**
+    /// The pool's `request*` methods no longer thread this flag across internal
+    /// attempts. A POST-WIRE failure is returned immediately (it must never be
+    /// replayed on another connection), so the cached/fallback/fresh chain is
+    /// only driven by PRE-WIRE failures and the fresh-connect setup errors are
+    /// genuinely pre-wire. This method is retained as a utility for combining a
+    /// prior on-wire observation with a later pre-wire error.
+    #[allow(dead_code)] // Retained public utility for combining a prior on-wire observation with a later pre-wire error.
     pub fn promote_on_wire_if(mut self, condition: bool) -> Self {
         if condition {
             self.request_on_wire = true;
@@ -1153,15 +1135,16 @@ impl Http3ConnectionPool {
     /// QUIC connection must be established), avoiding the overhead of cloning
     /// the TLS root certificate store on every request.
     ///
-    /// Body-on-wire tracking: the pool tries the cached connection first, then
-    /// falls back across other cached indices, then opens a new connection.
-    /// `any_request_on_wire` is set sticky across all internal attempts — once
-    /// one of them got past `send_request` (request headers committed), the
-    /// final returned [`H3PoolError`] reports `request_on_wire=true` regardless
-    /// of which later attempt produced the actual error message. This prevents
-    /// the gateway from inferring `connection_error=true` and replaying a
-    /// non-idempotent request that may already have reached the backend on
-    /// an earlier internal attempt.
+    /// Body-on-wire safety: the pool tries the cached connection first, then
+    /// falls back across other cached indices, then opens a new connection —
+    /// but ONLY for PRE-WIRE failures (the connection was dead before
+    /// `send_request` committed the request). The moment an attempt reports a
+    /// POST-WIRE failure ([`H3PoolError::request_on_wire`] is `true`) the error
+    /// is returned immediately: the request (headers + body) already reached the
+    /// backend on that stream, so replaying it on another connection would
+    /// double-execute a possibly non-idempotent request and bypass the gateway's
+    /// `retry_on_methods` policy. The gateway's own retry layer then decides
+    /// whether the request (if idempotent) may be retried.
     pub async fn request(
         &self,
         proxy: &Proxy,
@@ -1177,8 +1160,6 @@ impl Http3ConnectionPool {
             .unwrap_or(self.connections_per_backend)
             .max(1);
         let start = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize % conns_per_backend;
-
-        let mut any_request_on_wire = false;
 
         // Snapshot the SVID generation once at the top of the request so all
         // pool key constructions (cache probe, slow-path build, retry shards)
@@ -1201,6 +1182,12 @@ impl Http3ConnectionPool {
         });
         let max_response_body_size_bytes = self.env_config.max_response_body_size_bytes;
 
+        // PRE-WIRE failures (the connection was dead before the request was
+        // committed) are safe to retry on the next cached/fresh connection. A
+        // POST-WIRE failure means the request (headers + body) already reached
+        // the backend on this stream, so replaying it on another connection
+        // would double-execute a possibly non-idempotent request and bypass the
+        // gateway's retry_on_methods policy — surface it immediately instead.
         if let Some(pooled) = cached {
             let mut sr = pooled.send_request;
             match Self::do_request(
@@ -1215,11 +1202,9 @@ impl Http3ConnectionPool {
             .await
             {
                 Ok(result) => return Ok(result),
-                Err(e) => {
-                    if e.request_on_wire() {
-                        any_request_on_wire = true;
-                    }
-                    // Cached connection failed — fall through to the full
+                Err(e) if e.request_on_wire() => return Err(e),
+                Err(_) => {
+                    // Pre-wire cached failure — fall through to the full
                     // retry/reconnect path below which allocates pool keys.
                 }
             }
@@ -1244,10 +1229,8 @@ impl Http3ConnectionPool {
             .await
             {
                 Ok(result) => return Ok(result),
+                Err(e) if e.request_on_wire() => return Err(e),
                 Err(e) => {
-                    if e.request_on_wire() {
-                        any_request_on_wire = true;
-                    }
                     debug!("HTTP/3 cached connection failed, reconnecting: {}", e);
                     self.pool.invalidate(&key);
 
@@ -1270,10 +1253,8 @@ impl Http3ConnectionPool {
                             .await
                             {
                                 Ok(result) => return Ok(result),
-                                Err(e) => {
-                                    if e.request_on_wire() {
-                                        any_request_on_wire = true;
-                                    }
+                                Err(e) if e.request_on_wire() => return Err(e),
+                                Err(_) => {
                                     self.pool.invalidate(&fallback_key);
                                 }
                             }
@@ -1283,24 +1264,18 @@ impl Http3ConnectionPool {
             }
         }
 
-        // Create new connection — only now do we need the TLS config.
-        //
-        // CRITICAL: `tls_config_fn()` and `create_or_get_proxy_sender()`
-        // can fail BEFORE `do_request` runs. If an earlier internal
-        // attempt above already set `any_request_on_wire = true`, those
-        // setup failures must STILL promote the sticky flag — otherwise
-        // a post-wire first attempt followed by a fresh-connect setup
-        // failure would surface as `request_on_wire=false`, and the
-        // gateway would treat the call as pre-wire and replay a
-        // non-idempotent request via `retry_on_connect_failure`. Each
-        // `?` exit applies the promotion explicitly.
-        let tls_config = tls_config_fn()
-            .map_err(|e| H3PoolError::pre_wire(e).promote_on_wire_if(any_request_on_wire))?;
+        // Create new connection — only now do we need the TLS config. Any
+        // post-wire failure on an earlier cached attempt has already returned
+        // above, so reaching here means every prior attempt was pre-wire (the
+        // request never reached a backend) and this fresh attempt is the
+        // request's first delivery; connection-setup failures are therefore
+        // genuinely pre-wire.
+        let tls_config = tls_config_fn().map_err(H3PoolError::pre_wire)?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
         let pooled = self
             .create_or_get_proxy_sender(key, proxy, tls_config, h3_config)
             .await
-            .map_err(|e| H3PoolError::pre_wire(e).promote_on_wire_if(any_request_on_wire))?;
+            .map_err(H3PoolError::pre_wire)?;
         let mut sr_for_request = pooled.send_request;
 
         Self::do_request(
@@ -1313,7 +1288,6 @@ impl Http3ConnectionPool {
             max_response_body_size_bytes,
         )
         .await
-        .map_err(|e| e.promote_on_wire_if(any_request_on_wire))
     }
 
     /// Send an HTTP/3 request to an explicit host/port target, independent of
@@ -1352,10 +1326,13 @@ impl Http3ConnectionPool {
             svid_generation,
         );
 
-        let mut any_request_on_wire = false;
         let max_response_body_size_bytes = self.env_config.max_response_body_size_bytes;
 
-        // Try cached connection on the selected index first
+        // Try cached connection on the selected index first. A PRE-WIRE failure
+        // is safe to retry on another connection; a POST-WIRE failure means the
+        // request already reached the backend on this stream, so return it
+        // immediately to avoid double-executing a possibly non-idempotent
+        // request and bypassing the gateway's retry_on_methods policy.
         if let Some(pooled) = self.pool.cached(&key) {
             let mut sr = pooled.send_request;
             match Self::do_request(
@@ -1370,10 +1347,8 @@ impl Http3ConnectionPool {
             .await
             {
                 Ok(result) => return Ok(result),
+                Err(e) if e.request_on_wire() => return Err(e),
                 Err(e) => {
-                    if e.request_on_wire() {
-                        any_request_on_wire = true;
-                    }
                     debug!(
                         "HTTP/3 cached connection to {}:{} failed, reconnecting: {}",
                         target_host, target_port, e
@@ -1404,10 +1379,8 @@ impl Http3ConnectionPool {
                             .await
                             {
                                 Ok(result) => return Ok(result),
-                                Err(e) => {
-                                    if e.request_on_wire() {
-                                        any_request_on_wire = true;
-                                    }
+                                Err(e) if e.request_on_wire() => return Err(e),
+                                Err(_) => {
                                     self.pool.invalidate(&fallback_key);
                                 }
                             }
@@ -1417,13 +1390,11 @@ impl Http3ConnectionPool {
             }
         }
 
-        // Create new connection to the explicit target.
-        // See `request()` for why these `?` exits must apply the
-        // sticky `any_request_on_wire` promotion (post-wire cached
-        // attempt → fresh-connect setup failure must NOT report
-        // request_on_wire=false).
-        let tls_config = tls_config_fn()
-            .map_err(|e| H3PoolError::pre_wire(e).promote_on_wire_if(any_request_on_wire))?;
+        // Create new connection to the explicit target. Any post-wire failure
+        // on an earlier cached attempt has already returned above, so reaching
+        // here means every prior attempt was pre-wire; connection-setup
+        // failures are therefore genuinely pre-wire.
+        let tls_config = tls_config_fn().map_err(H3PoolError::pre_wire)?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
         let pooled = self
             .create_or_get_target_sender(
@@ -1435,7 +1406,7 @@ impl Http3ConnectionPool {
                 h3_config,
             )
             .await
-            .map_err(|e| H3PoolError::pre_wire(e).promote_on_wire_if(any_request_on_wire))?;
+            .map_err(H3PoolError::pre_wire)?;
         let mut sr_for_request = pooled.send_request;
 
         Self::do_request(
@@ -1448,7 +1419,6 @@ impl Http3ConnectionPool {
             max_response_body_size_bytes,
         )
         .await
-        .map_err(|e| e.promote_on_wire_if(any_request_on_wire))
     }
 
     /// Create a new QUIC connection + h3 session using a shared endpoint.
@@ -2432,8 +2402,6 @@ impl Http3ConnectionPool {
             .max(1);
         let start = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize % conns_per_backend;
 
-        let mut any_request_on_wire = false;
-
         // Snapshot the SVID generation once for the whole request. See
         // `request()` for the rationale (atomic-load amortization plus
         // generation pinning across retries).
@@ -2449,6 +2417,10 @@ impl Http3ConnectionPool {
                 svid_generation,
             )
         });
+        // A PRE-WIRE failure is safe to retry on another connection; a
+        // POST-WIRE failure means the request already reached the backend on
+        // this stream, so return it immediately rather than replaying it (see
+        // `request()`).
         if let Some(pooled) = cached {
             let mut sr = pooled.send_request;
             match Self::do_request_streaming(
@@ -2462,11 +2434,8 @@ impl Http3ConnectionPool {
             .await
             {
                 Ok(result) => return Ok(result),
-                Err(e) => {
-                    if e.request_on_wire() {
-                        any_request_on_wire = true;
-                    }
-                }
+                Err(e) if e.request_on_wire() => return Err(e),
+                Err(_) => {}
             }
         }
 
@@ -2486,10 +2455,8 @@ impl Http3ConnectionPool {
             .await
             {
                 Ok(result) => return Ok(result),
+                Err(e) if e.request_on_wire() => return Err(e),
                 Err(e) => {
-                    if e.request_on_wire() {
-                        any_request_on_wire = true;
-                    }
                     debug!("HTTP/3 cached connection failed, reconnecting: {}", e);
                     self.pool.invalidate(&key);
 
@@ -2510,10 +2477,8 @@ impl Http3ConnectionPool {
                             .await
                             {
                                 Ok(result) => return Ok(result),
-                                Err(e) => {
-                                    if e.request_on_wire() {
-                                        any_request_on_wire = true;
-                                    }
+                                Err(e) if e.request_on_wire() => return Err(e),
+                                Err(_) => {
                                     self.pool.invalidate(&fallback_key);
                                 }
                             }
@@ -2523,15 +2488,15 @@ impl Http3ConnectionPool {
             }
         }
 
-        // See `request()` for why these `?` exits must apply the
-        // sticky `any_request_on_wire` promotion.
-        let tls_config = tls_config_fn()
-            .map_err(|e| H3PoolError::pre_wire(e).promote_on_wire_if(any_request_on_wire))?;
+        // Create a fresh connection. Post-wire failures on earlier cached
+        // attempts have already returned above, so setup failures here are
+        // genuinely pre-wire.
+        let tls_config = tls_config_fn().map_err(H3PoolError::pre_wire)?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
         let pooled = self
             .create_or_get_proxy_sender(key, proxy, tls_config, h3_config)
             .await
-            .map_err(|e| H3PoolError::pre_wire(e).promote_on_wire_if(any_request_on_wire))?;
+            .map_err(H3PoolError::pre_wire)?;
         let mut sr_for_request = pooled.send_request;
 
         Self::do_request_streaming(
@@ -2543,7 +2508,6 @@ impl Http3ConnectionPool {
             body,
         )
         .await
-        .map_err(|e| e.promote_on_wire_if(any_request_on_wire))
     }
 
     /// Send an HTTP/3 request to an explicit host/port target, returning headers
@@ -2576,8 +2540,10 @@ impl Http3ConnectionPool {
             svid_generation,
         );
 
-        let mut any_request_on_wire = false;
-
+        // A PRE-WIRE failure is safe to retry on another connection; a
+        // POST-WIRE failure means the request already reached the backend on
+        // this stream, so return it immediately rather than replaying it (see
+        // `request()`).
         if let Some(pooled) = self.pool.cached(&key) {
             let mut sr = pooled.send_request;
             match Self::do_request_streaming(
@@ -2591,10 +2557,8 @@ impl Http3ConnectionPool {
             .await
             {
                 Ok(result) => return Ok(result),
+                Err(e) if e.request_on_wire() => return Err(e),
                 Err(e) => {
-                    if e.request_on_wire() {
-                        any_request_on_wire = true;
-                    }
                     debug!(
                         "HTTP/3 cached connection to {}:{} failed, reconnecting: {}",
                         target_host, target_port, e
@@ -2623,10 +2587,8 @@ impl Http3ConnectionPool {
                             .await
                             {
                                 Ok(result) => return Ok(result),
-                                Err(e) => {
-                                    if e.request_on_wire() {
-                                        any_request_on_wire = true;
-                                    }
+                                Err(e) if e.request_on_wire() => return Err(e),
+                                Err(_) => {
                                     self.pool.invalidate(&fallback_key);
                                 }
                             }
@@ -2636,10 +2598,10 @@ impl Http3ConnectionPool {
             }
         }
 
-        // See `request()` for why these `?` exits must apply the
-        // sticky `any_request_on_wire` promotion.
-        let tls_config = tls_config_fn()
-            .map_err(|e| H3PoolError::pre_wire(e).promote_on_wire_if(any_request_on_wire))?;
+        // Create a fresh connection to the explicit target. Post-wire failures
+        // on earlier cached attempts have already returned above, so setup
+        // failures here are genuinely pre-wire.
+        let tls_config = tls_config_fn().map_err(H3PoolError::pre_wire)?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
         let pooled = self
             .create_or_get_target_sender(
@@ -2651,7 +2613,7 @@ impl Http3ConnectionPool {
                 h3_config,
             )
             .await
-            .map_err(|e| H3PoolError::pre_wire(e).promote_on_wire_if(any_request_on_wire))?;
+            .map_err(H3PoolError::pre_wire)?;
         let mut sr_for_request = pooled.send_request;
 
         Self::do_request_streaming(
@@ -2663,7 +2625,6 @@ impl Http3ConnectionPool {
             body,
         )
         .await
-        .map_err(|e| e.promote_on_wire_if(any_request_on_wire))
     }
 }
 
