@@ -290,8 +290,14 @@ Limitations and behavior to know:
   transaction summary as `waf.action=blocked`. **UDP blocks** are a silent
   datagram `Drop` (standard UDP behavior). Both transports record `waf.*` on the
   stream transaction summary for every hit — blocked or monitored — via
-  `log_to_metadata` (on by default), so monitor-mode matches are observable in
-  the transaction log without enabling `log_to_stdout`.
+  `log_to_metadata` (on by default), so matches are observable in the transaction
+  log without enabling `log_to_stdout`. Across a UDP/DTLS session, hits **merge**:
+  matched rule ids accumulate, `waf.severity` keeps the highest seen, and a
+  `blocked` action is never downgraded by a later monitored datagram. The one
+  exception is a hit on the **opening** UDP datagram that is blocked before a
+  session is established: there is no session summary to attach to, and emitting a
+  per-datagram summary for a spoofable, sessionless datagram would be a log-flood
+  amplifier, so those blocks surface only on the opt-in `log_to_stdout` channel.
 - By default only client→backend traffic is inspected; set `inspect_response`
   to also scan backend→client datagrams.
 

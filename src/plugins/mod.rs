@@ -231,25 +231,20 @@ impl<'a> UdpMetadataSink<'a> {
         Self { map }
     }
 
-    /// Insert or overwrite a metadata field.
-    pub fn record(&self, key: &str, value: &str) {
+    /// Atomically read-modify-write the session metadata map under one lock.
+    ///
+    /// Inspecting plugins use this to *merge* per-datagram findings across a
+    /// session rather than overwrite them — e.g. union the matched rule ids and
+    /// keep the highest severity seen — so a later, lower-severity datagram
+    /// cannot erase earlier hits (last-write-wins). Holding the lock across the
+    /// whole read-modify-write also keeps the concurrent bidirectional datagram
+    /// tasks from racing on the same key.
+    pub fn update<F: FnOnce(&mut HashMap<String, String>)>(&self, f: F) {
         let mut map = self
             .map
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        map.insert(key.to_string(), value.to_string());
-    }
-
-    /// Insert a metadata field only if it is not already set. Used for fields
-    /// that must not be downgraded across a session's datagrams — e.g. a
-    /// `blocked` action must not be overwritten by a later `monitored` one.
-    pub fn record_if_absent(&self, key: &str, value: &str) {
-        let mut map = self
-            .map
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        map.entry(key.to_string())
-            .or_insert_with(|| value.to_string());
+        f(&mut map);
     }
 }
 

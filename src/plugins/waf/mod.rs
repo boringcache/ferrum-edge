@@ -794,23 +794,34 @@ impl Plugin for Waf {
         // Record the hit on the session transaction summary so a UDP/DTLS match
         // is observable by default — parity with the TCP `on_stream_connect` path,
         // not only when `log_to_stdout` is enabled. The per-datagram context is
-        // immutable, so this rides the proxy-provided session metadata sink.
+        // immutable, so this rides the proxy-provided session metadata sink. A
+        // session sees many datagrams, so findings are *merged* across them rather
+        // than overwritten (last-hit-wins): rule ids accumulate, severity keeps its
+        // max, and a `blocked` action is never downgraded by a later `monitored`
+        // hit. The whole merge runs under one lock so the bidirectional datagram
+        // tasks cannot race.
         if self.config.log_to_metadata
             && let Some(sink) = ctx.metadata_sink
         {
-            if !ids.is_empty() {
-                sink.record("waf.rule_hits", &ids);
-            }
-            sink.record("waf.target", "udp_stream");
-            sink.record("waf.severity", severity.as_str());
-            if block {
-                // A `blocked` action must win over any earlier `monitored` one
-                // recorded for this session, so overwrite it unconditionally.
-                sink.record("waf.action", "blocked");
-                sink.record_if_absent("waf.block_reason", "signature");
-            } else {
-                sink.record_if_absent("waf.action", "monitored");
-            }
+            sink.update(|meta| {
+                merge_csv_into(meta, "waf.rule_hits", &ids);
+                meta.insert("waf.target".to_string(), "udp_stream".to_string());
+                let raise = meta
+                    .get("waf.severity")
+                    .and_then(|current| parse_severity(current))
+                    .is_none_or(|current| severity > current);
+                if raise {
+                    meta.insert("waf.severity".to_string(), severity.as_str().to_string());
+                }
+                if block {
+                    meta.insert("waf.action".to_string(), "blocked".to_string());
+                    meta.entry("waf.block_reason".to_string())
+                        .or_insert_with(|| "signature".to_string());
+                } else {
+                    meta.entry("waf.action".to_string())
+                        .or_insert_with(|| "monitored".to_string());
+                }
+            });
         }
         self.warn_stream_hits(&ctx.proxy_id, &ctx.client_ip, "udp", &hits, block);
         if block {
@@ -1001,6 +1012,27 @@ fn parse_severity(value: &str) -> Option<Severity> {
         "critical" => Some(Severity::Critical),
         _ => None,
     }
+}
+
+/// Union a comma-separated `value` into `map[key]`, preserving first-seen order
+/// and dropping duplicates. Lets repeated stream WAF hits on one session
+/// accumulate matched rule ids instead of overwriting them (last-hit-wins).
+fn merge_csv_into(map: &mut HashMap<String, String>, key: &str, value: &str) {
+    if value.is_empty() {
+        return;
+    }
+    let Some(existing) = map.get(key) else {
+        map.insert(key.to_string(), value.to_string());
+        return;
+    };
+    let existing = existing.clone();
+    let mut ids: Vec<&str> = existing.split(',').filter(|s| !s.is_empty()).collect();
+    for id in value.split(',').filter(|s| !s.is_empty()) {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    map.insert(key.to_string(), ids.join(","));
 }
 
 fn parse_global_mode(raw: &str) -> Result<GlobalMode, String> {

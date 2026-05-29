@@ -1227,6 +1227,14 @@ async fn process_datagram(
         )
         .await
         {
+            // Blocked before any session exists. We intentionally do NOT emit a
+            // one-shot stream summary here. A sessionless UDP datagram has a
+            // trivially spoofable source, so a default-on (`log_to_metadata`)
+            // summary per blocked opening datagram would be a log-flood amplifier
+            // — unlike TCP, whose per-connection block summaries are bounded by a
+            // completed handshake, and unlike in-session UDP blocks, which ride
+            // the bounded per-session summary. The hit is still surfaced on the
+            // opt-in `log_to_stdout` channel via `warn_stream_hits`.
             return Ok(());
         }
         // Mesh `outboundTrafficPolicy: REGISTRY_ONLY` enforcement (T5-B).

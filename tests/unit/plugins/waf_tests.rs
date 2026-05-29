@@ -2360,6 +2360,63 @@ async fn stream_waf_udp_clean_datagram_records_no_metadata() {
 }
 
 #[tokio::test]
+async fn stream_waf_udp_metadata_merges_across_datagrams_and_keeps_max_severity() {
+    // A session sees many datagrams. Rule ids must accumulate (union) and the
+    // recorded severity must be the highest seen — a later, lower-severity hit
+    // must not erase the earlier rule id or downgrade the summary (regression for
+    // the last-hit-wins behavior).
+    let plugin = Waf::new(&json!({
+        "mode": "monitor",
+        "include_default_rules": false,
+        "stream": {
+            "signatures": [
+                { "id": "HIGH-SQLI", "pattern": "(?i)union\\s+select", "severity": "high" },
+                { "id": "LOW-PROBE", "pattern": "(?i)probe", "severity": "low" }
+            ]
+        }
+    }))
+    .unwrap();
+    let meta = std::sync::Mutex::new(std::collections::HashMap::new());
+    let sink = UdpMetadataSink::new(&meta);
+
+    // Datagram 1: high-severity hit.
+    let mut c1 = udp_ctx(b"union select", StreamBytesKind::PlaintextWire);
+    c1.metadata_sink = Some(sink);
+    assert_eq!(
+        plugin.on_udp_datagram(&c1).await,
+        UdpDatagramVerdict::Forward
+    );
+
+    // Datagram 2: only a low-severity hit — must not downgrade severity or drop
+    // the earlier rule id.
+    let mut c2 = udp_ctx(b"probe", StreamBytesKind::PlaintextWire);
+    c2.metadata_sink = Some(sink);
+    assert_eq!(
+        plugin.on_udp_datagram(&c2).await,
+        UdpDatagramVerdict::Forward
+    );
+
+    let recorded = meta.lock().unwrap();
+    let hits = recorded
+        .get("waf.rule_hits")
+        .map(String::as_str)
+        .unwrap_or("");
+    assert!(
+        hits.contains("HIGH-SQLI"),
+        "earlier rule id retained: {hits}"
+    );
+    assert!(
+        hits.contains("LOW-PROBE"),
+        "later rule id accumulated: {hits}"
+    );
+    assert_eq!(
+        recorded.get("waf.severity").map(String::as_str),
+        Some("high"),
+        "severity must stay at the max seen, not downgrade to the later low hit"
+    );
+}
+
+#[tokio::test]
 async fn stream_waf_tcp_require_tls_fails_closed_when_no_bytes() {
     // A client that idles until the peek times out (no first bytes) must not
     // slip past a tcp_require_tls port and then send plaintext.
