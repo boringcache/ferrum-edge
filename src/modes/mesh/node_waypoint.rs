@@ -64,7 +64,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use dashmap::DashMap;
 use ferrum_ebpf_common::{OrigDst4, OrigDst6};
 use sha2::{Digest, Sha256};
@@ -303,6 +303,12 @@ impl fmt::Display for NodeWaypointIdentityError {
 
 impl std::error::Error for NodeWaypointIdentityError {}
 
+/// Synchronous accept-path cookie lookup, returning `(pod_uid, workload SPIFFE
+/// hash)` for a socket cookie. Boxed because `ArcSwapOption` needs a `Sized`
+/// payload. Injected by the eBPF orig-dst bridge so the resolver itself stays
+/// aya-free; see [`NodeWaypointIdentityResolver::set_cookie_fallback`].
+pub type CookieLookupFallback = Box<dyn Fn(u64) -> Option<([u8; 16], u64)> + Send + Sync>;
+
 pub struct NodeWaypointIdentityResolver {
     /// Unified cookie → identity-key map. Linux socket cookies are globally
     /// unique across IPv4/IPv6, so the resolver doesn't need separate maps;
@@ -310,6 +316,15 @@ pub struct NodeWaypointIdentityResolver {
     /// (previously the IPv4 map was always probed first) and halves the
     /// DashMap shard-array overhead.
     cookie_records: DashMap<u64, CookieRecord>,
+    /// Optional synchronous fallback consulted by [`Self::resolve_cookie`] when
+    /// `cookie_records` misses. The orig-dst bridge mirrors the pinned BPF maps
+    /// into `cookie_records` only every `ORIG_DST_BRIDGE_POLL_INTERVAL_MS`, so a
+    /// connection accepted right after its accept-side cookie was stamped would
+    /// otherwise be dropped (UnknownCookie) until the next poll. This fallback
+    /// reads the pinned map directly so the first resolve succeeds. `None` on
+    /// non-eBPF builds / before the bridge installs it. Lock-free swap so the
+    /// hot accept path never blocks.
+    cookie_fallback: ArcSwapOption<CookieLookupFallback>,
     identities_by_pod_uid: DashMap<[u8; 16], Arc<NodeWaypointIdentity>>,
     policy_scopes_by_pod_uid: Arc<ArcSwap<HashMap<[u8; 16], Arc<PolicyScopeCache>>>>,
     workload_policy_scopes_by_spiffe: Arc<ArcSwap<HashMap<String, Arc<PolicyScopeCache>>>>,
@@ -357,6 +372,7 @@ impl NodeWaypointIdentityResolver {
         let shards = crate::util::sharding::pool_shard_amount(pool_shard_override);
         Self {
             cookie_records: DashMap::with_shard_amount(shards),
+            cookie_fallback: ArcSwapOption::empty(),
             identities_by_pod_uid: DashMap::with_shard_amount(shards),
             policy_scopes_by_pod_uid: Arc::new(ArcSwap::new(Arc::new(HashMap::new()))),
             workload_policy_scopes_by_spiffe: Arc::new(ArcSwap::new(Arc::new(HashMap::new()))),
@@ -365,6 +381,19 @@ impl NodeWaypointIdentityResolver {
             cgroup_sweep_inode_changed: AtomicU64::new(0),
             cgroup_sweep_passes: AtomicU64::new(0),
         }
+    }
+
+    /// Install the synchronous accept-path cookie fallback (the eBPF orig-dst
+    /// bridge supplies one backed by the pinned `FERRUM_ORIG_DST4/6` maps).
+    /// Lock-free swap; safe to call from the bridge while the accept path reads.
+    pub fn set_cookie_fallback(&self, fallback: CookieLookupFallback) {
+        self.cookie_fallback.store(Some(Arc::new(fallback)));
+    }
+
+    /// Drop the synchronous fallback (e.g. on bridge shutdown) so the resolver
+    /// no longer references closed BPF maps.
+    pub fn clear_cookie_fallback(&self) {
+        self.cookie_fallback.store(None);
     }
 
     pub fn record_orig_dst4(&self, cookie: u64, record: OrigDst4) {
@@ -842,10 +871,22 @@ impl NodeWaypointIdentityResolver {
         &self,
         cookie: u64,
     ) -> Result<Arc<NodeWaypointIdentity>, NodeWaypointIdentityError> {
-        let Some(record) = self.cookie_records.get(&cookie) else {
-            return Err(NodeWaypointIdentityError::UnknownCookie(cookie));
-        };
-        self.resolve_record(cookie, record.pod_uid, record.workload_spiffe_hash)
+        if let Some(record) = self.cookie_records.get(&cookie) {
+            return self.resolve_record(cookie, record.pod_uid, record.workload_spiffe_hash);
+        }
+        // Between-tick fallback (GAP-2M): the orig-dst bridge mirrors the pinned
+        // BPF maps into `cookie_records` only on its poll interval, so a cookie
+        // stamped on the accept side moments ago may not be mirrored yet. Read
+        // the pinned map synchronously so a freshly accepted connection resolves
+        // on the first try instead of being dropped until the next poll. No
+        // fallback (non-eBPF / pre-install) or a miss → UnknownCookie
+        // (fail-closed, unchanged).
+        if let Some(fallback) = self.cookie_fallback.load_full()
+            && let Some((pod_uid, workload_spiffe_hash)) = fallback(cookie)
+        {
+            return self.resolve_record(cookie, pod_uid, workload_spiffe_hash);
+        }
+        Err(NodeWaypointIdentityError::UnknownCookie(cookie))
     }
 
     fn resolve_record(
@@ -1060,6 +1101,45 @@ mod tests {
             .resolve_cookie(7)
             .expect_err("unknown cookie must fail closed");
         assert_eq!(error, NodeWaypointIdentityError::UnknownCookie(7));
+    }
+
+    #[test]
+    fn resolve_cookie_uses_synchronous_fallback_on_miss() {
+        let resolver = NodeWaypointIdentityResolver::new(0);
+        let pod_uid = parse_pod_uid("22222222-2222-2222-2222-222222222222").unwrap();
+        let identity =
+            NodeWaypointIdentity::new(pod_uid, spiffe("spiffe://td/ns/default/sa/reviews"));
+        let hash = identity.workload_spiffe_hash;
+        resolver.upsert_identity(identity);
+
+        // `cookie_records` is empty — simulates the 200ms orig-dst poll not
+        // having mirrored the just-stamped accept cookie yet. The injected
+        // synchronous fallback resolves cookie 42.
+        resolver.set_cookie_fallback(Box::new(move |cookie| {
+            (cookie == 42).then_some((pod_uid, hash))
+        }));
+
+        let resolved = resolver
+            .resolve_cookie(42)
+            .expect("synchronous fallback resolves the fresh cookie");
+        assert_eq!(resolved.pod_uid, pod_uid);
+
+        // A fallback miss still fails closed.
+        assert_eq!(
+            resolver
+                .resolve_cookie(99)
+                .expect_err("fallback miss fails closed"),
+            NodeWaypointIdentityError::UnknownCookie(99)
+        );
+
+        // Clearing the fallback reverts to pure in-memory resolution.
+        resolver.clear_cookie_fallback();
+        assert_eq!(
+            resolver
+                .resolve_cookie(42)
+                .expect_err("no fallback after clear fails closed"),
+            NodeWaypointIdentityError::UnknownCookie(42)
+        );
     }
 
     #[test]
