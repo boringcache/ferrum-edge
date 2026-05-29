@@ -24,11 +24,17 @@
 //! original destination into `FERRUM_ORIG_DST4` keyed by the *connecting*
 //! socket's cookie, but the proxy resolves by the *accepted* socket's cookie.
 //! At active-established (local port now assigned) the connect-side record is
-//! re-keyed by the connection 4-tuple into `FERRUM_ORIG_DST_BY_TUPLE4`; at
-//! passive-established the mirror tuple is looked up and the record re-stamped
-//! under the accept-side cookie. See [`bridge_active_established`] /
-//! [`bridge_passive_established`]. A byte-order or tuple mismatch only leaves
-//! resolution fail-closed (unchanged from pre-GAP-2M), never misattributed.
+//! re-keyed by `(netns cookie, connection 4-tuple)` into
+//! `FERRUM_ORIG_DST_BY_TUPLE4`; at passive-established the mirror tuple is
+//! looked up and the record re-stamped under the accept-side cookie. The netns
+//! cookie is essential: captured connections all target `127.0.0.1:15001`, so
+//! the 4-tuple alone collapses to loopback + an ephemeral port that can collide
+//! across pods in this one global map; the per-netns cookie keeps each pod's
+//! key distinct (no pod overwrites another's record → no identity
+//! misattribution) while staying identical across the two ends of a same-netns
+//! connection. See [`bridge_active_established`] / [`bridge_passive_established`].
+//! A byte-order / tuple / netns mismatch only leaves resolution fail-closed
+//! (unchanged from pre-GAP-2M), never misattributed.
 //!
 //! IPv6 is intentionally not bridged: aya's SockOpsContext `local_ip6`/
 //! `remote_ip6` accessors copy the whole `[u32; 4]` out of the ctx, which the
@@ -232,6 +238,14 @@ fn socket_cookie(ctx: &SockOpsContext) -> u64 {
     unsafe { aya_ebpf::helpers::bpf_get_socket_cookie(ctx.as_ptr()) }
 }
 
+#[inline(always)]
+fn socket_netns_cookie(ctx: &SockOpsContext) -> u64 {
+    // Safety: `bpf_get_netns_cookie` is a BPF helper valid on a sock_ops
+    // context (the kernel registers `bpf_get_netns_cookie_sock_ops_proto`);
+    // the verifier checks the context type.
+    unsafe { aya_ebpf::helpers::bpf_get_netns_cookie(ctx.as_ptr()) }
+}
+
 /// GAP-2M (active side). The connecting (client) socket has reached
 /// ESTABLISHED, so its ephemeral local port is now assigned. Look up the
 /// connect-side original-destination record (stamped by `connect4`/`connect6`
@@ -246,9 +260,11 @@ fn bridge_active_established(ctx: &SockOpsContext) {
     }
     let cookie = socket_cookie(ctx);
     // Active side: the local socket addr/port is the client, the rewritten
-    // remote addr/port is the loopback capture endpoint (the server).
+    // remote addr/port is the loopback capture endpoint (the server). The netns
+    // cookie disambiguates pods that share the loopback 4-tuple.
     if let Some(orig) = unsafe { FERRUM_ORIG_DST4.get(&OrigDstKey { cookie }) }.copied() {
         let tuple = ConnTuple4::new(
+            socket_netns_cookie(ctx),
             ctx.local_ip4(),
             ctx.local_port() as u16,
             ctx.remote_ip4(),
@@ -271,8 +287,10 @@ fn bridge_passive_established(ctx: &SockOpsContext) {
     }
     let cookie = socket_cookie(ctx);
     // Passive side mirrors the active tuple: the remote socket addr/port is the
-    // client, the local addr/port is the loopback server.
+    // client, the local addr/port is the loopback server. The netns cookie is
+    // the same as the active side for a same-netns connection.
     let tuple = ConnTuple4::new(
+        socket_netns_cookie(ctx),
         ctx.remote_ip4(),
         sock_ops_peer_port_host_order(ctx.remote_port()),
         ctx.local_ip4(),

@@ -57,16 +57,25 @@ pub struct OrigDst6 {
 /// passive-established it looks the tuple up and re-stamps the record under the
 /// accept-side cookie. Both callbacks must compute an identical key, so:
 ///
+/// - `netns_cookie` (`bpf_get_netns_cookie`) disambiguates pods, and is the
+///   load-bearing part of the key. Every captured connection is rewritten to
+///   `127.0.0.1:15001`, so `client_addr`/`server_addr` collapse to loopback and
+///   only the ephemeral `client_port` varies — and ephemeral ports are
+///   per-netns, so two pods can present the *same* 4-tuple into this one global
+///   map. The netns cookie is identical for both ends of a same-netns loopback
+///   connection but distinct across pods, so it makes the key globally unique
+///   and stops one pod's record from overwriting another's (which would
+///   misattribute identity to the accepted socket). A connection whose accept
+///   side lives in a different netns than its connect side never matches —
+///   fail-closed, never misattributed.
 /// - `client_addr` / `server_addr` are kept in **network byte order** (the
 ///   kernel stores `local_ip4` / `remote_ip4` that way on both sides).
-/// - `client_port` / `server_port` are normalized to **host byte order** by the
-///   kernel program (the connecting socket exposes its local port in host
-///   order, the peer port in network order, and vice-versa on the accept side).
+/// - `client_port` / `server_port` are normalized to **host byte order** (see
+///   [`sock_ops_peer_port_host_order`]).
 ///
 /// "client" is the originating pod socket; "server" is the loopback capture
-/// endpoint (127.0.0.1:15001). A byte-order mismatch yields a non-matching key
-/// and resolution simply stays fail-closed — never misattributed, since a live
-/// 4-tuple is unique per concurrent connection.
+/// endpoint (127.0.0.1:15001). `_pad` keeps `netns_cookie` 8-byte aligned with
+/// no implicit padding, so the map-key bytes are fully defined.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConnTuple4 {
@@ -74,10 +83,13 @@ pub struct ConnTuple4 {
     pub server_addr: u32,
     pub client_port: u16,
     pub server_port: u16,
+    pub _pad: u32,
+    pub netns_cookie: u64,
 }
 
 impl ConnTuple4 {
     pub const fn new(
+        netns_cookie: u64,
         client_addr: u32,
         client_port: u16,
         server_addr: u32,
@@ -88,13 +100,17 @@ impl ConnTuple4 {
             server_addr,
             client_port,
             server_port,
+            _pad: 0,
+            netns_cookie,
         }
     }
 }
 
-/// IPv6 connection 4-tuple key for the accept-side cookie bridge (GAP-2M),
-/// used by `FERRUM_ORIG_DST_BY_TUPLE6`. Byte-order rules match [`ConnTuple4`];
-/// `_pad` keeps the struct fixed-size and 4-byte aligned for the BPF verifier.
+/// IPv6 connection 4-tuple key for the accept-side cookie bridge (GAP-2M).
+/// Mirrors [`ConnTuple4`] (including the `netns_cookie` pod discriminator); the
+/// `sock_ops` bridge is currently IPv4-only, so this type is the documented v6
+/// wire format for the eventual IPv6 follow-up. `_pad` keeps `netns_cookie`
+/// 8-byte aligned with no implicit padding.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConnTuple6 {
@@ -103,10 +119,12 @@ pub struct ConnTuple6 {
     pub client_port: u16,
     pub server_port: u16,
     pub _pad: u32,
+    pub netns_cookie: u64,
 }
 
 impl ConnTuple6 {
     pub const fn new(
+        netns_cookie: u64,
         client_addr: [u32; 4],
         client_port: u16,
         server_addr: [u32; 4],
@@ -118,6 +136,7 @@ impl ConnTuple6 {
             client_port,
             server_port,
             _pad: 0,
+            netns_cookie,
         }
     }
 }
@@ -438,12 +457,14 @@ mod tests {
         assert_eq!(mem::size_of::<OrigDstKey>(), 8);
         assert_eq!(mem::size_of::<OrigDst4>(), 32);
         assert_eq!(mem::size_of::<OrigDst6>(), 48);
-        // ConnTuple4: two u32 (8) + two u16 (4) = 12 bytes, 4-byte aligned.
-        assert_eq!(mem::size_of::<ConnTuple4>(), 12);
-        assert_eq!(mem::align_of::<ConnTuple4>(), 4);
-        // ConnTuple6: two [u32;4] (32) + two u16 (4) + u32 pad (4) = 40 bytes.
-        assert_eq!(mem::size_of::<ConnTuple6>(), 40);
-        assert_eq!(mem::align_of::<ConnTuple6>(), 4);
+        // ConnTuple4: two u32 (8) + two u16 (4) + u32 pad (4) + u64 netns (8)
+        // = 24 bytes, 8-byte aligned (no implicit padding).
+        assert_eq!(mem::size_of::<ConnTuple4>(), 24);
+        assert_eq!(mem::align_of::<ConnTuple4>(), 8);
+        // ConnTuple6: two [u32;4] (32) + two u16 (4) + u32 pad (4) + u64 netns
+        // (8) = 48 bytes, 8-byte aligned.
+        assert_eq!(mem::size_of::<ConnTuple6>(), 48);
+        assert_eq!(mem::align_of::<ConnTuple6>(), 8);
         assert_eq!(mem::size_of::<PodInfo>(), 8);
         // WorkloadIdentity: [u8;16] (16) + u64 (8) + u64 pad (8) = 32 bytes,
         // 8-byte aligned for the BPF verifier.
