@@ -38,7 +38,11 @@
 //! live multi-pod-node verification step. A tuple/byte-order mismatch fails
 //! closed (no accept-side record written), never misattributes identity, so
 //! the unverified path is safe-by-construction. Pod-identity enrollment into
-//! `identities_by_pod_uid` from the slice workloads is a separate tier.
+//! `identities_by_pod_uid` is wired: the resolver lazily enrolls
+//! `pod_uid` → identity by hash-joining the eBPF-stamped
+//! `(pod_uid, workload_spiffe_hash)` against the slice's
+//! `workload_spiffe_hash` → SPIFFE index (installed at slice apply), so
+//! resolution is complete end-to-end in code.
 //!
 //! ## Why polling
 //!

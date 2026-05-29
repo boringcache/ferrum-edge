@@ -3414,22 +3414,22 @@ async fn serve_mesh_runtime(
         {
             mesh_background_handles.push(handle);
         }
-        // GAP-1b: spawn the orig-dst → identity bridge. It reads the pinned
-        // FERRUM_ORIG_DST4/6 maps the node-agent populated and mirrors each
-        // socket-cookie record into the resolver, giving record_orig_dst*
-        // their production caller. Without a node-agent / eBPF build the
-        // spawned task logs loudly and returns; the resolver stays empty and
-        // the accept path keeps failing closed.
+        // Spawn the orig-dst → identity bridge. It reads the pinned
+        // FERRUM_ORIG_DST4/6 maps the node-agent populated, mirrors each
+        // socket-cookie record into the resolver, and installs the synchronous
+        // accept-path fallback. Without a node-agent / eBPF build the spawned
+        // task logs loudly and returns; the resolver stays empty and the accept
+        // path fails closed.
         //
-        // NOTE (staged): GAP-1b alone does NOT make node-waypoint resolution
-        // succeed end-to-end. The records it mirrors are keyed by the source
-        // pod's connect-side cookie, while the accept path looks up the
-        // accept-side cookie (see `orig_dst_bridge` docs and
-        // `src/socket_opts.rs`); the accept-side registrar (GAP-2M) is a
-        // required follow-up. Identity enrollment into `identities_by_pod_uid`
-        // from `initial_slice.workloads` is likewise a separate follow-up tier
-        // — the snapshot installed above seeds POLICY SCOPES, not identities.
-        // Until both land, node-waypoint cookie resolution fails closed.
+        // Node-waypoint resolution is now wired end-to-end: the accept-side
+        // cookie registrar (GAP-2M) lives in the kernel sock_ops program, and
+        // the snapshot installed above seeds BOTH policy scopes AND a
+        // workload_spiffe_hash → SPIFFE index, so `resolve_record` lazily
+        // enrolls `pod_uid` → identity by hash-join against the eBPF-stamped
+        // records (no separate enrollment channel). The path is complete in
+        // code and CI-verified at the load/attach level (`ebpf-live`); it stays
+        // unexercised on a live multi-pod datapath, where a tuple/byte-order or
+        // enrollment miss fails closed (never misattributes).
         mesh_background_handles.push(spawn_orig_dst_bridge_task(resolver.clone(), &shutdown_tx));
         proxy_state.with_node_waypoint_identity_resolver(resolver)
     } else {
