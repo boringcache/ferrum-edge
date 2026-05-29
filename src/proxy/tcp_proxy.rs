@@ -2121,6 +2121,20 @@ async fn handle_tcp_connection_inner(
         }
     };
 
+    // Helper: release a half-open probe slot claimed by `can_execute` without
+    // recording success or failure. Used when the gateway rejects the
+    // connection locally (DestinationRule maxConnections cap), which is not a
+    // backend outcome — `record_neutral` decrements `half_open_in_flight` only
+    // when a probe was held and leaves breaker health untouched.
+    let record_cb_neutral = |cb_cache: &CircuitBreakerCache,
+                             proxy_id: &str,
+                             cb_info: &TcpConnCbInfo| {
+        if let Some(ref cb_config) = cb_info.cb_config {
+            let cb = cb_cache.get_or_create(proxy_id, cb_info.cb_target_key.as_deref(), cb_config);
+            cb.record_neutral(cb_info.is_half_open_probe);
+        }
+    };
+
     // Connection-phase retry loop. Retries DNS resolution + backend connect
     // with a different load-balanced target on each attempt. Once a backend
     // connection is established, bidirectional_copy begins and no further
@@ -2268,6 +2282,14 @@ async fn handle_tcp_connection_inner(
                     reason = %reason,
                     "TCP backend rejected: maxConnections reached"
                 );
+                // Release any half-open probe slot claimed for this target
+                // before retrying (which resets is_half_open_probe) or
+                // returning (which records no outcome). A gateway-local
+                // maxConnections rejection must not leak the probe slot —
+                // otherwise a HALF_OPEN breaker stays wedged (always rejecting)
+                // until a config reload. This is neutral: the cap is not a
+                // backend failure.
+                record_cb_neutral(circuit_breaker_cache, proxy_id, &current_cb_info);
                 if can_retry
                     && attempt < max_retries
                     && let Some(next) =
