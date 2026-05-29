@@ -28,8 +28,9 @@ use crate::consumer_index::ConsumerIndex;
 use crate::dns::DnsCache;
 use crate::load_balancer::{LoadBalancerCache, LoadBalancerCacheInner};
 use crate::plugins::{
-    Direction, Plugin, PluginResult, ProxyProtocol, StreamConnectionContext,
+    Direction, Plugin, PluginResult, ProxyProtocol, StreamBytesKind, StreamConnectionContext,
     StreamTransactionSummary, UdpDatagramContext, UdpDatagramDirection, UdpDatagramVerdict,
+    UdpMetadataSink,
 };
 use crate::proxy::stream_error::{StreamSetupError, StreamSetupKind, find_stream_setup_error};
 use crate::request_epoch::{RequestEpoch, RequestEpochStore};
@@ -98,6 +99,11 @@ struct UdpSession {
     /// Plugins and proxy metadata resolved from the RequestEpoch used to create this session.
     plugins: Arc<Vec<Arc<dyn Plugin>>>,
     datagram_plugins: Arc<[Arc<dyn Plugin>]>,
+    /// Nature of the per-datagram payloads this (plain-UDP-frontend) session
+    /// hands to `on_udp_datagram`: `PlaintextWire` for plain UDP, or
+    /// `EncryptedWire` for passthrough proxies that forward ciphertext. The
+    /// DTLS-terminating frontend path reports `DecryptedApp` inline instead.
+    datagram_payload_kind: StreamBytesKind,
     proxy_id: String,
     proxy_name: Option<String>,
     proxy_namespace: String,
@@ -190,14 +196,17 @@ fn resolve_udp_session_epoch_view(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn udp_datagram_allowed(
     datagram_plugins: &[Arc<dyn Plugin>],
     client_addr: SocketAddr,
     proxy_id: &str,
     proxy_name: Option<&str>,
     listen_port: u16,
-    datagram_size: usize,
+    payload: &[u8],
+    payload_kind: StreamBytesKind,
     direction: UdpDatagramDirection,
+    metadata_sink: Option<UdpMetadataSink<'_>>,
 ) -> bool {
     if datagram_plugins.is_empty() {
         return true;
@@ -208,8 +217,11 @@ async fn udp_datagram_allowed(
         proxy_id: Arc::from(proxy_id),
         proxy_name: proxy_name.map(Arc::from),
         listen_port,
-        datagram_size,
+        datagram_size: payload.len(),
         direction,
+        payload,
+        payload_kind,
+        metadata_sink,
     };
     for plugin in datagram_plugins {
         if matches!(plugin.on_udp_datagram(&ctx).await, UdpDatagramVerdict::Drop) {
@@ -1177,8 +1189,10 @@ async fn process_datagram(
             &session.proxy_id,
             session.proxy_name.as_deref(),
             session.listen_port,
-            data.len(),
+            data,
+            session.datagram_payload_kind,
             UdpDatagramDirection::ClientToBackend,
+            Some(UdpMetadataSink::new(&session.metadata)),
         )
         .await
         {
@@ -1189,17 +1203,38 @@ async fn process_datagram(
         let epoch = request_epoch.load();
         let view =
             resolve_udp_session_epoch_view(proxy_id, &epoch, data, sni_proxy_ids, listen_port)?;
+        // The opening datagram is inspected before the session exists, so capture
+        // any WAF metadata it records into a local map and seed it onto the new
+        // session below — otherwise a monitor-mode hit on the very first datagram
+        // (the one that creates the session) would never reach the transaction
+        // summary.
+        let first_datagram_metadata =
+            std::sync::Mutex::new(std::collections::HashMap::<String, String>::new());
         if !udp_datagram_allowed(
             &view.datagram_plugins,
             client_addr,
             &view.proxy.id,
             view.proxy.name.as_deref(),
             listen_port,
-            data.len(),
+            data,
+            if view.proxy.passthrough {
+                StreamBytesKind::EncryptedWire
+            } else {
+                StreamBytesKind::PlaintextWire
+            },
             UdpDatagramDirection::ClientToBackend,
+            Some(UdpMetadataSink::new(&first_datagram_metadata)),
         )
         .await
         {
+            // Blocked before any session exists. We intentionally do NOT emit a
+            // one-shot stream summary here. A sessionless UDP datagram has a
+            // trivially spoofable source, so a default-on (`log_to_metadata`)
+            // summary per blocked opening datagram would be a log-flood amplifier
+            // — unlike TCP, whose per-connection block summaries are bounded by a
+            // completed handshake, and unlike in-session UDP blocks, which ride
+            // the bounded per-session summary. The hit is still surfaced on the
+            // opt-in `log_to_stdout` channel via `warn_stream_hits`.
             return Ok(());
         }
         // Mesh `outboundTrafficPolicy: REGISTRY_ONLY` enforcement (T5-B).
@@ -1253,7 +1288,7 @@ async fn process_datagram(
                 Decision::Skip => {}
             }
         }
-        lookup_or_create_session(
+        let session = lookup_or_create_session(
             client_addr,
             &epoch,
             view,
@@ -1274,7 +1309,22 @@ async fn process_datagram(
             global_shutdown,
             overload,
         )
-        .await?
+        .await?;
+        // Seed the opening datagram's WAF metadata onto the session without
+        // clobbering anything `on_stream_connect` recorded during creation.
+        let seed = first_datagram_metadata
+            .into_inner()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !seed.is_empty() {
+            let mut session_meta = session
+                .metadata
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for (key, value) in seed {
+                session_meta.entry(key).or_insert(value);
+            }
+        }
+        session
     };
 
     // Record the per-datagram local (destination) address on the session the
@@ -1627,6 +1677,10 @@ async fn start_dtls_frontend_listener(
                     // Namespace/selector-scoped DENY/ALLOW rules are not enforced
                     // for DTLS streams (TCP and HTTP/HBONE are). See docs/mesh.md.
                     node_waypoint_policy_scope: None,
+                    // UDP inspects payload per-datagram via on_udp_datagram, not
+                    // via first_bytes (which is a TCP-stream concept).
+                    first_bytes: None,
+                    first_bytes_kind: None,
                 };
                 let mut rejected = false;
                 for plugin in plugins.iter() {
@@ -1750,6 +1804,11 @@ async fn start_dtls_frontend_listener(
 
                     if !handler_plugins.is_empty() || error_class.is_some() {
                         let disconnected_at = chrono::Utc::now();
+                        // Merge per-datagram WAF metadata recorded during
+                        // forwarding with any on_stream_connect metadata so DTLS
+                        // hits ride the transaction summary by default.
+                        let mut merged_metadata = handler_metadata;
+                        merged_metadata.extend(result.metadata);
                         let summary = build_dtls_stream_summary(DtlsDisconnectContext {
                             namespace: &handler_proxy_namespace,
                             proxy_id: &handler_proxy_id,
@@ -1769,7 +1828,7 @@ async fn start_dtls_frontend_listener(
                             error_class,
                             disconnect_direction,
                             disconnect_cause,
-                            metadata: &handler_metadata,
+                            metadata: &merged_metadata,
                         });
                         crate::runtime_metrics::global_ref().record_stream_transaction(&summary);
 
@@ -1821,6 +1880,9 @@ struct DtlsHandlerResult {
     backend: DtlsBackendInfo,
     bytes_sent: u64,
     bytes_received: u64,
+    /// Session metadata recorded by per-datagram hooks during forwarding (e.g.
+    /// WAF `waf.*` signature hits), merged into the disconnect summary.
+    metadata: std::collections::HashMap<String, String>,
     outcome: Result<(), anyhow::Error>,
 }
 
@@ -1855,6 +1917,10 @@ async fn handle_dtls_client(
     let bytes_sent = Arc::new(AtomicU64::new(0));
     let bytes_received = Arc::new(AtomicU64::new(0));
     let last_request_size = Arc::new(AtomicU64::new(0));
+    // Shared sink for per-datagram WAF metadata recorded by the forwarding tasks
+    // inside `handle_dtls_client_inner`; drained into the disconnect summary
+    // below so DTLS hits are observable by default (parity with plain UDP/TCP).
+    let datagram_metadata = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let outcome = handle_dtls_client_inner(
         client_conn,
         client_addr,
@@ -1869,6 +1935,7 @@ async fn handle_dtls_client(
         Arc::clone(&bytes_sent),
         Arc::clone(&bytes_received),
         Arc::clone(&last_request_size),
+        Arc::clone(&datagram_metadata),
         datagram_plugins,
         proxy_name,
         listen_port,
@@ -1879,6 +1946,10 @@ async fn handle_dtls_client(
         backend: backend_info,
         bytes_sent: bytes_sent.load(Ordering::Relaxed),
         bytes_received: bytes_received.load(Ordering::Relaxed),
+        metadata: datagram_metadata
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone(),
         outcome,
     }
 }
@@ -1979,6 +2050,7 @@ async fn handle_dtls_client_inner(
     bytes_sent: Arc<AtomicU64>,
     bytes_received: Arc<AtomicU64>,
     last_request_size: Arc<AtomicU64>,
+    datagram_metadata: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
     datagram_plugins: &Arc<[Arc<dyn Plugin>]>,
     proxy_name: Option<&str>,
     listen_port: u16,
@@ -2211,6 +2283,10 @@ async fn handle_dtls_client_inner(
     let dgram_client_ip_rev = Arc::clone(&dgram_client_ip);
     let dgram_proxy_id_rev = Arc::clone(&dgram_proxy_id);
     let dgram_proxy_name_rev = dgram_proxy_name.clone();
+    // Shared per-datagram WAF metadata sink, one clone per direction task; both
+    // feed the same session map drained into the disconnect summary.
+    let dgram_metadata_fwd = Arc::clone(&datagram_metadata);
+    let dgram_metadata_rev = Arc::clone(&datagram_metadata);
 
     // Client → Backend
     let client_to_backend = tokio::spawn(async move {
@@ -2237,6 +2313,10 @@ async fn handle_dtls_client_inner(
                     listen_port: dgram_listen_port,
                     datagram_size: len,
                     direction: UdpDatagramDirection::ClientToBackend,
+                    // DTLS-terminating frontend: `data` is decrypted plaintext.
+                    payload: &data,
+                    payload_kind: StreamBytesKind::DecryptedApp,
+                    metadata_sink: Some(UdpMetadataSink::new(dgram_metadata_fwd.as_ref())),
                 };
                 let mut dropped = false;
                 for plugin in dgram_plugins.iter() {
@@ -2333,6 +2413,10 @@ async fn handle_dtls_client_inner(
                     listen_port,
                     datagram_size: len,
                     direction: UdpDatagramDirection::BackendToClient,
+                    // DTLS-terminating frontend: `data` is decrypted plaintext.
+                    payload: &data,
+                    payload_kind: StreamBytesKind::DecryptedApp,
+                    metadata_sink: Some(UdpMetadataSink::new(dgram_metadata_rev.as_ref())),
                 };
                 let mut drop = false;
                 for plugin in dgram_plugins_rev.iter() {
@@ -2439,6 +2523,10 @@ async fn create_session(
         // Namespace/selector-scoped DENY/ALLOW rules are not enforced for UDP
         // streams (TCP and HTTP/HBONE are). See docs/mesh.md.
         node_waypoint_policy_scope: None,
+        // UDP inspects payload per-datagram via on_udp_datagram, not via
+        // first_bytes (which is a TCP-stream concept).
+        first_bytes: None,
+        first_bytes_kind: None,
     };
     for plugin in plugins.iter() {
         if let PluginResult::Reject { .. } = plugin.on_stream_connect(&mut stream_ctx).await {
@@ -2649,6 +2737,11 @@ async fn create_session(
         local_addr: std::sync::OnceLock::new(),
         plugins: Arc::clone(&plugins),
         datagram_plugins: Arc::clone(&datagram_plugins),
+        datagram_payload_kind: if is_passthrough {
+            StreamBytesKind::EncryptedWire
+        } else {
+            StreamBytesKind::PlaintextWire
+        },
         proxy_id: proxy_id.to_string(),
         proxy_name: proxy_name.clone(),
         proxy_namespace: proxy_namespace.clone(),
@@ -2863,6 +2956,9 @@ async fn create_session(
                     listen_port: reply_listen_port,
                     datagram_size: len,
                     direction: UdpDatagramDirection::BackendToClient,
+                    payload: send_data,
+                    payload_kind: reply_session.datagram_payload_kind,
+                    metadata_sink: Some(UdpMetadataSink::new(&reply_session.metadata)),
                 };
                 let mut drop = false;
                 for plugin in reply_datagram_plugins.iter() {
@@ -2967,6 +3063,11 @@ async fn create_session(
                                     listen_port: reply_listen_port,
                                     datagram_size: len2,
                                     direction: UdpDatagramDirection::BackendToClient,
+                                    payload: &buf[..len2],
+                                    payload_kind: reply_session.datagram_payload_kind,
+                                    metadata_sink: Some(UdpMetadataSink::new(
+                                        &reply_session.metadata,
+                                    )),
                                 };
                                 let mut drop = false;
                                 for plugin in reply_datagram_plugins.iter() {
@@ -3319,6 +3420,7 @@ mod tests {
             local_addr: std::sync::OnceLock::new(),
             plugins: Arc::new(Vec::new()),
             datagram_plugins: Arc::from([]),
+            datagram_payload_kind: crate::plugins::StreamBytesKind::PlaintextWire,
             proxy_id: "udp-proxy".to_string(),
             proxy_name: Some("UDP Proxy".to_string()),
             proxy_namespace: "ferrum".to_string(),
@@ -3592,6 +3694,7 @@ mod tests {
             local_addr: std::sync::OnceLock::new(),
             plugins: Arc::new(Vec::new()),
             datagram_plugins: Arc::from([]),
+            datagram_payload_kind: crate::plugins::StreamBytesKind::PlaintextWire,
             proxy_id: "udp-proxy".to_string(),
             proxy_name: Some("UDP Proxy".to_string()),
             proxy_namespace: "ferrum".to_string(),
