@@ -2090,8 +2090,10 @@ mod tests {
         plugin.open_session(value)
     }
 
-    #[test]
-    fn maybe_slide_respects_touch_interval() {
+    // tokio runtime required: building the plugin spawns the background JWKS
+    // refresh task even though maybe_slide_session itself is synchronous.
+    #[tokio::test]
+    async fn maybe_slide_respects_touch_interval() {
         // idle_ttl 1800 -> touch_interval 900.
         let plugin = build_plugin("https://idp.example.com/token");
         let now = 100_000;

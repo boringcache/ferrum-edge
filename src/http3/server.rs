@@ -28,7 +28,7 @@ use crate::consumer_index::ConsumerIndex;
 use crate::load_balancer::LoadBalancerCache;
 use crate::plugins::{Plugin, PluginResult, ProxyProtocol, RequestContext, TransactionSummary};
 use crate::proxy::headers::{
-    is_backend_request_strip_header, is_backend_response_strip_header,
+    apply_response_headers, is_backend_request_strip_header, is_backend_response_strip_header,
     parse_connection_listed_from_str_map,
 };
 use crate::proxy::{
@@ -4179,37 +4179,6 @@ fn reject_response_sets_content_type(headers: &HashMap<String, String>) -> bool 
         .any(|k| k.eq_ignore_ascii_case("content-type"))
 }
 
-/// Apply a response-header map onto a builder, emitting each newline-separated
-/// `set-cookie` value as its own header line.
-///
-/// `Set-Cookie` must not be folded into one value (RFC 6265), so the proxy keeps
-/// multiple cookies newline-joined in the response-header map (see
-/// `proxy::collect_response_headers_generic` and the sticky-session and OIDC
-/// rolling-session appends). `HeaderValue::from_str` rejects the embedded
-/// newline, so without this split the entire `set-cookie` header is dropped on
-/// H3 — losing backend cookies and the OIDC rolling/refresh cookie. Mirrors the
-/// HTTP/1 response path in `proxy`.
-fn apply_response_headers(
-    mut builder: http::response::Builder,
-    headers: &HashMap<String, String>,
-) -> http::response::Builder {
-    for (k, v) in headers {
-        if k == "set-cookie" {
-            for cookie_val in v.split('\n') {
-                if let Ok(val) = hyper::header::HeaderValue::from_str(cookie_val) {
-                    builder = builder.header(hyper::header::SET_COOKIE, val);
-                }
-            }
-        } else if let (Ok(name), Ok(val)) = (
-            hyper::header::HeaderName::from_bytes(k.as_bytes()),
-            hyper::header::HeaderValue::from_str(v),
-        ) {
-            builder = builder.header(name, val);
-        }
-    }
-    builder
-}
-
 async fn send_h3_reject_response(
     stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     status: StatusCode,
@@ -4724,37 +4693,6 @@ mod h3_streaming_after_proxy_tests {
                  so no duplicate Content-Type header is emitted"
             );
         }
-    }
-
-    #[test]
-    fn apply_response_headers_splits_newline_joined_set_cookie() {
-        // The proxy stores multiple Set-Cookie values newline-joined; on H3 they
-        // must be emitted as separate header lines, otherwise `from_str` rejects
-        // the embedded newline and the whole header (incl. the OIDC rolling
-        // cookie) is dropped.
-        let headers = HashMap::from([
-            (
-                "set-cookie".to_string(),
-                "backend=1; Path=/\nferrum_session=abc; HttpOnly".to_string(),
-            ),
-            ("x-other".to_string(), "v".to_string()),
-        ]);
-        let resp = super::apply_response_headers(http::Response::builder(), &headers)
-            .body(())
-            .expect("response builds");
-        let cookies: Vec<&str> = resp
-            .headers()
-            .get_all(http::header::SET_COOKIE)
-            .iter()
-            .map(|v| v.to_str().unwrap())
-            .collect();
-        assert_eq!(cookies.len(), 2, "each cookie must be its own header line");
-        assert!(cookies.contains(&"backend=1; Path=/"));
-        assert!(cookies.contains(&"ferrum_session=abc; HttpOnly"));
-        assert_eq!(
-            resp.headers().get("x-other").and_then(|v| v.to_str().ok()),
-            Some("v")
-        );
     }
 }
 
