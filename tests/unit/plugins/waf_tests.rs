@@ -2043,9 +2043,15 @@ fn sig_waf(mode: &str) -> Waf {
 /// A raw TCP `StreamConnectionContext` with no captured first bytes — models a
 /// peek that timed out or hit EOF before the client sent anything.
 fn stream_ctx_absent() -> StreamConnectionContext {
-    let mut ctx = stream_ctx(b"", StreamBytesKind::PlaintextWire);
-    ctx.first_bytes = None;
+    let mut ctx = stream_ctx_absent_kind(StreamBytesKind::PlaintextWire);
     ctx.first_bytes_kind = None;
+    ctx
+}
+
+fn stream_ctx_absent_kind(kind: StreamBytesKind) -> StreamConnectionContext {
+    let mut ctx = stream_ctx(b"", kind);
+    ctx.first_bytes = None;
+    ctx.first_bytes_kind = Some(kind);
     ctx
 }
 
@@ -2414,6 +2420,50 @@ async fn stream_waf_udp_metadata_merges_across_datagrams_and_keeps_max_severity(
         Some("high"),
         "severity must stay at the max seen, not downgrade to the later low hit"
     );
+}
+
+#[tokio::test]
+async fn stream_waf_signature_fails_closed_when_plaintext_first_bytes_missing() {
+    // A client that idles until the first-byte capture deadline must not be
+    // allowed to send an unchecked malicious opening payload after relay start.
+    let plugin = sig_waf("enforce");
+    let mut sctx = stream_ctx_absent_kind(StreamBytesKind::PlaintextWire);
+
+    let result = plugin.on_stream_connect(&mut sctx).await;
+
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    let md = sctx.metadata.as_ref().expect("metadata");
+    assert_eq!(
+        md.get("waf.block_reason").map(String::as_str),
+        Some("first_bytes_unavailable")
+    );
+}
+
+#[tokio::test]
+async fn stream_waf_signature_monitor_allows_but_records_when_first_bytes_missing() {
+    let plugin = sig_waf("monitor");
+    let mut sctx = stream_ctx_absent_kind(StreamBytesKind::DecryptedApp);
+
+    let result = plugin.on_stream_connect(&mut sctx).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    let md = sctx.metadata.as_ref().expect("metadata");
+    assert_eq!(md.get("waf.action").map(String::as_str), Some("monitored"));
+    assert!(!md.contains_key("waf.block_reason"));
+}
+
+#[tokio::test]
+async fn stream_waf_signature_missing_bytes_still_allows_encrypted_passthrough() {
+    // Passthrough bytes are ciphertext and are not L7-inspectable; missing
+    // ciphertext must not make stream signatures fail closed. Use
+    // tcp_require_tls for passthrough transport-shape enforcement.
+    let plugin = sig_waf("enforce");
+    let mut sctx = stream_ctx_absent_kind(StreamBytesKind::EncryptedWire);
+
+    let result = plugin.on_stream_connect(&mut sctx).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(sctx.metadata.is_none());
 }
 
 #[tokio::test]

@@ -746,13 +746,41 @@ impl Plugin for Waf {
         }
 
         // L7 signature scan over plaintext / decrypted opening bytes only.
-        if stream.inspect_tcp
-            && let Some(bytes) = ctx.first_bytes.clone()
-        {
+        // If an inspectable stream produced no bytes before the bounded capture
+        // deadline (idle client / EOF / read timeout), fail closed in enforce
+        // mode. Otherwise a client could wait out the peek/read window and send
+        // malicious first bytes after the backend relay starts. Encrypted
+        // passthrough remains fail-open for signatures because the gateway never
+        // has L7 plaintext to scan there.
+        if stream.inspect_tcp && !stream.signatures.is_empty() {
             let kind = ctx
                 .first_bytes_kind
                 .unwrap_or(StreamBytesKind::PlaintextWire);
             if kind.is_l7_inspectable() {
+                let Some(bytes) = ctx.first_bytes.clone() else {
+                    let blocked = self.config.mode == GlobalMode::Enforce;
+                    self.record_stream_metadata(
+                        ctx,
+                        "",
+                        Severity::High,
+                        blocked,
+                        "first_bytes_unavailable",
+                    );
+                    if self.config.log_to_stdout {
+                        warn!(
+                            target: "waf",
+                            proxy = %ctx.proxy_id,
+                            client_ip = %ctx.client_ip,
+                            transport = "tcp",
+                            blocked = blocked,
+                            "WAF: TCP stream first bytes unavailable for signature inspection"
+                        );
+                    }
+                    if blocked {
+                        return self.reject();
+                    }
+                    return PluginResult::Continue;
+                };
                 let hits = stream.signatures.matches(&bytes);
                 if !hits.is_empty() {
                     let (block, severity, ids) = self.stream_decision(&hits);

@@ -1949,10 +1949,10 @@ async fn handle_tcp_connection_inner(
         if scan_first_bytes {
             stream_ctx.first_bytes =
                 peek_tcp_first_bytes(&client_stream, sni_peek_timeout, first_bytes_min_len).await;
-            stream_ctx.first_bytes_kind = stream_ctx
-                .first_bytes
-                .as_ref()
-                .map(|_| StreamBytesKind::EncryptedWire);
+            // Preserve the wire kind even when the timed peek observes no bytes:
+            // first-bytes-aware plugins use this to distinguish encrypted
+            // passthrough (not L7-inspectable) from missing plaintext.
+            stream_ctx.first_bytes_kind = Some(StreamBytesKind::EncryptedWire);
         }
 
         // Run on_stream_connect plugins (they see SNI but not decrypted data).
@@ -2287,10 +2287,10 @@ async fn handle_tcp_connection_inner(
         if scan_first_bytes {
             stream_ctx.first_bytes =
                 peek_tcp_first_bytes(&client_stream, sni_peek_timeout, first_bytes_min_len).await;
-            stream_ctx.first_bytes_kind = stream_ctx
-                .first_bytes
-                .as_ref()
-                .map(|_| StreamBytesKind::PlaintextWire);
+            // Preserve the wire kind even when the timed peek observes no bytes:
+            // an enforcing stream WAF must fail closed instead of letting an
+            // idle client send unchecked bytes after the relay starts.
+            stream_ctx.first_bytes_kind = Some(StreamBytesKind::PlaintextWire);
         }
         if !plugins.is_empty() {
             run_tcp_stream_connect_plugins(

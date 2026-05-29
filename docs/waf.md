@@ -277,15 +277,16 @@ Limitations and behavior to know:
   connections. Plain-TCP proxies are peeked non-destructively and keep splice.
 - **First bytes only — best-effort, evadable by splitting.** TCP scanning
   inspects the opening segment the client sends (the first readable chunk, up to
-  4 KiB) once, before the backend is dialed — not the full byte stream. A
-  determined attacker can therefore evade a signature by splitting the payload:
-  send a benign prefix, wait for the gateway to forward it and connect, then send
-  the malicious remainder, which is relayed without a rescan. Waiting for more
-  bytes cannot close this — the attacker just delays past any bounded window, and
-  blocking on a fuller buffer would stall server-first protocols that send
-  nothing until greeted. Treat stream signatures as a cheap opening-payload
-  filter for opportunistic/automated probes, not a replacement for inspection at
-  the backend. UDP scanning is per-datagram (each datagram is scanned whole).
+  4 KiB) once, before the backend is dialed — not the full byte stream. If an
+  L7-inspectable TCP stream produces no opening bytes before the bounded capture
+  deadline, stream signatures fail closed in `enforce` mode, so an idle client
+  cannot wait out inspection and then send unchecked first bytes. A determined
+  attacker can still evade a signature by splitting after a benign prefix: send
+  bytes that do not match, wait for the gateway to forward them and connect, then
+  send the malicious remainder, which is relayed without a rescan. Treat stream
+  signatures as a cheap opening-payload filter for opportunistic/automated
+  probes, not a replacement for inspection at the backend. UDP scanning is
+  per-datagram (each datagram is scanned whole).
 - **TCP blocks** reject before any backend is dialed and ride the stream
   transaction summary as `waf.action=blocked`. **UDP blocks** are a silent
   datagram `Drop` (standard UDP behavior). Both transports record `waf.*` on the

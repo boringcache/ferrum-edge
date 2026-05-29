@@ -1990,6 +1990,39 @@ fn test_priority_override_applied_correctly() {
 }
 
 #[test]
+fn test_priority_override_delegates_stream_first_byte_requirements() {
+    let mut plugin_config = make_plugin_config_with_json(
+        "ps1",
+        "waf",
+        json!({
+            "include_default_rules": false,
+            "stream": {
+                "signatures": [{
+                    "id": "STREAM-SQLI-1",
+                    "pattern": "(?i)union\\s+select"
+                }]
+            }
+        }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    plugin_config.priority_override = Some(100);
+
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["ps1"])],
+        vec![plugin_config],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    let plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+
+    assert_eq!(plugins.len(), 1);
+    assert_eq!(plugins[0].priority(), 100);
+    assert!(plugins[0].requires_stream_first_bytes());
+    assert!(plugins[0].requires_stream_first_bytes_decrypted());
+    assert_eq!(plugins[0].stream_first_bytes_min_len(), 0);
+}
+
+#[test]
 fn test_priority_override_delegates_response_buffering_refinement() {
     let mut plugin_config = make_plugin_config_with_json(
         "ps1",
