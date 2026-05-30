@@ -1000,7 +1000,7 @@ async fn run_tcp_accept_loop(
     // accept() re-fails without consuming the backlog, busy-looping CPU + logs.
     // Back off (capped at 100ms) only on repeated consecutive failures so
     // isolated transient errors (e.g. ECONNABORTED) are not penalized.
-    let mut consecutive_accept_errors: u32 = 0;
+    let mut accept_backoff = crate::util::accept_backoff::AcceptBackoff::new();
     loop {
         tokio::select! {
             result = listener.accept() => {
@@ -1013,16 +1013,13 @@ async fn run_tcp_accept_loop(
                             "TCP accept error: {}",
                             e
                         );
-                        consecutive_accept_errors = consecutive_accept_errors.saturating_add(1);
-                        if consecutive_accept_errors > 1 {
-                            let backoff_ms = (consecutive_accept_errors as u64 * 10).min(100);
-                            tokio::time::sleep(std::time::Duration::from_millis(backoff_ms))
-                                .await;
+                        if let Some(delay) = accept_backoff.on_error(e.kind()) {
+                            tokio::time::sleep(delay).await;
                         }
                         continue;
                     }
                 };
-                consecutive_accept_errors = 0;
+                accept_backoff.on_success();
 
                 // Reject new connections under critical overload (same as HTTP proxy).
                 if state.overload.reject_new_connections.load(Ordering::Relaxed) {

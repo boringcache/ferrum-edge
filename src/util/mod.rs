@@ -2,5 +2,6 @@
 //! the proxy/admin/config layers — they expose pure helpers that those
 //! layers compose from.
 
+pub mod accept_backoff;
 pub mod body_limit;
 pub mod sharding;

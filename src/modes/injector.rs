@@ -604,12 +604,14 @@ pub async fn run(
         "Ferrum injector admission webhook listening"
     );
     let mut shutdown_rx = shutdown_tx.subscribe();
+    let mut accept_backoff = crate::util::accept_backoff::AcceptBackoff::new();
 
     loop {
         tokio::select! {
             result = listener.accept() => {
                 match result {
                     Ok((stream, remote_addr)) => {
+                        accept_backoff.on_success();
                         let config = Arc::clone(&config);
                         let tls_acceptor = tls_acceptor.clone();
                         let connection_permit = match &connection_limiter {
@@ -654,7 +656,14 @@ pub async fn run(
                             }
                         });
                     }
-                    Err(e) => error!("Failed to accept injector connection: {}", e),
+                    Err(e) => {
+                        error!("Failed to accept injector connection: {}", e);
+                        // Back off on a sustained fd-exhaustion run so accept()
+                        // cannot busy-spin a core and flood the error log.
+                        if let Some(delay) = accept_backoff.on_error(e.kind()) {
+                            tokio::time::sleep(delay).await;
+                        }
+                    }
                 }
             }
             _ = shutdown_rx.changed() => {

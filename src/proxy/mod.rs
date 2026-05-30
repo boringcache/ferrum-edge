@@ -7581,13 +7581,13 @@ async fn run_accept_loop(
     // re-fails immediately — a CPU + log busy-loop until the descriptor table
     // drains. A single transient error (e.g. ECONNABORTED, which consumes the
     // backlog entry) must NOT be penalized, so backoff engages only on repeats.
-    let mut consecutive_accept_errors: u32 = 0;
+    let mut accept_backoff = crate::util::accept_backoff::AcceptBackoff::new();
     loop {
         tokio::select! {
             result = listener.accept() => {
                 match result {
                     Ok((stream, remote_addr)) => {
-                        consecutive_accept_errors = 0;
+                        accept_backoff.on_success();
                         // Overload check: reject new connections under critical
                         // pressure. Checked after accept (inside the select!) so
                         // shutdown_rx is always observed even during sustained
@@ -7707,16 +7707,15 @@ async fn run_accept_loop(
                     }
                     Err(e) => {
                         error!("Failed to accept connection: {}", e);
-                        consecutive_accept_errors = consecutive_accept_errors.saturating_add(1);
                         // Back off (capped at 100ms) once accept() fails
                         // repeatedly in quick succession so fd exhaustion cannot
                         // peg a core and flood the logs. The brief sleep also
                         // gives the descriptor table a chance to drain. Shutdown
-                        // is delayed by at most one backoff interval.
-                        if consecutive_accept_errors > 1 {
-                            let backoff_ms = (consecutive_accept_errors as u64 * 10).min(100);
-                            tokio::time::sleep(std::time::Duration::from_millis(backoff_ms))
-                                .await;
+                        // is delayed by at most one backoff interval. Connection
+                        // abort/reset floods make progress and are not throttled
+                        // (see AcceptBackoff).
+                        if let Some(delay) = accept_backoff.on_error(e.kind()) {
+                            tokio::time::sleep(delay).await;
                         }
                     }
                 }
