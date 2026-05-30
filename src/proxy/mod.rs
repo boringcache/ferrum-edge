@@ -11388,14 +11388,27 @@ async fn handle_proxy_request_inner(
             let cl = response_headers
                 .get("content-length")
                 .and_then(|v| v.parse::<u64>().ok());
+            // Method + status thread into `H3FrameSource` so its graceful-close
+            // recovery gate uses the same `is_response_body_complete` predicate
+            // as the buffered path (HEAD/204/304 no-body responses included).
+            // `method` was moved into the transaction summary above, so read it
+            // back from `ctx`; one `Arc<str>` alloc per streaming-H3 response.
+            let h3_method: Arc<str> = Arc::from(ctx.method.as_str());
             let body = if state.response_buffer_cutoff_bytes == 0
                 && state.max_response_body_size_bytes == 0
             {
-                crate::proxy::body::direct_streaming_h3_body(h3_resp.recv_stream, cl)
+                crate::proxy::body::direct_streaming_h3_body(
+                    h3_resp.recv_stream,
+                    h3_method,
+                    response_status,
+                    cl,
+                )
             } else if state.max_response_body_size_bytes > 0 && cl.is_none() {
                 crate::proxy::body::size_limited_streaming_h3_body(
                     h3_resp.recv_stream,
                     state.max_response_body_size_bytes,
+                    h3_method,
+                    response_status,
                     cl,
                     state.env_config.http3_coalesce_min_bytes,
                     state.env_config.http3_coalesce_max_bytes,
@@ -11404,6 +11417,8 @@ async fn handle_proxy_request_inner(
             } else {
                 crate::proxy::body::coalescing_h3_body(
                     h3_resp.recv_stream,
+                    h3_method,
+                    response_status,
                     cl,
                     state.env_config.http3_coalesce_min_bytes,
                     state.env_config.http3_coalesce_max_bytes,

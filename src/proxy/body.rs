@@ -1063,6 +1063,13 @@ impl H3RecvStream for crate::http3::client::H3RequestStream {
 pub(crate) struct H3FrameSource<S = crate::http3::client::H3RequestStream> {
     recv_stream: S,
     state: H3FrameSourceState,
+    /// Request method (`Arc<str>` so construction clones cheaply, not per
+    /// frame). Threaded in alongside `status` so the graceful-close recovery
+    /// gate can call `is_response_body_complete`, which also treats HEAD/204/304
+    /// (no-body) responses as complete when empty.
+    method: Arc<str>,
+    /// Response status code. See `method`.
+    status: u16,
     /// Declared response Content-Length, if any. Used only to recognize a
     /// connection-level graceful close that arrives after a COMPLETE body.
     content_length: Option<u64>,
@@ -1071,10 +1078,12 @@ pub(crate) struct H3FrameSource<S = crate::http3::client::H3RequestStream> {
 }
 
 impl<S> H3FrameSource<S> {
-    fn new(recv_stream: S, content_length: Option<u64>) -> Self {
+    fn new(recv_stream: S, method: Arc<str>, status: u16, content_length: Option<u64>) -> Self {
         Self {
             recv_stream,
             state: H3FrameSourceState::Data,
+            method,
+            status,
             content_length,
             received: 0,
         }
@@ -1108,28 +1117,32 @@ impl<S: H3RecvStream + Unpin> FrameSource for H3FrameSource<S> {
                             // AFTER a complete body, matching the buffered path
                             // (drain_h3_response_body): CONNECTION_CLOSE(H3_NO_ERROR)
                             // or a coalesced GOAWAY/RemoteClosing is not a real
-                            // stream error once Content-Length is satisfied, so emit
-                            // clean EOS instead of a spurious mid-stream error.
+                            // stream error once the body is complete, so emit clean
+                            // EOS instead of a spurious mid-stream error.
                             //
-                            // Recovered ONLY when Content-Length is known and
-                            // EXACTLY satisfied (`received == cl`), mirroring the
-                            // buffered path's `is_response_body_complete`:
-                            //   * `received < cl` (truncation) never recovers, so
-                            //     no truncation can be masked.
-                            //   * `received > cl` (overlong) never recovers — an
-                            //     over-declared body is a framing violation the
-                            //     buffered path rejects too, so it must surface
-                            //     rather than be laundered into a clean EOS.
-                            // Scope: HEAD/204/304 (no-body) and unknown-length
-                            // (chunked) responses are intentionally OUT OF SCOPE —
-                            // `method`/`status` are not threaded into the streaming
-                            // H3 body constructors, so this gate cannot replicate
-                            // the no-body branch of `is_response_body_complete`;
-                            // those keep surfacing the close as an error (safe).
-                            if this.content_length.is_some_and(|cl| this.received == cl)
-                                && err
-                                    .downcast_ref::<h3::error::StreamError>()
-                                    .is_some_and(crate::http3::client::is_h3_graceful_close)
+                            // `is_response_body_complete` is the SAME completeness
+                            // predicate the buffered path uses, so the two paths
+                            // recover identically:
+                            //   * Content-Length known: recovers ONLY on exact
+                            //     satisfaction. `received < cl` (truncation) never
+                            //     recovers, so no truncation is masked; `received >
+                            //     cl` (overlong) never recovers either — an
+                            //     over-declared body is a framing violation that must
+                            //     surface, not be laundered into a clean EOS.
+                            //   * HEAD / 204 / 304: no-body responses are complete
+                            //     when `received == 0`, so a graceful close after the
+                            //     (empty) body recovers here too.
+                            //   * Unknown length (chunked, no Content-Length) stays
+                            //     OUT OF SCOPE: completeness can't be proven without
+                            //     the FIN, so the close still surfaces as an error.
+                            if crate::http3::client::is_response_body_complete(
+                                this.received,
+                                &this.method,
+                                this.status,
+                                this.content_length,
+                            ) && err
+                                .downcast_ref::<h3::error::StreamError>()
+                                .is_some_and(crate::http3::client::is_h3_graceful_close)
                             {
                                 return Poll::Ready(None);
                             }
@@ -1692,12 +1705,14 @@ where
 
 pub(crate) fn coalescing_h3_body(
     recv_stream: crate::http3::client::H3RequestStream,
+    method: Arc<str>,
+    status: u16,
     content_length: Option<u64>,
     coalesce_min_bytes: usize,
     coalesce_max_bytes: usize,
     flush_interval: Duration,
 ) -> ProxyBody {
-    let source = H3FrameSource::new(recv_stream, content_length);
+    let source = H3FrameSource::new(recv_stream, method, status, content_length);
     let buffer_capacity = coalesce_max_bytes.clamp(
         crate::http3::config::H3_COALESCE_MIN_FLOOR,
         crate::http3::config::H3_COALESCE_MAX_CAP,
@@ -1714,15 +1729,18 @@ pub(crate) fn coalescing_h3_body(
     ProxyBody::streaming(Box::pin(body))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn size_limited_streaming_h3_body(
     recv_stream: crate::http3::client::H3RequestStream,
     max_bytes: usize,
+    method: Arc<str>,
+    status: u16,
     content_length: Option<u64>,
     coalesce_min_bytes: usize,
     coalesce_max_bytes: usize,
     flush_interval: Duration,
 ) -> ProxyBody {
-    let source = H3FrameSource::new(recv_stream, content_length);
+    let source = H3FrameSource::new(recv_stream, method, status, content_length);
     let limited = SizeLimitedFrameSource::new(source, max_bytes);
     let buffer_capacity = coalesce_max_bytes.clamp(
         crate::http3::config::H3_COALESCE_MIN_FLOOR,
@@ -1742,10 +1760,12 @@ pub(crate) fn size_limited_streaming_h3_body(
 
 pub(crate) fn direct_streaming_h3_body(
     recv_stream: crate::http3::client::H3RequestStream,
+    method: Arc<str>,
+    status: u16,
     content_length: Option<u64>,
 ) -> ProxyBody {
     let body = DirectH3Body {
-        source: H3FrameSource::new(recv_stream, content_length),
+        source: H3FrameSource::new(recv_stream, method, status, content_length),
         content_length,
     };
     ProxyBody::streaming(Box::pin(body))
@@ -2242,6 +2262,8 @@ mod tests {
                     MockH3TrailerStep::Trailers(trailers),
                 ],
             ),
+            Arc::from("GET"),
+            200,
             None,
         );
 
