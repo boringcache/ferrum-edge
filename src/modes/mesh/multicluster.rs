@@ -50,7 +50,7 @@
 //! latency. This is documented for operators in `docs/mesh.md` "Cross-Cluster
 //! Endpoint Discovery".
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
@@ -975,12 +975,15 @@ async fn remote_discovery_loop(
 /// those addresses would silently become backend endpoints for a local service
 /// — a cross-trust-domain confused-deputy hijack.
 ///
-/// Enforcing that every contributed workload (and every service workload-ref)
-/// carries the declared trust domain makes ingestion fail closed: a peer under
-/// `eu-west-1.example.com` may only contribute `eu-west-1.example.com` identities
-/// and can no longer impersonate another domain's workloads. Mismatches are
-/// dropped (not fatal — one bad endpoint must not blackhole the whole snapshot)
-/// and surfaced via a structured `warn!` so the drops are observable.
+/// Enforcing that every contributed workload carries the declared trust domain,
+/// and that every service workload-ref still points at a surviving workload for
+/// that service, makes ingestion fail closed: a peer under
+/// `eu-west-1.example.com` may only contribute `eu-west-1.example.com`
+/// identities and can no longer impersonate another domain's workloads.
+/// Mismatches are dropped (not fatal — one bad endpoint must not blackhole the
+/// whole snapshot) and surfaced via a structured `warn!` so the drops are
+/// observable. If an explicitly-refed service loses all refs, the service is
+/// dropped instead of being converted into an empty-ref same-name selector.
 fn enforce_remote_trust_domain(
     endpoints: &mut RemoteClusterEndpoints,
     declared: &TrustDomain,
@@ -988,6 +991,7 @@ fn enforce_remote_trust_domain(
 ) {
     let mut dropped_workloads = 0usize;
     let mut dropped_service_refs = 0usize;
+    let mut dropped_services = 0usize;
     let mut example_offender: Option<String> = None;
     let mut note_offender = |spiffe_id: &SpiffeId| {
         if example_offender.is_none() {
@@ -1008,23 +1012,47 @@ fn enforce_remote_trust_domain(
         belongs
     });
 
-    for service in &mut endpoints.services {
+    let surviving_service_refs: HashSet<(String, String, String)> = endpoints
+        .workloads
+        .iter()
+        .map(|workload| {
+            (
+                workload.namespace.clone(),
+                workload.service_name.clone(),
+                workload.spiffe_id.as_str().to_string(),
+            )
+        })
+        .collect();
+
+    endpoints.services.retain_mut(|service| {
+        let had_explicit_refs = !service.workloads.is_empty();
         service.workloads.retain(|workload_ref| {
-            let belongs = workload_ref.spiffe_id.trust_domain() == declared;
+            let belongs = workload_ref.spiffe_id.trust_domain() == declared
+                && surviving_service_refs.contains(&(
+                    service.namespace.clone(),
+                    service.name.clone(),
+                    workload_ref.spiffe_id.as_str().to_string(),
+                ));
             if !belongs {
                 dropped_service_refs += 1;
                 note_offender(&workload_ref.spiffe_id);
             }
             belongs
         });
-    }
+        if had_explicit_refs && service.workloads.is_empty() {
+            dropped_services += 1;
+            return false;
+        }
+        true
+    });
 
-    if dropped_workloads > 0 || dropped_service_refs > 0 {
+    if dropped_workloads > 0 || dropped_service_refs > 0 || dropped_services > 0 {
         warn!(
             cluster = %cluster_name,
             declared_trust_domain = %declared,
             dropped_workloads,
             dropped_service_refs,
+            dropped_services,
             example_offending_spiffe_id = example_offender.as_deref().unwrap_or(""),
             "Dropped remote-cluster endpoints whose identity is outside the cluster's declared trust domain (cross-trust-domain confusion guard)"
         );
@@ -1399,6 +1427,43 @@ mod tests {
             endpoints.services[0].workloads[0].spiffe_id.as_str(),
             "spiffe://eu-west-1.example.com/ns/default/sa/reviews"
         );
+    }
+
+    #[test]
+    fn enforce_remote_trust_domain_drops_orphaned_refs_and_empty_services() {
+        let declared = td("eu-west-1.example.com");
+        let shared_spiffe = "spiffe://eu-west-1.example.com/ns/default/sa/shared";
+        let surviving_different_service = Workload {
+            trust_domain: declared.clone(),
+            ..workload(shared_spiffe, "payments", "10.9.0.3", None)
+        };
+        let dropped_split_identity = Workload {
+            trust_domain: td("cluster.local"),
+            ..workload(shared_spiffe, "api", "10.9.0.4", None)
+        };
+
+        let mut endpoints = RemoteClusterEndpoints {
+            workloads: vec![surviving_different_service, dropped_split_identity],
+            services: vec![
+                service("api", &[shared_spiffe]),
+                service("payments", &[shared_spiffe]),
+            ],
+        };
+
+        enforce_remote_trust_domain(&mut endpoints, &declared, "eu-west-1");
+
+        assert_eq!(
+            endpoints.workloads.len(),
+            1,
+            "the split-identity workload is dropped"
+        );
+        assert_eq!(
+            endpoints.services.len(),
+            1,
+            "the api service started with an explicit ref and must be dropped once that ref no longer points at a surviving api workload"
+        );
+        assert_eq!(endpoints.services[0].name, "payments");
+        assert_eq!(endpoints.services[0].workloads.len(), 1);
     }
 
     #[test]
