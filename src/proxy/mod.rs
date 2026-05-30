@@ -10068,59 +10068,58 @@ async fn handle_proxy_request_inner(
             }
         }
 
-        // Record the final backend outcome to the circuit breaker and disarm the
-        // neutral-release guard now that dispatch produced a real outcome.
+        // Record the final backend outcome to the circuit breaker once, here,
+        // and disarm the neutral-release guard. This mirrors the HTTP path's
+        // record_backend_outcome, which records BEFORE the response/after_proxy
+        // plugins run: the breaker must observe the BACKEND's outcome regardless
+        // of any gateway-side plugin rejection or body-too-large abort that the
+        // match arms below may apply to the client response. Recording before
+        // the match also releases the (possibly rotated) probe slot before any
+        // early return, so an after_proxy reject cannot leak it.
+        //
         // Previously the gRPC path recorded nothing here, so the breaker never
         // saw gRPC successes (could not recover from HALF_OPEN) or non-connect
         // failures (could not trip). check_circuit_breaker admitted any probe
         // against cb_target_key; the retry loop already recorded per-attempt
         // failures (and disarmed the guard) for rotated targets, and
         // grpc_skip_final_cb_record marks the case where a rotated retry's
-        // breaker rejected (the outcome was already recorded for the prior
-        // target).
-        //
-        // The STREAMING outcome is deferred to the Ok(Streaming) arm below: a
-        // client-side body-too-large abort surfaces here as Ok(Streaming) with a
-        // backend 200 but is returned as RESOURCE_EXHAUSTED, so it must be
-        // NEUTRAL — not a success that could close a HALF_OPEN breaker. That is
-        // only known after the request-body-size check, so the guard stays armed
-        // until then (a drop before it still releases the probe slot).
+        // breaker rejected (already recorded for the prior target).
         if !grpc_skip_final_cb_record && let Some(cb_config) = &proxy.circuit_breaker {
+            grpc_probe_guard.disarm();
+            let cb = state.circuit_breaker_cache.get_or_create(
+                &proxy.id,
+                grpc_final_cb_key.as_deref(),
+                cb_config,
+            );
             match &grpc_result {
-                // Deferred — recorded in the Ok(Streaming) match arm below once
-                // request_body_exceeded is known.
-                Ok(GrpcResponseKind::Streaming(_)) => {}
-                Ok(GrpcResponseKind::Buffered(r)) => {
-                    grpc_probe_guard.disarm();
-                    let cb = state.circuit_breaker_cache.get_or_create(
-                        &proxy.id,
-                        grpc_final_cb_key.as_deref(),
-                        cb_config,
-                    );
-                    record_grpc_backend_status_outcome(&cb, r.status, grpc_cb_probe_slot);
+                // Classify by the backend's HTTP status, like the HTTP path.
+                // For a streaming response the backend headers ARE the probe
+                // outcome; a LATE client request-body overflow (returned as
+                // RESOURCE_EXHAUSTED further below) is handled by the body
+                // wrapper exactly as the HTTP path handles a late streaming
+                // upload overflow — the backend status still stands. An
+                // oversized client request detected BEFORE backend headers is
+                // GrpcProxyError::ResourceExhausted (neutral arm below).
+                Ok(kind) => {
+                    let backend_status = match kind {
+                        GrpcResponseKind::Buffered(r) => r.status,
+                        GrpcResponseKind::Streaming(r) => r.status,
+                    };
+                    record_grpc_backend_status_outcome(&cb, backend_status, grpc_cb_probe_slot);
                 }
-                // Oversized client request payloads (ResourceExhausted) and
-                // request-body-read / gateway-config errors (Internal) are
-                // client/gateway-side, not backend failures. Record NEUTRAL so
-                // client behavior cannot trip or reopen the backend breaker —
-                // mirroring the HTTP path's ClientDisconnect -> record_neutral
-                // and this PR's own GrpcProbeReleaseGuard neutral early-returns.
+                // Oversized CLIENT request payloads (ResourceExhausted, detected
+                // before backend headers) and client-body-read / gateway-config
+                // errors (Internal) are client/gateway-side, not backend
+                // failures. Record NEUTRAL so client behavior cannot trip or
+                // reopen the backend breaker — mirroring the HTTP path's
+                // ClientDisconnect -> record_neutral. An oversized BACKEND
+                // response is GrpcProxyError::ResponseTooLarge (NOT
+                // ResourceExhausted) and falls to the failure arm below, matching
+                // the HTTP path's ResponseBodyTooLarge -> 502.
                 Err(GrpcProxyError::ResourceExhausted(_) | GrpcProxyError::Internal(_)) => {
-                    grpc_probe_guard.disarm();
-                    let cb = state.circuit_breaker_cache.get_or_create(
-                        &proxy.id,
-                        grpc_final_cb_key.as_deref(),
-                        cb_config,
-                    );
                     cb.record_neutral(grpc_cb_probe_slot);
                 }
                 Err(e) => {
-                    grpc_probe_guard.disarm();
-                    let cb = state.circuit_breaker_cache.get_or_create(
-                        &proxy.id,
-                        grpc_final_cb_key.as_deref(),
-                        cb_config,
-                    );
                     let connection_error = matches!(
                         e,
                         GrpcProxyError::BackendUnavailable { kind, .. } if kind.is_connect_class()
@@ -10188,34 +10187,6 @@ async fn handle_proxy_request_inner(
                     .request_body_exceeded
                     .as_ref()
                     .is_some_and(|f| f.load(std::sync::atomic::Ordering::Acquire));
-
-                // Record the streaming backend outcome to the circuit breaker
-                // now that the gateway-side body-too-large decision is final
-                // (deferred from the pre-dispatch record block so it observes
-                // request_body_exceeded). When the body exceeded the limit the
-                // request is returned as RESOURCE_EXHAUSTED below — a
-                // client/gateway-side outcome, so record NEUTRAL and never let
-                // it close/advance a HALF_OPEN breaker; otherwise classify by the
-                // backend HTTP status like the buffered path. An earlier
-                // after_proxy reject returns before this point with the guard
-                // still armed, so its probe slot is released neutrally there.
-                if !grpc_skip_final_cb_record && let Some(cb_config) = &proxy.circuit_breaker {
-                    grpc_probe_guard.disarm();
-                    let cb = state.circuit_breaker_cache.get_or_create(
-                        &proxy.id,
-                        grpc_final_cb_key.as_deref(),
-                        cb_config,
-                    );
-                    if body_exceeded {
-                        cb.record_neutral(grpc_cb_probe_slot);
-                    } else {
-                        record_grpc_backend_status_outcome(
-                            &cb,
-                            grpc_streaming.status,
-                            grpc_cb_probe_slot,
-                        );
-                    }
-                }
 
                 // Determine the final status for logging and metrics.
                 let final_status = if body_exceeded {
@@ -10712,7 +10683,7 @@ async fn handle_proxy_request_inner(
                     GrpcProxyError::BackendTimeout { .. } => {
                         grpc_proxy::grpc_status::DEADLINE_EXCEEDED
                     }
-                    GrpcProxyError::ResourceExhausted(_) => {
+                    GrpcProxyError::ResourceExhausted(_) | GrpcProxyError::ResponseTooLarge(_) => {
                         grpc_proxy::grpc_status::RESOURCE_EXHAUSTED
                     }
                     GrpcProxyError::Internal(_) => grpc_proxy::grpc_status::UNAVAILABLE,

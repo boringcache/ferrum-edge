@@ -268,54 +268,6 @@ fn test_half_open_client_disconnect_neutral_releases_probe_slot() {
 }
 
 #[test]
-fn grpc_streaming_body_too_large_neutral_does_not_close_half_open() {
-    // F04 (PR #1408): a gRPC streaming response whose CLIENT request body
-    // exceeded the limit is returned as RESOURCE_EXHAUSTED (a gateway-side size
-    // rejection) even though the backend returned HTTP 200 headers. The fix
-    // defers the streaming breaker record past that body-size check and records
-    // it as record_neutral, NOT record_success — so a HALF_OPEN probe is
-    // released WITHOUT closing the breaker. This pins the neutral-vs-success
-    // distinction: with success_threshold = 1 a single real success WOULD close,
-    // but a body-too-large neutral must not.
-    let config = CircuitBreakerConfig {
-        failure_threshold: 1,
-        success_threshold: 1,
-        timeout_seconds: 0,
-        failure_status_codes: vec![500],
-        half_open_max_requests: 1,
-        trip_on_connection_errors: true,
-    };
-    let cb = CircuitBreaker::new(config);
-    cb.record_failure(500, false, false);
-    assert!(cb.can_execute().unwrap());
-    assert_eq!(cb.state_name(), "half_open");
-
-    // Body-too-large outcome on the probe: neutral, not success.
-    cb.record_neutral(true);
-    assert_eq!(
-        cb.state_name(),
-        "half_open",
-        "a body-too-large (neutral) outcome must not close the breaker, even at success_threshold = 1"
-    );
-    assert_eq!(
-        cb.half_open_in_flight(),
-        0,
-        "the probe slot must still be released"
-    );
-
-    // A genuine success on the next probe DOES close — proving the breaker was
-    // held open only by classifying body-too-large as neutral rather than a
-    // backend success.
-    assert!(cb.can_execute().unwrap());
-    cb.record_success(true);
-    assert_eq!(
-        cb.state_name(),
-        "closed",
-        "a real backend success must close the breaker at success_threshold = 1"
-    );
-}
-
-#[test]
 fn record_success_without_probe_admission_still_advances_half_open() {
     // F04 (PR #1408): the gRPC retry loop now gates a rotated retry through
     // can_execute before dispatching (mirroring the HTTP path). This matters

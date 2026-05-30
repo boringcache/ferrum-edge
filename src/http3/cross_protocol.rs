@@ -2149,6 +2149,10 @@ where
                     grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
                     "Request payload exceeded backend limit",
                 ),
+                grpc_proxy::GrpcProxyError::ResponseTooLarge(_) => (
+                    grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
+                    "Response payload exceeded limit",
+                ),
                 grpc_proxy::GrpcProxyError::Internal(_) => {
                     (grpc_proxy::grpc_status::INTERNAL, "Internal gateway error")
                 }
