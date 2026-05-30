@@ -221,7 +221,8 @@ pub struct DnsCache {
     /// Percentage of TTL elapsed before background refresh triggers (1-99).
     refresh_threshold_percent: u8,
     /// Interval for the background task that retries failed DNS lookups.
-    /// Duration::ZERO disables the retry task.
+    /// Duration::ZERO disables the retry task; clamped to `MAX_TTL` so the
+    /// `tokio::time::interval` deadline arithmetic cannot overflow.
     failed_retry_interval: Duration,
 }
 
@@ -272,7 +273,12 @@ impl DnsCache {
             warmup_concurrency: config.warmup_concurrency.max(1),
             backend_allow_ips: config.backend_allow_ips,
             refresh_threshold_percent: config.refresh_threshold_percent.clamp(1, 99),
-            failed_retry_interval: Duration::from_secs(config.failed_retry_interval_seconds),
+            // Clamp like the other TTL-derived durations: an unbounded
+            // FERRUM_DNS_FAILED_RETRY_INTERVAL_SECONDS would otherwise overflow
+            // tokio's `Instant::now() + period` deadline arithmetic inside
+            // `tokio::time::interval` (a reachable panic, same class as F20).
+            failed_retry_interval: Duration::from_secs(config.failed_retry_interval_seconds)
+                .min(Self::MAX_TTL),
         }
     }
 
@@ -1527,6 +1533,26 @@ mod tests {
             entry.applied_ttl <= DnsCache::MAX_TTL,
             "stored TTL must be clamped to the ceiling"
         );
+    }
+
+    #[test]
+    fn failed_retry_interval_is_clamped_to_max_ttl() {
+        // F20 follow-up: FERRUM_DNS_FAILED_RETRY_INTERVAL_SECONDS is an
+        // unbounded u64 fed into `tokio::time::interval(Duration::from_secs(..))`.
+        // tokio computes the next deadline as `Instant::now() + period`, which
+        // panics on overflow — the same overflow class as the DNS TTLs. An
+        // enormous value must therefore be clamped to the 1-day ceiling. Assert
+        // at the value level (no runtime/interval needed for determinism).
+        let cache = DnsCache::new(DnsConfig {
+            failed_retry_interval_seconds: u64::MAX,
+            ..DnsConfig::default()
+        });
+        assert!(
+            cache.failed_retry_interval <= DnsCache::MAX_TTL,
+            "failed_retry_interval must be clamped to the ceiling to keep \
+             tokio's interval deadline arithmetic overflow-safe"
+        );
+        assert_eq!(cache.failed_retry_interval, DnsCache::MAX_TTL);
     }
 
     #[test]
