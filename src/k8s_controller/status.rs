@@ -729,7 +729,7 @@ fn merge_condition_entries(
     merged
 }
 
-fn preserve_unchanged_transition_time(mut desired: Value, existing: &Value) -> Value {
+pub(crate) fn preserve_unchanged_transition_time(mut desired: Value, existing: &Value) -> Value {
     let same_value = desired.get("status").and_then(Value::as_str)
         == existing.get("status").and_then(Value::as_str)
         && desired.get("reason").and_then(Value::as_str)
