@@ -145,6 +145,81 @@ fn test_half_open_non_failure_status_releases_probe_slot() {
 }
 
 #[test]
+fn grpc_gateway_side_errors_are_neutral_not_failures() {
+    // F04 (PR #1408): the gRPC final-record block maps client/gateway-side
+    // errors (ResourceExhausted = oversized client payload, Internal = client
+    // body-read / gateway TLS/URL config) to record_neutral, NOT
+    // record_failure(502). Before the fix they were 502 failures, so a client
+    // sending oversized payloads or cancelling RPCs could trip a HEALTHY
+    // backend's breaker. record_neutral must never trip the breaker.
+    let cb = CircuitBreaker::new(default_config()); // failure_threshold = 3
+    for _ in 0..5 {
+        cb.record_neutral(false);
+    }
+    assert_eq!(
+        cb.state_name(),
+        "closed",
+        "gateway-side gRPC errors (ResourceExhausted/Internal) must not trip the backend breaker"
+    );
+}
+
+#[test]
+fn grpc_gateway_side_error_releases_half_open_probe_without_reopening() {
+    // A gateway-side gRPC error that lands on a HALF_OPEN probe must release the
+    // probe slot via record_neutral WITHOUT reopening the breaker (the old 502
+    // failure would have reopened it, stalling recovery).
+    let config = CircuitBreakerConfig {
+        failure_threshold: 1,
+        success_threshold: 2,
+        timeout_seconds: 0,
+        failure_status_codes: vec![500],
+        half_open_max_requests: 1,
+        trip_on_connection_errors: true,
+    };
+    let cb = CircuitBreaker::new(config);
+    cb.record_failure(500, false, false);
+    assert!(cb.can_execute().unwrap());
+    assert_eq!(cb.state_name(), "half_open");
+    assert_eq!(cb.half_open_in_flight(), 1);
+
+    cb.record_neutral(true);
+
+    assert_eq!(
+        cb.state_name(),
+        "half_open",
+        "a gateway-side error must not reopen the breaker"
+    );
+    assert_eq!(
+        cb.half_open_in_flight(),
+        0,
+        "neutral outcome must release the half-open probe slot"
+    );
+    assert!(
+        cb.can_execute().is_ok(),
+        "released slot must admit another probe"
+    );
+}
+
+#[test]
+fn grpc_ok_with_http_5xx_status_trips_breaker() {
+    // F04: an Ok(GrpcResponseKind) carries the backend HTTP status, which can be
+    // a genuine 5xx (sandwiched LB / overloaded backend). The fix classifies by
+    // that status via failure_status_codes instead of recording every Ok as a
+    // blanket success — so a real HTTP 5xx must count toward tripping (and a
+    // HALF_OPEN probe must not close on it).
+    let cb = CircuitBreaker::new(default_config()); // 503 in failure codes, threshold 3
+    cb.record_failure(503, false, false);
+    cb.record_failure(503, false, false);
+    assert_eq!(cb.state_name(), "closed");
+    cb.record_failure(503, false, false);
+    assert_eq!(
+        cb.state_name(),
+        "open",
+        "gRPC backend HTTP 503 responses must count toward tripping the breaker"
+    );
+}
+
+#[test]
 fn test_cache_creates_and_reuses() {
     let cache = CircuitBreakerCache::new();
     let config = default_config();

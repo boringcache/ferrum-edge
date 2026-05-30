@@ -9546,6 +9546,14 @@ async fn handle_proxy_request_inner(
         // tracks whether that probe is still unconsumed so the retry loop and
         // the final record below cannot double-decrement it.
         let mut grpc_cb_probe_slot = cb_is_half_open_probe;
+        // The post-dispatch breaker record must be charged to the target that
+        // actually produced grpc_result. The retry loop can rotate targets, so
+        // track the final target here (init to the initial target) and update it
+        // on each rotation, mirroring the HTTP path's final_cb_target_key. The
+        // probe-slot release still lands correctly: grpc_cb_probe_slot is only
+        // still true when no rotation occurred, in which case this equals
+        // cb_target_key.
+        let mut grpc_final_cb_key = cb_target_key.clone();
         let mut grpc_probe_guard = GrpcProbeReleaseGuard {
             cb: if cb_is_half_open_probe {
                 proxy.circuit_breaker.as_ref().map(|cfg| {
@@ -9869,6 +9877,7 @@ async fn handle_proxy_request_inner(
                     );
                     grpc_current_cb_key =
                         Some(crate::circuit_breaker::target_key(&next.host, next.port));
+                    grpc_final_cb_key = grpc_current_cb_key.clone();
                     grpc_current_target = Some(next);
                 }
 
@@ -9925,11 +9934,40 @@ async fn handle_proxy_request_inner(
         if let Some(cb_config) = &proxy.circuit_breaker {
             let cb = state.circuit_breaker_cache.get_or_create(
                 &proxy.id,
-                cb_target_key.as_deref(),
+                grpc_final_cb_key.as_deref(),
                 cb_config,
             );
             match &grpc_result {
-                Ok(_) => cb.record_success(grpc_cb_probe_slot),
+                Ok(kind) => {
+                    // Classify by the backend's HTTP status, matching the HTTP
+                    // path. gRPC application errors ride as grpc-status trailers
+                    // over HTTP 200 (not a transport failure), so only a genuine
+                    // HTTP 5xx (e.g. a sandwiched LB or overloaded backend) trips
+                    // the breaker — a HALF_OPEN probe must not close the circuit
+                    // on such a status, and configured failure_status_codes must
+                    // still trip. record_success advances recovery for a real
+                    // non-failure status. (record_failure with a non-failure
+                    // status only releases the slot, so it cannot stand in for
+                    // record_success here.)
+                    let backend_status = match kind {
+                        GrpcResponseKind::Buffered(r) => r.status,
+                        GrpcResponseKind::Streaming(r) => r.status,
+                    };
+                    if cb.config().failure_status_codes.contains(&backend_status) {
+                        cb.record_failure(backend_status, false, grpc_cb_probe_slot);
+                    } else {
+                        cb.record_success(grpc_cb_probe_slot);
+                    }
+                }
+                // Oversized client request payloads (ResourceExhausted) and
+                // request-body-read / gateway-config errors (Internal) are
+                // client/gateway-side, not backend failures. Record NEUTRAL so
+                // client behavior cannot trip or reopen the backend breaker —
+                // mirroring the HTTP path's ClientDisconnect -> record_neutral
+                // and this PR's own GrpcProbeReleaseGuard neutral early-returns.
+                Err(GrpcProxyError::ResourceExhausted(_) | GrpcProxyError::Internal(_)) => {
+                    cb.record_neutral(grpc_cb_probe_slot);
+                }
                 Err(e) => {
                     let connection_error = matches!(
                         e,
