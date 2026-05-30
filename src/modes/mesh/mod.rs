@@ -4787,7 +4787,7 @@ fn plan_mesh_inbound_tls_reload(
             warn!(
                 mesh_slice_version = %slice.version,
                 ?mtls_mode,
-                "Unable to inspect mesh inbound TLS reload inputs: {error}; keeping previous TLS config"
+                "Unable to inspect mesh inbound TLS reload inputs: {error}; rejecting the entire mesh slice and keeping the last good config in its entirety (no authz/policy/ServiceEntry/endpoint update from this slice is applied) until the inbound TLS inputs are readable again"
             );
             return None;
         }
@@ -4834,7 +4834,7 @@ fn plan_mesh_inbound_tls_reload(
             warn!(
                 mesh_slice_version = %slice.version,
                 ?mtls_mode,
-                "Failed to rebuild mesh inbound TLS config from PeerAuthentication update: {error}; keeping previous TLS config"
+                "Failed to rebuild mesh inbound TLS config from PeerAuthentication update: {error}; rejecting the entire mesh slice and keeping the last good config in its entirety (no authz/policy/ServiceEntry/endpoint update from this slice is applied) until the inbound TLS rebuild succeeds"
             );
             // Drop the staged SPIFFE bundle: the slice is being rejected, so the
             // live slot must keep its previous trust bundles.
