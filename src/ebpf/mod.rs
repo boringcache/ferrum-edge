@@ -148,6 +148,11 @@ pub struct CaptureContract {
     pub hbone_redirect_port: u16,
     pub unix_socket_path: String,
     pub bpf_maps: CaptureBpfMaps,
+    /// Fail closed on captured IPv6 outbound (the `connect6` hook returns
+    /// `EPERM`) instead of redirecting it. Set in NodeWaypoint in-netns capture
+    /// mode, whose datapath is IPv4-only, so IPv6 egress cannot bypass
+    /// `mesh_authz`. See [`BpfCaptureConfig::ipv6_outbound_deny`].
+    pub ipv6_outbound_deny: bool,
 }
 
 impl CaptureContract {
@@ -180,6 +185,7 @@ impl CaptureContract {
             hbone_redirect_port,
             unix_socket_path,
             bpf_maps: CaptureBpfMaps::default(),
+            ipv6_outbound_deny: false,
         })
     }
 
@@ -190,11 +196,13 @@ impl CaptureContract {
             hbone_redirect_port: INBOUND_HBONE_PORT,
             unix_socket_path: DEFAULT_NODE_AGENT_SOCKET_PATH.to_string(),
             bpf_maps: CaptureBpfMaps::default(),
+            ipv6_outbound_deny: false,
         }
     }
 
     pub fn bpf_capture_config(&self) -> BpfCaptureConfig {
         BpfCaptureConfig::new(self.outbound_capture_port, self.hbone_redirect_port)
+            .with_ipv6_outbound_deny(self.ipv6_outbound_deny)
     }
 }
 
@@ -381,14 +389,17 @@ pub struct PodAttachmentState {
     pub cgroup_path: Option<String>,
     pub veth_iface: Option<String>,
     pub attached: bool,
-    /// Set when this pod has an active `includeOutboundPorts` entry in
-    /// `FERRUM_INCLUDE_PORTS`. The cgroup id is the BPF lookup key
-    /// (matches `bpf_get_current_cgroup_id`), captured at enrollment so
-    /// un-enrollment can remove the entry without re-statting the
-    /// cgroup path (which may already be gone by the time the pod is
-    /// deleted). `None` when the pod is unannotated or the cgroup id
-    /// could not be read.
-    pub include_ports_cgroup_id: Option<u64>,
+    /// Cgroup ids carrying this pod's `includeOutboundPorts` entries in
+    /// `FERRUM_INCLUDE_PORTS`: the pod cgroup inode plus every descendant
+    /// container-cgroup inode (`cgroup::collect_cgroup_tree_inodes`). The
+    /// `connect4`/`connect6` gate keys this map by `bpf_get_current_cgroup_id()`
+    /// — the container leaf cgroup, a child of the pod cgroup — so the policy
+    /// must live under the leaf inodes, not just the pod inode, or narrowing
+    /// never engages. Captured at enrollment as the removal keys so
+    /// un-enrollment drops every entry without re-statting a possibly-gone
+    /// cgroup tree. Empty when the pod is unannotated or no cgroup inode could
+    /// be read.
+    pub include_ports_cgroup_ids: Vec<u64>,
     /// Last `IncludePortsPolicy` applied to the BPF map for this pod, or
     /// `None` when the pod has no `includeOutboundPorts` annotation in
     /// effect. Used as the diff baseline on Kubernetes `Apply` (modify)
@@ -399,11 +410,17 @@ pub struct PodAttachmentState {
     /// or, worse, ignore live edits to `traffic.sidecar.istio.io/includeOutboundPorts`
     /// (the GAP-2K mid-life update gap this field closes).
     pub include_ports_policy: Option<IncludePortsPolicy>,
-    /// Set when this pod has an active `FERRUM_WORKLOAD_IDENTITY` entry
-    /// (GAP-1b). The cgroup id is the removal key, captured at enrollment so
-    /// un-enrollment can drop the entry without re-statting a possibly-gone
-    /// cgroup path. `None` when the identity could not be derived or written.
-    pub workload_identity_cgroup_id: Option<u64>,
+    /// Cgroup ids carrying this pod's `FERRUM_WORKLOAD_IDENTITY` entries
+    /// (GAP-1b): the pod cgroup inode plus every descendant container-cgroup
+    /// inode (see `cgroup::collect_cgroup_tree_inodes`). The connect hooks read
+    /// `bpf_get_current_cgroup_id()`, which is the *container* leaf cgroup —
+    /// a child of the pod cgroup on every Kubernetes cgroup driver — so the
+    /// identity must be written under those leaf inodes, not just the pod inode,
+    /// or the hook's lookup misses and resolution fails closed. Captured at
+    /// enrollment as the removal keys so un-enrollment drops every entry without
+    /// re-statting a possibly-gone cgroup path. Empty when the identity could
+    /// not be derived or no cgroup inode could be read.
+    pub workload_identity_cgroup_ids: Vec<u64>,
 }
 
 /// Fallback behavior when the kernel does not support eBPF capture.
@@ -516,6 +533,7 @@ pub struct MockEbpfBackend {
     pub detached_pods: Vec<String>,
     pub cleaned_up: bool,
     pub fail_update_capture_config: bool,
+    pub fail_attach_sock_ops: bool,
     pub sock_ops_attached_cgroup_root: Option<String>,
 }
 
@@ -625,6 +643,9 @@ impl EbpfBackend for MockEbpfBackend {
     }
 
     fn attach_sock_ops(&mut self, cgroup_root: &str) -> Result<(), String> {
+        if self.fail_attach_sock_ops {
+            return Err("sock_ops attach failed".to_string());
+        }
         self.sock_ops_attached_cgroup_root = Some(cgroup_root.to_string());
         Ok(())
     }

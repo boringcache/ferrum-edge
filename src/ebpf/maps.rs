@@ -42,59 +42,52 @@ pub struct BpfMaps {
 
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 impl BpfMaps {
-    pub fn from_ebpf(bpf: &Ebpf) -> Result<Self, String> {
+    pub fn from_ebpf(bpf: &mut Ebpf) -> Result<Self, String> {
         let pod_ips = BpfHashMap::try_from(
-            bpf.map("FERRUM_POD_IPS")
-                .ok_or("FERRUM_POD_IPS map not found")?
-                .clone(),
+            bpf.take_map("FERRUM_POD_IPS")
+                .ok_or("FERRUM_POD_IPS map not found")?,
         )
         .map_err(|e| format!("FERRUM_POD_IPS type mismatch: {e}"))?;
 
         let bypass_uids = BpfHashMap::try_from(
-            bpf.map("FERRUM_BYPASS_UIDS")
-                .ok_or("FERRUM_BYPASS_UIDS map not found")?
-                .clone(),
+            bpf.take_map("FERRUM_BYPASS_UIDS")
+                .ok_or("FERRUM_BYPASS_UIDS map not found")?,
         )
         .map_err(|e| format!("FERRUM_BYPASS_UIDS type mismatch: {e}"))?;
 
         let cidr_exclude4 = LpmTrie::try_from(
-            bpf.map("FERRUM_CIDR_EXCLUDE4")
-                .ok_or("FERRUM_CIDR_EXCLUDE4 map not found")?
-                .clone(),
+            bpf.take_map("FERRUM_CIDR_EXCLUDE4")
+                .ok_or("FERRUM_CIDR_EXCLUDE4 map not found")?,
         )
         .map_err(|e| format!("FERRUM_CIDR_EXCLUDE4 type mismatch: {e}"))?;
 
         let cidr_exclude6 = LpmTrie::try_from(
-            bpf.map("FERRUM_CIDR_EXCLUDE6")
-                .ok_or("FERRUM_CIDR_EXCLUDE6 map not found")?
-                .clone(),
+            bpf.take_map("FERRUM_CIDR_EXCLUDE6")
+                .ok_or("FERRUM_CIDR_EXCLUDE6 map not found")?,
         )
         .map_err(|e| format!("FERRUM_CIDR_EXCLUDE6 type mismatch: {e}"))?;
 
         let cidr_include4 = LpmTrie::try_from(
-            bpf.map("FERRUM_CIDR_INCLUDE4")
-                .ok_or("FERRUM_CIDR_INCLUDE4 map not found")?
-                .clone(),
+            bpf.take_map("FERRUM_CIDR_INCLUDE4")
+                .ok_or("FERRUM_CIDR_INCLUDE4 map not found")?,
         )
         .map_err(|e| format!("FERRUM_CIDR_INCLUDE4 type mismatch: {e}"))?;
 
         let cidr_include6 = LpmTrie::try_from(
-            bpf.map("FERRUM_CIDR_INCLUDE6")
-                .ok_or("FERRUM_CIDR_INCLUDE6 map not found")?
-                .clone(),
+            bpf.take_map("FERRUM_CIDR_INCLUDE6")
+                .ok_or("FERRUM_CIDR_INCLUDE6 map not found")?,
         )
         .map_err(|e| format!("FERRUM_CIDR_INCLUDE6 type mismatch: {e}"))?;
 
         let port_exclude = BpfHashMap::try_from(
-            bpf.map("FERRUM_PORT_EXCLUDE")
-                .ok_or("FERRUM_PORT_EXCLUDE map not found")?
-                .clone(),
+            bpf.take_map("FERRUM_PORT_EXCLUDE")
+                .ok_or("FERRUM_PORT_EXCLUDE map not found")?,
         )
         .map_err(|e| format!("FERRUM_PORT_EXCLUDE type mismatch: {e}"))?;
 
-        let capture_config = match bpf.map("FERRUM_CAPTURE_CONFIG") {
+        let capture_config = match bpf.take_map("FERRUM_CAPTURE_CONFIG") {
             Some(map) => Some(
-                BpfHashMap::try_from(map.clone())
+                BpfHashMap::try_from(map)
                     .map_err(|e| format!("FERRUM_CAPTURE_CONFIG type mismatch: {e}"))?,
             ),
             None => {
@@ -111,9 +104,9 @@ impl BpfMaps {
         // lookups, so capture stays correct for unannotated pods. Pods
         // that DO carry `includeOutboundPorts` will be over-captured (no
         // narrowing), which is the prior GAP-2K behavior.
-        let include_ports = match bpf.map("FERRUM_INCLUDE_PORTS") {
+        let include_ports = match bpf.take_map("FERRUM_INCLUDE_PORTS") {
             Some(map) => Some(
-                BpfHashMap::try_from(map.clone())
+                BpfHashMap::try_from(map)
                     .map_err(|e| format!("FERRUM_INCLUDE_PORTS type mismatch: {e}"))?,
             ),
             None => {
@@ -128,9 +121,9 @@ impl BpfMaps {
         // the missing map so the node-agent still boots; the connect hooks
         // fall back to the all-zero sentinel, which node-waypoint resolution
         // treats as fail-closed (the prior behavior).
-        let workload_identity = match bpf.map(super::BPF_MAP_WORKLOAD_IDENTITY) {
+        let workload_identity = match bpf.take_map(super::BPF_MAP_WORKLOAD_IDENTITY) {
             Some(map) => Some(
-                BpfHashMap::try_from(map.clone())
+                BpfHashMap::try_from(map)
                     .map_err(|e| format!("FERRUM_WORKLOAD_IDENTITY type mismatch: {e}"))?,
             ),
             None => {
@@ -155,75 +148,75 @@ impl BpfMaps {
         })
     }
 
-    pub fn insert_pod_ip(&self, ip: Ipv4Addr, info: &PodInfo) -> Result<(), String> {
+    pub fn insert_pod_ip(&mut self, ip: Ipv4Addr, info: &PodInfo) -> Result<(), String> {
         let key = u32::from(ip);
         let value = BpfPodInfo {
             proxy_port: info.proxy_port as u32,
             _pad: 0,
         };
-        let mut map = self.pod_ips.clone();
+        let map = &mut self.pod_ips;
         map.insert(key, value, 0)
             .map_err(|e| format!("Failed to insert pod IP {ip}: {e}"))
     }
 
-    pub fn remove_pod_ip(&self, ip: Ipv4Addr) -> Result<(), String> {
+    pub fn remove_pod_ip(&mut self, ip: Ipv4Addr) -> Result<(), String> {
         let key = u32::from(ip);
-        let mut map = self.pod_ips.clone();
+        let map = &mut self.pod_ips;
         map.remove(&key)
             .map_err(|e| format!("Failed to remove pod IP {ip}: {e}"))
     }
 
-    pub fn insert_bypass_uid(&self, uid: u32) -> Result<(), String> {
-        let mut map = self.bypass_uids.clone();
+    pub fn insert_bypass_uid(&mut self, uid: u32) -> Result<(), String> {
+        let map = &mut self.bypass_uids;
         map.insert(uid, 1u8, 0)
             .map_err(|e| format!("Failed to insert bypass UID {uid}: {e}"))
     }
 
-    pub fn insert_cidr_exclude(&self, cidr: &str) -> Result<(), String> {
+    pub fn insert_cidr_exclude(&mut self, cidr: &str) -> Result<(), String> {
         match parse_cidr_to_lpm_key(cidr)? {
             ParsedLpmKey::V4(key) => {
-                let mut map = self.cidr_exclude4.clone();
+                let map = &mut self.cidr_exclude4;
                 map.insert(&key, 1u8, 0)
                     .map_err(|e| format!("Failed to insert exclude CIDR '{cidr}': {e}"))
             }
             ParsedLpmKey::V6(key) => {
-                let mut map = self.cidr_exclude6.clone();
+                let map = &mut self.cidr_exclude6;
                 map.insert(&key, 1u8, 0)
                     .map_err(|e| format!("Failed to insert exclude CIDR '{cidr}': {e}"))
             }
         }
     }
 
-    pub fn insert_cidr_include(&self, cidr: &str) -> Result<(), String> {
+    pub fn insert_cidr_include(&mut self, cidr: &str) -> Result<(), String> {
         match parse_cidr_to_lpm_key(cidr)? {
             ParsedLpmKey::V4(key) => {
-                let mut map = self.cidr_include4.clone();
+                let map = &mut self.cidr_include4;
                 map.insert(&key, 1u8, 0)
                     .map_err(|e| format!("Failed to insert include CIDR '{cidr}': {e}"))
             }
             ParsedLpmKey::V6(key) => {
-                let mut map = self.cidr_include6.clone();
+                let map = &mut self.cidr_include6;
                 map.insert(&key, 1u8, 0)
                     .map_err(|e| format!("Failed to insert include CIDR '{cidr}': {e}"))
             }
         }
     }
 
-    pub fn insert_port_exclude(&self, port: u16) -> Result<(), String> {
-        let mut map = self.port_exclude.clone();
+    pub fn insert_port_exclude(&mut self, port: u16) -> Result<(), String> {
+        let map = &mut self.port_exclude;
         map.insert(port, 1u8, 0)
             .map_err(|e| format!("Failed to insert exclude port {port}: {e}"))
     }
 
-    pub fn update_capture_config(&self, config: &BpfCaptureConfig) -> Result<(), String> {
-        let Some(capture_config) = self.capture_config.as_ref() else {
+    pub fn update_capture_config(&mut self, config: &BpfCaptureConfig) -> Result<(), String> {
+        let Some(capture_config) = self.capture_config.as_mut() else {
             tracing::warn!(
                 "Skipping capture config update because FERRUM_CAPTURE_CONFIG map is absent"
             );
             return Ok(());
         };
-        let mut map = capture_config.clone();
-        map.insert(FERRUM_CAPTURE_CONFIG_KEY, *config, 0)
+        capture_config
+            .insert(FERRUM_CAPTURE_CONFIG_KEY, *config, 0)
             .map_err(|e| format!("Failed to update capture config: {e}"))
     }
 
@@ -231,15 +224,15 @@ impl BpfMaps {
     /// policy. Absent map (older ELF) is a no-op so the node agent boots
     /// even when the new gate is unavailable.
     pub fn insert_include_ports(
-        &self,
+        &mut self,
         cgroup_id: u64,
         policy: &IncludePortsPolicy,
     ) -> Result<(), String> {
-        let Some(include_ports) = self.include_ports.as_ref() else {
+        let Some(include_ports) = self.include_ports.as_mut() else {
             return Ok(());
         };
-        let mut map = include_ports.clone();
-        map.insert(cgroup_id, *policy, 0)
+        include_ports
+            .insert(cgroup_id, *policy, 0)
             .map_err(|e| format!("Failed to insert include-ports for cgroup {cgroup_id}: {e}"))
     }
 
@@ -247,12 +240,11 @@ impl BpfMaps {
     /// un-enrollment. Absent map (older ELF) is a no-op; absent key is
     /// silently tolerated because the BPF gate fail-opens on missing
     /// lookups.
-    pub fn remove_include_ports(&self, cgroup_id: u64) -> Result<(), String> {
-        let Some(include_ports) = self.include_ports.as_ref() else {
+    pub fn remove_include_ports(&mut self, cgroup_id: u64) -> Result<(), String> {
+        let Some(include_ports) = self.include_ports.as_mut() else {
             return Ok(());
         };
-        let mut map = include_ports.clone();
-        if let Err(e) = map.remove(&cgroup_id) {
+        if let Err(e) = include_ports.remove(&cgroup_id) {
             // `aya::maps::HashMap::remove` returns Err on ENOENT; demote
             // that to a debug log because pods that were never annotated
             // legitimately have no entry.
@@ -265,30 +257,42 @@ impl BpfMaps {
     /// Absent map (older ELF) is a no-op so the node agent boots even when
     /// the new map is unavailable.
     pub fn insert_workload_identity(
-        &self,
+        &mut self,
         cgroup_id: u64,
         identity: &WorkloadIdentity,
     ) -> Result<(), String> {
-        let Some(workload_identity) = self.workload_identity.as_ref() else {
+        let Some(workload_identity) = self.workload_identity.as_mut() else {
             return Ok(());
         };
-        let mut map = workload_identity.clone();
-        map.insert(cgroup_id, *identity, 0)
+        workload_identity
+            .insert(cgroup_id, *identity, 0)
             .map_err(|e| format!("Failed to insert workload identity for cgroup {cgroup_id}: {e}"))
     }
 
     /// Remove a per-cgroup workload identity entry, e.g. on pod
     /// un-enrollment. Absent map (older ELF) is a no-op; absent key is
     /// tolerated because the connect hooks fail-open to the unknown sentinel.
-    pub fn remove_workload_identity(&self, cgroup_id: u64) -> Result<(), String> {
-        let Some(workload_identity) = self.workload_identity.as_ref() else {
+    pub fn remove_workload_identity(&mut self, cgroup_id: u64) -> Result<(), String> {
+        let Some(workload_identity) = self.workload_identity.as_mut() else {
             return Ok(());
         };
-        let mut map = workload_identity.clone();
-        if let Err(e) = map.remove(&cgroup_id) {
-            tracing::debug!(cgroup_id, error = %e, "remove_workload_identity: entry missing");
+        match workload_identity.remove(&cgroup_id) {
+            Ok(()) => Ok(()),
+            // An absent key is benign (already removed / never written): the
+            // connect hooks fail-open to the unknown sentinel, so tolerate it.
+            Err(aya::maps::MapError::SyscallError(err))
+                if err.io_error.raw_os_error() == Some(libc::ENOENT) =>
+            {
+                tracing::debug!(cgroup_id, "remove_workload_identity: entry already absent");
+                Ok(())
+            }
+            // Any other failure leaves a stale identity in the map that could
+            // misattribute a reused cgroup inode — surface it rather than
+            // silently dropping the cgroup from the caller's tracking state.
+            Err(e) => Err(format!(
+                "Failed to remove workload identity for cgroup {cgroup_id}: {e}"
+            )),
         }
-        Ok(())
     }
 }
 

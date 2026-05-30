@@ -2139,8 +2139,9 @@ async fn mesh_authz_request_principals_deny_rule_skips_non_matching_jwt() {
 // by the node-waypoint accept path. These tests cover:
 //   1. Namespace-scoped policy applies only to pods in that namespace.
 //   2. Workload-selector ALLOW gates implicit-deny by source-pod labels.
-//   3. Missing scope cache + per_pod_policy_scoping=true falls back to
-//      mesh-wide policies only, so scoped policies cannot leak across pods.
+//   3. Missing scope + per_pod_policy_scoping=true fails closed (403) when
+//      scoped policies exist, and falls through to mesh-wide-only when the
+//      mesh has only mesh-wide policies, so scoped policies cannot leak.
 //   4. Disabled path preserves the construction-time filter.
 
 #[tokio::test]
@@ -2231,11 +2232,15 @@ async fn mesh_authz_per_pod_scoping_workload_selector_filter_blocks_implicit_den
 }
 
 #[tokio::test]
-async fn mesh_authz_per_pod_scoping_without_scope_cache_uses_mesh_wide_only() {
-    // Per-pod scoping is enabled but the accept path didn't enroll a scope
-    // for this pod (race during enrollment, or pod removed). The plugin
-    // should keep mesh-wide policies but drop namespace/selector-scoped
-    // policies because it cannot prove they apply to this source pod.
+async fn mesh_authz_per_pod_scoping_missing_scope_fails_closed_when_scoped_policies_present() {
+    // Per-pod scoping is enabled, a namespace-scoped policy exists, and this
+    // request has no per-pod scope. After the single-generation resolver, a
+    // missing scope means the workload's hash left the live slice gate (the pod
+    // was removed or re-keyed) — the scope is derived from the same slice that
+    // vouches the identity, so it is not an enrollment race. A long-lived
+    // HTTP/2/HBONE connection from a removed workload must therefore fail closed
+    // for scoped authz rather than silently dropping to mesh-wide-only, matching
+    // the stream path.
     let plugin = MeshAuthz::new(&json!({
         "mesh_policies": [
             policy_with_scope(
@@ -2258,18 +2263,68 @@ async fn mesh_authz_per_pod_scoping_without_scope_cache_uses_mesh_wide_only() {
     let result = plugin.authorize(&mut ctx).await;
 
     assert!(
+        matches!(
+            result,
+            PluginResult::Reject {
+                status_code: 403,
+                ..
+            }
+        ),
+        "missing per-pod scope with scoped policies present must fail closed, got {result:?}"
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.deny_policy")
+            .map(String::as_str),
+        Some("scope_missing"),
+        "fail-closed reject must stamp deny_policy=scope_missing"
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.scope_missing")
+            .map(String::as_str),
+        Some("true"),
+    );
+}
+
+#[tokio::test]
+async fn mesh_authz_per_pod_scoping_missing_scope_falls_through_when_only_mesh_wide() {
+    // With ONLY mesh-wide policies the mesh is fully evaluable without a per-pod
+    // scope, so a missing scope falls through to mesh-wide-only evaluation
+    // (here: allow) rather than failing closed — matching the stream path.
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [policy_with_scope(
+            "mesh-wide-allow",
+            PolicyScope::MeshWide,
+            PolicyAction::Allow,
+        )],
+        "per_pod_policy_scoping": true,
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/default/sa/client"));
+    // Intentionally do not set node_waypoint_policy_scope.
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(
         matches!(result, PluginResult::Continue),
-        "per_pod_policy_scoping with no scope cache should keep mesh-wide policies only, got {result:?}"
+        "missing scope with only mesh-wide policies should evaluate mesh-wide, got {result:?}"
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.scope_missing")
+            .map(String::as_str),
+        Some("true"),
     );
 }
 
 #[tokio::test]
 async fn mesh_authz_per_pod_scoping_missing_scope_sets_scope_missing_metadata() {
-    // When per_pod_policy_scoping is on and the request has no
-    // node_waypoint_policy_scope, the plugin falls back to mesh-wide
-    // policies only and must surface that state via
-    // `mesh_authz.scope_missing` so transaction logs make the race window
-    // visible to operators.
+    // With only mesh-wide policies configured (as here) and the request
+    // carrying no node_waypoint_policy_scope, the plugin evaluates mesh-wide
+    // and must surface `mesh_authz.scope_missing` so operators can see the
+    // fall-through in transaction logs. (With scoped policies present this same
+    // missing-scope state fails closed instead — covered separately.)
     let plugin = MeshAuthz::new(&json!({
         "mesh_policies": [policy_with_scope(
             "mesh-wide-allow",
@@ -2476,9 +2531,10 @@ async fn mesh_authz_on_stream_connect_mesh_wide_deny_closes_connection() {
 
 #[tokio::test]
 async fn mesh_authz_on_stream_connect_scope_missing_metadata_stamped() {
-    // (c) When per_pod_policy_scoping is on and no scope cache is present,
-    // `mesh_authz.scope_missing` must appear in the stream connection
-    // metadata so operators can observe the race window in transaction logs.
+    // (c) With only mesh-wide policies (as here), when per_pod_policy_scoping
+    // is on and no scope cache is present, `mesh_authz.scope_missing` must
+    // appear in the stream connection metadata so operators can observe the
+    // mesh-wide fall-through in transaction logs.
     let plugin = MeshAuthz::new(&json!({
         "mesh_policies": [policy_with_scope(
             "mesh-wide-allow",

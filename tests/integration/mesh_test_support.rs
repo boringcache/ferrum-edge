@@ -134,6 +134,7 @@ pub fn workload_for(
         weight: None,
         locality: None,
         service_account: Some(service_account),
+        pod_uid: None,
     }
 }
 

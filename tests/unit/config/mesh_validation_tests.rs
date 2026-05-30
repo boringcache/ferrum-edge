@@ -32,6 +32,7 @@ fn fresh_workload() -> Workload {
         weight: None,
         locality: None,
         service_account: None,
+        pod_uid: None,
     }
 }
 
@@ -913,6 +914,7 @@ fn gateway_config_validate_mesh_fields_dispatches() {
                 weight: None,
                 locality: None,
                 service_account: None,
+                pod_uid: None,
             }],
             ..Default::default()
         })),

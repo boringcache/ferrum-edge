@@ -1070,6 +1070,7 @@ mod tests {
             kind: kind.to_string(),
             metadata: K8sMetadata {
                 name: name.to_string(),
+                uid: String::new(),
                 namespace: "default".to_string(),
                 generation: Some(7),
                 labels: Default::default(),

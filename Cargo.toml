@@ -214,7 +214,7 @@ secrets-vault = ["dep:vaultrs"]
 secrets-aws = ["dep:aws-config", "dep:aws-sdk-secretsmanager"]
 secrets-gcp = ["dep:google-cloud-secretmanager-v1"]
 secrets-azure = ["dep:azure_identity", "dep:azure_security_keyvault_secrets", "dep:azure_core"]
-ebpf = ["dep:aya", "dep:aya-log"]
+ebpf = ["dep:aya", "dep:aya-log", "ferrum-ebpf-common/userspace"]
 
 # ── Build profiles ─────────────────────────────────────────────────────────
 # Dev: optimise for fast compile-edit-run cycles

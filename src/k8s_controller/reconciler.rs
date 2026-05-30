@@ -877,6 +877,7 @@ mod tests {
             weight: None,
             locality: None,
             service_account: Some(service_account.to_string()),
+            pod_uid: None,
         }
     }
 

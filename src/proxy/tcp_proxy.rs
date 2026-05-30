@@ -55,33 +55,37 @@ pub(crate) fn classify_stream_error(error: &anyhow::Error) -> crate::retry::Erro
 ///
 /// Behavior:
 /// - `resolver` is `None` outside `NodeWaypoint` topology and for non-mesh TCP
-///   proxies → returns `(None, None)`; the stream is mesh-wide-only with no
-///   per-pod scope consulted (unchanged pre-fix behavior).
+///   proxies → returns `(None, None)`; no per-pod scope is consulted (unchanged
+///   pre-fix behavior).
 /// - When the connection's `SO_COOKIE` cannot be resolved to an enrolled pod
-///   (GAP-2M caveat below, no node-agent enrollment yet, non-Linux, unknown
-///   cookie, identity race), returns `(None, None)`. `mesh_authz` then
-///   evaluates mesh-wide policies only and stamps
-///   `mesh_authz.scope_missing=true` — the same safe default the HTTP path
-///   uses for an unresolved per-pod scope.
+///   (GAP-2M IPv6 / tuple miss, no node-agent enrollment yet, non-Linux,
+///   unknown cookie), or the identity resolves but its workload has left the
+///   live slice, returns `(None, None)` and stamps `mesh_authz.scope_missing`.
+///   `mesh_authz` then **fails closed** (rejects the stream, 403) when any
+///   namespace/selector-scoped policy is configured, and falls through to
+///   mesh-wide-only when the mesh has only mesh-wide policies — the same gate
+///   the HTTP/HBONE path applies per request.
 ///
-/// **GAP-2M staging caveat**: today the resolver's cookie records are
+/// **GAP-2M accept-side bridge (IPv4)**: the resolver's cookie records are
 /// populated by the connect-side `orig_dst_bridge`, but the accept path looks
 /// up the accept-side `SO_COOKIE` — a different kernel socket with a different
-/// cookie (see `src/socket_opts.rs` and `src/ebpf/orig_dst_bridge.rs`). Until
-/// the GAP-2M sockops/sk_lookup bridge registers accept-side cookies, this
-/// helper returns `(None, None)` on every production connection and the stream
-/// downgrades to mesh-wide enforcement. The HBONE/HTTP path has the same
-/// staging dependency and currently fails closed at the same point. The
-/// per-pod scoping wiring is in place so once GAP-2M ships scoped enforcement
-/// starts on both paths without changes to this accept-path helper.
+/// cookie (see `src/socket_opts.rs` and `src/ebpf/orig_dst_bridge.rs`). The
+/// kernel `sock_ops` program bridges them for IPv4 by re-keying the orig-dst
+/// record under the accept-side cookie, so IPv4 connections resolve scoped
+/// policies with no further proxy-side change. IPv6 is not bridged (its
+/// `sock_ops` ctx accessors trip the verifier), so IPv6 accepts get no
+/// accept-side record and resolve `None` (fail-closed). The full datapath is CI
+/// compile/load-tested but unverified on a live multi-pod node.
 ///
-/// Fail-closed-soft, deliberately unlike the HBONE listener which drops a
-/// connection without a resolved identity: raw TCP stream proxies in
-/// node-waypoint topology may legitimately carry non-captured traffic, so an
-/// unresolved cookie downgrades to mesh-wide enforcement rather than refusing
-/// the stream. The scope itself (`PolicyScopeCache`) may still be `None` even
-/// when the identity resolves — a slice/identity enrollment race — which also
-/// yields mesh-wide-only via the same `mesh_authz` fallback.
+/// This helper never refuses the stream itself — unlike the HBONE listener,
+/// which drops a connection without a resolved identity — because raw TCP
+/// proxies in node-waypoint topology may legitimately carry non-captured
+/// traffic; it returns `(None, None)` and lets `mesh_authz` make the
+/// fail-closed-vs-mesh-wide decision above. The scope (`PolicyScopeCache`) may
+/// be `None` even when the identity resolves — the workload carries no scoped
+/// policy, or it left the current slice — and is taken from the same slice
+/// generation that resolved the identity, so a resolved identity can never be
+/// paired with an old/missing scope from a concurrent reload.
 fn resolve_node_waypoint_stream_scope(
     resolver: Option<&crate::modes::mesh::node_waypoint::NodeWaypointIdentityResolver>,
     stream: &TcpStream,
@@ -94,11 +98,13 @@ fn resolve_node_waypoint_stream_scope(
     let Some(resolver) = resolver else {
         return (None, None);
     };
+    // Take the scope FROM the resolve result so the identity gate and the
+    // per-pod scope come from the SAME slice generation (the "never partial"
+    // reload invariant). The TCP path captures scope once at accept and persists
+    // it for the connection's lifetime, so a second `policy_scope_for_pod` call
+    // here could read a newer generation's scope against an older gate decision.
     match resolver.resolve_stream(stream) {
-        Ok(identity) => (
-            resolver.policy_scope_for_pod(&identity.pod_uid),
-            Some(identity.spiffe_id.as_str().to_string()),
-        ),
+        Ok((identity, scope)) => (scope, Some(identity.spiffe_id.as_str().to_string())),
         Err(error) => {
             debug!(
                 proxy_id = %proxy_id,
@@ -776,8 +782,9 @@ pub struct TcpListenerConfig {
     /// source pod identity so the per-pod `PolicyScopeCache` can be stamped
     /// onto `StreamConnectionContext.node_waypoint_policy_scope` (parity with
     /// the HTTP/HBONE admit path in `src/proxy/mod.rs`). `None` for every other
-    /// topology and for non-mesh TCP proxies — those pass no per-pod scope and
-    /// `mesh_authz` (when present) evaluates mesh-wide policies only.
+    /// topology and for non-mesh TCP proxies — those pass no per-pod scope, so
+    /// `mesh_authz` (when present) evaluates its construction-time-filtered
+    /// policy set for the proxy's own workload identity rather than per-pod.
     pub node_waypoint_identity_resolver:
         Option<Arc<crate::modes::mesh::node_waypoint::NodeWaypointIdentityResolver>>,
 }
@@ -6131,11 +6138,11 @@ mod node_waypoint_stream_scope_tests {
 
         use ferrum_ebpf_common::OrigDst4;
 
-        use crate::identity::SpiffeId;
+        use crate::identity::{SpiffeId, TrustDomain};
+        use crate::modes::mesh::config::{Workload, WorkloadSelector};
         use crate::modes::mesh::node_waypoint::{
             NodeWaypointIdentity, NodeWaypointIdentityResolver, parse_pod_uid,
         };
-        use crate::modes::mesh::runtime::PolicyScopeCache;
 
         let resolver = Arc::new(NodeWaypointIdentityResolver::new(0));
         let pod = parse_pod_uid("11111111-1111-1111-1111-111111111111").unwrap();
@@ -6153,7 +6160,7 @@ mod node_waypoint_stream_scope_tests {
         let _client = connect.await.expect("join").expect("connect");
 
         // Register the orig-dst record under the *accepted* socket's real
-        // cookie (the accept-side registrar contract) and install the pod scope.
+        // cookie (the accept-side registrar contract).
         let cookie = crate::socket_opts::socket_cookie(&accepted).expect("SO_COOKIE");
         resolver.record_orig_dst4(
             cookie,
@@ -6164,16 +6171,31 @@ mod node_waypoint_stream_scope_tests {
                 workload_spiffe_hash: hash,
             },
         );
-        let mut scopes = HashMap::new();
-        scopes.insert(
-            pod,
-            Arc::new(PolicyScopeCache::new(
-                spiffe.clone(),
-                "team-a",
-                HashMap::new(),
-            )),
-        );
-        resolver.install_policy_scopes(scopes);
+        // Install the pod's scope the way production does — from the slice's
+        // workload set. The workload carries this pod's `metadata.uid` so the
+        // per-UID scope index (`scopes_by_pod_uid`) is keyed to match the
+        // captured pod; it also seeds the `workload_spiffe_hash` gate, which
+        // `resolve_record` re-validates against so a cached identity resolves
+        // only while its workload is still in the slice.
+        let workload = Workload {
+            spiffe_id: spiffe.clone(),
+            selector: WorkloadSelector {
+                labels: HashMap::new(),
+                namespace: Some("team-a".to_string()),
+            },
+            service_name: "api".to_string(),
+            addresses: Vec::new(),
+            ports: Vec::new(),
+            trust_domain: TrustDomain::new("cluster.local").expect("trust domain"),
+            namespace: "team-a".to_string(),
+            network: None,
+            cluster: None,
+            weight: None,
+            locality: None,
+            service_account: None,
+            pod_uid: Some("11111111-1111-1111-1111-111111111111".to_string()),
+        };
+        resolver.install_policy_scopes_from_workloads(&[workload]);
 
         let (scope, principal) = resolve_node_waypoint_stream_scope(
             Some(resolver.as_ref()),

@@ -9,6 +9,9 @@ pub fn dynamic_object_to_k8s_object(
 ) -> K8sObject {
     let metadata = K8sMetadata {
         name: obj.metadata.name.clone().unwrap_or_default(),
+        // Pod `metadata.uid` threads through to per-pod node-waypoint policy
+        // scope keying; populate it from the live object rather than dropping it.
+        uid: obj.metadata.uid.clone().unwrap_or_default(),
         namespace: if is_cluster_scoped(api_version, kind) {
             String::new()
         } else {

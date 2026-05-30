@@ -3956,6 +3956,7 @@ mod tests {
             weight: None,
             locality: None,
             service_account: Some("api".to_string()),
+            pod_uid: None,
         };
         let service = MeshService {
             name: "api".to_string(),

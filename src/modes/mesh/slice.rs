@@ -2023,6 +2023,7 @@ mod tests {
             weight: None,
             locality: None,
             service_account: None,
+            pod_uid: None,
         }
     }
 
@@ -4057,6 +4058,7 @@ mod tests {
                 weight: None,
                 locality: None,
                 service_account: None,
+                pod_uid: None,
             }],
             ..MeshSlice::default()
         };
@@ -4088,6 +4090,7 @@ mod tests {
                 weight: None,
                 locality: None,
                 service_account: None,
+                pod_uid: None,
             }],
             ..MeshSlice::default()
         };

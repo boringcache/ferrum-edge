@@ -16,7 +16,13 @@ use std::net::Ipv4Addr;
 use std::os::fd::AsFd;
 
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
-use aya::programs::{CgroupSockAddr, SchedClassifier, SockOps, SockOpsLinkId, TcAttachType};
+use aya::programs::cgroup_sock_addr::CgroupSockAddrLinkId;
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+use aya::programs::sock_ops::SockOpsLinkId;
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+use aya::programs::tc::SchedClassifierLinkId;
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+use aya::programs::{CgroupAttachMode, CgroupSockAddr, SchedClassifier, SockOps, TcAttachType};
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 use aya::{Ebpf, EbpfLoader};
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
@@ -54,8 +60,8 @@ const TC_PROGRAM: &str = "ferrum_tc_inbound";
 /// Tracks per-pod attachment state for cleanup.
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 struct PodLinks {
-    cgroup_link_ids: Vec<aya::programs::CgroupSockAddrLinkId>,
-    tc_link_ids: Vec<aya::programs::SchedClassifierLinkId>,
+    cgroup_link_ids: Vec<CgroupSockAddrLinkId>,
+    tc_link_ids: Vec<SchedClassifierLinkId>,
 }
 
 /// Real aya-backed eBPF loader. Only available on Linux with `--features ebpf`.
@@ -171,7 +177,7 @@ impl EbpfBackend for AyaEbpfBackend {
             );
         }
 
-        self.maps = Some(BpfMaps::from_ebpf(&bpf)?);
+        self.maps = Some(BpfMaps::from_ebpf(&mut bpf)?);
 
         // GAP-1b: pin the original-destination maps so the node-waypoint
         // mesh-proxy can open them by path through the orig-dst bridge.
@@ -194,7 +200,7 @@ impl EbpfBackend for AyaEbpfBackend {
     }
 
     fn update_capture_config(&mut self, config: &BpfCaptureConfig) -> Result<(), String> {
-        let maps = self.maps.as_ref().ok_or("BPF maps not initialized")?;
+        let maps = self.maps.as_mut().ok_or("BPF maps not initialized")?;
         maps.update_capture_config(config)
     }
 
@@ -215,7 +221,7 @@ impl EbpfBackend for AyaEbpfBackend {
             .map_err(|e| format!("'{program}' type mismatch: {e}"))?;
 
         let link_id = prog
-            .attach(cgroup_fd.as_fd())
+            .attach(cgroup_fd.as_fd(), CgroupAttachMode::Single)
             .map_err(|e| format!("Failed to attach '{program}' to '{cgroup_path}': {e}"))?;
 
         let links = self
@@ -263,32 +269,32 @@ impl EbpfBackend for AyaEbpfBackend {
     }
 
     fn update_pod_ip(&mut self, ip: Ipv4Addr, info: &PodInfo) -> Result<(), String> {
-        let maps = self.maps.as_ref().ok_or("BPF maps not initialized")?;
+        let maps = self.maps.as_mut().ok_or("BPF maps not initialized")?;
         maps.insert_pod_ip(ip, info)
     }
 
     fn remove_pod_ip(&mut self, ip: Ipv4Addr) -> Result<(), String> {
-        let maps = self.maps.as_ref().ok_or("BPF maps not initialized")?;
+        let maps = self.maps.as_mut().ok_or("BPF maps not initialized")?;
         maps.remove_pod_ip(ip)
     }
 
     fn update_bypass_uid(&mut self, uid: u32) -> Result<(), String> {
-        let maps = self.maps.as_ref().ok_or("BPF maps not initialized")?;
+        let maps = self.maps.as_mut().ok_or("BPF maps not initialized")?;
         maps.insert_bypass_uid(uid)
     }
 
     fn update_cidr_exclude(&mut self, cidr: &str) -> Result<(), String> {
-        let maps = self.maps.as_ref().ok_or("BPF maps not initialized")?;
+        let maps = self.maps.as_mut().ok_or("BPF maps not initialized")?;
         maps.insert_cidr_exclude(cidr)
     }
 
     fn update_cidr_include(&mut self, cidr: &str) -> Result<(), String> {
-        let maps = self.maps.as_ref().ok_or("BPF maps not initialized")?;
+        let maps = self.maps.as_mut().ok_or("BPF maps not initialized")?;
         maps.insert_cidr_include(cidr)
     }
 
     fn update_port_exclude(&mut self, port: u16) -> Result<(), String> {
-        let maps = self.maps.as_ref().ok_or("BPF maps not initialized")?;
+        let maps = self.maps.as_mut().ok_or("BPF maps not initialized")?;
         maps.insert_port_exclude(port)
     }
 
@@ -297,12 +303,12 @@ impl EbpfBackend for AyaEbpfBackend {
         cgroup_id: u64,
         policy: &IncludePortsPolicy,
     ) -> Result<(), String> {
-        let maps = self.maps.as_ref().ok_or("BPF maps not initialized")?;
+        let maps = self.maps.as_mut().ok_or("BPF maps not initialized")?;
         maps.insert_include_ports(cgroup_id, policy)
     }
 
     fn remove_pod_include_ports(&mut self, cgroup_id: u64) -> Result<(), String> {
-        let maps = self.maps.as_ref().ok_or("BPF maps not initialized")?;
+        let maps = self.maps.as_mut().ok_or("BPF maps not initialized")?;
         maps.remove_include_ports(cgroup_id)
     }
 
@@ -311,12 +317,12 @@ impl EbpfBackend for AyaEbpfBackend {
         cgroup_id: u64,
         identity: &ferrum_ebpf_common::WorkloadIdentity,
     ) -> Result<(), String> {
-        let maps = self.maps.as_ref().ok_or("BPF maps not initialized")?;
+        let maps = self.maps.as_mut().ok_or("BPF maps not initialized")?;
         maps.insert_workload_identity(cgroup_id, identity)
     }
 
     fn remove_workload_identity(&mut self, cgroup_id: u64) -> Result<(), String> {
-        let maps = self.maps.as_ref().ok_or("BPF maps not initialized")?;
+        let maps = self.maps.as_mut().ok_or("BPF maps not initialized")?;
         maps.remove_workload_identity(cgroup_id)
     }
 
@@ -344,7 +350,7 @@ impl EbpfBackend for AyaEbpfBackend {
             .map_err(|e| format!("'{BPF_PROGRAM_SOCK_OPS}' is not a SockOps program: {e}"))?;
 
         let link_id = prog
-            .attach(cgroup_fd.as_fd())
+            .attach(cgroup_fd.as_fd(), CgroupAttachMode::Single)
             .map_err(|e| format!("Failed to attach SOCK_OPS to '{cgroup_root}': {e}"))?;
 
         // Pin BEFORE storing link_id so a pinning failure can detach the
@@ -498,4 +504,259 @@ fn pin_map_at(bpf: &mut Ebpf, map_name: &str, pin_path: &str) -> Result<(), Stri
         .ok_or_else(|| format!("BPF map '{map_name}' not found"))?;
     map.pin(pin_path)
         .map_err(|e| format!("Failed to pin '{map_name}' at '{pin_path}': {e}"))
+}
+
+/// Live-kernel verification (GAP-2M / connect-side datapath).
+///
+/// These tests need a real Linux >= 5.7 kernel with cgroup v2 + bpffs and
+/// `CAP_BPF`/root, so they are `#[ignore]`d and only run via the dedicated
+/// `ebpf-live` CI job (`sudo cargo test --features ebpf --lib -- --ignored`).
+/// They self-skip (pass) when the kernel lacks the prerequisites so the job is
+/// green on best-effort runners and only red on a genuine load/attach failure.
+#[cfg(test)]
+mod live_kernel_tests {
+    use super::AyaEbpfBackend;
+    use crate::ebpf::EbpfBackend;
+    use crate::ebpf::kernel_probe::probe_kernel;
+    use ferrum_ebpf_common::WorkloadIdentity;
+    use std::fs;
+    use std::os::unix::fs::MetadataExt;
+    use std::path::PathBuf;
+
+    const CGROUP_ROOT: &str = "/sys/fs/cgroup";
+    const BPF_FS: &str = "/sys/fs/bpf";
+
+    /// A scratch cgroup v2 node, removed on drop. Attaching the
+    /// `cgroup_sock_addr` / `sock_ops` programs here (rather than the cgroup
+    /// root) keeps the test from perturbing the whole runner.
+    struct ScratchCgroup {
+        path: PathBuf,
+    }
+
+    impl ScratchCgroup {
+        fn create() -> std::io::Result<Self> {
+            let path =
+                PathBuf::from(CGROUP_ROOT).join(format!("ferrum-ebpf-live-{}", std::process::id()));
+            fs::create_dir_all(&path)?;
+            Ok(Self { path })
+        }
+
+        fn path_str(&self) -> String {
+            self.path.to_string_lossy().into_owned()
+        }
+
+        /// The kernel cgroup id equals the inode of the cgroup v2 directory.
+        fn cgroup_id(&self) -> u64 {
+            fs::metadata(&self.path).map(|m| m.ino()).unwrap_or(0)
+        }
+    }
+
+    impl Drop for ScratchCgroup {
+        fn drop(&mut self) {
+            // cgroup v2 dirs are removed with rmdir once empty.
+            let _ = fs::remove_dir(&self.path);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires root + real Linux >= 5.7 kernel (cgroup v2 + bpffs); run via the ebpf-live CI job"]
+    fn programs_load_verify_attach_and_map_round_trip() {
+        // Surface loader warnings — including the best-effort SOCK_OPS load,
+        // whose error carries the BPF verifier log — in `--nocapture` output so
+        // a load/verify failure is diagnosable straight from the CI job log.
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_test_writer()
+            .try_init();
+
+        let probe = probe_kernel(CGROUP_ROOT, BPF_FS);
+        if !probe.supports_ebpf() {
+            eprintln!(
+                "SKIP live-kernel eBPF test: prerequisites unmet (release={}, reason={:?})",
+                probe.kernel_release,
+                probe.degradation_reason()
+            );
+            return;
+        }
+
+        let mut backend = AyaEbpfBackend::new();
+        // Loading runs the in-kernel BPF verifier over every program in the
+        // ELF — connect4/6, getpeername4/6, tc_inbound, and the GAP-2M
+        // sock_ops cookie bridge. Success here is the core live validation
+        // that the (blind-built) kernel code is accepted by a real verifier.
+        backend
+            .load_programs()
+            .expect("load + verify BPF programs on the running kernel");
+
+        let cgroup = ScratchCgroup::create().expect("create scratch cgroup v2 node");
+
+        backend
+            .attach_cgroup("live-test", &cgroup.path_str(), "ferrum_connect4")
+            .expect("attach connect4 to scratch cgroup");
+        backend
+            .attach_sock_ops(&cgroup.path_str())
+            .expect("attach sock_ops (incl. GAP-2M bridge) to scratch cgroup");
+
+        // Exercise the workload-identity map RW path the connect hooks read to
+        // stamp pod_uid — the connect-side half of the node-waypoint identity
+        // flow.
+        let cgroup_id = cgroup.cgroup_id();
+        let identity = WorkloadIdentity::new([7u8; 16], 0xdead_beef_cafe_f00d);
+        backend
+            .update_workload_identity(cgroup_id, &identity)
+            .expect("write workload identity to FERRUM_WORKLOAD_IDENTITY");
+        backend
+            .remove_workload_identity(cgroup_id)
+            .expect("remove workload identity");
+
+        backend.cleanup_all().expect("cleanup BPF state");
+    }
+
+    /// Layer-2 datapath verification: a real captured `connect()` is rewritten
+    /// by `connect4` to the configured capture port and lands on a local server
+    /// — proving the connect-side capture works end to end on a live kernel, not
+    /// just that the program loads/attaches. Gated on `--features ebpf` because
+    /// it reaches the real backend's map handles (the no-ebpf build has a stub);
+    /// runs via the `ebpf-live` CI job, self-skipping when prerequisites are
+    /// unmet.
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    #[test]
+    #[ignore = "requires root + real Linux >= 5.7 kernel (cgroup v2 + bpffs); run via the ebpf-live CI job"]
+    fn connect4_redirects_a_real_captured_connection_to_the_capture_port() {
+        use std::time::{Duration, Instant};
+
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_test_writer()
+            .try_init();
+
+        let probe = probe_kernel(CGROUP_ROOT, BPF_FS);
+        if !probe.supports_ebpf() {
+            eprintln!(
+                "SKIP connect4-redirect live test: prerequisites unmet (release={}, reason={:?})",
+                probe.kernel_release,
+                probe.degradation_reason()
+            );
+            return;
+        }
+
+        let mut backend = AyaEbpfBackend::new();
+        backend
+            .load_programs()
+            .expect("load + verify BPF programs on the running kernel");
+
+        let cgroup = ScratchCgroup::create().expect("create scratch cgroup v2 node");
+        backend
+            .attach_cgroup("live-redirect", &cgroup.path_str(), "ferrum_connect4")
+            .expect("attach connect4 to scratch cgroup");
+        backend
+            .attach_sock_ops(&cgroup.path_str())
+            .expect("attach sock_ops to scratch cgroup");
+
+        // Server on an ephemeral loopback port. connect4 rewrites captured egress
+        // to exactly this port, so there is no fixed-port collision risk.
+        let server = std::net::TcpListener::bind("127.0.0.1:0").expect("bind capture-port server");
+        let capture_port = server.local_addr().unwrap().port();
+        server.set_nonblocking(true).unwrap();
+
+        // Make connect4 capture this cgroup's egress and rewrite it to
+        // `capture_port`. A wildcard `includeOutboundPorts` policy is the most
+        // robust trigger: `capture_allowed()` returns true for it immediately,
+        // BEFORE the include-CIDR LPM check, so capture does not depend on the
+        // CIDR trie. The 0.0.0.0/0 include CIDR is also installed as a second
+        // path.
+        let cgroup_id = cgroup.cgroup_id();
+        backend
+            .update_capture_config(&ferrum_ebpf_common::BpfCaptureConfig::new(
+                capture_port,
+                15008,
+            ))
+            .expect("set capture config");
+        {
+            let maps = backend.maps.as_mut().expect("maps loaded");
+            maps.insert_cidr_include("0.0.0.0/0")
+                .expect("insert 0.0.0.0/0 include CIDR");
+            maps.insert_include_ports(cgroup_id, &ferrum_ebpf_common::IncludePortsPolicy::all())
+                .expect("insert wildcard include-ports policy");
+        }
+
+        // Stamp an identity for this cgroup (connect4 records it into the
+        // orig-dst entry; mirrors the production connect-side stamp).
+        backend
+            .update_workload_identity(
+                cgroup_id,
+                &WorkloadIdentity::new([9u8; 16], 0x0123_4567_89ab_cdef),
+            )
+            .expect("stamp workload identity");
+
+        // Move this process into the scratch cgroup so its connect() goes through
+        // the connect4 program attached there.
+        // On some runners the process can't actually be moved (cgroup
+        // namespaces / delegation): the write may succeed yet the PID not
+        // appear in the target. Read `cgroup.procs` back and self-skip rather
+        // than hard-fail when the move didn't take effect — this layer can only
+        // run where it does, and a false failure here would be a flaky red.
+        let pid = std::process::id().to_string();
+        let procs_path = format!("{}/cgroup.procs", cgroup.path_str());
+        if std::fs::write(&procs_path, &pid).is_err() {
+            eprintln!("SKIP connect4-redirect: cannot write scratch cgroup.procs");
+            backend.cleanup_all().ok();
+            return;
+        }
+        let in_cgroup = std::fs::read_to_string(&procs_path)
+            .map(|procs| procs.split_whitespace().any(|p| p == pid))
+            .unwrap_or(false);
+        if !in_cgroup {
+            eprintln!(
+                "SKIP connect4-redirect: process did not move into the scratch cgroup \
+                 (cgroup namespace / delegation on this runner)"
+            );
+            let _ = std::fs::write(format!("{CGROUP_ROOT}/cgroup.procs"), &pid);
+            backend.cleanup_all().ok();
+            return;
+        }
+
+        // Connect to an unroutable TEST-NET-1 address (RFC 5737). Uncaptured
+        // this would time out; captured, connect4 rewrites it to
+        // 127.0.0.1:capture_port and it lands on `server`.
+        let connect_handle = std::thread::spawn(move || {
+            std::net::TcpStream::connect_timeout(
+                &"192.0.2.1:1234".parse().unwrap(),
+                Duration::from_secs(3),
+            )
+            .is_ok()
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut accepted = false;
+        while Instant::now() < deadline {
+            match server.accept() {
+                Ok(_) => {
+                    accepted = true;
+                    break;
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                Err(e) => panic!("capture-port server accept failed: {e}"),
+            }
+        }
+        let connected = connect_handle.join().unwrap_or(false);
+
+        // Capture diagnostics while still in the scratch cgroup (before moving
+        // back) so a genuine failure shows the capture port + cgroup membership.
+        let self_cgroup = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
+
+        // Move back to the cgroup root so the scratch cgroup can be removed, and
+        // clean up BPF state — before asserting, so a failed assert still tidies.
+        let _ = std::fs::write(format!("{CGROUP_ROOT}/cgroup.procs"), &pid);
+        backend.cleanup_all().expect("cleanup BPF state");
+
+        assert!(
+            connected && accepted,
+            "a captured connect() to an unroutable dst must be redirected by connect4 to the local \
+             capture port and accepted (connected={connected}, accepted={accepted}, \
+             capture_port={capture_port}, self_cgroup={self_cgroup:?})"
+        );
+    }
 }
