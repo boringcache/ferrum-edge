@@ -147,6 +147,26 @@ node-waypoint accept fails closed.
 > resolution additionally requires the GAP-2M cookie correlation described in
 > the staging caveat above.
 
+## Pod registry for in-netns capture listeners (node-waypoint)
+
+In node-waypoint topology with the mesh proxy's in-pod-netns outbound capture
+listeners enabled (`FERRUM_MESH_NODE_WAYPOINT_IN_NETNS_LISTENERS_ENABLED=true`
+on the proxy), the captured pod-loopback `127.0.0.1:15001` connections must be
+accepted *inside* each enrolled pod's network namespace. To let the proxy find
+those pods, the node-agent publishes a per-pod registry directory — the same
+"pinned path is the node-agent↔mesh-proxy IPC surface" pattern as the orig-dst
+maps:
+
+| Surface | Name / default | Format |
+|---|---|---|
+| Pod registry dir | `FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR` (default `/run/ferrum/node-waypoint-pods`) | One file per enrolled pod. File **name** = pod UID; file **contents** = the pod cgroup path. |
+
+The node-agent **writes** a pod's registry file on enrollment and **removes**
+it on teardown. The mesh proxy's `NetnsCaptureManager` polls this directory and
+reconciles one in-netns listener per pod (opening on add, closing on removal).
+This is Linux-only and, like the rest of the in-netns datapath, is
+implemented but live-datapath-unverified (it needs a live multi-pod node).
+
 ## Kernel Fallback
 
 The node agent probes the kernel once at startup (see `KernelProbeResult::supports_ebpf`):
