@@ -1250,15 +1250,16 @@ fn in_netns_listener_ready(registry_dir: &std::path::Path, pod_uid: &str) -> boo
     registry_dir.join(".ready").join(pod_uid).exists()
 }
 
-/// Attach the deferred outbound-redirect cgroup programs for an enrolled pod.
+/// Attach the deferred outbound-redirect program for an enrolled pod.
 ///
-/// `connect4` (IPv4) is the path that has a real in-netns listener and must
-/// attach for the promotion to be considered done; on failure the caller
-/// retries on the next tick (a succeeded `connect4` is never re-attached,
-/// avoiding a double-attach under `CgroupAttachMode::Single`). `connect6` (IPv6)
-/// is best-effort: node-waypoint IPv6 resolution stays fail-closed and the
-/// in-netns listener is IPv4-only, so a `connect6` failure does not gate
-/// readiness.
+/// Only `connect4` (IPv4) is attached. The in-netns capture listener and the
+/// GAP-2M sock-ops cookie bridge are both IPv4-only, so attaching `connect6`
+/// would rewrite IPv6 connects to `[::1]:<port>` — a pod-loopback port with no
+/// listener — and they would be refused rather than handled. Leaving `connect6`
+/// detached lets IPv6 egress flow normally (un-captured), matching
+/// node-waypoint's IPv6 fail-closed stance, until an IPv6 in-netns listener and
+/// bridge exist. On failure the caller retries on the next tick; a succeeded
+/// attach is never repeated (no double-attach under `CgroupAttachMode::Single`).
 fn attach_outbound_redirect(
     backend: &mut dyn EbpfBackend,
     pod_uid: &str,
@@ -1269,10 +1270,6 @@ fn attach_outbound_redirect(
         warn!(pod_uid, error = %e, "Failed to attach deferred connect4 outbound redirect; will retry");
         metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
         return false;
-    }
-    if let Err(e) = backend.attach_cgroup(pod_uid, cgroup, "ferrum_connect6") {
-        warn!(pod_uid, error = %e, "Failed to attach deferred connect6 outbound redirect (IPv6 best-effort); IPv4 capture is enabled");
-        metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
     }
     true
 }
@@ -1430,9 +1427,11 @@ pub fn handle_pod_added(
         // before the mesh proxy has opened the in-netns listener (it discovers
         // the pod from the registry we publish below and polls every ~2s), so
         // the pod's immediate connects would be refused. `promote_pending_redirects`
-        // attaches them once the proxy signals listener readiness. The inbound
-        // getpeername programs do not redirect and are safe to attach now. With
-        // in-netns publishing off (the default) attach all four up front, as before.
+        // attaches connect4 once the proxy signals listener readiness (connect6
+        // stays detached — the in-netns listener and sock-ops bridge are
+        // IPv4-only, so redirecting IPv6 would refuse it). The inbound getpeername
+        // programs do not redirect and are safe to attach now. With in-netns
+        // publishing off (the default) attach all four up front, as before.
         let defer_redirect = config.node_waypoint_pod_registry_dir.is_some();
         let programs: &[&str] = if defer_redirect {
             &["ferrum_getpeername4", "ferrum_getpeername6"]
@@ -2919,11 +2918,11 @@ mod tests {
             "connect4 attached once the listener is ready"
         );
         assert!(
-            backend
+            !backend
                 .cgroup_attachments
                 .iter()
                 .any(|(_, p)| p == "ferrum_connect6"),
-            "connect6 attached once the listener is ready"
+            "connect6 must NOT be attached in in-netns mode (IPv4-only listener and bridge)"
         );
 
         // Idempotent: a further pass with the pod marked Done does not re-attach

@@ -385,6 +385,16 @@ impl<B: NetnsBackend> NetnsCaptureManager<B> {
                 );
                 if let Some(old) = self.active.remove(&netns) {
                     old.close();
+                    // Retract readiness before reopening: if the reopen below
+                    // fails (a transient setns/bind/cgroup race), the node-agent
+                    // must not keep seeing a ready marker for a listener that no
+                    // longer exists and keep redirecting to a dead port. The open
+                    // path re-publishes the marker on success.
+                    if let Some(dir) = &self.ready_dir {
+                        for uid in &old.pod_uids {
+                            remove_ready_marker(dir, uid);
+                        }
+                    }
                 }
             }
 
@@ -995,6 +1005,73 @@ mod tests {
         assert!(
             !ready.path().join("pod-a").exists(),
             "the readiness marker must be removed when the listener closes"
+        );
+    }
+
+    #[tokio::test]
+    async fn reopen_failure_retracts_readiness_marker() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Backend that opens the first listener but fails every reopen, to drive
+        // the IP-change reopen path where the replacement bind fails.
+        struct FailReopenBackend {
+            opens: AtomicUsize,
+        }
+        impl NetnsBackend for FailReopenBackend {
+            fn netns_key(&self, _target: &PodCaptureTarget) -> Option<u64> {
+                Some(100)
+            }
+            fn open_listener(
+                &self,
+                _target: &PodCaptureTarget,
+                _addr: SocketAddr,
+            ) -> Option<watch::Sender<bool>> {
+                if self.opens.fetch_add(1, Ordering::SeqCst) == 0 {
+                    let (tx, _rx) = watch::channel(false);
+                    Some(tx)
+                } else {
+                    None
+                }
+            }
+        }
+
+        let ready = tempfile::tempdir().unwrap();
+        let targets = Arc::new(Mutex::new(vec![PodCaptureTarget {
+            pod_uid: "pod-a".to_string(),
+            cgroup_path: "/cg/a".to_string(),
+            pod_ip: None,
+        }]));
+        struct DynSource(Arc<Mutex<Vec<PodCaptureTarget>>>);
+        impl PodCaptureSource for DynSource {
+            fn list_targets(&self) -> Vec<PodCaptureTarget> {
+                self.0.lock().unwrap().clone()
+            }
+        }
+        let mut mgr = NetnsCaptureManager::new(
+            "127.0.0.1:15001".parse().unwrap(),
+            Arc::new(DynSource(targets.clone())),
+            FailReopenBackend {
+                opens: AtomicUsize::new(0),
+            },
+            Duration::from_secs(1),
+        )
+        .with_ready_dir(Some(ready.path().to_path_buf()));
+
+        // First open succeeds → marker present.
+        assert_eq!(mgr.reconcile_once(), 1);
+        assert!(ready.path().join("pod-a").exists());
+
+        // Pod IP changes → reopen attempted, backend fails it. The stale marker
+        // must be retracted so the node-agent stops treating the pod as ready.
+        targets.lock().unwrap()[0].pod_ip = Some("10.0.0.7".parse().unwrap());
+        assert_eq!(
+            mgr.reconcile_once(),
+            0,
+            "a failed reopen leaves no active listener"
+        );
+        assert!(
+            !ready.path().join("pod-a").exists(),
+            "the readiness marker must be retracted when the reopen fails"
         );
     }
 

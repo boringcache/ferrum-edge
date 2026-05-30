@@ -3447,21 +3447,36 @@ async fn serve_mesh_runtime(
     if runtime.topology == MeshTopology::NodeWaypoint
         && env_config.mesh_node_waypoint_in_netns_listeners
     {
-        // Bind the in-netns capture listeners at the SAME address the rest of the
-        // outbound capture path uses (`FERRUM_MESH_OUTBOUND_LISTEN_ADDR`), not a
-        // hardcoded constant. `connect4` rewrites captured pod egress to this
-        // port, so the in-netns listener must agree with it; deriving from a
-        // hardcoded `15001` while the operator configured something else would
-        // leave captured connects with no listener. A port of `0` disables the
-        // outbound listener entirely (nothing is captured), so there is nothing
-        // to accept in-netns — skip starting the manager.
-        let capture_addr = runtime.outbound_listen_addr;
-        if capture_addr.port() == 0 {
+        // `connect4` rewrites captured pod egress to `127.0.0.1:<port>` in the
+        // POD's loopback, taking only the port from FERRUM_MESH_OUTBOUND_LISTEN_ADDR
+        // (the rewrite IP is hardcoded loopback). So the in-netns listener must
+        // bind loopback and inherit ONLY the configured port — binding the
+        // configured IP verbatim (e.g. a node IP or `[::1]`) would listen on an
+        // address the pod never dials and refuse every IPv4 capture. The IP part
+        // of the configured address governs the HOST outbound listener, not this
+        // pod-netns one. Port `0` disables the outbound listener entirely
+        // (nothing is captured), so skip starting the manager.
+        let capture_port = runtime.outbound_listen_addr.port();
+        if capture_port == 0 {
             info!(
                 "Node-waypoint in-netns capture listeners requested, but the outbound listen \
                  port is 0 (disabled); not starting in-netns capture"
             );
         } else {
+            let capture_addr = std::net::SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                capture_port,
+            );
+            if !runtime.outbound_listen_addr.ip().is_loopback()
+                && !runtime.outbound_listen_addr.ip().is_unspecified()
+            {
+                info!(
+                    configured = %runtime.outbound_listen_addr,
+                    bound = %capture_addr,
+                    "Node-waypoint in-netns capture binds pod loopback with the configured \
+                     outbound port; the configured IP applies only to the host listener"
+                );
+            }
             // Share one connection semaphore across all in-netns listeners, sized
             // from `max_connections` exactly like the host listener path, so
             // captured pod egress is bounded by the same global connection cap
