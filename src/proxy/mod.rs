@@ -6211,10 +6211,23 @@ pub(crate) fn build_websocket_backend_url_with_target(
     // Host-only proxies (listen_path == None) have no prefix to strip.
     // Exact listen_paths carry a leading '=' marker for routing; strip only
     // the literal path part so WebSocket forwarding matches HTTP forwarding.
-    let remaining_path = if proxy.strip_listen_path {
-        &incoming_path[strip_len.min(incoming_path.len())..]
+    //
+    // `strip_len` is computed by the router against the encoded-slash
+    // NORMALIZED path, so slice the normalized path (not the raw one) to keep
+    // routing and forwarding in the same coordinate system; slicing the raw
+    // path mis-aligns by 2 bytes per %2f and can panic mid-UTF-8 codepoint.
+    // See `build_backend_url_with_target` for the full rationale. For paths
+    // without encoded slashes this is an allocation-free borrowed no-op.
+    let normalized_path = if proxy.strip_listen_path {
+        Some(crate::router_cache::normalize_encoded_slashes(
+            incoming_path,
+        ))
     } else {
-        incoming_path
+        None
+    };
+    let remaining_path = match &normalized_path {
+        Some(normalized) => &normalized[strip_len.min(normalized.len())..],
+        None => incoming_path,
     };
 
     let backend_path = target_path.or(proxy.backend_path.as_deref()).unwrap_or("");
@@ -11527,10 +11540,28 @@ pub fn build_backend_url_with_target(
         DispatchKind::TcpTls | DispatchKind::UdpDtls => "https",
     };
 
-    let remaining_path = if proxy.strip_listen_path {
-        &incoming_path[strip_len.min(incoming_path.len())..]
+    // `strip_len` (RouteMatch::matched_prefix_len) is a byte offset into the
+    // path AFTER encoded-slash normalization: the router matches against
+    // `normalize_encoded_slashes(path)`, which collapses %2f/%252f to '/'.
+    // Slicing that offset out of the RAW `incoming_path` is a coordinate
+    // mismatch — the offset is too small whenever the request contained
+    // encoded slashes (each %2f shrinks 2 bytes, %252f 4), which both forwards
+    // a corrupted tail to the backend (routing-vs-forwarding desync) and can
+    // index into the middle of a multi-byte UTF-8 codepoint, panicking the
+    // request task. Strip from the SAME normalized path the offset was
+    // computed against so the slice is coordinate-correct and on a char
+    // boundary. Normalization is an allocation-free borrow when the path has
+    // no encoded slashes (the common case) and only runs when stripping.
+    let normalized_path = if proxy.strip_listen_path {
+        Some(crate::router_cache::normalize_encoded_slashes(
+            incoming_path,
+        ))
     } else {
-        incoming_path
+        None
+    };
+    let remaining_path = match &normalized_path {
+        Some(normalized) => &normalized[strip_len.min(normalized.len())..],
+        None => incoming_path,
     };
 
     let backend_path = target_path.or(proxy.backend_path.as_deref()).unwrap_or("");
@@ -15944,6 +15975,161 @@ mod tests {
         );
 
         assert_eq!(url, "ws://backend.local:8080/internal/chat");
+    }
+
+    #[test]
+    fn backend_url_full_match_with_encoded_slash_does_not_panic_and_strips_fully() {
+        // F03 regression: the router computes matched_prefix_len against the
+        // encoded-slash-NORMALIZED path. For an exact/regex route the whole
+        // normalized path matches, so the entire path must be stripped. The
+        // raw path is longer (each %2f is 3 bytes vs the normalized 1), and a
+        // multi-byte char straddling the misaligned offset previously panicked
+        // the request task ("byte index N is not a char boundary").
+        let mut proxy = test_proxy(ResponseBodyMode::Stream);
+        proxy.dispatch_kind = DispatchKind::HttpPool;
+        proxy.backend_path = None;
+        proxy.strip_listen_path = true;
+
+        // Raw "/files/%2f€"; the router matched the full normalized
+        // "/files//€" (11 bytes) and reported that as strip_len.
+        let incoming_path = "/files/%2f\u{20ac}";
+        let strip_len = crate::router_cache::normalize_encoded_slashes(incoming_path).len();
+
+        // Must not panic, and the fully-matched path is fully stripped.
+        let url = build_backend_url_with_target(
+            &proxy,
+            incoming_path,
+            "",
+            "backend.local",
+            8080,
+            strip_len,
+            None,
+        );
+        assert_eq!(url, "http://backend.local:8080/");
+    }
+
+    #[test]
+    fn backend_url_encoded_slash_strip_is_coordinate_correct_ascii() {
+        // F03 regression (ASCII desync): raw "/a%2fb" normalizes to "/a/b".
+        // An exact route matches the full normalized path (4 bytes); slicing
+        // the RAW path at offset 4 used to forward "fb" to the backend
+        // (routing-vs-forwarding desync that can defeat backend path-scoped
+        // authorization). Slicing the normalized path yields the correct
+        // empty remainder.
+        let mut proxy = test_proxy(ResponseBodyMode::Stream);
+        proxy.dispatch_kind = DispatchKind::HttpPool;
+        proxy.backend_path = None;
+        proxy.strip_listen_path = true;
+
+        let incoming_path = "/a%2fb";
+        let strip_len = crate::router_cache::normalize_encoded_slashes(incoming_path).len();
+
+        let url = build_backend_url_with_target(
+            &proxy,
+            incoming_path,
+            "",
+            "backend.local",
+            8080,
+            strip_len,
+            None,
+        );
+        assert_eq!(url, "http://backend.local:8080/");
+    }
+
+    #[test]
+    fn backend_url_prefix_route_encoded_slash_in_prefix_strips_to_remainder() {
+        // F03 regression (prefix route, NON-EMPTY remainder): listen_path
+        // "/a/b", raw "/a%2fb/c" normalizes to "/a/b/c". A prefix route reports
+        // matched_prefix_len = listen_path.len() = 4, an offset into the
+        // NORMALIZED path. The old raw-path slice `&"/a%2fb/c"[4..]` forwarded
+        // "fb/c" (a routing-vs-forwarding desync); slicing the normalized path
+        // yields "/c". `strip_len` is hardcoded to the prefix length here (not
+        // recomputed via `normalize_encoded_slashes`) so the test locks the
+        // router→builder coordinate contract rather than the helper's own math.
+        let mut proxy = test_proxy(ResponseBodyMode::Stream);
+        proxy.dispatch_kind = DispatchKind::HttpPool;
+        proxy.backend_path = None;
+        proxy.strip_listen_path = true;
+
+        let incoming_path = "/a%2fb/c";
+        let strip_len = "/a/b".len();
+
+        let url = build_backend_url_with_target(
+            &proxy,
+            incoming_path,
+            "",
+            "backend.local",
+            8080,
+            strip_len,
+            None,
+        );
+        assert_eq!(url, "http://backend.local:8080/c");
+    }
+
+    #[test]
+    fn router_to_backend_url_contract_strips_encoded_slash_prefix() {
+        // End-to-end contract: derive `strip_len` from the REAL router so the
+        // builder is exercised against the exact offset `find_proxy` emits, not
+        // a locally recomputed one. Guards against future drift in the
+        // `matched_prefix_len` coordinate system (the desync this PR fixes).
+        // listen_path "/api"; raw "/api/files/a%2fb" normalizes to
+        // "/api/files/a/b"; the prefix match strips "/api" and forwards
+        // "/files/a/b" (the old raw-slice forwarded a corrupted tail).
+        let mut routed = test_proxy(ResponseBodyMode::Stream);
+        routed.dispatch_kind = DispatchKind::HttpPool;
+        routed.backend_path = None;
+        routed.listen_path = Some("/api".to_string());
+        routed.strip_listen_path = true;
+
+        let config = GatewayConfig {
+            proxies: vec![routed],
+            ..GatewayConfig::default()
+        };
+        let cache = crate::router_cache::RouterCache::new(&config, 100);
+
+        let incoming_path = "/api/files/a%2fb";
+        let rm = cache
+            .find_proxy(None, incoming_path)
+            .expect("prefix route should match the normalized path");
+
+        let url = build_backend_url_with_target(
+            rm.proxy.as_ref(),
+            incoming_path,
+            "",
+            "backend.local",
+            8080,
+            rm.matched_prefix_len,
+            None,
+        );
+        assert_eq!(url, "http://backend.local:8080/files/a/b");
+    }
+
+    #[test]
+    fn websocket_backend_url_encoded_slash_strip_is_coordinate_correct() {
+        // F03 regression for the WebSocket builder (mirrors the HTTP builder
+        // tests above; the WS builder got the identical normalize-then-slice
+        // fix but had no encoded-slash coverage). Raw "/ws/a%2fb" normalizes to
+        // "/ws/a/b"; prefix "/ws" strips to "/a/b". The old raw-path slice
+        // forwarded "/a%2fb" (a 2-byte offset skew) and could panic mid-
+        // codepoint; slicing the normalized path is correct.
+        let mut proxy = test_proxy(ResponseBodyMode::Stream);
+        proxy.backend_scheme = Some(BackendScheme::Http);
+        proxy.listen_path = Some("/ws".to_string());
+        proxy.strip_listen_path = true;
+
+        let incoming_path = "/ws/a%2fb";
+        let strip_len = "/ws".len();
+
+        let url = build_websocket_backend_url_with_target(
+            &proxy,
+            incoming_path,
+            "",
+            "backend.local",
+            8080,
+            strip_len,
+            None,
+        );
+        assert_eq!(url, "ws://backend.local:8080/a/b");
     }
 
     #[test]

@@ -1307,7 +1307,12 @@ fn make_cache_key(host: Option<&str>, path: &str) -> String {
 /// rejects the same encodings in configured `listen_path` values so that
 /// admission and runtime lookup share the same canonical alphabet. The two
 /// functions must be extended together if additional encodings are added.
-fn normalize_encoded_slashes(path: &str) -> Cow<'_, str> {
+///
+/// Also used by the backend-URL builders (`build_backend_url_with_target` /
+/// `build_websocket_backend_url_with_target`) to strip the listen-path prefix
+/// in the SAME coordinate system the router used to compute the offset, so the
+/// slice can never land mid-codepoint or desync routing from forwarding.
+pub(crate) fn normalize_encoded_slashes(path: &str) -> Cow<'_, str> {
     if !path.as_bytes().contains(&b'%') {
         return Cow::Borrowed(path);
     }
