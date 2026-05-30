@@ -27,7 +27,7 @@ use crate::scaffolding::backends::{
     tls_backend_without_quic_with_ok_response,
 };
 use crate::scaffolding::certs::TestCa;
-use crate::scaffolding::clients::Http3Client;
+use crate::scaffolding::clients::{Http2Client, Http3Client};
 use crate::scaffolding::harness::GatewayHarness;
 use crate::scaffolding::ports::{reserve_colocated_tcp_udp, reserve_port};
 use serde_json::{Value, json};
@@ -1404,5 +1404,175 @@ async fn h1_frontend_to_native_h3_backend_uses_frontend_forwarding_metadata() {
             && forwarded.contains("host=edge.example"),
         "Forwarded header should describe the H1 frontend request, got {forwarded:?}; \
          recorded request: {req:#?}"
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Test 12 — STREAMING H3 response path recovers a graceful QUIC close that
+// arrives AFTER a complete Content-Length body.
+//
+// Positive coverage for the recovery gate in `H3FrameSource::poll_frame`
+// (`src/proxy/body.rs`, the `Poll::Ready(Err(err))` arm): a connection-level
+// graceful close (`GOAWAY`/`RemoteClosing` here) that follows a COMPLETE body
+// must NOT surface as a spurious mid-stream error — it must emit clean EOS,
+// mirroring the buffered `drain_h3_response_body` path. A unit test can't reach
+// this: the vendored `h3::error::StreamError` is `#[non_exhaustive]` and
+// unconstructible downstream, so no mock can synthesize a graceful close.
+//
+// Wiring that forces the STREAMING `direct_streaming_h3_body` builder (the one
+// that owns `H3FrameSource`), NOT the buffered drain:
+//   * H2 (h2c) frontend → native H3 backend, so dispatch runs through
+//     `handle_proxy_request_inner` → `ResponseBody::StreamingH3` → `H3FrameSource`
+//     rather than the H3-frontend `src/http3/server.rs` loop (which has its own
+//     inline recovery and is already covered).
+//   * `FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES=0` + `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES=0`
+//     select `direct_streaming_h3_body` (the `response_buffer_cutoff == 0 &&
+//     max_response_body_size == 0` arm in `mod.rs:~11391`), so the body is
+//     `DirectH3Body` over `H3FrameSource`.
+//
+// Why an H2 frontend (not H1): when the recovery gate is NOT taken, the
+// gateway's frontend body errors AFTER the complete body. On HTTP/1.1 hyper
+// has already written the full Content-Length, treats the response as framed,
+// and silently swallows the trailing error — so an H1 client cannot observe
+// recovery success vs failure. On HTTP/2 the body must reach a clean
+// `END_STREAM`; a trailing body error makes hyper emit `RST_STREAM` instead,
+// which the H2 client surfaces as a body-read error. The H2 frontend is thus
+// what makes this a real positive guard for the branch (verified: with the gate
+// stubbed off, the H2 read fails; with it live, the read succeeds).
+//
+// Backend script (same proven shape as the integration tests
+// `h3_goaway_after_complete_body_is_treated_as_graceful` /
+// `h3_buffered_response_survives_graceful_close_race`):
+//   AcceptStream → RespondHeaders(200, content-length=N) → RespondData(N) →
+//   StallFor(50ms) → SendGoaway(0).
+// `SendGoaway` skips `stream.finish()`, so there is NO FIN — the gateway's H3
+// `recv_data()` yields the full N bytes, then on the NEXT poll hits
+// `Err(RemoteClosing)` at the recv_DATA boundary. That is exactly the gate.
+// The 50ms stall is load-bearing: it keeps the GOAWAY out of the HEADERS+DATA
+// UDP burst so `recv_response()` parses headers (and the body streams) before
+// the close arrives — otherwise the close races to the recv_RESPONSE boundary
+// (a different, unrecoverable 502 path) and this assertion never runs.
+//
+// Assert: H2 client gets 200 AND the full N-byte body with a clean stream end.
+// ────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h2_frontend_streaming_h3_recovers_graceful_goaway_after_complete_body() {
+    let ca = TestCa::new("phase-h3-stream-goaway-recover").expect("ca");
+    let (cert, key) = ca.valid().expect("leaf");
+
+    let (tcp_res, udp_res) = reserve_colocated_tcp_udp()
+        .await
+        .expect("colocated tcp/udp");
+    let backend_port = tcp_res.port;
+
+    // Capability probing needs the colocated TCP+TLS side to answer; the
+    // actual test request lands on the H3 backend once h3=supported.
+    let _tcp_backend = ScriptedTlsBackend::builder(
+        tcp_res.into_listener(),
+        TlsConfig::new(cert.clone(), key.clone())
+            .with_alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()]),
+    )
+    .step(TcpStep::ReadUntil(b"\r\n\r\n".to_vec()))
+    .step(TcpStep::Write(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec(),
+    ))
+    .step(TcpStep::Drop)
+    .spawn()
+    .expect("spawn tls");
+
+    // Deterministic body so we can assert exact bytes. 4 KiB exercises a
+    // real streamed data frame (vs a trivial 2-byte payload) while staying
+    // a single H3 DATA frame from the scripted backend.
+    let body_len = 4096usize;
+    let body: bytes::Bytes = bytes::Bytes::from(vec![b'h'; body_len]);
+
+    let h3_backend = ScriptedH3Backend::builder(udp_res.into_socket(), H3TlsConfig::new(cert, key))
+        .step(H3Step::AcceptStream)
+        .step(H3Step::RespondHeaders(vec![
+            (":status", "200".to_string()),
+            ("content-length", body_len.to_string()),
+            ("content-type", "application/octet-stream".to_string()),
+        ]))
+        .step(H3Step::RespondData(body.clone()))
+        // Let HEADERS+DATA propagate and the gateway parse the response +
+        // stream the body BEFORE the graceful close, so the close lands at
+        // the recv_DATA boundary (not recv_response). See the integration
+        // tests `h3_goaway_after_complete_body_is_treated_as_graceful` etc.
+        .step(H3Step::StallFor(Duration::from_millis(50)))
+        // GOAWAY = graceful "no new streams"; in-progress streams complete.
+        // Skips `stream.finish()`, so recv_data hits Err(RemoteClosing) after
+        // the complete body — the streaming recovery gate must emit clean EOS.
+        .step(H3Step::SendGoaway(0))
+        .spawn()
+        .expect("spawn h3 backend");
+
+    let harness = GatewayHarness::builder()
+        .file_config(file_mode_yaml_for_h3(backend_port))
+        .log_level("info")
+        .capture_output()
+        // Avoid pool warmup consuming the scripted backend's single
+        // connection script before this regression's GET.
+        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+        // Force the STREAMING `direct_streaming_h3_body` builder: both
+        // cutoff and the size limit must be 0 to take the direct-stream arm
+        // (see `mod.rs:~11391`). Otherwise the coalescing/size-limited arms
+        // run — still `H3FrameSource`, but we pin the direct path explicitly.
+        .env("FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES", "0")
+        .env("FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES", "0")
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    let entry = wait_for_capability_entry(&harness, Duration::from_secs(15))
+        .await
+        .expect("fetch capability entry")
+        .expect("registry populated within timeout");
+    assert_eq!(
+        entry["plain_http"]["h3"].as_str(),
+        Some("supported"),
+        "expected h3=supported so the request uses the native H3 backend path; entry: {entry:#?}"
+    );
+
+    // h2c (HTTP/2 prior-knowledge) frontend client. `Http2Client::get` reads
+    // the whole body via `resp.bytes()`, so a trailing `RST_STREAM` from a
+    // failed recovery (no clean END_STREAM) surfaces as a `reqwest::Error`
+    // rather than a successful read — the detective signal for this branch.
+    let client = Http2Client::h2c_prior_knowledge().expect("h2 client");
+    let resp = match client.get(&harness.proxy_url("/api/stream")).await {
+        Ok(resp) => resp,
+        Err(e) => {
+            let logs = harness.captured_combined().unwrap_or_default();
+            panic!(
+                "streaming H3 response failed over the H2 frontend after a graceful \
+                 GOAWAY (the recovery gate should have emitted clean EOS so the H2 \
+                 stream ends with END_STREAM, not RST_STREAM): {e}\n--- registry: \
+                 {entry:#?}\n--- logs ---\n{logs}"
+            );
+        }
+    };
+    if resp.status.as_u16() != 200 {
+        let logs = harness.captured_combined().unwrap_or_default();
+        panic!(
+            "expected 200 from H2 frontend to streaming H3 backend after graceful \
+             GOAWAY; got {}\n--- registry: {entry:#?}\n--- logs ---\n{logs}",
+            resp.status
+        );
+    }
+    if resp.body_bytes.len() != body_len || resp.body_bytes.as_ref() != body.as_ref() {
+        let logs = harness.captured_combined().unwrap_or_default();
+        panic!(
+            "expected the full {body_len}-byte streaming body with clean EOS; got \
+             {} bytes\n--- logs ---\n{logs}",
+            resp.body_bytes.len()
+        );
+    }
+
+    // Sanity: the H3 backend actually received the proxied GET (i.e. the
+    // request took the native H3 path, not a fallback).
+    let received = h3_backend.received_requests().await;
+    assert!(
+        received.iter().any(|r| r.method == "GET"),
+        "H3 backend must have received the frontend GET; recorded: {received:#?}"
     );
 }

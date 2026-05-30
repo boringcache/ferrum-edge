@@ -2043,9 +2043,15 @@ fn sig_waf(mode: &str) -> Waf {
 /// A raw TCP `StreamConnectionContext` with no captured first bytes — models a
 /// peek that timed out or hit EOF before the client sent anything.
 fn stream_ctx_absent() -> StreamConnectionContext {
-    let mut ctx = stream_ctx(b"", StreamBytesKind::PlaintextWire);
-    ctx.first_bytes = None;
+    let mut ctx = stream_ctx_absent_kind(StreamBytesKind::PlaintextWire);
     ctx.first_bytes_kind = None;
+    ctx
+}
+
+fn stream_ctx_absent_kind(kind: StreamBytesKind) -> StreamConnectionContext {
+    let mut ctx = stream_ctx(b"", kind);
+    ctx.first_bytes = None;
+    ctx.first_bytes_kind = Some(kind);
     ctx
 }
 
@@ -2093,6 +2099,42 @@ async fn stream_waf_signature_monitor_mode_records_but_allows() {
     let md = sctx.metadata.as_ref().expect("metadata set on monitor");
     assert_eq!(md.get("waf.action").map(String::as_str), Some("monitored"));
     assert!(!md.contains_key("waf.block_reason"));
+    // The enforce-action signature would reject under `enforce`, so monitor mode
+    // records it as a countable would-block alongside the matched rule ids.
+    assert_eq!(
+        md.get("waf.would_block_reason").map(String::as_str),
+        Some("signature")
+    );
+}
+
+#[tokio::test]
+async fn stream_waf_monitor_action_signature_is_not_a_would_block() {
+    // A signature whose own `action` is `monitor` never rejects — not even under
+    // global `enforce`. It must record the rule hit but NOT a would-block, so the
+    // would-block count reflects only signatures that would actually reject.
+    let plugin = Waf::new(&json!({
+        "mode": "enforce",
+        "include_default_rules": false,
+        "stream": {
+            "signatures": [{
+                "id": "STREAM-PROBE-1",
+                "pattern": "(?i)union\\s+select",
+                "severity": "medium",
+                "action": "monitor"
+            }]
+        }
+    }))
+    .unwrap();
+    let mut sctx = stream_ctx(b"id=1 union select 1", StreamBytesKind::PlaintextWire);
+
+    let result = plugin.on_stream_connect(&mut sctx).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    let md = sctx.metadata.as_ref().expect("metadata");
+    assert_eq!(md.get("waf.action").map(String::as_str), Some("monitored"));
+    assert!(md.contains_key("waf.rule_hits"));
+    assert!(!md.contains_key("waf.block_reason"));
+    assert!(!md.contains_key("waf.would_block_reason"));
 }
 
 #[tokio::test]
@@ -2317,6 +2359,13 @@ async fn stream_waf_udp_monitor_hit_records_metadata_via_sink() {
         recorded.contains_key("waf.rule_hits"),
         "matched rule ids should be recorded"
     );
+    // The enforce-action signature would reject under `enforce`, so monitor mode
+    // records the would-block reason for parity with the TCP path.
+    assert!(!recorded.contains_key("waf.block_reason"));
+    assert_eq!(
+        recorded.get("waf.would_block_reason").map(String::as_str),
+        Some("signature")
+    );
 }
 
 #[tokio::test]
@@ -2340,6 +2389,8 @@ async fn stream_waf_udp_enforce_hit_records_blocked_metadata() {
         recorded.get("waf.block_reason").map(String::as_str),
         Some("signature")
     );
+    // An actual block carries `block_reason`, never the monitor-only would-block.
+    assert!(!recorded.contains_key("waf.would_block_reason"));
 }
 
 #[tokio::test]
@@ -2417,6 +2468,135 @@ async fn stream_waf_udp_metadata_merges_across_datagrams_and_keeps_max_severity(
 }
 
 #[tokio::test]
+async fn stream_waf_signature_fails_closed_when_plaintext_first_bytes_missing() {
+    // A client that idles until the first-byte capture deadline must not be
+    // allowed to send an unchecked malicious opening payload after relay start.
+    let plugin = sig_waf("enforce");
+    let mut sctx = stream_ctx_absent_kind(StreamBytesKind::PlaintextWire);
+
+    let result = plugin.on_stream_connect(&mut sctx).await;
+
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    let md = sctx.metadata.as_ref().expect("metadata");
+    assert_eq!(
+        md.get("waf.block_reason").map(String::as_str),
+        Some("first_bytes_unavailable")
+    );
+}
+
+#[tokio::test]
+async fn stream_waf_signature_fails_closed_when_decrypted_first_bytes_missing() {
+    // The TLS-terminated branch: a `read_decrypted_first_bytes` timeout/EOF on a
+    // `frontend_tls` proxy yields no application bytes while the transport stays
+    // marked `DecryptedApp` (still L7-inspectable). That empty *consuming* read
+    // must fail closed in enforce mode just like the plaintext peek, completing
+    // the missing-first-bytes matrix.
+    let plugin = sig_waf("enforce");
+    let mut sctx = stream_ctx_absent_kind(StreamBytesKind::DecryptedApp);
+
+    let result = plugin.on_stream_connect(&mut sctx).await;
+
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    let md = sctx.metadata.as_ref().expect("metadata");
+    assert_eq!(md.get("waf.action").map(String::as_str), Some("blocked"));
+    assert_eq!(
+        md.get("waf.block_reason").map(String::as_str),
+        Some("first_bytes_unavailable")
+    );
+}
+
+#[tokio::test]
+async fn stream_waf_signature_monitor_allows_but_records_when_first_bytes_missing() {
+    let plugin = sig_waf("monitor");
+    let mut sctx = stream_ctx_absent_kind(StreamBytesKind::DecryptedApp);
+
+    let result = plugin.on_stream_connect(&mut sctx).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    let md = sctx.metadata.as_ref().expect("metadata");
+    assert_eq!(md.get("waf.action").map(String::as_str), Some("monitored"));
+    // Monitor mode never blocks, but the enforce-mode would-block must stay
+    // explicitly countable for rollout assessment (no rule_hits to infer from).
+    assert!(!md.contains_key("waf.block_reason"));
+    assert_eq!(
+        md.get("waf.would_block_reason").map(String::as_str),
+        Some("first_bytes_unavailable")
+    );
+}
+
+#[tokio::test]
+async fn stream_waf_signature_missing_bytes_still_allows_encrypted_passthrough() {
+    // Passthrough bytes are ciphertext and are not L7-inspectable; missing
+    // ciphertext must not make stream signatures fail closed. Use
+    // tcp_require_tls for passthrough transport-shape enforcement.
+    let plugin = sig_waf("enforce");
+    let mut sctx = stream_ctx_absent_kind(StreamBytesKind::EncryptedWire);
+
+    let result = plugin.on_stream_connect(&mut sctx).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(sctx.metadata.is_none());
+}
+
+#[tokio::test]
+async fn stream_waf_monitor_only_signatures_do_not_fail_closed_on_missing_bytes() {
+    // Global `enforce` but every signature is `action: monitor`: a present match
+    // is allowed (`stream_decision` blocks only enforce-action hits), so missing
+    // first bytes must NOT fail closed either — otherwise idle / server-first
+    // clients are rejected even though no configured signature could ever block.
+    let plugin = Waf::new(&json!({
+        "mode": "enforce",
+        "include_default_rules": false,
+        "stream": {
+            "signatures": [{
+                "id": "STREAM-PROBE-1",
+                "pattern": "(?i)union\\s+select",
+                "severity": "medium",
+                "action": "monitor"
+            }]
+        }
+    }))
+    .unwrap();
+    let mut sctx = stream_ctx_absent_kind(StreamBytesKind::PlaintextWire);
+
+    let result = plugin.on_stream_connect(&mut sctx).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    // No enforce-action signature could block, so nothing is recorded: not a
+    // block, not a would-block.
+    assert!(sctx.metadata.is_none());
+}
+
+#[tokio::test]
+async fn stream_waf_mixed_signatures_still_fail_closed_on_missing_bytes() {
+    // With at least one enforce-action signature configured, the hidden first
+    // bytes could have matched it, so the missing-bytes path must still fail
+    // closed under global `enforce` even though a monitor-action signature is
+    // also present.
+    let plugin = Waf::new(&json!({
+        "mode": "enforce",
+        "include_default_rules": false,
+        "stream": {
+            "signatures": [
+                { "id": "STREAM-PROBE-1", "pattern": "(?i)probe", "action": "monitor" },
+                { "id": "STREAM-SQLI-1", "pattern": "(?i)union\\s+select", "action": "enforce" }
+            ]
+        }
+    }))
+    .unwrap();
+    let mut sctx = stream_ctx_absent_kind(StreamBytesKind::PlaintextWire);
+
+    let result = plugin.on_stream_connect(&mut sctx).await;
+
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    let md = sctx.metadata.as_ref().expect("metadata");
+    assert_eq!(
+        md.get("waf.block_reason").map(String::as_str),
+        Some("first_bytes_unavailable")
+    );
+}
+
+#[tokio::test]
 async fn stream_waf_tcp_require_tls_fails_closed_when_no_bytes() {
     // A client that idles until the peek times out (no first bytes) must not
     // slip past a tcp_require_tls port and then send plaintext.
@@ -2441,12 +2621,12 @@ async fn stream_waf_tcp_require_tls_monitor_allows_but_records_when_no_bytes() {
     let result = plugin.on_stream_connect(&mut sctx).await;
 
     assert!(matches!(result, PluginResult::Continue));
+    let md = sctx.metadata.as_ref().expect("metadata");
+    assert_eq!(md.get("waf.action").map(String::as_str), Some("monitored"));
+    assert!(!md.contains_key("waf.block_reason"));
     assert_eq!(
-        sctx.metadata
-            .as_ref()
-            .and_then(|m| m.get("waf.action"))
-            .map(String::as_str),
-        Some("monitored")
+        md.get("waf.would_block_reason").map(String::as_str),
+        Some("tcp_require_tls")
     );
 }
 

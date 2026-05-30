@@ -146,6 +146,8 @@ async fn run_cp_grpc_tls_accept_loop(
     handshake_timeout_seconds: u64,
     tx: tokio::sync::mpsc::Sender<Result<CpGrpcIo, std::io::Error>>,
 ) {
+    let mut accept_backoff = crate::util::accept_backoff::AcceptBackoff::new();
+    let mut accept_err_log = crate::util::accept_backoff::LogRateLimiter::new();
     loop {
         if *shutdown_rx.borrow() {
             return;
@@ -155,6 +157,7 @@ async fn run_cp_grpc_tls_accept_loop(
             accepted = listener.accept() => {
                 match accepted {
                     Ok((stream, remote_addr)) => {
+                        accept_backoff.on_success();
                         let tls_config = tls_slot.load().as_ref().clone();
                         let tx = tx.clone();
                         tokio::spawn(async move {
@@ -196,7 +199,20 @@ async fn run_cp_grpc_tls_accept_loop(
                         });
                     }
                     Err(error) => {
-                        error!(error = %error, "Failed to accept CP gRPC connection");
+                        // Bound the log rate independently of the backoff: an
+                        // abort/reset flood is not backed off, so emit the
+                        // first error then one summary per second with the
+                        // suppressed count.
+                        if let Some(suppressed) =
+                            accept_err_log.on_event(crate::socket_opts::monotonic_now_ms())
+                        {
+                            error!(error = %error, suppressed, "Failed to accept CP gRPC connection");
+                        }
+                        // Back off on a sustained fd-exhaustion run so accept()
+                        // cannot busy-spin a core.
+                        if let Some(delay) = accept_backoff.on_error(error.kind()) {
+                            tokio::time::sleep(delay).await;
+                        }
                     }
                 }
             }

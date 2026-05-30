@@ -1563,12 +1563,13 @@ pub struct StreamConnectionContext {
     /// otherwise. `first_bytes_kind` describes whether these are plaintext,
     /// encrypted passthrough, or post-termination decrypted bytes.
     pub first_bytes: Option<bytes::Bytes>,
-    /// Nature of `first_bytes`. Usually `None` when `first_bytes` is `None`, with
-    /// one deliberate exception: a TLS/DTLS-terminating frontend sets this to
-    /// `DecryptedApp` to record that the transport was terminated even when it
-    /// did not read any application bytes (e.g. a guard-only config). That lets a
-    /// transport-shape guard like `tcp_require_tls` recognize the connection as
-    /// already-TLS without forcing a blocking read.
+    /// Nature of `first_bytes`. This may be `Some` even when `first_bytes` is
+    /// `None` if a timed first-byte capture observed no data: raw TCP sets the
+    /// expected wire kind so enforcing plugins can fail closed on missing
+    /// plaintext while still recognizing encrypted passthrough as not
+    /// L7-inspectable; TLS/DTLS-terminating frontends set `DecryptedApp` to
+    /// record that the transport was terminated even when no application bytes
+    /// were read.
     pub first_bytes_kind: Option<StreamBytesKind>,
 }
 

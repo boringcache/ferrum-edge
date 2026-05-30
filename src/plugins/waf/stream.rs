@@ -59,6 +59,14 @@ impl CompiledStreamSignatures {
     pub(super) fn is_empty(&self) -> bool {
         self.meta.is_empty()
     }
+
+    /// Whether any compiled signature is enforce-action, i.e. could actually
+    /// reject a matching payload under global `enforce` mode. A monitor-only set
+    /// never blocks a present match, so callers use this to avoid failing closed
+    /// (e.g. on missing first bytes) when no configured signature could block.
+    pub(super) fn has_enforce_action(&self) -> bool {
+        self.meta.iter().any(|m| m.action == RuleAction::Enforce)
+    }
 }
 
 /// Parsed `stream` sub-config for the WAF plugin.
