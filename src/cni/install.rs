@@ -130,7 +130,21 @@ fn find_primary_config(
         if path.file_name().and_then(|n| n.to_str()) == Some(target_file_name) {
             continue;
         }
-        let json = read_json_file(&path)?;
+        let json = match read_json_file(&path) {
+            Ok(json) => json,
+            Err(error) => {
+                // A malformed neighbour in the shared CNI conf dir (a
+                // half-written or vendor config another installer dropped) must
+                // not abort the scan — skip it and keep looking for the primary.
+                // The genuine "no primary found" case is still reported below.
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %error,
+                    "Skipping unparseable CNI config while searching for the primary to chain"
+                );
+                continue;
+            }
+        };
         if contains_plugin_type(&json, FERRUM_PLUGIN_TYPE) {
             continue;
         }
@@ -472,5 +486,50 @@ mod tests {
                 .contains(".tmp")),
             "successful install should not leave temp config files"
         );
+    }
+
+    #[test]
+    fn install_skips_malformed_sibling_and_chains_valid_primary() {
+        // A malformed NON-target sibling that sorts BEFORE the valid primary
+        // must not abort the scan — install should still find and chain the
+        // valid primary. (Regression: the parse error previously propagated via
+        // `?` and aborted the whole install.)
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source-ferrum-cni");
+        fs::write(&source, b"new binary").unwrap();
+        let bin_dir = root.path().join("bin");
+        let conf_dir = root.path().join("conf");
+        let socket_dir = root.path().join("run");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::create_dir_all(&conf_dir).unwrap();
+        fs::write(bin_dir.join("ferrum-cni"), b"old binary").unwrap();
+        // Malformed sibling sorting before the valid primary.
+        fs::write(conf_dir.join("05-broken.conf"), b"{truncated").unwrap();
+        fs::write(
+            conf_dir.join("10-calico.conflist"),
+            serde_json::to_vec(&serde_json::json!({
+                "cniVersion": "0.4.0",
+                "name": "calico",
+                "plugins": [{"type": "calico", "ipam": {"type": "calico-ipam"}}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let config = CniInstallConfig {
+            host_bin_dir: bin_dir.display().to_string(),
+            host_conf_dir: conf_dir.display().to_string(),
+            host_socket_dir: socket_dir.display().to_string(),
+            conf_file_name: "00-ferrum.conflist".to_string(),
+            chained_with: "calico".to_string(),
+            socket_path: "/var/run/ferrum/node-agent-cni.sock".to_string(),
+        };
+
+        let written = install(&config, &source)
+            .expect("install should skip the malformed sibling and chain the valid primary");
+        let generated: Value =
+            serde_json::from_slice(&fs::read(written).unwrap()).expect("generated config parses");
+        assert_eq!(generated["plugins"][0]["type"], "calico");
+        assert_eq!(generated["plugins"][1]["type"], "ferrum-cni");
     }
 }
