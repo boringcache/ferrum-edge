@@ -349,13 +349,29 @@ pub fn is_backend_response_strip_header(name: &str) -> bool {
     )
 }
 
-// NOTE: There is no `strip_connection_listed_response_headers` helper
-// because no response dispatch site holds a `&mut HeaderMap` long enough
-// to need it — they all collect from `&HeaderMap` into a
-// `HashMap<String, String>` and apply the strip in the same pass via
-// `parse_connection_listed_headers`. If a future caller needs in-place
-// removal on a response `HeaderMap`, just call
-// `parse_connection_listed_headers` and `remove` each returned name.
+/// In-place RFC 9110 §7.6.1 response-direction hop-by-hop trailer strip.
+///
+/// Shared by the H2 streaming wrapper (`proxy::body::StripHopByHopTrailers`)
+/// and the H3 cross-protocol gRPC streaming bridge so the two trailer-strip
+/// sites cannot drift. Mirrors the buffered helper
+/// `grpc_proxy::collect_buffered_grpc_trailers`, which applies the same static
+/// predicate.
+///
+/// No `Connection`-listed strip is applied: these trailers come off an H2/H3
+/// backend, where a `Connection` header cannot survive frame decoding
+/// (RFC 9113 §8.2.2), so `parse_connection_listed_headers` would be a no-op —
+/// and the buffered/streaming-wrapper paths likewise apply only the static
+/// predicate, so omitting it keeps all three sites identical.
+pub(crate) fn strip_response_hop_by_hop_trailers(trailers: &mut http::HeaderMap) {
+    let to_remove: Vec<http::HeaderName> = trailers
+        .keys()
+        .filter(|name| is_backend_response_strip_header(name.as_str()))
+        .cloned()
+        .collect();
+    for name in to_remove {
+        trailers.remove(&name);
+    }
+}
 
 /// Apply a response-header map onto a response builder, emitting each
 /// newline-separated `set-cookie` value as its own header line.
@@ -1048,6 +1064,68 @@ mod tests {
         assert!(headers.get("proxy-authorization").is_none());
         assert!(headers.get("proxy-connection").is_none());
         assert!(headers.get(http::header::CONTENT_LENGTH).is_none());
+    }
+
+    #[test]
+    fn strip_response_hop_by_hop_trailers_removes_hop_by_hop_names() {
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("grpc-status", http::HeaderValue::from_static("0"));
+        let hop_by_hop = [
+            "connection",
+            "keep-alive",
+            "proxy-authenticate",
+            "proxy-connection",
+            "te",
+            "trailer",
+            "transfer-encoding",
+            "upgrade",
+        ];
+        for name in hop_by_hop {
+            trailers.insert(name, http::HeaderValue::from_static("x"));
+        }
+        strip_response_hop_by_hop_trailers(&mut trailers);
+        for name in hop_by_hop {
+            assert!(
+                trailers.get(name).is_none(),
+                "hop-by-hop trailer `{name}` must be stripped"
+            );
+        }
+        assert_eq!(
+            trailers.get("grpc-status").and_then(|v| v.to_str().ok()),
+            Some("0"),
+            "grpc-status must be preserved"
+        );
+    }
+
+    #[test]
+    fn strip_response_hop_by_hop_trailers_preserves_grpc_and_custom_trailers() {
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("grpc-status", http::HeaderValue::from_static("0"));
+        trailers.insert("grpc-message", http::HeaderValue::from_static("ok"));
+        trailers.insert("x-custom-trailer", http::HeaderValue::from_static("v"));
+        strip_response_hop_by_hop_trailers(&mut trailers);
+        assert_eq!(trailers.len(), 3, "no legitimate trailers may be removed");
+        assert!(trailers.get("grpc-status").is_some());
+        assert!(trailers.get("grpc-message").is_some());
+        assert!(trailers.get("x-custom-trailer").is_some());
+    }
+
+    #[test]
+    fn strip_response_hop_by_hop_trailers_can_empty_an_all_hop_by_hop_map() {
+        // The Finding-A scenario: a backend trailer frame of ONLY hop-by-hop
+        // names strips down to empty, which is what drives the H3 bridge to
+        // finalize the QUIC stream with finish() instead of leaking it open.
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert(
+            "proxy-authenticate",
+            http::HeaderValue::from_static("Basic"),
+        );
+        trailers.insert("proxy-connection", http::HeaderValue::from_static("close"));
+        strip_response_hop_by_hop_trailers(&mut trailers);
+        assert!(
+            trailers.is_empty(),
+            "an all-hop-by-hop trailer frame must strip to empty"
+        );
     }
 
     #[test]

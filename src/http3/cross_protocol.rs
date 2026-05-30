@@ -113,7 +113,10 @@ use crate::plugins::{Plugin, PluginResult, RequestContext};
 use crate::proxy::ProxyState;
 use crate::proxy::backend_dispatch::record_backend_outcome;
 use crate::proxy::grpc_proxy::{self, GrpcResponseKind, proxy_grpc_request_from_bytes};
-use crate::proxy::headers::{is_backend_response_strip_header, parse_connection_listed_headers};
+use crate::proxy::headers::{
+    is_backend_response_strip_header, parse_connection_listed_headers,
+    strip_response_hop_by_hop_trailers,
+};
 use crate::request_epoch::RequestEpoch;
 use crate::retry::ErrorClass;
 
@@ -2067,14 +2070,38 @@ where
 
             let mut final_body_completed = body_completed;
             let mut final_client_disconnected = client_disconnected;
-            if body_completed
-                && let Some(trailers) = trailers
-                && !trailers.is_empty()
-                && let Err(e) = stream.send_trailers(trailers).await
-            {
-                warn!("H3 gRPC streaming send_trailers failed: {}", e);
-                final_client_disconnected = true;
-                final_body_completed = false;
+            if body_completed && let Some(mut trailers) = trailers {
+                // Strip RFC 9110 §7.6.1 response-direction hop-by-hop names from
+                // the backend gRPC trailers before forwarding to the H3 client,
+                // via the shared helper so this site, the buffered path
+                // (collect_buffered_grpc_trailers), and the H2 streaming wrapper
+                // (body::StripHopByHopTrailers) cannot drift. Otherwise a
+                // misbehaving/malicious backend can leak `trailer` /
+                // `proxy-authenticate` / `connection` / `keep-alive` etc. to the
+                // client through the TRAILERS frame.
+                let had_trailers = !trailers.is_empty();
+                strip_response_hop_by_hop_trailers(&mut trailers);
+                if !trailers.is_empty() {
+                    if let Err(e) = stream.send_trailers(trailers).await {
+                        warn!("H3 gRPC streaming send_trailers failed: {}", e);
+                        final_client_disconnected = true;
+                        final_body_completed = false;
+                    }
+                } else if had_trailers && let Err(e) = stream.finish().await {
+                    // Every trailer was hop-by-hop and got stripped to empty. The
+                    // map was non-empty on return, so stream_hyper_incoming left
+                    // the QUIC stream open for the caller to finalize (its
+                    // contract: it only finish()es when it returns None/empty
+                    // trailers). FIN it here — mirroring the buffered path's
+                    // `else { finish() }` above — so the stream is cleanly closed
+                    // instead of left open until the client times out (only RESET
+                    // on drop). The had_trailers guard avoids a double-finish when
+                    // the backend sent an already-empty trailer frame that
+                    // stream_hyper_incoming already finished.
+                    debug!("H3 gRPC streaming finish after trailer strip failed: {}", e);
+                    final_client_disconnected = true;
+                    final_body_completed = false;
+                }
             }
 
             record_backend_outcome(
