@@ -416,6 +416,15 @@ impl K8sAccumulator {
             "internal Gateway API dispatch precedence metadata must be stripped before translation output"
         );
         self.mesh.normalize();
+        // Sort single-winner / additive mesh resources by (namespace, name) for
+        // deterministic slice order. `peer_authentications` is sorted alongside
+        // its siblings so the inbound-mTLS resolver sees a stable order (its
+        // same-tier tiebreak in `resolve_effective_mtls_mode` is the
+        // load-bearing guarantee; this keeps the translated slice itself
+        // deterministic too).
+        self.mesh.peer_authentications.sort_by(|left, right| {
+            (&left.namespace, &left.name).cmp(&(&right.namespace, &right.name))
+        });
         self.mesh.request_authentications.sort_by(|left, right| {
             (&left.namespace, &left.name).cmp(&(&right.namespace, &right.name))
         });

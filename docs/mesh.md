@@ -830,7 +830,7 @@ Selector-less `PeerAuthentication` applies to all workloads in its namespace (or
 
 ### Resolution and listener wiring
 
-The effective mTLS mode for the inbound TLS-terminating listener is resolved at startup from the initial mesh slice via `resolve_effective_mtls_mode()`. Scope precedence (highest wins): `WorkloadSelector` > `Namespace` > `MeshWide`. Port-level overrides within the winning policy then take precedence over its top-level `mtls_mode`.
+The effective mTLS mode for the inbound TLS-terminating listener is resolved at startup from the initial mesh slice via `resolve_effective_mtls_mode()`. Scope precedence (highest wins): `WorkloadSelector` > `Namespace` > `MeshWide`. Among same-tier matches, the ASCII-smallest policy `name` wins — a deterministic tiebreaker (mirroring the sibling `ProxyConfig` resolver and the accumulator's `(namespace, name)` sort) so the resolved inbound mTLS posture cannot flap across pods or reconciles; two conflicting same-tier `PeerAuthentication`s are an operator misconfiguration and the contract is determinism, not mTLS-mode preference. Port-level overrides within the winning policy then take precedence over its top-level `mtls_mode`.
 
 The resulting `MeshClientAuth` is plumbed into the inbound TLS acceptor:
 

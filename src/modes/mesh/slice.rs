@@ -1948,9 +1948,17 @@ pub fn resolve_effective_mtls_mode<L: WorkloadLabels + ?Sized>(
         }
 
         let scope = classify_peer_auth_scope(pa);
-        let dominated = best
-            .as_ref()
-            .is_none_or(|(current_scope, _)| scope > *current_scope);
+        // Higher tier wins; within the SAME tier the ASCII-smallest policy name
+        // wins. This same-tier tiebreak matches the sibling single-winner
+        // resolvers (`resolved_proxy_config`, `resolve_applicable_sidecar_egress`)
+        // and makes the effective inbound mTLS posture deterministic. Without
+        // it, two equally-applicable PeerAuthentications in one tier resolve by
+        // slice iteration order, so the posture (STRICT vs PERMISSIVE/Disable)
+        // could differ across pods or flip across reconciles.
+        let dominated = best.as_ref().is_none_or(|(current_scope, current_pa)| {
+            scope > *current_scope
+                || (scope == *current_scope && pa.name.as_str() < current_pa.name.as_str())
+        });
         if dominated {
             best = Some((scope, pa));
         }
@@ -3413,6 +3421,43 @@ mod tests {
         let mode =
             resolve_effective_mtls_mode(&[], "default", &HashMap::<String, String>::new(), 8080);
         assert_eq!(mode, MtlsMode::Permissive);
+    }
+
+    #[test]
+    fn same_tier_peer_auth_resolves_to_ascii_smallest_name_regardless_of_order() {
+        // Two namespace-tier PeerAuthentications match the same workload with
+        // conflicting modes. The winner must be deterministic (ASCII-smallest
+        // name) independent of slice iteration order, so the inbound mTLS
+        // posture can't flap (STRICT vs PERMISSIVE) across pods/reconciles.
+        let strict = pa(
+            "aa-strict",
+            "default",
+            None,
+            MtlsMode::Strict,
+            HashMap::new(),
+        );
+        let permissive = pa(
+            "zz-permissive",
+            "default",
+            None,
+            MtlsMode::Permissive,
+            HashMap::new(),
+        );
+        let labels = HashMap::<String, String>::new();
+
+        let forward = vec![strict.clone(), permissive.clone()];
+        assert_eq!(
+            resolve_effective_mtls_mode(&forward, "default", &labels, 8080),
+            MtlsMode::Strict,
+            "aa-strict (ASCII-smallest) must win"
+        );
+
+        let reversed = vec![permissive, strict];
+        assert_eq!(
+            resolve_effective_mtls_mode(&reversed, "default", &labels, 8080),
+            MtlsMode::Strict,
+            "reversed slice order must resolve to the same winner"
+        );
     }
 
     #[test]

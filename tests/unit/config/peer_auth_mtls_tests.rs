@@ -124,35 +124,53 @@ fn mesh_slice_resolve_method_integration() {
     );
 }
 
-// ── Same-scope tie-breaking ─────────────────────────────────────────────
+// ── Same-scope tie-breaking (deterministic ASCII-smallest name) ─────────
 
 #[test]
-fn first_matching_workload_selector_wins_at_same_scope() {
-    let policies = vec![
-        peer_auth(
-            "wl-strict",
-            "default",
-            Some(WorkloadSelector {
-                labels: HashMap::from([("app".into(), "api".into())]),
-                namespace: None,
-            }),
-            MtlsMode::Strict,
-            HashMap::new(),
-        ),
-        peer_auth(
-            "wl-disable",
-            "default",
-            Some(WorkloadSelector {
-                labels: HashMap::from([("app".into(), "api".into())]),
-                namespace: None,
-            }),
-            MtlsMode::Disable,
-            HashMap::new(),
-        ),
-    ];
+fn same_scope_tie_resolves_to_ascii_smallest_name_regardless_of_order() {
+    // Two WorkloadSelector-tier PeerAuthentications match the same workload
+    // with conflicting modes. The winner is the ASCII-smallest policy name
+    // ("wl-disable" < "wl-strict"), independent of slice iteration order —
+    // matching the sibling single-winner resolvers (resolved_proxy_config,
+    // resolve_applicable_sidecar_egress). This makes the inbound mTLS posture
+    // deterministic across pods/reconciles instead of depending on order.
+    // (Two conflicting same-tier PeerAuthentications are an operator
+    // misconfiguration; the contract here is determinism, not mode preference.)
+    let strict = peer_auth(
+        "wl-strict",
+        "default",
+        Some(WorkloadSelector {
+            labels: HashMap::from([("app".into(), "api".into())]),
+            namespace: None,
+        }),
+        MtlsMode::Strict,
+        HashMap::new(),
+    );
+    let disable = peer_auth(
+        "wl-disable",
+        "default",
+        Some(WorkloadSelector {
+            labels: HashMap::from([("app".into(), "api".into())]),
+            namespace: None,
+        }),
+        MtlsMode::Disable,
+        HashMap::new(),
+    );
     let labels = HashMap::from([("app".to_string(), "api".to_string())]);
-    let mode = resolve_effective_mtls_mode(&policies, "default", &labels, 8080);
-    assert_eq!(mode, MtlsMode::Strict);
+
+    let forward = vec![strict.clone(), disable.clone()];
+    assert_eq!(
+        resolve_effective_mtls_mode(&forward, "default", &labels, 8080),
+        MtlsMode::Disable,
+        "wl-disable (ASCII-smallest name) wins"
+    );
+
+    let reversed = vec![disable, strict];
+    assert_eq!(
+        resolve_effective_mtls_mode(&reversed, "default", &labels, 8080),
+        MtlsMode::Disable,
+        "reversed slice order resolves to the same winner"
+    );
 }
 
 // ── Empty selector labels ───────────────────────────────────────────────
