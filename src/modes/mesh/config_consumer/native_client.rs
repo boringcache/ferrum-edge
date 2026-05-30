@@ -7,8 +7,8 @@ use tracing::{error, info, warn};
 
 use super::common::{
     BACKOFF_INITIAL_SECS, jittered_backoff, next_backoff_secs,
-    refresh_dp_grpc_tls_config_if_changed, tonic_tls_config, wait_for_shutdown,
-    wait_optional_tls_reload,
+    refresh_dp_grpc_tls_config_if_changed, should_race_primary_retry, tonic_tls_config,
+    wait_for_shutdown, wait_optional_tls_reload,
 };
 use crate::grpc::dp_client::{
     DpGrpcTlsConfig, DpGrpcTlsReload, GrpcJwtSecret, check_cp_version_compatibility,
@@ -27,6 +27,12 @@ pub struct NativeMeshClientConfig {
     pub workload_spiffe_id: Option<String>,
     pub waypoint_name: Option<String>,
     pub labels: HashMap<String, String>,
+    /// Shared CP-failover primary-retry interval
+    /// (`FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS`). When > 0 and connected to a
+    /// fallback CP after a first slice is installed, the client proactively
+    /// reconnects to the primary CP — matching the xDS client and the documented
+    /// HA failback model. `0` disables proactive failback (the prior behaviour).
+    pub primary_retry_secs: u64,
 }
 
 impl NativeMeshClientConfig {
@@ -86,22 +92,64 @@ pub async fn start_native_mesh_client_with_shutdown(
         let cp_url = &cp_urls[current_cp_index];
         let consumer = NativeMeshConfigConsumer::new(state.clone());
         let mut stream_shutdown_rx = shutdown_rx.clone();
-        let result = tokio::select! {
-            result = connect_mesh_subscribe(
-                cp_url,
-                &jwt_secret,
-                &config,
-                &consumer,
-                tls_config.as_ref(),
-            ) => result,
-            _ = wait_for_shutdown(&mut stream_shutdown_rx) => {
-                info!("Native mesh client shutting down");
-                return;
+        let is_fallback = current_cp_index != 0 && cp_urls.len() > 1;
+        let should_race_primary = should_race_primary_retry(
+            is_fallback,
+            config.primary_retry_secs,
+            state.has_first_slice(),
+        );
+        // On a fallback CP (after a first slice is installed) race the live
+        // stream against a primary-retry timer so the DP proactively returns to
+        // the primary CP, matching the xDS sibling and the documented HA failback
+        // model. On the primary CP, or before any slice arrives, skip the timer
+        // and keep the connection until it ends on its own.
+        let result = if should_race_primary {
+            tokio::select! {
+                result = connect_mesh_subscribe(
+                    cp_url,
+                    &jwt_secret,
+                    &config,
+                    &consumer,
+                    tls_config.as_ref(),
+                ) => result,
+                _ = tokio::time::sleep(Duration::from_secs(config.primary_retry_secs)) => {
+                    info!(
+                        primary_retry_secs = config.primary_retry_secs,
+                        cp_url = %cp_url,
+                        "Native primary retry interval elapsed; reconnecting to primary CP"
+                    );
+                    current_cp_index = 0;
+                    backoff_secs = BACKOFF_INITIAL_SECS;
+                    continue;
+                }
+                _ = wait_for_shutdown(&mut stream_shutdown_rx) => {
+                    info!("Native mesh client shutting down");
+                    return;
+                }
+                _ = wait_optional_tls_reload(tls_reload.as_ref().map(|reload| reload.revision_rx.clone())) => {
+                    info!("Mesh gRPC TLS source changed; reconnecting native MeshSubscribe stream");
+                    backoff_secs = BACKOFF_INITIAL_SECS;
+                    continue;
+                }
             }
-            _ = wait_optional_tls_reload(tls_reload.as_ref().map(|reload| reload.revision_rx.clone())) => {
-                info!("Mesh gRPC TLS source changed; reconnecting native MeshSubscribe stream");
-                backoff_secs = BACKOFF_INITIAL_SECS;
-                continue;
+        } else {
+            tokio::select! {
+                result = connect_mesh_subscribe(
+                    cp_url,
+                    &jwt_secret,
+                    &config,
+                    &consumer,
+                    tls_config.as_ref(),
+                ) => result,
+                _ = wait_for_shutdown(&mut stream_shutdown_rx) => {
+                    info!("Native mesh client shutting down");
+                    return;
+                }
+                _ = wait_optional_tls_reload(tls_reload.as_ref().map(|reload| reload.revision_rx.clone())) => {
+                    info!("Mesh gRPC TLS source changed; reconnecting native MeshSubscribe stream");
+                    backoff_secs = BACKOFF_INITIAL_SECS;
+                    continue;
+                }
             }
         };
 
@@ -279,5 +327,29 @@ mod tests {
                 .map(|slice| slice.version.as_str()),
             Some("v1")
         );
+    }
+
+    #[test]
+    fn primary_retry_only_races_on_fallback_after_first_slice() {
+        // The native client honors FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS via
+        // the shared gate: race the primary-retry timer only on a fallback CP,
+        // with a non-zero interval, after a first slice is installed.
+        assert!(!should_race_primary_retry(true, 300, false)); // no first slice yet
+        assert!(should_race_primary_retry(true, 300, true)); // fallback + slice
+        assert!(!should_race_primary_retry(false, 300, true)); // already on primary
+        assert!(!should_race_primary_retry(true, 0, true)); // retry disabled (0)
+    }
+
+    #[test]
+    fn native_config_carries_primary_retry_secs() {
+        let config = NativeMeshClientConfig {
+            node_id: "n".to_string(),
+            namespace: "ferrum".to_string(),
+            workload_spiffe_id: None,
+            waypoint_name: None,
+            labels: HashMap::new(),
+            primary_retry_secs: 300,
+        };
+        assert_eq!(config.primary_retry_secs, 300);
     }
 }
