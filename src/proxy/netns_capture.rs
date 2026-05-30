@@ -64,6 +64,11 @@ use super::{ListenerTlsSource, ProxyState, run_accept_loop};
 pub struct PodCaptureTarget {
     pub pod_uid: String,
     pub cgroup_path: String,
+    /// Source pod IP, if the node-agent published it. Used to override the
+    /// loopback peer of an accepted in-netns capture connection so client-IP
+    /// authz conditions, logs, and IP-keyed plugins see the real pod IP rather
+    /// than `127.0.0.1`.
+    pub pod_ip: Option<std::net::IpAddr>,
 }
 
 /// Source of the current enrolled-pod set. Production reads a directory the
@@ -102,13 +107,21 @@ impl PodCaptureSource for DirectoryCaptureSource {
             let Ok(contents) = std::fs::read_to_string(entry.path()) else {
                 continue;
             };
-            let cgroup_path = contents.trim().to_string();
+            // Line 1: pod cgroup path (required). Line 2: source pod IP
+            // (optional) — older entries with only the cgroup path parse with
+            // `pod_ip = None`.
+            let mut lines = contents.lines();
+            let cgroup_path = lines.next().unwrap_or("").trim().to_string();
             if cgroup_path.is_empty() {
                 continue;
             }
+            let pod_ip = lines
+                .next()
+                .and_then(|line| line.trim().parse::<std::net::IpAddr>().ok());
             targets.push(PodCaptureTarget {
                 pod_uid,
                 cgroup_path,
+                pod_ip,
             });
         }
         targets
@@ -378,6 +391,7 @@ impl NetnsBackend for ProxyNetnsBackend {
         let state = self.state.clone();
         let conn_semaphore = self.conn_semaphore.clone();
         let mesh_direction = self.mesh_direction;
+        let source_ip_override = target.pod_ip;
         tokio::spawn(async move {
             run_accept_loop(
                 listener,
@@ -390,6 +404,7 @@ impl NetnsBackend for ProxyNetnsBackend {
                 stop_rx,
                 mesh_direction,
                 0,
+                source_ip_override,
             )
             .await;
         });
@@ -583,6 +598,7 @@ mod tests {
         PodCaptureTarget {
             pod_uid: uid.to_string(),
             cgroup_path: cgroup.to_string(),
+            pod_ip: None,
         }
     }
 

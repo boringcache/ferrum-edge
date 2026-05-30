@@ -7225,6 +7225,7 @@ pub async fn start_proxy_listener_with_bound_listener(
         shutdown,
         None,
         0,
+        None,
     )
     .await;
     Ok(())
@@ -7578,6 +7579,7 @@ async fn start_proxy_listener_with_tls_source_and_signal(
                     shutdown_rx,
                     mesh_direction,
                     i,
+                    None,
                 )
                 .await;
             }));
@@ -7600,6 +7602,7 @@ async fn start_proxy_listener_with_tls_source_and_signal(
             shutdown,
             mesh_direction,
             0,
+            None,
         )
         .await;
 
@@ -7622,6 +7625,7 @@ async fn start_proxy_listener_with_tls_source_and_signal(
             shutdown,
             mesh_direction,
             0,
+            None,
         )
         .await;
     }
@@ -7639,6 +7643,12 @@ async fn run_accept_loop(
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
     _thread_id: usize,
+    // When `Some`, overrides the accepted connection's client IP. Used by the
+    // node-waypoint in-netns capture path: `connect4` rewrites a captured pod's
+    // egress to loopback, so the accepted peer is 127.0.0.1; this carries the
+    // real source pod IP so client-IP authz conditions, logs, and IP-keyed
+    // plugins see the pod instead of loopback. `None` everywhere else.
+    source_ip_override: Option<std::net::IpAddr>,
 ) {
     let frontend_listen_port = listener.local_addr().ok().map(|addr| addr.port());
     // Count consecutive accept() failures to back off a busy-loop. Under fd
@@ -7654,6 +7664,11 @@ async fn run_accept_loop(
             result = listener.accept() => {
                 match result {
                     Ok((stream, remote_addr)) => {
+                        // Override the loopback peer with the source pod IP for
+                        // in-netns capture connections (see `source_ip_override`).
+                        let remote_addr = source_ip_override
+                            .map(|ip| std::net::SocketAddr::new(ip, remote_addr.port()))
+                            .unwrap_or(remote_addr);
                         accept_backoff.on_success();
                         // Overload check: reject new connections under critical
                         // pressure. Checked after accept (inside the select!) so

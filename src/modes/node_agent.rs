@@ -1137,7 +1137,12 @@ fn pod_registry_uid_is_unsafe(pod_uid: &str) -> bool {
 /// proxy's in-netns capture listeners poll this directory. Never panics and
 /// never propagates: any I/O error (or an unsafe `pod_uid`) is logged at
 /// `warn!` and swallowed so pod enrollment is never aborted by registry I/O.
-fn publish_pod_registry(dir: &std::path::Path, pod_uid: &str, cgroup_path: &str) {
+fn publish_pod_registry(
+    dir: &std::path::Path,
+    pod_uid: &str,
+    cgroup_path: &str,
+    pod_ip: Option<std::net::Ipv4Addr>,
+) {
     if pod_registry_uid_is_unsafe(pod_uid) {
         warn!(
             pod_uid,
@@ -1156,7 +1161,14 @@ fn publish_pod_registry(dir: &std::path::Path, pod_uid: &str, cgroup_path: &str)
         return;
     }
     let path = dir.join(pod_uid);
-    if let Err(e) = std::fs::write(&path, format!("{cgroup_path}\n")) {
+    // Line 1: pod cgroup path. Line 2 (optional): source pod IP — the mesh
+    // proxy uses it to override the loopback peer of in-netns capture
+    // connections so authz/logs/IP-keyed plugins see the real pod IP.
+    let contents = match pod_ip {
+        Some(ip) => format!("{cgroup_path}\n{ip}\n"),
+        None => format!("{cgroup_path}\n"),
+    };
+    if let Err(e) = std::fs::write(&path, contents) {
         warn!(
             pod_uid,
             path = %path.display(),
@@ -1383,7 +1395,7 @@ pub fn handle_pod_added(
             &config.node_waypoint_pod_registry_dir,
             cgroup_path.as_deref(),
         ) {
-            publish_pod_registry(dir, pod_uid, cgroup_path_value);
+            publish_pod_registry(dir, pod_uid, cgroup_path_value, pod_ip);
         }
     }
 }
@@ -3044,19 +3056,27 @@ mod tests {
         // Directory does not exist yet — publish must create it.
         assert!(!registry.exists());
 
-        publish_pod_registry(&registry, "pod-uid-1", "/sys/fs/cgroup/kubepods/poduid1");
+        publish_pod_registry(
+            &registry,
+            "pod-uid-1",
+            "/sys/fs/cgroup/kubepods/poduid1",
+            Some(std::net::Ipv4Addr::new(10, 1, 2, 3)),
+        );
 
         let path = registry.join("pod-uid-1");
         assert!(path.exists(), "registry entry must be written");
         let contents = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(contents, "/sys/fs/cgroup/kubepods/poduid1\n");
+        assert_eq!(
+            contents, "/sys/fs/cgroup/kubepods/poduid1\n10.1.2.3\n",
+            "registry entry carries the cgroup path on line 1 and the source pod IP on line 2"
+        );
     }
 
     #[test]
     fn remove_pod_registry_removes_entry_and_tolerates_absent() {
         let dir = tempfile::tempdir().unwrap();
         let registry = dir.path().join("node-waypoint-pods");
-        publish_pod_registry(&registry, "pod-uid-1", "/cg/path");
+        publish_pod_registry(&registry, "pod-uid-1", "/cg/path", None);
         let path = registry.join("pod-uid-1");
         assert!(path.exists());
 
@@ -3077,7 +3097,7 @@ mod tests {
         // None of these may write anything; an escaping UID must be refused
         // before any directory is created or file written.
         for unsafe_uid in ["", "../escape", "a/b", "a\\b", "..", "foo/../bar"] {
-            publish_pod_registry(&registry, unsafe_uid, "/cg/path");
+            publish_pod_registry(&registry, unsafe_uid, "/cg/path", None);
         }
 
         // The guard fires before `create_dir_all`, so nothing was created and

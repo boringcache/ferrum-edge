@@ -686,15 +686,33 @@ mod live_kernel_tests {
 
         // Move this process into the scratch cgroup so its connect() goes through
         // the connect4 program attached there.
-        let joined = std::fs::write(
-            format!("{}/cgroup.procs", cgroup.path_str()),
-            std::process::id().to_string(),
-        )
-        .is_ok();
-        assert!(joined, "move test process into scratch cgroup");
+        // On some runners the process can't actually be moved (cgroup
+        // namespaces / delegation): the write may succeed yet the PID not
+        // appear in the target. Read `cgroup.procs` back and self-skip rather
+        // than hard-fail when the move didn't take effect — this layer can only
+        // run where it does, and a false failure here would be a flaky red.
+        let pid = std::process::id().to_string();
+        let procs_path = format!("{}/cgroup.procs", cgroup.path_str());
+        if std::fs::write(&procs_path, &pid).is_err() {
+            eprintln!("SKIP connect4-redirect: cannot write scratch cgroup.procs");
+            backend.cleanup_all().ok();
+            return;
+        }
+        let in_cgroup = std::fs::read_to_string(&procs_path)
+            .map(|procs| procs.split_whitespace().any(|p| p == pid))
+            .unwrap_or(false);
+        if !in_cgroup {
+            eprintln!(
+                "SKIP connect4-redirect: process did not move into the scratch cgroup \
+                 (cgroup namespace / delegation on this runner)"
+            );
+            let _ = std::fs::write(format!("{CGROUP_ROOT}/cgroup.procs"), &pid);
+            backend.cleanup_all().ok();
+            return;
+        }
 
-        // Connect to an unroutable TEST-NET-1 address (RFC 5737). Uncaptured this
-        // would time out; captured, connect4 rewrites it to
+        // Connect to an unroutable TEST-NET-1 address (RFC 5737). Uncaptured
+        // this would time out; captured, connect4 rewrites it to
         // 127.0.0.1:capture_port and it lands on `server`.
         let connect_handle = std::thread::spawn(move || {
             std::net::TcpStream::connect_timeout(
@@ -720,22 +738,20 @@ mod live_kernel_tests {
         }
         let connected = connect_handle.join().unwrap_or(false);
 
+        // Capture diagnostics while still in the scratch cgroup (before moving
+        // back) so a genuine failure shows the capture port + cgroup membership.
+        let self_cgroup = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
+
         // Move back to the cgroup root so the scratch cgroup can be removed, and
         // clean up BPF state — before asserting, so a failed assert still tidies.
-        let _ = std::fs::write(
-            format!("{CGROUP_ROOT}/cgroup.procs"),
-            std::process::id().to_string(),
-        );
+        let _ = std::fs::write(format!("{CGROUP_ROOT}/cgroup.procs"), &pid);
         backend.cleanup_all().expect("cleanup BPF state");
 
         assert!(
-            connected,
-            "a captured connect() to an unroutable dst must succeed (connect4 must \
-             redirect it to the local capture port)"
-        );
-        assert!(
-            accepted,
-            "the capture-port server must accept the connect4-redirected connection"
+            connected && accepted,
+            "a captured connect() to an unroutable dst must be redirected by connect4 to the local \
+             capture port and accepted (connected={connected}, accepted={accepted}, \
+             capture_port={capture_port}, self_cgroup={self_cgroup:?})"
         );
     }
 }
