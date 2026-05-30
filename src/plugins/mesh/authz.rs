@@ -519,14 +519,18 @@ impl MeshAuthz {
         attributes
     }
 
-    /// Predicate used by [`MeshAuthz::authorize`] to decide whether a
-    /// configured policy applies to the request's source pod when
-    /// per-pod policy scoping is enabled.
+    /// Predicate used by [`MeshAuthz::authorize`] /
+    /// [`MeshAuthz::on_stream_connect`] to decide whether a configured policy
+    /// applies to the request's source pod when per-pod policy scoping is
+    /// enabled.
     ///
-    /// Missing scope retains only mesh-wide policies — namespace- and
-    /// selector-scoped policies are withheld because we cannot prove they
-    /// apply to this source pod yet (typically a race between accept-time
-    /// pod resolution and the resolver enrolling the pod's workload scope).
+    /// With a resolved scope, only the policies that scope matches apply. A
+    /// `None` scope reaches this predicate ONLY after the caller has already
+    /// decided not to fail closed — i.e. no namespace/selector-scoped policies
+    /// are configured (a mesh-wide-only mesh) — so it keeps just the mesh-wide
+    /// policies. When scoped policies DO exist, a missing scope means the pod's
+    /// workload left the live slice generation (not an enrollment race) and the
+    /// caller rejects (403) before reaching here; see [`MeshAuthz::authorize`].
     fn policy_applies_to_pod(
         policy: &MeshPolicy,
         scope: Option<&crate::modes::mesh::runtime::PolicyScopeCache>,

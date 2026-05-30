@@ -735,7 +735,9 @@ impl NodeWaypointIdentityResolver {
     /// SPIFFE. One consistent `ArcSwap::load` plus two `HashMap::get`s
     /// (pod_uid → identity, SPIFFE → scope); paid once per HTTP/HBONE request on
     /// the node-waypoint admit path. Returns `None` when the pod is unknown or
-    /// the slice carries no scope for its workload (mesh-wide-only fallback).
+    /// its workload left the current slice generation (carries no scope); the
+    /// caller (`mesh_authz`) then fails closed when scoped policies exist, else
+    /// evaluates mesh-wide-only.
     pub fn policy_scope_for_pod(&self, pod_uid: &[u8; 16]) -> Option<Arc<PolicyScopeCache>> {
         let identity = self.identities_by_pod_uid.get(pod_uid)?;
         self.slice

@@ -8532,13 +8532,16 @@ async fn handle_proxy_request_inner(
         // (namespace + labels) rather than relying on the proxy listener's
         // shared identity, which is meaningless on a multi-pod listener.
         //
-        // Cost: one `ArcSwap::load` + one `HashMap::get` on the
-        // node-waypoint admit path. Cheap, paid once per request. If the
-        // pod has no installed scope yet (slice / identity enrollment race)
-        // the field stays `None` and `mesh_authz` falls back to mesh-wide
-        // policies only while emitting `mesh_authz.scope_missing` metadata
-        // so the race window is observable. When mesh_authz is not
-        // configured the stamped field is unused and propagates harmlessly.
+        // Cost: one `ArcSwap::load` + two `HashMap::get`s on the
+        // node-waypoint admit path. Cheap, paid once per request. The scope is
+        // derived from the same slice generation that vouches the pod's
+        // identity, so a `None` here means the pod's workload has left the live
+        // slice (removed/re-keyed), not an enrollment race: `mesh_authz` stamps
+        // `mesh_authz.scope_missing` and fails closed (403) when scoped policies
+        // exist, else evaluates mesh-wide-only. Re-queried per request so a
+        // workload removed mid-connection stops being served under scoped authz.
+        // When mesh_authz is not configured the stamped field is unused and
+        // propagates harmlessly.
         if let Some(resolver) = state.node_waypoint_identity_resolver.as_ref() {
             ctx.node_waypoint_policy_scope = resolver.policy_scope_for_pod(&identity.pod_uid);
         }

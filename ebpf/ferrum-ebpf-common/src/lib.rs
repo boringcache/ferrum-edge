@@ -414,14 +414,22 @@ impl BpfCaptureConfig {
 
 /// `aya::Pod` marks a type as plain-old-data that is safe to copy byte-for-byte
 /// in and out of BPF maps. It is implemented for the shared map key/value types
-/// only under the `userspace` feature (the aya userspace loader); the kernel
-/// (bpfel) build never links aya. The orphan rule requires these impls to live
-/// in this crate, where the types are defined.
+/// only under the `userspace` feature on Linux (the aya userspace loader); the
+/// kernel (bpfel) build never links aya. The orphan rule requires these impls to
+/// live in this crate, where the types are defined.
+///
+/// The `target_os = "linux"` gate mirrors aya being a Linux-only dependency in
+/// both this crate and `ferrum-edge` (and `ferrum-edge` gating its real backend
+/// on `cfg(all(feature = "ebpf", target_os = "linux"))`). `ferrum-edge
+/// --features ebpf` enables `ferrum-ebpf-common/userspace` on every target, so
+/// without this gate a non-Linux build (e.g. `cargo check --lib --features ebpf`
+/// on Darwin) would reference the unlinked `aya` crate; off Linux the tree falls
+/// back to the mock backend instead.
 ///
 /// Safety: every type below is `#[repr(C)]` and `Copy`, contains only
 /// fixed-width integers / byte arrays (no padding that aliases invalid bit
 /// patterns, no pointers), and matches the kernel-side map definition exactly.
-#[cfg(feature = "userspace")]
+#[cfg(all(feature = "userspace", target_os = "linux"))]
 mod userspace_pod {
     use super::*;
 
