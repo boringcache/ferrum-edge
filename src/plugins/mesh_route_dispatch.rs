@@ -1568,10 +1568,12 @@ impl Plugin for MeshRouteDispatch {
                         ctx.route_override_authority = Some(authority.to_string());
                     } else {
                         ctx.route_override_authority = None;
+                        restore_original_host(ctx, headers);
                     }
                 } else {
                     ctx.route_override_path = None;
                     ctx.route_override_authority = None;
+                    restore_original_host(ctx, headers);
                 }
                 return PluginResult::Continue;
             }
@@ -1647,6 +1649,39 @@ fn rewrite_request_path(
         out.push_str(tail);
     }
     out
+}
+
+/// Re-sync the forwarded `Host` header to the original client value, undoing a
+/// `Host` rewrite that a PRIOR `mesh_route_dispatch` instance on this proxy may
+/// have written into the shared header map. A later rule that keeps the original
+/// authority must not let a previous instance's rewritten `Host` leak into
+/// `X-Forwarded-Host` / `Forwarded` (which backend dispatch builds from
+/// `headers["host"]`).
+///
+/// The original `Host` is sourced from `ctx.headers`, NOT from the `headers`
+/// parameter: the handler threads ONE shared cloned map through every instance
+/// sequentially, so the `headers` param may already hold an earlier instance's
+/// rewritten value, whereas `ctx.headers` is untouched on this path. This is
+/// only reachable on the modify-headers (clone) path — `modifies_request_headers`
+/// is `true` iff some rule carries an authority rewrite, and that path clones
+/// `ctx.headers` rather than `mem::take`-ing it. When no instance rewrites, the
+/// handler `mem::take`s `ctx.headers` (leaving it empty) AND no `Host` rewrite
+/// ever happened, so the guard below skips the (unnecessary) restore.
+fn restore_original_host(ctx: &RequestContext, headers: &mut HashMap<String, String>) {
+    if ctx.headers.is_empty() {
+        // No-modify path: ctx.headers was mem::take'n empty and nothing rewrote
+        // Host. Touching `headers` here would wrongly drop the original Host.
+        return;
+    }
+    match ctx.headers.get("host") {
+        Some(original) => {
+            headers.insert("host".to_string(), original.clone());
+        }
+        None => {
+            // Client sent no Host but a prior instance injected one — drop it.
+            headers.remove("host");
+        }
+    }
 }
 
 /// Build the 3xx redirect response for a matching `redirect` rule. The
@@ -4913,6 +4948,66 @@ mod tests {
         );
         // No `uri` in the rewrite, so the path is untouched.
         assert!(ctx.route_override_path.is_none());
+    }
+
+    #[tokio::test]
+    async fn later_instance_without_authority_restores_original_host() {
+        // Clone-path scenario: because an authority-rewrite instance is present
+        // the handler clones ctx.headers (never mem::take's it), and threads one
+        // shared header map through both instances. ctx.headers holds the
+        // original client Host throughout.
+        let mut ctx = ctx_with("GET", "/api");
+        ctx.headers = host_headers("public.example.com");
+        let mut headers = host_headers("public.example.com");
+
+        // Instance A rewrites the authority and matches.
+        let plugin_a = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "internal"},
+                "rewrite": {"authority": "internal.example.com"}
+            }]
+        }))
+        .unwrap();
+        let _ = plugin_a.before_proxy(&mut ctx, &mut headers).await;
+        assert_eq!(
+            headers.get("host").map(String::as_str),
+            Some("internal.example.com")
+        );
+
+        // Instance B matches but does NOT rewrite the authority.
+        let plugin_b = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "other"}
+            }]
+        }))
+        .unwrap();
+        let _ = plugin_b.before_proxy(&mut ctx, &mut headers).await;
+
+        // The stale rewritten authority must not linger in the shared map (it
+        // would leak into X-Forwarded-Host / Forwarded); Host is restored to the
+        // original client value, and the override is cleared.
+        assert_eq!(
+            headers.get("host").map(String::as_str),
+            Some("public.example.com")
+        );
+        assert!(ctx.route_override_authority.is_none());
+    }
+
+    #[test]
+    fn restore_original_host_is_noop_when_ctx_headers_empty() {
+        // No-modify (mem::take) path: ctx.headers is empty. The restore must NOT
+        // touch the header map — nothing rewrote Host on this path, so the
+        // `headers` param already holds the original.
+        let mut ctx = ctx_with("GET", "/api");
+        ctx.headers.clear();
+        let mut headers = host_headers("public.example.com");
+        restore_original_host(&ctx, &mut headers);
+        assert_eq!(
+            headers.get("host").map(String::as_str),
+            Some("public.example.com")
+        );
     }
 
     #[tokio::test]
