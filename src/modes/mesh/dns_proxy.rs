@@ -750,12 +750,16 @@ async fn handle_dns_query_udp(
     forward_tx: &mpsc::Sender<UdpForwardRequest>,
     ttl: u32,
 ) {
-    let max_response_size = udp_response_size(&packet);
-    match evaluate_dns_query(&packet, table, ttl, max_response_size) {
+    match evaluate_dns_query(&packet, table, ttl, DnsResponseSizing::Udp) {
         DnsDecision::Respond(response) => {
             let _ = socket.send_to(&response, src).await;
         }
         DnsDecision::Forward(query) => {
+            // Size the queue-full error response from the already-parsed query
+            // (no second parse), matching the clamp evaluate_dns_query applied.
+            let max_response_size = query
+                .udp_payload_size
+                .clamp(DNS_UDP_SAFE_PACKET_SIZE, DNS_MAX_UDP_PACKET_SIZE);
             let request = UdpForwardRequest { packet, src, query };
             if let Err(err) = forward_tx.try_send(request) {
                 let request = err.into_inner();
@@ -826,7 +830,7 @@ async fn handle_dns_tcp_connection(
             }
         }
 
-        let response = match evaluate_dns_query(&packet, table, ttl, DNS_MAX_TCP_PACKET_SIZE) {
+        let response = match evaluate_dns_query(&packet, table, ttl, DnsResponseSizing::Tcp) {
             DnsDecision::Respond(response) => response,
             DnsDecision::Forward(_) => match forward_to_upstream_tcp(&packet, upstream).await {
                 Some(response) => response,
@@ -916,16 +920,21 @@ fn evaluate_dns_query(
     packet: &[u8],
     table: &ArcSwap<DnsResolutionTable>,
     ttl: u32,
-    max_response_size: usize,
+    sizing: DnsResponseSizing,
 ) -> DnsDecision {
+    // Parse the packet exactly once. The response-size cap is derived from the
+    // parsed query (UDP) or a transport constant (TCP) — the UDP path no longer
+    // re-parses the packet just to read `udp_payload_size`.
     let query = match parse_dns_query(packet) {
         Some(q) => q,
         None => {
+            let max_response_size = sizing.parse_failure_cap();
             return build_dns_error_response_from_packet(packet, RCODE_FORMERR, max_response_size)
                 .map(DnsDecision::Respond)
                 .unwrap_or(DnsDecision::Drop);
         }
     };
+    let max_response_size = sizing.response_cap(&query);
 
     // Only handle IN-class queries locally.
     if query.qclass != QCLASS_IN {
@@ -1293,14 +1302,34 @@ async fn send_udp_servfail(socket: &UdpSocket, query: &DnsQuery, client: SocketA
     let _ = socket.send_to(&response, client).await;
 }
 
-fn udp_response_size(packet: &[u8]) -> usize {
-    parse_dns_query(packet)
-        .map(|query| {
-            query
+/// How `evaluate_dns_query` caps the response size for the calling transport.
+/// Passing the transport (rather than a precomputed size) lets the evaluator
+/// parse the inbound packet exactly once: UDP derives the cap from the query's
+/// EDNS `udp_payload_size` (clamped), TCP uses the 64 KiB framed maximum.
+#[derive(Clone, Copy)]
+enum DnsResponseSizing {
+    Udp,
+    Tcp,
+}
+
+impl DnsResponseSizing {
+    /// Response-size cap for a successfully parsed query.
+    fn response_cap(self, query: &DnsQuery) -> usize {
+        match self {
+            DnsResponseSizing::Udp => query
                 .udp_payload_size
-                .clamp(DNS_UDP_SAFE_PACKET_SIZE, DNS_MAX_UDP_PACKET_SIZE)
-        })
-        .unwrap_or(DNS_UDP_SAFE_PACKET_SIZE)
+                .clamp(DNS_UDP_SAFE_PACKET_SIZE, DNS_MAX_UDP_PACKET_SIZE),
+            DnsResponseSizing::Tcp => DNS_MAX_TCP_PACKET_SIZE,
+        }
+    }
+
+    /// Response-size cap when the packet failed to parse (no EDNS info present).
+    fn parse_failure_cap(self) -> usize {
+        match self {
+            DnsResponseSizing::Udp => DNS_UDP_SAFE_PACKET_SIZE,
+            DnsResponseSizing::Tcp => DNS_MAX_TCP_PACKET_SIZE,
+        }
+    }
 }
 
 // ── DNS wire format parsing ──────────────────────────────────────────────
@@ -1405,16 +1434,22 @@ fn parse_dns_name(packet: &[u8], start: usize) -> Option<(String, usize)> {
     let mut name = String::with_capacity(64);
     let mut offset = start;
     let mut return_offset = None;
-    let mut visited = vec![false; packet.len()];
+    // Compression-pointer loop guard. Between pointer jumps the offset strictly
+    // advances (labels move it forward), so only a backward compression pointer
+    // can stall progress — bounding the number of jumps therefore guarantees
+    // termination, together with the 255-byte total-name cap below. This
+    // replaces a per-call `vec![false; packet.len()]` visited bitmap that
+    // allocated proportionally to packet length on EVERY name parse (a query
+    // can carry hundreds of additional-record names), a needless hot-path
+    // allocation amplifier. 16 jumps is far more than any legitimate query
+    // name needs (a QNAME never uses compression; AR names rarely do).
+    let mut pointer_jumps = 0u32;
+    const MAX_POINTER_JUMPS: u32 = 16;
 
     loop {
         if offset >= packet.len() {
             return None;
         }
-        if visited[offset] {
-            return None;
-        }
-        visited[offset] = true;
 
         let len = packet[offset] as usize;
 
@@ -1433,6 +1468,10 @@ fn parse_dns_name(packet: &[u8], start: usize) -> Option<(String, usize)> {
             }
             if return_offset.is_none() {
                 return_offset = Some(offset + 2);
+            }
+            pointer_jumps += 1;
+            if pointer_jumps > MAX_POINTER_JUMPS {
+                return None;
             }
             let pointer = ((len & 0x3F) << 8) | packet[offset + 1] as usize;
             if pointer >= packet.len() {
@@ -1908,6 +1947,21 @@ mod tests {
     }
 
     #[test]
+    fn parse_dns_name_rejects_compression_pointer_loop() {
+        // A name whose first byte is a compression pointer back to itself must
+        // be rejected (bounded jump guard), not loop forever. Before, an O(n)
+        // `visited` bitmap caught this; the bounded-jump guard must preserve the
+        // protection without the per-call allocation.
+        let mut packet = vec![0u8; 12]; // 12-byte header placeholder
+        packet.push(0xC0); // pointer marker, high 6 bits of offset = 0
+        packet.push(12); // low byte → offset 12 (points at this very pointer)
+        assert!(
+            parse_dns_name(&packet, 12).is_none(),
+            "self-referential compression pointer must be rejected"
+        );
+    }
+
+    #[test]
     fn build_dns_response_a_record() {
         let packet = build_a_query("api.example.com");
         let query = parse_dns_query(&packet).unwrap();
@@ -2019,7 +2073,7 @@ mod tests {
         let table = ArcSwap::from_pointee(DnsResolutionTable::from_mesh_slice(&slice));
         let packet = build_query_packet("api.example.com", QTYPE_TXT);
 
-        let response = match evaluate_dns_query(&packet, &table, 60, DNS_UDP_SAFE_PACKET_SIZE) {
+        let response = match evaluate_dns_query(&packet, &table, 60, DnsResponseSizing::Udp) {
             DnsDecision::Respond(response) => response,
             DnsDecision::Forward(_) => panic!("mesh-owned unsupported qtype should not forward"),
             DnsDecision::Drop => panic!("valid DNS query should not drop"),
@@ -2053,7 +2107,7 @@ mod tests {
         second_packet[..2].copy_from_slice(&0x5678u16.to_be_bytes());
 
         let first_response =
-            match evaluate_dns_query(&first_packet, &table, 60, DNS_UDP_SAFE_PACKET_SIZE) {
+            match evaluate_dns_query(&first_packet, &table, 60, DnsResponseSizing::Udp) {
                 DnsDecision::Respond(response) => response,
                 DnsDecision::Forward(_) => panic!("mesh name should not forward"),
                 DnsDecision::Drop => panic!("valid DNS query should not drop"),
@@ -2061,7 +2115,7 @@ mod tests {
         assert_eq!(table.load().response_cache_len(), 1);
 
         let second_response =
-            match evaluate_dns_query(&second_packet, &table, 60, DNS_UDP_SAFE_PACKET_SIZE) {
+            match evaluate_dns_query(&second_packet, &table, 60, DnsResponseSizing::Udp) {
                 DnsDecision::Respond(response) => response,
                 DnsDecision::Forward(_) => panic!("mesh name should not forward"),
                 DnsDecision::Drop => panic!("valid DNS query should not drop"),
@@ -2085,7 +2139,7 @@ mod tests {
         let table = ArcSwap::from_pointee(DnsResolutionTable::from_mesh_slice(&slice));
         let packet = build_a_query("api.example.com");
 
-        let _ = match evaluate_dns_query(&packet, &table, 60, DNS_MAX_TCP_PACKET_SIZE) {
+        let _ = match evaluate_dns_query(&packet, &table, 60, DnsResponseSizing::Tcp) {
             DnsDecision::Respond(response) => response,
             DnsDecision::Forward(_) => panic!("mesh name should not forward"),
             DnsDecision::Drop => panic!("valid DNS query should not drop"),
@@ -2949,7 +3003,7 @@ mod tests {
 
         // A query should get only IPv4
         let a_packet = build_a_query("dualstack.example.com");
-        let a_response = match evaluate_dns_query(&a_packet, &table, 60, DNS_MAX_UDP_PACKET_SIZE) {
+        let a_response = match evaluate_dns_query(&a_packet, &table, 60, DnsResponseSizing::Udp) {
             DnsDecision::Respond(r) => r,
             _ => panic!("A query for mesh name should produce a response"),
         };
@@ -2959,7 +3013,7 @@ mod tests {
         // AAAA query should get only IPv6
         let aaaa_packet = build_aaaa_query("dualstack.example.com");
         let aaaa_response =
-            match evaluate_dns_query(&aaaa_packet, &table, 60, DNS_MAX_UDP_PACKET_SIZE) {
+            match evaluate_dns_query(&aaaa_packet, &table, 60, DnsResponseSizing::Udp) {
                 DnsDecision::Respond(r) => r,
                 _ => panic!("AAAA query for mesh name should produce a response"),
             };
@@ -2981,7 +3035,7 @@ mod tests {
 
         let table = ArcSwap::from_pointee(DnsResolutionTable::from_mesh_slice(&slice));
         let packet = build_a_query("v6only.example.com");
-        let response = match evaluate_dns_query(&packet, &table, 60, DNS_MAX_UDP_PACKET_SIZE) {
+        let response = match evaluate_dns_query(&packet, &table, 60, DnsResponseSizing::Udp) {
             DnsDecision::Respond(r) => r,
             _ => panic!("mesh-owned name should produce a response, not forward"),
         };
@@ -3007,7 +3061,7 @@ mod tests {
 
         let table = ArcSwap::from_pointee(DnsResolutionTable::from_mesh_slice(&slice));
         let packet = build_aaaa_query("v4only.example.com");
-        let response = match evaluate_dns_query(&packet, &table, 60, DNS_MAX_UDP_PACKET_SIZE) {
+        let response = match evaluate_dns_query(&packet, &table, 60, DnsResponseSizing::Udp) {
             DnsDecision::Respond(r) => r,
             _ => panic!("mesh-owned name should produce a response"),
         };
@@ -3049,7 +3103,7 @@ mod tests {
 
         let table = ArcSwap::from_pointee(DnsResolutionTable::from_mesh_slice(&slice));
         let packet = build_a_query("google.com");
-        match evaluate_dns_query(&packet, &table, 60, DNS_MAX_UDP_PACKET_SIZE) {
+        match evaluate_dns_query(&packet, &table, 60, DnsResponseSizing::Udp) {
             DnsDecision::Forward(_) => {} // expected
             DnsDecision::Respond(_) => panic!("non-mesh name should be forwarded"),
             DnsDecision::Drop => panic!("valid query should not be dropped"),
@@ -3093,7 +3147,7 @@ mod tests {
 
         let table = ArcSwap::from_pointee(DnsResolutionTable::from_mesh_slice(&slice));
         let packet = build_a_query("api-svc.default.svc.cluster.local");
-        let response = match evaluate_dns_query(&packet, &table, 60, DNS_MAX_UDP_PACKET_SIZE) {
+        let response = match evaluate_dns_query(&packet, &table, 60, DnsResponseSizing::Udp) {
             DnsDecision::Respond(r) => r,
             _ => panic!("mesh service FQDN should produce a response"),
         };
@@ -3117,7 +3171,7 @@ mod tests {
 
         let table = ArcSwap::from_pointee(DnsResolutionTable::from_mesh_slice(&slice));
         let packet = build_a_query("external.third-party.com");
-        let response = match evaluate_dns_query(&packet, &table, 60, DNS_MAX_UDP_PACKET_SIZE) {
+        let response = match evaluate_dns_query(&packet, &table, 60, DnsResponseSizing::Udp) {
             DnsDecision::Respond(r) => r,
             _ => panic!("service entry host should produce a response"),
         };
