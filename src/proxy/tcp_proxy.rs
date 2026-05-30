@@ -80,8 +80,11 @@ pub(crate) fn classify_stream_error(error: &anyhow::Error) -> crate::retry::Erro
 /// node-waypoint topology may legitimately carry non-captured traffic, so an
 /// unresolved cookie downgrades to mesh-wide enforcement rather than refusing
 /// the stream. The scope itself (`PolicyScopeCache`) may still be `None` even
-/// when the identity resolves — a slice/identity enrollment race — which also
-/// yields mesh-wide-only via the same `mesh_authz` fallback.
+/// when the identity resolves — the workload simply carries no scoped policy in
+/// the current slice — which also yields mesh-wide-only via the same
+/// `mesh_authz` fallback. The scope is taken from the same slice generation
+/// that resolved the identity, so a resolved identity can never be paired with
+/// an old/missing scope from a concurrent reload.
 fn resolve_node_waypoint_stream_scope(
     resolver: Option<&crate::modes::mesh::node_waypoint::NodeWaypointIdentityResolver>,
     stream: &TcpStream,
@@ -94,11 +97,13 @@ fn resolve_node_waypoint_stream_scope(
     let Some(resolver) = resolver else {
         return (None, None);
     };
+    // Take the scope FROM the resolve result so the identity gate and the
+    // per-pod scope come from the SAME slice generation (the "never partial"
+    // reload invariant). The TCP path captures scope once at accept and persists
+    // it for the connection's lifetime, so a second `policy_scope_for_pod` call
+    // here could read a newer generation's scope against an older gate decision.
     match resolver.resolve_stream(stream) {
-        Ok(identity) => (
-            resolver.policy_scope_for_pod(&identity.pod_uid),
-            Some(identity.spiffe_id.as_str().to_string()),
-        ),
+        Ok((identity, scope)) => (scope, Some(identity.spiffe_id.as_str().to_string())),
         Err(error) => {
             debug!(
                 proxy_id = %proxy_id,

@@ -108,27 +108,49 @@ fn resolver_with_two_pods(cookie_a: u64, cookie_b: u64) -> Arc<NodeWaypointIdent
         },
     );
 
-    // Install per-pod scopes the way slice apply would: pod A in team-a with
-    // labels app=api,tier=web; pod B in team-b with app=api.
-    let mut scopes = HashMap::new();
-    scopes.insert(
-        pod_a,
-        Arc::new(ferrum_edge::modes::mesh::runtime::PolicyScopeCache::new(
-            spiffe(SPIFFE_A),
+    // Install per-pod scopes the way slice apply does: publish one slice
+    // generation built from the workload set. Pod A is in team-a with labels
+    // app=api,tier=web; pod B is in team-b with app=api. `policy_scope_for_pod`
+    // then derives each pod's scope by joining its enrolled identity's SPIFFE
+    // against the slice's SPIFFE→scope index.
+    resolver.install_policy_scopes_from_workloads(&[
+        workload(
+            SPIFFE_A,
             "team-a",
+            "api",
             labels(&[("app", "api"), ("tier", "web")]),
-        )),
-    );
-    scopes.insert(
-        pod_b,
-        Arc::new(ferrum_edge::modes::mesh::runtime::PolicyScopeCache::new(
-            spiffe(SPIFFE_B),
-            "team-b",
-            labels(&[("app", "api")]),
-        )),
-    );
-    resolver.install_policy_scopes(scopes);
+        ),
+        workload(SPIFFE_B, "team-b", "api", labels(&[("app", "api")])),
+    ]);
     resolver
+}
+
+/// Build a minimal `Workload` for the slice-driven scope install.
+fn workload(
+    spiffe_id: &str,
+    namespace: &str,
+    service_name: &str,
+    labels: HashMap<String, String>,
+) -> ferrum_edge::modes::mesh::config::Workload {
+    use ferrum_edge::identity::TrustDomain;
+    use ferrum_edge::modes::mesh::config::{Workload, WorkloadSelector};
+    Workload {
+        spiffe_id: spiffe(spiffe_id),
+        selector: WorkloadSelector {
+            labels,
+            namespace: Some(namespace.to_string()),
+        },
+        service_name: service_name.to_string(),
+        addresses: Vec::new(),
+        ports: Vec::new(),
+        trust_domain: TrustDomain::new("cluster.local").expect("valid trust domain"),
+        namespace: namespace.to_string(),
+        network: None,
+        cluster: None,
+        weight: None,
+        locality: None,
+        service_account: None,
+    }
 }
 
 /// A Namespace-scoped policy resolves through the per-pod scope to apply to the
@@ -343,16 +365,21 @@ async fn resolve_stream_against_real_accepted_socket_maps_to_pod_scope() {
     };
     resolver.install_policy_scopes_from_workloads(&[workload]);
 
-    // The exact chain the TCP accept loop now runs.
-    let identity = resolver
+    // The exact chain the TCP accept loop now runs: `resolve_stream` returns
+    // BOTH the identity and the per-pod scope from one consistent slice load.
+    let (identity, scope) = resolver
         .resolve_stream(&accepted)
         .expect("accepted socket resolves to enrolled pod identity");
     assert_eq!(identity.pod_uid, pod_a);
     assert_eq!(identity.spiffe_id.as_str(), SPIFFE_A);
 
-    let scope = resolver
+    // The scope returned by resolve and the scope re-queried per request must
+    // agree (same generation), and both must be present for this vouched pod.
+    let scope = scope.expect("resolve must return the resolved pod's scope");
+    let requeried = resolver
         .policy_scope_for_pod(&identity.pod_uid)
         .expect("resolved pod has an installed policy scope");
+    assert_eq!(scope.namespace, requeried.namespace);
 
     let team_a_deny = policy_with_scope(
         "team-a-deny",

@@ -7612,7 +7612,11 @@ async fn run_accept_loop(
                         let node_waypoint_identity =
                             if let Some(resolver) = state.node_waypoint_identity_resolver.as_ref() {
                                 match resolver.resolve_stream(&stream) {
-                                    Ok(identity) => Some(identity),
+                                    // HTTP/HBONE re-queries the per-pod scope per
+                                    // request, so the accept-time scope is unused
+                                    // here; keep only the identity on the
+                                    // connection metadata.
+                                    Ok((identity, _scope)) => Some(identity),
                                     Err(error) => {
                                         record_node_waypoint_identity_drop(&state.overload, &error);
                                         debug!(
