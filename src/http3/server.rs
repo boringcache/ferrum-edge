@@ -1935,10 +1935,22 @@ async fn handle_h3_request(
                         // the probe slot without touching the least-connections
                         // gauge. Without it, a single oversized upload during
                         // HALF_OPEN permanently wedges the breaker (same leak
-                        // class as the native-H3 streaming path). Client-caused:
-                        // connection_error=true skips the latency sample / phantom
-                        // passive success; ClientDisconnect routes to the
-                        // state-neutral record_neutral().
+                        // class as the native-H3 streaming path).
+                        //
+                        // An oversized client upload is client-caused, so
+                        // ClientDisconnect drives the outcome:
+                        //   * connection_error=false — accurate (no transport
+                        //     error occurred; we chose to 413 a too-large body).
+                        //     The ClientDisconnect class centrally suppresses both
+                        //     the least-latency sample (the synthetic 413 reflects
+                        //     no real backend latency) and the passive-health
+                        //     report (no phantom <500 success, and no failure even
+                        //     if 413 sat in unhealthy_status_codes), so passing
+                        //     true here would be redundant and less truthful.
+                        //   * the breaker still goes neutral via record_neutral():
+                        //     the ClientDisconnect arm is evaluated before
+                        //     connection_error, releasing the half-open probe slot
+                        //     without tripping the breaker.
                         crate::proxy::backend_dispatch::record_backend_outcome_no_conn_end(
                             &state,
                             &proxy,
@@ -1947,7 +1959,7 @@ async fn handle_h3_request(
                             upstream_target.as_deref(),
                             cb_target_key.as_deref(),
                             413,
-                            true,
+                            false,
                             Some(crate::retry::ErrorClass::ClientDisconnect),
                             cb_is_half_open_probe,
                             false,
@@ -2128,14 +2140,16 @@ async fn handle_h3_request(
                     // target on every oversized streaming upload. An oversized
                     // client body is client-caused, which drives the two flags
                     // below:
-                    //   * connection_error=true — the request body never
-                    //     reached the backend application layer, so the
-                    //     least-latency TTFB sample is suppressed (a synthetic
-                    //     413 reflects no real backend latency) and passive
-                    //     health does not see a phantom <500 success that would
-                    //     reset failure tracking and re-admit an unhealthy
-                    //     target. It records a conservative failure instead,
-                    //     matching the sibling 502 client-disconnect path below.
+                    //   * connection_error=false — accurate: no transport error
+                    //     occurred; we chose to emit a 413 for a too-large body.
+                    //     The ClientDisconnect class centrally suppresses the
+                    //     least-latency TTFB sample (a synthetic 413 reflects no
+                    //     real backend latency) AND the passive-health report (no
+                    //     phantom <500 success that would reset failure tracking
+                    //     and re-admit an unhealthy target, and no failure even if
+                    //     413 sat in unhealthy_status_codes), so we no longer need
+                    //     connection_error=true to force that suppression — the
+                    //     class does it more accurately.
                     //   * skip_circuit_breaker_record=false — release any
                     //     half-open probe slot via the state-neutral
                     //     record_neutral() (ErrorClass::ClientDisconnect takes
@@ -2152,7 +2166,7 @@ async fn handle_h3_request(
                         upstream_target.as_deref(),
                         cb_target_key.as_deref(),
                         413,
-                        true,
+                        false,
                         Some(crate::retry::ErrorClass::ClientDisconnect),
                         cb_is_half_open_probe,
                         false,
@@ -2182,7 +2196,14 @@ async fn handle_h3_request(
 
                 // Record outcome for CB/health even on failure.
                 // Frontend client aborts while uploading request bodies are
-                // client-caused and must not poison backend CB/passive health.
+                // client-caused and must not poison backend CB/passive health:
+                // h3_streaming_body_failure_outcome maps that case to
+                // (connection_error=false, ClientDisconnect), and the
+                // ClientDisconnect class is centrally suppressed in
+                // record_backend_outcome_inner — it routes the breaker to
+                // record_neutral() and skips both the least-latency sample and
+                // the passive-health report (so this 502 no longer records a
+                // passive failure even when 502 sits in unhealthy_status_codes).
                 let (outcome_connection_error, outcome_error_class) =
                     h3_streaming_body_failure_outcome(
                         is_client_request_body_disconnect,
