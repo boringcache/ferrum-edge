@@ -148,6 +148,11 @@ pub struct CaptureContract {
     pub hbone_redirect_port: u16,
     pub unix_socket_path: String,
     pub bpf_maps: CaptureBpfMaps,
+    /// Fail closed on captured IPv6 outbound (the `connect6` hook returns
+    /// `EPERM`) instead of redirecting it. Set in NodeWaypoint in-netns capture
+    /// mode, whose datapath is IPv4-only, so IPv6 egress cannot bypass
+    /// `mesh_authz`. See [`BpfCaptureConfig::ipv6_outbound_deny`].
+    pub ipv6_outbound_deny: bool,
 }
 
 impl CaptureContract {
@@ -180,6 +185,7 @@ impl CaptureContract {
             hbone_redirect_port,
             unix_socket_path,
             bpf_maps: CaptureBpfMaps::default(),
+            ipv6_outbound_deny: false,
         })
     }
 
@@ -190,11 +196,13 @@ impl CaptureContract {
             hbone_redirect_port: INBOUND_HBONE_PORT,
             unix_socket_path: DEFAULT_NODE_AGENT_SOCKET_PATH.to_string(),
             bpf_maps: CaptureBpfMaps::default(),
+            ipv6_outbound_deny: false,
         }
     }
 
     pub fn bpf_capture_config(&self) -> BpfCaptureConfig {
         BpfCaptureConfig::new(self.outbound_capture_port, self.hbone_redirect_port)
+            .with_ipv6_outbound_deny(self.ipv6_outbound_deny)
     }
 }
 

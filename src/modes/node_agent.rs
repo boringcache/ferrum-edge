@@ -138,7 +138,7 @@ impl NodeAgentConfig {
                 })
                 .unwrap_or_default();
         let excluded_namespaces = pod_watcher::build_excluded_namespaces(&extra_excluded);
-        let capture_contract = CaptureContract::new(
+        let mut capture_contract = CaptureContract::new(
             env_config.node_agent_proxy_mode,
             capture_config.outbound_port,
             env_config.node_agent_hbone_redirect_port,
@@ -147,13 +147,19 @@ impl NodeAgentConfig {
 
         // In-netns capture is the default for NodeWaypoint: publish the per-pod
         // registry (and defer redirect until the mesh proxy's in-netns listener
-        // is ready) whenever the node-agent runs in NodeWaypoint proxy mode.
-        // Other proxy modes have no in-netns listener consumer, so leave it
-        // `None` and skip all the filesystem work on the hot paths.
-        let node_waypoint_pod_registry_dir = if env_config.node_agent_proxy_mode
+        // is ready) whenever the node-agent runs in NodeWaypoint proxy mode with
+        // outbound capture enabled. Other proxy modes have no in-netns listener
+        // consumer, so leave it `None` and skip all the filesystem work on the
+        // hot paths.
+        let node_waypoint_in_netns = env_config.node_agent_proxy_mode
             == NodeAgentProxyMode::NodeWaypoint
-            && capture_config.outbound_capture_enabled
-        {
+            && capture_config.outbound_capture_enabled;
+        // The in-netns listener and GAP-2M sock-ops bridge are IPv4-only, so
+        // captured IPv6 egress must FAIL CLOSED (the `connect6` hook returns
+        // EPERM via this flag) rather than bypass `mesh_authz`. Excluded v6
+        // (CIDR/port excludes) is decided before the deny and still flows.
+        capture_contract.ipv6_outbound_deny = node_waypoint_in_netns;
+        let node_waypoint_pod_registry_dir = if node_waypoint_in_netns {
             Some(std::path::PathBuf::from(
                 &env_config.mesh_node_waypoint_pod_registry_dir,
             ))
@@ -1299,14 +1305,17 @@ fn in_netns_listener_ready(registry_dir: &std::path::Path, pod_uid: &str) -> boo
 
 /// Attach the deferred outbound-redirect program for an enrolled pod.
 ///
-/// Only `connect4` (IPv4) is attached. The in-netns capture listener and the
-/// GAP-2M sock-ops cookie bridge are both IPv4-only, so attaching `connect6`
-/// would rewrite IPv6 connects to `[::1]:<port>` — a pod-loopback port with no
-/// listener — and they would be refused rather than handled. Leaving `connect6`
-/// detached lets IPv6 egress flow normally (un-captured), matching
-/// node-waypoint's IPv6 fail-closed stance, until an IPv6 in-netns listener and
-/// bridge exist. On failure the caller retries on the next tick; a succeeded
-/// attach is never repeated (no double-attach under `CgroupAttachMode::Single`).
+/// Only `connect4` is promoted here: it rewrites egress to the pod-loopback
+/// capture port, so it must wait for the proxy's in-netns listener (the
+/// readiness gate). `connect6` is NOT a redirect in NodeWaypoint mode and is NOT
+/// promoted here — the in-netns listener and GAP-2M bridge are IPv4-only, so
+/// `connect6` is attached up front at enrollment as a fail-closed denier (the
+/// `ipv6_outbound_deny` capture-config flag makes it return EPERM for captured
+/// v6), rejecting IPv6 egress rather than redirecting it to a v6 listener that
+/// does not exist or letting it bypass `mesh_authz`. It needs no listener so it
+/// is not readiness-gated. On failure the caller retries on the next tick; a
+/// succeeded attach is never repeated (no double-attach under
+/// `CgroupAttachMode::Single`).
 fn attach_outbound_redirect(
     backend: &mut dyn EbpfBackend,
     pod_uid: &str,
@@ -1467,22 +1476,33 @@ pub fn handle_pod_added(
     };
 
     if let Some(ref cgroup) = cgroup_path {
-        // Attach inbound getpeername now, but DEFER the outbound-redirect
-        // programs (connect4/connect6) in two cases: (a) outbound capture is
-        // disabled (FERRUM_MESH_OUTBOUND_LISTEN_ADDR port 0) — then connect4/
-        // connect6 are never attached and egress flows normally; or (b) in-netns
-        // capture publishing is on — attaching connect4 now would rewrite a
-        // freshly enrolled pod's egress to a pod-loopback capture port before the
-        // mesh proxy has opened the in-netns listener (refused), so
-        // `promote_pending_redirects` attaches connect4 once the proxy signals
-        // readiness (connect6 stays detached — the in-netns listener and sock-ops
-        // bridge are IPv4-only). Otherwise (outbound on, non-NodeWaypoint) attach
-        // all four up front. The registry dir is `None` when outbound is disabled,
-        // so no promotion runs and connect4/connect6 are simply never attached.
+        // Attach inbound getpeername now; outbound-redirect handling depends on
+        // mode:
+        //  (a) outbound capture disabled (FERRUM_MESH_OUTBOUND_LISTEN_ADDR port
+        //      0) — connect4/connect6 are never attached and egress flows
+        //      normally (no capture, nothing to fail closed).
+        //  (b) NodeWaypoint in-netns capture — connect4 is DEFERRED (attaching it
+        //      now would rewrite a freshly enrolled pod's egress to the
+        //      pod-loopback capture port before the mesh proxy has opened the
+        //      in-netns listener, which would refuse it), so
+        //      `promote_pending_redirects` attaches connect4 once the proxy
+        //      signals readiness. connect6 IS attached now as a fail-closed
+        //      denier: the in-netns listener + sock-ops bridge are IPv4-only, so
+        //      the `ipv6_outbound_deny` capture-config flag makes connect6 return
+        //      EPERM for captured v6 — otherwise IPv6 egress would bypass
+        //      mesh_authz entirely. It needs no listener, so it is not deferred.
+        //  (c) otherwise (outbound on, non-NodeWaypoint) — attach all four up
+        //      front (connect6 redirects normally; the deny flag is unset).
         let outbound_enabled = config.capture_config.outbound_capture_enabled;
         let defer_redirect = config.node_waypoint_pod_registry_dir.is_some();
-        let programs: &[&str] = if !outbound_enabled || defer_redirect {
+        let programs: &[&str] = if !outbound_enabled {
             &["ferrum_getpeername4", "ferrum_getpeername6"]
+        } else if defer_redirect {
+            &[
+                "ferrum_connect6",
+                "ferrum_getpeername4",
+                "ferrum_getpeername6",
+            ]
         } else {
             &[
                 "ferrum_connect4",
@@ -2410,6 +2430,51 @@ mod tests {
     }
 
     #[test]
+    fn from_env_config_fail_closes_ipv6_only_in_node_waypoint_mode() {
+        // NodeWaypoint in-netns capture is IPv4-only, so the node-agent must mark
+        // the capture config to fail-close captured IPv6 egress (connect6 →
+        // EPERM) rather than let it bypass mesh_authz. Other proxy modes leave v6
+        // egress alone.
+        let waypoint = EnvConfig {
+            node_agent_proxy_mode: NodeAgentProxyMode::NodeWaypoint,
+            ..EnvConfig::default()
+        };
+        with_env_vars(&[("FERRUM_NODE_AGENT_NODE_NAME", "node-a")], || {
+            let config = NodeAgentConfig::from_env_config(&waypoint)
+                .expect("node-agent config should parse");
+            assert!(
+                config.capture_contract.ipv6_outbound_deny,
+                "NodeWaypoint in-netns mode must fail-close captured IPv6 egress"
+            );
+            assert_ne!(
+                config
+                    .capture_contract
+                    .bpf_capture_config()
+                    .ipv6_outbound_deny,
+                0,
+                "the deny flag must reach the BPF capture config the connect6 hook reads"
+            );
+            assert!(
+                config.node_waypoint_pod_registry_dir.is_some(),
+                "in-netns registry is published in NodeWaypoint mode"
+            );
+        });
+
+        let local_pod = EnvConfig {
+            node_agent_proxy_mode: NodeAgentProxyMode::LocalPod,
+            ..EnvConfig::default()
+        };
+        with_env_vars(&[("FERRUM_NODE_AGENT_NODE_NAME", "node-b")], || {
+            let config = NodeAgentConfig::from_env_config(&local_pod)
+                .expect("node-agent config should parse");
+            assert!(
+                !config.capture_contract.ipv6_outbound_deny,
+                "non-NodeWaypoint modes do not fail-close IPv6 egress"
+            );
+        });
+    }
+
+    #[test]
     fn initialize_backend_populates_maps() {
         let config = NodeAgentConfig {
             node_name: "test-node".to_string(),
@@ -3011,10 +3076,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn node_waypoint_defers_redirect_until_listener_ready() {
-        // With in-netns capture publishing enabled, enrollment must NOT attach
-        // the outbound-redirect programs (connect4/connect6) — only the inbound
-        // getpeername programs — so a freshly enrolled pod's egress is not
-        // redirected before the mesh proxy opens the in-netns listener.
+        // With in-netns capture publishing enabled, enrollment must DEFER the
+        // IPv4 outbound redirect (connect4) until the mesh proxy opens the
+        // in-netns listener, while attaching the inbound getpeername programs and
+        // connect6 (the fail-closed IPv6 denier, which needs no listener) up
+        // front — so a freshly enrolled pod's IPv4 egress is not redirected to a
+        // dead port and its IPv6 egress cannot bypass mesh_authz.
         let _veth_guard = crate::ebpf::veth::tests::TestOverrideGuard::new("veth_test");
         let mut backend = MockEbpfBackend::default();
         backend.load_programs().unwrap();
@@ -3057,15 +3124,19 @@ mod tests {
             .map(|(_, prog)| prog.as_str())
             .collect();
         assert!(
-            !attached.contains(&"ferrum_connect4") && !attached.contains(&"ferrum_connect6"),
-            "outbound redirect programs must be deferred, got {attached:?}"
+            !attached.contains(&"ferrum_connect4"),
+            "connect4 (IPv4 outbound redirect) must be deferred until the in-netns listener is ready, got {attached:?}"
+        );
+        assert!(
+            attached.contains(&"ferrum_connect6"),
+            "connect6 attaches immediately as the fail-closed IPv6 denier, got {attached:?}"
         );
         assert!(
             attached.contains(&"ferrum_getpeername4") && attached.contains(&"ferrum_getpeername6"),
             "inbound getpeername programs attach immediately, got {attached:?}"
         );
 
-        // Promotion while the listener is not ready leaves redirect deferred.
+        // Promotion while the listener is not ready leaves the IPv4 redirect deferred.
         let mut redirect_state = HashMap::new();
         promote_pending_redirects(
             &mut backend,
@@ -3082,7 +3153,7 @@ mod tests {
             "redirect stays deferred while the listener is not ready"
         );
 
-        // Once the listener is ready, the redirect is enabled (connect4 + connect6).
+        // Once the listener is ready, the IPv4 redirect (connect4) is enabled.
         promote_pending_redirects(
             &mut backend,
             &pod_states,
@@ -3098,11 +3169,11 @@ mod tests {
             "connect4 attached once the listener is ready"
         );
         assert!(
-            !backend
+            backend
                 .cgroup_attachments
                 .iter()
                 .any(|(_, p)| p == "ferrum_connect6"),
-            "connect6 must NOT be attached in in-netns mode (IPv4-only listener and bridge)"
+            "connect6 stays attached as the fail-closed IPv6 denier (attached at enrollment, not via promotion)"
         );
 
         // Idempotent: a further pass with the pod marked Done does not re-attach

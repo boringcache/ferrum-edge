@@ -205,6 +205,13 @@ impl WorkloadIdentity {
 pub struct BpfCaptureConfig {
     pub outbound_capture_port: u32,
     pub hbone_redirect_port: u32,
+    /// Non-zero → captured IPv6 outbound connections are DENIED (the `connect6`
+    /// hook returns `EPERM`) instead of redirected. Set in NodeWaypoint in-netns
+    /// capture mode, whose in-netns listener and GAP-2M sock-ops bridge are
+    /// IPv4-only: without it, captured IPv6 egress would bypass `mesh_authz`
+    /// entirely instead of failing closed. Excluded v6 (bypass UID / port / CIDR
+    /// excludes) is decided before the deny and still flows.
+    pub ipv6_outbound_deny: u32,
 }
 
 /// Maximum number of explicit `includeOutboundPorts` ports the per-cgroup
@@ -425,7 +432,15 @@ impl BpfCaptureConfig {
         Self {
             outbound_capture_port: outbound_capture_port as u32,
             hbone_redirect_port: hbone_redirect_port as u32,
+            ipv6_outbound_deny: 0,
         }
+    }
+
+    /// Set whether captured IPv6 outbound connections fail closed (denied) —
+    /// see [`Self::ipv6_outbound_deny`].
+    pub const fn with_ipv6_outbound_deny(mut self, deny: bool) -> Self {
+        self.ipv6_outbound_deny = deny as u32;
+        self
     }
 
     pub const fn default_ports() -> Self {
@@ -499,7 +514,7 @@ mod tests {
         // 8-byte aligned for the BPF verifier.
         assert_eq!(mem::size_of::<WorkloadIdentity>(), 32);
         assert_eq!(mem::align_of::<WorkloadIdentity>(), 8);
-        assert_eq!(mem::size_of::<BpfCaptureConfig>(), 8);
+        assert_eq!(mem::size_of::<BpfCaptureConfig>(), 12);
         assert_eq!(mem::size_of::<CidrKey4>(), 4);
         assert_eq!(mem::size_of::<CidrKey6>(), 16);
         // IncludePortsPolicy: two u32 (8) + [u16; INCLUDE_PORTS_MAX] (32) = 40 bytes, 4-byte aligned.
@@ -672,5 +687,30 @@ mod tests {
         assert_eq!(config.outbound_capture_port, OUTBOUND_CAPTURE_PORT as u32);
         assert_eq!(config.hbone_redirect_port, INBOUND_HBONE_PORT as u32);
         assert_eq!(FERRUM_CAPTURE_CONFIG_KEY, 0);
+        // IPv6 egress is redirected (not denied) by default; the deny is opt-in
+        // for the IPv4-only NodeWaypoint in-netns datapath.
+        assert_eq!(config.ipv6_outbound_deny, 0);
+    }
+
+    #[test]
+    fn ipv6_outbound_deny_flag_round_trips() {
+        assert_eq!(
+            BpfCaptureConfig::new(15001, 15008).ipv6_outbound_deny,
+            0,
+            "v6 deny is off unless explicitly set"
+        );
+        assert_ne!(
+            BpfCaptureConfig::new(15001, 15008)
+                .with_ipv6_outbound_deny(true)
+                .ipv6_outbound_deny,
+            0,
+            "with_ipv6_outbound_deny(true) must set the fail-closed flag the connect6 hook reads"
+        );
+        assert_eq!(
+            BpfCaptureConfig::new(15001, 15008)
+                .with_ipv6_outbound_deny(false)
+                .ipv6_outbound_deny,
+            0
+        );
     }
 }
