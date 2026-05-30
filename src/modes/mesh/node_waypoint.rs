@@ -930,9 +930,14 @@ impl NodeWaypointIdentityResolver {
                 workload_spiffe_hash: identity.workload_spiffe_hash,
                 orig_dst4_cookies,
                 orig_dst6_cookies,
-                has_policy_scope: slice
-                    .scopes_by_spiffe
-                    .contains_key(identity.spiffe_id.as_str()),
+                // Per-pod-UID scope first (normal K8s pods), then the SPIFFE
+                // fallback (uid-less VM/WorkloadEntry) — mirroring
+                // `policy_scope_for_pod` so the admin view matches what authz
+                // actually resolves.
+                has_policy_scope: slice.scopes_by_pod_uid.contains_key(&identity.pod_uid)
+                    || slice
+                        .scopes_by_spiffe
+                        .contains_key(identity.spiffe_id.as_str()),
             }
         }));
         out.sort_by_key(|summary| summary.pod_uid);

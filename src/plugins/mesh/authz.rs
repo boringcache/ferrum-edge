@@ -40,9 +40,10 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::identity::{SpiffeId, TrustDomain};
 use crate::modes::mesh::config::{
-    MeshPolicy, PolicyScope, is_mesh_condition_ip_key, is_supported_mesh_condition_key,
-    mesh_condition_has_values, normalize_request_match_host_pattern,
-    policy_scope_applies_to_workload, validate_mesh_condition_ip_block,
+    MeshPolicy, PolicyAction, PolicyScope, is_mesh_condition_ip_key,
+    is_supported_mesh_condition_key, mesh_condition_has_values,
+    normalize_request_match_host_pattern, policy_scope_applies_to_workload,
+    validate_mesh_condition_ip_block,
 };
 use crate::modes::mesh::hbone::{BAGGAGE_HEADER, HboneIdentity};
 use crate::modes::mesh::policy::{
@@ -347,10 +348,20 @@ impl MeshAuthz {
         // The stream path fails closed on a missing per-pod scope only when such
         // policies exist; otherwise mesh-wide-only evaluation is complete.
         let has_scoped_policies = per_pod_policy_scoping
-            && slice
-                .mesh_policies
-                .iter()
-                .any(|policy| !matches!(policy.scope, PolicyScope::MeshWide));
+            && slice.mesh_policies.iter().any(|policy| {
+                // Only ENFORCING scoped policies justify failing closed on a
+                // missing per-pod scope. A scoped `Audit` rule only records
+                // `mesh_authz.audit_policy` and returns `Continue`, so an
+                // audit-only scoped policy must not 403 the request — let it
+                // fall through like any other non-enforcing case. Istio
+                // empty-rule ALLOW (allow-nothing) is translated to a
+                // never-matching `Allow` rule, so it is still counted here.
+                !matches!(policy.scope, PolicyScope::MeshWide)
+                    && policy
+                        .rules
+                        .iter()
+                        .any(|rule| matches!(rule.action, PolicyAction::Allow | PolicyAction::Deny))
+            });
         Ok(Self {
             slice,
             has_header_rules,

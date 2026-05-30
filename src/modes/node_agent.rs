@@ -1220,17 +1220,6 @@ pub fn handle_pod_added(
     let pod_ip = event.pod_ip_str.and_then(pod_watcher::parse_pod_ip);
     let cgroup_path = cgroup::resolve_pod_cgroup_path(&config.cgroup_root, pod_uid)
         .map(|p| p.to_string_lossy().to_string());
-    // Publish this pod's cgroup path to the per-pod registry so the mesh
-    // proxy's in-netns capture listeners can discover it. Enrollment is already
-    // confirmed above (the non-`Enroll` decision early-returns). Best-effort and
-    // gated on `node_waypoint_pod_registry_dir` being `Some` (in-netns listeners
-    // + NodeWaypoint topology); only meaningful once the cgroup path resolves.
-    if let (Some(dir), Some(cgroup_path_value)) = (
-        &config.node_waypoint_pod_registry_dir,
-        cgroup_path.as_deref(),
-    ) {
-        publish_pod_registry(dir, pod_uid, cgroup_path_value);
-    }
     // Production: the kube-rs caller sets `veth_iface_override = None`; the
     // resolver first uses an explicit pod PID when available, then falls back
     // to the resolved pod cgroup to find a live process in that pod.
@@ -1384,6 +1373,18 @@ pub fn handle_pod_added(
 
     if state.attached {
         pod_states.insert(pod_uid.to_string(), state);
+        // Publish to the in-netns capture registry only AFTER enrollment fully
+        // succeeded (programs attached, pod-IP + identity written), so a failed
+        // or partial enrollment never leaves a stale entry that would make the
+        // mesh proxy open a listener for a pod that was never captured. Removal
+        // is handled by `handle_pod_removed`. Gated on the registry being
+        // configured (in-netns listeners + NodeWaypoint topology).
+        if let (Some(dir), Some(cgroup_path_value)) = (
+            &config.node_waypoint_pod_registry_dir,
+            cgroup_path.as_deref(),
+        ) {
+            publish_pod_registry(dir, pod_uid, cgroup_path_value);
+        }
     }
 }
 

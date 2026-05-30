@@ -222,12 +222,23 @@ impl<B: NetnsBackend> NetnsCaptureManager<B> {
             }
         }
 
-        // Close listeners whose netns no longer has any enrolled pod.
+        // Close a listener only when ALL of its pods have left the registry. A
+        // transient PID/netns-resolve miss (e.g. a container restarting while
+        // its registry file still exists) keeps the pod in `targets`, so its
+        // listener is retained — matching the retry contract above and avoiding
+        // capture flapping. `desired` is netns-keyed and omits this round's
+        // unresolvable pods, so it must NOT drive teardown.
+        let registry_uids: HashSet<&str> = targets.iter().map(|t| t.pod_uid.as_str()).collect();
         let gone: Vec<u64> = self
             .active
-            .keys()
-            .filter(|netns| !desired.contains_key(netns))
-            .copied()
+            .iter()
+            .filter(|(_, listener)| {
+                !listener
+                    .pod_uids
+                    .iter()
+                    .any(|uid| registry_uids.contains(uid.as_str()))
+            })
+            .map(|(netns, _)| *netns)
             .collect();
         for netns in gone {
             if let Some(listener) = self.active.remove(&netns) {
@@ -336,15 +347,30 @@ impl NetnsBackend for ProxyNetnsBackend {
         };
 
         // Per-listener stop signal. A forwarder flips it when the global
-        // shutdown fires, so the accept loop stops on either signal.
+        // shutdown fires so the accept loop stops on either signal; the
+        // forwarder ALSO exits when the listener is closed directly (via
+        // `ActiveListener::close`, e.g. on pod removal), so a churned listener
+        // never leaves an idle task lingering until process shutdown.
         let (stop_tx, stop_rx) = watch::channel(false);
         let forwarder_stop = stop_tx.clone();
+        let mut closed = stop_tx.subscribe();
         let mut global = self.global_shutdown.clone();
         tokio::spawn(async move {
-            while global.changed().await.is_ok() {
-                if *global.borrow() {
-                    let _ = forwarder_stop.send(true);
-                    break;
+            loop {
+                tokio::select! {
+                    changed = global.changed() => {
+                        if changed.is_err() || *global.borrow() {
+                            let _ = forwarder_stop.send(true);
+                            break;
+                        }
+                    }
+                    changed = closed.changed() => {
+                        // Listener closed directly (pod removed) — nothing to
+                        // forward; just stop this task.
+                        if changed.is_err() || *closed.borrow() {
+                            break;
+                        }
+                    }
                 }
             }
         });
