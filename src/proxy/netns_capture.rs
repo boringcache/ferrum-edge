@@ -55,7 +55,7 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
-use super::{ListenerTlsSource, ProxyState, run_accept_loop};
+use super::{ListenerTlsSource, ProxyState, SourceIpOverride, run_accept_loop};
 
 /// A pod the node-agent has enrolled for node-waypoint capture. `cgroup_path`
 /// is the pod cgroup directory the node-agent resolved; the manager walks it to
@@ -145,22 +145,31 @@ pub trait NetnsBackend: Send + Sync + 'static {
         &self,
         target: &PodCaptureTarget,
         capture_addr: SocketAddr,
-    ) -> Option<watch::Sender<bool>>;
+    ) -> Option<OpenedNetnsListener>;
+}
+
+pub struct OpenedNetnsListener {
+    stop: watch::Sender<bool>,
+    source_ip: Option<watch::Sender<Option<IpAddr>>>,
+}
+
+impl OpenedNetnsListener {
+    fn new(stop: watch::Sender<bool>, source_ip: Option<watch::Sender<Option<IpAddr>>>) -> Self {
+        Self { stop, source_ip }
+    }
 }
 
 /// One open in-netns listener, keyed in the manager by netns inode.
 struct ActiveListener {
     stop: watch::Sender<bool>,
+    source_ip_tx: Option<watch::Sender<Option<IpAddr>>>,
     /// Pods sharing this netns (normally exactly one; a pod's sandbox and
     /// containers share its netns). Kept for observability and so a netns stays
     /// open while any of its pods is still enrolled.
     pod_uids: HashSet<String>,
     /// The source pod IP this listener's accept loop is currently overriding
-    /// with (its `source_ip_override`), captured at open time. Tracked so a
-    /// later change to the pod's registered IP (or its first assignment, when
-    /// the pod was enrolled before `status.podIP` existed) reopens the listener
-    /// instead of silently reporting `127.0.0.1`/a stale IP to authz, logs, and
-    /// IP-keyed plugins.
+    /// with. Tracked so a later change to the pod's registered IP can update the
+    /// running accept loop without rebinding the pod-loopback socket.
     source_ip: Option<IpAddr>,
 }
 
@@ -359,11 +368,11 @@ impl<B: NetnsBackend> NetnsCaptureManager<B> {
         }
 
         // Open listeners for newly-seen netns; for an existing netns, refresh pod
-        // membership and reopen when the source pod IP changed. The accept loop
-        // captures `source_ip_override` once at open, so a pod that was enrolled
-        // before `status.podIP` existed (override `None`), or whose IP later
-        // changed, would otherwise keep reporting `127.0.0.1`/a stale IP to
-        // authz, logs, and IP-keyed plugins until the pod is removed.
+        // membership and update the source-IP override when the pod IP changes.
+        // The accept loop reads the override from a watch channel, so a pod that
+        // was enrolled before `status.podIP` existed (override `None`), or whose
+        // IP later changed, does not need a socket rebind just to report the
+        // current pod IP to authz, logs, and IP-keyed plugins.
         for (netns, pod_uids) in desired {
             // The source IP this netns's listener should report: take it from the
             // same target that would open it. Stable while one pod owns the netns
@@ -371,74 +380,28 @@ impl<B: NetnsBackend> NetnsCaptureManager<B> {
             let desired_target = targets.iter().find(|t| pod_uids.contains(&t.pod_uid));
             let desired_ip = desired_target.and_then(|t| t.pod_ip);
 
-            if let Some(existing_ip) = self.active.get(&netns).map(|l| l.source_ip) {
+            if let Some(listener) = self.active.get_mut(&netns) {
+                let existing_ip = listener.source_ip;
                 if existing_ip == desired_ip {
-                    if let Some(listener) = self.active.get_mut(&netns) {
-                        listener.pod_uids = pod_uids;
-                    }
+                    listener.pod_uids = pod_uids;
                     continue;
                 }
-                // Source pod IP changed. The accept loop captures
-                // `source_ip_override` at open, so adopt the new IP by retiring
-                // the old listener and opening a replacement. Do not use
-                // `SO_REUSEPORT` to bind-before-close here: this listener is
-                // opened inside the workload pod's network namespace, and
-                // opting into a reuseport group would let a same-eUID pod
-                // process bind the same loopback addr:port and receive captured
-                // egress before Ferrum's accept path enforces mesh policy.
-                let Some(target) = desired_target else {
-                    continue;
-                };
+                // Source pod IP changed. Keep the existing listener and push the
+                // new override into its accept loop. Rebinding this pod-loopback
+                // socket would either require SO_REUSEPORT (unsafe inside a
+                // workload netns) or create a no-listener window for redirected
+                // egress.
+                listener.pod_uids = pod_uids;
+                listener.source_ip = desired_ip;
+                if let Some(source_ip_tx) = &listener.source_ip_tx {
+                    let _ = source_ip_tx.send(desired_ip);
+                }
                 debug!(
                     netns_inode = netns,
                     old_ip = ?existing_ip,
                     new_ip = ?desired_ip,
-                    "Node-waypoint capture: source pod IP changed; rebinding in-netns listener"
+                    "Node-waypoint capture: source pod IP changed; updated in-netns listener override"
                 );
-                if let Some(old) = self.active.remove(&netns) {
-                    old.close();
-                    if let Some(dir) = &self.ready_dir {
-                        for uid in &old.pod_uids {
-                            remove_ready_marker(dir, uid);
-                        }
-                    }
-                }
-                match self.backend.open_listener(target, self.capture_addr) {
-                    Some(stop) => {
-                        // A listener now exists for this netns, so publish the
-                        // readiness markers again.
-                        if let Some(dir) = &self.ready_dir {
-                            for uid in &pod_uids {
-                                write_ready_marker(dir, uid);
-                            }
-                        }
-                        self.active.insert(
-                            netns,
-                            ActiveListener {
-                                stop,
-                                pod_uids,
-                                source_ip: desired_ip,
-                            },
-                        );
-                        info!(
-                            netns_inode = netns,
-                            pod_uid = %target.pod_uid,
-                            source_ip = ?desired_ip,
-                            "Reopened node-waypoint in-netns capture listener for new source pod IP"
-                        );
-                    }
-                    None => {
-                        // Replacement bind failed after retiring the stale
-                        // listener. Leave the pod unready so the node-agent does
-                        // not keep redirecting egress to a closed capture port; a
-                        // later reconcile will retry the open.
-                        warn!(
-                            netns_inode = netns,
-                            pod_uid = %target.pod_uid,
-                            "Failed to rebind in-netns listener for new source pod IP; listener closed, will retry"
-                        );
-                    }
-                }
                 continue;
             }
 
@@ -448,7 +411,7 @@ impl<B: NetnsBackend> NetnsCaptureManager<B> {
                 continue;
             };
             match self.backend.open_listener(target, self.capture_addr) {
-                Some(stop) => {
+                Some(opened) => {
                     info!(
                         netns_inode = netns,
                         pod_uid = %target.pod_uid,
@@ -466,7 +429,8 @@ impl<B: NetnsBackend> NetnsCaptureManager<B> {
                     self.active.insert(
                         netns,
                         ActiveListener {
-                            stop,
+                            stop: opened.stop,
+                            source_ip_tx: opened.source_ip,
                             pod_uids,
                             source_ip: desired_ip,
                         },
@@ -533,7 +497,7 @@ impl NetnsBackend for ProxyNetnsBackend {
         &self,
         target: &PodCaptureTarget,
         capture_addr: SocketAddr,
-    ) -> Option<watch::Sender<bool>> {
+    ) -> Option<OpenedNetnsListener> {
         let std_listener =
             match imp::bind_capture_listener_in_pod_netns(&target.cgroup_path, capture_addr) {
                 Ok(listener) => listener,
@@ -561,6 +525,7 @@ impl NetnsBackend for ProxyNetnsBackend {
         // `ActiveListener::close`, e.g. on pod removal), so a churned listener
         // never leaves an idle task lingering until process shutdown.
         let (stop_tx, stop_rx) = watch::channel(false);
+        let (source_ip_tx, source_ip_rx) = watch::channel(target.pod_ip);
         let forwarder_stop = stop_tx.clone();
         let mut closed = stop_tx.subscribe();
         let mut global = self.global_shutdown.clone();
@@ -587,7 +552,6 @@ impl NetnsBackend for ProxyNetnsBackend {
         let state = self.state.clone();
         let conn_semaphore = self.conn_semaphore.clone();
         let mesh_direction = self.mesh_direction;
-        let source_ip_override = target.pod_ip;
         tokio::spawn(async move {
             run_accept_loop(
                 listener,
@@ -600,12 +564,12 @@ impl NetnsBackend for ProxyNetnsBackend {
                 stop_rx,
                 mesh_direction,
                 0,
-                source_ip_override,
+                SourceIpOverride::Dynamic(source_ip_rx),
             )
             .await;
         });
 
-        Some(stop_tx)
+        Some(OpenedNetnsListener::new(stop_tx, Some(source_ip_tx)))
     }
 }
 
@@ -784,14 +748,14 @@ mod tests {
             &self,
             target: &PodCaptureTarget,
             _addr: SocketAddr,
-        ) -> Option<watch::Sender<bool>> {
+        ) -> Option<OpenedNetnsListener> {
             let netns = self.netns_key(target)?;
             self.opened.lock().unwrap().push(netns);
             // The manager records closes by dropping the listener from `active`;
             // tests assert on `mgr.active` membership, so the mock just hands
             // back a live stop handle.
             let (tx, _rx) = watch::channel(false);
-            Some(tx)
+            Some(OpenedNetnsListener::new(tx, None))
         }
     }
 
@@ -920,11 +884,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconcile_reopens_listener_when_pod_ip_changes() {
+    async fn reconcile_updates_listener_source_ip_when_pod_ip_changes() {
         // pod-a is enrolled before `status.podIP` exists (override `None`), then
-        // gets an IP, then the IP changes. Each transition must reopen the
-        // listener so the accept loop's `source_ip_override` tracks the current
-        // pod IP rather than reporting loopback / a stale address.
+        // gets an IP, then the IP changes. Each transition must update the
+        // listener's source override without rebinding the pod-loopback socket.
         let targets = Arc::new(Mutex::new(vec![PodCaptureTarget {
             pod_uid: "pod-a".to_string(),
             cgroup_path: "/cg/a".to_string(),
@@ -959,25 +922,25 @@ mod tests {
             "no reopen when the source IP is unchanged"
         );
 
-        // status.podIP assigned → reopen so the override is no longer None.
+        // status.podIP assigned → update the override without reopening.
         let ip1: IpAddr = "10.1.2.3".parse().unwrap();
         targets.lock().unwrap()[0].pod_ip = Some(ip1);
         assert_eq!(mgr.reconcile_once(), 1);
         assert_eq!(
             mgr.backend.opened.lock().unwrap().len(),
-            2,
-            "reopened when the pod first gets an IP"
+            1,
+            "pod IP assignment must not reopen the listener"
         );
         assert_eq!(mgr.active.get(&100).unwrap().source_ip, Some(ip1));
 
-        // IP changes again → reopen again.
+        // IP changes again → update again without reopening.
         let ip2: IpAddr = "10.1.2.9".parse().unwrap();
         targets.lock().unwrap()[0].pod_ip = Some(ip2);
         assert_eq!(mgr.reconcile_once(), 1);
         assert_eq!(
             mgr.backend.opened.lock().unwrap().len(),
-            3,
-            "reopened when the pod IP changes"
+            1,
+            "pod IP changes must not reopen the listener"
         );
         assert_eq!(mgr.active.get(&100).unwrap().source_ip, Some(ip2));
     }
@@ -1059,11 +1022,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reopen_failure_closes_listener_and_marker() {
+    async fn pod_ip_change_keeps_listener_and_marker_without_reopen() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        // Backend that opens the first listener but fails every reopen, to drive
-        // the IP-change reopen path where the replacement bind fails.
+        // Backend that opens the first listener and would fail any later open.
+        // A pod IP update must not call it again: closing the active listener
+        // would leave already-promoted redirects pointing at an empty port.
         struct FailReopenBackend {
             opens: AtomicUsize,
         }
@@ -1075,10 +1039,10 @@ mod tests {
                 &self,
                 _target: &PodCaptureTarget,
                 _addr: SocketAddr,
-            ) -> Option<watch::Sender<bool>> {
+            ) -> Option<OpenedNetnsListener> {
                 if self.opens.fetch_add(1, Ordering::SeqCst) == 0 {
                     let (tx, _rx) = watch::channel(false);
-                    Some(tx)
+                    Some(OpenedNetnsListener::new(tx, None))
                 } else {
                     None
                 }
@@ -1111,19 +1075,22 @@ mod tests {
         assert_eq!(mgr.reconcile_once(), 1);
         assert!(ready.path().join("pod-a").exists());
 
-        // Pod IP changes → rebind attempted, backend fails it. Because the
-        // in-pod listener must not use SO_REUSEPORT, the manager retires the
-        // stale listener first and leaves the pod unready until a later reconcile
-        // can bind a replacement.
+        // Pod IP changes → update metadata only. The existing listener and ready
+        // marker must stay in place even though any reopen would fail.
         targets.lock().unwrap()[0].pod_ip = Some("10.0.0.7".parse().unwrap());
         assert_eq!(
             mgr.reconcile_once(),
-            0,
-            "a failed rebind leaves no stale listener active"
+            1,
+            "a pod IP update keeps the existing listener active"
         );
         assert!(
-            !ready.path().join("pod-a").exists(),
-            "the readiness marker is removed when the stale listener is closed"
+            ready.path().join("pod-a").exists(),
+            "the readiness marker stays while the listener still serves the pod"
+        );
+        assert_eq!(
+            mgr.backend.opens.load(Ordering::SeqCst),
+            1,
+            "pod IP changes must not attempt a replacement bind"
         );
     }
 
