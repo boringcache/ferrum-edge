@@ -316,12 +316,10 @@ pub fn increment_xds_first_slice_nack(namespace: impl AsRef<str>, type_url: impl
         .fetch_add(1, Ordering::Relaxed);
 }
 
-/// Count a mesh slice applied under xDS resource warming from a partial per-type
-/// update — i.e. the converged required-type versions were not all identical
-/// (e.g. a policy/workload-only ECDS update applied without re-sending the
-/// name-only CDS/EDS/LDS/RDS). This is expected steady-state activity under
-/// warming, not an error; the counter lets operators confirm incremental
-/// convergence is happening and gauge config churn. Keyed by `namespace` only
+/// Count any defensive mesh-slice apply that is explicitly marked as version
+/// skewed. Normal xDS apply now requires coherent required-type versions before
+/// installing a slice, so this counter should remain zero unless a future caller
+/// deliberately opts into applying a skewed warmed slice. Keyed by `namespace` only
 /// (matching `ferrum_xds_first_slice_nacks_total`) — low, operator-bounded
 /// cardinality; the per-type version strings live behind JWT on
 /// `/mesh/config-drift` because they embed config timestamps + content digests.
@@ -481,7 +479,7 @@ pub fn render_mesh_observability_metrics(output: &mut String) {
 
     if !XDS_WARMING_PARTIAL_APPLIES.is_empty() {
         output.push_str(
-            "# HELP ferrum_xds_warming_partial_applies_total Mesh slices applied under xDS resource warming from a partial per-type update (converged required-type versions were not all identical).\n",
+            "# HELP ferrum_xds_warming_partial_applies_total Mesh slices applied while marked as xDS required-version skewed. Normal coherent xDS apply should not increment this.\n",
         );
         output.push_str("# TYPE ferrum_xds_warming_partial_applies_total counter\n");
         for entry in XDS_WARMING_PARTIAL_APPLIES.iter() {
