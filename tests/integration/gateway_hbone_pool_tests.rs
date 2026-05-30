@@ -16,6 +16,8 @@ use rcgen::{
 };
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -200,6 +202,84 @@ async fn start_hbone_echo_server(
     (addr, baggage_rx)
 }
 
+/// HBONE echo server that survives across many CONNECT streams and counts every
+/// distinct TCP connection it accepts. Each accepted TCP connection is one full
+/// TLS+h2 handshake, so the returned counter is the number of times the gateway
+/// pool (re)dialed the sidecar. The regression test for PR #1400 asserts this
+/// stays at 1 while a busy connection is repeatedly served by the shared-lock
+/// fast path: if the fast path stops refreshing recency, the connection is
+/// pruned as idle and redialed, bumping this counter past 1.
+///
+/// Unlike `start_hbone_echo_server`, every CONNECT stream on every connection is
+/// answered with an echo, so the pool can keep driving `get_tunnel` in a loop.
+async fn start_hbone_counting_echo_server(
+    server_slot: SharedSvidBundle,
+) -> (std::net::SocketAddr, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind hbone counting server");
+    let addr = listener.local_addr().expect("listener addr");
+    let connection_count = Arc::new(AtomicUsize::new(0));
+    let count_for_task = connection_count.clone();
+
+    tokio::spawn(async move {
+        let inbound = build_spiffe_inbound_config(server_slot, true, Arc::new(Vec::new()))
+            .expect("server config");
+        let acceptor = TlsAcceptor::from(inbound);
+        loop {
+            let (tcp, _) = match listener.accept().await {
+                Ok(accepted) => accepted,
+                Err(_) => return,
+            };
+            count_for_task.fetch_add(1, Ordering::SeqCst);
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let tls = match acceptor.accept(tcp).await {
+                    Ok(tls) => tls,
+                    Err(_) => return,
+                };
+                let mut h2 = match h2::server::handshake(tls).await {
+                    Ok(h2) => h2,
+                    Err(_) => return,
+                };
+                while let Some(next) = h2.accept().await {
+                    let (request, mut respond) = match next {
+                        Ok(stream) => stream,
+                        Err(_) => break,
+                    };
+                    if request.method() != http::Method::CONNECT {
+                        continue;
+                    }
+                    tokio::spawn(async move {
+                        let mut recv = request.into_body();
+                        let response = Response::builder()
+                            .status(StatusCode::OK)
+                            .body(())
+                            .expect("connect response");
+                        let mut send = match respond.send_response(response, false) {
+                            Ok(send) => send,
+                            Err(_) => return,
+                        };
+                        while let Some(chunk) = recv.data().await {
+                            let chunk = match chunk {
+                                Ok(chunk) => chunk,
+                                Err(_) => return,
+                            };
+                            let _ = recv.flow_control().release_capacity(chunk.len());
+                            if send.send_data(chunk, false).is_err() {
+                                return;
+                            }
+                        }
+                        let _ = send.send_data(Bytes::new(), true);
+                    });
+                }
+            });
+        }
+    });
+
+    (addr, connection_count)
+}
+
 async fn start_hbone_reject_server(
     server_slot: SharedSvidBundle,
     status: StatusCode,
@@ -289,6 +369,126 @@ async fn hbone_pool_opens_spiffe_mtls_connect_and_injects_source_baggage() {
 
     assert_eq!(&echoed, b"mesh-hello");
     assert_eq!(baggage_rx.await.expect("baggage"), gateway_id.as_str());
+}
+
+/// Regression for PR #1400: a connection that is only ever served by the
+/// shared-lock fast path (`try_cached_sender_read`) must not be pruned as idle.
+///
+/// The fast path returns a cached, ready sender without taking the exclusive
+/// shard write lock. Before the fix it returned that sender WITHOUT advancing
+/// `last_used_at`, so on a busy pool a heavily-used connection's recency never
+/// moved: once `idle_timeout_seconds` elapsed it was pruned and the next request
+/// paid a full TCP+mTLS+h2 redial. The fix bumps `last_used_at` with a relaxed
+/// atomic store on the fast path.
+///
+/// `entries`/`last_used_at` are private, so this asserts behaviorally: the echo
+/// server counts every TCP connection it accepts (one per handshake/redial).
+/// With the fix the gateway dials exactly once and reuses it across a busy loop
+/// that spans several idle windows; without the fix the connection is recycled
+/// and the counter climbs past 1. `pool_size()` is also pinned at 1 throughout.
+#[tokio::test(flavor = "multi_thread")]
+async fn hbone_fast_path_hit_refreshes_recency_and_keeps_busy_connection_alive() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let td = TrustDomain::new("cluster.local").unwrap();
+    let (root_der, root_pem, root_key_pem) = synthetic_root(&td);
+    let gateway_id = SpiffeId::from_parts(&td, "ns/edge/sa/gateway").unwrap();
+    let server_id = SpiffeId::from_parts(&td, "ns/default/sa/orders").unwrap();
+    let (gateway_leaf, gateway_key) = issue_svid(&gateway_id, &root_pem, &root_key_pem);
+    let (server_leaf, server_key) = issue_svid(&server_id, &root_pem, &root_key_pem);
+
+    let gateway_slot = svid_slot(bundle_for(
+        gateway_id,
+        gateway_leaf,
+        gateway_key,
+        root_der.clone(),
+    ));
+    let server_slot = svid_slot(bundle_for(server_id, server_leaf, server_key, root_der));
+    let (server_addr, connection_count) = start_hbone_counting_echo_server(server_slot).await;
+
+    // Small idle window with a single connection per backend so a missed recency
+    // refresh would prune-and-redial within the busy loop below.
+    let pool_config = PoolConfig {
+        idle_timeout_seconds: 1,
+        http2_connections_per_host: 1,
+        ..PoolConfig::default()
+    };
+    let pool = HboneConnectionPool::new(
+        pool_config,
+        DnsCache::new(DnsConfig::default()),
+        gateway_slot,
+        4,
+    );
+    let proxy = proxy_for_test();
+
+    // One round-trip over a freshly checked-out tunnel; drives a CONNECT stream
+    // and proves the underlying connection is live without leaving it pending.
+    async fn drive_busy_round_trip(pool: &HboneConnectionPool, proxy: &Proxy, server_port: u16) {
+        let mut tunnel = tokio::time::timeout(
+            Duration::from_secs(10),
+            pool.get_tunnel(proxy, "127.0.0.1", 8080, server_port),
+        )
+        .await
+        .expect("timely hbone tunnel open")
+        .expect("open hbone tunnel");
+        tunnel.write_all(b"ping").await.expect("write busy tunnel");
+        let mut echoed = [0_u8; 4];
+        tokio::time::timeout(Duration::from_secs(5), tunnel.read_exact(&mut echoed))
+            .await
+            .expect("timely echo through busy tunnel")
+            .expect("read echoed busy bytes");
+        assert_eq!(&echoed, b"ping");
+        let _ = tokio::time::timeout(Duration::from_secs(1), tunnel.shutdown()).await;
+    }
+
+    // Warm exactly one connection. This goes through the create path.
+    drive_busy_round_trip(&pool, &proxy, server_addr.port()).await;
+    assert_eq!(
+        pool.pool_size(),
+        1,
+        "warmup should leave exactly one pooled HBONE connection"
+    );
+    assert_eq!(
+        connection_count.load(Ordering::SeqCst),
+        1,
+        "warmup should open exactly one TCP connection"
+    );
+
+    // Drive the fast path every ~250ms for ~3s. The idle window is 1s, so the
+    // total span comfortably exceeds several idle timeouts. Every checkout after
+    // warmup is served by `try_cached_sender_read`; if it stopped refreshing
+    // recency, the entry would expire and the next checkout would redial.
+    let loop_started = std::time::Instant::now();
+    let mut iterations = 0_u32;
+    while loop_started.elapsed() < Duration::from_secs(3) {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        drive_busy_round_trip(&pool, &proxy, server_addr.port()).await;
+        iterations += 1;
+        assert_eq!(
+            pool.pool_size(),
+            1,
+            "fast-path reuse must keep exactly one pooled connection (iteration {iterations})"
+        );
+        assert_eq!(
+            connection_count.load(Ordering::SeqCst),
+            1,
+            "busy fast-path reuse must not redial the sidecar (iteration {iterations})"
+        );
+    }
+
+    assert!(
+        iterations >= 8,
+        "expected the busy loop to span several idle windows, only ran {iterations} iterations"
+    );
+    assert_eq!(
+        connection_count.load(Ordering::SeqCst),
+        1,
+        "the busy connection must be reused, not recycled, across the whole idle-spanning loop"
+    );
+    assert_eq!(
+        pool.pool_size(),
+        1,
+        "exactly one HBONE connection should remain pooled at the end"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
