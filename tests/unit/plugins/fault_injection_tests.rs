@@ -467,6 +467,8 @@ async fn test_stream_connect_abort_100_percent() {
         sni_hostname: None,
         mesh_direction: None,
         node_waypoint_policy_scope: None,
+        first_bytes: None,
+        first_bytes_kind: None,
     };
 
     let result = plugin.on_stream_connect(&mut ctx).await;
@@ -514,6 +516,8 @@ async fn test_stream_connect_delay_100_percent() {
         sni_hostname: None,
         mesh_direction: None,
         node_waypoint_policy_scope: None,
+        first_bytes: None,
+        first_bytes_kind: None,
     };
 
     let start = std::time::Instant::now();

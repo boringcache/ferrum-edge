@@ -28,7 +28,7 @@ use crate::consumer_index::ConsumerIndex;
 use crate::load_balancer::LoadBalancerCache;
 use crate::plugins::{Plugin, PluginResult, ProxyProtocol, RequestContext, TransactionSummary};
 use crate::proxy::headers::{
-    is_backend_request_strip_header, is_backend_response_strip_header,
+    apply_response_headers, is_backend_request_strip_header, is_backend_response_strip_header,
     parse_connection_listed_from_str_map,
 };
 use crate::proxy::{
@@ -2336,15 +2336,8 @@ async fn handle_h3_request(
 
         // Send response headers on the H3 stream
         let status_code = StatusCode::from_u16(response_status).unwrap_or(StatusCode::BAD_GATEWAY);
-        let mut resp_builder = Response::builder().status(status_code);
-        for (k, v) in &response_headers {
-            if let (Ok(name), Ok(val)) = (
-                hyper::header::HeaderName::from_bytes(k.as_bytes()),
-                hyper::header::HeaderValue::from_str(v),
-            ) {
-                resp_builder = resp_builder.header(name, val);
-            }
-        }
+        let mut resp_builder =
+            apply_response_headers(Response::builder().status(status_code), &response_headers);
         if !response_headers.contains_key("content-type") {
             resp_builder = resp_builder.header("content-type", "application/json");
         }
@@ -3244,16 +3237,8 @@ async fn handle_h3_request(
 
         // Build and send buffered response
         let status = StatusCode::from_u16(response_status).unwrap_or(StatusCode::BAD_GATEWAY);
-        let mut resp_builder = Response::builder().status(status);
-
-        for (k, v) in &response_headers {
-            if let (Ok(name), Ok(val)) = (
-                hyper::header::HeaderName::from_bytes(k.as_bytes()),
-                hyper::header::HeaderValue::from_str(v),
-            ) {
-                resp_builder = resp_builder.header(name, val);
-            }
-        }
+        let mut resp_builder =
+            apply_response_headers(Response::builder().status(status), &response_headers);
 
         if !response_headers.contains_key("content-type") {
             resp_builder = resp_builder.header("content-type", "application/json");
@@ -3821,15 +3806,8 @@ async fn proxy_to_backend_h3_streaming(
 
     // Send response headers on the H3 stream
     let status = StatusCode::from_u16(response_status).unwrap_or(StatusCode::BAD_GATEWAY);
-    let mut resp_builder = Response::builder().status(status);
-    for (k, v) in &response_headers {
-        if let (Ok(name), Ok(val)) = (
-            hyper::header::HeaderName::from_bytes(k.as_bytes()),
-            hyper::header::HeaderValue::from_str(v),
-        ) {
-            resp_builder = resp_builder.header(name, val);
-        }
-    }
+    let mut resp_builder =
+        apply_response_headers(Response::builder().status(status), &response_headers);
     if !response_headers.contains_key("content-type") {
         resp_builder = resp_builder.header("content-type", "application/json");
     }
@@ -4215,14 +4193,7 @@ async fn send_h3_reject_response(
     if !reject_response_sets_content_type(headers) {
         builder = builder.header("content-type", "application/json");
     }
-    for (k, v) in headers {
-        if let (Ok(name), Ok(val)) = (
-            hyper::header::HeaderName::from_bytes(k.as_bytes()),
-            hyper::header::HeaderValue::from_str(v),
-        ) {
-            builder = builder.header(name, val);
-        }
-    }
+    builder = apply_response_headers(builder, headers);
     let resp = builder
         .body(())
         .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 reject response: {}", e))?;
@@ -4313,6 +4284,15 @@ async fn send_h3_reject_flavor_aware(
             || k.eq_ignore_ascii_case("grpc-status")
             || k.eq_ignore_ascii_case("grpc-message")
         {
+            continue;
+        }
+        if k.eq_ignore_ascii_case("set-cookie") {
+            // Newline-separated cookies must each become their own header line.
+            for cookie_val in v.split('\n') {
+                if let Ok(val) = hyper::header::HeaderValue::from_str(cookie_val) {
+                    builder = builder.header(hyper::header::SET_COOKIE, val);
+                }
+            }
             continue;
         }
         if let (Ok(name), Ok(val)) = (
