@@ -77,6 +77,13 @@ pub struct CaptureConfig {
     pub proxy_uid: Option<u32>,
     pub inbound_port: u16,
     pub outbound_port: u16,
+    /// Whether outbound capture is enabled. The node-agent sets this `false`
+    /// when `FERRUM_MESH_OUTBOUND_LISTEN_ADDR`'s port is `0` (the mesh proxy
+    /// disables its outbound listener), so it neither attaches the connect4/
+    /// connect6 redirect nor publishes the in-netns registry — otherwise a
+    /// captured pod's egress would be rewritten to a loopback port with no
+    /// listener. Inbound capture is unaffected.
+    pub outbound_capture_enabled: bool,
     pub include_cidrs: Vec<String>,
     /// True when `include_cidrs` came from operator or pod configuration rather
     /// than the implicit catch-all default. When includeOutboundPorts is set,
@@ -113,6 +120,7 @@ impl CaptureConfig {
             proxy_uid: Some(DEFAULT_PROXY_UID),
             inbound_port,
             outbound_port,
+            outbound_capture_enabled: true,
             include_cidrs: vec!["0.0.0.0/0".to_string()],
             include_cidrs_explicit: false,
             include_all_outbound_ports: false,
@@ -160,6 +168,7 @@ impl CaptureConfig {
             proxy_uid,
             inbound_port: 15006,
             outbound_port: 15001,
+            outbound_capture_enabled: true,
             include_cidrs,
             include_cidrs_explicit,
             include_all_outbound_ports: false,

@@ -104,17 +104,19 @@ impl NodeAgentConfig {
         }
 
         let mut capture_config = CaptureConfig::from_env()?;
-        // Align the eBPF connect4 outbound-rewrite port with the mesh proxy's
-        // in-netns capture listener: both read FERRUM_MESH_OUTBOUND_LISTEN_ADDR
-        // (default 127.0.0.1:15001), so captured connects are rewritten to exactly
-        // the port the proxy listens on inside the pod netns. Co-deployed
-        // node-waypoint node-agent + proxy must set this env consistently; port 0
-        // (proxy outbound disabled) keeps the capture default.
-        if let Some(addr) = resolve_ferrum_var("FERRUM_MESH_OUTBOUND_LISTEN_ADDR")
+        // Both the node-agent and the mesh proxy read FERRUM_MESH_OUTBOUND_LISTEN_ADDR
+        // (default 127.0.0.1:15001), so the eBPF connect4 rewrite port and the
+        // proxy's in-netns listener stay aligned — co-deployed node-waypoint
+        // node-agent + proxy must set this env consistently. Port 0 means the
+        // proxy disables its outbound listener, so disable outbound capture here
+        // too (no connect4/connect6, no in-netns registry) rather than rewrite
+        // egress to a dead loopback port; inbound capture is unaffected.
+        match resolve_ferrum_var("FERRUM_MESH_OUTBOUND_LISTEN_ADDR")
             .and_then(|raw| raw.trim().parse::<std::net::SocketAddr>().ok())
-            && addr.port() != 0
         {
-            capture_config.outbound_port = addr.port();
+            Some(addr) if addr.port() == 0 => capture_config.outbound_capture_enabled = false,
+            Some(addr) => capture_config.outbound_port = addr.port(),
+            None => {}
         }
         capture_config.ensure_exclude_port(env_config.node_agent_hbone_redirect_port);
         let cgroup_root = resolve_ferrum_var("FERRUM_NODE_AGENT_CGROUP_ROOT")
@@ -148,14 +150,16 @@ impl NodeAgentConfig {
         // is ready) whenever the node-agent runs in NodeWaypoint proxy mode.
         // Other proxy modes have no in-netns listener consumer, so leave it
         // `None` and skip all the filesystem work on the hot paths.
-        let node_waypoint_pod_registry_dir =
-            if env_config.node_agent_proxy_mode == NodeAgentProxyMode::NodeWaypoint {
-                Some(std::path::PathBuf::from(
-                    &env_config.mesh_node_waypoint_pod_registry_dir,
-                ))
-            } else {
-                None
-            };
+        let node_waypoint_pod_registry_dir = if env_config.node_agent_proxy_mode
+            == NodeAgentProxyMode::NodeWaypoint
+            && capture_config.outbound_capture_enabled
+        {
+            Some(std::path::PathBuf::from(
+                &env_config.mesh_node_waypoint_pod_registry_dir,
+            ))
+        } else {
+            None
+        };
 
         Ok(Self {
             node_name,
@@ -577,7 +581,7 @@ async fn run_with_backend(
         attached_pods = pod_states.len(),
         "Node agent shutting down, detaching BPF programs"
     );
-    cleanup_all_pods(backend.as_mut(), &pod_states);
+    cleanup_all_pods(backend.as_mut(), &pod_states, config);
 
     if let Some(handle) = cni_listener_handle
         && let Err(err) = handle.await
@@ -1463,19 +1467,21 @@ pub fn handle_pod_added(
     };
 
     if let Some(ref cgroup) = cgroup_path {
-        // When in-netns capture publishing is enabled, DEFER the outbound-
-        // redirect programs (connect4/connect6): attaching them now would
-        // rewrite a freshly enrolled pod's egress to a pod-loopback capture port
-        // before the mesh proxy has opened the in-netns listener (it discovers
-        // the pod from the registry we publish below and polls every ~2s), so
-        // the pod's immediate connects would be refused. `promote_pending_redirects`
-        // attaches connect4 once the proxy signals listener readiness (connect6
-        // stays detached — the in-netns listener and sock-ops bridge are
-        // IPv4-only, so redirecting IPv6 would refuse it). The inbound getpeername
-        // programs do not redirect and are safe to attach now. With in-netns
-        // publishing off (the default) attach all four up front, as before.
+        // Attach inbound getpeername now, but DEFER the outbound-redirect
+        // programs (connect4/connect6) in two cases: (a) outbound capture is
+        // disabled (FERRUM_MESH_OUTBOUND_LISTEN_ADDR port 0) — then connect4/
+        // connect6 are never attached and egress flows normally; or (b) in-netns
+        // capture publishing is on — attaching connect4 now would rewrite a
+        // freshly enrolled pod's egress to a pod-loopback capture port before the
+        // mesh proxy has opened the in-netns listener (refused), so
+        // `promote_pending_redirects` attaches connect4 once the proxy signals
+        // readiness (connect6 stays detached — the in-netns listener and sock-ops
+        // bridge are IPv4-only). Otherwise (outbound on, non-NodeWaypoint) attach
+        // all four up front. The registry dir is `None` when outbound is disabled,
+        // so no promotion runs and connect4/connect6 are simply never attached.
+        let outbound_enabled = config.capture_config.outbound_capture_enabled;
         let defer_redirect = config.node_waypoint_pod_registry_dir.is_some();
-        let programs: &[&str] = if defer_redirect {
+        let programs: &[&str] = if !outbound_enabled || defer_redirect {
             &["ferrum_getpeername4", "ferrum_getpeername6"]
         } else {
             &[
@@ -2310,9 +2316,17 @@ fn initialize_backend(
 fn cleanup_all_pods(
     backend: &mut dyn EbpfBackend,
     pod_states: &DashMap<String, PodAttachmentState>,
+    config: &NodeAgentConfig,
 ) {
     for entry in pod_states.iter() {
         let state = entry.value();
+        // Drop the in-netns registry entry + readiness marker so a mesh proxy
+        // that keeps running after this node-agent stops/restarts does not keep a
+        // dead in-netns listener open for a pod that is no longer enrolled.
+        if let Some(dir) = &config.node_waypoint_pod_registry_dir {
+            remove_pod_registry(dir, &state.pod_uid);
+            remove_pod_ready_marker(dir, &state.pod_uid);
+        }
         if state.attached
             && let Err(e) = backend.detach_pod(&state.pod_uid)
         {
@@ -2404,6 +2418,7 @@ mod tests {
                 proxy_uid: Some(1337),
                 inbound_port: 15006,
                 outbound_port: 15001,
+                outbound_capture_enabled: true,
                 include_cidrs: vec!["10.0.0.0/8".to_string()],
                 include_cidrs_explicit: true,
                 include_all_outbound_ports: false,
@@ -2554,11 +2569,129 @@ mod tests {
             },
         );
 
-        cleanup_all_pods(&mut backend, &pod_states);
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: "/nonexistent".to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        };
+        cleanup_all_pods(&mut backend, &pod_states, &config);
 
         assert_eq!(backend.detached_pods.len(), 1);
         assert_eq!(backend.detached_pods[0], "pod-1");
         assert!(backend.cleaned_up);
+    }
+
+    #[test]
+    fn cleanup_all_pods_removes_registry_and_ready_files() {
+        // Shutdown must drop each enrolled pod's registry entry + .ready marker so
+        // a mesh proxy that keeps running doesn't leak a dead in-netns listener.
+        let mut backend = MockEbpfBackend::default();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let registry = tempfile::tempdir().unwrap();
+        let ready_dir = registry.path().join(".ready");
+        std::fs::create_dir_all(&ready_dir).unwrap();
+        std::fs::write(registry.path().join("pod-x"), "/cg/x\n").unwrap();
+        std::fs::write(ready_dir.join("pod-x"), b"").unwrap();
+        pod_states.insert(
+            "pod-x".to_string(),
+            PodAttachmentState {
+                pod_uid: "pod-x".to_string(),
+                pod_name: "p".to_string(),
+                namespace: "default".to_string(),
+                pod_ip: None,
+                cgroup_path: Some("/cg/x".to_string()),
+                veth_iface: None,
+                attached: true,
+                include_ports_cgroup_ids: Vec::new(),
+                include_ports_policy: None,
+                workload_identity_cgroup_ids: Vec::new(),
+            },
+        );
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: "/nonexistent".to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: Some(registry.path().to_path_buf()),
+        };
+
+        cleanup_all_pods(&mut backend, &pod_states, &config);
+
+        assert!(
+            !registry.path().join("pod-x").exists(),
+            "registry entry removed on shutdown"
+        );
+        assert!(
+            !ready_dir.join("pod-x").exists(),
+            "ready marker removed on shutdown"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn node_waypoint_disabled_outbound_skips_connect_redirect() {
+        // FERRUM_MESH_OUTBOUND_LISTEN_ADDR port 0 disables outbound capture: the
+        // node-agent must NOT attach connect4/connect6 (egress would otherwise be
+        // rewritten to a dead loopback port), but inbound getpeername still attaches.
+        let _veth_guard = crate::ebpf::veth::tests::TestOverrideGuard::new("veth_test");
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let cgroup_root = tempfile::tempdir().unwrap();
+        let pod_uid = "pod-uid-noout";
+        std::fs::create_dir_all(cgroup_root.path().join(format!("kubepods/pod{pod_uid}"))).unwrap();
+        let mut capture_config = CaptureConfig::explicit(15006, 15001);
+        capture_config.outbound_capture_enabled = false;
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config,
+            cgroup_root: cgroup_root.path().to_string_lossy().to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        };
+        let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+        let event = PodEvent {
+            pod_uid,
+            pod_name: "test-pod",
+            namespace: "default",
+            service_account: None,
+            labels: &labels,
+            annotations: &HashMap::new(),
+            pod_ip_str: Some("10.0.0.5"),
+            pod_pid: None,
+            veth_iface_override: Some("veth-mock"),
+        };
+
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+
+        let attached: Vec<&str> = backend
+            .cgroup_attachments
+            .iter()
+            .map(|(_, p)| p.as_str())
+            .collect();
+        assert!(
+            !attached.contains(&"ferrum_connect4") && !attached.contains(&"ferrum_connect6"),
+            "outbound redirect must not attach when outbound capture is disabled, got {attached:?}"
+        );
+        assert!(
+            attached.contains(&"ferrum_getpeername4"),
+            "inbound capture still attaches when outbound is disabled, got {attached:?}"
+        );
     }
 
     // Verifies handle_fallback's control flow (setup → wait → cleanup → Ok)

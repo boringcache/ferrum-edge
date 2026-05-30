@@ -276,10 +276,23 @@ impl BpfMaps {
         let Some(workload_identity) = self.workload_identity.as_mut() else {
             return Ok(());
         };
-        if let Err(e) = workload_identity.remove(&cgroup_id) {
-            tracing::debug!(cgroup_id, error = %e, "remove_workload_identity: entry missing");
+        match workload_identity.remove(&cgroup_id) {
+            Ok(()) => Ok(()),
+            // An absent key is benign (already removed / never written): the
+            // connect hooks fail-open to the unknown sentinel, so tolerate it.
+            Err(aya::maps::MapError::SyscallError(err))
+                if err.io_error.raw_os_error() == Some(libc::ENOENT) =>
+            {
+                tracing::debug!(cgroup_id, "remove_workload_identity: entry already absent");
+                Ok(())
+            }
+            // Any other failure leaves a stale identity in the map that could
+            // misattribute a reused cgroup inode — surface it rather than
+            // silently dropping the cgroup from the caller's tracking state.
+            Err(e) => Err(format!(
+                "Failed to remove workload identity for cgroup {cgroup_id}: {e}"
+            )),
         }
-        Ok(())
     }
 }
 
