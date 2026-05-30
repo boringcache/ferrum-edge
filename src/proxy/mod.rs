@@ -1399,6 +1399,86 @@ fn record_grpc_backend_status_outcome(
     }
 }
 
+/// Load a gRPC streaming late client-upload overflow flag with `Acquire`
+/// ordering, pairing with the `Release` store in
+/// `GrpcBody::Streaming::poll_frame`. A `None` flag (no request-body limit
+/// configured) reads as `false`. Takes the flag field directly rather than
+/// `&GrpcStreamingResponse` so callers can read it after `headers`/`body` have
+/// been moved out of the response. Point-in-time read: for bidi/client-streaming
+/// RPCs the flag can still flip `true` afterward as request frames keep
+/// uploading concurrently with the response body.
+fn grpc_request_body_limit_exceeded(flag: &Option<Arc<std::sync::atomic::AtomicBool>>) -> bool {
+    flag.as_ref().is_some_and(|f| f.load(Ordering::Acquire))
+}
+
+/// Classify and record a gRPC streaming probe outcome onto an already-resolved
+/// breaker. A client-upload overflow (`request_body_exceeded`) is a gateway-side
+/// abort — the gateway RST the request because the *client* exceeded the
+/// configured size, not because the backend misbehaved — so it is recorded
+/// NEUTRAL: client-controlled upload size must neither heal nor trip the backend
+/// breaker. Otherwise the backend's HTTP status classifies the probe, exactly
+/// like [`record_grpc_backend_status_outcome`].
+///
+/// Split out from [`record_grpc_streaming_circuit_breaker_outcome`] so the
+/// classification rule is unit-testable against a real `CircuitBreaker` without
+/// constructing a full `ProxyState`.
+fn record_grpc_streaming_outcome_on_breaker(
+    cb: &crate::circuit_breaker::CircuitBreaker,
+    backend_status: u16,
+    request_body_exceeded: bool,
+    is_half_open_probe: bool,
+) {
+    if request_body_exceeded {
+        cb.record_neutral(is_half_open_probe);
+    } else {
+        record_grpc_backend_status_outcome(cb, backend_status, is_half_open_probe);
+    }
+}
+
+/// Record a gRPC streaming probe outcome to the circuit breaker, treating a
+/// client-upload overflow as NEUTRAL rather than a backend success/failure.
+/// Resolves the breaker, disarms the neutral-release guard, then delegates the
+/// classification to [`record_grpc_streaming_outcome_on_breaker`].
+///
+/// LIMITATION — partial coverage of "late" overflows. `request_body_exceeded` is
+/// sampled ONCE by the caller, right after the `after_proxy` hooks and BEFORE the
+/// response body streams downstream. The flag lives on the *client request* body
+/// (`GrpcBody::Streaming`) and, for bidi/client-streaming RPCs, can still flip to
+/// `true` AFTER this point as request frames keep uploading concurrently with the
+/// response body. An overflow that trips during response-body streaming therefore
+/// lands after the breaker has already classified the probe, so it retains the
+/// backend status — matching the HTTP path, which likewise records the backend
+/// outcome at header time (`record_backend_outcome*`) and does not neutralize a
+/// late streaming-upload overflow. Only overflows already flagged by the time
+/// `after_proxy` returns (e.g. a header-phase plugin await that lets the upload
+/// overrun) are neutralized here. Fully neutralizing the late case would require
+/// deferring BOTH the classification and the probe-slot release to response-body
+/// completion (attached to the streaming body), which would hold a HALF_OPEN
+/// probe slot open for the entire streaming RPC lifetime — a behavior/availability
+/// trade-off intentionally left to a follow-up.
+fn record_grpc_streaming_circuit_breaker_outcome(
+    state: &ProxyState,
+    proxy: &Proxy,
+    cb_target_key: Option<&str>,
+    backend_status: u16,
+    request_body_exceeded: bool,
+    is_half_open_probe: bool,
+    probe_guard: &mut GrpcProbeReleaseGuard,
+) {
+    if let Some(cb_config) = &proxy.circuit_breaker {
+        probe_guard.disarm();
+        let cb = state
+            .circuit_breaker_cache
+            .get_or_create(&proxy.id, cb_target_key, cb_config);
+        record_grpc_streaming_outcome_on_breaker(
+            &cb,
+            backend_status,
+            request_body_exceeded,
+            is_half_open_probe,
+        );
+    }
+}
+
 /// Build RFC 7239 Forwarded header value.
 /// IPv6 addresses are quoted per RFC 7239 §6.
 /// Writes directly into a single pre-allocated buffer to avoid intermediate
@@ -10068,14 +10148,12 @@ async fn handle_proxy_request_inner(
             }
         }
 
-        // Record the final backend outcome to the circuit breaker once, here,
-        // and disarm the neutral-release guard. This mirrors the HTTP path's
-        // record_backend_outcome, which records BEFORE the response/after_proxy
-        // plugins run: the breaker must observe the BACKEND's outcome regardless
-        // of any gateway-side plugin rejection or body-too-large abort that the
-        // match arms below may apply to the client response. Recording before
-        // the match also releases the (possibly rotated) probe slot before any
-        // early return, so an after_proxy reject cannot leak it.
+        // Record non-streaming final backend outcomes to the circuit breaker
+        // once, here, and disarm the neutral-release guard. Buffered gRPC
+        // results and dispatch errors have no late streaming request-body flag,
+        // so they can mirror the HTTP path and record before response handling.
+        // Streaming responses defer until that flag is checked below; plugin
+        // rejects in the streaming arm record explicitly before returning.
         //
         // Previously the gRPC path recorded nothing here, so the breaker never
         // saw gRPC successes (could not recover from HALF_OPEN) or non-connect
@@ -10085,27 +10163,31 @@ async fn handle_proxy_request_inner(
         // grpc_skip_final_cb_record marks the case where a rotated retry's
         // breaker rejected (already recorded for the prior target).
         if !grpc_skip_final_cb_record && let Some(cb_config) = &proxy.circuit_breaker {
-            grpc_probe_guard.disarm();
             let cb = state.circuit_breaker_cache.get_or_create(
                 &proxy.id,
                 grpc_final_cb_key.as_deref(),
                 cb_config,
             );
             match &grpc_result {
-                // Classify by the backend's HTTP status, like the HTTP path.
-                // For a streaming response the backend headers ARE the probe
-                // outcome; a LATE client request-body overflow (returned as
-                // RESOURCE_EXHAUSTED further below) is handled by the body
-                // wrapper exactly as the HTTP path handles a late streaming
-                // upload overflow — the backend status still stands. An
-                // oversized client request detected BEFORE backend headers is
-                // GrpcProxyError::ResourceExhausted (neutral arm below).
-                Ok(kind) => {
-                    let backend_status = match kind {
-                        GrpcResponseKind::Buffered(r) => r.status,
-                        GrpcResponseKind::Streaming(r) => r.status,
-                    };
-                    record_grpc_backend_status_outcome(&cb, backend_status, grpc_cb_probe_slot);
+                // Classify buffered responses by the backend's HTTP status,
+                // like the HTTP path. An oversized client request detected
+                // BEFORE backend headers is GrpcProxyError::ResourceExhausted
+                // (neutral arm below); late streaming request overflows defer
+                // to the streaming arm so they can also be neutral.
+                Ok(GrpcResponseKind::Buffered(r)) => {
+                    grpc_probe_guard.disarm();
+                    record_grpc_backend_status_outcome(&cb, r.status, grpc_cb_probe_slot);
+                }
+                Ok(GrpcResponseKind::Streaming(_)) => {
+                    // Defer: the streaming arm samples the late client request-body
+                    // overflow flag (after after_proxy hooks) and records via
+                    // record_grpc_streaming_circuit_breaker_outcome, so a
+                    // client-controlled oversized upload that is *already* flagged
+                    // by then releases the HALF_OPEN probe neutrally instead of
+                    // falsely healing the backend. NOTE: this is best-effort — an
+                    // overflow that only trips later, during response-body
+                    // streaming, lands after that sample and retains the backend
+                    // status (see the LIMITATION note on that helper).
                 }
                 // Oversized CLIENT request payloads (ResourceExhausted, detected
                 // before backend headers) and client-body-read / gateway-config
@@ -10117,9 +10199,11 @@ async fn handle_proxy_request_inner(
                 // ResourceExhausted) and falls to the failure arm below, matching
                 // the HTTP path's ResponseBodyTooLarge -> 502.
                 Err(GrpcProxyError::ResourceExhausted(_) | GrpcProxyError::Internal(_)) => {
+                    grpc_probe_guard.disarm();
                     cb.record_neutral(grpc_cb_probe_slot);
                 }
                 Err(e) => {
+                    grpc_probe_guard.disarm();
                     let connection_error = matches!(
                         e,
                         GrpcProxyError::BackendUnavailable { kind, .. } if kind.is_connect_class()
@@ -10152,6 +10236,19 @@ async fn handle_proxy_request_inner(
                     )
                     .await
                     {
+                        let body_exceeded =
+                            grpc_request_body_limit_exceeded(&grpc_streaming.request_body_exceeded);
+                        if !grpc_skip_final_cb_record {
+                            record_grpc_streaming_circuit_breaker_outcome(
+                                &state,
+                                &proxy,
+                                grpc_final_cb_key.as_deref(),
+                                grpc_streaming.status,
+                                body_exceeded,
+                                grpc_cb_probe_slot,
+                                &mut grpc_probe_guard,
+                            );
+                        }
                         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
                         let normalized = normalize_reject_response(
                             StatusCode::from_u16(reject.status_code)
@@ -10183,10 +10280,8 @@ async fn handle_proxy_request_inner(
                 // Check if the streaming request body exceeded the size limit
                 // BEFORE logging — otherwise the transaction summary captures a
                 // success status while we're about to return RESOURCE_EXHAUSTED.
-                let body_exceeded = grpc_streaming
-                    .request_body_exceeded
-                    .as_ref()
-                    .is_some_and(|f| f.load(std::sync::atomic::Ordering::Acquire));
+                let body_exceeded =
+                    grpc_request_body_limit_exceeded(&grpc_streaming.request_body_exceeded);
 
                 // Determine the final status for logging and metrics.
                 let final_status = if body_exceeded {
@@ -10199,6 +10294,18 @@ async fn handle_proxy_request_inner(
                 } else {
                     None
                 };
+
+                if !grpc_skip_final_cb_record {
+                    record_grpc_streaming_circuit_breaker_outcome(
+                        &state,
+                        &proxy,
+                        grpc_final_cb_key.as_deref(),
+                        grpc_streaming.status,
+                        body_exceeded,
+                        grpc_cb_probe_slot,
+                        &mut grpc_probe_guard,
+                    );
+                }
 
                 let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
                 let plugin_execution_ms = plugin_execution_ns as f64 / 1_000_000.0;
@@ -15615,6 +15722,100 @@ mod tests {
     use async_trait::async_trait;
     use http::header::HeaderValue;
     use serde_json::json;
+
+    /// Directly exercises the gRPC streaming circuit-breaker classification:
+    /// a late client-upload overflow is gateway-side and must be NEUTRAL, while
+    /// a non-overflow outcome is classified by the backend HTTP status. These
+    /// drive `record_grpc_streaming_outcome_on_breaker` — the `ProxyState`-free
+    /// core of `record_grpc_streaming_circuit_breaker_outcome` — against a real
+    /// breaker, so a regression that dropped the `request_body_exceeded` branch
+    /// or misclassified the status would fail here (unlike a bare
+    /// `record_neutral` call, which only tests the breaker primitive).
+    mod grpc_streaming_cb_outcome {
+        use super::super::record_grpc_streaming_outcome_on_breaker;
+        use crate::circuit_breaker::CircuitBreaker;
+        use crate::config::types::CircuitBreakerConfig;
+
+        fn half_open_probe_config() -> CircuitBreakerConfig {
+            CircuitBreakerConfig {
+                failure_threshold: 1,
+                success_threshold: 1,
+                timeout_seconds: 0,
+                failure_status_codes: vec![500],
+                half_open_max_requests: 1,
+                trip_on_connection_errors: true,
+            }
+        }
+
+        // Trip to OPEN, then admit one HALF_OPEN probe. `timeout_seconds == 0`
+        // makes `can_execute` transition OPEN -> HALF_OPEN immediately.
+        fn breaker_with_admitted_half_open_probe() -> CircuitBreaker {
+            let cb = CircuitBreaker::new(half_open_probe_config());
+            cb.record_failure(500, false, false);
+            assert!(cb.can_execute().unwrap());
+            assert_eq!(cb.state_name(), "half_open");
+            assert_eq!(cb.half_open_in_flight(), 1);
+            cb
+        }
+
+        #[test]
+        fn late_upload_overflow_is_neutral_and_keeps_breaker_half_open() {
+            let cb = breaker_with_admitted_half_open_probe();
+            // Backend headers were 200, but the client upload overran
+            // (request_body_exceeded == true): gateway-side, must not heal.
+            record_grpc_streaming_outcome_on_breaker(&cb, 200, true, true);
+            assert_eq!(
+                cb.state_name(),
+                "half_open",
+                "client-upload overflow must not close a HALF_OPEN breaker"
+            );
+            assert_eq!(
+                cb.half_open_in_flight(),
+                0,
+                "neutral outcome must release the probe slot"
+            );
+        }
+
+        #[test]
+        fn overflow_is_neutral_regardless_of_backend_status() {
+            // Even a 500 backend status is neutral when the upload overran — the
+            // abort is gateway-side, so it must neither trip nor heal.
+            let cb = breaker_with_admitted_half_open_probe();
+            record_grpc_streaming_outcome_on_breaker(&cb, 500, true, true);
+            assert_eq!(
+                cb.state_name(),
+                "half_open",
+                "overflow must be neutral regardless of backend status"
+            );
+            assert_eq!(cb.half_open_in_flight(), 0);
+        }
+
+        #[test]
+        fn clean_2xx_streaming_probe_heals_breaker() {
+            let cb = breaker_with_admitted_half_open_probe();
+            // No overflow, backend 200: a genuine probe success.
+            // success_threshold == 1, so the breaker closes.
+            record_grpc_streaming_outcome_on_breaker(&cb, 200, false, true);
+            assert_eq!(
+                cb.state_name(),
+                "closed",
+                "a clean 2xx streaming probe must heal the breaker"
+            );
+        }
+
+        #[test]
+        fn streaming_5xx_without_overflow_reopens_breaker() {
+            let cb = breaker_with_admitted_half_open_probe();
+            // No overflow, backend 500 (a configured failure status): the probe
+            // failed, so the breaker reopens.
+            record_grpc_streaming_outcome_on_breaker(&cb, 500, false, true);
+            assert_eq!(
+                cb.state_name(),
+                "open",
+                "a 5xx streaming probe must reopen the breaker"
+            );
+        }
+    }
 
     struct ResponseBufferPlugin {
         should_buffer: bool,
