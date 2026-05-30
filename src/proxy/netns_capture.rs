@@ -482,10 +482,6 @@ mod imp {
             Err(std::io::Error::last_os_error())
         }
     }
-
-    // Keep `Path` import used on all cfgs.
-    #[allow(dead_code)]
-    fn _path_marker(_p: &Path) {}
 }
 
 #[cfg(not(target_os = "linux"))]
