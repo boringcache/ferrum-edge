@@ -111,26 +111,30 @@ fn resolver_with_two_pods(cookie_a: u64, cookie_b: u64) -> Arc<NodeWaypointIdent
     // Install per-pod scopes the way slice apply does: publish one slice
     // generation built from the workload set. Pod A is in team-a with labels
     // app=api,tier=web; pod B is in team-b with app=api. `policy_scope_for_pod`
-    // then derives each pod's scope by joining its enrolled identity's SPIFFE
-    // against the slice's SPIFFE→scope index.
+    // looks each pod up by the exact UID the eBPF stamps (its workload's
+    // `metadata.uid`), so the two pods are scoped independently.
     resolver.install_policy_scopes_from_workloads(&[
         workload(
             SPIFFE_A,
             "team-a",
             "api",
             labels(&[("app", "api"), ("tier", "web")]),
+            POD_A,
         ),
-        workload(SPIFFE_B, "team-b", "api", labels(&[("app", "api")])),
+        workload(SPIFFE_B, "team-b", "api", labels(&[("app", "api")]), POD_B),
     ]);
     resolver
 }
 
-/// Build a minimal `Workload` for the slice-driven scope install.
+/// Build a minimal `Workload` for the slice-driven scope install. `pod_uid` must
+/// match the captured pod's `metadata.uid` so the per-pod-UID scope index
+/// (`scopes_by_pod_uid`) keys to the exact UID the eBPF stamps.
 fn workload(
     spiffe_id: &str,
     namespace: &str,
     service_name: &str,
     labels: HashMap<String, String>,
+    pod_uid: &str,
 ) -> ferrum_edge::modes::mesh::config::Workload {
     use ferrum_edge::identity::TrustDomain;
     use ferrum_edge::modes::mesh::config::{Workload, WorkloadSelector};
@@ -150,7 +154,7 @@ fn workload(
         weight: None,
         locality: None,
         service_account: None,
-        pod_uid: None,
+        pod_uid: Some(pod_uid.to_string()),
     }
 }
 
@@ -345,8 +349,10 @@ async fn resolve_stream_against_real_accepted_socket_maps_to_pod_scope() {
         },
     );
     // Install the pod's scope the production way — from the slice's workload
-    // set — which also seeds `workload_identities_by_hash` so `resolve_record`'s
-    // current-slice re-validation passes for the resolved identity.
+    // set — which also seeds the `workload_spiffe_hash` gate so `resolve_record`'s
+    // current-slice re-validation passes for the resolved identity. The workload
+    // carries this pod's `metadata.uid` so the per-pod-UID scope index keys to the
+    // captured pod.
     let workload = Workload {
         spiffe_id: spiffe(SPIFFE_A),
         selector: WorkloadSelector {
@@ -363,7 +369,7 @@ async fn resolve_stream_against_real_accepted_socket_maps_to_pod_scope() {
         weight: None,
         locality: None,
         service_account: None,
-        pod_uid: None,
+        pod_uid: Some(POD_A.to_string()),
     };
     resolver.install_policy_scopes_from_workloads(&[workload]);
 

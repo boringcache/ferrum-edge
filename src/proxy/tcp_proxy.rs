@@ -6172,7 +6172,9 @@ mod node_waypoint_stream_scope_tests {
             },
         );
         // Install the pod's scope the way production does — from the slice's
-        // workload set. This also seeds `workload_identities_by_hash`, which
+        // workload set. The workload carries this pod's `metadata.uid` so the
+        // per-UID scope index (`scopes_by_pod_uid`) is keyed to match the
+        // captured pod; it also seeds the `workload_spiffe_hash` gate, which
         // `resolve_record` re-validates against so a cached identity resolves
         // only while its workload is still in the slice.
         let workload = Workload {
@@ -6191,7 +6193,7 @@ mod node_waypoint_stream_scope_tests {
             weight: None,
             locality: None,
             service_account: None,
-            pod_uid: None,
+            pod_uid: Some("11111111-1111-1111-1111-111111111111".to_string()),
         };
         resolver.install_policy_scopes_from_workloads(&[workload]);
 
