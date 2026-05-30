@@ -3704,32 +3704,31 @@ async fn serve_mesh_runtime(
             .await;
     }
 
-    // Spawn the SPIFFE trust-bundle federation poller before the apply task so
-    // the first slice apply observes whatever the poller has already fetched.
-    // The poller updates `mesh_state.federation_store()` on each successful
-    // poll; the apply task subscribes to the same store. Disabled when
-    // `FERRUM_MESH_FEDERATION_POLL_INTERVAL_SECONDS=0` or when the slice has
-    // no remote clusters configured.
+    // Spawn the SPIFFE trust-bundle federation poller reconciler before the
+    // apply task so the first slice apply observes whatever the poller has
+    // already fetched. Unlike the old one-shot spawn, the reconciler watches
+    // slice updates: it starts pollers for federation endpoints added after
+    // startup, stops pollers for removed clusters, and calls
+    // `FederationStore::remove` when a cluster is withdrawn so a stale federated
+    // trust anchor cannot keep being overlaid onto slice applies. No pollers run
+    // when `FERRUM_MESH_FEDERATION_POLL_INTERVAL_SECONDS=0` or no remote cluster
+    // carries a federation endpoint.
     let federation_poller_config = federation::FederationPollerConfig::from_env(
         env_config.mesh_federation_poll_interval_seconds,
         env_config.mesh_federation_poll_timeout_seconds,
         env_config.mesh_federation_fail_open,
     );
-    let initial_multi_cluster = initial_applied_mesh_slice
-        .as_ref()
-        .and_then(|slice| slice.multi_cluster.clone());
-    if let Some(handles) = federation::spawn_federation_poller(
-        initial_multi_cluster.as_ref(),
+    let federation_manager = federation::FederationPollerManager::new(
         federation_poller_config,
         proxy_state.plugin_cache.http_client().clone(),
         mesh_state.federation_store().clone(),
+    );
+    mesh_background_handles.push(start_federation_poller_reconcile_task(
+        mesh_state.clone(),
+        federation_manager,
         shutdown_tx.subscribe(),
-    ) {
-        for handle in handles.tasks {
-            mesh_background_handles.push(handle);
-        }
-        info!("SPIFFE trust-bundle federation poller running");
-    }
+    ));
+    info!("SPIFFE trust-bundle federation poller reconciler running");
 
     // Spawn cross-cluster endpoint discovery (Tier 3b). A reconciler watches
     // slice + federation updates and keeps one poller per currently eligible
@@ -4943,6 +4942,48 @@ async fn apply_mesh_inbound_tls_reload(
             );
         }
     }
+}
+
+/// Reconcile the SPIFFE federation pollers against the live mesh slice. Mirrors
+/// [`start_remote_cluster_discovery_reconcile_task`]: on each slice update it
+/// re-derives the federation poll targets and starts/stops per-cluster pollers,
+/// so a post-startup `federation_endpoint` addition is honored and a withdrawn
+/// cluster's stale federated trust bundle is dropped (via
+/// `FederationStore::remove`, which bumps the revision the apply task watches).
+fn start_federation_poller_reconcile_task(
+    mesh_state: MeshRuntimeState,
+    mut manager: federation::FederationPollerManager,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut updates = mesh_state.subscribe();
+        loop {
+            if *shutdown_rx.borrow() {
+                manager.shutdown();
+                return;
+            }
+
+            let snapshot = mesh_state.snapshot();
+            let multi_cluster = snapshot
+                .as_ref()
+                .as_ref()
+                .and_then(|slice| slice.multi_cluster.as_ref());
+            manager.reconcile(multi_cluster);
+
+            tokio::select! {
+                changed = updates.changed() => {
+                    if changed.is_err() {
+                        manager.shutdown();
+                        return;
+                    }
+                }
+                _ = wait_for_mesh_shutdown(&mut shutdown_rx) => {
+                    manager.shutdown();
+                    return;
+                }
+            }
+        }
+    })
 }
 
 fn start_remote_cluster_discovery_reconcile_task(
