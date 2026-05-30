@@ -1598,16 +1598,7 @@ where
                         // unreachable; preserve the frame defensively.
                         Err(other) => return Poll::Ready(Some(Ok(other))),
                     };
-                    let to_remove: Vec<http::HeaderName> = trailers
-                        .keys()
-                        .filter(|name| {
-                            crate::proxy::headers::is_backend_response_strip_header(name.as_str())
-                        })
-                        .cloned()
-                        .collect();
-                    for name in to_remove {
-                        trailers.remove(&name);
-                    }
+                    crate::proxy::headers::strip_response_hop_by_hop_trailers(&mut trailers);
                     Poll::Ready(Some(Ok(Frame::trailers(trailers))))
                 } else {
                     Poll::Ready(Some(Ok(frame)))
