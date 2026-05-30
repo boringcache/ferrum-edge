@@ -18,8 +18,9 @@
 //! 4. One `ArcSwap::load` of the current slice generation + `HashMap` lookups
 //!    against its `identities_by_hash` gate, re-validating that the control
 //!    plane still vouches for the resolved workload (fail closed if it was
-//!    removed) and, from the SAME load, deriving the per-pod policy scope from
-//!    `scopes_by_spiffe`. No allocation; the same loaded generation serves the
+//!    removed) and, from the SAME load, deriving the per-pod policy scope by
+//!    pod UID (`scopes_by_pod_uid`, with a SPIFFE-keyed fallback for uid-less
+//!    VM workloads). No allocation; the same loaded generation serves the
 //!    cached and lazy-enrollment branches AND the returned scope, so a reader
 //!    can never pair a new gate with an old/missing scope.
 //! 5. One `Arc::clone` (~5 ns) to hand the identity to the connection task.
@@ -33,9 +34,11 @@
 //! gate: the accept path receives `(identity, scope)` from one `resolve_*`
 //! call (one slice load). The HTTP/HBONE request path re-derives scope per
 //! request via [`NodeWaypointIdentityResolver::policy_scope_for_pod`] — one
-//! `ArcSwap::load` plus two `HashMap::get`s (pod_uid → identity, SPIFFE →
-//! scope) — so a workload whose SPIFFE hash is unchanged but whose scope
-//! changed is served the scope from the very generation that re-vouched for it.
+//! `ArcSwap::load` then a `scopes_by_pod_uid` lookup (SPIFFE fallback for
+//! uid-less workloads) — so a workload whose SPIFFE hash is unchanged but whose
+//! scope changed is served the scope from the very generation that re-vouched
+//! for it. Keying scope by pod UID (not SPIFFE) means pods that share a service
+//! account but carry different labels are scoped independently.
 //! The slice is published as one atomic `ArcSwap` store on slice apply; nothing
 //! is rebuilt in the accept loop.
 //!
@@ -264,7 +267,33 @@ where
 #[derive(Default)]
 struct NodeWaypointSlice {
     identities_by_hash: std::collections::HashMap<u64, SpiffeId>,
+    /// Per-pod policy scope keyed by the exact `[u8; 16]` pod UID the eBPF
+    /// capture stamps (parsed from each per-pod workload's `metadata.uid`).
+    /// Pods that share a SPIFFE but differ in labels get distinct entries, so
+    /// selector-scoped policy is evaluated against the source pod's own labels
+    /// — never a cross-pod label merge.
+    scopes_by_pod_uid: std::collections::HashMap<[u8; 16], std::sync::Arc<PolicyScopeCache>>,
+    /// Fallback scope keyed by SPIFFE, populated ONLY by uid-less workloads
+    /// (WorkloadEntry/VM). Several uid-less workloads sharing a SPIFFE are
+    /// merged by label intersection, as before — they carry no per-pod identity
+    /// to distinguish. Captured pods are resolved per-UID above and never reach
+    /// this map unless their workload is absent from the live slice.
     scopes_by_spiffe: std::collections::HashMap<String, std::sync::Arc<PolicyScopeCache>>,
+}
+
+impl NodeWaypointSlice {
+    /// Resolve a pod's policy scope from this one generation: prefer the
+    /// per-pod-UID entry (the source pod's exact labels), falling back to the
+    /// SPIFFE-keyed entry for uid-less (VM/WorkloadEntry) workloads. `None`
+    /// means the pod's workload is not in the live slice — the caller
+    /// (`mesh_authz`) then fails closed when scoped policies exist, else
+    /// evaluates mesh-wide-only.
+    fn scope_for(&self, pod_uid: &[u8; 16], spiffe_id: &str) -> Option<Arc<PolicyScopeCache>> {
+        if let Some(scope) = self.scopes_by_pod_uid.get(pod_uid) {
+            return Some(Arc::clone(scope));
+        }
+        self.scopes_by_spiffe.get(spiffe_id).cloned()
+    }
 }
 
 pub struct NodeWaypointPolicyScopeSnapshot {
@@ -731,17 +760,25 @@ impl NodeWaypointIdentityResolver {
         }
     }
 
-    /// Per-pod policy scope, derived from the current slice via the identity's
-    /// SPIFFE. One consistent `ArcSwap::load` plus two `HashMap::get`s
-    /// (pod_uid → identity, SPIFFE → scope); paid once per HTTP/HBONE request on
-    /// the node-waypoint admit path. Returns `None` when the pod is unknown or
-    /// its workload left the current slice generation (carries no scope); the
-    /// caller (`mesh_authz`) then fails closed when scoped policies exist, else
-    /// evaluates mesh-wide-only.
+    /// Per-pod policy scope from the current slice. Prefers the per-pod-UID
+    /// entry (the source pod's exact labels), keyed by the same `[u8; 16]` the
+    /// eBPF stamps; falls back to the SPIFFE-keyed entry only for uid-less
+    /// (VM/WorkloadEntry) workloads. One consistent `ArcSwap::load`, paid once
+    /// per HTTP/HBONE request on the node-waypoint admit path. Returns `None`
+    /// when the pod's workload is not in the live slice generation (carries no
+    /// scope); the caller (`mesh_authz`) then fails closed when scoped policies
+    /// exist, else evaluates mesh-wide-only.
     pub fn policy_scope_for_pod(&self, pod_uid: &[u8; 16]) -> Option<Arc<PolicyScopeCache>> {
+        let slice = self.slice.load();
+        // Per-pod UID first: the authoritative key for captured pods, and it
+        // needs no enrolled identity (the eBPF stamps the pod UID directly).
+        if let Some(scope) = slice.scopes_by_pod_uid.get(pod_uid) {
+            return Some(Arc::clone(scope));
+        }
+        // SPIFFE fallback (uid-less VM/WorkloadEntry) needs the resolved
+        // identity to know the pod's SPIFFE.
         let identity = self.identities_by_pod_uid.get(pod_uid)?;
-        self.slice
-            .load()
+        slice
             .scopes_by_spiffe
             .get(identity.spiffe_id.as_str())
             .cloned()
@@ -770,7 +807,37 @@ impl NodeWaypointIdentityResolver {
         I: IntoIterator<Item = &'a Workload>,
     {
         let workloads: Vec<&Workload> = workloads.into_iter().collect();
-        let scopes_by_spiffe = workload_policy_scope_index(workloads.iter().copied());
+        // Per-pod scope: each workload carrying a pod UID gets its OWN scope
+        // keyed by the exact `[u8; 16]` the eBPF stamps (parsed from
+        // `metadata.uid`). No cross-pod merge, so pods sharing a SPIFFE but
+        // differing in labels are scoped against their own labels. A malformed
+        // UID is skipped (the SPIFFE gate still vouches the identity; scope then
+        // falls through to `None` → fail closed when scoped policies exist).
+        let mut scopes_by_pod_uid: HashMap<[u8; 16], Arc<PolicyScopeCache>> = HashMap::new();
+        for workload in &workloads {
+            let Some(raw_uid) = workload.pod_uid.as_deref() else {
+                continue;
+            };
+            match parse_pod_uid(raw_uid) {
+                Ok(uid) => {
+                    scopes_by_pod_uid
+                        .insert(uid, Arc::new(PolicyScopeCache::from_workload(workload)));
+                }
+                Err(error) => {
+                    warn!(
+                        pod_uid = %raw_uid,
+                        %error,
+                        "Skipping node-waypoint per-pod scope for workload with invalid pod UID"
+                    );
+                }
+            }
+        }
+        // SPIFFE-keyed fallback covers ONLY uid-less (WorkloadEntry/VM)
+        // workloads; pod workloads are resolved per-UID above. Merging uid-less
+        // workloads by SPIFFE (intersection) is acceptable — they carry no
+        // per-pod identity to distinguish.
+        let scopes_by_spiffe =
+            workload_policy_scope_index(workloads.iter().copied().filter(|w| w.pod_uid.is_none()));
         // The identity gate covers ALL workloads (every pod needs an identity
         // for authz, not only those carrying scoped policies).
         let mut identities_by_hash: HashMap<u64, SpiffeId> = HashMap::new();
@@ -782,6 +849,7 @@ impl NodeWaypointIdentityResolver {
         NodeWaypointPolicyScopeSnapshot {
             slice: NodeWaypointSlice {
                 identities_by_hash,
+                scopes_by_pod_uid,
                 scopes_by_spiffe,
             },
         }
@@ -988,11 +1056,9 @@ impl NodeWaypointIdentityResolver {
             if !slice.identities_by_hash.contains_key(&expected_hash) {
                 return Err(NodeWaypointIdentityError::UnknownPod(pod_uid));
             }
-            // Scope from the SAME generation that just vouched for the identity.
-            let scope = slice
-                .scopes_by_spiffe
-                .get(identity.spiffe_id.as_str())
-                .cloned();
+            // Scope from the SAME generation that just vouched for the identity:
+            // per-pod UID first, SPIFFE fallback for uid-less workloads.
+            let scope = slice.scope_for(&pod_uid, identity.spiffe_id.as_str());
             return Ok((identity, scope));
         }
 
@@ -1005,7 +1071,7 @@ impl NodeWaypointIdentityResolver {
         // re-check is needed. Identity AND scope both come from this single
         // `slice` load.
         if let Some(spiffe_id) = slice.identities_by_hash.get(&expected_hash).cloned() {
-            let scope = slice.scopes_by_spiffe.get(spiffe_id.as_str()).cloned();
+            let scope = slice.scope_for(&pod_uid, spiffe_id.as_str());
             let identity = self.upsert_identity(NodeWaypointIdentity::new(pod_uid, spiffe_id));
             return Ok((identity, scope));
         }
@@ -1174,6 +1240,7 @@ mod tests {
             weight: None,
             locality: None,
             service_account: None,
+            pod_uid: None,
         }
     }
 
@@ -1853,6 +1920,118 @@ mod tests {
             resolver.policy_scope_for_pod(&pod_orphan).is_none(),
             "pod with no Workload entry must derive no scope"
         );
+    }
+
+    fn workload_with_uid(
+        spiffe_id: &str,
+        namespace: &str,
+        service_name: &str,
+        labels: HashMap<String, String>,
+        pod_uid: &str,
+    ) -> Workload {
+        Workload {
+            pod_uid: Some(pod_uid.to_string()),
+            ..workload(spiffe_id, namespace, service_name, labels)
+        }
+    }
+
+    /// Two pods that share a service account — and therefore one SPIFFE ID —
+    /// but carry different labels (a canary `version` split, or two ReplicaSets
+    /// mid-rollout) must each resolve their OWN scope. Keying scope by SPIFFE
+    /// alone collapsed them to the label *intersection*, silently dropping
+    /// selector-scoped policy for the diverging label; keying by pod UID keeps
+    /// them distinct. Covers both the per-request (`policy_scope_for_pod`) and
+    /// the accept (`resolve_cookie`) lookups.
+    #[test]
+    fn per_pod_uid_scope_distinguishes_pods_sharing_a_spiffe() {
+        let resolver = NodeWaypointIdentityResolver::new(0);
+        let uid_v1 = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        let uid_v2 = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+        let pod_v1 = parse_pod_uid(uid_v1).unwrap();
+        let pod_v2 = parse_pod_uid(uid_v2).unwrap();
+        let shared_spiffe = "spiffe://td/ns/default/sa/web";
+
+        let workloads = vec![
+            workload_with_uid(
+                shared_spiffe,
+                "default",
+                "web",
+                HashMap::from([
+                    ("app".to_string(), "web".to_string()),
+                    ("version".to_string(), "v1".to_string()),
+                ]),
+                uid_v1,
+            ),
+            workload_with_uid(
+                shared_spiffe,
+                "default",
+                "web",
+                HashMap::from([
+                    ("app".to_string(), "web".to_string()),
+                    ("version".to_string(), "v2".to_string()),
+                ]),
+                uid_v2,
+            ),
+        ];
+        resolver.install_policy_scopes_from_workloads(&workloads);
+
+        // Per-request path: keyed by the exact pod UID the eBPF stamps — no
+        // enrolled identity required, and no cross-pod label merge.
+        let scope_v1 = resolver
+            .policy_scope_for_pod(&pod_v1)
+            .expect("v1 pod scope");
+        let scope_v2 = resolver
+            .policy_scope_for_pod(&pod_v2)
+            .expect("v2 pod scope");
+        assert_eq!(
+            scope_v1.labels.get("version").map(String::as_str),
+            Some("v1"),
+            "v1 pod must keep its own labels, not the intersection"
+        );
+        assert_eq!(
+            scope_v2.labels.get("version").map(String::as_str),
+            Some("v2"),
+            "v2 pod must keep its own labels, not the intersection"
+        );
+
+        // Accept path: resolve_cookie returns the SAME per-pod scope (both pods
+        // stamp the shared SPIFFE hash, but the pod UID disambiguates the scope).
+        let hash = workload_spiffe_hash(&spiffe(shared_spiffe));
+        resolver.record_orig_dst4(51, orig_dst4(pod_v2, hash));
+        let (resolved, scope) = resolver.resolve_cookie(51).expect("v2 cookie resolves");
+        assert_eq!(resolved.pod_uid, pod_v2);
+        assert_eq!(
+            scope
+                .expect("v2 accept scope")
+                .labels
+                .get("version")
+                .map(String::as_str),
+            Some("v2"),
+        );
+    }
+
+    /// A workload with no pod UID (WorkloadEntry / VM) is scoped via the SPIFFE
+    /// fallback once its identity is enrolled — preserving pre-fix behavior for
+    /// non-pod workloads that the eBPF capture never stamps a pod UID for.
+    #[test]
+    fn uidless_workload_scope_falls_back_to_spiffe() {
+        let resolver = NodeWaypointIdentityResolver::new(0);
+        let pod_uid = parse_pod_uid("cccccccc-cccc-cccc-cccc-cccccccccccc").unwrap();
+        resolver.upsert_identity(NodeWaypointIdentity::new(
+            pod_uid,
+            spiffe("spiffe://td/ns/default/sa/vm"),
+        ));
+        // pod_uid: None → contributes only to the SPIFFE-keyed fallback index.
+        resolver.install_policy_scopes_from_workloads(&[workload(
+            "spiffe://td/ns/default/sa/vm",
+            "default",
+            "vm",
+            HashMap::from([("app".to_string(), "vm".to_string())]),
+        )]);
+        let scope = resolver
+            .policy_scope_for_pod(&pod_uid)
+            .expect("uid-less workload resolves via SPIFFE fallback");
+        assert_eq!(scope.labels.get("app").map(String::as_str), Some("vm"));
     }
 
     #[test]

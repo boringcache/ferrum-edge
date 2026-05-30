@@ -53,6 +53,7 @@ fn mesh_config_round_trips_through_serde() {
                 weight: None,
                 locality: None,
                 service_account: None,
+                pod_uid: None,
             }],
             services: vec![MeshService {
                 name: "api".into(),

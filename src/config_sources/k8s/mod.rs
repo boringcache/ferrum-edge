@@ -29,6 +29,11 @@ const MAX_FAULT_DELAY_MS: u64 = 3_600_000;
 pub struct K8sMetadata {
     #[serde(default)]
     pub name: String,
+    /// Kubernetes object UID (`metadata.uid`). Used to key node-waypoint
+    /// per-pod policy scope by the pod's exact UID. Optional + default so
+    /// old K8s payload JSON deserializes unchanged.
+    #[serde(default)]
+    pub uid: String,
     #[serde(default = "default_namespace")]
     pub namespace: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2097,6 +2102,7 @@ mod tests {
             kind: kind.to_string(),
             metadata: K8sMetadata {
                 name: "sample".to_string(),
+                uid: String::new(),
                 namespace: "default".to_string(),
                 generation: None,
                 labels: HashMap::new(),

@@ -1213,6 +1213,7 @@ mod tests {
             weight: None,
             locality: locality.map(str::to_string),
             service_account: None,
+            pod_uid: None,
         }
     }
 

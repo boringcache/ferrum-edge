@@ -150,6 +150,7 @@ fn workload(
         weight: None,
         locality: None,
         service_account: None,
+        pod_uid: None,
     }
 }
 

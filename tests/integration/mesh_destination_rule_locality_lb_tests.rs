@@ -26,6 +26,7 @@ fn istio_object(kind: &str, name: &str, spec: serde_json::Value) -> K8sObject {
         kind: kind.to_string(),
         metadata: K8sMetadata {
             name: name.to_string(),
+            uid: String::new(),
             namespace: "default".to_string(),
             generation: None,
             labels: Default::default(),
