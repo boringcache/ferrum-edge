@@ -3447,33 +3447,58 @@ async fn serve_mesh_runtime(
     if runtime.topology == MeshTopology::NodeWaypoint
         && env_config.mesh_node_waypoint_in_netns_listeners
     {
-        // Invariant: a compile-time-constant valid socket address literal.
-        let capture_addr: std::net::SocketAddr = DEFAULT_OUTBOUND_LISTEN_ADDR
-            .parse()
-            .expect("DEFAULT_OUTBOUND_LISTEN_ADDR is a valid socket address");
-        let source = Arc::new(crate::proxy::netns_capture::DirectoryCaptureSource::new(
-            env_config.mesh_node_waypoint_pod_registry_dir.clone(),
-        ));
-        let backend = crate::proxy::netns_capture::ProxyNetnsBackend::new(
-            proxy_state.clone(),
-            None,
-            Some(MeshTrafficDirection::Outbound),
-            shutdown_tx.subscribe(),
-        );
-        let manager = crate::proxy::netns_capture::NetnsCaptureManager::new(
-            capture_addr,
-            source,
-            backend,
-            std::time::Duration::from_secs(2),
-        );
-        let manager_shutdown = shutdown_tx.subscribe();
-        info!(
-            registry_dir = %env_config.mesh_node_waypoint_pod_registry_dir,
-            "Node-waypoint in-netns outbound capture listeners enabled"
-        );
-        mesh_background_handles.push(tokio::spawn(async move {
-            manager.run(manager_shutdown).await;
-        }));
+        // Bind the in-netns capture listeners at the SAME address the rest of the
+        // outbound capture path uses (`FERRUM_MESH_OUTBOUND_LISTEN_ADDR`), not a
+        // hardcoded constant. `connect4` rewrites captured pod egress to this
+        // port, so the in-netns listener must agree with it; deriving from a
+        // hardcoded `15001` while the operator configured something else would
+        // leave captured connects with no listener. A port of `0` disables the
+        // outbound listener entirely (nothing is captured), so there is nothing
+        // to accept in-netns — skip starting the manager.
+        let capture_addr = runtime.outbound_listen_addr;
+        if capture_addr.port() == 0 {
+            info!(
+                "Node-waypoint in-netns capture listeners requested, but the outbound listen \
+                 port is 0 (disabled); not starting in-netns capture"
+            );
+        } else {
+            // Share one connection semaphore across all in-netns listeners, sized
+            // from `max_connections` exactly like the host listener path, so
+            // captured pod egress is bounded by the same global connection cap
+            // rather than bypassing it (an unbounded `None`).
+            let conn_semaphore: Option<Arc<tokio::sync::Semaphore>> =
+                if env_config.max_connections > 0 {
+                    Some(Arc::new(tokio::sync::Semaphore::new(
+                        env_config.max_connections,
+                    )))
+                } else {
+                    None
+                };
+            let source = Arc::new(crate::proxy::netns_capture::DirectoryCaptureSource::new(
+                env_config.mesh_node_waypoint_pod_registry_dir.clone(),
+            ));
+            let backend = crate::proxy::netns_capture::ProxyNetnsBackend::new(
+                proxy_state.clone(),
+                conn_semaphore,
+                Some(MeshTrafficDirection::Outbound),
+                shutdown_tx.subscribe(),
+            );
+            let manager = crate::proxy::netns_capture::NetnsCaptureManager::new(
+                capture_addr,
+                source,
+                backend,
+                std::time::Duration::from_secs(2),
+            );
+            let manager_shutdown = shutdown_tx.subscribe();
+            info!(
+                registry_dir = %env_config.mesh_node_waypoint_pod_registry_dir,
+                capture_addr = %capture_addr,
+                "Node-waypoint in-netns outbound capture listeners enabled"
+            );
+            mesh_background_handles.push(tokio::spawn(async move {
+                manager.run(manager_shutdown).await;
+            }));
+        }
     }
     if let Some(ref slice) = initial_applied_mesh_slice {
         mesh_state.record_applied_slice(slice);

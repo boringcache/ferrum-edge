@@ -1431,6 +1431,16 @@ fn reconcile_existing_pod_ip(
         metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
     }
     state.pod_ip = Some(new_ip);
+    // Keep the in-netns capture registry's pod IP in sync (line 2 of the entry)
+    // so the mesh proxy reopens its in-netns listener with the new
+    // `source_ip_override` instead of reporting a stale IP to authz/logs/IP-keyed
+    // plugins. Best-effort and gated on in-netns publishing being enabled.
+    if let (Some(dir), Some(cgroup)) = (
+        &config.node_waypoint_pod_registry_dir,
+        state.cgroup_path.as_deref(),
+    ) {
+        publish_pod_registry(dir, pod_uid, cgroup, Some(new_ip));
+    }
 }
 
 /// Re-evaluate the `includeOutboundPorts` annotations of an already-enrolled

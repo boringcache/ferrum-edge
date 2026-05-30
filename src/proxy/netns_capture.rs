@@ -46,7 +46,7 @@
 //! `FERRUM_MESH_NODE_WAYPOINT_IN_NETNS_LISTENERS_ENABLED` (default off).
 
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -154,6 +154,13 @@ struct ActiveListener {
     /// containers share its netns). Kept for observability and so a netns stays
     /// open while any of its pods is still enrolled.
     pod_uids: HashSet<String>,
+    /// The source pod IP this listener's accept loop is currently overriding
+    /// with (its `source_ip_override`), captured at open time. Tracked so a
+    /// later change to the pod's registered IP (or its first assignment, when
+    /// the pod was enrolled before `status.podIP` existed) reopens the listener
+    /// instead of silently reporting `127.0.0.1`/a stale IP to authz, logs, and
+    /// IP-keyed plugins.
+    source_ip: Option<IpAddr>,
 }
 
 impl ActiveListener {
@@ -216,17 +223,27 @@ impl<B: NetnsBackend> NetnsCaptureManager<B> {
     fn reconcile_once(&mut self) -> usize {
         let targets = self.source.list_targets();
 
-        // Desired state: netns inode → pods in it. A target whose netns can't be
-        // resolved right now is simply skipped (retried next poll); it never
-        // tears down an existing listener.
+        // Resolve every enrolled pod's current netns once. Three buckets matter
+        // for reconcile:
+        //   * `desired`           netns inode → pods that resolve to it now
+        //   * `resolved_uid_netns` pod UID → the netns it resolves to now
+        //   * `unresolved_uids`    pods present in the registry but whose netns
+        //                          can't be resolved this round (terminating /
+        //                          PID race) — the transient-grace set
+        // and `registry_uids` is every pod the registry currently lists.
         let mut desired: HashMap<u64, HashSet<String>> = HashMap::new();
+        let mut resolved_uid_netns: HashMap<String, u64> = HashMap::new();
+        let mut unresolved_uids: HashSet<String> = HashSet::new();
+        let registry_uids: HashSet<String> = targets.iter().map(|t| t.pod_uid.clone()).collect();
         for target in &targets {
             if let Some(netns) = self.backend.netns_key(target) {
                 desired
                     .entry(netns)
                     .or_default()
                     .insert(target.pod_uid.clone());
+                resolved_uid_netns.insert(target.pod_uid.clone(), netns);
             } else {
+                unresolved_uids.insert(target.pod_uid.clone());
                 debug!(
                     pod_uid = %target.pod_uid,
                     cgroup = %target.cgroup_path,
@@ -235,21 +252,27 @@ impl<B: NetnsBackend> NetnsCaptureManager<B> {
             }
         }
 
-        // Close a listener only when ALL of its pods have left the registry. A
-        // transient PID/netns-resolve miss (e.g. a container restarting while
-        // its registry file still exists) keeps the pod in `targets`, so its
-        // listener is retained — matching the retry contract above and avoiding
-        // capture flapping. `desired` is netns-keyed and omits this round's
-        // unresolvable pods, so it must NOT drive teardown.
-        let registry_uids: HashSet<&str> = targets.iter().map(|t| t.pod_uid.as_str()).collect();
+        // Close a listener when none of its pods still justify it. A pod on the
+        // listener for netns N justifies keeping N open when it is still in the
+        // registry AND either (a) still resolves to N, or (b) is unresolvable
+        // this round — the transient PID/netns-miss grace case (container
+        // restarting while its registry file persists), which must not flap the
+        // listener. A pod that has left the registry, OR that now resolves to a
+        // DIFFERENT netns (sandbox/netns restart, or an in-place registry
+        // rewrite between polls), no longer justifies N: leaving N open would
+        // leak the old socket and pin the dead netns alive. The pod's new netns
+        // gets its own listener in the open pass below.
         let gone: Vec<u64> = self
             .active
             .iter()
-            .filter(|(_, listener)| {
-                !listener
-                    .pod_uids
-                    .iter()
-                    .any(|uid| registry_uids.contains(uid.as_str()))
+            .filter(|(netns, listener)| {
+                !listener.pod_uids.iter().any(|uid| {
+                    registry_uids.contains(uid)
+                        && match resolved_uid_netns.get(uid) {
+                            Some(resolved) => *resolved == **netns,
+                            None => unresolved_uids.contains(uid),
+                        }
+                })
             })
             .map(|(netns, _)| *netns)
             .collect();
@@ -263,14 +286,39 @@ impl<B: NetnsBackend> NetnsCaptureManager<B> {
             }
         }
 
-        // Open listeners for newly-seen netns; refresh membership for existing.
+        // Open listeners for newly-seen netns; for an existing netns, refresh pod
+        // membership and reopen when the source pod IP changed. The accept loop
+        // captures `source_ip_override` once at open, so a pod that was enrolled
+        // before `status.podIP` existed (override `None`), or whose IP later
+        // changed, would otherwise keep reporting `127.0.0.1`/a stale IP to
+        // authz, logs, and IP-keyed plugins until the pod is removed.
         for (netns, pod_uids) in desired {
+            // The source IP this netns's listener should report: take it from the
+            // same target that would open it. Stable while one pod owns the netns
+            // (the normal case — a pod's sandbox and containers share it).
+            let desired_target = targets.iter().find(|t| pod_uids.contains(&t.pod_uid));
+            let desired_ip = desired_target.and_then(|t| t.pod_ip);
+
             if let Some(existing) = self.active.get_mut(&netns) {
-                existing.pod_uids = pod_uids;
-                continue;
+                if existing.source_ip == desired_ip {
+                    existing.pod_uids = pod_uids;
+                    continue;
+                }
+                // Source pod IP changed → reopen so the accept loop adopts the new
+                // override. Close the old listener, then fall through to reopen.
+                debug!(
+                    netns_inode = netns,
+                    old_ip = ?existing.source_ip,
+                    new_ip = ?desired_ip,
+                    "Node-waypoint capture: source pod IP changed; reopening in-netns listener"
+                );
+                if let Some(old) = self.active.remove(&netns) {
+                    old.close();
+                }
             }
+
             // Any target in this netns can open it — they share the namespace.
-            let Some(target) = targets.iter().find(|t| pod_uids.contains(&t.pod_uid)) else {
+            let Some(target) = desired_target else {
                 continue;
             };
             match self.backend.open_listener(target, self.capture_addr) {
@@ -278,9 +326,17 @@ impl<B: NetnsBackend> NetnsCaptureManager<B> {
                     info!(
                         netns_inode = netns,
                         pod_uid = %target.pod_uid,
+                        source_ip = ?desired_ip,
                         "Opened node-waypoint in-netns capture listener"
                     );
-                    self.active.insert(netns, ActiveListener { stop, pod_uids });
+                    self.active.insert(
+                        netns,
+                        ActiveListener {
+                            stop,
+                            pod_uids,
+                            source_ip: desired_ip,
+                        },
+                    );
                 }
                 None => {
                     warn!(
@@ -716,6 +772,108 @@ mod tests {
         );
         assert_eq!(mgr.reconcile_once(), 1, "only the resolvable pod opens");
         assert!(mgr.active.contains_key(&100));
+    }
+
+    #[tokio::test]
+    async fn reconcile_reopens_listener_when_pod_ip_changes() {
+        // pod-a is enrolled before `status.podIP` exists (override `None`), then
+        // gets an IP, then the IP changes. Each transition must reopen the
+        // listener so the accept loop's `source_ip_override` tracks the current
+        // pod IP rather than reporting loopback / a stale address.
+        let targets = Arc::new(Mutex::new(vec![PodCaptureTarget {
+            pod_uid: "pod-a".to_string(),
+            cgroup_path: "/cg/a".to_string(),
+            pod_ip: None,
+        }]));
+
+        struct DynSource(Arc<Mutex<Vec<PodCaptureTarget>>>);
+        impl PodCaptureSource for DynSource {
+            fn list_targets(&self) -> Vec<PodCaptureTarget> {
+                self.0.lock().unwrap().clone()
+            }
+        }
+
+        let backend = MockBackend::new(&[("/cg/a", Some(100))]);
+        let mut mgr = NetnsCaptureManager::new(
+            "127.0.0.1:15001".parse().unwrap(),
+            Arc::new(DynSource(targets.clone())),
+            backend,
+            Duration::from_secs(1),
+        );
+
+        // Initial open carries no source IP.
+        assert_eq!(mgr.reconcile_once(), 1);
+        assert_eq!(mgr.backend.opened.lock().unwrap().len(), 1);
+        assert_eq!(mgr.active.get(&100).unwrap().source_ip, None);
+
+        // Unchanged IP (still None) → membership refresh only, no reopen.
+        assert_eq!(mgr.reconcile_once(), 1);
+        assert_eq!(
+            mgr.backend.opened.lock().unwrap().len(),
+            1,
+            "no reopen when the source IP is unchanged"
+        );
+
+        // status.podIP assigned → reopen so the override is no longer None.
+        let ip1: IpAddr = "10.1.2.3".parse().unwrap();
+        targets.lock().unwrap()[0].pod_ip = Some(ip1);
+        assert_eq!(mgr.reconcile_once(), 1);
+        assert_eq!(
+            mgr.backend.opened.lock().unwrap().len(),
+            2,
+            "reopened when the pod first gets an IP"
+        );
+        assert_eq!(mgr.active.get(&100).unwrap().source_ip, Some(ip1));
+
+        // IP changes again → reopen again.
+        let ip2: IpAddr = "10.1.2.9".parse().unwrap();
+        targets.lock().unwrap()[0].pod_ip = Some(ip2);
+        assert_eq!(mgr.reconcile_once(), 1);
+        assert_eq!(
+            mgr.backend.opened.lock().unwrap().len(),
+            3,
+            "reopened when the pod IP changes"
+        );
+        assert_eq!(mgr.active.get(&100).unwrap().source_ip, Some(ip2));
+    }
+
+    #[tokio::test]
+    async fn reconcile_closes_listener_when_pod_uid_moves_netns() {
+        // pod-a is enrolled in netns 100, then its sandbox/netns restarts and the
+        // SAME pod UID now resolves to netns 200 (in-place registry rewrite or
+        // remove+publish between polls). The stale listener for 100 must close
+        // (no leaked socket / pinned dead netns) and a fresh one open for 200.
+        let source = Arc::new(StaticSource(vec![target("pod-a", "/cg/a")]));
+        let backend = MockBackend::new(&[("/cg/a", Some(100))]);
+        let mut mgr = NetnsCaptureManager::new(
+            "127.0.0.1:15001".parse().unwrap(),
+            source,
+            backend,
+            Duration::from_secs(1),
+        );
+        assert_eq!(mgr.reconcile_once(), 1);
+        assert!(mgr.active.contains_key(&100));
+
+        // Same UID, new netns.
+        mgr.backend
+            .netns_by_cgroup
+            .lock()
+            .unwrap()
+            .insert("/cg/a".to_string(), Some(200));
+
+        assert_eq!(
+            mgr.reconcile_once(),
+            1,
+            "exactly one listener, now on the new netns"
+        );
+        assert!(
+            !mgr.active.contains_key(&100),
+            "stale netns listener must be closed when the pod UID moves netns"
+        );
+        assert!(
+            mgr.active.contains_key(&200),
+            "a listener must open for the pod's new netns"
+        );
     }
 }
 
