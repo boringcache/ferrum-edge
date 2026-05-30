@@ -6191,6 +6191,7 @@ mod node_waypoint_stream_scope_tests {
             weight: None,
             locality: None,
             service_account: None,
+            pod_uid: None,
         };
         resolver.install_policy_scopes_from_workloads(&[workload]);
 

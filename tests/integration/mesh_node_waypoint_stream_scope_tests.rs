@@ -363,6 +363,7 @@ async fn resolve_stream_against_real_accepted_socket_maps_to_pod_scope() {
         weight: None,
         locality: None,
         service_account: None,
+        pod_uid: None,
     };
     resolver.install_policy_scopes_from_workloads(&[workload]);
 
