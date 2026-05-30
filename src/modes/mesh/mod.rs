@@ -5041,15 +5041,26 @@ fn start_mesh_slice_apply_task(
                                 // instant the proxy config is accepted — before
                                 // recording the apply result or reloading TLS — so
                                 // the window where the new config is live but the
-                                // resolver still resolves removed workloads against
-                                // the old identity index is the minimum possible.
-                                // (Config and resolver are independent ArcSwaps, so
-                                // they cannot swap atomically; staging-until-accept
-                                // keeps a rejected slice side-effect-free, which
-                                // precludes pre-swapping the resolver before the
-                                // config. install_policy_scope_snapshot publishes
-                                // the fail-closed gate first, so within that window
-                                // a removed workload fails closed.)
+                                // resolver still holds the previous generation is
+                                // the minimum possible. Config and resolver are
+                                // independent ArcSwaps that cannot swap atomically,
+                                // and staging-until-accept keeps a rejected slice
+                                // side-effect-free, which precludes pre-swapping the
+                                // resolver before update_config. So config swaps
+                                // first and the resolver swaps here, one statement
+                                // later: within that bounded window the OLD
+                                // generation still answers, so a workload the new
+                                // slice removed keeps resolving its old scope
+                                // (served briefly — NOT failed closed in-window),
+                                // and a newly added one is not yet enrolled. This is
+                                // the accepted, self-correcting apply-gap residual:
+                                // it closes the instant the store below runs, and
+                                // because the HTTP/HBONE path re-queries the scope
+                                // per request it picks up the new generation on the
+                                // next request (the stream path captures at accept).
+                                // The fail-closed authz gate is enforced against
+                                // whichever generation is live — it is not an
+                                // in-window guarantee.
                                 if accepted && let Some((resolver, snapshot)) = staged_policy_scopes
                                 {
                                     resolver.install_policy_scope_snapshot(snapshot);

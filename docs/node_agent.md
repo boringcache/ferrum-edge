@@ -111,16 +111,23 @@ pipeline:
    mirrors each cookie→identity record into the `NodeWaypointIdentityResolver`
    (`record_orig_dst4`/`record_orig_dst6`).
 
-> **Staging caveat — this last hop fails closed today.** Source-identity
-> recovery is **not yet end-to-end**, even with a node-agent and an `ebpf`-built
-> image running. The bridge mirrors records keyed by the **connect-side** socket
-> cookie, but the proxy accept path resolves by the **accepted** socket's cookie
-> — a different value — so `resolve_stream` cannot match the mirrored record and
-> returns no identity (fails closed). Correlating the two cookies (GAP-2M) and
-> populating `identities_by_pod_uid` for pod-UID resolution are follow-ups.
-> Until they land, the capture pipeline ships and is observable, but the
-> node-waypoint accept path does not yet obtain a real source identity and
-> falls back to its closed-by-default behavior.
+> **Caveat — IPv4 landed (live-datapath-unverified); IPv6 fails closed.** The
+> connect-side vs accept-side cookie mismatch — the bridge mirrors records keyed
+> by the **connect-side** socket cookie, but the proxy accept path resolves by
+> the **accepted** socket's cookie — is now bridged by the kernel `sock_ops`
+> program (GAP-2M): at active-established it re-keys the IPv4 record by
+> `(netns cookie, connection 4-tuple)`, and at passive-established it re-stamps
+> it under the accept-side cookie, so `resolve_stream` matches the mirrored
+> record. Pod-UID resolution (`identities_by_pod_uid`) is also wired — the
+> resolver lazily enrolls `pod_uid`→identity by hash-joining the slice's
+> `workload_spiffe_hash`→SPIFFE index against the eBPF-stamped record. Two
+> caveats remain: **(1) IPv4 only** — aya's IPv6 `sock_ops` ctx accessors trip
+> the verifier, so IPv6 (and the v6 half of dual-stack) accepts get no
+> accept-side record and stay fail-closed; **(2)** the full
+> connect→capture→accept datapath is CI compile- and load/attach-tested but
+> **not yet verified on a live multi-pod node**. On any tuple/byte-order
+> mismatch (or an IPv6 accept) no accept-side record is written and the accept
+> path resolves no identity (fail-closed, never misattributed).
 
 The bridge polls (the orig-dst maps are LRU hash maps, not ringbufs), ages out
 cookies the kernel evicted, retries with backoff if the mesh-proxy starts
