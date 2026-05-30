@@ -301,9 +301,20 @@ impl MeshGrpcServer {
         apply_incremental_to_config_snapshot(&mut candidate, delta);
         candidate.normalize_fields();
         candidate.normalize_mesh_fields();
-        let result =
-            Self::build_mesh_config_update_if_changed(&candidate, slice_request, previous_slice)?;
+        // Advance the per-stream base BEFORE building the wire frame: the delta
+        // is logically consumed regardless of whether THIS frame serializes.
+        // Deferring this past the `?` below would drop the delta from the
+        // accumulator on a serialization failure, so every subsequent delta
+        // would apply onto a base missing this one — a persistent per-stream
+        // config divergence. (The Full/Lagged arms always advance the snapshot;
+        // the caller still gates `previous_slice` advancement on a built update
+        // and drops the frame on Err, so the next delta converges cleanly.)
         *stream_config = candidate;
+        let result = Self::build_mesh_config_update_if_changed(
+            stream_config,
+            slice_request,
+            previous_slice,
+        )?;
         Ok(result)
     }
 
@@ -567,6 +578,10 @@ mod tests {
         assert_eq!(stream_config.loaded_at, poll_timestamp);
         assert_eq!(next_slice.version, poll_timestamp.to_rfc3339());
         assert_eq!(next_slice.services.len(), 1);
+        // The base advanced: this delta is now baked into stream_config, so the
+        // next delta applies on top of it rather than re-diverging. (The fix
+        // makes this advancement unconditional — it no longer hinges on the wire
+        // frame building successfully; see apply_mesh_delta_to_stream_config.)
     }
 
     #[test]
