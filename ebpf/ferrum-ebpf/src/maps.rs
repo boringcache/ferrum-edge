@@ -6,8 +6,8 @@
 use aya_ebpf::macros::map;
 use aya_ebpf::maps::{HashMap, LpmTrie, LruHashMap, PerCpuArray, RingBuf};
 use ferrum_ebpf_common::{
-    BpfCaptureConfig, CidrKey4, CidrKey6, IncludePortsPolicy, OrigDst4, OrigDst6, OrigDstKey,
-    PodInfo, WorkloadIdentity, SOCK_OPS_RINGBUF_DEFAULT_BYTES, SOCK_OPS_STATS_LEN,
+    BpfCaptureConfig, CidrKey4, CidrKey6, ConnTuple4, IncludePortsPolicy, OrigDst4, OrigDst6,
+    OrigDstKey, PodInfo, WorkloadIdentity, SOCK_OPS_RINGBUF_DEFAULT_BYTES, SOCK_OPS_STATS_LEN,
 };
 
 /// Original IPv4 destination before connect rewrite, keyed by socket cookie.
@@ -19,6 +19,18 @@ pub static FERRUM_ORIG_DST4: LruHashMap<OrigDstKey, OrigDst4> =
 /// Original IPv6 destination before connect rewrite.
 #[map]
 pub static FERRUM_ORIG_DST6: LruHashMap<OrigDstKey, OrigDst6> =
+    LruHashMap::with_max_entries(65536, 0);
+
+/// GAP-2M accept-side cookie bridge (IPv4): the original destination re-keyed
+/// by the connection 4-tuple. The `sock_ops` program writes this at
+/// active-established (copying the connect-side record from `FERRUM_ORIG_DST4`)
+/// and consumes it at passive-established to re-stamp `FERRUM_ORIG_DST4` under
+/// the proxy's accept-side socket cookie. Kernel-internal: not pinned, not read
+/// by userspace. IPv4 only — the `sock_ops` bridge cannot read the IPv6 ctx
+/// address fields without tripping the BPF verifier, so there is no v6 analogue
+/// (IPv6 node-waypoint resolution stays fail-closed; see `sock_ops.rs`).
+#[map]
+pub static FERRUM_ORIG_DST_BY_TUPLE4: LruHashMap<ConnTuple4, OrigDst4> =
     LruHashMap::with_max_entries(65536, 0);
 
 /// Enrolled pod IPs. Keyed by IPv4 address (network byte order `u32`).

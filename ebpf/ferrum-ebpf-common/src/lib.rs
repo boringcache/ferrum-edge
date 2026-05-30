@@ -47,6 +47,100 @@ pub struct OrigDst6 {
     pub workload_spiffe_hash: u64,
 }
 
+/// IPv4 connection 4-tuple key for the accept-side cookie bridge (GAP-2M),
+/// used by `FERRUM_ORIG_DST_BY_TUPLE4`.
+///
+/// The connect hook stamps `FERRUM_ORIG_DST4` under the *connecting* socket's
+/// cookie, but the node-waypoint proxy resolves by the *accepted* server-side
+/// socket's cookie — a different kernel socket. The `sock_ops` program bridges
+/// the two: at active-established it re-keys the record by this tuple, and at
+/// passive-established it looks the tuple up and re-stamps the record under the
+/// accept-side cookie. Both callbacks must compute an identical key, so:
+///
+/// - `netns_cookie` (`bpf_get_netns_cookie`) disambiguates pods, and is the
+///   load-bearing part of the key. Every captured connection is rewritten to
+///   `127.0.0.1:15001`, so `client_addr`/`server_addr` collapse to loopback and
+///   only the ephemeral `client_port` varies — and ephemeral ports are
+///   per-netns, so two pods can present the *same* 4-tuple into this one global
+///   map. The netns cookie is identical for both ends of a same-netns loopback
+///   connection but distinct across pods, so it makes the key globally unique
+///   and stops one pod's record from overwriting another's (which would
+///   misattribute identity to the accepted socket). A connection whose accept
+///   side lives in a different netns than its connect side never matches —
+///   fail-closed, never misattributed.
+/// - `client_addr` / `server_addr` are kept in **network byte order** (the
+///   kernel stores `local_ip4` / `remote_ip4` that way on both sides).
+/// - `client_port` / `server_port` are normalized to **host byte order** (see
+///   [`sock_ops_peer_port_host_order`]).
+///
+/// "client" is the originating pod socket; "server" is the loopback capture
+/// endpoint (127.0.0.1:15001). `_pad` keeps `netns_cookie` 8-byte aligned with
+/// no implicit padding, so the map-key bytes are fully defined.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConnTuple4 {
+    pub client_addr: u32,
+    pub server_addr: u32,
+    pub client_port: u16,
+    pub server_port: u16,
+    pub _pad: u32,
+    pub netns_cookie: u64,
+}
+
+impl ConnTuple4 {
+    pub const fn new(
+        netns_cookie: u64,
+        client_addr: u32,
+        client_port: u16,
+        server_addr: u32,
+        server_port: u16,
+    ) -> Self {
+        Self {
+            client_addr,
+            server_addr,
+            client_port,
+            server_port,
+            _pad: 0,
+            netns_cookie,
+        }
+    }
+}
+
+/// IPv6 connection 4-tuple key for the accept-side cookie bridge (GAP-2M).
+/// Mirrors [`ConnTuple4`] (including the `netns_cookie` pod discriminator); the
+/// `sock_ops` bridge is currently IPv4-only, so this type is the documented v6
+/// wire format for the eventual IPv6 follow-up. `_pad` keeps `netns_cookie`
+/// 8-byte aligned with no implicit padding.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConnTuple6 {
+    pub client_addr: [u32; 4],
+    pub server_addr: [u32; 4],
+    pub client_port: u16,
+    pub server_port: u16,
+    pub _pad: u32,
+    pub netns_cookie: u64,
+}
+
+impl ConnTuple6 {
+    pub const fn new(
+        netns_cookie: u64,
+        client_addr: [u32; 4],
+        client_port: u16,
+        server_addr: [u32; 4],
+        server_port: u16,
+    ) -> Self {
+        Self {
+            client_addr,
+            server_addr,
+            client_port,
+            server_port,
+            _pad: 0,
+            netns_cookie,
+        }
+    }
+}
+
 /// Pod metadata in the `FERRUM_POD_IPS` map, keyed by IPv4 address (`u32`).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,6 +205,13 @@ impl WorkloadIdentity {
 pub struct BpfCaptureConfig {
     pub outbound_capture_port: u32,
     pub hbone_redirect_port: u32,
+    /// Non-zero → captured IPv6 outbound connections are DENIED (the `connect6`
+    /// hook returns `EPERM`) instead of redirected. Set in NodeWaypoint in-netns
+    /// capture mode, whose in-netns listener and GAP-2M sock-ops bridge are
+    /// IPv4-only: without it, captured IPv6 egress would bypass `mesh_authz`
+    /// entirely instead of failing closed. Excluded v6 (bypass UID / port / CIDR
+    /// excludes) is decided before the deny and still flows.
+    pub ipv6_outbound_deny: u32,
 }
 
 /// Maximum number of explicit `includeOutboundPorts` ports the per-cgroup
@@ -268,6 +369,42 @@ pub const IPV4_LOOPBACK_NBO: u32 = u32::from_ne_bytes([127, 0, 0, 1]);
 /// IPv6 loopback `[::1]` stored as the kernel's `user_ip6` expects (NBO).
 pub const IPV6_LOOPBACK_NBO: [u32; 4] = [0, 0, 0, u32::from_ne_bytes([0, 0, 0, 1])];
 
+/// Convert a `bpf_sock_ops.remote_port` value to a host-byte-order port.
+///
+/// `remote_port` is the peer port in network byte order, but the kernel does
+/// **not** store it in the low 16 bits: on little-endian kernels the sock_ops
+/// ctx rewrite stores it as `(__be16 dport) << 16`, so the real port sits in
+/// the upper half. The canonical decode (matching the kernel's own
+/// `bpf_ntohl(skops->remote_port)` samples) is a full 32-bit
+/// network-to-host swap, then truncate — `u32::from_be(remote_port) as u16`.
+/// Truncating first (`remote_port as u16`) would read the always-zero low half
+/// on LE and yield `0`. `bpf_sock_ops.local_port`, by contrast, is already in
+/// host byte order and needs no conversion.
+pub const fn sock_ops_peer_port_host_order(remote_port: u32) -> u16 {
+    u32::from_be(remote_port) as u16
+}
+
+/// Decode a `bpf_sock_addr.user_port` value to a host-byte-order port.
+///
+/// Unlike `bpf_sock_ops.remote_port` (see [`sock_ops_peer_port_host_order`]),
+/// the cgroup `connect4`/`connect6`/`getpeername` address context stores the
+/// port the way a `sockaddr_in.sin_port` does: **network byte order in the low
+/// 16 bits**, high 16 bits zero (the kernel sets and reads it as
+/// `bpf_htons(port)`). The sock_ops high-half `<< 16` convention does **not**
+/// apply here — using it reads the always-zero high half and yields `0`. So the
+/// decode is "take the low half, swap to host order".
+pub const fn sock_addr_user_port_to_host(user_port: u32) -> u16 {
+    u16::from_be((user_port & 0xFFFF) as u16)
+}
+
+/// Encode a host-byte-order port into a `bpf_sock_addr.user_port` value: network
+/// byte order in the low 16 bits, high 16 bits zero — the inverse of
+/// [`sock_addr_user_port_to_host`], and what the kernel expects when a
+/// cgroup/connect program rewrites the destination port.
+pub const fn host_port_to_sock_addr_user_port(port: u16) -> u32 {
+    port.to_be() as u32
+}
+
 impl CidrKey4 {
     /// Build an LPM key payload from a network-byte-order IPv4 address.
     pub const fn new(addr_nbo: u32) -> Self {
@@ -295,12 +432,62 @@ impl BpfCaptureConfig {
         Self {
             outbound_capture_port: outbound_capture_port as u32,
             hbone_redirect_port: hbone_redirect_port as u32,
+            ipv6_outbound_deny: 0,
         }
+    }
+
+    /// Set whether captured IPv6 outbound connections fail closed (denied) —
+    /// see [`Self::ipv6_outbound_deny`].
+    pub const fn with_ipv6_outbound_deny(mut self, deny: bool) -> Self {
+        self.ipv6_outbound_deny = deny as u32;
+        self
     }
 
     pub const fn default_ports() -> Self {
         Self::new(OUTBOUND_CAPTURE_PORT, INBOUND_HBONE_PORT)
     }
+}
+
+/// `aya::Pod` marks a type as plain-old-data that is safe to copy byte-for-byte
+/// in and out of BPF maps. It is implemented for the shared map key/value types
+/// only under the `userspace` feature on Linux (the aya userspace loader); the
+/// kernel (bpfel) build never links aya. The orphan rule requires these impls to
+/// live in this crate, where the types are defined.
+///
+/// The `target_os = "linux"` gate mirrors aya being a Linux-only dependency in
+/// both this crate and `ferrum-edge` (and `ferrum-edge` gating its real backend
+/// on `cfg(all(feature = "ebpf", target_os = "linux"))`). `ferrum-edge
+/// --features ebpf` enables `ferrum-ebpf-common/userspace` on every target, so
+/// without this gate a non-Linux build (e.g. `cargo check --lib --features ebpf`
+/// on Darwin) would reference the unlinked `aya` crate; off Linux the tree falls
+/// back to the mock backend instead.
+///
+/// Safety: every type below is `#[repr(C)]` and `Copy`, contains only
+/// fixed-width integers / byte arrays (no padding that aliases invalid bit
+/// patterns, no pointers), and matches the kernel-side map definition exactly.
+#[cfg(all(feature = "userspace", target_os = "linux"))]
+mod userspace_pod {
+    use super::*;
+
+    macro_rules! impl_pod {
+        ($($t:ty),+ $(,)?) => {
+            $(unsafe impl aya::Pod for $t {})+
+        };
+    }
+
+    impl_pod!(
+        OrigDstKey,
+        OrigDst4,
+        OrigDst6,
+        ConnTuple4,
+        ConnTuple6,
+        PodInfo,
+        WorkloadIdentity,
+        BpfCaptureConfig,
+        IncludePortsPolicy,
+        CidrKey4,
+        CidrKey6,
+    );
 }
 
 #[cfg(test)]
@@ -314,12 +501,20 @@ mod tests {
         assert_eq!(mem::size_of::<OrigDstKey>(), 8);
         assert_eq!(mem::size_of::<OrigDst4>(), 32);
         assert_eq!(mem::size_of::<OrigDst6>(), 48);
+        // ConnTuple4: two u32 (8) + two u16 (4) + u32 pad (4) + u64 netns (8)
+        // = 24 bytes, 8-byte aligned (no implicit padding).
+        assert_eq!(mem::size_of::<ConnTuple4>(), 24);
+        assert_eq!(mem::align_of::<ConnTuple4>(), 8);
+        // ConnTuple6: two [u32;4] (32) + two u16 (4) + u32 pad (4) + u64 netns
+        // (8) = 48 bytes, 8-byte aligned.
+        assert_eq!(mem::size_of::<ConnTuple6>(), 48);
+        assert_eq!(mem::align_of::<ConnTuple6>(), 8);
         assert_eq!(mem::size_of::<PodInfo>(), 8);
         // WorkloadIdentity: [u8;16] (16) + u64 (8) + u64 pad (8) = 32 bytes,
         // 8-byte aligned for the BPF verifier.
         assert_eq!(mem::size_of::<WorkloadIdentity>(), 32);
         assert_eq!(mem::align_of::<WorkloadIdentity>(), 8);
-        assert_eq!(mem::size_of::<BpfCaptureConfig>(), 8);
+        assert_eq!(mem::size_of::<BpfCaptureConfig>(), 12);
         assert_eq!(mem::size_of::<CidrKey4>(), 4);
         assert_eq!(mem::size_of::<CidrKey6>(), 16);
         // IncludePortsPolicy: two u32 (8) + [u16; INCLUDE_PORTS_MAX] (32) = 40 bytes, 4-byte aligned.
@@ -339,6 +534,8 @@ mod tests {
         assert_copy::<OrigDstKey>();
         assert_copy::<OrigDst4>();
         assert_copy::<OrigDst6>();
+        assert_copy::<ConnTuple4>();
+        assert_copy::<ConnTuple6>();
         assert_copy::<PodInfo>();
         assert_copy::<BpfCaptureConfig>();
         assert_copy::<CidrKey4>();
@@ -436,6 +633,46 @@ mod tests {
     }
 
     #[test]
+    fn sock_ops_peer_port_decodes_be_high_half() {
+        // bpf_sock_ops.remote_port on little-endian = (__be16 dport) << 16.
+        // Port 8080 (0x1F90 host): network bytes [0x1F, 0x90] → 16-bit LE load
+        // 0x901F → << 16 = 0x901F_0000.
+        assert_eq!(sock_ops_peer_port_host_order(0x901F_0000), 8080);
+        // Port 80 (0x0050 host): network bytes [0x00, 0x50] → 0x5000 → << 16.
+        assert_eq!(sock_ops_peer_port_host_order(0x5000_0000), 80);
+        // The previous bug (`remote_port as u16` first) read the zero low half
+        // and returned 0 for both of these.
+        assert_ne!(sock_ops_peer_port_host_order(0x901F_0000), 0);
+    }
+
+    #[test]
+    fn sock_addr_user_port_low_half_round_trip() {
+        // bpf_sock_addr.user_port carries sin_port: network byte order in the
+        // LOW 16 bits (high half zero), unlike bpf_sock_ops.remote_port. Encode
+        // and decode must be inverses, must place the port in the low half, and
+        // must NOT use the sock_ops high-half (`<< 16`) convention — which is the
+        // bug that left connect4 redirecting to port 0 on the live datapath.
+        for port in [1u16, 80, 443, 8080, 15001, 45435, 65535] {
+            let encoded = host_port_to_sock_addr_user_port(port);
+            assert_eq!(
+                encoded & 0xFFFF_0000,
+                0,
+                "port {port}: the high 16 bits must be zero"
+            );
+            assert_eq!(
+                sock_addr_user_port_to_host(encoded),
+                port,
+                "encode/decode must round-trip for port {port}"
+            );
+            assert_ne!(
+                encoded,
+                (port as u32) << 16,
+                "port {port} must not use the sock_ops high-half encoding"
+            );
+        }
+    }
+
+    #[test]
     fn ipv6_loopback_constant() {
         assert_eq!(IPV6_LOOPBACK_NBO[0], 0);
         assert_eq!(IPV6_LOOPBACK_NBO[1], 0);
@@ -450,5 +687,30 @@ mod tests {
         assert_eq!(config.outbound_capture_port, OUTBOUND_CAPTURE_PORT as u32);
         assert_eq!(config.hbone_redirect_port, INBOUND_HBONE_PORT as u32);
         assert_eq!(FERRUM_CAPTURE_CONFIG_KEY, 0);
+        // IPv6 egress is redirected (not denied) by default; the deny is opt-in
+        // for the IPv4-only NodeWaypoint in-netns datapath.
+        assert_eq!(config.ipv6_outbound_deny, 0);
+    }
+
+    #[test]
+    fn ipv6_outbound_deny_flag_round_trips() {
+        assert_eq!(
+            BpfCaptureConfig::new(15001, 15008).ipv6_outbound_deny,
+            0,
+            "v6 deny is off unless explicitly set"
+        );
+        assert_ne!(
+            BpfCaptureConfig::new(15001, 15008)
+                .with_ipv6_outbound_deny(true)
+                .ipv6_outbound_deny,
+            0,
+            "with_ipv6_outbound_deny(true) must set the fail-closed flag the connect6 hook reads"
+        );
+        assert_eq!(
+            BpfCaptureConfig::new(15001, 15008)
+                .with_ipv6_outbound_deny(false)
+                .ipv6_outbound_deny,
+            0
+        );
     }
 }

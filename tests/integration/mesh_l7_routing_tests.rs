@@ -28,6 +28,7 @@ fn object(kind: &str, spec: Value) -> K8sObject {
         kind: kind.to_string(),
         metadata: K8sMetadata {
             name: "sample".to_string(),
+            uid: String::new(),
             namespace: "default".to_string(),
             generation: None,
             labels: HashMap::new(),

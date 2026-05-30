@@ -12,8 +12,9 @@ use crate::maps::{
     FERRUM_INCLUDE_PORTS, FERRUM_ORIG_DST6, FERRUM_PORT_EXCLUDE, FERRUM_WORKLOAD_IDENTITY,
 };
 use ferrum_ebpf_common::{
-    CidrKey6, IncludePortsPolicy, OrigDst6, OrigDstKey, WorkloadIdentity,
-    FERRUM_CAPTURE_CONFIG_KEY, IPV6_LOOPBACK_NBO, OUTBOUND_CAPTURE_PORT,
+    host_port_to_sock_addr_user_port, sock_addr_user_port_to_host, CidrKey6, IncludePortsPolicy,
+    OrigDst6, OrigDstKey, WorkloadIdentity, FERRUM_CAPTURE_CONFIG_KEY, IPV6_LOOPBACK_NBO,
+    OUTBOUND_CAPTURE_PORT,
 };
 
 #[cgroup_sock_addr(connect6)]
@@ -33,8 +34,21 @@ fn try_connect6(ctx: &SockAddrContext) -> Result<i32, i64> {
         return Ok(1);
     }
 
-    let dst_ip = sock_addr.user_ip6;
-    let dst_port = (sock_addr.user_port >> 16) as u16;
+    // Read the IPv6 destination element-by-element. The cgroup/connect6 ctx
+    // (`bpf_sock_addr`) only permits direct scalar field loads at constant
+    // offsets; copying `user_ip6` as a whole `[u32; 4]` makes LLVM take the
+    // array base (ctx+8) into a register, and the verifier rejects the
+    // resulting "modified ctx ptr" dereference. Per-element reads fold the
+    // offset into each load (ctx+8/12/16/20), which the verifier accepts.
+    let dst_ip = [
+        sock_addr.user_ip6[0],
+        sock_addr.user_ip6[1],
+        sock_addr.user_ip6[2],
+        sock_addr.user_ip6[3],
+    ];
+    // `bpf_sock_addr.user_port`: network-order port in the LOW 16 bits (see
+    // connect4 / `sock_addr_user_port_to_host`), NOT the sock_ops high half.
+    let dst_port = sock_addr_user_port_to_host(sock_addr.user_port);
 
     if unsafe { FERRUM_PORT_EXCLUDE.get(&dst_port) }.is_some() {
         return Ok(1);
@@ -55,6 +69,17 @@ fn try_connect6(ctx: &SockAddrContext) -> Result<i32, i64> {
         return Ok(1);
     }
 
+    // IPv4-only datapath fail-closed: when configured (NodeWaypoint in-netns
+    // capture, whose in-netns listener and sock-ops bridge are v4-only), DENY a
+    // captured IPv6 connection — return 0 so the kernel fails the `connect()`
+    // with EPERM — instead of redirecting it to a v6 capture listener that does
+    // not exist. Without this, captured IPv6 egress would bypass `mesh_authz`
+    // entirely. Excluded traffic (bypass UID / port / CIDR excludes,
+    // non-included ports) already returned `Ok(1)` above and still flows.
+    if ipv6_outbound_deny() {
+        return Ok(0);
+    }
+
     let cookie = unsafe { aya_ebpf::helpers::bpf_get_socket_cookie(ctx.as_ptr()) };
     let key = OrigDstKey { cookie };
     // Stamp the source pod's identity onto the orig-dst record (see connect4
@@ -70,8 +95,12 @@ fn try_connect6(ctx: &SockAddrContext) -> Result<i32, i64> {
     let _ = FERRUM_ORIG_DST6.insert(&key, &orig, 0);
 
     let sock_addr = unsafe { &mut *ctx.sock_addr };
-    sock_addr.user_ip6 = IPV6_LOOPBACK_NBO;
-    sock_addr.user_port = outbound_capture_port() << 16;
+    // Per-element store for the same verifier reason as the read above.
+    sock_addr.user_ip6[0] = IPV6_LOOPBACK_NBO[0];
+    sock_addr.user_ip6[1] = IPV6_LOOPBACK_NBO[1];
+    sock_addr.user_ip6[2] = IPV6_LOOPBACK_NBO[2];
+    sock_addr.user_ip6[3] = IPV6_LOOPBACK_NBO[3];
+    sock_addr.user_port = host_port_to_sock_addr_user_port(outbound_capture_port() as u16);
 
     Ok(1)
 }
@@ -94,6 +123,18 @@ fn outbound_capture_port() -> u32 {
     match unsafe { FERRUM_CAPTURE_CONFIG.get(&key) } {
         Some(config) if config.outbound_capture_port != 0 => config.outbound_capture_port & 0xffff,
         _ => OUTBOUND_CAPTURE_PORT as u32,
+    }
+}
+
+/// Whether captured IPv6 egress should fail closed (the node-agent sets this in
+/// NodeWaypoint in-netns mode, whose datapath is IPv4-only). Absent config →
+/// `false` (redirect as normal), so non-NodeWaypoint capture is unaffected.
+#[inline(always)]
+fn ipv6_outbound_deny() -> bool {
+    let key = FERRUM_CAPTURE_CONFIG_KEY;
+    match unsafe { FERRUM_CAPTURE_CONFIG.get(&key) } {
+        Some(config) => config.ipv6_outbound_deny != 0,
+        None => false,
     }
 }
 

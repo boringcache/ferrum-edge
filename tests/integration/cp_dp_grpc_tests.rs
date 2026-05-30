@@ -164,6 +164,7 @@ fn create_test_mesh_config() -> GatewayConfig {
             weight: None,
             locality: None,
             service_account: None,
+            pod_uid: None,
         }],
         services: vec![MeshService {
             name: "api".to_string(),

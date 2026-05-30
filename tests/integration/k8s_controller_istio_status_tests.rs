@@ -43,6 +43,7 @@ fn object(api_version: &str, kind: &str, name: &str, spec: Value) -> K8sObject {
         kind: kind.to_string(),
         metadata: K8sMetadata {
             name: name.to_string(),
+            uid: String::new(),
             namespace: "default".to_string(),
             generation: Some(3),
             labels: HashMap::new(),

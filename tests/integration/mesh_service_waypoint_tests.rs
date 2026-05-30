@@ -66,6 +66,7 @@ fn meta_full(
 ) -> K8sMetadata {
     K8sMetadata {
         name: name.to_string(),
+        uid: String::new(),
         namespace: namespace.to_string(),
         generation: None,
         labels,
@@ -430,6 +431,7 @@ fn workload_in_namespace(namespace: &str, spiffe: &str) -> Workload {
         weight: None,
         locality: None,
         service_account: None,
+        pod_uid: None,
     }
 }
 

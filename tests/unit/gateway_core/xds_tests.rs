@@ -44,6 +44,7 @@ fn workload(name: &str, app: &str) -> Workload {
         weight: None,
         locality: None,
         service_account: None,
+        pod_uid: None,
     }
 }
 

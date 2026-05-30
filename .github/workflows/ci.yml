@@ -1072,6 +1072,107 @@ jobs:
           path: ebpf/target/bpfel-unknown-none/release/ferrum-ebpf
           retention-days: 14
 
+  build-ebpf-userspace:
+    name: Build eBPF Userspace Loader
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          shared-key: "ci-ebpf-userspace"
+
+      - name: Build userspace aya loader (--features ebpf)
+        # The aya userspace loader (src/ebpf/loader.rs, src/ebpf/maps.rs) only
+        # compiles under `--features ebpf` on Linux, and no other CI job
+        # exercises it — the default image ships the no-op mock backend. This
+        # guarantees the loader keeps building as the shared BPF ABI
+        # (ferrum-ebpf-common) and map set evolve. The kernel ELF is read at
+        # runtime, so no compiled BPF object is needed here.
+        run: cargo build --lib --features ebpf
+        env:
+          RUST_BACKTRACE: 1
+
+  ebpf-live:
+    name: eBPF Live-Kernel Test
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Install nightly Rust with rust-src
+        uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
+        with:
+          components: rust-src
+
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          shared-key: "ci-ebpf-live"
+
+      - name: Install bpf-linker
+        run: cargo install bpf-linker --locked
+
+      - name: Build BPF programs (kernel object)
+        run: cd ebpf && cargo +nightly build --target bpfel-unknown-none -Z build-std=core --release -p ferrum-ebpf
+
+      - name: Build live-kernel test binary (--features ebpf)
+        run: cargo test --features ebpf --lib --no-run
+
+      - name: Ensure bpffs is mounted
+        run: sudo mount -t bpf bpf /sys/fs/bpf 2>/dev/null || true
+
+      - name: Run live-kernel eBPF test as root
+        # Loads + verifies every BPF program (including the GAP-2M sock_ops
+        # cookie bridge) on the runner's real kernel, attaches them to a
+        # scratch cgroup, and round-trips the workload-identity map. The test
+        # self-skips (passes) if the runner lacks kernel >= 5.7 / cgroup v2 /
+        # bpffs. Run the prebuilt test binary directly under sudo so cargo
+        # never runs as root against the user-owned target dir.
+        run: |
+          set -euo pipefail
+          BIN=$(cargo test --features ebpf --lib --no-run --message-format=json 2>/dev/null \
+            | jq -r 'select(.profile.test == true and .executable != null and (.target.kind[0] == "lib")) | .executable' \
+            | tail -n1)
+          echo "Live-kernel test binary: $BIN"
+          sudo -E "FERRUM_NODE_AGENT_BPF_ELF_PATH=$GITHUB_WORKSPACE/ebpf/target/bpfel-unknown-none/release/ferrum-ebpf" \
+            "$BIN" ebpf::loader::live_kernel_tests --ignored --nocapture --test-threads=1
+        env:
+          RUST_BACKTRACE: 1
+
+  netns-capture-live:
+    name: Node-Waypoint In-Netns Capture Live Test
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          shared-key: "ci-netns-capture-live"
+
+      - name: Build live test binary
+        run: cargo test --lib --no-run
+
+      - name: Run in-netns capture live tests as root
+        # Privileged functional tests for the per-pod-netns outbound capture
+        # listener (`src/proxy/netns_capture.rs`). They create + enter network
+        # namespaces (needs CAP_SYS_ADMIN) to prove a 127.0.0.1:15001 listener
+        # bound INSIDE a pod netns is reachable from a client in that netns and
+        # isolated from the host netns — the loopback property a single
+        # host-netns listener cannot satisfy. Each test self-skips (passes) when
+        # the runner lacks root / `unshare`. Run the prebuilt binary directly
+        # under sudo so cargo never runs as root against the user-owned target.
+        run: |
+          set -euo pipefail
+          BIN=$(cargo test --lib --no-run --message-format=json 2>/dev/null \
+            | jq -r 'select(.profile.test == true and .executable != null and (.target.kind[0] == "lib")) | .executable' \
+            | tail -n1)
+          echo "In-netns live test binary: $BIN"
+          sudo -E "$BIN" proxy::netns_capture::live_netns_tests --ignored --nocapture --test-threads=1
+        env:
+          RUST_BACKTRACE: 1
+
   performance-regression:
     name: Performance Regression Check
     if: github.event_name == 'pull_request'

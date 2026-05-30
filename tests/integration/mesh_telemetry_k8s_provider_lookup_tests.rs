@@ -24,6 +24,7 @@ fn k8s_object(
         kind: kind.to_string(),
         metadata: K8sMetadata {
             name: name.to_string(),
+            uid: String::new(),
             namespace: namespace.to_string(),
             generation: None,
             labels: Default::default(),

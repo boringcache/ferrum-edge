@@ -90,6 +90,7 @@ fn mesh_workload(id: &str, service_name: &str, address: &str, port: u16) -> Work
         weight: None,
         locality: None,
         service_account: None,
+        pod_uid: None,
     }
 }
 

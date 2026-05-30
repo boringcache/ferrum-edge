@@ -46,6 +46,10 @@ struct CoreService {
 struct CorePod {
     namespace: String,
     name: String,
+    /// Kubernetes `metadata.uid`; threaded onto each per-pod `Workload` so the
+    /// node-waypoint resolver can key policy scope by the exact pod UID the
+    /// eBPF capture stamps. Empty when the pod object carried no UID.
+    uid: String,
     labels: HashMap<String, String>,
     service_account: String,
     addresses: Vec<String>,
@@ -228,6 +232,7 @@ fn collect_pod(acc: &mut K8sAccumulator, object: &K8sObject) {
     let pod = CorePod {
         namespace: object.metadata.namespace.clone(),
         name: object.metadata.name.clone(),
+        uid: object.metadata.uid.clone(),
         labels: object.metadata.labels.clone(),
         service_account: string_field(&object.spec, "serviceAccountName")
             .filter(|value| !value.is_empty())
@@ -387,6 +392,9 @@ fn workload_from_pod(
         weight: None,
         locality,
         service_account: Some(pod.service_account.clone()),
+        // Per-pod UID for node-waypoint scope keying; `None` when the pod
+        // object carried no UID so the resolver falls back to SPIFFE scope.
+        pod_uid: (!pod.uid.is_empty()).then(|| pod.uid.clone()),
     })
 }
 
@@ -629,6 +637,7 @@ mod tests {
             kind: kind.to_string(),
             metadata: K8sMetadata {
                 name: name.to_string(),
+                uid: String::new(),
                 namespace: namespace.to_string(),
                 generation: None,
                 labels: HashMap::new(),
@@ -1015,6 +1024,7 @@ mod tests {
             api_version: "networking.istio.io/v1".to_string(),
             metadata: K8sMetadata {
                 name: "vm-reviews".to_string(),
+                uid: String::new(),
                 namespace: "default".to_string(),
                 generation: None,
                 labels: HashMap::new(),
@@ -1054,6 +1064,7 @@ mod tests {
             api_version: "networking.istio.io/v1".to_string(),
             metadata: K8sMetadata {
                 name: "vm-reviews".to_string(),
+                uid: String::new(),
                 namespace: "default".to_string(),
                 generation: None,
                 labels: HashMap::new(),
@@ -1093,6 +1104,7 @@ mod tests {
             api_version: "networking.istio.io/v1".to_string(),
             metadata: K8sMetadata {
                 name: "vm-reviews".to_string(),
+                uid: String::new(),
                 namespace: "default".to_string(),
                 generation: None,
                 labels: HashMap::new(),
@@ -1132,6 +1144,7 @@ mod tests {
             api_version: "networking.istio.io/v1".to_string(),
             metadata: K8sMetadata {
                 name: "manual-reviews".to_string(),
+                uid: String::new(),
                 namespace: "default".to_string(),
                 generation: None,
                 labels: HashMap::new(),
@@ -1169,6 +1182,7 @@ mod tests {
             api_version: "networking.istio.io/v1".to_string(),
             metadata: K8sMetadata {
                 name: "manual-reviews".to_string(),
+                uid: String::new(),
                 namespace: "default".to_string(),
                 generation: None,
                 labels: HashMap::new(),
@@ -1206,6 +1220,7 @@ mod tests {
             api_version: "networking.istio.io/v1".to_string(),
             metadata: K8sMetadata {
                 name: "manual-reviews".to_string(),
+                uid: String::new(),
                 namespace: "default".to_string(),
                 generation: None,
                 labels: HashMap::new(),
@@ -1247,6 +1262,7 @@ mod tests {
             api_version: "networking.istio.io/v1".to_string(),
             metadata: K8sMetadata {
                 name: "reviews".to_string(),
+                uid: String::new(),
                 namespace: "default".to_string(),
                 generation: None,
                 labels: HashMap::new(),

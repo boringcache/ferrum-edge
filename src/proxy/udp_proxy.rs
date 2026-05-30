@@ -1678,10 +1678,13 @@ async fn start_dtls_frontend_listener(
                     // serves all clients from one shared frontend socket with a
                     // single cookie, so there is no per-source-pod cookie to
                     // resolve here. With `per_pod_policy_scoping` on
-                    // (node-waypoint topology), `mesh_authz` therefore evaluates
-                    // mesh-wide policies only and stamps `mesh_authz.scope_missing`.
-                    // Namespace/selector-scoped DENY/ALLOW rules are not enforced
-                    // for DTLS streams (TCP and HTTP/HBONE are). See docs/mesh.md.
+                    // (node-waypoint topology), `mesh_authz` stamps
+                    // `mesh_authz.scope_missing` and, because the per-pod scope is
+                    // always absent here, fails closed (rejects the stream, 403)
+                    // when any namespace/selector-scoped policy is configured;
+                    // with only mesh-wide policies it evaluates them normally.
+                    // Per-pod scoped enforcement is unavailable for DTLS streams
+                    // (TCP and HTTP/HBONE have it). See docs/mesh.md.
                     node_waypoint_policy_scope: None,
                     // UDP inspects payload per-datagram via on_udp_datagram, not
                     // via first_bytes (which is a TCP-stream concept).
@@ -2525,9 +2528,11 @@ async fn create_session(
         // every client off one shared frontend socket with a single cookie, so
         // there is no per-source-pod cookie to resolve here. With
         // `per_pod_policy_scoping` on (node-waypoint topology), `mesh_authz`
-        // evaluates mesh-wide policies only and stamps `mesh_authz.scope_missing`.
-        // Namespace/selector-scoped DENY/ALLOW rules are not enforced for UDP
-        // streams (TCP and HTTP/HBONE are). See docs/mesh.md.
+        // stamps `mesh_authz.scope_missing` and, because the per-pod scope is
+        // always absent here, fails closed (rejects the stream, 403) when any
+        // namespace/selector-scoped policy is configured; with only mesh-wide
+        // policies it evaluates them normally. Per-pod scoped enforcement is
+        // unavailable for UDP streams (TCP and HTTP/HBONE have it). See docs/mesh.md.
         node_waypoint_policy_scope: None,
         // UDP inspects payload per-datagram via on_udp_datagram, not via
         // first_bytes (which is a TCP-stream concept).

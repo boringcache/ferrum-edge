@@ -1984,6 +1984,9 @@ fn workload_entry(acc: &K8sAccumulator, object: &K8sObject) -> Result<Workload, 
         weight,
         locality,
         service_account: service_account_raw.map(ToOwned::to_owned),
+        // WorkloadEntry is a VM/static workload with no Kubernetes pod UID;
+        // node-waypoint scope falls back to SPIFFE keying for these.
+        pod_uid: None,
     })
 }
 
@@ -4148,6 +4151,7 @@ mod tests {
             kind: kind.to_string(),
             metadata: K8sMetadata {
                 name: name.to_string(),
+                uid: String::new(),
                 namespace: namespace.to_string(),
                 generation: None,
                 labels: HashMap::new(),
@@ -12385,6 +12389,7 @@ extensionProviders:
                 kind: "ProxyConfig".to_string(),
                 metadata: K8sMetadata {
                     name: "mesh-default".to_string(),
+                    uid: String::new(),
                     namespace: "istio-config".to_string(),
                     generation: None,
                     labels: HashMap::new(),
@@ -12424,6 +12429,7 @@ extensionProviders:
                 kind: "ProxyConfig".to_string(),
                 metadata: K8sMetadata {
                     name: "mesh-api".to_string(),
+                    uid: String::new(),
                     namespace: "istio-config".to_string(),
                     generation: None,
                     labels: HashMap::new(),
@@ -12556,6 +12562,7 @@ extensionProviders:
                     kind: "ProxyConfig".to_string(),
                     metadata: K8sMetadata {
                         name: "api-overrides".to_string(),
+                        uid: String::new(),
                         namespace: "default".to_string(),
                         generation: None,
                         labels: HashMap::new(),
@@ -13119,6 +13126,7 @@ extensionProviders:
             kind: "Service".to_string(),
             metadata: K8sMetadata {
                 name: name.to_string(),
+                uid: String::new(),
                 namespace: namespace.to_string(),
                 generation: None,
                 labels: HashMap::new(),
@@ -13137,6 +13145,7 @@ extensionProviders:
             kind: "VirtualService".to_string(),
             metadata: K8sMetadata {
                 name: name.to_string(),
+                uid: String::new(),
                 namespace: "default".to_string(),
                 generation: None,
                 labels: HashMap::new(),
@@ -13331,6 +13340,7 @@ extensionProviders:
             kind: "Service".to_string(),
             metadata: K8sMetadata {
                 name: "reviews".to_string(),
+                uid: String::new(),
                 namespace: "default".to_string(),
                 generation: None,
                 labels: HashMap::new(),
@@ -13382,6 +13392,7 @@ extensionProviders:
             kind: "Service".to_string(),
             metadata: K8sMetadata {
                 name: "reviews".to_string(),
+                uid: String::new(),
                 namespace: "default".to_string(),
                 generation: None,
                 labels: HashMap::new(),

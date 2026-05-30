@@ -108,27 +108,54 @@ fn resolver_with_two_pods(cookie_a: u64, cookie_b: u64) -> Arc<NodeWaypointIdent
         },
     );
 
-    // Install per-pod scopes the way slice apply would: pod A in team-a with
-    // labels app=api,tier=web; pod B in team-b with app=api.
-    let mut scopes = HashMap::new();
-    scopes.insert(
-        pod_a,
-        Arc::new(ferrum_edge::modes::mesh::runtime::PolicyScopeCache::new(
-            spiffe(SPIFFE_A),
+    // Install per-pod scopes the way slice apply does: publish one slice
+    // generation built from the workload set. Pod A is in team-a with labels
+    // app=api,tier=web; pod B is in team-b with app=api. `policy_scope_for_pod`
+    // looks each pod up by the exact UID the eBPF stamps (its workload's
+    // `metadata.uid`), so the two pods are scoped independently.
+    resolver.install_policy_scopes_from_workloads(&[
+        workload(
+            SPIFFE_A,
             "team-a",
+            "api",
             labels(&[("app", "api"), ("tier", "web")]),
-        )),
-    );
-    scopes.insert(
-        pod_b,
-        Arc::new(ferrum_edge::modes::mesh::runtime::PolicyScopeCache::new(
-            spiffe(SPIFFE_B),
-            "team-b",
-            labels(&[("app", "api")]),
-        )),
-    );
-    resolver.install_policy_scopes(scopes);
+            POD_A,
+        ),
+        workload(SPIFFE_B, "team-b", "api", labels(&[("app", "api")]), POD_B),
+    ]);
     resolver
+}
+
+/// Build a minimal `Workload` for the slice-driven scope install. `pod_uid` must
+/// match the captured pod's `metadata.uid` so the per-pod-UID scope index
+/// (`scopes_by_pod_uid`) keys to the exact UID the eBPF stamps.
+fn workload(
+    spiffe_id: &str,
+    namespace: &str,
+    service_name: &str,
+    labels: HashMap<String, String>,
+    pod_uid: &str,
+) -> ferrum_edge::modes::mesh::config::Workload {
+    use ferrum_edge::identity::TrustDomain;
+    use ferrum_edge::modes::mesh::config::{Workload, WorkloadSelector};
+    Workload {
+        spiffe_id: spiffe(spiffe_id),
+        selector: WorkloadSelector {
+            labels,
+            namespace: Some(namespace.to_string()),
+        },
+        service_name: service_name.to_string(),
+        addresses: Vec::new(),
+        ports: Vec::new(),
+        trust_domain: TrustDomain::new("cluster.local").expect("valid trust domain"),
+        namespace: namespace.to_string(),
+        network: None,
+        cluster: None,
+        weight: None,
+        locality: None,
+        service_account: None,
+        pod_uid: Some(pod_uid.to_string()),
+    }
 }
 
 /// A Namespace-scoped policy resolves through the per-pod scope to apply to the
@@ -234,11 +261,18 @@ fn unresolved_cookie_yields_no_scope() {
     );
 }
 
-/// Sanity: a pod whose identity is enrolled but whose workload had no scope
-/// installed (slice/identity race) yields `None` from `policy_scope_for_pod`,
-/// which the accept loop forwards as `node_waypoint_policy_scope: None`.
+/// An enrolled identity whose workload is absent from the current slice fails
+/// closed on resolve. Enrollment is now slice-driven (lazy hash-join), so an
+/// identity outlives its workload only when the control plane removed it;
+/// `resolve_record` re-validates the cached identity against the live slice
+/// index (`workload_identities_by_hash`) and fails closed rather than resolving
+/// to a now-orphaned identity. The stream accept loop then stamps no per-pod
+/// scope (mesh-wide-only fallback, see `resolve_node_waypoint_stream_scope`);
+/// the HBONE accept loop drops the connection. (Pre-fix this surfaced as
+/// "resolves but no scope", which slice-coupled enrollment made unreachable: a
+/// vouched workload always contributes both its hash and its scope.)
 #[test]
-fn enrolled_pod_without_installed_scope_yields_none() {
+fn enrolled_pod_whose_workload_is_absent_from_slice_fails_closed() {
     let resolver = Arc::new(NodeWaypointIdentityResolver::new(0));
     let pod_a = parse_pod_uid(POD_A).unwrap();
     let id_a = NodeWaypointIdentity::new(pod_a, spiffe(SPIFFE_A));
@@ -253,13 +287,17 @@ fn enrolled_pod_without_installed_scope_yields_none() {
             workload_spiffe_hash: hash_a,
         },
     );
-    // No install_policy_scopes call — scope index is empty.
-    let resolved = resolver.resolve_cookie(7).expect("identity resolves");
-    assert_eq!(resolved.pod_uid, pod_a);
+    // No workload in the current slice vouches for this identity's hash (the
+    // index is empty), so resolution fails closed even though the identity is
+    // cached in `identities_by_pod_uid`.
     assert!(
-        resolver.policy_scope_for_pod(&resolved.pod_uid).is_none(),
-        "no installed scope must surface as None so mesh_authz falls back to \
-         mesh-wide-only and stamps scope_missing"
+        resolver.resolve_cookie(7).is_err(),
+        "an identity whose workload is not in the current slice must fail \
+         closed, not resolve to a stale identity"
+    );
+    assert!(
+        resolver.policy_scope_for_pod(&pod_a).is_none(),
+        "and with no installed scope the per-pod lookup stays None"
     );
 }
 
@@ -274,6 +312,8 @@ fn enrolled_pod_without_installed_scope_yields_none() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn resolve_stream_against_real_accepted_socket_maps_to_pod_scope() {
+    use ferrum_edge::identity::TrustDomain;
+    use ferrum_edge::modes::mesh::config::Workload;
     use tokio::net::{TcpListener, TcpStream};
 
     let resolver = Arc::new(NodeWaypointIdentityResolver::new(0));
@@ -308,29 +348,46 @@ async fn resolve_stream_against_real_accepted_socket_maps_to_pod_scope() {
             workload_spiffe_hash: hash_a,
         },
     );
-    resolver.install_policy_scopes({
-        let mut scopes = HashMap::new();
-        scopes.insert(
-            pod_a,
-            Arc::new(ferrum_edge::modes::mesh::runtime::PolicyScopeCache::new(
-                spiffe(SPIFFE_A),
-                "team-a",
-                labels(&[("app", "api"), ("tier", "web")]),
-            )),
-        );
-        scopes
-    });
+    // Install the pod's scope the production way — from the slice's workload
+    // set — which also seeds the `workload_spiffe_hash` gate so `resolve_record`'s
+    // current-slice re-validation passes for the resolved identity. The workload
+    // carries this pod's `metadata.uid` so the per-pod-UID scope index keys to the
+    // captured pod.
+    let workload = Workload {
+        spiffe_id: spiffe(SPIFFE_A),
+        selector: WorkloadSelector {
+            labels: labels(&[("app", "api"), ("tier", "web")]),
+            namespace: Some("team-a".to_string()),
+        },
+        service_name: "api".to_string(),
+        addresses: Vec::new(),
+        ports: Vec::new(),
+        trust_domain: TrustDomain::new("cluster.local").expect("valid trust domain"),
+        namespace: "team-a".to_string(),
+        network: None,
+        cluster: None,
+        weight: None,
+        locality: None,
+        service_account: None,
+        pod_uid: Some(POD_A.to_string()),
+    };
+    resolver.install_policy_scopes_from_workloads(&[workload]);
 
-    // The exact chain the TCP accept loop now runs.
-    let identity = resolver
+    // The exact chain the TCP accept loop now runs: `resolve_stream` returns
+    // BOTH the identity and the per-pod scope from one consistent slice load.
+    let (identity, scope) = resolver
         .resolve_stream(&accepted)
         .expect("accepted socket resolves to enrolled pod identity");
     assert_eq!(identity.pod_uid, pod_a);
     assert_eq!(identity.spiffe_id.as_str(), SPIFFE_A);
 
-    let scope = resolver
+    // The scope returned by resolve and the scope re-queried per request must
+    // agree (same generation), and both must be present for this vouched pod.
+    let scope = scope.expect("resolve must return the resolved pod's scope");
+    let requeried = resolver
         .policy_scope_for_pod(&identity.pod_uid)
         .expect("resolved pod has an installed policy scope");
+    assert_eq!(scope.namespace, requeried.namespace);
 
     let team_a_deny = policy_with_scope(
         "team-a-deny",

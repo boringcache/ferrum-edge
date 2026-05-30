@@ -10,7 +10,7 @@
 //! | `ferrum_getpeername4` | cgroup/getpeername4 | Return original IPv4 destination   |
 //! | `ferrum_getpeername6` | cgroup/getpeername6 | Return original IPv6 destination   |
 //! | `ferrum_tc_inbound` | tc/ingress        | Classify enrolled pod inbound traffic |
-//! | `ferrum_sock_ops`   | sock_ops (cgroup) | TCP-layer events (connect/accept/FIN/RST/RTT) for node-waypoint observability |
+//! | `ferrum_sock_ops`   | sock_ops (cgroup) | TCP-layer events (connect/accept/FIN/RST/RTT) + GAP-2M accept-side cookie bridge |
 //!
 //! Build: `cargo +nightly build --target bpfel-unknown-none -Z build-std=core --release`
 

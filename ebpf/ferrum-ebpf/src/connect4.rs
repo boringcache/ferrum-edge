@@ -19,8 +19,9 @@ use crate::maps::{
     FERRUM_INCLUDE_PORTS, FERRUM_ORIG_DST4, FERRUM_PORT_EXCLUDE, FERRUM_WORKLOAD_IDENTITY,
 };
 use ferrum_ebpf_common::{
-    CidrKey4, IncludePortsPolicy, OrigDst4, OrigDstKey, WorkloadIdentity,
-    FERRUM_CAPTURE_CONFIG_KEY, IPV4_LOOPBACK_NBO, OUTBOUND_CAPTURE_PORT,
+    host_port_to_sock_addr_user_port, sock_addr_user_port_to_host, CidrKey4, IncludePortsPolicy,
+    OrigDst4, OrigDstKey, WorkloadIdentity, FERRUM_CAPTURE_CONFIG_KEY, IPV4_LOOPBACK_NBO,
+    OUTBOUND_CAPTURE_PORT,
 };
 
 #[cgroup_sock_addr(connect4)]
@@ -41,7 +42,9 @@ fn try_connect4(ctx: &SockAddrContext) -> Result<i32, i64> {
     }
 
     let dst_ip = sock_addr.user_ip4;
-    let dst_port = (sock_addr.user_port >> 16) as u16;
+    // `bpf_sock_addr.user_port` carries the port in network byte order in the
+    // LOW 16 bits (sockaddr_in.sin_port), NOT the sock_ops high-half convention.
+    let dst_port = sock_addr_user_port_to_host(sock_addr.user_port);
 
     if unsafe { FERRUM_PORT_EXCLUDE.get(&dst_port) }.is_some() {
         return Ok(1);
@@ -80,7 +83,7 @@ fn try_connect4(ctx: &SockAddrContext) -> Result<i32, i64> {
 
     let sock_addr = unsafe { &mut *ctx.sock_addr };
     sock_addr.user_ip4 = IPV4_LOOPBACK_NBO;
-    sock_addr.user_port = outbound_capture_port() << 16;
+    sock_addr.user_port = host_port_to_sock_addr_user_port(outbound_capture_port() as u16);
 
     Ok(1)
 }
