@@ -285,11 +285,12 @@ fn parse(uri: String) -> Result<SpiffeId, SpiffeIdError> {
     })
 }
 
-/// Per the SPIFFE-ID spec, path segments use the `pchar` grammar restricted
-/// to ASCII letters, digits, and the unreserved punctuation `-._~`. Reserved
-/// or escaped characters are rejected — operators must encode SVIDs in
-/// canonical form.
+/// Per the SPIFFE-ID spec, each path segment is restricted to
+/// `[A-Za-z0-9.-_]` — ASCII letters, digits, and the punctuation `.`, `-`, `_`.
+/// This is STRICTER than RFC 3986 `pchar`/unreserved: `~`, percent-encoding,
+/// and reserved characters are all rejected, so operators must encode SVIDs in
+/// canonical form (a conformant peer such as SPIRE/ztunnel rejects them too).
 #[inline]
 fn is_path_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | '~')
+    c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_')
 }

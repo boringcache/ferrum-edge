@@ -240,6 +240,18 @@ fn spiffe_id_rejects_idn_path() {
 }
 
 #[test]
+fn spiffe_id_rejects_tilde_path_char() {
+    // Per the SPIFFE-ID spec a path segment is `[A-Za-z0-9.-_]` — `~` is NOT
+    // allowed (stricter than RFC 3986 unreserved). A conformant peer (SPIRE,
+    // ztunnel) rejects it, so Ferrum must too rather than accept a non-canonical
+    // identity off a hostile/misconfigured peer cert.
+    assert!(matches!(
+        SpiffeId::new("spiffe://prod.example.com/ns/a~b/sa/x"),
+        Err(SpiffeIdError::InvalidPathChar { ch: '~', .. })
+    ));
+}
+
+#[test]
 fn spiffe_id_rejects_too_long() {
     let body = "a".repeat(MAX_SPIFFE_ID_LEN + 1);
     let raw = format!("spiffe://prod.example.com/{body}");
