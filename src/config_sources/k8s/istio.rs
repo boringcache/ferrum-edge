@@ -584,7 +584,8 @@ fn peer_authentication(
     object: &K8sObject,
 ) -> Result<PeerAuthentication, K8sTranslateError> {
     let mtls = object.spec.get("mtls").unwrap_or(&Value::Null);
-    let effective_mtls_mode = mtls_mode(string_field(mtls, "mode").unwrap_or("PERMISSIVE"));
+    let effective_mtls_mode = mtls_mode(string_field(mtls, "mode").unwrap_or("PERMISSIVE"))
+        .map_err(|message| invalid_resource(object, format!("mtls.mode {message}")))?;
     let mut port_overrides = HashMap::new();
     for (port, value) in object
         .spec
@@ -594,7 +595,10 @@ fn peer_authentication(
         .flat_map(|ports| ports.iter())
     {
         let port = port_from_string(object, port, "portLevelMtls")?;
-        let mode = mtls_mode(string_field(value, "mode").unwrap_or("PERMISSIVE"));
+        let mode =
+            mtls_mode(string_field(value, "mode").unwrap_or("PERMISSIVE")).map_err(|message| {
+                invalid_resource(object, format!("portLevelMtls[{port}].mode {message}"))
+            })?;
         port_overrides.insert(port, mode);
     }
 
@@ -1819,11 +1823,27 @@ fn translate_subset(
     })
 }
 
-fn mtls_mode(value: &str) -> MtlsMode {
+/// Translate an Istio PeerAuthentication `mtls.mode` string into [`MtlsMode`].
+///
+/// Istio defines exactly four values: `UNSET`, `DISABLE`, `PERMISSIVE`, and
+/// `STRICT`. `UNSET` means "inherit from the next-higher tier"; Ferrum models
+/// that inheritance through `resolve_effective_mtls_mode` precedence, so an
+/// explicit `UNSET` contributes the same default posture as `PERMISSIVE` here
+/// (unchanged from prior behaviour).
+///
+/// A genuinely unknown value (e.g. a typo like `STICT`) is **rejected** rather
+/// than silently treated as `PERMISSIVE`. Otherwise a malformed
+/// PeerAuthentication would quietly downgrade a workload's inbound mTLS from the
+/// intended `STRICT` to `PERMISSIVE`; the error instead surfaces to the operator
+/// as `FerrumAccepted=False`.
+fn mtls_mode(value: &str) -> Result<MtlsMode, String> {
     match value {
-        "STRICT" => MtlsMode::Strict,
-        "DISABLE" => MtlsMode::Disable,
-        _ => MtlsMode::Permissive,
+        "STRICT" => Ok(MtlsMode::Strict),
+        "PERMISSIVE" | "UNSET" => Ok(MtlsMode::Permissive),
+        "DISABLE" => Ok(MtlsMode::Disable),
+        other => Err(format!(
+            "unsupported value '{other}' (expected one of UNSET, DISABLE, PERMISSIVE, STRICT)"
+        )),
     }
 }
 
