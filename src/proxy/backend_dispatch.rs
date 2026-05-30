@@ -438,6 +438,15 @@ fn circuit_breaker_target_key(
 /// Route-override plugins must pass the shadowed effective proxy so passive
 /// health and least-latency reporting attribute to the upstream that was
 /// actually dispatched to.
+///
+/// `error_class == Some(ErrorClass::ClientDisconnect)` is handled centrally: a
+/// client-caused disconnect carries no signal about backend health, so it routes
+/// the circuit breaker to `record_neutral` AND skips the least-latency sample and
+/// passive-health report entirely. Callers that detect a client disconnect can
+/// therefore set `connection_error` to whatever is most accurate for their path
+/// without worrying about poisoning backend health — the `ClientDisconnect` arm
+/// suppresses latency/passive regardless, and is evaluated before
+/// `connection_error` for the breaker.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn record_backend_outcome(
     state: &ProxyState,
@@ -453,20 +462,99 @@ pub(crate) fn record_backend_outcome(
     skip_circuit_breaker_record: bool,
     backend_elapsed: Duration,
 ) {
-    // End connection tracking for least-connections
-    if let (Some(target), Some(balancer)) = (upstream_target, selected_balancer) {
+    record_backend_outcome_inner(
+        state,
+        proxy,
+        lb_snapshot,
+        selected_balancer,
+        upstream_target,
+        final_cb_target_key,
+        response_status,
+        connection_error,
+        error_class,
+        is_half_open_probe,
+        skip_circuit_breaker_record,
+        backend_elapsed,
+        true,
+    );
+}
+
+/// Like [`record_backend_outcome`] but records everything EXCEPT ending
+/// least-connections connection tracking.
+///
+/// Use on dispatch paths where a `LoadBalancerConnectionGuard` already owns the
+/// connection-end (so it is correctly deferred until a streaming response body
+/// completes), or where the path never issued a matching
+/// `record_connection_start`. This prevents the double-decrement that occurs
+/// when both a guard and this function end the same connection — which silently
+/// undercounts active connections and biases least-connections balancing.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_backend_outcome_no_conn_end(
+    state: &ProxyState,
+    proxy: &Proxy,
+    lb_snapshot: &LoadBalancerCacheInner,
+    selected_balancer: Option<&Arc<LoadBalancer>>,
+    upstream_target: Option<&UpstreamTarget>,
+    final_cb_target_key: Option<&str>,
+    response_status: u16,
+    connection_error: bool,
+    error_class: Option<ErrorClass>,
+    is_half_open_probe: bool,
+    skip_circuit_breaker_record: bool,
+    backend_elapsed: Duration,
+) {
+    record_backend_outcome_inner(
+        state,
+        proxy,
+        lb_snapshot,
+        selected_balancer,
+        upstream_target,
+        final_cb_target_key,
+        response_status,
+        connection_error,
+        error_class,
+        is_half_open_probe,
+        skip_circuit_breaker_record,
+        backend_elapsed,
+        false,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_backend_outcome_inner(
+    state: &ProxyState,
+    proxy: &Proxy,
+    lb_snapshot: &LoadBalancerCacheInner,
+    selected_balancer: Option<&Arc<LoadBalancer>>,
+    upstream_target: Option<&UpstreamTarget>,
+    final_cb_target_key: Option<&str>,
+    response_status: u16,
+    connection_error: bool,
+    error_class: Option<ErrorClass>,
+    is_half_open_probe: bool,
+    skip_circuit_breaker_record: bool,
+    backend_elapsed: Duration,
+    end_connection: bool,
+) {
+    // End connection tracking for least-connections. Skipped when a
+    // LoadBalancerConnectionGuard owns the end, or when no start was issued.
+    if end_connection && let (Some(target), Some(balancer)) = (upstream_target, selected_balancer) {
         balancer.record_connection_end(target);
     }
 
     // Record backend TTFB for least-latency load balancing (passive path).
     // Only record when:
-    //   1. No connection error (timeouts/refused don't reflect real latency)
-    //   2. Response is non-5xx (error responses may have artificially low latency
+    //   1. The outcome is not a client-caused disconnect. A client that gave up
+    //      before (or mid-) request tells us nothing about backend latency, so a
+    //      synthetic status (e.g. a 413 we emitted) must not feed the EWMA.
+    //   2. No connection error (timeouts/refused don't reflect real latency)
+    //   3. Response is non-5xx (error responses may have artificially low latency
     //      from fast-failing backends, which would skew the EWMA toward broken targets)
-    //   3. No active health checks configured for this upstream — when active probes
+    //   4. No active health checks configured for this upstream — when active probes
     //      exist, they provide consistent, controlled RTT measurements and take
     //      precedence over passive TTFB which includes variable application processing time
-    if !connection_error
+    if error_class != Some(ErrorClass::ClientDisconnect)
+        && !connection_error
         && response_status < 500
         && let (Some(upstream_id), Some(target)) = (proxy.upstream_id.as_deref(), upstream_target)
     {
@@ -504,8 +592,18 @@ pub(crate) fn record_backend_outcome(
         }
     }
 
-    // Passive health check reporting (O(1) upstream lookup via index)
-    if let (Some(upstream_id), Some(target)) = (proxy.upstream_id.as_deref(), upstream_target)
+    // Passive health check reporting (O(1) upstream lookup via index).
+    //
+    // Skip entirely for client-caused disconnects: the client gave up before (or
+    // mid-) request, so the outcome carries no signal about backend health. The
+    // synthetic status we emit (e.g. a 413 on an oversized upload, or a 502 when
+    // the client aborts the upload) must touch neither a phantom <500 success
+    // that would reset failure tracking and re-admit an unhealthy target, nor a
+    // failure when that status happens to be in `unhealthy_status_codes`. The
+    // sibling H3 oversized/abort paths rely on this so their "must not poison
+    // backend passive health" comments hold.
+    if error_class != Some(ErrorClass::ClientDisconnect)
+        && let (Some(upstream_id), Some(target)) = (proxy.upstream_id.as_deref(), upstream_target)
         && let Some(upstream) = LoadBalancerCache::get_upstream_from(lb_snapshot, upstream_id)
     {
         let passive = passive_health_for_target(proxy, &upstream, target);
@@ -954,6 +1052,215 @@ mod tests {
         assert_eq!(
             selection.target.as_ref().map(|target| target.port),
             Some(9090)
+        );
+    }
+
+    #[tokio::test]
+    async fn record_backend_outcome_no_conn_end_preserves_active_connection_count() {
+        // F06 regression: the HTTP dispatch path holds a
+        // LoadBalancerConnectionGuard (start in ctor, end on drop) AND used to
+        // call record_backend_outcome, which ALSO ended the connection -- so
+        // the least-connections gauge was decremented twice per request.
+        // record_backend_outcome_no_conn_end must record CB/health/latency
+        // WITHOUT ending the connection (the guard owns that); the full
+        // record_backend_outcome must still end it.
+        let mut config: crate::config::types::GatewayConfig =
+            serde_json::from_value(serde_json::json!({
+                "version": "1",
+                "consumers": [],
+                "plugin_configs": [],
+                "proxies": [{
+                    "id": "lc-proxy",
+                    "listen_path": "/",
+                    "backend_scheme": "http",
+                    "backend_host": "unused.local",
+                    "backend_port": 0,
+                    "upstream_id": "lc-upstream"
+                }],
+                "upstreams": [{
+                    "id": "lc-upstream",
+                    "targets": [{"host": "10.0.0.1", "port": 8080}],
+                    "algorithm": "least_connections"
+                }]
+            }))
+            .expect("test config should deserialize");
+        config.normalize_fields();
+        let dns_cache = crate::dns::DnsCache::new(crate::dns::DnsConfig::default());
+        let env_config = crate::config::env_config::EnvConfig::default();
+        let (state, _) = crate::proxy::ProxyState::new(config, dns_cache, env_config, None, None)
+            .expect("test proxy state should build");
+        let epoch = state.request_epoch.load();
+        let proxy = &epoch.config.proxies[0];
+
+        let selection =
+            select_upstream_target(proxy, &state, &epoch, "192.0.2.10", &HashMap::new());
+        let balancer = selection
+            .balancer
+            .clone()
+            .expect("least-connections upstream proxy should resolve a balancer");
+        let target = selection
+            .target
+            .clone()
+            .expect("a target should be selected");
+
+        let active = || {
+            balancer
+                .active_connections
+                .iter()
+                .map(|entry| entry.value().load(std::sync::atomic::Ordering::Relaxed))
+                .sum::<i64>()
+        };
+
+        // The guard's constructor would do this start.
+        balancer.record_connection_start(target.as_ref());
+        assert_eq!(active(), 1, "record_connection_start increments the gauge");
+
+        // no_conn_end must NOT decrement -- the guard owns the end.
+        record_backend_outcome_no_conn_end(
+            &state,
+            proxy,
+            &epoch.load_balancer,
+            Some(&balancer),
+            Some(target.as_ref()),
+            None,
+            200,
+            false,
+            None,
+            false,
+            true,
+            std::time::Duration::ZERO,
+        );
+        assert_eq!(
+            active(),
+            1,
+            "record_backend_outcome_no_conn_end must not end the connection"
+        );
+
+        // The full variant DOES end it (used by the bare-start H3 paths).
+        record_backend_outcome(
+            &state,
+            proxy,
+            &epoch.load_balancer,
+            Some(&balancer),
+            Some(target.as_ref()),
+            None,
+            200,
+            false,
+            None,
+            false,
+            true,
+            std::time::Duration::ZERO,
+        );
+        assert_eq!(
+            active(),
+            0,
+            "record_backend_outcome must end the connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_disconnect_outcome_does_not_record_passive_health() {
+        // A client-caused disconnect carries no signal about backend health, so
+        // record_backend_outcome_inner must skip the passive-health report even
+        // when the (synthetic) status we emit sits in unhealthy_status_codes.
+        // Otherwise the sibling H3 oversized-413 / client-abort-502 paths would
+        // poison passive health for the selected target. The contrast call with
+        // error_class=None proves both that the harness genuinely observes
+        // passive state and that the skip is ClientDisconnect-specific.
+        let passive = PassiveHealthCheck {
+            unhealthy_status_codes: vec![502],
+            unhealthy_threshold: 1,
+            ..PassiveHealthCheck::default()
+        };
+        let mut config: crate::config::types::GatewayConfig =
+            serde_json::from_value(serde_json::json!({
+                "version": "1",
+                "consumers": [],
+                "plugin_configs": [],
+                "proxies": [{
+                    "id": "ph-proxy",
+                    "listen_path": "/",
+                    "backend_scheme": "http",
+                    "backend_host": "unused.local",
+                    "backend_port": 0,
+                    "upstream_id": "ph-upstream"
+                }],
+                "upstreams": [{
+                    "id": "ph-upstream",
+                    "targets": [{"host": "10.0.0.1", "port": 8080}],
+                    "algorithm": "round_robin"
+                }]
+            }))
+            .expect("test config should deserialize");
+        config.upstreams[0].health_checks = Some(crate::config::types::HealthCheckConfig {
+            active: None,
+            passive: Some(passive),
+        });
+        config.normalize_fields();
+        let dns_cache = crate::dns::DnsCache::new(crate::dns::DnsConfig::default());
+        let env_config = crate::config::env_config::EnvConfig::default();
+        let (state, _) = crate::proxy::ProxyState::new(config, dns_cache, env_config, None, None)
+            .expect("test proxy state should build");
+        let epoch = state.request_epoch.load();
+        let proxy = &epoch.config.proxies[0];
+        let target = UpstreamTarget {
+            host: "10.0.0.1".to_string(),
+            port: 8080,
+            weight: 1,
+            tags: HashMap::new(),
+            locality: None,
+            path: None,
+        };
+
+        let is_unhealthy = || {
+            state
+                .health_checker
+                .passive_health
+                .get(&proxy.id)
+                .is_some_and(|ph| ph.unhealthy.contains_key("10.0.0.1:8080"))
+        };
+
+        // ClientDisconnect 502 must NOT mark the target unhealthy even though
+        // 502 is in unhealthy_status_codes and the threshold is 1.
+        record_backend_outcome_no_conn_end(
+            &state,
+            proxy,
+            &epoch.load_balancer,
+            None,
+            Some(&target),
+            None,
+            502,
+            false,
+            Some(ErrorClass::ClientDisconnect),
+            false,
+            true,
+            std::time::Duration::ZERO,
+        );
+        assert!(
+            !is_unhealthy(),
+            "ClientDisconnect outcome must not poison passive health (no failure recorded for the backend target)"
+        );
+
+        // A genuine backend 502 (error_class=None) MUST mark it unhealthy,
+        // proving the skip above is specific to ClientDisconnect and that the
+        // harness actually observes passive-health state.
+        record_backend_outcome_no_conn_end(
+            &state,
+            proxy,
+            &epoch.load_balancer,
+            None,
+            Some(&target),
+            None,
+            502,
+            false,
+            None,
+            false,
+            true,
+            std::time::Duration::ZERO,
+        );
+        assert!(
+            is_unhealthy(),
+            "a real backend 502 in unhealthy_status_codes must mark the target unhealthy"
         );
     }
 }

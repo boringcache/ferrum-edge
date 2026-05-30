@@ -137,7 +137,7 @@ impl Plugin for UdpRateLimiting {
         Some(self.limiter.tracked_keys_count())
     }
 
-    async fn on_udp_datagram(&self, ctx: &UdpDatagramContext) -> UdpDatagramVerdict {
+    async fn on_udp_datagram(&self, ctx: &UdpDatagramContext<'_>) -> UdpDatagramVerdict {
         let over_capacity = self.maybe_evict();
         let key = Arc::clone(&ctx.client_ip);
 

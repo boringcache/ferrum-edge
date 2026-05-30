@@ -25,8 +25,9 @@ use super::utils::jwks_store::JwksKeyStore;
 use super::utils::jwt_verifier::{JwtVerifyParams, peek_unverified_issuer, verify_jwt_with_jwks};
 use super::utils::scope_role_check::{self, ScopeRoleRequirements};
 use super::utils::token_extract::{
-    TokenHeaderLocation, TokenLocation, TokenLocationExtract, extract_authorization_bearer,
-    extract_from_location, mark_original_token_stripping_metadata as mark_token_stripping_metadata,
+    STRIP_QUERY_PARAM_METADATA_PREFIX, TokenHeaderLocation, TokenLocation, TokenLocationExtract,
+    extract_authorization_bearer, extract_from_location,
+    mark_original_token_stripping_metadata as mark_token_stripping_metadata,
     provider_locations_extract_token,
 };
 use super::{JwtAuthAttributeValue, PluginResult, RequestContext};
@@ -35,7 +36,6 @@ use super::{JwtAuthAttributeValue, PluginResult, RequestContext};
 const DEFAULT_JWKS_REFRESH_INTERVAL_SECS: u64 = 900;
 const STRIP_AUTHORIZATION_METADATA_KEY: &str = "jwks_auth.strip_authorization";
 const STRIP_HEADER_METADATA_PREFIX: &str = "jwks_auth.strip_header.";
-pub(crate) const STRIP_QUERY_PARAM_METADATA_PREFIX: &str = "jwks_auth.strip_query_param.";
 const CLAIM_HEADER_METADATA_PREFIX: &str = "jwks_auth.claim_header.";
 
 /// JWKS authentication plugin.

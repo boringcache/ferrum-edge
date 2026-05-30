@@ -220,6 +220,137 @@ fn grpc_ok_with_http_5xx_status_trips_breaker() {
 }
 
 #[test]
+fn test_half_open_client_disconnect_neutral_releases_probe_slot() {
+    // Regression for F09 (PR #1392): the H3 oversized-upload (413) path is
+    // admitted as a half-open probe and maps ErrorClass::ClientDisconnect to
+    // cb.record_neutral(is_half_open_probe). Before the fix it passed
+    // skip_circuit_breaker_record=true, skipping record_neutral entirely, so
+    // the reserved probe slot was never released — with half_open_max_requests
+    // = 1 a single oversized upload during HALF_OPEN permanently wedged the
+    // breaker and black-holed the target. record_neutral must release the slot
+    // without changing breaker state.
+    let config = CircuitBreakerConfig {
+        failure_threshold: 1,
+        success_threshold: 2,
+        timeout_seconds: 0,
+        failure_status_codes: vec![500],
+        half_open_max_requests: 1,
+        trip_on_connection_errors: true,
+    };
+    let cb = CircuitBreaker::new(config);
+
+    cb.record_failure(500, false, false);
+    assert_eq!(cb.state_name(), "open");
+
+    // Transition to half-open and reserve the single probe slot.
+    assert!(cb.can_execute().unwrap());
+    assert_eq!(cb.state_name(), "half_open");
+    assert_eq!(cb.half_open_in_flight(), 1);
+    assert!(cb.can_execute().is_err(), "the single probe slot is taken");
+
+    // The client-disconnect (oversized upload) outcome routes here.
+    cb.record_neutral(true);
+
+    assert_eq!(
+        cb.half_open_in_flight(),
+        0,
+        "client-disconnect neutral outcome must release its half-open probe slot"
+    );
+    assert_eq!(
+        cb.state_name(),
+        "half_open",
+        "record_neutral must not change breaker state"
+    );
+    assert!(
+        cb.can_execute().is_ok(),
+        "released probe slot must re-admit a half-open probe"
+    );
+}
+
+#[test]
+fn grpc_streaming_body_too_large_neutral_does_not_close_half_open() {
+    // F04 (PR #1408): a gRPC streaming response whose CLIENT request body
+    // exceeded the limit is returned as RESOURCE_EXHAUSTED (a gateway-side size
+    // rejection) even though the backend returned HTTP 200 headers. The fix
+    // defers the streaming breaker record past that body-size check and records
+    // it as record_neutral, NOT record_success — so a HALF_OPEN probe is
+    // released WITHOUT closing the breaker. This pins the neutral-vs-success
+    // distinction: with success_threshold = 1 a single real success WOULD close,
+    // but a body-too-large neutral must not.
+    let config = CircuitBreakerConfig {
+        failure_threshold: 1,
+        success_threshold: 1,
+        timeout_seconds: 0,
+        failure_status_codes: vec![500],
+        half_open_max_requests: 1,
+        trip_on_connection_errors: true,
+    };
+    let cb = CircuitBreaker::new(config);
+    cb.record_failure(500, false, false);
+    assert!(cb.can_execute().unwrap());
+    assert_eq!(cb.state_name(), "half_open");
+
+    // Body-too-large outcome on the probe: neutral, not success.
+    cb.record_neutral(true);
+    assert_eq!(
+        cb.state_name(),
+        "half_open",
+        "a body-too-large (neutral) outcome must not close the breaker, even at success_threshold = 1"
+    );
+    assert_eq!(
+        cb.half_open_in_flight(),
+        0,
+        "the probe slot must still be released"
+    );
+
+    // A genuine success on the next probe DOES close — proving the breaker was
+    // held open only by classifying body-too-large as neutral rather than a
+    // backend success.
+    assert!(cb.can_execute().unwrap());
+    cb.record_success(true);
+    assert_eq!(
+        cb.state_name(),
+        "closed",
+        "a real backend success must close the breaker at success_threshold = 1"
+    );
+}
+
+#[test]
+fn record_success_without_probe_admission_still_advances_half_open() {
+    // F04 (PR #1408): the gRPC retry loop now gates a rotated retry through
+    // can_execute before dispatching (mirroring the HTTP path). This matters
+    // because record_success with is_half_open_probe = false STILL advances the
+    // half-open success counter — it only skips the in-flight decrement — and
+    // can close the breaker. A retry that bypassed admission would therefore
+    // wrongly drive recovery, which is exactly what the gate prevents. Pin that
+    // record_success(false) is NOT a no-op on a HALF_OPEN breaker.
+    let config = CircuitBreakerConfig {
+        failure_threshold: 1,
+        success_threshold: 2,
+        timeout_seconds: 0,
+        failure_status_codes: vec![500],
+        half_open_max_requests: 1,
+        trip_on_connection_errors: true,
+    };
+    let cb = CircuitBreaker::new(config);
+    cb.record_failure(500, false, false);
+    // Transition to half-open (reserves the single probe slot).
+    assert!(cb.can_execute().unwrap());
+    assert_eq!(cb.state_name(), "half_open");
+
+    // Two non-probe successes (e.g. unadmitted rotated retries) advance the
+    // half-open success_count to the threshold and close the breaker.
+    cb.record_success(false);
+    assert_eq!(cb.state_name(), "half_open");
+    cb.record_success(false);
+    assert_eq!(
+        cb.state_name(),
+        "closed",
+        "record_success(is_half_open_probe = false) advances half-open recovery and can close the breaker"
+    );
+}
+
+#[test]
 fn test_cache_creates_and_reuses() {
     let cache = CircuitBreakerCache::new();
     let config = default_config();

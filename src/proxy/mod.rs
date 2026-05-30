@@ -1209,7 +1209,21 @@ async fn buffer_request_body_for_before_proxy(
         limited
             .collect()
             .await
-            .map_err(|_| RequestBodyBufferError::TooLarge)?
+            .map_err(|e| {
+                // Limited::collect() returns either a LengthLimitError (the body
+                // actually exceeded the cap -> 413) or the underlying transport
+                // error (the client dropped the connection mid-upload -> 499).
+                // Distinguish them so a client disconnect is not misreported and
+                // logged as "Request body exceeds maximum size", mirroring the
+                // unlimited branch below.
+                if e.downcast_ref::<http_body_util::LengthLimitError>()
+                    .is_some()
+                {
+                    RequestBodyBufferError::TooLarge
+                } else {
+                    RequestBodyBufferError::ClientDisconnected(e.to_string())
+                }
+            })?
             .to_bytes()
             .to_vec()
     } else {
@@ -1362,6 +1376,26 @@ impl Drop for GrpcProbeReleaseGuard {
         {
             cb.record_neutral(true);
         }
+    }
+}
+
+/// Record a gRPC backend outcome to the circuit breaker, classified by the
+/// backend's HTTP status (mirrors the HTTP path). gRPC application errors ride
+/// as `grpc-status` trailers over HTTP 200 (not a transport failure), so a
+/// status outside `failure_status_codes` is a success that advances HALF_OPEN
+/// recovery; only a genuine HTTP failure status (e.g. a sandwiched LB /
+/// overloaded backend 5xx) trips the breaker. `record_failure` with a
+/// non-failure status only releases the probe slot, so it cannot stand in for
+/// `record_success` on a 2xx HALF_OPEN probe.
+fn record_grpc_backend_status_outcome(
+    cb: &crate::circuit_breaker::CircuitBreaker,
+    backend_status: u16,
+    is_half_open_probe: bool,
+) {
+    if cb.config().failure_status_codes.contains(&backend_status) {
+        cb.record_failure(backend_status, false, is_half_open_probe);
+    } else {
+        cb.record_success(is_half_open_probe);
     }
 }
 
@@ -5948,6 +5982,25 @@ async fn handle_websocket_request_authenticated(
                     "Failed to upgrade WebSocket connection for {}: {}",
                     proxy_id, e
                 );
+                // The handshake response (101 for H1, 200 for H2) was already
+                // sent to the client, so a plugin that opted into
+                // on_ws_disconnect must still observe a disconnect even though
+                // the upgrade handoff failed before any frames flowed.
+                // run_websocket_proxy (the only other site that fires these
+                // hooks) never runs on this path, so fire them here directly
+                // with zero frame/byte counts and an upgrade-failure tag,
+                // reusing the same construction as the tunnel/frame paths.
+                fire_ws_tunnel_disconnect_hooks(
+                    &ws_disconnect_plugins,
+                    &proxy_id,
+                    &session_meta,
+                    Some((
+                        crate::plugins::Direction::Unknown,
+                        retry::ErrorClass::ConnectionClosed,
+                        None,
+                    )),
+                )
+                .await;
             }
         }
     });
@@ -6104,6 +6157,13 @@ fn is_websocket_backend_strip_header(name: &str) -> bool {
             | "sec-websocket-key"
             | "sec-websocket-version"
             | "sec-websocket-accept"
+            // The gateway's WebSocket bridge (tungstenite) cannot encode or
+            // decode permessage-deflate, so the client's extension OFFER must
+            // not reach the backend: a deflate-capable backend would accept it,
+            // set rsv1 on data frames, and the bridge would tear the session
+            // down with a protocol error. Strip the offer so no extension is
+            // ever negotiated end to end.
+            | "sec-websocket-extensions"
             | "x-consumer-username"
             | "x-consumer-custom-id"
     )
@@ -6203,10 +6263,23 @@ pub(crate) fn build_websocket_backend_url_with_target(
     // Host-only proxies (listen_path == None) have no prefix to strip.
     // Exact listen_paths carry a leading '=' marker for routing; strip only
     // the literal path part so WebSocket forwarding matches HTTP forwarding.
-    let remaining_path = if proxy.strip_listen_path {
-        &incoming_path[strip_len.min(incoming_path.len())..]
+    //
+    // `strip_len` is computed by the router against the encoded-slash
+    // NORMALIZED path, so slice the normalized path (not the raw one) to keep
+    // routing and forwarding in the same coordinate system; slicing the raw
+    // path mis-aligns by 2 bytes per %2f and can panic mid-UTF-8 codepoint.
+    // See `build_backend_url_with_target` for the full rationale. For paths
+    // without encoded slashes this is an allocation-free borrowed no-op.
+    let normalized_path = if proxy.strip_listen_path {
+        Some(crate::router_cache::normalize_encoded_slashes(
+            incoming_path,
+        ))
     } else {
-        incoming_path
+        None
+    };
+    let remaining_path = match &normalized_path {
+        Some(normalized) => &normalized[strip_len.min(normalized.len())..],
+        None => incoming_path,
     };
 
     let backend_path = target_path.or(proxy.backend_path.as_deref()).unwrap_or("");
@@ -7567,11 +7640,20 @@ async fn run_accept_loop(
     _thread_id: usize,
 ) {
     let frontend_listen_port = listener.local_addr().ok().map(|addr| addr.port());
+    // Count consecutive accept() failures to back off a busy-loop. Under fd
+    // exhaustion (EMFILE/ENFILE) accept() fails WITHOUT consuming the pending
+    // connection or clearing the socket's read-readiness, so the next accept()
+    // re-fails immediately — a CPU + log busy-loop until the descriptor table
+    // drains. A single transient error (e.g. ECONNABORTED, which consumes the
+    // backlog entry) must NOT be penalized, so backoff engages only on repeats.
+    let mut accept_backoff = crate::util::accept_backoff::AcceptBackoff::new();
+    let mut accept_err_log = crate::util::accept_backoff::LogRateLimiter::new();
     loop {
         tokio::select! {
             result = listener.accept() => {
                 match result {
                     Ok((stream, remote_addr)) => {
+                        accept_backoff.on_success();
                         // Overload check: reject new connections under critical
                         // pressure. Checked after accept (inside the select!) so
                         // shutdown_rx is always observed even during sustained
@@ -7690,7 +7772,26 @@ async fn run_accept_loop(
                         });
                     }
                     Err(e) => {
-                        error!("Failed to accept connection: {}", e);
+                        // Bound the log rate independently of the backoff: an
+                        // abort/reset flood makes progress and is not backed
+                        // off, so without this it could emit one error per
+                        // accept. Emit the first error, then at most one
+                        // summary per second carrying the suppressed count.
+                        if let Some(suppressed) =
+                            accept_err_log.on_event(crate::socket_opts::monotonic_now_ms())
+                        {
+                            error!(suppressed, "Failed to accept connection: {}", e);
+                        }
+                        // Back off (capped at 100ms) once accept() fails
+                        // repeatedly in quick succession so fd exhaustion cannot
+                        // peg a core. The brief sleep also gives the descriptor
+                        // table a chance to drain. Shutdown is delayed by at
+                        // most one backoff interval. Connection abort/reset
+                        // floods make progress and are not throttled (see
+                        // AcceptBackoff).
+                        if let Some(delay) = accept_backoff.on_error(e.kind()) {
+                            tokio::time::sleep(delay).await;
+                        }
                     }
                 }
             }
@@ -8248,15 +8349,10 @@ pub(crate) async fn normalize_grpc_plugin_rejection_with_after_proxy_hooks(
 
 fn build_response_from_normalized_reject(reject: NormalizedRejectResponse) -> Response<ProxyBody> {
     let is_grpc_error = reject.grpc_status.is_some();
-    let mut builder = Response::builder().status(reject.http_status);
-    for (key, value) in &reject.headers {
-        if let (Ok(name), Ok(val)) = (
-            hyper::header::HeaderName::from_bytes(key.as_bytes()),
-            hyper::header::HeaderValue::from_str(value),
-        ) {
-            builder = builder.header(name, val);
-        }
-    }
+    let builder = headers_mod::apply_response_headers(
+        Response::builder().status(reject.http_status),
+        &reject.headers,
+    );
 
     let body = if reject.body.is_empty() {
         ProxyBody::empty()
@@ -9554,6 +9650,12 @@ async fn handle_proxy_request_inner(
         // still true when no rotation occurred, in which case this equals
         // cb_target_key.
         let mut grpc_final_cb_key = cb_target_key.clone();
+        // Set when a load-balanced retry rotates to a target whose breaker
+        // rejects the attempt (see the can_execute gate in the retry loop): the
+        // current outcome was already recorded for the prior target, so the
+        // post-dispatch record below must be skipped. Mirrors the HTTP path's
+        // `skip_final_cb_record`.
+        let mut grpc_skip_final_cb_record = false;
         let mut grpc_probe_guard = GrpcProbeReleaseGuard {
             cb: if cb_is_half_open_probe {
                 proxy.circuit_breaker.as_ref().map(|cfg| {
@@ -9846,11 +9948,24 @@ async fn handle_proxy_request_inner(
                     // This intermediate failure consumes the probe slot (if any);
                     // the post-dispatch record must not decrement it again.
                     grpc_cb_probe_slot = false;
+                    // The probe slot this guard would release on drop has now
+                    // been released by record_failure above, so disarm it.
+                    // Otherwise a future dropped during the retry backoff/next
+                    // attempt would call record_neutral on the same breaker and
+                    // release a second slot (over-admitting probes when
+                    // half_open_max_requests > 1).
+                    grpc_probe_guard.disarm();
                 }
 
                 let delay = retry::retry_delay(retry_config, grpc_attempt);
                 tokio::time::sleep(delay).await;
                 grpc_attempt += 1;
+
+                // Save the pre-rotation CB key so that if the rotated target's
+                // breaker rejects below, the already-recorded current outcome
+                // stays attributed to the target that produced it. Mirrors the
+                // HTTP retry path.
+                let grpc_pre_rotation_cb_key = grpc_current_cb_key.clone();
 
                 // Try a different target on retry if load balancing is configured
                 if let (Some(_upstream_id), Some(prev_target)) =
@@ -9879,6 +9994,36 @@ async fn handle_proxy_request_inner(
                         Some(crate::circuit_breaker::target_key(&next.host, next.port));
                     grpc_final_cb_key = grpc_current_cb_key.clone();
                     grpc_current_target = Some(next);
+                }
+
+                // Enforce the (possibly rotated) target's circuit breaker before
+                // dispatching this retry, mirroring the HTTP retry path. Without
+                // this gate a retry can dispatch to — and then record an outcome
+                // against — a target whose breaker is OPEN or has no free
+                // HALF_OPEN probe slot, letting an unadmitted retry advance or
+                // close a breaker that should have rejected the attempt.
+                if let Some(cb_config) = &proxy.circuit_breaker {
+                    match state.circuit_breaker_cache.can_execute(
+                        &proxy.id,
+                        grpc_current_cb_key.as_deref(),
+                        cb_config,
+                    ) {
+                        Ok((_cb, is_half_open_probe)) => {
+                            grpc_cb_probe_slot = is_half_open_probe;
+                        }
+                        Err(_) => {
+                            // Rotated/retried target's breaker rejected: don't
+                            // dispatch to it. The current grpc_result (the
+                            // connection error recorded at the top of this
+                            // iteration) stays as the outcome. Restore the final
+                            // key to the target that produced it and skip the
+                            // post-dispatch record so we neither double-record
+                            // nor attribute to the never-dispatched target.
+                            grpc_final_cb_key = grpc_pre_rotation_cb_key;
+                            grpc_skip_final_cb_record = true;
+                            break;
+                        }
+                    }
                 }
 
                 warn!(
@@ -9923,41 +10068,36 @@ async fn handle_proxy_request_inner(
             }
         }
 
-        // Record the final backend outcome to the circuit breaker, and disarm
-        // the neutral-release guard now that dispatch produced a real outcome.
+        // Record the final backend outcome to the circuit breaker and disarm the
+        // neutral-release guard now that dispatch produced a real outcome.
         // Previously the gRPC path recorded nothing here, so the breaker never
         // saw gRPC successes (could not recover from HALF_OPEN) or non-connect
         // failures (could not trip). check_circuit_breaker admitted any probe
-        // against cb_target_key, so record there; the retry loop already
-        // recorded per-attempt failures for any rotated targets.
-        grpc_probe_guard.disarm();
-        if let Some(cb_config) = &proxy.circuit_breaker {
-            let cb = state.circuit_breaker_cache.get_or_create(
-                &proxy.id,
-                grpc_final_cb_key.as_deref(),
-                cb_config,
-            );
+        // against cb_target_key; the retry loop already recorded per-attempt
+        // failures (and disarmed the guard) for rotated targets, and
+        // grpc_skip_final_cb_record marks the case where a rotated retry's
+        // breaker rejected (the outcome was already recorded for the prior
+        // target).
+        //
+        // The STREAMING outcome is deferred to the Ok(Streaming) arm below: a
+        // client-side body-too-large abort surfaces here as Ok(Streaming) with a
+        // backend 200 but is returned as RESOURCE_EXHAUSTED, so it must be
+        // NEUTRAL — not a success that could close a HALF_OPEN breaker. That is
+        // only known after the request-body-size check, so the guard stays armed
+        // until then (a drop before it still releases the probe slot).
+        if !grpc_skip_final_cb_record && let Some(cb_config) = &proxy.circuit_breaker {
             match &grpc_result {
-                Ok(kind) => {
-                    // Classify by the backend's HTTP status, matching the HTTP
-                    // path. gRPC application errors ride as grpc-status trailers
-                    // over HTTP 200 (not a transport failure), so only a genuine
-                    // HTTP 5xx (e.g. a sandwiched LB or overloaded backend) trips
-                    // the breaker — a HALF_OPEN probe must not close the circuit
-                    // on such a status, and configured failure_status_codes must
-                    // still trip. record_success advances recovery for a real
-                    // non-failure status. (record_failure with a non-failure
-                    // status only releases the slot, so it cannot stand in for
-                    // record_success here.)
-                    let backend_status = match kind {
-                        GrpcResponseKind::Buffered(r) => r.status,
-                        GrpcResponseKind::Streaming(r) => r.status,
-                    };
-                    if cb.config().failure_status_codes.contains(&backend_status) {
-                        cb.record_failure(backend_status, false, grpc_cb_probe_slot);
-                    } else {
-                        cb.record_success(grpc_cb_probe_slot);
-                    }
+                // Deferred — recorded in the Ok(Streaming) match arm below once
+                // request_body_exceeded is known.
+                Ok(GrpcResponseKind::Streaming(_)) => {}
+                Ok(GrpcResponseKind::Buffered(r)) => {
+                    grpc_probe_guard.disarm();
+                    let cb = state.circuit_breaker_cache.get_or_create(
+                        &proxy.id,
+                        grpc_final_cb_key.as_deref(),
+                        cb_config,
+                    );
+                    record_grpc_backend_status_outcome(&cb, r.status, grpc_cb_probe_slot);
                 }
                 // Oversized client request payloads (ResourceExhausted) and
                 // request-body-read / gateway-config errors (Internal) are
@@ -9966,9 +10106,21 @@ async fn handle_proxy_request_inner(
                 // mirroring the HTTP path's ClientDisconnect -> record_neutral
                 // and this PR's own GrpcProbeReleaseGuard neutral early-returns.
                 Err(GrpcProxyError::ResourceExhausted(_) | GrpcProxyError::Internal(_)) => {
+                    grpc_probe_guard.disarm();
+                    let cb = state.circuit_breaker_cache.get_or_create(
+                        &proxy.id,
+                        grpc_final_cb_key.as_deref(),
+                        cb_config,
+                    );
                     cb.record_neutral(grpc_cb_probe_slot);
                 }
                 Err(e) => {
+                    grpc_probe_guard.disarm();
+                    let cb = state.circuit_breaker_cache.get_or_create(
+                        &proxy.id,
+                        grpc_final_cb_key.as_deref(),
+                        cb_config,
+                    );
                     let connection_error = matches!(
                         e,
                         GrpcProxyError::BackendUnavailable { kind, .. } if kind.is_connect_class()
@@ -10036,6 +10188,34 @@ async fn handle_proxy_request_inner(
                     .request_body_exceeded
                     .as_ref()
                     .is_some_and(|f| f.load(std::sync::atomic::Ordering::Acquire));
+
+                // Record the streaming backend outcome to the circuit breaker
+                // now that the gateway-side body-too-large decision is final
+                // (deferred from the pre-dispatch record block so it observes
+                // request_body_exceeded). When the body exceeded the limit the
+                // request is returned as RESOURCE_EXHAUSTED below — a
+                // client/gateway-side outcome, so record NEUTRAL and never let
+                // it close/advance a HALF_OPEN breaker; otherwise classify by the
+                // backend HTTP status like the buffered path. An earlier
+                // after_proxy reject returns before this point with the guard
+                // still armed, so its probe slot is released neutrally there.
+                if !grpc_skip_final_cb_record && let Some(cb_config) = &proxy.circuit_breaker {
+                    grpc_probe_guard.disarm();
+                    let cb = state.circuit_breaker_cache.get_or_create(
+                        &proxy.id,
+                        grpc_final_cb_key.as_deref(),
+                        cb_config,
+                    );
+                    if body_exceeded {
+                        cb.record_neutral(grpc_cb_probe_slot);
+                    } else {
+                        record_grpc_backend_status_outcome(
+                            &cb,
+                            grpc_streaming.status,
+                            grpc_cb_probe_slot,
+                        );
+                    }
+                }
 
                 // Determine the final status for logging and metrics.
                 let final_status = if body_exceeded {
@@ -10160,16 +10340,13 @@ async fn handle_proxy_request_inner(
 
                 // Build the response with the live Incoming body — hyper will forward
                 // DATA frames and TRAILERS to the downstream client as they arrive.
-                let mut resp_builder = Response::builder()
-                    .status(StatusCode::from_u16(grpc_streaming.status).unwrap_or(StatusCode::OK));
-                for (k, v) in &response_headers {
-                    if let (Ok(name), Ok(val)) = (
-                        hyper::header::HeaderName::from_bytes(k.as_bytes()),
-                        hyper::header::HeaderValue::from_str(v),
-                    ) {
-                        resp_builder = resp_builder.header(name, val);
-                    }
-                }
+                // Split any newline-joined Set-Cookie into separate header lines.
+                let resp_builder = headers_mod::apply_response_headers(
+                    Response::builder().status(
+                        StatusCode::from_u16(grpc_streaming.status).unwrap_or(StatusCode::OK),
+                    ),
+                    &response_headers,
+                );
                 // For bidi/client-streaming RPCs where the request body is still
                 // sending: GrpcBody::Streaming returns an error when exceeded,
                 // which causes hyper to RST_STREAM the request. The backend then
@@ -10221,6 +10398,18 @@ async fn handle_proxy_request_inner(
                 } else {
                     body
                 };
+
+                // Keep the per-IP concurrent-request guard alive for the full
+                // streaming-body lifetime, matching the HTTP streaming path
+                // (body.with_per_ip_request_guard). per_ip_guard is a
+                // function-scope local that would otherwise drop when this
+                // handler returns at header flush — releasing the per-IP slot
+                // while the gRPC body and trailers are still streaming, which
+                // lets a client evade the per-IP concurrency limit on
+                // long-lived streaming RPCs.
+                if let Some(guard) = per_ip_guard {
+                    body = body.with_per_ip_request_guard(guard);
+                }
 
                 // Detach the deferred logger before handing the body to
                 // `resp_builder.body(...)`. If the build fails (e.g. plugin/
@@ -10494,17 +10683,13 @@ async fn handle_proxy_request_inner(
 
                 record_request(&state, response_status);
 
-                // Build gRPC response with headers and trailers
-                let mut resp_builder = Response::builder()
-                    .status(StatusCode::from_u16(response_status).unwrap_or(StatusCode::OK));
-                for (k, v) in &response_headers {
-                    if let (Ok(name), Ok(val)) = (
-                        hyper::header::HeaderName::from_bytes(k.as_bytes()),
-                        hyper::header::HeaderValue::from_str(v),
-                    ) {
-                        resp_builder = resp_builder.header(name, val);
-                    }
-                }
+                // Build gRPC response with headers and trailers (splitting any
+                // newline-joined Set-Cookie into separate header lines).
+                let resp_builder = headers_mod::apply_response_headers(
+                    Response::builder()
+                        .status(StatusCode::from_u16(response_status).unwrap_or(StatusCode::OK)),
+                    &response_headers,
+                );
 
                 return Ok(resp_builder
                     .body(ProxyBody::full(Bytes::from(response_body)))
@@ -10970,8 +11155,12 @@ async fn handle_proxy_request_inner(
         "Backend response received"
     );
 
-    // Record outcome across CB, passive health, latency, and connection tracking.
-    backend_dispatch::record_backend_outcome(
+    // Record outcome across CB, passive health, and latency. Connection-end is
+    // owned by the LoadBalancerConnectionGuard (`with_lb_connection_guard` /
+    // drop), which correctly defers the decrement until a streaming response
+    // body completes. Use the no-conn-end variant so the least-connections
+    // gauge is not decremented twice per request (guard + this call).
+    backend_dispatch::record_backend_outcome_no_conn_end(
         &state,
         &proxy,
         &epoch.load_balancer,
@@ -11282,22 +11471,9 @@ async fn handle_proxy_request_inner(
     let mut resp_builder = Response::builder()
         .status(StatusCode::from_u16(response_status).unwrap_or(StatusCode::BAD_GATEWAY));
 
-    for (k, v) in &response_headers {
-        if k == "set-cookie" {
-            // Set-Cookie values were stored newline-separated to avoid RFC-violating
-            // comma folding. Emit each value as a separate header line.
-            for cookie_val in v.split('\n') {
-                if let Ok(val) = hyper::header::HeaderValue::from_str(cookie_val) {
-                    resp_builder = resp_builder.header("set-cookie", val);
-                }
-            }
-        } else if let (Ok(name), Ok(val)) = (
-            hyper::header::HeaderName::from_bytes(k.as_bytes()),
-            hyper::header::HeaderValue::from_str(v),
-        ) {
-            resp_builder = resp_builder.header(name, val);
-        }
-    }
+    // Apply backend/plugin response headers, splitting newline-joined Set-Cookie
+    // into separate header lines (RFC 6265).
+    resp_builder = headers_mod::apply_response_headers(resp_builder, &response_headers);
 
     // Add gateway error categorization headers so clients and ops teams
     // can distinguish different failure modes:
@@ -11517,14 +11693,27 @@ async fn handle_proxy_request_inner(
             let cl = response_headers
                 .get("content-length")
                 .and_then(|v| v.parse::<u64>().ok());
+            // Method + status thread into `H3FrameSource` so its graceful-close
+            // recovery gate uses the same `is_response_body_complete` predicate
+            // as the buffered path (HEAD/204/304 no-body responses included).
+            // `method` was moved into the transaction summary above, so read it
+            // back from `ctx`; one `Arc<str>` alloc per streaming-H3 response.
+            let h3_method: Arc<str> = Arc::from(ctx.method.as_str());
             let body = if state.response_buffer_cutoff_bytes == 0
                 && state.max_response_body_size_bytes == 0
             {
-                crate::proxy::body::direct_streaming_h3_body(h3_resp.recv_stream, cl)
+                crate::proxy::body::direct_streaming_h3_body(
+                    h3_resp.recv_stream,
+                    h3_method,
+                    response_status,
+                    cl,
+                )
             } else if state.max_response_body_size_bytes > 0 && cl.is_none() {
                 crate::proxy::body::size_limited_streaming_h3_body(
                     h3_resp.recv_stream,
                     state.max_response_body_size_bytes,
+                    h3_method,
+                    response_status,
                     cl,
                     state.env_config.http3_coalesce_min_bytes,
                     state.env_config.http3_coalesce_max_bytes,
@@ -11533,6 +11722,8 @@ async fn handle_proxy_request_inner(
             } else {
                 crate::proxy::body::coalescing_h3_body(
                     h3_resp.recv_stream,
+                    h3_method,
+                    response_status,
                     cl,
                     state.env_config.http3_coalesce_min_bytes,
                     state.env_config.http3_coalesce_max_bytes,
@@ -11641,10 +11832,28 @@ pub fn build_backend_url_with_target(
         DispatchKind::TcpTls | DispatchKind::UdpDtls => "https",
     };
 
-    let remaining_path = if proxy.strip_listen_path {
-        &incoming_path[strip_len.min(incoming_path.len())..]
+    // `strip_len` (RouteMatch::matched_prefix_len) is a byte offset into the
+    // path AFTER encoded-slash normalization: the router matches against
+    // `normalize_encoded_slashes(path)`, which collapses %2f/%252f to '/'.
+    // Slicing that offset out of the RAW `incoming_path` is a coordinate
+    // mismatch — the offset is too small whenever the request contained
+    // encoded slashes (each %2f shrinks 2 bytes, %252f 4), which both forwards
+    // a corrupted tail to the backend (routing-vs-forwarding desync) and can
+    // index into the middle of a multi-byte UTF-8 codepoint, panicking the
+    // request task. Strip from the SAME normalized path the offset was
+    // computed against so the slice is coordinate-correct and on a char
+    // boundary. Normalization is an allocation-free borrow when the path has
+    // no encoded slashes (the common case) and only runs when stripping.
+    let normalized_path = if proxy.strip_listen_path {
+        Some(crate::router_cache::normalize_encoded_slashes(
+            incoming_path,
+        ))
     } else {
-        incoming_path
+        None
+    };
+    let remaining_path = match &normalized_path {
+        Some(normalized) => &normalized[strip_len.min(normalized.len())..],
+        None => incoming_path,
     };
 
     let backend_path = target_path.or(proxy.backend_path.as_deref()).unwrap_or("");
@@ -13208,7 +13417,9 @@ pub(crate) fn query_string_after_plugin_strips<'a>(
         .metadata
         .keys()
         .filter_map(|key| {
-            key.strip_prefix(crate::plugins::jwks_auth::STRIP_QUERY_PARAM_METADATA_PREFIX)
+            key.strip_prefix(
+                crate::plugins::utils::token_extract::STRIP_QUERY_PARAM_METADATA_PREFIX,
+            )
         })
         .collect();
     if strip_names.is_empty() {
@@ -16059,6 +16270,161 @@ mod tests {
     }
 
     #[test]
+    fn backend_url_full_match_with_encoded_slash_does_not_panic_and_strips_fully() {
+        // F03 regression: the router computes matched_prefix_len against the
+        // encoded-slash-NORMALIZED path. For an exact/regex route the whole
+        // normalized path matches, so the entire path must be stripped. The
+        // raw path is longer (each %2f is 3 bytes vs the normalized 1), and a
+        // multi-byte char straddling the misaligned offset previously panicked
+        // the request task ("byte index N is not a char boundary").
+        let mut proxy = test_proxy(ResponseBodyMode::Stream);
+        proxy.dispatch_kind = DispatchKind::HttpPool;
+        proxy.backend_path = None;
+        proxy.strip_listen_path = true;
+
+        // Raw "/files/%2f€"; the router matched the full normalized
+        // "/files//€" (11 bytes) and reported that as strip_len.
+        let incoming_path = "/files/%2f\u{20ac}";
+        let strip_len = crate::router_cache::normalize_encoded_slashes(incoming_path).len();
+
+        // Must not panic, and the fully-matched path is fully stripped.
+        let url = build_backend_url_with_target(
+            &proxy,
+            incoming_path,
+            "",
+            "backend.local",
+            8080,
+            strip_len,
+            None,
+        );
+        assert_eq!(url, "http://backend.local:8080/");
+    }
+
+    #[test]
+    fn backend_url_encoded_slash_strip_is_coordinate_correct_ascii() {
+        // F03 regression (ASCII desync): raw "/a%2fb" normalizes to "/a/b".
+        // An exact route matches the full normalized path (4 bytes); slicing
+        // the RAW path at offset 4 used to forward "fb" to the backend
+        // (routing-vs-forwarding desync that can defeat backend path-scoped
+        // authorization). Slicing the normalized path yields the correct
+        // empty remainder.
+        let mut proxy = test_proxy(ResponseBodyMode::Stream);
+        proxy.dispatch_kind = DispatchKind::HttpPool;
+        proxy.backend_path = None;
+        proxy.strip_listen_path = true;
+
+        let incoming_path = "/a%2fb";
+        let strip_len = crate::router_cache::normalize_encoded_slashes(incoming_path).len();
+
+        let url = build_backend_url_with_target(
+            &proxy,
+            incoming_path,
+            "",
+            "backend.local",
+            8080,
+            strip_len,
+            None,
+        );
+        assert_eq!(url, "http://backend.local:8080/");
+    }
+
+    #[test]
+    fn backend_url_prefix_route_encoded_slash_in_prefix_strips_to_remainder() {
+        // F03 regression (prefix route, NON-EMPTY remainder): listen_path
+        // "/a/b", raw "/a%2fb/c" normalizes to "/a/b/c". A prefix route reports
+        // matched_prefix_len = listen_path.len() = 4, an offset into the
+        // NORMALIZED path. The old raw-path slice `&"/a%2fb/c"[4..]` forwarded
+        // "fb/c" (a routing-vs-forwarding desync); slicing the normalized path
+        // yields "/c". `strip_len` is hardcoded to the prefix length here (not
+        // recomputed via `normalize_encoded_slashes`) so the test locks the
+        // router→builder coordinate contract rather than the helper's own math.
+        let mut proxy = test_proxy(ResponseBodyMode::Stream);
+        proxy.dispatch_kind = DispatchKind::HttpPool;
+        proxy.backend_path = None;
+        proxy.strip_listen_path = true;
+
+        let incoming_path = "/a%2fb/c";
+        let strip_len = "/a/b".len();
+
+        let url = build_backend_url_with_target(
+            &proxy,
+            incoming_path,
+            "",
+            "backend.local",
+            8080,
+            strip_len,
+            None,
+        );
+        assert_eq!(url, "http://backend.local:8080/c");
+    }
+
+    #[test]
+    fn router_to_backend_url_contract_strips_encoded_slash_prefix() {
+        // End-to-end contract: derive `strip_len` from the REAL router so the
+        // builder is exercised against the exact offset `find_proxy` emits, not
+        // a locally recomputed one. Guards against future drift in the
+        // `matched_prefix_len` coordinate system (the desync this PR fixes).
+        // listen_path "/api"; raw "/api/files/a%2fb" normalizes to
+        // "/api/files/a/b"; the prefix match strips "/api" and forwards
+        // "/files/a/b" (the old raw-slice forwarded a corrupted tail).
+        let mut routed = test_proxy(ResponseBodyMode::Stream);
+        routed.dispatch_kind = DispatchKind::HttpPool;
+        routed.backend_path = None;
+        routed.listen_path = Some("/api".to_string());
+        routed.strip_listen_path = true;
+
+        let config = GatewayConfig {
+            proxies: vec![routed],
+            ..GatewayConfig::default()
+        };
+        let cache = crate::router_cache::RouterCache::new(&config, 100);
+
+        let incoming_path = "/api/files/a%2fb";
+        let rm = cache
+            .find_proxy(None, incoming_path)
+            .expect("prefix route should match the normalized path");
+
+        let url = build_backend_url_with_target(
+            rm.proxy.as_ref(),
+            incoming_path,
+            "",
+            "backend.local",
+            8080,
+            rm.matched_prefix_len,
+            None,
+        );
+        assert_eq!(url, "http://backend.local:8080/files/a/b");
+    }
+
+    #[test]
+    fn websocket_backend_url_encoded_slash_strip_is_coordinate_correct() {
+        // F03 regression for the WebSocket builder (mirrors the HTTP builder
+        // tests above; the WS builder got the identical normalize-then-slice
+        // fix but had no encoded-slash coverage). Raw "/ws/a%2fb" normalizes to
+        // "/ws/a/b"; prefix "/ws" strips to "/a/b". The old raw-path slice
+        // forwarded "/a%2fb" (a 2-byte offset skew) and could panic mid-
+        // codepoint; slicing the normalized path is correct.
+        let mut proxy = test_proxy(ResponseBodyMode::Stream);
+        proxy.backend_scheme = Some(BackendScheme::Http);
+        proxy.listen_path = Some("/ws".to_string());
+        proxy.strip_listen_path = true;
+
+        let incoming_path = "/ws/a%2fb";
+        let strip_len = "/ws".len();
+
+        let url = build_websocket_backend_url_with_target(
+            &proxy,
+            incoming_path,
+            "",
+            "backend.local",
+            8080,
+            strip_len,
+            None,
+        );
+        assert_eq!(url, "ws://backend.local:8080/a/b");
+    }
+
+    #[test]
     fn websocket_forwardable_headers_use_sanitized_proxy_headers() {
         let mut headers = HashMap::new();
         headers.insert("host".to_string(), "edge.example".to_string());
@@ -16320,7 +16686,7 @@ mod tests {
         ctx.metadata.insert(
             format!(
                 "{}{}",
-                crate::plugins::jwks_auth::STRIP_QUERY_PARAM_METADATA_PREFIX,
+                crate::plugins::utils::token_extract::STRIP_QUERY_PARAM_METADATA_PREFIX,
                 "access_token"
             ),
             "true".to_string(),
@@ -16328,7 +16694,7 @@ mod tests {
         ctx.metadata.insert(
             format!(
                 "{}{}",
-                crate::plugins::jwks_auth::STRIP_QUERY_PARAM_METADATA_PREFIX,
+                crate::plugins::utils::token_extract::STRIP_QUERY_PARAM_METADATA_PREFIX,
                 "encoded token"
             ),
             "true".to_string(),

@@ -1584,17 +1584,27 @@ pub(crate) async fn proxy_grpc_request_core(
 
     // Parse gRPC deadline AFTER proxy_headers merge so that before_proxy plugins
     // that add/replace/remove grpc-timeout are reflected in the effective timeout.
-    // Cap by the proxy's backend_read_timeout_ms so client deadlines propagate
-    // without exceeding the operator-configured maximum. When backend_read_timeout_ms
-    // is 0 (disabled), the gRPC deadline is used uncapped; with no deadline either,
-    // there is no timeout.
-    let effective_timeout_ms = match parse_grpc_timeout_ms(&headers) {
+    // Two distinct timeout regimes:
+    //  * client_deadline_ms — a client-supplied `grpc-timeout` (capped by the
+    //    operator's backend_read_timeout_ms so it never exceeds the configured
+    //    maximum; uncapped when that is 0). This is END-TO-END by gRPC spec, so
+    //    it must bound the response-header wait + body collection as ONE shared
+    //    budget — otherwise a slow backend gets up to ~2x the client's stated
+    //    deadline (the F11 bug this PR fixes).
+    //  * per_phase_read_ms — the operator backend_read_timeout_ms safety net
+    //    used when the client set no deadline. This is a PER-READ stall guard,
+    //    not an RPC budget, so each phase (header wait, body collection) gets a
+    //    FRESH full budget. Folding it into a single end-to-end budget would
+    //    newly time out a large buffered response from a slow-but-progressing
+    //    backend that previously succeeded, so the two phases stay independent —
+    //    matching the long-standing operator semantics and the streaming path.
+    let (client_deadline_ms, per_phase_read_ms) = match parse_grpc_timeout_ms(&headers) {
         Some(grpc_ms) if proxy.backend_read_timeout_ms > 0 => {
-            Some(grpc_ms.min(proxy.backend_read_timeout_ms))
+            (Some(grpc_ms.min(proxy.backend_read_timeout_ms)), None)
         }
-        Some(grpc_ms) => Some(grpc_ms),
-        None if proxy.backend_read_timeout_ms > 0 => Some(proxy.backend_read_timeout_ms),
-        None => None,
+        Some(grpc_ms) => (Some(grpc_ms), None),
+        None if proxy.backend_read_timeout_ms > 0 => (None, Some(proxy.backend_read_timeout_ms)),
+        None => (None, None),
     };
 
     let mut backend_req = Request::new(GrpcBody::Buffered(Full::new(body_bytes)));
@@ -1617,9 +1627,36 @@ pub(crate) async fn proxy_grpc_request_core(
             )
         }
     };
-    let response = if let Some(timeout_ms) = effective_timeout_ms {
-        let read_timeout = Duration::from_millis(timeout_ms);
-        tokio::time::timeout(read_timeout, send_fut)
+    // For a client-supplied gRPC deadline, compute ONE absolute deadline shared
+    // via timeout_at by both the header wait here and the body collection below
+    // — the deadline is end-to-end, so the two phases share one budget instead
+    // of each arming a fresh full timer (the F11 ~2x bug). `checked_add` guards a
+    // pathologically large client deadline from overflowing the `Instant` add
+    // (which would panic the request path, unlike the old `timeout(Duration)`
+    // form); on overflow the deadline is treated as effectively unbounded. The
+    // operator fallback (`per_phase_read_ms`) instead arms a fresh per-phase
+    // timer in each phase, preserving the prior per-read stall-guard semantics.
+    let client_deadline = client_deadline_ms.and_then(|ms| {
+        tokio::time::Instant::now()
+            .checked_add(Duration::from_millis(ms))
+            .map(|deadline| (ms, deadline))
+    });
+    let response = if let Some((timeout_ms, deadline)) = client_deadline {
+        tokio::time::timeout_at(deadline, send_fut)
+            .await
+            .map_err(|_| {
+                warn!(
+                    "gRPC: read timeout ({}ms, end-to-end) waiting for backend response",
+                    timeout_ms
+                );
+                GrpcProxyError::BackendTimeout {
+                    kind: GrpcTimeoutKind::Read,
+                    message: format!("Read timeout after {}ms (end-to-end)", timeout_ms),
+                }
+            })?
+            .map_err(map_send_err)?
+    } else if let Some(timeout_ms) = per_phase_read_ms {
+        tokio::time::timeout(Duration::from_millis(timeout_ms), send_fut)
             .await
             .map_err(|_| {
                 warn!(
@@ -1728,7 +1765,27 @@ pub(crate) async fn proxy_grpc_request_core(
         Ok(())
     };
 
-    if let Some(timeout_ms) = effective_timeout_ms {
+    if let Some((timeout_ms, deadline)) = client_deadline {
+        // Same end-to-end deadline as the header wait above — for a
+        // client-supplied gRPC deadline the header wait and body collection
+        // share one budget, not two.
+        tokio::time::timeout_at(deadline, body_collection)
+            .await
+            .map_err(|_| {
+                warn!(
+                    "gRPC: read timeout ({}ms, end-to-end) while collecting response body",
+                    timeout_ms
+                );
+                GrpcProxyError::BackendTimeout {
+                    kind: GrpcTimeoutKind::Read,
+                    message: format!("Body read timeout after {}ms (end-to-end)", timeout_ms),
+                }
+            })??;
+    } else if let Some(timeout_ms) = per_phase_read_ms {
+        // Operator fallback: a FRESH per-phase budget for body collection,
+        // independent of the header wait — preserves the prior per-read stall
+        // guard so a slow-but-progressing large buffered response is not newly
+        // timed out by a shared end-to-end budget.
         tokio::time::timeout(Duration::from_millis(timeout_ms), body_collection)
             .await
             .map_err(|_| {
@@ -2254,6 +2311,68 @@ mod tests {
                 line
             );
         }
+    }
+
+    /// F11: the buffered gRPC path must apply a CLIENT-SUPPLIED `grpc-timeout`
+    /// as ONE end-to-end budget (a single shared `timeout_at` deadline spanning
+    /// the header wait + body collection), while the OPERATOR
+    /// `backend_read_timeout_ms` fallback keeps a FRESH per-phase
+    /// `tokio::time::timeout` in each phase.
+    ///
+    /// Guarded structurally because the unit harness has no mock H2 backend to
+    /// drive paused-clock timing (mirrors the source-introspection precedent in
+    /// `proxy_grpc_request_always_preserves_body_bytes_for_retry`).
+    #[test]
+    fn proxy_grpc_request_core_shares_one_client_deadline_but_per_phase_fallback() {
+        let src = include_str!("grpc_proxy.rs");
+        let fn_start = src
+            .find("pub(crate) async fn proxy_grpc_request_core(")
+            .expect("proxy_grpc_request_core signature not found");
+        let tail = &src[fn_start..];
+        let fn_end = tail
+            .find("\n}\n")
+            .expect("failed to locate end of proxy_grpc_request_core body");
+        let body = &tail[..fn_end];
+
+        // The client deadline is computed ONCE (a single shared Instant) and
+        // reused by both phases via timeout_at — never recomputed per phase.
+        let client_now = body.matches("tokio::time::Instant::now()").count();
+        assert_eq!(
+            client_now, 1,
+            "the client gRPC deadline must be computed ONCE and shared by both \
+             phases; found {client_now} `Instant::now()` call(s). A second one \
+             means the header wait and body collection no longer share one \
+             end-to-end budget (the F11 ~2x bug)."
+        );
+        let timeout_at = body.matches("tokio::time::timeout_at(").count();
+        assert_eq!(
+            timeout_at, 2,
+            "both the header wait and body collection must consume the SAME \
+             shared client deadline via timeout_at; found {timeout_at}."
+        );
+
+        // The deadline Instant add must be overflow-guarded (checked_add) so a
+        // pathological client `grpc-timeout` cannot panic the request path.
+        assert!(
+            body.contains("checked_add(Duration::from_millis("),
+            "the client deadline must use checked_add to avoid an Instant \
+             overflow panic on a pathological grpc-timeout."
+        );
+
+        // The operator `backend_read_timeout_ms` fallback must stay PER-PHASE:
+        // a fresh `tokio::time::timeout` in BOTH the header-wait and
+        // body-collection arms (two independent timers, not one shared budget).
+        let per_phase = body
+            .matches("tokio::time::timeout(Duration::from_millis(")
+            .count();
+        assert_eq!(
+            per_phase, 2,
+            "the operator backend_read_timeout_ms fallback must arm a FRESH \
+             per-phase `tokio::time::timeout` in each phase (header wait + body \
+             collection); found {per_phase}. Folding it into the shared \
+             end-to-end deadline regresses slow-but-progressing buffered \
+             responses."
+        );
     }
 
     // ── collect_buffered_grpc_trailers ─────────────────────────────────────

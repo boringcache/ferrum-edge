@@ -1,6 +1,6 @@
 # OIDC Relying Party
 
-Ferrum Edge can act as an OpenID Connect relying party for browser-facing routes with the `oidc_relying_party` plugin. The plugin starts an authorization-code flow with PKCE, validates the returned ID token against provider JWKS, creates an encrypted gateway session cookie, optionally enriches claims from UserInfo, and can fan selected claims out to upstream request headers.
+Ferrum Edge can act as an OpenID Connect relying party for browser-facing routes with the `oidc_relying_party` plugin. The plugin starts an authorization-code flow with PKCE, validates the returned ID token against provider JWKS, creates an encrypted gateway session cookie, optionally enriches claims from UserInfo, and can fan selected claims out to upstream request headers. The session uses a sliding idle window and, when a refresh token is available, transparently refreshes the access/ID tokens before they expire.
 
 ## Minimal Configuration
 
@@ -35,6 +35,21 @@ Exactly one provider is supported. Use `discovery_url` for normal OIDC providers
 - `behavior.trusted_redirect_hosts` gates post-login redirects. If no trusted redirect is available, the plugin uses `behavior.post_login_default_path`.
 - UserInfo `sub` must match the ID token `sub`, and UserInfo cannot override protected ID token claims.
 - Claim header mappings reject reserved headers, including `Authorization`, `Host`, hop-by-hop headers, and Ferrum consumer identity headers.
+
+## Session Lifetime and Token Refresh
+
+The gateway session has two bounds, both enforced on every request:
+
+- **Absolute lifetime** — `session.ttl_secs` (default `3600`) measured from login. A session is never valid past this, regardless of activity.
+- **Idle timeout** — `session.idle_ttl_secs` (default `1800`) of inactivity. This is a *sliding* window: each request advances the session's last-touch time, so an actively used session stays valid until the absolute lifetime. To keep the per-request cost and `Set-Cookie` churn low, the cookie is re-issued at most about twice per idle window (once more than half of `idle_ttl_secs` has elapsed since the last update), not on every request.
+
+When the provider issues a refresh token (typically by adding the `offline_access` scope), the plugin proactively refreshes the tokens `behavior.refresh_skew_secs` (default `30`) before the access token expires:
+
+- A new access token, a rotated refresh token, and an optional new ID token are accepted. A returned ID token is re-validated against the provider JWKS and must bind to the same subject; if it carries a `nonce` it must match the original login.
+- On success, the refreshed claims drive scope/role checks and claim-header fan-out, and the session cookie is re-issued.
+- Refresh is best-effort. A failure is not fatal: the existing session stays valid by its own ttl/idle bounds and the next attempt is deferred briefly so a flaky token endpoint is not retried on every request. The gateway session lifetime is governed by the cookie bounds above, not by access-token expiry.
+
+Both a sliding update and a refresh re-issue the session cookie on the proxied response via `Set-Cookie`, preserving any cookie the backend also set.
 
 ## Client Authentication
 

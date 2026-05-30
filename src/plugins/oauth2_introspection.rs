@@ -27,15 +27,15 @@ use super::utils::introspection_cache::{
 };
 use super::utils::scope_role_check::{self, ScopeRoleRequirements};
 use super::utils::token_extract::{
-    TokenHeaderLocation, TokenLocation, TokenLocationExtract, extract_authorization_bearer,
-    extract_from_location, mark_original_token_stripping_metadata as mark_token_stripping_metadata,
+    STRIP_QUERY_PARAM_METADATA_PREFIX, TokenHeaderLocation, TokenLocation, TokenLocationExtract,
+    extract_authorization_bearer, extract_from_location,
+    mark_original_token_stripping_metadata as mark_token_stripping_metadata,
     provider_locations_extract_token,
 };
 use super::{PluginResult, RequestContext};
 
 const STRIP_AUTHORIZATION_METADATA_KEY: &str = "oauth2_introspection.strip_authorization";
 const STRIP_HEADER_METADATA_PREFIX: &str = "oauth2_introspection.strip_header.";
-const STRIP_QUERY_PARAM_METADATA_PREFIX: &str = "oauth2_introspection.strip_query_param.";
 const CLAIM_HEADER_METADATA_PREFIX: &str = "oauth2_introspection.claim_header.";
 
 pub struct Oauth2Introspection {

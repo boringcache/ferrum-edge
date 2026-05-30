@@ -14,8 +14,8 @@
 //! and should be run with: cargo test --test functional_tests functional_grpc -- --ignored --nocapture
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
-use hyper::body::Incoming;
+use http_body_util::{BodyExt, Full, StreamBody};
+use hyper::body::{Frame, Incoming};
 use hyper::server::conn::http2::Builder as Http2ServerBuilder;
 use hyper::service::service_fn;
 use hyper::{Request, Response};
@@ -26,7 +26,9 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
+use tokio::sync::{mpsc, watch};
 use tokio::time::sleep;
+use tokio_stream::wrappers::ReceiverStream;
 
 // ============================================================================
 // Helpers
@@ -124,6 +126,105 @@ async fn start_grpc_echo_backend(port: u16) -> tokio::task::JoinHandle<()> {
                     if !format!("{}", e).contains("connection closed") {
                         eprintln!("gRPC echo backend error: {}", e);
                     }
+                }
+            });
+        }
+    })
+}
+
+/// Start a mock server-streaming gRPC backend (h2c HTTP/2) that HOLDS its
+/// response stream open.
+///
+/// Unlike [`start_grpc_echo_backend`] (which buffers the request, replies with
+/// a complete `Full` body, and completes immediately), this backend:
+/// - Sends `200 application/grpc` headers, then exactly ONE initial DATA frame.
+/// - STALLS — withholds the gRPC trailers (`grpc-status`) and stream EOF until
+///   the `release` watch channel flips to `true`.
+///
+/// Because the response stream never reaches EOF until released, the gateway's
+/// streaming gRPC response body (and therefore the per-IP in-flight request
+/// slot attached to it via `body.with_per_ip_request_guard`) stays alive for
+/// the full streaming-response lifetime. This is exactly the condition the F15
+/// per-IP-evasion fix protects.
+///
+/// A `watch::Receiver<bool>` (not a `Notify`) is used for the release signal so
+/// the recovery probe is race-free: `watch` retains the latest value, so a
+/// release flipped to `true` BEFORE a later request's sender parks is observed
+/// immediately rather than lost (as `Notify::notify_waiters()` would be).
+///
+/// The caller passes a pre-bound `TcpListener` so the backend owns the
+/// listening socket for its whole lifetime — there is no free-port→bind race
+/// window between port allocation and accept.
+async fn start_grpc_streaming_backend(
+    listener: TcpListener,
+    release: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let (stream, _addr) = match listener.accept().await {
+                Ok(conn) => conn,
+                Err(_) => break,
+            };
+            let _ = stream.set_nodelay(true);
+            let release = release.clone();
+
+            tokio::spawn(async move {
+                let io = TokioIo::new(stream);
+                let builder = Http2ServerBuilder::new(TokioExecutor::new());
+
+                let service = service_fn(move |req: Request<Incoming>| {
+                    let mut release = release.clone();
+                    async move {
+                        // Drain the request body in the background so client-
+                        // streaming / unary uploads don't wedge; we don't need
+                        // its contents for this test.
+                        let mut req_body = req.into_body();
+                        tokio::spawn(async move { while req_body.frame().await.is_some() {} });
+
+                        // Frame channel: emit one initial DATA frame, then keep
+                        // the stream open (Pending) until `release` is true, at
+                        // which point we send the gRPC trailers and close.
+                        let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, std::io::Error>>(2);
+
+                        // One initial gRPC DATA frame (a single empty unary
+                        // message: [compressed=0][len=0]).
+                        let initial = Bytes::from_static(b"\x00\x00\x00\x00\x00");
+                        let _ = tx.send(Ok(Frame::data(initial))).await;
+
+                        // Background sender: park until released, then emit
+                        // trailers (grpc-status: 0) and drop tx to signal EOF.
+                        tokio::spawn(async move {
+                            // `watch::changed()` returns Err only if all senders
+                            // drop; in that case fall through and close the
+                            // stream so the test never hangs on drain.
+                            while !*release.borrow_and_update() {
+                                if release.changed().await.is_err() {
+                                    break;
+                                }
+                            }
+                            let mut trailers = hyper::HeaderMap::new();
+                            trailers.insert(
+                                "grpc-status",
+                                hyper::header::HeaderValue::from_static("0"),
+                            );
+                            let _ = tx.send(Ok(Frame::trailers(trailers))).await;
+                            // tx drops here → stream EOF.
+                        });
+
+                        let body = StreamBody::new(ReceiverStream::new(rx));
+                        let response = Response::builder()
+                            .status(200)
+                            .header("content-type", "application/grpc")
+                            .body(body)
+                            .expect("build streaming gRPC response");
+                        Ok::<_, hyper::Error>(response)
+                    }
+                });
+
+                if let Err(e) = builder.serve_connection(io, service).await
+                    && !format!("{}", e).contains("connection closed")
+                {
+                    eprintln!("gRPC streaming backend error: {}", e);
                 }
             });
         }
@@ -336,6 +437,93 @@ async fn send_grpc_request(
         .unwrap_or_default();
 
     Ok((status, headers, body_bytes))
+}
+
+/// A live, still-open gRPC response stream returned by [`open_grpc_stream`].
+///
+/// Holds the response status, the first DATA frame that already arrived, and
+/// the LIVE response body (not collected). Keeping this value alive keeps the
+/// downstream H2 stream — and therefore the gateway's per-IP request slot —
+/// open. Dropping it (or calling [`LiveGrpcStream::drain`]) tears the stream
+/// down. The HTTP/2 client connection task is aborted on drop.
+struct LiveGrpcStream {
+    status: u16,
+    first_frame: Bytes,
+    body: Incoming,
+    conn_task: tokio::task::JoinHandle<()>,
+}
+
+impl LiveGrpcStream {
+    /// Drain the remaining response body to completion (consumes the stream),
+    /// then drop the connection. Used after the backend has been released so
+    /// the gateway can observe EOF and free the per-IP slot.
+    async fn drain(mut self) {
+        while self.body.frame().await.is_some() {}
+        self.conn_task.abort();
+    }
+}
+
+impl Drop for LiveGrpcStream {
+    fn drop(&mut self) {
+        self.conn_task.abort();
+    }
+}
+
+/// Open a gRPC stream through the gateway and return it LIVE (without
+/// collecting the body), so the downstream stream stays open.
+///
+/// Mirrors [`send_grpc_request`]'s `http2::handshake` + `send_request`, but
+/// instead of `collect()`-ing the response it reads `response.status()` and
+/// the FIRST response frame (via `poll_frame`/`BodyExt::frame`), then returns
+/// the live body handle. This is what lets the test pin a long-lived
+/// server-streaming RPC in flight while it probes the per-IP limit with a
+/// second request.
+async fn open_grpc_stream(
+    gateway_addr: &str,
+    path: &str,
+    body: &[u8],
+) -> Result<LiveGrpcStream, Box<dyn std::error::Error + Send + Sync>> {
+    use hyper::client::conn::http2;
+
+    let addr: SocketAddr = gateway_addr.parse()?;
+    let stream = tokio::net::TcpStream::connect(addr).await?;
+    let _ = stream.set_nodelay(true);
+    let io = TokioIo::new(stream);
+
+    let (mut sender, conn) = http2::handshake(TokioExecutor::new(), io).await?;
+    let conn_task = tokio::spawn(async move {
+        if let Err(e) = conn.await {
+            eprintln!("open_grpc_stream h2 connection error: {}", e);
+        }
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("content-type", "application/grpc")
+        .header("te", "trailers")
+        .body(Full::new(Bytes::from(body.to_vec())))?;
+    let response = sender.send_request(req).await?;
+    let status = response.status().as_u16();
+    let mut incoming = response.into_body();
+
+    // Read the first frame so we know the stream is established and the
+    // streaming body is actively held by the gateway. The streaming backend
+    // sends one DATA frame up-front. Bound the wait so a hang fails the test
+    // rather than blocking forever.
+    let first_frame = match tokio::time::timeout(Duration::from_secs(5), incoming.frame()).await {
+        Ok(Some(Ok(frame))) => frame.into_data().unwrap_or_default(),
+        Ok(Some(Err(e))) => return Err(format!("first gRPC frame errored: {e}").into()),
+        Ok(None) => return Err("gRPC stream ended before first frame".into()),
+        Err(_) => return Err("timed out waiting for first gRPC frame".into()),
+    };
+
+    Ok(LiveGrpcStream {
+        status,
+        first_frame,
+        body: incoming,
+        conn_task,
+    })
 }
 
 /// Wait for the gateway to start by attempting TCP connections.
@@ -1010,4 +1198,137 @@ async fn test_grpc_early_rejects_use_grpc_error_shape() {
     let _ = gateway.wait();
     echo_handle.abort();
     println!("test_grpc_early_rejects_use_grpc_error_shape PASSED");
+}
+
+/// Regression for F15 (PR #1402): a long-lived server-streaming gRPC RPC must
+/// HOLD the per-IP in-flight request slot for the FULL streaming-response
+/// lifetime, not release it at response-header time.
+///
+/// The fix attaches the `PerIpRequestGuard` to the streaming `ProxyBody`
+/// (`src/proxy/mod.rs`: `body.with_per_ip_request_guard(guard)`), so the slot
+/// is occupied until the streaming body finishes. Pre-fix, the guard dropped
+/// when the gRPC handler returned at header flush — releasing the slot while
+/// the body was still streaming, which let a client EVADE the per-IP limit on
+/// long-lived streaming RPCs.
+///
+/// With the limit at 1 and stream #1 parked mid-response, a SECOND request from
+/// the same IP must be rejected with **HTTP 429**. The per-IP reject fires in
+/// `proxy::handle_request` BEFORE gRPC dispatch and returns a plain
+/// `build_response(StatusCode::TOO_MANY_REQUESTS, ...)` — so the rejection is a
+/// real HTTP 429, NOT a `grpc-status` trailer frame.
+///
+/// Structural inverse of the WebSocket case
+/// `test_h3_websocket_releases_per_ip_request_slot_after_200` (WS releases the
+/// slot after the 200; gRPC streaming holds it).
+#[ignore]
+#[tokio::test]
+async fn test_grpc_streaming_holds_per_ip_request_slot() {
+    // Pre-bind the streaming backend's listener so it owns the socket for its
+    // whole lifetime (no free-port→bind race). Read the port before moving the
+    // listener into the backend.
+    let backend_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind streaming gRPC backend");
+    let backend_port = backend_listener
+        .local_addr()
+        .expect("backend local_addr")
+        .port();
+
+    // `release` watch channel: flip to `true` to let a parked streaming
+    // response emit its trailers and EOF. Held `false` while we probe the limit.
+    let (release_tx, release_rx) = watch::channel(false);
+    let backend_handle = start_grpc_streaming_backend(backend_listener, release_rx).await;
+    sleep(Duration::from_millis(300)).await;
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    // Reuse the standard gRPC config: the `/grpc` route has no plugins and no
+    // retries, so it takes the fully-streaming gRPC fast path
+    // (`proxy_grpc_request_streaming`) whose response body holds the per-IP
+    // guard.
+    write_grpc_config(&config_path, backend_port);
+
+    build_gateway().expect("Failed to build gateway");
+    // FERRUM_MAX_CONCURRENT_REQUESTS_PER_IP=1: a single in-flight request per
+    // IP. FERRUM_POOL_WARMUP_ENABLED=false: warmup must not consume the slot —
+    // only the test's own stream should hold it. (Warmup connects to the
+    // backend at startup and could otherwise occupy the in-flight accounting.)
+    let (mut gateway, gateway_port) = start_gateway_with_retry_extra_env(
+        config_path.to_str().unwrap(),
+        &[
+            ("FERRUM_MAX_CONCURRENT_REQUESTS_PER_IP", "1"),
+            ("FERRUM_POOL_WARMUP_ENABLED", "false"),
+        ],
+    )
+    .await;
+
+    let gateway_addr = format!("127.0.0.1:{}", gateway_port);
+
+    // Stream #1: open a long-lived server-streaming RPC and keep it OPEN. The
+    // backend sends headers + one DATA frame, then stalls — so the gateway's
+    // streaming response body (and the per-IP slot bound to it) stays alive.
+    let stream1 = open_grpc_stream(&gateway_addr, "/grpc/my.EchoService/ServerStream", b"")
+        .await
+        .expect("stream #1 should open");
+    assert_eq!(
+        stream1.status, 200,
+        "streaming gRPC RPC should return HTTP 200"
+    );
+    assert!(
+        !stream1.first_frame.is_empty(),
+        "the streaming backend's first DATA frame should have arrived (slot now held)"
+    );
+
+    // Request #2 from the SAME IP while stream #1 holds the only slot. The
+    // per-IP limiter must reject it with a plain HTTP 429 BEFORE gRPC dispatch.
+    //
+    // The 5s timeout converts the pre-fix regression into a fast, descriptive
+    // failure instead of a hang: pre-fix, the slot was released at stream #1's
+    // header flush, so request #2 would be ADMITTED — and `send_grpc_request`
+    // would then block in `collect()` on the still-stalled streaming backend
+    // (no EOF until release), hanging the test. Post-fix, the 429 returns
+    // immediately, well inside the timeout.
+    let (status2, _headers2, _body2) = tokio::time::timeout(
+        Duration::from_secs(5),
+        send_grpc_request(&gateway_addr, "/grpc/my.EchoService/Echo", b"", &[]),
+    )
+    .await
+    .expect(
+        "request #2 must resolve fast with a 429; a hang here means it was \
+         wrongly admitted to the stalled streaming backend (F15 regression)",
+    )
+    .expect("request #2 should complete (with a 429)");
+    assert_eq!(
+        status2, 429,
+        "a 2nd same-IP request while a streaming RPC holds the slot must be \
+         rejected with HTTP 429 (per-IP limit), not admitted — this is the F15 \
+         evasion the fix closes"
+    );
+
+    // Release the backend (flips the watch to `true`, waking every parked
+    // streaming response) and drain stream #1 to completion so the gateway
+    // observes EOF and frees the per-IP slot.
+    let _ = release_tx.send(true);
+    stream1.drain().await;
+    // Give the gateway a moment to run the guard's Drop after body completion.
+    sleep(Duration::from_millis(300)).await;
+
+    // With the slot freed, a fresh same-IP streaming request must be admitted
+    // again (status 200, first frame arrives). The watch is already `true`, so
+    // this stream's backend sender releases as soon as it parks — no hang, and
+    // no lost-wakeup race.
+    let stream3 = open_grpc_stream(&gateway_addr, "/grpc/my.EchoService/ServerStream2", b"")
+        .await
+        .expect("stream #3 should open once the slot is freed");
+    assert_eq!(
+        stream3.status, 200,
+        "after the streaming RPC finished, the per-IP slot must be free for a \
+         new same-IP request"
+    );
+    stream3.drain().await;
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    backend_handle.abort();
+    println!("test_grpc_streaming_holds_per_ip_request_slot PASSED");
 }

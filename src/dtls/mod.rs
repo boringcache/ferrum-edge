@@ -921,6 +921,15 @@ impl DtlsServer {
             // during the DTLS handshake. The first cert is the peer cert, the
             // rest are intermediates/CA chain certs.
             let mut peer_cert_ders: Vec<Vec<u8>> = Vec::new();
+            // Whether a client certificate was actually presented AND verified
+            // against the configured client CA during the handshake. dimpl's
+            // `require_client_certificate(true)` only makes the server SEND a
+            // CertificateRequest; it still completes the handshake when the
+            // client returns an empty Certificate (both DTLS 1.2 and 1.3), so an
+            // empty cert produces no `Output::PeerCert` and `validate_client_cert`
+            // never runs. We track verification explicitly and refuse to deliver
+            // an unauthenticated session in the `Output::Connected` arm below.
+            let mut verified_peer_cert = false;
 
             // Drain init outputs (just Timeout from handle_timeout)
             for _ in 0..MAX_OUTPUTS_PER_DRAIN {
@@ -1053,6 +1062,19 @@ impl DtlsServer {
                         Output::Connected => {
                             just_connected = true;
                             connected = true;
+                            // Enforce client-certificate authentication as a hard
+                            // requirement. dimpl completes the handshake even when
+                            // the client returns an empty Certificate, so without
+                            // this gate an unauthenticated peer would be delivered
+                            // with `tls_client_cert_der = None`, bypassing DTLS
+                            // frontend mTLS. Refuse to deliver such a session.
+                            if client_cert_verifier.is_some() && !verified_peer_cert {
+                                warn!(
+                                    client = %peer_addr,
+                                    "DTLS frontend mTLS required but client presented no verified certificate; dropping session"
+                                );
+                                return;
+                            }
                             // Deliver accepted connection (take app_out_rx — only happens once)
                             let Some(rx) = app_out_rx.take() else {
                                 continue; // Already connected — should not happen
@@ -1082,11 +1104,14 @@ impl DtlsServer {
                             }
                         }
                         Output::PeerCert(der) => {
-                            if let Some(verifier) = client_cert_verifier.as_deref()
-                                && let Err(e) = validate_client_cert(der, verifier)
-                            {
-                                warn!(client = %peer_addr, "Client cert validation failed: {}", e);
-                                return;
+                            if let Some(verifier) = client_cert_verifier.as_deref() {
+                                if let Err(e) = validate_client_cert(der, verifier) {
+                                    warn!(client = %peer_addr, "Client cert validation failed: {}", e);
+                                    return;
+                                }
+                                // A client certificate was presented and verified
+                                // against the configured client CA.
+                                verified_peer_cert = true;
                             }
                             // Store the certificate DER for plugin access after Connected
                             peer_cert_ders.push(der.to_vec());

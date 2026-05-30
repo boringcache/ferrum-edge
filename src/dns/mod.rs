@@ -221,11 +221,19 @@ pub struct DnsCache {
     /// Percentage of TTL elapsed before background refresh triggers (1-99).
     refresh_threshold_percent: u8,
     /// Interval for the background task that retries failed DNS lookups.
-    /// Duration::ZERO disables the retry task.
+    /// Duration::ZERO disables the retry task; clamped to `MAX_TTL` so the
+    /// `tokio::time::interval` deadline arithmetic cannot overflow.
     failed_retry_interval: Duration,
 }
 
 impl DnsCache {
+    /// Upper bound for every TTL-derived `Duration` (override, min, stale,
+    /// error, and the effective record TTL). Matches the per-proxy
+    /// `dns_cache_ttl` ceiling (1 day) so unbounded `FERRUM_DNS_*` env-var
+    /// seconds cannot overflow the `Instant + Duration` / `Duration * u32`
+    /// arithmetic on the resolution hot path (a reachable panic).
+    const MAX_TTL: Duration = Duration::from_secs(86_400);
+
     /// Expose the configured backend IP allowlist policy for non-DNS
     /// backend target validation paths (for example, service discovery).
     /// Cloned because `BackendAllowIps` is no longer `Copy`.
@@ -251,10 +259,12 @@ impl DnsCache {
             global_overrides,
             resolver: Arc::new(resolver),
             dns_order,
-            ttl_override: config.ttl_override_seconds.map(Duration::from_secs),
-            min_ttl: Duration::from_secs(config.min_ttl_seconds),
-            stale_ttl: Duration::from_secs(config.stale_ttl_seconds),
-            error_ttl: Duration::from_secs(config.error_ttl_seconds),
+            ttl_override: config
+                .ttl_override_seconds
+                .map(|s| Duration::from_secs(s).min(Self::MAX_TTL)),
+            min_ttl: Duration::from_secs(config.min_ttl_seconds).min(Self::MAX_TTL),
+            stale_ttl: Duration::from_secs(config.stale_ttl_seconds).min(Self::MAX_TTL),
+            error_ttl: Duration::from_secs(config.error_ttl_seconds).min(Self::MAX_TTL),
             max_cache_size: config.max_cache_size,
             refreshing: Arc::new(DashMap::with_shard_amount(shards)),
             refresh_semaphore: Arc::new(Semaphore::new(config.max_concurrent_refreshes.max(1))),
@@ -263,7 +273,12 @@ impl DnsCache {
             warmup_concurrency: config.warmup_concurrency.max(1),
             backend_allow_ips: config.backend_allow_ips,
             refresh_threshold_percent: config.refresh_threshold_percent.clamp(1, 99),
-            failed_retry_interval: Duration::from_secs(config.failed_retry_interval_seconds),
+            // Clamp like the other TTL-derived durations: an unbounded
+            // FERRUM_DNS_FAILED_RETRY_INTERVAL_SECONDS would otherwise overflow
+            // tokio's `Instant::now() + period` deadline arithmetic inside
+            // `tokio::time::interval` (a reachable panic, same class as F20).
+            failed_retry_interval: Duration::from_secs(config.failed_retry_interval_seconds)
+                .min(Self::MAX_TTL),
         }
     }
 
@@ -309,6 +324,11 @@ impl DnsCache {
         // This is the single success insertion path for foreground resolves,
         // stale refreshes, proactive background refreshes, and failed-retry
         // recovery. Cache reads intentionally trust entries accepted here.
+        //
+        // Clamp the effective TTL so an unbounded override / record TTL cannot
+        // overflow the `Instant + Duration` arithmetic below (or the
+        // `Duration * u32` threshold in the proactive refresh loop).
+        let ttl = ttl.min(Self::MAX_TTL);
         self.check_backend_addresses_policy(&addresses, hostname)?;
         let cache_key = dns_hostname_key(hostname);
 
@@ -1255,15 +1275,21 @@ fn build_resolver(config: &DnsConfig) -> Resolver<TokioRuntimeProvider> {
     }
 
     // When a global TTL override is set, clamp hickory's internal cache to match
-    // so the resolver doesn't serve records beyond the override lifetime.
+    // so the resolver doesn't serve records beyond the override lifetime. Bound
+    // it by MAX_TTL first: hickory clamps each record's TTL up to
+    // positive_max_ttl and computes `valid_until = Instant::now() + ttl`, so an
+    // unbounded FERRUM_DNS_TTL_OVERRIDE_SECONDS would overflow that addition
+    // inside hickory — before DnsCache::cache_success_entry's own clamp can run.
     if let Some(override_secs) = config.ttl_override_seconds {
-        let d = Duration::from_secs(override_secs);
+        let d = Duration::from_secs(override_secs).min(DnsCache::MAX_TTL);
         resolver_opts.positive_min_ttl = Some(d);
         resolver_opts.positive_max_ttl = Some(d);
     }
 
-    // Apply error/negative TTL
-    let neg_ttl = Duration::from_secs(config.error_ttl_seconds);
+    // Apply error/negative TTL (same MAX_TTL bound: the negative-response path
+    // also does `Instant::now() + ttl` inside hickory, so an unbounded
+    // FERRUM_DNS_ERROR_TTL would overflow on the first failed lookup).
+    let neg_ttl = Duration::from_secs(config.error_ttl_seconds).min(DnsCache::MAX_TTL);
     resolver_opts.negative_min_ttl = Some(neg_ttl);
     resolver_opts.negative_max_ttl = Some(neg_ttl);
 
@@ -1469,6 +1495,85 @@ mod tests {
             cache.cache.get("metadata.internal").is_none(),
             "Denied DNS answers must not be inserted for foreground or background refresh paths"
         );
+    }
+
+    #[test]
+    fn cache_success_entry_clamps_unbounded_ttl_without_panicking() {
+        // F20: huge TTLs (from an unbounded FERRUM_DNS_* env var, or an absurd
+        // record TTL) must not overflow the `Instant + Duration` /
+        // `Duration * u32` arithmetic on the resolution path. Build a cache
+        // whose env-derived TTLs are enormous AND pass an enormous per-call
+        // TTL; the call must succeed (no panic) and the stored TTL must be
+        // clamped to the 1-day ceiling.
+        let cache = DnsCache::new(DnsConfig {
+            ttl_override_seconds: Some(u64::MAX),
+            stale_ttl_seconds: u64::MAX,
+            min_ttl_seconds: u64::MAX,
+            error_ttl_seconds: u64::MAX,
+            ..DnsConfig::default()
+        });
+
+        let result = cache.cache_success_entry(
+            "example.internal",
+            vec!["8.8.8.8".parse().unwrap()],
+            Some(CachedRecordType::A),
+            Duration::from_secs(u64::MAX),
+            None,
+        );
+
+        assert!(
+            result.is_ok(),
+            "an unbounded TTL must not panic the resolution path"
+        );
+        let entry = cache
+            .cache
+            .get("example.internal")
+            .expect("entry should be cached");
+        assert!(
+            entry.applied_ttl <= DnsCache::MAX_TTL,
+            "stored TTL must be clamped to the ceiling"
+        );
+    }
+
+    #[test]
+    fn failed_retry_interval_is_clamped_to_max_ttl() {
+        // F20 follow-up: FERRUM_DNS_FAILED_RETRY_INTERVAL_SECONDS is an
+        // unbounded u64 fed into `tokio::time::interval(Duration::from_secs(..))`.
+        // tokio computes the next deadline as `Instant::now() + period`, which
+        // panics on overflow — the same overflow class as the DNS TTLs. An
+        // enormous value must therefore be clamped to the 1-day ceiling. Assert
+        // at the value level (no runtime/interval needed for determinism).
+        let cache = DnsCache::new(DnsConfig {
+            failed_retry_interval_seconds: u64::MAX,
+            ..DnsConfig::default()
+        });
+        assert!(
+            cache.failed_retry_interval <= DnsCache::MAX_TTL,
+            "failed_retry_interval must be clamped to the ceiling to keep \
+             tokio's interval deadline arithmetic overflow-safe"
+        );
+        assert_eq!(cache.failed_retry_interval, DnsCache::MAX_TTL);
+    }
+
+    #[test]
+    fn build_resolver_clamps_unbounded_ttls_into_hickory_opts() {
+        // F20: build_resolver feeds positive/negative TTL bounds into hickory's
+        // ResolverOpts. hickory clamps each record's TTL up to positive_max_ttl
+        // and computes `valid_until = Instant::now() + ttl`, so an unbounded
+        // FERRUM_DNS_TTL_OVERRIDE_SECONDS / FERRUM_DNS_ERROR_TTL would overflow
+        // that addition INSIDE hickory, before cache_success_entry's clamp ever
+        // runs. The bounds handed to hickory must therefore be capped at MAX_TTL
+        // (the original PR clamped only DnsCache's own fields, not these).
+        let resolver = build_resolver(&DnsConfig {
+            ttl_override_seconds: Some(u64::MAX),
+            error_ttl_seconds: u64::MAX,
+            ..DnsConfig::default()
+        });
+        let opts = resolver.options();
+        assert_eq!(opts.positive_min_ttl, Some(DnsCache::MAX_TTL));
+        assert_eq!(opts.positive_max_ttl, Some(DnsCache::MAX_TTL));
+        assert_eq!(opts.negative_min_ttl, Some(DnsCache::MAX_TTL));
+        assert_eq!(opts.negative_max_ttl, Some(DnsCache::MAX_TTL));
     }
 
     #[tokio::test]

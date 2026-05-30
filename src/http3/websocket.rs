@@ -218,6 +218,11 @@ fn collect_forwardable_h3_headers(
         "sec-websocket-key",
         "sec-websocket-version",
         "sec-websocket-accept",
+        // The WebSocket bridge cannot encode/decode permessage-deflate, so the
+        // client's extension offer must not reach the backend (it would set
+        // rsv1 and the session would be torn down). Mirrors the H1/H2 strip in
+        // proxy::is_websocket_backend_strip_header.
+        "sec-websocket-extensions",
         "host",
         "transfer-encoding",
         "te",
@@ -1160,6 +1165,7 @@ mod tests {
             "sec-websocket-key",
             "sec-websocket-version",
             "sec-websocket-accept",
+            "sec-websocket-extensions",
         ] {
             assert!(
                 !has_key(&out, stripped),
@@ -1167,14 +1173,14 @@ mod tests {
                 stripped,
             );
         }
-        // Subprotocol / extensions ARE forwarded — backend WS picks them up
-        // and re-negotiates with the upstream WebSocket server. This mirrors
-        // the H1/H2 path's `collect_forwardable_headers` behavior.
+        // Subprotocol IS forwarded — the backend WS client re-negotiates it
+        // with the upstream server. Extensions (e.g. permessage-deflate) are
+        // NOT forwarded: the gateway's WebSocket bridge cannot encode/decode
+        // compressed frames, so a deflate-capable backend that accepted the
+        // offer would set rsv1 and the session would be torn down with a
+        // protocol error. Mirrors the H1/H2 strip in
+        // proxy::is_websocket_backend_strip_header.
         assert_eq!(value_for(&out, "sec-websocket-protocol"), Some("chat"));
-        assert_eq!(
-            value_for(&out, "sec-websocket-extensions"),
-            Some("permessage-deflate"),
-        );
     }
 
     #[test]

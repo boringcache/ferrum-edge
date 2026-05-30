@@ -219,12 +219,15 @@ pub async fn serve_admin_on_listener(
     tls_config: Option<Arc<rustls::ServerConfig>>,
 ) -> Result<(), anyhow::Error> {
     let mut shutdown_rx = shutdown;
+    let mut accept_backoff = crate::util::accept_backoff::AcceptBackoff::new();
+    let mut accept_err_log = crate::util::accept_backoff::LogRateLimiter::new();
 
     loop {
         tokio::select! {
             result = listener.accept() => {
                 match result {
                     Ok((stream, remote_addr)) => {
+                        accept_backoff.on_success();
                         // Admin IP allowlist: reject connections from non-allowed IPs
                         // at the TCP level, before TLS handshake or request processing.
                         if !state.admin_allowed_cidrs.is_empty()
@@ -256,7 +259,21 @@ pub async fn serve_admin_on_listener(
                         });
                     }
                     Err(e) => {
-                        error!("Failed to accept admin connection: {}", e);
+                        // Bound the log rate independently of the backoff: an
+                        // abort/reset flood is not backed off, so emit the
+                        // first error then one summary per second with the
+                        // suppressed count.
+                        if let Some(suppressed) =
+                            accept_err_log.on_event(crate::socket_opts::monotonic_now_ms())
+                        {
+                            error!(suppressed, "Failed to accept admin connection: {}", e);
+                        }
+                        // Back off on a sustained fd-exhaustion run so accept()
+                        // cannot busy-spin a core (abort/reset floods make
+                        // progress and are not throttled; see AcceptBackoff).
+                        if let Some(delay) = accept_backoff.on_error(e.kind()) {
+                            tokio::time::sleep(delay).await;
+                        }
                     }
                 }
             }
@@ -286,12 +303,15 @@ pub async fn serve_admin_on_listener_with_dynamic_tls(
     tls_slot: crate::tls::SharedFrontendTls,
 ) -> Result<(), anyhow::Error> {
     let mut shutdown_rx = shutdown;
+    let mut accept_backoff = crate::util::accept_backoff::AcceptBackoff::new();
+    let mut accept_err_log = crate::util::accept_backoff::LogRateLimiter::new();
 
     loop {
         tokio::select! {
             result = listener.accept() => {
                 match result {
                     Ok((stream, remote_addr)) => {
+                        accept_backoff.on_success();
                         if !state.admin_allowed_cidrs.is_empty()
                             && !state.admin_allowed_cidrs.contains(&remote_addr.ip())
                         {
@@ -324,7 +344,21 @@ pub async fn serve_admin_on_listener_with_dynamic_tls(
                         });
                     }
                     Err(e) => {
-                        error!("Failed to accept admin connection: {}", e);
+                        // Bound the log rate independently of the backoff: an
+                        // abort/reset flood is not backed off, so emit the
+                        // first error then one summary per second with the
+                        // suppressed count.
+                        if let Some(suppressed) =
+                            accept_err_log.on_event(crate::socket_opts::monotonic_now_ms())
+                        {
+                            error!(suppressed, "Failed to accept admin connection: {}", e);
+                        }
+                        // Back off on a sustained fd-exhaustion run so accept()
+                        // cannot busy-spin a core (abort/reset floods make
+                        // progress and are not throttled; see AcceptBackoff).
+                        if let Some(delay) = accept_backoff.on_error(e.kind()) {
+                            tokio::time::sleep(delay).await;
+                        }
                     }
                 }
             }

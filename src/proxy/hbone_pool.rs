@@ -42,10 +42,14 @@ thread_local! {
     static HBONE_POOL_KEY_BUF: RefCell<String> = RefCell::new(String::with_capacity(160));
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct HbonePoolEntry {
     sender: SendRequest<Bytes>,
-    last_used_at: Instant,
+    /// Unix seconds of the last checkout. Stored atomically so the shared-lock
+    /// fast path (`try_cached_sender_read`) can refresh recency without taking
+    /// the exclusive shard write lock — a busy connection must not be pruned as
+    /// idle merely because it is only ever served by the fast path.
+    last_used_at: AtomicU64,
     idle_timeout_seconds: u64,
 }
 
@@ -426,7 +430,7 @@ impl HboneConnectionPool {
                 record_hbone_evictions(prune_pool_entries(entries));
                 entries.push(HbonePoolEntry {
                     sender: sender.clone(),
-                    last_used_at: Instant::now(),
+                    last_used_at: AtomicU64::new(unix_secs()),
                     idle_timeout_seconds: pool_config.idle_timeout_seconds,
                 });
                 let max_entries = pool_config.http2_connections_per_host.max(1);
@@ -439,7 +443,7 @@ impl HboneConnectionPool {
             .or_insert_with(|| {
                 vec![HbonePoolEntry {
                     sender: sender.clone(),
-                    last_used_at: Instant::now(),
+                    last_used_at: AtomicU64::new(unix_secs()),
                     idle_timeout_seconds: pool_config.idle_timeout_seconds,
                 }]
             });
@@ -461,7 +465,7 @@ impl HboneConnectionPool {
             let sender = entry.sender.clone();
             match sender.clone().ready().now_or_never() {
                 Some(Ok(ready)) => {
-                    entry.last_used_at = Instant::now();
+                    entry.last_used_at.store(unix_secs(), Ordering::Relaxed);
                     return Some(CachedSender::Ready(ready));
                 }
                 Some(Err(_)) => {
@@ -482,7 +486,7 @@ impl HboneConnectionPool {
             if let Some(idx) = pending_idx
                 && let Some(entry) = entries.get_mut(idx)
             {
-                entry.last_used_at = Instant::now();
+                entry.last_used_at.store(unix_secs(), Ordering::Relaxed);
             }
             pending.map(CachedSender::Pending)
         } else {
@@ -490,22 +494,29 @@ impl HboneConnectionPool {
         }
     }
 
-    /// Shared-lock fast path: scan for a ready sender without pruning or
-    /// updating `last_used_at`. Avoids the exclusive shard write lock that
-    /// `cached_sender` holds during prune + scan + clone. Expired entries
-    /// are skipped (not removed); dead senders fall through to the write
-    /// path. The `last_used_at` staleness is bounded by
-    /// `maybe_prune_idle_entries` running on the next write-path call.
+    /// Shared-lock fast path: scan for a ready sender and refresh its
+    /// `last_used_at` via a relaxed atomic store, avoiding the exclusive shard
+    /// write lock that `cached_sender` holds during prune + scan + clone.
+    /// Refreshing recency here keeps a connection served only by this path from
+    /// being pruned as idle. Expired entries are skipped (not removed); dead
+    /// senders fall through to the write path.
     fn try_cached_sender_read(&self, key: &str) -> Option<SendRequest<Bytes>> {
         let entries = self.entries.get(key)?;
-        let now = Instant::now();
+        let now = unix_secs();
         for entry in entries.value().iter() {
-            if entry_idle_expired(entry.last_used_at, entry.idle_timeout_seconds, now) {
+            let last_used = entry.last_used_at.load(Ordering::Relaxed);
+            if entry_idle_expired(last_used, entry.idle_timeout_seconds, now) {
                 continue;
             }
             let sender = entry.sender.clone();
             match sender.ready().now_or_never() {
-                Some(Ok(ready)) => return Some(ready),
+                Some(Ok(ready)) => {
+                    // Refresh recency on the shared-lock fast path so a busy
+                    // connection is not pruned as idle. This is the whole point
+                    // of this path existing: avoid the exclusive write lock.
+                    entry.last_used_at.store(now, Ordering::Relaxed);
+                    return Some(ready);
+                }
                 _ => continue,
             }
         }
@@ -913,11 +924,12 @@ fn current_svid_identity(
 
 fn prune_pool_entries(entries: &mut Vec<HbonePoolEntry>) -> usize {
     let before = entries.len();
+    let now = unix_secs();
     entries.retain(|entry| {
         !entry_idle_expired(
-            entry.last_used_at,
+            entry.last_used_at.load(Ordering::Relaxed),
             entry.idle_timeout_seconds,
-            Instant::now(),
+            now,
         )
     });
     before.saturating_sub(entries.len())
@@ -928,9 +940,19 @@ fn record_hbone_evictions(count: usize) {
         .record_pool_evictions(crate::runtime_metrics::PoolKind::Hbone, count as u64);
 }
 
-fn entry_idle_expired(last_used_at: Instant, idle_timeout_seconds: u64, now: Instant) -> bool {
-    idle_timeout_seconds > 0
-        && now.saturating_duration_since(last_used_at) > Duration::from_secs(idle_timeout_seconds)
+// `last_used_secs`/`now_secs` are wall-clock `unix_secs()`, matching the
+// connection-pool idle convention in `GenericPool` (`last_used_epoch_ms`) so
+// the two pools age idle entries the same way. A backward wall-clock step
+// (NTP correction, VM resume) makes `saturating_sub` under-count idle time, so
+// an idle entry may survive a few extra prune cycles until the clock catches
+// up — never unbounded, since dead senders are still culled by the `ready()`
+// health probe on both the read and write paths. A forward step larger than
+// the timeout can evict one fresh entry, after which it self-heals. A repo-wide
+// migration to a monotonic clock (this pool's prune scheduler + `GenericPool`
+// together) is the right place to remove that residual, not a piecemeal switch
+// of this one field that would desync it from the rest of the pool's timing.
+fn entry_idle_expired(last_used_secs: u64, idle_timeout_seconds: u64, now_secs: u64) -> bool {
+    idle_timeout_seconds > 0 && now_secs.saturating_sub(last_used_secs) > idle_timeout_seconds
 }
 
 fn unix_secs() -> u64 {
@@ -1010,13 +1032,21 @@ fn write_hbone_pool_key(
 }
 
 fn write_pool_config_key(buf: &mut String, pool_config: &PoolConfig) {
+    // Pool-MANAGEMENT policy is intentionally excluded from the key: it does
+    // not change the h2-over-mTLS connection's identity or wire behavior, and
+    // including it fragmented the pool (two proxies targeting the same sidecar
+    // with the same SVID but different idle-timeout / per-host caps could not
+    // share an established mTLS connection). Specifically:
+    //   - idle_timeout_seconds is tracked per HbonePoolEntry for idle pruning;
+    //   - http2_connections_per_host is applied as a max-entries cap at insert.
+    // Only fields that affect the actual connection (protocol selection,
+    // keepalive, and h2 SETTINGS) remain — mirroring the direct-H2 pool key,
+    // per the "never add policy fields to pool keys" invariant.
     let _ = write!(
         buf,
-        "|pool={},{},{},{},{},{},{},{},{},{},{}",
-        pool_config.idle_timeout_seconds,
+        "|pool={},{},{},{},{},{},{},{},{}",
         u8::from(pool_config.enable_http_keep_alive),
         u8::from(pool_config.enable_http2),
-        pool_config.http2_connections_per_host,
         pool_config.tcp_keepalive_seconds,
         pool_config.http2_keep_alive_interval_seconds,
         pool_config.http2_keep_alive_timeout_seconds,
@@ -1270,7 +1300,7 @@ mod tests {
         );
         assert_eq!(
             key,
-            "hbone|orders.default.svc.cluster.local|8080|15008|10.0.0.2|0123456789abcdef|pool=12,0,1,3,22,33,44,65535,131072,0,16384,none"
+            "hbone|orders.default.svc.cluster.local|8080|15008|10.0.0.2|0123456789abcdef|pool=0,1,22,33,44,65535,131072,0,16384,none"
         );
     }
 
@@ -1278,7 +1308,9 @@ mod tests {
     fn pool_key_changes_when_per_proxy_pool_overrides_change() {
         let base_config = PoolConfig::default();
         let overridden_config = PoolConfig {
-            http2_connections_per_host: base_config.http2_connections_per_host + 1,
+            // A genuine connection-affecting H2 setting (still part of the key
+            // after pool-management policy was dropped from it).
+            http2_initial_stream_window_size: base_config.http2_initial_stream_window_size + 1,
             ..base_config.clone()
         };
 
@@ -1302,6 +1334,40 @@ mod tests {
         assert_ne!(
             base_key, overridden_key,
             "HBONE pools with different effective per-proxy H2 sizing must not share senders"
+        );
+    }
+
+    #[test]
+    fn pool_key_ignores_pool_management_policy() {
+        // F19: idle_timeout_seconds and http2_connections_per_host are
+        // pool-management policy, not connection identity. Two proxies that
+        // differ ONLY in those must produce the SAME key so they can share an
+        // established mTLS connection to the same sidecar.
+        let base_config = PoolConfig::default();
+        let policy_only_config = PoolConfig {
+            idle_timeout_seconds: base_config.idle_timeout_seconds + 100,
+            http2_connections_per_host: base_config.http2_connections_per_host + 5,
+            ..base_config.clone()
+        };
+        let base_key = pool_key_owned(
+            "orders.default.svc.cluster.local",
+            8080,
+            15008,
+            None,
+            "fingerprint",
+            &base_config,
+        );
+        let policy_only_key = pool_key_owned(
+            "orders.default.svc.cluster.local",
+            8080,
+            15008,
+            None,
+            "fingerprint",
+            &policy_only_config,
+        );
+        assert_eq!(
+            base_key, policy_only_key,
+            "HBONE pool key must not be fragmented by idle-timeout / per-host-cap policy"
         );
     }
 
@@ -1423,10 +1489,10 @@ mod tests {
 
     #[test]
     fn idle_expiration_uses_last_used_time() {
-        let now = Instant::now();
+        let now: u64 = 1_000_000;
 
         assert!(
-            entry_idle_expired(now - Duration::from_secs(2), 1, now),
+            entry_idle_expired(now - 2, 1, now),
             "entries idle longer than the timeout should expire"
         );
         assert!(
@@ -1434,7 +1500,7 @@ mod tests {
             "freshly used entries should stay in the pool"
         );
         assert!(
-            !entry_idle_expired(now - Duration::from_secs(60), 0, now),
+            !entry_idle_expired(now - 60, 0, now),
             "zero idle timeout disables idle pruning"
         );
     }
