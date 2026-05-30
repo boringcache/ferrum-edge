@@ -40,6 +40,7 @@ pub mod hbone_pool;
 mod hbone_proxy;
 pub mod headers;
 pub mod http2_pool;
+pub mod netns_capture;
 pub mod sni;
 pub mod stream_error;
 pub mod stream_listener;
