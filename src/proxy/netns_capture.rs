@@ -436,10 +436,10 @@ mod imp {
             if scanned > 1024 {
                 break;
             }
-            if let Ok(procs) = std::fs::read_to_string(dir.join("cgroup.procs")) {
-                if let Some(pid) = procs.split_whitespace().find_map(|raw| raw.parse().ok()) {
-                    return Some(pid);
-                }
+            if let Ok(procs) = std::fs::read_to_string(dir.join("cgroup.procs"))
+                && let Some(pid) = procs.split_whitespace().find_map(|raw| raw.parse().ok())
+            {
+                return Some(pid);
             }
             if let Ok(entries) = std::fs::read_dir(&dir) {
                 for entry in entries.flatten() {
@@ -674,5 +674,154 @@ mod tests {
         );
         assert_eq!(mgr.reconcile_once(), 1, "only the resolvable pod opens");
         assert!(mgr.active.contains_key(&100));
+    }
+}
+
+/// Privileged functional tests for the in-netns capture primitive
+/// ([`imp::bind_capture_listener_in_pod_netns`]). They create and enter network
+/// namespaces, which needs `CAP_SYS_ADMIN`/root, so they are `#[ignore]`d and
+/// run only by the dedicated `netns-capture-live` CI job. Each self-skips
+/// (returns, passing) when it lacks root or `unshare` — mirroring
+/// `ebpf::loader::live_kernel_tests`.
+///
+/// No eBPF here: this layer proves the OS mechanism the whole design rests on —
+/// a `127.0.0.1:15001` listener bound *inside* a pod's netns is reachable from a
+/// client in that netns and **unreachable from the host netns** (the per-pod
+/// loopback isolation that makes a single host-netns listener insufficient).
+#[cfg(all(test, target_os = "linux"))]
+mod live_netns_tests {
+    use std::io::Write;
+    use std::net::{Ipv4Addr, SocketAddr, TcpStream};
+    use std::os::fd::AsRawFd;
+    use std::process::{Child, Command};
+    use std::time::{Duration, Instant};
+
+    const CAPTURE_PORT: u16 = 15001;
+
+    fn is_root() -> bool {
+        // Safety: `geteuid` is always sound and never fails.
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    /// Spawn a child living in a fresh network namespace (loopback brought up),
+    /// then sleeping. `/proc/<pid>/ns/net` is the synthetic "pod" netns.
+    /// `None` if `unshare` is unavailable. `unshare --net` does not fork, so the
+    /// spawned PID is the process living in the new netns.
+    fn spawn_pod_netns_child() -> Option<Child> {
+        Command::new("unshare")
+            .args([
+                "--net",
+                "sh",
+                "-c",
+                "ip link set lo up 2>/dev/null || true; exec sleep 30",
+            ])
+            .spawn()
+            .ok()
+    }
+
+    /// Reaps the child netns process on drop so the test never leaks it.
+    struct ChildGuard(Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// Connect to `127.0.0.1:port` from inside `pid`'s network namespace, on a
+    /// throwaway thread (setns mutates only the calling thread, and the thread
+    /// exits immediately so no restore is needed). Returns whether it connected.
+    fn connect_inside_netns(pid: u32, port: u16) -> bool {
+        std::thread::spawn(move || -> bool {
+            let Ok(target) = std::fs::File::open(format!("/proc/{pid}/ns/net")) else {
+                return false;
+            };
+            // Safety: `target` is an open netns handle owned for the call.
+            if unsafe { libc::setns(target.as_raw_fd(), libc::CLONE_NEWNET) } != 0 {
+                return false;
+            }
+            match TcpStream::connect_timeout(
+                &SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+                Duration::from_secs(2),
+            ) {
+                Ok(mut stream) => {
+                    let _ = stream.write_all(b"ping");
+                    true
+                }
+                Err(_) => false,
+            }
+        })
+        .join()
+        .unwrap_or(false)
+    }
+
+    #[test]
+    #[ignore = "requires root + CAP_SYS_ADMIN to create/enter network namespaces"]
+    fn in_netns_listener_reachable_inside_pod_and_isolated_from_host() {
+        if !is_root() {
+            eprintln!("SKIP: not root; cannot create network namespaces");
+            return;
+        }
+        let Some(child) = spawn_pod_netns_child() else {
+            eprintln!("SKIP: `unshare --net` unavailable");
+            return;
+        };
+        let pid = child.id();
+        let _child = ChildGuard(child);
+        // Let the child unshare its netns and bring loopback up.
+        std::thread::sleep(Duration::from_millis(400));
+
+        // Synthetic pod cgroup: `first_pid_in_cgroup` only reads `cgroup.procs`,
+        // so a tempdir holding the child PID is enough — no real cgroupfs.
+        let cgdir = tempfile::tempdir().unwrap();
+        std::fs::write(cgdir.path().join("cgroup.procs"), format!("{pid}\n")).unwrap();
+        let cgroup_path = cgdir.path().to_string_lossy().to_string();
+
+        let listener = super::imp::bind_capture_listener_in_pod_netns(
+            &cgroup_path,
+            SocketAddr::from((Ipv4Addr::LOCALHOST, CAPTURE_PORT)),
+        )
+        .expect("bind capture listener inside the pod netns");
+        listener
+            .set_nonblocking(true)
+            .expect("listener set_nonblocking");
+
+        // (1) A client INSIDE the pod netns must reach the in-netns listener.
+        assert!(
+            connect_inside_netns(pid, CAPTURE_PORT),
+            "a client inside the pod netns must reach the in-netns capture listener"
+        );
+
+        // Poll accept with a deadline so a missed connection can never hang CI.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut accepted = false;
+        while Instant::now() < deadline {
+            match listener.accept() {
+                Ok(_) => {
+                    accepted = true;
+                    break;
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(e) => panic!("in-netns listener accept failed: {e}"),
+            }
+        }
+        assert!(
+            accepted,
+            "the in-netns listener must accept the pod's loopback connection"
+        );
+
+        // (2) The HOST netns must NOT reach 127.0.0.1:15001 — the listener lives
+        // only in the pod netns. This loopback isolation is exactly why a single
+        // host-netns listener can never serve captured pods.
+        let host_reach = TcpStream::connect_timeout(
+            &SocketAddr::from((Ipv4Addr::LOCALHOST, CAPTURE_PORT)),
+            Duration::from_millis(500),
+        );
+        assert!(
+            host_reach.is_err(),
+            "host netns must not reach a pod-netns-only loopback listener (got {host_reach:?})"
+        );
     }
 }
