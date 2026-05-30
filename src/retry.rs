@@ -313,6 +313,7 @@ pub fn classify_grpc_proxy_error(e: &crate::proxy::grpc_proxy::GrpcProxyError) -
             }
         }
         GrpcProxyError::ResourceExhausted(_) => ErrorClass::RequestError,
+        GrpcProxyError::ResponseTooLarge(_) => ErrorClass::ResponseBodyTooLarge,
         GrpcProxyError::Internal(_) => ErrorClass::RequestError,
     }
 }

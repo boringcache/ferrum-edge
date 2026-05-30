@@ -532,6 +532,23 @@ fn test_grpc_internal_error_classified() {
     assert_eq!(classify_grpc_proxy_error(&err), ErrorClass::RequestError);
 }
 
+#[test]
+fn test_grpc_response_too_large_classified_as_backend_failure() {
+    // F04 (PR #1408): an oversized BACKEND response body is
+    // GrpcProxyError::ResponseTooLarge — distinct from the oversized CLIENT
+    // request (ResourceExhausted, classified as a client-side RequestError).
+    // It must classify as ResponseBodyTooLarge so the circuit breaker treats it
+    // as a backend failure (502), mirroring the HTTP path, rather than a neutral
+    // client-side outcome.
+    let err = GrpcProxyError::ResponseTooLarge(
+        "gRPC response payload size exceeds maximum of 1024 bytes".into(),
+    );
+    assert_eq!(
+        classify_grpc_proxy_error(&err),
+        ErrorClass::ResponseBodyTooLarge
+    );
+}
+
 // --- classify_boxed_error tests (WebSocket / generic errors) ---
 
 #[test]

@@ -1348,6 +1348,58 @@ impl Drop for LoadBalancerConnectionGuard {
     }
 }
 
+/// RAII guard that releases a half-open circuit-breaker probe slot on drop
+/// unless an explicit outcome was recorded first (`disarm`).
+///
+/// The gRPC dispatch block has many early-return paths (plugin rejects,
+/// body-too-large, internal errors) reached AFTER `check_circuit_breaker` may
+/// have admitted a HALF_OPEN probe. The gRPC path historically recorded no
+/// outcome on those paths, leaking the probe slot and wedging the breaker. On
+/// such early returns this guard records a NEUTRAL outcome (a gateway-side
+/// decision is neither a backend success nor failure), releasing the slot
+/// without changing breaker health. The success/failure paths disarm it and
+/// record the real outcome instead.
+struct GrpcProbeReleaseGuard {
+    cb: Option<Arc<crate::circuit_breaker::CircuitBreaker>>,
+    armed: bool,
+}
+
+impl GrpcProbeReleaseGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for GrpcProbeReleaseGuard {
+    fn drop(&mut self) {
+        if self.armed
+            && let Some(cb) = &self.cb
+        {
+            cb.record_neutral(true);
+        }
+    }
+}
+
+/// Record a gRPC backend outcome to the circuit breaker, classified by the
+/// backend's HTTP status (mirrors the HTTP path). gRPC application errors ride
+/// as `grpc-status` trailers over HTTP 200 (not a transport failure), so a
+/// status outside `failure_status_codes` is a success that advances HALF_OPEN
+/// recovery; only a genuine HTTP failure status (e.g. a sandwiched LB /
+/// overloaded backend 5xx) trips the breaker. `record_failure` with a
+/// non-failure status only releases the probe slot, so it cannot stand in for
+/// `record_success` on a 2xx HALF_OPEN probe.
+fn record_grpc_backend_status_outcome(
+    cb: &crate::circuit_breaker::CircuitBreaker,
+    backend_status: u16,
+    is_half_open_probe: bool,
+) {
+    if cb.config().failure_status_codes.contains(&backend_status) {
+        cb.record_failure(backend_status, false, is_half_open_probe);
+    } else {
+        cb.record_success(is_half_open_probe);
+    }
+}
+
 /// Build RFC 7239 Forwarded header value.
 /// IPv6 addresses are quoted per RFC 7239 §6.
 /// Writes directly into a single pre-allocated buffer to avoid intermediate
@@ -9589,6 +9641,44 @@ async fn handle_proxy_request_inner(
         // (grpc_proxy.rs), so we must pass the resolved Cow<Proxy> through
         // dispatch. Borrowed when no override applies; cloned only when the
         // selected target or per-port timeout differs.
+
+        // Account for a HALF_OPEN circuit-breaker probe slot that
+        // check_circuit_breaker may have admitted for this request. The gRPC
+        // block returns from many early paths; this guard records a NEUTRAL
+        // outcome on drop (releasing the probe slot) unless an explicit
+        // success/failure is recorded after dispatch. `grpc_cb_probe_slot`
+        // tracks whether that probe is still unconsumed so the retry loop and
+        // the final record below cannot double-decrement it.
+        let mut grpc_cb_probe_slot = cb_is_half_open_probe;
+        // The post-dispatch breaker record must be charged to the target that
+        // actually produced grpc_result. The retry loop can rotate targets, so
+        // track the final target here (init to the initial target) and update it
+        // on each rotation, mirroring the HTTP path's final_cb_target_key. The
+        // probe-slot release still lands correctly: grpc_cb_probe_slot is only
+        // still true when no rotation occurred, in which case this equals
+        // cb_target_key.
+        let mut grpc_final_cb_key = cb_target_key.clone();
+        // Set when a load-balanced retry rotates to a target whose breaker
+        // rejects the attempt (see the can_execute gate in the retry loop): the
+        // current outcome was already recorded for the prior target, so the
+        // post-dispatch record below must be skipped. Mirrors the HTTP path's
+        // `skip_final_cb_record`.
+        let mut grpc_skip_final_cb_record = false;
+        let mut grpc_probe_guard = GrpcProbeReleaseGuard {
+            cb: if cb_is_half_open_probe {
+                proxy.circuit_breaker.as_ref().map(|cfg| {
+                    state.circuit_breaker_cache.get_or_create(
+                        &proxy.id,
+                        cb_target_key.as_deref(),
+                        cfg,
+                    )
+                })
+            } else {
+                None
+            },
+            armed: true,
+        };
+
         let grpc_connection_proxy =
             resolve_backend_connection_proxy_for_target(&proxy, upstream_target.as_deref());
         let grpc_dispatch_proxy: &Proxy = grpc_connection_proxy.as_ref();
@@ -9862,12 +9952,28 @@ async fn handle_proxy_request_inner(
                         grpc_current_cb_key.as_deref(),
                         cb_config,
                     );
-                    cb.record_failure(502, true, cb_is_half_open_probe);
+                    cb.record_failure(502, true, grpc_cb_probe_slot);
+                    // This intermediate failure consumes the probe slot (if any);
+                    // the post-dispatch record must not decrement it again.
+                    grpc_cb_probe_slot = false;
+                    // The probe slot this guard would release on drop has now
+                    // been released by record_failure above, so disarm it.
+                    // Otherwise a future dropped during the retry backoff/next
+                    // attempt would call record_neutral on the same breaker and
+                    // release a second slot (over-admitting probes when
+                    // half_open_max_requests > 1).
+                    grpc_probe_guard.disarm();
                 }
 
                 let delay = retry::retry_delay(retry_config, grpc_attempt);
                 tokio::time::sleep(delay).await;
                 grpc_attempt += 1;
+
+                // Save the pre-rotation CB key so that if the rotated target's
+                // breaker rejects below, the already-recorded current outcome
+                // stays attributed to the target that produced it. Mirrors the
+                // HTTP retry path.
+                let grpc_pre_rotation_cb_key = grpc_current_cb_key.clone();
 
                 // Try a different target on retry if load balancing is configured
                 if let (Some(_upstream_id), Some(prev_target)) =
@@ -9894,7 +10000,38 @@ async fn handle_proxy_request_inner(
                     );
                     grpc_current_cb_key =
                         Some(crate::circuit_breaker::target_key(&next.host, next.port));
+                    grpc_final_cb_key = grpc_current_cb_key.clone();
                     grpc_current_target = Some(next);
+                }
+
+                // Enforce the (possibly rotated) target's circuit breaker before
+                // dispatching this retry, mirroring the HTTP retry path. Without
+                // this gate a retry can dispatch to — and then record an outcome
+                // against — a target whose breaker is OPEN or has no free
+                // HALF_OPEN probe slot, letting an unadmitted retry advance or
+                // close a breaker that should have rejected the attempt.
+                if let Some(cb_config) = &proxy.circuit_breaker {
+                    match state.circuit_breaker_cache.can_execute(
+                        &proxy.id,
+                        grpc_current_cb_key.as_deref(),
+                        cb_config,
+                    ) {
+                        Ok((_cb, is_half_open_probe)) => {
+                            grpc_cb_probe_slot = is_half_open_probe;
+                        }
+                        Err(_) => {
+                            // Rotated/retried target's breaker rejected: don't
+                            // dispatch to it. The current grpc_result (the
+                            // connection error recorded at the top of this
+                            // iteration) stays as the outcome. Restore the final
+                            // key to the target that produced it and skip the
+                            // post-dispatch record so we neither double-record
+                            // nor attribute to the never-dispatched target.
+                            grpc_final_cb_key = grpc_pre_rotation_cb_key;
+                            grpc_skip_final_cb_record = true;
+                            break;
+                        }
+                    }
                 }
 
                 warn!(
@@ -9936,6 +10073,73 @@ async fn handle_proxy_request_inner(
                     state.max_response_body_size_bytes,
                 )
                 .await;
+            }
+        }
+
+        // Record the final backend outcome to the circuit breaker once, here,
+        // and disarm the neutral-release guard. This mirrors the HTTP path's
+        // record_backend_outcome, which records BEFORE the response/after_proxy
+        // plugins run: the breaker must observe the BACKEND's outcome regardless
+        // of any gateway-side plugin rejection or body-too-large abort that the
+        // match arms below may apply to the client response. Recording before
+        // the match also releases the (possibly rotated) probe slot before any
+        // early return, so an after_proxy reject cannot leak it.
+        //
+        // Previously the gRPC path recorded nothing here, so the breaker never
+        // saw gRPC successes (could not recover from HALF_OPEN) or non-connect
+        // failures (could not trip). check_circuit_breaker admitted any probe
+        // against cb_target_key; the retry loop already recorded per-attempt
+        // failures (and disarmed the guard) for rotated targets, and
+        // grpc_skip_final_cb_record marks the case where a rotated retry's
+        // breaker rejected (already recorded for the prior target).
+        if !grpc_skip_final_cb_record && let Some(cb_config) = &proxy.circuit_breaker {
+            grpc_probe_guard.disarm();
+            let cb = state.circuit_breaker_cache.get_or_create(
+                &proxy.id,
+                grpc_final_cb_key.as_deref(),
+                cb_config,
+            );
+            match &grpc_result {
+                // Classify by the backend's HTTP status, like the HTTP path.
+                // For a streaming response the backend headers ARE the probe
+                // outcome; a LATE client request-body overflow (returned as
+                // RESOURCE_EXHAUSTED further below) is handled by the body
+                // wrapper exactly as the HTTP path handles a late streaming
+                // upload overflow — the backend status still stands. An
+                // oversized client request detected BEFORE backend headers is
+                // GrpcProxyError::ResourceExhausted (neutral arm below).
+                Ok(kind) => {
+                    let backend_status = match kind {
+                        GrpcResponseKind::Buffered(r) => r.status,
+                        GrpcResponseKind::Streaming(r) => r.status,
+                    };
+                    record_grpc_backend_status_outcome(&cb, backend_status, grpc_cb_probe_slot);
+                }
+                // Oversized CLIENT request payloads (ResourceExhausted, detected
+                // before backend headers) and client-body-read / gateway-config
+                // errors (Internal) are client/gateway-side, not backend
+                // failures. Record NEUTRAL so client behavior cannot trip or
+                // reopen the backend breaker — mirroring the HTTP path's
+                // ClientDisconnect -> record_neutral. An oversized BACKEND
+                // response is GrpcProxyError::ResponseTooLarge (NOT
+                // ResourceExhausted) and falls to the failure arm below, matching
+                // the HTTP path's ResponseBodyTooLarge -> 502.
+                Err(GrpcProxyError::ResourceExhausted(_) | GrpcProxyError::Internal(_)) => {
+                    cb.record_neutral(grpc_cb_probe_slot);
+                }
+                Err(e) => {
+                    let connection_error = matches!(
+                        e,
+                        GrpcProxyError::BackendUnavailable { kind, .. } if kind.is_connect_class()
+                    ) || matches!(
+                        e,
+                        GrpcProxyError::BackendTimeout {
+                            kind: grpc_proxy::GrpcTimeoutKind::Connect,
+                            ..
+                        }
+                    );
+                    cb.record_failure(502, connection_error, grpc_cb_probe_slot);
+                }
             }
         }
 
@@ -10487,7 +10691,7 @@ async fn handle_proxy_request_inner(
                     GrpcProxyError::BackendTimeout { .. } => {
                         grpc_proxy::grpc_status::DEADLINE_EXCEEDED
                     }
-                    GrpcProxyError::ResourceExhausted(_) => {
+                    GrpcProxyError::ResourceExhausted(_) | GrpcProxyError::ResponseTooLarge(_) => {
                         grpc_proxy::grpc_status::RESOURCE_EXHAUSTED
                     }
                     GrpcProxyError::Internal(_) => grpc_proxy::grpc_status::UNAVAILABLE,
