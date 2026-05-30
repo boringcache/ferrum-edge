@@ -145,6 +145,54 @@ fn test_half_open_non_failure_status_releases_probe_slot() {
 }
 
 #[test]
+fn test_half_open_client_disconnect_neutral_releases_probe_slot() {
+    // Regression for F09 (PR #1392): the H3 oversized-upload (413) path is
+    // admitted as a half-open probe and maps ErrorClass::ClientDisconnect to
+    // cb.record_neutral(is_half_open_probe). Before the fix it passed
+    // skip_circuit_breaker_record=true, skipping record_neutral entirely, so
+    // the reserved probe slot was never released — with half_open_max_requests
+    // = 1 a single oversized upload during HALF_OPEN permanently wedged the
+    // breaker and black-holed the target. record_neutral must release the slot
+    // without changing breaker state.
+    let config = CircuitBreakerConfig {
+        failure_threshold: 1,
+        success_threshold: 2,
+        timeout_seconds: 0,
+        failure_status_codes: vec![500],
+        half_open_max_requests: 1,
+        trip_on_connection_errors: true,
+    };
+    let cb = CircuitBreaker::new(config);
+
+    cb.record_failure(500, false, false);
+    assert_eq!(cb.state_name(), "open");
+
+    // Transition to half-open and reserve the single probe slot.
+    assert!(cb.can_execute().unwrap());
+    assert_eq!(cb.state_name(), "half_open");
+    assert_eq!(cb.half_open_in_flight(), 1);
+    assert!(cb.can_execute().is_err(), "the single probe slot is taken");
+
+    // The client-disconnect (oversized upload) outcome routes here.
+    cb.record_neutral(true);
+
+    assert_eq!(
+        cb.half_open_in_flight(),
+        0,
+        "client-disconnect neutral outcome must release its half-open probe slot"
+    );
+    assert_eq!(
+        cb.state_name(),
+        "half_open",
+        "record_neutral must not change breaker state"
+    );
+    assert!(
+        cb.can_execute().is_ok(),
+        "released probe slot must re-admit a half-open probe"
+    );
+}
+
+#[test]
 fn test_cache_creates_and_reuses() {
     let cache = CircuitBreakerCache::new();
     let config = default_config();

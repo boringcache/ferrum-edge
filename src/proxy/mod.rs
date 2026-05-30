@@ -10882,8 +10882,12 @@ async fn handle_proxy_request_inner(
         "Backend response received"
     );
 
-    // Record outcome across CB, passive health, latency, and connection tracking.
-    backend_dispatch::record_backend_outcome(
+    // Record outcome across CB, passive health, and latency. Connection-end is
+    // owned by the LoadBalancerConnectionGuard (`with_lb_connection_guard` /
+    // drop), which correctly defers the decrement until a streaming response
+    // body completes. Use the no-conn-end variant so the least-connections
+    // gauge is not decremented twice per request (guard + this call).
+    backend_dispatch::record_backend_outcome_no_conn_end(
         &state,
         &proxy,
         &epoch.load_balancer,
