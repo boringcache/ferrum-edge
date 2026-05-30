@@ -494,12 +494,12 @@ impl HboneConnectionPool {
         }
     }
 
-    /// Shared-lock fast path: scan for a ready sender without pruning or
-    /// updating `last_used_at`. Avoids the exclusive shard write lock that
-    /// `cached_sender` holds during prune + scan + clone. Expired entries
-    /// are skipped (not removed); dead senders fall through to the write
-    /// path. The `last_used_at` staleness is bounded by
-    /// `maybe_prune_idle_entries` running on the next write-path call.
+    /// Shared-lock fast path: scan for a ready sender and refresh its
+    /// `last_used_at` via a relaxed atomic store, avoiding the exclusive shard
+    /// write lock that `cached_sender` holds during prune + scan + clone.
+    /// Refreshing recency here keeps a connection served only by this path from
+    /// being pruned as idle. Expired entries are skipped (not removed); dead
+    /// senders fall through to the write path.
     fn try_cached_sender_read(&self, key: &str) -> Option<SendRequest<Bytes>> {
         let entries = self.entries.get(key)?;
         let now = unix_secs();
@@ -940,6 +940,17 @@ fn record_hbone_evictions(count: usize) {
         .record_pool_evictions(crate::runtime_metrics::PoolKind::Hbone, count as u64);
 }
 
+// `last_used_secs`/`now_secs` are wall-clock `unix_secs()`, matching the
+// connection-pool idle convention in `GenericPool` (`last_used_epoch_ms`) so
+// the two pools age idle entries the same way. A backward wall-clock step
+// (NTP correction, VM resume) makes `saturating_sub` under-count idle time, so
+// an idle entry may survive a few extra prune cycles until the clock catches
+// up — never unbounded, since dead senders are still culled by the `ready()`
+// health probe on both the read and write paths. A forward step larger than
+// the timeout can evict one fresh entry, after which it self-heals. A repo-wide
+// migration to a monotonic clock (this pool's prune scheduler + `GenericPool`
+// together) is the right place to remove that residual, not a piecemeal switch
+// of this one field that would desync it from the rest of the pool's timing.
 fn entry_idle_expired(last_used_secs: u64, idle_timeout_seconds: u64, now_secs: u64) -> bool {
     idle_timeout_seconds > 0 && now_secs.saturating_sub(last_used_secs) > idle_timeout_seconds
 }
