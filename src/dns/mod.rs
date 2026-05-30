@@ -1269,15 +1269,21 @@ fn build_resolver(config: &DnsConfig) -> Resolver<TokioRuntimeProvider> {
     }
 
     // When a global TTL override is set, clamp hickory's internal cache to match
-    // so the resolver doesn't serve records beyond the override lifetime.
+    // so the resolver doesn't serve records beyond the override lifetime. Bound
+    // it by MAX_TTL first: hickory clamps each record's TTL up to
+    // positive_max_ttl and computes `valid_until = Instant::now() + ttl`, so an
+    // unbounded FERRUM_DNS_TTL_OVERRIDE_SECONDS would overflow that addition
+    // inside hickory — before DnsCache::cache_success_entry's own clamp can run.
     if let Some(override_secs) = config.ttl_override_seconds {
-        let d = Duration::from_secs(override_secs);
+        let d = Duration::from_secs(override_secs).min(DnsCache::MAX_TTL);
         resolver_opts.positive_min_ttl = Some(d);
         resolver_opts.positive_max_ttl = Some(d);
     }
 
-    // Apply error/negative TTL
-    let neg_ttl = Duration::from_secs(config.error_ttl_seconds);
+    // Apply error/negative TTL (same MAX_TTL bound: the negative-response path
+    // also does `Instant::now() + ttl` inside hickory, so an unbounded
+    // FERRUM_DNS_ERROR_TTL would overflow on the first failed lookup).
+    let neg_ttl = Duration::from_secs(config.error_ttl_seconds).min(DnsCache::MAX_TTL);
     resolver_opts.negative_min_ttl = Some(neg_ttl);
     resolver_opts.negative_max_ttl = Some(neg_ttl);
 
@@ -1521,6 +1527,27 @@ mod tests {
             entry.applied_ttl <= DnsCache::MAX_TTL,
             "stored TTL must be clamped to the ceiling"
         );
+    }
+
+    #[test]
+    fn build_resolver_clamps_unbounded_ttls_into_hickory_opts() {
+        // F20: build_resolver feeds positive/negative TTL bounds into hickory's
+        // ResolverOpts. hickory clamps each record's TTL up to positive_max_ttl
+        // and computes `valid_until = Instant::now() + ttl`, so an unbounded
+        // FERRUM_DNS_TTL_OVERRIDE_SECONDS / FERRUM_DNS_ERROR_TTL would overflow
+        // that addition INSIDE hickory, before cache_success_entry's clamp ever
+        // runs. The bounds handed to hickory must therefore be capped at MAX_TTL
+        // (the original PR clamped only DnsCache's own fields, not these).
+        let resolver = build_resolver(&DnsConfig {
+            ttl_override_seconds: Some(u64::MAX),
+            error_ttl_seconds: u64::MAX,
+            ..DnsConfig::default()
+        });
+        let opts = resolver.options();
+        assert_eq!(opts.positive_min_ttl, Some(DnsCache::MAX_TTL));
+        assert_eq!(opts.positive_max_ttl, Some(DnsCache::MAX_TTL));
+        assert_eq!(opts.negative_min_ttl, Some(DnsCache::MAX_TTL));
+        assert_eq!(opts.negative_max_ttl, Some(DnsCache::MAX_TTL));
     }
 
     #[tokio::test]
