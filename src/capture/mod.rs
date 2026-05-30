@@ -466,11 +466,21 @@ impl EbpfPlan {
 
 impl IptablesPlan {
     pub fn script(&self) -> String {
-        iptables_script(
-            &self.v4_commands,
-            &self.v6_commands,
-            self.ip6tables_mode,
-            true,
+        // `set -e` makes the injected init container fail **closed**: if any
+        // iptables rule fails to apply, the script exits non-zero and the pod's
+        // init phase fails, instead of starting the workload with a partial
+        // capture ruleset that would let egress silently bypass the mesh proxy
+        // (and therefore `mesh_authz`). The idempotent command shapes are
+        // `set -e`-safe — `-N ... || true` and `-C ... || -A ...` only abort on
+        // a real `-A` append failure, never on the expected `-C`/`-N` misses.
+        format!(
+            "set -e\n{}",
+            iptables_script(
+                &self.v4_commands,
+                &self.v6_commands,
+                self.ip6tables_mode,
+                true,
+            )
         )
     }
 
@@ -783,6 +793,31 @@ mod tests {
             plan.v4_commands
                 .iter()
                 .any(|cmd| cmd.contains("--to-ports 15001"))
+        );
+    }
+
+    #[test]
+    fn iptables_setup_script_fails_closed_with_set_e() {
+        // The injector runs this script as the init container's `/bin/sh -c`
+        // body. Without `set -e` a rule that fails mid-script would still exit 0,
+        // starting the pod with a partial ruleset that lets egress bypass mesh
+        // capture (and mesh_authz). It must fail closed.
+        let plan = IptablesPlan::for_config(&CaptureConfig::explicit(15006, 15001));
+        let script = plan.script();
+        assert!(
+            script.starts_with("set -e\n"),
+            "setup script must start with `set -e` to fail closed on a partial ruleset, got:\n{script}"
+        );
+        // The idempotent guards must survive `set -e`: `-N ... || true` and
+        // `-C ... || -A ...` must not abort on the expected chain-exists /
+        // rule-absent misses.
+        assert!(
+            script.contains("|| true"),
+            "chain creation must stay idempotent under set -e"
+        );
+        assert!(
+            script.contains(" -C ") && script.contains("|| iptables"),
+            "append must stay check-then-add idempotent under set -e"
         );
     }
 
