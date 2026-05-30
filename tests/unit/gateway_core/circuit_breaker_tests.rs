@@ -201,6 +201,41 @@ fn grpc_gateway_side_error_releases_half_open_probe_without_reopening() {
 }
 
 #[test]
+fn grpc_streaming_late_request_body_too_large_neutral_does_not_close_half_open() {
+    // A client-streaming/bidi gRPC upload can exceed the request-body limit
+    // after backend headers have arrived. Even if those headers are HTTP 200,
+    // the final client-visible outcome is gateway-side RESOURCE_EXHAUSTED, so
+    // the breaker must release the HALF_OPEN probe neutrally instead of
+    // treating the backend status as a recovery success.
+    let config = CircuitBreakerConfig {
+        failure_threshold: 1,
+        success_threshold: 1,
+        timeout_seconds: 0,
+        failure_status_codes: vec![500],
+        half_open_max_requests: 1,
+        trip_on_connection_errors: true,
+    };
+    let cb = CircuitBreaker::new(config);
+    cb.record_failure(500, false, false);
+    assert!(cb.can_execute().unwrap());
+    assert_eq!(cb.state_name(), "half_open");
+    assert_eq!(cb.half_open_in_flight(), 1);
+
+    cb.record_neutral(true);
+
+    assert_eq!(
+        cb.state_name(),
+        "half_open",
+        "late oversized gRPC uploads must not close a half-open breaker"
+    );
+    assert_eq!(
+        cb.half_open_in_flight(),
+        0,
+        "neutral late upload overflow must release the probe slot"
+    );
+}
+
+#[test]
 fn grpc_ok_with_http_5xx_status_trips_breaker() {
     // F04: an Ok(GrpcResponseKind) carries the backend HTTP status, which can be
     // a genuine 5xx (sandwiched LB / overloaded backend). The fix classifies by
