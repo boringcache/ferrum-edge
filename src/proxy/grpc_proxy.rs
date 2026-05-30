@@ -55,6 +55,24 @@ use crate::tls::backend::{
 };
 use crate::util::body_limit::is_length_limit_error;
 
+/// Observer fired exactly when the streaming gRPC **request upload** reaches a
+/// terminal state — clean EOF, overflow abort, or stream drop (client/backend
+/// reset). Attached to the `GrpcBody::Streaming` request-body wrapper and
+/// invoked from its `Drop`, which hyper runs once it is done sending the
+/// request body (END_STREAM) or abandons the stream.
+///
+/// The gRPC transport layer stays agnostic to what the observer does. The proxy
+/// layer wires it to circuit-breaker probe accounting (`GrpcStreamingProbeRecorder`
+/// in `proxy::mod`) so a client-upload overflow at ANY point in the RPC — even
+/// one that only trips during response-body streaming — is classified at upload
+/// termination instead of at response-header time.
+pub trait GrpcUploadTerminationObserver: Send + Sync {
+    /// Called once, when the request-body upload terminates. Implementations
+    /// must be cheap and non-blocking (this runs inside `Drop` on hyper's
+    /// connection task): no `.await`, no locks held across work.
+    fn on_upload_terminated(&self);
+}
+
 /// Sum type for gRPC request bodies: either pre-buffered or streaming from the
 /// client. This allows a single pool type (`SendRequest<GrpcBody>`) to handle
 /// both buffered (retries, plugins) and streaming (zero-copy fast path) bodies.
@@ -82,7 +100,28 @@ pub enum GrpcBody {
         bytes_seen: usize,
         max_bytes: usize,
         exceeded: Arc<AtomicBool>,
+        /// Fired from `Drop` when this request body terminates. Carries the
+        /// deferred circuit-breaker probe accounting so a late upload overflow
+        /// is recorded at upload termination, not at response-header time.
+        /// `None` when no circuit breaker is configured for the proxy.
+        upload_observer: Option<Arc<dyn GrpcUploadTerminationObserver>>,
     },
+}
+
+impl Drop for GrpcBody {
+    fn drop(&mut self) {
+        // Notify the upload-termination observer when the streaming request
+        // body is dropped. hyper drops it once the upload finishes (END_STREAM)
+        // or the stream is reset, so this is the canonical "request upload
+        // terminated" signal — independent of the response body's lifetime.
+        if let GrpcBody::Streaming {
+            upload_observer, ..
+        } = self
+            && let Some(observer) = upload_observer.as_ref()
+        {
+            observer.on_upload_terminated();
+        }
+    }
 }
 
 impl http_body::Body for GrpcBody {
@@ -102,6 +141,7 @@ impl http_body::Body for GrpcBody {
                 bytes_seen,
                 max_bytes,
                 exceeded,
+                ..
             } => match Pin::new(incoming).poll_frame(cx) {
                 Poll::Ready(Some(Ok(frame))) => {
                     if *max_bytes > 0
@@ -1336,6 +1376,13 @@ pub async fn proxy_grpc_request_from_bytes(
 /// Request body size limits (`max_grpc_recv_size_bytes`) are enforced inline via
 /// byte counting in `GrpcBody::Streaming`. Each frame's size is accumulated and
 /// the stream errors if the limit is exceeded, causing the H2 connection to reset.
+///
+/// `body_size_exceeded` is the shared overflow flag the request body sets on
+/// limit breach; the caller owns it (and a matching `upload_observer`) so the
+/// circuit-breaker probe outcome can be deferred to request-upload termination.
+/// `upload_observer`, when present, is fired from the request body's `Drop` once
+/// the upload terminates (clean EOF or overflow abort) — see
+/// `GrpcUploadTerminationObserver`.
 #[allow(clippy::too_many_arguments)]
 pub async fn proxy_grpc_request_streaming(
     req: Request<Incoming>,
@@ -1345,14 +1392,16 @@ pub async fn proxy_grpc_request_streaming(
     _dns_cache: &DnsCache,
     proxy_headers: &HashMap<String, String>,
     max_grpc_recv_size_bytes: usize,
+    body_size_exceeded: Arc<AtomicBool>,
+    upload_observer: Option<Arc<dyn GrpcUploadTerminationObserver>>,
 ) -> Result<GrpcResponseKind, GrpcProxyError> {
     let (parts, body) = req.into_parts();
-    let body_size_exceeded = Arc::new(AtomicBool::new(false));
     let grpc_body = GrpcBody::Streaming {
         incoming: body,
         bytes_seen: 0,
         max_bytes: max_grpc_recv_size_bytes,
         exceeded: Arc::clone(&body_size_exceeded),
+        upload_observer,
     };
 
     let uri: hyper::Uri = backend_url
