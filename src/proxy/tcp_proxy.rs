@@ -1683,8 +1683,11 @@ async fn peek_tcp_first_bytes(
 /// TLS-terminated client stream for first-bytes inspection. Unlike the raw peek
 /// this *consumes* the bytes from the TLS session, so the caller must forward the
 /// returned prefix to the backend before relaying the remainder and must not use
-/// kTLS splice for the connection. Returns an empty vec on timeout/EOF (treated
-/// as "nothing to inspect", fail-open).
+/// kTLS splice for the connection. Returns an empty vec on timeout/EOF; the
+/// caller leaves `first_bytes_kind = Some(DecryptedApp)` set so the stream WAF
+/// treats the absent prefix as a missing capture and fails closed in `enforce`
+/// mode when signatures are configured (see `Waf::on_stream_connect`) rather
+/// than as an implicit fail-open "nothing to inspect".
 async fn read_decrypted_first_bytes<S>(stream: &mut S, timeout: Option<Duration>) -> Vec<u8>
 where
     S: tokio::io::AsyncRead + Unpin,

@@ -425,13 +425,22 @@ impl Waf {
 
     /// Record stream WAF decision fields on a TCP `StreamConnectionContext` so
     /// they ride the stream transaction summary out to every logging sink.
+    ///
+    /// `blocked` is the decision in the *current* mode; `would_block` is whether
+    /// the same condition blocks in `enforce` mode (always true for the transport
+    /// guards, `any_enforce` for signatures). When blocked, the cause rides
+    /// `waf.block_reason`. In `monitor` mode nothing is blocked, so an
+    /// enforce-mode would-block is recorded as `waf.would_block_reason` instead —
+    /// the transport guards carry no `rule_hits`, so without this an operator
+    /// gauging rollout impact could not count missing-first-bytes would-blocks.
     fn record_stream_metadata(
         &self,
         ctx: &mut StreamConnectionContext,
         rule_hits: &str,
         severity: Severity,
         blocked: bool,
-        block_reason: &str,
+        would_block: bool,
+        reason: &str,
     ) {
         if !self.config.log_to_metadata {
             return;
@@ -446,7 +455,9 @@ impl Waf {
             if blocked { "blocked" } else { "monitored" }.to_string(),
         );
         if blocked {
-            ctx.insert_metadata("waf.block_reason".to_string(), block_reason.to_string());
+            ctx.insert_metadata("waf.block_reason".to_string(), reason.to_string());
+        } else if would_block {
+            ctx.insert_metadata("waf.would_block_reason".to_string(), reason.to_string());
         }
     }
 
@@ -727,7 +738,16 @@ impl Plugin for Waf {
                 .is_some_and(|b| looks_like_tls_client_hello(b));
             if !terminated && !presents_tls {
                 let blocked = self.config.mode == GlobalMode::Enforce;
-                self.record_stream_metadata(ctx, "", Severity::High, blocked, "tcp_require_tls");
+                // A transport-shape miss always blocks in enforce mode, so it is
+                // unconditionally a would-block for monitor-mode accounting.
+                self.record_stream_metadata(
+                    ctx,
+                    "",
+                    Severity::High,
+                    blocked,
+                    true,
+                    "tcp_require_tls",
+                );
                 if self.config.log_to_stdout {
                     warn!(
                         target: "waf",
@@ -759,11 +779,14 @@ impl Plugin for Waf {
             if kind.is_l7_inspectable() {
                 let Some(bytes) = ctx.first_bytes.clone() else {
                     let blocked = self.config.mode == GlobalMode::Enforce;
+                    // Missing inspectable bytes always blocks in enforce mode, so
+                    // it is unconditionally a would-block for monitor accounting.
                     self.record_stream_metadata(
                         ctx,
                         "",
                         Severity::High,
                         blocked,
+                        true,
                         "first_bytes_unavailable",
                     );
                     if self.config.log_to_stdout {
@@ -784,7 +807,18 @@ impl Plugin for Waf {
                 let hits = stream.signatures.matches(&bytes);
                 if !hits.is_empty() {
                     let (block, severity, ids) = self.stream_decision(&hits);
-                    self.record_stream_metadata(ctx, &ids, severity, block, "signature");
+                    // `block` folds in the global mode; the monitor-mode
+                    // would-block signal is whether any matched signature is
+                    // enforce-action (i.e. would reject under `enforce`).
+                    let would_block = hits.iter().any(|h| h.action == RuleAction::Enforce);
+                    self.record_stream_metadata(
+                        ctx,
+                        &ids,
+                        severity,
+                        block,
+                        would_block,
+                        "signature",
+                    );
                     self.warn_stream_hits(&ctx.proxy_id, &ctx.client_ip, "tcp", &hits, block);
                     if block {
                         return self.reject();
@@ -819,6 +853,10 @@ impl Plugin for Waf {
             return UdpDatagramVerdict::Forward;
         }
         let (block, severity, ids) = self.stream_decision(&hits);
+        // `block` folds in the global mode; the monitor-mode would-block signal is
+        // whether any matched signature is enforce-action (would reject under
+        // `enforce`). Mirrors the TCP `record_stream_metadata` accounting.
+        let would_block = hits.iter().any(|h| h.action == RuleAction::Enforce);
         // Record the hit on the session transaction summary so a UDP/DTLS match
         // is observable by default — parity with the TCP `on_stream_connect` path,
         // not only when `log_to_stdout` is enabled. The per-datagram context is
@@ -848,6 +886,13 @@ impl Plugin for Waf {
                 } else {
                     meta.entry("waf.action".to_string())
                         .or_insert_with(|| "monitored".to_string());
+                    // Monitor mode: keep the enforce-mode would-block countable.
+                    // `block`/`would_block` are mode-exclusive, so this never
+                    // coexists with `waf.block_reason` in a session.
+                    if would_block {
+                        meta.entry("waf.would_block_reason".to_string())
+                            .or_insert_with(|| "signature".to_string());
+                    }
                 }
             });
         }

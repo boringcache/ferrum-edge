@@ -287,6 +287,18 @@ Limitations and behavior to know:
   signatures as a cheap opening-payload filter for opportunistic/automated
   probes, not a replacement for inspection at the backend. UDP scanning is
   per-datagram (each datagram is scanned whole).
+- **Server-first plaintext protocols are incompatible with `inspect_tcp`
+  signatures in `enforce` mode.** The first-byte capture runs *before the backend
+  is dialed*, so for protocols where the server speaks first (MySQL, PostgreSQL,
+  SMTP, FTP, Redis-with-greeting, many DB wire protocols) the client sends
+  nothing until it receives the server banner — which never arrives in the
+  capture window because the backend is not connected yet. The peek elapses at
+  the deadline, no first bytes are captured, and the fail-closed rule above
+  rejects **every** connection (`waf.block_reason=first_bytes_unavailable`).
+  Because `inspect_tcp` defaults to `true` whenever a `stream` block has
+  signatures, putting SQLi signatures in front of MySQL blocks all traffic. In
+  front of a server-first protocol, use `tcp_require_tls` for transport-shape
+  enforcement, run the signatures in `monitor` mode, or set `inspect_tcp: false`.
 - **TCP blocks** reject before any backend is dialed and ride the stream
   transaction summary as `waf.action=blocked`. **UDP blocks** are a silent
   datagram `Drop` (standard UDP behavior). Both transports record `waf.*` on the
@@ -316,10 +328,20 @@ When `log_to_metadata` is true (default), every WAF-evaluated request carries
 logging sinks are configured (stdout, http, tcp, kafka, loki, …):
 `waf.rule_hits`, `waf.target`, `waf.severity`, `waf.score`, `waf.action`
 (`blocked` / `monitored` / `clean`), `waf.first_blocking_rule`,
-`waf.block_reason`, `waf.paranoia`, plus `waf.scan_truncated` /
-`waf.scan_timed_out`. Blocked requests reject before backend dispatch and
-still produce a transaction summary carrying these fields, so blocks are
-visible in the same per-request log line as allowed traffic.
+`waf.block_reason`, `waf.would_block_reason`, `waf.paranoia`, plus
+`waf.scan_truncated` / `waf.scan_timed_out`. Blocked requests reject before
+backend dispatch and still produce a transaction summary carrying these
+fields, so blocks are visible in the same per-request log line as allowed
+traffic.
+
+`waf.block_reason` names why a request was blocked: `rule`, `score`, or
+`body_too_large` for HTTP-family traffic, and `tcp_require_tls`,
+`first_bytes_unavailable`, or `signature` for stream (TCP/UDP) traffic. Stream
+inspection additionally records `waf.would_block_reason` (the same stream value
+set) on `monitor`-mode connections that *would* have blocked under `enforce`,
+so enforce-mode impact stays directly countable before you switch modes — in
+particular the server-first `first_bytes_unavailable` false-positive risk noted
+above, whose would-blocks carry no `waf.rule_hits` to infer from.
 
 `log_to_stdout` additionally emits a dedicated structured `warn!`
 (`target: "waf"`) per matched rule, independent of any logging plugin.
