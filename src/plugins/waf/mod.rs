@@ -778,9 +778,19 @@ impl Plugin for Waf {
                 .unwrap_or(StreamBytesKind::PlaintextWire);
             if kind.is_l7_inspectable() {
                 let Some(bytes) = ctx.first_bytes.clone() else {
+                    // Mirror the present-payload decision (`stream_decision`): a
+                    // config with no enforce-action signature never rejects a
+                    // match, so it must not fail closed on missing bytes either —
+                    // that would block idle / server-first clients with no
+                    // possible block to justify it. Only an enforce-action
+                    // signature, whose hidden match we cannot rule out, fails
+                    // closed.
+                    if !stream.signatures.has_enforce_action() {
+                        return PluginResult::Continue;
+                    }
                     let blocked = self.config.mode == GlobalMode::Enforce;
-                    // Missing inspectable bytes always blocks in enforce mode, so
-                    // it is unconditionally a would-block for monitor accounting.
+                    // An enforce-action signature exists, so this is a would-block
+                    // in enforce mode (recorded for monitor-mode accounting).
                     self.record_stream_metadata(
                         ctx,
                         "",

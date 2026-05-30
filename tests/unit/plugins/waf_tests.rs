@@ -2539,6 +2539,64 @@ async fn stream_waf_signature_missing_bytes_still_allows_encrypted_passthrough()
 }
 
 #[tokio::test]
+async fn stream_waf_monitor_only_signatures_do_not_fail_closed_on_missing_bytes() {
+    // Global `enforce` but every signature is `action: monitor`: a present match
+    // is allowed (`stream_decision` blocks only enforce-action hits), so missing
+    // first bytes must NOT fail closed either — otherwise idle / server-first
+    // clients are rejected even though no configured signature could ever block.
+    let plugin = Waf::new(&json!({
+        "mode": "enforce",
+        "include_default_rules": false,
+        "stream": {
+            "signatures": [{
+                "id": "STREAM-PROBE-1",
+                "pattern": "(?i)union\\s+select",
+                "severity": "medium",
+                "action": "monitor"
+            }]
+        }
+    }))
+    .unwrap();
+    let mut sctx = stream_ctx_absent_kind(StreamBytesKind::PlaintextWire);
+
+    let result = plugin.on_stream_connect(&mut sctx).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    // No enforce-action signature could block, so nothing is recorded: not a
+    // block, not a would-block.
+    assert!(sctx.metadata.is_none());
+}
+
+#[tokio::test]
+async fn stream_waf_mixed_signatures_still_fail_closed_on_missing_bytes() {
+    // With at least one enforce-action signature configured, the hidden first
+    // bytes could have matched it, so the missing-bytes path must still fail
+    // closed under global `enforce` even though a monitor-action signature is
+    // also present.
+    let plugin = Waf::new(&json!({
+        "mode": "enforce",
+        "include_default_rules": false,
+        "stream": {
+            "signatures": [
+                { "id": "STREAM-PROBE-1", "pattern": "(?i)probe", "action": "monitor" },
+                { "id": "STREAM-SQLI-1", "pattern": "(?i)union\\s+select", "action": "enforce" }
+            ]
+        }
+    }))
+    .unwrap();
+    let mut sctx = stream_ctx_absent_kind(StreamBytesKind::PlaintextWire);
+
+    let result = plugin.on_stream_connect(&mut sctx).await;
+
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    let md = sctx.metadata.as_ref().expect("metadata");
+    assert_eq!(
+        md.get("waf.block_reason").map(String::as_str),
+        Some("first_bytes_unavailable")
+    );
+}
+
+#[tokio::test]
 async fn stream_waf_tcp_require_tls_fails_closed_when_no_bytes() {
     // A client that idles until the peek times out (no first bytes) must not
     // slip past a tcp_require_tls port and then send plaintext.

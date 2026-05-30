@@ -279,8 +279,11 @@ Limitations and behavior to know:
   inspects the opening segment the client sends (the first readable chunk, up to
   4 KiB) once, before the backend is dialed — not the full byte stream. If an
   L7-inspectable TCP stream produces no opening bytes before the bounded capture
-  deadline, stream signatures fail closed in `enforce` mode, so an idle client
-  cannot wait out inspection and then send unchecked first bytes. A determined
+  deadline, stream signatures fail closed in `enforce` mode when an
+  enforce-action signature is configured (one whose hidden match could not be
+  ruled out), so an idle client cannot wait out inspection and then send
+  unchecked first bytes. A monitor-only signature set never blocks a present
+  match, so it is allowed through on missing bytes too. A determined
   attacker can still evade a signature by splitting after a benign prefix: send
   bytes that do not match, wait for the gateway to forward them and connect, then
   send the malicious remainder, which is relayed without a rescan. Treat stream
@@ -296,9 +299,10 @@ Limitations and behavior to know:
   the deadline, no first bytes are captured, and the fail-closed rule above
   rejects **every** connection (`waf.block_reason=first_bytes_unavailable`).
   Because `inspect_tcp` defaults to `true` whenever a `stream` block has
-  signatures, putting SQLi signatures in front of MySQL blocks all traffic. In
-  front of a server-first protocol, use `tcp_require_tls` for transport-shape
-  enforcement, run the signatures in `monitor` mode, or set `inspect_tcp: false`.
+  signatures, putting enforce-action SQLi signatures in front of MySQL blocks all
+  traffic. In front of a server-first protocol, use `tcp_require_tls` for
+  transport-shape enforcement, keep the signatures non-blocking (global `monitor`
+  mode or every signature's `action: monitor`), or set `inspect_tcp: false`.
 - **TCP blocks** reject before any backend is dialed and ride the stream
   transaction summary as `waf.action=blocked`. **UDP blocks** are a silent
   datagram `Drop` (standard UDP behavior). Both transports record `waf.*` on the
