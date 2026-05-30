@@ -1110,10 +1110,23 @@ impl<S: H3RecvStream + Unpin> FrameSource for H3FrameSource<S> {
                             // or a coalesced GOAWAY/RemoteClosing is not a real
                             // stream error once Content-Length is satisfied, so emit
                             // clean EOS instead of a spurious mid-stream error.
-                            // Recovered ONLY when Content-Length is known AND
-                            // satisfied — a chunked/unknown-length body keeps
-                            // surfacing the error so no truncation can be masked.
-                            if this.content_length.is_some_and(|cl| this.received >= cl)
+                            //
+                            // Recovered ONLY when Content-Length is known and
+                            // EXACTLY satisfied (`received == cl`), mirroring the
+                            // buffered path's `is_response_body_complete`:
+                            //   * `received < cl` (truncation) never recovers, so
+                            //     no truncation can be masked.
+                            //   * `received > cl` (overlong) never recovers — an
+                            //     over-declared body is a framing violation the
+                            //     buffered path rejects too, so it must surface
+                            //     rather than be laundered into a clean EOS.
+                            // Scope: HEAD/204/304 (no-body) and unknown-length
+                            // (chunked) responses are intentionally OUT OF SCOPE —
+                            // `method`/`status` are not threaded into the streaming
+                            // H3 body constructors, so this gate cannot replicate
+                            // the no-body branch of `is_response_body_complete`;
+                            // those keep surfacing the close as an error (safe).
+                            if this.content_length.is_some_and(|cl| this.received == cl)
                                 && err
                                     .downcast_ref::<h3::error::StreamError>()
                                     .is_some_and(crate::http3::client::is_h3_graceful_close)
