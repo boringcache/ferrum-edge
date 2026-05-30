@@ -12,7 +12,9 @@ inputs:
     description: Docker image name and tag to build.
     required: true
   base-image:
-    description: Runtime base image.
+    description: >-
+      Runtime base image. The supplied binary must be built against a glibc
+      version no newer than this image provides.
     required: false
     default: gcr.io/distroless/cc-debian13:nonroot
   strip-binary:
@@ -25,12 +27,17 @@ runs:
   steps:
     - name: Build runtime image from prebuilt binary
       shell: bash
+      env:
+        BINARY_PATH: ${{ inputs.binary-path }}
+        IMAGE: ${{ inputs.image }}
+        BASE_IMAGE: ${{ inputs.base-image }}
+        STRIP_BINARY: ${{ inputs.strip-binary }}
       run: |
         set -euo pipefail
 
-        binary_path="${{ inputs.binary-path }}"
-        image="${{ inputs.image }}"
-        base_image="${{ inputs.base-image }}"
+        binary_path="$BINARY_PATH"
+        image="$IMAGE"
+        base_image="$BASE_IMAGE"
 
         if [ ! -f "$binary_path" ]; then
           echo "::error title=Missing ferrum-edge binary::$binary_path does not exist"
@@ -41,13 +48,17 @@ runs:
         trap 'rm -rf "$image_context"' EXIT
 
         install -m 0755 "$binary_path" "$image_context/ferrum-edge"
-        if [ "${{ inputs.strip-binary }}" = "true" ] && command -v strip >/dev/null 2>&1; then
+        if [ "$STRIP_BINARY" = "true" ] && command -v strip >/dev/null 2>&1; then
           strip "$image_context/ferrum-edge" || true
         fi
 
         {
           printf 'FROM %s\n' "$base_image"
           cat <<'DOCKERFILE'
+        # Keep this runtime stage aligned with the release Dockerfile runtime
+        # stage. This action only swaps the source of /app/ferrum-edge so CI
+        # conformance jobs can package a prebuilt binary instead of compiling
+        # inside Docker.
         WORKDIR /app
 
         COPY --chown=nonroot:nonroot ferrum-edge /app/ferrum-edge
