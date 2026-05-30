@@ -611,4 +611,131 @@ mod live_kernel_tests {
 
         backend.cleanup_all().expect("cleanup BPF state");
     }
+
+    /// Layer-2 datapath verification: a real captured `connect()` is rewritten
+    /// by `connect4` to the configured capture port and lands on a local server
+    /// — proving the connect-side capture works end to end on a live kernel, not
+    /// just that the program loads/attaches. Gated on `--features ebpf` because
+    /// it reaches the real backend's map handles (the no-ebpf build has a stub);
+    /// runs via the `ebpf-live` CI job, self-skipping when prerequisites are
+    /// unmet.
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    #[test]
+    #[ignore = "requires root + real Linux >= 5.7 kernel (cgroup v2 + bpffs); run via the ebpf-live CI job"]
+    fn connect4_redirects_a_real_captured_connection_to_the_capture_port() {
+        use std::time::{Duration, Instant};
+
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_test_writer()
+            .try_init();
+
+        let probe = probe_kernel(CGROUP_ROOT, BPF_FS);
+        if !probe.supports_ebpf() {
+            eprintln!(
+                "SKIP connect4-redirect live test: prerequisites unmet (release={}, reason={:?})",
+                probe.kernel_release,
+                probe.degradation_reason()
+            );
+            return;
+        }
+
+        let mut backend = AyaEbpfBackend::new();
+        backend
+            .load_programs()
+            .expect("load + verify BPF programs on the running kernel");
+
+        let cgroup = ScratchCgroup::create().expect("create scratch cgroup v2 node");
+        backend
+            .attach_cgroup("live-redirect", &cgroup.path_str(), "ferrum_connect4")
+            .expect("attach connect4 to scratch cgroup");
+        backend
+            .attach_sock_ops(&cgroup.path_str())
+            .expect("attach sock_ops to scratch cgroup");
+
+        // Server on an ephemeral loopback port. connect4 rewrites captured egress
+        // to exactly this port, so there is no fixed-port collision risk.
+        let server = std::net::TcpListener::bind("127.0.0.1:0").expect("bind capture-port server");
+        let capture_port = server.local_addr().unwrap().port();
+        server.set_nonblocking(true).unwrap();
+
+        // Capture config: rewrite outbound to `capture_port`; install 0.0.0.0/0
+        // as an include CIDR so connect4 actually captures (without an include
+        // match it fail-opens and never rewrites).
+        backend
+            .update_capture_config(&ferrum_ebpf_common::BpfCaptureConfig::new(
+                capture_port,
+                15008,
+            ))
+            .expect("set capture config");
+        backend
+            .maps
+            .as_mut()
+            .expect("maps loaded")
+            .insert_cidr_include("0.0.0.0/0")
+            .expect("insert 0.0.0.0/0 include CIDR");
+
+        // Stamp an identity for this cgroup (connect4 records it into the
+        // orig-dst entry; mirrors the production connect-side stamp).
+        backend
+            .update_workload_identity(
+                cgroup.cgroup_id(),
+                &WorkloadIdentity::new([9u8; 16], 0x0123_4567_89ab_cdef),
+            )
+            .expect("stamp workload identity");
+
+        // Move this process into the scratch cgroup so its connect() goes through
+        // the connect4 program attached there.
+        let joined = std::fs::write(
+            format!("{}/cgroup.procs", cgroup.path_str()),
+            std::process::id().to_string(),
+        )
+        .is_ok();
+        assert!(joined, "move test process into scratch cgroup");
+
+        // Connect to an unroutable TEST-NET-1 address (RFC 5737). Uncaptured this
+        // would time out; captured, connect4 rewrites it to
+        // 127.0.0.1:capture_port and it lands on `server`.
+        let connect_handle = std::thread::spawn(move || {
+            std::net::TcpStream::connect_timeout(
+                &"192.0.2.1:1234".parse().unwrap(),
+                Duration::from_secs(3),
+            )
+            .is_ok()
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut accepted = false;
+        while Instant::now() < deadline {
+            match server.accept() {
+                Ok(_) => {
+                    accepted = true;
+                    break;
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                Err(e) => panic!("capture-port server accept failed: {e}"),
+            }
+        }
+        let connected = connect_handle.join().unwrap_or(false);
+
+        // Move back to the cgroup root so the scratch cgroup can be removed, and
+        // clean up BPF state — before asserting, so a failed assert still tidies.
+        let _ = std::fs::write(
+            format!("{CGROUP_ROOT}/cgroup.procs"),
+            std::process::id().to_string(),
+        );
+        backend.cleanup_all().expect("cleanup BPF state");
+
+        assert!(
+            connected,
+            "a captured connect() to an unroutable dst must succeed (connect4 must \
+             redirect it to the local capture port)"
+        );
+        assert!(
+            accepted,
+            "the capture-port server must accept the connect4-redirected connection"
+        );
+    }
 }
