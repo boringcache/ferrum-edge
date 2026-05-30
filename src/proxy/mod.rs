@@ -40,6 +40,7 @@ pub mod hbone_pool;
 mod hbone_proxy;
 pub mod headers;
 pub mod http2_pool;
+pub mod netns_capture;
 pub mod sni;
 pub mod stream_error;
 pub mod stream_listener;
@@ -7426,6 +7427,7 @@ pub async fn start_proxy_listener_with_bound_listener(
         shutdown,
         None,
         0,
+        None,
     )
     .await;
     Ok(())
@@ -7779,6 +7781,7 @@ async fn start_proxy_listener_with_tls_source_and_signal(
                     shutdown_rx,
                     mesh_direction,
                     i,
+                    None,
                 )
                 .await;
             }));
@@ -7801,6 +7804,7 @@ async fn start_proxy_listener_with_tls_source_and_signal(
             shutdown,
             mesh_direction,
             0,
+            None,
         )
         .await;
 
@@ -7823,6 +7827,7 @@ async fn start_proxy_listener_with_tls_source_and_signal(
             shutdown,
             mesh_direction,
             0,
+            None,
         )
         .await;
     }
@@ -7832,6 +7837,7 @@ async fn start_proxy_listener_with_tls_source_and_signal(
 
 /// Accept loop that runs on a single listener socket. Multiple instances can
 /// run concurrently on the same address when SO_REUSEPORT is enabled.
+#[allow(clippy::too_many_arguments)]
 async fn run_accept_loop(
     listener: TcpListener,
     state: ProxyState,
@@ -7840,6 +7846,12 @@ async fn run_accept_loop(
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
     _thread_id: usize,
+    // When `Some`, overrides the accepted connection's client IP. Used by the
+    // node-waypoint in-netns capture path: `connect4` rewrites a captured pod's
+    // egress to loopback, so the accepted peer is 127.0.0.1; this carries the
+    // real source pod IP so client-IP authz conditions, logs, and IP-keyed
+    // plugins see the pod instead of loopback. `None` everywhere else.
+    source_ip_override: Option<std::net::IpAddr>,
 ) {
     let frontend_listen_port = listener.local_addr().ok().map(|addr| addr.port());
     // Count consecutive accept() failures to back off a busy-loop. Under fd
@@ -7855,6 +7867,11 @@ async fn run_accept_loop(
             result = listener.accept() => {
                 match result {
                     Ok((stream, remote_addr)) => {
+                        // Override the loopback peer with the source pod IP for
+                        // in-netns capture connections (see `source_ip_override`).
+                        let remote_addr = source_ip_override
+                            .map(|ip| std::net::SocketAddr::new(ip, remote_addr.port()))
+                            .unwrap_or(remote_addr);
                         accept_backoff.on_success();
                         // Overload check: reject new connections under critical
                         // pressure. Checked after accept (inside the select!) so
@@ -7888,7 +7905,11 @@ async fn run_accept_loop(
                         let node_waypoint_identity =
                             if let Some(resolver) = state.node_waypoint_identity_resolver.as_ref() {
                                 match resolver.resolve_stream(&stream) {
-                                    Ok(identity) => Some(identity),
+                                    // HTTP/HBONE re-queries the per-pod scope per
+                                    // request, so the accept-time scope is unused
+                                    // here; keep only the identity on the
+                                    // connection metadata.
+                                    Ok((identity, _scope)) => Some(identity),
                                     Err(error) => {
                                         record_node_waypoint_identity_drop(&state.overload, &error);
                                         debug!(
@@ -8823,13 +8844,16 @@ async fn handle_proxy_request_inner(
         // (namespace + labels) rather than relying on the proxy listener's
         // shared identity, which is meaningless on a multi-pod listener.
         //
-        // Cost: one `ArcSwap::load` + one `HashMap::get` on the
-        // node-waypoint admit path. Cheap, paid once per request. If the
-        // pod has no installed scope yet (slice / identity enrollment race)
-        // the field stays `None` and `mesh_authz` falls back to mesh-wide
-        // policies only while emitting `mesh_authz.scope_missing` metadata
-        // so the race window is observable. When mesh_authz is not
-        // configured the stamped field is unused and propagates harmlessly.
+        // Cost: one `ArcSwap::load` + two `HashMap::get`s on the
+        // node-waypoint admit path. Cheap, paid once per request. The scope is
+        // derived from the same slice generation that vouches the pod's
+        // identity, so a `None` here means the pod's workload has left the live
+        // slice (removed/re-keyed), not an enrollment race: `mesh_authz` stamps
+        // `mesh_authz.scope_missing` and fails closed (403) when scoped policies
+        // exist, else evaluates mesh-wide-only. Re-queried per request so a
+        // workload removed mid-connection stops being served under scoped authz.
+        // When mesh_authz is not configured the stamped field is unused and
+        // propagates harmlessly.
         if let Some(resolver) = state.node_waypoint_identity_resolver.as_ref() {
             ctx.node_waypoint_policy_scope = resolver.policy_scope_for_pod(&identity.pod_uid);
         }

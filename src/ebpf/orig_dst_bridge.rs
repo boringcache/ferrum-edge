@@ -14,24 +14,35 @@
 //! `record_orig_dst6` their first production caller (before this they had no
 //! caller and the resolver's cookie map was always empty).
 //!
-//! ## Staging: connect-side vs accept-side cookie (GAP-2M required)
+//! ## Connect-side vs accept-side cookie (GAP-2M bridge)
 //!
-//! This bridge is the **connect-side half** of node-waypoint resolution and is
-//! NOT sufficient on its own to make the accept path resolve identities.
 //! `connect4`/`connect6` key each record by the *source pod's
 //! connecting-socket* cookie (`bpf_get_socket_cookie` on the connect socket).
 //! The proxy accept path, however, resolves by the *accepted server-side
 //! socket's* `SO_COOKIE` (`resolve_stream` → `socket_cookie(accepted_stream)`),
 //! which is a different kernel socket with a different cookie — see the
-//! invariant documented in `src/socket_opts.rs`. Registering records under the
-//! accept-side cookie is the job of the **GAP-2M sockops/sk_lookup bridge,
-//! which is not yet implemented**. Until GAP-2M lands, the records mirrored
-//! here are not the ones the accept path looks up, so node-waypoint cookie
-//! resolution still **fails closed** (the safe default). Pod-identity
-//! enrollment into `identities_by_pod_uid` from the slice workloads is a
-//! separate remaining tier. In short: this module ships the GAP-1b plumbing
-//! and exercises `record_orig_dst*`, but does not by itself make end-to-end
-//! node-waypoint resolution succeed on a live kernel.
+//! invariant documented in `src/socket_opts.rs`.
+//!
+//! The **GAP-2M accept-side bridge is now implemented in the kernel `sock_ops`
+//! program** (`ebpf/ferrum-ebpf/src/sock_ops.rs`): at active-established it
+//! re-keys the connect-side record by the connection 4-tuple, and at
+//! passive-established it re-stamps that record into `FERRUM_ORIG_DST4`/
+//! `FERRUM_ORIG_DST6` under the *accept-side* cookie. This bridge therefore
+//! mirrors accept-side-cookie records too, so the accept path's `SO_COOKIE`
+//! lookup resolves the source identity without any change to this module.
+//!
+//! **Verification status:** CI compile-checks the kernel program
+//! (`build-ebpf`) and loads + attaches it on a real ≥5.7 kernel (`ebpf-live`).
+//! The full connect→capture→accept datapath (which would confirm the tuple
+//! byte-order and end-to-end resolution) is not exercised by CI and remains a
+//! live multi-pod-node verification step. A tuple/byte-order mismatch fails
+//! closed (no accept-side record written), never misattributes identity, so
+//! the unverified path is safe-by-construction. Pod-identity enrollment into
+//! `identities_by_pod_uid` is wired: the resolver lazily enrolls
+//! `pod_uid` → identity by hash-joining the eBPF-stamped
+//! `(pod_uid, workload_spiffe_hash)` against the slice's
+//! `workload_spiffe_hash` → SPIFFE index (installed at slice apply), so
+//! resolution is complete end-to-end in code.
 //!
 //! ## Why polling
 //!
@@ -42,16 +53,21 @@
 //! out of the resolver so its map cannot grow unboundedly relative to the BPF
 //! map.
 //!
-//! Two known limitations of this staged polling design, to be addressed when
-//! the GAP-2M accept-side path is wired:
+//! **Between-tick freshness** is handled by a synchronous fallback: this bridge
+//! installs a closure on the resolver (via `set_cookie_fallback`) that reads the
+//! current pinned maps directly. When the accept path hits a cookie the poll
+//! has not mirrored yet, `resolve_cookie` consults that fallback (one BPF
+//! lookup) instead of dropping the connection until the next tick — so a
+//! freshly accepted connection resolves on the first try. The maps are shared
+//! via `ArcSwap` so a node-agent restart re-open transparently re-points the
+//! fallback.
+//!
+//! One known limitation of this staged polling design remains:
 //! - **Full re-sync cost.** Each tick currently re-scans both maps in full
 //!   (≈2 syscalls per LRU entry) and re-inserts every record; on a busy node
-//!   this should become an incremental or ringbuf-driven sync.
-//! - **Between-tick freshness.** A connection accepted in the window between
-//!   the source pod's `connect()` and the next poll tick can be dropped
-//!   fail-closed even though its record already exists in the kernel map; the
-//!   accept path should be able to synchronously consult the pinned map for a
-//!   fresh unknown cookie rather than wait for the next poll.
+//!   this should become an incremental or ringbuf-driven sync. (The poll still
+//!   ages out evicted/closed cookies; the synchronous fallback only covers the
+//!   freshly-accepted miss case.)
 //!
 //! ## Startup race and node-agent restart
 //!
@@ -115,7 +131,8 @@ mod production {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use aya::maps::{HashMap as BpfHashMap, MapData};
+    use arc_swap::ArcSwap;
+    use aya::maps::{HashMap as BpfHashMap, Map, MapData};
     use ferrum_ebpf_common::{OrigDst4, OrigDst6, OrigDstKey};
     use tracing::{debug, info, warn};
 
@@ -136,7 +153,7 @@ mod production {
         resolver: Arc<NodeWaypointIdentityResolver>,
         mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
-        let (mut maps, mut inodes) = match wait_for_pinned_maps(&mut shutdown_rx).await {
+        let (initial_maps, mut inodes) = match wait_for_pinned_maps(&mut shutdown_rx).await {
             WaitOutcome::Found(pair) => pair,
             WaitOutcome::Shutdown => {
                 info!("Node-waypoint orig-dst bridge shutting down before maps were pinned");
@@ -150,6 +167,22 @@ mod production {
             "Node-waypoint orig-dst bridge attached; mirroring cookie records into resolver"
         );
 
+        // Share the open maps so the accept-path synchronous fallback can read
+        // the pinned maps directly between poll ticks while this task keeps
+        // polling and re-opens on node-agent restart. `ArcSwap` lets a re-open
+        // publish fresh maps without the fallback having to re-install.
+        let maps = Arc::new(ArcSwap::from_pointee(initial_maps));
+
+        // GAP-2M: install the synchronous accept-path cookie fallback. On a
+        // resolver miss (a cookie stamped on the accept side since the last
+        // poll), the resolver reads the current pinned maps directly — one BPF
+        // lookup — instead of dropping the connection until the next poll tick.
+        {
+            let maps = maps.clone();
+            resolver
+                .set_cookie_fallback(Box::new(move |cookie| lookup_cookie(&maps.load(), cookie)));
+        }
+
         let mut poll =
             tokio::time::interval(Duration::from_millis(ORIG_DST_BRIDGE_POLL_INTERVAL_MS));
         poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -161,11 +194,14 @@ mod production {
                 _ = shutdown_rx.changed() => {
                     if *shutdown_rx.borrow() {
                         info!("Node-waypoint orig-dst bridge shutting down");
+                        // Drop the fallback so the resolver no longer references
+                        // these maps once this task (and the maps) go away.
+                        resolver.clear_cookie_fallback();
                         return Ok(());
                     }
                 }
                 _ = poll.tick() => {
-                    sync_once(&maps, &resolver);
+                    sync_once(&maps.load(), &resolver);
                 }
                 _ = inode_check.tick() => {
                     let current = MapInodes::read();
@@ -175,7 +211,9 @@ mod production {
                         );
                         match open_pinned_maps() {
                             Some((reopened, reopened_inodes)) => {
-                                maps = reopened;
+                                // Publish the fresh maps; the fallback closure
+                                // sees them on its next `load()`.
+                                maps.store(Arc::new(reopened));
                                 inodes = reopened_inodes;
                                 // The resolver's cookie records reference the
                                 // previous map generation; clear them so a
@@ -195,6 +233,21 @@ mod production {
                 }
             }
         }
+    }
+
+    /// Synchronous single-cookie lookup backing the accept-path fallback.
+    /// Returns `(pod_uid, workload_spiffe_hash)` when the cookie is present in
+    /// either pinned orig-dst map. One BPF map lookup per family; invoked only
+    /// on a resolver miss, so it stays off the steady-state hot path.
+    fn lookup_cookie(maps: &OpenMaps, cookie: u64) -> Option<([u8; 16], u64)> {
+        let key = OrigDstKey { cookie };
+        if let Ok(record) = maps.orig_dst4.get(&key, 0) {
+            return Some((record.pod_uid, record.workload_spiffe_hash));
+        }
+        if let Ok(record) = maps.orig_dst6.get(&key, 0) {
+            return Some((record.pod_uid, record.workload_spiffe_hash));
+        }
+        None
     }
 
     /// One poll: re-sync the resolver's cookie records from the live BPF maps.
@@ -285,11 +338,11 @@ mod production {
 
     fn open_pinned_maps() -> Option<(OpenMaps, MapInodes)> {
         let v4_data = MapData::from_pin(BPF_ORIG_DST4_PIN_PATH).ok()?;
-        let orig_dst4 = OrigDst4Map::try_from(v4_data)
+        let orig_dst4 = OrigDst4Map::try_from(Map::LruHashMap(v4_data))
             .map_err(|e| warn!(error = %e, "FERRUM_ORIG_DST4 pin type mismatch"))
             .ok()?;
         let v6_data = MapData::from_pin(BPF_ORIG_DST6_PIN_PATH).ok()?;
-        let orig_dst6 = OrigDst6Map::try_from(v6_data)
+        let orig_dst6 = OrigDst6Map::try_from(Map::LruHashMap(v6_data))
             .map_err(|e| warn!(error = %e, "FERRUM_ORIG_DST6 pin type mismatch"))
             .ok()?;
         let inodes = MapInodes::read();

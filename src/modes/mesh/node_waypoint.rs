@@ -15,17 +15,32 @@
 //! 2. One `DashMap::get` against the unified cookie record map (returns
 //!    `(pod_uid, workload_spiffe_hash)`).
 //! 3. One `DashMap::get` against the identity map (returns `Arc<NodeWaypointIdentity>`).
-//! 4. One `Arc::clone` (~5 ns) to hand the identity to the connection task.
+//! 4. One `ArcSwap::load` of the current slice generation + `HashMap` lookups
+//!    against its `identities_by_hash` gate, re-validating that the control
+//!    plane still vouches for the resolved workload (fail closed if it was
+//!    removed) and, from the SAME load, deriving the per-pod policy scope by
+//!    pod UID (`scopes_by_pod_uid`, with a SPIFFE-keyed fallback for uid-less
+//!    VM workloads). No allocation; the same loaded generation serves the
+//!    cached and lazy-enrollment branches AND the returned scope, so a reader
+//!    can never pair a new gate with an old/missing scope.
+//! 5. One `Arc::clone` (~5 ns) to hand the identity to the connection task.
 //!
 //! Both hot-path DashMaps are sized via `crate::util::sharding::pool_shard_amount`
 //! so contention scales with `num_cpus`. New accept-path atomics (per-reason
 //! `node_waypoint_*_drops` counters in `OverloadState`) are `CachePadded` —
 //! see `src/overload.rs`.
 //!
-//! Per-pod policy scope lookup is a separate HTTP request-path read:
-//! one `ArcSwap::load` plus one `HashMap::get` when mesh authz stamps
-//! node-waypoint request context. Scope rebuilds happen on slice apply and
-//! identity enrollment, not in the accept loop.
+//! Per-pod policy scope is part of the SAME slice generation as the identity
+//! gate: the accept path receives `(identity, scope)` from one `resolve_*`
+//! call (one slice load). The HTTP/HBONE request path re-derives scope per
+//! request via [`NodeWaypointIdentityResolver::policy_scope_for_pod`] — one
+//! `ArcSwap::load` then a `scopes_by_pod_uid` lookup (SPIFFE fallback for
+//! uid-less workloads) — so a workload whose SPIFFE hash is unchanged but whose
+//! scope changed is served the scope from the very generation that re-vouched
+//! for it. Keying scope by pod UID (not SPIFFE) means pods that share a service
+//! account but carry different labels are scoped independently.
+//! The slice is published as one atomic `ArcSwap` store on slice apply; nothing
+//! is rebuilt in the accept loop.
 //!
 //! Linux socket cookies are unique across the IPv4/IPv6 protocol families, so
 //! both address families share a single cookie record map; this avoids the
@@ -60,11 +75,10 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use dashmap::DashMap;
 use ferrum_ebpf_common::{OrigDst4, OrigDst6};
 use sha2::{Digest, Sha256};
@@ -190,63 +204,40 @@ impl NodeWaypointIdentity {
     }
 }
 
-struct PolicyScopeAccumulator {
-    spiffe_id: SpiffeId,
-    namespace: Option<String>,
-    labels: HashMap<String, String>,
+/// One atomically-published node-waypoint slice generation: the fail-closed
+/// identity gate (`workload_spiffe_hash` -> SPIFFE, covering ALL workloads) and
+/// the per-pod-UID policy-scope index (pod UID -> scope) in a single `ArcSwap`
+/// payload, so a lock-free reader sees a consistent (gate, scope) view — never
+/// a mix of a new gate with an old/missing scope.
+#[derive(Default)]
+struct NodeWaypointSlice {
+    identities_by_hash: std::collections::HashMap<u64, SpiffeId>,
+    /// Per-pod policy scope keyed by the exact `[u8; 16]` pod UID the eBPF
+    /// capture stamps (parsed from each per-pod workload's `metadata.uid`).
+    /// Pods that share a SPIFFE but differ in labels get distinct entries, so
+    /// selector-scoped policy is evaluated against the source pod's own labels
+    /// — never a cross-pod label merge.
+    scopes_by_pod_uid: std::collections::HashMap<[u8; 16], std::sync::Arc<PolicyScopeCache>>,
 }
 
-impl PolicyScopeAccumulator {
-    fn new(workload: &Workload) -> Self {
-        Self {
-            spiffe_id: workload.spiffe_id.clone(),
-            namespace: Some(workload.namespace.clone()),
-            labels: workload.selector.labels.clone(),
-        }
+impl NodeWaypointSlice {
+    /// Resolve a captured pod's policy scope from this one generation, keyed by
+    /// the exact `[u8; 16]` the eBPF stamps. `None` means the pod's workload is
+    /// not in the live slice generation — the caller (`mesh_authz`) then fails
+    /// closed when scoped policies exist, else evaluates mesh-wide-only.
+    ///
+    /// A captured pod is NEVER resolved through the SPIFFE-keyed index: that
+    /// index is for uid-less (VM/WorkloadEntry) workloads, and a same-SPIFFE
+    /// uid-less workload's labels are not this pod's — collapsing onto them would
+    /// evaluate scoped policy against the wrong labels (and let a selector-scoped
+    /// DENY be evaded). A captured pod whose UID is absent fails closed instead.
+    fn scope_for(&self, pod_uid: &[u8; 16]) -> Option<Arc<PolicyScopeCache>> {
+        self.scopes_by_pod_uid.get(pod_uid).map(Arc::clone)
     }
-
-    fn merge(&mut self, workload: &Workload) {
-        match self.namespace.as_ref() {
-            Some(namespace) if namespace == &workload.namespace => {}
-            _ => self.namespace = None,
-        }
-        self.labels.retain(|key, value| {
-            workload
-                .selector
-                .labels
-                .get(key)
-                .is_some_and(|candidate| candidate == value)
-        });
-    }
-
-    fn into_scope(self) -> PolicyScopeCache {
-        PolicyScopeCache::new(
-            self.spiffe_id,
-            self.namespace.unwrap_or_default(),
-            self.labels,
-        )
-    }
-}
-
-fn workload_policy_scope_index<'a, I>(workloads: I) -> HashMap<String, Arc<PolicyScopeCache>>
-where
-    I: IntoIterator<Item = &'a Workload>,
-{
-    let mut accumulators: HashMap<String, PolicyScopeAccumulator> = HashMap::new();
-    for workload in workloads {
-        accumulators
-            .entry(workload.spiffe_id.as_str().to_string())
-            .and_modify(|accumulator| accumulator.merge(workload))
-            .or_insert_with(|| PolicyScopeAccumulator::new(workload));
-    }
-    accumulators
-        .into_iter()
-        .map(|(spiffe_id, accumulator)| (spiffe_id, Arc::new(accumulator.into_scope())))
-        .collect()
 }
 
 pub struct NodeWaypointPolicyScopeSnapshot {
-    workload_policy_scopes_by_spiffe: HashMap<String, Arc<PolicyScopeCache>>,
+    slice: NodeWaypointSlice,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -303,6 +294,12 @@ impl fmt::Display for NodeWaypointIdentityError {
 
 impl std::error::Error for NodeWaypointIdentityError {}
 
+/// Synchronous accept-path cookie lookup, returning `(pod_uid, workload SPIFFE
+/// hash)` for a socket cookie. Boxed because `ArcSwapOption` needs a `Sized`
+/// payload. Injected by the eBPF orig-dst bridge so the resolver itself stays
+/// aya-free; see [`NodeWaypointIdentityResolver::set_cookie_fallback`].
+pub type CookieLookupFallback = Box<dyn Fn(u64) -> Option<([u8; 16], u64)> + Send + Sync>;
+
 pub struct NodeWaypointIdentityResolver {
     /// Unified cookie → identity-key map. Linux socket cookies are globally
     /// unique across IPv4/IPv6, so the resolver doesn't need separate maps;
@@ -310,10 +307,26 @@ pub struct NodeWaypointIdentityResolver {
     /// (previously the IPv4 map was always probed first) and halves the
     /// DashMap shard-array overhead.
     cookie_records: DashMap<u64, CookieRecord>,
+    /// Optional synchronous fallback consulted by [`Self::resolve_cookie`] when
+    /// `cookie_records` misses. The orig-dst bridge mirrors the pinned BPF maps
+    /// into `cookie_records` only every `ORIG_DST_BRIDGE_POLL_INTERVAL_MS`, so a
+    /// connection accepted right after its accept-side cookie was stamped would
+    /// otherwise be dropped (UnknownCookie) until the next poll. This fallback
+    /// reads the pinned map directly so the first resolve succeeds. `None` on
+    /// non-eBPF builds / before the bridge installs it. Lock-free swap so the
+    /// hot accept path never blocks.
+    cookie_fallback: ArcSwapOption<CookieLookupFallback>,
     identities_by_pod_uid: DashMap<[u8; 16], Arc<NodeWaypointIdentity>>,
-    policy_scopes_by_pod_uid: Arc<ArcSwap<HashMap<[u8; 16], Arc<PolicyScopeCache>>>>,
-    workload_policy_scopes_by_spiffe: Arc<ArcSwap<HashMap<String, Arc<PolicyScopeCache>>>>,
-    policy_scope_update_lock: Mutex<()>,
+    /// The current node-waypoint slice generation, published atomically as one
+    /// `ArcSwap` payload: the fail-closed identity gate
+    /// (`workload_spiffe_hash` → SPIFFE for every workload) and the per-pod-UID
+    /// policy-scope index (pod UID → scope). `resolve_record` loads this once
+    /// and derives BOTH the identity (joining the eBPF-stamped
+    /// `(pod_uid, workload_spiffe_hash)` against `identities_by_hash` to lazily
+    /// enroll `pod_uid` → identity) and the per-pod scope (`scopes_by_pod_uid`)
+    /// from the SAME load, so a reader can never see a new gate with an
+    /// old/missing scope (the "never partial" reload invariant).
+    slice: ArcSwap<NodeWaypointSlice>,
     // Sweep counters below are intentionally NOT `CachePadded` (unlike the
     // accept-path `node_waypoint_*_drops` atomics in `OverloadState`). They
     // are written at most once per sweep tick (default 30s) on a single
@@ -331,17 +344,26 @@ pub struct NodeWaypointIdentityResolver {
     /// whether anything was evicted. Useful for "is the sweep task alive"
     /// liveness diagnostics.
     cgroup_sweep_passes: AtomicU64,
+    /// Monotonic count of lazily-enrolled (non-cgroup-bound) identities
+    /// reclaimed by the sweep because no live cookie record still referenced
+    /// the pod — the churn-reclamation path for the production enrollment
+    /// model, which binds no cgroup. Operators can watch this to see pod
+    /// turnover.
+    idle_unreferenced_evicted: AtomicU64,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct CgroupSweepReport {
     pub evicted_inode_changed: usize,
     pub evicted_path_missing: usize,
+    /// Lazily-enrolled (non-cgroup-bound) identities reclaimed because no live
+    /// cookie record still referenced the pod (pod churn).
+    pub evicted_idle_unreferenced: usize,
 }
 
 impl CgroupSweepReport {
     pub fn total_evicted(&self) -> usize {
-        self.evicted_inode_changed + self.evicted_path_missing
+        self.evicted_inode_changed + self.evicted_path_missing + self.evicted_idle_unreferenced
     }
 }
 
@@ -350,6 +372,7 @@ pub struct CgroupSweepSnapshot {
     pub passes: u64,
     pub inode_changed_total: u64,
     pub path_missing_total: u64,
+    pub idle_unreferenced_total: u64,
 }
 
 impl NodeWaypointIdentityResolver {
@@ -357,14 +380,27 @@ impl NodeWaypointIdentityResolver {
         let shards = crate::util::sharding::pool_shard_amount(pool_shard_override);
         Self {
             cookie_records: DashMap::with_shard_amount(shards),
+            cookie_fallback: ArcSwapOption::empty(),
             identities_by_pod_uid: DashMap::with_shard_amount(shards),
-            policy_scopes_by_pod_uid: Arc::new(ArcSwap::new(Arc::new(HashMap::new()))),
-            workload_policy_scopes_by_spiffe: Arc::new(ArcSwap::new(Arc::new(HashMap::new()))),
-            policy_scope_update_lock: Mutex::new(()),
+            slice: ArcSwap::from_pointee(NodeWaypointSlice::default()),
             cgroup_sweep_path_missing: AtomicU64::new(0),
             cgroup_sweep_inode_changed: AtomicU64::new(0),
             cgroup_sweep_passes: AtomicU64::new(0),
+            idle_unreferenced_evicted: AtomicU64::new(0),
         }
+    }
+
+    /// Install the synchronous accept-path cookie fallback (the eBPF orig-dst
+    /// bridge supplies one backed by the pinned `FERRUM_ORIG_DST4/6` maps).
+    /// Lock-free swap; safe to call from the bridge while the accept path reads.
+    pub fn set_cookie_fallback(&self, fallback: CookieLookupFallback) {
+        self.cookie_fallback.store(Some(Arc::new(fallback)));
+    }
+
+    /// Drop the synchronous fallback (e.g. on bridge shutdown) so the resolver
+    /// no longer references closed BPF maps.
+    pub fn clear_cookie_fallback(&self) {
+        self.cookie_fallback.store(None);
     }
 
     pub fn record_orig_dst4(&self, cookie: u64, record: OrigDst4) {
@@ -410,7 +446,6 @@ impl NodeWaypointIdentityResolver {
         let identity = Arc::new(identity);
         self.identities_by_pod_uid
             .insert(identity.pod_uid, identity.clone());
-        self.sync_policy_scope_for_identity(&identity);
         identity
     }
 
@@ -456,18 +491,36 @@ impl NodeWaypointIdentityResolver {
 
     pub fn remove_identity(&self, pod_uid: &[u8; 16]) {
         self.identities_by_pod_uid.remove(pod_uid);
-        self.remove_policy_scopes_for_pods(&[*pod_uid]);
     }
 
-    /// Iterate every enrolled identity and re-check its cgroup binding.
-    /// Identities whose `cgroup_path` is gone or whose current inode no
-    /// longer matches the enrolled value are removed. Identities without
-    /// cgroup binding (`cgroup_path: None` OR `cgroup_inode: None`) are
-    /// always kept — the sweep is opt-in per identity.
+    /// Periodic identity reclamation, in two passes over the enrolled set:
     ///
-    /// Also clears policy scope entries for evicted pods so a stale
-    /// PolicyScopeCache from a previous incarnation cannot apply to a
-    /// newly enrolled pod with the same UID.
+    /// 1. **cgroup-binding** — for identities enrolled with a cgroup path/inode
+    ///    (`upsert_identity_with_cgroup`), re-stat the path and evict when it is
+    ///    gone or its inode/fingerprint no longer matches the enrolled value
+    ///    (pod removed, or restarted under the same UID).
+    /// 2. **idle-unreferenced** — for identities *without* a cgroup binding (the
+    ///    production lazy hash-join enrollment binds none, and nothing calls
+    ///    `remove_identity` for them), evict those whose `pod_uid` is no longer
+    ///    referenced by any live cookie record *and* whose identity `Arc` has no
+    ///    other holder (`strong_count == 1`). A dead pod's accept-side cookies
+    ///    age out of `cookie_records` (mirrored from the BPF LRU by the orig-dst
+    ///    bridge), so this reclaims churned pods that would otherwise stay cached
+    ///    forever and bloat the rebuilt per-pod scope maps. The `strong_count`
+    ///    guard is load-bearing: HTTP/HBONE connections store the resolved
+    ///    identity `Arc` for their whole lifetime and re-query the per-pod scope
+    ///    on every request, so if the BPF LRU evicts a live connection's cookie
+    ///    the cookie-reference check alone would wrongly drop its scope and
+    ///    downgrade later streams to mesh-wide — holding an `Arc` ref keeps the
+    ///    pod un-evictable until the connection closes. An evicted-but-still-live
+    ///    idle pod simply re-enrolls on its next connection (fail-closed safe).
+    ///
+    /// Per-pod policy scope is derived from the current slice via the identity's
+    /// SPIFFE (`policy_scope_for_pod`), not stored per pod, so evicting an
+    /// identity from `identities_by_pod_uid` is sufficient — there is no
+    /// separate per-pod scope map to clear, and a stale PolicyScopeCache from a
+    /// previous incarnation can never apply to a newly enrolled pod with the
+    /// same UID.
     pub fn sweep_cgroup_stale_identities(&self) -> CgroupSweepReport {
         #[derive(Clone, Copy)]
         enum CgroupExpectation {
@@ -509,7 +562,6 @@ impl NodeWaypointIdentityResolver {
         }
 
         let mut report = CgroupSweepReport::default();
-        let mut evicted_pod_uids: Vec<[u8; 16]> = Vec::new();
 
         // Snapshot cgroup bindings first so filesystem metadata calls don't
         // hold DashMap shard locks used by accept-time identity resolution.
@@ -574,13 +626,55 @@ impl NodeWaypointIdentityResolver {
                     report.evicted_path_missing += 1;
                 }
             }
-
-            evicted_pod_uids.push(pod_uid);
         }
 
-        if !evicted_pod_uids.is_empty() {
-            self.remove_policy_scopes_for_pods(&evicted_pod_uids);
+        // Idle-unreferenced pass (see method docs): reclaim non-cgroup-bound
+        // (lazily-enrolled) identities whose pod is no longer referenced by any
+        // live cookie record. Snapshot the referenced set and the candidate
+        // keys first so filesystem-free bookkeeping doesn't hold shard locks.
+        let referenced: std::collections::HashSet<[u8; 16]> = self
+            .cookie_records
+            .iter()
+            .map(|entry| entry.value().pod_uid)
+            .collect();
+        let idle_candidates: Vec<[u8; 16]> = self
+            .identities_by_pod_uid
+            .iter()
+            .filter(|entry| {
+                let identity = entry.value();
+                identity.cgroup_path.is_none() || identity.cgroup_inode.is_none()
+            })
+            .map(|entry| *entry.key())
+            .filter(|pod_uid| !referenced.contains(pod_uid))
+            .collect();
+        for pod_uid in idle_candidates {
+            let removed = self
+                .identities_by_pod_uid
+                .remove_if(&pod_uid, |_, identity| {
+                    // Re-check "still unbound" under the shard lock so a
+                    // concurrent cgroup enrollment is never reclaimed here.
+                    if identity.cgroup_path.is_some() && identity.cgroup_inode.is_some() {
+                        return false;
+                    }
+                    // Skip if an open connection still holds this identity Arc.
+                    // The HTTP/HBONE accept path stores the resolved
+                    // `Arc<NodeWaypointIdentity>` on the connection for its whole
+                    // lifetime and re-queries the per-pod scope on every request
+                    // (`proxy/mod.rs`), so the BPF LRU evicting this pod's cookie
+                    // mid-connection must NOT let the sweep drop its scope — that
+                    // would downgrade later streams to mesh-wide. `strong_count
+                    // == 1` means only this map entry references the identity, so
+                    // no connection holds it; `> 1` means at least one open
+                    // connection does, so keep it. (The cookie-reference check
+                    // above already covers TCP, whose scope is resolved once at
+                    // accept and never re-queried.)
+                    Arc::strong_count(identity) == 1
+                });
+            if removed.is_some() {
+                report.evicted_idle_unreferenced += 1;
+            }
         }
+
         self.cgroup_sweep_passes.fetch_add(1, Ordering::Relaxed);
         if report.evicted_inode_changed > 0 {
             self.cgroup_sweep_inode_changed
@@ -590,6 +684,10 @@ impl NodeWaypointIdentityResolver {
             self.cgroup_sweep_path_missing
                 .fetch_add(report.evicted_path_missing as u64, Ordering::Relaxed);
         }
+        if report.evicted_idle_unreferenced > 0 {
+            self.idle_unreferenced_evicted
+                .fetch_add(report.evicted_idle_unreferenced as u64, Ordering::Relaxed);
+        }
         report
     }
 
@@ -598,43 +696,38 @@ impl NodeWaypointIdentityResolver {
             passes: self.cgroup_sweep_passes.load(Ordering::Relaxed),
             inode_changed_total: self.cgroup_sweep_inode_changed.load(Ordering::Relaxed),
             path_missing_total: self.cgroup_sweep_path_missing.load(Ordering::Relaxed),
+            idle_unreferenced_total: self.idle_unreferenced_evicted.load(Ordering::Relaxed),
         }
     }
 
-    fn remove_policy_scopes_for_pods(&self, pod_uids: &[[u8; 16]]) {
-        if pod_uids.is_empty() {
-            return;
-        }
-
-        let _guard = self.lock_policy_scope_update();
-        let current = self.policy_scopes_by_pod_uid.load();
-        if !pod_uids.iter().any(|pod_uid| current.contains_key(pod_uid)) {
-            return;
-        }
-
-        let mut scopes = current.as_ref().clone();
-        for pod_uid in pod_uids {
-            scopes.remove(pod_uid);
-        }
-        self.policy_scopes_by_pod_uid.store(Arc::new(scopes));
-    }
-
-    pub fn install_policy_scopes(&self, scopes: HashMap<[u8; 16], Arc<PolicyScopeCache>>) {
-        let _guard = self.lock_policy_scope_update();
-        self.policy_scopes_by_pod_uid.store(Arc::new(scopes));
-    }
-
+    /// Per-pod policy scope from the current slice, keyed by the same `[u8; 16]`
+    /// the eBPF stamps. One consistent `ArcSwap::load`, paid once per HTTP/HBONE
+    /// request on the node-waypoint admit path. Returns `None` when the pod's
+    /// workload is not in the live slice generation; the caller (`mesh_authz`)
+    /// then fails closed when scoped policies exist, else evaluates
+    /// mesh-wide-only.
+    ///
+    /// Scope is slice-driven (keyed by the workload's `metadata.uid`), not
+    /// derived from the enrolled identity — so it is reclaimed by slice updates,
+    /// not by identity removal/sweep, and a removed/re-keyed workload fails
+    /// closed instead of borrowing a same-SPIFFE workload's labels. Captured
+    /// pods never fall back to the SPIFFE-keyed index (that is for uid-less
+    /// workloads).
     pub fn policy_scope_for_pod(&self, pod_uid: &[u8; 16]) -> Option<Arc<PolicyScopeCache>> {
-        self.policy_scopes_by_pod_uid.load().get(pod_uid).cloned()
+        self.slice
+            .load()
+            .scopes_by_pod_uid
+            .get(pod_uid)
+            .map(Arc::clone)
     }
 
-    /// Install per-pod policy scopes derived from a slice's workload set.
+    /// Install a node-waypoint slice generation derived from a slice's workload
+    /// set.
     ///
     /// Used by tests and direct resolver callers. Mesh slice apply should
     /// prefer [`build_policy_scope_snapshot_from_workloads`] and
-    /// [`install_policy_scope_snapshot`] so it can stage scopes before config
-    /// validation while publishing them only after the proxy config is
-    /// accepted.
+    /// [`install_policy_scope_snapshot`] so it can stage the slice before config
+    /// validation while publishing it only after the proxy config is accepted.
     pub fn install_policy_scopes_from_workloads<'a, I>(&self, workloads: I)
     where
         I: IntoIterator<Item = &'a Workload>,
@@ -650,88 +743,56 @@ impl NodeWaypointIdentityResolver {
     where
         I: IntoIterator<Item = &'a Workload>,
     {
-        let workload_policy_scopes_by_spiffe = workload_policy_scope_index(workloads);
+        let workloads: Vec<&Workload> = workloads.into_iter().collect();
+        // Per-pod scope: each workload carrying a pod UID gets its OWN scope
+        // keyed by the exact `[u8; 16]` the eBPF stamps (parsed from
+        // `metadata.uid`). No cross-pod merge, so pods sharing a SPIFFE but
+        // differing in labels are scoped against their own labels. A malformed
+        // UID is skipped (the SPIFFE gate still vouches the identity; scope then
+        // falls through to `None` → fail closed when scoped policies exist).
+        let mut scopes_by_pod_uid: HashMap<[u8; 16], Arc<PolicyScopeCache>> = HashMap::new();
+        for workload in &workloads {
+            let Some(raw_uid) = workload.pod_uid.as_deref() else {
+                continue;
+            };
+            match parse_pod_uid(raw_uid) {
+                Ok(uid) => {
+                    scopes_by_pod_uid
+                        .insert(uid, Arc::new(PolicyScopeCache::from_workload(workload)));
+                }
+                Err(error) => {
+                    warn!(
+                        pod_uid = %raw_uid,
+                        %error,
+                        "Skipping node-waypoint per-pod scope for workload with invalid pod UID"
+                    );
+                }
+            }
+        }
+        // The identity gate covers ALL workloads (every pod needs an identity
+        // for authz, not only those carrying scoped policies).
+        let mut identities_by_hash: HashMap<u64, SpiffeId> = HashMap::new();
+        for workload in &workloads {
+            identities_by_hash
+                .entry(workload_spiffe_hash(&workload.spiffe_id))
+                .or_insert_with(|| workload.spiffe_id.clone());
+        }
         NodeWaypointPolicyScopeSnapshot {
-            workload_policy_scopes_by_spiffe,
+            slice: NodeWaypointSlice {
+                identities_by_hash,
+                scopes_by_pod_uid,
+            },
         }
     }
 
+    /// Publish the whole slice atomically as one generation: a single
+    /// `ArcSwap` store of the `(identity gate, scope index)` payload. Because
+    /// the gate and the scopes ride one `ArcSwap`, a lock-free reader
+    /// (`resolve_record` / `policy_scope_for_pod`) sees a coherent generation —
+    /// it can never observe a new gate paired with an old/missing scope, which
+    /// is the "never partial" reload invariant this resolver must hold.
     pub fn install_policy_scope_snapshot(&self, snapshot: NodeWaypointPolicyScopeSnapshot) {
-        let _guard = self.lock_policy_scope_update();
-        let workload_policy_scopes_by_spiffe = snapshot.workload_policy_scopes_by_spiffe;
-        let policy_scopes_by_pod_uid =
-            self.build_per_pod_scopes_from_workload_index(&workload_policy_scopes_by_spiffe);
-        self.workload_policy_scopes_by_spiffe
-            .store(Arc::new(workload_policy_scopes_by_spiffe));
-        self.policy_scopes_by_pod_uid
-            .store(Arc::new(policy_scopes_by_pod_uid));
-    }
-
-    pub fn build_per_pod_scopes_from_workloads<'a, I>(
-        &self,
-        workloads: I,
-    ) -> HashMap<[u8; 16], Arc<PolicyScopeCache>>
-    where
-        I: IntoIterator<Item = &'a Workload>,
-    {
-        let workload_index = workload_policy_scope_index(workloads);
-        self.build_per_pod_scopes_from_workload_index(&workload_index)
-    }
-
-    fn sync_policy_scope_for_identity(&self, identity: &NodeWaypointIdentity) {
-        let _guard = self.lock_policy_scope_update();
-        let scope = self
-            .workload_policy_scopes_by_spiffe
-            .load()
-            .get(identity.spiffe_id.as_str())
-            .cloned();
-        let current = self.policy_scopes_by_pod_uid.load();
-        let mut scopes = current.as_ref().clone();
-        if let Some(scope) = scope {
-            scopes.insert(identity.pod_uid, scope);
-        } else {
-            scopes.remove(&identity.pod_uid);
-        }
-        self.policy_scopes_by_pod_uid.store(Arc::new(scopes));
-    }
-
-    fn lock_policy_scope_update(&self) -> std::sync::MutexGuard<'_, ()> {
-        // Recover from a poisoned lock so a transient panic in a previous
-        // updater cannot wedge slice apply or identity enrollment forever.
-        // We log when the recovery happens because a poisoned mutex means
-        // the prior holder panicked mid-update — the per-pod scope map and
-        // the workload-scope index may be out of sync until the next
-        // accepted slice apply rebuilds both. Silent recovery would hide
-        // that history; the warn! makes it surface in operator logs and
-        // postmortem captures.
-        self.policy_scope_update_lock
-            .lock()
-            .unwrap_or_else(|poisoned| {
-                warn!(
-                    "node-waypoint policy-scope update lock was poisoned by a previous panic; \
-                 recovering and continuing — per-pod scope map may be transiently inconsistent \
-                 with the workload index until the next mesh slice apply"
-                );
-                poisoned.into_inner()
-            })
-    }
-
-    fn build_per_pod_scopes_from_workload_index(
-        &self,
-        workload_index: &HashMap<String, Arc<PolicyScopeCache>>,
-    ) -> HashMap<[u8; 16], Arc<PolicyScopeCache>> {
-        if workload_index.is_empty() {
-            return HashMap::new();
-        }
-        self.identities_by_pod_uid
-            .iter()
-            .filter_map(|entry| {
-                let identity = entry.value();
-                workload_index
-                    .get(identity.spiffe_id.as_str())
-                    .map(|scope| (identity.pod_uid, scope.clone()))
-            })
-            .collect()
+        self.slice.store(std::sync::Arc::new(snapshot.slice));
     }
 
     /// Build an operator-facing snapshot of the currently enrolled identities.
@@ -784,7 +845,7 @@ impl NodeWaypointIdentityResolver {
             }
         }
 
-        let policy_scopes = self.policy_scopes_by_pod_uid.load();
+        let slice = self.slice.load();
         let mut out: Vec<NodeWaypointIdentitySummary> =
             Vec::with_capacity(self.identities_by_pod_uid.len());
         out.extend(self.identities_by_pod_uid.iter().map(|entry| {
@@ -799,7 +860,11 @@ impl NodeWaypointIdentityResolver {
                 workload_spiffe_hash: identity.workload_spiffe_hash,
                 orig_dst4_cookies,
                 orig_dst6_cookies,
-                has_policy_scope: policy_scopes.contains_key(&identity.pod_uid),
+                // Mirrors `policy_scope_for_pod`: a captured pod has a scope iff
+                // the slice carries its exact pod UID. Node-waypoint resolves
+                // only eBPF-captured, uid-bearing pods; there is no SPIFFE
+                // fallback, so an absent UID is a fail-closed miss here too.
+                has_policy_scope: slice.scopes_by_pod_uid.contains_key(&identity.pod_uid),
             }
         }));
         out.sort_by_key(|summary| summary.pod_uid);
@@ -831,29 +896,60 @@ impl NodeWaypointIdentityResolver {
     pub fn resolve_stream(
         &self,
         stream: &TcpStream,
-    ) -> Result<Arc<NodeWaypointIdentity>, NodeWaypointIdentityError> {
+    ) -> Result<(Arc<NodeWaypointIdentity>, Option<Arc<PolicyScopeCache>>), NodeWaypointIdentityError>
+    {
         let cookie = crate::socket_opts::socket_cookie(stream).map_err(|error| {
             NodeWaypointIdentityError::SocketCookieUnavailable(error.to_string())
         })?;
         self.resolve_cookie(cookie)
     }
 
+    /// Resolve a socket cookie to its `(identity, scope)` pair, both derived
+    /// from the SAME slice load (see [`Self::resolve_record`]). Both branches —
+    /// the warm `cookie_records` hit and the between-tick synchronous fallback —
+    /// fail closed with `UnknownCookie` on a miss.
     pub fn resolve_cookie(
         &self,
         cookie: u64,
-    ) -> Result<Arc<NodeWaypointIdentity>, NodeWaypointIdentityError> {
-        let Some(record) = self.cookie_records.get(&cookie) else {
-            return Err(NodeWaypointIdentityError::UnknownCookie(cookie));
-        };
-        self.resolve_record(cookie, record.pod_uid, record.workload_spiffe_hash)
+    ) -> Result<(Arc<NodeWaypointIdentity>, Option<Arc<PolicyScopeCache>>), NodeWaypointIdentityError>
+    {
+        if let Some(record) = self.cookie_records.get(&cookie) {
+            return self.resolve_record(cookie, record.pod_uid, record.workload_spiffe_hash);
+        }
+        // Between-tick fallback (GAP-2M): the orig-dst bridge mirrors the pinned
+        // BPF maps into `cookie_records` only on its poll interval, so a cookie
+        // stamped on the accept side moments ago may not be mirrored yet. Read
+        // the pinned map synchronously so a freshly accepted connection resolves
+        // on the first try instead of being dropped until the next poll. No
+        // fallback (non-eBPF / pre-install) or a miss → UnknownCookie
+        // (fail-closed, unchanged).
+        if let Some(fallback) = self.cookie_fallback.load_full()
+            && let Some((pod_uid, workload_spiffe_hash)) = fallback(cookie)
+        {
+            return self.resolve_record(cookie, pod_uid, workload_spiffe_hash);
+        }
+        Err(NodeWaypointIdentityError::UnknownCookie(cookie))
     }
 
+    /// Resolve an eBPF-stamped `(pod_uid, workload_spiffe_hash)` record to its
+    /// identity AND per-pod policy scope from a single, consistent slice load.
+    ///
+    /// The fail-closed identity gate (`identities_by_hash`) and the per-pod-UID
+    /// scope index (`scopes_by_pod_uid`) ride one `ArcSwap` generation, so a
+    /// reader can never pair a new gate with an old/missing scope: a workload
+    /// whose SPIFFE
+    /// hash is unchanged but whose scope changed is admitted with the matching
+    /// scope from the very generation that vouched for it, satisfying the "never
+    /// partial" reload invariant. The scope is returned to the caller (the TCP
+    /// accept path captures it once at accept; the HTTP path re-queries per
+    /// request via [`Self::policy_scope_for_pod`], itself a single slice load).
     fn resolve_record(
         &self,
         cookie: u64,
         pod_uid: [u8; 16],
         expected_hash: u64,
-    ) -> Result<Arc<NodeWaypointIdentity>, NodeWaypointIdentityError> {
+    ) -> Result<(Arc<NodeWaypointIdentity>, Option<Arc<PolicyScopeCache>>), NodeWaypointIdentityError>
+    {
         if pod_uid == [0; 16] {
             return Err(NodeWaypointIdentityError::MissingPodUid(cookie));
         }
@@ -861,18 +957,59 @@ impl NodeWaypointIdentityResolver {
             return Err(NodeWaypointIdentityError::MissingWorkloadHash { cookie, pod_uid });
         }
 
-        let Some(identity) = self.identities_by_pod_uid.get(&pod_uid) else {
-            return Err(NodeWaypointIdentityError::UnknownPod(pod_uid));
-        };
-        let identity = identity.clone();
-        if identity.workload_spiffe_hash != expected_hash {
-            return Err(NodeWaypointIdentityError::WorkloadHashMismatch {
-                pod_uid,
-                expected: expected_hash,
-                actual: identity.workload_spiffe_hash,
-            });
+        // The current slice generation: the authoritative `workload_spiffe_hash`
+        // gate AND the SPIFFE → scope index. Loaded ONCE so the gate decision and
+        // the derived scope come from the same coherent generation, and so the
+        // cached and lazy-enrollment paths fail closed identically when the
+        // control plane removes a workload.
+        let slice = self.slice.load();
+
+        if let Some(identity) = self.identities_by_pod_uid.get(&pod_uid) {
+            let identity = identity.clone();
+            if identity.workload_spiffe_hash != expected_hash {
+                return Err(NodeWaypointIdentityError::WorkloadHashMismatch {
+                    pod_uid,
+                    expected: expected_hash,
+                    actual: identity.workload_spiffe_hash,
+                });
+            }
+            // Re-validate the cached identity against the *current* slice
+            // (finding-#18). Enrollment (below) only happens when the hash is
+            // present in the slice gate, but later slice updates replace that
+            // generation without touching `identities_by_pod_uid`. If the control
+            // plane has since removed this workload (its hash left the gate) while
+            // the pod keeps stamping the old `(pod_uid, hash)`, fail closed
+            // instead of serving the now-orphaned identity — matching the lazy
+            // branch's no-matching-slice behavior. In production every enrolled
+            // identity's hash was in the gate at enroll time, so this rejects only
+            // genuinely removed/re-keyed workloads, never a still-valid one. The
+            // stale cache entry is left in place: it never resolves while its hash
+            // is absent, is re-validated for free if the workload returns, and is
+            // reclaimed by the cgroup-inode / idle sweep when the pod exits.
+            if !slice.identities_by_hash.contains_key(&expected_hash) {
+                return Err(NodeWaypointIdentityError::UnknownPod(pod_uid));
+            }
+            // Scope from the SAME generation that just vouched for the identity:
+            // captured pods resolve strictly per-UID (None on miss → fail closed).
+            let scope = slice.scope_for(&pod_uid);
+            return Ok((identity, scope));
         }
-        Ok(identity)
+
+        // Lazy enrollment (hash-join). The eBPF side stamps the record with
+        // `(pod_uid, workload_spiffe_hash)`; the slice supplies the SPIFFE keyed
+        // by that hash (installed at slice apply via the policy-scope snapshot).
+        // Join on the hash to enroll `pod_uid` → identity on first sight. No
+        // matching slice workload → `UnknownPod` (fail-closed, unchanged). The
+        // enrolled identity's hash equals `expected_hash` by construction, so no
+        // re-check is needed. Identity AND scope both come from this single
+        // `slice` load.
+        if let Some(spiffe_id) = slice.identities_by_hash.get(&expected_hash).cloned() {
+            let scope = slice.scope_for(&pod_uid);
+            let identity = self.upsert_identity(NodeWaypointIdentity::new(pod_uid, spiffe_id));
+            return Ok((identity, scope));
+        }
+
+        Err(NodeWaypointIdentityError::UnknownPod(pod_uid))
     }
 }
 
@@ -966,7 +1103,8 @@ pub fn spawn_cgroup_sweep_task(
                         info!(
                             evicted_inode_changed = report.evicted_inode_changed,
                             evicted_path_missing = report.evicted_path_missing,
-                            "Node-waypoint cgroup sweep evicted stale identities"
+                            evicted_idle_unreferenced = report.evicted_idle_unreferenced,
+                            "Node-waypoint identity sweep evicted stale identities"
                         );
                     }
                 }
@@ -1035,7 +1173,23 @@ mod tests {
             weight: None,
             locality: None,
             service_account: None,
+            pod_uid: None,
         }
+    }
+
+    /// Make the resolver's slice gate vouch for `spiffe_ids` so
+    /// `resolve_record`'s current-slice re-validation passes. Production enrolls
+    /// identities only through the slice (lazy hash-join), so a still-valid
+    /// identity's hash is always present in the slice's `identities_by_hash`
+    /// gate. These older unit tests pre-seed `identities_by_pod_uid` directly via
+    /// `upsert_identity` for brevity, so they must also seed the slice the
+    /// resolver now revalidates against.
+    fn vouch_for_workloads(resolver: &NodeWaypointIdentityResolver, spiffe_ids: &[&str]) {
+        let workloads: Vec<Workload> = spiffe_ids
+            .iter()
+            .map(|spiffe_id| workload(spiffe_id, "default", "app", HashMap::new()))
+            .collect();
+        resolver.install_policy_scopes_from_workloads(&workloads);
     }
 
     #[test]
@@ -1045,11 +1199,120 @@ mod tests {
         let identity = NodeWaypointIdentity::new(pod_uid, spiffe("spiffe://td/ns/default/sa/api"));
         let hash = identity.workload_spiffe_hash;
         resolver.upsert_identity(identity);
+        // A uid-bearing workload supplies BOTH the slice gate (identities_by_hash)
+        // and the per-pod scope (scopes_by_pod_uid) for this captured pod's UID.
+        resolver.install_policy_scopes_from_workloads(&[workload_with_uid(
+            "spiffe://td/ns/default/sa/api",
+            "default",
+            "api",
+            HashMap::new(),
+            "11111111-1111-1111-1111-111111111111",
+        )]);
         resolver.record_orig_dst4(7, orig_dst4(pod_uid, hash));
 
-        let resolved = resolver.resolve_cookie(7).expect("identity resolves");
+        let (resolved, scope) = resolver.resolve_cookie(7).expect("identity resolves");
         assert_eq!(resolved.pod_uid, pod_uid);
         assert_eq!(resolved.spiffe_id.as_str(), "spiffe://td/ns/default/sa/api");
+        // The vouching workload carries a scope (namespace "default"), so the
+        // returned scope comes from the same generation that vouched.
+        assert!(
+            scope.is_some(),
+            "a vouched workload's resolve must return its scope from the same slice"
+        );
+    }
+
+    #[test]
+    fn resolve_cookie_lazily_enrolls_identity_from_slice_hash_index() {
+        let resolver = NodeWaypointIdentityResolver::new(0);
+        let pod_uid = parse_pod_uid("33333333-3333-3333-3333-333333333333").unwrap();
+        let spiffe_id = spiffe("spiffe://td/ns/default/sa/web");
+        let hash = workload_spiffe_hash(&spiffe_id);
+
+        // Slice apply installs the hash → SPIFFE index from the workloads;
+        // production never pre-enrolls via upsert_identity.
+        let workloads = vec![workload_with_uid(
+            "spiffe://td/ns/default/sa/web",
+            "default",
+            "web",
+            HashMap::new(),
+            "33333333-3333-3333-3333-333333333333",
+        )];
+        let snapshot = resolver.build_policy_scope_snapshot_from_workloads(&workloads);
+        resolver.install_policy_scope_snapshot(snapshot);
+
+        // The eBPF side mirrors a cookie record carrying (pod_uid, hash); no
+        // identity exists in identities_by_pod_uid yet.
+        resolver.record_orig_dst4(7, orig_dst4(pod_uid, hash));
+
+        // Resolution enrolls the identity by hash-join on first sight, and the
+        // scope is returned from the same slice generation.
+        let (resolved, scope) = resolver
+            .resolve_cookie(7)
+            .expect("lazy enrollment resolves the cookie");
+        assert_eq!(resolved.pod_uid, pod_uid);
+        assert_eq!(resolved.spiffe_id.as_str(), "spiffe://td/ns/default/sa/web");
+        assert!(
+            scope.is_some(),
+            "lazy enrollment must return the workload's scope from the same slice load"
+        );
+
+        // A cookie whose hash matches no slice workload still fails closed.
+        let other_pod = parse_pod_uid("44444444-4444-4444-4444-444444444444").unwrap();
+        resolver.record_orig_dst4(8, orig_dst4(other_pod, 0xdead_beef));
+        assert_eq!(
+            resolver
+                .resolve_cookie(8)
+                .expect_err("unknown hash fails closed"),
+            NodeWaypointIdentityError::UnknownPod(other_pod)
+        );
+    }
+
+    #[test]
+    fn cached_identity_fails_closed_after_slice_drops_its_workload() {
+        // GAP-2M fail-closed regression: once a pod is lazily enrolled it is
+        // cached in `identities_by_pod_uid`. A later slice that removes its
+        // workload publishes a new generation whose `identities_by_hash` gate no
+        // longer carries the hash, but does not touch the cache, so the
+        // cached-identity branch must re-validate against the current slice and
+        // fail closed — otherwise a decommissioned workload keeps resolving as
+        // long as the pod stamps the old (pod_uid, hash).
+        let resolver = NodeWaypointIdentityResolver::new(0);
+        let pod_uid = parse_pod_uid("55555555-5555-5555-5555-555555555555").unwrap();
+        let spiffe_id = spiffe("spiffe://td/ns/default/sa/web");
+        let hash = workload_spiffe_hash(&spiffe_id);
+
+        // Slice vouches for the workload; the pod enrolls lazily on first resolve.
+        vouch_for_workloads(&resolver, &["spiffe://td/ns/default/sa/web"]);
+        resolver.record_orig_dst4(7, orig_dst4(pod_uid, hash));
+        let (resolved, _scope) = resolver
+            .resolve_cookie(7)
+            .expect("resolves while the workload is in the slice");
+        assert_eq!(resolved.pod_uid, pod_uid);
+        assert!(
+            resolver.identities_by_pod_uid.contains_key(&pod_uid),
+            "first resolve must cache the enrolled identity"
+        );
+
+        // The control plane removes that workload (the slice now carries a
+        // different one), so its hash leaves the index.
+        vouch_for_workloads(&resolver, &["spiffe://td/ns/default/sa/other"]);
+
+        // The pod keeps stamping the old (pod_uid, hash). The cached-identity
+        // branch must fail closed rather than serve the orphaned identity.
+        assert_eq!(
+            resolver
+                .resolve_cookie(7)
+                .expect_err("a removed workload must fail closed even when cached"),
+            NodeWaypointIdentityError::UnknownPod(pod_uid)
+        );
+
+        // If the workload returns, the cached identity is re-validated for free
+        // (no eviction, no re-enrollment): resolution succeeds again.
+        vouch_for_workloads(&resolver, &["spiffe://td/ns/default/sa/web"]);
+        let (reresolved, _scope) = resolver
+            .resolve_cookie(7)
+            .expect("a returning workload re-validates the cached identity");
+        assert_eq!(reresolved.spiffe_id, spiffe_id);
     }
 
     #[test]
@@ -1063,15 +1326,56 @@ mod tests {
     }
 
     #[test]
+    fn resolve_cookie_uses_synchronous_fallback_on_miss() {
+        let resolver = NodeWaypointIdentityResolver::new(0);
+        let pod_uid = parse_pod_uid("22222222-2222-2222-2222-222222222222").unwrap();
+        let identity =
+            NodeWaypointIdentity::new(pod_uid, spiffe("spiffe://td/ns/default/sa/reviews"));
+        let hash = identity.workload_spiffe_hash;
+        resolver.upsert_identity(identity);
+        vouch_for_workloads(&resolver, &["spiffe://td/ns/default/sa/reviews"]);
+
+        // `cookie_records` is empty — simulates the 200ms orig-dst poll not
+        // having mirrored the just-stamped accept cookie yet. The injected
+        // synchronous fallback resolves cookie 42.
+        resolver.set_cookie_fallback(Box::new(move |cookie| {
+            (cookie == 42).then_some((pod_uid, hash))
+        }));
+
+        let (resolved, _scope) = resolver
+            .resolve_cookie(42)
+            .expect("synchronous fallback resolves the fresh cookie");
+        assert_eq!(resolved.pod_uid, pod_uid);
+
+        // A fallback miss still fails closed.
+        assert_eq!(
+            resolver
+                .resolve_cookie(99)
+                .expect_err("fallback miss fails closed"),
+            NodeWaypointIdentityError::UnknownCookie(99)
+        );
+
+        // Clearing the fallback reverts to pure in-memory resolution.
+        resolver.clear_cookie_fallback();
+        assert_eq!(
+            resolver
+                .resolve_cookie(42)
+                .expect_err("no fallback after clear fails closed"),
+            NodeWaypointIdentityError::UnknownCookie(42)
+        );
+    }
+
+    #[test]
     fn resolve_cookie_returns_ipv6_enrolled_identity() {
         let resolver = NodeWaypointIdentityResolver::new(0);
         let pod_uid = parse_pod_uid("11111111-1111-1111-1111-111111111111").unwrap();
         let identity = NodeWaypointIdentity::new(pod_uid, spiffe("spiffe://td/ns/default/sa/api"));
         let hash = identity.workload_spiffe_hash;
         resolver.upsert_identity(identity);
+        vouch_for_workloads(&resolver, &["spiffe://td/ns/default/sa/api"]);
         resolver.record_orig_dst6(7, orig_dst6(pod_uid, hash));
 
-        let resolved = resolver.resolve_cookie(7).expect("IPv6 identity resolves");
+        let (resolved, _scope) = resolver.resolve_cookie(7).expect("IPv6 identity resolves");
         assert_eq!(resolved.pod_uid, pod_uid);
         assert_eq!(resolved.spiffe_id.as_str(), "spiffe://td/ns/default/sa/api");
     }
@@ -1130,13 +1434,21 @@ mod tests {
         let pod_uid = parse_pod_uid("11111111-1111-1111-1111-111111111111").unwrap();
         let mut labels = HashMap::new();
         labels.insert("app".to_string(), "reviews".to_string());
-        let cache = Arc::new(PolicyScopeCache::new(
-            spiffe("spiffe://td/ns/default/sa/reviews"),
-            "default",
-            labels.clone(),
-        ));
         let resolver = NodeWaypointIdentityResolver::new(0);
-        resolver.install_policy_scopes(HashMap::from([(pod_uid, cache.clone())]));
+        // Install the scope via the slice keyed by this pod's UID; the enrolled
+        // identity below is incidental now that scope is resolved per-UID, not
+        // derived from the identity's SPIFFE.
+        resolver.install_policy_scopes_from_workloads(&[workload_with_uid(
+            "spiffe://td/ns/default/sa/reviews",
+            "default",
+            "reviews",
+            labels.clone(),
+            "11111111-1111-1111-1111-111111111111",
+        )]);
+        resolver.upsert_identity(NodeWaypointIdentity::new(
+            pod_uid,
+            spiffe("spiffe://td/ns/default/sa/reviews"),
+        ));
 
         let policy = MeshPolicy {
             name: "reviews-only".to_string(),
@@ -1204,14 +1516,7 @@ mod tests {
             NodeWaypointIdentity::new(pod_uid, spiffe("spiffe://td/ns/default/sa/api")),
             cgroup_path.clone(),
         );
-
-        // Pre-populate a policy scope cache so the sweep clears it too.
-        let scope_cache = Arc::new(PolicyScopeCache::new(
-            spiffe("spiffe://td/ns/default/sa/api"),
-            "default",
-            HashMap::new(),
-        ));
-        resolver.install_policy_scopes(HashMap::from([(pod_uid, scope_cache)]));
+        assert!(resolver.identities_by_pod_uid.contains_key(&pod_uid));
 
         // Simulate pod removal: delete the cgroup dir.
         std::fs::remove_dir_all(&cgroup_path).expect("remove cgroup dir");
@@ -1220,10 +1525,9 @@ mod tests {
         assert_eq!(report.evicted_path_missing, 1);
         assert_eq!(report.evicted_inode_changed, 0);
         assert!(!resolver.identities_by_pod_uid.contains_key(&pod_uid));
-        assert!(
-            resolver.policy_scope_for_pod(&pod_uid).is_none(),
-            "policy scope must be evicted with identity"
-        );
+        // Per-pod scope is slice-driven and decoupled from identity eviction
+        // (reclaimed by slice updates, not by this sweep) — see
+        // `later_slice_dropping_workload_reclaims_pod_scope`.
         let snapshot = resolver.cgroup_sweep_snapshot();
         assert_eq!(snapshot.path_missing_total, 1);
     }
@@ -1289,63 +1593,184 @@ mod tests {
         );
     }
 
+    /// Scope is keyed by the slice's per-pod-UID index, NOT by the enrolled
+    /// identity, so `remove_identity` (cgroup/idle reclamation) leaves the pod's
+    /// scope intact — it is reclaimed by slice updates, not identity lifecycle.
+    /// The previous model cleared scope on identity removal; that coupling is
+    /// what let a captured pod fall back to a same-SPIFFE workload's scope when
+    /// its own identity churned, which H1 removes.
     #[test]
-    fn remove_identity_clears_policy_scope_cache() {
+    fn remove_identity_does_not_affect_slice_driven_scope() {
         let resolver = NodeWaypointIdentityResolver::new(0);
         let pod_uid = parse_pod_uid("11111111-1111-1111-1111-111111111111").unwrap();
+        resolver.install_policy_scopes_from_workloads(&[workload_with_uid(
+            "spiffe://td/ns/default/sa/api",
+            "default",
+            "api",
+            HashMap::new(),
+            "11111111-1111-1111-1111-111111111111",
+        )]);
         resolver.upsert_identity(NodeWaypointIdentity::new(
             pod_uid,
             spiffe("spiffe://td/ns/default/sa/api"),
         ));
-        let scope_cache = Arc::new(PolicyScopeCache::new(
-            spiffe("spiffe://td/ns/default/sa/api"),
-            "default",
-            HashMap::new(),
-        ));
-        resolver.install_policy_scopes(HashMap::from([(pod_uid, scope_cache)]));
+        assert!(resolver.policy_scope_for_pod(&pod_uid).is_some());
 
         resolver.remove_identity(&pod_uid);
 
+        // Identity is gone, but the slice still carries the pod's UID → scope
+        // stays available (decoupled from identity lifecycle).
         assert!(!resolver.identities_by_pod_uid.contains_key(&pod_uid));
         assert!(
-            resolver.policy_scope_for_pod(&pod_uid).is_none(),
-            "explicit identity removal must clear stale policy scope too"
+            resolver.policy_scope_for_pod(&pod_uid).is_some(),
+            "scope is slice-driven and must survive identity removal"
         );
     }
 
     #[test]
-    fn remove_identity_clears_policy_scope_cache_when_identity_already_missing() {
+    fn remove_identity_is_a_noop_when_identity_already_missing() {
+        // Scope is slice-driven (keyed by pod UID), so a pod whose UID is not in
+        // the slice's per-UID index has no scope regardless of identity state,
+        // and removing a never-enrolled identity is a harmless no-op. The
+        // installed workload below is uid-less, so it contributes no per-UID
+        // scope for this pod (it only populates the SPIFFE-keyed VM index).
         let resolver = NodeWaypointIdentityResolver::new(0);
         let pod_uid = parse_pod_uid("11111111-1111-1111-1111-111111111111").unwrap();
-        let scope_cache = Arc::new(PolicyScopeCache::new(
-            spiffe("spiffe://td/ns/default/sa/api"),
+        resolver.install_policy_scopes_from_workloads(&[workload(
+            "spiffe://td/ns/default/sa/api",
             "default",
+            "api",
             HashMap::new(),
-        ));
-        resolver.install_policy_scopes(HashMap::from([(pod_uid, scope_cache)]));
+        )]);
 
+        // No per-UID scope for this pod, and no identity was ever enrolled.
+        assert!(resolver.policy_scope_for_pod(&pod_uid).is_none());
         resolver.remove_identity(&pod_uid);
-
         assert!(
             resolver.policy_scope_for_pod(&pod_uid).is_none(),
-            "explicit identity removal must clear orphaned policy scope too"
+            "a pod whose UID is absent from the slice has no scope"
         );
     }
 
     #[test]
-    fn sweep_keeps_identities_without_cgroup_binding() {
-        // Identities enrolled via the legacy upsert path (no cgroup) must
-        // be left in place — the sweep is opt-in per identity, not a
-        // global GC of every enrolled pod.
+    fn sweep_keeps_referenced_unbound_identity() {
+        // An unbound (lazily-enrolled, no cgroup) identity that is still
+        // referenced by a live cookie record must be kept: the idle pass only
+        // reclaims pods that no longer have any live cookie, and the cgroup pass
+        // ignores unbound entries entirely.
         let resolver = NodeWaypointIdentityResolver::new(0);
         let pod_uid = parse_pod_uid("22222222-2222-2222-2222-222222222222").unwrap();
-        resolver.upsert_identity(NodeWaypointIdentity::new(
-            pod_uid,
-            spiffe("spiffe://td/ns/default/sa/legacy"),
-        ));
+        let identity =
+            NodeWaypointIdentity::new(pod_uid, spiffe("spiffe://td/ns/default/sa/legacy"));
+        let hash = identity.workload_spiffe_hash;
+        resolver.upsert_identity(identity);
+        // A live cookie record keeps the pod referenced.
+        resolver.record_orig_dst4(7, orig_dst4(pod_uid, hash));
 
         let report = resolver.sweep_cgroup_stale_identities();
         assert_eq!(report.total_evicted(), 0);
+        assert!(resolver.identities_by_pod_uid.contains_key(&pod_uid));
+    }
+
+    #[test]
+    fn sweep_evicts_unreferenced_lazy_identity() {
+        // GAP-2M lifecycle (P2): the production lazy hash-join enrollment binds
+        // no cgroup, so the cgroup pass never reclaims it and nothing calls
+        // remove_identity. When the pod churns away its cookies age out of
+        // cookie_records; the idle pass must then reclaim the orphaned identity
+        // so it does not grow without bound. (Per-pod scope is slice-driven and
+        // reclaimed by slice updates, not by this sweep — see
+        // `later_slice_dropping_workload_reclaims_pod_scope`.)
+        let resolver = NodeWaypointIdentityResolver::new(0);
+        let pod_uid = parse_pod_uid("66666666-6666-6666-6666-666666666666").unwrap();
+        let spiffe_id = spiffe("spiffe://td/ns/default/sa/web");
+        let hash = workload_spiffe_hash(&spiffe_id);
+
+        vouch_for_workloads(&resolver, &["spiffe://td/ns/default/sa/web"]);
+        resolver.record_orig_dst4(7, orig_dst4(pod_uid, hash));
+        resolver
+            .resolve_cookie(7)
+            .expect("lazy enrollment resolves while the pod is live");
+        assert!(resolver.identities_by_pod_uid.contains_key(&pod_uid));
+
+        // While the cookie is live the idle pass keeps it.
+        let report = resolver.sweep_cgroup_stale_identities();
+        assert_eq!(report.evicted_idle_unreferenced, 0);
+        assert!(resolver.identities_by_pod_uid.contains_key(&pod_uid));
+
+        // Pod dies → its accept-side cookies age out of the mirrored map.
+        resolver.retain_cookie_records(&std::collections::HashSet::new());
+
+        let report = resolver.sweep_cgroup_stale_identities();
+        assert_eq!(report.evicted_idle_unreferenced, 1);
+        assert!(!resolver.identities_by_pod_uid.contains_key(&pod_uid));
+    }
+
+    #[test]
+    fn sweep_keeps_unbound_identity_held_by_open_connection() {
+        // Finding-2 regression: HTTP/HBONE connections hold the resolved
+        // identity Arc for their lifetime and re-query the per-pod scope on
+        // every request. If the BPF LRU evicts a live connection's cookie, the
+        // cookie-reference signal goes stale — but the sweep must NOT evict the
+        // pod (else later streams on that connection lose per-pod scoping). An
+        // outstanding Arc ref (strong_count > 1) keeps it un-evictable.
+        let resolver = NodeWaypointIdentityResolver::new(0);
+        let pod_uid = parse_pod_uid("88888888-8888-8888-8888-888888888888").unwrap();
+        let spiffe_id = spiffe("spiffe://td/ns/default/sa/web");
+        let hash = workload_spiffe_hash(&spiffe_id);
+
+        resolver.install_policy_scopes_from_workloads(&[workload_with_uid(
+            "spiffe://td/ns/default/sa/web",
+            "default",
+            "web",
+            HashMap::new(),
+            "88888888-8888-8888-8888-888888888888",
+        )]);
+        resolver.record_orig_dst4(7, orig_dst4(pod_uid, hash));
+        // Simulate an open connection: resolve and HOLD the returned Arc, the
+        // way the accept path stores it on the connection for its lifetime.
+        let (conn_identity, _scope) = resolver.resolve_cookie(7).expect("resolves and enrolls");
+
+        // The connection's cookie ages out of the mirror (BPF LRU eviction)
+        // while the connection is still open.
+        resolver.retain_cookie_records(&std::collections::HashSet::new());
+
+        let report = resolver.sweep_cgroup_stale_identities();
+        assert_eq!(
+            report.evicted_idle_unreferenced, 0,
+            "a pod whose identity an open connection still holds must not be evicted"
+        );
+        assert!(resolver.identities_by_pod_uid.contains_key(&pod_uid));
+        assert!(resolver.policy_scope_for_pod(&pod_uid).is_some());
+
+        // Once the connection closes (Arc dropped), the next sweep reclaims it.
+        drop(conn_identity);
+        let report = resolver.sweep_cgroup_stale_identities();
+        assert_eq!(report.evicted_idle_unreferenced, 1);
+        assert!(!resolver.identities_by_pod_uid.contains_key(&pod_uid));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sweep_keeps_cgroup_bound_identity_when_unreferenced() {
+        // cgroup-bound identities are the cgroup pass's domain; the idle pass
+        // must never reclaim them even with no live cookie reference, or it
+        // would race the cgroup lifecycle.
+        let resolver = NodeWaypointIdentityResolver::new(0);
+        let pod_uid = parse_pod_uid("77777777-7777-7777-7777-777777777777").unwrap();
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let cgroup_path = tmp.path().join("pod");
+        std::fs::create_dir_all(&cgroup_path).expect("create cgroup dir");
+
+        let identity = resolver.upsert_identity_with_cgroup(
+            NodeWaypointIdentity::new(pod_uid, spiffe("spiffe://td/ns/default/sa/web")),
+            cgroup_path,
+        );
+        assert!(identity.cgroup_inode.is_some(), "binding must be recorded");
+
+        // No cookie record references the pod, but it is cgroup-bound.
+        let report = resolver.sweep_cgroup_stale_identities();
+        assert_eq!(report.evicted_idle_unreferenced, 0);
         assert!(resolver.identities_by_pod_uid.contains_key(&pod_uid));
     }
 
@@ -1367,17 +1792,21 @@ mod tests {
             identity.cgroup_inode.is_none(),
             "stat failure must leave cgroup_inode unset"
         );
+        // A live cookie keeps the pod referenced so the idle pass leaves it
+        // alone; the point under test is that the *cgroup* pass ignores an
+        // entry with no recorded inode (it never tries to stat the missing path).
+        resolver.record_orig_dst4(7, orig_dst4(pod_uid, identity.workload_spiffe_hash));
         let report = resolver.sweep_cgroup_stale_identities();
         assert_eq!(
             report.total_evicted(),
             0,
-            "sweep ignores identities without a recorded inode"
+            "cgroup pass ignores identities without a recorded inode"
         );
         assert!(resolver.identities_by_pod_uid.contains_key(&pod_uid));
     }
 
     #[test]
-    fn build_per_pod_scopes_from_workloads_indexes_by_pod_uid_via_spiffe() {
+    fn per_pod_scope_keyed_by_pod_uid() {
         let resolver = NodeWaypointIdentityResolver::new(0);
 
         let pod_a = parse_pod_uid("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap();
@@ -1399,34 +1828,160 @@ mod tests {
         ));
 
         let workloads = vec![
-            workload(
+            workload_with_uid(
                 "spiffe://td/ns/default/sa/api",
                 "default",
                 "api",
                 HashMap::from([("app".to_string(), "api".to_string())]),
+                "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
             ),
-            workload(
+            workload_with_uid(
                 "spiffe://td/ns/default/sa/billing",
                 "default",
                 "billing",
                 HashMap::from([("app".to_string(), "billing".to_string())]),
+                "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
             ),
         ];
 
-        let map = resolver.build_per_pod_scopes_from_workloads(&workloads);
+        // Installing the slice publishes the per-pod-UID scope index, keyed by
+        // each workload's `metadata.uid`. `policy_scope_for_pod` looks the pod up
+        // by the exact UID the eBPF stamps — no enrolled identity required.
+        resolver.install_policy_scopes_from_workloads(&workloads);
 
-        assert_eq!(map.len(), 2);
-        let scope_a = map.get(&pod_a).expect("api workload scope");
+        let scope_a = resolver
+            .policy_scope_for_pod(&pod_a)
+            .expect("api workload scope");
         assert_eq!(scope_a.namespace, "default");
         assert_eq!(scope_a.labels.get("app").map(String::as_str), Some("api"));
-        let scope_b = map.get(&pod_b).expect("billing workload scope");
+        let scope_b = resolver
+            .policy_scope_for_pod(&pod_b)
+            .expect("billing workload scope");
         assert_eq!(
             scope_b.labels.get("app").map(String::as_str),
             Some("billing")
         );
         assert!(
-            !map.contains_key(&pod_orphan),
-            "pod with no Workload entry must be omitted"
+            resolver.policy_scope_for_pod(&pod_orphan).is_none(),
+            "pod with no Workload entry must derive no scope"
+        );
+    }
+
+    fn workload_with_uid(
+        spiffe_id: &str,
+        namespace: &str,
+        service_name: &str,
+        labels: HashMap<String, String>,
+        pod_uid: &str,
+    ) -> Workload {
+        Workload {
+            pod_uid: Some(pod_uid.to_string()),
+            ..workload(spiffe_id, namespace, service_name, labels)
+        }
+    }
+
+    /// Two pods that share a service account — and therefore one SPIFFE ID —
+    /// but carry different labels (a canary `version` split, or two ReplicaSets
+    /// mid-rollout) must each resolve their OWN scope. Keying scope by SPIFFE
+    /// alone collapsed them to the label *intersection*, silently dropping
+    /// selector-scoped policy for the diverging label; keying by pod UID keeps
+    /// them distinct. Covers both the per-request (`policy_scope_for_pod`) and
+    /// the accept (`resolve_cookie`) lookups.
+    #[test]
+    fn per_pod_uid_scope_distinguishes_pods_sharing_a_spiffe() {
+        let resolver = NodeWaypointIdentityResolver::new(0);
+        let uid_v1 = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        let uid_v2 = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+        let pod_v1 = parse_pod_uid(uid_v1).unwrap();
+        let pod_v2 = parse_pod_uid(uid_v2).unwrap();
+        let shared_spiffe = "spiffe://td/ns/default/sa/web";
+
+        let workloads = vec![
+            workload_with_uid(
+                shared_spiffe,
+                "default",
+                "web",
+                HashMap::from([
+                    ("app".to_string(), "web".to_string()),
+                    ("version".to_string(), "v1".to_string()),
+                ]),
+                uid_v1,
+            ),
+            workload_with_uid(
+                shared_spiffe,
+                "default",
+                "web",
+                HashMap::from([
+                    ("app".to_string(), "web".to_string()),
+                    ("version".to_string(), "v2".to_string()),
+                ]),
+                uid_v2,
+            ),
+        ];
+        resolver.install_policy_scopes_from_workloads(&workloads);
+
+        // Per-request path: keyed by the exact pod UID the eBPF stamps — no
+        // enrolled identity required, and no cross-pod label merge.
+        let scope_v1 = resolver
+            .policy_scope_for_pod(&pod_v1)
+            .expect("v1 pod scope");
+        let scope_v2 = resolver
+            .policy_scope_for_pod(&pod_v2)
+            .expect("v2 pod scope");
+        assert_eq!(
+            scope_v1.labels.get("version").map(String::as_str),
+            Some("v1"),
+            "v1 pod must keep its own labels, not the intersection"
+        );
+        assert_eq!(
+            scope_v2.labels.get("version").map(String::as_str),
+            Some("v2"),
+            "v2 pod must keep its own labels, not the intersection"
+        );
+
+        // Accept path: resolve_cookie returns the SAME per-pod scope (both pods
+        // stamp the shared SPIFFE hash, but the pod UID disambiguates the scope).
+        let hash = workload_spiffe_hash(&spiffe(shared_spiffe));
+        resolver.record_orig_dst4(51, orig_dst4(pod_v2, hash));
+        let (resolved, scope) = resolver.resolve_cookie(51).expect("v2 cookie resolves");
+        assert_eq!(resolved.pod_uid, pod_v2);
+        assert_eq!(
+            scope
+                .expect("v2 accept scope")
+                .labels
+                .get("version")
+                .map(String::as_str),
+            Some("v2"),
+        );
+    }
+
+    /// H1 fail-closed: a captured pod (the eBPF stamps its pod UID) whose only
+    /// matching workload in the slice is uid-less (a VM/WorkloadEntry sharing the
+    /// SPIFFE) must NOT borrow that workload's scope. Resolving the pod through
+    /// the SPIFFE-keyed index would evaluate scoped policy against the wrong
+    /// labels and could let a selector-scoped DENY be evaded; the pod fails
+    /// closed (no per-UID scope) until its own uid-bearing workload is in the
+    /// slice. The SPIFFE-keyed index stays for genuine uid-less workloads, but
+    /// `policy_scope_for_pod` (captured pods) never consults it.
+    #[test]
+    fn captured_pod_does_not_borrow_uidless_spiffe_scope() {
+        let resolver = NodeWaypointIdentityResolver::new(0);
+        let pod_uid = parse_pod_uid("cccccccc-cccc-cccc-cccc-cccccccccccc").unwrap();
+        resolver.upsert_identity(NodeWaypointIdentity::new(
+            pod_uid,
+            spiffe("spiffe://td/ns/default/sa/vm"),
+        ));
+        // pod_uid: None → contributes only to the SPIFFE-keyed index, never to
+        // the per-UID index a captured pod resolves through.
+        resolver.install_policy_scopes_from_workloads(&[workload(
+            "spiffe://td/ns/default/sa/vm",
+            "default",
+            "vm",
+            HashMap::from([("app".to_string(), "vm".to_string())]),
+        )]);
+        assert!(
+            resolver.policy_scope_for_pod(&pod_uid).is_none(),
+            "a captured pod must not borrow a same-SPIFFE uid-less workload's scope (fail closed)"
         );
     }
 
@@ -1473,12 +2028,15 @@ mod tests {
         let snapshot_pre = resolver.identities_snapshot();
         assert!(!snapshot_pre[0].has_policy_scope);
 
-        let cache = Arc::new(PolicyScopeCache::new(
-            spiffe("spiffe://td/ns/default/sa/api"),
+        // `has_policy_scope` reflects whether the current slice carries a per-pod
+        // scope for this pod's exact UID (mirroring what authz resolves).
+        resolver.install_policy_scopes_from_workloads(&[workload_with_uid(
+            "spiffe://td/ns/default/sa/api",
             "default",
+            "api",
             HashMap::new(),
-        ));
-        resolver.install_policy_scopes(HashMap::from([(pod_uid, cache)]));
+            "11111111-1111-1111-1111-111111111111",
+        )]);
 
         let snapshot_post = resolver.identities_snapshot();
         assert!(snapshot_post[0].has_policy_scope);
@@ -1532,17 +2090,19 @@ mod tests {
         );
     }
 
+    /// Inverse of the pre-H1 behavior: when two pods share a SPIFFE but carry
+    /// divergent labels, keying scope by pod UID gives each pod ALL of its own
+    /// labels. The old SPIFFE-keyed model intersected them, silently dropping
+    /// the divergent label (here `app`) from every pod's scope — and with it any
+    /// selector-scoped policy that matched on that label.
     #[test]
-    fn build_per_pod_scopes_from_workloads_uses_common_labels_for_shared_spiffe() {
+    fn per_pod_scope_keeps_all_own_labels_not_intersection() {
         let resolver = NodeWaypointIdentityResolver::new(0);
-        let pod_uid = parse_pod_uid("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap();
-        resolver.upsert_identity(NodeWaypointIdentity::new(
-            pod_uid,
-            spiffe("spiffe://td/ns/default/sa/shared"),
-        ));
+        let pod_api = parse_pod_uid("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap();
+        let pod_billing = parse_pod_uid("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb").unwrap();
 
         let workloads = vec![
-            workload(
+            workload_with_uid(
                 "spiffe://td/ns/default/sa/shared",
                 "default",
                 "api",
@@ -1550,8 +2110,9 @@ mod tests {
                     ("app".to_string(), "api".to_string()),
                     ("version".to_string(), "v1".to_string()),
                 ]),
+                "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
             ),
-            workload(
+            workload_with_uid(
                 "spiffe://td/ns/default/sa/shared",
                 "default",
                 "billing",
@@ -1559,32 +2120,45 @@ mod tests {
                     ("app".to_string(), "billing".to_string()),
                     ("version".to_string(), "v1".to_string()),
                 ]),
+                "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
             ),
         ];
+        resolver.install_policy_scopes_from_workloads(&workloads);
 
-        let map = resolver.build_per_pod_scopes_from_workloads(&workloads);
+        // Each pod keeps its OWN app label (no intersection), plus the shared one.
+        let api = resolver
+            .policy_scope_for_pod(&pod_api)
+            .expect("api pod scope");
+        assert_eq!(api.namespace, "default");
+        assert_eq!(api.labels.get("app").map(String::as_str), Some("api"));
+        assert_eq!(api.labels.get("version").map(String::as_str), Some("v1"));
 
-        let scope = map.get(&pod_uid).expect("shared SPIFFE scope");
-        assert_eq!(scope.namespace, "default");
-        assert_eq!(scope.labels.get("version").map(String::as_str), Some("v1"));
-        assert!(
-            !scope.labels.contains_key("app"),
-            "divergent labels for a shared SPIFFE ID must not leak into the pod scope"
+        let billing = resolver
+            .policy_scope_for_pod(&pod_billing)
+            .expect("billing pod scope");
+        assert_eq!(
+            billing.labels.get("app").map(String::as_str),
+            Some("billing")
+        );
+        assert_eq!(
+            billing.labels.get("version").map(String::as_str),
+            Some("v1")
         );
     }
 
     #[test]
     fn install_policy_scopes_from_workloads_updates_late_enrolled_identity() {
         let resolver = NodeWaypointIdentityResolver::new(0);
-        let workloads = vec![workload(
+        let pod_uid = parse_pod_uid("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap();
+        let workloads = vec![workload_with_uid(
             "spiffe://td/ns/default/sa/api",
             "default",
             "api",
             HashMap::from([("app".to_string(), "api".to_string())]),
+            "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
         )];
         resolver.install_policy_scopes_from_workloads(&workloads);
 
-        let pod_uid = parse_pod_uid("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap();
         resolver.upsert_identity(NodeWaypointIdentity::new(
             pod_uid,
             spiffe("spiffe://td/ns/default/sa/api"),
@@ -1605,11 +2179,12 @@ mod tests {
             spiffe("spiffe://td/ns/default/sa/api"),
         ));
 
-        let workloads = vec![workload(
+        let workloads = vec![workload_with_uid(
             "spiffe://td/ns/default/sa/api",
             "default",
             "api",
             HashMap::from([("app".to_string(), "api".to_string())]),
+            "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
         )];
         let snapshot = resolver.build_policy_scope_snapshot_from_workloads(&workloads);
 
@@ -1626,86 +2201,73 @@ mod tests {
         assert_eq!(scope.labels.get("app").map(String::as_str), Some("api"));
     }
 
+    /// Scope publication needs no enrolled identity: building a staged snapshot
+    /// from a uid-bearing workload and installing it publishes the per-UID scope
+    /// even though no identity is ever enrolled for the pod. Scope is keyed by
+    /// the slice's `metadata.uid`, decoupled from identity enrollment order. The
+    /// staged snapshot must still not leak into live authz before install.
     #[test]
-    fn staged_policy_scope_snapshot_includes_identity_enrolled_before_install() {
+    fn slice_install_publishes_scope_without_enrolled_identity() {
         let resolver = NodeWaypointIdentityResolver::new(0);
         let pod_uid = parse_pod_uid("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap();
 
-        let workloads = vec![workload(
+        let workloads = vec![workload_with_uid(
             "spiffe://td/ns/default/sa/api",
             "default",
             "api",
             HashMap::from([("app".to_string(), "api".to_string())]),
+            "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
         )];
         let snapshot = resolver.build_policy_scope_snapshot_from_workloads(&workloads);
 
-        resolver.upsert_identity(NodeWaypointIdentity::new(
-            pod_uid,
-            spiffe("spiffe://td/ns/default/sa/api"),
-        ));
+        // No identity enrolled, and the candidate snapshot is not yet installed.
         assert!(
             resolver.policy_scope_for_pod(&pod_uid).is_none(),
-            "identity enrolled before accepted slice install must not publish candidate scope early"
+            "staged scopes must not leak into live authz before install"
         );
 
         resolver.install_policy_scope_snapshot(snapshot);
 
         let scope = resolver
             .policy_scope_for_pod(&pod_uid)
-            .expect("install should rebuild pod map from current identities");
+            .expect("install publishes the per-UID scope with no identity required");
         assert_eq!(scope.labels.get("app").map(String::as_str), Some("api"));
     }
 
+    /// Per-pod scope is reclaimed by SLICE updates, not identity lifecycle: a
+    /// later slice that no longer carries the pod's workload (its UID leaves the
+    /// per-UID index) makes the pod fail closed, even while its identity is still
+    /// enrolled. This is the bound that keeps `scopes_by_pod_uid` from growing —
+    /// install rebuilds it wholesale from the new workload set.
     #[test]
-    fn staged_policy_scope_snapshot_excludes_identity_removed_before_install() {
+    fn later_slice_dropping_workload_reclaims_pod_scope() {
         let resolver = NodeWaypointIdentityResolver::new(0);
         let pod_uid = parse_pod_uid("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap();
         resolver.upsert_identity(NodeWaypointIdentity::new(
             pod_uid,
             spiffe("spiffe://td/ns/default/sa/api"),
         ));
-
-        let workloads = vec![workload(
+        resolver.install_policy_scopes_from_workloads(&[workload_with_uid(
             "spiffe://td/ns/default/sa/api",
             "default",
             "api",
             HashMap::from([("app".to_string(), "api".to_string())]),
-        )];
-        let snapshot = resolver.build_policy_scope_snapshot_from_workloads(&workloads);
+            "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        )]);
+        assert!(resolver.policy_scope_for_pod(&pod_uid).is_some());
 
-        resolver.remove_identity(&pod_uid);
-        resolver.install_policy_scope_snapshot(snapshot);
-
+        // A later slice drops the workload (e.g. the pod was deleted). The
+        // identity may still be enrolled, but the pod's UID is no longer in the
+        // per-UID index → it fails closed.
+        resolver.install_policy_scopes_from_workloads(std::iter::empty());
         assert!(
             resolver.policy_scope_for_pod(&pod_uid).is_none(),
-            "install must not resurrect a scope for an identity removed after staging"
+            "a workload absent from the new slice must reclaim the pod's scope"
         );
     }
 
     #[test]
-    fn remove_identity_removes_policy_scope() {
-        let resolver = NodeWaypointIdentityResolver::new(0);
-        let workloads = vec![workload(
-            "spiffe://td/ns/default/sa/api",
-            "default",
-            "api",
-            HashMap::from([("app".to_string(), "api".to_string())]),
-        )];
-        resolver.install_policy_scopes_from_workloads(&workloads);
-        let pod_uid = parse_pod_uid("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap();
-        resolver.upsert_identity(NodeWaypointIdentity::new(
-            pod_uid,
-            spiffe("spiffe://td/ns/default/sa/api"),
-        ));
-        assert!(resolver.policy_scope_for_pod(&pod_uid).is_some());
-
-        resolver.remove_identity(&pod_uid);
-
-        assert!(resolver.policy_scope_for_pod(&pod_uid).is_none());
-    }
-
-    #[test]
-    fn build_per_pod_scopes_from_workloads_empty_workloads_returns_empty_map() {
+    fn empty_slice_derives_no_per_pod_scope() {
         let resolver = NodeWaypointIdentityResolver::new(0);
         let pod_a = parse_pod_uid("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap();
         resolver.upsert_identity(NodeWaypointIdentity::new(
@@ -1713,8 +2275,10 @@ mod tests {
             spiffe("spiffe://td/ns/default/sa/api"),
         ));
 
-        let map: HashMap<_, _> = resolver.build_per_pod_scopes_from_workloads(std::iter::empty());
-        assert!(map.is_empty());
+        // Installing an empty workload set leaves the slice's per-UID scope index
+        // empty, so the pod's UID is absent and it resolves no per-pod scope.
+        resolver.install_policy_scopes_from_workloads(std::iter::empty());
+        assert!(resolver.policy_scope_for_pod(&pod_a).is_none());
     }
 
     #[test]
@@ -1722,11 +2286,13 @@ mod tests {
         // Regression guard for the documented hot-path contract:
         // - 1x cookie_records.get
         // - 1x identities_by_pod_uid.get
+        // - 1x slice.load + HashMap lookups (gate re-validation + per-UID scope
+        //   lookup; one ArcSwap load serves both, no allocation)
         // - 0 allocations on success
         //
-        // We assert the structural shape (two DashMaps, one Arc clone) by
-        // making the same call twice and confirming both arms hit warm
-        // entries without re-inserting anything. If a future refactor adds
+        // We assert the structural shape (two DashMaps, one ArcSwap load, one
+        // Arc clone) by making the same call twice and confirming both arms hit
+        // warm entries without re-inserting anything. If a future refactor adds
         // a third DashMap probe or an alloc, this test still passes, but the
         // module-level rustdoc is the source of truth and any change here that
         // adds work must update that contract.
@@ -1735,10 +2301,11 @@ mod tests {
         let identity = NodeWaypointIdentity::new(pod_uid, spiffe("spiffe://td/ns/default/sa/api"));
         let hash = identity.workload_spiffe_hash;
         let stored = resolver.upsert_identity(identity);
+        vouch_for_workloads(&resolver, &["spiffe://td/ns/default/sa/api"]);
         resolver.record_orig_dst4(7, orig_dst4(pod_uid, hash));
 
-        let first = resolver.resolve_cookie(7).expect("warm v4 cookie");
-        let second = resolver.resolve_cookie(7).expect("repeat warm v4 cookie");
+        let (first, _scope) = resolver.resolve_cookie(7).expect("warm v4 cookie");
+        let (second, _scope) = resolver.resolve_cookie(7).expect("repeat warm v4 cookie");
         // Same Arc reused, no rebuild.
         assert!(Arc::ptr_eq(&first, &stored));
         assert!(Arc::ptr_eq(&second, &stored));
@@ -1756,9 +2323,10 @@ mod tests {
         let identity = NodeWaypointIdentity::new(pod_uid, spiffe("spiffe://td/ns/default/sa/api"));
         let hash = identity.workload_spiffe_hash;
         resolver.upsert_identity(identity);
+        vouch_for_workloads(&resolver, &["spiffe://td/ns/default/sa/api"]);
         resolver.record_orig_dst6(42, orig_dst6(pod_uid, hash));
 
-        let resolved = resolver
+        let (resolved, _scope) = resolver
             .resolve_cookie(42)
             .expect("v6-only cookie resolves");
         assert_eq!(resolved.pod_uid, pod_uid);
@@ -1820,26 +2388,25 @@ mod tests {
     fn bridge_recorded_cookie_resolves_to_identity() {
         // Exercises the resolver's cookie→identity lookup mechanics IN
         // ISOLATION: a record (as record_orig_dst4 would mirror it) plus a
-        // hand-enrolled identity under the same cookie resolves. This is NOT
-        // the production end-to-end accept path, which differs in two staged
-        // ways (see the `orig_dst_bridge` module docs): (1) the accept path
-        // looks up the *accept-side* socket cookie, not the connect-side cookie
-        // the bridge records (the GAP-2M registrar that bridges them is not yet
-        // implemented), and (2) `identities_by_pod_uid` is enrolled by hand
-        // here, whereas no production path yet populates it from slice
-        // workloads. The single cookie + manual enroll deliberately pin the
-        // resolver logic; this does not prove live resolution succeeds.
+        // pre-enrolled identity under the same cookie resolves. Production now
+        // resolves the *accept-side* socket cookie bridged by the GAP-2M
+        // sock_ops program and enrolls identities through the lazy hash-join at
+        // resolve time; here we seed both sides by hand (the slice index via
+        // `vouch_for_workloads`, the identity via `upsert_identity`) and a single
+        // cookie record, so this pins the resolver logic rather than proving the
+        // live end-to-end datapath.
         let resolver = NodeWaypointIdentityResolver::new(0);
         let spiffe_id = spiffe("spiffe://td/ns/default/sa/api");
         let pod_uid = [9u8; 16];
         let hash = workload_spiffe_hash(&spiffe_id);
 
         resolver.upsert_identity(NodeWaypointIdentity::new(pod_uid, spiffe_id.clone()));
+        vouch_for_workloads(&resolver, &["spiffe://td/ns/default/sa/api"]);
         // The bridge mirrors the BPF record (stamped with pod_uid + hash by
         // the connect hook) into the resolver.
         resolver.record_orig_dst4(77, orig_dst4(pod_uid, hash));
 
-        let resolved = resolver.resolve_cookie(77).expect("cookie resolves");
+        let (resolved, _scope) = resolver.resolve_cookie(77).expect("cookie resolves");
         assert_eq!(resolved.pod_uid, pod_uid);
         assert_eq!(resolved.spiffe_id, spiffe_id);
     }

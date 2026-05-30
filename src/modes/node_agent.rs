@@ -63,6 +63,13 @@ pub struct NodeAgentConfig {
     /// `FERRUM_K8S_TRUST_DOMAIN` (default `cluster.local`) so it matches the
     /// CP-side SPIFFE format that the node-waypoint resolver enrolls.
     pub trust_domain: String,
+    /// Directory under which the node-agent publishes a per-pod registry file
+    /// (`<dir>/<pod_uid>` containing the pod cgroup path) for the mesh proxy's
+    /// in-netns capture listeners to consume. `Some` only when in-netns
+    /// listeners are enabled AND the proxy mode is `NodeWaypoint`; `None`
+    /// disables publishing entirely (the registry is meaningless outside that
+    /// topology). Sourced from `FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR`.
+    pub node_waypoint_pod_registry_dir: Option<std::path::PathBuf>,
 }
 
 /// CNI plugin listener configuration. Resolved from the env config in
@@ -97,6 +104,20 @@ impl NodeAgentConfig {
         }
 
         let mut capture_config = CaptureConfig::from_env()?;
+        // Both the node-agent and the mesh proxy read FERRUM_MESH_OUTBOUND_LISTEN_ADDR
+        // (default 127.0.0.1:15001), so the eBPF connect4 rewrite port and the
+        // proxy's in-netns listener stay aligned — co-deployed node-waypoint
+        // node-agent + proxy must set this env consistently. Port 0 means the
+        // proxy disables its outbound listener, so disable outbound capture here
+        // too (no connect4/connect6, no in-netns registry) rather than rewrite
+        // egress to a dead loopback port; inbound capture is unaffected.
+        match resolve_ferrum_var("FERRUM_MESH_OUTBOUND_LISTEN_ADDR")
+            .and_then(|raw| raw.trim().parse::<std::net::SocketAddr>().ok())
+        {
+            Some(addr) if addr.port() == 0 => capture_config.outbound_capture_enabled = false,
+            Some(addr) => capture_config.outbound_port = addr.port(),
+            None => {}
+        }
         capture_config.ensure_exclude_port(env_config.node_agent_hbone_redirect_port);
         let cgroup_root = resolve_ferrum_var("FERRUM_NODE_AGENT_CGROUP_ROOT")
             .unwrap_or_else(|| DEFAULT_CGROUP_ROOT.to_string());
@@ -117,12 +138,34 @@ impl NodeAgentConfig {
                 })
                 .unwrap_or_default();
         let excluded_namespaces = pod_watcher::build_excluded_namespaces(&extra_excluded);
-        let capture_contract = CaptureContract::new(
+        let mut capture_contract = CaptureContract::new(
             env_config.node_agent_proxy_mode,
             capture_config.outbound_port,
             env_config.node_agent_hbone_redirect_port,
             DEFAULT_NODE_AGENT_SOCKET_PATH,
         )?;
+
+        // In-netns capture is the default for NodeWaypoint: publish the per-pod
+        // registry (and defer redirect until the mesh proxy's in-netns listener
+        // is ready) whenever the node-agent runs in NodeWaypoint proxy mode with
+        // outbound capture enabled. Other proxy modes have no in-netns listener
+        // consumer, so leave it `None` and skip all the filesystem work on the
+        // hot paths.
+        let node_waypoint_in_netns = env_config.node_agent_proxy_mode
+            == NodeAgentProxyMode::NodeWaypoint
+            && capture_config.outbound_capture_enabled;
+        // The in-netns listener and GAP-2M sock-ops bridge are IPv4-only, so
+        // captured IPv6 egress must FAIL CLOSED (the `connect6` hook returns
+        // EPERM via this flag) rather than bypass `mesh_authz`. Excluded v6
+        // (CIDR/port excludes) is decided before the deny and still flows.
+        capture_contract.ipv6_outbound_deny = node_waypoint_in_netns;
+        let node_waypoint_pod_registry_dir = if node_waypoint_in_netns {
+            Some(std::path::PathBuf::from(
+                &env_config.mesh_node_waypoint_pod_registry_dir,
+            ))
+        } else {
+            None
+        };
 
         Ok(Self {
             node_name,
@@ -133,6 +176,7 @@ impl NodeAgentConfig {
             excluded_namespaces,
             capture_contract,
             trust_domain: env_config.k8s_trust_domain.clone(),
+            node_waypoint_pod_registry_dir,
         })
     }
 }
@@ -387,7 +431,7 @@ async fn run_with_backend(
     startup_ready: Arc<AtomicBool>,
     cni_config: CniListenerConfig,
 ) -> Result<(), anyhow::Error> {
-    initialize_backend(backend.as_mut(), config)?;
+    initialize_backend(backend.as_mut(), config, metrics.as_ref())?;
 
     let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
 
@@ -427,6 +471,16 @@ async fn run_with_backend(
         config.node_name
     );
 
+    // Node-waypoint deferred-redirect promotion (in-netns capture). When the pod
+    // registry is published, `handle_pod_added` defers connect4/connect6; this
+    // timer drives `promote_pending_redirects` to enable them once the mesh
+    // proxy has opened each pod's in-netns listener. Disabled (the select arm is
+    // gated off) when in-netns capture publishing is off.
+    let redirect_gate_enabled = config.node_waypoint_pod_registry_dir.is_some();
+    let mut redirect_promote_interval = tokio::time::interval(REDIRECT_PROMOTE_INTERVAL);
+    let mut redirect_state: HashMap<String, (RedirectAttachmentKey, RedirectPromotion)> =
+        HashMap::new();
+
     loop {
         if *shutdown_rx.borrow() {
             break;
@@ -450,7 +504,7 @@ async fn run_with_backend(
                     }
                     Some(Ok(Event::Delete(pod))) => {
                         if let Some(uid) = pod_uid(&pod) {
-                            handle_pod_removed(backend.as_mut(), &pod_states, metrics.as_ref(), &uid);
+                            handle_pod_removed(backend.as_mut(), &pod_states, config, metrics.as_ref(), &uid);
                         }
                     }
                     Some(Ok(Event::Init)) => {
@@ -475,7 +529,7 @@ async fn run_with_backend(
                                 .map(|entry| entry.key().clone())
                                 .collect();
                             for uid in stale_uids {
-                                handle_pod_removed(backend.as_mut(), &pod_states, metrics.as_ref(), &uid);
+                                handle_pod_removed(backend.as_mut(), &pod_states, config, metrics.as_ref(), &uid);
                             }
                         }
                         startup_ready.store(true, Ordering::Release);
@@ -512,6 +566,17 @@ async fn run_with_backend(
                     }
                 }
             }
+            _ = redirect_promote_interval.tick(), if redirect_gate_enabled => {
+                if let Some(registry_dir) = config.node_waypoint_pod_registry_dir.as_deref() {
+                    promote_pending_redirects(
+                        backend.as_mut(),
+                        &pod_states,
+                        metrics.as_ref(),
+                        &mut redirect_state,
+                        |uid| in_netns_listener_ready(registry_dir, uid),
+                    );
+                }
+            }
         }
     }
 
@@ -522,7 +587,7 @@ async fn run_with_backend(
         attached_pods = pod_states.len(),
         "Node agent shutting down, detaching BPF programs"
     );
-    cleanup_all_pods(backend.as_mut(), &pod_states);
+    cleanup_all_pods(backend.as_mut(), &pod_states, config);
 
     if let Some(handle) = cni_listener_handle
         && let Err(err) = handle.await
@@ -686,7 +751,7 @@ fn apply_cni_add_from_pod(
 pub fn apply_cni_request(
     backend: &mut dyn EbpfBackend,
     pod_states: &DashMap<String, PodAttachmentState>,
-    _config: &NodeAgentConfig,
+    config: &NodeAgentConfig,
     metrics: &NodeAgentMetrics,
     request: &CniRpcRequest,
 ) -> CniRpcResponse {
@@ -715,7 +780,7 @@ pub fn apply_cni_request(
                         .to_string(),
                 };
             }
-            handle_pod_removed(backend, pod_states, metrics, event.pod_uid);
+            handle_pod_removed(backend, pod_states, config, metrics, event.pod_uid);
             CniRpcResponse::Ok
         }
         RpcVerb::Check => {
@@ -795,31 +860,6 @@ fn parse_pod_include_outbound_ports(
     }
 }
 
-/// Read the cgroup id (kernel inode number, which is what
-/// `bpf_get_current_cgroup_id` returns) for an enrolled pod's cgroup path.
-/// Returns `None` on stat error so the node-agent can warn and continue
-/// without aborting enrollment — losing per-pod narrowing is a graceful
-/// degradation, not a fatal condition.
-#[cfg(unix)]
-fn read_cgroup_id_for_pod(cgroup_path: &str) -> Option<u64> {
-    use std::os::unix::fs::MetadataExt;
-    match std::fs::metadata(cgroup_path) {
-        Ok(meta) => Some(meta.ino()),
-        Err(e) => {
-            debug!(cgroup_path, error = %e, "Failed to stat cgroup for includeOutboundPorts; per-pod narrowing skipped");
-            None
-        }
-    }
-}
-
-#[cfg(not(unix))]
-fn read_cgroup_id_for_pod(_cgroup_path: &str) -> Option<u64> {
-    // The node-agent only ships on Linux; this stub keeps non-Unix builds
-    // (developer macOS / Windows for tests) compiling without pulling in
-    // platform-specific deps.
-    None
-}
-
 /// Convert a parsed pod-level [`IncludeOutboundPorts`] into the BPF wire
 /// shape. Emits a `warn!` when the explicit-port list overflows the BPF
 /// map's per-entry cap; the resulting policy still narrows traffic but to
@@ -847,23 +887,30 @@ fn include_outbound_ports_to_policy(
 /// Outcome of writing (or attempting to write) a pod's parsed
 /// `includeOutboundPorts` annotation into the BPF map.
 ///
-/// Carries both the cgroup id the entry is keyed on (so removal can use
-/// it without re-statting the cgroup) and the [`IncludePortsPolicy`]
-/// actually written, so the watcher can diff against this baseline on
-/// the next Modified event and skip BPF map churn when the parsed value
-/// has not changed.
+/// Carries the cgroup ids the entry was written under — the pod cgroup inode
+/// plus every descendant container-cgroup inode (`connect4`/`connect6` look up
+/// `FERRUM_INCLUDE_PORTS` by the *leaf* cgroup, so the policy must live under
+/// the whole subtree, not just the pod inode) — so removal can drop every entry
+/// without re-statting the cgroup tree, and the [`IncludePortsPolicy`] actually
+/// written, so the watcher can diff against this baseline on the next Modified
+/// event and skip BPF map churn when the parsed value has not changed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AppliedIncludePorts {
-    cgroup_id: u64,
+    cgroup_ids: Vec<u64>,
     policy: IncludePortsPolicy,
 }
 
-/// Push the parsed per-pod include-port policy into the BPF map. Returns
-/// the cgroup id and policy we wrote so callers can stash both on
-/// `PodAttachmentState`: the cgroup id is the removal key, the policy is
-/// the diff baseline for mid-life Modified events. Returns `None` when
-/// there's nothing to write (no annotation, malformed annotation, or
-/// cgroup-id stat failed) — none of which should abort enrollment.
+/// Push the parsed per-pod include-port policy into the BPF map. Returns the
+/// cgroup ids and policy we wrote so callers can stash both on
+/// `PodAttachmentState`: the ids are the removal keys, the policy is the diff
+/// baseline for mid-life Modified events. The policy is written under the pod
+/// cgroup inode AND every descendant container-cgroup inode, because the
+/// `connect4`/`connect6` gate keys `FERRUM_INCLUDE_PORTS` by
+/// `bpf_get_current_cgroup_id()` (the container leaf cgroup) — writing only the
+/// pod inode would never match the hook's key and the narrowing would silently
+/// not engage. Returns `None` when there's nothing to write (no annotation,
+/// malformed annotation, no readable cgroup inode, or every write failing) —
+/// none of which should abort enrollment.
 fn apply_include_outbound_ports(
     backend: &mut dyn EbpfBackend,
     pod_uid: &str,
@@ -882,29 +929,48 @@ fn apply_include_outbound_ports(
             return None;
         }
     };
-    let cgroup_id = read_cgroup_id_for_pod(cgroup_path)?;
+    let cgroup_ids = cgroup::collect_cgroup_tree_inodes(std::path::Path::new(cgroup_path));
+    if cgroup_ids.is_empty() {
+        warn!(
+            pod_uid,
+            cgroup_path,
+            "Could not read any cgroup inode for pod; includeOutboundPorts narrowing will not engage"
+        );
+        return None;
+    }
     let policy = include_outbound_ports_to_policy(pod_uid, &include);
-    match backend.update_pod_include_ports(cgroup_id, &policy) {
-        Ok(()) => {
-            debug!(
-                pod_uid,
-                cgroup_id,
-                all_ports = policy.is_all_ports(),
-                port_count = policy.port_count,
-                "Wrote per-pod includeOutboundPorts entry to BPF map"
-            );
-            Some(AppliedIncludePorts { cgroup_id, policy })
-        }
-        Err(e) => {
-            warn!(
-                pod_uid,
-                cgroup_id,
-                error = %e,
-                "Failed to update FERRUM_INCLUDE_PORTS for pod; capture will not narrow"
-            );
-            None
+    let mut written = Vec::with_capacity(cgroup_ids.len());
+    for cgroup_id in cgroup_ids {
+        match backend.update_pod_include_ports(cgroup_id, &policy) {
+            Ok(()) => written.push(cgroup_id),
+            Err(e) => {
+                warn!(
+                    pod_uid,
+                    cgroup_id,
+                    error = %e,
+                    "Failed to write FERRUM_INCLUDE_PORTS for a pod cgroup inode; that cgroup's capture will not narrow"
+                );
+            }
         }
     }
+    if written.is_empty() {
+        warn!(
+            pod_uid,
+            "No FERRUM_INCLUDE_PORTS entries written for pod; capture will not narrow"
+        );
+        return None;
+    }
+    debug!(
+        pod_uid,
+        cgroup_ids = written.len(),
+        all_ports = policy.is_all_ports(),
+        port_count = policy.port_count,
+        "Wrote per-pod includeOutboundPorts entries across pod cgroup tree"
+    );
+    Some(AppliedIncludePorts {
+        cgroup_ids: written,
+        policy,
+    })
 }
 
 /// Build the source workload identity for a pod and write it into the
@@ -914,11 +980,19 @@ fn apply_include_outbound_ports(
 /// CP-side format the node-waypoint resolver enrolls; the hash uses the same
 /// `workload_spiffe_hash` algorithm as the resolver so the two agree.
 ///
-/// Best-effort: a bad pod UID, an un-buildable SPIFFE ID, a cgroup-id stat
-/// failure, or a BPF write error logs and returns `None` without aborting
-/// enrollment. When this is skipped the connect hooks fall back to the
-/// all-zero sentinel and node-waypoint resolution fails closed for that pod —
-/// the same posture as before identity stamping existed.
+/// The identity is written under the pod cgroup inode AND every descendant
+/// container-cgroup inode (`cgroup::collect_cgroup_tree_inodes`). The connect
+/// hooks look the identity up by `bpf_get_current_cgroup_id()`, which is the
+/// *container* leaf cgroup — a child of the pod cgroup on every Kubernetes
+/// cgroup driver — so writing only the pod inode would never match the hook's
+/// key and resolution would silently fail closed in real pods.
+///
+/// Returns the cgroup inodes successfully written (the un-enrollment keys), or
+/// an empty Vec on any total failure (bad pod UID, un-buildable SPIFFE ID, no
+/// readable cgroup inode, or every BPF write failing). Best-effort: an empty
+/// return logs and does not abort enrollment — the connect hooks then fall back
+/// to the all-zero sentinel and node-waypoint resolution fails closed for that
+/// pod, the same posture as before identity stamping existed.
 fn apply_workload_identity(
     backend: &mut dyn EbpfBackend,
     config: &NodeAgentConfig,
@@ -926,33 +1000,55 @@ fn apply_workload_identity(
     namespace: &str,
     service_account: Option<&str>,
     cgroup_path: &str,
-) -> Option<u64> {
-    let identity = build_workload_identity(
+) -> Vec<u64> {
+    let Some(identity) = build_workload_identity(
         pod_uid,
         namespace,
         service_account.unwrap_or("default"),
         &config.trust_domain,
-    )?;
-    let cgroup_id = read_cgroup_id_for_pod(cgroup_path)?;
-    match backend.update_workload_identity(cgroup_id, &identity) {
-        Ok(()) => {
-            debug!(
-                pod_uid,
-                cgroup_id, "Wrote source workload identity to FERRUM_WORKLOAD_IDENTITY"
-            );
-            Some(cgroup_id)
-        }
-        Err(e) => {
-            warn!(
-                pod_uid,
-                cgroup_id,
-                error = %e,
-                "Failed to update FERRUM_WORKLOAD_IDENTITY for pod; node-waypoint identity \
-                 resolution will fail closed for traffic from this pod"
-            );
-            None
+    ) else {
+        return Vec::new();
+    };
+    let cgroup_ids = cgroup::collect_cgroup_tree_inodes(std::path::Path::new(cgroup_path));
+    if cgroup_ids.is_empty() {
+        warn!(
+            pod_uid,
+            cgroup_path,
+            "Could not read any cgroup inode for pod; node-waypoint identity resolution will \
+             fail closed for traffic from this pod"
+        );
+        return Vec::new();
+    }
+
+    let mut written = Vec::with_capacity(cgroup_ids.len());
+    for cgroup_id in cgroup_ids {
+        match backend.update_workload_identity(cgroup_id, &identity) {
+            Ok(()) => written.push(cgroup_id),
+            Err(e) => {
+                warn!(
+                    pod_uid,
+                    cgroup_id,
+                    error = %e,
+                    "Failed to write FERRUM_WORKLOAD_IDENTITY for a pod cgroup inode; \
+                     traffic from that cgroup will fail closed"
+                );
+            }
         }
     }
+    if written.is_empty() {
+        warn!(
+            pod_uid,
+            "No FERRUM_WORKLOAD_IDENTITY entries written for pod; node-waypoint identity \
+             resolution will fail closed for traffic from this pod"
+        );
+    } else {
+        debug!(
+            pod_uid,
+            cgroup_ids = written.len(),
+            "Wrote source workload identity to FERRUM_WORKLOAD_IDENTITY across pod cgroup tree"
+        );
+    }
+    written
 }
 
 /// Construct the `WorkloadIdentity` for a pod from its UID and the derived
@@ -1070,6 +1166,234 @@ pub struct PodEvent<'a> {
     pub veth_iface_override: Option<&'a str>,
 }
 
+/// Reject a `pod_uid` that could escape the registry directory. A pod UID is a
+/// Kubernetes-assigned value; treating it as a path component without checks
+/// would let an empty, slash-, backslash-, or `..`-bearing value write or
+/// delete files outside `dir`. Returns `true` when the UID is unsafe to use as
+/// a leaf filename.
+fn pod_registry_uid_is_unsafe(pod_uid: &str) -> bool {
+    pod_uid.is_empty() || pod_uid.contains('/') || pod_uid.contains('\\') || pod_uid.contains("..")
+}
+
+/// Best-effort publish of a single pod's registry entry: ensure `dir` exists,
+/// then write `dir/<pod_uid>` containing `cgroup_path` on one line. The mesh
+/// proxy's in-netns capture listeners poll this directory. Never panics and
+/// never propagates: any I/O error (or an unsafe `pod_uid`) is logged at
+/// `warn!` and swallowed so pod enrollment is never aborted by registry I/O.
+fn publish_pod_registry(
+    dir: &std::path::Path,
+    pod_uid: &str,
+    cgroup_path: &str,
+    pod_ip: Option<std::net::Ipv4Addr>,
+) {
+    if pod_registry_uid_is_unsafe(pod_uid) {
+        warn!(
+            pod_uid,
+            "Refusing to publish node-waypoint pod registry entry: pod UID is empty or contains \
+             path separators / '..'"
+        );
+        return;
+    }
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        warn!(
+            pod_uid,
+            dir = %dir.display(),
+            error = %e,
+            "Failed to create node-waypoint pod registry directory"
+        );
+        return;
+    }
+    let path = dir.join(pod_uid);
+    // Line 1: pod cgroup path. Line 2 (optional): source pod IP — the mesh
+    // proxy uses it to override the loopback peer of in-netns capture
+    // connections so authz/logs/IP-keyed plugins see the real pod IP.
+    let contents = match pod_ip {
+        Some(ip) => format!("{cgroup_path}\n{ip}\n"),
+        None => format!("{cgroup_path}\n"),
+    };
+    if let Err(e) = std::fs::write(&path, contents) {
+        warn!(
+            pod_uid,
+            path = %path.display(),
+            error = %e,
+            "Failed to write node-waypoint pod registry entry"
+        );
+    }
+}
+
+/// Best-effort removal of a single pod's registry entry (`dir/<pod_uid>`).
+/// A missing file is treated as success (the entry was never published or was
+/// already cleaned up); any other I/O error (or an unsafe `pod_uid`) is logged
+/// at `warn!` and swallowed.
+fn remove_pod_registry(dir: &std::path::Path, pod_uid: &str) {
+    if pod_registry_uid_is_unsafe(pod_uid) {
+        warn!(
+            pod_uid,
+            "Refusing to remove node-waypoint pod registry entry: pod UID is empty or contains \
+             path separators / '..'"
+        );
+        return;
+    }
+    let path = dir.join(pod_uid);
+    if let Err(e) = std::fs::remove_file(&path)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(
+            pod_uid,
+            path = %path.display(),
+            error = %e,
+            "Failed to remove node-waypoint pod registry entry"
+        );
+    }
+}
+
+/// Remove the mesh proxy's readiness marker `dir/.ready/<pod_uid>` on pod
+/// teardown. The proxy also removes it when its in-netns listener closes, but
+/// doing it here too closes the window where a same-UID re-enroll could observe
+/// a stale marker for the torn-down listener (and attach redirect to the new
+/// netns before a listener exists there). Best-effort; shares the registry
+/// path-safety guard.
+fn remove_pod_ready_marker(dir: &std::path::Path, pod_uid: &str) {
+    if pod_registry_uid_is_unsafe(pod_uid) {
+        return;
+    }
+    let path = dir.join(".ready").join(pod_uid);
+    if let Err(e) = std::fs::remove_file(&path)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(
+            pod_uid,
+            path = %path.display(),
+            error = %e,
+            "Failed to remove node-waypoint readiness marker"
+        );
+    }
+}
+
+/// Per-pod state for the deferred node-waypoint outbound-redirect promotion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RedirectPromotion {
+    /// Redirect not yet enabled; the value counts readiness checks seen so far.
+    Pending(u32),
+    /// Redirect programs attached — no further work for this pod.
+    Done,
+}
+
+/// The pod attachment target a ledger entry was recorded against: `(cgroup
+/// path, veth iface)`. It changes exactly when `handle_pod_added` re-enrolls a
+/// pod (a sandbox/veth change detaches connect4 and re-defers it), so comparing
+/// it lets the promotion restart a stale `Done` rather than skip the new netns
+/// forever (which would leave the re-enrolled pod un-captured until restart).
+type RedirectAttachmentKey = (Option<String>, Option<String>);
+
+/// How often the node-agent re-checks deferred pods for in-netns listener
+/// readiness before enabling their eBPF outbound redirect.
+const REDIRECT_PROMOTE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Enable the outbound redirect anyway after this many readiness checks without
+/// a ready signal, so a pod is never left un-captured forever when the mesh
+/// proxy never publishes a marker (e.g. it is not running on this node).
+/// ~30 s at [`REDIRECT_PROMOTE_INTERVAL`].
+const REDIRECT_PROMOTE_MAX_ATTEMPTS: u32 = 30;
+
+/// Production readiness predicate: the mesh proxy publishes a marker file at
+/// `<registry_dir>/.ready/<pod_uid>` once it has opened the pod's in-netns
+/// capture listener (see [`crate::proxy::netns_capture`]).
+fn in_netns_listener_ready(registry_dir: &std::path::Path, pod_uid: &str) -> bool {
+    registry_dir.join(".ready").join(pod_uid).exists()
+}
+
+/// Attach the deferred outbound-redirect program for an enrolled pod.
+///
+/// Only `connect4` is promoted here: it rewrites egress to the pod-loopback
+/// capture port, so it must wait for the proxy's in-netns listener (the
+/// readiness gate). `connect6` is NOT a redirect in NodeWaypoint mode and is NOT
+/// promoted here — the in-netns listener and GAP-2M bridge are IPv4-only, so
+/// `connect6` is attached up front at enrollment as a fail-closed denier (the
+/// `ipv6_outbound_deny` capture-config flag makes it return EPERM for captured
+/// v6), rejecting IPv6 egress rather than redirecting it to a v6 listener that
+/// does not exist or letting it bypass `mesh_authz`. It needs no listener so it
+/// is not readiness-gated. On failure the caller retries on the next tick; a
+/// succeeded attach is never repeated (no double-attach under
+/// `CgroupAttachMode::Single`).
+fn attach_outbound_redirect(
+    backend: &mut dyn EbpfBackend,
+    pod_uid: &str,
+    cgroup: &str,
+    metrics: &NodeAgentMetrics,
+) -> bool {
+    if let Err(e) = backend.attach_cgroup(pod_uid, cgroup, "ferrum_connect4") {
+        warn!(pod_uid, error = %e, "Failed to attach deferred connect4 outbound redirect; will retry");
+        metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    true
+}
+
+/// One promotion pass for deferred node-waypoint outbound redirect. Runs only
+/// when in-netns capture publishing is enabled. For each enrolled pod whose
+/// redirect is still pending, enable it once `is_ready(pod_uid)` reports the
+/// mesh proxy has opened the in-netns listener, with a bounded-attempts
+/// fallback so capture still engages if the signal never arrives. `is_ready` is
+/// injected so the bookkeeping is unit-testable without a live mesh proxy.
+fn promote_pending_redirects(
+    backend: &mut dyn EbpfBackend,
+    pod_states: &DashMap<String, PodAttachmentState>,
+    metrics: &NodeAgentMetrics,
+    redirect_state: &mut HashMap<String, (RedirectAttachmentKey, RedirectPromotion)>,
+    is_ready: impl Fn(&str) -> bool,
+) {
+    // Drop ledger entries for pods that are gone so it cannot grow unbounded.
+    redirect_state.retain(|uid, _| pod_states.contains_key(uid));
+
+    // Snapshot enrolled pods + their current attachment key; don't hold DashMap
+    // guards across the attach calls (which borrow `backend` mutably).
+    let candidates: Vec<(String, String, RedirectAttachmentKey)> = pod_states
+        .iter()
+        .filter_map(|entry| {
+            let state = entry.value();
+            if !state.attached {
+                return None;
+            }
+            let cgroup = state.cgroup_path.clone()?;
+            let key = (state.cgroup_path.clone(), state.veth_iface.clone());
+            Some((entry.key().clone(), cgroup, key))
+        })
+        .collect();
+
+    for (pod_uid, cgroup, key) in candidates {
+        // A stored entry whose attachment key differs is a re-enrollment (the
+        // pod's sandbox/veth changed → handle_pod_removed detached connect4 and
+        // the re-enroll deferred it again): restart from scratch instead of
+        // trusting a stale `Done`. Order matters — the key-mismatch arm must
+        // precede the `Done` arm so a re-enrolled, previously-Done pod requeues.
+        let attempts = match redirect_state.get(&pod_uid) {
+            Some((stored_key, _)) if *stored_key != key => 0,
+            Some((_, RedirectPromotion::Done)) => continue,
+            Some((_, RedirectPromotion::Pending(n))) => *n,
+            None => 0,
+        };
+        let ready = is_ready(&pod_uid);
+        if ready || attempts >= REDIRECT_PROMOTE_MAX_ATTEMPTS {
+            if attach_outbound_redirect(backend, &pod_uid, &cgroup, metrics) {
+                redirect_state.insert(pod_uid.clone(), (key, RedirectPromotion::Done));
+                info!(
+                    pod_uid = %pod_uid,
+                    listener_ready = ready,
+                    attempts,
+                    "Node-waypoint: enabled outbound redirect after in-netns listener readiness"
+                );
+            } else {
+                // connect4 attach failed; retry next tick at the same attempt
+                // count so the bounded fallback still applies eventually.
+                redirect_state.insert(pod_uid, (key, RedirectPromotion::Pending(attempts)));
+            }
+        } else {
+            redirect_state.insert(pod_uid, (key, RedirectPromotion::Pending(attempts + 1)));
+        }
+    }
+}
+
 pub fn handle_pod_added(
     backend: &mut dyn EbpfBackend,
     pod_states: &DashMap<String, PodAttachmentState>,
@@ -1086,7 +1410,7 @@ pub fn handle_pod_added(
     );
     if decision != EnrollmentDecision::Enroll {
         if pod_states.contains_key(pod_uid) {
-            handle_pod_removed(backend, pod_states, metrics, pod_uid);
+            handle_pod_removed(backend, pod_states, config, metrics, pod_uid);
         }
         debug!(
             pod_uid,
@@ -1115,7 +1439,7 @@ pub fn handle_pod_added(
                 .is_some_and(|iface| state.veth_iface.as_ref() != Some(iface));
         if attachment_target_changed {
             drop(state);
-            handle_pod_removed(backend, pod_states, metrics, pod_uid);
+            handle_pod_removed(backend, pod_states, config, metrics, pod_uid);
         } else {
             reconcile_existing_pod_ip(backend, config, metrics, pod_uid, pod_ip, &mut state);
             reconcile_existing_pod_include_ports(
@@ -1123,6 +1447,14 @@ pub fn handle_pod_added(
                 metrics,
                 pod_uid,
                 event.annotations,
+                &mut state,
+            );
+            reconcile_existing_pod_workload_identity(
+                backend,
+                config,
+                pod_uid,
+                namespace,
+                event.service_account,
                 &mut state,
             );
             debug!(pod_uid, pod_name, "Pod already enrolled, reconciled state");
@@ -1138,20 +1470,49 @@ pub fn handle_pod_added(
         cgroup_path: cgroup_path.clone(),
         veth_iface: veth_iface.clone(),
         attached: false,
-        include_ports_cgroup_id: None,
+        include_ports_cgroup_ids: Vec::new(),
         include_ports_policy: None,
-        workload_identity_cgroup_id: None,
+        workload_identity_cgroup_ids: Vec::new(),
     };
 
     if let Some(ref cgroup) = cgroup_path {
-        let programs = [
-            "ferrum_connect4",
-            "ferrum_connect6",
-            "ferrum_getpeername4",
-            "ferrum_getpeername6",
-        ];
+        // Attach inbound getpeername now; outbound-redirect handling depends on
+        // mode:
+        //  (a) outbound capture disabled (FERRUM_MESH_OUTBOUND_LISTEN_ADDR port
+        //      0) — connect4/connect6 are never attached and egress flows
+        //      normally (no capture, nothing to fail closed).
+        //  (b) NodeWaypoint in-netns capture — connect4 is DEFERRED (attaching it
+        //      now would rewrite a freshly enrolled pod's egress to the
+        //      pod-loopback capture port before the mesh proxy has opened the
+        //      in-netns listener, which would refuse it), so
+        //      `promote_pending_redirects` attaches connect4 once the proxy
+        //      signals readiness. connect6 IS attached now as a fail-closed
+        //      denier: the in-netns listener + sock-ops bridge are IPv4-only, so
+        //      the `ipv6_outbound_deny` capture-config flag makes connect6 return
+        //      EPERM for captured v6 — otherwise IPv6 egress would bypass
+        //      mesh_authz entirely. It needs no listener, so it is not deferred.
+        //  (c) otherwise (outbound on, non-NodeWaypoint) — attach all four up
+        //      front (connect6 redirects normally; the deny flag is unset).
+        let outbound_enabled = config.capture_config.outbound_capture_enabled;
+        let defer_redirect = config.node_waypoint_pod_registry_dir.is_some();
+        let programs: &[&str] = if !outbound_enabled {
+            &["ferrum_getpeername4", "ferrum_getpeername6"]
+        } else if defer_redirect {
+            &[
+                "ferrum_connect6",
+                "ferrum_getpeername4",
+                "ferrum_getpeername6",
+            ]
+        } else {
+            &[
+                "ferrum_connect4",
+                "ferrum_connect6",
+                "ferrum_getpeername4",
+                "ferrum_getpeername6",
+            ]
+        };
         let mut attach_ok = true;
-        for prog in &programs {
+        for prog in programs {
             if let Err(e) = backend.attach_cgroup(pod_uid, cgroup, prog) {
                 warn!(pod_uid, program = prog, error = %e, "Failed to attach cgroup program");
                 metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
@@ -1204,13 +1565,13 @@ pub fn handle_pod_added(
             if let Some(applied) =
                 apply_include_outbound_ports(backend, pod_uid, cgroup, event.annotations)
             {
-                state.include_ports_cgroup_id = Some(applied.cgroup_id);
+                state.include_ports_cgroup_ids = applied.cgroup_ids;
                 state.include_ports_policy = Some(applied.policy);
             }
             // GAP-1b: write the source workload identity so connect hooks can
             // stamp orig-dst records. Best-effort like include-ports; failure
             // leaves node-waypoint resolution failing closed for this pod.
-            state.workload_identity_cgroup_id = apply_workload_identity(
+            state.workload_identity_cgroup_ids = apply_workload_identity(
                 backend,
                 config,
                 pod_uid,
@@ -1225,8 +1586,8 @@ pub fn handle_pod_added(
                 pod_name,
                 namespace,
                 ?pod_ip,
-                include_ports_narrowing = state.include_ports_cgroup_id.is_some(),
-                workload_identity = state.workload_identity_cgroup_id.is_some(),
+                include_ports_cgroups = state.include_ports_cgroup_ids.len(),
+                workload_identity_cgroups = state.workload_identity_cgroup_ids.len(),
                 "Pod enrolled for eBPF capture"
             );
         } else if let Err(e) = backend.detach_pod(pod_uid) {
@@ -1243,6 +1604,18 @@ pub fn handle_pod_added(
 
     if state.attached {
         pod_states.insert(pod_uid.to_string(), state);
+        // Publish to the in-netns capture registry only AFTER enrollment fully
+        // succeeded (programs attached, pod-IP + identity written), so a failed
+        // or partial enrollment never leaves a stale entry that would make the
+        // mesh proxy open a listener for a pod that was never captured. Removal
+        // is handled by `handle_pod_removed`. Gated on the registry being
+        // configured (in-netns listeners + NodeWaypoint topology).
+        if let (Some(dir), Some(cgroup_path_value)) = (
+            &config.node_waypoint_pod_registry_dir,
+            cgroup_path.as_deref(),
+        ) {
+            publish_pod_registry(dir, pod_uid, cgroup_path_value, pod_ip);
+        }
     }
 }
 
@@ -1277,6 +1650,16 @@ fn reconcile_existing_pod_ip(
         metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
     }
     state.pod_ip = Some(new_ip);
+    // Keep the in-netns capture registry's pod IP in sync (line 2 of the entry)
+    // so the mesh proxy reopens its in-netns listener with the new
+    // `source_ip_override` instead of reporting a stale IP to authz/logs/IP-keyed
+    // plugins. Best-effort and gated on in-netns publishing being enabled.
+    if let (Some(dir), Some(cgroup)) = (
+        &config.node_waypoint_pod_registry_dir,
+        state.cgroup_path.as_deref(),
+    ) {
+        publish_pod_registry(dir, pod_uid, cgroup, Some(new_ip));
+    }
 }
 
 /// Re-evaluate the `includeOutboundPorts` annotations of an already-enrolled
@@ -1327,113 +1710,219 @@ fn reconcile_existing_pod_include_ports(
         }
     };
 
-    // Hot-path diff-skip: most Modified events are unrelated to capture
-    // annotations (status updates, container restart counts, etc.). The
-    // `Option<IncludePortsPolicy>` derives `PartialEq`, so this is a
-    // cheap structural compare — no allocations, no syscalls.
-    if desired == state.include_ports_policy {
+    // Cheap fast path for unannotated pods (the common case): no policy now and
+    // none before → nothing to reconcile, and crucially no cgroup-tree walk.
+    // Most Modified events (status updates, restart counts) hit this.
+    if desired.is_none() && state.include_ports_policy.is_none() {
         return;
     }
 
-    // Identity for removal/replace lookups. Prefer the cgroup id stashed
-    // at enrollment (still valid even if the cgroup path was rotated
-    // out from under us); fall back to re-statting the path only when
-    // we have no prior id (the pod was previously unannotated and is
-    // newly transitioning into having a policy).
-    let cgroup_id_for_lookup = state.include_ports_cgroup_id.or_else(|| {
-        state
-            .cgroup_path
-            .as_deref()
-            .and_then(read_cgroup_id_for_pod)
+    match desired {
+        Some(new_policy) => {
+            // Re-walk the whole pod cgroup subtree on every event (not just on a
+            // policy change): the `connect4`/`connect6` gate keys
+            // `FERRUM_INCLUDE_PORTS` by the container *leaf* cgroup, and
+            // container leaves start (and restart under fresh inodes) after the
+            // initial pod event — so a leaf that appears later must still pick up
+            // the policy or narrowing silently never engages for it. (The
+            // workload-identity reconcile re-walks for the same reason; here the
+            // per-event read_dir is paid only for annotated pods.)
+            let current = state
+                .cgroup_path
+                .as_deref()
+                .map(|path| cgroup::collect_cgroup_tree_inodes(std::path::Path::new(path)))
+                .unwrap_or_default();
+            if current.is_empty() {
+                // No readable cgroup inode yet (the Pod object reached the
+                // watcher before kubelet created the cgroup). Skip and let a
+                // future event retry; operationally normal, not a failure.
+                debug!(
+                    pod_uid,
+                    "Mid-life includeOutboundPorts update deferred: no cgroup inode available"
+                );
+                return;
+            }
+            let current_set: HashSet<u64> = current.iter().copied().collect();
+            let enrolled_set: HashSet<u64> =
+                state.include_ports_cgroup_ids.iter().copied().collect();
+            // Diff-skip: same policy AND same enrolled cgroup set → no map work.
+            if state.include_ports_policy.as_ref() == Some(&new_policy)
+                && current_set == enrolled_set
+            {
+                return;
+            }
+            // Drop entries for inodes that left the tree (a restarted
+            // container's old leaf) so they don't linger in the fixed-size map.
+            for cgroup_id in &state.include_ports_cgroup_ids {
+                if !current_set.contains(cgroup_id)
+                    && let Err(e) = backend.remove_pod_include_ports(*cgroup_id)
+                {
+                    warn!(
+                        pod_uid,
+                        cgroup_id = *cgroup_id,
+                        error = %e,
+                        "Failed to remove stale includeOutboundPorts entry for a departed cgroup inode"
+                    );
+                }
+            }
+            let mut written = Vec::with_capacity(current.len());
+            for cgroup_id in current {
+                match backend.update_pod_include_ports(cgroup_id, &new_policy) {
+                    Ok(()) => written.push(cgroup_id),
+                    Err(e) => warn!(
+                        pod_uid,
+                        cgroup_id,
+                        error = %e,
+                        "Failed to write mid-life includeOutboundPorts update for a cgroup inode"
+                    ),
+                }
+            }
+            if written.is_empty() {
+                metrics
+                    .pod_annotation_updates_failed
+                    .fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            let prev_summary = describe_policy(state.include_ports_policy.as_ref());
+            let new_summary = describe_policy(Some(&new_policy));
+            info!(
+                pod_uid,
+                cgroup_ids = written.len(),
+                prev_policy = %prev_summary,
+                new_policy = %new_summary,
+                "Re-applied mid-life pod includeOutboundPorts annotation update across cgroup tree"
+            );
+            state.include_ports_cgroup_ids = written;
+            state.include_ports_policy = Some(new_policy);
+            metrics
+                .pod_annotation_updates_applied
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        None => {
+            // The pod removed its annotation entirely → drop every entry so the
+            // gate fail-opens back to "capture everything" for this pod. Use the
+            // stashed ids (the cgroup tree may already be gone); ENOENT-tolerant.
+            if state.include_ports_cgroup_ids.is_empty() {
+                // Nothing was written (e.g. enrolled before the cgroup existed)
+                // but the baseline disagreed; just clear it for future diffs.
+                state.include_ports_policy = None;
+                return;
+            }
+            for cgroup_id in &state.include_ports_cgroup_ids {
+                if let Err(e) = backend.remove_pod_include_ports(*cgroup_id) {
+                    warn!(
+                        pod_uid,
+                        cgroup_id = *cgroup_id,
+                        error = %e,
+                        "Failed to drop mid-life pod includeOutboundPorts BPF entry"
+                    );
+                }
+            }
+            let prev_summary = describe_policy(state.include_ports_policy.as_ref());
+            info!(
+                pod_uid,
+                cgroup_ids = state.include_ports_cgroup_ids.len(),
+                prev_policy = %prev_summary,
+                "Mid-life pod removed includeOutboundPorts annotation; dropped BPF map entries"
+            );
+            state.include_ports_cgroup_ids.clear();
+            state.include_ports_policy = None;
+            metrics
+                .pod_annotation_updates_applied
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Re-walk an already-enrolled pod's cgroup tree on reconcile and reconcile the
+/// `FERRUM_WORKLOAD_IDENTITY` entries against it: write the source workload
+/// identity under newly-observed cgroup inodes and drop entries for inodes that
+/// have left the tree.
+///
+/// Container cgroups appear *after* the pod cgroup (containers start once the
+/// pod object exists) and rotate to fresh inodes on restart, so the leaf
+/// cgroups the connect hook reads via `bpf_get_current_cgroup_id()` may not
+/// have existed at initial enrollment. Kubernetes emits many Modified events
+/// over a pod's lifecycle (readiness, container statuses, IP), so re-walking
+/// here enrolls a newly-started container's cgroup within seconds.
+///
+/// A restarted container's old leaf `.scope` is deleted and recreated under a
+/// fresh inode, so this also removes entries whose inode has left the tree —
+/// otherwise every restart would leak one entry into the fixed-size (4096)
+/// `FERRUM_WORKLOAD_IDENTITY` map until pod deletion, eventually exhausting it
+/// and failing identity writes (hence node-waypoint resolution) for other pods.
+/// An empty walk means the pod cgroup itself is gone (pod teardown); leave that
+/// to `handle_pod_removed` rather than flushing live entries on a transient or
+/// teardown read. Best-effort: failures log and continue.
+fn reconcile_existing_pod_workload_identity(
+    backend: &mut dyn EbpfBackend,
+    config: &NodeAgentConfig,
+    pod_uid: &str,
+    namespace: &str,
+    service_account: Option<&str>,
+    state: &mut PodAttachmentState,
+) {
+    let Some(cgroup_path) = state.cgroup_path.clone() else {
+        return;
+    };
+    let current = cgroup::collect_cgroup_tree_inodes(std::path::Path::new(&cgroup_path));
+    if current.is_empty() {
+        return;
+    }
+    let current_set: HashSet<u64> = current.iter().copied().collect();
+
+    // Drop entries no longer present in the tree (e.g. a restarted container's
+    // old leaf cgroup) from both the BPF map and our tracking set.
+    state.workload_identity_cgroup_ids.retain(|cgroup_id| {
+        if current_set.contains(cgroup_id) {
+            return true;
+        }
+        match backend.remove_workload_identity(*cgroup_id) {
+            Ok(()) => debug!(
+                pod_uid,
+                cgroup_id = *cgroup_id,
+                "Removed stale (restarted-container) cgroup inode from FERRUM_WORKLOAD_IDENTITY"
+            ),
+            Err(e) => warn!(
+                pod_uid,
+                cgroup_id = *cgroup_id,
+                error = %e,
+                "Failed to remove stale pod cgroup inode from FERRUM_WORKLOAD_IDENTITY"
+            ),
+        }
+        false
     });
 
-    match (desired, cgroup_id_for_lookup) {
-        (Some(new_policy), Some(cgroup_id)) => {
-            // Add or replace. `update_pod_include_ports` is an insert-or-
-            // overwrite on the BPF HashMap; the kernel does not require
-            // explicit removal before re-insertion.
-            match backend.update_pod_include_ports(cgroup_id, &new_policy) {
-                Ok(()) => {
-                    let prev_summary = describe_policy(state.include_ports_policy.as_ref());
-                    let new_summary = describe_policy(Some(&new_policy));
-                    info!(
-                        pod_uid,
-                        cgroup_id,
-                        prev_policy = %prev_summary,
-                        new_policy = %new_summary,
-                        "Re-applied mid-life pod includeOutboundPorts annotation update to BPF map"
-                    );
-                    state.include_ports_cgroup_id = Some(cgroup_id);
-                    state.include_ports_policy = Some(new_policy);
-                    metrics
-                        .pod_annotation_updates_applied
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                Err(e) => {
-                    warn!(
-                        pod_uid,
-                        cgroup_id,
-                        error = %e,
-                        "Failed to re-apply mid-life pod includeOutboundPorts update; keeping previous policy"
-                    );
-                    metrics
-                        .pod_annotation_updates_failed
-                        .fetch_add(1, Ordering::Relaxed);
-                }
+    // Write the identity for newly-observed leaves.
+    let Some(identity) = build_workload_identity(
+        pod_uid,
+        namespace,
+        service_account.unwrap_or("default"),
+        &config.trust_domain,
+    ) else {
+        return;
+    };
+    for cgroup_id in current {
+        if state.workload_identity_cgroup_ids.contains(&cgroup_id) {
+            continue;
+        }
+        match backend.update_workload_identity(cgroup_id, &identity) {
+            Ok(()) => {
+                debug!(
+                    pod_uid,
+                    cgroup_id,
+                    "Enrolled newly-observed pod cgroup inode into FERRUM_WORKLOAD_IDENTITY"
+                );
+                state.workload_identity_cgroup_ids.push(cgroup_id);
             }
-        }
-        (None, Some(cgroup_id)) => {
-            // The pod removed its annotation entirely → drop the BPF
-            // entry so the gate fail-opens back to "capture everything"
-            // for this pod, matching pre-enrollment behavior.
-            match backend.remove_pod_include_ports(cgroup_id) {
-                Ok(()) => {
-                    let prev_summary = describe_policy(state.include_ports_policy.as_ref());
-                    info!(
-                        pod_uid,
-                        cgroup_id,
-                        prev_policy = %prev_summary,
-                        "Mid-life pod removed includeOutboundPorts annotation; dropped BPF map entry"
-                    );
-                    state.include_ports_cgroup_id = None;
-                    state.include_ports_policy = None;
-                    metrics
-                        .pod_annotation_updates_applied
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                Err(e) => {
-                    warn!(
-                        pod_uid,
-                        cgroup_id,
-                        error = %e,
-                        "Failed to drop mid-life pod includeOutboundPorts BPF entry; keeping previous policy"
-                    );
-                    metrics
-                        .pod_annotation_updates_failed
-                        .fetch_add(1, Ordering::Relaxed);
-                }
+            Err(e) => {
+                warn!(
+                    pod_uid,
+                    cgroup_id,
+                    error = %e,
+                    "Failed to write FERRUM_WORKLOAD_IDENTITY for a newly-observed pod cgroup inode"
+                );
             }
-        }
-        (Some(_), None) => {
-            // We want to write a new entry but have no cgroup id — most
-            // likely the pod was enrolled before its cgroup path
-            // existed (Kubernetes Pod object reaches the watcher before
-            // kubelet finishes creating the cgroup). Skip and let a
-            // future event retry; do NOT count this as a failure because
-            // it is operationally normal.
-            debug!(
-                pod_uid,
-                "Mid-life includeOutboundPorts update deferred: cgroup id unavailable"
-            );
-        }
-        (None, None) => {
-            // Nothing to write and nothing to remove. Reachable only if
-            // `desired` flipped from `None` to `None` in a way that
-            // disagreed with `state.include_ports_policy` (e.g. the
-            // baseline was `Some(_)` but the cgroup id was unknown when
-            // it was stashed). Clear the baseline so future diffs are
-            // consistent.
-            state.include_ports_policy = None;
         }
     }
 }
@@ -1458,9 +1947,23 @@ fn describe_policy(policy: Option<&IncludePortsPolicy>) -> String {
 pub fn handle_pod_removed(
     backend: &mut dyn EbpfBackend,
     pod_states: &DashMap<String, PodAttachmentState>,
+    config: &NodeAgentConfig,
     metrics: &NodeAgentMetrics,
     pod_uid: &str,
 ) {
+    // Drop this pod's per-pod registry entry (if publishing is enabled) so the
+    // mesh proxy's in-netns capture listeners stop discovering a torn-down pod.
+    // Best-effort and independent of whether the pod was actually attached: a
+    // pod that failed to fully enroll may still have a stale registry file.
+    if let Some(dir) = &config.node_waypoint_pod_registry_dir {
+        remove_pod_registry(dir, pod_uid);
+        // Also drop the proxy's readiness marker so a same-UID re-enroll within
+        // the proxy's ~2s reconcile window cannot observe a stale `ready` for the
+        // torn-down listener and attach redirect to the new netns before a
+        // listener exists there.
+        remove_pod_ready_marker(dir, pod_uid);
+    }
+
     let removed = pod_states.remove(pod_uid);
     let Some((_, state)) = removed else {
         return;
@@ -1475,31 +1978,32 @@ pub fn handle_pod_removed(
         {
             warn!(pod_uid, %ip, error = %e, "Failed to remove pod IP from map");
         }
-        // Pair with `apply_include_outbound_ports` — only annotated pods
-        // ever carried an entry. Use the stashed cgroup id so we don't
-        // re-stat the cgroup path, which may already have been torn down
-        // by kubelet.
-        if let Some(cgroup_id) = state.include_ports_cgroup_id
-            && let Err(e) = backend.remove_pod_include_ports(cgroup_id)
-        {
-            warn!(
-                pod_uid,
-                cgroup_id,
-                error = %e,
-                "Failed to remove pod includeOutboundPorts entry from BPF map"
-            );
+        // Pair with `apply_include_outbound_ports` — only annotated pods ever
+        // carried entries. Use the stashed cgroup ids (pod inode + descendant
+        // container-cgroup inodes) so we don't re-stat a possibly torn-down
+        // cgroup tree. Tolerates ENOENT per entry.
+        for cgroup_id in &state.include_ports_cgroup_ids {
+            if let Err(e) = backend.remove_pod_include_ports(*cgroup_id) {
+                warn!(
+                    pod_uid,
+                    cgroup_id = *cgroup_id,
+                    error = %e,
+                    "Failed to remove pod includeOutboundPorts entry from BPF map"
+                );
+            }
         }
         // GAP-1b: pair with `apply_workload_identity`. Use the stashed cgroup
-        // id so we don't re-stat a possibly torn-down cgroup path.
-        if let Some(cgroup_id) = state.workload_identity_cgroup_id
-            && let Err(e) = backend.remove_workload_identity(cgroup_id)
-        {
-            warn!(
-                pod_uid,
-                cgroup_id,
-                error = %e,
-                "Failed to remove pod workload-identity entry from BPF map"
-            );
+        // ids (pod inode + descendant container-cgroup inodes) so we don't
+        // re-stat a possibly torn-down cgroup tree. Tolerates ENOENT per entry.
+        for cgroup_id in &state.workload_identity_cgroup_ids {
+            if let Err(e) = backend.remove_workload_identity(*cgroup_id) {
+                warn!(
+                    pod_uid,
+                    cgroup_id = *cgroup_id,
+                    error = %e,
+                    "Failed to remove pod workload-identity entry from BPF map"
+                );
+            }
         }
         metrics.pods_unenrolled.fetch_add(1, Ordering::Relaxed);
         info!(pod_uid, pod_name = %state.pod_name, "Pod unenrolled from eBPF capture");
@@ -1769,6 +2273,7 @@ async fn execute_iptables_commands(commands: &[String], phase: &str) -> Result<(
 fn initialize_backend(
     backend: &mut dyn EbpfBackend,
     config: &NodeAgentConfig,
+    metrics: &NodeAgentMetrics,
 ) -> Result<(), anyhow::Error> {
     backend.load_programs().map_err(anyhow::Error::msg)?;
     backend
@@ -1802,14 +2307,24 @@ fn initialize_backend(
     // UID bypass).
 
     if config.capture_contract.proxy_mode == NodeAgentProxyMode::NodeWaypoint {
-        // Best-effort SOCK_OPS attach at cgroup root for TCP-layer
-        // observability in node-waypoint mode. A failure here only loses
-        // telemetry; capture (cgroup_sockaddr / tc) continues to operate.
+        // SOCK_OPS at the cgroup root carries BOTH TCP-layer telemetry AND the
+        // GAP-2M accept-side cookie bridge that node-waypoint per-pod identity
+        // resolution depends on. A failure here is therefore not merely lost
+        // counters: with no accept-side cookie stamping, every node-waypoint
+        // connection resolves `UnknownCookie` and scoped authz fails closed.
+        // Surface it as topology degradation (gauge + error) — not a quiet
+        // telemetry warning — so operators see identity resolution is down even
+        // though cgroup/tc capture continues.
         if let Err(e) = backend.attach_sock_ops(&config.cgroup_root) {
-            warn!(
+            metrics.set_topology_degraded("node_waypoint_sock_ops_unavailable");
+            error!(
                 cgroup_root = %config.cgroup_root,
                 error = %e,
-                "Failed to attach SOCK_OPS program; mesh-proxy will see zero TCP-layer counters"
+                "Failed to attach SOCK_OPS in node-waypoint mode: the GAP-2M accept-side \
+                 cookie bridge is not running, so per-pod source-identity resolution is \
+                 disabled and scoped node-waypoint authz will fail closed (TCP-layer \
+                 telemetry is also lost). cgroup/tc capture continues. Set \
+                 ferrum_mesh_node_topology_degraded{{reason=\"node_waypoint_sock_ops_unavailable\"}}=1."
             );
         }
     }
@@ -1821,9 +2336,17 @@ fn initialize_backend(
 fn cleanup_all_pods(
     backend: &mut dyn EbpfBackend,
     pod_states: &DashMap<String, PodAttachmentState>,
+    config: &NodeAgentConfig,
 ) {
     for entry in pod_states.iter() {
         let state = entry.value();
+        // Drop the in-netns registry entry + readiness marker so a mesh proxy
+        // that keeps running after this node-agent stops/restarts does not keep a
+        // dead in-netns listener open for a pod that is no longer enrolled.
+        if let Some(dir) = &config.node_waypoint_pod_registry_dir {
+            remove_pod_registry(dir, &state.pod_uid);
+            remove_pod_ready_marker(dir, &state.pod_uid);
+        }
         if state.attached
             && let Err(e) = backend.detach_pod(&state.pod_uid)
         {
@@ -1907,6 +2430,51 @@ mod tests {
     }
 
     #[test]
+    fn from_env_config_fail_closes_ipv6_only_in_node_waypoint_mode() {
+        // NodeWaypoint in-netns capture is IPv4-only, so the node-agent must mark
+        // the capture config to fail-close captured IPv6 egress (connect6 →
+        // EPERM) rather than let it bypass mesh_authz. Other proxy modes leave v6
+        // egress alone.
+        let waypoint = EnvConfig {
+            node_agent_proxy_mode: NodeAgentProxyMode::NodeWaypoint,
+            ..EnvConfig::default()
+        };
+        with_env_vars(&[("FERRUM_NODE_AGENT_NODE_NAME", "node-a")], || {
+            let config = NodeAgentConfig::from_env_config(&waypoint)
+                .expect("node-agent config should parse");
+            assert!(
+                config.capture_contract.ipv6_outbound_deny,
+                "NodeWaypoint in-netns mode must fail-close captured IPv6 egress"
+            );
+            assert_ne!(
+                config
+                    .capture_contract
+                    .bpf_capture_config()
+                    .ipv6_outbound_deny,
+                0,
+                "the deny flag must reach the BPF capture config the connect6 hook reads"
+            );
+            assert!(
+                config.node_waypoint_pod_registry_dir.is_some(),
+                "in-netns registry is published in NodeWaypoint mode"
+            );
+        });
+
+        let local_pod = EnvConfig {
+            node_agent_proxy_mode: NodeAgentProxyMode::LocalPod,
+            ..EnvConfig::default()
+        };
+        with_env_vars(&[("FERRUM_NODE_AGENT_NODE_NAME", "node-b")], || {
+            let config = NodeAgentConfig::from_env_config(&local_pod)
+                .expect("node-agent config should parse");
+            assert!(
+                !config.capture_contract.ipv6_outbound_deny,
+                "non-NodeWaypoint modes do not fail-close IPv6 egress"
+            );
+        });
+    }
+
+    #[test]
     fn initialize_backend_populates_maps() {
         let config = NodeAgentConfig {
             node_name: "test-node".to_string(),
@@ -1915,6 +2483,7 @@ mod tests {
                 proxy_uid: Some(1337),
                 inbound_port: 15006,
                 outbound_port: 15001,
+                outbound_capture_enabled: true,
                 include_cidrs: vec!["10.0.0.0/8".to_string()],
                 include_cidrs_explicit: true,
                 include_all_outbound_ports: false,
@@ -1930,10 +2499,11 @@ mod tests {
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
             trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
         };
 
         let mut backend = MockEbpfBackend::default();
-        initialize_backend(&mut backend, &config).unwrap();
+        initialize_backend(&mut backend, &config, &NodeAgentMetrics::default()).unwrap();
 
         assert!(backend.programs_loaded);
         assert_eq!(backend.bypass_uids, vec![1337]);
@@ -1958,15 +2528,48 @@ mod tests {
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
             trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
         };
         config.capture_contract.proxy_mode = NodeAgentProxyMode::NodeWaypoint;
 
         let mut backend = MockEbpfBackend::default();
-        initialize_backend(&mut backend, &config).unwrap();
+        initialize_backend(&mut backend, &config, &NodeAgentMetrics::default()).unwrap();
 
         assert_eq!(
             backend.sock_ops_attached_cgroup_root.as_deref(),
             Some("/sys/fs/cgroup")
+        );
+    }
+
+    #[test]
+    fn initialize_backend_node_waypoint_sock_ops_failure_marks_degraded() {
+        let mut config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: "/sys/fs/cgroup".to_string(),
+            bpf_fs_path: "/sys/fs/bpf".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        };
+        config.capture_contract.proxy_mode = NodeAgentProxyMode::NodeWaypoint;
+        let mut backend = MockEbpfBackend {
+            fail_attach_sock_ops: true,
+            ..MockEbpfBackend::default()
+        };
+        let metrics = NodeAgentMetrics::default();
+
+        // Init still succeeds — cgroup/tc capture is unaffected — but the
+        // SOCK_OPS failure (which carries the GAP-2M identity bridge) must
+        // surface as topology degradation, not a silent telemetry warning.
+        initialize_backend(&mut backend, &config, &metrics).unwrap();
+
+        assert!(backend.sock_ops_attached_cgroup_root.is_none());
+        assert_eq!(
+            metrics.snapshot().topology_degraded_reason,
+            Some("node_waypoint_sock_ops_unavailable")
         );
     }
 
@@ -1981,13 +2584,14 @@ mod tests {
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
             trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
         };
         let mut backend = MockEbpfBackend {
             fail_update_capture_config: true,
             ..MockEbpfBackend::default()
         };
 
-        let err = initialize_backend(&mut backend, &config)
+        let err = initialize_backend(&mut backend, &config, &NodeAgentMetrics::default())
             .expect_err("capture-config failure should abort initialization");
 
         assert!(err.to_string().contains("capture config update failed"));
@@ -2009,9 +2613,9 @@ mod tests {
                 cgroup_path: None,
                 veth_iface: Some("veth-mock".to_string()),
                 attached: true,
-                include_ports_cgroup_id: None,
+                include_ports_cgroup_ids: Vec::new(),
                 include_ports_policy: None,
-                workload_identity_cgroup_id: None,
+                workload_identity_cgroup_ids: Vec::new(),
             },
         );
         pod_states.insert(
@@ -2024,17 +2628,135 @@ mod tests {
                 cgroup_path: None,
                 veth_iface: None,
                 attached: false,
-                include_ports_cgroup_id: None,
+                include_ports_cgroup_ids: Vec::new(),
                 include_ports_policy: None,
-                workload_identity_cgroup_id: None,
+                workload_identity_cgroup_ids: Vec::new(),
             },
         );
 
-        cleanup_all_pods(&mut backend, &pod_states);
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: "/nonexistent".to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        };
+        cleanup_all_pods(&mut backend, &pod_states, &config);
 
         assert_eq!(backend.detached_pods.len(), 1);
         assert_eq!(backend.detached_pods[0], "pod-1");
         assert!(backend.cleaned_up);
+    }
+
+    #[test]
+    fn cleanup_all_pods_removes_registry_and_ready_files() {
+        // Shutdown must drop each enrolled pod's registry entry + .ready marker so
+        // a mesh proxy that keeps running doesn't leak a dead in-netns listener.
+        let mut backend = MockEbpfBackend::default();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let registry = tempfile::tempdir().unwrap();
+        let ready_dir = registry.path().join(".ready");
+        std::fs::create_dir_all(&ready_dir).unwrap();
+        std::fs::write(registry.path().join("pod-x"), "/cg/x\n").unwrap();
+        std::fs::write(ready_dir.join("pod-x"), b"").unwrap();
+        pod_states.insert(
+            "pod-x".to_string(),
+            PodAttachmentState {
+                pod_uid: "pod-x".to_string(),
+                pod_name: "p".to_string(),
+                namespace: "default".to_string(),
+                pod_ip: None,
+                cgroup_path: Some("/cg/x".to_string()),
+                veth_iface: None,
+                attached: true,
+                include_ports_cgroup_ids: Vec::new(),
+                include_ports_policy: None,
+                workload_identity_cgroup_ids: Vec::new(),
+            },
+        );
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: "/nonexistent".to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: Some(registry.path().to_path_buf()),
+        };
+
+        cleanup_all_pods(&mut backend, &pod_states, &config);
+
+        assert!(
+            !registry.path().join("pod-x").exists(),
+            "registry entry removed on shutdown"
+        );
+        assert!(
+            !ready_dir.join("pod-x").exists(),
+            "ready marker removed on shutdown"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn node_waypoint_disabled_outbound_skips_connect_redirect() {
+        // FERRUM_MESH_OUTBOUND_LISTEN_ADDR port 0 disables outbound capture: the
+        // node-agent must NOT attach connect4/connect6 (egress would otherwise be
+        // rewritten to a dead loopback port), but inbound getpeername still attaches.
+        let _veth_guard = crate::ebpf::veth::tests::TestOverrideGuard::new("veth_test");
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let cgroup_root = tempfile::tempdir().unwrap();
+        let pod_uid = "pod-uid-noout";
+        std::fs::create_dir_all(cgroup_root.path().join(format!("kubepods/pod{pod_uid}"))).unwrap();
+        let mut capture_config = CaptureConfig::explicit(15006, 15001);
+        capture_config.outbound_capture_enabled = false;
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config,
+            cgroup_root: cgroup_root.path().to_string_lossy().to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        };
+        let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+        let event = PodEvent {
+            pod_uid,
+            pod_name: "test-pod",
+            namespace: "default",
+            service_account: None,
+            labels: &labels,
+            annotations: &HashMap::new(),
+            pod_ip_str: Some("10.0.0.5"),
+            pod_pid: None,
+            veth_iface_override: Some("veth-mock"),
+        };
+
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+
+        let attached: Vec<&str> = backend
+            .cgroup_attachments
+            .iter()
+            .map(|(_, p)| p.as_str())
+            .collect();
+        assert!(
+            !attached.contains(&"ferrum_connect4") && !attached.contains(&"ferrum_connect6"),
+            "outbound redirect must not attach when outbound capture is disabled, got {attached:?}"
+        );
+        assert!(
+            attached.contains(&"ferrum_getpeername4"),
+            "inbound capture still attaches when outbound is disabled, got {attached:?}"
+        );
     }
 
     // Verifies handle_fallback's control flow (setup → wait → cleanup → Ok)
@@ -2062,6 +2784,7 @@ mod tests {
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
             trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
         };
         let probe = kernel_probe::KernelProbeResult {
             kernel_release: "4.19.0".to_string(),
@@ -2133,6 +2856,7 @@ mod tests {
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
             trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
         };
         let probe = kernel_probe::KernelProbeResult {
             kernel_release: "4.19.0".to_string(),
@@ -2248,6 +2972,7 @@ mod tests {
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
             trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
         };
         let probe = kernel_probe::KernelProbeResult {
             kernel_release: "4.19.0".to_string(),
@@ -2321,6 +3046,7 @@ mod tests {
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
             trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
         };
         let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
         let event = PodEvent {
@@ -2347,6 +3073,489 @@ mod tests {
         assert_eq!(metrics.pods_enrolled.load(Ordering::Relaxed), 1);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn node_waypoint_defers_redirect_until_listener_ready() {
+        // With in-netns capture publishing enabled, enrollment must DEFER the
+        // IPv4 outbound redirect (connect4) until the mesh proxy opens the
+        // in-netns listener, while attaching the inbound getpeername programs and
+        // connect6 (the fail-closed IPv6 denier, which needs no listener) up
+        // front — so a freshly enrolled pod's IPv4 egress is not redirected to a
+        // dead port and its IPv6 egress cannot bypass mesh_authz.
+        let _veth_guard = crate::ebpf::veth::tests::TestOverrideGuard::new("veth_test");
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let cgroup_root = tempfile::tempdir().unwrap();
+        let pod_uid = "pod-uid-defer";
+        std::fs::create_dir_all(cgroup_root.path().join(format!("kubepods/pod{pod_uid}"))).unwrap();
+        let registry = tempfile::tempdir().unwrap();
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: cgroup_root.path().to_string_lossy().to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: Some(registry.path().to_path_buf()),
+        };
+        let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+        let event = PodEvent {
+            pod_uid,
+            pod_name: "test-pod",
+            namespace: "default",
+            service_account: None,
+            labels: &labels,
+            annotations: &HashMap::new(),
+            pod_ip_str: Some("10.0.0.5"),
+            pod_pid: None,
+            veth_iface_override: Some("veth-mock"),
+        };
+
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+
+        assert!(pod_states.contains_key(pod_uid), "pod is enrolled");
+        let attached: Vec<&str> = backend
+            .cgroup_attachments
+            .iter()
+            .map(|(_, prog)| prog.as_str())
+            .collect();
+        assert!(
+            !attached.contains(&"ferrum_connect4"),
+            "connect4 (IPv4 outbound redirect) must be deferred until the in-netns listener is ready, got {attached:?}"
+        );
+        assert!(
+            attached.contains(&"ferrum_connect6"),
+            "connect6 attaches immediately as the fail-closed IPv6 denier, got {attached:?}"
+        );
+        assert!(
+            attached.contains(&"ferrum_getpeername4") && attached.contains(&"ferrum_getpeername6"),
+            "inbound getpeername programs attach immediately, got {attached:?}"
+        );
+
+        // Promotion while the listener is not ready leaves the IPv4 redirect deferred.
+        let mut redirect_state = HashMap::new();
+        promote_pending_redirects(
+            &mut backend,
+            &pod_states,
+            &metrics,
+            &mut redirect_state,
+            |_| false,
+        );
+        assert!(
+            !backend
+                .cgroup_attachments
+                .iter()
+                .any(|(_, p)| p == "ferrum_connect4"),
+            "redirect stays deferred while the listener is not ready"
+        );
+
+        // Once the listener is ready, the IPv4 redirect (connect4) is enabled.
+        promote_pending_redirects(
+            &mut backend,
+            &pod_states,
+            &metrics,
+            &mut redirect_state,
+            |_| true,
+        );
+        assert!(
+            backend
+                .cgroup_attachments
+                .iter()
+                .any(|(_, p)| p == "ferrum_connect4"),
+            "connect4 attached once the listener is ready"
+        );
+        assert!(
+            backend
+                .cgroup_attachments
+                .iter()
+                .any(|(_, p)| p == "ferrum_connect6"),
+            "connect6 stays attached as the fail-closed IPv6 denier (attached at enrollment, not via promotion)"
+        );
+
+        // Idempotent: a further pass with the pod marked Done does not re-attach
+        // connect4 (a double-attach would error under CgroupAttachMode::Single).
+        let connect4_count = backend
+            .cgroup_attachments
+            .iter()
+            .filter(|(_, p)| p == "ferrum_connect4")
+            .count();
+        promote_pending_redirects(
+            &mut backend,
+            &pod_states,
+            &metrics,
+            &mut redirect_state,
+            |_| true,
+        );
+        assert_eq!(
+            backend
+                .cgroup_attachments
+                .iter()
+                .filter(|(_, p)| p == "ferrum_connect4")
+                .count(),
+            connect4_count,
+            "connect4 must not be re-attached once promotion is Done"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn node_waypoint_redirect_falls_back_after_max_attempts() {
+        // If the readiness signal never arrives, the redirect must still be
+        // enabled after the bounded attempt budget so the pod is not left
+        // un-captured forever (e.g. the mesh proxy is not running on this node).
+        let _veth_guard = crate::ebpf::veth::tests::TestOverrideGuard::new("veth_test");
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let cgroup_root = tempfile::tempdir().unwrap();
+        let pod_uid = "pod-uid-fallback";
+        std::fs::create_dir_all(cgroup_root.path().join(format!("kubepods/pod{pod_uid}"))).unwrap();
+        let registry = tempfile::tempdir().unwrap();
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: cgroup_root.path().to_string_lossy().to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: Some(registry.path().to_path_buf()),
+        };
+        let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+        let event = PodEvent {
+            pod_uid,
+            pod_name: "test-pod",
+            namespace: "default",
+            service_account: None,
+            labels: &labels,
+            annotations: &HashMap::new(),
+            pod_ip_str: Some("10.0.0.5"),
+            pod_pid: None,
+            veth_iface_override: Some("veth-mock"),
+        };
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+
+        let mut redirect_state = HashMap::new();
+        // Never ready: after the full attempt budget the redirect is still deferred.
+        for _ in 0..REDIRECT_PROMOTE_MAX_ATTEMPTS {
+            promote_pending_redirects(
+                &mut backend,
+                &pod_states,
+                &metrics,
+                &mut redirect_state,
+                |_| false,
+            );
+        }
+        assert!(
+            !backend
+                .cgroup_attachments
+                .iter()
+                .any(|(_, p)| p == "ferrum_connect4"),
+            "redirect not yet promoted before the attempt budget is exhausted"
+        );
+        // One more tick crosses the threshold and enables redirect anyway.
+        promote_pending_redirects(
+            &mut backend,
+            &pod_states,
+            &metrics,
+            &mut redirect_state,
+            |_| false,
+        );
+        assert!(
+            backend
+                .cgroup_attachments
+                .iter()
+                .any(|(_, p)| p == "ferrum_connect4"),
+            "redirect enabled by the bounded fallback after max attempts"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn node_waypoint_requeues_redirect_after_same_uid_reenrollment() {
+        // A same-UID re-enroll (sandbox/veth change → handle_pod_removed detaches
+        // connect4, re-enroll re-defers it) must re-promote the redirect, not be
+        // skipped forever by a stale `Done` keyed only by pod UID.
+        let _veth_guard = crate::ebpf::veth::tests::TestOverrideGuard::new("veth_test");
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let cgroup_root = tempfile::tempdir().unwrap();
+        let pod_uid = "pod-uid-reenroll";
+        std::fs::create_dir_all(cgroup_root.path().join(format!("kubepods/pod{pod_uid}"))).unwrap();
+        let registry = tempfile::tempdir().unwrap();
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: cgroup_root.path().to_string_lossy().to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: Some(registry.path().to_path_buf()),
+        };
+        let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+        let annotations = HashMap::new();
+        let make_event = |veth: &'static str| PodEvent {
+            pod_uid,
+            pod_name: "test-pod",
+            namespace: "default",
+            service_account: None,
+            labels: &labels,
+            annotations: &annotations,
+            pod_ip_str: Some("10.0.0.5"),
+            pod_pid: None,
+            veth_iface_override: Some(veth),
+        };
+        let connect4_count = |b: &MockEbpfBackend| {
+            b.cgroup_attachments
+                .iter()
+                .filter(|(_, p)| p == "ferrum_connect4")
+                .count()
+        };
+
+        let mut redirect_state = HashMap::new();
+
+        // Enroll with veth-A; the listener is ready → connect4 attached once.
+        handle_pod_added(
+            &mut backend,
+            &pod_states,
+            &config,
+            &metrics,
+            &make_event("veth-A"),
+        );
+        promote_pending_redirects(
+            &mut backend,
+            &pod_states,
+            &metrics,
+            &mut redirect_state,
+            |_| true,
+        );
+        assert_eq!(
+            connect4_count(&backend),
+            1,
+            "connect4 attached on first promotion"
+        );
+
+        // Re-enroll the SAME UID with a different veth: handle_pod_added detaches
+        // and re-defers connect4 for the new attachment.
+        handle_pod_added(
+            &mut backend,
+            &pod_states,
+            &config,
+            &metrics,
+            &make_event("veth-B"),
+        );
+        promote_pending_redirects(
+            &mut backend,
+            &pod_states,
+            &metrics,
+            &mut redirect_state,
+            |_| true,
+        );
+        assert_eq!(
+            connect4_count(&backend),
+            2,
+            "redirect must be re-promoted after same-UID re-enrollment, not skipped by a stale Done"
+        );
+    }
+
+    #[test]
+    fn handle_pod_removed_clears_readiness_marker() {
+        // Pod teardown must drop the proxy's `.ready/<uid>` marker too, so a
+        // same-UID re-enroll can't see a stale `ready` for the torn-down listener.
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let registry = tempfile::tempdir().unwrap();
+        let ready_dir = registry.path().join(".ready");
+        std::fs::create_dir_all(&ready_dir).unwrap();
+        let marker = ready_dir.join("pod-x");
+        std::fs::write(&marker, b"").unwrap();
+        std::fs::write(registry.path().join("pod-x"), "/cg/x\n").unwrap();
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: "/nonexistent".to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: Some(registry.path().to_path_buf()),
+        };
+
+        handle_pod_removed(&mut backend, &pod_states, &config, &metrics, "pod-x");
+
+        assert!(
+            !registry.path().join("pod-x").exists(),
+            "registry entry removed on teardown"
+        );
+        assert!(!marker.exists(), "readiness marker removed on pod teardown");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handle_pod_added_enrolls_identity_under_container_cgroup_leaves() {
+        use std::os::unix::fs::MetadataExt;
+
+        // Regression for the leaf-vs-pod cgroup bug (P1): the connect hook reads
+        // `bpf_get_current_cgroup_id()`, which is the *container* leaf cgroup —
+        // a child of the pod cgroup — so the node-agent must write
+        // FERRUM_WORKLOAD_IDENTITY under the container cgroup inodes, not only
+        // the pod cgroup inode, or the hook's lookup misses and node-waypoint
+        // resolution fails closed in real pods.
+        let _veth_guard = crate::ebpf::veth::tests::TestOverrideGuard::new("veth_test");
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+
+        let cgroup_root = tempfile::tempdir().unwrap();
+        // A valid UUID so the SPIFFE identity builds; cgroupfs driver layout.
+        let pod_uid = "11111111-1111-1111-1111-111111111111";
+        let pod_cgroup = cgroup_root.path().join(format!("kubepods/pod{pod_uid}"));
+        let container_cgroup = pod_cgroup.join("crio-abc123.scope");
+        std::fs::create_dir_all(&container_cgroup).unwrap();
+
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: cgroup_root.path().to_string_lossy().to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        };
+        let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+        let event = PodEvent {
+            pod_uid,
+            pod_name: "test-pod",
+            namespace: "default",
+            service_account: Some("api"),
+            labels: &labels,
+            annotations: &HashMap::new(),
+            pod_ip_str: Some("10.0.0.5"),
+            pod_pid: None,
+            veth_iface_override: Some("veth-mock"),
+        };
+
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+
+        let pod_ino = std::fs::metadata(&pod_cgroup).unwrap().ino();
+        let container_ino = std::fs::metadata(&container_cgroup).unwrap().ino();
+
+        // The container leaf inode — the id the connect hook actually looks up —
+        // must carry the identity, alongside the pod inode.
+        assert!(
+            backend.workload_identities.contains_key(&container_ino),
+            "identity must be enrolled under the container (leaf) cgroup inode"
+        );
+        assert!(
+            backend.workload_identities.contains_key(&pod_ino),
+            "identity must also be enrolled under the pod cgroup inode"
+        );
+        // It is a real derived identity, not the all-zero fail-closed sentinel.
+        let identity = backend.workload_identities.get(&container_ino).unwrap();
+        assert_ne!(identity.pod_uid, [0u8; 16]);
+        assert_ne!(identity.workload_spiffe_hash, 0);
+
+        let state = pod_states.get(pod_uid).unwrap();
+        assert!(state.workload_identity_cgroup_ids.contains(&container_ino));
+        assert!(state.workload_identity_cgroup_ids.contains(&pod_ino));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconcile_removes_stale_container_cgroup_identity_on_restart() {
+        use std::os::unix::fs::MetadataExt;
+
+        // Regression: a container restart replaces its leaf cgroup with a fresh
+        // inode. Reconcile must drop the old leaf's FERRUM_WORKLOAD_IDENTITY
+        // entry (from both the BPF map and state) and not just append the new
+        // one, or stale entries accumulate in the fixed-size map across restarts
+        // and eventually fail other pods' enrollments.
+        let _veth_guard = crate::ebpf::veth::tests::TestOverrideGuard::new("veth_test");
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+
+        let cgroup_root = tempfile::tempdir().unwrap();
+        let pod_uid = "11111111-1111-1111-1111-111111111111";
+        let pod_cgroup = cgroup_root.path().join(format!("kubepods/pod{pod_uid}"));
+        let container1 = pod_cgroup.join("crio-aaaa.scope");
+        std::fs::create_dir_all(&container1).unwrap();
+
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: cgroup_root.path().to_string_lossy().to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        };
+        let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+        let event = PodEvent {
+            pod_uid,
+            pod_name: "test-pod",
+            namespace: "default",
+            service_account: Some("api"),
+            labels: &labels,
+            annotations: &HashMap::new(),
+            pod_ip_str: Some("10.0.0.5"),
+            pod_pid: None,
+            veth_iface_override: Some("veth-mock"),
+        };
+
+        // Initial enrollment writes the pod inode + container1's leaf inode.
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+        let container1_ino = std::fs::metadata(&container1).unwrap().ino();
+        let pod_ino = std::fs::metadata(&pod_cgroup).unwrap().ino();
+        assert!(backend.workload_identities.contains_key(&container1_ino));
+
+        // Container restarts: a new leaf cgroup appears. Create it *before*
+        // removing the old one so the two inodes are guaranteed distinct (a
+        // freed inode can be reused immediately by the next mkdir).
+        let container2 = pod_cgroup.join("crio-bbbb.scope");
+        std::fs::create_dir_all(&container2).unwrap();
+        let container2_ino = std::fs::metadata(&container2).unwrap().ino();
+        assert_ne!(container1_ino, container2_ino);
+        std::fs::remove_dir(&container1).unwrap();
+
+        // Same pod cgroup path → the reconcile branch runs.
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+
+        // The new leaf is enrolled and the pod inode kept; the stale leaf is gone
+        // from both the BPF map and the tracked id set.
+        assert!(
+            backend.workload_identities.contains_key(&container2_ino),
+            "the restarted container's new leaf cgroup must be enrolled"
+        );
+        assert!(backend.workload_identities.contains_key(&pod_ino));
+        assert!(
+            !backend.workload_identities.contains_key(&container1_ino),
+            "the restarted container's stale leaf cgroup entry must be removed"
+        );
+        let state = pod_states.get(pod_uid).unwrap();
+        assert!(state.workload_identity_cgroup_ids.contains(&container2_ino));
+        assert!(!state.workload_identity_cgroup_ids.contains(&container1_ino));
+    }
+
     #[test]
     fn handle_pod_added_missing_cgroup_does_not_poison_state() {
         let mut backend = MockEbpfBackend::default();
@@ -2362,6 +3571,7 @@ mod tests {
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
             trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
         };
         let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
         let event = PodEvent {
@@ -2396,6 +3606,7 @@ mod tests {
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
             trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
         };
         let event = PodEvent {
             pod_uid: "pod-uid-2",
@@ -2430,9 +3641,9 @@ mod tests {
                 cgroup_path: Some("/sys/fs/cgroup/kubepods/poduid2".to_string()),
                 veth_iface: None,
                 attached: true,
-                include_ports_cgroup_id: None,
+                include_ports_cgroup_ids: Vec::new(),
                 include_ports_policy: None,
-                workload_identity_cgroup_id: None,
+                workload_identity_cgroup_ids: Vec::new(),
             },
         );
         let config = NodeAgentConfig {
@@ -2444,6 +3655,7 @@ mod tests {
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
             trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
         };
         let event = PodEvent {
             pod_uid: "pod-uid-2",
@@ -2479,6 +3691,7 @@ mod tests {
             excluded_namespaces: excluded,
             capture_contract: CaptureContract::local_pod_defaults(),
             trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
         };
         let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
         let event = PodEvent {
@@ -2515,9 +3728,9 @@ mod tests {
                 cgroup_path: Some("/sys/fs/cgroup/kubepods/poduid1".to_string()),
                 veth_iface: Some("veth123".to_string()),
                 attached: true,
-                include_ports_cgroup_id: None,
+                include_ports_cgroup_ids: Vec::new(),
                 include_ports_policy: None,
-                workload_identity_cgroup_id: None,
+                workload_identity_cgroup_ids: Vec::new(),
             },
         );
         backend
@@ -2530,7 +3743,18 @@ mod tests {
             )
             .unwrap();
 
-        handle_pod_removed(&mut backend, &pod_states, &metrics, "pod-uid-1");
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: "/sys/fs/cgroup".to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        };
+        handle_pod_removed(&mut backend, &pod_states, &config, &metrics, "pod-uid-1");
 
         assert!(!pod_states.contains_key("pod-uid-1"));
         assert_eq!(backend.detached_pods, vec!["pod-uid-1"]);
@@ -2543,11 +3767,94 @@ mod tests {
         let mut backend = MockEbpfBackend::default();
         let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
         let metrics = NodeAgentMetrics::default();
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: "/sys/fs/cgroup".to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        };
 
-        handle_pod_removed(&mut backend, &pod_states, &metrics, "nonexistent");
+        handle_pod_removed(&mut backend, &pod_states, &config, &metrics, "nonexistent");
 
         assert!(backend.detached_pods.is_empty());
         assert_eq!(metrics.pods_unenrolled.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn publish_pod_registry_writes_file_with_cgroup_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = dir.path().join("node-waypoint-pods");
+        // Directory does not exist yet — publish must create it.
+        assert!(!registry.exists());
+
+        publish_pod_registry(
+            &registry,
+            "pod-uid-1",
+            "/sys/fs/cgroup/kubepods/poduid1",
+            Some(std::net::Ipv4Addr::new(10, 1, 2, 3)),
+        );
+
+        let path = registry.join("pod-uid-1");
+        assert!(path.exists(), "registry entry must be written");
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            contents, "/sys/fs/cgroup/kubepods/poduid1\n10.1.2.3\n",
+            "registry entry carries the cgroup path on line 1 and the source pod IP on line 2"
+        );
+    }
+
+    #[test]
+    fn remove_pod_registry_removes_entry_and_tolerates_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = dir.path().join("node-waypoint-pods");
+        publish_pod_registry(&registry, "pod-uid-1", "/cg/path", None);
+        let path = registry.join("pod-uid-1");
+        assert!(path.exists());
+
+        remove_pod_registry(&registry, "pod-uid-1");
+        assert!(!path.exists(), "registry entry must be removed");
+
+        // A second removal (file already gone) must be a no-op, not a panic.
+        remove_pod_registry(&registry, "pod-uid-1");
+        // Removing from a directory that never existed must also be tolerated.
+        remove_pod_registry(&dir.path().join("missing-dir"), "pod-uid-1");
+    }
+
+    #[test]
+    fn publish_pod_registry_rejects_path_traversal_uids() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = dir.path().join("node-waypoint-pods");
+
+        // None of these may write anything; an escaping UID must be refused
+        // before any directory is created or file written.
+        for unsafe_uid in ["", "../escape", "a/b", "a\\b", "..", "foo/../bar"] {
+            publish_pod_registry(&registry, unsafe_uid, "/cg/path", None);
+        }
+
+        // The guard fires before `create_dir_all`, so nothing was created and
+        // no traversal target was written.
+        assert!(
+            !registry.exists(),
+            "unsafe pod UID must not create the registry directory"
+        );
+        assert!(
+            !dir.path().join("escape").exists(),
+            "'..' in pod UID must not write outside the registry directory"
+        );
+
+        // remove_pod_registry shares the guard: an unsafe UID is a no-op even
+        // when the directory exists with a sibling file.
+        std::fs::create_dir_all(&registry).unwrap();
+        let keep = registry.join("real-pod");
+        std::fs::write(&keep, "x").unwrap();
+        remove_pod_registry(&registry, "../real-pod");
+        remove_pod_registry(&registry, "..");
+        assert!(keep.exists(), "unsafe UID must not delete a sibling entry");
     }
 
     /// `apply_cni_request` ADD without Kubernetes metadata is a no-op and
@@ -2569,6 +3876,7 @@ mod tests {
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
             trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
         };
         let req = CniRpcRequest {
             verb: RpcVerb::Add,
@@ -2608,6 +3916,7 @@ mod tests {
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
             trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
         };
         let ip = std::net::Ipv4Addr::new(10, 0, 0, 9);
         pod_states.insert(
@@ -2620,9 +3929,9 @@ mod tests {
                 pod_ip: Some(ip),
                 cgroup_path: None,
                 veth_iface: None,
-                include_ports_cgroup_id: None,
+                include_ports_cgroup_ids: Vec::new(),
                 include_ports_policy: None,
-                workload_identity_cgroup_id: None,
+                workload_identity_cgroup_ids: Vec::new(),
             },
         );
         let req = CniRpcRequest {
@@ -2663,6 +3972,7 @@ mod tests {
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
             trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
         };
         let req = CniRpcRequest {
             verb: RpcVerb::Add,
@@ -2703,6 +4013,7 @@ mod tests {
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
             trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
         };
         // Pre-populate as if the watcher had already enrolled the pod.
         pod_states.insert(
@@ -2715,9 +4026,9 @@ mod tests {
                 cgroup_path: Some("/sys/fs/cgroup/kubepods/poduid1".to_string()),
                 veth_iface: Some("veth123".to_string()),
                 attached: true,
-                include_ports_cgroup_id: None,
+                include_ports_cgroup_ids: Vec::new(),
                 include_ports_policy: None,
-                workload_identity_cgroup_id: None,
+                workload_identity_cgroup_ids: Vec::new(),
             },
         );
         let req = CniRpcRequest {
@@ -2771,6 +4082,7 @@ mod tests {
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
             trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
         };
 
         // Untracked pod: CHECK is Rejected.
@@ -2804,9 +4116,9 @@ mod tests {
                 cgroup_path: None,
                 veth_iface: None,
                 attached: true,
-                include_ports_cgroup_id: None,
+                include_ports_cgroup_ids: Vec::new(),
                 include_ports_policy: None,
-                workload_identity_cgroup_id: None,
+                workload_identity_cgroup_ids: Vec::new(),
             },
         );
         let resp = apply_cni_request(&mut backend, &pod_states, &config, &metrics, &req);
@@ -2827,6 +4139,7 @@ mod tests {
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
             trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
         };
         let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
 
@@ -2840,9 +4153,9 @@ mod tests {
                 cgroup_path: None,
                 veth_iface: Some("veth-mock".to_string()),
                 attached: true,
-                include_ports_cgroup_id: None,
+                include_ports_cgroup_ids: Vec::new(),
                 include_ports_policy: None,
-                workload_identity_cgroup_id: None,
+                workload_identity_cgroup_ids: Vec::new(),
             },
         );
 
@@ -2880,6 +4193,7 @@ mod tests {
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
             trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
         };
         let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
 
@@ -2893,9 +4207,9 @@ mod tests {
                 cgroup_path: Some(cgroup_path.to_string_lossy().to_string()),
                 veth_iface: Some("veth-old".to_string()),
                 attached: true,
-                include_ports_cgroup_id: None,
+                include_ports_cgroup_ids: Vec::new(),
                 include_ports_policy: None,
-                workload_identity_cgroup_id: None,
+                workload_identity_cgroup_ids: Vec::new(),
             },
         );
 
@@ -2939,6 +4253,7 @@ mod tests {
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
             trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
         };
         let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
 
@@ -2952,9 +4267,9 @@ mod tests {
                 cgroup_path: None,
                 veth_iface: Some("veth-mock".to_string()),
                 attached: true,
-                include_ports_cgroup_id: None,
+                include_ports_cgroup_ids: Vec::new(),
                 include_ports_policy: None,
-                workload_identity_cgroup_id: None,
+                workload_identity_cgroup_ids: Vec::new(),
             },
         );
 
@@ -2989,6 +4304,7 @@ mod tests {
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
             trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
         };
         let probe = kernel_probe::KernelProbeResult {
             kernel_release: "4.19.0".to_string(),
@@ -3039,6 +4355,7 @@ mod tests {
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
             trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
         };
         let probe = kernel_probe::KernelProbeResult {
             kernel_release: "6.1.0".to_string(),
@@ -3339,25 +4656,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn read_cgroup_id_returns_inode_for_real_path() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().to_string_lossy().to_string();
-        // Both calls should return the same value because the directory is
-        // the same; we only assert the helper returns *something* truthy and
-        // is stable across reads. Exact inode value depends on filesystem.
-        let id1 = read_cgroup_id_for_pod(&path).expect("real path stats");
-        let id2 = read_cgroup_id_for_pod(&path).expect("repeat stats");
-        assert_eq!(id1, id2);
-        assert!(id1 > 0);
-    }
-
-    #[test]
-    fn read_cgroup_id_returns_none_on_missing_path() {
-        assert!(read_cgroup_id_for_pod("/nonexistent/cgroup/path/here").is_none());
-    }
-
     #[test]
     fn handle_pod_added_writes_include_ports_for_annotated_pod() {
         let _veth_guard = crate::ebpf::veth::tests::TestOverrideGuard::new("veth_test");
@@ -3381,6 +4679,7 @@ mod tests {
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
             trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
         };
         let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
         let annotations =
@@ -3401,7 +4700,9 @@ mod tests {
 
         let state = pod_states.get("pod-uid-1").expect("pod enrolled");
         let cgroup_id = state
-            .include_ports_cgroup_id
+            .include_ports_cgroup_ids
+            .first()
+            .copied()
             .expect("cgroup id stashed for annotated pod");
         let policy = backend
             .include_ports
@@ -3410,6 +4711,149 @@ mod tests {
         assert!(!policy.is_all_ports());
         assert_eq!(policy.port_count, 2);
         assert_eq!(&policy.ports[..2], &[5432, 8080]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handle_pod_added_writes_include_ports_under_container_cgroup_leaves() {
+        use std::os::unix::fs::MetadataExt;
+
+        // Finding-1 regression: the connect4/connect6 gate looks up
+        // FERRUM_INCLUDE_PORTS by `bpf_get_current_cgroup_id()` (the container
+        // leaf cgroup), so the policy must be written under the container
+        // cgroup inodes, not only the pod inode, or per-pod port narrowing
+        // silently never engages on real pods.
+        let _veth_guard = crate::ebpf::veth::tests::TestOverrideGuard::new("veth_test");
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+
+        let cgroup_root = tempfile::tempdir().unwrap();
+        let pod_uid = "pod-uid-1";
+        let pod_cgroup = cgroup_root.path().join(format!("kubepods/pod{pod_uid}"));
+        let container_cgroup = pod_cgroup.join("crio-abc123.scope");
+        std::fs::create_dir_all(&container_cgroup).unwrap();
+
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: cgroup_root.path().to_string_lossy().to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        };
+        let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+        let annotations =
+            annotations_with(&[("traffic.sidecar.istio.io/includeOutboundPorts", "5432,8080")]);
+        let event = PodEvent {
+            pod_uid,
+            pod_name: "test-pod",
+            namespace: "default",
+            service_account: None,
+            labels: &labels,
+            annotations: &annotations,
+            pod_ip_str: Some("10.0.0.5"),
+            pod_pid: None,
+            veth_iface_override: Some("veth-mock"),
+        };
+
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+
+        let pod_ino = std::fs::metadata(&pod_cgroup).unwrap().ino();
+        let container_ino = std::fs::metadata(&container_cgroup).unwrap().ino();
+
+        // The container leaf inode — the id the gate actually looks up — must
+        // carry the narrowing policy, alongside the pod inode.
+        let leaf_policy = backend
+            .include_ports
+            .get(&container_ino)
+            .expect("includeOutboundPorts must be written under the container leaf inode");
+        assert_eq!(leaf_policy.port_count, 2);
+        assert!(backend.include_ports.contains_key(&pod_ino));
+
+        let state = pod_states.get(pod_uid).unwrap();
+        assert!(state.include_ports_cgroup_ids.contains(&container_ino));
+        assert!(state.include_ports_cgroup_ids.contains(&pod_ino));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconcile_enrolls_late_container_include_ports_under_unchanged_policy() {
+        use std::os::unix::fs::MetadataExt;
+
+        // Finding regression: a container leaf cgroup that appears AFTER the
+        // initial pod event (the common case — containers start once the pod
+        // cgroup exists) must pick up the includeOutboundPorts policy even
+        // though the annotation is unchanged. The reconcile re-walks the tree on
+        // every event, so a later Modified event enrolls the new leaf.
+        let _veth_guard = crate::ebpf::veth::tests::TestOverrideGuard::new("veth_test");
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+
+        let cgroup_root = tempfile::tempdir().unwrap();
+        let pod_uid = "pod-uid-1";
+        let pod_cgroup = cgroup_root.path().join(format!("kubepods/pod{pod_uid}"));
+        // Only the pod cgroup exists at the initial event — no container yet.
+        std::fs::create_dir_all(&pod_cgroup).unwrap();
+
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: cgroup_root.path().to_string_lossy().to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        };
+        let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+        let annotations =
+            annotations_with(&[("traffic.sidecar.istio.io/includeOutboundPorts", "5432,8080")]);
+        let event = PodEvent {
+            pod_uid,
+            pod_name: "test-pod",
+            namespace: "default",
+            service_account: None,
+            labels: &labels,
+            annotations: &annotations,
+            pod_ip_str: Some("10.0.0.5"),
+            pod_pid: None,
+            veth_iface_override: Some("veth-mock"),
+        };
+
+        // Initial enrollment: only the pod inode is present.
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+        let pod_ino = std::fs::metadata(&pod_cgroup).unwrap().ino();
+        assert!(backend.include_ports.contains_key(&pod_ino));
+
+        // A container starts AFTER enrollment, creating its leaf cgroup.
+        let container_cgroup = pod_cgroup.join("crio-late.scope");
+        std::fs::create_dir_all(&container_cgroup).unwrap();
+        let container_ino = std::fs::metadata(&container_cgroup).unwrap().ino();
+        assert!(
+            !backend.include_ports.contains_key(&container_ino),
+            "the late container leaf is not enrolled until the next reconcile"
+        );
+
+        // A subsequent Modified event with the SAME annotation must still enroll
+        // the new leaf (the reconcile re-walks despite the unchanged policy).
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+
+        let leaf_policy = backend
+            .include_ports
+            .get(&container_ino)
+            .expect("late container leaf must be enrolled on reconcile under unchanged policy");
+        assert_eq!(leaf_policy.port_count, 2);
+        let state = pod_states.get(pod_uid).unwrap();
+        assert!(state.include_ports_cgroup_ids.contains(&container_ino));
+        assert!(state.include_ports_cgroup_ids.contains(&pod_ino));
     }
 
     #[test]
@@ -3432,6 +4876,7 @@ mod tests {
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
             trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
         };
         let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
         let annotations =
@@ -3452,7 +4897,9 @@ mod tests {
 
         let state = pod_states.get("pod-uid-1").expect("pod enrolled");
         let cgroup_id = state
-            .include_ports_cgroup_id
+            .include_ports_cgroup_ids
+            .first()
+            .copied()
             .expect("cgroup id stashed for wildcard annotation");
         let policy = backend
             .include_ports
@@ -3483,6 +4930,7 @@ mod tests {
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
             trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
         };
         let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
         let event = PodEvent {
@@ -3501,7 +4949,7 @@ mod tests {
 
         let state = pod_states.get("pod-uid-1").expect("pod enrolled");
         assert!(
-            state.include_ports_cgroup_id.is_none(),
+            state.include_ports_cgroup_ids.is_empty(),
             "unannotated pod must not stash a cgroup id"
         );
         assert!(
@@ -3531,6 +4979,7 @@ mod tests {
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
             trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
         };
         let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
         let annotations =
@@ -3552,7 +5001,7 @@ mod tests {
         let state = pod_states.get("pod-uid-1").expect("pod still enrolls");
         assert!(state.attached);
         assert!(
-            state.include_ports_cgroup_id.is_none(),
+            state.include_ports_cgroup_ids.is_empty(),
             "malformed annotation must not write a BPF entry"
         );
         assert!(backend.include_ports.is_empty());
@@ -3576,6 +5025,7 @@ mod tests {
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
             trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
         };
         let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
         let annotations =
@@ -3595,7 +5045,7 @@ mod tests {
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
         assert_eq!(backend.include_ports.len(), 1, "entry must be written");
 
-        handle_pod_removed(&mut backend, &pod_states, &metrics, "pod-uid-1");
+        handle_pod_removed(&mut backend, &pod_states, &config, &metrics, "pod-uid-1");
         assert!(
             backend.include_ports.is_empty(),
             "removal must drop the include-ports entry"
@@ -3629,6 +5079,7 @@ mod tests {
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
             trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
         };
         (cgroup_root, config)
     }
@@ -3738,7 +5189,9 @@ mod tests {
         let cgroup_id = pod_states
             .get("pod-uid-1")
             .expect("pod enrolled")
-            .include_ports_cgroup_id
+            .include_ports_cgroup_ids
+            .first()
+            .copied()
             .expect("cgroup id stashed");
         assert_eq!(backend.include_ports.get(&cgroup_id).unwrap().port_count, 1);
 
@@ -3807,7 +5260,9 @@ mod tests {
         let cgroup_id = pod_states
             .get("pod-uid-1")
             .unwrap()
-            .include_ports_cgroup_id
+            .include_ports_cgroup_ids
+            .first()
+            .copied()
             .unwrap();
         let entry = backend.include_ports.get(&cgroup_id).unwrap();
         assert!(
@@ -3846,7 +5301,9 @@ mod tests {
         let cgroup_id_before = pod_states
             .get("pod-uid-1")
             .unwrap()
-            .include_ports_cgroup_id
+            .include_ports_cgroup_ids
+            .first()
+            .copied()
             .unwrap();
         assert!(backend.include_ports.contains_key(&cgroup_id_before));
 
@@ -3867,7 +5324,7 @@ mod tests {
         );
         let state = pod_states.get("pod-uid-1").unwrap();
         assert!(
-            state.include_ports_cgroup_id.is_none(),
+            state.include_ports_cgroup_ids.is_empty(),
             "state must forget the cgroup id when the entry is removed"
         );
         assert!(state.include_ports_policy.is_none());
@@ -3915,7 +5372,9 @@ mod tests {
 
         let state = pod_states.get("pod-uid-1").unwrap();
         let cgroup_id = state
-            .include_ports_cgroup_id
+            .include_ports_cgroup_ids
+            .first()
+            .copied()
             .expect("mid-life add must stash a cgroup id");
         let entry = backend
             .include_ports
@@ -4051,7 +5510,9 @@ mod tests {
         let cgroup_id = pod_states
             .get("pod-uid-1")
             .unwrap()
-            .include_ports_cgroup_id
+            .include_ports_cgroup_ids
+            .first()
+            .copied()
             .unwrap();
         let before = *backend.include_ports.get(&cgroup_id).unwrap();
 
@@ -4070,9 +5531,8 @@ mod tests {
             "malformed annotation must NOT rewrite the BPF entry"
         );
         let state = pod_states.get("pod-uid-1").unwrap();
-        assert_eq!(
-            state.include_ports_cgroup_id,
-            Some(cgroup_id),
+        assert!(
+            state.include_ports_cgroup_ids.contains(&cgroup_id),
             "previous cgroup id must be retained"
         );
         assert!(state.include_ports_policy.is_some());

@@ -86,6 +86,13 @@ pub struct Workload {
     /// still falls back to `"default"` for SVID issuance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_account: Option<String>,
+    /// Kubernetes pod UID (`metadata.uid`) for per-pod K8s workloads; `None`
+    /// for WorkloadEntry/VM workloads that have no pod identity. Node-waypoint
+    /// per-pod policy scoping keys a pod's scope by this exact UID so pods that
+    /// share a service account (and therefore a SPIFFE ID) but carry different
+    /// labels are scoped independently instead of collapsed to one merged scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pod_uid: Option<String>,
 }
 
 /// A port advertised by a workload.

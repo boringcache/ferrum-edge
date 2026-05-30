@@ -6,3 +6,11 @@ description = "Shared types between Ferrum eBPF programs and userspace loader"
 
 [features]
 default = []
+# Enabled by the userspace aya loader (ferrum-edge --features ebpf). Pulls in
+# aya and implements aya::Pod for the shared map key/value types so they can be
+# used as BPF map keys/values from the userspace side. The kernel (bpfel) build
+# leaves this off and never links aya.
+userspace = ["dep:aya"]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+aya = { version = "0.13", optional = true }

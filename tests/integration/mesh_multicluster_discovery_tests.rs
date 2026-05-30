@@ -61,6 +61,7 @@ fn workload(spiffe_id: &str, service: &str, addr: &str, locality: Option<&str>) 
         weight: None,
         locality: locality.map(str::to_string),
         service_account: None,
+        pod_uid: None,
     }
 }
 

@@ -3414,27 +3414,117 @@ async fn serve_mesh_runtime(
         {
             mesh_background_handles.push(handle);
         }
-        // GAP-1b: spawn the orig-dst → identity bridge. It reads the pinned
-        // FERRUM_ORIG_DST4/6 maps the node-agent populated and mirrors each
-        // socket-cookie record into the resolver, giving record_orig_dst*
-        // their production caller. Without a node-agent / eBPF build the
-        // spawned task logs loudly and returns; the resolver stays empty and
-        // the accept path keeps failing closed.
+        // Spawn the orig-dst → identity bridge. It reads the pinned
+        // FERRUM_ORIG_DST4/6 maps the node-agent populated, mirrors each
+        // socket-cookie record into the resolver, and installs the synchronous
+        // accept-path fallback. Without a node-agent / eBPF build the spawned
+        // task logs loudly and returns; the resolver stays empty and the accept
+        // path fails closed.
         //
-        // NOTE (staged): GAP-1b alone does NOT make node-waypoint resolution
-        // succeed end-to-end. The records it mirrors are keyed by the source
-        // pod's connect-side cookie, while the accept path looks up the
-        // accept-side cookie (see `orig_dst_bridge` docs and
-        // `src/socket_opts.rs`); the accept-side registrar (GAP-2M) is a
-        // required follow-up. Identity enrollment into `identities_by_pod_uid`
-        // from `initial_slice.workloads` is likewise a separate follow-up tier
-        // — the snapshot installed above seeds POLICY SCOPES, not identities.
-        // Until both land, node-waypoint cookie resolution fails closed.
+        // Node-waypoint resolution is now wired end-to-end: the accept-side
+        // cookie registrar (GAP-2M) lives in the kernel sock_ops program, and
+        // the snapshot installed above seeds BOTH policy scopes AND a
+        // workload_spiffe_hash → SPIFFE index, so `resolve_record` lazily
+        // enrolls `pod_uid` → identity by hash-join against the eBPF-stamped
+        // records (no separate enrollment channel). The path is complete in
+        // code and CI-verified at the load/attach level (`ebpf-live`); it stays
+        // unexercised on a live multi-pod datapath, where a tuple/byte-order or
+        // enrollment miss fails closed (never misattributes).
         mesh_background_handles.push(spawn_orig_dst_bridge_task(resolver.clone(), &shutdown_tx));
         proxy_state.with_node_waypoint_identity_resolver(resolver)
     } else {
         proxy_state
     };
+    // Node-waypoint in-netns outbound capture listeners (opt-in). The default
+    // outbound listener binds 127.0.0.1:15001 in the HOST netns, which a pod's
+    // loopback-rewritten capture (`connect4` → 127.0.0.1:15001) can never reach;
+    // with this enabled the proxy additionally opens a 127.0.0.1:15001 listener
+    // INSIDE each enrolled pod's network namespace, so captured connections are
+    // accepted there and the GAP-2M sock_ops same-netns cookie bridge resolves
+    // their source identity. Pods are discovered from the registry the node-agent
+    // publishes. Linux-only; the full pod-loopback datapath is verified only on a
+    // live multi-pod node (see `src/proxy/netns_capture.rs`).
+    if runtime.topology == MeshTopology::NodeWaypoint {
+        // `connect4` rewrites captured pod egress to `127.0.0.1:<port>` in the
+        // POD's loopback, taking only the port from FERRUM_MESH_OUTBOUND_LISTEN_ADDR
+        // (the rewrite IP is hardcoded loopback). So the in-netns listener must
+        // bind loopback and inherit ONLY the configured port — binding the
+        // configured IP verbatim (e.g. a node IP or `[::1]`) would listen on an
+        // address the pod never dials and refuse every IPv4 capture. The IP part
+        // of the configured address governs the HOST outbound listener, not this
+        // pod-netns one. Port `0` disables the outbound listener entirely
+        // (nothing is captured), so skip starting the manager.
+        let capture_port = runtime.outbound_listen_addr.port();
+        if capture_port == 0 {
+            info!(
+                "Node-waypoint in-netns capture listeners requested, but the outbound listen \
+                 port is 0 (disabled); not starting in-netns capture"
+            );
+        } else {
+            let capture_addr = std::net::SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                capture_port,
+            );
+            if !runtime.outbound_listen_addr.ip().is_loopback()
+                && !runtime.outbound_listen_addr.ip().is_unspecified()
+            {
+                info!(
+                    configured = %runtime.outbound_listen_addr,
+                    bound = %capture_addr,
+                    "Node-waypoint in-netns capture binds pod loopback with the configured \
+                     outbound port; the configured IP applies only to the host listener"
+                );
+            }
+            // One connection semaphore shared across all in-netns listeners,
+            // sized from `max_connections` exactly like every other listener path
+            // (each `run_accept_loop` builds its own — `max_connections` is a
+            // per-listener cap in Ferrum, not a single process-wide one). This
+            // bounds captured pod egress with a `max_connections`-sized limiter
+            // rather than leaving it unbounded (`None`); it is intentionally a
+            // separate cap from the inbound HBONE listener's so a saturated
+            // inbound path cannot starve all local-pod egress (and vice versa).
+            let conn_semaphore: Option<Arc<tokio::sync::Semaphore>> =
+                if env_config.max_connections > 0 {
+                    Some(Arc::new(tokio::sync::Semaphore::new(
+                        env_config.max_connections,
+                    )))
+                } else {
+                    None
+                };
+            let source = Arc::new(crate::proxy::netns_capture::DirectoryCaptureSource::new(
+                env_config.mesh_node_waypoint_pod_registry_dir.clone(),
+            ));
+            let backend = crate::proxy::netns_capture::ProxyNetnsBackend::new(
+                proxy_state.clone(),
+                conn_semaphore,
+                Some(MeshTrafficDirection::Outbound),
+                shutdown_tx.subscribe(),
+            );
+            // Listener-readiness markers go in a `.ready` subdir of the registry
+            // dir; the node-agent gates enabling a pod's eBPF outbound redirect
+            // on its marker so a freshly enrolled pod's egress is not captured
+            // before a listener exists. `DirectoryCaptureSource` skips dotfiles,
+            // so the subdir is invisible to the pod-discovery scan.
+            let ready_dir = std::path::Path::new(&env_config.mesh_node_waypoint_pod_registry_dir)
+                .join(".ready");
+            let manager = crate::proxy::netns_capture::NetnsCaptureManager::new(
+                capture_addr,
+                source,
+                backend,
+                std::time::Duration::from_secs(2),
+            )
+            .with_ready_dir(Some(ready_dir));
+            let manager_shutdown = shutdown_tx.subscribe();
+            info!(
+                registry_dir = %env_config.mesh_node_waypoint_pod_registry_dir,
+                capture_addr = %capture_addr,
+                "Node-waypoint in-netns outbound capture listeners enabled"
+            );
+            mesh_background_handles.push(tokio::spawn(async move {
+                manager.run(manager_shutdown).await;
+            }));
+        }
+    }
     if let Some(ref slice) = initial_applied_mesh_slice {
         mesh_state.record_applied_slice(slice);
     }
@@ -5037,16 +5127,40 @@ fn start_mesh_slice_apply_task(
                                     current_loaded_at,
                                     candidate_loaded_at,
                                 );
+                                // Publish the node-waypoint resolver snapshot the
+                                // instant the proxy config is accepted — before
+                                // recording the apply result or reloading TLS — so
+                                // the window where the new config is live but the
+                                // resolver still holds the previous generation is
+                                // the minimum possible. Config and resolver are
+                                // independent ArcSwaps that cannot swap atomically,
+                                // and staging-until-accept keeps a rejected slice
+                                // side-effect-free, which precludes pre-swapping the
+                                // resolver before update_config. So config swaps
+                                // first and the resolver swaps here, one statement
+                                // later: within that bounded window the OLD
+                                // generation still answers, so a workload the new
+                                // slice removed keeps resolving its old scope
+                                // (served briefly — NOT failed closed in-window),
+                                // and a newly added one is not yet enrolled. This is
+                                // the accepted, self-correcting apply-gap residual:
+                                // it closes the instant the store below runs, and
+                                // because the HTTP/HBONE path re-queries the scope
+                                // per request it picks up the new generation on the
+                                // next request (the stream path captures at accept).
+                                // The fail-closed authz gate is enforced against
+                                // whichever generation is live — it is not an
+                                // in-window guarantee.
+                                if accepted && let Some((resolver, snapshot)) = staged_policy_scopes
+                                {
+                                    resolver.install_policy_scope_snapshot(snapshot);
+                                }
                                 record_mesh_slice_apply_result(
                                     &mesh_state,
                                     &mut last_applied_slice,
                                     slice,
                                     accepted,
                                 );
-                                if accepted && let Some((resolver, snapshot)) = staged_policy_scopes
-                                {
-                                    resolver.install_policy_scope_snapshot(snapshot);
-                                }
                                 if accepted && let Some((mtls_mode, plan)) = live_reload {
                                     apply_mesh_inbound_tls_reload(
                                         &proxy_state,
@@ -5956,6 +6070,7 @@ mod tests {
             weight: None,
             locality: None,
             service_account: None,
+            pod_uid: None,
         }
     }
 

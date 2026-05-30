@@ -51,6 +51,7 @@ fn slice_with_one_service() -> MeshSlice {
         weight: None,
         locality: None,
         service_account: Some("echo".to_string()),
+        pod_uid: None,
     };
     let service = MeshService {
         name: "echo".to_string(),

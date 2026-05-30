@@ -40,11 +40,15 @@
 //!
 //! The aggregation + failover path and the poll loop are covered by unit tests
 //! with a mock [`RemoteServiceSource`]. The [`NativeRemoteSource`] gRPC dialer
-//! is exercised structurally but a full two-control-plane round trip is not
-//! reproduced in this environment; the remaining live-verification step is a
-//! CP-to-CP integration deployment (two mesh control planes federated). This is
-//! documented for operators in `docs/mesh.md` "Cross-Cluster Endpoint
-//! Discovery".
+//! is additionally covered by an in-process two-CP round trip: tests stand up a
+//! real `MeshSubscribe` gRPC server on a loopback port and drive the production
+//! dialer against it — channel dial, DP-JWT mint + server-side verification,
+//! heartbeat skipping, slice decode, endpoint extraction, and a full
+//! discovery-loop install (see `mod tests`). The remaining live-verification
+//! step is a true cross-cluster deployment — two mesh control planes on
+//! separate networks — exercising the dialer under real network churn / loss /
+//! latency. This is documented for operators in `docs/mesh.md` "Cross-Cluster
+//! Endpoint Discovery".
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -1209,6 +1213,7 @@ mod tests {
             weight: None,
             locality: locality.map(str::to_string),
             service_account: None,
+            pod_uid: None,
         }
     }
 
@@ -1789,5 +1794,360 @@ mod tests {
             !rx.has_changed().unwrap(),
             "no-op poll with identical endpoints must not bump revision"
         );
+    }
+
+    // ── Real two-CP gRPC round trip ────────────────────────────────────────
+    //
+    // The tests above stub `RemoteServiceSource::fetch` with `MockSource`. The
+    // ones below stand up an in-process `MeshConfigSync` gRPC server on a
+    // loopback port and point the *production* dialer
+    // ([`NativeRemoteSource`] -> `fetch_remote_slice_endpoints`) at it, so the
+    // real wire path is exercised end to end: channel dial, DP-JWT mint +
+    // server-side verification (the same `verify_grpc_jwt_metadata` the real
+    // `MeshGrpcServer` uses), `MeshSubscribe` streaming, heartbeat skipping,
+    // slice-JSON decode, and workload/service extraction. This is the
+    // in-process stand-in for a two-control-plane round trip; a true
+    // cross-cluster deployment under network churn/loss stays an infra-level
+    // verification step.
+
+    use crate::grpc::auth::verify_grpc_jwt_metadata;
+    use crate::grpc::proto::mesh_config_sync_server::{MeshConfigSync, MeshConfigSyncServer};
+    use crate::grpc::proto::{MeshConfigUpdate, MeshSubscribeRequest};
+    use crate::modes::mesh::slice::MeshSlice;
+    use chrono::Utc;
+    use std::pin::Pin;
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+    use tokio_stream::wrappers::TcpListenerStream;
+    use tonic::transport::Server;
+    use tonic::{Request, Response, Status};
+
+    /// What the stub remote CP emits on a `MeshSubscribe`.
+    #[derive(Clone, Copy)]
+    enum StubBehavior {
+        /// A single non-heartbeat slice, then the stream ends.
+        SliceOnly,
+        /// A heartbeat first, then the slice: the dialer must skip the
+        /// heartbeat and return the slice's endpoints.
+        HeartbeatThenSlice,
+        /// Only a heartbeat, then the stream closes without ever delivering a
+        /// slice: the dialer must surface a "closed before slice" error.
+        HeartbeatThenClose,
+        /// Never emit anything: the dialer must hit its request timeout.
+        Stall,
+    }
+
+    #[derive(Clone)]
+    struct StubRemoteCp {
+        slice: Arc<MeshSlice>,
+        /// When `Some`, the stub verifies the bearer JWT exactly as the real
+        /// CP does, proving the minted DP token is acceptable on the wire.
+        verify_secret: Option<GrpcJwtSecret>,
+        behavior: StubBehavior,
+    }
+
+    #[tonic::async_trait]
+    impl MeshConfigSync for StubRemoteCp {
+        type MeshSubscribeStream =
+            Pin<Box<dyn tokio_stream::Stream<Item = Result<MeshConfigUpdate, Status>> + Send>>;
+
+        async fn mesh_subscribe(
+            &self,
+            request: Request<MeshSubscribeRequest>,
+        ) -> Result<Response<Self::MeshSubscribeStream>, Status> {
+            if let Some(secret) = &self.verify_secret {
+                verify_grpc_jwt_metadata(request.metadata(), secret.as_str(), secret.issuer())?;
+            }
+
+            let slice_update = MeshConfigUpdate {
+                version: self.slice.version.clone(),
+                timestamp: Utc::now().timestamp(),
+                mesh_slice_json: serde_json::to_string(self.slice.as_ref())
+                    .map_err(|e| Status::internal(format!("serialize slice: {e}")))?,
+                ferrum_version: crate::FERRUM_VERSION.to_string(),
+                heartbeat: false,
+            };
+            let heartbeat = MeshConfigUpdate {
+                version: self.slice.version.clone(),
+                timestamp: Utc::now().timestamp(),
+                mesh_slice_json: String::new(),
+                ferrum_version: crate::FERRUM_VERSION.to_string(),
+                heartbeat: true,
+            };
+
+            let items: Vec<Result<MeshConfigUpdate, Status>> = match self.behavior {
+                StubBehavior::SliceOnly => vec![Ok(slice_update)],
+                StubBehavior::HeartbeatThenSlice => vec![Ok(heartbeat), Ok(slice_update)],
+                StubBehavior::HeartbeatThenClose => vec![Ok(heartbeat)],
+                StubBehavior::Stall => {
+                    let stream: Self::MeshSubscribeStream = Box::pin(tokio_stream::pending());
+                    return Ok(Response::new(stream));
+                }
+            };
+            let stream: Self::MeshSubscribeStream = Box::pin(tokio_stream::iter(items));
+            Ok(Response::new(stream))
+        }
+    }
+
+    struct StubCpHandle {
+        url: String,
+        shutdown_tx: Option<oneshot::Sender<()>>,
+        task: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+    }
+
+    impl StubCpHandle {
+        async fn shutdown(mut self) {
+            if let Some(tx) = self.shutdown_tx.take() {
+                let _ = tx.send(());
+            }
+            let _ = tokio::time::timeout(Duration::from_secs(2), &mut self.task).await;
+        }
+    }
+
+    async fn start_stub_cp(stub: StubRemoteCp) -> StubCpHandle {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub CP");
+        let addr = listener.local_addr().expect("stub CP local addr");
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let incoming = TcpListenerStream::new(listener);
+        let task = tokio::spawn(async move {
+            Server::builder()
+                .add_service(MeshConfigSyncServer::new(stub))
+                .serve_with_incoming_shutdown(incoming, async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+        StubCpHandle {
+            url: format!("http://{addr}"),
+            shutdown_tx: Some(shutdown_tx),
+            task,
+        }
+    }
+
+    /// A remote slice carrying two `reviews` workloads and one `reviews`
+    /// service, so the dialer has real endpoints to extract.
+    fn remote_slice_with_endpoints() -> MeshSlice {
+        MeshSlice {
+            node_id: "remote-cp".to_string(),
+            namespace: "default".to_string(),
+            version: "v-remote-1".to_string(),
+            workloads: vec![
+                workload(
+                    "spiffe://remote.local/ns/default/sa/reviews-1",
+                    "reviews",
+                    "10.2.0.1",
+                    None,
+                ),
+                workload(
+                    "spiffe://remote.local/ns/default/sa/reviews-2",
+                    "reviews",
+                    "10.2.0.2",
+                    None,
+                ),
+            ],
+            services: vec![service(
+                "reviews",
+                &["spiffe://remote.local/ns/default/sa/reviews-1"],
+            )],
+            ..MeshSlice::default()
+        }
+    }
+
+    fn remote_ctx(
+        url: &str,
+        jwt_secret: Option<GrpcJwtSecret>,
+        request_timeout: Duration,
+    ) -> RemoteClusterPollContext {
+        RemoteClusterPollContext {
+            cluster_name: "west".to_string(),
+            trust_domain: td("remote.local"),
+            network: None,
+            control_plane_url: url.to_string(),
+            config: RemoteDiscoveryConfig {
+                poll_interval: Duration::from_millis(20),
+                request_timeout,
+                jwt_secret,
+                node_id: "dp-1".to_string(),
+                namespace: "default".to_string(),
+                tls_config: RemoteDiscoveryTlsConfig::default(),
+            },
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_source_round_trip_returns_remote_endpoints() {
+        let secret = GrpcJwtSecret::new("multicluster-roundtrip-secret-0000".to_string());
+        let handle = start_stub_cp(StubRemoteCp {
+            slice: Arc::new(remote_slice_with_endpoints()),
+            verify_secret: Some(secret.clone()),
+            behavior: StubBehavior::SliceOnly,
+        })
+        .await;
+
+        let ctx = remote_ctx(&handle.url, Some(secret.clone()), Duration::from_secs(5));
+        let endpoints = NativeRemoteSource::new(&ctx, secret)
+            .fetch()
+            .await
+            .expect("real gRPC round trip returns the remote slice's endpoints");
+
+        assert_eq!(endpoints.workloads.len(), 2);
+        assert_eq!(endpoints.services.len(), 1);
+        assert_eq!(endpoints.services[0].name, "reviews");
+        assert!(
+            endpoints
+                .workloads
+                .iter()
+                .any(|w| w.addresses == vec!["10.2.0.1".to_string()]),
+            "decoded workloads must carry the remote addresses"
+        );
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_source_skips_heartbeat_and_returns_first_slice() {
+        let secret = GrpcJwtSecret::new("multicluster-heartbeat-secret-000".to_string());
+        let handle = start_stub_cp(StubRemoteCp {
+            slice: Arc::new(remote_slice_with_endpoints()),
+            verify_secret: Some(secret.clone()),
+            behavior: StubBehavior::HeartbeatThenSlice,
+        })
+        .await;
+
+        let ctx = remote_ctx(&handle.url, Some(secret.clone()), Duration::from_secs(5));
+        let endpoints = NativeRemoteSource::new(&ctx, secret)
+            .fetch()
+            .await
+            .expect("the heartbeat is skipped and the slice is returned");
+        assert_eq!(endpoints.workloads.len(), 2);
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_source_rejects_mismatched_jwt() {
+        let server_secret = GrpcJwtSecret::new("server-side-secret-aaaaaaaaaaaa".to_string());
+        let client_secret = GrpcJwtSecret::new("client-side-secret-bbbbbbbbbbbb".to_string());
+        let handle = start_stub_cp(StubRemoteCp {
+            slice: Arc::new(remote_slice_with_endpoints()),
+            verify_secret: Some(server_secret),
+            behavior: StubBehavior::SliceOnly,
+        })
+        .await;
+
+        let ctx = remote_ctx(
+            &handle.url,
+            Some(client_secret.clone()),
+            Duration::from_secs(5),
+        );
+        let err = NativeRemoteSource::new(&ctx, client_secret)
+            .fetch()
+            .await
+            .expect_err("a token signed with the wrong secret must be rejected by the remote CP");
+        assert!(
+            err.contains("MeshSubscribe failed"),
+            "expected a remote-rejection error, got: {err}"
+        );
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_source_errors_when_stream_closes_without_slice() {
+        let secret = GrpcJwtSecret::new("multicluster-noslice-secret-00000".to_string());
+        let handle = start_stub_cp(StubRemoteCp {
+            slice: Arc::new(remote_slice_with_endpoints()),
+            verify_secret: Some(secret.clone()),
+            behavior: StubBehavior::HeartbeatThenClose,
+        })
+        .await;
+
+        let ctx = remote_ctx(&handle.url, Some(secret.clone()), Duration::from_secs(5));
+        let err = NativeRemoteSource::new(&ctx, secret)
+            .fetch()
+            .await
+            .expect_err("a stream that closes after only a heartbeat must error");
+        assert!(
+            err.contains("closed before delivering a slice"),
+            "expected a stream-closed error, got: {err}"
+        );
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_source_times_out_when_remote_withholds_slice() {
+        let secret = GrpcJwtSecret::new("multicluster-timeout-secret-00000".to_string());
+        let handle = start_stub_cp(StubRemoteCp {
+            slice: Arc::new(remote_slice_with_endpoints()),
+            verify_secret: Some(secret.clone()),
+            behavior: StubBehavior::Stall,
+        })
+        .await;
+
+        let ctx = remote_ctx(
+            &handle.url,
+            Some(secret.clone()),
+            Duration::from_millis(300),
+        );
+        let err = NativeRemoteSource::new(&ctx, secret)
+            .fetch()
+            .await
+            .expect_err("a remote that never sends a slice must time out");
+        assert!(
+            err.contains("timed out"),
+            "expected a timeout error, got: {err}"
+        );
+
+        handle.shutdown().await;
+    }
+
+    /// End-to-end: the discovery loop, driven by the production
+    /// [`native_source_factory`] dialer against a live (loopback) CP, installs
+    /// the remote endpoints into the store tagged with the synthetic remote
+    /// locality. This is the closest in-process analogue to a two-CP round
+    /// trip installing remote endpoints.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn discovery_loop_installs_remote_endpoints_via_real_grpc() {
+        let secret = GrpcJwtSecret::new("multicluster-loop-secret-0000000".to_string());
+        let handle = start_stub_cp(StubRemoteCp {
+            slice: Arc::new(remote_slice_with_endpoints()),
+            verify_secret: Some(secret.clone()),
+            behavior: StubBehavior::SliceOnly,
+        })
+        .await;
+
+        let ctx = remote_ctx(&handle.url, Some(secret), Duration::from_secs(5));
+        let source = native_source_factory(&ctx);
+
+        let store = RemoteEndpointStore::new();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task_store = store.clone();
+        let task_gen = store.register_cluster("west");
+        let loop_handle = tokio::spawn(async move {
+            remote_discovery_loop(ctx, source, task_store, shutdown_rx, task_gen).await
+        });
+
+        let mut rx = store.subscribe();
+        tokio::time::timeout(Duration::from_secs(5), rx.changed())
+            .await
+            .expect("remote install event within timeout")
+            .expect("revision channel open");
+
+        let snap = store.snapshot();
+        let entry = snap.clusters.get("west").expect("west entry installed");
+        assert_eq!(entry.endpoints.workloads.len(), 2);
+        // Remote workloads carry the synthetic remote locality so the
+        // priority-tier LB tiers them below local endpoints.
+        assert_eq!(
+            entry.endpoints.workloads[0].locality.as_deref(),
+            Some("remote-west")
+        );
+
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(2), loop_handle).await;
+        handle.shutdown().await;
     }
 }

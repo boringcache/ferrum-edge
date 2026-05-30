@@ -848,7 +848,7 @@ Field semantics:
 - `spiffe_id` — SPIFFE ID assigned to that pod's service account (`spiffe://{trust_domain}/ns/{namespace}/sa/{service_account}` by convention).
 - `workload_spiffe_hash` — first 8 bytes of SHA-256 over the SPIFFE ID, big-endian as `u64`. Matches the value the eBPF `OrigDst{4,6}` map carries for cross-correlation with `node_agent` telemetry.
 - `orig_dst4_cookies` / `orig_dst6_cookies` — number of socket cookies currently mapped to this pod via the IPv4 / IPv6 original-destination map. `0` means the pod is enrolled but has no in-flight outbound connection on that family.
-- `has_policy_scope` — `true` iff a per-pod `PolicyScopeCache` is installed for this pod from the accepted mesh slice's workload metadata. When `false`, mesh-authz retains mesh-wide policies only for this pod; namespace-scoped and selector-scoped policies are withheld until the resolver has the pod's workload scope.
+- `has_policy_scope` — `true` iff a per-pod `PolicyScopeCache` is derived for this pod from the accepted mesh slice's workload metadata. When `false`, the pod's workload is not in the live slice generation, so mesh-authz **fails closed** (rejects with 403) if any namespace- or selector-scoped policy is configured; a mesh with only mesh-wide policies stays fully evaluable and falls through to mesh-wide-only.
 
 `identities` is sorted by `pod_uid` so polling produces stable output. Entries with zero cookies are kept — enrolled-but-idle pods are operationally interesting (the cookie count answers "is this pod taking traffic?").
 

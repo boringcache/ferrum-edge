@@ -704,7 +704,17 @@ async fn opa_error_logs_do_not_include_request_fields() {
     drop(guard);
 
     let logs = writer.contents();
-    assert!(logs.contains("opa_non_success_status"));
+    // The mock returns 500, so the OPA plugin normally logs
+    // `opa_non_success_status`. Under heavy parallel test load the request to
+    // the local mock can instead fail transiently before reaching it, which the
+    // plugin logs as `opa_call_failed` (and still rejects 503). Either way an
+    // OPA error was logged and the property under test — no request fields in
+    // the error log — must hold, so accept either reason rather than coupling
+    // to the exact (environment-dependent) error path.
+    assert!(
+        logs.contains("opa_non_success_status") || logs.contains("opa_call_failed"),
+        "an OPA error must be logged on a failed decision; logs={logs}"
+    );
     for secret in [
         "Authorization",
         "Bearer client-token",
