@@ -379,15 +379,13 @@ impl<B: NetnsBackend> NetnsCaptureManager<B> {
                     continue;
                 }
                 // Source pod IP changed. The accept loop captures
-                // `source_ip_override` at open, so adopt the new IP by opening a
-                // REPLACEMENT listener and only THEN retiring the old one. The
-                // in-netns socket sets `SO_REUSEPORT`, so the replacement binds the
-                // same pod-loopback `addr:port` while the old listener is still
-                // open: a close-then-rebind would race `close()` (which only
-                // signals the async accept loop) and hit `EADDRINUSE`, leaving the
-                // readiness marker removed and captured egress refused until a
-                // later reconcile. Binding first means a failed rebind keeps the
-                // existing listener and its markers intact.
+                // `source_ip_override` at open, so adopt the new IP by retiring
+                // the old listener and opening a replacement. Do not use
+                // `SO_REUSEPORT` to bind-before-close here: this listener is
+                // opened inside the workload pod's network namespace, and
+                // opting into a reuseport group would let a same-eUID pod
+                // process bind the same loopback addr:port and receive captured
+                // egress before Ferrum's accept path enforces mesh policy.
                 let Some(target) = desired_target else {
                     continue;
                 };
@@ -397,16 +395,24 @@ impl<B: NetnsBackend> NetnsCaptureManager<B> {
                     new_ip = ?desired_ip,
                     "Node-waypoint capture: source pod IP changed; rebinding in-netns listener"
                 );
+                if let Some(old) = self.active.remove(&netns) {
+                    old.close();
+                    if let Some(dir) = &self.ready_dir {
+                        for uid in &old.pod_uids {
+                            remove_ready_marker(dir, uid);
+                        }
+                    }
+                }
                 match self.backend.open_listener(target, self.capture_addr) {
                     Some(stop) => {
-                        // A listener now exists for this netns, so (re)publish the
-                        // readiness markers, then displace and close the old one.
+                        // A listener now exists for this netns, so publish the
+                        // readiness markers again.
                         if let Some(dir) = &self.ready_dir {
                             for uid in &pod_uids {
                                 write_ready_marker(dir, uid);
                             }
                         }
-                        let old = self.active.insert(
+                        self.active.insert(
                             netns,
                             ActiveListener {
                                 stop,
@@ -414,9 +420,6 @@ impl<B: NetnsBackend> NetnsCaptureManager<B> {
                                 source_ip: desired_ip,
                             },
                         );
-                        if let Some(old) = old {
-                            old.close();
-                        }
                         info!(
                             netns_inode = netns,
                             pod_uid = %target.pod_uid,
@@ -425,16 +428,14 @@ impl<B: NetnsBackend> NetnsCaptureManager<B> {
                         );
                     }
                     None => {
-                        // Replacement bind failed; keep the existing listener
-                        // (captured egress keeps flowing with the prior source IP,
-                        // markers stay valid) and retry on the next reconcile.
-                        if let Some(listener) = self.active.get_mut(&netns) {
-                            listener.pod_uids = pod_uids;
-                        }
+                        // Replacement bind failed after retiring the stale
+                        // listener. Leave the pod unready so the node-agent does
+                        // not keep redirecting egress to a closed capture port; a
+                        // later reconcile will retry the open.
                         warn!(
                             netns_inode = netns,
                             pod_uid = %target.pod_uid,
-                            "Failed to rebind in-netns listener for new source pod IP; keeping existing listener, will retry"
+                            "Failed to rebind in-netns listener for new source pod IP; listener closed, will retry"
                         );
                     }
                 }
@@ -650,12 +651,11 @@ mod imp {
                 Some(socket2::Protocol::TCP),
             )?;
             socket.set_reuse_address(true)?;
-            // SO_REUSEPORT lets an IP-change rebind open a replacement listener
-            // on this same pod-loopback addr:port while the old listener is still
-            // open, so the reconcile can bind-before-close and never lose the
-            // port to a close→rebind EADDRINUSE race (see the rebind path in
-            // `reconcile`).
-            socket.set_reuse_port(true)?;
+            // Do not enable SO_REUSEPORT here. The socket is bound inside the
+            // workload pod's network namespace, so pod processes with the same
+            // effective UID could otherwise join the reuseport group on this
+            // loopback tuple and intercept captured egress before Ferrum's
+            // accept path performs identity resolution and policy checks.
             socket.set_nonblocking(true)?;
             socket.bind(&addr.into())?;
             socket.listen(1024)?;
@@ -1059,7 +1059,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reopen_failure_keeps_existing_listener_and_marker() {
+    async fn reopen_failure_closes_listener_and_marker() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         // Backend that opens the first listener but fails every reopen, to drive
@@ -1111,19 +1111,19 @@ mod tests {
         assert_eq!(mgr.reconcile_once(), 1);
         assert!(ready.path().join("pod-a").exists());
 
-        // Pod IP changes → rebind attempted, backend fails it. Bind-before-close
-        // keeps the existing listener (captured egress keeps flowing with the
-        // prior source IP) and its readiness marker valid, instead of tearing the
-        // listener down and refusing egress until a later reconcile.
+        // Pod IP changes → rebind attempted, backend fails it. Because the
+        // in-pod listener must not use SO_REUSEPORT, the manager retires the
+        // stale listener first and leaves the pod unready until a later reconcile
+        // can bind a replacement.
         targets.lock().unwrap()[0].pod_ip = Some("10.0.0.7".parse().unwrap());
         assert_eq!(
             mgr.reconcile_once(),
-            1,
-            "a failed rebind keeps the existing listener active"
+            0,
+            "a failed rebind leaves no stale listener active"
         );
         assert!(
-            ready.path().join("pod-a").exists(),
-            "the readiness marker stays while the existing listener still serves the pod"
+            !ready.path().join("pod-a").exists(),
+            "the readiness marker is removed when the stale listener is closed"
         );
     }
 
