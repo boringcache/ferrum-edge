@@ -1047,7 +1047,14 @@ pub enum GrpcProxyError {
         kind: GrpcTimeoutKind,
         message: String,
     },
+    /// The CLIENT request payload exceeded the configured maximum (detected
+    /// before the backend produced response headers). Client-side — the
+    /// circuit breaker treats this as neutral, like an HTTP client disconnect.
     ResourceExhausted(String),
+    /// The BACKEND response payload exceeded `max_response_body_size_bytes`.
+    /// Backend-side — the circuit breaker treats this as a 502-class failure,
+    /// mirroring the HTTP path's `ErrorClass::ResponseBodyTooLarge`.
+    ResponseTooLarge(String),
     Internal(String),
 }
 
@@ -1084,6 +1091,7 @@ impl std::fmt::Display for GrpcProxyError {
         match self {
             Self::BackendUnavailable { message, .. }
             | Self::ResourceExhausted(message)
+            | Self::ResponseTooLarge(message)
             | Self::Internal(message) => write!(f, "{}", message),
             Self::BackendTimeout { message, .. } => write!(f, "{}", message),
         }
@@ -1733,7 +1741,7 @@ pub(crate) async fn proxy_grpc_request_core(
                             && body_bytes.len().saturating_add(data.len())
                                 > max_response_body_size_bytes
                         {
-                            return Err(GrpcProxyError::ResourceExhausted(format!(
+                            return Err(GrpcProxyError::ResponseTooLarge(format!(
                                 "gRPC response payload size exceeds maximum of {} bytes",
                                 max_response_body_size_bytes
                             )));
