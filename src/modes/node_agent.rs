@@ -1029,6 +1029,44 @@ fn apply_workload_identity(
     written
 }
 
+fn cleanup_pre_enrollment_maps(
+    backend: &mut dyn EbpfBackend,
+    pod_uid: &str,
+    state: &PodAttachmentState,
+) {
+    for cgroup_id in &state.include_ports_cgroup_ids {
+        if let Err(e) = backend.remove_pod_include_ports(*cgroup_id) {
+            warn!(
+                pod_uid,
+                cgroup_id = *cgroup_id,
+                error = %e,
+                "Failed to remove pre-enrollment includeOutboundPorts entry from BPF map"
+            );
+        }
+    }
+    for cgroup_id in &state.workload_identity_cgroup_ids {
+        if let Err(e) = backend.remove_workload_identity(*cgroup_id) {
+            warn!(
+                pod_uid,
+                cgroup_id = *cgroup_id,
+                error = %e,
+                "Failed to remove pre-enrollment workload-identity entry from BPF map"
+            );
+        }
+    }
+}
+
+fn cleanup_partial_pod_enrollment(
+    backend: &mut dyn EbpfBackend,
+    pod_uid: &str,
+    state: &PodAttachmentState,
+) {
+    if let Err(e) = backend.detach_pod(pod_uid) {
+        warn!(pod_uid, error = %e, "Failed to clean up partially attached pod");
+    }
+    cleanup_pre_enrollment_maps(backend, pod_uid, state);
+}
+
 /// Construct the `WorkloadIdentity` for a pod from its UID and the derived
 /// SPIFFE ID. Returns `None` when the pod UID is not a valid UUID or the
 /// SPIFFE components are unusable.
@@ -1329,6 +1367,25 @@ fn handle_pod_added(
     };
 
     if let Some(ref cgroup) = cgroup_path {
+        // Seed per-cgroup policy maps before connect hooks can run. Otherwise
+        // the first connection from an annotated pod can observe missing
+        // `includeOutboundPorts` policy and fall back to the node-wide capture
+        // shape before the enrollment path writes the pod-specific map entry.
+        if let Some(applied) =
+            apply_include_outbound_ports(backend, pod_uid, cgroup, event.annotations)
+        {
+            state.include_ports_cgroup_ids = applied.cgroup_ids;
+            state.include_ports_policy = Some(applied.policy);
+        }
+        state.workload_identity_cgroup_ids = apply_workload_identity(
+            backend,
+            config,
+            pod_uid,
+            namespace,
+            event.service_account,
+            cgroup,
+        );
+
         // Attach cgroup programs before marking the pod enrolled. When outbound
         // capture is disabled (FERRUM_MESH_OUTBOUND_LISTEN_ADDR port 0), the
         // connect hooks are intentionally omitted and egress flows normally.
@@ -1369,18 +1426,14 @@ fn handle_pod_added(
                     "Could not resolve pod veth interface, skipping attachment"
                 );
                 metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
-                if let Err(e) = backend.detach_pod(pod_uid) {
-                    warn!(pod_uid, error = %e, "Failed to clean up partially attached pod");
-                }
+                cleanup_partial_pod_enrollment(backend, pod_uid, &state);
                 return;
             };
 
             if let Err(e) = backend.attach_tc(pod_uid, iface, "ferrum_tc_inbound") {
                 warn!(pod_uid, iface, error = %e, "Failed to attach tc program");
                 metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
-                if let Err(detach_err) = backend.detach_pod(pod_uid) {
-                    warn!(pod_uid, error = %detach_err, "Failed to clean up partially attached pod");
-                }
+                cleanup_partial_pod_enrollment(backend, pod_uid, &state);
                 return;
             }
             if let Some(ip) = pod_ip {
@@ -1391,34 +1444,10 @@ fn handle_pod_added(
                 if let Err(e) = backend.update_pod_ip(ip, &info) {
                     warn!(pod_uid, %ip, error = %e, "Failed to update pod IP map");
                     metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
-                    if let Err(detach_err) = backend.detach_pod(pod_uid) {
-                        warn!(pod_uid, error = %detach_err, "Failed to clean up partially attached pod");
-                    }
+                    cleanup_partial_pod_enrollment(backend, pod_uid, &state);
                     return;
                 }
             }
-            // Per-pod `includeOutboundPorts` narrowing. Best-effort: any
-            // failure to parse or to write the BPF map leaves the pod
-            // captured at the cgroup level without per-port narrowing
-            // (which is the prior GAP-2K behavior). Enrollment itself
-            // must not abort on this.
-            if let Some(applied) =
-                apply_include_outbound_ports(backend, pod_uid, cgroup, event.annotations)
-            {
-                state.include_ports_cgroup_ids = applied.cgroup_ids;
-                state.include_ports_policy = Some(applied.policy);
-            }
-            // GAP-1b: write the source workload identity so connect hooks can
-            // stamp orig-dst records. Best-effort like include-ports; failure
-            // leaves node-waypoint resolution failing closed for this pod.
-            state.workload_identity_cgroup_ids = apply_workload_identity(
-                backend,
-                config,
-                pod_uid,
-                namespace,
-                event.service_account,
-                cgroup,
-            );
             state.attached = true;
             metrics.pods_enrolled.fetch_add(1, Ordering::Relaxed);
             info!(
@@ -1430,8 +1459,8 @@ fn handle_pod_added(
                 workload_identity_cgroups = state.workload_identity_cgroup_ids.len(),
                 "Pod enrolled for eBPF capture"
             );
-        } else if let Err(e) = backend.detach_pod(pod_uid) {
-            warn!(pod_uid, error = %e, "Failed to clean up partially attached pod");
+        } else {
+            cleanup_partial_pod_enrollment(backend, pod_uid, &state);
         }
     } else {
         warn!(
@@ -2888,13 +2917,15 @@ mod tests {
             node_waypoint_pod_registry_dir: None,
         };
         let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+        let annotations =
+            annotations_with(&[("traffic.sidecar.istio.io/includeOutboundPorts", "8080")]);
         let event = PodEvent {
             pod_uid: "pod-uid-1",
             pod_name: "test-pod",
             namespace: "default",
             service_account: None,
             labels: &labels,
-            annotations: &HashMap::new(),
+            annotations: &annotations,
             pod_ip_str: Some("10.0.0.5"),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
@@ -2940,13 +2971,15 @@ mod tests {
             node_waypoint_pod_registry_dir: Some(registry.path().to_path_buf()),
         };
         let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+        let annotations =
+            annotations_with(&[("traffic.sidecar.istio.io/includeOutboundPorts", "8080")]);
         let event = PodEvent {
             pod_uid,
             pod_name: "test-pod",
             namespace: "default",
             service_account: None,
             labels: &labels,
-            annotations: &HashMap::new(),
+            annotations: &annotations,
             pod_ip_str: Some("10.0.0.5"),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
@@ -2963,6 +2996,21 @@ mod tests {
         assert!(
             attached.contains(&"ferrum_connect4"),
             "connect4 must attach during enrollment so IPv4 egress cannot bypass mesh_authz, got {attached:?}"
+        );
+        let include_write = backend
+            .operations
+            .iter()
+            .position(|op| op.starts_with("update_pod_include_ports:"))
+            .expect("includeOutboundPorts map must be written");
+        let connect4_attach = backend
+            .operations
+            .iter()
+            .position(|op| op == "attach_cgroup:ferrum_connect4")
+            .expect("connect4 must attach");
+        assert!(
+            include_write < connect4_attach,
+            "includeOutboundPorts policy must be seeded before connect4 is active, got {:?}",
+            backend.operations
         );
         assert!(
             attached.contains(&"ferrum_connect6"),
