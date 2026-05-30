@@ -164,6 +164,20 @@ maps:
 The node-agent **writes** a pod's registry file on enrollment and **removes**
 it on teardown. The mesh proxy's `NetnsCaptureManager` polls this directory and
 reconciles one in-netns listener per pod (opening on add, closing on removal).
+
+**Deferred redirect / readiness handshake.** So a freshly enrolled pod's egress
+is not redirected to a pod-loopback capture port before a listener exists to
+accept it (the rewritten `connect()` would be refused), the node-agent defers
+attaching the outbound-redirect programs (`connect4`/`connect6`) at enrollment
+when in-netns publishing is on — the inbound `getpeername4`/`getpeername6`
+programs, which do not redirect, are still attached immediately. The proxy
+writes a marker `<registry_dir>/.ready/<pod_uid>` once it has opened that pod's
+in-netns listener; the node-agent enables the redirect on its next promotion
+tick (1s) after the marker appears, with a ~30s bounded fallback so capture
+still engages even if the marker never arrives (e.g. the proxy is absent on this
+node). The proxy must therefore mount the registry directory **read-write**; the
+`.ready` subdir is a dotfile and is skipped by the pod-discovery scan.
+
 This is Linux-only and, like the rest of the in-netns datapath, is
 implemented but live-datapath-unverified (it needs a live multi-pod node).
 

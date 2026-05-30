@@ -47,7 +47,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -169,6 +169,52 @@ impl ActiveListener {
     }
 }
 
+/// Resolve the readiness-marker path `<dir>/<pod_uid>`, rejecting a `pod_uid`
+/// that is empty or could escape `dir` (path separators / `.` / `..`). The pod
+/// UIDs come from registry filenames the node-agent already guards, but the
+/// marker path is built independently here, so guard it again (defense in
+/// depth — the manager writes into a directory shared with the node-agent).
+fn ready_marker_path(dir: &Path, pod_uid: &str) -> Option<PathBuf> {
+    if pod_uid.is_empty()
+        || pod_uid == "."
+        || pod_uid == ".."
+        || pod_uid.contains('/')
+        || pod_uid.contains('\\')
+    {
+        return None;
+    }
+    Some(dir.join(pod_uid))
+}
+
+/// Publish a listener-readiness marker for `pod_uid`. Best-effort: a failure to
+/// create the directory or write the file is logged and swallowed (the pod just
+/// stays un-redirected a little longer on the node-agent side, which is the
+/// safe direction).
+fn write_ready_marker(dir: &Path, pod_uid: &str) {
+    let Some(path) = ready_marker_path(dir, pod_uid) else {
+        return;
+    };
+    if let Err(error) = std::fs::create_dir_all(dir) {
+        warn!(pod_uid, dir = %dir.display(), %error, "Failed to create in-netns readiness marker dir");
+        return;
+    }
+    if let Err(error) = std::fs::write(&path, b"") {
+        warn!(pod_uid, path = %path.display(), %error, "Failed to write in-netns readiness marker");
+    }
+}
+
+/// Remove a listener-readiness marker for `pod_uid`. A missing file is success.
+fn remove_ready_marker(dir: &Path, pod_uid: &str) {
+    let Some(path) = ready_marker_path(dir, pod_uid) else {
+        return;
+    };
+    if let Err(error) = std::fs::remove_file(&path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(pod_uid, path = %path.display(), %error, "Failed to remove in-netns readiness marker");
+    }
+}
+
 /// Reconciles in-netns capture listeners against the enrolled-pod set.
 pub struct NetnsCaptureManager<B: NetnsBackend> {
     capture_addr: SocketAddr,
@@ -177,6 +223,13 @@ pub struct NetnsCaptureManager<B: NetnsBackend> {
     poll_interval: Duration,
     /// netns inode → its open listener.
     active: HashMap<u64, ActiveListener>,
+    /// When set, a per-pod readiness marker (`<dir>/<pod_uid>`) is written when
+    /// that pod's listener opens and removed when it closes. The node-agent
+    /// gates enabling the pod's eBPF outbound redirect on this marker so a
+    /// freshly enrolled pod's egress is never rewritten to a pod-loopback
+    /// capture port before a listener exists to accept it. `None` disables
+    /// marker publishing (unit tests).
+    ready_dir: Option<PathBuf>,
 }
 
 impl<B: NetnsBackend> NetnsCaptureManager<B> {
@@ -192,7 +245,20 @@ impl<B: NetnsBackend> NetnsCaptureManager<B> {
             backend,
             poll_interval,
             active: HashMap::new(),
+            ready_dir: None,
         }
+    }
+
+    /// Set the directory into which a per-pod listener-readiness marker
+    /// (`<dir>/<pod_uid>`) is written when the pod's in-netns listener is open
+    /// and removed when it closes. The node-agent watches these markers and
+    /// only enables a pod's eBPF outbound redirect once its marker exists, so a
+    /// freshly enrolled pod's captured egress is never sent to a pod-loopback
+    /// port with no listener yet (connection refused). `None` (the default)
+    /// disables marker publishing — used by unit tests.
+    pub fn with_ready_dir(mut self, dir: Option<PathBuf>) -> Self {
+        self.ready_dir = dir;
+        self
     }
 
     /// Poll-and-reconcile until `shutdown` flips to `true`, then close every
@@ -279,6 +345,11 @@ impl<B: NetnsBackend> NetnsCaptureManager<B> {
         for netns in gone {
             if let Some(listener) = self.active.remove(&netns) {
                 listener.close();
+                if let Some(dir) = &self.ready_dir {
+                    for uid in &listener.pod_uids {
+                        remove_ready_marker(dir, uid);
+                    }
+                }
                 info!(
                     netns_inode = netns,
                     "Closed node-waypoint in-netns capture listener"
@@ -329,6 +400,14 @@ impl<B: NetnsBackend> NetnsCaptureManager<B> {
                         source_ip = ?desired_ip,
                         "Opened node-waypoint in-netns capture listener"
                     );
+                    // Mark every pod in this netns ready: a listener now exists
+                    // to accept its captured egress, so the node-agent may enable
+                    // its eBPF outbound redirect.
+                    if let Some(dir) = &self.ready_dir {
+                        for uid in &pod_uids {
+                            write_ready_marker(dir, uid);
+                        }
+                    }
                     self.active.insert(
                         netns,
                         ActiveListener {
@@ -352,8 +431,14 @@ impl<B: NetnsBackend> NetnsCaptureManager<B> {
     }
 
     fn shutdown_all(&mut self) {
+        let ready_dir = self.ready_dir.clone();
         for (_, listener) in self.active.drain() {
             listener.close();
+            if let Some(dir) = &ready_dir {
+                for uid in &listener.pod_uids {
+                    remove_ready_marker(dir, uid);
+                }
+            }
         }
     }
 }
@@ -873,6 +958,58 @@ mod tests {
         assert!(
             mgr.active.contains_key(&200),
             "a listener must open for the pod's new netns"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_writes_and_removes_readiness_markers() {
+        // With a ready dir configured, opening a pod's listener writes its
+        // readiness marker (the node-agent's gate to enable redirect); closing
+        // it removes the marker.
+        let ready = tempfile::tempdir().unwrap();
+        let targets = Arc::new(Mutex::new(vec![target("pod-a", "/cg/a")]));
+        struct DynSource(Arc<Mutex<Vec<PodCaptureTarget>>>);
+        impl PodCaptureSource for DynSource {
+            fn list_targets(&self) -> Vec<PodCaptureTarget> {
+                self.0.lock().unwrap().clone()
+            }
+        }
+        let backend = MockBackend::new(&[("/cg/a", Some(100))]);
+        let mut mgr = NetnsCaptureManager::new(
+            "127.0.0.1:15001".parse().unwrap(),
+            Arc::new(DynSource(targets.clone())),
+            backend,
+            Duration::from_secs(1),
+        )
+        .with_ready_dir(Some(ready.path().to_path_buf()));
+
+        assert_eq!(mgr.reconcile_once(), 1);
+        assert!(
+            ready.path().join("pod-a").exists(),
+            "a readiness marker must be written when the listener opens"
+        );
+
+        // Pod leaves the registry → listener closes → marker removed.
+        targets.lock().unwrap().clear();
+        assert_eq!(mgr.reconcile_once(), 0);
+        assert!(
+            !ready.path().join("pod-a").exists(),
+            "the readiness marker must be removed when the listener closes"
+        );
+    }
+
+    #[test]
+    fn ready_marker_path_rejects_unsafe_pod_uids() {
+        let dir = Path::new("/run/ferrum/node-waypoint-pods/.ready");
+        for unsafe_uid in ["", ".", "..", "a/b", "a\\b", "../escape"] {
+            assert!(
+                ready_marker_path(dir, unsafe_uid).is_none(),
+                "unsafe pod UID {unsafe_uid:?} must be rejected"
+            );
+        }
+        assert_eq!(
+            ready_marker_path(dir, "pod-uid-1"),
+            Some(dir.join("pod-uid-1"))
         );
     }
 }

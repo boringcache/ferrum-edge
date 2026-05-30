@@ -3483,12 +3483,20 @@ async fn serve_mesh_runtime(
                 Some(MeshTrafficDirection::Outbound),
                 shutdown_tx.subscribe(),
             );
+            // Listener-readiness markers go in a `.ready` subdir of the registry
+            // dir; the node-agent gates enabling a pod's eBPF outbound redirect
+            // on its marker so a freshly enrolled pod's egress is not captured
+            // before a listener exists. `DirectoryCaptureSource` skips dotfiles,
+            // so the subdir is invisible to the pod-discovery scan.
+            let ready_dir = std::path::Path::new(&env_config.mesh_node_waypoint_pod_registry_dir)
+                .join(".ready");
             let manager = crate::proxy::netns_capture::NetnsCaptureManager::new(
                 capture_addr,
                 source,
                 backend,
                 std::time::Duration::from_secs(2),
-            );
+            )
+            .with_ready_dir(Some(ready_dir));
             let manager_shutdown = shutdown_tx.subscribe();
             info!(
                 registry_dir = %env_config.mesh_node_waypoint_pod_registry_dir,
