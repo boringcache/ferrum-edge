@@ -371,35 +371,78 @@ impl<B: NetnsBackend> NetnsCaptureManager<B> {
             let desired_target = targets.iter().find(|t| pod_uids.contains(&t.pod_uid));
             let desired_ip = desired_target.and_then(|t| t.pod_ip);
 
-            if let Some(existing) = self.active.get_mut(&netns) {
-                if existing.source_ip == desired_ip {
-                    existing.pod_uids = pod_uids;
+            if let Some(existing_ip) = self.active.get(&netns).map(|l| l.source_ip) {
+                if existing_ip == desired_ip {
+                    if let Some(listener) = self.active.get_mut(&netns) {
+                        listener.pod_uids = pod_uids;
+                    }
                     continue;
                 }
-                // Source pod IP changed → reopen so the accept loop adopts the new
-                // override. Close the old listener, then fall through to reopen.
+                // Source pod IP changed. The accept loop captures
+                // `source_ip_override` at open, so adopt the new IP by opening a
+                // REPLACEMENT listener and only THEN retiring the old one. The
+                // in-netns socket sets `SO_REUSEPORT`, so the replacement binds the
+                // same pod-loopback `addr:port` while the old listener is still
+                // open: a close-then-rebind would race `close()` (which only
+                // signals the async accept loop) and hit `EADDRINUSE`, leaving the
+                // readiness marker removed and captured egress refused until a
+                // later reconcile. Binding first means a failed rebind keeps the
+                // existing listener and its markers intact.
+                let Some(target) = desired_target else {
+                    continue;
+                };
                 debug!(
                     netns_inode = netns,
-                    old_ip = ?existing.source_ip,
+                    old_ip = ?existing_ip,
                     new_ip = ?desired_ip,
-                    "Node-waypoint capture: source pod IP changed; reopening in-netns listener"
+                    "Node-waypoint capture: source pod IP changed; rebinding in-netns listener"
                 );
-                if let Some(old) = self.active.remove(&netns) {
-                    old.close();
-                    // Retract readiness before reopening: if the reopen below
-                    // fails (a transient setns/bind/cgroup race), the node-agent
-                    // must not keep seeing a ready marker for a listener that no
-                    // longer exists and keep redirecting to a dead port. The open
-                    // path re-publishes the marker on success.
-                    if let Some(dir) = &self.ready_dir {
-                        for uid in &old.pod_uids {
-                            remove_ready_marker(dir, uid);
+                match self.backend.open_listener(target, self.capture_addr) {
+                    Some(stop) => {
+                        // A listener now exists for this netns, so (re)publish the
+                        // readiness markers, then displace and close the old one.
+                        if let Some(dir) = &self.ready_dir {
+                            for uid in &pod_uids {
+                                write_ready_marker(dir, uid);
+                            }
                         }
+                        let old = self.active.insert(
+                            netns,
+                            ActiveListener {
+                                stop,
+                                pod_uids,
+                                source_ip: desired_ip,
+                            },
+                        );
+                        if let Some(old) = old {
+                            old.close();
+                        }
+                        info!(
+                            netns_inode = netns,
+                            pod_uid = %target.pod_uid,
+                            source_ip = ?desired_ip,
+                            "Reopened node-waypoint in-netns capture listener for new source pod IP"
+                        );
+                    }
+                    None => {
+                        // Replacement bind failed; keep the existing listener
+                        // (captured egress keeps flowing with the prior source IP,
+                        // markers stay valid) and retry on the next reconcile.
+                        if let Some(listener) = self.active.get_mut(&netns) {
+                            listener.pod_uids = pod_uids;
+                        }
+                        warn!(
+                            netns_inode = netns,
+                            pod_uid = %target.pod_uid,
+                            "Failed to rebind in-netns listener for new source pod IP; keeping existing listener, will retry"
+                        );
                     }
                 }
+                continue;
             }
 
-            // Any target in this netns can open it — they share the namespace.
+            // New netns: open a listener. Any target in this netns can open it —
+            // they share the namespace.
             let Some(target) = desired_target else {
                 continue;
             };
@@ -607,6 +650,12 @@ mod imp {
                 Some(socket2::Protocol::TCP),
             )?;
             socket.set_reuse_address(true)?;
+            // SO_REUSEPORT lets an IP-change rebind open a replacement listener
+            // on this same pod-loopback addr:port while the old listener is still
+            // open, so the reconcile can bind-before-close and never lose the
+            // port to a close→rebind EADDRINUSE race (see the rebind path in
+            // `reconcile`).
+            socket.set_reuse_port(true)?;
             socket.set_nonblocking(true)?;
             socket.bind(&addr.into())?;
             socket.listen(1024)?;
@@ -1010,7 +1059,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reopen_failure_retracts_readiness_marker() {
+    async fn reopen_failure_keeps_existing_listener_and_marker() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         // Backend that opens the first listener but fails every reopen, to drive
@@ -1062,17 +1111,19 @@ mod tests {
         assert_eq!(mgr.reconcile_once(), 1);
         assert!(ready.path().join("pod-a").exists());
 
-        // Pod IP changes → reopen attempted, backend fails it. The stale marker
-        // must be retracted so the node-agent stops treating the pod as ready.
+        // Pod IP changes → rebind attempted, backend fails it. Bind-before-close
+        // keeps the existing listener (captured egress keeps flowing with the
+        // prior source IP) and its readiness marker valid, instead of tearing the
+        // listener down and refusing egress until a later reconcile.
         targets.lock().unwrap()[0].pod_ip = Some("10.0.0.7".parse().unwrap());
         assert_eq!(
             mgr.reconcile_once(),
-            0,
-            "a failed reopen leaves no active listener"
+            1,
+            "a failed rebind keeps the existing listener active"
         );
         assert!(
-            !ready.path().join("pod-a").exists(),
-            "the readiness marker must be retracted when the reopen fails"
+            ready.path().join("pod-a").exists(),
+            "the readiness marker stays while the existing listener still serves the pod"
         );
     }
 

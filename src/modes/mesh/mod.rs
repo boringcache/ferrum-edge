@@ -3475,10 +3475,14 @@ async fn serve_mesh_runtime(
                      outbound port; the configured IP applies only to the host listener"
                 );
             }
-            // Share one connection semaphore across all in-netns listeners, sized
-            // from `max_connections` exactly like the host listener path, so
-            // captured pod egress is bounded by the same global connection cap
-            // rather than bypassing it (an unbounded `None`).
+            // One connection semaphore shared across all in-netns listeners,
+            // sized from `max_connections` exactly like every other listener path
+            // (each `run_accept_loop` builds its own — `max_connections` is a
+            // per-listener cap in Ferrum, not a single process-wide one). This
+            // bounds captured pod egress with a `max_connections`-sized limiter
+            // rather than leaving it unbounded (`None`); it is intentionally a
+            // separate cap from the inbound HBONE listener's so a saturated
+            // inbound path cannot starve all local-pod egress (and vice versa).
             let conn_semaphore: Option<Arc<tokio::sync::Semaphore>> =
                 if env_config.max_connections > 0 {
                     Some(Arc::new(tokio::sync::Semaphore::new(
