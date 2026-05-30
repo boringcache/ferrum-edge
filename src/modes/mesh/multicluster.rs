@@ -62,7 +62,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use crate::grpc::dp_client::{DpGrpcTlsConfig, GrpcJwtSecret};
-use crate::identity::TrustDomain;
+use crate::identity::{SpiffeId, TrustDomain};
 use crate::modes::mesh::config::{AppProtocol, MeshService, MultiClusterConfig, Workload};
 
 /// Backoff bounds shared with [`super::federation`] and
@@ -887,6 +887,7 @@ async fn remote_discovery_loop(
         let attempt_started_at = std::time::Instant::now();
         let result = source.fetch().await.and_then(|mut endpoints| {
             validate_remote_endpoints(&ctx.cluster_name, &endpoints)?;
+            enforce_remote_trust_domain(&mut endpoints, &ctx.trust_domain, &ctx.cluster_name);
             tag_remote_workloads(&mut endpoints, &ctx.cluster_name, ctx.network.as_deref());
             Ok(endpoints)
         });
@@ -954,6 +955,79 @@ async fn remote_discovery_loop(
             _ = tokio::time::sleep(sleep_duration) => {}
             _ = wait_for_shutdown(&mut shutdown_rx) => return,
         }
+    }
+}
+
+/// Drop any remote-cluster endpoints whose identity falls outside the cluster's
+/// **declared** trust domain.
+///
+/// Cross-cluster discovery is gated only on a federated trust bundle existing
+/// for the remote's declared trust domain; the remote CP's response is otherwise
+/// trusted verbatim ([`tag_remote_workloads`] rewrites only provenance/locality,
+/// never identity). Without this filter a federated peer (which may be a
+/// lower-trust partner, or compromised) could return a workload claiming a
+/// `spiffe_id`/`trust_domain` in the LOCAL domain (`cluster.local`) or any other
+/// domain, with attacker-chosen `addresses`. Because the merge keys services by
+/// `(namespace, name)` and matches workloads to services by namespace +
+/// `service_name`/`spiffe_id` (never by trust domain — see
+/// [`crate::service_discovery::mesh`]), and the outbound mTLS dial only verifies
+/// the backend cert chains to *some* trusted domain (not the claimed identity),
+/// those addresses would silently become backend endpoints for a local service
+/// — a cross-trust-domain confused-deputy hijack.
+///
+/// Enforcing that every contributed workload (and every service workload-ref)
+/// carries the declared trust domain makes ingestion fail closed: a peer under
+/// `eu-west-1.example.com` may only contribute `eu-west-1.example.com` identities
+/// and can no longer impersonate another domain's workloads. Mismatches are
+/// dropped (not fatal — one bad endpoint must not blackhole the whole snapshot)
+/// and surfaced via a structured `warn!` so the drops are observable.
+fn enforce_remote_trust_domain(
+    endpoints: &mut RemoteClusterEndpoints,
+    declared: &TrustDomain,
+    cluster_name: &str,
+) {
+    let mut dropped_workloads = 0usize;
+    let mut dropped_service_refs = 0usize;
+    let mut example_offender: Option<String> = None;
+    let mut note_offender = |spiffe_id: &SpiffeId| {
+        if example_offender.is_none() {
+            example_offender = Some(spiffe_id.as_str().to_string());
+        }
+    };
+
+    endpoints.workloads.retain(|workload| {
+        // A workload must carry the declared trust domain in BOTH its
+        // `trust_domain` field and the trust domain embedded in its SPIFFE id —
+        // a mismatch in either is treated as foreign and dropped.
+        let belongs =
+            workload.trust_domain == *declared && workload.spiffe_id.trust_domain() == declared;
+        if !belongs {
+            dropped_workloads += 1;
+            note_offender(&workload.spiffe_id);
+        }
+        belongs
+    });
+
+    for service in &mut endpoints.services {
+        service.workloads.retain(|workload_ref| {
+            let belongs = workload_ref.spiffe_id.trust_domain() == declared;
+            if !belongs {
+                dropped_service_refs += 1;
+                note_offender(&workload_ref.spiffe_id);
+            }
+            belongs
+        });
+    }
+
+    if dropped_workloads > 0 || dropped_service_refs > 0 {
+        warn!(
+            cluster = %cluster_name,
+            declared_trust_domain = %declared,
+            dropped_workloads,
+            dropped_service_refs,
+            example_offending_spiffe_id = example_offender.as_deref().unwrap_or(""),
+            "Dropped remote-cluster endpoints whose identity is outside the cluster's declared trust domain (cross-trust-domain confusion guard)"
+        );
     }
 }
 
@@ -1200,13 +1274,19 @@ mod tests {
     }
 
     fn workload(spiffe_id: &str, service: &str, address: &str, locality: Option<&str>) -> Workload {
+        // Derive `trust_domain` from the SPIFFE id so fixtures stay
+        // self-consistent (a real workload's `trust_domain` always matches its
+        // identity). Tests that need a deliberate split-identity / impersonation
+        // workload override `trust_domain` via struct-update syntax.
+        let spiffe_id = spiffe(spiffe_id);
+        let trust_domain = spiffe_id.trust_domain().clone();
         Workload {
-            spiffe_id: spiffe(spiffe_id),
+            spiffe_id,
             selector: WorkloadSelector::default(),
             service_name: service.to_string(),
             addresses: vec![address.to_string()],
             ports: vec![],
-            trust_domain: td("cluster.local"),
+            trust_domain,
             namespace: "default".to_string(),
             network: None,
             cluster: None,
@@ -1249,6 +1329,100 @@ mod tests {
             },
         );
         RemoteEndpointSnapshot { clusters }
+    }
+
+    #[test]
+    fn enforce_remote_trust_domain_drops_foreign_identities() {
+        let declared = td("eu-west-1.example.com");
+
+        // Fully in-domain: survives.
+        let in_domain = Workload {
+            trust_domain: declared.clone(),
+            ..workload(
+                "spiffe://eu-west-1.example.com/ns/default/sa/reviews",
+                "reviews",
+                "10.9.0.1",
+                None,
+            )
+        };
+        // Impersonator: claims the LOCAL trust domain in both spiffe_id and
+        // trust_domain — exactly the confused-deputy hijack the filter blocks.
+        let impersonator = Workload {
+            trust_domain: td("cluster.local"),
+            ..workload(
+                "spiffe://cluster.local/ns/default/sa/reviews",
+                "reviews",
+                "10.6.6.6",
+                None,
+            )
+        };
+        // Split identity: spiffe domain matches declared but the trust_domain
+        // field is foreign — must also be dropped (both must match).
+        let split = Workload {
+            trust_domain: td("cluster.local"),
+            ..workload(
+                "spiffe://eu-west-1.example.com/ns/default/sa/api",
+                "api",
+                "10.9.0.2",
+                None,
+            )
+        };
+
+        let mut endpoints = RemoteClusterEndpoints {
+            workloads: vec![in_domain, impersonator, split],
+            services: vec![service(
+                "reviews",
+                &[
+                    "spiffe://eu-west-1.example.com/ns/default/sa/reviews",
+                    "spiffe://cluster.local/ns/default/sa/reviews",
+                ],
+            )],
+        };
+
+        enforce_remote_trust_domain(&mut endpoints, &declared, "eu-west-1");
+
+        assert_eq!(
+            endpoints.workloads.len(),
+            1,
+            "only the fully in-domain workload survives"
+        );
+        assert_eq!(
+            endpoints.workloads[0].spiffe_id.as_str(),
+            "spiffe://eu-west-1.example.com/ns/default/sa/reviews"
+        );
+        assert_eq!(
+            endpoints.services[0].workloads.len(),
+            1,
+            "the foreign service workload-ref is dropped"
+        );
+        assert_eq!(
+            endpoints.services[0].workloads[0].spiffe_id.as_str(),
+            "spiffe://eu-west-1.example.com/ns/default/sa/reviews"
+        );
+    }
+
+    #[test]
+    fn enforce_remote_trust_domain_keeps_all_in_domain() {
+        let declared = td("eu-west-1.example.com");
+        let in_domain = Workload {
+            trust_domain: declared.clone(),
+            ..workload(
+                "spiffe://eu-west-1.example.com/ns/default/sa/reviews",
+                "reviews",
+                "10.9.0.1",
+                None,
+            )
+        };
+        let mut endpoints = RemoteClusterEndpoints {
+            workloads: vec![in_domain],
+            services: vec![service(
+                "reviews",
+                &["spiffe://eu-west-1.example.com/ns/default/sa/reviews"],
+            )],
+        };
+        enforce_remote_trust_domain(&mut endpoints, &declared, "eu-west-1");
+        assert_eq!(endpoints.workloads.len(), 1);
+        assert_eq!(endpoints.services[0].workloads.len(), 1);
     }
 
     #[test]
