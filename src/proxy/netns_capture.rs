@@ -42,8 +42,9 @@
 //! stub that reports unsupported. The reconcile bookkeeping and the registry
 //! parser are unit-tested with a mock backend; the `setns`/`bind` path and the
 //! full pod-loopback datapath are **not** unit- or CI-testable (they need a live
-//! multi-pod node) and are exercised only in a real cluster. Gated behind
-//! `FERRUM_MESH_NODE_WAYPOINT_IN_NETNS_LISTENERS_ENABLED` (default off).
+//! multi-pod node) and are exercised only in a real cluster. Always on for
+//! NodeWaypoint topology; the registry directory path is configurable via
+//! `FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR`.
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};

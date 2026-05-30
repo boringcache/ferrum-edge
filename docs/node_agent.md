@@ -149,11 +149,11 @@ node-waypoint accept fails closed.
 
 ## Pod registry for in-netns capture listeners (node-waypoint)
 
-In node-waypoint topology with the mesh proxy's in-pod-netns outbound capture
-listeners enabled (`FERRUM_MESH_NODE_WAYPOINT_IN_NETNS_LISTENERS_ENABLED=true`
-on the proxy), the captured pod-loopback `127.0.0.1:15001` connections must be
-accepted *inside* each enrolled pod's network namespace. To let the proxy find
-those pods, the node-agent publishes a per-pod registry directory — the same
+In node-waypoint topology the mesh proxy's in-pod-netns outbound capture
+listeners (always on for NodeWaypoint) accept the captured pod-loopback
+`127.0.0.1:<outbound port>` connections *inside* each enrolled pod's network
+namespace. To let the proxy find those pods, the node-agent publishes a per-pod
+registry directory — the same
 "pinned path is the node-agent↔mesh-proxy IPC surface" pattern as the orig-dst
 maps:
 

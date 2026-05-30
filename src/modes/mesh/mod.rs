@@ -3444,9 +3444,7 @@ async fn serve_mesh_runtime(
     // their source identity. Pods are discovered from the registry the node-agent
     // publishes. Linux-only; the full pod-loopback datapath is verified only on a
     // live multi-pod node (see `src/proxy/netns_capture.rs`).
-    if runtime.topology == MeshTopology::NodeWaypoint
-        && env_config.mesh_node_waypoint_in_netns_listeners
-    {
+    if runtime.topology == MeshTopology::NodeWaypoint {
         // `connect4` rewrites captured pod egress to `127.0.0.1:<port>` in the
         // POD's loopback, taking only the port from FERRUM_MESH_OUTBOUND_LISTEN_ADDR
         // (the rewrite IP is hardcoded loopback). So the in-netns listener must

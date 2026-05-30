@@ -131,19 +131,19 @@ impl NodeAgentConfig {
             DEFAULT_NODE_AGENT_SOCKET_PATH,
         )?;
 
-        // Per-pod registry publishing is meaningful only when the mesh proxy
-        // runs in-netns capture listeners in NodeWaypoint topology; otherwise
-        // there is no consumer and we leave it `None` so the hot paths skip
-        // all filesystem work.
-        let node_waypoint_pod_registry_dir = if env_config.mesh_node_waypoint_in_netns_listeners
-            && env_config.node_agent_proxy_mode == NodeAgentProxyMode::NodeWaypoint
-        {
-            Some(std::path::PathBuf::from(
-                &env_config.mesh_node_waypoint_pod_registry_dir,
-            ))
-        } else {
-            None
-        };
+        // In-netns capture is the default for NodeWaypoint: publish the per-pod
+        // registry (and defer redirect until the mesh proxy's in-netns listener
+        // is ready) whenever the node-agent runs in NodeWaypoint proxy mode.
+        // Other proxy modes have no in-netns listener consumer, so leave it
+        // `None` and skip all the filesystem work on the hot paths.
+        let node_waypoint_pod_registry_dir =
+            if env_config.node_agent_proxy_mode == NodeAgentProxyMode::NodeWaypoint {
+                Some(std::path::PathBuf::from(
+                    &env_config.mesh_node_waypoint_pod_registry_dir,
+                ))
+            } else {
+                None
+            };
 
         Ok(Self {
             node_name,
