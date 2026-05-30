@@ -1063,13 +1063,29 @@ impl H3RecvStream for crate::http3::client::H3RequestStream {
 pub(crate) struct H3FrameSource<S = crate::http3::client::H3RequestStream> {
     recv_stream: S,
     state: H3FrameSourceState,
+    /// Request method (`Arc<str>` so construction clones cheaply, not per
+    /// frame). Threaded in alongside `status` so the graceful-close recovery
+    /// gate can call `is_response_body_complete`, which also treats HEAD/204/304
+    /// (no-body) responses as complete when empty.
+    method: Arc<str>,
+    /// Response status code. See `method`.
+    status: u16,
+    /// Declared response Content-Length, if any. Used only to recognize a
+    /// connection-level graceful close that arrives after a COMPLETE body.
+    content_length: Option<u64>,
+    /// Total response body bytes yielded so far.
+    received: u64,
 }
 
 impl<S> H3FrameSource<S> {
-    fn new(recv_stream: S) -> Self {
+    fn new(recv_stream: S, method: Arc<str>, status: u16, content_length: Option<u64>) -> Self {
         Self {
             recv_stream,
             state: H3FrameSourceState::Data,
+            method,
+            status,
+            content_length,
+            received: 0,
         }
     }
 
@@ -1086,19 +1102,55 @@ impl<S: H3RecvStream + Unpin> FrameSource for H3FrameSource<S> {
         let this = self.get_mut();
         loop {
             match this.state {
-                H3FrameSourceState::Data => match Pin::new(&mut this.recv_stream)
-                    .poll_recv_data_bytes(cx)
-                {
-                    Poll::Ready(Ok(Some(data))) => return Poll::Ready(Some(Ok(Frame::data(data)))),
-                    Poll::Ready(Ok(None)) => {
-                        this.state = H3FrameSourceState::Trailers;
+                H3FrameSourceState::Data => {
+                    match Pin::new(&mut this.recv_stream).poll_recv_data_bytes(cx) {
+                        Poll::Ready(Ok(Some(data))) => {
+                            this.received = this.received.saturating_add(data.len() as u64);
+                            return Poll::Ready(Some(Ok(Frame::data(data))));
+                        }
+                        Poll::Ready(Ok(None)) => {
+                            this.state = H3FrameSourceState::Trailers;
+                        }
+                        Poll::Ready(Err(err)) => {
+                            this.state = H3FrameSourceState::Done;
+                            // Recover a connection-level graceful close that arrives
+                            // AFTER a complete body, matching the buffered path
+                            // (drain_h3_response_body): CONNECTION_CLOSE(H3_NO_ERROR)
+                            // or a coalesced GOAWAY/RemoteClosing is not a real
+                            // stream error once the body is complete, so emit clean
+                            // EOS instead of a spurious mid-stream error.
+                            //
+                            // `is_response_body_complete` is the SAME completeness
+                            // predicate the buffered path uses, so the two paths
+                            // recover identically:
+                            //   * Content-Length known: recovers ONLY on exact
+                            //     satisfaction. `received < cl` (truncation) never
+                            //     recovers, so no truncation is masked; `received >
+                            //     cl` (overlong) never recovers either — an
+                            //     over-declared body is a framing violation that must
+                            //     surface, not be laundered into a clean EOS.
+                            //   * HEAD / 204 / 304: no-body responses are complete
+                            //     when `received == 0`, so a graceful close after the
+                            //     (empty) body recovers here too.
+                            //   * Unknown length (chunked, no Content-Length) stays
+                            //     OUT OF SCOPE: completeness can't be proven without
+                            //     the FIN, so the close still surfaces as an error.
+                            if crate::http3::client::is_response_body_complete(
+                                this.received,
+                                &this.method,
+                                this.status,
+                                this.content_length,
+                            ) && err
+                                .downcast_ref::<h3::error::StreamError>()
+                                .is_some_and(crate::http3::client::is_h3_graceful_close)
+                            {
+                                return Poll::Ready(None);
+                            }
+                            return Poll::Ready(Some(Err(err)));
+                        }
+                        Poll::Pending => return Poll::Pending,
                     }
-                    Poll::Ready(Err(err)) => {
-                        this.state = H3FrameSourceState::Done;
-                        return Poll::Ready(Some(Err(err)));
-                    }
-                    Poll::Pending => return Poll::Pending,
-                },
+                }
                 H3FrameSourceState::Trailers => {
                     match Pin::new(&mut this.recv_stream).poll_recv_trailers_map(cx) {
                         Poll::Ready(Ok(Some(trailers))) => {
@@ -1653,12 +1705,14 @@ where
 
 pub(crate) fn coalescing_h3_body(
     recv_stream: crate::http3::client::H3RequestStream,
+    method: Arc<str>,
+    status: u16,
     content_length: Option<u64>,
     coalesce_min_bytes: usize,
     coalesce_max_bytes: usize,
     flush_interval: Duration,
 ) -> ProxyBody {
-    let source = H3FrameSource::new(recv_stream);
+    let source = H3FrameSource::new(recv_stream, method, status, content_length);
     let buffer_capacity = coalesce_max_bytes.clamp(
         crate::http3::config::H3_COALESCE_MIN_FLOOR,
         crate::http3::config::H3_COALESCE_MAX_CAP,
@@ -1675,15 +1729,18 @@ pub(crate) fn coalescing_h3_body(
     ProxyBody::streaming(Box::pin(body))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn size_limited_streaming_h3_body(
     recv_stream: crate::http3::client::H3RequestStream,
     max_bytes: usize,
+    method: Arc<str>,
+    status: u16,
     content_length: Option<u64>,
     coalesce_min_bytes: usize,
     coalesce_max_bytes: usize,
     flush_interval: Duration,
 ) -> ProxyBody {
-    let source = H3FrameSource::new(recv_stream);
+    let source = H3FrameSource::new(recv_stream, method, status, content_length);
     let limited = SizeLimitedFrameSource::new(source, max_bytes);
     let buffer_capacity = coalesce_max_bytes.clamp(
         crate::http3::config::H3_COALESCE_MIN_FLOOR,
@@ -1703,10 +1760,12 @@ pub(crate) fn size_limited_streaming_h3_body(
 
 pub(crate) fn direct_streaming_h3_body(
     recv_stream: crate::http3::client::H3RequestStream,
+    method: Arc<str>,
+    status: u16,
     content_length: Option<u64>,
 ) -> ProxyBody {
     let body = DirectH3Body {
-        source: H3FrameSource::new(recv_stream),
+        source: H3FrameSource::new(recv_stream, method, status, content_length),
         content_length,
     };
     ProxyBody::streaming(Box::pin(body))
@@ -2191,17 +2250,22 @@ mod tests {
         let mut trailers = http::HeaderMap::new();
         trailers.insert("grpc-status", "0".parse().unwrap());
 
-        let mut source = H3FrameSource::new(MockH3RecvStream::new(
-            vec![
-                MockH3DataStep::Pending,
-                MockH3DataStep::Data(Bytes::from("chunk")),
-                MockH3DataStep::End,
-            ],
-            vec![
-                MockH3TrailerStep::Pending,
-                MockH3TrailerStep::Trailers(trailers),
-            ],
-        ));
+        let mut source = H3FrameSource::new(
+            MockH3RecvStream::new(
+                vec![
+                    MockH3DataStep::Pending,
+                    MockH3DataStep::Data(Bytes::from("chunk")),
+                    MockH3DataStep::End,
+                ],
+                vec![
+                    MockH3TrailerStep::Pending,
+                    MockH3TrailerStep::Trailers(trailers),
+                ],
+            ),
+            Arc::from("GET"),
+            200,
+            None,
+        );
 
         assert!(matches!(poll_source(&mut source), Poll::Pending));
         assert!(!source.is_done());
