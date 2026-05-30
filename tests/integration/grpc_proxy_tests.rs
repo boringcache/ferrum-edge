@@ -195,6 +195,15 @@ fn create_test_env_config() -> ferrum_edge::config::EnvConfig {
 
 /// Create a ProxyState configured with gRPC proxies.
 fn create_test_proxy_state(proxies: Vec<Proxy>) -> ProxyState {
+    create_test_proxy_state_with_env(proxies, create_test_env_config())
+}
+
+/// Like [`create_test_proxy_state`] but with a caller-supplied `EnvConfig` so a
+/// test can override runtime limits (e.g. `max_grpc_recv_size_bytes`).
+fn create_test_proxy_state_with_env(
+    proxies: Vec<Proxy>,
+    env_config: ferrum_edge::config::EnvConfig,
+) -> ProxyState {
     let dns_cache = DnsCache::new(DnsConfig {
         global_overrides: HashMap::new(),
         resolver_addresses: None,
@@ -227,7 +236,7 @@ fn create_test_proxy_state(proxies: Vec<Proxy>) -> ProxyState {
         ..Default::default()
     };
     let (state, _health_check_handles) =
-        ProxyState::new(config, dns_cache, create_test_env_config(), None, None).unwrap();
+        ProxyState::new(config, dns_cache, env_config, None, None).unwrap();
     state
 }
 
@@ -923,5 +932,407 @@ async fn grpc_retry_enabled_does_not_stall_trailers_behind_streaming_body() {
         NUM_FRAMES,
         PER_FRAME_DELAY_MS,
         arrival_times
+    );
+}
+
+/// Backend for the streaming circuit-breaker tests.
+///
+/// It (a) DRAINS the request body in a background task so request DATA frames
+/// keep flowing — this grants gateway→backend flow-control window so the gateway
+/// actually polls (and size-checks) the client's frames — and (b) streams a
+/// response with the given HTTP `status` that stays OPEN (one data frame, then a
+/// long hold before trailers) so the client can keep the request stream open and
+/// observe breaker state *during* response-body streaming, after response headers
+/// have already reached the client.
+async fn start_streaming_response_backend(
+    status: u16,
+) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    use http_body::Frame;
+    use http_body_util::{BodyExt, StreamBody};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let handle = tokio::spawn(async move {
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(conn) => conn,
+                Err(_) => break,
+            };
+            let _ = stream.set_nodelay(true);
+
+            tokio::spawn(async move {
+                let io = TokioIo::new(stream);
+                let builder = Http2ServerBuilder::new(TokioExecutor::new());
+
+                let service = service_fn(|req: Request<Incoming>| async move {
+                    // (a) Drain the request body so the upload keeps advancing and
+                    // the gateway polls the client's overflowing frame.
+                    let mut req_body = req.into_body();
+                    tokio::spawn(async move {
+                        while let Some(frame) = req_body.frame().await {
+                            if frame.is_err() {
+                                break;
+                            }
+                        }
+                    });
+
+                    // (b) Stream a response that stays open well past the point
+                    // where the client injects the overflow. Capacity 1 keeps the
+                    // sender honest, but the long sleep is what holds it open.
+                    let (tx, rx) = tokio::sync::mpsc::channel::<
+                        Result<Frame<Bytes>, std::convert::Infallible>,
+                    >(1);
+                    tokio::spawn(async move {
+                        // One gRPC data frame (5-byte length prefix + empty msg).
+                        let _ = tx
+                            .send(Ok(Frame::data(Bytes::from_static(&[0, 0, 0, 0, 0]))))
+                            .await;
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        let mut trailers = hyper::HeaderMap::new();
+                        trailers.insert(
+                            hyper::header::HeaderName::from_static("grpc-status"),
+                            hyper::header::HeaderValue::from_static("0"),
+                        );
+                        let _ = tx.send(Ok(Frame::trailers(trailers))).await;
+                    });
+
+                    let body = StreamBody::new(tokio_stream::wrappers::ReceiverStream::new(rx));
+                    Ok::<_, hyper::Error>(
+                        Response::builder()
+                            .status(status)
+                            .header("content-type", "application/grpc")
+                            .body(body)
+                            .unwrap(),
+                    )
+                });
+
+                if let Err(e) = builder.serve_connection(io, service).await {
+                    eprintln!("Streaming response backend connection error: {}", e);
+                }
+            });
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    (addr, handle)
+}
+
+/// Issue #1412: a gRPC streaming client-upload overflow that trips DURING
+/// response-body streaming (bidi / client-streaming) must record NEUTRAL for the
+/// circuit breaker — it must NOT falsely heal a HALF_OPEN probe — and it must
+/// release the probe slot at *upload* termination (not response completion).
+///
+/// This is the real end-to-end counterpart to the in-module
+/// `grpc_streaming_cb_outcome` classification tests: it drives an actual H2
+/// stream through the gateway so the deferred `GrpcStreamingProbeRecorder` path
+/// (request-body `Drop` → breaker record) is exercised, not just the
+/// `ProxyState`-free helper.
+///
+/// Before the fix the gateway sampled `request_body_exceeded` once at header
+/// time (overflow not yet tripped) and recorded the backend 200 as a probe
+/// success, healing the breaker to CLOSED.
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_streaming_late_upload_overflow_during_response_records_neutral() {
+    use ferrum_edge::config::types::CircuitBreakerConfig;
+    use http_body::Frame;
+    use http_body_util::StreamBody;
+
+    // Small recv limit so a single follow-up frame overflows comfortably.
+    const MAX_GRPC_RECV: usize = 1024;
+
+    let (backend_addr, _backend_handle) = start_streaming_response_backend(200).await;
+
+    let mut proxy = create_grpc_proxy("grpc-late-overflow", "/grpc", backend_addr.port());
+    proxy.circuit_breaker = Some(CircuitBreakerConfig {
+        failure_threshold: 1,
+        success_threshold: 1,
+        timeout_seconds: 0, // OPEN -> HALF_OPEN immediately on next admission
+        failure_status_codes: vec![500],
+        half_open_max_requests: 1,
+        trip_on_connection_errors: true,
+    });
+    let cb_config = proxy.circuit_breaker.clone().unwrap();
+    let backend_host = proxy.backend_host.clone();
+    let backend_port = proxy.backend_port;
+    let proxy_id = proxy.id.clone();
+
+    let mut env = create_test_env_config();
+    env.max_grpc_recv_size_bytes = MAX_GRPC_RECV;
+    let state = create_test_proxy_state_with_env(vec![proxy], env);
+    let inspect_state = state.clone();
+
+    // Resolve the SAME breaker key the gateway uses (per-target for a single
+    // backend proxy) and trip it to OPEN so the streaming request is admitted as
+    // the sole HALF_OPEN probe.
+    let cb_key = ferrum_edge::circuit_breaker::target_key(&backend_host, backend_port);
+    let cb =
+        inspect_state
+            .circuit_breaker_cache
+            .get_or_create(&proxy_id, Some(&cb_key), &cb_config);
+    cb.record_failure(500, false, false);
+    assert_eq!(
+        cb.state_name(),
+        "open",
+        "breaker should be OPEN after a single failure (failure_threshold = 1)"
+    );
+
+    let (gateway_addr, _gateway_handle) = start_test_gateway(state).await;
+
+    // Open an H2 connection and send a request with a CHANNEL-backed body so we
+    // can keep the request stream open and inject the overflow AFTER response
+    // headers arrive (i.e. during response-body streaming).
+    use hyper::client::conn::http2;
+    let stream = tokio::net::TcpStream::connect(gateway_addr).await.unwrap();
+    let _ = stream.set_nodelay(true);
+    let io = TokioIo::new(stream);
+    let (mut sender, conn) = http2::handshake(TokioExecutor::new(), io).await.unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let (body_tx, body_rx) =
+        tokio::sync::mpsc::channel::<Result<Frame<Bytes>, std::convert::Infallible>>(4);
+    let req_body = StreamBody::new(tokio_stream::wrappers::ReceiverStream::new(body_rx));
+    let req = Request::builder()
+        .method("POST")
+        .uri("/grpc/my.Service/BidiOverflow")
+        .header("content-type", "application/grpc")
+        .header("te", "trailers")
+        .body(req_body)
+        .unwrap();
+
+    // Headers go on the wire immediately; the body streams from the channel.
+    let response = sender.send_request(req).await.expect("send_request failed");
+    assert_eq!(
+        response.status(),
+        200,
+        "backend headers (200) must reach the client before the overflow"
+    );
+
+    // The probe was admitted and the gateway captured the 200 status, but the
+    // upload has NOT terminated — nothing is recorded yet, so the probe slot is
+    // still held and the breaker is still HALF_OPEN. (On the pre-fix path the
+    // breaker would already have healed to CLOSED here.)
+    assert_eq!(
+        cb.state_name(),
+        "half_open",
+        "probe must be admitted (HALF_OPEN), not already healed, at header time"
+    );
+    assert_eq!(
+        cb.half_open_in_flight(),
+        1,
+        "probe slot must still be held while the request upload is in flight"
+    );
+
+    // Now overflow the request body DURING response-body streaming.
+    let overflow = Bytes::from(vec![b'X'; MAX_GRPC_RECV * 8]);
+    let _ = body_tx.send(Ok(Frame::data(overflow))).await;
+    // Drop the sender so the request stream terminates (END_STREAM) even if the
+    // gateway has not already RST it for the overflow.
+    drop(body_tx);
+
+    // The gateway detects the overflow, RSTs the request, drops the streaming
+    // request-body wrapper, and the deferred recorder fires NEUTRAL at upload
+    // termination — releasing the probe slot. Poll until the slot is released.
+    let mut released = false;
+    for _ in 0..200 {
+        if cb.half_open_in_flight() == 0 {
+            released = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        released,
+        "deferred recorder must release the HALF_OPEN probe slot at upload \
+         termination (half_open_in_flight never returned to 0)"
+    );
+
+    // The probe slot must be released at UPLOAD termination, not held for the
+    // full (5 s) response-stream lifetime — the poll above completed well inside
+    // that window, proving the slot was not pinned to response completion.
+
+    // Decisive assertion: a late client-upload overflow is gateway-side, so it
+    // records NEUTRAL — the breaker must NOT heal to CLOSED.
+    assert_eq!(
+        cb.state_name(),
+        "half_open",
+        "a late client-upload overflow must record NEUTRAL and leave the breaker \
+         HALF_OPEN (it must not falsely heal the probe)"
+    );
+}
+
+/// Companion to the late-overflow test: a CLEAN streaming probe (no overflow)
+/// must still heal a HALF_OPEN breaker through the deferred recorder. The
+/// recorder classifies by backend status at request-upload termination; here the
+/// upload EOFs before the backend responds, so the heal resolves at the
+/// `note_status` side of the join. This guards against the deferral accidentally
+/// dropping the success classification (acceptance criterion: "a clean upload +
+/// 2xx backend still heals").
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_streaming_clean_probe_heals_breaker_via_deferred_recorder() {
+    use ferrum_edge::config::types::CircuitBreakerConfig;
+
+    let (backend_addr, _backend_handle) = start_mock_grpc_backend().await;
+
+    let mut proxy = create_grpc_proxy("grpc-clean-heal", "/grpc", backend_addr.port());
+    proxy.circuit_breaker = Some(CircuitBreakerConfig {
+        failure_threshold: 1,
+        success_threshold: 1,
+        timeout_seconds: 0, // OPEN -> HALF_OPEN immediately on next admission
+        failure_status_codes: vec![500],
+        half_open_max_requests: 1,
+        trip_on_connection_errors: true,
+    });
+    let cb_config = proxy.circuit_breaker.clone().unwrap();
+    let backend_host = proxy.backend_host.clone();
+    let backend_port = proxy.backend_port;
+    let proxy_id = proxy.id.clone();
+
+    let state = create_test_proxy_state(vec![proxy]);
+    let inspect_state = state.clone();
+
+    let cb_key = ferrum_edge::circuit_breaker::target_key(&backend_host, backend_port);
+    let cb =
+        inspect_state
+            .circuit_breaker_cache
+            .get_or_create(&proxy_id, Some(&cb_key), &cb_config);
+    cb.record_failure(500, false, false);
+    assert_eq!(
+        cb.state_name(),
+        "open",
+        "breaker should be OPEN after a failure"
+    );
+
+    let (gateway_addr, _gateway_handle) = start_test_gateway(state).await;
+
+    // A normal streaming probe: the backend replies 200 (grpc-status 0). This
+    // still uses the streaming fast path (no retry, no body plugins), so the
+    // deferred recorder owns the outcome.
+    let (status, _headers, _body) = send_grpc_request(
+        gateway_addr,
+        "/grpc/my.Service/Echo",
+        b"\x00\x00\x00\x00\x05hello",
+        &[],
+    )
+    .await
+    .expect("request failed");
+    assert_eq!(status, 200);
+
+    // The recorder records the backend 200 at upload termination → success →
+    // the breaker heals (success_threshold = 1) and releases the probe slot.
+    let mut healed = false;
+    for _ in 0..200 {
+        if cb.state_name() == "closed" {
+            healed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        healed,
+        "a clean 2xx streaming probe must heal the breaker via the deferred \
+         recorder (state was {})",
+        cb.state_name()
+    );
+    assert_eq!(
+        cb.half_open_in_flight(),
+        0,
+        "healing must release the HALF_OPEN probe slot"
+    );
+}
+
+/// Regression guard for the deferral scope: a CLOSED-state (non-probe) streaming
+/// request whose backend returns a failure status must trip the breaker at
+/// RESPONSE-HEADER time, NOT be withheld until the request upload terminates.
+/// Otherwise a long/slow bidi upload would keep the breaker closed and admit more
+/// traffic to a failing backend. The deferred recorder is intentionally scoped to
+/// HALF_OPEN probes only.
+///
+/// The request stream is kept OPEN (no EOF / no overflow) while we assert the
+/// breaker has already opened — proving the failure was recorded eagerly, since a
+/// deferred record would not have fired yet.
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_streaming_closed_state_backend_failure_trips_breaker_at_header_time() {
+    use ferrum_edge::config::types::CircuitBreakerConfig;
+    use http_body::Frame;
+    use http_body_util::StreamBody;
+
+    // Backend returns HTTP 503 (a transport-level failure status) and holds the
+    // stream open for 5 s.
+    let (backend_addr, _backend_handle) = start_streaming_response_backend(503).await;
+
+    let mut proxy = create_grpc_proxy("grpc-closed-fail", "/grpc", backend_addr.port());
+    proxy.circuit_breaker = Some(CircuitBreakerConfig {
+        failure_threshold: 1, // a single failure trips CLOSED -> OPEN
+        success_threshold: 1,
+        timeout_seconds: 60, // stays OPEN (no immediate HALF_OPEN); this is NOT a probe
+        failure_status_codes: vec![503],
+        half_open_max_requests: 1,
+        trip_on_connection_errors: true,
+    });
+    let cb_config = proxy.circuit_breaker.clone().unwrap();
+    let backend_host = proxy.backend_host.clone();
+    let backend_port = proxy.backend_port;
+    let proxy_id = proxy.id.clone();
+
+    // Breaker starts CLOSED (no pre-trip) — this request is a normal, non-probe
+    // CLOSED-state request.
+    let state = create_test_proxy_state(vec![proxy]);
+    let inspect_state = state.clone();
+    let cb_key = ferrum_edge::circuit_breaker::target_key(&backend_host, backend_port);
+    let cb =
+        inspect_state
+            .circuit_breaker_cache
+            .get_or_create(&proxy_id, Some(&cb_key), &cb_config);
+    assert_eq!(cb.state_name(), "closed", "breaker should start CLOSED");
+
+    let (gateway_addr, _gateway_handle) = start_test_gateway(state).await;
+
+    use hyper::client::conn::http2;
+    let stream = tokio::net::TcpStream::connect(gateway_addr).await.unwrap();
+    let _ = stream.set_nodelay(true);
+    let io = TokioIo::new(stream);
+    let (mut sender, conn) = http2::handshake(TokioExecutor::new(), io).await.unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    // Keep the request stream OPEN (channel body, no EOF) so the upload does not
+    // terminate. A deferred record would therefore NOT fire.
+    let (body_tx, body_rx) =
+        tokio::sync::mpsc::channel::<Result<Frame<Bytes>, std::convert::Infallible>>(4);
+    let req_body = StreamBody::new(tokio_stream::wrappers::ReceiverStream::new(body_rx));
+    let req = Request::builder()
+        .method("POST")
+        .uri("/grpc/my.Service/SlowUpload")
+        .header("content-type", "application/grpc")
+        .header("te", "trailers")
+        .body(req_body)
+        .unwrap();
+
+    let response = sender.send_request(req).await.expect("send_request failed");
+    assert_eq!(
+        response.status(),
+        503,
+        "backend failure status reaches client"
+    );
+
+    // The breaker must already be OPEN — the failure was recorded at header time,
+    // not deferred to upload termination (the upload is still open below).
+    assert_eq!(
+        cb.state_name(),
+        "open",
+        "a CLOSED-state streaming backend failure must trip the breaker at header \
+         time, not wait for the (still-open) upload to terminate"
+    );
+
+    // Clean up: closing the body now must not change the already-recorded outcome.
+    drop(body_tx);
+    assert_eq!(
+        cb.state_name(),
+        "open",
+        "breaker must remain OPEN after the upload terminates (no double-record)"
     );
 }
