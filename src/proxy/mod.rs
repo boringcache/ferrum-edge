@@ -1446,11 +1446,12 @@ fn record_grpc_streaming_outcome_on_breaker(
 /// sent before dispatch, so `request_body_exceeded` is `None` and no *late*
 /// overflow is possible — sampling once at header time is exact.
 ///
-/// The **fully-streaming fast path** (`proxy_grpc_request_streaming`, where the
-/// request body uploads concurrently with the response) does NOT use this helper.
-/// A bidi/client-streaming upload can overflow AFTER response headers, so that
-/// path defers classification + probe-slot release to request-upload termination
-/// via [`GrpcStreamingProbeRecorder`] instead of sampling the flag once here.
+/// Also used by the **fully-streaming fast path** (`proxy_grpc_request_streaming`)
+/// for CLOSED-state (non-probe) requests, so a backend failure trips the breaker
+/// at header time rather than being withheld until a long/slow upload finishes.
+/// On that path a HALF_OPEN *probe* instead defers classification + probe-slot
+/// release to request-upload termination via [`GrpcStreamingProbeRecorder`],
+/// because only a probe can be falsely healed by a late upload overflow.
 fn record_grpc_streaming_circuit_breaker_outcome(
     state: &ProxyState,
     proxy: &Proxy,
@@ -1474,11 +1475,16 @@ fn record_grpc_streaming_circuit_breaker_outcome(
     }
 }
 
-/// Defers a gRPC streaming probe's circuit-breaker classification and probe-slot
-/// release to **request-upload termination** rather than response-header time, so
-/// a client-upload overflow at ANY point in the RPC's lifetime — including one
-/// that only trips during response-body streaming (bidi / client-streaming) — is
-/// recorded NEUTRAL and cannot falsely heal a HALF_OPEN probe.
+/// Defers a gRPC streaming **HALF_OPEN probe's** circuit-breaker classification
+/// and probe-slot release to **request-upload termination** rather than
+/// response-header time, so a client-upload overflow that only trips during
+/// response-body streaming (bidi / client-streaming) is recorded NEUTRAL and
+/// cannot falsely heal the probe.
+///
+/// Used only for HALF_OPEN probes. CLOSED-state (non-probe) streaming requests
+/// record at header time via [`record_grpc_streaming_circuit_breaker_outcome`]
+/// so a backend failure trips the breaker promptly instead of being withheld for
+/// the duration of a long/slow upload.
 ///
 /// The outcome is recorded **exactly once**, at the join of two events:
 ///  1. `note_status` — the backend response status is known (header time), set by
@@ -1567,11 +1573,12 @@ impl crate::proxy::grpc_proxy::GrpcUploadTerminationObserver for GrpcStreamingPr
 }
 
 /// Finalize a gRPC streaming probe's circuit-breaker outcome once the response
-/// headers are known. With a deferred `recorder` (the fully-streaming fast path)
-/// the eager probe guard is disarmed and classification is handed off to
-/// [`GrpcStreamingProbeRecorder`], which fires at request-upload termination.
-/// Without one (buffered-request streaming path) the outcome is recorded
-/// immediately by backend status, exactly as before.
+/// headers are known. With a deferred `recorder` (a HALF_OPEN probe on the
+/// fully-streaming fast path) the eager probe guard is disarmed and
+/// classification is handed off to [`GrpcStreamingProbeRecorder`], which fires at
+/// request-upload termination. Without one (buffered-request streaming path, or a
+/// CLOSED-state non-probe request) the outcome is recorded immediately by backend
+/// status, exactly as before.
 #[allow(clippy::too_many_arguments)]
 fn finalize_grpc_streaming_probe_outcome(
     recorder: Option<&Arc<GrpcStreamingProbeRecorder>>,
@@ -9953,11 +9960,12 @@ async fn handle_proxy_request_inner(
         // streams response frame-by-frame).
         let grpc_can_use_streaming_fast_path = grpc_should_stream && !grpc_has_retry;
         // Deferred circuit-breaker probe recorder for the fully-streaming fast
-        // path. Set only when that path is taken AND a breaker is configured; it
-        // defers classification + probe-slot release to request-upload
-        // termination so a late client-upload overflow records NEUTRAL instead of
-        // falsely healing the probe. `None` keeps the buffered-request streaming
-        // path on the header-time record helper.
+        // path. Set only when that path is taken AND the request was admitted as
+        // a HALF_OPEN probe; it defers classification + probe-slot release to
+        // request-upload termination so a late client-upload overflow records
+        // NEUTRAL instead of falsely healing the probe. `None` (no breaker,
+        // CLOSED state, or the buffered-request streaming path) records the
+        // outcome at response-header time as before.
         let mut grpc_streaming_probe_recorder: Option<Arc<GrpcStreamingProbeRecorder>> = None;
         let (mut grpc_result, grpc_body_bytes) = if grpc_needs_request_body_hooks {
             // Split path: collect body → run plugin hooks → dispatch
@@ -10094,32 +10102,49 @@ async fn handle_proxy_request_inner(
                 //
                 // The request body keeps uploading after response headers
                 // arrive (bidi / client-streaming), so a client-upload overflow
-                // can trip *during* response-body streaming. Build a deferred
-                // probe recorder wired to the body's overflow flag and fired
-                // from the request body's `Drop`, so the breaker is classified
-                // at upload termination (NEUTRAL on overflow) rather than healed
-                // at header time. No retry on this path means
+                // can trip *during* response-body streaming. For a HALF_OPEN
+                // probe that would falsely heal the breaker, so defer the
+                // outcome: build a recorder wired to the body's overflow flag
+                // and fired from the request body's `Drop`, classifying the
+                // probe at upload termination (NEUTRAL on overflow) instead of
+                // healing it at header time. No retry on this path means
                 // `grpc_final_cb_key == cb_target_key` and `grpc_cb_probe_slot`
                 // is unconsumed, so the recorder owns the single outcome.
+                //
+                // Limit the deferral to HALF_OPEN probes. A CLOSED-state
+                // (non-probe) streaming request records at response-header time
+                // (the `None` branch in `finalize_grpc_streaming_probe_outcome`),
+                // so a backend failure trips the breaker promptly rather than
+                // being withheld for the duration of a long/slow upload. That
+                // matches the HTTP path, which records the backend outcome at
+                // header time and likewise does not neutralize a late
+                // streaming-upload overflow.
                 let body_size_exceeded = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let upload_observer: Option<Arc<dyn grpc_proxy::GrpcUploadTerminationObserver>> =
-                    proxy.circuit_breaker.as_ref().map(|cb_config| {
-                        let cb = state.circuit_breaker_cache.get_or_create(
-                            &proxy.id,
-                            grpc_final_cb_key.as_deref(),
-                            cb_config,
-                        );
-                        let recorder = Arc::new(GrpcStreamingProbeRecorder::new(
-                            cb,
-                            grpc_cb_probe_slot,
-                            Arc::clone(&body_size_exceeded),
-                        ));
-                        grpc_streaming_probe_recorder = Some(Arc::clone(&recorder));
-                        // `let`-binding the trait object drives the `Arc<Concrete>` ->
-                        // `Arc<dyn Trait>` unsizing coercion (`as` cannot do this).
-                        let observer: Arc<dyn grpc_proxy::GrpcUploadTerminationObserver> = recorder;
-                        observer
-                    });
+                    match (grpc_cb_probe_slot, proxy.circuit_breaker.as_ref()) {
+                        (true, Some(cb_config)) => {
+                            let cb = state.circuit_breaker_cache.get_or_create(
+                                &proxy.id,
+                                grpc_final_cb_key.as_deref(),
+                                cb_config,
+                            );
+                            let recorder = Arc::new(GrpcStreamingProbeRecorder::new(
+                                cb,
+                                grpc_cb_probe_slot,
+                                Arc::clone(&body_size_exceeded),
+                            ));
+                            grpc_streaming_probe_recorder = Some(Arc::clone(&recorder));
+                            // `let`-binding the trait object drives the
+                            // `Arc<Concrete>` -> `Arc<dyn Trait>` unsizing
+                            // coercion (`as` cannot do this).
+                            let observer: Arc<dyn grpc_proxy::GrpcUploadTerminationObserver> =
+                                recorder;
+                            Some(observer)
+                        }
+                        // Non-probe (CLOSED state) or no breaker: record at
+                        // header time, no deferral.
+                        _ => None,
+                    };
                 let result = grpc_proxy::proxy_grpc_request_streaming(
                     request,
                     grpc_dispatch_proxy,
@@ -10364,14 +10389,16 @@ async fn handle_proxy_request_inner(
                 }
                 Ok(GrpcResponseKind::Streaming(_)) => {
                     // Defer: the streaming arm finalizes via
-                    // finalize_grpc_streaming_probe_outcome. On the fully-streaming
-                    // fast path that hands off to GrpcStreamingProbeRecorder, which
-                    // classifies the probe at request-upload termination — so a
-                    // client-upload overflow at ANY point (including one that only
-                    // trips during response-body streaming) records NEUTRAL and
+                    // finalize_grpc_streaming_probe_outcome. For a HALF_OPEN probe
+                    // on the fully-streaming fast path that hands off to
+                    // GrpcStreamingProbeRecorder, which classifies the probe at
+                    // request-upload termination — so a client-upload overflow that
+                    // only trips during response-body streaming records NEUTRAL and
                     // releases the HALF_OPEN probe slot instead of falsely healing
-                    // the backend. On the buffered-request streaming path (no late
-                    // overflow possible) it records immediately by backend status.
+                    // the backend. CLOSED-state (non-probe) requests and the
+                    // buffered-request streaming path record immediately by backend
+                    // status (a backend failure trips the breaker without waiting
+                    // for a long/slow upload to finish).
                 }
                 // Oversized CLIENT request payloads (ResourceExhausted, detected
                 // before backend headers) and client-body-read / gateway-config
