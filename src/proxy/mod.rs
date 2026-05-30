@@ -7635,6 +7635,7 @@ async fn start_proxy_listener_with_tls_source_and_signal(
 
 /// Accept loop that runs on a single listener socket. Multiple instances can
 /// run concurrently on the same address when SO_REUSEPORT is enabled.
+#[allow(clippy::too_many_arguments)]
 async fn run_accept_loop(
     listener: TcpListener,
     state: ProxyState,
