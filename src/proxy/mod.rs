@@ -1502,9 +1502,12 @@ fn record_grpc_streaming_circuit_breaker_outcome(
 /// At the record point the overflow flag is re-read: NEUTRAL if set, otherwise
 /// classified by the captured backend status — identical to
 /// [`record_grpc_streaming_outcome_on_breaker`]. Keying off upload termination
-/// (bounded by the client's request) rather than response-body completion avoids
-/// pinning a HALF_OPEN probe slot for the entire — potentially very long-lived —
-/// server/bidi response stream.
+/// rather than response-body completion avoids pinning a HALF_OPEN probe slot
+/// for the entire — potentially very long-lived — server/bidi response stream.
+/// Once response headers are known, a bounded post-header upload timer records
+/// NEUTRAL if a client keeps the upload open past the route/client timeout, so
+/// HALF_OPEN probe slots cannot be pinned by an unended bidi/client-streaming
+/// upload.
 struct GrpcStreamingProbeRecorder {
     cb: Arc<crate::circuit_breaker::CircuitBreaker>,
     is_half_open_probe: bool,
@@ -1515,6 +1518,7 @@ struct GrpcStreamingProbeRecorder {
     status_known: std::sync::atomic::AtomicBool,
     upload_terminated: std::sync::atomic::AtomicBool,
     recorded: std::sync::atomic::AtomicBool,
+    post_header_upload_timeout: Option<Duration>,
 }
 
 impl GrpcStreamingProbeRecorder {
@@ -1522,6 +1526,7 @@ impl GrpcStreamingProbeRecorder {
         cb: Arc<crate::circuit_breaker::CircuitBreaker>,
         is_half_open_probe: bool,
         request_body_exceeded: Arc<std::sync::atomic::AtomicBool>,
+        post_header_upload_timeout: Option<Duration>,
     ) -> Self {
         Self {
             cb,
@@ -1531,14 +1536,18 @@ impl GrpcStreamingProbeRecorder {
             status_known: std::sync::atomic::AtomicBool::new(false),
             upload_terminated: std::sync::atomic::AtomicBool::new(false),
             recorded: std::sync::atomic::AtomicBool::new(false),
+            post_header_upload_timeout,
         }
     }
 
     /// Capture the backend response status (known at header time) and activate
-    /// the recorder. Records now if the upload has already terminated.
-    fn note_status(&self, backend_status: u16) {
+    /// the recorder. Records now if the upload has already terminated. Otherwise
+    /// starts a post-header upload guard so a client cannot pin the HALF_OPEN
+    /// probe slot indefinitely by keeping a bidi/client-streaming upload open.
+    fn note_status(self: &Arc<Self>, backend_status: u16) {
         self.backend_status.store(backend_status, Ordering::Release);
         self.status_known.store(true, Ordering::Release);
+        self.start_post_header_upload_timeout();
         self.try_record();
     }
 
@@ -1563,6 +1572,37 @@ impl GrpcStreamingProbeRecorder {
             self.is_half_open_probe,
         );
     }
+
+    fn start_post_header_upload_timeout(self: &Arc<Self>) {
+        let Some(timeout) = self.post_header_upload_timeout else {
+            return;
+        };
+        if self.upload_terminated.load(Ordering::Acquire) {
+            return;
+        }
+        let recorder = Arc::clone(self);
+        let _ = tokio::spawn(async move {
+            tokio::time::sleep(timeout).await;
+            recorder.record_neutral_if_upload_still_open();
+        });
+    }
+
+    fn record_neutral_if_upload_still_open(&self) {
+        if !self.status_known.load(Ordering::Acquire) {
+            return;
+        }
+        if self.upload_terminated.load(Ordering::Acquire) {
+            return;
+        }
+        if self.recorded.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        warn!(
+            "gRPC streaming HALF_OPEN probe upload did not terminate within {:?}; recording neutral outcome",
+            self.post_header_upload_timeout
+        );
+        self.cb.record_neutral(self.is_half_open_probe);
+    }
 }
 
 impl crate::proxy::grpc_proxy::GrpcUploadTerminationObserver for GrpcStreamingProbeRecorder {
@@ -1576,8 +1616,9 @@ impl crate::proxy::grpc_proxy::GrpcUploadTerminationObserver for GrpcStreamingPr
 /// headers are known. With a deferred `recorder` (a HALF_OPEN probe on the
 /// fully-streaming fast path) the eager probe guard is disarmed and
 /// classification is handed off to [`GrpcStreamingProbeRecorder`], which fires at
-/// request-upload termination. Without one (buffered-request streaming path, or a
-/// CLOSED-state non-probe request) the outcome is recorded immediately by backend
+/// request-upload termination or records NEUTRAL if the post-header upload guard
+/// expires. Without one (buffered-request streaming path, or a CLOSED-state
+/// non-probe request) the outcome is recorded immediately by backend
 /// status, exactly as before.
 #[allow(clippy::too_many_arguments)]
 fn finalize_grpc_streaming_probe_outcome(
@@ -1593,7 +1634,8 @@ fn finalize_grpc_streaming_probe_outcome(
     match recorder {
         Some(recorder) => {
             // The recorder owns the probe-slot release (it records at upload
-            // termination), so disarm the eager guard to avoid a double release.
+            // termination, or NEUTRAL when the post-header upload guard expires),
+            // so disarm the eager guard to avoid a double release.
             probe_guard.disarm();
             recorder.note_status(backend_status);
         }
@@ -10128,10 +10170,25 @@ async fn handle_proxy_request_inner(
                                 grpc_final_cb_key.as_deref(),
                                 cb_config,
                             );
+                            let post_header_upload_timeout =
+                                grpc_proxy::parse_grpc_timeout_ms(request.headers())
+                                    .map(|grpc_ms| {
+                                        if proxy.backend_read_timeout_ms > 0 {
+                                            grpc_ms.min(proxy.backend_read_timeout_ms)
+                                        } else {
+                                            grpc_ms
+                                        }
+                                    })
+                                    .or_else(|| {
+                                        (proxy.backend_read_timeout_ms > 0)
+                                            .then_some(proxy.backend_read_timeout_ms)
+                                    })
+                                    .map(Duration::from_millis);
                             let recorder = Arc::new(GrpcStreamingProbeRecorder::new(
                                 cb,
                                 grpc_cb_probe_slot,
                                 Arc::clone(&body_size_exceeded),
+                                post_header_upload_timeout,
                             ));
                             grpc_streaming_probe_recorder = Some(Arc::clone(&recorder));
                             // `let`-binding the trait object drives the
@@ -16022,6 +16079,48 @@ mod tests {
                 cb.state_name(),
                 "closed",
                 "a clean 2xx streaming probe must heal the breaker"
+            );
+        }
+
+        #[tokio::test]
+        async fn post_header_upload_timeout_releases_probe_slot_neutral() {
+            let cb = std::sync::Arc::new(breaker_with_admitted_half_open_probe());
+            let request_body_exceeded =
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let recorder = std::sync::Arc::new(super::super::GrpcStreamingProbeRecorder::new(
+                std::sync::Arc::clone(&cb),
+                true,
+                request_body_exceeded,
+                Some(std::time::Duration::from_millis(10)),
+            ));
+
+            recorder.note_status(200);
+            assert_eq!(
+                cb.half_open_in_flight(),
+                1,
+                "the slot remains held before the post-header upload guard expires"
+            );
+
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+            assert_eq!(
+                cb.state_name(),
+                "half_open",
+                "an unended upload past the post-header guard is neutral and must not heal"
+            );
+            assert_eq!(
+                cb.half_open_in_flight(),
+                0,
+                "the post-header upload guard must release the probe slot"
+            );
+
+            super::super::grpc_proxy::GrpcUploadTerminationObserver::on_upload_terminated(
+                recorder.as_ref(),
+            );
+            assert_eq!(
+                cb.state_name(),
+                "half_open",
+                "late upload termination after the timeout must not double-record"
             );
         }
 
