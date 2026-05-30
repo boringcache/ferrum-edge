@@ -377,6 +377,27 @@ pub const fn sock_ops_peer_port_host_order(remote_port: u32) -> u16 {
     u32::from_be(remote_port) as u16
 }
 
+/// Decode a `bpf_sock_addr.user_port` value to a host-byte-order port.
+///
+/// Unlike `bpf_sock_ops.remote_port` (see [`sock_ops_peer_port_host_order`]),
+/// the cgroup `connect4`/`connect6`/`getpeername` address context stores the
+/// port the way a `sockaddr_in.sin_port` does: **network byte order in the low
+/// 16 bits**, high 16 bits zero (the kernel sets and reads it as
+/// `bpf_htons(port)`). The sock_ops high-half `<< 16` convention does **not**
+/// apply here — using it reads the always-zero high half and yields `0`. So the
+/// decode is "take the low half, swap to host order".
+pub const fn sock_addr_user_port_to_host(user_port: u32) -> u16 {
+    u16::from_be((user_port & 0xFFFF) as u16)
+}
+
+/// Encode a host-byte-order port into a `bpf_sock_addr.user_port` value: network
+/// byte order in the low 16 bits, high 16 bits zero — the inverse of
+/// [`sock_addr_user_port_to_host`], and what the kernel expects when a
+/// cgroup/connect program rewrites the destination port.
+pub const fn host_port_to_sock_addr_user_port(port: u16) -> u32 {
+    port.to_be() as u32
+}
+
 impl CidrKey4 {
     /// Build an LPM key payload from a network-byte-order IPv4 address.
     pub const fn new(addr_nbo: u32) -> Self {
@@ -607,6 +628,33 @@ mod tests {
         // The previous bug (`remote_port as u16` first) read the zero low half
         // and returned 0 for both of these.
         assert_ne!(sock_ops_peer_port_host_order(0x901F_0000), 0);
+    }
+
+    #[test]
+    fn sock_addr_user_port_low_half_round_trip() {
+        // bpf_sock_addr.user_port carries sin_port: network byte order in the
+        // LOW 16 bits (high half zero), unlike bpf_sock_ops.remote_port. Encode
+        // and decode must be inverses, must place the port in the low half, and
+        // must NOT use the sock_ops high-half (`<< 16`) convention — which is the
+        // bug that left connect4 redirecting to port 0 on the live datapath.
+        for port in [1u16, 80, 443, 8080, 15001, 45435, 65535] {
+            let encoded = host_port_to_sock_addr_user_port(port);
+            assert_eq!(
+                encoded & 0xFFFF_0000,
+                0,
+                "port {port}: the high 16 bits must be zero"
+            );
+            assert_eq!(
+                sock_addr_user_port_to_host(encoded),
+                port,
+                "encode/decode must round-trip for port {port}"
+            );
+            assert_ne!(
+                encoded,
+                (port as u32) << 16,
+                "port {port} must not use the sock_ops high-half encoding"
+            );
+        }
     }
 
     #[test]

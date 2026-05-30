@@ -10,7 +10,7 @@ use aya_ebpf::programs::SockAddrContext;
 use aya_ebpf::EbpfContext;
 
 use crate::maps::FERRUM_ORIG_DST4;
-use ferrum_ebpf_common::OrigDstKey;
+use ferrum_ebpf_common::{host_port_to_sock_addr_user_port, OrigDstKey};
 
 #[cgroup_sock_addr(getpeername4)]
 pub fn ferrum_getpeername4(ctx: SockAddrContext) -> i32 {
@@ -28,7 +28,10 @@ fn try_getpeername4(ctx: &SockAddrContext) -> Result<i32, i64> {
     if let Some(orig) = unsafe { FERRUM_ORIG_DST4.get(&key) } {
         let sock_addr = unsafe { &mut *ctx.sock_addr };
         sock_addr.user_ip4 = orig.addr;
-        sock_addr.user_port = (orig.port as u32) << 16;
+        // `orig.port` is host byte order; `user_port` wants network byte order in
+        // the low 16 bits (sockaddr_in.sin_port), so the app's getpeername() sees
+        // the real original destination port.
+        sock_addr.user_port = host_port_to_sock_addr_user_port(orig.port as u16);
     }
 
     Ok(1)

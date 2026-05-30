@@ -12,8 +12,9 @@ use crate::maps::{
     FERRUM_INCLUDE_PORTS, FERRUM_ORIG_DST6, FERRUM_PORT_EXCLUDE, FERRUM_WORKLOAD_IDENTITY,
 };
 use ferrum_ebpf_common::{
-    CidrKey6, IncludePortsPolicy, OrigDst6, OrigDstKey, WorkloadIdentity,
-    FERRUM_CAPTURE_CONFIG_KEY, IPV6_LOOPBACK_NBO, OUTBOUND_CAPTURE_PORT,
+    host_port_to_sock_addr_user_port, sock_addr_user_port_to_host, CidrKey6, IncludePortsPolicy,
+    OrigDst6, OrigDstKey, WorkloadIdentity, FERRUM_CAPTURE_CONFIG_KEY, IPV6_LOOPBACK_NBO,
+    OUTBOUND_CAPTURE_PORT,
 };
 
 #[cgroup_sock_addr(connect6)]
@@ -45,7 +46,9 @@ fn try_connect6(ctx: &SockAddrContext) -> Result<i32, i64> {
         sock_addr.user_ip6[2],
         sock_addr.user_ip6[3],
     ];
-    let dst_port = (sock_addr.user_port >> 16) as u16;
+    // `bpf_sock_addr.user_port`: network-order port in the LOW 16 bits (see
+    // connect4 / `sock_addr_user_port_to_host`), NOT the sock_ops high half.
+    let dst_port = sock_addr_user_port_to_host(sock_addr.user_port);
 
     if unsafe { FERRUM_PORT_EXCLUDE.get(&dst_port) }.is_some() {
         return Ok(1);
@@ -86,7 +89,7 @@ fn try_connect6(ctx: &SockAddrContext) -> Result<i32, i64> {
     sock_addr.user_ip6[1] = IPV6_LOOPBACK_NBO[1];
     sock_addr.user_ip6[2] = IPV6_LOOPBACK_NBO[2];
     sock_addr.user_ip6[3] = IPV6_LOOPBACK_NBO[3];
-    sock_addr.user_port = outbound_capture_port() << 16;
+    sock_addr.user_port = host_port_to_sock_addr_user_port(outbound_capture_port() as u16);
 
     Ok(1)
 }
