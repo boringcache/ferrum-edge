@@ -26,10 +26,12 @@
 //! Node-waypoint mode is different because one proxy instance handles many
 //! pods. When `per_pod_policy_scoping` is enabled, construction-time filtering
 //! is skipped and the request path evaluates the `PolicyScopeCache` attached to
-//! `RequestContext::node_waypoint_policy_scope`. If the pod has no installed
-//! scope yet, only mesh-wide policies are retained; namespace and selector
-//! scoped policies are withheld until the resolver has the pod's workload
-//! metadata.
+//! `RequestContext::node_waypoint_policy_scope`. A missing scope means the
+//! pod's workload is no longer in the live slice (the resolver derives a pod's
+//! scope from the same single generation that vouches its identity, so it is
+//! not an enrollment race): both the HTTP/HBONE and stream paths then **fail
+//! closed** (403) when any namespace/selector-scoped policy is configured, and
+//! fall through to mesh-wide-only when the mesh carries only mesh-wide policies.
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -753,8 +755,35 @@ impl Plugin for MeshAuthz {
         // services, destination_rules, etc. the authz engine never reads).
         let mut scope_missing = false;
         let decision = if self.per_pod_policy_scoping {
+            scope_missing = ctx.node_waypoint_policy_scope.is_none();
+            // Fail closed when scoped policies exist and this request's pod has
+            // no current scope — matching the stream path (`on_stream_connect`).
+            // The resolver derives a pod's scope from the SAME slice generation
+            // that vouches its identity, and the accepting connection holds the
+            // identity `Arc` (which the idle sweep's strong_count guard keeps
+            // enrolled), so a missing scope here is NOT an enrollment race: it
+            // means the workload's hash has left the live slice gate (the pod was
+            // removed or re-keyed). A long-lived HTTP/2/HBONE connection from a
+            // removed workload must therefore stop being served under scoped
+            // authz rather than silently dropping to mesh-wide-only — the same
+            // per-request gate the stream path enforces at accept. A mesh with
+            // only mesh-wide policies stays fully evaluable and falls through.
+            if scope_missing && self.has_scoped_policies {
+                ctx.metadata
+                    .insert("mesh_authz.scope_missing".to_string(), "true".to_string());
+                ctx.metadata.insert(
+                    "mesh_authz.deny_policy".to_string(),
+                    "scope_missing".to_string(),
+                );
+                self.record_policy_deny(&ctx.metadata, source_for_log.as_deref());
+                return PluginResult::Reject {
+                    status_code: 403,
+                    body: r#"{"error":"Mesh authorization denied: missing per-pod policy scope"}"#
+                        .into(),
+                    headers: HashMap::new(),
+                };
+            }
             let scope = ctx.node_waypoint_policy_scope.as_deref();
-            scope_missing = scope.is_none();
             let policies = self
                 .slice
                 .mesh_policies
@@ -764,11 +793,10 @@ impl Plugin for MeshAuthz {
         } else {
             evaluate_mesh_authorization(&self.slice, &request)
         };
-        // Surface the per-pod-scope race window through transaction logs so
-        // operators can see when mesh_authz is falling back to mesh-wide
-        // policies because the resolver hasn't enrolled the pod's workload
-        // metadata yet. Only emitted when per_pod_policy_scoping is on, so
-        // sidecar/ambient/east-west/egress traffic is unaffected.
+        // Remaining scope-missing cases reach here only when no scoped policies
+        // are configured (the mesh is fully evaluable mesh-wide), so surface the
+        // fall-through for operator visibility. The fail-closed removed-workload
+        // case returns above. Only emitted when per_pod_policy_scoping is on.
         if scope_missing {
             ctx.metadata
                 .insert("mesh_authz.scope_missing".to_string(), "true".to_string());
