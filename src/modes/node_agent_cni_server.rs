@@ -119,7 +119,19 @@ pub fn spawn_cni_listener(
             return;
         }
 
-        let listener = match UnixListener::bind(&socket_path) {
+        // bind() creates the socket inode world-reachable (mode 0777 & ~umask)
+        // and it is only narrowed to 0660 afterward — a window in which the
+        // well-known socket path is connectable by any local UID. Close it by
+        // binding to a private temp name, chmod-ing it to 0660, then ATOMICALLY
+        // renaming it into place, so the path `ferrum-cni` actually connects to
+        // is never more permissive than 0660. (We can't tighten the parent dir
+        // to 0700 — `/var/run/ferrum` is shared with other node-agent runtime
+        // state such as the node-waypoint pod registry, which the non-root proxy
+        // must traverse — and a process-wide umask change would race other
+        // threads' file creates on the multithreaded runtime.)
+        let temp_socket_path = format!("{socket_path}.tmp.{}", std::process::id());
+        let _ = std::fs::remove_file(&temp_socket_path);
+        let listener = match UnixListener::bind(&temp_socket_path) {
             Ok(listener) => listener,
             Err(err) => {
                 error!(
@@ -130,12 +142,25 @@ pub fn spawn_cni_listener(
                 return;
             }
         };
-        if let Err(err) = set_socket_perms(&socket_path) {
-            warn!(
+        // Narrow to 0660 BEFORE publishing under the well-known name. If this
+        // fails, abort rather than publish a world-reachable socket.
+        if let Err(err) = set_socket_perms(&temp_socket_path) {
+            error!(
                 socket_path = %socket_path,
                 error = %err,
-                "Failed to chmod node-agent CNI socket to 0660; continuing with default perms"
+                "Failed to chmod node-agent CNI socket to 0660 before publish; aborting CNI listener (falling back to kube-rs watcher)"
             );
+            let _ = std::fs::remove_file(&temp_socket_path);
+            return;
+        }
+        if let Err(err) = std::fs::rename(&temp_socket_path, &socket_path) {
+            error!(
+                socket_path = %socket_path,
+                error = %err,
+                "Failed to publish node-agent CNI socket; CNI plugin path will fall back to kube-rs watcher"
+            );
+            let _ = std::fs::remove_file(&temp_socket_path);
+            return;
         }
         info!(
             socket_path = %socket_path,
@@ -426,6 +451,51 @@ mod tests {
             event.pod_uid, "",
             "missing pod_uid should map to empty string so callers can short-circuit"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn published_cni_socket_is_never_world_permissive() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("node-agent-cni.sock");
+        let socket_path_str = socket_path.to_string_lossy().to_string();
+
+        let (tx, _rx) = cni_work_channel();
+        let metrics = Arc::new(NodeAgentMetrics::default());
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let handle = spawn_cni_listener(socket_path_str.clone(), tx, metrics, shutdown_rx);
+
+        // Wait for the listener to publish the socket at the well-known path.
+        let mut mode = None;
+        for _ in 0..200 {
+            if let Ok(meta) = std::fs::metadata(&socket_path) {
+                mode = Some(meta.permissions().mode() & 0o777);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let mode = mode.expect("listener should publish the socket");
+        assert_eq!(
+            mode, 0o660,
+            "published socket must be exactly 0660, got {mode:o}"
+        );
+        assert_eq!(
+            mode & 0o007,
+            0,
+            "published socket must never be world-accessible (even transiently at the well-known path)"
+        );
+
+        // The private temp socket must be cleaned up after the atomic rename.
+        let temp = format!("{socket_path_str}.tmp.{}", std::process::id());
+        assert!(
+            !std::path::Path::new(&temp).exists(),
+            "temp socket must not linger after publish"
+        );
+
+        let _ = shutdown_tx.send(true);
+        handle.abort();
     }
 
     #[tokio::test]
