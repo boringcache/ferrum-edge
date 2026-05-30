@@ -623,6 +623,7 @@ impl MeshDnsProxy {
         // Bounds the TCP accept() busy-loop under fd exhaustion (the UDP recv
         // branch shares one datagram socket and is not an fd-accept loop).
         let mut accept_backoff = crate::util::accept_backoff::AcceptBackoff::new();
+        let mut accept_err_log = crate::util::accept_backoff::LogRateLimiter::new();
 
         loop {
             tokio::select! {
@@ -685,7 +686,15 @@ impl MeshDnsProxy {
                             });
                         }
                         Err(e) => {
-                            warn!(error = %e, "DNS proxy TCP accept error");
+                            // Bound the log rate independently of the backoff
+                            // (an abort/reset flood is not backed off): emit the
+                            // first error then one summary per second with the
+                            // suppressed count.
+                            if let Some(suppressed) =
+                                accept_err_log.on_event(crate::socket_opts::monotonic_now_ms())
+                            {
+                                warn!(error = %e, suppressed, "DNS proxy TCP accept error");
+                            }
                             if let Some(delay) = accept_backoff.on_error(e.kind()) {
                                 tokio::time::sleep(delay).await;
                             }

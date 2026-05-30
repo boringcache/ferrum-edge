@@ -143,6 +143,7 @@ pub fn spawn_cni_listener(
         );
 
         let mut accept_backoff = crate::util::accept_backoff::AcceptBackoff::new();
+        let mut accept_err_log = crate::util::accept_backoff::LogRateLimiter::new();
         loop {
             tokio::select! {
                 changed = shutdown.changed() => {
@@ -161,7 +162,15 @@ pub fn spawn_cni_listener(
                             });
                         }
                         Err(err) => {
-                            warn!(error = %err, "Node-agent CNI listener accept failed");
+                            // Bound the log rate independently of the backoff
+                            // (an abort/reset flood is not backed off): emit the
+                            // first error then one summary per second with the
+                            // suppressed count.
+                            if let Some(suppressed) =
+                                accept_err_log.on_event(crate::socket_opts::monotonic_now_ms())
+                            {
+                                warn!(error = %err, suppressed, "Node-agent CNI listener accept failed");
+                            }
                             if let Some(delay) = accept_backoff.on_error(err.kind()) {
                                 tokio::time::sleep(delay).await;
                             }
