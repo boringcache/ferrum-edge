@@ -996,21 +996,39 @@ async fn run_tcp_accept_loop(
     mut global_shutdown_rx: Option<watch::Receiver<bool>>,
     accept_loop_id: usize,
 ) -> Result<(), anyhow::Error> {
+    // See `run_accept_loop` in proxy/mod.rs: under fd exhaustion (EMFILE/ENFILE)
+    // accept() re-fails without consuming the backlog, busy-looping CPU + logs.
+    // Back off (capped at 100ms) only on repeated consecutive failures so
+    // isolated transient errors (e.g. ECONNABORTED) are not penalized.
+    let mut accept_backoff = crate::util::accept_backoff::AcceptBackoff::new();
+    let mut accept_err_log = crate::util::accept_backoff::LogRateLimiter::new();
     loop {
         tokio::select! {
             result = listener.accept() => {
                 let (stream, remote_addr) = match result {
                     Ok(conn) => conn,
                     Err(e) => {
-                        warn!(
-                            proxy_id = %state.proxy_id,
-                            accept_loop = accept_loop_id,
-                            "TCP accept error: {}",
-                            e
-                        );
+                        // Bound the log rate independently of the backoff (an
+                        // abort/reset flood is not backed off): emit the first
+                        // error, then one summary per second with the count.
+                        if let Some(suppressed) =
+                            accept_err_log.on_event(crate::socket_opts::monotonic_now_ms())
+                        {
+                            warn!(
+                                proxy_id = %state.proxy_id,
+                                accept_loop = accept_loop_id,
+                                suppressed,
+                                "TCP accept error: {}",
+                                e
+                            );
+                        }
+                        if let Some(delay) = accept_backoff.on_error(e.kind()) {
+                            tokio::time::sleep(delay).await;
+                        }
                         continue;
                     }
                 };
+                accept_backoff.on_success();
 
                 // Reject new connections under critical overload (same as HTTP proxy).
                 if state.overload.reject_new_connections.load(Ordering::Relaxed) {
