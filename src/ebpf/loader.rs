@@ -659,27 +659,32 @@ mod live_kernel_tests {
         let capture_port = server.local_addr().unwrap().port();
         server.set_nonblocking(true).unwrap();
 
-        // Capture config: rewrite outbound to `capture_port`; install 0.0.0.0/0
-        // as an include CIDR so connect4 actually captures (without an include
-        // match it fail-opens and never rewrites).
+        // Make connect4 capture this cgroup's egress and rewrite it to
+        // `capture_port`. A wildcard `includeOutboundPorts` policy is the most
+        // robust trigger: `capture_allowed()` returns true for it immediately,
+        // BEFORE the include-CIDR LPM check, so capture does not depend on the
+        // CIDR trie. The 0.0.0.0/0 include CIDR is also installed as a second
+        // path.
+        let cgroup_id = cgroup.cgroup_id();
         backend
             .update_capture_config(&ferrum_ebpf_common::BpfCaptureConfig::new(
                 capture_port,
                 15008,
             ))
             .expect("set capture config");
-        backend
-            .maps
-            .as_mut()
-            .expect("maps loaded")
-            .insert_cidr_include("0.0.0.0/0")
-            .expect("insert 0.0.0.0/0 include CIDR");
+        {
+            let maps = backend.maps.as_mut().expect("maps loaded");
+            maps.insert_cidr_include("0.0.0.0/0")
+                .expect("insert 0.0.0.0/0 include CIDR");
+            maps.insert_include_ports(cgroup_id, &ferrum_ebpf_common::IncludePortsPolicy::all())
+                .expect("insert wildcard include-ports policy");
+        }
 
         // Stamp an identity for this cgroup (connect4 records it into the
         // orig-dst entry; mirrors the production connect-side stamp).
         backend
             .update_workload_identity(
-                cgroup.cgroup_id(),
+                cgroup_id,
                 &WorkloadIdentity::new([9u8; 16], 0x0123_4567_89ab_cdef),
             )
             .expect("stamp workload identity");
