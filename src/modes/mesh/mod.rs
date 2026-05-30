@@ -3435,6 +3435,46 @@ async fn serve_mesh_runtime(
     } else {
         proxy_state
     };
+    // Node-waypoint in-netns outbound capture listeners (opt-in). The default
+    // outbound listener binds 127.0.0.1:15001 in the HOST netns, which a pod's
+    // loopback-rewritten capture (`connect4` → 127.0.0.1:15001) can never reach;
+    // with this enabled the proxy additionally opens a 127.0.0.1:15001 listener
+    // INSIDE each enrolled pod's network namespace, so captured connections are
+    // accepted there and the GAP-2M sock_ops same-netns cookie bridge resolves
+    // their source identity. Pods are discovered from the registry the node-agent
+    // publishes. Linux-only; the full pod-loopback datapath is verified only on a
+    // live multi-pod node (see `src/proxy/netns_capture.rs`).
+    if runtime.topology == MeshTopology::NodeWaypoint
+        && env_config.mesh_node_waypoint_in_netns_listeners
+    {
+        // Invariant: a compile-time-constant valid socket address literal.
+        let capture_addr: std::net::SocketAddr = DEFAULT_OUTBOUND_LISTEN_ADDR
+            .parse()
+            .expect("DEFAULT_OUTBOUND_LISTEN_ADDR is a valid socket address");
+        let source = Arc::new(crate::proxy::netns_capture::DirectoryCaptureSource::new(
+            env_config.mesh_node_waypoint_pod_registry_dir.clone(),
+        ));
+        let backend = crate::proxy::netns_capture::ProxyNetnsBackend::new(
+            proxy_state.clone(),
+            None,
+            Some(MeshTrafficDirection::Outbound),
+            shutdown_tx.subscribe(),
+        );
+        let manager = crate::proxy::netns_capture::NetnsCaptureManager::new(
+            capture_addr,
+            source,
+            backend,
+            std::time::Duration::from_secs(2),
+        );
+        let manager_shutdown = shutdown_tx.subscribe();
+        info!(
+            registry_dir = %env_config.mesh_node_waypoint_pod_registry_dir,
+            "Node-waypoint in-netns outbound capture listeners enabled"
+        );
+        mesh_background_handles.push(tokio::spawn(async move {
+            manager.run(manager_shutdown).await;
+        }));
+    }
     if let Some(ref slice) = initial_applied_mesh_slice {
         mesh_state.record_applied_slice(slice);
     }

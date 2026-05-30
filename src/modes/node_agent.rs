@@ -63,6 +63,13 @@ pub struct NodeAgentConfig {
     /// `FERRUM_K8S_TRUST_DOMAIN` (default `cluster.local`) so it matches the
     /// CP-side SPIFFE format that the node-waypoint resolver enrolls.
     pub trust_domain: String,
+    /// Directory under which the node-agent publishes a per-pod registry file
+    /// (`<dir>/<pod_uid>` containing the pod cgroup path) for the mesh proxy's
+    /// in-netns capture listeners to consume. `Some` only when in-netns
+    /// listeners are enabled AND the proxy mode is `NodeWaypoint`; `None`
+    /// disables publishing entirely (the registry is meaningless outside that
+    /// topology). Sourced from `FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR`.
+    pub node_waypoint_pod_registry_dir: Option<std::path::PathBuf>,
 }
 
 /// CNI plugin listener configuration. Resolved from the env config in
@@ -124,6 +131,20 @@ impl NodeAgentConfig {
             DEFAULT_NODE_AGENT_SOCKET_PATH,
         )?;
 
+        // Per-pod registry publishing is meaningful only when the mesh proxy
+        // runs in-netns capture listeners in NodeWaypoint topology; otherwise
+        // there is no consumer and we leave it `None` so the hot paths skip
+        // all filesystem work.
+        let node_waypoint_pod_registry_dir = if env_config.mesh_node_waypoint_in_netns_listeners
+            && env_config.node_agent_proxy_mode == NodeAgentProxyMode::NodeWaypoint
+        {
+            Some(std::path::PathBuf::from(
+                &env_config.mesh_node_waypoint_pod_registry_dir,
+            ))
+        } else {
+            None
+        };
+
         Ok(Self {
             node_name,
             capture_config,
@@ -133,6 +154,7 @@ impl NodeAgentConfig {
             excluded_namespaces,
             capture_contract,
             trust_domain: env_config.k8s_trust_domain.clone(),
+            node_waypoint_pod_registry_dir,
         })
     }
 }
@@ -450,7 +472,7 @@ async fn run_with_backend(
                     }
                     Some(Ok(Event::Delete(pod))) => {
                         if let Some(uid) = pod_uid(&pod) {
-                            handle_pod_removed(backend.as_mut(), &pod_states, metrics.as_ref(), &uid);
+                            handle_pod_removed(backend.as_mut(), &pod_states, config, metrics.as_ref(), &uid);
                         }
                     }
                     Some(Ok(Event::Init)) => {
@@ -475,7 +497,7 @@ async fn run_with_backend(
                                 .map(|entry| entry.key().clone())
                                 .collect();
                             for uid in stale_uids {
-                                handle_pod_removed(backend.as_mut(), &pod_states, metrics.as_ref(), &uid);
+                                handle_pod_removed(backend.as_mut(), &pod_states, config, metrics.as_ref(), &uid);
                             }
                         }
                         startup_ready.store(true, Ordering::Release);
@@ -686,7 +708,7 @@ fn apply_cni_add_from_pod(
 pub fn apply_cni_request(
     backend: &mut dyn EbpfBackend,
     pod_states: &DashMap<String, PodAttachmentState>,
-    _config: &NodeAgentConfig,
+    config: &NodeAgentConfig,
     metrics: &NodeAgentMetrics,
     request: &CniRpcRequest,
 ) -> CniRpcResponse {
@@ -715,7 +737,7 @@ pub fn apply_cni_request(
                         .to_string(),
                 };
             }
-            handle_pod_removed(backend, pod_states, metrics, event.pod_uid);
+            handle_pod_removed(backend, pod_states, config, metrics, event.pod_uid);
             CniRpcResponse::Ok
         }
         RpcVerb::Check => {
@@ -1101,6 +1123,75 @@ pub struct PodEvent<'a> {
     pub veth_iface_override: Option<&'a str>,
 }
 
+/// Reject a `pod_uid` that could escape the registry directory. A pod UID is a
+/// Kubernetes-assigned value; treating it as a path component without checks
+/// would let an empty, slash-, backslash-, or `..`-bearing value write or
+/// delete files outside `dir`. Returns `true` when the UID is unsafe to use as
+/// a leaf filename.
+fn pod_registry_uid_is_unsafe(pod_uid: &str) -> bool {
+    pod_uid.is_empty() || pod_uid.contains('/') || pod_uid.contains('\\') || pod_uid.contains("..")
+}
+
+/// Best-effort publish of a single pod's registry entry: ensure `dir` exists,
+/// then write `dir/<pod_uid>` containing `cgroup_path` on one line. The mesh
+/// proxy's in-netns capture listeners poll this directory. Never panics and
+/// never propagates: any I/O error (or an unsafe `pod_uid`) is logged at
+/// `warn!` and swallowed so pod enrollment is never aborted by registry I/O.
+fn publish_pod_registry(dir: &std::path::Path, pod_uid: &str, cgroup_path: &str) {
+    if pod_registry_uid_is_unsafe(pod_uid) {
+        warn!(
+            pod_uid,
+            "Refusing to publish node-waypoint pod registry entry: pod UID is empty or contains \
+             path separators / '..'"
+        );
+        return;
+    }
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        warn!(
+            pod_uid,
+            dir = %dir.display(),
+            error = %e,
+            "Failed to create node-waypoint pod registry directory"
+        );
+        return;
+    }
+    let path = dir.join(pod_uid);
+    if let Err(e) = std::fs::write(&path, format!("{cgroup_path}\n")) {
+        warn!(
+            pod_uid,
+            path = %path.display(),
+            error = %e,
+            "Failed to write node-waypoint pod registry entry"
+        );
+    }
+}
+
+/// Best-effort removal of a single pod's registry entry (`dir/<pod_uid>`).
+/// A missing file is treated as success (the entry was never published or was
+/// already cleaned up); any other I/O error (or an unsafe `pod_uid`) is logged
+/// at `warn!` and swallowed.
+fn remove_pod_registry(dir: &std::path::Path, pod_uid: &str) {
+    if pod_registry_uid_is_unsafe(pod_uid) {
+        warn!(
+            pod_uid,
+            "Refusing to remove node-waypoint pod registry entry: pod UID is empty or contains \
+             path separators / '..'"
+        );
+        return;
+    }
+    let path = dir.join(pod_uid);
+    if let Err(e) = std::fs::remove_file(&path)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(
+            pod_uid,
+            path = %path.display(),
+            error = %e,
+            "Failed to remove node-waypoint pod registry entry"
+        );
+    }
+}
+
 pub fn handle_pod_added(
     backend: &mut dyn EbpfBackend,
     pod_states: &DashMap<String, PodAttachmentState>,
@@ -1117,7 +1208,7 @@ pub fn handle_pod_added(
     );
     if decision != EnrollmentDecision::Enroll {
         if pod_states.contains_key(pod_uid) {
-            handle_pod_removed(backend, pod_states, metrics, pod_uid);
+            handle_pod_removed(backend, pod_states, config, metrics, pod_uid);
         }
         debug!(
             pod_uid,
@@ -1129,6 +1220,17 @@ pub fn handle_pod_added(
     let pod_ip = event.pod_ip_str.and_then(pod_watcher::parse_pod_ip);
     let cgroup_path = cgroup::resolve_pod_cgroup_path(&config.cgroup_root, pod_uid)
         .map(|p| p.to_string_lossy().to_string());
+    // Publish this pod's cgroup path to the per-pod registry so the mesh
+    // proxy's in-netns capture listeners can discover it. Enrollment is already
+    // confirmed above (the non-`Enroll` decision early-returns). Best-effort and
+    // gated on `node_waypoint_pod_registry_dir` being `Some` (in-netns listeners
+    // + NodeWaypoint topology); only meaningful once the cgroup path resolves.
+    if let (Some(dir), Some(cgroup_path_value)) = (
+        &config.node_waypoint_pod_registry_dir,
+        cgroup_path.as_deref(),
+    ) {
+        publish_pod_registry(dir, pod_uid, cgroup_path_value);
+    }
     // Production: the kube-rs caller sets `veth_iface_override = None`; the
     // resolver first uses an explicit pod PID when available, then falls back
     // to the resolved pod cgroup to find a live process in that pod.
@@ -1146,7 +1248,7 @@ pub fn handle_pod_added(
                 .is_some_and(|iface| state.veth_iface.as_ref() != Some(iface));
         if attachment_target_changed {
             drop(state);
-            handle_pod_removed(backend, pod_states, metrics, pod_uid);
+            handle_pod_removed(backend, pod_states, config, metrics, pod_uid);
         } else {
             reconcile_existing_pod_ip(backend, config, metrics, pod_uid, pod_ip, &mut state);
             reconcile_existing_pod_include_ports(
@@ -1603,9 +1705,18 @@ fn describe_policy(policy: Option<&IncludePortsPolicy>) -> String {
 pub fn handle_pod_removed(
     backend: &mut dyn EbpfBackend,
     pod_states: &DashMap<String, PodAttachmentState>,
+    config: &NodeAgentConfig,
     metrics: &NodeAgentMetrics,
     pod_uid: &str,
 ) {
+    // Drop this pod's per-pod registry entry (if publishing is enabled) so the
+    // mesh proxy's in-netns capture listeners stop discovering a torn-down pod.
+    // Best-effort and independent of whether the pod was actually attached: a
+    // pod that failed to fully enroll may still have a stale registry file.
+    if let Some(dir) = &config.node_waypoint_pod_registry_dir {
+        remove_pod_registry(dir, pod_uid);
+    }
+
     let removed = pod_states.remove(pod_uid);
     let Some((_, state)) = removed else {
         return;
@@ -2087,6 +2198,7 @@ mod tests {
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
             trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
         };
 
         let mut backend = MockEbpfBackend::default();
@@ -2115,6 +2227,7 @@ mod tests {
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
             trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
         };
         config.capture_contract.proxy_mode = NodeAgentProxyMode::NodeWaypoint;
 
@@ -2138,6 +2251,7 @@ mod tests {
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
             trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
         };
         config.capture_contract.proxy_mode = NodeAgentProxyMode::NodeWaypoint;
         let mut backend = MockEbpfBackend {
@@ -2169,6 +2283,7 @@ mod tests {
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
             trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
         };
         let mut backend = MockEbpfBackend {
             fail_update_capture_config: true,
@@ -2250,6 +2365,7 @@ mod tests {
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
             trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
         };
         let probe = kernel_probe::KernelProbeResult {
             kernel_release: "4.19.0".to_string(),
@@ -2321,6 +2437,7 @@ mod tests {
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
             trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
         };
         let probe = kernel_probe::KernelProbeResult {
             kernel_release: "4.19.0".to_string(),
@@ -2436,6 +2553,7 @@ mod tests {
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
             trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
         };
         let probe = kernel_probe::KernelProbeResult {
             kernel_release: "4.19.0".to_string(),
@@ -2509,6 +2627,7 @@ mod tests {
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
             trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
         };
         let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
         let event = PodEvent {
@@ -2568,6 +2687,7 @@ mod tests {
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
             trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
         };
         let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
         let event = PodEvent {
@@ -2638,6 +2758,7 @@ mod tests {
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
             trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
         };
         let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
         let event = PodEvent {
@@ -2701,6 +2822,7 @@ mod tests {
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
             trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
         };
         let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
         let event = PodEvent {
@@ -2735,6 +2857,7 @@ mod tests {
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
             trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
         };
         let event = PodEvent {
             pod_uid: "pod-uid-2",
@@ -2783,6 +2906,7 @@ mod tests {
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
             trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
         };
         let event = PodEvent {
             pod_uid: "pod-uid-2",
@@ -2818,6 +2942,7 @@ mod tests {
             excluded_namespaces: excluded,
             capture_contract: CaptureContract::local_pod_defaults(),
             trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
         };
         let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
         let event = PodEvent {
@@ -2869,7 +2994,18 @@ mod tests {
             )
             .unwrap();
 
-        handle_pod_removed(&mut backend, &pod_states, &metrics, "pod-uid-1");
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: "/sys/fs/cgroup".to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        };
+        handle_pod_removed(&mut backend, &pod_states, &config, &metrics, "pod-uid-1");
 
         assert!(!pod_states.contains_key("pod-uid-1"));
         assert_eq!(backend.detached_pods, vec!["pod-uid-1"]);
@@ -2882,11 +3018,86 @@ mod tests {
         let mut backend = MockEbpfBackend::default();
         let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
         let metrics = NodeAgentMetrics::default();
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: "/sys/fs/cgroup".to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        };
 
-        handle_pod_removed(&mut backend, &pod_states, &metrics, "nonexistent");
+        handle_pod_removed(&mut backend, &pod_states, &config, &metrics, "nonexistent");
 
         assert!(backend.detached_pods.is_empty());
         assert_eq!(metrics.pods_unenrolled.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn publish_pod_registry_writes_file_with_cgroup_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = dir.path().join("node-waypoint-pods");
+        // Directory does not exist yet — publish must create it.
+        assert!(!registry.exists());
+
+        publish_pod_registry(&registry, "pod-uid-1", "/sys/fs/cgroup/kubepods/poduid1");
+
+        let path = registry.join("pod-uid-1");
+        assert!(path.exists(), "registry entry must be written");
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(contents, "/sys/fs/cgroup/kubepods/poduid1\n");
+    }
+
+    #[test]
+    fn remove_pod_registry_removes_entry_and_tolerates_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = dir.path().join("node-waypoint-pods");
+        publish_pod_registry(&registry, "pod-uid-1", "/cg/path");
+        let path = registry.join("pod-uid-1");
+        assert!(path.exists());
+
+        remove_pod_registry(&registry, "pod-uid-1");
+        assert!(!path.exists(), "registry entry must be removed");
+
+        // A second removal (file already gone) must be a no-op, not a panic.
+        remove_pod_registry(&registry, "pod-uid-1");
+        // Removing from a directory that never existed must also be tolerated.
+        remove_pod_registry(&dir.path().join("missing-dir"), "pod-uid-1");
+    }
+
+    #[test]
+    fn publish_pod_registry_rejects_path_traversal_uids() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = dir.path().join("node-waypoint-pods");
+
+        // None of these may write anything; an escaping UID must be refused
+        // before any directory is created or file written.
+        for unsafe_uid in ["", "../escape", "a/b", "a\\b", "..", "foo/../bar"] {
+            publish_pod_registry(&registry, unsafe_uid, "/cg/path");
+        }
+
+        // The guard fires before `create_dir_all`, so nothing was created and
+        // no traversal target was written.
+        assert!(
+            !registry.exists(),
+            "unsafe pod UID must not create the registry directory"
+        );
+        assert!(
+            !dir.path().join("escape").exists(),
+            "'..' in pod UID must not write outside the registry directory"
+        );
+
+        // remove_pod_registry shares the guard: an unsafe UID is a no-op even
+        // when the directory exists with a sibling file.
+        std::fs::create_dir_all(&registry).unwrap();
+        let keep = registry.join("real-pod");
+        std::fs::write(&keep, "x").unwrap();
+        remove_pod_registry(&registry, "../real-pod");
+        remove_pod_registry(&registry, "..");
+        assert!(keep.exists(), "unsafe UID must not delete a sibling entry");
     }
 
     /// `apply_cni_request` ADD without Kubernetes metadata is a no-op and
@@ -2908,6 +3119,7 @@ mod tests {
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
             trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
         };
         let req = CniRpcRequest {
             verb: RpcVerb::Add,
@@ -2947,6 +3159,7 @@ mod tests {
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
             trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
         };
         let ip = std::net::Ipv4Addr::new(10, 0, 0, 9);
         pod_states.insert(
@@ -3002,6 +3215,7 @@ mod tests {
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
             trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
         };
         let req = CniRpcRequest {
             verb: RpcVerb::Add,
@@ -3042,6 +3256,7 @@ mod tests {
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
             trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
         };
         // Pre-populate as if the watcher had already enrolled the pod.
         pod_states.insert(
@@ -3110,6 +3325,7 @@ mod tests {
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
             trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
         };
 
         // Untracked pod: CHECK is Rejected.
@@ -3166,6 +3382,7 @@ mod tests {
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
             trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
         };
         let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
 
@@ -3219,6 +3436,7 @@ mod tests {
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
             trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
         };
         let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
 
@@ -3278,6 +3496,7 @@ mod tests {
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
             trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
         };
         let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
 
@@ -3328,6 +3547,7 @@ mod tests {
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
             trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
         };
         let probe = kernel_probe::KernelProbeResult {
             kernel_release: "4.19.0".to_string(),
@@ -3378,6 +3598,7 @@ mod tests {
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
             trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
         };
         let probe = kernel_probe::KernelProbeResult {
             kernel_release: "6.1.0".to_string(),
@@ -3701,6 +3922,7 @@ mod tests {
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
             trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
         };
         let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
         let annotations =
@@ -3765,6 +3987,7 @@ mod tests {
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
             trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
         };
         let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
         let annotations =
@@ -3831,6 +4054,7 @@ mod tests {
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
             trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
         };
         let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
         let annotations =
@@ -3895,6 +4119,7 @@ mod tests {
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
             trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
         };
         let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
         let annotations =
@@ -3948,6 +4173,7 @@ mod tests {
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
             trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
         };
         let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
         let event = PodEvent {
@@ -3996,6 +4222,7 @@ mod tests {
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
             trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
         };
         let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
         let annotations =
@@ -4041,6 +4268,7 @@ mod tests {
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
             trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
         };
         let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
         let annotations =
@@ -4060,7 +4288,7 @@ mod tests {
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
         assert_eq!(backend.include_ports.len(), 1, "entry must be written");
 
-        handle_pod_removed(&mut backend, &pod_states, &metrics, "pod-uid-1");
+        handle_pod_removed(&mut backend, &pod_states, &config, &metrics, "pod-uid-1");
         assert!(
             backend.include_ports.is_empty(),
             "removal must drop the include-ports entry"
@@ -4094,6 +4322,7 @@ mod tests {
             excluded_namespaces: HashSet::new(),
             capture_contract: CaptureContract::local_pod_defaults(),
             trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
         };
         (cgroup_root, config)
     }
