@@ -2800,6 +2800,21 @@ fn inject_mesh_global_plugins(
         "labels": mesh_slice.labels.clone(),
         "trust_domain_aliases": trust_domain_aliases,
     });
+    // Mirror the mesh_authz assertor gate so telemetry source-identity
+    // attribution honors HBONE baggage only from trusted assertors (a forged
+    // baggage `source.principal` from an ordinary workload must not mis-attribute
+    // metrics/graph/spans). As with mesh_authz, only thread the operator-set
+    // list when present so unset (default ztunnel/waypoint) and explicit `[]`
+    // (lock baggage rewriting down) stay distinguishable.
+    if !runtime.trusted_hbone_assertors.is_empty() {
+        workload_metrics_config["trusted_hbone_assertors"] = serde_json::Value::Array(
+            runtime
+                .trusted_hbone_assertors
+                .iter()
+                .map(|raw| serde_json::Value::String(raw.clone()))
+                .collect(),
+        );
+    }
     // Apply ProxyConfig sampling as a baseline. The more granular Telemetry
     // resource below may override on the `sampling_percentage` key.
     if let Some(proxy_cfg) = mesh_slice.resolved_proxy_config()

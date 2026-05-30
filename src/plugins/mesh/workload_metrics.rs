@@ -15,7 +15,10 @@ use crate::identity::{SpiffeId, TrustDomain};
 use crate::modes::mesh::MeshTrafficDirection;
 use crate::modes::mesh::config::TracingProvider;
 use crate::modes::mesh::hbone::{BAGGAGE_HEADER, HboneIdentity};
-use crate::plugins::mesh::authz::parse_trust_domain_aliases;
+use crate::plugins::mesh::authz::{
+    TrustedAssertor, is_trusted_hbone_assertor, parse_trust_domain_aliases,
+    parse_trusted_hbone_assertors,
+};
 use crate::plugins::otel_tracing::{
     OtelTracing, SpanData, SpanKind, TraceExporter, build_traceparent, ensure_trace_metadata,
     trace_exporters_from_providers, trace_is_sampled,
@@ -124,6 +127,12 @@ pub struct WorkloadMetrics {
     workload_spiffe_id: Option<SpiffeId>,
     labels: HashMap<String, String>,
     trust_domain_aliases: Vec<TrustDomain>,
+    /// HBONE trusted-assertor allow-list. Baggage `source.principal` is honored
+    /// only when the authenticated peer matches this list (default
+    /// ztunnel/waypoint), mirroring `mesh_authz` so telemetry attribution can
+    /// never diverge from the authorization decision. Empty = no peer may
+    /// assert baggage (fail closed).
+    trusted_hbone_assertors: Vec<TrustedAssertor>,
     /// Tracing sampling percentage 0.0–100.0 (from Telemetry CRD).
     sampling_percentage: Option<f64>,
     /// Custom tags injected into every transaction's metadata.
@@ -182,6 +191,8 @@ impl WorkloadMetrics {
             .unwrap_or_default();
         let trust_domain_aliases =
             parse_trust_domain_aliases(config).map_err(|e| format!("workload_metrics: {e}"))?;
+        let trusted_hbone_assertors =
+            parse_trusted_hbone_assertors(config).map_err(|e| format!("workload_metrics: {e}"))?;
         let sampling_percentage = match config.get("sampling_percentage") {
             Some(value) => {
                 let Some(percentage) = value.as_f64() else {
@@ -251,6 +262,7 @@ impl WorkloadMetrics {
             workload_spiffe_id,
             labels,
             trust_domain_aliases,
+            trusted_hbone_assertors,
             sampling_percentage,
             custom_tags,
             custom_header_tags,
@@ -297,54 +309,53 @@ impl WorkloadMetrics {
             }
         }
         let hbone_identity = hbone_identity_from_headers(ctx, headers);
-        // For authenticated ambient HBONE, the peer cert identifies the
-        // ztunnel, while baggage identifies the originating workload. If the
-        // baggage identity's trust domain neither matches the peer cert's
-        // trust domain nor appears in `trust_domain_aliases`, drop it and
-        // fall back to the ztunnel's cert identity. Mirror of the gate
-        // applied by `mesh_authz`.
+        // Resolve the source identity using the SAME baggage trust gate as
+        // `mesh_authz` (shared `is_trusted_hbone_assertor` predicate) so the
+        // telemetry attribution can never diverge from the authorization
+        // decision. On authenticated ambient HBONE the peer cert identifies the
+        // assertor (ztunnel/waypoint, by default) while baggage carries the
+        // originating workload. Baggage `source.principal` is honored ONLY when
+        // the peer is a trusted assertor AND the baggage trust domain matches
+        // the peer's (or an alias). Otherwise the baggage is dropped, we fall
+        // back to the peer-cert identity, and we stamp `mesh.ignored_baggage`
+        // with the reason (mirroring `mesh_authz.ignored_baggage.*`). Without
+        // the assertor gate any authenticated workload pod could forge a baggage
+        // `source.principal` and mis-attribute its own traffic to a victim
+        // workload across metrics, the service graph, spans, and access logs.
         let baggage_source_principal = hbone_identity
             .as_ref()
             .and_then(|identity| identity.source_principal.clone());
-        let trusted_baggage_source_principal = ctx
-            .peer_spiffe_id
-            .is_some()
-            .then(|| baggage_source_principal.clone())
-            .flatten();
-        let trust_domain_mismatch = match (
-            ctx.peer_spiffe_id.as_ref(),
-            baggage_source_principal.as_ref(),
-        ) {
+        let source_identity = match (ctx.peer_spiffe_id.as_ref(), baggage_source_principal) {
             (Some(peer), Some(baggage)) => {
-                !self.trust_domain_allowed(peer.trust_domain(), baggage.trust_domain())
+                if !is_trusted_hbone_assertor(&self.trusted_hbone_assertors, peer) {
+                    ctx.metadata.insert(
+                        "mesh.ignored_baggage".to_string(),
+                        "untrusted_assertor".to_string(),
+                    );
+                    Some(peer.clone())
+                } else if !self.trust_domain_allowed(peer.trust_domain(), baggage.trust_domain()) {
+                    ctx.metadata.insert(
+                        "mesh.ignored_baggage".to_string(),
+                        "trust_domain_mismatch".to_string(),
+                    );
+                    Some(peer.clone())
+                } else {
+                    Some(baggage)
+                }
             }
-            _ => false,
-        };
-        if trust_domain_mismatch {
-            ctx.metadata.insert(
-                "mesh.ignored_baggage".to_string(),
-                "trust_domain_mismatch".to_string(),
-            );
-        } else if ctx.peer_spiffe_id.is_none()
-            && hbone_identity
-                .as_ref()
-                .and_then(|identity| identity.source_principal.as_ref())
-                .is_some()
-        {
-            ctx.metadata.insert(
-                "mesh.ignored_baggage".to_string(),
-                "unauthenticated_hbone".to_string(),
-            );
+            // An unauthenticated request must never have its source identity
+            // rewritten by baggage; fall back to the workload hint below.
+            (None, Some(_)) => {
+                ctx.metadata.insert(
+                    "mesh.ignored_baggage".to_string(),
+                    "unauthenticated_hbone".to_string(),
+                );
+                None
+            }
+            // No baggage principal: use the authenticated peer identity if any.
+            (peer, None) => peer.cloned(),
         }
-        let source_identity = if trust_domain_mismatch {
-            ctx.peer_spiffe_id
-                .clone()
-                .or_else(|| self.workload_spiffe_id.clone())
-        } else {
-            trusted_baggage_source_principal
-                .or_else(|| ctx.peer_spiffe_id.clone())
-                .or_else(|| self.workload_spiffe_id.clone())
-        };
+        .or_else(|| self.workload_spiffe_id.clone());
         ctx.metadata.insert(
             "mesh.connection_security_policy".to_string(),
             if ctx.peer_spiffe_id.is_some() || ctx.tls_client_cert_der.is_some() {
