@@ -65,6 +65,13 @@ jobs:
           echo "supported_features=$supported_features" >> "$GITHUB_OUTPUT"
           echo "conformance_tests=$conformance_tests" >> "$GITHUB_OUTPUT"
 
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          shared-key: "gateway-api-conformance"
+
+      - name: Build gateway binary
+        run: cargo build --bin ferrum-edge
+
       - name: Set up Go
         uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:
@@ -79,8 +86,11 @@ jobs:
           sudo chmod +x /usr/local/bin/kubectl
           curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
 
-      - name: Build Ferrum image
-        run: docker build -t "$FERRUM_IMAGE" .
+      - name: Package Ferrum image
+        uses: ./.github/actions/package-ferrum-runtime-image
+        with:
+          binary-path: target/debug/ferrum-edge
+          image: ${{ env.FERRUM_IMAGE }}
 
       - name: Create kind cluster
         run: |

@@ -1,0 +1,77 @@
+name: Package Ferrum runtime image
+description: >-
+  Builds a small Ferrum runtime container image around an already-built
+  ferrum-edge binary. Intended for CI labs that need a Kubernetes image but do
+  not need to validate the full release Dockerfile build.
+
+inputs:
+  binary-path:
+    description: Path to the prebuilt ferrum-edge binary.
+    required: true
+  image:
+    description: Docker image name and tag to build.
+    required: true
+  base-image:
+    description: Runtime base image.
+    required: false
+    default: gcr.io/distroless/cc-debian13:nonroot
+  strip-binary:
+    description: Strip debug symbols from the copied binary before packaging.
+    required: false
+    default: "true"
+
+runs:
+  using: composite
+  steps:
+    - name: Build runtime image from prebuilt binary
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        binary_path="${{ inputs.binary-path }}"
+        image="${{ inputs.image }}"
+        base_image="${{ inputs.base-image }}"
+
+        if [ ! -f "$binary_path" ]; then
+          echo "::error title=Missing ferrum-edge binary::$binary_path does not exist"
+          exit 1
+        fi
+
+        image_context="$(mktemp -d)"
+        trap 'rm -rf "$image_context"' EXIT
+
+        install -m 0755 "$binary_path" "$image_context/ferrum-edge"
+        if [ "${{ inputs.strip-binary }}" = "true" ] && command -v strip >/dev/null 2>&1; then
+          strip "$image_context/ferrum-edge" || true
+        fi
+
+        {
+          printf 'FROM %s\n' "$base_image"
+          cat <<'DOCKERFILE'
+        WORKDIR /app
+
+        COPY --chown=nonroot:nonroot ferrum-edge /app/ferrum-edge
+
+        ENV PATH="/app:${PATH}" \
+            FERRUM_MODE=database \
+            FERRUM_LOG_LEVEL=error \
+            FERRUM_PROXY_HTTP_PORT=8000 \
+            FERRUM_PROXY_HTTPS_PORT=8443 \
+            FERRUM_ADMIN_HTTP_PORT=9000 \
+            FERRUM_ADMIN_HTTPS_PORT=9443
+
+        EXPOSE 8000 8443 9000 9443 50051
+
+        HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+            CMD ["/app/ferrum-edge", "health"]
+
+        LABEL org.opencontainers.image.title="Ferrum Edge" \
+              org.opencontainers.image.description="High-performance edge proxy built in Rust" \
+              org.opencontainers.image.source="https://github.com/ferrum-edge/ferrum-edge"
+
+        ENTRYPOINT ["/app/ferrum-edge"]
+        CMD ["run"]
+        DOCKERFILE
+        } > "$image_context/Dockerfile"
+
+        docker build -t "$image" "$image_context"
