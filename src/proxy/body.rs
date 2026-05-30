@@ -2403,6 +2403,42 @@ mod tests {
         must_be_sync::<SyncBody<CountingIncoming>>();
     }
 
+    #[test]
+    fn per_ip_request_guard_releases_only_when_proxy_body_drops() {
+        // F15 regression: streaming gRPC now attaches the PerIpRequestGuard to
+        // the ProxyBody (via with_per_ip_request_guard) so the per-IP concurrency
+        // slot is held for the FULL streaming-response lifetime instead of being
+        // released at response-header time (the limit-evasion this PR closes).
+        // This pins the guard->body lifetime coupling that the fix relies on: the
+        // count must stay held while the body is alive and decrement exactly once
+        // when the body drops (stream completion or client-disconnect Drop).
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let ip = "203.0.113.7".to_string();
+        let counts: Arc<dashmap::DashMap<String, AtomicU64>> = Arc::new(dashmap::DashMap::new());
+        counts.insert(ip.clone(), AtomicU64::new(1));
+        let load = || counts.get(&ip).unwrap().value().load(Ordering::Relaxed);
+
+        let guard = crate::proxy::PerIpRequestGuard {
+            ip: ip.clone(),
+            counts: Arc::clone(&counts),
+        };
+
+        // Attaching the guard to the body must NOT release the slot.
+        let body = ProxyBody::full(Bytes::from_static(b"streaming-grpc-response"))
+            .with_per_ip_request_guard(guard);
+        assert_eq!(load(), 1, "slot must stay held while the body is alive");
+
+        // The slot is released only when the body (and thus its guard) drops.
+        drop(body);
+        assert_eq!(
+            load(),
+            0,
+            "dropping the body must release the per-IP slot exactly once"
+        );
+    }
+
     /// A `Send`-but-`!Sync` witness body. Used purely for compile-time
     /// negative tests below — the inclusion of a `Cell<()>` field makes
     /// the type `!Sync` while leaving it `Send`.
