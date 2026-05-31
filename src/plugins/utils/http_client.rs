@@ -144,8 +144,9 @@ impl std::fmt::Debug for PluginHttpClient {
 /// CLAUDE.md explicitly forbids ("DnsCacheResolver must be plugged into
 /// every reqwest::Client in production").
 ///
-/// If even this minimal builder fails, only then fall back to
-/// `reqwest::Client::new()` (an exceptional, doubly-degraded path).
+/// If even this minimal builder fails, build a no-DNS fallback that still keeps
+/// redirects disabled. If that cannot be constructed either, fail closed rather
+/// than silently re-enabling reqwest's default redirect-following behavior.
 fn build_dns_cached_fallback_client(dns_cache: Option<DnsCache>) -> reqwest::Client {
     // Never auto-follow redirects on a shared outbound client (SSRF posture,
     // matches src/connection_pool.rs and the configured clients above).
@@ -160,17 +161,21 @@ fn build_dns_cached_fallback_client(dns_cache: Option<DnsCache>) -> reqwest::Cli
              Falling back to a no-redirect minimal plugin client as a last resort.",
             e
         );
-        reqwest::Client::builder()
+        match reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .unwrap_or_else(|e2| {
+        {
+            Ok(client) => client,
+            Err(e2) => {
                 tracing::error!(
                     "Failed to build fallback plugin client with redirect policy set: {}. \
-                     Using reqwest::Client::new() as a final fallback.",
+                     Refusing to create a reqwest default client because it would re-enable \
+                     redirect following.",
                     e2
                 );
-                reqwest::Client::new()
-            })
+                std::process::exit(1);
+            }
+        }
     })
 }
 
@@ -399,8 +404,8 @@ impl PluginHttpClient {
             );
             // No DNS cache to attach on this path — `from_pool_config` is
             // explicitly the cache-less constructor (tests / fallback). Use
-            // the shared helper so the last-resort `Client::new()` path is
-            // logged uniformly across both `new()` and this code path.
+            // the shared helper so the final no-DNS fallback is logged
+            // uniformly across both `new()` and this code path.
             build_dns_cached_fallback_client(None)
         });
 
@@ -843,7 +848,7 @@ mod fallback_tests {
             after_len > initial_len,
             "DNS cache should have populated via the cached resolver \
              (initial={}, after={}). If the fallback bypassed the resolver \
-             via Client::new(), the cache would stay empty.",
+             via a default reqwest client, the cache would stay empty.",
             initial_len,
             after_len
         );
