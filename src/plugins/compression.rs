@@ -592,21 +592,25 @@ impl Plugin for CompressionPlugin {
             // request path; if it is absent (e.g. an HBONE CONNECT tunnel where
             // pre-before_proxy buffering is skipped) we fall back to the prior
             // best-effort behaviour and let transform_request_body handle it.
-            if let Some(body) = ctx.request_body_bytes.as_ref()
-                && !body.is_empty()
-                && let Err(e) =
+            if let Some(body) = ctx.request_body_bytes.as_ref() {
+                let decode_result = if body.is_empty() {
+                    Err("empty compressed request body".to_string())
+                } else {
                     self.decompress(encoding, body, self.config.max_decompressed_request_size)
-            {
-                // Reject with a protocol-appropriate gateway error. The proxy
-                // normalizes this to a trailers-only gRPC error for
-                // application/grpc and a plain 400 otherwise. The detailed
-                // cause is logged, not leaked to the client.
-                warn!("compression: rejecting request with undecodable {encoding} body: {e}");
-                return PluginResult::Reject {
-                    status_code: 400,
-                    body: r#"{"error":"Malformed compressed request body"}"#.to_string(),
-                    headers: HashMap::new(),
+                        .map(|_| ())
                 };
+                if let Err(e) = decode_result {
+                    // Reject with a protocol-appropriate gateway error. The proxy
+                    // normalizes this to a trailers-only gRPC error for
+                    // application/grpc and a plain 400 otherwise. The detailed
+                    // cause is logged, not leaked to the client.
+                    warn!("compression: rejecting request with undecodable {encoding} body: {e}");
+                    return PluginResult::Reject {
+                        status_code: 400,
+                        body: r#"{"error":"Malformed compressed request body"}"#.to_string(),
+                        headers: HashMap::new(),
+                    };
+                }
             }
 
             ctx.metadata.insert(

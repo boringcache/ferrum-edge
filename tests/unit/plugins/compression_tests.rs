@@ -1035,6 +1035,27 @@ fn make_request_ctx_with_body(content_encoding: &str, body: &[u8]) -> RequestCon
     ctx
 }
 
+#[tokio::test]
+async fn test_empty_gzip_request_body_is_rejected() {
+    let plugin = make_plugin(json!({"decompress_request": true}));
+    let mut ctx = make_request_ctx_with_body("gzip", &[]);
+    let mut headers = HashMap::new();
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    headers.insert("content-length".to_string(), "0".to_string());
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    match result {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 400),
+        other => panic!("expected Reject for empty gzip body, got {other:?}"),
+    }
+    assert_eq!(
+        headers.get("content-encoding").map(String::as_str),
+        Some("gzip")
+    );
+    assert_eq!(headers.get("content-length").map(String::as_str), Some("0"));
+}
+
 /// #59: a corrupt gzip request body must be rejected with a clean 400 in
 /// `before_proxy`, and the `Content-Encoding`/`Content-Length` headers must NOT
 /// be stripped (so we never forward a still-compressed body mislabeled as
