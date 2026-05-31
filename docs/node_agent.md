@@ -165,24 +165,22 @@ The node-agent **writes** a pod's registry file on enrollment and **removes**
 it on teardown. The mesh proxy's `NetnsCaptureManager` polls this directory and
 reconciles one in-netns listener per pod (opening on add, closing on removal).
 
-**Deferred redirect / readiness handshake.** So a freshly enrolled pod's egress
-is not redirected to a pod-loopback capture port before a listener exists to
-accept it (the rewritten `connect()` would be refused), the node-agent defers
-attaching the IPv4 outbound-redirect program (`connect4`) at enrollment when
-in-netns publishing is on — the inbound `getpeername4`/`getpeername6` programs
-(which do not redirect) are attached immediately, and `connect6` is attached
-immediately too but as a **fail-closed IPv6 denier**: the in-netns listener and
-GAP-2M bridge are IPv4-only, so the node-agent sets the `ipv6_outbound_deny`
-capture-config flag and `connect6` returns `EPERM` for captured IPv6 instead of
-redirecting it (or letting it bypass `mesh_authz`). Excluded v6 (CIDR/port
-excludes) still flows, and `connect6` needs no listener so it is not
-readiness-gated. The proxy writes a marker `<registry_dir>/.ready/<pod_uid>`
-once it has opened that pod's in-netns listener; the node-agent enables
-`connect4` on its next promotion tick (1s) after the marker appears, with a ~30s
-bounded fallback so capture still engages even if the marker never arrives (e.g.
-the proxy is absent on this node). The proxy must therefore mount the registry
-directory **read-write**; the `.ready` subdir is a dotfile and is skipped by the
-pod-discovery scan.
+**Fail-closed startup enforcement.** In-netns listener startup is asynchronous,
+so the mesh proxy may not yet have accepted the registry entry when pod
+enrollment returns. The node-agent still attaches the IPv4 outbound-redirect
+program (`connect4`) during enrollment, before the pod is marked enrolled, so
+newly started workloads cannot open direct IPv4 egress connections that bypass
+`mesh_authz`. Until the proxy opens the pod-loopback listener, captured IPv4
+connections may be refused, but they fail closed instead of bypassing policy.
+The inbound `getpeername4`/`getpeername6` programs are also attached during
+enrollment. `connect6` is attached immediately as a **fail-closed IPv6 denier**:
+the in-netns listener and GAP-2M bridge are IPv4-only, so the node-agent sets
+the `ipv6_outbound_deny` capture-config flag and `connect6` returns `EPERM` for
+captured IPv6 instead of redirecting it (or letting it bypass `mesh_authz`).
+Excluded v6 (CIDR/port excludes) still flows. The proxy may write
+`<registry_dir>/.ready/<pod_uid>` once it has opened that pod's in-netns
+listener for observability and stale-listener cleanup; the `.ready` subdir is a
+dotfile and is skipped by the pod-discovery scan.
 
 This is Linux-only and, like the rest of the in-netns datapath, is
 implemented but live-datapath-unverified (it needs a live multi-pod node).

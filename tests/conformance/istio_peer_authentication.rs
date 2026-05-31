@@ -92,6 +92,61 @@ fn peer_auth_disable_mode() {
     assert_eq!(pa.mtls_mode, MtlsMode::Disable);
 }
 
+/// An unrecognized `mtls.mode` (e.g. a typo) is rejected at translation rather
+/// than silently downgraded to `PERMISSIVE`. Otherwise a malformed
+/// PeerAuthentication would quietly weaken a workload's intended inbound mTLS
+/// posture; the rejection instead surfaces as `FerrumAccepted=False`.
+#[test]
+fn peer_auth_unknown_mode_fails_closed() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "mtls.mode unknown value fails closed",
+        status = Status::Supported,
+        notes = "Unrecognized mode strings are rejected (FerrumAccepted=False) instead of silently mapping to PERMISSIVE.",
+    );
+    let err = translate_k8s_objects(
+        &[peer_auth(
+            "pa-typo",
+            "default",
+            json!({"mtls": {"mode": "STICT"}}),
+        )],
+        options(),
+    )
+    .expect_err("unknown mtls.mode should reject the policy");
+    let message = err.to_string();
+    assert!(
+        message.contains("mtls.mode") && message.contains("STICT") && message.contains("STRICT"),
+        "error should identify the bad mode and the valid set, got: {message}"
+    );
+}
+
+/// A typo'd `portLevelMtls.<port>.mode` is likewise rejected rather than
+/// silently downgraded to `PERMISSIVE`.
+#[test]
+fn peer_auth_unknown_port_level_mode_fails_closed() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "portLevelMtls.<port>.mode unknown value fails closed",
+        status = Status::Supported,
+        notes =
+            "Per-port override with an unrecognized mode is rejected, not mapped to PERMISSIVE.",
+    );
+    let err = translate_k8s_objects(
+        &[peer_auth(
+            "pa-port-typo",
+            "default",
+            json!({"mtls": {"mode": "STRICT"}, "portLevelMtls": {"8080": {"mode": "PREMISSIVE"}}}),
+        )],
+        options(),
+    )
+    .expect_err("unknown portLevelMtls mode should reject the policy");
+    let message = err.to_string();
+    assert!(
+        message.contains("portLevelMtls[8080].mode") && message.contains("PREMISSIVE"),
+        "error should identify the bad port-level mode, got: {message}"
+    );
+}
+
 /// `selector.matchLabels` → `WorkloadSelector` scope at translation.
 #[test]
 fn peer_auth_workload_selector_scope() {

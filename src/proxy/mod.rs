@@ -65,7 +65,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, watch};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
 use tokio_tungstenite::{
@@ -7434,7 +7434,7 @@ pub async fn start_proxy_listener_with_bound_listener(
         shutdown,
         None,
         0,
-        None,
+        SourceIpOverride::none(),
     )
     .await;
     Ok(())
@@ -7788,7 +7788,7 @@ async fn start_proxy_listener_with_tls_source_and_signal(
                     shutdown_rx,
                     mesh_direction,
                     i,
-                    None,
+                    SourceIpOverride::none(),
                 )
                 .await;
             }));
@@ -7811,7 +7811,7 @@ async fn start_proxy_listener_with_tls_source_and_signal(
             shutdown,
             mesh_direction,
             0,
-            None,
+            SourceIpOverride::none(),
         )
         .await;
 
@@ -7834,12 +7834,30 @@ async fn start_proxy_listener_with_tls_source_and_signal(
             shutdown,
             mesh_direction,
             0,
-            None,
+            SourceIpOverride::none(),
         )
         .await;
     }
 
     Ok(())
+}
+
+pub(super) enum SourceIpOverride {
+    Static(Option<std::net::IpAddr>),
+    Dynamic(watch::Receiver<Option<std::net::IpAddr>>),
+}
+
+impl SourceIpOverride {
+    fn none() -> Self {
+        Self::Static(None)
+    }
+
+    fn current(&self) -> Option<std::net::IpAddr> {
+        match self {
+            Self::Static(ip) => *ip,
+            Self::Dynamic(rx) => *rx.borrow(),
+        }
+    }
 }
 
 /// Accept loop that runs on a single listener socket. Multiple instances can
@@ -7853,12 +7871,12 @@ async fn run_accept_loop(
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
     _thread_id: usize,
-    // When `Some`, overrides the accepted connection's client IP. Used by the
-    // node-waypoint in-netns capture path: `connect4` rewrites a captured pod's
-    // egress to loopback, so the accepted peer is 127.0.0.1; this carries the
-    // real source pod IP so client-IP authz conditions, logs, and IP-keyed
-    // plugins see the pod instead of loopback. `None` everywhere else.
-    source_ip_override: Option<std::net::IpAddr>,
+    // Overrides the accepted connection's client IP. Used by the node-waypoint
+    // in-netns capture path: `connect4` rewrites a captured pod's egress to
+    // loopback, so the accepted peer is 127.0.0.1; this carries the real source
+    // pod IP so client-IP authz conditions, logs, and IP-keyed plugins see the
+    // pod instead of loopback.
+    source_ip_override: SourceIpOverride,
 ) {
     let frontend_listen_port = listener.local_addr().ok().map(|addr| addr.port());
     // Count consecutive accept() failures to back off a busy-loop. Under fd
@@ -7877,6 +7895,7 @@ async fn run_accept_loop(
                         // Override the loopback peer with the source pod IP for
                         // in-netns capture connections (see `source_ip_override`).
                         let remote_addr = source_ip_override
+                            .current()
                             .map(|ip| std::net::SocketAddr::new(ip, remote_addr.port()))
                             .unwrap_or(remote_addr);
                         accept_backoff.on_success();

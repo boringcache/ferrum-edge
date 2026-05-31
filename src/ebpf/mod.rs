@@ -530,6 +530,9 @@ pub struct MockEbpfBackend {
     /// the previous entry for the same `cgroup_id`. Tests assert on this map to
     /// verify a pod's identity reached the BPF surface.
     pub workload_identities: HashMap<u64, WorkloadIdentity>,
+    /// Ordered mock operation log for tests that need to assert side-effect
+    /// ordering across different BPF surfaces.
+    pub operations: Vec<String>,
     pub detached_pods: Vec<String>,
     pub cleaned_up: bool,
     pub fail_update_capture_config: bool,
@@ -557,6 +560,7 @@ impl EbpfBackend for MockEbpfBackend {
         cgroup_path: &str,
         program: &str,
     ) -> Result<(), String> {
+        self.operations.push(format!("attach_cgroup:{program}"));
         self.cgroup_attachments
             .push((cgroup_path.to_string(), program.to_string()));
         Ok(())
@@ -608,6 +612,8 @@ impl EbpfBackend for MockEbpfBackend {
         cgroup_id: u64,
         policy: &IncludePortsPolicy,
     ) -> Result<(), String> {
+        self.operations
+            .push(format!("update_pod_include_ports:{cgroup_id}"));
         self.include_ports.insert(cgroup_id, *policy);
         Ok(())
     }
@@ -622,6 +628,8 @@ impl EbpfBackend for MockEbpfBackend {
         cgroup_id: u64,
         identity: &WorkloadIdentity,
     ) -> Result<(), String> {
+        self.operations
+            .push(format!("update_workload_identity:{cgroup_id}"));
         self.workload_identities.insert(cgroup_id, *identity);
         Ok(())
     }
