@@ -65,7 +65,7 @@ fn escape_label_value(value: &str) -> String {
 /// Protocol family of a recorded entry. Stored on `ChargebackEntry` so the
 /// render path can label HTTP and stream activity distinctly without re-parsing
 /// the entry key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProtocolFamily {
     Http,
     Stream,
@@ -80,42 +80,113 @@ impl ProtocolFamily {
     }
 }
 
-/// Atomic chargeback entry. Tracks call counts, per-call charges, bandwidth
-/// counters (bytes + monetary), staleness, and render metadata.
+/// Currency and namespace of a single `api_chargeback` plugin instance
+/// (finding #24).
 ///
-/// The `consumer`, `proxy_id`, `proxy_name`, `status_code`, and
-/// `protocol_family` fields are set once on creation and read during render.
-/// They are NOT in the DashMap key (which is a plain `String`) — this allows
-/// the hot-path `get()` to use a borrowed `&str` from a thread-local buffer
-/// with zero allocation.
+/// The chargeback registry is a process-global singleton shared by every
+/// `api_chargeback` instance, but currency and namespace are properties of the
+/// individual instance (global / proxy / proxy_group scope), not of the
+/// process. Each instance holds an `InstanceScope` and passes it (alongside the
+/// per-request consumer) into the registry's `record_*` methods. The cold path
+/// (first record per unique key) stamps these `Arc<str>` onto the new
+/// [`ChargebackEntry`] with a cheap `Arc` clone; the hot path (cache hit)
+/// touches none of them, preserving the zero-allocation recording path.
+#[derive(Clone)]
+pub struct InstanceScope {
+    /// Instance currency label (e.g. "USD"). Emitted per-row at render time.
+    pub currency: Arc<str>,
+    /// Pre-rendered Prometheus namespace label fragment, e.g.
+    /// `,namespace="ferrum"` (empty string when the namespace is empty). This is
+    /// the only namespace representation the renderers need: Prometheus appends
+    /// it verbatim and the JSON output does not carry a namespace field.
+    pub namespace_label: Arc<str>,
+}
+
+impl InstanceScope {
+    /// Build an instance scope from a currency and namespace, pre-rendering the
+    /// Prometheus label fragment once at construction.
+    pub fn new(currency: &str, namespace: &str) -> Self {
+        Self {
+            currency: Arc::from(currency),
+            namespace_label: Arc::from(Self::namespace_label_for(namespace).as_str()),
+        }
+    }
+
+    /// Build the Prometheus namespace label fragment for a namespace value.
+    /// Empty namespace produces an empty fragment so no `namespace=""` label is
+    /// emitted.
+    pub fn namespace_label_for(namespace: &str) -> String {
+        if namespace.is_empty() {
+            String::new()
+        } else {
+            format!(",namespace=\"{}\"", escape_label_value(namespace))
+        }
+    }
+}
+
+/// Atomic chargeback entry. Tracks call counts, exact byte counters, staleness,
+/// and render metadata.
+///
+/// **Monetary accuracy (finding #76)**: monetary totals are NOT accumulated.
+/// Only the exact integer inputs — `call_count`, `bytes_sent_total`,
+/// `bytes_received_total` — are summed via plain `fetch_add`, and charges are
+/// derived once at render time as `count * price` / `bytes * price`. This
+/// eliminates the order-dependent per-add f64 rounding drift that an
+/// accumulate-money-as-f64-bits design suffers over high transaction volume,
+/// while keeping the lock-free atomics trivial. The per-entry prices
+/// (`call_price`, `bw_price_sent`, `bw_price_received`) are config-derived
+/// constants fixed at entry creation.
+///
+/// **Per-instance scoping (finding #24)**: `currency` and `namespace_label` are
+/// stored per entry (set from the constructing plugin instance) rather than in
+/// a single process-global, last-writer-wins registry field. A single process
+/// legitimately hosts multiple `api_chargeback` instances with different
+/// currencies/namespaces (global / proxy / proxy_group scopes), so each
+/// exported row carries the currency and namespace of the instance that
+/// recorded it.
+///
+/// The `consumer`, `proxy_id`, `proxy_name`, `status_code`,
+/// `protocol_family`, prices, `currency`, and `namespace_label` fields are set
+/// once on creation and read during render. They are NOT in the DashMap key
+/// (which is a plain `String`) — this allows the hot-path `get()` to use a
+/// borrowed `&str` from a thread-local buffer with zero allocation.
 ///
 /// For stream entries the `status_code` is `0` and there is exactly one entry
 /// per `(consumer, proxy_id)` (streams have no HTTP status).
 pub struct ChargebackEntry {
     pub call_count: AtomicU64,
-    /// Accumulated per-call (transaction or stream-session) charge, stored as
-    /// the u64 bits of an f64.
-    pub charge_total_bits: AtomicU64,
     /// Bytes the gateway sent onward toward the backend on the client's behalf
     /// (request body for HTTP, client→backend half of a stream relay).
     pub bytes_sent_total: AtomicU64,
     /// Bytes the gateway received from the backend and forwarded to the client
     /// (response body for HTTP, backend→client half of a stream relay).
     pub bytes_received_total: AtomicU64,
-    /// Accumulated bandwidth charge for client→backend bytes, f64 bits.
-    pub bandwidth_charge_sent_bits: AtomicU64,
-    /// Accumulated bandwidth charge for backend→client bytes, f64 bits.
-    pub bandwidth_charge_received_bits: AtomicU64,
     pub last_updated: AtomicU64,
+    // --- Pricing (immutable after creation, config-derived) ---
+    /// Per-call (or per-stream-connection) price. Charge is `call_count * this`.
+    pub call_price: f64,
+    /// Per-byte price for client→backend bytes.
+    pub bw_price_sent: f64,
+    /// Per-byte price for backend→client bytes.
+    pub bw_price_received: f64,
     // --- Render metadata (immutable after creation) ---
     pub consumer: Arc<str>,
     pub proxy_id: Arc<str>,
     pub proxy_name: Arc<str>,
     pub status_code: u16,
     pub protocol_family: ProtocolFamily,
+    /// Currency label (e.g., "USD", "EUR") of the instance that created the
+    /// entry. Per-entry so multiple instances with different currencies do not
+    /// misattribute one another's charges.
+    pub currency: Arc<str>,
+    /// Pre-rendered Prometheus namespace label fragment, e.g.
+    /// `,namespace="ferrum"` (empty string when no namespace), of the instance
+    /// that created the entry.
+    pub namespace_label: Arc<str>,
 }
 
 impl ChargebackEntry {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         epoch: Instant,
         consumer: Arc<str>,
@@ -123,81 +194,66 @@ impl ChargebackEntry {
         proxy_name: Arc<str>,
         status_code: u16,
         protocol_family: ProtocolFamily,
+        call_price: f64,
+        bw_price_sent: f64,
+        bw_price_received: f64,
+        currency: Arc<str>,
+        namespace_label: Arc<str>,
     ) -> Self {
         Self {
             call_count: AtomicU64::new(0),
-            charge_total_bits: AtomicU64::new(0f64.to_bits()),
             bytes_sent_total: AtomicU64::new(0),
             bytes_received_total: AtomicU64::new(0),
-            bandwidth_charge_sent_bits: AtomicU64::new(0f64.to_bits()),
-            bandwidth_charge_received_bits: AtomicU64::new(0f64.to_bits()),
             last_updated: AtomicU64::new(epoch.elapsed().as_nanos() as u64),
+            call_price,
+            bw_price_sent,
+            bw_price_received,
             consumer,
             proxy_id,
             proxy_name,
             status_code,
             protocol_family,
+            currency,
+            namespace_label,
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn record(
-        &self,
-        call_price: f64,
-        bytes_sent: u64,
-        bytes_received: u64,
-        bw_price_sent: f64,
-        bw_price_received: f64,
-        count_call: bool,
-        epoch: Instant,
-    ) {
+    fn record(&self, bytes_sent: u64, bytes_received: u64, count_call: bool, epoch: Instant) {
         if count_call {
             self.call_count.fetch_add(1, Ordering::Relaxed);
-        }
-        if call_price > 0.0 {
-            add_f64_atomic(&self.charge_total_bits, call_price);
         }
         if bytes_sent > 0 {
             self.bytes_sent_total
                 .fetch_add(bytes_sent, Ordering::Relaxed);
-            if bw_price_sent > 0.0 {
-                let charge = bytes_sent as f64 * bw_price_sent;
-                add_f64_atomic(&self.bandwidth_charge_sent_bits, charge);
-            }
         }
         if bytes_received > 0 {
             self.bytes_received_total
                 .fetch_add(bytes_received, Ordering::Relaxed);
-            if bw_price_received > 0.0 {
-                let charge = bytes_received as f64 * bw_price_received;
-                add_f64_atomic(&self.bandwidth_charge_received_bits, charge);
-            }
         }
         self.last_updated
             .store(epoch.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    /// Total per-call (or per-connection) charge, computed once from exact
+    /// inputs: `call_count * call_price`.
+    pub fn call_charge(&self) -> f64 {
+        self.call_count.load(Ordering::Relaxed) as f64 * self.call_price
+    }
+
+    /// Bandwidth charge for client→backend bytes: `bytes_sent_total * price`.
+    pub fn bandwidth_charge_sent(&self) -> f64 {
+        self.bytes_sent_total.load(Ordering::Relaxed) as f64 * self.bw_price_sent
+    }
+
+    /// Bandwidth charge for backend→client bytes: `bytes_received_total * price`.
+    pub fn bandwidth_charge_received(&self) -> f64 {
+        self.bytes_received_total.load(Ordering::Relaxed) as f64 * self.bw_price_received
     }
 
     fn nanos_since_update(&self, epoch: Instant) -> u64 {
         let now = epoch.elapsed().as_nanos() as u64;
         let last = self.last_updated.load(Ordering::Relaxed);
         now.saturating_sub(last)
-    }
-}
-
-/// CAS loop to atomically add `delta` to an f64 stored as u64 bits.
-fn add_f64_atomic(slot: &AtomicU64, delta: f64) {
-    loop {
-        let old = slot.load(Ordering::Relaxed);
-        let new_val = f64::from_bits(old) + delta;
-        match slot.compare_exchange_weak(
-            old,
-            new_val.to_bits(),
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => break,
-            Err(_) => continue,
-        }
     }
 }
 
@@ -227,16 +283,12 @@ const STREAM_STATUS_SENTINEL: u16 = 0;
 pub struct ChargebackRegistry {
     epoch: Instant,
     pub entries: DashMap<String, ChargebackEntry>,
-    /// Currency label (e.g., "USD", "EUR"). Set by the first plugin instance.
-    currency: ArcSwap<String>,
     /// Cached render output with generation timestamp.
     prometheus_cache: ArcSwap<Option<(Instant, String)>>,
     json_cache: ArcSwap<Option<(Instant, String)>>,
     render_cache_ttl_secs: AtomicU64,
     stale_entry_ttl_nanos: AtomicU64,
     cache_invalidation_min_age_nanos: AtomicU64,
-    /// Extra label fragment for namespace isolation.
-    namespace_label: std::sync::RwLock<String>,
     /// Guards against spawning duplicate background cleanup tasks.
     cleanup_task_started: AtomicBool,
 }
@@ -252,7 +304,6 @@ impl ChargebackRegistry {
         Self {
             epoch: Instant::now(),
             entries: DashMap::new(),
-            currency: ArcSwap::from_pointee("USD".to_string()),
             prometheus_cache: ArcSwap::from_pointee(None),
             json_cache: ArcSwap::from_pointee(None),
             render_cache_ttl_secs: AtomicU64::new(DEFAULT_RENDER_CACHE_TTL_SECS),
@@ -260,20 +311,24 @@ impl ChargebackRegistry {
             cache_invalidation_min_age_nanos: AtomicU64::new(
                 DEFAULT_CACHE_INVALIDATION_MIN_AGE_NANOS,
             ),
-            namespace_label: std::sync::RwLock::new(String::new()),
             cleanup_task_started: AtomicBool::new(false),
         }
     }
 
+    /// Configure the process-global render/cleanup knobs that govern the SHARED
+    /// registry infrastructure (render cache TTL, stale-entry eviction TTL,
+    /// cache-invalidation min age). These intentionally remain registry-global
+    /// because a single cleanup task and a single render cache serve all plugin
+    /// instances. Currency and namespace are NOT configured here — they are
+    /// scoped per [`ChargebackEntry`] so multiple instances with different
+    /// currencies/namespaces never misattribute one another's charges
+    /// (finding #24).
     pub fn configure(
         &self,
-        currency: &str,
         render_cache_ttl_secs: u64,
         stale_entry_ttl_secs: u64,
         cache_invalidation_min_age_ms: u64,
-        namespace: &str,
     ) {
-        self.currency.store(Arc::new(currency.to_string()));
         self.render_cache_ttl_secs
             .store(render_cache_ttl_secs, Ordering::Relaxed);
         self.stale_entry_ttl_nanos.store(
@@ -284,9 +339,6 @@ impl ChargebackRegistry {
             cache_invalidation_min_age_ms.saturating_mul(1_000_000),
             Ordering::Relaxed,
         );
-        if let Ok(mut ns_label) = self.namespace_label.write() {
-            *ns_label = format!(",namespace=\"{}\"", escape_label_value(namespace));
-        }
     }
 
     /// Start a background task that periodically evicts stale entries.
@@ -322,6 +374,7 @@ impl ChargebackRegistry {
     #[allow(clippy::too_many_arguments)]
     pub fn record_http(
         &self,
+        scope: &InstanceScope,
         consumer: &str,
         proxy_id: &str,
         proxy_name: &str,
@@ -333,6 +386,7 @@ impl ChargebackRegistry {
         bw_price_received: f64,
     ) {
         self.record_inner(
+            scope,
             consumer,
             proxy_id,
             proxy_name,
@@ -353,6 +407,7 @@ impl ChargebackRegistry {
     #[allow(clippy::too_many_arguments)]
     pub fn record_stream(
         &self,
+        scope: &InstanceScope,
         consumer: &str,
         proxy_id: &str,
         proxy_name: &str,
@@ -363,6 +418,7 @@ impl ChargebackRegistry {
         bw_price_received: f64,
     ) {
         self.record_inner(
+            scope,
             consumer,
             proxy_id,
             proxy_name,
@@ -380,6 +436,7 @@ impl ChargebackRegistry {
     #[allow(clippy::too_many_arguments)]
     pub fn record_websocket_bandwidth(
         &self,
+        scope: &InstanceScope,
         consumer: &str,
         proxy_id: &str,
         proxy_name: &str,
@@ -389,6 +446,7 @@ impl ChargebackRegistry {
         bw_price_received: f64,
     ) {
         self.record_inner(
+            scope,
             consumer,
             proxy_id,
             proxy_name,
@@ -409,13 +467,17 @@ impl ChargebackRegistry {
     /// buffer — one `write!` into a pre-allocated `String`, one DashMap read-lock,
     /// a handful of atomic operations. Zero heap allocation.
     ///
-    /// **Cold-path (first record per unique combination)**: Allocates the `String`
-    /// key, three `Arc<str>` for render metadata, and a new `ChargebackEntry`.
-    /// This runs once per unique `(consumer, proxy, status_code)` combination
-    /// (per `(consumer, proxy)` for streams).
+    /// **Cold-path (first record per unique combination)**: Clones the per-instance
+    /// `Arc<str>` render metadata (consumer/proxy/currency/namespace) and allocates
+    /// the owned `String` key and a new `ChargebackEntry`. This runs once per unique
+    /// `(consumer, proxy, status_code)` combination (per `(consumer, proxy)` for
+    /// streams). The currency/namespace come from the recording plugin instance's
+    /// [`InstanceScope`], so each entry is scoped to the instance that created it
+    /// (finding #24).
     #[allow(clippy::too_many_arguments)]
     fn record_inner(
         &self,
+        scope: &InstanceScope,
         consumer: &str,
         proxy_id: &str,
         proxy_name: &str,
@@ -441,15 +503,7 @@ impl ChargebackRegistry {
             let _ = write!(buf, "{}|{}|{}", consumer, proxy_id, status_code);
 
             if let Some(entry) = self.entries.get(buf.as_str()) {
-                entry.record(
-                    if count_call { call_price } else { 0.0 },
-                    bytes_sent,
-                    bytes_received,
-                    bw_price_sent,
-                    bw_price_received,
-                    count_call,
-                    self.epoch,
-                );
+                entry.record(bytes_sent, bytes_received, count_call, self.epoch);
                 return true;
             }
             false
@@ -457,6 +511,8 @@ impl ChargebackRegistry {
 
         if !hit {
             // Cold path: allocate owned key + metadata for DashMap insertion.
+            // Currency/namespace come from the recording instance's scope so the
+            // entry is attributed to the instance that created it (finding #24).
             let owned_key = format!("{}|{}|{}", consumer, proxy_id, status_code);
             self.entries
                 .entry(owned_key)
@@ -468,17 +524,14 @@ impl ChargebackRegistry {
                         Arc::from(proxy_name),
                         status_code,
                         protocol_family,
+                        if count_call { call_price } else { 0.0 },
+                        bw_price_sent,
+                        bw_price_received,
+                        Arc::clone(&scope.currency),
+                        Arc::clone(&scope.namespace_label),
                     )
                 })
-                .record(
-                    if count_call { call_price } else { 0.0 },
-                    bytes_sent,
-                    bytes_received,
-                    bw_price_sent,
-                    bw_price_received,
-                    count_call,
-                    self.epoch,
-                );
+                .record(bytes_sent, bytes_received, count_call, self.epoch);
         }
 
         self.maybe_invalidate_caches();
@@ -536,13 +589,6 @@ impl ChargebackRegistry {
     }
 
     pub fn render_prometheus_uncached(&self) -> String {
-        let currency = self.currency.load();
-        let ns_label = self
-            .namespace_label
-            .read()
-            .map(|l| l.clone())
-            .unwrap_or_default();
-
         // Multiple counter families × ~200 bytes per entry
         let estimated_cap = 1024 + self.entries.len() * 600;
         let mut output = String::with_capacity(estimated_cap);
@@ -565,7 +611,7 @@ impl ChargebackRegistry {
                 escape_label_value(&v.proxy_id),
                 escape_label_value(&v.proxy_name),
                 v.status_code,
-                ns_label,
+                v.namespace_label,
                 count
             ));
         }
@@ -579,16 +625,15 @@ impl ChargebackRegistry {
             if v.protocol_family != ProtocolFamily::Http {
                 continue;
             }
-            let charge = f64::from_bits(v.charge_total_bits.load(Ordering::Relaxed));
             output.push_str(&format!(
                 "ferrum_api_charges_total{{consumer=\"{}\",proxy_id=\"{}\",proxy_name=\"{}\",status_code=\"{}\",currency=\"{}\"{}}} {:.10}\n",
                 escape_label_value(&v.consumer),
                 escape_label_value(&v.proxy_id),
                 escape_label_value(&v.proxy_name),
                 v.status_code,
-                escape_label_value(&currency),
-                ns_label,
-                charge
+                escape_label_value(&v.currency),
+                v.namespace_label,
+                v.call_charge()
             ));
         }
 
@@ -609,7 +654,7 @@ impl ChargebackRegistry {
                 escape_label_value(&v.consumer),
                 escape_label_value(&v.proxy_id),
                 escape_label_value(&v.proxy_name),
-                ns_label,
+                v.namespace_label,
                 count
             ));
         }
@@ -623,62 +668,70 @@ impl ChargebackRegistry {
             if v.protocol_family != ProtocolFamily::Stream {
                 continue;
             }
-            let charge = f64::from_bits(v.charge_total_bits.load(Ordering::Relaxed));
             output.push_str(&format!(
                 "ferrum_api_stream_connection_charges_total{{consumer=\"{}\",proxy_id=\"{}\",proxy_name=\"{}\",currency=\"{}\"{}}} {:.10}\n",
                 escape_label_value(&v.consumer),
                 escape_label_value(&v.proxy_id),
                 escape_label_value(&v.proxy_name),
-                escape_label_value(&currency),
-                ns_label,
-                charge
+                escape_label_value(&v.currency),
+                v.namespace_label,
+                v.call_charge()
             ));
         }
 
-        // --- Bandwidth metrics (both HTTP and stream entries, aggregated per
-        //     (consumer, proxy_id) so HTTP entries spread across status codes
-        //     collapse to one row per direction) ---
-
-        #[derive(Default)]
+        // --- Bandwidth metrics. Aggregated per (consumer, proxy_id,
+        //     protocol_family) so HTTP entries spread across status codes
+        //     collapse to one row per direction, while HTTP and stream activity
+        //     under the same proxy_id stay on separate, deterministically
+        //     labeled rows (finding #75). Currency/namespace come from the
+        //     recording instance and are carried per-aggregate (finding #24).
         struct BandwidthAggregate {
             proxy_name: String,
-            protocol_family: Option<ProtocolFamily>,
+            currency: Arc<str>,
+            namespace_label: Arc<str>,
             bytes_sent: u64,
             bytes_received: u64,
             charge_sent: f64,
             charge_received: f64,
         }
 
-        let mut bw_aggregates: HashMap<(String, String), BandwidthAggregate> = HashMap::new();
+        let mut bw_aggregates: HashMap<(String, String, ProtocolFamily), BandwidthAggregate> =
+            HashMap::new();
         for entry in self.entries.iter() {
             let v = entry.value();
             let agg = bw_aggregates
-                .entry((v.consumer.to_string(), v.proxy_id.to_string()))
-                .or_default();
-            if agg.proxy_name.is_empty() {
-                agg.proxy_name = v.proxy_name.to_string();
-            }
-            agg.protocol_family.get_or_insert(v.protocol_family);
+                .entry((
+                    v.consumer.to_string(),
+                    v.proxy_id.to_string(),
+                    v.protocol_family,
+                ))
+                .or_insert_with(|| BandwidthAggregate {
+                    proxy_name: v.proxy_name.to_string(),
+                    currency: Arc::clone(&v.currency),
+                    namespace_label: Arc::clone(&v.namespace_label),
+                    bytes_sent: 0,
+                    bytes_received: 0,
+                    charge_sent: 0.0,
+                    charge_received: 0.0,
+                });
             agg.bytes_sent += v.bytes_sent_total.load(Ordering::Relaxed);
             agg.bytes_received += v.bytes_received_total.load(Ordering::Relaxed);
-            agg.charge_sent += f64::from_bits(v.bandwidth_charge_sent_bits.load(Ordering::Relaxed));
-            agg.charge_received +=
-                f64::from_bits(v.bandwidth_charge_received_bits.load(Ordering::Relaxed));
+            agg.charge_sent += v.bandwidth_charge_sent();
+            agg.charge_received += v.bandwidth_charge_received();
         }
 
         output.push_str(
             "# HELP ferrum_api_bytes_sent_total Total bytes the gateway sent client->backend on this consumer's behalf.\n",
         );
         output.push_str("# TYPE ferrum_api_bytes_sent_total counter\n");
-        for ((consumer, proxy_id), agg) in &bw_aggregates {
-            let family = agg.protocol_family.unwrap_or(ProtocolFamily::Http);
+        for ((consumer, proxy_id, family), agg) in &bw_aggregates {
             output.push_str(&format!(
                 "ferrum_api_bytes_sent_total{{consumer=\"{}\",proxy_id=\"{}\",proxy_name=\"{}\",protocol_family=\"{}\"{}}} {}\n",
                 escape_label_value(consumer),
                 escape_label_value(proxy_id),
                 escape_label_value(&agg.proxy_name),
                 family.label(),
-                ns_label,
+                agg.namespace_label,
                 agg.bytes_sent
             ));
         }
@@ -687,15 +740,14 @@ impl ChargebackRegistry {
             "# HELP ferrum_api_bytes_received_total Total bytes the gateway received backend->client and forwarded to this consumer.\n",
         );
         output.push_str("# TYPE ferrum_api_bytes_received_total counter\n");
-        for ((consumer, proxy_id), agg) in &bw_aggregates {
-            let family = agg.protocol_family.unwrap_or(ProtocolFamily::Http);
+        for ((consumer, proxy_id, family), agg) in &bw_aggregates {
             output.push_str(&format!(
                 "ferrum_api_bytes_received_total{{consumer=\"{}\",proxy_id=\"{}\",proxy_name=\"{}\",protocol_family=\"{}\"{}}} {}\n",
                 escape_label_value(consumer),
                 escape_label_value(proxy_id),
                 escape_label_value(&agg.proxy_name),
                 family.label(),
-                ns_label,
+                agg.namespace_label,
                 agg.bytes_received
             ));
         }
@@ -704,16 +756,15 @@ impl ChargebackRegistry {
             "# HELP ferrum_api_bandwidth_charges_total Total bandwidth charges per consumer, split by direction.\n",
         );
         output.push_str("# TYPE ferrum_api_bandwidth_charges_total counter\n");
-        for ((consumer, proxy_id), agg) in &bw_aggregates {
-            let family = agg.protocol_family.unwrap_or(ProtocolFamily::Http);
+        for ((consumer, proxy_id, family), agg) in &bw_aggregates {
             output.push_str(&format!(
                 "ferrum_api_bandwidth_charges_total{{consumer=\"{}\",proxy_id=\"{}\",proxy_name=\"{}\",direction=\"sent\",currency=\"{}\",protocol_family=\"{}\"{}}} {:.10}\n",
                 escape_label_value(consumer),
                 escape_label_value(proxy_id),
                 escape_label_value(&agg.proxy_name),
-                escape_label_value(&currency),
+                escape_label_value(&agg.currency),
                 family.label(),
-                ns_label,
+                agg.namespace_label,
                 agg.charge_sent
             ));
             output.push_str(&format!(
@@ -721,9 +772,9 @@ impl ChargebackRegistry {
                 escape_label_value(consumer),
                 escape_label_value(proxy_id),
                 escape_label_value(&agg.proxy_name),
-                escape_label_value(&currency),
+                escape_label_value(&agg.currency),
                 family.label(),
-                ns_label,
+                agg.namespace_label,
                 agg.charge_received
             ));
         }
@@ -751,13 +802,19 @@ impl ChargebackRegistry {
     }
 
     pub fn render_json_uncached(&self) -> String {
-        let currency = self.currency.load();
-
-        // Nested structure: consumer -> proxy -> {protocol, by_status, stream_summary, bandwidth}
-        #[derive(Default)]
+        // Nested structure: consumer -> proxy -> {protocol, by_status, stream, bandwidth}.
+        //
+        // Currency is carried per proxy (it is a property of the recording
+        // plugin instance — finding #24) and the proxy retains separate HTTP
+        // (`by_status`) and stream (`stream_*`) breakdowns so a proxy serving
+        // both families reports a deterministic `protocol_family` and always
+        // emits its `stream` sub-object when stream activity exists (finding
+        // #75).
         struct ProxyAggregate {
             proxy_name: String,
-            protocol_family: Option<ProtocolFamily>,
+            currency: Arc<str>,
+            has_http: bool,
+            has_stream: bool,
             by_status: HashMap<u16, (u64, f64)>,
             stream_connections: u64,
             stream_charges: f64,
@@ -768,21 +825,47 @@ impl ChargebackRegistry {
         }
 
         let mut consumers: HashMap<String, HashMap<String, ProxyAggregate>> = HashMap::new();
+        // Top-level currency: the single currency in use, or "mixed" when
+        // instances disagree (consumers must then read per-proxy `currency`).
+        let mut overall_currency: Option<Arc<str>> = None;
+        let mut currency_mixed = false;
 
         for entry in self.entries.iter() {
             let v = entry.value();
             let calls = v.call_count.load(Ordering::Relaxed);
-            let charge = f64::from_bits(v.charge_total_bits.load(Ordering::Relaxed));
+            let call_charge = v.call_charge();
             let bytes_sent = v.bytes_sent_total.load(Ordering::Relaxed);
             let bytes_received = v.bytes_received_total.load(Ordering::Relaxed);
-            let bw_sent = f64::from_bits(v.bandwidth_charge_sent_bits.load(Ordering::Relaxed));
-            let bw_received =
-                f64::from_bits(v.bandwidth_charge_received_bits.load(Ordering::Relaxed));
+            let bw_sent = v.bandwidth_charge_sent();
+            let bw_received = v.bandwidth_charge_received();
+
+            if !currency_mixed {
+                match overall_currency.as_ref() {
+                    None => overall_currency = Some(Arc::clone(&v.currency)),
+                    Some(existing) if existing.as_ref() != v.currency.as_ref() => {
+                        currency_mixed = true;
+                    }
+                    Some(_) => {}
+                }
+            }
 
             let proxy_map = consumers.entry(v.consumer.to_string()).or_default();
-            let proxy_entry = proxy_map.entry(v.proxy_id.to_string()).or_default();
-            proxy_entry.proxy_name = v.proxy_name.to_string();
-            proxy_entry.protocol_family.get_or_insert(v.protocol_family);
+            let proxy_entry =
+                proxy_map
+                    .entry(v.proxy_id.to_string())
+                    .or_insert_with(|| ProxyAggregate {
+                        proxy_name: v.proxy_name.to_string(),
+                        currency: Arc::clone(&v.currency),
+                        has_http: false,
+                        has_stream: false,
+                        by_status: HashMap::new(),
+                        stream_connections: 0,
+                        stream_charges: 0.0,
+                        bytes_sent: 0,
+                        bytes_received: 0,
+                        bandwidth_charge_sent: 0.0,
+                        bandwidth_charge_received: 0.0,
+                    });
             proxy_entry.bytes_sent += bytes_sent;
             proxy_entry.bytes_received += bytes_received;
             proxy_entry.bandwidth_charge_sent += bw_sent;
@@ -790,11 +873,15 @@ impl ChargebackRegistry {
 
             match v.protocol_family {
                 ProtocolFamily::Http => {
-                    proxy_entry.by_status.insert(v.status_code, (calls, charge));
+                    proxy_entry.has_http = true;
+                    proxy_entry
+                        .by_status
+                        .insert(v.status_code, (calls, call_charge));
                 }
                 ProtocolFamily::Stream => {
+                    proxy_entry.has_stream = true;
                     proxy_entry.stream_connections = calls;
-                    proxy_entry.stream_charges = charge;
+                    proxy_entry.stream_charges = call_charge;
                 }
             }
         }
@@ -837,10 +924,19 @@ impl ChargebackRegistry {
                 total_bandwidth_charges +=
                     agg.bandwidth_charge_sent + agg.bandwidth_charge_received;
 
+                // Deterministic protocol_family label: "mixed" when a proxy
+                // carries both HTTP and stream activity, otherwise the single
+                // family present (finding #75).
+                let protocol_family = match (agg.has_http, agg.has_stream) {
+                    (true, true) => "mixed",
+                    (false, true) => ProtocolFamily::Stream.label(),
+                    _ => ProtocolFamily::Http.label(),
+                };
+
                 let mut proxy_obj = serde_json::json!({
                     "proxy_name": agg.proxy_name,
-                    "protocol_family":
-                        agg.protocol_family.unwrap_or(ProtocolFamily::Http).label(),
+                    "currency": agg.currency.as_ref(),
+                    "protocol_family": protocol_family,
                     "total_calls": proxy_total_calls,
                     "total_charges": proxy_total_charges,
                     "by_status": serde_json::Value::Object(status_objects),
@@ -851,7 +947,10 @@ impl ChargebackRegistry {
                         "charge_received": agg.bandwidth_charge_received,
                     },
                 });
-                if let Some(ProtocolFamily::Stream) = agg.protocol_family {
+                // Always emit the stream sub-object when stream activity exists,
+                // regardless of whether an HTTP entry shares the proxy_id, so the
+                // visible breakdown reconciles with the totals (finding #75).
+                if agg.has_stream {
                     proxy_obj["stream"] = serde_json::json!({
                         "connections": agg.stream_connections,
                         "connection_charges": agg.stream_charges,
@@ -875,8 +974,14 @@ impl ChargebackRegistry {
             );
         }
 
+        let currency = if currency_mixed {
+            "mixed"
+        } else {
+            overall_currency.as_deref().unwrap_or("USD")
+        };
+
         let result = serde_json::json!({
-            "currency": currency.as_str(),
+            "currency": currency,
             "generated_at": chrono::Utc::now().to_rfc3339(),
             "consumers": serde_json::Value::Object(consumer_objects),
         });
@@ -888,6 +993,10 @@ impl ChargebackRegistry {
 pub struct ApiChargeback {
     registry: Arc<ChargebackRegistry>,
     pricing: PricingConfig,
+    /// This instance's currency + namespace, stamped onto every entry it
+    /// records so multiple instances never misattribute one another's charges
+    /// (finding #24).
+    scope: InstanceScope,
 }
 
 fn optional_u64(config: &Value, key: &str, default: u64) -> Result<u64, String> {
@@ -958,19 +1067,26 @@ impl ApiChargeback {
             );
         }
 
-        // Validation passed — now safe to mutate the global registry.
+        // Validation passed — now safe to configure the shared registry. Only
+        // the process-global render/cleanup knobs are set here; currency and
+        // namespace are scoped per entry via this instance's `InstanceScope`
+        // (finding #24).
         registry.configure(
-            currency,
             render_cache_ttl_secs,
             stale_entry_ttl_secs,
             cache_invalidation_min_age_ms,
-            namespace,
         );
 
         let cleanup_interval_seconds = optional_u64(config, "cleanup_interval_seconds", 300)?;
         registry.start_cleanup_task(cleanup_interval_seconds);
 
-        Ok(Self { registry, pricing })
+        let scope = InstanceScope::new(currency, namespace);
+
+        Ok(Self {
+            registry,
+            pricing,
+            scope,
+        })
     }
 }
 
@@ -1007,6 +1123,7 @@ impl Plugin for ApiChargeback {
         let proxy_name = summary.proxy_name.as_deref().unwrap_or("unknown");
 
         self.registry.record_http(
+            &self.scope,
             consumer,
             proxy_id,
             proxy_name,
@@ -1035,6 +1152,7 @@ impl Plugin for ApiChargeback {
         let proxy_name = summary.proxy_name.as_deref().unwrap_or("unknown");
 
         self.registry.record_stream(
+            &self.scope,
             consumer,
             &summary.proxy_id,
             proxy_name,
@@ -1067,6 +1185,7 @@ impl Plugin for ApiChargeback {
         }
         let proxy_name = summary.proxy_name.as_deref().unwrap_or("unknown");
         self.registry.record_websocket_bandwidth(
+            &self.scope,
             consumer,
             &summary.proxy_id,
             proxy_name,

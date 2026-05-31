@@ -561,6 +561,7 @@ All families include a `namespace` label.
       "proxies": {
         "proxy-abc": {
           "proxy_name": "Payments API",
+          "currency": "USD",
           "protocol_family": "http",
           "total_charges": 1.5105,
           "total_calls": 150000,
@@ -577,6 +578,7 @@ All families include a `namespace` label.
         },
         "tcp-edge": {
           "proxy_name": "TCP Edge",
+          "currency": "USD",
           "protocol_family": "stream",
           "total_charges": 0.0397,
           "total_calls": 42,
@@ -597,6 +599,8 @@ All families include a `namespace` label.
   }
 }
 ```
+
+Each `api_chargeback` plugin instance owns its own `currency` and `namespace` (per global/proxy/proxy_group scope). The currency and namespace are recorded per proxy, so a process hosting multiple instances with different currencies reports each proxy under its own currency rather than a single last-writer-wins value. The top-level `currency` is the single currency in use, or `"mixed"` when instances disagree — read the per-proxy `currency` field in that case. A proxy that serves both HTTP and stream traffic under one `proxy_id` reports `"protocol_family": "mixed"` and includes both a populated `by_status` map and a `stream` sub-object, so the per-family breakdown always reconciles with the proxy totals.
 
 **Multi-node deployments**: Each gateway node accumulates charges independently in memory. In CP/DP topologies, scrape `/charges` from every DP node with admin JWT credentials and aggregate externally. See [plugins.md](plugins.md#api_chargeback) for Prometheus scrape configuration examples.
 

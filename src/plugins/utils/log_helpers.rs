@@ -84,16 +84,17 @@ pub fn build_batch_config(
                 .max(defaults.min_flush_interval_ms),
         ),
         buffer_capacity,
-        retry: RetryPolicy {
-            // Plugin config remains `max_retries`; RetryPolicy stores total
-            // attempts, so add the initial try here.
-            max_attempts: max_retries.saturating_add(1).min(u64::from(u32::MAX)) as u32,
-            delay: Duration::from_millis(
+        // Plugin config remains `max_retries`; RetryPolicy stores total
+        // attempts, so add the initial try here. These loggers use a constant
+        // inter-attempt delay (no backoff/jitter), so build a fixed policy.
+        retry: RetryPolicy::fixed(
+            max_retries.saturating_add(1).min(u64::from(u32::MAX)) as u32,
+            Duration::from_millis(
                 config["retry_delay_ms"]
                     .as_u64()
                     .unwrap_or(defaults.retry_delay_ms),
             ),
-        },
+        ),
         plugin_name,
     }
 }

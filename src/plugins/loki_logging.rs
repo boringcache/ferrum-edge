@@ -154,10 +154,7 @@ impl LokiLogging {
             // Loki retries inside `send_batch` so we can reuse the same
             // serialized + gzipped body bytes across attempts.
             BatchConfig {
-                retry: RetryPolicy {
-                    max_attempts: 1,
-                    delay: Duration::from_millis(0),
-                },
+                retry: RetryPolicy::fixed(1, Duration::from_millis(0)),
                 ..batch_config
             },
             move |batch| {

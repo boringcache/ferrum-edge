@@ -1134,7 +1134,7 @@ configured) but no per-call charge.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `currency` | String | `"USD"` | Currency label included in Prometheus metrics and JSON output. Informational only — the plugin does not perform currency conversion |
+| `currency` | String | `"USD"` | Currency label included in Prometheus metrics and JSON output. Informational only — the plugin does not perform currency conversion. Scoped per plugin instance: each `api_chargeback` instance (global/proxy/proxy_group scope) stamps its own currency onto the charges it records and emits it per row, so instances with different currencies do not overwrite one another |
 | `pricing_tiers` | Array | _(optional)_ | Per-call HTTP-family pricing. Each tier maps a set of status codes to a per-call price |
 | `pricing_tiers[].status_codes` | Array\<Integer\> | _(required inside a tier)_ | HTTP status codes that trigger this tier's charge. A status code must appear in exactly one tier |
 | `pricing_tiers[].price_per_call` | Number | _(required inside a tier)_ | Charge per HTTP call (e.g. `0.00001`). Must be non-negative |
@@ -1155,7 +1155,7 @@ authenticated because chargeback output can contain customer and billing data.
 | Query Parameter | Description |
 |---|---|
 | _(none)_ | Prometheus text exposition format. Counter families: `ferrum_api_chargeable_calls_total` and `ferrum_api_charges_total` (HTTP per-call counts and charges, status-code labelled); `ferrum_api_stream_connections_total` and `ferrum_api_stream_connection_charges_total` (stream session counts and per-session charges); `ferrum_api_bytes_sent_total` / `ferrum_api_bytes_received_total` (bandwidth byte counters aggregated per `consumer`/`proxy_id`/`protocol_family`); and `ferrum_api_bandwidth_charges_total` (bandwidth charges, with `direction="sent"`/`"received"` and `protocol_family="http"`/`"stream"`). All metrics include a `namespace` label |
-| `?format=json` | JSON format with nested consumer → proxy breakdown. Each proxy carries `protocol_family`, per-status `by_status` calls/charges, a `bandwidth` block (`bytes_sent`, `bytes_received`, `charge_sent`, `charge_received`), and (for stream proxies) a `stream` block with session counts and per-connection charges. Consumer totals split into `per_call_charges`, `stream_connection_charges`, and `bandwidth_charges` |
+| `?format=json` | JSON format with nested consumer → proxy breakdown. Each proxy carries its `currency`, a `protocol_family` (`http`, `stream`, or `mixed` when one `proxy_id` carries both), per-status `by_status` calls/charges, a `bandwidth` block (`bytes_sent`, `bytes_received`, `charge_sent`, `charge_received`), and a `stream` block (session counts + per-connection charges) whenever the proxy recorded stream activity — so a `mixed` proxy shows both `by_status` and `stream` and the breakdown reconciles with the totals. The top-level `currency` is the single currency in use, or `"mixed"` when instances disagree. Consumer totals split into `per_call_charges`, `stream_connection_charges`, and `bandwidth_charges` |
 
 **Multi-node deployments (CP/DP):** Each gateway node (DP) accumulates charges
 independently in memory. In CP/DP topologies, the CP does not proxy traffic and

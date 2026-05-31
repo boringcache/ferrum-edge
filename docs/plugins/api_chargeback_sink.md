@@ -88,6 +88,18 @@ another supported secret suffix at startup, then reference the materialized base
 variable (`FERRUM_CLICKHOUSE_PASSWORD`) from `password_ref`. `password_ref`
 must name a `FERRUM_*` variable.
 
+## Retry
+
+A failed ClickHouse export is retried up to `retry.max_attempts` times. The
+inter-attempt delay uses **bounded exponential backoff**: it starts at
+`retry.initial_delay_ms` and doubles each attempt, capped at `retry.max_delay_ms`
+(which must be `>= retry.initial_delay_ms`). When `retry.jitter` is `true`
+(default), each delay is replaced with a uniformly random value in
+`[0, computed_delay]` (full jitter) so a fleet of nodes does not synchronize a
+retry storm against a struggling ClickHouse. After the attempt budget is
+exhausted the batch is handed to the spool (when enabled) instead of being
+dropped.
+
 ## Spool And Replay
 
 Spool files are written under:

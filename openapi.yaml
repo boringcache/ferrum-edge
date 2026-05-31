@@ -13239,6 +13239,11 @@ components:
       properties:
         currency:
           type: string
+          description: |
+            Currency in use across all recorded charges. Each `api_chargeback`
+            plugin instance carries its own currency (per global/proxy/proxy_group
+            scope), so this is `"mixed"` when instances disagree — read the
+            per-proxy `currency` field for the authoritative value in that case.
           example: "USD"
         generated_at:
           type: string
@@ -13270,10 +13275,20 @@ components:
                   properties:
                     proxy_name:
                       type: string
+                    currency:
+                      type: string
+                      description: |
+                        Currency of the `api_chargeback` instance that recorded
+                        this proxy's charges. Authoritative even when the
+                        top-level `currency` is `"mixed"`.
+                      example: "USD"
                     protocol_family:
                       type: string
-                      enum: [http, stream]
-                      description: Protocol family this proxy serves. Bandwidth metrics and the JSON breakdown are scoped per family.
+                      enum: [http, stream, mixed]
+                      description: |
+                        Protocol family this proxy serves. `"mixed"` when the same
+                        proxy_id carries both HTTP and stream activity. Bandwidth
+                        metrics and the JSON breakdown are scoped per family.
                     total_charges:
                       type: number
                       description: Per-proxy sum of per-call, stream-connection, and bandwidth charges.
@@ -13282,7 +13297,7 @@ components:
                       description: Per-proxy sum of HTTP calls + stream sessions.
                     by_status:
                       type: object
-                      description: HTTP per-status breakdown (empty for stream proxies).
+                      description: HTTP per-status breakdown (empty for stream-only proxies; populated for `http` and `mixed`).
                       additionalProperties:
                         type: object
                         properties:
@@ -13307,7 +13322,7 @@ components:
                           description: Accumulated bandwidth charge for backend->client bytes.
                     stream:
                       type: object
-                      description: Present only for stream proxies (TCP/UDP/DTLS).
+                      description: Present whenever the proxy recorded stream activity (TCP/UDP/DTLS), including `mixed` proxies that also serve HTTP.
                       properties:
                         connections:
                           type: integer
