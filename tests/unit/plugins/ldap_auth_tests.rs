@@ -636,12 +636,20 @@ async fn spawn_bind_response_ldap_server(result_code: u8) -> (u16, tokio::task::
 
             // bindResponse, messageID 1, caller-provided resultCode.
             let response: [u8; 14] = [
-                0x30, 0x0c, // LDAPMessage SEQUENCE, len 12
-                0x02, 0x01, 0x01, // messageID INTEGER 1
-                0x61, 0x07, // [APPLICATION 1] BindResponse, len 7
-                0x0a, 0x01, result_code, // resultCode ENUMERATED
-                0x04, 0x00, // matchedDN ""
-                0x04, 0x00, // diagnosticMessage ""
+                0x30,
+                0x0c, // LDAPMessage SEQUENCE, len 12
+                0x02,
+                0x01,
+                0x01, // messageID INTEGER 1
+                0x61,
+                0x07, // [APPLICATION 1] BindResponse, len 7
+                0x0a,
+                0x01,
+                result_code, // resultCode ENUMERATED
+                0x04,
+                0x00, // matchedDN ""
+                0x04,
+                0x00, // diagnosticMessage ""
             ];
             let _ = stream.write_all(&response).await;
             let _ = stream.flush().await;
