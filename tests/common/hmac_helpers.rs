@@ -10,7 +10,25 @@ type HmacSha256 = Hmac<Sha256>;
 /// Generate an HMAC-SHA256 signature for a request, matching the signing
 /// string format expected by the `hmac_auth` plugin.
 pub fn generate_hmac_signature(method: &str, path: &str, date: &str, secret: &str) -> String {
-    let signing_string = format!("{}\n{}\n{}\n{}", method, path, date, empty_digest_header());
+    generate_hmac_signature_with_query(method, path, "", date, secret)
+}
+
+/// Generate an HMAC-SHA256 signature for a request with a raw query string.
+pub fn generate_hmac_signature_with_query(
+    method: &str,
+    path: &str,
+    query: &str,
+    date: &str,
+    secret: &str,
+) -> String {
+    let signing_string = format!(
+        "{}\n{}\n{}\n{}\n{}",
+        method,
+        path,
+        query,
+        date,
+        empty_digest_header()
+    );
     let mut mac =
         HmacSha256::new_from_slice(secret.as_bytes()).expect("Failed to create HMAC instance");
     mac.update(signing_string.as_bytes());
