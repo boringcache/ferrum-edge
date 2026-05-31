@@ -1204,10 +1204,20 @@ fn test_same_proxy_records_stay_partitioned_by_instance_scope() {
     );
 
     let json: serde_json::Value = serde_json::from_str(&registry.render_json_uncached()).unwrap();
-    let proxy = &json["consumers"]["alice"]["proxies"]["shared-proxy"];
-    assert_eq!(proxy["currency"], "mixed");
-    assert_eq!(proxy["by_status"]["200"]["count"], 2);
-    assert_eq!(proxy["by_status"]["200"]["charges"], 3.0);
+    let proxies = json["consumers"]["alice"]["proxies"].as_object().unwrap();
+    assert_eq!(proxies.len(), 2);
+    assert!(proxies.values().any(|proxy| {
+        proxy["proxy_id"] == "shared-proxy"
+            && proxy["currency"] == "USD"
+            && proxy["by_status"]["200"]["calls"] == 1
+            && proxy["by_status"]["200"]["charges"] == 1.0
+    }));
+    assert!(proxies.values().any(|proxy| {
+        proxy["proxy_id"] == "shared-proxy"
+            && proxy["currency"] == "EUR"
+            && proxy["by_status"]["200"]["calls"] == 1
+            && proxy["by_status"]["200"]["charges"] == 2.0
+    }));
 }
 
 /// When every entry shares one currency, the top-level JSON `currency` reports
