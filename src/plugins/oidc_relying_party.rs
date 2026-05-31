@@ -789,6 +789,10 @@ impl OidcRelyingParty {
             return self.challenge(ctx, true);
         }
 
+        let leeway = self.provider.id_token_clock_skew.as_secs() as i64;
+        let claims_expired_before_refresh =
+            now > payload.expires_at_unix.saturating_add(leeway);
+
         // Keep the session live: refresh tokens when due (which also re-derives
         // claims from any new ID token), then slide the idle window. Any change
         // is re-sealed and emitted as a `Set-Cookie` by `after_proxy`.
@@ -801,8 +805,7 @@ impl OidcRelyingParty {
         // deferred/failed, or not yet due — fail closed and force re-auth rather than
         // emitting stale claim headers and scope/role decisions. Sessions still within
         // token expiry keep their validly-verified-at-login behavior.
-        let leeway = self.provider.id_token_clock_skew.as_secs() as i64;
-        if !refresh.refreshed && now > payload.expires_at_unix.saturating_add(leeway) {
+        if claims_expired_before_refresh && !refresh.refreshed {
             return self.challenge(ctx, true);
         }
 
