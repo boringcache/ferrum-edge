@@ -1929,6 +1929,30 @@ fn peer_auth_applies_to_workload<L: WorkloadLabels + ?Sized>(
             .is_none_or(|selector| workload_selector_matches(selector, namespace, labels))
 }
 
+/// Effective inbound mTLS mode a single PeerAuthentication yields for `port`: a
+/// per-port override takes precedence over the policy's top-level `mtls_mode`.
+fn peer_auth_effective_mode(pa: &PeerAuthentication, port: u16) -> MtlsMode {
+    pa.port_overrides
+        .get(&port)
+        .copied()
+        .unwrap_or(pa.mtls_mode)
+}
+
+/// Fail-secure restrictiveness rank used to resolve SAME-tier
+/// PeerAuthentication ties: a smaller rank is more secure and wins the tie.
+/// PeerAuthentication only ever carries the server-side modes
+/// (`Strict` > `Permissive` > `Disable`); the DestinationRule client-side modes
+/// are invalid here and are ranked least-preferred so a stray one can never
+/// outrank — and thereby downgrade — a trusted `Strict`.
+fn peer_auth_mtls_restrictiveness(mode: MtlsMode) -> u8 {
+    match mode {
+        MtlsMode::Strict => 0,
+        MtlsMode::Permissive => 1,
+        MtlsMode::Disable => 2,
+        MtlsMode::Simple | MtlsMode::Mutual | MtlsMode::IstioMutual => 3,
+    }
+}
+
 /// Resolve the effective mTLS mode for a given port from a set of
 /// PeerAuthentication policies.
 ///
@@ -1948,18 +1972,39 @@ pub fn resolve_effective_mtls_mode<L: WorkloadLabels + ?Sized>(
         }
 
         let scope = classify_peer_auth_scope(pa);
-        // Higher tier wins; within the SAME tier the ASCII-smallest
-        // `(namespace, name)` wins. Namespace must be the primary tiebreaker
-        // because root-namespace selector PeerAuthentications can intentionally
-        // apply across namespaces, while tenant namespace policies only apply
-        // locally. Considering namespace first keeps the decision deterministic
-        // without letting an attacker-controlled policy name outrank a trusted
-        // namespace policy in the same tier.
-        let dominated = best.as_ref().is_none_or(|(current_scope, current_pa)| {
-            scope > *current_scope
-                || (scope == *current_scope
-                    && (pa.namespace.as_str(), pa.name.as_str())
-                        < (current_pa.namespace.as_str(), current_pa.name.as_str()))
+        // Higher tier wins (WorkloadSelector > Namespace > MeshWide). Within the
+        // SAME tier, two equally-applicable PeerAuthentications are an operator
+        // misconfiguration, so resolve the tie FAIL-SECURE: prefer the more-
+        // restrictive effective mTLS mode for this port (Strict > Permissive >
+        // Disable). This is both deterministic AND a real trust boundary —
+        // because the winner is decided by mode, not by the policy's namespace
+        // string or name, a tenant-controlled policy cannot downgrade inbound
+        // mTLS below a trusted same-tier policy by choosing a low-sorting
+        // namespace or policy name (and a customized root namespace that sorts
+        // after tenants is equally safe). Only when the effective modes are
+        // identical do we fall back to the value-neutral `(namespace, name)`
+        // ordering, purely to pick a canonical winner deterministically across
+        // pods/reconciles.
+        let dominated = best.as_ref().is_none_or(|&(current_scope, current_pa)| {
+            use std::cmp::Ordering;
+            match scope.cmp(&current_scope) {
+                Ordering::Greater => true,
+                Ordering::Less => false,
+                Ordering::Equal => {
+                    let candidate =
+                        peer_auth_mtls_restrictiveness(peer_auth_effective_mode(pa, port));
+                    let current =
+                        peer_auth_mtls_restrictiveness(peer_auth_effective_mode(current_pa, port));
+                    match candidate.cmp(&current) {
+                        Ordering::Less => true,
+                        Ordering::Greater => false,
+                        Ordering::Equal => {
+                            (pa.namespace.as_str(), pa.name.as_str())
+                                < (current_pa.namespace.as_str(), current_pa.name.as_str())
+                        }
+                    }
+                }
+            }
         });
         if dominated {
             best = Some((scope, pa));
@@ -1967,13 +2012,7 @@ pub fn resolve_effective_mtls_mode<L: WorkloadLabels + ?Sized>(
     }
 
     match best {
-        Some((_, pa)) => {
-            // Port-level override within the winning policy.
-            pa.port_overrides
-                .get(&port)
-                .copied()
-                .unwrap_or(pa.mtls_mode)
-        }
+        Some((_, pa)) => peer_auth_effective_mode(pa, port),
         None => MtlsMode::Permissive,
     }
 }
@@ -3426,21 +3465,22 @@ mod tests {
     }
 
     #[test]
-    fn same_tier_peer_auth_resolves_to_ascii_smallest_namespace_and_name_regardless_of_order() {
+    fn same_tier_peer_auth_resolves_fail_secure_to_more_restrictive_mode() {
         // Two namespace-tier PeerAuthentications match the same workload with
-        // conflicting modes. The winner must be deterministic (ASCII-smallest
-        // namespace/name tuple) independent of slice iteration order, so the
-        // inbound mTLS posture can't flap (STRICT vs PERMISSIVE) across
-        // pods/reconciles.
+        // conflicting modes. The tie resolves FAIL-SECURE to the more-
+        // restrictive mode (Strict > Permissive > Disable), independent of slice
+        // iteration order and of the policies' names, so the inbound mTLS
+        // posture can neither flap across pods/reconciles nor be downgraded by a
+        // low-sorting policy name.
         let strict = pa(
-            "aa-strict",
+            "zz-strict",
             "default",
             None,
             MtlsMode::Strict,
             HashMap::new(),
         );
         let permissive = pa(
-            "zz-permissive",
+            "aa-permissive",
             "default",
             None,
             MtlsMode::Permissive,
@@ -3448,66 +3488,39 @@ mod tests {
         );
         let labels = HashMap::<String, String>::new();
 
-        let forward = vec![strict.clone(), permissive.clone()];
+        // `aa-permissive` sorts before `zz-strict`, so a name tiebreak would
+        // have picked Permissive; fail-secure must still pick Strict.
+        let forward = vec![permissive.clone(), strict.clone()];
         assert_eq!(
             resolve_effective_mtls_mode(&forward, "default", &labels, 8080),
             MtlsMode::Strict,
-            "aa-strict/default (ASCII-smallest tuple) must win"
+            "the more-restrictive mode must win regardless of policy name order"
         );
 
-        let reversed = vec![permissive, strict];
+        let reversed = vec![strict, permissive];
         assert_eq!(
             resolve_effective_mtls_mode(&reversed, "default", &labels, 8080),
             MtlsMode::Strict,
-            "reversed slice order must resolve to the same winner"
+            "reversed slice order must resolve to the same fail-secure winner"
         );
     }
 
     #[test]
-    fn same_tier_peer_auth_same_name_resolves_to_ascii_smallest_namespace() {
-        // Mesh-wide policies from different namespaces can share a name and
-        // both apply to the workload. Namespace must participate in the
-        // tiebreak or equal names fall back to slice iteration order.
+    fn same_tier_peer_auth_prefers_more_restrictive_mode_over_namespace_order() {
+        // Mesh-wide policies from different namespaces both apply. The tie is
+        // decided by mode, not by namespace string: Strict wins even though its
+        // namespace sorts AFTER the conflicting Permissive policy's namespace.
+        // This is what makes a customized root namespace that sorts after tenant
+        // namespaces safe — namespace order can no longer downgrade mTLS.
         let strict = pa_with_scope(
-            "default",
-            "aaa-root",
+            "mesh-default",
+            "zzz-root",
             PolicyScope::MeshWide,
             MtlsMode::Strict,
         );
         let permissive = pa_with_scope(
-            "default",
-            "zzz-root",
-            PolicyScope::MeshWide,
-            MtlsMode::Permissive,
-        );
-        let labels = HashMap::<String, String>::new();
-
-        let forward = vec![strict.clone(), permissive.clone()];
-        assert_eq!(
-            resolve_effective_mtls_mode(&forward, "default", &labels, 8080),
-            MtlsMode::Strict,
-            "aaa-root/default (ASCII-smallest tuple) must win"
-        );
-
-        let reversed = vec![permissive, strict];
-        assert_eq!(
-            resolve_effective_mtls_mode(&reversed, "default", &labels, 8080),
-            MtlsMode::Strict,
-            "reversed slice order must resolve to the same winner"
-        );
-    }
-
-    #[test]
-    fn same_tier_peer_auth_prefers_ascii_smallest_namespace_before_name() {
-        let strict = pa_with_scope(
-            "zz-policy",
+            "mesh-default",
             "aaa-root",
-            PolicyScope::MeshWide,
-            MtlsMode::Strict,
-        );
-        let permissive = pa_with_scope(
-            "aa-policy",
-            "zzz-root",
             PolicyScope::MeshWide,
             MtlsMode::Permissive,
         );
@@ -3517,7 +3530,7 @@ mod tests {
         assert_eq!(
             resolve_effective_mtls_mode(&forward, "default", &labels, 8080),
             MtlsMode::Strict,
-            "aaa-root/zz-policy must win before zzz-root/aa-policy"
+            "Strict must win even though zzz-root sorts after aaa-root"
         );
 
         let reversed = vec![strict, permissive];
@@ -3525,6 +3538,41 @@ mod tests {
             resolve_effective_mtls_mode(&reversed, "default", &labels, 8080),
             MtlsMode::Strict,
             "reversed slice order must resolve to the same winner"
+        );
+    }
+
+    #[test]
+    fn same_tier_peer_auth_equal_modes_resolve_deterministically() {
+        // When two same-tier policies carry the SAME effective mode, the result
+        // is identical regardless of slice order; the value-neutral
+        // (namespace, name) tiebreak only selects a canonical winning policy,
+        // never the resolved mode.
+        let a = pa_with_scope(
+            "zz-policy",
+            "aaa-root",
+            PolicyScope::MeshWide,
+            MtlsMode::Permissive,
+        );
+        let b = pa_with_scope(
+            "aa-policy",
+            "zzz-root",
+            PolicyScope::MeshWide,
+            MtlsMode::Permissive,
+        );
+        let labels = HashMap::<String, String>::new();
+
+        let forward = vec![a.clone(), b.clone()];
+        assert_eq!(
+            resolve_effective_mtls_mode(&forward, "default", &labels, 8080),
+            MtlsMode::Permissive,
+            "equal-mode same-tier policies resolve to that mode"
+        );
+
+        let reversed = vec![b, a];
+        assert_eq!(
+            resolve_effective_mtls_mode(&reversed, "default", &labels, 8080),
+            MtlsMode::Permissive,
+            "reversed slice order resolves to the same mode"
         );
     }
 
