@@ -3,9 +3,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use chrono::{DateTime, Utc};
+use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 
 use crate::identity::ca::PublishedTrustBundle;
@@ -571,6 +572,7 @@ const MESH_LABEL_INTERN_CAP: usize = 4096;
 /// shared `Arc<str>` so [`mesh_request_key`] can clone (atomic increment)
 /// instead of heap-allocating a fresh `Arc` per field on every call.
 static MESH_LABEL_INTERN: LazyLock<DashMap<Box<str>, Arc<str>>> = LazyLock::new(DashMap::new);
+static MESH_LABEL_INTERN_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Intern a mesh label value into a shared `Arc<str>`.
 ///
@@ -583,18 +585,26 @@ fn intern_label(value: &str) -> Arc<str> {
     if let Some(existing) = MESH_LABEL_INTERN.get(value) {
         return Arc::clone(existing.value());
     }
-    // Bound the pool. A small concurrent overshoot past the cap is acceptable
-    // (matches the codebase's relaxed soft-cap conventions); the key property
-    // is that growth stops, so this can never become an unbounded memory sink.
-    if MESH_LABEL_INTERN.len() >= MESH_LABEL_INTERN_CAP {
+    if MESH_LABEL_INTERN_COUNT
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+            (count < MESH_LABEL_INTERN_CAP).then_some(count + 1)
+        })
+        .is_err()
+    {
         return Arc::from(value);
     }
-    Arc::clone(
-        MESH_LABEL_INTERN
-            .entry(Box::from(value))
-            .or_insert_with(|| Arc::from(value))
-            .value(),
-    )
+
+    match MESH_LABEL_INTERN.entry(Box::from(value)) {
+        Entry::Occupied(entry) => {
+            MESH_LABEL_INTERN_COUNT.fetch_sub(1, Ordering::Relaxed);
+            Arc::clone(entry.get())
+        }
+        Entry::Vacant(entry) => {
+            let interned = Arc::from(value);
+            entry.insert(Arc::clone(&interned));
+            interned
+        }
+    }
 }
 
 /// Build the RED/service-graph metric key for a mesh request.
