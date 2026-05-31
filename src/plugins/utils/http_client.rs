@@ -147,7 +147,9 @@ impl std::fmt::Debug for PluginHttpClient {
 /// If even this minimal builder fails, only then fall back to
 /// `reqwest::Client::new()` (an exceptional, doubly-degraded path).
 fn build_dns_cached_fallback_client(dns_cache: Option<DnsCache>) -> reqwest::Client {
-    let mut builder = reqwest::Client::builder();
+    // Never auto-follow redirects on a shared outbound client (SSRF posture,
+    // matches src/connection_pool.rs and the configured clients above).
+    let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
     if let Some(dns_cache) = dns_cache {
         let resolver = DnsCacheResolver::new(dns_cache);
         builder = builder.dns_resolver(Arc::new(resolver));
@@ -193,57 +195,87 @@ impl PluginHttpClient {
         let dns_cache_clone = dns_cache.clone();
         let resolver = DnsCacheResolver::new(dns_cache);
 
+        // Load + validate the custom CA bundle ONCE, keeping the raw PEM so the
+        // exact trust posture can be re-applied to the fallback builder below if
+        // the fully-tuned `build()` fails — a custom CA configured for
+        // exclusivity must never be silently widened back to platform/webpki
+        // roots by a builder error. CA bundles are public trust material, so
+        // holding the bytes in memory is not a secret-exposure concern.
+        //
+        // Trust resolution:
+        //   - tls_no_verify=true   → skip verification entirely (handled in
+        //                            `apply_tls_posture` via
+        //                            danger_accept_invalid_certs)
+        //   - Custom CA configured → trust ONLY that CA (CA exclusivity via
+        //                            tls_certs_only — replaces the trust store
+        //                            wholesale)
+        //   - No CA configured     → reqwest 0.13's rustls default
+        //                            (rustls-platform-verifier: OS keychain on
+        //                            macOS, Windows cert store, bundled webpki on
+        //                            Linux). The backend proxy path in
+        //                            src/tls/backend.rs uses bundled webpki on
+        //                            every platform via use_preconfigured_tls;
+        //                            this helper-client path differs.
+        let ca_pem: Option<Vec<u8>> = if !tls_no_verify {
+            tls_ca_bundle_path.and_then(|ca_path| {
+                let source = CertSource::parse(ca_path, MaterialKind::CaBundle);
+                match load_material_blocking(&source, MaterialKind::CaBundle) {
+                    Ok(ca_material) => {
+                        let bytes = ca_material.bytes.expose_secret();
+                        // Validate now so we never carry un-parseable bytes into
+                        // the (re-)apply step.
+                        match reqwest::Certificate::from_pem(bytes) {
+                            Ok(_) => Some(bytes.to_vec()),
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Failed to parse CA bundle from {}: {}",
+                                    ca_material.source_id,
+                                    e
+                                );
+                                None
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to load CA bundle: {}", e);
+                        None
+                    }
+                }
+            })
+        } else {
+            None
+        };
+
+        // Apply the gateway's TLS trust posture (skip-verify, or exclusive
+        // custom CA) to a builder. Captured so the fallback path below
+        // re-applies the SAME posture instead of reverting to platform/webpki
+        // roots on a build() failure.
+        let apply_tls_posture = |b: reqwest::ClientBuilder| -> reqwest::ClientBuilder {
+            let mut b = b.danger_accept_invalid_certs(tls_no_verify);
+            if let Some(pem) = ca_pem.as_deref() {
+                match reqwest::Certificate::from_pem(pem) {
+                    // reqwest 0.13: `tls_certs_only` replaces the trust store
+                    // entirely (CA exclusivity).
+                    Ok(cert) => b = b.tls_certs_only([cert]),
+                    Err(e) => tracing::warn!("Failed to re-parse CA bundle: {}", e),
+                }
+            }
+            b
+        };
+
         let mut builder = reqwest::Client::builder()
             .pool_max_idle_per_host(pool_config.max_idle_per_host)
             .pool_idle_timeout(Duration::from_secs(pool_config.idle_timeout_seconds))
             .connect_timeout(Duration::from_secs(30))
             .timeout(Duration::from_secs(60))
-            .danger_accept_invalid_certs(tls_no_verify)
+            // Never auto-follow redirects on the shared outbound client: a 30x
+            // from a permitted host could otherwise transparently redirect a
+            // plugin call (jwks/oidc discovery, webhooks, request_mirror,
+            // ai_federation) to an internal service or cloud metadata endpoint.
+            // Matches src/connection_pool.rs.
+            .redirect(reqwest::redirect::Policy::none())
             .dns_resolver(Arc::new(resolver));
-
-        // Load custom CA bundle for verifying internal/corporate CAs.
-        // Trust resolution:
-        //   - tls_no_verify=true                 → skip verification entirely
-        //                                          (handled above via
-        //                                          danger_accept_invalid_certs)
-        //   - Custom CA configured               → trust ONLY that CA
-        //                                          (CA exclusivity via
-        //                                          tls_certs_only — replaces the
-        //                                          trust store wholesale)
-        //   - No CA configured (this branch       → fall through to reqwest 0.13's
-        //     skipped)                              rustls feature default, which
-        //                                          uses rustls-platform-verifier:
-        //                                          OS keychain on macOS, Windows
-        //                                          cert store on Windows, bundled
-        //                                          webpki on Linux. The backend
-        //                                          proxy path in src/tls/backend.rs
-        //                                          uses bundled webpki on every
-        //                                          platform via use_preconfigured_tls;
-        //                                          this helper-client path differs.
-        if !tls_no_verify && let Some(ca_path) = tls_ca_bundle_path {
-            let source = CertSource::parse(ca_path, MaterialKind::CaBundle);
-            match load_material_blocking(&source, MaterialKind::CaBundle) {
-                Ok(ca_material) => {
-                    match reqwest::Certificate::from_pem(ca_material.bytes.expose_secret()) {
-                        Ok(cert) => {
-                            // reqwest 0.13: `tls_certs_only` replaces the trust
-                            // store entirely (CA exclusivity).
-                            builder = builder.tls_certs_only([cert]);
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "Failed to parse CA bundle from {}: {}",
-                                ca_material.source_id,
-                                e
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to load CA bundle: {}", e);
-                }
-            }
-        }
+        builder = apply_tls_posture(builder);
 
         if pool_config.enable_http_keep_alive {
             builder = builder.tcp_keepalive(Duration::from_secs(pool_config.tcp_keepalive_seconds));
@@ -261,11 +293,24 @@ impl PluginHttpClient {
 
         let client = builder.build().unwrap_or_else(|e| {
             tracing::error!(
-                "Failed to build plugin HTTP client: {}. \
-                 Falling back to a minimal DNS-cached client (TLS/pool/keepalive settings will not apply).",
-                e
+                "Failed to build fully-configured plugin HTTP client: {e}. Retrying a \
+                 minimal builder that preserves the TLS trust posture (custom CA / \
+                 no-verify) and DNS cache, dropping only pool/keepalive tuning — a \
+                 custom CA configured for exclusivity must not be silently widened to \
+                 platform/webpki roots."
             );
-            build_dns_cached_fallback_client(Some(dns_cache_clone.clone()))
+            let fallback = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .dns_resolver(Arc::new(DnsCacheResolver::new(dns_cache_clone.clone())));
+            apply_tls_posture(fallback).build().unwrap_or_else(|e2| {
+                tracing::error!(
+                    "Minimal TLS-preserving plugin client also failed to build: {e2}. \
+                     Falling back to a DNS-cached client WITHOUT the custom CA / no-verify \
+                     settings — outbound TLS trust may be WIDER than configured until the \
+                     TLS configuration is fixed."
+                );
+                build_dns_cached_fallback_client(Some(dns_cache_clone.clone()))
+            })
         });
 
         Self {
@@ -317,7 +362,10 @@ impl PluginHttpClient {
             .pool_max_idle_per_host(config.max_idle_per_host)
             .pool_idle_timeout(Duration::from_secs(config.idle_timeout_seconds))
             .connect_timeout(Duration::from_secs(30))
-            .timeout(Duration::from_secs(60));
+            .timeout(Duration::from_secs(60))
+            // Never auto-follow redirects on the shared outbound client
+            // (SSRF posture, matches `new()` and src/connection_pool.rs).
+            .redirect(reqwest::redirect::Policy::none());
 
         if config.enable_http_keep_alive {
             builder = builder.tcp_keepalive(Duration::from_secs(config.tcp_keepalive_seconds));
