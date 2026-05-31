@@ -299,6 +299,18 @@ fn canonical_htu_from_url_rejects_non_http_scheme() {
     assert_eq!(canonical_htu_from_url("not a url"), None);
 }
 
+#[test]
+fn canonical_htu_from_url_rejects_userinfo() {
+    assert_eq!(
+        canonical_htu_from_url("https://alice@example.com/resource"),
+        None
+    );
+    assert_eq!(
+        canonical_htu_from_url("https://alice:secret@example.com/resource"),
+        None
+    );
+}
+
 // ── minimal RSA public-key DER parsing (SPKI) for building the test JWK ─────
 
 fn der_from_pem(pem: &str) -> Vec<u8> {

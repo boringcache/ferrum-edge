@@ -210,6 +210,9 @@ pub fn canonical_htu(scheme: &str, host: &str, path: &str) -> Option<String> {
 /// ignored (dropped by `canonical_htu`).
 pub fn canonical_htu_from_url(raw: &str) -> Option<String> {
     let parsed = url::Url::parse(raw).ok()?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return None;
+    }
     let host = parsed.host_str()?;
     let host_with_port = match parsed.port() {
         Some(port) => format!("{host}:{port}"),
