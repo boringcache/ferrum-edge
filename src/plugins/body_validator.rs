@@ -1487,16 +1487,86 @@ fn json_integer_i128(v: &Value) -> Option<i128> {
         .or_else(|| v.as_u64().map(i128::from))
 }
 
+fn pow10_i128(exp: u32) -> Option<i128> {
+    let mut value = 1_i128;
+    for _ in 0..exp {
+        value = value.checked_mul(10)?;
+    }
+    Some(value)
+}
+
+fn parse_json_decimal_number(text: &str) -> Option<(i128, i128)> {
+    let (mantissa, exponent) = match text.find(|ch| ch == 'e' || ch == 'E') {
+        Some(index) => {
+            let exponent = text[index + 1..].parse::<i32>().ok()?;
+            (&text[..index], exponent)
+        }
+        None => (text, 0),
+    };
+
+    let (sign, digits_text) = match mantissa.as_bytes().first() {
+        Some(b'-') => (-1_i128, &mantissa[1..]),
+        Some(b'+') => (1_i128, &mantissa[1..]),
+        _ => (1_i128, mantissa),
+    };
+
+    let mut digits = String::with_capacity(digits_text.len());
+    let mut fractional_digits = 0_i32;
+    let mut seen_decimal = false;
+    for ch in digits_text.chars() {
+        match ch {
+            '0'..='9' => {
+                digits.push(ch);
+                if seen_decimal {
+                    fractional_digits += 1;
+                }
+            }
+            '.' if !seen_decimal => seen_decimal = true,
+            _ => return None,
+        }
+    }
+
+    let trimmed = digits.trim_start_matches('0');
+    let mut numerator = if trimmed.is_empty() {
+        0
+    } else {
+        trimmed.parse::<i128>().ok()?.checked_mul(sign)?
+    };
+
+    let scale = fractional_digits.checked_sub(exponent)?;
+    if scale < 0 {
+        numerator = numerator.checked_mul(pow10_i128(scale.unsigned_abs())?)?;
+        return Some((numerator, 1));
+    }
+
+    Some((numerator, pow10_i128(scale as u32)?))
+}
+
+fn json_decimal_rational(v: &Value) -> Option<(i128, i128)> {
+    parse_json_decimal_number(&v.as_number()?.to_string())
+}
+
+fn decimal_value_is_multiple_of(data: &Value, divisor: &Value) -> Option<bool> {
+    let (value_num, value_den) = json_decimal_rational(data)?;
+    let (divisor_num, divisor_den) = json_decimal_rational(divisor)?;
+    let divisor_product = divisor_num.checked_mul(value_den)?.checked_abs()?;
+    if divisor_product == 0 {
+        return None;
+    }
+    let value_product = value_num.checked_mul(divisor_den)?;
+    Some(value_product % divisor_product == 0)
+}
+
 /// Evaluates JSON Schema `multipleOf` for a numeric instance (finding #65).
 ///
 /// When both the instance value and the divisor are integral, exact integer
 /// modulo is used so neither float representation error nor a magnitude-blind
 /// absolute tolerance can flip the verdict (e.g. `u64::MAX` is correctly a
-/// multiple of 3, which the float path misjudges). Otherwise a magnitude-scaled
-/// relative tolerance is used, checking that the float remainder is near zero
-/// *or* near the divisor so values just under a clean multiple (e.g. 0.3 against
-/// `multipleOf: 0.1`, whose float remainder is ~0.0999…) are not wrongly
-/// rejected. `n`/`multiple` are the pre-extracted `f64` views of `data`/`divisor`.
+/// multiple of 3, which the float path misjudges). Decimal JSON numbers then
+/// use an exact rational check, so currency-like schemas such as
+/// `multipleOf: 0.01` neither reject true multiples nor admit large
+/// non-multiples through a wide float tolerance. `n`/`multiple` are the
+/// pre-extracted `f64` views of `data`/`divisor`.
 fn value_is_multiple_of(data: &Value, divisor: &Value, n: f64, multiple: f64) -> bool {
     if let (Some(value_int), Some(divisor_int)) =
         (json_integer_i128(data), json_integer_i128(divisor))
@@ -1505,12 +1575,17 @@ fn value_is_multiple_of(data: &Value, divisor: &Value, n: f64, multiple: f64) ->
         return value_int % divisor_int == 0;
     }
 
-    // Float path: keep the tolerance bounded by the divisor, not by the
-    // submitted value. Scaling by `n` makes the accepted remainder window grow
-    // until large non-multiples pass (e.g. 1e14 + 0.05 against 0.1).
+    if let Some(is_multiple) = decimal_value_is_multiple_of(data, divisor) {
+        return is_multiple;
+    }
+
+    // Float fallback: scale by the quotient to allow accumulated modulo error,
+    // but cap the window relative to the divisor so large non-multiples cannot
+    // pass merely because `n` is large.
     let rem = (n % multiple).abs();
     let abs_multiple = multiple.abs();
-    let tol = 4.0 * f64::EPSILON * abs_multiple.max(1.0);
+    let quotient = (n / multiple).abs().max(1.0);
+    let tol = (8.0 * f64::EPSILON * quotient * abs_multiple).min(abs_multiple * 1e-9);
     rem <= tol || (abs_multiple - rem).abs() <= tol
 }
 
