@@ -712,6 +712,101 @@ impl AiSemanticCache {
         }
     }
 
+    async fn build_vector_snapshot(
+        cache: Arc<DashMap<String, CacheEntry>>,
+        ttl: Duration,
+        max_candidates: usize,
+    ) -> Result<Option<HnswMap<EmbeddingPoint, VectorEntry>>, tokio::task::JoinError> {
+        tokio::task::spawn_blocking(move || {
+            // HnswMap is immutable, so local semantic inserts/removals are
+            // made visible in batches. The dirty flag is cleared before this
+            // snapshot; any concurrent insert that races this scan re-dirties
+            // the index and schedules a later rebuild.
+            let now = Instant::now();
+            let mut points = Vec::new();
+            let mut values = Vec::new();
+
+            for entry in cache.iter() {
+                if now.duration_since(entry.inserted_at) >= ttl {
+                    continue;
+                }
+                let (Some(scope_key), Some(embedding)) =
+                    (entry.semantic_scope_key.clone(), entry.embedding.clone())
+                else {
+                    continue;
+                };
+                points.push(embedding);
+                values.push(VectorEntry {
+                    cache_key: entry.key().clone(),
+                    scope_key,
+                });
+            }
+
+            if points.is_empty() {
+                return None;
+            }
+
+            Some(
+                HnswBuilder::default()
+                    .ef_search(max_candidates)
+                    .ef_construction(max_candidates.max(100))
+                    .seed(0)
+                    .build(points, values),
+            )
+        })
+        .await
+    }
+
+    fn store_vector_snapshot_result(
+        build_result: Result<Option<HnswMap<EmbeddingPoint, VectorEntry>>, tokio::task::JoinError>,
+        vector_index: &ArcSwapOption<VectorSnapshot>,
+        dirty: &AtomicBool,
+    ) {
+        match build_result {
+            Ok(Some(index)) => {
+                vector_index.store(Some(Arc::new(VectorSnapshot { index })));
+            }
+            Ok(None) => {
+                vector_index.store(None);
+            }
+            Err(err) => {
+                dirty.store(true, Ordering::Release);
+                debug!(
+                    error = %err,
+                    "ai_semantic_cache: semantic vector index rebuild task failed"
+                );
+            }
+        }
+    }
+
+    pub(crate) async fn rebuild_vector_index_for_tests(&self) {
+        let Some(semantic) = self.semantic.as_ref() else {
+            return;
+        };
+
+        while self
+            .vector_index_rebuild_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            tokio::task::yield_now().await;
+        }
+
+        self.vector_index_dirty.store(false, Ordering::Release);
+        let build_result =
+            Self::build_vector_snapshot(Arc::clone(&self.cache), self.ttl, semantic.max_candidates)
+                .await;
+        Self::store_vector_snapshot_result(
+            build_result,
+            self.vector_index.as_ref(),
+            self.vector_index_dirty.as_ref(),
+        );
+        self.last_vector_rebuild
+            .store(current_epoch_seconds(), Ordering::Release);
+        self.vector_index_rebuild_running
+            .store(false, Ordering::Release);
+    }
+
     fn refresh_vector_index_if_due(&self) {
         let Some(semantic) = self.semantic.as_ref() else {
             return;
@@ -750,60 +845,8 @@ impl AiSemanticCache {
         let max_candidates = semantic.max_candidates;
 
         tokio::spawn(async move {
-            let build_result = tokio::task::spawn_blocking(move || {
-                // HnswMap is immutable, so local semantic inserts/removals are
-                // made visible in batches. The dirty flag was cleared before
-                // this snapshot; any concurrent insert that races this scan
-                // re-dirties the index and schedules a later rebuild.
-                let now = Instant::now();
-                let mut points = Vec::new();
-                let mut values = Vec::new();
-
-                for entry in cache.iter() {
-                    if now.duration_since(entry.inserted_at) >= ttl {
-                        continue;
-                    }
-                    let (Some(scope_key), Some(embedding)) =
-                        (entry.semantic_scope_key.clone(), entry.embedding.clone())
-                    else {
-                        continue;
-                    };
-                    points.push(embedding);
-                    values.push(VectorEntry {
-                        cache_key: entry.key().clone(),
-                        scope_key,
-                    });
-                }
-
-                if points.is_empty() {
-                    return None;
-                }
-
-                Some(
-                    HnswBuilder::default()
-                        .ef_search(max_candidates)
-                        .ef_construction(max_candidates.max(100))
-                        .seed(0)
-                        .build(points, values),
-                )
-            })
-            .await;
-
-            match build_result {
-                Ok(Some(index)) => {
-                    vector_index.store(Some(Arc::new(VectorSnapshot { index })));
-                }
-                Ok(None) => {
-                    vector_index.store(None);
-                }
-                Err(err) => {
-                    dirty.store(true, Ordering::Release);
-                    debug!(
-                        error = %err,
-                        "ai_semantic_cache: semantic vector index rebuild task failed"
-                    );
-                }
-            }
+            let build_result = Self::build_vector_snapshot(cache, ttl, max_candidates).await;
+            Self::store_vector_snapshot_result(build_result, vector_index.as_ref(), dirty.as_ref());
             rebuild_running.store(false, Ordering::Release);
         });
     }

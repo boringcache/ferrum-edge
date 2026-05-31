@@ -12446,7 +12446,7 @@ components:
           type: integer
           format: uint64
           default: 10000
-          description: Maximum number of cached entries (local mode)
+          description: Maximum number of cached entries (local mode). In semantic mode, HNSW snapshot memory also scales with this count outside max_total_size_bytes.
         max_entry_size_bytes:
           type: integer
           format: uint64

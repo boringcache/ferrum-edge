@@ -1,3 +1,4 @@
+use ferrum_edge::_test_support::rebuild_ai_semantic_cache_vector_index;
 use ferrum_edge::config::types::Consumer;
 use ferrum_edge::plugins::ai_semantic_cache::AiSemanticCache;
 use ferrum_edge::plugins::{
@@ -78,6 +79,7 @@ async fn store_response(
     let _ = plugin
         .on_final_response_body(&mut ctx, 200, &response_headers, response_body)
         .await;
+    rebuild_ai_semantic_cache_vector_index(plugin).await;
 }
 
 fn make_plugin(config: serde_json::Value) -> AiSemanticCache {

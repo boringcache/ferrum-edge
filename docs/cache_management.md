@@ -58,7 +58,7 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 
 **What it stores:** Resolved IP addresses for backend hostnames, upstream targets, and plugin endpoints.
 
-**Default limit:** 10,000 entries.
+**Default limit:** 10,000 entries. In semantic mode, HNSW snapshot memory and periodic full-index rebuild CPU also scale with this count outside the response-entry byte budget.
 
 **Env var:** `FERRUM_DNS_CACHE_MAX_SIZE`.
 
