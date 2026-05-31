@@ -1505,12 +1505,12 @@ fn value_is_multiple_of(data: &Value, divisor: &Value, n: f64, multiple: f64) ->
         return value_int % divisor_int == 0;
     }
 
-    // Float path: scale the tolerance by operand magnitude and allow a few ULPs
-    // of accumulated rounding. Accept when the remainder sits near 0 or near the
-    // divisor (the latter covers values just below an exact multiple).
+    // Float path: keep the tolerance bounded by the divisor, not by the
+    // submitted value. Scaling by `n` makes the accepted remainder window grow
+    // until large non-multiples pass (e.g. 1e14 + 0.05 against 0.1).
     let rem = (n % multiple).abs();
     let abs_multiple = multiple.abs();
-    let tol = 4.0 * f64::EPSILON * n.abs().max(abs_multiple).max(1.0);
+    let tol = 4.0 * f64::EPSILON * abs_multiple.max(1.0);
     rem <= tol || (abs_multiple - rem).abs() <= tol
 }
 

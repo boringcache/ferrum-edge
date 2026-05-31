@@ -954,6 +954,14 @@ async fn test_json_schema_multiple_of_fractional_divisor_rejects_non_multiple() 
     assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
 }
 
+#[tokio::test]
+async fn test_json_schema_multiple_of_large_fractional_non_multiple_rejected() {
+    let plugin = json_schema_plugin(serde_json::json!({"type": "number", "multipleOf": 0.1}));
+    let mut ctx = make_json_ctx("100000000000000.05");
+    let mut headers = make_json_headers();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
 // Currency-style divisor (0.01): valid amount accepted, invalid rejected.
 #[tokio::test]
 async fn test_json_schema_multiple_of_currency_divisor() {
