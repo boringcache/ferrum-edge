@@ -247,9 +247,11 @@ mod tests {
     }
 
     #[test]
-    fn regex_exemption_preserves_explicit_leading_anchor() {
-        // An operator who already anchored their pattern gets it verbatim (no
-        // double `^^`), and a floating match is still expressible via `~.*`.
+    fn explicit_anchor_and_floating_patterns_still_work_after_wrap() {
+        // An operator-anchored pattern keeps anchored matching after the
+        // `^(?:...)` wrap (the resulting `^(?:^/internal/)` is a harmless
+        // double-anchor on single-line paths), and a floating match is still
+        // expressible via `~.*`.
         let anchored = serde_json::json!({"paths":["~^/internal/"]});
         let exemptions = CompiledExemptions::from_config(Some(&anchored)).unwrap();
         let internal =

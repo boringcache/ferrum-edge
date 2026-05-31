@@ -133,6 +133,49 @@ async fn short_regex_exemption_does_not_disable_waf_on_unintended_paths() {
 }
 
 #[tokio::test]
+async fn regex_alternation_exemption_anchors_all_branches() {
+    // Regression for finding #7 (residual): a `~regex` exemption with a
+    // top-level alternation must anchor EVERY branch. Before the `^(?:...)`
+    // wrap, `~health|metrics` compiled to `^health|metrics` == `(^health)|
+    // (metrics)`, leaving the `metrics` branch UNANCHORED — so it exempted (and
+    // silently disabled the WAF on) any path merely containing "metrics", e.g.
+    // `/v1/metrics-internal`.
+    let plugin = Waf::new(&json!({
+        "global_exemptions": { "paths": ["~health|metrics"] },
+        "rule_modes": { "FE-SQLI-002": "enforce" }
+    }))
+    .unwrap();
+
+    // Path containing the second alternation branch as a substring: NOT exempt.
+    let mut unintended = ctx("GET", "/v1/metrics-internal");
+    unintended.set_raw_query_string("q=%27%20OR%201%3D1".into());
+    let result = plugin.authorize(&mut unintended).await;
+    match result {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 403),
+        other => panic!(
+            "expected WAF to enforce on a path merely containing an alternation branch, got {other:?}"
+        ),
+    }
+    assert!(
+        unintended
+            .metadata
+            .get("waf.rule_hits")
+            .is_some_and(|hits| hits.contains("FE-SQLI-002")),
+        "WAF must inspect a path that only contains an alternation branch substring"
+    );
+
+    // A path that BEGINS with an anchored branch is still exempt.
+    let mut intended = ctx("GET", "metrics/list");
+    intended.set_raw_query_string("q=%27%20OR%201%3D1".into());
+    let result = plugin.authorize(&mut intended).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(
+        !intended.metadata.keys().any(|key| key.starts_with("waf.")),
+        "a path beginning with an alternation branch must still short-circuit"
+    );
+}
+
+#[tokio::test]
 async fn waf_clears_preexisting_reserved_metadata_before_evaluation() {
     let plugin = Waf::new(&json!({})).unwrap();
     let mut ctx = ctx("GET", "/search");

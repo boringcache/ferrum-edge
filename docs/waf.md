@@ -97,6 +97,14 @@ are likewise checked against request and response **bodies**, not just the
 URL/path, so an overlong-encoded body payload that lossy percent-decoding cannot
 recover to its literal character is still flagged as an evasion attempt.
 
+Note that body marker detection is a heuristic: a benign body that legitimately
+contains a literal encoded marker (e.g. `code=SAVE50%25`, a `%00` in free text,
+or `%c0%ae` in a paste) can raise `FE-ENCODING-001`. This is why
+`FE-ENCODING-001/002` default to **Monitor** (they record `waf.rule_hits`
+metadata rather than blocking) even when the WAF is in `enforce` mode — operators
+opt a rule into blocking explicitly via `rule_modes` once they have confirmed it
+is clean for their traffic.
+
 ## Rule targets
 
 A rule's `target` selects what it inspects:

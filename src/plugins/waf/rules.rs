@@ -206,20 +206,24 @@ impl CompiledConditions {
     }
 }
 
-/// Start-anchor a user-supplied `~regex` path pattern unless it already begins
-/// with `^`. The WAF evaluates path regexes with `is_match`, which is
-/// unanchored (substring) by default; without anchoring a short pattern like
-/// `api` silently matches every path containing it (`/v1/api-keys`,
-/// `/secret/api/admin`). This mirrors the `prefix*` branch's start-anchored
-/// semantics. Shared by `global_exemptions.paths` and rule `conditions.paths`
-/// so both `~` path syntaxes behave identically. Callers wanting a floating
-/// match write `~.*pattern`; an explicit leading `^` is preserved as-is.
+/// Start-anchor a user-supplied `~regex` path pattern. The WAF evaluates path
+/// regexes with `is_match`, which is unanchored (substring) by default; without
+/// anchoring a short pattern like `api` silently matches every path containing
+/// it (`/v1/api-keys`, `/secret/api/admin`). This mirrors the `prefix*`
+/// branch's start-anchored semantics. Shared by `global_exemptions.paths` and
+/// rule `conditions.paths` so both `~` path syntaxes behave identically.
+/// Callers wanting a floating match write `~.*pattern`.
+///
+/// The whole pattern is wrapped in `^(?:...)` rather than just prefixed with
+/// `^`, so that EVERY branch of a top-level alternation is anchored. A bare `^`
+/// prefix only anchors the first branch — `a|b` becomes `^a|b` == `(^a)|(b)`,
+/// leaving `b` unanchored (substring). For an exemption that re-opens the exact
+/// WAF-disabling over-match this guard exists to close (a `~a|b` exemption
+/// would still exempt any path merely containing `b`). Double-anchoring an
+/// already-`^`-prefixed pattern (`^(?:^/api)`) is harmless for single-line path
+/// matching.
 pub(super) fn anchor_condition_path_regex(regex: &str) -> Cow<'_, str> {
-    if regex.starts_with('^') {
-        Cow::Borrowed(regex)
-    } else {
-        Cow::Owned(format!("^{regex}"))
-    }
+    Cow::Owned(format!("^(?:{regex})"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
