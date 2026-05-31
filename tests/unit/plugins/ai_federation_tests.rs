@@ -1115,6 +1115,14 @@ fn test_normalize_error_body_is_capped() {
 }
 
 #[test]
+fn test_fallback_error_body_is_capped_before_return() {
+    let body = vec![b'X'; test_helpers::MAX_UPSTREAM_ERROR_BYTES * 4];
+    let capped = test_helpers::cap_upstream_error_body(body);
+    assert_eq!(capped.len(), test_helpers::MAX_UPSTREAM_ERROR_BYTES);
+    assert!(capped.iter().all(|byte| *byte == b'X'));
+}
+
+#[test]
 fn test_normalize_error_body_cap_handles_short_bodies() {
     // Bodies shorter than the cap are reflected in full (no panic on the
     // `body.len().min(cap)` slice).

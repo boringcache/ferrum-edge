@@ -1384,6 +1384,11 @@ fn build_provider_url(provider: &ResolvedProvider, model: &str) -> String {
 /// body to arbitrary downstream callers. See finding #52.
 const MAX_UPSTREAM_ERROR_BYTES: usize = 512;
 
+fn cap_upstream_error_body(mut body: Vec<u8>) -> Vec<u8> {
+    body.truncate(MAX_UPSTREAM_ERROR_BYTES);
+    body
+}
+
 /// Normalize a provider response to OpenAI Chat Completions format.
 fn normalize_response(
     provider_type: ProviderType,
@@ -1997,7 +2002,7 @@ impl Plugin for AiFederation {
                             "ai_federation: provider returned fallback-eligible status"
                         );
                         last_status = Some(*status);
-                        last_body = Some(body.clone());
+                        last_body = Some(cap_upstream_error_body(body.clone()));
                     }
                 }
                 continue;
@@ -2198,6 +2203,10 @@ pub mod test_helpers {
 
     /// Maximum raw upstream-error bytes reflected to callers (finding #52).
     pub const MAX_UPSTREAM_ERROR_BYTES: usize = super::MAX_UPSTREAM_ERROR_BYTES;
+
+    pub fn cap_upstream_error_body(body: Vec<u8>) -> Vec<u8> {
+        super::cap_upstream_error_body(body)
+    }
 
     /// Expose request translation for tests.
     pub fn translate_request_test(
