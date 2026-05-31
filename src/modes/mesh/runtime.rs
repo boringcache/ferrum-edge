@@ -211,6 +211,7 @@ pub struct MeshRuntimeState {
     first_ready: Arc<Notify>,
     has_first: Arc<AtomicBool>,
     revision_tx: Arc<watch::Sender<u64>>,
+    applied_revision_tx: Arc<watch::Sender<u64>>,
     egress_scope: Arc<MeshEgressScopeState>,
     federation_store: FederationStore,
     remote_endpoint_store: RemoteEndpointStore,
@@ -222,6 +223,7 @@ pub struct MeshRuntimeState {
 impl MeshRuntimeState {
     pub fn new() -> Self {
         let (revision_tx, _) = watch::channel(0u64);
+        let (applied_revision_tx, _) = watch::channel(0u64);
         Self {
             current: Arc::new(ArcSwap::new(Arc::new(None))),
             applied: Arc::new(ArcSwap::new(Arc::new(None))),
@@ -230,6 +232,7 @@ impl MeshRuntimeState {
             first_ready: Arc::new(Notify::new()),
             has_first: Arc::new(AtomicBool::new(false)),
             revision_tx: Arc::new(revision_tx),
+            applied_revision_tx: Arc::new(applied_revision_tx),
             egress_scope: Arc::new(MeshEgressScopeState::new()),
             federation_store: FederationStore::new(),
             remote_endpoint_store: RemoteEndpointStore::new(),
@@ -284,6 +287,11 @@ impl MeshRuntimeState {
         self.revision_tx.subscribe()
     }
 
+    /// Subscribe to slices accepted by the proxy runtime.
+    pub fn subscribe_applied(&self) -> watch::Receiver<u64> {
+        self.applied_revision_tx.subscribe()
+    }
+
     /// Operator surface for the active mesh egress scope. Updated only when a
     /// new slice is accepted by the proxy runtime.
     pub fn egress_scope_state(&self) -> &MeshEgressScopeState {
@@ -334,6 +342,8 @@ impl MeshRuntimeState {
         self.egress_scope.install_from_slice(slice);
         self.applied.store(Arc::new(Some(slice.clone())));
         self.last_applied_at.store(Arc::new(Some(Utc::now())));
+        self.applied_revision_tx
+            .send_modify(|revision| *revision += 1);
     }
 
     /// Resolve once the initial mesh slice is available.
@@ -485,6 +495,7 @@ mod tests {
     #[tokio::test]
     async fn applied_snapshot_tracks_only_accepted_slices() {
         let state = MeshRuntimeState::new();
+        let applied_rx = state.subscribe_applied();
         install_slice_for_test(
             &state,
             MeshSlice {
@@ -495,6 +506,11 @@ mod tests {
 
         assert!(state.applied_snapshot().as_ref().is_none());
         assert!(state.last_applied_at().is_none());
+        assert_eq!(
+            *applied_rx.borrow(),
+            0,
+            "received-only slices must not notify applied-slice watchers"
+        );
 
         let accepted = MeshSlice {
             version: "accepted".to_string(),
@@ -511,6 +527,11 @@ mod tests {
             Some("accepted")
         );
         assert!(state.last_applied_at().is_some());
+        assert_eq!(
+            *applied_rx.borrow(),
+            1,
+            "accepted slices notify applied-slice watchers"
+        );
     }
 
     #[test]
