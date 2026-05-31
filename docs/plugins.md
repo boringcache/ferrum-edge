@@ -1271,6 +1271,8 @@ Authenticates requests using the client's TLS/DTLS certificate, matching a confi
 
 **Supported `cert_field` values:** `subject_cn`, `subject_ou`, `subject_o`, `san_dns`, `san_email`, `fingerprint_sha256`, `serial`
 
+> **`serial` format.** The serial identity is the lowercase hex of the certificate's raw DER integer bytes — no separators, with any leading `00` byte preserved (DER includes a leading `00` for positive serials whose high bit is set). Store the **lowercase** of `openssl x509 -serial -noout -in cert.pem` output (which is uppercase, e.g. `00AB12…` → store `00ab12…`). Do not strip leading zeros and do not use the colon-separated form from `openssl x509 -text`.
+
 **Consumer credential** (`mtls_auth`) — array:
 ```yaml
 credentials:

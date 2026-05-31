@@ -36,7 +36,9 @@ enum CertField {
     SanEmail,
     /// SHA-256 fingerprint of the DER-encoded certificate (lowercase hex)
     FingerprintSha256,
-    /// Certificate serial number (lowercase hex)
+    /// Certificate serial number as lowercase hex of the raw DER integer
+    /// bytes, no separators, leading `00` preserved (i.e. the lowercase of
+    /// `openssl x509 -serial` output).
     Serial,
 }
 
@@ -185,7 +187,10 @@ impl IssuerFilter {
 /// - `san_dns` — First DNS Subject Alternative Name
 /// - `san_email` — First email Subject Alternative Name
 /// - `fingerprint_sha256` — SHA-256 fingerprint (lowercase hex)
-/// - `serial` — Certificate serial number (lowercase hex)
+/// - `serial` — Certificate serial number as lowercase hex of the raw DER
+///   integer bytes, no separators, leading `00` preserved. Store the
+///   lowercase of `openssl x509 -serial` output (e.g. `0a1b2c`, or `00ab…`
+///   for serials whose high bit is set).
 ///
 /// # Consumer Credentials
 ///
@@ -400,7 +405,16 @@ impl MtlsAuth {
             CertField::FingerprintSha256 => {
                 Ok(super::utils::cert_hash::sha256_hex_lower(der_bytes))
             }
-            CertField::Serial => Ok(cert.serial.to_str_radix(16)),
+            // Render the serial from its raw big-endian DER integer bytes as
+            // lowercase hex with no separators. `BigUint::to_str_radix(16)`
+            // strips leading zeros and produces a variable-length string, which
+            // silently fails to match serials operators obtain from
+            // `openssl x509 -serial` (even-length, with a leading `00` byte for
+            // positive integers whose high bit is set). `raw_serial()` preserves
+            // the DER bytes verbatim — including any leading `00` — so this
+            // yields a stable, even-length canonical form. Operators store the
+            // lowercase of the `openssl x509 -serial` output. (Finding #31.)
+            CertField::Serial => Ok(hex::encode(cert.raw_serial())),
         }
     }
 
