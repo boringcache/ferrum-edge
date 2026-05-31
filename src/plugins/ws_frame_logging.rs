@@ -192,36 +192,12 @@ impl WsFrameLogging {
 /// `hashed` is the prefix of the payload that is folded into the digest,
 /// `full_len` is the total payload length reported to operators, and
 /// `truncated` indicates the digest only covers a prefix of the payload.
-/// Per-process random salt mixed into payload fingerprints. Generated once at
-/// first use. A bare `sha256(payload)` is an offline confirmation oracle: a
-/// log reader who guesses a low-entropy payload (a boolean, a short token from a
-/// known set) can precompute its digest and confirm the match. Salting with a
-/// process-random key keeps the digest a stable *within-process* correlator
-/// (identical payloads still share a fingerprint for this process's lifetime)
-/// while making the digest non-precomputable across processes/deployments.
-fn fingerprint_salt() -> &'static [u8; 32] {
-    use ring::rand::SecureRandom;
-    static SALT: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
-    SALT.get_or_init(|| {
-        let mut salt = [0u8; 32];
-        if ring::rand::SystemRandom::new().fill(&mut salt).is_err() {
-            // SystemRandom::fill effectively never fails; if it ever did, seed
-            // from the PID so we still never emit an unsalted (precomputable)
-            // digest. Best-effort, not a security guarantee for this rare path.
-            let pid = std::process::id().to_le_bytes();
-            for (i, b) in salt.iter_mut().enumerate() {
-                *b = pid[i % pid.len()] ^ (i as u8);
-            }
-        }
-        salt
-    })
-}
-
 fn payload_fingerprint(hashed: &[u8], full_len: usize, truncated: bool) -> String {
     use sha2::{Digest, Sha256};
-    // Salted digest (see `fingerprint_salt`): non-reversible AND non-precomputable.
+    // Unsalted digest by design: operators aggregate WS logs across workers and
+    // rolling restarts, so identical payloads must keep the same fingerprint
+    // across process lifetimes. The raw payload is still never logged.
     let mut hasher = Sha256::new();
-    hasher.update(fingerprint_salt());
     hasher.update(hashed);
     let digest = hasher.finalize();
     // 6 bytes -> 12 lowercase hex chars: enough entropy to correlate frames
