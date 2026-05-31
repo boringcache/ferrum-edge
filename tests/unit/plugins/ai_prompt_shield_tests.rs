@@ -907,6 +907,19 @@ async fn test_content_mode_scans_system_field() {
 }
 
 #[tokio::test]
+async fn test_content_mode_scans_responses_instructions_field() {
+    let plugin = AiPromptShield::new(&json!({"patterns": ["ssn"]})).unwrap();
+    let mut ctx = make_post_ctx(&json!({
+        "model": "gpt-4o",
+        "instructions": "Use SSN 123-45-6789 as the sample identifier",
+        "input": "Summarize this request"
+    }));
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(400));
+}
+
+#[tokio::test]
 async fn test_content_mode_scans_input_array_and_text_parts() {
     // `input` may be an array of strings or of {type:"text", text} parts.
     let plugin = AiPromptShield::new(&json!({"patterns": ["ssn"]})).unwrap();
@@ -962,6 +975,35 @@ async fn test_content_mode_scans_structured_responses_input() {
 }
 
 #[tokio::test]
+async fn test_content_mode_responses_input_honors_exclude_roles() {
+    let plugin = AiPromptShield::new(&json!({
+        "patterns": ["ssn"],
+        "exclude_roles": ["system"]
+    }))
+    .unwrap();
+
+    let mut ctx = make_post_ctx(&json!({
+        "model": "gpt-4o",
+        "input": [
+            {"role": "system", "content": [{"type": "input_text", "text": "ignore 123-45-6789"}]},
+            {"role": "user", "content": [{"type": "input_text", "text": "clean request"}]}
+        ]
+    }));
+    let mut headers = make_post_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+    let mut ctx = make_post_ctx(&json!({
+        "model": "gpt-4o",
+        "input": [
+            {"role": "system", "content": [{"type": "input_text", "text": "ignore 123-45-6789"}]},
+            {"role": "user", "content": [{"type": "input_text", "text": "block 987-65-4321"}]}
+        ]
+    }));
+    let mut headers = make_post_headers();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+#[tokio::test]
 async fn test_content_mode_no_pii_in_prompt_passes() {
     // Negative case: clean prompt/input/system payloads still pass through.
     let plugin = AiPromptShield::new(&json!({"patterns": ["ssn", "email"]})).unwrap();
@@ -990,6 +1032,7 @@ async fn test_content_mode_redacts_prompt_input_system_fields() {
         "model": "gpt-3.5-turbo-instruct",
         "prompt": "ssn 123-45-6789",
         "system": "email a@b.com",
+        "instructions": "email c@d.com",
         "input": ["card holder", "ssn 987-65-4321"]
     }))
     .unwrap();
@@ -1010,10 +1053,48 @@ async fn test_content_mode_redacts_prompt_input_system_fields() {
         system.contains("[REDACTED:email]") && !system.contains("a@b.com"),
         "system must be redacted: {system}"
     );
+    let instructions = v["instructions"].as_str().unwrap();
+    assert!(
+        instructions.contains("[REDACTED:email]") && !instructions.contains("c@d.com"),
+        "instructions must be redacted: {instructions}"
+    );
     let input1 = v["input"][1].as_str().unwrap();
     assert!(
         input1.contains("[REDACTED:ssn]") && !input1.contains("987-65-4321"),
         "input array element must be redacted: {input1}"
+    );
+}
+
+#[tokio::test]
+async fn test_content_mode_responses_input_redaction_honors_exclude_roles() {
+    let plugin = AiPromptShield::new(&json!({
+        "action": "redact",
+        "patterns": ["ssn"],
+        "exclude_roles": ["system"]
+    }))
+    .unwrap();
+
+    let body = serde_json::to_vec(&json!({
+        "model": "gpt-4o",
+        "input": [
+            {"role": "system", "content": [{"type": "input_text", "text": "keep 123-45-6789"}]},
+            {"role": "user", "content": [{"type": "input_text", "text": "redact 987-65-4321"}]}
+        ]
+    }))
+    .unwrap();
+
+    let result = plugin
+        .transform_request_body(&body, Some("application/json"), &HashMap::new())
+        .await
+        .expect("expected redacted body");
+    let v: serde_json::Value = serde_json::from_slice(&result).unwrap();
+
+    let system_text = v["input"][0]["content"][0]["text"].as_str().unwrap();
+    assert_eq!(system_text, "keep 123-45-6789");
+    let user_text = v["input"][1]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        user_text.contains("[REDACTED:ssn]") && !user_text.contains("987-65-4321"),
+        "user Responses input must be redacted: {user_text}"
     );
 }
 

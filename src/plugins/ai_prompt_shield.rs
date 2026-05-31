@@ -37,10 +37,11 @@ const STRUCTURAL_KEYS: &[&str] = &[
 /// Top-level request fields that carry prompt text in non-`messages` LLM
 /// request shapes. Scanned in `ScanMode::Content` in addition to
 /// `messages[].content`: OpenAI legacy completions use `prompt`, the
-/// Responses API and embeddings use `input`, and Anthropic carries a
-/// top-level `system` string. Each may be a string, an array of strings, or
-/// an array of `{type:"text", text:"..."}` parts.
-const CONTENT_SCAN_FIELDS: &[&str] = &["prompt", "input", "system"];
+/// Responses API and embeddings use `input`, OpenAI Responses uses
+/// `instructions`, and Anthropic carries a top-level `system` string. Each may
+/// be a string, an array of strings, or an array of `{type:"text", text:"..."}`
+/// parts.
+const CONTENT_SCAN_FIELDS: &[&str] = &["prompt", "input", "instructions", "system"];
 
 /// Action to take when PII is detected.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -285,7 +286,7 @@ impl AiPromptShield {
                 // strings, or an array of `{type:"text", text:"..."}` parts.
                 for field in CONTENT_SCAN_FIELDS {
                     if let Some(value) = json.get(field) {
-                        collect_field_text(value, &mut texts);
+                        collect_field_text(value, &self.exclude_roles, &mut texts);
                     }
                 }
                 texts
@@ -426,7 +427,7 @@ impl AiPromptShield {
         // reported as redacted but forwarded unredacted (a fail-open bypass).
         for field in CONTENT_SCAN_FIELDS {
             if let Some(value) = json.get_mut(field) {
-                redact_field_text(value, &|text| self.redact_text(text));
+                redact_field_text(value, &self.exclude_roles, &|text| self.redact_text(text));
             }
         }
     }
@@ -729,12 +730,16 @@ fn is_text_content_part_type(part_type: &str) -> bool {
 }
 
 /// Collect scannable text from a top-level LLM content field
-/// (`prompt`/`input`/`system`). Handles a plain string, an array of strings, an
-/// array of `{type: text|input_text|output_text, text}` content parts, and the
-/// structured OpenAI Responses `input` shape — an array of message objects
-/// `{role, content: <string | array of parts>}` — by recursing into each
-/// message's `content`.
-fn collect_field_text<'a>(value: &'a Value, texts: &mut Vec<&'a str>) {
+/// (`prompt`/`input`/`instructions`/`system`). Handles a plain string, an array
+/// of strings, an array of `{type: text|input_text|output_text, text}` content
+/// parts, and the structured OpenAI Responses `input` shape — an array of
+/// message objects `{role, content: <string | array of parts>}` — by recursing
+/// into each message's `content`.
+fn collect_field_text<'a>(
+    value: &'a Value,
+    exclude_roles: &HashSet<String>,
+    texts: &mut Vec<&'a str>,
+) {
     match value {
         Value::String(s) => texts.push(s.as_str()),
         Value::Array(items) => {
@@ -751,9 +756,16 @@ fn collect_field_text<'a>(value: &'a Value, texts: &mut Vec<&'a str>) {
                                 texts.push(text);
                             }
                         } else if let Some(content) = obj.get("content") {
+                            if obj
+                                .get("role")
+                                .and_then(|r| r.as_str())
+                                .is_some_and(|role| exclude_roles.contains(role))
+                            {
+                                continue;
+                            }
                             // Message object `{role, content}` (structured
                             // Responses `input`): scan its content.
-                            collect_field_text(content, texts);
+                            collect_field_text(content, exclude_roles, texts);
                         }
                     }
                     _ => {}
@@ -763,7 +775,14 @@ fn collect_field_text<'a>(value: &'a Value, texts: &mut Vec<&'a str>) {
         // A field that is itself a single message object `{role, content}`.
         Value::Object(obj) => {
             if let Some(content) = obj.get("content") {
-                collect_field_text(content, texts);
+                if obj
+                    .get("role")
+                    .and_then(|r| r.as_str())
+                    .is_some_and(|role| exclude_roles.contains(role))
+                {
+                    return;
+                }
+                collect_field_text(content, exclude_roles, texts);
             }
         }
         _ => {}
@@ -772,9 +791,14 @@ fn collect_field_text<'a>(value: &'a Value, texts: &mut Vec<&'a str>) {
 
 /// Redact PII in a top-level LLM field that may be a string, an array of
 /// strings, or an array of `{type:"text", text:"..."}` content parts (e.g.
-/// `prompt`, `input`, `system`). Mirrors `collect_field_text` so detection
-/// and redaction stay symmetric — anything scanned for PII is also rewritten.
-fn redact_field_text(value: &mut Value, redact: &impl Fn(&str) -> String) {
+/// `prompt`, `input`, `instructions`, `system`). Mirrors `collect_field_text`
+/// so detection and redaction stay symmetric — anything scanned for PII is
+/// also rewritten.
+fn redact_field_text(
+    value: &mut Value,
+    exclude_roles: &HashSet<String>,
+    redact: &impl Fn(&str) -> String,
+) {
     match value {
         Value::String(s) => {
             let redacted = redact(s);
@@ -803,8 +827,14 @@ fn redact_field_text(value: &mut Value, redact: &impl Fn(&str) -> String) {
                                     obj.insert("text".to_string(), Value::String(redacted));
                                 }
                             }
+                        } else if obj
+                            .get("role")
+                            .and_then(|r| r.as_str())
+                            .is_some_and(|role| exclude_roles.contains(role))
+                        {
+                            continue;
                         } else if let Some(content) = obj.get_mut("content") {
-                            redact_field_text(content, redact);
+                            redact_field_text(content, exclude_roles, redact);
                         }
                     }
                     _ => {}
@@ -812,8 +842,14 @@ fn redact_field_text(value: &mut Value, redact: &impl Fn(&str) -> String) {
             }
         }
         Value::Object(obj) => {
-            if let Some(content) = obj.get_mut("content") {
-                redact_field_text(content, redact);
+            let excluded = obj
+                .get("role")
+                .and_then(|r| r.as_str())
+                .is_some_and(|role| exclude_roles.contains(role));
+            if !excluded
+                && let Some(content) = obj.get_mut("content")
+            {
+                redact_field_text(content, exclude_roles, redact);
             }
         }
         _ => {}
