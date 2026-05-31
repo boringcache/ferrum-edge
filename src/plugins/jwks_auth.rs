@@ -1420,7 +1420,11 @@ async fn discover_jwks_uri(
 /// IP is blocked at the connect layer when `backend_allow_ips` is restrictive.
 /// `PluginHttpClient` does not currently disable HTTP redirect following, so the
 /// host equality enforced here applies to the first hop only; the DNS-layer IP
-/// policy is the backstop for redirected hops.
+/// policy is the backstop for redirected hops. Note that the default
+/// `FERRUM_BACKEND_ALLOW_IPS=both` does NOT screen any IPs — operators relying on
+/// discovery hardening against redirect-based SSRF should set it to
+/// `public`/`private`. (Disabling redirects on the shared client is tracked
+/// separately.)
 fn validate_discovered_jwks_uri(jwks_uri: &str, discovery_url: &str) -> Result<String, String> {
     let parsed = Url::parse(jwks_uri).map_err(|e| {
         format!("OIDC discovery returned an invalid jwks_uri (not a valid URL): {e}")

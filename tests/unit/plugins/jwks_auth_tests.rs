@@ -569,6 +569,37 @@ async fn test_jwks_auth_oidc_discovery_rejects_metadata_endpoint_jwks_uri() {
     );
 }
 
+/// Regression test for finding #5 (SSRF, userinfo host-confusion): a jwks_uri
+/// that embeds the discovery host in the URL **userinfo** while pointing the
+/// real authority at a metadata/internal IP
+/// (`http://127.0.0.1@169.254.169.254/...`) must be rejected. The same-host
+/// check parses the authority host (`169.254.169.254`) rather than substring-
+/// matching, so the userinfo cannot smuggle a spurious same-host match. The
+/// discovery server binds 127.0.0.1, so its host equals the userinfo here.
+#[tokio::test]
+async fn test_jwks_auth_oidc_discovery_rejects_userinfo_host_confusion_jwks_uri() {
+    let malicious_jwks_uri = "http://127.0.0.1@169.254.169.254/latest/meta-data/jwks.json";
+    let (discovery_server, discovery_url) = start_oidc_discovery_server(malicious_jwks_uri).await;
+
+    let plugin = JwksAuth::new(
+        &json!({
+            "providers": [{"discovery_url": discovery_url}],
+            "jwks_refresh_interval_secs": 3600
+        }),
+        default_client(),
+    )
+    .unwrap();
+
+    wait_for_discovery_request(&discovery_server).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    assert!(
+        plugin.active_jwks_uris().is_empty(),
+        "userinfo host-confusion jwks_uri must not create an active store, got: {:?}",
+        plugin.active_jwks_uris()
+    );
+}
+
 /// Regression test for finding #5 (SSRF): an OIDC discovery document whose
 /// `jwks_uri` uses a non-URL scheme (`file:`) must be rejected.
 #[tokio::test]
