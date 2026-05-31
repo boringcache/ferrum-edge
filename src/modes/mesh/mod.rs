@@ -3224,8 +3224,7 @@ pub async fn run(
     shutdown_tx: tokio::sync::watch::Sender<bool>,
 ) -> Result<(), anyhow::Error> {
     let runtime = MeshRuntimeConfig::from_env_config(&env_config)
-        .map_err(|e| anyhow::anyhow!(e))
-        .context("invalid mesh runtime configuration")?;
+        .map_err(|e| anyhow::anyhow!("invalid mesh runtime configuration: {e}"))?;
     ensure_runtime_config_protocol_supported(&runtime)?;
 
     info!(

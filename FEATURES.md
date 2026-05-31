@@ -135,7 +135,7 @@ Ferrum supports dynamic upstream target discovery through four providers, config
 - **AI Request Guard** — validate and constrain AI requests: model allow/block lists, max_tokens enforcement (reject or clamp), message count limits, prompt length limits, temperature range, system prompt blocking
 - **AI Rate Limiter** — token-aware rate limiting per consumer or IP with sliding window, auto-detecting provider format from responses; supports centralized Redis-backed mode for cross-instance token budget coordination. Compatible with any RESP-protocol server (Redis, Valkey, DragonflyDB, KeyDB, Garnet). TLS uses gateway-level settings
 - **AI Prompt Shield** — PII detection and redaction in prompts with built-in patterns (SSN, credit card, email, phone, API keys, AWS keys, IBAN) and custom regex support
-- **AI Semantic Cache** — LLM response caching with normalized prompt matching (v1 exact-match with whitespace/case normalization, v2 roadmap for embedding-based similarity)
+- **AI Semantic Cache** — LLM response caching with normalized exact-match keys by default, optional embedding-based semantic similarity through configurable OpenAI-compatible, Voyage/Claude, Cohere, Gemini/Vertex, Mistral, or Bedrock embedding formats, local HNSW vector search, and local or Redis exact-response storage
 - **AI Response Guard** — output-side content guardrails: PII detection in responses, blocked phrase filtering, and response format validation
 
 ### WebSocket Plugins
