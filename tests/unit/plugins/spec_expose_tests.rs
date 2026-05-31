@@ -511,7 +511,10 @@ fn test_sanitize_upstream_content_type_allow_list() {
     // Allowed spec media types pass through verbatim, including parameters.
     for allowed in [
         "application/json",
+        "application/openapi+json",
+        "application/openapi+yaml",
         "application/yaml",
+        "application/vnd.oai.openapi+json",
         "text/yaml",
         "application/x-yaml",
         "application/xml",
@@ -524,6 +527,10 @@ fn test_sanitize_upstream_content_type_allow_list() {
     assert_eq!(
         sanitize("Application/JSON; charset=utf-8"),
         "Application/JSON; charset=utf-8"
+    );
+    assert_eq!(
+        sanitize("application/vnd.oai.openapi+json;version=3.0"),
+        "application/vnd.oai.openapi+json;version=3.0"
     );
     assert_eq!(
         sanitize("  application/yaml  ; q=1"),
