@@ -6,7 +6,9 @@
 //! `resolve_effective_mtls_mode` and `MeshSlice::resolve_effective_mtls_mode`
 //! surface with scenarios that benefit from the external-crate perspective.
 
-use ferrum_edge::modes::mesh::config::{MtlsMode, PeerAuthentication, WorkloadSelector};
+use ferrum_edge::modes::mesh::config::{
+    MtlsMode, PeerAuthentication, PolicyScope, WorkloadSelector,
+};
 use ferrum_edge::modes::mesh::slice::{MeshSlice, resolve_effective_mtls_mode};
 use std::collections::{BTreeMap, HashMap};
 
@@ -24,6 +26,26 @@ fn peer_auth(
         selector,
         mtls_mode: mode,
         port_overrides,
+    }
+}
+
+fn peer_auth_with_scope(
+    name: &str,
+    namespace: &str,
+    scope: PolicyScope,
+    mode: MtlsMode,
+) -> PeerAuthentication {
+    let selector = match &scope {
+        PolicyScope::WorkloadSelector { selector } => Some(selector.clone()),
+        PolicyScope::MeshWide | PolicyScope::Namespace { .. } => None,
+    };
+    PeerAuthentication {
+        name: name.to_string(),
+        namespace: namespace.to_string(),
+        scope: Some(scope),
+        selector,
+        mtls_mode: mode,
+        port_overrides: HashMap::new(),
     }
 }
 
@@ -124,35 +146,114 @@ fn mesh_slice_resolve_method_integration() {
     );
 }
 
-// ── Same-scope tie-breaking ─────────────────────────────────────────────
+// ── Same-scope tie-breaking (deterministic ASCII-smallest name/namespace) ─
 
 #[test]
-fn first_matching_workload_selector_wins_at_same_scope() {
-    let policies = vec![
-        peer_auth(
-            "wl-strict",
-            "default",
-            Some(WorkloadSelector {
-                labels: HashMap::from([("app".into(), "api".into())]),
-                namespace: None,
-            }),
-            MtlsMode::Strict,
-            HashMap::new(),
-        ),
-        peer_auth(
-            "wl-disable",
-            "default",
-            Some(WorkloadSelector {
-                labels: HashMap::from([("app".into(), "api".into())]),
-                namespace: None,
-            }),
-            MtlsMode::Disable,
-            HashMap::new(),
-        ),
-    ];
+fn same_scope_tie_resolves_to_ascii_smallest_name_and_namespace_regardless_of_order() {
+    // Two WorkloadSelector-tier PeerAuthentications match the same workload
+    // with conflicting modes. The winner is the ASCII-smallest policy
+    // name/namespace tuple, independent of slice iteration order. This makes
+    // the inbound mTLS posture deterministic across pods/reconciles instead
+    // of depending on order. (Two conflicting same-tier PeerAuthentications
+    // are an operator misconfiguration; the contract here is determinism, not
+    // mode preference.)
+    let strict = peer_auth(
+        "wl-strict",
+        "default",
+        Some(WorkloadSelector {
+            labels: HashMap::from([("app".into(), "api".into())]),
+            namespace: None,
+        }),
+        MtlsMode::Strict,
+        HashMap::new(),
+    );
+    let disable = peer_auth(
+        "wl-disable",
+        "default",
+        Some(WorkloadSelector {
+            labels: HashMap::from([("app".into(), "api".into())]),
+            namespace: None,
+        }),
+        MtlsMode::Disable,
+        HashMap::new(),
+    );
     let labels = HashMap::from([("app".to_string(), "api".to_string())]);
-    let mode = resolve_effective_mtls_mode(&policies, "default", &labels, 8080);
-    assert_eq!(mode, MtlsMode::Strict);
+
+    let forward = vec![strict.clone(), disable.clone()];
+    assert_eq!(
+        resolve_effective_mtls_mode(&forward, "default", &labels, 8080),
+        MtlsMode::Disable,
+        "wl-disable/default (ASCII-smallest tuple) wins"
+    );
+
+    let reversed = vec![disable, strict];
+    assert_eq!(
+        resolve_effective_mtls_mode(&reversed, "default", &labels, 8080),
+        MtlsMode::Disable,
+        "reversed slice order resolves to the same winner"
+    );
+}
+
+#[test]
+fn same_scope_same_name_tie_resolves_to_ascii_smallest_namespace_regardless_of_order() {
+    let strict = peer_auth_with_scope(
+        "mesh-default",
+        "aaa-root",
+        PolicyScope::MeshWide,
+        MtlsMode::Strict,
+    );
+    let permissive = peer_auth_with_scope(
+        "mesh-default",
+        "zzz-root",
+        PolicyScope::MeshWide,
+        MtlsMode::Permissive,
+    );
+    let labels = HashMap::<String, String>::new();
+
+    let forward = vec![strict.clone(), permissive.clone()];
+    assert_eq!(
+        resolve_effective_mtls_mode(&forward, "default", &labels, 8080),
+        MtlsMode::Strict,
+        "aaa-root/mesh-default (ASCII-smallest tuple) wins"
+    );
+
+    let reversed = vec![permissive, strict];
+    assert_eq!(
+        resolve_effective_mtls_mode(&reversed, "default", &labels, 8080),
+        MtlsMode::Strict,
+        "reversed slice order resolves to the same winner"
+    );
+}
+
+#[test]
+fn same_scope_tie_prefers_ascii_smallest_name_before_namespace() {
+    let strict = peer_auth_with_scope(
+        "aa-policy",
+        "zzz-root",
+        PolicyScope::MeshWide,
+        MtlsMode::Strict,
+    );
+    let permissive = peer_auth_with_scope(
+        "zz-policy",
+        "aaa-root",
+        PolicyScope::MeshWide,
+        MtlsMode::Permissive,
+    );
+    let labels = HashMap::<String, String>::new();
+
+    let forward = vec![permissive.clone(), strict.clone()];
+    assert_eq!(
+        resolve_effective_mtls_mode(&forward, "default", &labels, 8080),
+        MtlsMode::Strict,
+        "aa-policy/zzz-root wins before zz-policy/aaa-root"
+    );
+
+    let reversed = vec![strict, permissive];
+    assert_eq!(
+        resolve_effective_mtls_mode(&reversed, "default", &labels, 8080),
+        MtlsMode::Strict,
+        "reversed slice order resolves to the same winner"
+    );
 }
 
 // ── Empty selector labels ───────────────────────────────────────────────
