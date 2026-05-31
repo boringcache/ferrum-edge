@@ -54,6 +54,25 @@ use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
 
 const VECTOR_REBUILD_INTERVAL_SECONDS: u64 = 30;
 
+const RESPONSE_SHAPE_FIELDS: &[&str] = &[
+    "tools",
+    "tool_choice",
+    "response_format",
+    "seed",
+    "logit_bias",
+    "n",
+    "stop",
+    "presence_penalty",
+    "frequency_penalty",
+    "logprobs",
+    "top_logprobs",
+    "parallel_tool_calls",
+    "reasoning_effort",
+    "modalities",
+    "prediction",
+    "service_tier",
+];
+
 /// A cached LLM response.
 #[derive(Debug, Clone)]
 struct CacheEntry {
@@ -241,9 +260,9 @@ struct SerializableCacheEntry {
     status_code: u16,
     headers: HashMap<String, String>,
     body: Vec<u8>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     semantic_scope_key: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     embedding: Option<Vec<f32>>,
 }
 
@@ -412,14 +431,8 @@ impl AiSemanticCache {
         // canonical JSON serialization (sort_keys not required at this level
         // because it's the user-supplied payload) so any byte-level change
         // breaks the key.
-        for field in &[
-            "tools",
-            "tool_choice",
-            "response_format",
-            "seed",
-            "logit_bias",
-        ] {
-            if let Some(value) = body.get(*field) {
+        for field in RESPONSE_SHAPE_FIELDS {
+            if let Some(value) = body.get(field) {
                 start_key_part(&mut key_input, &mut has_part);
                 key_input.push_str(field);
                 key_input.push(':');
@@ -678,7 +691,7 @@ impl AiSemanticCache {
         }
     }
 
-    fn refresh_vector_index_if_due(&self, force: bool) {
+    async fn refresh_vector_index_if_due(&self, force: bool) {
         if self.semantic.is_none() || !self.vector_index_dirty.load(Ordering::Relaxed) {
             return;
         }
@@ -701,18 +714,17 @@ impl AiSemanticCache {
             return;
         }
 
-        // HnswMap is immutable, so local semantic inserts/removals are made
-        // visible in batches. This keeps normal cache stores from paying a
-        // full O(cache size) rebuild each time; entries inserted during a
-        // rebuild become searchable on the next scheduled refresh.
-        self.rebuild_vector_index();
-    }
-
-    fn rebuild_vector_index(&self) {
         let Some(semantic) = self.semantic.as_ref() else {
             return;
         };
+        if !self.vector_index_dirty.swap(false, Ordering::AcqRel) {
+            return;
+        };
 
+        // HnswMap is immutable, so local semantic inserts/removals are made
+        // visible in batches. Clear the dirty flag before snapshotting; any
+        // concurrent insert that races this scan will set it back to true and
+        // trigger the next scheduled rebuild.
         let now = Instant::now();
         let mut points = Vec::new();
         let mut values = Vec::new();
@@ -735,18 +747,32 @@ impl AiSemanticCache {
 
         if points.is_empty() {
             self.vector_index.store(None);
-            self.vector_index_dirty.store(false, Ordering::Relaxed);
             return;
         }
 
-        let index = HnswBuilder::default()
-            .ef_search(semantic.max_candidates)
-            .ef_construction(semantic.max_candidates.max(100))
-            .seed(0)
-            .build(points, values);
-        self.vector_index
-            .store(Some(Arc::new(VectorSnapshot { index })));
-        self.vector_index_dirty.store(false, Ordering::Relaxed);
+        let max_candidates = semantic.max_candidates;
+        let build_result = tokio::task::spawn_blocking(move || {
+            HnswBuilder::default()
+                .ef_search(max_candidates)
+                .ef_construction(max_candidates.max(100))
+                .seed(0)
+                .build(points, values)
+        })
+        .await;
+
+        match build_result {
+            Ok(index) => {
+                self.vector_index
+                    .store(Some(Arc::new(VectorSnapshot { index })));
+            }
+            Err(err) => {
+                self.vector_index_dirty.store(true, Ordering::Relaxed);
+                debug!(
+                    error = %err,
+                    "ai_semantic_cache: semantic vector index rebuild task failed"
+                );
+            }
+        }
     }
 
     /// Periodic cleanup of expired entries.
@@ -781,7 +807,6 @@ impl AiSemanticCache {
             self.total_size.fetch_sub(removed_size, Ordering::Relaxed);
             if removed_semantic_entry {
                 self.mark_vector_index_dirty();
-                self.refresh_vector_index_if_due(false);
             }
         }
 
@@ -814,7 +839,6 @@ impl AiSemanticCache {
             }
             if removed_semantic_entry {
                 self.mark_vector_index_dirty();
-                self.refresh_vector_index_if_due(false);
             }
         }
     }
@@ -866,14 +890,8 @@ fn cache_entry_approx_size(
 }
 
 fn append_response_shape_fields(body: &Value, buffer: &mut String, has_part: &mut bool) {
-    for field in &[
-        "tools",
-        "tool_choice",
-        "response_format",
-        "seed",
-        "logit_bias",
-    ] {
-        if let Some(value) = body.get(*field) {
+    for field in RESPONSE_SHAPE_FIELDS {
+        if let Some(value) = body.get(field) {
             start_key_part(buffer, has_part);
             buffer.push_str(field);
             buffer.push(':');
@@ -951,7 +969,7 @@ fn build_embedding_request_payload(semantic: &SemanticConfig, input: &str) -> Va
             insert_optional_string(&mut payload, "taskType", &semantic.input_type);
             insert_optional_dimension(
                 &mut payload,
-                "output_dimensionality",
+                "outputDimensionality",
                 semantic.output_dimension,
             );
             payload
@@ -1218,10 +1236,12 @@ impl Plugin for AiSemanticCache {
                     .fetch_sub(removed.approx_size, Ordering::Relaxed);
                 if removed.embedding.is_some() {
                     self.mark_vector_index_dirty();
-                    self.refresh_vector_index_if_due(false);
+                    self.refresh_vector_index_if_due(false).await;
                 }
             }
         }
+
+        self.refresh_vector_index_if_due(false).await;
 
         if self.semantic.is_some()
             && let (Some(scope_key), Some(input)) = (
@@ -1258,12 +1278,8 @@ impl Plugin for AiSemanticCache {
                         };
                     }
 
-                    if let Ok(serialized_embedding) = serde_json::to_string(&embedding.to_vec()) {
-                        ctx.metadata
-                            .insert("_ai_cache_embedding".to_string(), serialized_embedding);
-                        ctx.metadata
-                            .insert("_ai_cache_semantic_scope".to_string(), scope_key);
-                    }
+                    ctx.ai_semantic_cache_embedding = Some(embedding.to_vec());
+                    ctx.ai_semantic_cache_scope_key = Some(scope_key);
                 }
                 Err(err) => {
                     debug!(
@@ -1343,11 +1359,10 @@ impl Plugin for AiSemanticCache {
         // cache-hit consumer — leaking session state and misleading
         // downstream clients about their own rate-limit/trace context.
         let safe_headers = sanitize_cached_headers(response_headers);
-        let semantic_scope_key = ctx.metadata.remove("_ai_cache_semantic_scope");
+        let semantic_scope_key = ctx.ai_semantic_cache_scope_key.take();
         let embedding = ctx
-            .metadata
-            .remove("_ai_cache_embedding")
-            .and_then(|raw| serde_json::from_str::<Vec<f32>>(&raw).ok())
+            .ai_semantic_cache_embedding
+            .take()
             .and_then(|values| EmbeddingPoint::from_raw(values).ok());
         let approx_size = cache_entry_approx_size(
             body.len(),
@@ -1389,7 +1404,7 @@ impl Plugin for AiSemanticCache {
         self.cache.insert(cache_key.clone(), entry);
         if replaced_semantic_entry || embedding.is_some() {
             self.mark_vector_index_dirty();
-            self.refresh_vector_index_if_due(false);
+            self.refresh_vector_index_if_due(false).await;
         }
 
         // Also store in Redis if configured
@@ -1400,8 +1415,8 @@ impl Plugin for AiSemanticCache {
                 status_code: response_status,
                 headers: safe_headers,
                 body: body.to_vec(),
-                semantic_scope_key,
-                embedding: embedding.map(|point| point.to_vec()),
+                semantic_scope_key: None,
+                embedding: None,
             };
             if let Ok(data) = serde_json::to_vec(&serializable) {
                 let redis_key = redis.make_key(&[&cache_key]);
@@ -1730,7 +1745,7 @@ mod tests {
         );
         assert_eq!(gemini["content"]["parts"][0]["text"], input);
         assert_eq!(gemini["taskType"], "SEMANTIC_SIMILARITY");
-        assert_eq!(gemini["output_dimensionality"], 256);
+        assert_eq!(gemini["outputDimensionality"], 256);
 
         let vertex = build_embedding_request_payload(
             &semantic_config_for(EmbeddingProvider::GoogleVertex),
@@ -1766,5 +1781,20 @@ mod tests {
                 vec![1.0, 2.0, 3.0]
             );
         }
+    }
+
+    #[test]
+    fn redis_serialized_cache_entry_omits_semantic_vector_fields_when_empty() {
+        let entry = SerializableCacheEntry {
+            status_code: 200,
+            headers: HashMap::new(),
+            body: b"cached".to_vec(),
+            semantic_scope_key: None,
+            embedding: None,
+        };
+
+        let value = serde_json::to_value(&entry).unwrap();
+        assert!(value.get("semantic_scope_key").is_none());
+        assert!(value.get("embedding").is_none());
     }
 }

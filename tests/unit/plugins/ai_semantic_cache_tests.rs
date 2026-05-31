@@ -6,7 +6,7 @@ use ferrum_edge::plugins::{
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
-use wiremock::matchers::{header, method, path};
+use wiremock::matchers::{body_string_contains, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Build a synthetic Consumer for cross-consumer scoping tests. Only
@@ -93,6 +93,36 @@ async fn mount_embedding_mock(server: &MockServer, expected_calls: u64) {
                 {"embedding": [1.0, 0.0, 0.0]}
             ]
         })))
+        .expect(expected_calls)
+        .mount(server)
+        .await;
+}
+
+async fn mount_embedding_mock_for_input(
+    server: &MockServer,
+    input_fragment: &str,
+    embedding: [f32; 3],
+    expected_calls: u64,
+) {
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .and(header("authorization", "Bearer test-key"))
+        .and(body_string_contains(input_fragment))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [
+                {"embedding": embedding}
+            ]
+        })))
+        .expect(expected_calls)
+        .mount(server)
+        .await;
+}
+
+async fn mount_embedding_failure_mock(server: &MockServer, expected_calls: u64) {
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .and(header("authorization", "Bearer test-key"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
         .expect(expected_calls)
         .mount(server)
         .await;
@@ -376,6 +406,110 @@ async fn test_semantic_similarity_hit_after_exact_miss() {
             result
         ),
     }
+}
+
+#[tokio::test]
+async fn test_semantic_similarity_miss_below_threshold() {
+    let mock_server = MockServer::start().await;
+    mount_embedding_mock_for_input(&mock_server, "vector seed one", [1.0, 0.0, 0.0], 1).await;
+    mount_embedding_mock_for_input(&mock_server, "vector seed two", [0.0, 1.0, 0.0], 1).await;
+    let plugin = make_plugin(semantic_config(&mock_server));
+
+    let body1 = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "Vector seed one"}]
+    });
+    let body2 = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "Vector seed two"}]
+    });
+
+    store_response(
+        &plugin,
+        &serde_json::to_string(&body1).unwrap(),
+        None,
+        b"first",
+    )
+    .await;
+
+    let hit =
+        run_before_proxy_get_status(&plugin, &serde_json::to_string(&body2).unwrap(), None).await;
+    assert!(
+        !hit,
+        "orthogonal embeddings should miss when below semantic_similarity_threshold"
+    );
+}
+
+#[tokio::test]
+async fn test_semantic_embedding_failure_falls_back_to_miss() {
+    let mock_server = MockServer::start().await;
+    mount_embedding_failure_mock(&mock_server, 1).await;
+    let plugin = make_plugin(semantic_config(&mock_server));
+
+    let body = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "Will the embedding endpoint fail?"}]
+    });
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/v1/chat/completions".to_string(),
+    );
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        serde_json::to_string(&body).unwrap(),
+    );
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata.get("ai_cache_status").map(String::as_str),
+        Some("MISS")
+    );
+
+    let mut response_headers = HashMap::new();
+    response_headers.insert("content-type".to_string(), "application/json".to_string());
+    let _ = plugin
+        .on_final_response_body(&mut ctx, 200, &response_headers, b"backend")
+        .await;
+    assert_eq!(plugin.tracked_keys_count(), Some(1));
+}
+
+#[tokio::test]
+async fn test_semantic_similarity_respects_response_shaping_scope() {
+    let mock_server = MockServer::start().await;
+    mount_embedding_mock(&mock_server, 2).await;
+    let plugin = make_plugin(semantic_config(&mock_server));
+
+    let body1 = json!({
+        "model": "gpt-4o",
+        "n": 1,
+        "stop": ["END"],
+        "messages": [{"role": "user", "content": "Summarize this response-shape case."}]
+    });
+    let body2 = json!({
+        "model": "gpt-4o",
+        "n": 2,
+        "stop": ["DONE"],
+        "messages": [{"role": "user", "content": "Summarize that response-shape case."}]
+    });
+
+    store_response(
+        &plugin,
+        &serde_json::to_string(&body1).unwrap(),
+        None,
+        b"one-choice",
+    )
+    .await;
+
+    let hit =
+        run_before_proxy_get_status(&plugin, &serde_json::to_string(&body2).unwrap(), None).await;
+    assert!(
+        !hit,
+        "semantic hit must not cross response-shaping parameters"
+    );
 }
 
 #[tokio::test]
