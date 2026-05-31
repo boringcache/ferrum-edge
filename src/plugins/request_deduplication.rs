@@ -24,7 +24,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tracing::debug;
 
@@ -121,6 +121,7 @@ pub struct RequestDeduplication {
     enforce_required: bool,
     /// Local in-memory cache.
     local_cache: Arc<DashMap<String, DeduplicationEntry>>,
+    completed_count: AtomicUsize,
     /// Optional Redis client for centralized deduplication.
     redis_client: Option<Arc<RedisRateLimitClient>>,
     /// Monotonic-seconds timestamp (relative to `PROCESS_START`) of the last
@@ -177,6 +178,7 @@ impl RequestDeduplication {
             scope_by_consumer,
             enforce_required,
             local_cache: Arc::new(DashMap::new()),
+            completed_count: AtomicUsize::new(0),
             redis_client,
             last_cleanup: AtomicU64::new(CLEANUP_NEVER),
         })
@@ -348,6 +350,8 @@ impl RequestDeduplication {
             }
         });
 
+        self.completed_count
+            .store(surviving_completed, Ordering::Relaxed);
         self.evict_completed_over_capacity(surviving_completed);
     }
 
@@ -361,7 +365,7 @@ impl RequestDeduplication {
         // be temporarily exceeded if the cache is saturated with active
         // in-flight work; correctness is strictly preferred over hitting the
         // memory cap.
-        if completed_hint == 0 || self.local_cache.len() <= self.max_entries {
+        if completed_hint <= self.max_entries {
             return;
         }
 
@@ -373,9 +377,14 @@ impl RequestDeduplication {
         }
         completed_with_time.sort_by_key(|(_, t)| *t);
 
-        let to_remove = self.local_cache.len().saturating_sub(self.max_entries);
+        let to_remove = completed_with_time.len().saturating_sub(self.max_entries);
         for (key, _) in completed_with_time.into_iter().take(to_remove) {
-            self.local_cache.remove(&key);
+            if matches!(
+                self.local_cache.remove(&key).map(|(_, entry)| entry),
+                Some(DeduplicationEntry::Completed(_))
+            ) {
+                self.completed_count.fetch_sub(1, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -633,9 +642,15 @@ impl Plugin for RequestDeduplication {
         };
 
         // Store in local cache
-        self.local_cache
+        let previous = self
+            .local_cache
             .insert(key.clone(), DeduplicationEntry::Completed(cached.clone()));
-        self.evict_completed_over_capacity(1);
+        let completed = if matches!(previous, Some(DeduplicationEntry::Completed(_))) {
+            self.completed_count.load(Ordering::Relaxed)
+        } else {
+            self.completed_count.fetch_add(1, Ordering::Relaxed) + 1
+        };
+        self.evict_completed_over_capacity(completed);
 
         // Also store in Redis if available
         if self.redis_client.is_some() {
