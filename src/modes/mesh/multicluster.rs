@@ -976,8 +976,8 @@ async fn remote_discovery_loop(
 /// — a cross-trust-domain confused-deputy hijack.
 ///
 /// Enforcing that every contributed workload carries the declared trust domain,
-/// and that every service workload-ref still points at a surviving workload for
-/// that service, makes ingestion fail closed: a peer under
+/// and that every service workload-ref still points at a surviving workload in
+/// that service namespace, makes ingestion fail closed: a peer under
 /// `eu-west-1.example.com` may only contribute `eu-west-1.example.com`
 /// identities and can no longer impersonate another domain's workloads.
 /// Mismatches are dropped (not fatal — one bad endpoint must not blackhole the
@@ -1012,13 +1012,12 @@ fn enforce_remote_trust_domain(
         belongs
     });
 
-    let surviving_service_refs: HashSet<(String, String, String)> = endpoints
+    let surviving_workload_refs: HashSet<(String, String)> = endpoints
         .workloads
         .iter()
         .map(|workload| {
             (
                 workload.namespace.clone(),
-                workload.service_name.clone(),
                 workload.spiffe_id.as_str().to_string(),
             )
         })
@@ -1028,9 +1027,8 @@ fn enforce_remote_trust_domain(
         let had_explicit_refs = !service.workloads.is_empty();
         service.workloads.retain(|workload_ref| {
             let belongs = workload_ref.spiffe_id.trust_domain() == declared
-                && surviving_service_refs.contains(&(
+                && surviving_workload_refs.contains(&(
                     service.namespace.clone(),
-                    service.name.clone(),
                     workload_ref.spiffe_id.as_str().to_string(),
                 ));
             if !belongs {
@@ -1433,13 +1431,14 @@ mod tests {
     fn enforce_remote_trust_domain_drops_orphaned_refs_and_empty_services() {
         let declared = td("eu-west-1.example.com");
         let shared_spiffe = "spiffe://eu-west-1.example.com/ns/default/sa/shared";
+        let orphan_spiffe = "spiffe://eu-west-1.example.com/ns/default/sa/orphan";
         let surviving_different_service = Workload {
             trust_domain: declared.clone(),
             ..workload(shared_spiffe, "payments", "10.9.0.3", None)
         };
         let dropped_split_identity = Workload {
             trust_domain: td("cluster.local"),
-            ..workload(shared_spiffe, "api", "10.9.0.4", None)
+            ..workload(orphan_spiffe, "api", "10.9.0.4", None)
         };
 
         let mut endpoints = RemoteClusterEndpoints {
@@ -1447,6 +1446,7 @@ mod tests {
             services: vec![
                 service("api", &[shared_spiffe]),
                 service("payments", &[shared_spiffe]),
+                service("orphaned", &[orphan_spiffe]),
             ],
         };
 
@@ -1459,10 +1459,17 @@ mod tests {
         );
         assert_eq!(
             endpoints.services.len(),
-            1,
-            "the api service started with an explicit ref and must be dropped once that ref no longer points at a surviving api workload"
+            2,
+            "the orphaned service is dropped, while legacy refs to surviving in-domain workloads stay explicit"
         );
-        assert_eq!(endpoints.services[0].name, "payments");
+        let service_names: Vec<_> = endpoints
+            .services
+            .iter()
+            .map(|service| service.name.as_str())
+            .collect();
+        assert!(service_names.contains(&"api"));
+        assert!(service_names.contains(&"payments"));
+        assert!(!service_names.contains(&"orphaned"));
         assert_eq!(endpoints.services[0].workloads.len(), 1);
     }
 
