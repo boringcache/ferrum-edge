@@ -1004,6 +1004,23 @@ async fn test_content_mode_responses_input_honors_exclude_roles() {
 }
 
 #[tokio::test]
+async fn test_content_mode_top_level_system_honors_exclude_roles() {
+    let plugin = AiPromptShield::new(&json!({
+        "patterns": ["ssn"],
+        "exclude_roles": ["system"]
+    }))
+    .unwrap();
+
+    let mut ctx = make_post_ctx(&json!({
+        "model": "claude-3-5-sonnet",
+        "system": "operator sample 123-45-6789",
+        "messages": [{"role": "user", "content": "clean request"}]
+    }));
+    let mut headers = make_post_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+}
+
+#[tokio::test]
 async fn test_content_mode_no_pii_in_prompt_passes() {
     // Negative case: clean prompt/input/system payloads still pass through.
     let plugin = AiPromptShield::new(&json!({"patterns": ["ssn", "email"]})).unwrap();
