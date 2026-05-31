@@ -146,8 +146,7 @@ impl NodeAgentConfig {
         )?;
 
         // In-netns capture is the default for NodeWaypoint: publish the per-pod
-        // registry (and defer redirect until the mesh proxy's in-netns listener
-        // is ready) whenever the node-agent runs in NodeWaypoint proxy mode with
+        // registry whenever the node-agent runs in NodeWaypoint proxy mode with
         // outbound capture enabled. Other proxy modes have no in-netns listener
         // consumer, so leave it `None` and skip all the filesystem work on the
         // hot paths.
@@ -471,16 +470,6 @@ async fn run_with_backend(
         config.node_name
     );
 
-    // Node-waypoint deferred-redirect promotion (in-netns capture). When the pod
-    // registry is published, `handle_pod_added` defers connect4/connect6; this
-    // timer drives `promote_pending_redirects` to enable them once the mesh
-    // proxy has opened each pod's in-netns listener. Disabled (the select arm is
-    // gated off) when in-netns capture publishing is off.
-    let redirect_gate_enabled = config.node_waypoint_pod_registry_dir.is_some();
-    let mut redirect_promote_interval = tokio::time::interval(REDIRECT_PROMOTE_INTERVAL);
-    let mut redirect_state: HashMap<String, (RedirectAttachmentKey, RedirectPromotion)> =
-        HashMap::new();
-
     loop {
         if *shutdown_rx.borrow() {
             break;
@@ -564,17 +553,6 @@ async fn run_with_backend(
                         cni_work_open = false;
                         debug!("CNI work queue closed; CNI plugin path inactive for the remainder of this run");
                     }
-                }
-            }
-            _ = redirect_promote_interval.tick(), if redirect_gate_enabled => {
-                if let Some(registry_dir) = config.node_waypoint_pod_registry_dir.as_deref() {
-                    promote_pending_redirects(
-                        backend.as_mut(),
-                        &pod_states,
-                        metrics.as_ref(),
-                        &mut redirect_state,
-                        |uid| in_netns_listener_ready(registry_dir, uid),
-                    );
                 }
             }
         }
@@ -1051,6 +1029,44 @@ fn apply_workload_identity(
     written
 }
 
+fn cleanup_pre_enrollment_maps(
+    backend: &mut dyn EbpfBackend,
+    pod_uid: &str,
+    state: &PodAttachmentState,
+) {
+    for cgroup_id in &state.include_ports_cgroup_ids {
+        if let Err(e) = backend.remove_pod_include_ports(*cgroup_id) {
+            warn!(
+                pod_uid,
+                cgroup_id = *cgroup_id,
+                error = %e,
+                "Failed to remove pre-enrollment includeOutboundPorts entry from BPF map"
+            );
+        }
+    }
+    for cgroup_id in &state.workload_identity_cgroup_ids {
+        if let Err(e) = backend.remove_workload_identity(*cgroup_id) {
+            warn!(
+                pod_uid,
+                cgroup_id = *cgroup_id,
+                error = %e,
+                "Failed to remove pre-enrollment workload-identity entry from BPF map"
+            );
+        }
+    }
+}
+
+fn cleanup_partial_pod_enrollment(
+    backend: &mut dyn EbpfBackend,
+    pod_uid: &str,
+    state: &PodAttachmentState,
+) {
+    if let Err(e) = backend.detach_pod(pod_uid) {
+        warn!(pod_uid, error = %e, "Failed to clean up partially attached pod");
+    }
+    cleanup_pre_enrollment_maps(backend, pod_uid, state);
+}
+
 /// Construct the `WorkloadIdentity` for a pod from its UID and the derived
 /// SPIFFE ID. Returns `None` when the pod UID is not a valid UUID or the
 /// SPIFFE components are unusable.
@@ -1250,8 +1266,7 @@ fn remove_pod_registry(dir: &std::path::Path, pod_uid: &str) {
 /// Remove the mesh proxy's readiness marker `dir/.ready/<pod_uid>` on pod
 /// teardown. The proxy also removes it when its in-netns listener closes, but
 /// doing it here too closes the window where a same-UID re-enroll could observe
-/// a stale marker for the torn-down listener (and attach redirect to the new
-/// netns before a listener exists there). Best-effort; shares the registry
+/// a stale marker for the torn-down listener. Best-effort; shares the registry
 /// path-safety guard.
 fn remove_pod_ready_marker(dir: &std::path::Path, pod_uid: &str) {
     if pod_registry_uid_is_unsafe(pod_uid) {
@@ -1270,131 +1285,7 @@ fn remove_pod_ready_marker(dir: &std::path::Path, pod_uid: &str) {
     }
 }
 
-/// Per-pod state for the deferred node-waypoint outbound-redirect promotion.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RedirectPromotion {
-    /// Redirect not yet enabled; the value counts readiness checks seen so far.
-    Pending(u32),
-    /// Redirect programs attached — no further work for this pod.
-    Done,
-}
-
-/// The pod attachment target a ledger entry was recorded against: `(cgroup
-/// path, veth iface)`. It changes exactly when `handle_pod_added` re-enrolls a
-/// pod (a sandbox/veth change detaches connect4 and re-defers it), so comparing
-/// it lets the promotion restart a stale `Done` rather than skip the new netns
-/// forever (which would leave the re-enrolled pod un-captured until restart).
-type RedirectAttachmentKey = (Option<String>, Option<String>);
-
-/// How often the node-agent re-checks deferred pods for in-netns listener
-/// readiness before enabling their eBPF outbound redirect.
-const REDIRECT_PROMOTE_INTERVAL: Duration = Duration::from_secs(1);
-
-/// Enable the outbound redirect anyway after this many readiness checks without
-/// a ready signal, so a pod is never left un-captured forever when the mesh
-/// proxy never publishes a marker (e.g. it is not running on this node).
-/// ~30 s at [`REDIRECT_PROMOTE_INTERVAL`].
-const REDIRECT_PROMOTE_MAX_ATTEMPTS: u32 = 30;
-
-/// Production readiness predicate: the mesh proxy publishes a marker file at
-/// `<registry_dir>/.ready/<pod_uid>` once it has opened the pod's in-netns
-/// capture listener (see [`crate::proxy::netns_capture`]).
-fn in_netns_listener_ready(registry_dir: &std::path::Path, pod_uid: &str) -> bool {
-    registry_dir.join(".ready").join(pod_uid).exists()
-}
-
-/// Attach the deferred outbound-redirect program for an enrolled pod.
-///
-/// Only `connect4` is promoted here: it rewrites egress to the pod-loopback
-/// capture port, so it must wait for the proxy's in-netns listener (the
-/// readiness gate). `connect6` is NOT a redirect in NodeWaypoint mode and is NOT
-/// promoted here — the in-netns listener and GAP-2M bridge are IPv4-only, so
-/// `connect6` is attached up front at enrollment as a fail-closed denier (the
-/// `ipv6_outbound_deny` capture-config flag makes it return EPERM for captured
-/// v6), rejecting IPv6 egress rather than redirecting it to a v6 listener that
-/// does not exist or letting it bypass `mesh_authz`. It needs no listener so it
-/// is not readiness-gated. On failure the caller retries on the next tick; a
-/// succeeded attach is never repeated (no double-attach under
-/// `CgroupAttachMode::Single`).
-fn attach_outbound_redirect(
-    backend: &mut dyn EbpfBackend,
-    pod_uid: &str,
-    cgroup: &str,
-    metrics: &NodeAgentMetrics,
-) -> bool {
-    if let Err(e) = backend.attach_cgroup(pod_uid, cgroup, "ferrum_connect4") {
-        warn!(pod_uid, error = %e, "Failed to attach deferred connect4 outbound redirect; will retry");
-        metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
-        return false;
-    }
-    true
-}
-
-/// One promotion pass for deferred node-waypoint outbound redirect. Runs only
-/// when in-netns capture publishing is enabled. For each enrolled pod whose
-/// redirect is still pending, enable it once `is_ready(pod_uid)` reports the
-/// mesh proxy has opened the in-netns listener, with a bounded-attempts
-/// fallback so capture still engages if the signal never arrives. `is_ready` is
-/// injected so the bookkeeping is unit-testable without a live mesh proxy.
-fn promote_pending_redirects(
-    backend: &mut dyn EbpfBackend,
-    pod_states: &DashMap<String, PodAttachmentState>,
-    metrics: &NodeAgentMetrics,
-    redirect_state: &mut HashMap<String, (RedirectAttachmentKey, RedirectPromotion)>,
-    is_ready: impl Fn(&str) -> bool,
-) {
-    // Drop ledger entries for pods that are gone so it cannot grow unbounded.
-    redirect_state.retain(|uid, _| pod_states.contains_key(uid));
-
-    // Snapshot enrolled pods + their current attachment key; don't hold DashMap
-    // guards across the attach calls (which borrow `backend` mutably).
-    let candidates: Vec<(String, String, RedirectAttachmentKey)> = pod_states
-        .iter()
-        .filter_map(|entry| {
-            let state = entry.value();
-            if !state.attached {
-                return None;
-            }
-            let cgroup = state.cgroup_path.clone()?;
-            let key = (state.cgroup_path.clone(), state.veth_iface.clone());
-            Some((entry.key().clone(), cgroup, key))
-        })
-        .collect();
-
-    for (pod_uid, cgroup, key) in candidates {
-        // A stored entry whose attachment key differs is a re-enrollment (the
-        // pod's sandbox/veth changed → handle_pod_removed detached connect4 and
-        // the re-enroll deferred it again): restart from scratch instead of
-        // trusting a stale `Done`. Order matters — the key-mismatch arm must
-        // precede the `Done` arm so a re-enrolled, previously-Done pod requeues.
-        let attempts = match redirect_state.get(&pod_uid) {
-            Some((stored_key, _)) if *stored_key != key => 0,
-            Some((_, RedirectPromotion::Done)) => continue,
-            Some((_, RedirectPromotion::Pending(n))) => *n,
-            None => 0,
-        };
-        let ready = is_ready(&pod_uid);
-        if ready || attempts >= REDIRECT_PROMOTE_MAX_ATTEMPTS {
-            if attach_outbound_redirect(backend, &pod_uid, &cgroup, metrics) {
-                redirect_state.insert(pod_uid.clone(), (key, RedirectPromotion::Done));
-                info!(
-                    pod_uid = %pod_uid,
-                    listener_ready = ready,
-                    attempts,
-                    "Node-waypoint: enabled outbound redirect after in-netns listener readiness"
-                );
-            } else {
-                // connect4 attach failed; retry next tick at the same attempt
-                // count so the bounded fallback still applies eventually.
-                redirect_state.insert(pod_uid, (key, RedirectPromotion::Pending(attempts)));
-            }
-        } else {
-            redirect_state.insert(pod_uid, (key, RedirectPromotion::Pending(attempts + 1)));
-        }
-    }
-}
-
-pub fn handle_pod_added(
+fn handle_pod_added(
     backend: &mut dyn EbpfBackend,
     pod_states: &DashMap<String, PodAttachmentState>,
     config: &NodeAgentConfig,
@@ -1476,33 +1367,39 @@ pub fn handle_pod_added(
     };
 
     if let Some(ref cgroup) = cgroup_path {
-        // Attach inbound getpeername now; outbound-redirect handling depends on
-        // mode:
-        //  (a) outbound capture disabled (FERRUM_MESH_OUTBOUND_LISTEN_ADDR port
-        //      0) — connect4/connect6 are never attached and egress flows
-        //      normally (no capture, nothing to fail closed).
-        //  (b) NodeWaypoint in-netns capture — connect4 is DEFERRED (attaching it
-        //      now would rewrite a freshly enrolled pod's egress to the
-        //      pod-loopback capture port before the mesh proxy has opened the
-        //      in-netns listener, which would refuse it), so
-        //      `promote_pending_redirects` attaches connect4 once the proxy
-        //      signals readiness. connect6 IS attached now as a fail-closed
-        //      denier: the in-netns listener + sock-ops bridge are IPv4-only, so
-        //      the `ipv6_outbound_deny` capture-config flag makes connect6 return
-        //      EPERM for captured v6 — otherwise IPv6 egress would bypass
-        //      mesh_authz entirely. It needs no listener, so it is not deferred.
-        //  (c) otherwise (outbound on, non-NodeWaypoint) — attach all four up
-        //      front (connect6 redirects normally; the deny flag is unset).
+        // Seed per-cgroup policy maps before connect hooks can run. Otherwise
+        // the first connection from an annotated pod can observe missing
+        // `includeOutboundPorts` policy and fall back to the node-wide capture
+        // shape before the enrollment path writes the pod-specific map entry.
+        if let Some(applied) =
+            apply_include_outbound_ports(backend, pod_uid, cgroup, event.annotations)
+        {
+            state.include_ports_cgroup_ids = applied.cgroup_ids;
+            state.include_ports_policy = Some(applied.policy);
+        }
+        state.workload_identity_cgroup_ids = apply_workload_identity(
+            backend,
+            config,
+            pod_uid,
+            namespace,
+            event.service_account,
+            cgroup,
+        );
+
+        // Attach cgroup programs before marking the pod enrolled. When outbound
+        // capture is disabled (FERRUM_MESH_OUTBOUND_LISTEN_ADDR port 0), the
+        // connect hooks are intentionally omitted and egress flows normally.
+        // Otherwise attach both connect hooks up front, including NodeWaypoint
+        // in-netns mode: delaying connect4 until the mesh proxy listener is
+        // ready would leave a startup window where IPv4 egress bypasses
+        // mesh_authz entirely. Attaching connect4 immediately is fail-closed
+        // until the proxy opens the pod-loopback listener (connects may be
+        // refused, but they cannot bypass policy). In NodeWaypoint mode
+        // connect6 is configured as a fail-closed IPv6 denier via
+        // `ipv6_outbound_deny`; in other modes it redirects normally.
         let outbound_enabled = config.capture_config.outbound_capture_enabled;
-        let defer_redirect = config.node_waypoint_pod_registry_dir.is_some();
         let programs: &[&str] = if !outbound_enabled {
             &["ferrum_getpeername4", "ferrum_getpeername6"]
-        } else if defer_redirect {
-            &[
-                "ferrum_connect6",
-                "ferrum_getpeername4",
-                "ferrum_getpeername6",
-            ]
         } else {
             &[
                 "ferrum_connect4",
@@ -1529,18 +1426,14 @@ pub fn handle_pod_added(
                     "Could not resolve pod veth interface, skipping attachment"
                 );
                 metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
-                if let Err(e) = backend.detach_pod(pod_uid) {
-                    warn!(pod_uid, error = %e, "Failed to clean up partially attached pod");
-                }
+                cleanup_partial_pod_enrollment(backend, pod_uid, &state);
                 return;
             };
 
             if let Err(e) = backend.attach_tc(pod_uid, iface, "ferrum_tc_inbound") {
                 warn!(pod_uid, iface, error = %e, "Failed to attach tc program");
                 metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
-                if let Err(detach_err) = backend.detach_pod(pod_uid) {
-                    warn!(pod_uid, error = %detach_err, "Failed to clean up partially attached pod");
-                }
+                cleanup_partial_pod_enrollment(backend, pod_uid, &state);
                 return;
             }
             if let Some(ip) = pod_ip {
@@ -1551,34 +1444,10 @@ pub fn handle_pod_added(
                 if let Err(e) = backend.update_pod_ip(ip, &info) {
                     warn!(pod_uid, %ip, error = %e, "Failed to update pod IP map");
                     metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
-                    if let Err(detach_err) = backend.detach_pod(pod_uid) {
-                        warn!(pod_uid, error = %detach_err, "Failed to clean up partially attached pod");
-                    }
+                    cleanup_partial_pod_enrollment(backend, pod_uid, &state);
                     return;
                 }
             }
-            // Per-pod `includeOutboundPorts` narrowing. Best-effort: any
-            // failure to parse or to write the BPF map leaves the pod
-            // captured at the cgroup level without per-port narrowing
-            // (which is the prior GAP-2K behavior). Enrollment itself
-            // must not abort on this.
-            if let Some(applied) =
-                apply_include_outbound_ports(backend, pod_uid, cgroup, event.annotations)
-            {
-                state.include_ports_cgroup_ids = applied.cgroup_ids;
-                state.include_ports_policy = Some(applied.policy);
-            }
-            // GAP-1b: write the source workload identity so connect hooks can
-            // stamp orig-dst records. Best-effort like include-ports; failure
-            // leaves node-waypoint resolution failing closed for this pod.
-            state.workload_identity_cgroup_ids = apply_workload_identity(
-                backend,
-                config,
-                pod_uid,
-                namespace,
-                event.service_account,
-                cgroup,
-            );
             state.attached = true;
             metrics.pods_enrolled.fetch_add(1, Ordering::Relaxed);
             info!(
@@ -1590,8 +1459,8 @@ pub fn handle_pod_added(
                 workload_identity_cgroups = state.workload_identity_cgroup_ids.len(),
                 "Pod enrolled for eBPF capture"
             );
-        } else if let Err(e) = backend.detach_pod(pod_uid) {
-            warn!(pod_uid, error = %e, "Failed to clean up partially attached pod");
+        } else {
+            cleanup_partial_pod_enrollment(backend, pod_uid, &state);
         }
     } else {
         warn!(
@@ -1959,8 +1828,7 @@ pub fn handle_pod_removed(
         remove_pod_registry(dir, pod_uid);
         // Also drop the proxy's readiness marker so a same-UID re-enroll within
         // the proxy's ~2s reconcile window cannot observe a stale `ready` for the
-        // torn-down listener and attach redirect to the new netns before a
-        // listener exists there.
+        // torn-down listener.
         remove_pod_ready_marker(dir, pod_uid);
     }
 
@@ -3049,13 +2917,15 @@ mod tests {
             node_waypoint_pod_registry_dir: None,
         };
         let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+        let annotations =
+            annotations_with(&[("traffic.sidecar.istio.io/includeOutboundPorts", "8080")]);
         let event = PodEvent {
             pod_uid: "pod-uid-1",
             pod_name: "test-pod",
             namespace: "default",
             service_account: None,
             labels: &labels,
-            annotations: &HashMap::new(),
+            annotations: &annotations,
             pod_ip_str: Some("10.0.0.5"),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
@@ -3075,20 +2945,18 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn node_waypoint_defers_redirect_until_listener_ready() {
-        // With in-netns capture publishing enabled, enrollment must DEFER the
-        // IPv4 outbound redirect (connect4) until the mesh proxy opens the
-        // in-netns listener, while attaching the inbound getpeername programs and
-        // connect6 (the fail-closed IPv6 denier, which needs no listener) up
-        // front — so a freshly enrolled pod's IPv4 egress is not redirected to a
-        // dead port and its IPv6 egress cannot bypass mesh_authz.
+    fn node_waypoint_attaches_redirects_at_enrollment() {
+        // In-netns NodeWaypoint mode still publishes the pod registry for the
+        // proxy listener, but cgroup enforcement must be active before enrollment
+        // returns. Delaying connect4 creates a startup egress bypass; attaching
+        // it immediately is fail-closed until the pod-loopback listener is ready.
         let _veth_guard = crate::ebpf::veth::tests::TestOverrideGuard::new("veth_test");
         let mut backend = MockEbpfBackend::default();
         backend.load_programs().unwrap();
         let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
         let metrics = NodeAgentMetrics::default();
         let cgroup_root = tempfile::tempdir().unwrap();
-        let pod_uid = "pod-uid-defer";
+        let pod_uid = "pod-uid-enforce";
         std::fs::create_dir_all(cgroup_root.path().join(format!("kubepods/pod{pod_uid}"))).unwrap();
         let registry = tempfile::tempdir().unwrap();
         let config = NodeAgentConfig {
@@ -3103,13 +2971,15 @@ mod tests {
             node_waypoint_pod_registry_dir: Some(registry.path().to_path_buf()),
         };
         let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+        let annotations =
+            annotations_with(&[("traffic.sidecar.istio.io/includeOutboundPorts", "8080")]);
         let event = PodEvent {
             pod_uid,
             pod_name: "test-pod",
             namespace: "default",
             service_account: None,
             labels: &labels,
-            annotations: &HashMap::new(),
+            annotations: &annotations,
             pod_ip_str: Some("10.0.0.5"),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
@@ -3124,8 +2994,23 @@ mod tests {
             .map(|(_, prog)| prog.as_str())
             .collect();
         assert!(
-            !attached.contains(&"ferrum_connect4"),
-            "connect4 (IPv4 outbound redirect) must be deferred until the in-netns listener is ready, got {attached:?}"
+            attached.contains(&"ferrum_connect4"),
+            "connect4 must attach during enrollment so IPv4 egress cannot bypass mesh_authz, got {attached:?}"
+        );
+        let include_write = backend
+            .operations
+            .iter()
+            .position(|op| op.starts_with("update_pod_include_ports:"))
+            .expect("includeOutboundPorts map must be written");
+        let connect4_attach = backend
+            .operations
+            .iter()
+            .position(|op| op == "attach_cgroup:ferrum_connect4")
+            .expect("connect4 must attach");
+        assert!(
+            include_write < connect4_attach,
+            "includeOutboundPorts policy must be seeded before connect4 is active, got {:?}",
+            backend.operations
         );
         assert!(
             attached.contains(&"ferrum_connect6"),
@@ -3135,153 +3020,14 @@ mod tests {
             attached.contains(&"ferrum_getpeername4") && attached.contains(&"ferrum_getpeername6"),
             "inbound getpeername programs attach immediately, got {attached:?}"
         );
-
-        // Promotion while the listener is not ready leaves the IPv4 redirect deferred.
-        let mut redirect_state = HashMap::new();
-        promote_pending_redirects(
-            &mut backend,
-            &pod_states,
-            &metrics,
-            &mut redirect_state,
-            |_| false,
-        );
-        assert!(
-            !backend
-                .cgroup_attachments
-                .iter()
-                .any(|(_, p)| p == "ferrum_connect4"),
-            "redirect stays deferred while the listener is not ready"
-        );
-
-        // Once the listener is ready, the IPv4 redirect (connect4) is enabled.
-        promote_pending_redirects(
-            &mut backend,
-            &pod_states,
-            &metrics,
-            &mut redirect_state,
-            |_| true,
-        );
-        assert!(
-            backend
-                .cgroup_attachments
-                .iter()
-                .any(|(_, p)| p == "ferrum_connect4"),
-            "connect4 attached once the listener is ready"
-        );
-        assert!(
-            backend
-                .cgroup_attachments
-                .iter()
-                .any(|(_, p)| p == "ferrum_connect6"),
-            "connect6 stays attached as the fail-closed IPv6 denier (attached at enrollment, not via promotion)"
-        );
-
-        // Idempotent: a further pass with the pod marked Done does not re-attach
-        // connect4 (a double-attach would error under CgroupAttachMode::Single).
-        let connect4_count = backend
-            .cgroup_attachments
-            .iter()
-            .filter(|(_, p)| p == "ferrum_connect4")
-            .count();
-        promote_pending_redirects(
-            &mut backend,
-            &pod_states,
-            &metrics,
-            &mut redirect_state,
-            |_| true,
-        );
-        assert_eq!(
-            backend
-                .cgroup_attachments
-                .iter()
-                .filter(|(_, p)| p == "ferrum_connect4")
-                .count(),
-            connect4_count,
-            "connect4 must not be re-attached once promotion is Done"
-        );
     }
 
     #[cfg(unix)]
     #[test]
-    fn node_waypoint_redirect_falls_back_after_max_attempts() {
-        // If the readiness signal never arrives, the redirect must still be
-        // enabled after the bounded attempt budget so the pod is not left
-        // un-captured forever (e.g. the mesh proxy is not running on this node).
-        let _veth_guard = crate::ebpf::veth::tests::TestOverrideGuard::new("veth_test");
-        let mut backend = MockEbpfBackend::default();
-        backend.load_programs().unwrap();
-        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
-        let metrics = NodeAgentMetrics::default();
-        let cgroup_root = tempfile::tempdir().unwrap();
-        let pod_uid = "pod-uid-fallback";
-        std::fs::create_dir_all(cgroup_root.path().join(format!("kubepods/pod{pod_uid}"))).unwrap();
-        let registry = tempfile::tempdir().unwrap();
-        let config = NodeAgentConfig {
-            node_name: "test-node".to_string(),
-            capture_config: CaptureConfig::explicit(15006, 15001),
-            cgroup_root: cgroup_root.path().to_string_lossy().to_string(),
-            bpf_fs_path: "/nonexistent".to_string(),
-            fallback_mode: FallbackMode::Iptables,
-            excluded_namespaces: HashSet::new(),
-            capture_contract: CaptureContract::local_pod_defaults(),
-            trust_domain: "cluster.local".to_string(),
-            node_waypoint_pod_registry_dir: Some(registry.path().to_path_buf()),
-        };
-        let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
-        let event = PodEvent {
-            pod_uid,
-            pod_name: "test-pod",
-            namespace: "default",
-            service_account: None,
-            labels: &labels,
-            annotations: &HashMap::new(),
-            pod_ip_str: Some("10.0.0.5"),
-            pod_pid: None,
-            veth_iface_override: Some("veth-mock"),
-        };
-        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
-
-        let mut redirect_state = HashMap::new();
-        // Never ready: after the full attempt budget the redirect is still deferred.
-        for _ in 0..REDIRECT_PROMOTE_MAX_ATTEMPTS {
-            promote_pending_redirects(
-                &mut backend,
-                &pod_states,
-                &metrics,
-                &mut redirect_state,
-                |_| false,
-            );
-        }
-        assert!(
-            !backend
-                .cgroup_attachments
-                .iter()
-                .any(|(_, p)| p == "ferrum_connect4"),
-            "redirect not yet promoted before the attempt budget is exhausted"
-        );
-        // One more tick crosses the threshold and enables redirect anyway.
-        promote_pending_redirects(
-            &mut backend,
-            &pod_states,
-            &metrics,
-            &mut redirect_state,
-            |_| false,
-        );
-        assert!(
-            backend
-                .cgroup_attachments
-                .iter()
-                .any(|(_, p)| p == "ferrum_connect4"),
-            "redirect enabled by the bounded fallback after max attempts"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn node_waypoint_requeues_redirect_after_same_uid_reenrollment() {
-        // A same-UID re-enroll (sandbox/veth change → handle_pod_removed detaches
-        // connect4, re-enroll re-defers it) must re-promote the redirect, not be
-        // skipped forever by a stale `Done` keyed only by pod UID.
+    fn node_waypoint_reenrollment_attaches_redirect_immediately() {
+        // A same-UID re-enroll (sandbox/veth change) detaches and then reattaches
+        // the redirect as part of the new enrollment; no asynchronous promotion
+        // ledger is needed to restore enforcement.
         let _veth_guard = crate::ebpf::veth::tests::TestOverrideGuard::new("veth_test");
         let mut backend = MockEbpfBackend::default();
         backend.load_programs().unwrap();
@@ -3322,9 +3068,6 @@ mod tests {
                 .count()
         };
 
-        let mut redirect_state = HashMap::new();
-
-        // Enroll with veth-A; the listener is ready → connect4 attached once.
         handle_pod_added(
             &mut backend,
             &pod_states,
@@ -3332,21 +3075,12 @@ mod tests {
             &metrics,
             &make_event("veth-A"),
         );
-        promote_pending_redirects(
-            &mut backend,
-            &pod_states,
-            &metrics,
-            &mut redirect_state,
-            |_| true,
-        );
         assert_eq!(
             connect4_count(&backend),
             1,
-            "connect4 attached on first promotion"
+            "connect4 attached during first enrollment"
         );
 
-        // Re-enroll the SAME UID with a different veth: handle_pod_added detaches
-        // and re-defers connect4 for the new attachment.
         handle_pod_added(
             &mut backend,
             &pod_states,
@@ -3354,17 +3088,10 @@ mod tests {
             &metrics,
             &make_event("veth-B"),
         );
-        promote_pending_redirects(
-            &mut backend,
-            &pod_states,
-            &metrics,
-            &mut redirect_state,
-            |_| true,
-        );
         assert_eq!(
             connect4_count(&backend),
             2,
-            "redirect must be re-promoted after same-UID re-enrollment, not skipped by a stale Done"
+            "connect4 reattaches immediately during same-UID re-enrollment"
         );
     }
 
