@@ -13,12 +13,8 @@ fn example_audit_plugin_registered() -> bool {
 }
 
 fn create_example_audit_plugin(config: &serde_json::Value) -> Result<bool, String> {
-    create_custom_plugin(
-        "example_audit_plugin",
-        config,
-        PluginHttpClient::default(),
-    )
-    .map(|plugin| plugin.is_some())
+    create_custom_plugin("example_audit_plugin", config, PluginHttpClient::default())
+        .map(|plugin| plugin.is_some())
 }
 
 #[test]
