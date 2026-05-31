@@ -28,6 +28,7 @@ pub mod rate_limit;
 pub mod redis_rate_limiter;
 pub mod response_body;
 pub mod route_header_transform;
+pub mod runtime_bool_gate;
 pub mod scope_role_check;
 pub mod session_cookie;
 pub mod size_limit;

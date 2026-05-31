@@ -916,6 +916,37 @@ async fn test_response_transformer_rejects_empty_runtime_overlay_scope() {
     assert!(err.contains("runtime_overlay_scope"));
 }
 
+#[test]
+fn test_response_transformer_overlay_gate_parsing_is_namespaced() {
+    use ferrum_edge::modes::mesh::config::{MeshRuntimeOverlay, RuntimeValue};
+    use ferrum_edge::plugins::response_transformer::runtime_overlay;
+
+    let _guard = ferrum_edge::modes::mesh::runtime_overlay_consumers::test_lock();
+    runtime_overlay::reset_for_test();
+
+    let mut fields = HashMap::new();
+    fields.insert(
+        "ferrum.response_transformer.public.enabled".to_string(),
+        RuntimeValue::Bool(true),
+    );
+    fields.insert(
+        "ferrum.response_transformer.internal.enabled".to_string(),
+        RuntimeValue::Bool(false),
+    );
+    fields.insert(
+        "ferrum.request_transformer.public.enabled".to_string(),
+        RuntimeValue::Bool(false),
+    );
+
+    runtime_overlay::apply_overlay(&MeshRuntimeOverlay { fields });
+    let snap = runtime_overlay::current_gates();
+    assert_eq!(snap.gate("public"), Some(true));
+    assert_eq!(snap.gate("internal"), Some(false));
+    assert_eq!(snap.gate("missing"), None);
+
+    runtime_overlay::reset_for_test();
+}
+
 #[tokio::test]
 async fn test_response_transformer_overlay_gate_observable_end_to_end() {
     use ferrum_edge::modes::mesh::config::{MeshRuntimeOverlay, RuntimeValue};

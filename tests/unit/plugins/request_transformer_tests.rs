@@ -1250,6 +1250,44 @@ async fn test_request_transformer_rejects_non_bool_default_enabled() {
     assert!(err.contains("default_enabled"));
 }
 
+#[test]
+fn test_request_transformer_overlay_gate_parsing() {
+    use ferrum_edge::modes::mesh::config::{MeshRuntimeOverlay, RuntimeValue};
+    use ferrum_edge::plugins::request_transformer::runtime_overlay;
+
+    let _guard = ferrum_edge::modes::mesh::runtime_overlay_consumers::test_lock();
+    runtime_overlay::reset_for_test();
+
+    let mut fields = HashMap::new();
+    fields.insert(
+        "ferrum.request_transformer.public.enabled".to_string(),
+        RuntimeValue::Bool(false),
+    );
+    fields.insert(
+        "ferrum.request_transformer.internal.enabled".to_string(),
+        RuntimeValue::Bool(true),
+    );
+    fields.insert(
+        "ferrum.request_transformer.bad.enabled".to_string(),
+        RuntimeValue::Number(1.0),
+    );
+    fields.insert(
+        "ferrum.request_transformer..enabled".to_string(),
+        RuntimeValue::Bool(true),
+    );
+
+    runtime_overlay::apply_overlay(&MeshRuntimeOverlay { fields });
+    let snap = runtime_overlay::current_gates();
+    assert_eq!(snap.gate("public"), Some(false));
+    assert_eq!(snap.gate("internal"), Some(true));
+    assert_eq!(snap.gate("bad"), None);
+    assert_eq!(snap.gate(""), None);
+    assert_eq!(snap.gate("missing"), None);
+
+    runtime_overlay::apply_overlay(&MeshRuntimeOverlay::default());
+    assert_eq!(runtime_overlay::current_gates().gate("public"), None);
+}
+
 #[tokio::test]
 async fn test_request_transformer_overlay_gate_observable_end_to_end() {
     // Single test that walks every overlay-gate behaviour serially to

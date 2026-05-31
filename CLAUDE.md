@@ -50,9 +50,19 @@ Prerequisite: `protoc`; `build.rs` runs `tonic_build` on `proto/ferrum.proto`.
 
 Test what changed and let CI run the full matrix. For Rust changes, run `cargo fmt --all -- --check`, targeted clippy, and relevant tests. Docs/comment-only changes usually need `git diff --check`. Config/schema/spec/template changes need validation of the changed surface and Rust checks only if Rust changed.
 
-Target by scope: private source functions use `cargo test --lib <module>::tests`; public APIs use `cargo test --test unit_tests <filter>`; cross-module behavior uses `cargo test --test integration_tests <filter>`; proxy hot-path changes use `cargo build --bin ferrum-edge && cargo test --test functional_tests <filter> -- --ignored`.
+Target by scope: public APIs use `cargo test --test unit_tests <filter>`; cross-module behavior uses `cargo test --test integration_tests <filter>`; proxy hot-path changes use `cargo build --bin ferrum-edge && cargo test --test functional_tests <filter> -- --ignored`. Avoid adding new inline source tests; prefer external unit tests, integration tests, or focused test-only helpers under `tests/`.
 
 Run the full local suite only for shared infrastructure, cross-module refactors, pre-release work, or when CI is congested. Leave `CARGO_TARGET_DIR` unset across parallel worktrees; inside one workspace, run fmt, clippy, and tests sequentially.
+
+## Testing And Refactoring Guidelines
+
+- Do not add inline tests, ad hoc test runners, or test-only logic to production source files unless explicitly required to cover a private invariant without widening runtime APIs.
+- Place tests in `tests/` using the repository's established `unit`, `integration`, `functional`, `conformance`, and helper layouts.
+- Keep production files focused on runtime code; shared test fixtures, mocks, and helpers belong under test-specific helper directories.
+- When adding or updating tests, follow existing test framework, naming, and module registration conventions.
+- When refactoring duplicated logic, prefer small shared utilities over copy/paste and keep domain-specific logic near its domain.
+- Split large source files by responsibility only when it improves cohesion, readability, or ownership boundaries.
+- Preserve existing behavior during refactors unless a behavior change is explicitly requested or an obvious bug is documented.
 
 ## Operating Modes
 
