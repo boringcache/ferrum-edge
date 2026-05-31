@@ -7,6 +7,7 @@
 use ferrum_edge::identity::spiffe::{
     SpiffeId, UriSanError, extract_spiffe_id_from_cert, spiffe_id_to_san, try_extract_spiffe_id,
 };
+use rcgen::string::Ia5String;
 use rcgen::{CertificateParams, KeyPair, SanType};
 
 fn build_test_cert(spiffe_uri: Option<&str>, dns: Option<&str>) -> Vec<u8> {
@@ -20,6 +21,23 @@ fn build_test_cert(spiffe_uri: Option<&str>, dns: Option<&str>) -> Vec<u8> {
     if let Some(dns_name) = dns {
         params.subject_alt_names.push(SanType::DnsName(
             rcgen::string::Ia5String::try_from(dns_name.to_string()).unwrap(),
+        ));
+    }
+    let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("keypair");
+    let cert = params.self_signed(&key_pair).expect("self_signed");
+    cert.der().to_vec()
+}
+
+fn build_test_cert_with_uri_sans(uris: &[&str], dns: Option<&str>) -> Vec<u8> {
+    let mut params = CertificateParams::default();
+    for uri in uris {
+        params.subject_alt_names.push(SanType::URI(
+            Ia5String::try_from((*uri).to_string()).expect("URI SAN is IA5"),
+        ));
+    }
+    if let Some(dns_name) = dns {
+        params.subject_alt_names.push(SanType::DnsName(
+            Ia5String::try_from(dns_name.to_string()).unwrap(),
         ));
     }
     let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("keypair");
@@ -44,6 +62,22 @@ fn extract_picks_first_spiffe_uri_when_multiple_sans() {
     );
     let id = extract_spiffe_id_from_cert(&der).expect("URI SAN found amid DNS SAN");
     assert_eq!(id.as_str(), "spiffe://prod.example.com/ns/foo");
+}
+
+#[test]
+fn extract_rejects_spiffe_uri_with_additional_uri_san() {
+    let der = build_test_cert_with_uri_sans(
+        &[
+            "spiffe://prod.example.com/ns/foo",
+            "https://foo.example.com/identity",
+        ],
+        None,
+    );
+    let result = extract_spiffe_id_from_cert(&der);
+    assert!(matches!(
+        result,
+        Err(UriSanError::MultipleUriSans { count: 2 })
+    ));
 }
 
 #[test]

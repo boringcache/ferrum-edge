@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use tracing::debug;
 
+use crate::identity::spiffe::UriSanError;
 use crate::plugins::{
     HTTP_FAMILY_AND_STREAM_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext,
     StreamConnectionContext, priority,
@@ -28,6 +29,24 @@ impl SpiffeIdentity {
             )),
         }
     }
+}
+
+fn reject_invalid_spiffe_cert(error: &UriSanError) -> Option<PluginResult> {
+    if !matches!(
+        error,
+        UriSanError::MultipleUriSans { .. } | UriSanError::InvalidSpiffeId { .. }
+    ) {
+        return None;
+    }
+    debug!(
+        "spiffe_identity: rejecting peer cert with invalid SPIFFE URI SAN: {}",
+        error
+    );
+    Some(PluginResult::Reject {
+        status_code: 403,
+        body: "invalid SPIFFE identity certificate".to_string(),
+        headers: std::collections::HashMap::new(),
+    })
 }
 
 #[async_trait]
@@ -56,8 +75,11 @@ impl Plugin for SpiffeIdentity {
                 }
                 Ok(None) => {}
                 Err(e) => {
+                    if let Some(reject) = reject_invalid_spiffe_cert(&e) {
+                        return reject;
+                    }
                     debug!(
-                        "spiffe_identity: peer cert has SPIFFE URI but it is malformed: {}",
+                        "spiffe_identity: could not parse peer cert for SPIFFE ID: {}",
                         e
                     );
                 }
@@ -87,8 +109,11 @@ impl Plugin for SpiffeIdentity {
                 }
                 Ok(None) => {}
                 Err(e) => {
+                    if let Some(reject) = reject_invalid_spiffe_cert(&e) {
+                        return reject;
+                    }
                     debug!(
-                        "spiffe_identity: stream peer cert SPIFFE URI malformed: {}",
+                        "spiffe_identity: could not parse stream peer cert for SPIFFE ID: {}",
                         e
                     );
                 }

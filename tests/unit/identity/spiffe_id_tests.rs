@@ -223,6 +223,24 @@ fn spiffe_id_rejects_empty_path_segment() {
 }
 
 #[test]
+fn spiffe_id_rejects_dot_only_path_segments() {
+    for raw in [
+        "spiffe://prod.example.com/.",
+        "spiffe://prod.example.com/..",
+        "spiffe://prod.example.com/ns/../sa/admin",
+        "spiffe://prod.example.com/ns/./sa/admin",
+    ] {
+        assert!(
+            matches!(
+                SpiffeId::new(raw),
+                Err(SpiffeIdError::DotPathSegment { .. })
+            ),
+            "{raw} should reject relative path modifiers"
+        );
+    }
+}
+
+#[test]
 fn spiffe_id_rejects_invalid_path_char() {
     assert!(matches!(
         SpiffeId::new("spiffe://prod.example.com/foo bar"),
@@ -236,6 +254,18 @@ fn spiffe_id_rejects_idn_path() {
     assert!(matches!(
         SpiffeId::new("spiffe://prod.example.com/π"),
         Err(SpiffeIdError::InvalidPathChar { .. })
+    ));
+}
+
+#[test]
+fn spiffe_id_rejects_tilde_path_char() {
+    // Per the SPIFFE-ID spec a path segment is `[A-Za-z0-9.-_]` — `~` is NOT
+    // allowed (stricter than RFC 3986 unreserved). A conformant peer (SPIRE,
+    // ztunnel) rejects it, so Ferrum must too rather than accept a non-canonical
+    // identity off a hostile/misconfigured peer cert.
+    assert!(matches!(
+        SpiffeId::new("spiffe://prod.example.com/ns/a~b/sa/x"),
+        Err(SpiffeIdError::InvalidPathChar { ch: '~', .. })
     ));
 }
 

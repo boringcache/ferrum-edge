@@ -8,6 +8,7 @@
 //! - The authority is the trust domain (see [`TrustDomain`]).
 //! - The path is a sequence of `/`-separated non-empty segments. Each segment
 //!   may contain ASCII letters, digits, hyphens, periods, and underscores.
+//!   Dot-only segments (`.` and `..`) are forbidden.
 //! - Query and fragment components are forbidden.
 //! - Trailing slashes are forbidden.
 //! - Empty paths (i.e. the trust-domain root) are allowed and represent the
@@ -193,6 +194,8 @@ pub enum SpiffeIdError {
     TrailingSlash(String),
     #[error("SPIFFE ID '{uri}' has empty path segment between slashes")]
     EmptyPathSegment { uri: String },
+    #[error("SPIFFE ID '{uri}' has forbidden dot-only path segment '{segment}'")]
+    DotPathSegment { uri: String, segment: String },
     #[error("SPIFFE ID '{uri}' path segment '{segment}' contains invalid character '{ch}'")]
     InvalidPathChar {
         uri: String,
@@ -266,6 +269,12 @@ fn parse(uri: String) -> Result<SpiffeId, SpiffeIdError> {
         if segment.is_empty() {
             return Err(SpiffeIdError::EmptyPathSegment { uri: uri.clone() });
         }
+        if matches!(segment, "." | "..") {
+            return Err(SpiffeIdError::DotPathSegment {
+                uri: uri.clone(),
+                segment: segment.to_string(),
+            });
+        }
         for ch in segment.chars() {
             if !is_path_char(ch) {
                 return Err(SpiffeIdError::InvalidPathChar {
@@ -285,11 +294,13 @@ fn parse(uri: String) -> Result<SpiffeId, SpiffeIdError> {
     })
 }
 
-/// Per the SPIFFE-ID spec, path segments use the `pchar` grammar restricted
-/// to ASCII letters, digits, and the unreserved punctuation `-._~`. Reserved
-/// or escaped characters are rejected — operators must encode SVIDs in
-/// canonical form.
+/// Per the SPIFFE-ID spec, each path segment is restricted to
+/// `[A-Za-z0-9.-_]` — ASCII letters, digits, and the punctuation `.`, `-`, `_`;
+/// complete `.` and `..` relative path segments are rejected separately. This
+/// is STRICTER than RFC 3986 `pchar`/unreserved: `~`, percent-encoding, and
+/// reserved characters are all rejected, so operators must encode SVIDs in
+/// canonical form (a conformant peer such as SPIRE/ztunnel rejects them too).
 #[inline]
 fn is_path_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | '~')
+    c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_')
 }
