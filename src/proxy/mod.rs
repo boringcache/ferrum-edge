@@ -1518,7 +1518,7 @@ struct GrpcStreamingProbeRecorder {
     status_known: std::sync::atomic::AtomicBool,
     upload_terminated: std::sync::atomic::AtomicBool,
     recorded: std::sync::atomic::AtomicBool,
-    post_header_upload_timeout: Option<Duration>,
+    post_header_upload_deadline: Option<Instant>,
 }
 
 impl GrpcStreamingProbeRecorder {
@@ -1526,7 +1526,7 @@ impl GrpcStreamingProbeRecorder {
         cb: Arc<crate::circuit_breaker::CircuitBreaker>,
         is_half_open_probe: bool,
         request_body_exceeded: Arc<std::sync::atomic::AtomicBool>,
-        post_header_upload_timeout: Option<Duration>,
+        post_header_upload_deadline: Option<Instant>,
     ) -> Self {
         Self {
             cb,
@@ -1536,7 +1536,7 @@ impl GrpcStreamingProbeRecorder {
             status_known: std::sync::atomic::AtomicBool::new(false),
             upload_terminated: std::sync::atomic::AtomicBool::new(false),
             recorded: std::sync::atomic::AtomicBool::new(false),
-            post_header_upload_timeout,
+            post_header_upload_deadline,
         }
     }
 
@@ -1574,12 +1574,16 @@ impl GrpcStreamingProbeRecorder {
     }
 
     fn start_post_header_upload_timeout(self: &Arc<Self>) {
-        let Some(timeout) = self.post_header_upload_timeout else {
+        let Some(deadline) = self.post_header_upload_deadline else {
             return;
         };
         if self.upload_terminated.load(Ordering::Acquire) {
             return;
         }
+        let Some(timeout) = deadline.checked_duration_since(Instant::now()) else {
+            self.record_neutral_if_upload_still_open();
+            return;
+        };
         let recorder = Arc::clone(self);
         std::mem::drop(tokio::spawn(async move {
             tokio::time::sleep(timeout).await;
@@ -1598,8 +1602,7 @@ impl GrpcStreamingProbeRecorder {
             return;
         }
         warn!(
-            "gRPC streaming HALF_OPEN probe upload did not terminate within {:?}; recording neutral outcome",
-            self.post_header_upload_timeout
+            "gRPC streaming HALF_OPEN probe upload did not terminate before its deadline; recording neutral outcome",
         );
         self.cb.record_neutral(self.is_half_open_probe);
     }
@@ -10170,25 +10173,20 @@ async fn handle_proxy_request_inner(
                                 grpc_final_cb_key.as_deref(),
                                 cb_config,
                             );
-                            let post_header_upload_timeout =
-                                grpc_proxy::parse_grpc_timeout_ms(request.headers())
-                                    .map(|grpc_ms| {
-                                        if proxy.backend_read_timeout_ms > 0 {
-                                            grpc_ms.min(proxy.backend_read_timeout_ms)
-                                        } else {
-                                            grpc_ms
-                                        }
-                                    })
-                                    .or_else(|| {
-                                        (proxy.backend_read_timeout_ms > 0)
-                                            .then_some(proxy.backend_read_timeout_ms)
-                                    })
-                                    .map(Duration::from_millis);
+                            let post_header_upload_deadline =
+                                grpc_proxy::streaming_effective_timeout_ms_after_proxy_headers(
+                                    request.headers(),
+                                    proxy_headers,
+                                    proxy.as_ref(),
+                                )
+                                .and_then(|timeout_ms| {
+                                    Instant::now().checked_add(Duration::from_millis(timeout_ms))
+                                });
                             let recorder = Arc::new(GrpcStreamingProbeRecorder::new(
                                 cb,
                                 grpc_cb_probe_slot,
                                 Arc::clone(&body_size_exceeded),
-                                post_header_upload_timeout,
+                                post_header_upload_deadline,
                             ));
                             grpc_streaming_probe_recorder = Some(Arc::clone(&recorder));
                             // `let`-binding the trait object drives the
@@ -16091,7 +16089,7 @@ mod tests {
                 std::sync::Arc::clone(&cb),
                 true,
                 request_body_exceeded,
-                Some(std::time::Duration::from_millis(10)),
+                std::time::Instant::now().checked_add(std::time::Duration::from_millis(10)),
             ));
 
             recorder.note_status(200);
@@ -16121,6 +16119,35 @@ mod tests {
                 cb.state_name(),
                 "half_open",
                 "late upload termination after the timeout must not double-record"
+            );
+        }
+
+        #[tokio::test]
+        async fn elapsed_post_header_upload_deadline_releases_probe_slot_neutral() {
+            let cb = std::sync::Arc::new(breaker_with_admitted_half_open_probe());
+            let request_body_exceeded =
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let elapsed_deadline = std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_millis(1))
+                .expect("small instant subtraction");
+            let recorder = std::sync::Arc::new(super::super::GrpcStreamingProbeRecorder::new(
+                std::sync::Arc::clone(&cb),
+                true,
+                request_body_exceeded,
+                Some(elapsed_deadline),
+            ));
+
+            recorder.note_status(200);
+
+            assert_eq!(
+                cb.state_name(),
+                "half_open",
+                "an elapsed post-header upload deadline is neutral and must not heal"
+            );
+            assert_eq!(
+                cb.half_open_in_flight(),
+                0,
+                "an elapsed deadline must release the probe slot immediately"
             );
         }
 

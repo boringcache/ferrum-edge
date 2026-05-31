@@ -1447,11 +1447,7 @@ pub async fn proxy_grpc_request_streaming(
     // When no gRPC deadline is set: fall back to backend_read_timeout_ms
     // as a safety net against indefinitely stalled backends. Slow uploads
     // without deadlines should be bounded.
-    let effective_timeout_ms = match parse_grpc_timeout_ms(&headers) {
-        Some(grpc_ms) => Some(grpc_ms),
-        None if proxy.backend_read_timeout_ms > 0 => Some(proxy.backend_read_timeout_ms),
-        None => None,
-    };
+    let effective_timeout_ms = streaming_effective_timeout_ms(&headers, proxy);
 
     let mut backend_req = Request::new(grpc_body);
     *backend_req.method_mut() = parts.method;
@@ -1952,6 +1948,34 @@ pub fn parse_grpc_timeout_ms(headers: &hyper::HeaderMap) -> Option<u64> {
     Some(ms.max(1))
 }
 
+/// Effective timeout for the fully streaming gRPC path.
+///
+/// Client-supplied `grpc-timeout` is an end-to-end RPC deadline and is used
+/// directly. `backend_read_timeout_ms` is only a fallback when the client did
+/// not set a deadline.
+pub(crate) fn streaming_effective_timeout_ms(
+    headers: &hyper::HeaderMap,
+    proxy: &Proxy,
+) -> Option<u64> {
+    match parse_grpc_timeout_ms(headers) {
+        Some(grpc_ms) => Some(grpc_ms),
+        None if proxy.backend_read_timeout_ms > 0 => Some(proxy.backend_read_timeout_ms),
+        None => None,
+    }
+}
+
+/// Build the same post-plugin header view that [`proxy_grpc_request_streaming`]
+/// uses, then derive its effective streaming timeout.
+pub(crate) fn streaming_effective_timeout_ms_after_proxy_headers(
+    request_headers: &hyper::HeaderMap,
+    proxy_headers: &HashMap<String, String>,
+    proxy: &Proxy,
+) -> Option<u64> {
+    let mut headers = request_headers.clone();
+    merge_proxy_headers_and_strip_for_grpc(&mut headers, proxy_headers);
+    streaming_effective_timeout_ms(&headers, proxy)
+}
+
 #[cfg(test)]
 mod tests {
     //! Inline tests for private internals of the gRPC proxy.
@@ -2051,6 +2075,46 @@ mod tests {
         assert!(
             key.ends_with("|svidg=23"),
             "workload SVID generation must be represented in the gRPC pool key: {key}"
+        );
+    }
+
+    #[test]
+    fn streaming_effective_timeout_uses_post_plugin_headers_without_backend_cap() {
+        let mut proxy = grpc_pool_test_proxy();
+        proxy.backend_read_timeout_ms = 250;
+        let mut request_headers = hyper::HeaderMap::new();
+        request_headers.insert(
+            "grpc-timeout",
+            hyper::header::HeaderValue::from_static("10S"),
+        );
+        let mut proxy_headers = HashMap::new();
+        proxy_headers.insert("grpc-timeout".to_string(), "3S".to_string());
+
+        assert_eq!(
+            streaming_effective_timeout_ms_after_proxy_headers(
+                &request_headers,
+                &proxy_headers,
+                &proxy,
+            ),
+            Some(3_000),
+            "the streaming guard must use the same post-plugin grpc-timeout as dispatch and must not cap it by backend_read_timeout_ms"
+        );
+    }
+
+    #[test]
+    fn streaming_effective_timeout_falls_back_to_backend_read_timeout() {
+        let mut proxy = grpc_pool_test_proxy();
+        proxy.backend_read_timeout_ms = 750;
+        let request_headers = hyper::HeaderMap::new();
+        let proxy_headers = HashMap::new();
+
+        assert_eq!(
+            streaming_effective_timeout_ms_after_proxy_headers(
+                &request_headers,
+                &proxy_headers,
+                &proxy,
+            ),
+            Some(750),
         );
     }
 
