@@ -1371,7 +1371,7 @@ async fn discover_jwks_uri(
 ) -> Result<String, String> {
     let req = http_client.get().get(discovery_url);
     let response = http_client
-        .execute_no_redirect(req, "jwks_auth_oidc_discovery")
+        .execute(req, "jwks_auth_oidc_discovery")
         .await
         .map_err(|e| format!("OIDC discovery request failed: {}", e))?;
 

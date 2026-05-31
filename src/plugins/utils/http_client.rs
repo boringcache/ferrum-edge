@@ -11,6 +11,9 @@
 //! - **HTTP/2 multiplexing**: Multiple log/metric streams over one connection
 //! - **Idle timeout**: Stale connections cleaned up automatically
 //! - **DNS caching**: Uses the gateway's `DnsCache` for shared, warmed DNS
+//! - **No redirect following**: outbound calls reach only the configured
+//!   endpoint; server-chosen 3xx targets (e.g. a cloud metadata IP) are never
+//!   followed — SSRF defense-in-depth
 //!
 //! # Usage for plugin authors
 //!
@@ -63,7 +66,6 @@ use std::time::Duration;
 #[derive(Clone)]
 pub struct PluginHttpClient {
     client: Arc<reqwest::Client>,
-    no_redirect_client: Arc<reqwest::Client>,
     /// Threshold above which outbound plugin HTTP calls are logged as slow.
     /// Configured via `FERRUM_PLUGIN_HTTP_SLOW_THRESHOLD_MS` (default: 1000ms).
     slow_threshold: Duration,
@@ -147,131 +149,21 @@ impl std::fmt::Debug for PluginHttpClient {
 ///
 /// If even this minimal builder fails, only then fall back to
 /// `reqwest::Client::new()` (an exceptional, doubly-degraded path).
-#[derive(Clone, Copy)]
-enum RedirectMode {
-    Follow,
-    None,
-}
-
-impl RedirectMode {
-    fn apply(self, builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
-        match self {
-            Self::Follow => builder,
-            Self::None => builder.redirect(reqwest::redirect::Policy::none()),
-        }
-    }
-}
-
-fn build_dns_cached_fallback_client(
-    dns_cache: Option<DnsCache>,
-    redirect_mode: RedirectMode,
-) -> reqwest::Client {
-    let mut builder = reqwest::Client::builder();
+fn build_dns_cached_fallback_client(dns_cache: Option<DnsCache>) -> reqwest::Client {
+    // Even this degraded fallback must not follow redirects — see
+    // `PluginHttpClient::new()` for the SSRF rationale.
+    let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
     if let Some(dns_cache) = dns_cache {
         let resolver = DnsCacheResolver::new(dns_cache);
         builder = builder.dns_resolver(Arc::new(resolver));
     }
-    builder = redirect_mode.apply(builder);
     builder.build().unwrap_or_else(|e| {
         tracing::error!(
             "Failed to build minimal DNS-cached fallback plugin client: {}. \
              Using reqwest::Client::new() as a last resort — DNS will bypass the gateway cache.",
             e
         );
-        redirect_mode
-            .apply(reqwest::Client::builder())
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new())
-    })
-}
-
-fn build_plugin_reqwest_client(
-    pool_config: &PoolConfig,
-    dns_cache: Option<DnsCache>,
-    tls_no_verify: bool,
-    tls_ca_bundle_path: Option<&str>,
-    redirect_mode: RedirectMode,
-) -> reqwest::Client {
-    let fallback_dns_cache = dns_cache.clone();
-    let mut builder = reqwest::Client::builder()
-        .pool_max_idle_per_host(pool_config.max_idle_per_host)
-        .pool_idle_timeout(Duration::from_secs(pool_config.idle_timeout_seconds))
-        .connect_timeout(Duration::from_secs(30))
-        .timeout(Duration::from_secs(60))
-        .danger_accept_invalid_certs(tls_no_verify);
-
-    if let Some(dns_cache) = dns_cache {
-        let resolver = DnsCacheResolver::new(dns_cache);
-        builder = builder.dns_resolver(Arc::new(resolver));
-    }
-
-    builder = redirect_mode.apply(builder);
-
-    // Load custom CA bundle for verifying internal/corporate CAs.
-    // Trust resolution:
-    //   - tls_no_verify=true                 → skip verification entirely
-    //                                          (handled above via
-    //                                          danger_accept_invalid_certs)
-    //   - Custom CA configured               → trust ONLY that CA
-    //                                          (CA exclusivity via
-    //                                          tls_certs_only — replaces the
-    //                                          trust store wholesale)
-    //   - No CA configured (this branch       → fall through to reqwest 0.13's
-    //     skipped)                              rustls feature default, which
-    //                                          uses rustls-platform-verifier:
-    //                                          OS keychain on macOS, Windows
-    //                                          cert store on Windows, bundled
-    //                                          webpki on Linux. The backend
-    //                                          proxy path in src/tls/backend.rs
-    //                                          uses bundled webpki on every
-    //                                          platform via use_preconfigured_tls;
-    //                                          this helper-client path differs.
-    if !tls_no_verify && let Some(ca_path) = tls_ca_bundle_path {
-        let source = CertSource::parse(ca_path, MaterialKind::CaBundle);
-        match load_material_blocking(&source, MaterialKind::CaBundle) {
-            Ok(ca_material) => {
-                match reqwest::Certificate::from_pem(ca_material.bytes.expose_secret()) {
-                    Ok(cert) => {
-                        // reqwest 0.13: `tls_certs_only` replaces the trust
-                        // store entirely (CA exclusivity).
-                        builder = builder.tls_certs_only([cert]);
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to parse CA bundle from {}: {}",
-                            ca_material.source_id,
-                            e
-                        );
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!("Failed to load CA bundle: {}", e);
-            }
-        }
-    }
-
-    if pool_config.enable_http_keep_alive {
-        builder = builder.tcp_keepalive(Duration::from_secs(pool_config.tcp_keepalive_seconds));
-    }
-
-    if pool_config.enable_http2 {
-        builder = builder
-            .http2_keep_alive_interval(Duration::from_secs(
-                pool_config.http2_keep_alive_interval_seconds,
-            ))
-            .http2_keep_alive_timeout(Duration::from_secs(
-                pool_config.http2_keep_alive_timeout_seconds,
-            ));
-    }
-
-    builder.build().unwrap_or_else(|e| {
-        tracing::error!(
-            "Failed to build plugin HTTP client: {}. \
-             Falling back to a minimal DNS-cached client (TLS/pool/keepalive settings will not apply).",
-            e
-        );
-        build_dns_cached_fallback_client(fallback_dns_cache, redirect_mode)
+        reqwest::Client::new()
     })
 }
 
@@ -288,6 +180,10 @@ impl PluginHttpClient {
     /// - Custom CA bundle from `FERRUM_TLS_CA_BUNDLE_PATH` (internal CAs)
     /// - `FERRUM_TLS_NO_VERIFY` support (skip TLS verification)
     /// - 30s connect timeout, 60s request timeout (generous for log sinks)
+    /// - Redirect following disabled via `reqwest::redirect::Policy::none()`:
+    ///   plugin egress reaches only the configured endpoint, never a
+    ///   server-chosen 3xx target (SSRF defense-in-depth — mirrors the backend
+    ///   proxy client in `connection_pool.rs`)
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         pool_config: &PoolConfig,
@@ -304,24 +200,97 @@ impl PluginHttpClient {
         pool_shard_amount: usize,
     ) -> Self {
         let dns_cache_clone = dns_cache.clone();
-        let client = build_plugin_reqwest_client(
-            pool_config,
-            Some(dns_cache.clone()),
-            tls_no_verify,
-            tls_ca_bundle_path,
-            RedirectMode::Follow,
-        );
-        let no_redirect_client = build_plugin_reqwest_client(
-            pool_config,
-            Some(dns_cache),
-            tls_no_verify,
-            tls_ca_bundle_path,
-            RedirectMode::None,
-        );
+        let resolver = DnsCacheResolver::new(dns_cache);
+
+        let mut builder = reqwest::Client::builder()
+            .pool_max_idle_per_host(pool_config.max_idle_per_host)
+            .pool_idle_timeout(Duration::from_secs(pool_config.idle_timeout_seconds))
+            .connect_timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(60))
+            // Never auto-follow redirects on plugin outbound calls. A
+            // compromised or spoofed upstream (e.g. an OIDC IdP whose JWKS or
+            // discovery endpoint passes the first-hop same-host check in
+            // jwks_auth's `validate_discovered_jwks_uri`) could otherwise
+            // return a 3xx pointing at an attacker-chosen host such as the
+            // cloud metadata endpoint (http://169.254.169.254/...), and reqwest
+            // would follow it. Host/issuer pinning only validates the first
+            // hop, and the `DnsCacheResolver` IP screen only rejects
+            // private/loopback/link-local targets under a restrictive
+            // `FERRUM_BACKEND_ALLOW_IPS` (not the default `Both`). Mirrors the
+            // backend proxy client in `connection_pool.rs`.
+            .redirect(reqwest::redirect::Policy::none())
+            .danger_accept_invalid_certs(tls_no_verify)
+            .dns_resolver(Arc::new(resolver));
+
+        // Load custom CA bundle for verifying internal/corporate CAs.
+        // Trust resolution:
+        //   - tls_no_verify=true                 → skip verification entirely
+        //                                          (handled above via
+        //                                          danger_accept_invalid_certs)
+        //   - Custom CA configured               → trust ONLY that CA
+        //                                          (CA exclusivity via
+        //                                          tls_certs_only — replaces the
+        //                                          trust store wholesale)
+        //   - No CA configured (this branch       → fall through to reqwest 0.13's
+        //     skipped)                              rustls feature default, which
+        //                                          uses rustls-platform-verifier:
+        //                                          OS keychain on macOS, Windows
+        //                                          cert store on Windows, bundled
+        //                                          webpki on Linux. The backend
+        //                                          proxy path in src/tls/backend.rs
+        //                                          uses bundled webpki on every
+        //                                          platform via use_preconfigured_tls;
+        //                                          this helper-client path differs.
+        if !tls_no_verify && let Some(ca_path) = tls_ca_bundle_path {
+            let source = CertSource::parse(ca_path, MaterialKind::CaBundle);
+            match load_material_blocking(&source, MaterialKind::CaBundle) {
+                Ok(ca_material) => {
+                    match reqwest::Certificate::from_pem(ca_material.bytes.expose_secret()) {
+                        Ok(cert) => {
+                            // reqwest 0.13: `tls_certs_only` replaces the trust
+                            // store entirely (CA exclusivity).
+                            builder = builder.tls_certs_only([cert]);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to parse CA bundle from {}: {}",
+                                ca_material.source_id,
+                                e
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to load CA bundle: {}", e);
+                }
+            }
+        }
+
+        if pool_config.enable_http_keep_alive {
+            builder = builder.tcp_keepalive(Duration::from_secs(pool_config.tcp_keepalive_seconds));
+        }
+
+        if pool_config.enable_http2 {
+            builder = builder
+                .http2_keep_alive_interval(Duration::from_secs(
+                    pool_config.http2_keep_alive_interval_seconds,
+                ))
+                .http2_keep_alive_timeout(Duration::from_secs(
+                    pool_config.http2_keep_alive_timeout_seconds,
+                ));
+        }
+
+        let client = builder.build().unwrap_or_else(|e| {
+            tracing::error!(
+                "Failed to build plugin HTTP client: {}. \
+                 Falling back to a minimal DNS-cached client (TLS/pool/keepalive settings will not apply).",
+                e
+            );
+            build_dns_cached_fallback_client(Some(dns_cache_clone.clone()))
+        });
 
         Self {
             client: Arc::new(client),
-            no_redirect_client: Arc::new(no_redirect_client),
             slow_threshold: Duration::from_millis(slow_threshold_ms),
             max_retries,
             retry_delay: Duration::from_millis(retry_delay_ms),
@@ -365,13 +334,46 @@ impl PluginHttpClient {
     /// Uses reqwest's default DNS resolution. Prefer `new()` in production
     /// to share the gateway's DNS cache across all plugins.
     pub fn from_pool_config(config: &PoolConfig) -> Self {
-        let client = build_plugin_reqwest_client(config, None, false, None, RedirectMode::Follow);
-        let no_redirect_client =
-            build_plugin_reqwest_client(config, None, false, None, RedirectMode::None);
+        let mut builder = reqwest::Client::builder()
+            .pool_max_idle_per_host(config.max_idle_per_host)
+            .pool_idle_timeout(Duration::from_secs(config.idle_timeout_seconds))
+            .connect_timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(60))
+            // Disable redirect following — see `new()` for the SSRF rationale.
+            // This cache-less constructor (tests / fallback, also backs
+            // `Default`) applies the same egress policy so plugin outbound
+            // calls cannot be bounced to a server-chosen host.
+            .redirect(reqwest::redirect::Policy::none());
+
+        if config.enable_http_keep_alive {
+            builder = builder.tcp_keepalive(Duration::from_secs(config.tcp_keepalive_seconds));
+        }
+
+        if config.enable_http2 {
+            builder = builder
+                .http2_keep_alive_interval(Duration::from_secs(
+                    config.http2_keep_alive_interval_seconds,
+                ))
+                .http2_keep_alive_timeout(Duration::from_secs(
+                    config.http2_keep_alive_timeout_seconds,
+                ));
+        }
+
+        let client = builder.build().unwrap_or_else(|e| {
+            tracing::error!(
+                "Failed to build plugin HTTP client: {}. \
+                 Falling back to a minimal client (no DNS cache available on this path).",
+                e
+            );
+            // No DNS cache to attach on this path — `from_pool_config` is
+            // explicitly the cache-less constructor (tests / fallback). Use
+            // the shared helper so the last-resort `Client::new()` path is
+            // logged uniformly across both `new()` and this code path.
+            build_dns_cached_fallback_client(None)
+        });
 
         Self {
             client: Arc::new(client),
-            no_redirect_client: Arc::new(no_redirect_client),
             slow_threshold: Duration::from_millis(1000),
             max_retries: 0,
             retry_delay: Duration::from_millis(100),
@@ -530,23 +532,7 @@ impl PluginHttpClient {
         label: &str,
     ) -> Result<reqwest::Response, reqwest::Error> {
         let request = request.build()?;
-        self.execute_request(&self.client, request, label, None, None)
-            .await
-    }
-
-    /// Send a pre-built request without following HTTP redirects.
-    ///
-    /// Use this for security-sensitive fetches where the validated first-hop
-    /// URL must remain the final URL, such as OIDC discovery and JWKS key
-    /// retrieval.
-    pub async fn execute_no_redirect(
-        &self,
-        request: reqwest::RequestBuilder,
-        label: &str,
-    ) -> Result<reqwest::Response, reqwest::Error> {
-        let request = request.build()?;
-        self.execute_request(&self.no_redirect_client, request, label, None, None)
-            .await
+        self.execute_request(request, label, None, None).await
     }
 
     /// Send a pre-built request while logging only a caller-supplied redacted
@@ -566,7 +552,7 @@ impl PluginHttpClient {
             let error_class = classify_reqwest_error(&e);
             format!("{error_class} building request to {redacted_url}")
         })?;
-        self.execute_request(&self.client, request, label, None, Some(redacted_url))
+        self.execute_request(request, label, None, Some(redacted_url))
             .await
             .map_err(|e| {
                 let error_class = classify_reqwest_error(&e);
@@ -588,13 +574,12 @@ impl PluginHttpClient {
         accumulator: &AtomicU64,
     ) -> Result<reqwest::Response, reqwest::Error> {
         let request = request.build()?;
-        self.execute_request(&self.client, request, label, Some(accumulator), None)
+        self.execute_request(request, label, Some(accumulator), None)
             .await
     }
 
     async fn execute_request(
         &self,
-        client: &reqwest::Client,
         request: reqwest::Request,
         label: &str,
         accumulator: Option<&AtomicU64>,
@@ -614,7 +599,7 @@ impl PluginHttpClient {
 
         loop {
             let attempt_start = std::time::Instant::now();
-            let result = client.execute(current_request).await;
+            let result = self.client.execute(current_request).await;
             let attempt_elapsed = attempt_start.elapsed();
             if let Some(accumulator) = accumulator {
                 accumulator.fetch_add(attempt_elapsed.as_nanos() as u64, Ordering::Relaxed);
@@ -800,12 +785,12 @@ mod fallback_tests {
     #[test]
     fn fallback_client_builds_with_dns_cache() {
         let dns_cache = DnsCache::new(DnsConfig::default());
-        let _client = build_dns_cached_fallback_client(Some(dns_cache), RedirectMode::Follow);
+        let _client = build_dns_cached_fallback_client(Some(dns_cache));
     }
 
     #[test]
     fn fallback_client_builds_without_dns_cache() {
-        let _client = build_dns_cached_fallback_client(None, RedirectMode::Follow);
+        let _client = build_dns_cached_fallback_client(None);
     }
 
     #[tokio::test]
@@ -813,8 +798,7 @@ mod fallback_tests {
         // Verify the fallback client routes DNS through the gateway cache.
         let dns_cache = DnsCache::new(DnsConfig::default());
         let initial_len = dns_cache.cache_len();
-        let client =
-            build_dns_cached_fallback_client(Some(dns_cache.clone()), RedirectMode::Follow);
+        let client = build_dns_cached_fallback_client(Some(dns_cache.clone()));
 
         let _ = client
             .get("http://localhost:1/")
@@ -831,5 +815,108 @@ mod fallback_tests {
             initial_len,
             after_len
         );
+    }
+}
+
+#[cfg(test)]
+mod redirect_tests {
+    //! SSRF defense-in-depth: the shared plugin HTTP client must NOT follow
+    //! 3xx redirects. A spoofed/compromised upstream (e.g. an OIDC IdP whose
+    //! JWKS endpoint passes jwks_auth's first-hop same-host check) could
+    //! otherwise redirect a plugin-initiated fetch to an attacker-chosen host
+    //! such as the cloud metadata endpoint. These tests stand up a local
+    //! listener that answers every request with a same-host 302 and assert the
+    //! client surfaces the 302 verbatim — exactly one request, never chased.
+    //!
+    //! Inline (like `fallback_tests`) because they exercise client
+    //! construction behavior — `new()` and `from_pool_config()` — directly.
+    use super::*;
+    use crate::dns::DnsConfig;
+    use std::sync::atomic::AtomicUsize;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// Spawn a listener that answers every request with a same-host 302
+    /// (`Location: http://<self>/chased`), counting how many requests it
+    /// served. If the client followed the redirect it would loop back here and
+    /// the counter would climb past 1 (and reqwest would ultimately error with
+    /// "too many redirects"); with `Policy::none()` the client stops at the
+    /// first 302.
+    async fn spawn_redirecting_server() -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_task = count.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                count_task.fetch_add(1, Ordering::SeqCst);
+                // Read the request line/headers so the client's write side
+                // drains; the contents are irrelevant to the assertion.
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let body = "redirected";
+                let response = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://{addr}/chased\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.flush().await;
+            }
+        });
+        (format!("http://{addr}/"), count)
+    }
+
+    async fn assert_redirect_not_followed(client: &PluginHttpClient) {
+        let (url, count) = spawn_redirecting_server().await;
+        let resp = client
+            .get()
+            .get(&url)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .expect("request should succeed and return the 302, not error");
+        assert_eq!(
+            resp.status().as_u16(),
+            302,
+            "client must surface the 3xx instead of following it; a followed \
+             redirect would loop and change the status"
+        );
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "exactly one request must reach the server; >1 means the redirect \
+             was chased"
+        );
+    }
+
+    #[tokio::test]
+    async fn from_pool_config_does_not_follow_redirects() {
+        // Exercises the cache-less constructor (also backs `Default`).
+        let client = PluginHttpClient::default();
+        assert_redirect_not_followed(&client).await;
+    }
+
+    #[tokio::test]
+    async fn new_does_not_follow_redirects() {
+        // Exercises the production constructor (DNS-cache path).
+        let client = PluginHttpClient::new(
+            &PoolConfig::default(),
+            DnsCache::new(DnsConfig::default()),
+            1000,
+            0,
+            100,
+            false,
+            None,
+            Arc::new(Vec::new()),
+            crate::config::types::DEFAULT_NAMESPACE,
+            BackendAllowIps::Both,
+            Arc::new(Vec::new()),
+            0,
+        );
+        assert_redirect_not_followed(&client).await;
     }
 }

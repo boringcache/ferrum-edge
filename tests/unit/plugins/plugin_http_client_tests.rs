@@ -64,7 +64,7 @@ async fn test_execute_returns_error_response() {
 }
 
 #[tokio::test]
-async fn test_execute_no_redirect_returns_redirect_response() {
+async fn test_execute_returns_redirect_response_without_following() {
     let redirect_server = MockServer::start().await;
     let target_server = MockServer::start().await;
 
@@ -86,10 +86,7 @@ async fn test_execute_no_redirect_returns_redirect_response() {
     let req = client
         .get()
         .get(format!("{}/redirect", redirect_server.uri()));
-    let resp = client
-        .execute_no_redirect(req, "test_plugin")
-        .await
-        .unwrap();
+    let resp = client.execute(req, "test_plugin").await.unwrap();
     assert_eq!(resp.status(), 302);
     assert_eq!(
         target_server

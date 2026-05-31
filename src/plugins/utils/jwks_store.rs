@@ -160,7 +160,7 @@ impl JwksKeyStore {
         let req = self.http_client.get().get(&self.jwks_uri);
         let response = self
             .http_client
-            .execute_no_redirect(req, "jwks_fetch")
+            .execute(req, "jwks_fetch")
             .await
             .map_err(|e| format!("JWKS fetch failed: {}", e))?;
 
