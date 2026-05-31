@@ -1976,6 +1976,41 @@ pub(crate) fn streaming_effective_timeout_ms_after_proxy_headers(
     streaming_effective_timeout_ms(&headers, proxy)
 }
 
+/// Timeout for the post-header upload guard used by HALF_OPEN streaming probes.
+///
+/// Unlike the end-to-end streaming RPC timeout, this guard only limits how long
+/// a circuit-breaker probe slot can remain deferred after backend response
+/// headers arrive while the client upload stays open. Cap client-supplied
+/// `grpc-timeout` by `backend_read_timeout_ms` when configured so a remote
+/// client cannot pin the single default HALF_OPEN probe slot for an
+/// attacker-selected deadline.
+pub(crate) fn streaming_post_header_upload_timeout_ms(
+    headers: &hyper::HeaderMap,
+    proxy: &Proxy,
+) -> Option<u64> {
+    match parse_grpc_timeout_ms(headers) {
+        Some(grpc_ms) if proxy.backend_read_timeout_ms > 0 => {
+            Some(grpc_ms.min(proxy.backend_read_timeout_ms))
+        }
+        Some(grpc_ms) => Some(grpc_ms),
+        None if proxy.backend_read_timeout_ms > 0 => Some(proxy.backend_read_timeout_ms),
+        None => None,
+    }
+}
+
+/// Build the same post-plugin header view that [`proxy_grpc_request_streaming`]
+/// uses, then derive the capped post-header upload guard timeout for HALF_OPEN
+/// streaming probes.
+pub(crate) fn streaming_post_header_upload_timeout_ms_after_proxy_headers(
+    request_headers: &hyper::HeaderMap,
+    proxy_headers: &HashMap<String, String>,
+    proxy: &Proxy,
+) -> Option<u64> {
+    let mut headers = request_headers.clone();
+    merge_proxy_headers_and_strip_for_grpc(&mut headers, proxy_headers);
+    streaming_post_header_upload_timeout_ms(&headers, proxy)
+}
+
 #[cfg(test)]
 mod tests {
     //! Inline tests for private internals of the gRPC proxy.
@@ -2097,19 +2132,42 @@ mod tests {
                 &proxy,
             ),
             Some(3_000),
-            "the streaming guard must use the same post-plugin grpc-timeout as dispatch and must not cap it by backend_read_timeout_ms"
+            "the streaming RPC timeout uses the same post-plugin grpc-timeout as dispatch and must not cap it by backend_read_timeout_ms"
         );
     }
 
     #[test]
-    fn streaming_effective_timeout_falls_back_to_backend_read_timeout() {
+    fn streaming_post_header_upload_timeout_caps_post_plugin_grpc_timeout() {
+        let mut proxy = grpc_pool_test_proxy();
+        proxy.backend_read_timeout_ms = 250;
+        let mut request_headers = hyper::HeaderMap::new();
+        request_headers.insert(
+            "grpc-timeout",
+            hyper::header::HeaderValue::from_static("10S"),
+        );
+        let mut proxy_headers = HashMap::new();
+        proxy_headers.insert("grpc-timeout".to_string(), "3S".to_string());
+
+        assert_eq!(
+            streaming_post_header_upload_timeout_ms_after_proxy_headers(
+                &request_headers,
+                &proxy_headers,
+                &proxy,
+            ),
+            Some(250),
+            "the HALF_OPEN probe upload guard must cap client-controlled grpc-timeout by backend_read_timeout_ms"
+        );
+    }
+
+    #[test]
+    fn streaming_post_header_upload_timeout_falls_back_to_backend_read_timeout() {
         let mut proxy = grpc_pool_test_proxy();
         proxy.backend_read_timeout_ms = 750;
         let request_headers = hyper::HeaderMap::new();
         let proxy_headers = HashMap::new();
 
         assert_eq!(
-            streaming_effective_timeout_ms_after_proxy_headers(
+            streaming_post_header_upload_timeout_ms_after_proxy_headers(
                 &request_headers,
                 &proxy_headers,
                 &proxy,

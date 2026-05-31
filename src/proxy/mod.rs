@@ -10193,13 +10193,15 @@ async fn handle_proxy_request_inner(
                                 cb_config,
                             );
                             let post_header_upload_deadline =
-                                grpc_proxy::streaming_effective_timeout_ms_after_proxy_headers(
+                                grpc_proxy::streaming_post_header_upload_timeout_ms_after_proxy_headers(
                                     request.headers(),
                                     proxy_headers,
                                     proxy.as_ref(),
                                 )
-                                .and_then(|timeout_ms| {
-                                    Instant::now().checked_add(Duration::from_millis(timeout_ms))
+                                .map(|timeout_ms| {
+                                    Instant::now()
+                                        .checked_add(Duration::from_millis(timeout_ms))
+                                        .unwrap_or_else(Instant::now)
                                 });
                             let recorder = Arc::new(GrpcStreamingProbeRecorder::new(
                                 cb,
