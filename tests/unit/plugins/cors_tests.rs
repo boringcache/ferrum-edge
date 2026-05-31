@@ -816,7 +816,7 @@ async fn test_wildcard_subdomain_rejects_non_http_scheme() {
         }
         _ => panic!("Expected 403 Reject — non-http scheme must not match wildcard subdomain"),
     }
-    assert!(ctx.metadata.get("cors_origin").is_none());
+    assert!(!ctx.metadata.contains_key("cors_origin"));
 }
 
 // No-regression guard for finding #51: `http://` (not just `https://`) must
