@@ -11262,6 +11262,11 @@ components:
                 properties:
                   paths:
                     type: array
+                    description: >-
+                      Exact paths by default. A trailing `*` means prefix match,
+                      and a leading `~` means a start-anchored regex (implicit
+                      leading `^`). Use `~.*pattern` for a floating substring
+                      match.
                     items:
                       type: string
                   methods:
@@ -11511,7 +11516,10 @@ components:
           properties:
             paths:
               type: array
-              description: Exact paths by default; trailing * means prefix match and leading ~ means regex.
+              description: >-
+                Exact paths by default. A trailing `*` means prefix match, and a
+                leading `~` means a start-anchored regex (implicit leading `^`).
+                Use `~.*pattern` for a floating substring match.
               items:
                 type: string
             methods:

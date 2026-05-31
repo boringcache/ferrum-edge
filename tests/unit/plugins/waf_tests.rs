@@ -323,6 +323,60 @@ async fn request_body_scan_uses_context_aware_final_body_hook() {
 }
 
 #[tokio::test]
+async fn body_encoding_specials_trigger_buffering_without_body_rules() {
+    let plugin = Waf::new(&json!({
+        "include_default_rules": false,
+        "response_inspection": true,
+        "response_body_inspection": true,
+        "custom_rules": [{
+            "id": "FE-ENCODING-001",
+            "name": "Double URL encoding",
+            "category": "encoding_evasion",
+            "severity": "medium",
+            "target": "full_url",
+            "match_kind": "contains",
+            "pattern": "%25",
+            "action": "enforce"
+        }]
+    }))
+    .unwrap();
+
+    let mut req_ctx = ctx("POST", "/submit");
+    req_ctx
+        .headers
+        .insert("content-type".into(), "text/plain".into());
+    assert!(plugin.requires_request_body_buffering());
+    assert!(plugin.should_buffer_request_body(&req_ctx));
+    let headers = req_ctx.headers.clone();
+    let result = plugin
+        .on_final_request_body_with_context(&mut req_ctx, &headers, b"file=%252e%252e%252fetc")
+        .await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert_eq!(
+        req_ctx.metadata.get("waf.rule_hits").map(String::as_str),
+        Some("FE-ENCODING-001")
+    );
+
+    let mut resp_ctx = ctx("GET", "/download");
+    let response_headers = HashMap::from([("content-type".to_string(), "text/plain".to_string())]);
+    assert!(plugin.requires_response_body_buffering());
+    assert!(plugin.should_buffer_response_body(&resp_ctx));
+    let result = plugin
+        .on_final_response_body(
+            &mut resp_ctx,
+            200,
+            &response_headers,
+            b"file=%252e%252e%252fetc",
+        )
+        .await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert_eq!(
+        resp_ctx.metadata.get("waf.rule_hits").map(String::as_str),
+        Some("FE-ENCODING-001")
+    );
+}
+
+#[tokio::test]
 async fn highest_severity_is_preserved_across_scan_phases() {
     let plugin = Waf::new(&json!({
         "mode": "monitor",
@@ -584,9 +638,20 @@ async fn body_overlong_utf8_marker_is_flagged_as_encoding_evasion() {
     // null-byte markers were only checked on the URL/path, never on bodies.
     // An overlong-UTF8-encoded body payload is lossy-decoded to U+FFFD rather
     // than the dangerous char and previously raised no signal. The body
-    // encoding-evasion check now flags it via FE-ENCODING-001.
+    // encoding-evasion check now flags it via the dedicated FE-ENCODING-002
+    // overlong marker rule, so rule_modes and overrides for that rule apply.
     let plugin = Waf::new(&json!({
-        "rule_modes": { "FE-ENCODING-001": "enforce" }
+        "include_default_rules": false,
+        "custom_rules": [{
+            "id": "FE-ENCODING-002",
+            "name": "Overlong UTF-8 marker",
+            "category": "encoding_evasion",
+            "severity": "medium",
+            "target": "full_url",
+            "match_kind": "contains",
+            "pattern": "%c0",
+            "action": "enforce"
+        }]
     }))
     .unwrap();
     let mut ctx = ctx("POST", "/submit");
@@ -605,7 +670,7 @@ async fn body_overlong_utf8_marker_is_flagged_as_encoding_evasion() {
     assert!(
         ctx.metadata
             .get("waf.rule_hits")
-            .is_some_and(|hits| hits.contains("FE-ENCODING-001")),
+            .is_some_and(|hits| hits.contains("FE-ENCODING-002")),
         "overlong-UTF8 marker in a body must raise the encoding-evasion signal"
     );
 }

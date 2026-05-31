@@ -92,18 +92,19 @@ decompression-style blowups), so double- and triple-stacked encodings are fully
 reduced but a payload stacked deeper than the cap is not. Rather than silently
 forwarding such a body, the WAF raises the `encoding_evasion` signal
 (`FE-ENCODING-001`) for it — the same rule that flags URL double-encoding. The
-overlong-UTF8, double-encoding, and null-byte markers (`FE-ENCODING-001/002`)
-are likewise checked against request and response **bodies**, not just the
-URL/path, so an overlong-encoded body payload that lossy percent-decoding cannot
-recover to its literal character is still flagged as an evasion attempt.
+overlong-UTF8 (`FE-ENCODING-002`), double-encoding, and null-byte
+(`FE-ENCODING-001`) markers are likewise checked against request and response
+**bodies**, not just the URL/path, so an overlong-encoded body payload that
+lossy percent-decoding cannot recover to its literal character is still flagged
+as an evasion attempt.
 
 Note that body marker detection is a heuristic: a benign body that legitimately
 contains a literal encoded marker (e.g. `code=SAVE50%25`, a `%00` in free text,
-or `%c0%ae` in a paste) can raise `FE-ENCODING-001`. This is why
-`FE-ENCODING-001/002` default to **Monitor** (they record `waf.rule_hits`
-metadata rather than blocking) even when the WAF is in `enforce` mode — operators
-opt a rule into blocking explicitly via `rule_modes` once they have confirmed it
-is clean for their traffic.
+or `%c0%ae` in a paste) can raise `FE-ENCODING-001` or `FE-ENCODING-002`.
+This is why both rules default to **Monitor** (they record `waf.rule_hits`
+metadata rather than blocking) even when the WAF is in `enforce` mode —
+operators opt a rule into blocking explicitly via `rule_modes` once they have
+confirmed it is clean for their traffic.
 
 ## Rule targets
 

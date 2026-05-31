@@ -527,9 +527,12 @@ impl Waf {
 
     fn scan_encoding_specials(&self, outcome: &mut ScanOutcome, value: &str, ctx: &RequestContext) {
         if let Some(rule_index) = self.specials.encoding
-            && (decode::has_double_encoded_marker(value)
-                || decode::has_percent_null_byte(value)
-                || decode::has_overlong_utf8_marker(value))
+            && (decode::has_double_encoded_marker(value) || decode::has_percent_null_byte(value))
+        {
+            self.push_special(outcome, rule_index, value, ctx);
+        }
+        if let Some(rule_index) = self.specials.overlong_utf8
+            && decode::has_overlong_utf8_marker(value)
         {
             self.push_special(outcome, rule_index, value, ctx);
         }
@@ -541,10 +544,11 @@ impl Waf {
     /// `percent_decode_plus` cannot losslessly recover (it collapses invalid
     /// UTF-8 to U+FFFD), and encodings stacked deeper than the layered-decode
     /// round cap so the decoded payload never reaches the body regex set. Flag
-    /// both against the raw body text so they are surfaced the same way URL
-    /// double-encoding is, rather than silently forwarded. Reuses the existing
-    /// FE-ENCODING-001 rule index, so this adds no rule/schema and is deduped
-    /// against any URL-side hit by `ScanOutcome::push`.
+    /// both against the raw body text so they are surfaced through the same
+    /// rules as URL-side checks rather than silently forwarded. Double-encoding,
+    /// percent-null, and beyond-cap residuals use FE-ENCODING-001; overlong
+    /// UTF-8 uses FE-ENCODING-002 so per-rule modes and overrides remain
+    /// effective.
     ///
     /// `residual_encoding` is the beyond-cap signal reported by
     /// `decoded_variants_with_residual`, threaded in so the layered decode runs
@@ -556,17 +560,22 @@ impl Waf {
         residual_encoding: bool,
         ctx: &RequestContext,
     ) {
-        let Some(rule_index) = self.specials.encoding else {
-            return;
-        };
+        let percent_markers_present = text.as_bytes().contains(&b'%');
+        if let Some(rule_index) = self.specials.encoding {
+            let flagged = residual_encoding
+                || (percent_markers_present
+                    && (decode::has_double_encoded_marker(text)
+                        || decode::has_percent_null_byte(text)));
+            if flagged {
+                self.push_special(outcome, rule_index, text, ctx);
+            }
+        }
         // The marker helpers all look for `%`-prefixed sequences, so skip their
         // (up to MiB-sized) byte scans entirely when the body contains no `%`.
-        let flagged = residual_encoding
-            || (text.as_bytes().contains(&b'%')
-                && (decode::has_double_encoded_marker(text)
-                    || decode::has_percent_null_byte(text)
-                    || decode::has_overlong_utf8_marker(text)));
-        if flagged {
+        if percent_markers_present
+            && let Some(rule_index) = self.specials.overlong_utf8
+            && decode::has_overlong_utf8_marker(text)
+        {
             self.push_special(outcome, rule_index, text, ctx);
         }
     }
