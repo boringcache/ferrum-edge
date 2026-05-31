@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::plugins::RequestContext;
 
-use super::rules::IpCidr;
+use super::rules::{IpCidr, anchor_condition_path_regex};
 
 #[derive(Debug, Default)]
 pub struct CompiledExemptions {
@@ -118,7 +118,16 @@ impl CompiledExemptions {
 
 fn exemption_path_pattern(raw: String) -> String {
     if let Some(regex) = raw.strip_prefix('~') {
-        regex.to_string()
+        // Start-anchor `~regex` exemptions so they match from the beginning of
+        // the path, matching the `prefix*` branch's semantics. The compiled set
+        // is evaluated with `is_match`, which is unanchored (substring) by
+        // default, so an un-anchored entry like `~api` would otherwise exempt
+        // ANY path merely containing `api` (e.g. `/v1/api-keys`,
+        // `/secret/api/admin`) — short-circuiting the entire WAF on those
+        // routes via the early return in `request_short_circuits`. Operators
+        // who genuinely want a substring/floating match can still write
+        // `~.*pattern`; an explicit leading `^` is preserved as-is.
+        anchor_condition_path_regex(regex).into_owned()
     } else if let Some(prefix) = raw.strip_suffix('*') {
         format!("^{}", regex::escape(prefix))
     } else {
@@ -211,5 +220,47 @@ mod tests {
 
         let dashed = RequestContext::new("127.0.0.1".into(), "GET".into(), "/health-admin".into());
         assert!(!exemptions.request_short_circuits(&dashed));
+    }
+
+    #[test]
+    fn regex_exemption_is_start_anchored_and_does_not_overmatch() {
+        // A short `~regex` exemption must anchor at the start of the path. A
+        // bare `~api` previously matched UNANCHORED, so it exempted (and thus
+        // silently disabled the WAF on) any path merely containing "api" —
+        // e.g. `/v1/api-keys`. After anchoring it only exempts paths that
+        // BEGIN with "api".
+        let config = serde_json::json!({"paths":["~api"]});
+        let exemptions = CompiledExemptions::from_config(Some(&config)).unwrap();
+
+        // Path beginning with the pattern is still exempt.
+        let starts = RequestContext::new("127.0.0.1".into(), "GET".into(), "api/v1".into());
+        assert!(exemptions.request_short_circuits(&starts));
+
+        // Paths that merely CONTAIN the pattern must NOT be exempt — otherwise
+        // a one-word regex disables the WAF on sensitive routes.
+        let contains_mid =
+            RequestContext::new("127.0.0.1".into(), "GET".into(), "/v1/api-keys".into());
+        assert!(!exemptions.request_short_circuits(&contains_mid));
+        let contains_deep =
+            RequestContext::new("127.0.0.1".into(), "GET".into(), "/secret/api/admin".into());
+        assert!(!exemptions.request_short_circuits(&contains_deep));
+    }
+
+    #[test]
+    fn regex_exemption_preserves_explicit_leading_anchor() {
+        // An operator who already anchored their pattern gets it verbatim (no
+        // double `^^`), and a floating match is still expressible via `~.*`.
+        let anchored = serde_json::json!({"paths":["~^/internal/"]});
+        let exemptions = CompiledExemptions::from_config(Some(&anchored)).unwrap();
+        let internal =
+            RequestContext::new("127.0.0.1".into(), "GET".into(), "/internal/metrics".into());
+        assert!(exemptions.request_short_circuits(&internal));
+        let other = RequestContext::new("127.0.0.1".into(), "GET".into(), "/public".into());
+        assert!(!exemptions.request_short_circuits(&other));
+
+        let floating = serde_json::json!({"paths":["~.*/admin"]});
+        let exemptions = CompiledExemptions::from_config(Some(&floating)).unwrap();
+        let nested = RequestContext::new("127.0.0.1".into(), "GET".into(), "/team/admin".into());
+        assert!(exemptions.request_short_circuits(&nested));
     }
 }

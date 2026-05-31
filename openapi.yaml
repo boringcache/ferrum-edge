@@ -11489,6 +11489,13 @@ components:
       properties:
         paths:
           type: array
+          description: >-
+            Paths that short-circuit the entire WAF. Each entry matches from the
+            start of the path: a plain string is an exact full-path match,
+            `prefix*` is a prefix match, and `~regex` is a start-anchored regex
+            (implicit leading `^`). Use `~.*pattern` for a floating substring
+            match. Keep entries tight — an over-broad pattern silently disables
+            the WAF on unintended routes.
           items:
             type: string
         methods:

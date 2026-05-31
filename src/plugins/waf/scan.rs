@@ -207,8 +207,16 @@ impl Waf {
         // Re-scan decoded forms so payloads hidden behind JSON `\uXXXX`,
         // HTML entities, or percent-encoding cannot evade the raw-byte set.
         // Lossy UTF-8 keeps one hostile byte from disabling text decoding for
-        // the rest of an otherwise inspectable body.
-        for variant in normalize::decoded_variants(text.as_ref()) {
+        // the rest of an otherwise inspectable body. The same pass reports
+        // whether an encoding stacked deeper than the decode cap remains.
+        let (variants, residual_encoding) =
+            normalize::decoded_variants_with_residual(text.as_ref());
+        // Flag overlong-UTF8 / double-encoding / null-byte markers and the
+        // beyond-cap residual in the body, mirroring the URL-side FE-ENCODING
+        // check (markers `percent_decode_plus` cannot recover, and stacks the
+        // layered decode cannot fully peel, are otherwise silent).
+        self.scan_body_encoding_specials(&mut outcome, text.as_ref(), residual_encoding, ctx);
+        for variant in variants {
             self.scan_json_path_rules(&mut outcome, variant.as_bytes(), ctx);
             self.scan_bytes_set(
                 &mut outcome,
@@ -276,7 +284,10 @@ impl Waf {
             ctx,
         );
         let text = String::from_utf8_lossy(body);
-        for variant in normalize::decoded_variants(text.as_ref()) {
+        let (variants, residual_encoding) =
+            normalize::decoded_variants_with_residual(text.as_ref());
+        self.scan_body_encoding_specials(&mut outcome, text.as_ref(), residual_encoding, ctx);
+        for variant in variants {
             self.scan_bytes_set(
                 &mut outcome,
                 self.compiled.response_body_bytes.as_ref(),
@@ -521,6 +532,42 @@ impl Waf {
                 || decode::has_overlong_utf8_marker(value))
         {
             self.push_special(outcome, rule_index, value, ctx);
+        }
+    }
+
+    /// Body-scoped counterpart to `scan_encoding_specials`. The FE-ENCODING
+    /// special only inspects the URL/path, but the same evasions appear in
+    /// bodies: overlong-UTF8 / double-encoding / null-byte markers that
+    /// `percent_decode_plus` cannot losslessly recover (it collapses invalid
+    /// UTF-8 to U+FFFD), and encodings stacked deeper than the layered-decode
+    /// round cap so the decoded payload never reaches the body regex set. Flag
+    /// both against the raw body text so they are surfaced the same way URL
+    /// double-encoding is, rather than silently forwarded. Reuses the existing
+    /// FE-ENCODING-001 rule index, so this adds no rule/schema and is deduped
+    /// against any URL-side hit by `ScanOutcome::push`.
+    ///
+    /// `residual_encoding` is the beyond-cap signal reported by
+    /// `decoded_variants_with_residual`, threaded in so the layered decode runs
+    /// once for both the variant set and this check.
+    fn scan_body_encoding_specials(
+        &self,
+        outcome: &mut ScanOutcome,
+        text: &str,
+        residual_encoding: bool,
+        ctx: &RequestContext,
+    ) {
+        let Some(rule_index) = self.specials.encoding else {
+            return;
+        };
+        // The marker helpers all look for `%`-prefixed sequences, so skip their
+        // (up to MiB-sized) byte scans entirely when the body contains no `%`.
+        let flagged = residual_encoding
+            || (text.as_bytes().contains(&b'%')
+                && (decode::has_double_encoded_marker(text)
+                    || decode::has_percent_null_byte(text)
+                    || decode::has_overlong_utf8_marker(text)));
+        if flagged {
+            self.push_special(outcome, rule_index, text, ctx);
         }
     }
 
@@ -776,8 +823,20 @@ fn append_materialized_query(
     full_url: &mut String,
     query_params: &std::collections::HashMap<String, String>,
 ) {
+    // `query_params` is a `HashMap` with `RandomState`, so its iteration order
+    // is non-deterministic across processes. Sort by (key, value) before
+    // appending so `full_url`-target rules whose patterns depend on parameter
+    // ordering/adjacency produce stable enforce/monitor verdicts regardless of
+    // map layout. This is the synthetic-context fallback (raw query absent but
+    // parsed params present); the live proxy path uses the verbatim raw query
+    // and never reaches here, so the sort's allocation is off the common hot
+    // path. HTTP Parameter Pollution is intentionally not detected here: the
+    // collapsed map cannot represent duplicate keys, so there is nothing to
+    // compare — the raw-query branch owns HPP detection.
+    let mut pairs: Vec<(&String, &String)> = query_params.iter().collect();
+    pairs.sort_unstable();
     let mut first = true;
-    for (key, value) in query_params {
+    for (key, value) in pairs {
         if first {
             full_url.push('?');
             first = false;
@@ -816,7 +875,36 @@ mod tests {
         let mut long_run = "1".repeat(MAX_LUHN_DIGIT_RUN_SCAN + 128);
         long_run.push_str("4111111111111111");
 
+        // Accepted, documented limitation (see docs/waf.md "Detection limits"):
+        // a card embedded after a >MAX_LUHN_DIGIT_RUN_SCAN contiguous-digit
+        // prefix is not detected, bounding Luhn work on attacker-supplied
+        // page-long digit runs.
         assert!(!contains_luhn_candidate(&long_run));
         assert!(contains_luhn_candidate("x4111111111111111"));
+    }
+
+    #[test]
+    fn materialized_query_is_deterministic_regardless_of_map_order() {
+        // `append_materialized_query` must sort by (key, value) so the
+        // synthetic-context `full_url` is stable across HashMap layouts —
+        // otherwise `full_url`-target rules that depend on parameter adjacency
+        // produce non-deterministic enforce/monitor verdicts.
+        let mut params = HashMap::new();
+        params.insert("b".to_string(), "2".to_string());
+        params.insert("a".to_string(), "1".to_string());
+        params.insert("c".to_string(), "3".to_string());
+
+        let mut full_url = String::from("/path");
+        append_materialized_query(&mut full_url, &params);
+        assert_eq!(full_url, "/path?a=1&b=2&c=3");
+
+        // Duplicate insertion order / rebuild must not change the result.
+        let mut other = HashMap::new();
+        other.insert("c".to_string(), "3".to_string());
+        other.insert("a".to_string(), "1".to_string());
+        other.insert("b".to_string(), "2".to_string());
+        let mut full_url2 = String::from("/path");
+        append_materialized_query(&mut full_url2, &other);
+        assert_eq!(full_url, full_url2);
     }
 }
