@@ -8909,7 +8909,12 @@ components:
                 description: Direct URL to the IdP's JWKS endpoint
               discovery_url:
                 type: string
-                description: OIDC discovery URL (auto-discovers jwks_uri)
+                description: >-
+                  OIDC discovery URL (auto-discovers jwks_uri). The discovered
+                  jwks_uri must use the same origin as the discovery URL
+                  (scheme, host, and effective port). For IdPs that serve JWKS
+                  from a different origin than discovery, configure jwks_uri
+                  directly instead.
               jwks:
                 oneOf:
                   - type: string
