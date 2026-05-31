@@ -1452,16 +1452,14 @@ fn multipart_part_to_schema_value(part: &MultipartPart, schema: &Value) -> Resul
             "size".to_string(),
             Value::Number(serde_json::Number::from(part.body.len() as u64)),
         );
-        // Only copy the part body into a JSON string when the schema can
-        // actually validate a `content` field. When it cannot (no `content`
-        // property and `additionalProperties` is absent/true), the copy is pure
-        // waste on a buffered request path, so skip it (finding #88). This is
-        // outcome-preserving: the cases where `content` affects validity --
-        // a declared `content` property, a constraining `additionalProperties`
-        // schema, or `additionalProperties: false` -- still materialize it.
-        if object_schema_validates_content(schema)
-            && let Ok(text) = std::str::from_utf8(&part.body)
-        {
+        // Materialize the part body as a `content` string so the schema can
+        // validate it. (A finding-#88 micro-optimization that skipped this copy
+        // when the schema "couldn't validate content" was reverted: it was NOT
+        // outcome-preserving — for `maxProperties` / `minProperties` /
+        // `propertyNames` / `patternProperties` / `dependentRequired` / `not` /
+        // `oneOf`-`anyOf` part schemas the mere presence of `content` changes
+        // validity. The body is already bounded, so the copy is cheap.)
+        if let Ok(text) = std::str::from_utf8(&part.body) {
             out.insert("content".to_string(), Value::String(text.to_string()));
         }
         return Ok(Value::Object(out));
@@ -1802,42 +1800,6 @@ fn schema_has_required(schema: &Value) -> bool {
         .get("required")
         .and_then(Value::as_array)
         .is_some_and(|values| values.iter().any(Value::is_string))
-}
-
-/// Whether a multipart-part object schema can validate the synthetic `content`
-/// field, so `multipart_part_to_schema_value` knows whether copying the part
-/// body into a JSON string is worthwhile (finding #88). True when `content` is a
-/// declared property, listed in `required`, when `additionalProperties` is a
-/// constraining schema, or when `additionalProperties: false` would reject an
-/// unexpected `content` field; false when `content` is unconstrained (no
-/// property, not required, and `additionalProperties` absent or `true`). The
-/// extra checks keep the optimization outcome-preserving: every case where the
-/// presence or shape of `content` could change validation still materializes it.
-fn object_schema_validates_content(schema: &Value) -> bool {
-    if schema
-        .get("properties")
-        .and_then(Value::as_object)
-        .is_some_and(|properties| properties.contains_key("content"))
-    {
-        return true;
-    }
-    // `required: ["content"]` checks presence even without a declared property.
-    if schema
-        .get("required")
-        .and_then(Value::as_array)
-        .is_some_and(|values| values.iter().any(|value| value.as_str() == Some("content")))
-    {
-        return true;
-    }
-    match schema.get("additionalProperties") {
-        // A schema object constrains every undeclared field, including content.
-        Some(Value::Object(_)) => true,
-        // `false` rejects undeclared fields; keep emitting content so the
-        // existing reject outcome is preserved.
-        Some(Value::Bool(false)) => true,
-        // Absent or `true`: content is allowed but unvalidated -- skip the copy.
-        _ => false,
-    }
 }
 
 fn xml_name<'a>(schema: &'a Value, default: Option<&'a str>) -> Option<&'a str> {
