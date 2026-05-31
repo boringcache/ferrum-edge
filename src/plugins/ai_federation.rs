@@ -1384,9 +1384,16 @@ fn build_provider_url(provider: &ResolvedProvider, model: &str) -> String {
 /// body to arbitrary downstream callers. See finding #52.
 const MAX_UPSTREAM_ERROR_BYTES: usize = 512;
 
-fn cap_upstream_error_body(mut body: Vec<u8>) -> Vec<u8> {
-    body.truncate(MAX_UPSTREAM_ERROR_BYTES);
-    body
+fn cap_upstream_error_body(body: Vec<u8>) -> Vec<u8> {
+    let error_text = String::from_utf8_lossy(&body[..body.len().min(MAX_UPSTREAM_ERROR_BYTES)]);
+    serde_json::json!({
+        "error": {
+            "message": format!("Upstream provider error: {error_text}"),
+            "type": "upstream_error",
+        }
+    })
+    .to_string()
+    .into_bytes()
 }
 
 /// Normalize a provider response to OpenAI Chat Completions format.

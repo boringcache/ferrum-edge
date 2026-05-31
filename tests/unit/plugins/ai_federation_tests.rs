@@ -1118,8 +1118,10 @@ fn test_normalize_error_body_is_capped() {
 fn test_fallback_error_body_is_capped_before_return() {
     let body = vec![b'X'; test_helpers::MAX_UPSTREAM_ERROR_BYTES * 4];
     let capped = test_helpers::cap_upstream_error_body(body);
-    assert_eq!(capped.len(), test_helpers::MAX_UPSTREAM_ERROR_BYTES);
-    assert!(capped.iter().all(|byte| *byte == b'X'));
+    let json: serde_json::Value = serde_json::from_slice(&capped).unwrap();
+    let message = json["error"]["message"].as_str().unwrap();
+    assert!(message.contains("XXX"));
+    assert!(message.len() <= test_helpers::MAX_UPSTREAM_ERROR_BYTES + 64);
 }
 
 #[test]
