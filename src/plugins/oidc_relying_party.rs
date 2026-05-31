@@ -426,6 +426,19 @@ impl OidcRelyingParty {
             provider_obj,
             token_endpoint.as_deref().or(discovery_url.as_deref()),
         )?;
+        // Validate like the other endpoint fields (a parseable http(s) URL with
+        // a host) so a malformed or non-http(s) value is rejected at config load
+        // instead of being forwarded to the IdP and browser at logout. Uses the
+        // lenient validate_url_string (not validate_redirect_uri) so localhost/dev
+        // setups are not over-constrained. Do this before spawning discovery so
+        // rejected plugin configs have no background side effects.
+        let post_logout_redirect_uri = optional_string(
+            provider_obj,
+            "post_logout_redirect_uri",
+            "provider[0]",
+        )?
+        .map(|url| validate_url_string(&url, "provider[0].post_logout_redirect_uri"))
+        .transpose()?;
         let jwks_store = Arc::new(ArcSwap::from_pointee(jwks_uri.as_ref().map(|uri| {
             get_or_create_jwks_store(uri, &http_client, DEFAULT_JWKS_REFRESH_INTERVAL)
         })));
@@ -449,18 +462,7 @@ impl OidcRelyingParty {
             redirect_uri,
             callback_path,
             logout_path,
-            // Validate like the other endpoint fields (a parseable http(s) URL with
-            // a host) so a malformed or non-http(s) value is rejected at config load
-            // instead of being forwarded to the IdP and browser at logout. Uses the
-            // lenient validate_url_string (not validate_redirect_uri) so localhost/dev
-            // setups are not over-constrained.
-            post_logout_redirect_uri: optional_string(
-                provider_obj,
-                "post_logout_redirect_uri",
-                "provider[0]",
-            )?
-            .map(|url| validate_url_string(&url, "provider[0].post_logout_redirect_uri"))
-            .transpose()?,
+            post_logout_redirect_uri,
             consumer_identity_claim: optional_string(
                 provider_obj,
                 "consumer_identity_claim",
@@ -560,9 +562,7 @@ impl OidcRelyingParty {
             + token
                 .expires_in
                 .unwrap_or(self.session.ttl.as_secs() as i64);
-        let claims_expires_at = claim_expiry(&merged_claims)
-            .map(|exp| exp.min(expires_at))
-            .unwrap_or(expires_at);
+        let claims_expires_at = claim_expiry(&merged_claims).unwrap_or(expires_at);
         let payload = SessionPayload {
             version: 1,
             sub: extract_claim_string(&merged_claims, "sub").unwrap_or_default(),
@@ -572,7 +572,7 @@ impl OidcRelyingParty {
             expires_at_unix: expires_at,
             claims_expires_at_unix: claims_expires_at,
             refresh_after_unix: next_refresh_after(
-                expires_at,
+                expires_at.min(claims_expires_at),
                 now,
                 self.behavior.refresh_skew.as_secs() as i64,
             ),
@@ -796,30 +796,32 @@ impl OidcRelyingParty {
         }
 
         let leeway = self.provider.id_token_clock_skew.as_secs() as i64;
-        let claims_expires_at = if payload.claims_expires_at_unix > 0 {
-            payload.claims_expires_at_unix
-        } else {
-            payload.expires_at_unix
-        };
+        let claims_expires_at = effective_claims_expires_at(&payload);
+        let backfilled_claims_expiry = payload.claims_expires_at_unix <= 0;
+        if backfilled_claims_expiry {
+            payload.claims_expires_at_unix = claims_expires_at;
+        }
         let claims_expired_before_refresh = now > claims_expires_at.saturating_add(leeway);
+        if claims_expired_before_refresh && payload.refresh_token_b64.is_some() {
+            payload.refresh_after_unix = now;
+        }
 
         // Keep the session live: refresh tokens when due (which also re-derives
         // claims from any new ID token), then slide the idle window. Any change
         // is re-sealed and emitted as a `Set-Cookie` by `after_proxy`.
         let refresh = self.maybe_refresh_session(&mut payload, now).await;
 
-        // Token-freshness gate: the ID token was validly verified at login, but its
-        // claims must not be served as live authorization past the access/ID-token
-        // expiry. If the effective token is still expired (beyond a small clock-skew
-        // leeway) and a refresh did not just succeed — no refresh token, refresh
-        // deferred/failed, or not yet due — fail closed and force re-auth rather than
-        // emitting stale claim headers and scope/role decisions. Sessions still within
-        // token expiry keep their validly-verified-at-login behavior.
-        if claims_expired_before_refresh && !refresh.refreshed {
+        // Token-freshness gate: the ID token was validly verified at login, but
+        // its claims must not be served as live authorization past their
+        // effective expiry. If they are still expired after any forced/due
+        // refresh attempt, fail closed and force re-auth rather than emitting
+        // stale claim headers and scope/role decisions.
+        let claims_expires_at = effective_claims_expires_at(&payload);
+        if now > claims_expires_at.saturating_add(leeway) {
             return self.challenge(ctx, true);
         }
 
-        let mut mutated = refresh.mutated;
+        let mut mutated = refresh.mutated || refresh.refreshed || backfilled_claims_expiry;
         mutated |= self.maybe_slide_session(&mut payload, now);
         if mutated {
             match self.seal_session_cookie(&payload) {
@@ -946,6 +948,8 @@ impl OidcRelyingParty {
         if !token.token_type.eq_ignore_ascii_case("bearer") {
             return Err(r#"{"error":"Invalid refresh token type"}"#.to_string());
         }
+        let existing_claims_expires_at = stored_claims_expires_at(payload);
+        let expires_at = expires_at_for_token(&token, now, self.session.ttl);
         // A refreshed ID token is optional; when present, re-validate it (bound to
         // the same subject, nonce only if carried) and adopt its claims so
         // scope/role checks and claim headers track current authorization.
@@ -979,22 +983,23 @@ impl OidcRelyingParty {
             payload.sub =
                 extract_claim_string(&merged, "sub").unwrap_or_else(|| payload.sub.clone());
             payload.id_token_b64 = id_token.to_string();
-            payload.claims_expires_at_unix = claim_expiry(&merged)
-                .map(|exp| exp.min(expires_at_for_token(&token, now, self.session.ttl)))
-                .unwrap_or_else(|| expires_at_for_token(&token, now, self.session.ttl));
+            payload.claims_expires_at_unix = claim_expiry(&merged).unwrap_or(expires_at);
             payload.claims = merged;
             true
         } else {
+            payload.claims_expires_at_unix = existing_claims_expires_at.min(expires_at);
             false
         };
-        let expires_at = expires_at_for_token(&token, now, self.session.ttl);
         payload.access_token_b64 = token.access_token;
         if let Some(rotated) = token.refresh_token {
             payload.refresh_token_b64 = Some(rotated);
         }
         payload.expires_at_unix = expires_at;
-        payload.refresh_after_unix =
-            next_refresh_after(expires_at, now, self.behavior.refresh_skew.as_secs() as i64);
+        payload.refresh_after_unix = next_refresh_after(
+            expires_at.min(payload.claims_expires_at_unix),
+            now,
+            self.behavior.refresh_skew.as_secs() as i64,
+        );
         payload.last_touch_unix = now;
         Ok(claims_refreshed)
     }
@@ -1721,6 +1726,18 @@ fn expires_at_for_token(token: &RefreshTokenResponse, now: i64, session_ttl: Dur
 
 fn claim_expiry(claims: &Value) -> Option<i64> {
     claims.get("exp").and_then(Value::as_i64)
+}
+
+fn effective_claims_expires_at(payload: &SessionPayload) -> i64 {
+    stored_claims_expires_at(payload).min(payload.expires_at_unix)
+}
+
+fn stored_claims_expires_at(payload: &SessionPayload) -> i64 {
+    if payload.claims_expires_at_unix > 0 {
+        payload.claims_expires_at_unix
+    } else {
+        claim_expiry(&payload.claims).unwrap_or(payload.expires_at_unix)
+    }
 }
 
 fn is_browser_request(ctx: &RequestContext, behavior: &BehaviorConfig) -> bool {
