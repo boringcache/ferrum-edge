@@ -212,6 +212,11 @@ impl AiRateLimiter {
         let mut prompt_tokens: Option<u64> = None;
         let mut completion_tokens: Option<u64> = None;
         let mut total_tokens: Option<u64> = None;
+        // Whether any usage/token block was actually observed in the stream.
+        // Used to distinguish "provider reported the field as 0" (a real count)
+        // from "the stream had no recognizable usage block" (unmeasurable) in
+        // prompt_tokens/completion_tokens modes.
+        let mut saw_usage = false;
 
         for line in body.lines() {
             let data = if let Some(stripped) = line.strip_prefix("data: ") {
@@ -235,6 +240,7 @@ impl AiRateLimiter {
                 && usage.is_object()
                 && !usage.as_object().is_some_and(|object| object.is_empty())
             {
+                saw_usage = true;
                 let usage = if self.provider != "auto" {
                     extract_response_usage(
                         &json,
@@ -255,12 +261,14 @@ impl AiRateLimiter {
                 && let Some(message) = json.get("message")
                 && let Some(usage) = message.get("usage")
             {
+                saw_usage = true;
                 prompt_tokens = usage.get("input_tokens").and_then(|value| value.as_u64());
             }
 
             if json.get("type").and_then(|value| value.as_str()) == Some("message_delta")
                 && let Some(usage) = json.get("usage")
             {
+                saw_usage = true;
                 completion_tokens = usage.get("output_tokens").and_then(|value| value.as_u64());
             }
 
@@ -269,6 +277,12 @@ impl AiRateLimiter {
             // `extract_response_usage` so we share Cohere v2's shape logic.
             if json.get("type").and_then(|value| value.as_str()) == Some("message-end") {
                 let usage = extract_response_usage(&json, AiProvider::Cohere);
+                if usage.prompt_tokens.is_some()
+                    || usage.completion_tokens.is_some()
+                    || usage.total_tokens.is_some()
+                {
+                    saw_usage = true;
+                }
                 if usage.prompt_tokens.is_some() {
                     prompt_tokens = usage.prompt_tokens;
                 }
@@ -290,9 +304,15 @@ impl AiRateLimiter {
             };
         }
 
+        // Only substitute 0 when a usage block was actually present but the
+        // per-mode counter was legitimately reported as absent (treat as 0).
+        // When no usage block was seen at all, return None so the caller's
+        // None-branch warning fires, matching total_tokens-mode behavior and
+        // giving operators a signal that the SSE shape was not understood.
+        let zero_if_seen = if saw_usage { Some(0) } else { None };
         match self.count_mode.as_str() {
-            "prompt_tokens" => prompt_tokens.or(Some(0)),
-            "completion_tokens" => completion_tokens.or(Some(0)),
+            "prompt_tokens" => prompt_tokens.or(zero_if_seen),
+            "completion_tokens" => completion_tokens.or(zero_if_seen),
             _ => total_tokens,
         }
     }
@@ -455,12 +475,12 @@ impl Plugin for AiRateLimiter {
             return PluginResult::Continue;
         }
 
-        let tokens = self.read_tokens_from_metadata(&ctx.metadata).or_else(|| {
-            let content_type = response_headers
-                .get("content-type")
-                .map(String::as_str)
-                .unwrap_or("");
+        let content_type = response_headers
+            .get("content-type")
+            .map(String::as_str)
+            .unwrap_or("");
 
+        let tokens = self.read_tokens_from_metadata(&ctx.metadata).or_else(|| {
             if body.is_empty() {
                 return None;
             }
@@ -479,7 +499,18 @@ impl Plugin for AiRateLimiter {
         let tokens = match tokens {
             Some(tokens) => tokens,
             None => {
-                debug!("ai_rate_limiter: could not extract token count from response");
+                // Fail-open on accuracy: a 2xx whose token count we cannot
+                // resolve (unrecognized provider/response shape, truncated
+                // SSE, or missing usage block) is not charged to the window.
+                // Surface at warn so operators can detect which providers /
+                // response shapes are being silently missed.
+                warn!(
+                    provider = %self.provider,
+                    content_type = %content_type,
+                    count_mode = %self.count_mode,
+                    "ai_rate_limiter: could not extract token count from 2xx response; \
+                     request not charged to rate-limit window"
+                );
                 return PluginResult::Continue;
             }
         };
