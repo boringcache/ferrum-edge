@@ -387,12 +387,19 @@ impl Plugin for RequestMirror {
         self.http_client
             .strip_egress_baggage_in_vec(&mut mirror_headers);
 
+        // Strip query params before ANY logging of the mirror URL — it is built
+        // from the original request's query string and can carry secrets
+        // (`?access_token=`, `?api_key=`, `?sig=`). Computed here, before the
+        // permit-exhaustion drop path, so every log site uses the stripped form
+        // (the full `mirror_url` is still used for the actual mirror request).
+        let mirror_url_for_log = strip_query_params(&mirror_url).to_string();
+
         let permit = match self.mirror_in_flight.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
                 warn!(
                     "request_mirror: dropping mirror request for {} {} because max_in_flight limit was reached",
-                    method, mirror_url
+                    method, mirror_url_for_log
                 );
                 return PluginResult::Continue;
             }
@@ -429,7 +436,6 @@ impl Plugin for RequestMirror {
         ctx.mirror_result_rx = Some(rx);
 
         let http_client = self.http_client.clone();
-        let mirror_url_for_log = strip_query_params(&mirror_url).to_string();
         let max_response_body_bytes = self.max_response_body_bytes;
 
         // Fire-and-forget: spawn an async task to send the mirror request.
