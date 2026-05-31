@@ -9,6 +9,7 @@
 //! Run with:
 //!   cargo test --test functional_tests functional_mesh_mode -- --ignored --nocapture
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::{Child, Command, Stdio};
@@ -16,18 +17,24 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use arc_swap::ArcSwap;
 use chrono::Utc;
 use futures_util::{Stream, StreamExt, stream};
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
+use serde_json::Value;
 use tempfile::TempDir;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{oneshot, watch};
+use tokio::sync::{broadcast, oneshot, watch};
 use tokio_stream::wrappers::{IntervalStream, TcpListenerStream};
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
+use ferrum_edge::config::types::GatewayConfig;
+use ferrum_edge::grpc::cp_server::DEFAULT_CP_DP_JWT_ISSUER;
 use ferrum_edge::grpc::proto::mesh_config_sync_server::{MeshConfigSync, MeshConfigSyncServer};
-use ferrum_edge::grpc::proto::{MeshConfigUpdate, MeshSubscribeRequest};
+use ferrum_edge::grpc::proto::{ConfigUpdate, MeshConfigUpdate, MeshSubscribeRequest};
 use ferrum_edge::modes::mesh::slice::MeshSlice;
+use ferrum_edge::xds::XdsAdsServer;
 
 use crate::common::ensure_gateway_built;
 use crate::scaffolding::ports::reserve_port;
@@ -51,6 +58,25 @@ struct StaticMeshControlPlane {
     subscribe_count: Arc<AtomicUsize>,
 }
 
+fn verify_mesh_grpc_auth(metadata: &tonic::metadata::MetadataMap) -> Result<(), Status> {
+    let token = metadata
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.strip_prefix("Bearer ").unwrap_or(value))
+        .ok_or_else(|| Status::unauthenticated("missing authorization token"))?;
+    let key = DecodingKey::from_secret(GRPC_SECRET.as_bytes());
+    let mut validation = Validation::new(Algorithm::HS256);
+    validation.validate_exp = true;
+    validation.required_spec_claims = ["exp", "iat", "sub", "iss"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    validation.set_issuer(&[DEFAULT_CP_DP_JWT_ISSUER]);
+    decode::<Value>(token, &key, &validation)
+        .map(|_| ())
+        .map_err(|err| Status::unauthenticated(format!("invalid authorization token: {err}")))
+}
+
 #[tonic::async_trait]
 impl MeshConfigSync for StaticMeshControlPlane {
     type MeshSubscribeStream = Pin<Box<dyn Stream<Item = Result<MeshConfigUpdate, Status>> + Send>>;
@@ -59,6 +85,7 @@ impl MeshConfigSync for StaticMeshControlPlane {
         &self,
         request: Request<MeshSubscribeRequest>,
     ) -> Result<Response<Self::MeshSubscribeStream>, Status> {
+        verify_mesh_grpc_auth(request.metadata())?;
         let request = request.into_inner();
         self.subscribe_count.fetch_add(1, Ordering::Relaxed);
         let _ = self.request_tx.send(Some(request));
@@ -139,6 +166,57 @@ async fn start_static_mesh_cp(slice: MeshSlice) -> MeshCpHandle {
     }
 }
 
+struct XdsCpHandle {
+    addr: SocketAddr,
+    shutdown_tx: Option<oneshot::Sender<()>>,
+    task: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+}
+
+impl XdsCpHandle {
+    async fn shutdown(mut self) {
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+        match tokio::time::timeout(Duration::from_secs(2), &mut self.task).await {
+            Ok(_) => {}
+            Err(_) => {
+                self.task.abort();
+                let _ = self.task.await;
+            }
+        }
+    }
+}
+
+async fn start_xds_cp(config: GatewayConfig) -> XdsCpHandle {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind xDS CP");
+    let addr = listener.local_addr().expect("xDS CP local addr");
+    let config = Arc::new(ArcSwap::from_pointee(config));
+    let (update_tx, _) = broadcast::channel::<ConfigUpdate>(8);
+    let server = XdsAdsServer::new(
+        config,
+        update_tx,
+        GRPC_SECRET.to_string(),
+        DEFAULT_CP_DP_JWT_ISSUER.to_string(),
+        "ferrum".to_string(),
+        32,
+    );
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let incoming = TcpListenerStream::new(listener);
+    let task = tokio::spawn(async move {
+        Server::builder()
+            .add_service(server.into_service())
+            .serve_with_incoming_shutdown(incoming, async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+    });
+    XdsCpHandle {
+        addr,
+        shutdown_tx: Some(shutdown_tx),
+        task,
+    }
+}
+
 fn initial_mesh_slice(node_id: &str) -> MeshSlice {
     MeshSlice {
         node_id: node_id.to_string(),
@@ -156,17 +234,50 @@ fn scrub_ferrum_env(cmd: &mut Command) {
     }
 }
 
-fn spawn_mesh_gateway(
-    temp: &TempDir,
-    cp_addr: std::net::SocketAddr,
-    inbound_port: u16,
-    outbound_port: u16,
-    node_id: &str,
-) -> Child {
+struct MeshPorts {
+    inbound: u16,
+    outbound: u16,
+    hbone: u16,
+    egress: u16,
+}
+
+async fn reserve_mesh_ports() -> MeshPorts {
+    MeshPorts {
+        inbound: reserve_port()
+            .await
+            .expect("reserve mesh inbound port")
+            .drop_and_take_port(),
+        outbound: reserve_port()
+            .await
+            .expect("reserve mesh outbound port")
+            .drop_and_take_port(),
+        hbone: reserve_port()
+            .await
+            .expect("reserve mesh hbone port")
+            .drop_and_take_port(),
+        egress: reserve_port()
+            .await
+            .expect("reserve mesh egress port")
+            .drop_and_take_port(),
+    }
+}
+
+struct MeshGatewaySpawnOptions<'a> {
+    cp_addr: SocketAddr,
+    ports: MeshPorts,
+    node_id: &'a str,
+    config_protocol: &'a str,
+    topology: &'a str,
+    waypoint_name: Option<&'a str>,
+}
+
+fn spawn_mesh_gateway(temp: &TempDir, options: MeshGatewaySpawnOptions<'_>) -> Child {
     let stdout =
         std::fs::File::create(temp.path().join("mesh.stdout.log")).expect("create stdout capture");
     let stderr =
         std::fs::File::create(temp.path().join("mesh.stderr.log")).expect("create stderr capture");
+    std::fs::create_dir_all(temp.path().join("node-waypoint-pods"))
+        .expect("create node-waypoint pod registry dir");
     let mut cmd = Command::new(binary_path());
     scrub_ferrum_env(&mut cmd);
     cmd.args(["run"])
@@ -181,21 +292,38 @@ fn spawn_mesh_gateway(
         .env("FERRUM_PROXY_HTTP_PORT", "0")
         .env("FERRUM_ADMIN_HTTP_PORT", "0")
         .env("FERRUM_CP_DP_GRPC_JWT_SECRET", GRPC_SECRET)
-        .env("FERRUM_DP_CP_GRPC_URLS", format!("http://{cp_addr}"))
-        .env("FERRUM_MESH_CONFIG_PROTOCOL", "native")
-        .env("FERRUM_MESH_TOPOLOGY", "sidecar")
-        .env("FERRUM_MESH_NODE_ID", node_id)
+        .env(
+            "FERRUM_DP_CP_GRPC_URLS",
+            format!("http://{}", options.cp_addr),
+        )
+        .env("FERRUM_MESH_CONFIG_PROTOCOL", options.config_protocol)
+        .env("FERRUM_MESH_TOPOLOGY", options.topology)
+        .env("FERRUM_MESH_NODE_ID", options.node_id)
         .env(
             "FERRUM_MESH_INBOUND_LISTEN_ADDR",
-            format!("127.0.0.1:{inbound_port}"),
+            format!("127.0.0.1:{}", options.ports.inbound),
         )
         .env(
             "FERRUM_MESH_OUTBOUND_LISTEN_ADDR",
-            format!("127.0.0.1:{outbound_port}"),
+            format!("127.0.0.1:{}", options.ports.outbound),
         )
-        .env("FERRUM_MESH_HBONE_LISTEN_ADDR", "127.0.0.1:0")
+        .env(
+            "FERRUM_MESH_HBONE_LISTEN_ADDR",
+            format!("127.0.0.1:{}", options.ports.hbone),
+        )
+        .env(
+            "FERRUM_MESH_EGRESS_LISTEN_ADDR",
+            format!("127.0.0.1:{}", options.ports.egress),
+        )
         .env("FERRUM_MESH_DNS_PROXY_ENABLED", "false")
-        .env("FERRUM_MESH_FEDERATION_POLL_INTERVAL_SECONDS", "0");
+        .env("FERRUM_MESH_FEDERATION_POLL_INTERVAL_SECONDS", "0")
+        .env(
+            "FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR",
+            temp.path().join("node-waypoint-pods"),
+        );
+    if let Some(waypoint_name) = options.waypoint_name {
+        cmd.env("FERRUM_MESH_WAYPOINT_NAME", waypoint_name);
+    }
     cmd.spawn().expect("spawn mesh gateway")
 }
 
@@ -256,6 +384,19 @@ async fn wait_for_tcp_port(port: u16, timeout: Duration) -> bool {
     }
 }
 
+async fn tcp_port_stays_closed(port: u16, duration: Duration) -> bool {
+    let deadline = Instant::now() + duration;
+    loop {
+        if TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+            return false;
+        }
+        if Instant::now() >= deadline {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 #[ignore]
 #[tokio::test]
 async fn functional_mesh_mode_starts_after_native_mesh_subscribe() {
@@ -266,16 +407,21 @@ async fn functional_mesh_mode_starts_after_native_mesh_subscribe() {
         let node_id = format!("functional-mesh-node-{attempt}");
         let cp = start_static_mesh_cp(initial_mesh_slice(&node_id)).await;
         let mut request_rx = cp.request_rx.clone();
-        let inbound_port = reserve_port()
-            .await
-            .expect("reserve mesh inbound port")
-            .drop_and_take_port();
-        let outbound_port = reserve_port()
-            .await
-            .expect("reserve mesh outbound port")
-            .drop_and_take_port();
+        let ports = reserve_mesh_ports().await;
+        let inbound_port = ports.inbound;
+        let outbound_port = ports.outbound;
         let temp = TempDir::new().expect("temp dir");
-        let mut child = spawn_mesh_gateway(&temp, cp.addr, inbound_port, outbound_port, &node_id);
+        let mut child = spawn_mesh_gateway(
+            &temp,
+            MeshGatewaySpawnOptions {
+                cp_addr: cp.addr,
+                ports,
+                node_id: &node_id,
+                config_protocol: "native",
+                topology: "sidecar",
+                waypoint_name: None,
+            },
+        );
 
         let subscribe = wait_for_mesh_subscribe(&mut request_rx, STARTUP_TIMEOUT).await;
         let inbound_listening = wait_for_tcp_port(inbound_port, STARTUP_TIMEOUT).await;
@@ -308,4 +454,131 @@ async fn functional_mesh_mode_starts_after_native_mesh_subscribe() {
     }
 
     panic!("mesh mode did not start after {RETRY_ATTEMPTS} attempts\n{last_failure}");
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_mode_native_topology_listeners_match_contract() {
+    ensure_gateway_built().expect("gateway binary built");
+
+    struct Case {
+        topology: &'static str,
+        waypoint_name: Option<&'static str>,
+        expected_open: fn(&MeshPorts) -> Vec<u16>,
+        expected_closed: fn(&MeshPorts) -> Vec<u16>,
+    }
+
+    let cases = [
+        Case {
+            topology: "ambient",
+            waypoint_name: None,
+            expected_open: |ports| vec![ports.outbound, ports.hbone],
+            expected_closed: |ports| vec![ports.inbound, ports.egress],
+        },
+        Case {
+            topology: "node_waypoint",
+            waypoint_name: None,
+            expected_open: |ports| vec![ports.hbone],
+            expected_closed: |ports| vec![ports.inbound, ports.outbound, ports.egress],
+        },
+        Case {
+            topology: "service_waypoint",
+            waypoint_name: Some("functional-waypoint"),
+            expected_open: |ports| vec![ports.hbone],
+            expected_closed: |ports| vec![ports.inbound, ports.outbound, ports.egress],
+        },
+    ];
+
+    for case in cases {
+        let node_id = format!("functional-mesh-{}-node", case.topology);
+        let cp = start_static_mesh_cp(initial_mesh_slice(&node_id)).await;
+        let mut request_rx = cp.request_rx.clone();
+        let ports = reserve_mesh_ports().await;
+        let open_ports = (case.expected_open)(&ports);
+        let closed_ports = (case.expected_closed)(&ports);
+        let temp = TempDir::new().expect("temp dir");
+        let mut child = spawn_mesh_gateway(
+            &temp,
+            MeshGatewaySpawnOptions {
+                cp_addr: cp.addr,
+                ports,
+                node_id: &node_id,
+                config_protocol: "native",
+                topology: case.topology,
+                waypoint_name: case.waypoint_name,
+            },
+        );
+
+        let subscribe = wait_for_mesh_subscribe(&mut request_rx, STARTUP_TIMEOUT).await;
+        let mut all_open = true;
+        for port in &open_ports {
+            all_open &= wait_for_tcp_port(*port, STARTUP_TIMEOUT).await;
+        }
+        let mut all_closed = true;
+        for port in &closed_ports {
+            all_closed &= tcp_port_stays_closed(*port, Duration::from_millis(500)).await;
+        }
+
+        kill_child(&mut child);
+        cp.shutdown().await;
+
+        assert!(
+            subscribe.is_some() && all_open && all_closed,
+            "topology {} listener contract failed: subscribe={:?}, open_ports={:?}, \
+             closed_ports={:?}, all_open={}, all_closed={}\n{}",
+            case.topology,
+            subscribe.as_ref().map(|r| (&r.node_id, &r.namespace)),
+            open_ports,
+            closed_ports,
+            all_open,
+            all_closed,
+            captured_output(&temp)
+        );
+    }
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_mode_starts_after_xds_ads() {
+    ensure_gateway_built().expect("gateway binary built");
+
+    let mut last_failure = String::new();
+    for attempt in 1..=RETRY_ATTEMPTS {
+        let node_id = format!("functional-mesh-xds-node-{attempt}");
+        let cp = start_xds_cp(GatewayConfig::default()).await;
+        let ports = reserve_mesh_ports().await;
+        let inbound_port = ports.inbound;
+        let outbound_port = ports.outbound;
+        let temp = TempDir::new().expect("temp dir");
+        let mut child = spawn_mesh_gateway(
+            &temp,
+            MeshGatewaySpawnOptions {
+                cp_addr: cp.addr,
+                ports,
+                node_id: &node_id,
+                config_protocol: "xds",
+                topology: "sidecar",
+                waypoint_name: None,
+            },
+        );
+
+        let inbound_listening = wait_for_tcp_port(inbound_port, STARTUP_TIMEOUT).await;
+        let outbound_listening = wait_for_tcp_port(outbound_port, STARTUP_TIMEOUT).await;
+
+        kill_child(&mut child);
+        cp.shutdown().await;
+
+        if inbound_listening && outbound_listening {
+            return;
+        }
+
+        last_failure = format!(
+            "attempt {attempt}: inbound_listening={inbound_listening}, \
+             outbound_listening={outbound_listening}\n{}",
+            captured_output(&temp)
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+
+    panic!("mesh mode did not start from xDS ADS after {RETRY_ATTEMPTS} attempts\n{last_failure}");
 }
