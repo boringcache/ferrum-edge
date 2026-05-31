@@ -104,6 +104,12 @@ impl WsFrameLogging {
             None => 128,
         }
         .min(MAX_PREVIEW_BYTES as u64) as usize;
+        if include_payload_preview && payload_preview_bytes == 0 {
+            return Err(
+                "ws_frame_logging: 'payload_preview_bytes' must be greater than zero when payload previews are enabled"
+                    .to_string(),
+            );
+        }
 
         let log_ping_pong = match config.get("log_ping_pong") {
             Some(v) => v

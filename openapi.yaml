@@ -6145,12 +6145,14 @@ components:
         payload_preview_bytes:
           type: integer
           default: 128
+          minimum: 1
           maximum: 65536
           description: >-
             Maximum number of leading payload bytes folded into the fingerprint
             digest. Clamped to 65 536 to bound per-frame hashing on the WebSocket
             hot path. Only applies when `include_payload_preview` is true; the
-            raw bytes are never emitted.
+            raw bytes are never emitted. Must be greater than zero when payload
+            previews are enabled.
         log_ping_pong:
           type: boolean
           default: false

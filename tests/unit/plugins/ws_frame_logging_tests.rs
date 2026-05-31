@@ -338,22 +338,13 @@ async fn test_payload_preview_exact_char_boundary() {
     assert!(result.is_none());
 }
 
-#[tokio::test]
-async fn test_payload_preview_bytes_zero_produces_empty() {
-    // payload_preview_bytes=0 should not panic, produces empty preview
-    let plugin =
+#[test]
+fn test_payload_preview_bytes_zero_rejected_when_preview_enabled() {
+    let err =
         WsFrameLogging::new(&json!({"include_payload_preview": true, "payload_preview_bytes": 0}))
-            .unwrap();
-    let msg = Message::Text("hello".into());
-    let result = plugin
-        .on_ws_frame(
-            "test-proxy",
-            1,
-            WebSocketFrameDirection::ClientToBackend,
-            &msg,
-        )
-        .await;
-    assert!(result.is_none());
+            .err()
+            .expect("zero-byte payload fingerprints must be rejected");
+    assert!(err.contains("payload_preview_bytes"), "got: {err}");
 }
 
 #[tokio::test]

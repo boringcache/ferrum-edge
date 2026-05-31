@@ -3748,7 +3748,7 @@ Logs metadata for every WebSocket frame passing through the proxy. Provides fram
 |---|---|---|---|
 | `log_level` | String | `"info"` | Log level for frame entries: `trace`, `debug`, or `info` (case-sensitive — unknown values are rejected at config load time) |
 | `include_payload_preview` | bool | `false` | Emit a non-reversible payload fingerprint (`sha256:<prefix> len=<n>`) in the `preview` field. Raw frame bytes are never logged |
-| `payload_preview_bytes` | u64 | `128` | Maximum leading payload bytes folded into the fingerprint digest (clamped to 64 KiB) |
+| `payload_preview_bytes` | u64 | `128` | Maximum leading payload bytes folded into the fingerprint digest (clamped to 64 KiB; must be greater than zero when previews are enabled) |
 | `log_ping_pong` | bool | `false` | Log Ping and Pong control frames |
 
 ```yaml
