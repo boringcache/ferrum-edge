@@ -419,6 +419,12 @@ pub struct RequestContext {
     pub timestamp_received: DateTime<Utc>,
     /// Extra metadata plugins can attach
     pub metadata: HashMap<String, String>,
+    /// Semantic-cache embedding vector staged between `before_proxy` and
+    /// `on_final_response_body`. Kept out of `metadata` so high-dimensional
+    /// vectors cannot enter transaction logs.
+    pub(crate) ai_semantic_cache_embedding: Option<Vec<f32>>,
+    /// Semantic-cache scope key paired with `ai_semantic_cache_embedding`.
+    pub(crate) ai_semantic_cache_scope_key: Option<String>,
     /// Whether reserved `waf.*` metadata has been cleared for this request.
     ///
     /// `metadata` is intentionally public plugin scratch space. WAF-owned log
@@ -611,6 +617,8 @@ impl RequestContext {
             auth_method: None,
             timestamp_received: Utc::now(),
             metadata: HashMap::new(),
+            ai_semantic_cache_embedding: None,
+            ai_semantic_cache_scope_key: None,
             waf_metadata_initialized: false,
             waf_owned_metadata: HashMap::new(),
             waf_score: 0,
@@ -665,6 +673,8 @@ impl RequestContext {
             auth_method: self.auth_method,
             timestamp_received: self.timestamp_received,
             metadata: self.metadata.clone(),
+            ai_semantic_cache_embedding: self.ai_semantic_cache_embedding.clone(),
+            ai_semantic_cache_scope_key: self.ai_semantic_cache_scope_key.clone(),
             waf_metadata_initialized: self.waf_metadata_initialized,
             waf_owned_metadata: self.waf_owned_metadata.clone(),
             waf_score: self.waf_score,
@@ -1703,7 +1713,6 @@ pub mod priority {
     pub const TCP_CONNECTION_THROTTLE: u16 = 2050;
     pub const MESH_AUTHZ: u16 = 2075;
     pub const OPA: u16 = 2080;
-    pub const AI_SEMANTIC_CACHE: u16 = 2700;
     pub const REQUEST_DEDUPLICATION: u16 = 2750;
     pub const REQUEST_SIZE_LIMITING: u16 = 2800;
     pub const GRAPHQL: u16 = 2850;
@@ -1714,6 +1723,7 @@ pub mod priority {
     pub const BODY_VALIDATOR: u16 = 2950;
     pub const OPENAPI_VALIDATOR: u16 = 2960;
     pub const AI_REQUEST_GUARD: u16 = 2975;
+    pub const AI_SEMANTIC_CACHE: u16 = 2980;
     pub const AI_FEDERATION: u16 = 2985;
     /// `mesh_route_dispatch`: rewrites `route_override_*` on `RequestContext`
     /// based on Istio VirtualService method/header/query-param predicates.

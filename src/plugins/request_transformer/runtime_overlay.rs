@@ -15,56 +15,26 @@
 //! process-global `ArcSwap`. Hot path: one `Arc<HashMap>` clone per
 //! request — no map allocation, no locking.
 
-use std::collections::HashMap;
-use std::sync::{Arc, LazyLock};
+use std::sync::LazyLock;
 
 use arc_swap::ArcSwap;
 
 use crate::modes::mesh::config::MeshRuntimeOverlay;
-#[cfg(test)]
-use crate::modes::mesh::config::RuntimeValue;
+use crate::plugins::utils::runtime_bool_gate::{self, BoolGateMap};
 
 pub(crate) const KEY_PREFIX: &str = "ferrum.request_transformer.";
 pub(crate) const ENABLED_SUFFIX: &str = ".enabled";
 
-type GateMap = HashMap<String, bool>;
+static GATES: LazyLock<ArcSwap<BoolGateMap>> = LazyLock::new(runtime_bool_gate::new_store);
 
-static GATES: LazyLock<ArcSwap<GateMap>> = LazyLock::new(|| ArcSwap::new(Arc::new(HashMap::new())));
-
-/// Cheap process-wide snapshot of the current gate state.
-#[derive(Clone)]
-pub struct GateSnapshot {
-    inner: Arc<GateMap>,
-}
-
-impl GateSnapshot {
-    /// `Some(value)` when the overlay carried `ferrum.request_transformer.<scope>.enabled`;
-    /// `None` otherwise so the plugin can fall back to its static default.
-    pub fn gate(&self, scope: &str) -> Option<bool> {
-        self.inner.get(scope).copied()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn is_empty(&self) -> bool {
-        self.inner.is_empty()
-    }
-}
+pub type GateSnapshot = runtime_bool_gate::BoolGateSnapshot;
 
 pub fn current_gates() -> GateSnapshot {
-    GateSnapshot {
-        inner: GATES.load_full(),
-    }
+    runtime_bool_gate::current_snapshot(&GATES)
 }
 
 pub fn apply_overlay(overlay: &MeshRuntimeOverlay) {
-    let mut next: GateMap = HashMap::new();
-    crate::plugins::utils::transformer_gate::collect_gates(
-        overlay,
-        KEY_PREFIX,
-        ENABLED_SUFFIX,
-        &mut next,
-    );
-    GATES.store(Arc::new(next));
+    runtime_bool_gate::apply_overlay(&GATES, overlay, KEY_PREFIX, ENABLED_SUFFIX);
 }
 
 /// Reset state for tests in external crates. `pub` + `#[doc(hidden)]` so
@@ -75,79 +45,5 @@ pub fn apply_overlay(overlay: &MeshRuntimeOverlay) {
 #[doc(hidden)]
 #[allow(dead_code)]
 pub fn reset_for_test() {
-    GATES.store(Arc::new(HashMap::new()));
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn test_guard() -> std::sync::MutexGuard<'static, ()> {
-        crate::modes::mesh::runtime_overlay_consumers::test_lock()
-    }
-
-    fn overlay(entries: &[(&str, RuntimeValue)]) -> MeshRuntimeOverlay {
-        let mut fields = HashMap::new();
-        for (key, value) in entries {
-            fields.insert((*key).to_string(), value.clone());
-        }
-        MeshRuntimeOverlay { fields }
-    }
-
-    #[test]
-    fn applies_bool_gate_per_scope() {
-        let _guard = test_guard();
-        reset_for_test();
-        apply_overlay(&overlay(&[
-            (
-                "ferrum.request_transformer.public.enabled",
-                RuntimeValue::Bool(false),
-            ),
-            (
-                "ferrum.request_transformer.internal.enabled",
-                RuntimeValue::Bool(true),
-            ),
-        ]));
-        let snap = current_gates();
-        assert_eq!(snap.gate("public"), Some(false));
-        assert_eq!(snap.gate("internal"), Some(true));
-        assert_eq!(snap.gate("missing"), None);
-    }
-
-    #[test]
-    fn ignores_non_bool_values() {
-        let _guard = test_guard();
-        reset_for_test();
-        apply_overlay(&overlay(&[(
-            "ferrum.request_transformer.bad.enabled",
-            RuntimeValue::Number(1.0),
-        )]));
-        let snap = current_gates();
-        assert!(snap.is_empty());
-    }
-
-    #[test]
-    fn empty_scope_is_ignored() {
-        let _guard = test_guard();
-        reset_for_test();
-        apply_overlay(&overlay(&[(
-            "ferrum.request_transformer..enabled",
-            RuntimeValue::Bool(true),
-        )]));
-        let snap = current_gates();
-        assert!(snap.is_empty());
-    }
-
-    #[test]
-    fn empty_overlay_clears_state() {
-        let _guard = test_guard();
-        reset_for_test();
-        apply_overlay(&overlay(&[(
-            "ferrum.request_transformer.cart.enabled",
-            RuntimeValue::Bool(false),
-        )]));
-        assert_eq!(current_gates().gate("cart"), Some(false));
-        apply_overlay(&MeshRuntimeOverlay::default());
-        assert_eq!(current_gates().gate("cart"), None);
-    }
+    runtime_bool_gate::reset(&GATES);
 }

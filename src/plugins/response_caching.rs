@@ -10,10 +10,11 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use http::{HeaderName, Method};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -61,14 +62,48 @@ fn cache_key_host_part(host: &str) -> String {
     }
 }
 
-fn is_sensitive_vary_header(header: &str) -> bool {
-    header.eq_ignore_ascii_case("authorization")
-        || header.eq_ignore_ascii_case("proxy-authorization")
-        || header.eq_ignore_ascii_case("cookie")
+/// Render an authenticated principal as the `sha256-<hex>` `consumer_part` of
+/// a cache key. SHA-256-hashing keeps a username or SPIFFE ID (which may carry
+/// the `:` / `|` key delimiters and can surface in debug logs) out of the key
+/// verbatim. Built with `String::with_capacity` + `push_str` rather than
+/// `format!` because `build_base_cache_key` runs on the `before_proxy` hot path
+/// for every authenticated request (mirrors [`cache_key_host_part`]).
+fn cache_key_identity_part(identity: &str) -> String {
+    let digest = sha256_hex(identity);
+    let mut part = String::with_capacity(7 + digest.len());
+    part.push_str("sha256-");
+    part.push_str(&digest);
+    part
+}
+
+/// Request headers whose presence makes a cacheable response automatically vary
+/// by that header.
+///
+/// These are credentials or session identifiers, so they are auto-added to the
+/// keyed `Vary` set at storage time (see `on_final_response_body`) and
+/// SHA-256-hashed by [`cache_key_vary_value`] when they appear in a cache key.
+/// Additional operator-configured or backend-supplied Vary headers are also
+/// hashed when their header name matches the centralized log-redaction
+/// sensitivity rules.
+const SENSITIVE_VARY_HEADERS: [&str; 3] = ["authorization", "proxy-authorization", "cookie"];
+
+fn is_auto_sensitive_vary_header(header: &str) -> bool {
+    SENSITIVE_VARY_HEADERS
+        .iter()
+        .any(|sensitive| header.eq_ignore_ascii_case(sensitive))
+}
+
+fn should_hash_vary_header_value(header: &str) -> bool {
+    is_auto_sensitive_vary_header(header)
+        || super::utils::metadata_redaction::is_sensitive_metadata_key(header)
+}
+
+fn should_snapshot_header_value_as_cache_key_part(header: &str) -> bool {
+    !header.eq_ignore_ascii_case("host") && should_hash_vary_header_value(header)
 }
 
 fn cache_key_vary_value(header: &str, value: &str) -> String {
-    if is_sensitive_vary_header(header) {
+    if should_hash_vary_header_value(header) {
         let digest = sha256_hex(value);
         let mut hashed = String::with_capacity(7 + digest.len());
         hashed.push_str("sha256-");
@@ -77,6 +112,30 @@ fn cache_key_vary_value(header: &str, value: &str) -> String {
     } else {
         value.to_string()
     }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct RequestHeaderSnapshotEntry {
+    header: String,
+    value: String,
+    value_is_cache_key_part: bool,
+}
+
+struct RestoredRequestHeadersView {
+    headers: HashMap<String, String>,
+    cache_key_ready_headers: HashSet<String>,
+}
+
+fn merge_vary_header(vary_headers: &mut Vec<String>, header: &str) -> bool {
+    if vary_headers.iter().any(|existing| existing == header) {
+        return false;
+    }
+    vary_headers.push(header.to_string());
+    true
+}
+
+fn vary_index_prune_slack(cache_len: usize) -> usize {
+    if cache_len == 0 { 0 } else { cache_len / 4 + 1 }
 }
 
 /// Cache keys use `:` as a structural delimiter, but URL paths legitimately
@@ -112,6 +171,17 @@ struct CacheEntry {
     body: Bytes,
     inserted_at: Instant,
     ttl: Duration,
+    /// Byte length of the base-key prefix of this entry's full cache key.
+    ///
+    /// A full cache key is always its base key optionally followed by
+    /// `:<vary dimensions>` (see [`ResponseCaching::build_cache_key`]), so
+    /// `&key[..base_key_len]` recovers the base key without re-parsing the
+    /// colon-delimited (and query-colon-bearing) structure. [`prune_vary_index`]
+    /// uses it to reclaim `vary_index` mappings whose base key has no surviving
+    /// variant.
+    ///
+    /// [`prune_vary_index`]: ResponseCaching::prune_vary_index
+    base_key_len: usize,
 }
 
 impl CacheEntry {
@@ -479,10 +549,23 @@ impl ResponseCaching {
             }
         }
 
-        let consumer_part = if self.config.cache_key_include_consumer {
-            ctx.effective_identity().unwrap_or("_anon")
-        } else {
-            ""
+        // Bind the cache entry to the authenticated principal whenever the
+        // request is authenticated by ANY mechanism — a gateway Consumer
+        // (key_auth / mtls_auth / basic_auth / hmac_auth) or an external
+        // `authenticated_identity` emitted by jwks_auth / oidc. Without this,
+        // two principals authenticated by a non-`Authorization` scheme (API
+        // key, mTLS, JWT carried in a custom header) share one cache entry
+        // whenever the backend marks the response `public` / `s-maxage`,
+        // serving one principal's private response to another. The identity
+        // is SHA-256-hashed so a username or SPIFFE ID (which may contain the
+        // `:` / `|` key delimiters and can surface in debug logs) never lands
+        // in the key verbatim. `cache_key_include_consumer` remains an
+        // explicit opt-in that additionally keys *anonymous* requests as
+        // `_anon`.
+        let consumer_part: Cow<'_, str> = match ctx.effective_identity() {
+            Some(identity) => Cow::Owned(cache_key_identity_part(identity)),
+            None if self.config.cache_key_include_consumer => Cow::Borrowed("_anon"),
+            None => Cow::Borrowed(""),
         };
 
         let encoded_path = encode_path_for_cache_key(&ctx.path);
@@ -505,7 +588,7 @@ impl ResponseCaching {
         key.push(':');
         key.push_str(&query_part);
         key.push(':');
-        key.push_str(consumer_part);
+        key.push_str(&consumer_part);
         key
     }
 
@@ -514,6 +597,16 @@ impl ResponseCaching {
         ctx: &RequestContext,
         vary_headers: &[String],
         request_headers: &HashMap<String, String>,
+    ) -> String {
+        self.build_cache_key_with_ready_values(ctx, vary_headers, request_headers, None)
+    }
+
+    fn build_cache_key_with_ready_values(
+        &self,
+        ctx: &RequestContext,
+        vary_headers: &[String],
+        request_headers: &HashMap<String, String>,
+        cache_key_ready_headers: Option<&HashSet<String>>,
     ) -> String {
         let base_key = self.build_base_cache_key(ctx, request_headers);
         if vary_headers.is_empty() {
@@ -530,10 +623,16 @@ impl ResponseCaching {
                 .get(header.as_str())
                 .map(String::as_str)
                 .unwrap_or("");
-            let value = cache_key_vary_value(header, value);
             cache_key.push_str(header);
             cache_key.push('=');
-            cache_key.push_str(&value);
+            if let Some(ready_headers) = cache_key_ready_headers
+                && ready_headers.contains(header)
+            {
+                cache_key.push_str(value);
+            } else {
+                let value = cache_key_vary_value(header, value);
+                cache_key.push_str(&value);
+            }
         }
 
         cache_key
@@ -549,6 +648,39 @@ impl ResponseCaching {
             .get(base_key)
             .map(|headers| headers.clone())
             .unwrap_or_else(|| self.config.vary_by_headers.clone())
+    }
+
+    fn merge_present_sensitive_vary_headers(
+        &self,
+        vary_headers: &mut Vec<String>,
+        request_headers: &HashMap<String, String>,
+    ) -> bool {
+        let mut added = false;
+        for sensitive in SENSITIVE_VARY_HEADERS {
+            if request_headers.contains_key(sensitive) {
+                added |= merge_vary_header(vary_headers, sensitive);
+            }
+        }
+        if added {
+            vary_headers.sort();
+        }
+        added
+    }
+
+    fn merge_existing_vary_headers(&self, base_key: &str, vary_headers: &mut Vec<String>) -> bool {
+        let Some(existing_headers) = self.vary_index.get(base_key).map(|headers| headers.clone())
+        else {
+            return false;
+        };
+
+        let mut added = false;
+        for header in existing_headers {
+            added |= merge_vary_header(vary_headers, &header);
+        }
+        if added {
+            vary_headers.sort();
+        }
+        added
     }
 
     fn merged_vary_headers(
@@ -680,6 +812,60 @@ impl ResponseCaching {
         }
     }
 
+    /// Reclaim `vary_index` mappings whose base key has no surviving cache
+    /// variant.
+    ///
+    /// `vary_index` is keyed by base key and otherwise pruned only in
+    /// [`Self::invalidate_base_key`]; eviction, expiry, and path invalidation
+    /// drop entries from `self.cache` but leave their `vary_index` mapping
+    /// behind. Because the base key now embeds the per-principal `consumer_part`
+    /// (see [`Self::build_base_cache_key`]), a workload with high principal
+    /// cardinality (JWT `sub`s, ephemeral SPIFFE IDs) would otherwise grow
+    /// `vary_index` without bound even though `self.cache` stays capped at
+    /// `max_entries`. A stale mapping is only ever fail-safe — it over-specifies
+    /// the vary list for a base key with no live entry, so the next lookup
+    /// simply MISSes and re-stores — making this a pure memory reclaim, not a
+    /// correctness fix.
+    ///
+    /// The number of distinct live base keys can never exceed
+    /// `self.cache.len()`, so `vary_index.len() > self.cache.len()` is a
+    /// necessary precondition for any stale mapping to exist. The sweep is
+    /// deliberately batched with slack so a saturated, high-cardinality cache
+    /// reclaims stale mappings in groups instead of cloning every live base key
+    /// on every store.
+    fn prune_vary_index(&self) {
+        let cache_len = self.cache.len();
+        if self.vary_index.len() <= cache_len.saturating_add(vary_index_prune_slack(cache_len)) {
+            return;
+        }
+
+        // Materialize the live base keys (owned) before touching `vary_index`
+        // so no `self.cache` read guards are held across the `retain` below.
+        let live_base_keys: HashSet<String> = self
+            .cache
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .key()
+                    .get(..entry.value().base_key_len)
+                    .map(str::to_string)
+            })
+            .collect();
+
+        let before = self.vary_index.len();
+        self.vary_index
+            .retain(|base_key, _| live_base_keys.contains(base_key));
+
+        let removed = before.saturating_sub(self.vary_index.len());
+        if removed > 0 {
+            debug!(
+                removed = removed,
+                vary_index_len = self.vary_index.len(),
+                "response_caching: pruned stale vary_index entries"
+            );
+        }
+    }
+
     /// Invalidate cache entries matching a path pattern.
     /// Called when an unsafe method (POST/PUT/PATCH/DELETE) hits a path.
     fn invalidate_path(&self, ctx: &RequestContext) {
@@ -711,6 +897,10 @@ impl ResponseCaching {
         if removed_size > 0 {
             self.total_size.fetch_sub(removed_size, Ordering::Relaxed);
         }
+        // A path sweep can strand many base keys' `vary_index` mappings at once
+        // (every principal/variant of the invalidated path); reclaim them now
+        // rather than waiting for the next store.
+        self.prune_vary_index();
     }
 
     fn add_cache_status_header(&self, headers: &mut HashMap<String, String>, value: &str) {
@@ -736,14 +926,30 @@ impl ResponseCaching {
     }
 
     /// Stash the transformed-header values `before_proxy` saw for every
-    /// key that can land in the cache key — `host`, `authorization`, and
-    /// each configured `vary_by_headers` entry. `on_final_response_body`
-    /// reads it back via [`Self::restore_request_headers_view`] so the
-    /// storage cache key is derived from the same header view as the
-    /// lookup. Without this, a request-side transformer that touches a
-    /// vary header (e.g. injecting `X-Tenant` from a consumer property)
-    /// would make the storage key disagree with the lookup key and the
-    /// cache would never hit.
+    /// key that can land in the cache key — `host`, the sensitive
+    /// credential/session headers in [`SENSITIVE_VARY_HEADERS`]
+    /// (`authorization`, `proxy-authorization`, `cookie`), and each configured
+    /// `vary_by_headers` entry. `on_final_response_body` reads it back via
+    /// [`Self::restore_request_headers_view`] so the storage cache key is
+    /// derived from the same header view as the lookup. Without this, a
+    /// request-side transformer that touches one of these headers (e.g.
+    /// injecting `X-Tenant` from a consumer property, or rewriting `cookie`)
+    /// would make the storage key disagree with the lookup key and the cache
+    /// would never hit.
+    ///
+    /// Non-Host values that match the centralized metadata-redaction
+    /// sensitivity rules are stashed as the same SHA-256 cache-key component
+    /// [`cache_key_vary_value`] would produce. The restore path marks those
+    /// headers as cache-key-ready so storage does not hash them a second time.
+    /// This keeps raw cookies, credentials, and operator-redacted Vary header
+    /// values out of `ctx.metadata`, which is copied into transaction log
+    /// metadata. Host stays raw in the snapshot because it feeds the base-key
+    /// host hash, not a Vary dimension.
+    ///
+    /// The auto-sensitive headers are stashed unconditionally because the
+    /// storage path auto-Varies them (see `on_final_response_body`), so they are
+    /// load-bearing cache-key dimensions even when the operator never lists them
+    /// in `vary_by_headers`.
     ///
     /// Snapshot is intentionally narrow: only headers we know we will
     /// consume go into it. Headers that show up later via the response
@@ -756,18 +962,31 @@ impl ResponseCaching {
         ctx: &mut RequestContext,
         headers: &HashMap<String, String>,
     ) {
-        let mut snapshot: Vec<(String, String)> =
-            Vec::with_capacity(self.config.vary_by_headers.len() + 2);
+        let mut snapshot: Vec<RequestHeaderSnapshotEntry> = Vec::with_capacity(
+            self.config.vary_by_headers.len() + 1 + SENSITIVE_VARY_HEADERS.len(),
+        );
         let mut push_if_present = |key: &str| {
             if let Some(value) = headers.get(key) {
-                snapshot.push((key.to_string(), value.clone()));
+                let value_is_cache_key_part = should_snapshot_header_value_as_cache_key_part(key);
+                let value = if value_is_cache_key_part {
+                    cache_key_vary_value(key, value)
+                } else {
+                    value.clone()
+                };
+                snapshot.push(RequestHeaderSnapshotEntry {
+                    header: key.to_string(),
+                    value,
+                    value_is_cache_key_part,
+                });
             }
         };
         push_if_present("host");
-        push_if_present("authorization");
+        for header in SENSITIVE_VARY_HEADERS {
+            push_if_present(header);
+        }
         for header in &self.config.vary_by_headers {
-            // Skip duplicates that match the always-stashed pair above.
-            if header == "host" || header == "authorization" {
+            // Skip duplicates that match the always-stashed keys above.
+            if header == "host" || is_auto_sensitive_vary_header(header) {
                 continue;
             }
             push_if_present(header);
@@ -788,16 +1007,26 @@ impl ResponseCaching {
     /// snapshotted keys reflect the transformed values seen at lookup
     /// time while any other key (typically a header added by the
     /// response's own `Vary` directive) falls back to the original.
-    fn restore_request_headers_view(&self, ctx: &RequestContext) -> HashMap<String, String> {
-        let mut view = ctx.headers.clone();
+    fn restore_request_headers_view(&self, ctx: &RequestContext) -> RestoredRequestHeadersView {
+        let mut headers = ctx.headers.clone();
+        let mut cache_key_ready_headers = HashSet::new();
         if let Some(serialized) = ctx.metadata.get(CACHE_REQUEST_HEADERS_SNAPSHOT)
-            && let Ok(snapshot) = serde_json::from_str::<Vec<(String, String)>>(serialized)
+            && let Ok(snapshot) =
+                serde_json::from_str::<Vec<RequestHeaderSnapshotEntry>>(serialized)
         {
-            for (key, value) in snapshot {
-                view.insert(key, value);
+            for entry in snapshot {
+                if entry.value_is_cache_key_part
+                    && should_snapshot_header_value_as_cache_key_part(&entry.header)
+                {
+                    cache_key_ready_headers.insert(entry.header.clone());
+                }
+                headers.insert(entry.header, entry.value);
             }
         }
-        view
+        RestoredRequestHeadersView {
+            headers,
+            cache_key_ready_headers,
+        }
     }
 }
 
@@ -935,7 +1164,12 @@ impl Plugin for ResponseCaching {
             }
         }
 
-        let vary_headers = self.cache_lookup_vary_headers(&base_key);
+        let mut vary_headers = self.cache_lookup_vary_headers(&base_key);
+        // A request that carries credentials/session headers must never probe
+        // the unvaried base key, even if this base key has only seen anonymous
+        // responses so far. Storage also merges these dimensions so the
+        // `vary_index` stays widened for future anonymous lookups.
+        self.merge_present_sensitive_vary_headers(&mut vary_headers, headers);
         let cache_key = self.build_cache_key(ctx, &vary_headers, headers);
         // Store the full cache key (with Vary dimensions) so on_final_response_body
         // can mark the correct variant-specific key in the uncacheable predictor.
@@ -1094,37 +1328,58 @@ impl Plugin for ResponseCaching {
             }
         };
 
-        // Per RFC 7234 §3.2, a shared cache MUST NOT serve a cached response
-        // to a request other than the one that produced it when the original
-        // request carried an `Authorization` header — unless the response
-        // explicitly opted-in via `Cache-Control: public` / `must-revalidate`
-        // / `s-maxage`. `shared_cache_allows_authorized_response` already
-        // gates that decision above. Once we've decided to cache, we MUST
-        // also key the cache entry by the Authorization value so two users
-        // presenting different bearer tokens land on different cache entries.
+        // Never narrow the indexed Vary dimensions for a base key. Once a
+        // credential/session or backend Vary dimension has been introduced,
+        // later responses that lack that header still need to store under an
+        // explicit empty-valued variant rather than replacing the index with a
+        // smaller set and making credential-bearing lookups probe the base key.
+        self.merge_existing_vary_headers(&base_key, &mut vary_headers);
+
+        // Per RFC 7234 §3.2 / §8, a shared cache MUST NOT serve a stored
+        // response to a request other than the one that produced it when the
+        // original request carried credentials — unless the response
+        // explicitly opted in via `Cache-Control: public` / `must-revalidate`
+        // / `s-maxage`. `shared_cache_allows_authorized_response` gates that
+        // decision above. Once we've decided to cache, we MUST also key the
+        // entry by the credential so two clients presenting different
+        // credentials land on different cache entries.
         //
-        // Auto-merge `authorization` into the Vary list whenever the request
-        // had an Authorization header. Operators don't need to remember to
-        // configure `cache_key_include_consumer: true` or list `authorization`
-        // in `vary_by_headers` — the safe default is to never share cached
-        // authorized responses across distinct credentials. The merged list
-        // is sorted and re-stored in `vary_index` so the same dimension
-        // applies to every subsequent lookup at this base key.
+        // Auto-merge every credential/session header the request carried
+        // (`authorization`, `proxy-authorization`, `cookie`) into the keyed
+        // Vary list. Operators don't need to remember to set
+        // `cache_key_include_consumer: true` or list these in
+        // `vary_by_headers` — the safe default is to never share a cached
+        // response across distinct credentials or sessions. The merged list is
+        // sorted and re-stored in `vary_index` so the same dimension applies to
+        // every subsequent lookup at this base key.
+        //
+        // This is complementary to the per-principal `consumer_part` in
+        // `build_base_cache_key`: that isolates *authenticated* principals
+        // (API key / mTLS / JWT) even when the credential rides a non-standard
+        // header; this isolates the raw credential/session headers themselves,
+        // including anonymous `Cookie`-only sessions that have no
+        // `effective_identity`.
         //
         // `lookup_headers` was built above from
         // `restore_request_headers_view`: it layers `before_proxy`'s header
         // snapshot on top of `ctx.headers`, so configured `vary_by_headers`
-        // / `host` / `authorization` reflect the transformed values that
+        // / `host` / the sensitive headers reflect the transformed values that
         // were live during lookup. Response-added Vary headers fall back to
-        // `ctx.headers`, the same source any future lookup would use for
-        // them, so the lookup/storage symmetry holds for those too.
-        let storage_auth_present = lookup_headers.contains_key("authorization");
-        if storage_auth_present && !vary_headers.iter().any(|h| h == "authorization") {
-            vary_headers.push("authorization".to_string());
-            vary_headers.sort();
-        }
+        // `ctx.headers`, the same source any future lookup would use for them,
+        // so the lookup/storage symmetry holds for those too.
+        self.merge_present_sensitive_vary_headers(&mut vary_headers, &lookup_headers.headers);
 
-        let cache_key = self.build_cache_key(ctx, &vary_headers, &lookup_headers);
+        let cache_key = self.build_cache_key_with_ready_values(
+            ctx,
+            &vary_headers,
+            &lookup_headers.headers,
+            Some(&lookup_headers.cache_key_ready_headers),
+        );
+        debug_assert_eq!(
+            base_key,
+            self.build_base_cache_key(ctx, &lookup_headers.headers),
+            "response_caching base-key inputs must be reproduced by the request-header snapshot"
+        );
 
         if body.len() > self.config.max_entry_size_bytes {
             debug!(
@@ -1153,6 +1408,10 @@ impl Plugin for ResponseCaching {
             body: Bytes::copy_from_slice(body),
             inserted_at: Instant::now(),
             ttl,
+            // `cache_key` is `base_key` plus an optional `:<vary>` suffix, so
+            // `base_key.len()` is the prefix that `prune_vary_index` slices back
+            // out to recover this entry's base key.
+            base_key_len: base_key.len(),
         };
         let entry_size = entry.approx_size();
 
@@ -1185,6 +1444,9 @@ impl Plugin for ResponseCaching {
         );
 
         self.evict_if_needed();
+        // The store above is the only path that grows `vary_index`; prune here
+        // so a high-cardinality principal stream can't leak it unboundedly.
+        self.prune_vary_index();
         PluginResult::Continue
     }
 }
@@ -1251,6 +1513,161 @@ mod tests {
         assert!(!stored_key.contains(bearer));
         assert!(!stored_key.contains("reviewer-secret-token"));
         assert!(stored_key.contains("authorization=sha256-"));
+    }
+
+    #[tokio::test]
+    async fn cookie_is_auto_varied_and_hashed_without_explicit_config() {
+        // No `vary_by_headers` configured and no authenticated identity: the
+        // storage path must still auto-Vary `cookie` so distinct sessions
+        // never share one `public` entry, and the raw cookie value must be
+        // SHA-256-hashed out of the key. (finding #15)
+        let plugin = plugin_with_config(json!({ "ttl_seconds": 60 }));
+
+        let mut ctx = make_ctx("GET", "/dashboard");
+        ctx.headers
+            .insert("cookie".to_string(), "session=top-secret".to_string());
+        let mut request_headers = ctx.headers.clone();
+        let result = plugin.before_proxy(&mut ctx, &mut request_headers).await;
+        assert!(matches!(result, PluginResult::Continue));
+
+        let mut response_headers = HashMap::new();
+        response_headers.insert(
+            "cache-control".to_string(),
+            "public, max-age=60".to_string(),
+        );
+        plugin
+            .on_final_response_body(&mut ctx, 200, &response_headers, b"dashboard-body")
+            .await;
+
+        let cache_keys: Vec<String> = plugin
+            .cache
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+        assert_eq!(cache_keys.len(), 1);
+        let stored_key = &cache_keys[0];
+        assert!(
+            !stored_key.contains("top-secret"),
+            "raw cookie leaked into cache key: {stored_key}"
+        );
+        assert!(
+            stored_key.contains("cookie=sha256-"),
+            "cookie was not auto-varied into the cache key: {stored_key}"
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticated_principal_keyed_into_base_key_without_consumer_flag() {
+        // Default config (`cache_key_include_consumer: false`). An identity
+        // authenticated by a non-`Authorization` scheme must still be bound
+        // into the cache key (SHA-256-hashed), so a `public` per-user response
+        // is never shared across principals. (finding #1)
+        let plugin = plugin_with_config(json!({ "ttl_seconds": 60 }));
+
+        let mut ctx = make_ctx("GET", "/api/profile");
+        ctx.authenticated_identity = Some("alice@example.com".to_string());
+        let mut request_headers = ctx.headers.clone();
+        plugin.before_proxy(&mut ctx, &mut request_headers).await;
+
+        let mut response_headers = HashMap::new();
+        response_headers.insert(
+            "cache-control".to_string(),
+            "public, max-age=60".to_string(),
+        );
+        plugin
+            .on_final_response_body(&mut ctx, 200, &response_headers, b"alice-body")
+            .await;
+
+        let cache_keys: Vec<String> = plugin
+            .cache
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+        assert_eq!(cache_keys.len(), 1);
+        let stored_key = &cache_keys[0];
+        assert!(
+            !stored_key.contains("alice@example.com"),
+            "raw identity leaked into cache key: {stored_key}"
+        );
+        assert!(
+            stored_key.contains(&format!("sha256-{}", sha256_hex("alice@example.com"))),
+            "authenticated principal was not bound into the base key: {stored_key}"
+        );
+    }
+
+    #[tokio::test]
+    async fn vary_index_stays_bounded_under_high_principal_cardinality() {
+        // Binding the principal into the base key (the fix above) means each
+        // distinct identity gets its own base key — and `vary_index` is keyed
+        // by base key. `vary_index` was only ever pruned in
+        // `invalidate_base_key`, so a stream of distinct principals (JWT `sub`s,
+        // ephemeral SPIFFE IDs) would leak it without bound even though
+        // `self.cache` stays capped at `max_entries`. `prune_vary_index` must
+        // reclaim mappings whose base key has no surviving cache variant.
+        let max_entries = 4;
+        let plugin = plugin_with_config(json!({
+            "ttl_seconds": 60,
+            "max_entries": max_entries,
+        }));
+
+        let principals = 40;
+        for i in 0..principals {
+            let mut ctx = make_ctx("GET", "/api/profile");
+            ctx.authenticated_identity = Some(format!("user-{i}"));
+            // A `cookie` makes the full key `base(principal):cookie=sha256-…`,
+            // so the base key is a strict prefix of the full key — this also
+            // exercises `base_key_len` slicing on a vary-suffixed key.
+            ctx.headers
+                .insert("cookie".to_string(), "session=shared".to_string());
+            let mut request_headers = ctx.headers.clone();
+            plugin.before_proxy(&mut ctx, &mut request_headers).await;
+
+            let mut response_headers = HashMap::new();
+            response_headers.insert(
+                "cache-control".to_string(),
+                "public, max-age=60".to_string(),
+            );
+            plugin
+                .on_final_response_body(&mut ctx, 200, &response_headers, b"profile-body")
+                .await;
+        }
+
+        // Cache is capped by eviction, and `vary_index` is reclaimed alongside
+        // it — not left at `principals` (40) entries as it would be without the
+        // prune. Distinct live base keys can never exceed the live cache.
+        //
+        // `== max_entries` (not `<=`): 40 distinct non-expiring entries must
+        // pin the cache exactly at its cap, which also proves the responses
+        // were actually stored — otherwise the `vary_index` bounds below would
+        // pass vacuously.
+        assert_eq!(
+            plugin.cache.len(),
+            max_entries,
+            "expected the cache pinned at max_entries; got {}",
+            plugin.cache.len()
+        );
+        let max_vary_index_entries =
+            plugin.cache.len() + vary_index_prune_slack(plugin.cache.len());
+        assert!(
+            plugin.vary_index.len() <= max_vary_index_entries,
+            "vary_index leaked past cache+slack bound ({}): {} entries — prune_vary_index did not reclaim stale base keys",
+            max_vary_index_entries,
+            plugin.vary_index.len()
+        );
+        assert!(
+            plugin.vary_index.len() <= max_entries + vary_index_prune_slack(max_entries),
+            "vary_index ({}) outgrew max_entries plus prune slack ({})",
+            plugin.vary_index.len(),
+            max_entries + vary_index_prune_slack(max_entries)
+        );
+    }
+
+    #[test]
+    fn host_snapshot_values_are_not_marked_cache_key_ready() {
+        assert!(!should_snapshot_header_value_as_cache_key_part("host"));
+        assert!(!should_snapshot_header_value_as_cache_key_part("Host"));
+        assert!(should_snapshot_header_value_as_cache_key_part("cookie"));
+        assert!(should_snapshot_header_value_as_cache_key_part("x-api-key"));
     }
 
     #[test]

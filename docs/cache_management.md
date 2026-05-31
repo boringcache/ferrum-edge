@@ -58,7 +58,7 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 
 **What it stores:** Resolved IP addresses for backend hostnames, upstream targets, and plugin endpoints.
 
-**Default limit:** 10,000 entries.
+**Default limit:** 10,000 entries. In semantic mode, HNSW snapshot memory and periodic full-index rebuild CPU also scale with this count outside the response-entry byte budget.
 
 **Env var:** `FERRUM_DNS_CACHE_MAX_SIZE`.
 
@@ -176,13 +176,13 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 
 ### AI Semantic Cache
 
-**What it stores:** Cached LLM responses keyed by normalized prompt text.
+**What it stores:** Cached LLM responses keyed by normalized prompt text. When `semantic_similarity_enabled` is true, local cache entries can also carry prompt embeddings and are indexed in a local HNSW vector snapshot for semantic lookup after exact misses.
 
 **Default limit:** 10,000 entries.
 
 **Config field:** `max_entries` (in plugin config JSON).
 
-**Cleanup mechanism:** TTL-based expiration (`ttl_seconds` config field). When the cache exceeds `max_entries`, oldest entries are evicted.
+**Cleanup mechanism:** TTL-based expiration (`ttl_seconds` config field). When the cache exceeds `max_entries`, oldest entries are evicted. The optional semantic vector snapshot is rebuilt by a detached background task after local semantic entries are inserted or evicted, at most once every 30 seconds after the first indexed semantic entry. `max_total_size_bytes` includes retained embedding vectors and semantic scope keys; the HNSW snapshot keeps an additional local vector and graph copy outside the response-entry budget.
 
 ### Request Deduplication
 
