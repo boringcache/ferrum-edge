@@ -9,6 +9,7 @@ use tracing::{debug, warn};
 const DROP_WARN_EVERY: u64 = 100;
 pub const MAX_BATCH_SIZE: usize = 10_000;
 pub const MAX_BUFFER_CAPACITY: usize = 1_000_000;
+const MAX_TOKIO_SLEEP_MS: u64 = i64::MAX as u64;
 
 /// Strategy for retrying a failed flush. The flush closure owns its own
 /// status-code-aware logic (e.g. "don't retry 401/403, do retry 408/429") —
@@ -53,11 +54,14 @@ impl RetryPolicy {
     /// jitter). The jitter uses a lightweight counter-based PRNG — it does not
     /// need cryptographic quality — mirroring `crate::retry::retry_delay`.
     fn backoff_delay(&self, attempt: u32) -> Duration {
-        let base_ms = self.delay.as_millis().min(u128::from(u64::MAX)) as u64;
+        let base_ms = self
+            .delay
+            .as_millis()
+            .min(u128::from(MAX_TOKIO_SLEEP_MS)) as u64;
         let cap_ms = self
             .max_delay
             .as_millis()
-            .min(u128::from(u64::MAX))
+            .min(u128::from(MAX_TOKIO_SLEEP_MS))
             .max(u128::from(base_ms)) as u64;
 
         // delay * 2^(attempt-1), saturating, then capped at max_delay.
@@ -468,5 +472,20 @@ mod tests {
         };
         assert_eq!(policy.backoff_delay(1), Duration::from_millis(500));
         assert_eq!(policy.backoff_delay(3), Duration::from_millis(500));
+    }
+
+    #[test]
+    fn backoff_delay_is_capped_to_tokio_timer_range() {
+        let policy = RetryPolicy {
+            max_attempts: 2,
+            delay: Duration::from_millis(u64::MAX),
+            max_delay: Duration::from_millis(u64::MAX),
+            jitter: false,
+        };
+
+        assert_eq!(
+            policy.backoff_delay(1),
+            Duration::from_millis(MAX_TOKIO_SLEEP_MS)
+        );
     }
 }
