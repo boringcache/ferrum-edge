@@ -852,9 +852,7 @@ fn redact_field_text(
                 .get("role")
                 .and_then(|r| r.as_str())
                 .is_some_and(|role| exclude_roles.contains(role));
-            if !excluded
-                && let Some(content) = obj.get_mut("content")
-            {
+            if !excluded && let Some(content) = obj.get_mut("content") {
                 redact_field_text(content, exclude_roles, redact);
             }
         }
