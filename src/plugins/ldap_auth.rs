@@ -25,19 +25,18 @@
 //!   CAs in the system / webpki bundle are NOT trusted, preventing a
 //!   public-CA-issued certificate from MITM-ing the LDAP connection.
 //! - `FERRUM_TLS_NO_VERIFY` — skip TLS certificate verification (testing only)
-//!
-//! CRL checking is NOT currently applied — `PluginHttpClient` does not yet
-//! expose the gateway's parsed CRL list to plugins. TODO: plumb
-//! `Vec<CertificateRevocationListDer<'static>>` through `PluginHttpClient`
-//! and pass it to `build_server_verifier_with_crls()` here so LDAP TLS gains
-//! the same revocation guarantees as the proxy backend paths.
+//! - `FERRUM_TLS_CRL_FILE_PATH` — gateway CRL list. When configured (and
+//!   verification is not disabled), revoked LDAP server certificates are
+//!   rejected via `build_server_verifier_with_crls()`, giving `ldaps://` /
+//!   STARTTLS the same revocation guarantees as the proxy backend, DTLS,
+//!   frontend mTLS, and rustls logging-sink surfaces.
 
 use async_trait::async_trait;
 use base64::Engine;
 use dashmap::DashMap;
 use ldap3::{LdapConnAsync, LdapConnSettings, Scope, SearchEntry};
 use rustls::ClientConfig;
-use rustls::pki_types::CertificateDer;
+use rustls::pki_types::{CertificateDer, CertificateRevocationListDer};
 use serde_json::Map;
 use serde_json::Value;
 use std::collections::HashSet;
@@ -52,6 +51,38 @@ use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 use super::utils::PluginHttpClient;
 use super::utils::auth_flow::{self, AuthMechanism, ExtractedCredential, VerifyOutcome};
 use super::{RequestContext, strip_auth_scheme};
+
+/// Outcome of an LDAP authentication attempt, distinguishing a genuine
+/// credential-negative result (wrong password / user not found) from a
+/// backend or configuration failure (directory unreachable, service-account
+/// bind rejected, search RPC error).
+///
+/// `verify()` maps `Credential` to `VerifyOutcome::Invalid` (HTTP 401) and
+/// `Backend` to `VerifyOutcome::Internal` (HTTP 500), mirroring the existing
+/// group-membership path so the two paths are consistent. Returning 401 for a
+/// directory outage or misconfigured service account would tell the client its
+/// credentials are wrong — prompting credential re-submission and masking the
+/// operational problem (finding #32). Each variant carries the specific cause
+/// for the `warn!` log only; the client always sees a generic message.
+enum AuthError {
+    /// The presented credentials were rejected, or the user does not exist.
+    /// Maps to 401.
+    Credential(String),
+    /// The directory was unreachable, the service account failed/was rejected,
+    /// or a search RPC failed. Operational/config problem, not the client's
+    /// fault. Maps to 500.
+    Backend(String),
+}
+
+impl AuthError {
+    /// The specific cause, for operator-facing `warn!` logs only — never sent
+    /// to the client.
+    fn log_message(&self) -> &str {
+        match self {
+            AuthError::Credential(msg) | AuthError::Backend(msg) => msg,
+        }
+    }
+}
 
 pub struct LdapAuth {
     ldap_url: String,
@@ -182,6 +213,26 @@ impl LdapAuth {
             );
         }
 
+        // Finding #33: when group enforcement is configured but no service
+        // account is available, the group-membership search runs over an
+        // ANONYMOUS-bound connection. Many directories deny anonymous reads of
+        // group objects / `member` attributes, so the search silently returns
+        // zero entries and a legitimately entitled user gets a 403. Surface
+        // this dependency on directory ACLs at config time rather than as
+        // silent denials at request time. (Search-then-bind already mandates a
+        // service account above, so this only fires for direct-bind configs.)
+        if !required_groups.is_empty()
+            && (service_account_dn.is_none() || service_account_password.is_none())
+        {
+            warn!(
+                "ldap_auth: 'required_groups' is set without a service account \
+                 ('service_account_dn'/'service_account_password'); the group-membership search \
+                 will use an ANONYMOUS bind. Group enforcement will only work if the directory \
+                 permits anonymous reads of group objects — otherwise entitled users will be \
+                 denied (403). Configure a service account to avoid relying on directory ACLs."
+            );
+        }
+
         let group_attribute =
             parse_optional_string(config_obj, "group_attribute")?.unwrap_or_else(|| "cn".into());
 
@@ -210,13 +261,17 @@ impl LdapAuth {
 
         let consumer_mapping = parse_bool(config_obj, "consumer_mapping", true)?;
 
-        // Build rustls TLS config respecting gateway settings
+        // Build rustls TLS config respecting gateway settings, including the
+        // gateway's parsed CRL list (`FERRUM_TLS_CRL_FILE_PATH`) so revoked LDAP
+        // server certificates are rejected — parity with the proxy backend /
+        // DTLS / rustls logging-sink surfaces (finding #84).
         let tls_no_verify = http_client.tls_no_verify();
         let needs_tls = is_ldaps || starttls;
         let tls_config = if needs_tls {
             Some(build_ldap_tls_config(
                 tls_no_verify,
                 http_client.tls_ca_bundle_path(),
+                http_client.tls_crls(),
             )?)
         } else {
             None
@@ -295,7 +350,11 @@ impl LdapAuth {
     }
 
     /// Connect to the LDAP server with configured settings.
-    async fn connect(&self) -> Result<ldap3::Ldap, String> {
+    ///
+    /// A connection failure is a backend/infrastructure problem (directory
+    /// unreachable, TLS handshake failure), not a credential problem, so it is
+    /// surfaced as [`AuthError::Backend`].
+    async fn connect(&self) -> Result<ldap3::Ldap, AuthError> {
         let mut settings = LdapConnSettings::new()
             .set_conn_timeout(self.connect_timeout)
             .set_starttls(self.starttls)
@@ -307,7 +366,7 @@ impl LdapAuth {
 
         let (conn, mut ldap) = LdapConnAsync::with_settings(settings, &self.ldap_url)
             .await
-            .map_err(|e| format!("ldap_auth: connection failed: {e}"))?;
+            .map_err(|e| AuthError::Backend(format!("ldap_auth: connection failed: {e}")))?;
 
         // Drive the connection in the background
         ldap3::drive!(conn);
@@ -320,7 +379,14 @@ impl LdapAuth {
 
     /// Authenticate a user via direct bind or search-then-bind.
     /// Returns the user's DN on success.
-    async fn authenticate_user(&self, username: &str, password: &str) -> Result<String, String> {
+    ///
+    /// Errors are classified ([`AuthError`]) so that a rejected user bind /
+    /// "user not found" surfaces as a 401 while a directory outage, a failed
+    /// service-account bind, or a search RPC error surfaces as a 500 (finding
+    /// #32). A bind that *fails* (transport / RPC error) is a backend problem;
+    /// a bind that is *rejected* (LDAP returned a non-success result code for
+    /// the end user's credentials) is the genuine invalid-credential case.
+    async fn authenticate_user(&self, username: &str, password: &str) -> Result<String, AuthError> {
         let mut ldap = self.connect().await?;
 
         let user_dn = if let Some(ref template) = self.bind_dn_template {
@@ -328,20 +394,27 @@ impl LdapAuth {
             let dn = template.replace("{username}", &escape_dn_value(username));
             ldap.simple_bind(&dn, password)
                 .await
-                .map_err(|e| format!("ldap_auth: bind failed: {e}"))?
+                .map_err(|e| AuthError::Backend(format!("ldap_auth: bind failed: {e}")))?
                 .success()
-                .map_err(|e| format!("ldap_auth: bind rejected: {e}"))?;
+                .map_err(|e| AuthError::Credential(format!("ldap_auth: bind rejected: {e}")))?;
             dn
         } else {
             // Search-then-bind: find user DN via service account
             let service_dn = self.service_account_dn.as_deref().unwrap_or_default();
             let service_pw = self.service_account_password.as_deref().unwrap_or_default();
 
+            // A failed/rejected service-account bind is an operator
+            // misconfiguration, never the end user's fault — classify both as
+            // backend errors so the client is not told its credentials are wrong.
             ldap.simple_bind(service_dn, service_pw)
                 .await
-                .map_err(|e| format!("ldap_auth: service account bind failed: {e}"))?
+                .map_err(|e| {
+                    AuthError::Backend(format!("ldap_auth: service account bind failed: {e}"))
+                })?
                 .success()
-                .map_err(|e| format!("ldap_auth: service account bind rejected: {e}"))?;
+                .map_err(|e| {
+                    AuthError::Backend(format!("ldap_auth: service account bind rejected: {e}"))
+                })?;
 
             let search_base = self.search_base_dn.as_deref().unwrap_or_default();
             let filter = self
@@ -353,18 +426,19 @@ impl LdapAuth {
             let (rs, _result) = ldap
                 .search(search_base, Scope::Subtree, &filter, vec!["dn"])
                 .await
-                .map_err(|e| format!("ldap_auth: user search failed: {e}"))?
+                .map_err(|e| AuthError::Backend(format!("ldap_auth: user search failed: {e}")))?
                 .success()
-                .map_err(|e| format!("ldap_auth: user search error: {e}"))?;
+                .map_err(|e| AuthError::Backend(format!("ldap_auth: user search error: {e}")))?;
 
             if rs.is_empty() {
-                return Err("ldap_auth: user not found".to_string());
+                return Err(AuthError::Credential(
+                    "ldap_auth: user not found".to_string(),
+                ));
             }
 
-            let entry =
-                SearchEntry::construct(rs.into_iter().next().ok_or_else(|| {
-                    "ldap_auth: user not found after non-empty check".to_string()
-                })?);
+            let entry = SearchEntry::construct(rs.into_iter().next().ok_or_else(|| {
+                AuthError::Backend("ldap_auth: user not found after non-empty check".to_string())
+            })?);
             let user_dn = entry.dn;
 
             // Unbind the service account, re-connect and bind as the user
@@ -374,9 +448,11 @@ impl LdapAuth {
             user_ldap
                 .simple_bind(&user_dn, password)
                 .await
-                .map_err(|e| format!("ldap_auth: user bind failed: {e}"))?
+                .map_err(|e| AuthError::Backend(format!("ldap_auth: user bind failed: {e}")))?
                 .success()
-                .map_err(|e| format!("ldap_auth: user bind rejected: {e}"))?;
+                .map_err(|e| {
+                    AuthError::Credential(format!("ldap_auth: user bind rejected: {e}"))
+                })?;
 
             let _ = user_ldap.unbind().await;
             user_dn
@@ -387,7 +463,16 @@ impl LdapAuth {
     }
 
     /// Check if the authenticated user belongs to at least one of the required groups.
-    async fn check_group_membership(&self, user_dn: &str, username: &str) -> Result<bool, String> {
+    ///
+    /// All failures here (connect, group-check bind, search RPC) are
+    /// backend/infrastructure problems, surfaced as [`AuthError::Backend`] →
+    /// 500. A successful search that simply matches no group is `Ok(false)`
+    /// (the user is genuinely not entitled → 403).
+    async fn check_group_membership(
+        &self,
+        user_dn: &str,
+        username: &str,
+    ) -> Result<bool, AuthError> {
         if self.required_groups.is_empty() {
             return Ok(true);
         }
@@ -410,15 +495,30 @@ impl LdapAuth {
             })
             .unwrap_or(default_filter);
 
-        // Use service account if available, otherwise anonymous bind
+        // Bind with the service account when one is configured; otherwise the
+        // group search runs over an ANONYMOUS-bound connection. Many directories
+        // deny or restrict anonymous reads of group `member` attributes, in
+        // which case the search returns zero entries and a legitimately
+        // entitled user is wrongly denied (403). Operators are warned at
+        // startup (see `new()`) when group enforcement relies on anonymous
+        // search; finding #33.
         let mut ldap = self.connect().await?;
-        if let (Some(dn), Some(pw)) = (&self.service_account_dn, &self.service_account_password) {
+        let used_service_account = if let (Some(dn), Some(pw)) =
+            (&self.service_account_dn, &self.service_account_password)
+        {
             ldap.simple_bind(dn, pw)
                 .await
-                .map_err(|e| format!("ldap_auth: group check bind failed: {e}"))?
+                .map_err(|e| {
+                    AuthError::Backend(format!("ldap_auth: group check bind failed: {e}"))
+                })?
                 .success()
-                .map_err(|e| format!("ldap_auth: group check bind rejected: {e}"))?;
-        }
+                .map_err(|e| {
+                    AuthError::Backend(format!("ldap_auth: group check bind rejected: {e}"))
+                })?;
+            true
+        } else {
+            false
+        };
 
         let (rs, _result) = ldap
             .search(
@@ -428,11 +528,26 @@ impl LdapAuth {
                 vec![self.group_attribute.as_str()],
             )
             .await
-            .map_err(|e| format!("ldap_auth: group search failed: {e}"))?
+            .map_err(|e| AuthError::Backend(format!("ldap_auth: group search failed: {e}")))?
             .success()
-            .map_err(|e| format!("ldap_auth: group search error: {e}"))?;
+            .map_err(|e| AuthError::Backend(format!("ldap_auth: group search error: {e}")))?;
 
         let _ = ldap.unbind().await;
+
+        // A zero-entry result is ambiguous: the user may genuinely belong to no
+        // group, OR the directory may have silently returned nothing because an
+        // anonymous (no service account) search of group objects is restricted
+        // by directory ACLs. Surface that distinction so operators can tell an
+        // entitlement denial from a misconfigured search permission (finding #33).
+        if rs.is_empty() && !used_service_account {
+            warn!(
+                "ldap_auth: group search for user '{}' under '{}' returned no entries over an \
+                 anonymous bind; this is either a genuine no-membership result or the directory \
+                 restricts anonymous reads of group objects — configure 'service_account_dn'/\
+                 'service_account_password' if groups are not being matched",
+                username, group_base
+            );
+        }
 
         for result_entry in rs {
             let entry = SearchEntry::construct(result_entry);
@@ -587,12 +702,17 @@ fn parse_string_array(config: &Map<String, Value>, field: &str) -> Result<Vec<St
 ///   custom certificate verifier (mirroring the proxy backend / WebSocket /
 ///   gRPC paths) which accepts every cert presented.
 ///
-/// CRL: not currently applied. `PluginHttpClient` does not expose the parsed
-/// CRL list to plugins; once it does, route `crls` into
-/// `crate::tls::build_server_verifier_with_crls()` here.
+/// CRL: when `FERRUM_TLS_NO_VERIFY` is not set, the verifier is built via
+/// [`crate::tls::build_server_verifier_with_crls()`] with the gateway's parsed
+/// CRL list (`crls`, sourced from `PluginHttpClient::tls_crls()`). Revoked LDAP
+/// server certificates are rejected, matching the proxy backend / DTLS /
+/// frontend mTLS / rustls logging-sink surfaces. An empty `crls` slice yields a
+/// plain WebPki verifier (no behavioural change vs. the previous root-store
+/// verifier).
 fn build_ldap_tls_config(
     no_verify: bool,
     ca_bundle_path: Option<&str>,
+    crls: &[CertificateRevocationListDer<'static>],
 ) -> Result<Arc<ClientConfig>, String> {
     // ldap3's `tls-rustls-ring` feature forwards `rustls/ring`, which selects
     // the ring crypto provider for TLS primitives but DOES NOT install it as
@@ -618,10 +738,17 @@ fn build_ldap_tls_config(
             .with_custom_certificate_verifier(Arc::new(crate::tls::NoVerifier))
             .with_no_client_auth()
     } else {
+        // Build a WebPki verifier from the (CA-exclusive) trust store and apply
+        // the gateway's parsed CRL list so revoked LDAP server certificates are
+        // rejected, matching the proxy backend / DTLS / frontend mTLS / rustls
+        // logging-sink surfaces (finding #84). When no CRL is configured this is
+        // equivalent to the default root-store verifier. `build_server_verifier_with_crls`
+        // uses `allow_unknown_revocation_status() + only_check_end_entity_revocation()`
+        // so certs from CAs without a matching CRL are still accepted.
         let root_store = build_ldap_root_store(ca_bundle_path)?;
-        builder
-            .with_root_certificates(root_store)
-            .with_no_client_auth()
+        let verifier = crate::tls::build_server_verifier_with_crls(root_store, crls)
+            .map_err(|e| format!("ldap_auth: failed to build TLS verifier: {e}"))?;
+        builder.with_webpki_verifier(verifier).with_no_client_auth()
     };
 
     Ok(Arc::new(config))
@@ -824,12 +951,21 @@ impl AuthMechanism for LdapAuth {
             return self.identity_outcome(&username, consumer_index);
         }
 
-        // Authenticate against LDAP
+        // Authenticate against LDAP. Distinguish a genuine credential failure
+        // (401) from a backend/config failure (500); see finding #32. The
+        // client always receives a generic message — the specific cause is only
+        // logged via `warn!`.
         let user_dn = match self.authenticate_user(&username, &password).await {
             Ok(dn) => dn,
-            Err(e) => {
+            Err(AuthError::Credential(e)) => {
                 warn!("{}", e);
                 return VerifyOutcome::Invalid(r#"{"error":"LDAP authentication failed"}"#.into());
+            }
+            Err(AuthError::Backend(e)) => {
+                warn!("{}", e);
+                return VerifyOutcome::Internal(
+                    r#"{"error":"LDAP authentication temporarily unavailable"}"#.into(),
+                );
             }
         };
 
@@ -847,7 +983,7 @@ impl AuthMechanism for LdapAuth {
                     );
                 }
                 Err(e) => {
-                    warn!("{}", e);
+                    warn!("{}", e.log_message());
                     return VerifyOutcome::Internal(
                         r#"{"error":"LDAP group membership check failed"}"#.into(),
                     );
@@ -959,6 +1095,9 @@ mod tests {
             .push(rcgen::DnType::CommonName, cn);
         params.key_usages.push(KeyUsagePurpose::KeyCertSign);
         params.key_usages.push(KeyUsagePurpose::DigitalSignature);
+        // `CrlSign` lets this CA also sign CRLs (required by rcgen for the CRL
+        // revocation test); harmless for the CA-exclusivity tests.
+        params.key_usages.push(KeyUsagePurpose::CrlSign);
         let cert = must(params.self_signed(&key_pair), "self-sign CA");
         TestCa {
             cert_pem: cert.pem(),
@@ -1049,7 +1188,10 @@ mod tests {
     #[test]
     fn no_verify_returns_arc_clientconfig() {
         ensure_crypto_provider();
-        let cfg = must(build_ldap_tls_config(true, None), "build no-verify config");
+        let cfg = must(
+            build_ldap_tls_config(true, None, &[]),
+            "build no-verify config",
+        );
         // Cheap structural smoke check: must be an Arc<ClientConfig>.
         let _: &ClientConfig = cfg.as_ref();
     }
@@ -1057,7 +1199,10 @@ mod tests {
     #[test]
     fn missing_ca_bundle_path_falls_back_to_webpki() {
         ensure_crypto_provider();
-        let cfg = must(build_ldap_tls_config(false, None), "build webpki config");
+        let cfg = must(
+            build_ldap_tls_config(false, None, &[]),
+            "build webpki config",
+        );
         let _: &ClientConfig = cfg.as_ref();
     }
 
@@ -1065,7 +1210,7 @@ mod tests {
     fn empty_ca_bundle_rejected() {
         ensure_crypto_provider();
         let f = must(NamedTempFile::new(), "create empty temp CA file");
-        let err = build_ldap_tls_config(false, f.path().to_str()).unwrap_err();
+        let err = build_ldap_tls_config(false, f.path().to_str(), &[]).unwrap_err();
         assert!(
             err.contains("no valid CA certificates"),
             "unexpected error: {err}"
@@ -1075,7 +1220,7 @@ mod tests {
     #[test]
     fn missing_ca_bundle_file_rejected() {
         ensure_crypto_provider();
-        let err = build_ldap_tls_config(false, Some("/nonexistent/path/ca.pem")).unwrap_err();
+        let err = build_ldap_tls_config(false, Some("/nonexistent/path/ca.pem"), &[]).unwrap_err();
         assert!(err.contains("failed to read"), "unexpected error: {err}");
     }
 
@@ -1089,7 +1234,7 @@ mod tests {
 
         let ca_file = write_pem_to_temp(&ca_a.cert_pem);
         let client_cfg = must(
-            build_ldap_tls_config(false, ca_file.path().to_str()),
+            build_ldap_tls_config(false, ca_file.path().to_str(), &[]),
             "build client config",
         );
 
@@ -1120,7 +1265,7 @@ mod tests {
         // Build config trusting only CA-A; server presents CA-B-signed cert.
         let ca_file = write_pem_to_temp(&ca_a.cert_pem);
         let client_cfg = must(
-            build_ldap_tls_config(false, ca_file.path().to_str()),
+            build_ldap_tls_config(false, ca_file.path().to_str(), &[]),
             "build client config",
         );
 
@@ -1162,6 +1307,98 @@ mod tests {
         assert!(
             webpki_store.len() > 10,
             "webpki fallback should populate many trust anchors"
+        );
+    }
+
+    /// Generate a leaf cert (PEM cert + PEM key) signed by `ca` with an explicit
+    /// serial number, so a CRL can reference it. Mirrors `generate_signed_leaf`.
+    fn generate_signed_leaf_with_serial(
+        ca: &TestCa,
+        cn: &str,
+        sans: &[&str],
+        serial: u64,
+    ) -> (String, String) {
+        let key_pair = must(
+            KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256),
+            "generate leaf key",
+        );
+        let mut params = must(
+            CertificateParams::new(sans.iter().map(|s| s.to_string()).collect::<Vec<_>>()),
+            "build leaf params",
+        );
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, cn);
+        params.serial_number = Some(rcgen::SerialNumber::from(serial));
+        let cert = must(params.signed_by(&key_pair, &ca.issuer), "sign leaf");
+        (cert.pem(), key_pair.serialize_pem())
+    }
+
+    /// Build a CRL signed by `ca` revoking the given certificate serial.
+    fn build_crl_revoking(ca: &TestCa, serial: u64) -> CertificateRevocationListDer<'static> {
+        use rcgen::{
+            CertificateRevocationListParams, RevocationReason, RevokedCertParams, SerialNumber,
+        };
+        use time::{Duration as TimeDuration, OffsetDateTime};
+
+        let now = OffsetDateTime::now_utc();
+        let params = CertificateRevocationListParams {
+            this_update: now,
+            next_update: now + TimeDuration::days(7),
+            crl_number: SerialNumber::from(1u64),
+            issuing_distribution_point: None,
+            revoked_certs: vec![RevokedCertParams {
+                serial_number: SerialNumber::from(serial),
+                revocation_time: now,
+                reason_code: Some(RevocationReason::KeyCompromise),
+                invalidity_date: None,
+            }],
+            key_identifier_method: rcgen::KeyIdMethod::Sha256,
+        };
+        let crl = must(params.signed_by(&ca.issuer), "sign CRL");
+        crl.der().clone()
+    }
+
+    /// Finding #84: with a gateway CRL configured, a revoked LDAP server
+    /// certificate is REJECTED during the TLS handshake; without the CRL the
+    /// same (otherwise valid, CA-trusted) certificate is ACCEPTED. The
+    /// before/after contrast proves the CRL — not some other validation step —
+    /// is what blocks the revoked cert.
+    #[tokio::test(flavor = "current_thread")]
+    async fn crl_rejects_revoked_server_cert() {
+        ensure_crypto_provider();
+        const REVOKED_SERIAL: u64 = 0x5151;
+
+        let ca = generate_test_ca("Test CA CRL");
+        let (leaf_pem, leaf_key_pem) =
+            generate_signed_leaf_with_serial(&ca, "localhost", &["localhost"], REVOKED_SERIAL);
+        let ca_file = write_pem_to_temp(&ca.cert_pem);
+        let crl = build_crl_revoking(&ca, REVOKED_SERIAL);
+
+        // Without a CRL: the CA-signed cert is trusted, handshake succeeds.
+        let cfg_no_crl = must(
+            build_ldap_tls_config(false, ca_file.path().to_str(), &[]),
+            "build no-CRL config",
+        );
+        let server_cfg = build_server_config(&leaf_pem, &leaf_key_pem);
+        let (port, _task) = spawn_oneshot_tls_server(server_cfg).await;
+        let ok = dial_with_config(port, cfg_no_crl).await;
+        assert!(
+            ok.is_ok(),
+            "handshake should SUCCEED without a CRL (baseline), got: {ok:?}"
+        );
+
+        // With the CRL revoking this serial: handshake must fail.
+        let cfg_with_crl = must(
+            build_ldap_tls_config(false, ca_file.path().to_str(), std::slice::from_ref(&crl)),
+            "build CRL config",
+        );
+        let server_cfg = build_server_config(&leaf_pem, &leaf_key_pem);
+        let (port, _task) = spawn_oneshot_tls_server(server_cfg).await;
+        let revoked = dial_with_config(port, cfg_with_crl).await;
+        assert!(
+            revoked.is_err(),
+            "handshake must FAIL when the server cert is revoked by the CRL"
         );
     }
 }

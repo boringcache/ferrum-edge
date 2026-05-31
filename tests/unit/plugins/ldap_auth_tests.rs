@@ -279,6 +279,47 @@ fn test_required_groups_with_group_base_dn_valid() {
 }
 
 #[test]
+fn test_required_groups_direct_bind_without_service_account_accepted() {
+    // Finding #33: direct-bind + required_groups with no service account is a
+    // footgun (the group search falls back to an ANONYMOUS bind, which many
+    // directories restrict). The plugin emits a startup warning but does NOT
+    // reject the config — anonymous group search is legitimate on directories
+    // that permit it, so failing construction would break valid deployments.
+    let result = LdapAuth::new(
+        &json!({
+            "ldap_url": "ldap://ldap.example.com:389",
+            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "required_groups": ["admins"],
+            "group_base_dn": "ou=groups,dc=example,dc=com"
+        }),
+        http_client(),
+    );
+    assert!(
+        result.is_ok(),
+        "direct-bind + required_groups without a service account must remain a \
+         valid (warned) config, not a hard error"
+    );
+}
+
+#[test]
+fn test_required_groups_with_service_account_accepted() {
+    // The recommended configuration: a service account is supplied for the
+    // group-membership search, so no anonymous bind is used.
+    let result = LdapAuth::new(
+        &json!({
+            "ldap_url": "ldap://ldap.example.com:389",
+            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "required_groups": ["admins"],
+            "group_base_dn": "ou=groups,dc=example,dc=com",
+            "service_account_dn": "cn=admin,dc=example,dc=com",
+            "service_account_password": "admin_password"
+        }),
+        http_client(),
+    );
+    assert!(result.is_ok());
+}
+
+#[test]
 fn test_custom_group_attribute() {
     let plugin = LdapAuth::new(
         &json!({
@@ -570,9 +611,88 @@ async fn test_empty_password_rejected_without_contacting_ldap() {
     );
 }
 
+/// Minimal mock LDAP server: accepts one TCP connection, reads the client's
+/// first request (the simple bind), and replies with a `bindResponse` carrying
+/// `resultCode` 49 (`invalidCredentials`). This is the genuine wrong-password
+/// case, which finding #32 says must map to 401 — distinct from a backend
+/// failure (500). ldap3 assigns message ID 1 to the first operation on a fresh
+/// connection, so the response is encoded at message ID 1.
+///
+/// LDAPMessage ::= SEQUENCE { messageID INTEGER (1), BindResponse }
+/// BindResponse ::= [APPLICATION 1] SEQUENCE { resultCode ENUMERATED (49),
+///                                             matchedDN "", diagnosticMessage "" }
+async fn spawn_invalid_credentials_ldap_server() -> (u16, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock LDAP server");
+    let port = listener.local_addr().expect("mock LDAP local addr").port();
+
+    let task = tokio::spawn(async move {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            // Drain the bind request so ldap3 doesn't see a half-open peer.
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf).await;
+
+            // bindResponse, messageID 1, resultCode 49 (invalidCredentials).
+            let response: [u8; 14] = [
+                0x30, 0x0c, // LDAPMessage SEQUENCE, len 12
+                0x02, 0x01, 0x01, // messageID INTEGER 1
+                0x61, 0x07, // [APPLICATION 1] BindResponse, len 7
+                0x0a, 0x01, 0x31, // resultCode ENUMERATED 49
+                0x04, 0x00, // matchedDN ""
+                0x04, 0x00, // diagnosticMessage ""
+            ];
+            let _ = stream.write_all(&response).await;
+            let _ = stream.flush().await;
+            // Hold the connection briefly so the client reads the response
+            // before the socket is torn down.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    });
+
+    (port, task)
+}
+
 #[tokio::test]
-async fn test_ldap_connection_failure_returns_401() {
-    // This test verifies that when LDAP is unreachable, we get a 401
+async fn test_ldap_invalid_credentials_returns_401() {
+    // Finding #32: a directory that accepts the connection but REJECTS the bind
+    // (resultCode 49, invalidCredentials) is the genuine wrong-password case and
+    // must map to 401 — not the 500 reserved for backend/config failures.
+    let (port, task) = spawn_invalid_credentials_ldap_server().await;
+
+    let plugin = LdapAuth::new(
+        &json!({
+            "ldap_url": format!("ldap://127.0.0.1:{port}"),
+            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "connect_timeout_seconds": 5
+        }),
+        http_client(),
+    )
+    .unwrap();
+
+    let mut ctx = make_ctx();
+    ctx.headers.insert(
+        "authorization".to_string(),
+        basic_header("alice", "wrong-password"),
+    );
+    let consumer_index = ConsumerIndex::new(&[]);
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_reject(result, Some(401));
+
+    task.abort();
+}
+
+#[tokio::test]
+async fn test_ldap_connection_failure_returns_500() {
+    // Finding #32: an unreachable LDAP server is a backend/infrastructure
+    // failure, not a credential failure. It must surface as a 500 so the client
+    // is not falsely told its credentials are wrong (which would prompt useless
+    // credential re-submission and mask the outage). Point at a closed loopback
+    // port so the connection is refused immediately.
     let plugin = LdapAuth::new(
         &json!({
             "ldap_url": "ldap://127.0.0.1:19",
@@ -591,7 +711,37 @@ async fn test_ldap_connection_failure_returns_401() {
     let consumer_index = ConsumerIndex::new(&[]);
 
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
-    assert_reject(result, Some(401));
+    assert_reject(result, Some(500));
+}
+
+#[tokio::test]
+async fn test_ldap_connection_failure_search_bind_returns_500() {
+    // Finding #32: the same backend-vs-credential distinction must hold in
+    // search-then-bind mode. An unreachable directory (refused connection on a
+    // closed loopback port) is a 500, not a 401 — the service-account bind never
+    // even runs, so this is unambiguously infrastructure, not bad credentials.
+    let plugin = LdapAuth::new(
+        &json!({
+            "ldap_url": "ldap://127.0.0.1:19",
+            "search_base_dn": "ou=users,dc=example,dc=com",
+            "search_filter": "(&(objectClass=person)(uid={username}))",
+            "service_account_dn": "cn=admin,dc=example,dc=com",
+            "service_account_password": "admin_password",
+            "connect_timeout_seconds": 1
+        }),
+        http_client(),
+    )
+    .unwrap();
+
+    let mut ctx = make_ctx();
+    ctx.headers.insert(
+        "authorization".to_string(),
+        basic_header("testuser", "password"),
+    );
+    let consumer_index = ConsumerIndex::new(&[]);
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_reject(result, Some(500));
 }
 
 // ─── AD config combination tests ─────────────────────────────────────────
