@@ -1518,7 +1518,7 @@ Authenticates requests using HMAC signatures with mandatory request-body integri
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `clock_skew_seconds` | u64 | `300` | Maximum allowed skew for the `Date` header replay window |
+| `clock_skew_seconds` | u64 | `300` | Maximum allowed skew for the `Date` header freshness window |
 
 Expected `Authorization` header format:
 
@@ -1534,10 +1534,12 @@ hmac username="<username>", algorithm="hmac-sha256", signature="<base64>"
 **Signing string**:
 
 ```text
-{METHOD}\n{PATH}\n{DATE}\n{DIGEST_HEADER_VALUE}
+{METHOD}\n{PATH}\n{QUERY}\n{DATE}\n{DIGEST_HEADER_VALUE}
 ```
 
-where `DIGEST_HEADER_VALUE` is the literal value of the `Digest:` or `Content-Digest:` header (e.g., `sha-256=<base64-of-sha256-of-body>`). Including the digest header in the signing string means a tampered digest header (without re-signing) breaks the HMAC, and a tampered body (without recomputing the digest) breaks the digest verification.
+where `{PATH}` is the request path component only, `{QUERY}` is the raw query string as received (percent-encoded, without the leading `?`, empty when there is no query), and `DIGEST_HEADER_VALUE` is the literal value of the `Digest:` or `Content-Digest:` header (e.g., `sha-256=<base64-of-sha256-of-body>`). Binding the query string means altering or adding query parameters invalidates the signature; clients must sign the byte-for-byte raw query string the gateway receives. Including the digest header means a tampered digest header (without re-signing) breaks the HMAC, and a tampered body (without recomputing the digest) breaks the digest verification.
+
+> **Replay protection is a freshness window, not single-use.** The signed `Date` header bounds requests to `now ± clock_skew_seconds`; there is no nonce/seen-signature store, so a captured valid request can be replayed verbatim until the window elapses. Keep `clock_skew_seconds` tight for non-idempotent routes and do not rely on `hmac_auth` alone for them.
 
 **Consumer credential** (`hmac_auth`) — array:
 ```yaml
