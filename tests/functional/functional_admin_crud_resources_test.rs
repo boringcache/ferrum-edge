@@ -99,6 +99,47 @@ const PLUGIN_NAMES_UNDER_TEST: &[&str] = &[
     "example_plugin",
 ];
 
+struct MongoDatabaseCleanup {
+    url: String,
+    database: String,
+}
+
+impl MongoDatabaseCleanup {
+    fn new(url: String, database: String) -> Self {
+        Self { url, database }
+    }
+}
+
+impl Drop for MongoDatabaseCleanup {
+    fn drop(&mut self) {
+        let url = self.url.clone();
+        let database = self.database.clone();
+        let handle = std::thread::spawn(move || {
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                eprintln!("failed to build runtime for MongoDB cleanup of {database}");
+                return;
+            };
+
+            runtime.block_on(async move {
+                match mongodb::Client::with_uri_str(&url).await {
+                    Ok(client) => {
+                        if let Err(error) = client.database(&database).drop().await {
+                            eprintln!("failed to drop MongoDB test database {database}: {error}");
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("failed to connect for MongoDB test database cleanup: {error}");
+                    }
+                }
+            });
+        });
+        let _ = handle.join();
+    }
+}
+
 #[tokio::test]
 #[ignore]
 async fn test_admin_sqlite_runtime_resource_crud_matrix() {
@@ -156,6 +197,7 @@ async fn test_admin_mongodb_runtime_resource_crud_matrix() {
         .await
         .expect("spawn mongo backend b");
     let mongo_database = format!("ferrum_crud_{}", Uuid::new_v4().simple());
+    let _mongo_cleanup = MongoDatabaseCleanup::new(mongo_url.clone(), mongo_database.clone());
 
     let gateway = TestGateway::builder()
         .mode_database(DbType::Mongo(mongo_url))
