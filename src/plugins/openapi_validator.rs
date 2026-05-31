@@ -14,7 +14,6 @@ use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::config::types::OPENAPI_VALIDATOR_DEFAULT_CONTENT_TYPES;
 
@@ -23,17 +22,10 @@ use super::{HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, RequestContext};
 const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
 const DEFAULT_ERROR_TRUNCATE_CHARS: usize = 1024;
 /// Public, stable metadata key carrying the bypass/skip reason for loggers and
-/// observability. It is write-only output; control-flow read-back uses the
-/// per-instance key built in `new()` so sibling instances cannot cross-apply a
-/// bypass decision (see finding #17).
+/// observability. It is write-only output; control flow recomputes bypass
+/// decisions per instance so sibling instances cannot cross-apply a bypass
+/// decision (see finding #17).
 const SKIP_REASON_KEY: &str = "openapi_validator.skip_reason";
-
-/// Monotonic source of per-instance ids. Multiple `openapi_validator` instances
-/// can run on one request and share `ctx.metadata`; namespacing the internal
-/// cache keys by instance id keeps each instance from reading another's matched
-/// operation (which is resolved against differently-ordered per-instance entry
-/// vectors) or its bypass decision. See finding #17.
-static INSTANCE_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EnforcementMode {
@@ -103,8 +95,6 @@ struct ParsedOperation {
 }
 
 struct OperationMatch<'a> {
-    method: &'a str,
-    index: usize,
     entry: &'a OperationEntry,
 }
 
@@ -174,12 +164,6 @@ pub struct OpenapiValidator {
     response_error_status: u16,
     error_content_type: String,
     error_truncate_chars: usize,
-    /// Per-instance metadata keys for the internal request -> body-phase cache.
-    /// Built once in `new()` so the hot path never allocates them, and suffixed
-    /// with a unique instance id so co-located instances stay isolated (#17).
-    matched_operation_method_key: String,
-    matched_operation_index_key: String,
-    skip_reason_cache_key: String,
 }
 
 impl OpenapiValidator {
@@ -295,17 +279,6 @@ impl OpenapiValidator {
         let error_truncate_chars =
             optional_usize(object, "error_truncate_chars")?.unwrap_or(DEFAULT_ERROR_TRUNCATE_CHARS);
 
-        // Namespace the internal cache keys per instance so multiple
-        // openapi_validator instances on one request never read each other's
-        // matched-operation index (resolved against differently-ordered entry
-        // vectors) or bypass decision via shared ctx.metadata (finding #17).
-        let instance_id = INSTANCE_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let matched_operation_method_key =
-            format!("openapi_validator.matched_operation_method.{instance_id}");
-        let matched_operation_index_key =
-            format!("openapi_validator.matched_operation_index.{instance_id}");
-        let skip_reason_cache_key = format!("openapi_validator.skip_reason.{instance_id}");
-
         Ok(Self {
             mode,
             validate_request,
@@ -326,9 +299,6 @@ impl OpenapiValidator {
             response_error_status,
             error_content_type,
             error_truncate_chars,
-            matched_operation_method_key,
-            matched_operation_index_key,
-            skip_reason_cache_key,
         })
     }
 
@@ -337,51 +307,21 @@ impl OpenapiValidator {
     }
 
     fn match_operation(&self, method: &str, path: &str) -> Option<OperationMatch<'_>> {
-        let (method, bucket) = self
+        let (_, bucket) = self
             .ops_by_method
             .iter()
             .find(|(key, _)| key.eq_ignore_ascii_case(method))?;
         let index = bucket.path_regexes.matches(path).into_iter().next()?;
-        bucket.entries.get(index).map(|entry| OperationMatch {
-            method,
-            index,
-            entry,
-        })
-    }
-
-    fn cached_operation<'a>(&'a self, ctx: &RequestContext) -> Option<&'a OperationEntry> {
-        // Keys are namespaced by instance id, so a value present here was
-        // written by THIS instance against THIS instance's entry vector (#17).
-        let method = ctx.metadata.get(&self.matched_operation_method_key)?;
-        if !method.eq_ignore_ascii_case(&ctx.method) {
-            return None;
-        }
-        let index = ctx
-            .metadata
-            .get(&self.matched_operation_index_key)?
-            .parse::<usize>()
-            .ok()?;
-        self.ops_by_method.get(method)?.entries.get(index)
+        bucket.entries.get(index).map(|entry| OperationMatch { entry })
     }
 
     fn operation_for_context<'a>(&'a self, ctx: &RequestContext) -> Option<&'a OperationEntry> {
-        self.cached_operation(ctx).or_else(|| {
-            self.match_operation(&ctx.method, &ctx.path)
-                .map(|matched| matched.entry)
-        })
+        self.match_operation(&ctx.method, &ctx.path)
+            .map(|matched| matched.entry)
     }
 
     fn mark_operation(&self, ctx: &mut RequestContext, operation: OperationMatch<'_>) {
         self.mark_operation_entry(ctx, operation.entry);
-        // Internal cache, keyed per instance so siblings don't read our index.
-        ctx.metadata.insert(
-            self.matched_operation_method_key.clone(),
-            operation.method.to_string(),
-        );
-        ctx.metadata.insert(
-            self.matched_operation_index_key.clone(),
-            operation.index.to_string(),
-        );
     }
 
     fn mark_operation_entry(&self, ctx: &mut RequestContext, operation: &OperationEntry) {
@@ -402,31 +342,11 @@ impl OpenapiValidator {
         Some(entry)
     }
 
-    fn cached_bypass_reason(&self, ctx: &RequestContext) -> Option<&'static str> {
-        // Read the per-instance cache key, not the shared public key: bypass
-        // rules are instance-specific, so trusting a sibling instance's reason
-        // would silently skip THIS instance's validation (finding #17).
-        match ctx
-            .metadata
-            .get(&self.skip_reason_cache_key)
-            .map(String::as_str)
-        {
-            Some("bypass_path") => Some("bypass_path"),
-            Some("bypass_method") => Some("bypass_method"),
-            Some("bypass_consumer") => Some("bypass_consumer"),
-            Some("bypass_header") => Some("bypass_header"),
-            _ => None,
-        }
-    }
-
     fn bypass_reason_for_headers(
         &self,
         ctx: &RequestContext,
         headers: &HashMap<String, String>,
     ) -> Option<&'static str> {
-        if let Some(reason) = self.cached_bypass_reason(ctx) {
-            return Some(reason);
-        }
         if self
             .bypass_paths
             .as_ref()
@@ -475,9 +395,6 @@ impl OpenapiValidator {
         // instances; this is output only).
         ctx.metadata
             .insert(SKIP_REASON_KEY.to_string(), reason.to_string());
-        // Per-instance cache read back by cached_bypass_reason (#17).
-        ctx.metadata
-            .insert(self.skip_reason_cache_key.clone(), reason.to_string());
     }
 
     fn handle_violation(
@@ -646,10 +563,7 @@ impl Plugin for OpenapiValidator {
             self.mark_skip(ctx, reason);
             return PluginResult::Continue;
         }
-        let Some(operation) = self
-            .cached_operation(ctx)
-            .or_else(|| self.match_and_mark_operation(ctx))
-        else {
+        let Some(operation) = self.match_and_mark_operation(ctx) else {
             if self.fail_on_unknown_operation {
                 return self.handle_violation(
                     ctx,
@@ -724,10 +638,7 @@ impl Plugin for OpenapiValidator {
             self.mark_skip(ctx, reason);
             return PluginResult::Continue;
         }
-        let Some(operation) = self
-            .cached_operation(ctx)
-            .or_else(|| self.match_and_mark_operation(ctx))
-        else {
+        let Some(operation) = self.match_and_mark_operation(ctx) else {
             if self.fail_on_unknown_operation {
                 return self.handle_violation(
                     ctx,

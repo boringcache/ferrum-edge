@@ -242,6 +242,14 @@ async fn literal_path_beats_parameter_path() {
             .map(String::as_str),
         Some("GET /users/me")
     );
+    assert!(
+        !ctx.metadata
+            .keys()
+            .any(|key| key.starts_with("openapi_validator.matched_operation_method.")
+                || key.starts_with("openapi_validator.matched_operation_index.")),
+        "internal operation cache keys must not be exposed in metadata: {:?}",
+        ctx.metadata
+    );
 }
 
 #[tokio::test]
@@ -269,6 +277,13 @@ async fn bypass_header_skips_buffering_and_validation() {
             .get("openapi_validator.skip_reason")
             .map(String::as_str),
         Some("bypass_header")
+    );
+    assert!(
+        !ctx.metadata
+            .keys()
+            .any(|key| key.starts_with("openapi_validator.skip_reason.")),
+        "internal skip cache keys must not be exposed in metadata: {:?}",
+        ctx.metadata
     );
 }
 
