@@ -24,6 +24,20 @@
 //! re-emit namespace declarations may fail verification. Operators
 //! integrating with IdPs that mandate strict c14n should validate end-to-end
 //! before depending on these paths.
+//!
+//! ## XML Signature Wrapping (XSW) mitigation
+//!
+//! Because verification is substring-based rather than DOM + exclusive-c14n,
+//! the X.509 path enforces that every signed `#id` Reference resolves to a
+//! UNIQUE `wsu:Id` across the whole envelope (see `count_wsu_id_occurrences`),
+//! rejecting any envelope carrying a duplicate id — the classic XSW vector
+//! where an attacker keeps the legitimately-signed element and injects a second
+//! element with the same id that the backend consumes. The SAML path retains
+//! its single-`<Assertion>` guard plus the Reference-URI-equals-assertion-id
+//! check. A residual risk remains for a backend that selects a *different*
+//! same-local-name element than the gateway digested; reducing the forwarded
+//! body to only the signed subtree (or full DOM + exclusive-c14n) is the
+//! long-term fix.
 
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -40,6 +54,7 @@ use x509_parser::prelude::*;
 
 use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 
+use super::utils::auth_flow::constant_time_eq;
 use super::{Plugin, PluginResult, RequestContext};
 
 // ── Namespace URIs ──────────────────────────────────────────────────────────
@@ -50,6 +65,13 @@ const XMLDSIG_RSA_SHA256: &str = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha
 const XMLDSIG_RSA_SHA1: &str = "http://www.w3.org/2000/09/xmldsig#rsa-sha1";
 const XMLDSIG_SHA256: &str = "http://www.w3.org/2001/04/xmlenc#sha256";
 const XMLDSIG_SHA1: &str = "http://www.w3.org/2000/09/xmldsig#sha1";
+
+/// Upper bound on the number of `<Reference>` elements processed in a single
+/// `<SignedInfo>`. Each reference drives a full-envelope scan + digest before
+/// the signature is checked, so this caps attacker-controlled CPU on the
+/// unauthenticated request path. Real signatures reference a handful of
+/// elements; 64 is far above any legitimate use.
+const MAX_SIGNED_REFERENCES: usize = 64;
 
 // ── Config types ────────────────────────────────────────────────────────────
 
@@ -533,18 +555,34 @@ impl SoapWsSecurity {
         let password_value = extract_element_text_content(&password_element, "Password")
             .ok_or_else(|| "WS-Security: Password element has no content".to_string())?;
 
-        // Determine password type from the Type attribute, falling back to config
-        let effective_type = if let Some(type_attr) = find_attribute(&password_element, "Type") {
-            if type_attr.contains("PasswordDigest") || type_attr == PASSWORD_DIGEST_TYPE {
-                PasswordType::PasswordDigest
-            } else if type_attr.contains("PasswordText") || type_attr == PASSWORD_TEXT_TYPE {
-                PasswordType::PasswordText
-            } else {
-                self.password_type
+        // The verification mode is dictated solely by the operator-configured
+        // `password_type`, NEVER by the client-supplied `Type` attribute.
+        // Letting the wire value select the mode lets an attacker who knows the
+        // plaintext credential downgrade a configured PasswordDigest policy
+        // (Nonce / Created / replay protection) to plain PasswordText by sending
+        // `Type="...#PasswordText"`. If a recognized `Type` attribute is present
+        // it must agree with the configured policy; a mismatch is rejected.
+        if let Some(type_attr) = find_attribute(&password_element, "Type") {
+            let wire_type =
+                if type_attr.contains("PasswordDigest") || type_attr == PASSWORD_DIGEST_TYPE {
+                    Some(PasswordType::PasswordDigest)
+                } else if type_attr.contains("PasswordText") || type_attr == PASSWORD_TEXT_TYPE {
+                    Some(PasswordType::PasswordText)
+                } else {
+                    // Unrecognized Type value — fall through to the configured
+                    // policy rather than guessing a verification mode.
+                    None
+                };
+            if let Some(wire_type) = wire_type
+                && wire_type != self.password_type
+            {
+                return Err(
+                    "WS-Security: Password Type does not match the configured password_type"
+                        .to_string(),
+                );
             }
-        } else {
-            self.password_type
-        };
+        }
+        let effective_type = self.password_type;
 
         // Find the matching credential
         let cred = self
@@ -560,7 +598,12 @@ impl SoapWsSecurity {
 
         match effective_type {
             PasswordType::PasswordText => {
-                if password_value != cred.password {
+                // Constant-time compare: `password_value` is attacker-controlled
+                // and `cred.password` is the stored shared secret, so a
+                // short-circuiting `!=` leaks password bytes via timing. Mirrors
+                // basic_auth / hmac_auth; `constant_time_eq` handles length
+                // mismatches safely.
+                if !constant_time_eq(password_value.as_bytes(), cred.password.as_bytes()) {
                     return Err("WS-Security: invalid password".to_string());
                 }
             }
@@ -591,7 +634,9 @@ impl SoapWsSecurity {
                 let computed = digest::digest(&digest::SHA1_FOR_LEGACY_USE_ONLY, &data);
                 let expected_b64 = BASE64.encode(computed.as_ref());
 
-                if password_value.trim() != expected_b64 {
+                // Constant-time compare for consistency with the PasswordText
+                // path (the digest is derived from the shared secret).
+                if !constant_time_eq(password_value.trim().as_bytes(), expected_b64.as_bytes()) {
                     return Err("WS-Security: PasswordDigest verification failed".to_string());
                 }
             }
@@ -658,7 +703,12 @@ impl SoapWsSecurity {
 
     // ── X.509 signature verification ────────────────────────────────────
 
-    fn validate_x509_signature(&self, security_block: &str, soap_body: &str) -> Result<(), String> {
+    fn validate_x509_signature(
+        &self,
+        security_block: &str,
+        soap_body: &str,
+        envelope: &str,
+    ) -> Result<(), String> {
         // Extract the Signature element
         let sig_block = find_element_block(security_block, "Signature")
             .ok_or_else(|| "WS-Security: missing Signature element".to_string())?;
@@ -694,7 +744,7 @@ impl SoapWsSecurity {
         }
 
         // Verify Reference digests
-        self.verify_reference_digests(&signed_info, security_block, soap_body)?;
+        self.verify_reference_digests(&signed_info, security_block, soap_body, envelope)?;
 
         // Check that Timestamp is signed (if required)
         if self.require_signed_timestamp {
@@ -750,6 +800,7 @@ impl SoapWsSecurity {
         signed_info: &str,
         security_block: &str,
         soap_body: &str,
+        envelope: &str,
     ) -> Result<(), String> {
         // Find all Reference elements in SignedInfo. We must use the variant
         // that returns the end offset so we can advance past each match —
@@ -761,6 +812,19 @@ impl SoapWsSecurity {
             find_element_block_from_with_end(signed_info, "Reference", search_from)
         {
             reference_count += 1;
+            // Bound attacker-controlled work: each Reference triggers a
+            // full-envelope id-uniqueness scan plus an element resolution and a
+            // digest over the referenced bytes, all before the signature is
+            // verified. Capping the Reference count keeps an unauthenticated
+            // request from forcing O(references × body) CPU. A legitimate
+            // WS-Security signature covers a handful of elements (Timestamp,
+            // Body, a few headers); 64 is far above any real use.
+            if reference_count > MAX_SIGNED_REFERENCES {
+                return Err(format!(
+                    "WS-Security: too many Signature References (> {})",
+                    MAX_SIGNED_REFERENCES
+                ));
+            }
             // Defensive: ensure the cursor advances even for pathological
             // inputs (e.g. zero-length match). Without this, a malformed
             // element could still loop indefinitely.
@@ -787,6 +851,22 @@ impl SoapWsSecurity {
                 // Entire document
                 soap_body.to_string()
             } else if let Some(ref_id) = uri.strip_prefix('#') {
+                // XML Signature Wrapping defense: a signed reference must
+                // resolve to exactly ONE element in the whole envelope.
+                // WS-Security / XMLDSIG ids are document-unique, so a duplicate
+                // wsu:Id means an attacker wrapped the signed element — the bytes
+                // we digest (the first match) could then differ from the element a
+                // backend consumes. The count spans the FULL envelope, not just
+                // the regions the resolver searches, so a duplicate injected
+                // anywhere is caught. Mirrors the SAML single-Assertion guard.
+                let occurrences = count_wsu_id_occurrences(envelope, ref_id);
+                if occurrences > 1 {
+                    return Err(format!(
+                        "WS-Security: referenced id '{}' is not unique in the envelope \
+                         ({} occurrences) — possible XML signature wrapping",
+                        ref_id, occurrences
+                    ));
+                }
                 find_element_by_wsu_id(security_block, ref_id)
                     .or_else(|| find_element_by_wsu_id(soap_body, ref_id))
                     .ok_or_else(|| {
@@ -1394,7 +1474,7 @@ impl Plugin for SoapWsSecurity {
 
         // Validate X.509 signature
         if self.x509_enabled
-            && let Err(e) = self.validate_x509_signature(&security_block, &soap_body)
+            && let Err(e) = self.validate_x509_signature(&security_block, &soap_body, envelope)
         {
             warn!("soap_ws_security: X.509 signature validation failed: {}", e);
             return PluginResult::Reject {
@@ -1674,6 +1754,47 @@ fn find_element_by_wsu_id(xml: &str, id: &str) -> Option<String> {
 /// Extract the wsu:Id (or plain Id) attribute from an element.
 fn find_wsu_id(element: &str) -> Option<String> {
     find_attribute(element, "wsu:Id").or_else(|| find_attribute(element, "Id"))
+}
+
+/// Count how many elements in `xml` bear the given `wsu:Id` / `Id` attribute
+/// value. Used to reject XML Signature Wrapping (XSW): a signed reference whose
+/// id resolves to more than one element means an attacker injected a duplicate,
+/// so the byte range the signature covers may differ from the element a backend
+/// consumes.
+///
+/// Every `wsu:Id="X"` contains the substring `Id="X"`, so counting the
+/// unprefixed form (both quote styles) counts each physical attribute exactly
+/// once whether or not it carries the `wsu:` prefix. Any over-count (e.g. a
+/// hypothetical `FooId="X"` attribute) only ever causes a fail-closed
+/// rejection, never a missed wrapping.
+fn count_wsu_id_occurrences(xml: &str, id: &str) -> usize {
+    // Every `wsu:Id="X"` / `Id="X"` contains the trailing substring `Id="X"`,
+    // so we scan for that (both quote styles) and accept a match only when the
+    // byte immediately before `Id` is NOT an XML name character — i.e. it is the
+    // `:` of a `wsu:` (or other) prefix, or attribute-separating whitespace.
+    // This counts standalone and prefixed id attributes exactly once each while
+    // ignoring unrelated attributes whose name merely ends in `Id`
+    // (`CorrelationId`, `MessageId`, …), which would otherwise reject a
+    // legitimately-signed envelope. It also matches exactly what a DOM parser
+    // treats as an id attribute, so it never undercounts a real duplicate —
+    // staying sound against wrapping while avoiding false positives.
+    fn is_xml_name_char(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')
+    }
+    let count_anchored = |needle: &str| -> usize {
+        let bytes = xml.as_bytes();
+        let mut count = 0;
+        let mut from = 0;
+        while let Some(rel) = xml[from..].find(needle) {
+            let pos = from + rel;
+            if pos == 0 || !is_xml_name_char(bytes[pos - 1]) {
+                count += 1;
+            }
+            from = pos + needle.len();
+        }
+        count
+    };
+    count_anchored(&format!("Id=\"{}\"", id)) + count_anchored(&format!("Id='{}'", id))
 }
 
 /// Resolve the signing certificate from a SAML `<Signature>` block.

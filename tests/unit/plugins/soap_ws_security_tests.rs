@@ -485,6 +485,54 @@ async fn test_username_token_wrong_password_rejects() {
 }
 
 #[tokio::test]
+async fn test_password_digest_config_rejects_passwordtext_type_downgrade() {
+    // finding #19: with password_type=PasswordDigest configured, a client must
+    // not be able to downgrade to plain PasswordText by sending
+    // `Type="...#PasswordText"` — that bypasses the Nonce/Created/replay
+    // protections the operator selected. Even presenting the correct plaintext
+    // password must be rejected because the wire Type disagrees with the policy.
+    let plugin = SoapWsSecurity::new(&username_token_digest_config()).unwrap();
+    let ut = r#"<wsse:UsernameToken>
+        <wsse:Username>alice</wsse:Username>
+        <wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordText">secret123</wsse:Password>
+    </wsse:UsernameToken>"#;
+    let body = wrap_soap(ut);
+    let mut ctx = make_ctx_with_soap_body(&body);
+    let mut headers = soap_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(is_reject(&result));
+    assert_eq!(reject_status(&result), 401);
+    assert!(
+        reject_body(&result).contains("Password Type does not match"),
+        "expected password-type-mismatch rejection, got: {}",
+        reject_body(&result)
+    );
+}
+
+#[tokio::test]
+async fn test_password_text_config_rejects_passworddigest_type() {
+    // finding #19 (converse): a PasswordText-configured plugin must reject a
+    // wire Type of PasswordDigest rather than silently switching verification
+    // modes based on the attacker-supplied attribute.
+    let plugin = SoapWsSecurity::new(&username_token_config()).unwrap();
+    let ut = r#"<wsse:UsernameToken>
+        <wsse:Username>alice</wsse:Username>
+        <wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest">secret123</wsse:Password>
+    </wsse:UsernameToken>"#;
+    let body = wrap_soap(ut);
+    let mut ctx = make_ctx_with_soap_body(&body);
+    let mut headers = soap_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(is_reject(&result));
+    assert_eq!(reject_status(&result), 401);
+    assert!(
+        reject_body(&result).contains("Password Type does not match"),
+        "expected password-type-mismatch rejection, got: {}",
+        reject_body(&result)
+    );
+}
+
+#[tokio::test]
 async fn test_username_token_unknown_user_rejects() {
     let plugin = SoapWsSecurity::new(&username_token_config()).unwrap();
     let ut = r#"<wsse:UsernameToken>
@@ -1922,6 +1970,80 @@ mod x509_roundtrip {
         assert!(
             matches!(result, PluginResult::Continue),
             "expected Continue with valid RSA signature, got {:?}",
+            result,
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_wsu_id_is_rejected_as_signature_wrapping() {
+        // finding #2 (XML Signature Wrapping): the signed Reference targets
+        // `#TS-1`. If an attacker injects a SECOND element bearing
+        // wsu:Id="TS-1" elsewhere in the envelope, the substring resolver would
+        // digest the first (legitimately signed) element while a backend might
+        // consume the injected duplicate. The uniqueness guard must reject the
+        // envelope before trusting the signature.
+        let cert = mint_rsa_cert();
+        let cert_file = write_pem_to_tempfile(&cert.cert_pem);
+        let plugin = SoapWsSecurity::new(&x509_plugin_config(cert_file.path())).unwrap();
+
+        let valid = build_signed_soap_envelope(&cert);
+        // Inject a duplicate wsu:Id="TS-1" element into the SOAP body.
+        let wrapped = valid.replace(
+            "<soap:Body>",
+            "<soap:Body><Injected wsu:Id=\"TS-1\" \
+             xmlns:wsu=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd\">\
+             attacker-controlled</Injected>",
+        );
+        assert_ne!(
+            valid, wrapped,
+            "duplicate-id injection must modify the envelope"
+        );
+
+        let mut ctx = make_ctx_with_soap_body(&wrapped);
+        let mut headers = soap_headers();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+        match result {
+            PluginResult::Reject {
+                status_code, body, ..
+            } => {
+                assert_eq!(status_code, 401);
+                assert!(
+                    body.contains("signature wrapping") || body.contains("not unique"),
+                    "expected XML-signature-wrapping rejection, got: {body}"
+                );
+            }
+            other => panic!("expected Reject for duplicate wsu:Id, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn business_attribute_ending_in_id_is_not_treated_as_duplicate() {
+        // The signed wsu:Id is "TS-1". A legitimate, correctly-signed envelope
+        // that also carries an unrelated business attribute whose NAME ends in
+        // "Id" with the same value (e.g. `CorrelationId="TS-1"`) must NOT be
+        // rejected as wrapping — the uniqueness count is anchored on the XML
+        // name boundary, so `CorrelationId` is not counted as a `wsu:Id`/`Id`.
+        let cert = mint_rsa_cert();
+        let cert_file = write_pem_to_tempfile(&cert.cert_pem);
+        let plugin = SoapWsSecurity::new(&x509_plugin_config(cert_file.path())).unwrap();
+
+        let valid = build_signed_soap_envelope(&cert);
+        let with_business_attr = valid.replace(
+            "<GetPrice xmlns=\"http://example.com/prices\">",
+            "<GetPrice xmlns=\"http://example.com/prices\" CorrelationId=\"TS-1\">",
+        );
+        assert_ne!(
+            valid, with_business_attr,
+            "business attribute injection must modify the envelope"
+        );
+
+        let mut ctx = make_ctx_with_soap_body(&with_business_attr);
+        let mut headers = soap_headers();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert!(
+            matches!(result, PluginResult::Continue),
+            "valid signature with an unrelated *Id business attribute must be accepted, got {:?}",
             result,
         );
     }
