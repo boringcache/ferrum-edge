@@ -527,7 +527,9 @@ impl Waf {
 
     fn scan_encoding_specials(&self, outcome: &mut ScanOutcome, value: &str, ctx: &RequestContext) {
         if let Some(rule_index) = self.specials.encoding
-            && (decode::has_double_encoded_marker(value) || decode::has_percent_null_byte(value))
+            && (decode::has_double_encoded_marker(value)
+                || decode::has_percent_null_byte(value)
+                || decode::has_overlong_utf8_marker(value))
         {
             self.push_special(outcome, rule_index, value, ctx);
         }

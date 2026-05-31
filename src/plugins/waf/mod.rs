@@ -317,8 +317,7 @@ impl Waf {
     }
 
     fn request_body_eligible_for_scan(&self, content_type: Option<&str>) -> bool {
-        self.body_encoding_specials_active()
-            || self.should_inspect_body_content_type(content_type)
+        self.should_inspect_body_content_type(content_type)
     }
 
     async fn run_body_scan_with_budget<F>(&self, scan: F) -> ScanOutcome
@@ -666,9 +665,7 @@ impl Waf {
         // Response bodies with missing or malformed content-type are still
         // eligible when binary inspection is explicit; request bodies are
         // gated earlier by `should_buffer_request_body`.
-        self.body_encoding_specials_active()
-            || self.config.inspect_binary_body
-            || self.should_inspect_body_content_type(content_type)
+        self.config.inspect_binary_body || self.should_inspect_body_content_type(content_type)
     }
 }
 
