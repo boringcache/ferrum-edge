@@ -10526,6 +10526,7 @@ components:
 
     AccessControlConfig:
       type: object
+      additionalProperties: false
       description: >-
         Plugin: access_control — consumer-based and group-based allow/deny for
         HTTP-family and TCP/UDP stream proxies. Evaluation order: deny
@@ -10537,6 +10538,43 @@ components:
         with an allow-list (`allowed_consumers`/`allowed_groups`) because the
         allow-list is not applied to unmapped external identities. Use
         ip_restriction for IP/CIDR rules.
+      allOf:
+        - anyOf:
+            - required: [allowed_consumers]
+              properties:
+                allowed_consumers:
+                  minItems: 1
+            - required: [disallowed_consumers]
+              properties:
+                disallowed_consumers:
+                  minItems: 1
+            - required: [allowed_groups]
+              properties:
+                allowed_groups:
+                  minItems: 1
+            - required: [disallowed_groups]
+              properties:
+                disallowed_groups:
+                  minItems: 1
+            - required: [allow_authenticated_identity]
+              properties:
+                allow_authenticated_identity:
+                  enum: [true]
+        - not:
+            allOf:
+              - required: [allow_authenticated_identity]
+                properties:
+                  allow_authenticated_identity:
+                    enum: [true]
+              - anyOf:
+                  - required: [allowed_consumers]
+                    properties:
+                      allowed_consumers:
+                        minItems: 1
+                  - required: [allowed_groups]
+                    properties:
+                      allowed_groups:
+                        minItems: 1
       properties:
         allowed_consumers:
           type: array
