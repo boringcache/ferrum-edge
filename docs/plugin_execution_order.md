@@ -226,7 +226,7 @@ Priority bands are spaced with gaps so future plugins can slot in without renumb
 |------|---------------|---------|---------|
 | **Early** | 0–949 | Tracing, IDs, preflight, and request short-circuiting before auth | `otel_tracing` (25), `correlation_id` (50), `cors` (100), `request_termination` (125), `mesh_outbound_registry` (130), `ip_restriction` (150), `geo_restriction` (175), `bot_detection` (200), `spec_expose` (210), `sse` (250), `grpc_web` (260), `grpc_method_router` (275), `spiffe_identity` (940) |
 | **AuthN** | 950–1999 | Authentication / identity verification | `mtls_auth` (950), `jwks_auth` (1000), `oauth2_introspection` (1050), `oidc_relying_party` (1075), `jwt_auth` (1100), `key_auth` (1200), `ldap_auth` (1250), `basic_auth` (1300), `hmac_auth` (1400), `soap_ws_security` (1500) |
-| **Admission** | 2000–2999 | Authorization, validation, and request admission control | `access_control` (2000), `tcp_connection_throttle` (2050), `mesh_authz` (2075), `opa` (2080), `ai_semantic_cache` (2700), `request_deduplication` (2750), `request_size_limiting` (2800), `ws_message_size_limiting` (2810), `graphql` (2850), `rate_limiting` (2900), `ws_rate_limiting` (2910), `udp_rate_limiting` (2915), `ai_prompt_shield` (2925), `waf` (2930), `fault_injection` (2940), `body_validator` (2950), `openapi_validator` (2960), `ai_request_guard` (2975), `ai_federation` (2985), `mesh_route_dispatch` (2995) |
+| **Admission** | 2000–2999 | Authorization, validation, and request admission control | `access_control` (2000), `tcp_connection_throttle` (2050), `mesh_authz` (2075), `opa` (2080), `request_deduplication` (2750), `request_size_limiting` (2800), `ws_message_size_limiting` (2810), `graphql` (2850), `rate_limiting` (2900), `ws_rate_limiting` (2910), `udp_rate_limiting` (2915), `ai_prompt_shield` (2925), `waf` (2930), `fault_injection` (2940), `body_validator` (2950), `openapi_validator` (2960), `ai_request_guard` (2975), `ai_semantic_cache` (2980), `ai_federation` (2985), `mesh_route_dispatch` (2995) |
 | **Transform** | 3000–3999 | Request shaping and response buffering decisions | `request_transformer` (3000), `serverless_function` (3025), `response_mock` (3030), `grpc_deadline` (3050), `request_mirror` (3075), `load_testing` (3080), `response_size_limiting` (3490), `response_caching` (3500) |
 | **Response** | 4000–4999 | Response transformation, compression, security headers, and AI accounting | `response_transformer` (4000), `compression` (4050), `ai_response_guard` (4075), `security_headers` (4080), `ai_token_metrics` (4100), `ai_rate_limiter` (4200) |
 | **Custom** | 5000 | Default for unrecognized/custom plugins | _(future plugins)_ |
@@ -273,20 +273,20 @@ Given all built-in plugins enabled, the execution order is:
 | 25 | `tcp_connection_throttle` | 2050 | on_stream_connect, on_stream_disconnect |
 | 26 | `mesh_authz` | 2075 | authorize, on_stream_connect |
 | 27 | `opa` | 2080 | authorize |
-| 28 | `ai_semantic_cache` | 2700 | before_proxy, after_proxy, on_final_response_body |
-| 29 | `request_deduplication` | 2750 | before_proxy, on_final_response_body |
-| 30 | `request_size_limiting` | 2800 | on_request_received, before_proxy, on_final_request_body |
-| 31 | `ws_message_size_limiting` | 2810 | on_ws_frame |
-| 32 | `graphql` | 2850 | before_proxy |
-| 33 | `rate_limiting` | 2900 | on_request_received (IP mode), authorize (consumer mode), before_proxy, after_proxy, on_stream_connect |
-| 34 | `ws_rate_limiting` | 2910 | on_ws_frame |
-| 35 | `udp_rate_limiting` | 2915 | on_udp_datagram |
-| 36 | `ai_prompt_shield` | 2925 | before_proxy, transform_request_body |
-| 37 | `waf` | 2930 | authorize, on_final_request_body, after_proxy, on_final_response_body, on_stream_connect, on_udp_datagram |
-| 38 | `fault_injection` | 2940 | before_proxy, on_stream_connect |
-| 39 | `body_validator` | 2950 | before_proxy, on_final_request_body, on_final_response_body |
-| 40 | `openapi_validator` | 2960 | before_proxy, on_final_request_body, on_final_response_body |
-| 41 | `ai_request_guard` | 2975 | before_proxy, transform_request_body |
+| 28 | `request_deduplication` | 2750 | before_proxy, on_final_response_body |
+| 29 | `request_size_limiting` | 2800 | on_request_received, before_proxy, on_final_request_body |
+| 30 | `ws_message_size_limiting` | 2810 | on_ws_frame |
+| 31 | `graphql` | 2850 | before_proxy |
+| 32 | `rate_limiting` | 2900 | on_request_received (IP mode), authorize (consumer mode), before_proxy, after_proxy, on_stream_connect |
+| 33 | `ws_rate_limiting` | 2910 | on_ws_frame |
+| 34 | `udp_rate_limiting` | 2915 | on_udp_datagram |
+| 35 | `ai_prompt_shield` | 2925 | before_proxy, transform_request_body |
+| 36 | `waf` | 2930 | authorize, on_final_request_body, after_proxy, on_final_response_body, on_stream_connect, on_udp_datagram |
+| 37 | `fault_injection` | 2940 | before_proxy, on_stream_connect |
+| 38 | `body_validator` | 2950 | before_proxy, on_final_request_body, on_final_response_body |
+| 39 | `openapi_validator` | 2960 | before_proxy, on_final_request_body, on_final_response_body |
+| 40 | `ai_request_guard` | 2975 | before_proxy, transform_request_body |
+| 41 | `ai_semantic_cache` | 2980 | before_proxy, after_proxy, on_final_response_body |
 | 42 | `ai_federation` | 2985 | before_proxy |
 | 43 | `mesh_route_dispatch` | 2995 | before_proxy |
 | 44 | `request_transformer` | 3000 | before_proxy, transform_request_body |
