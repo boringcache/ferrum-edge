@@ -10,6 +10,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use http::{HeaderName, Method};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
@@ -75,25 +76,30 @@ fn cache_key_identity_part(identity: &str) -> String {
     part
 }
 
-/// Request headers whose values are credentials or session identifiers.
+/// Request headers whose presence makes a cacheable response automatically vary
+/// by that header.
 ///
-/// These are SHA-256-hashed by [`cache_key_vary_value`] when they appear in a
-/// cache key (so the raw secret never lands in the key or debug logs) and are
-/// auto-added to the keyed `Vary` set at storage time (see
-/// `on_final_response_body`) so two requests bearing distinct credentials or
-/// sessions never collapse onto one shared cache entry. Driving both the
-/// auto-Vary loop and [`is_sensitive_vary_header`] off this single list keeps
-/// them from drifting apart.
+/// These are credentials or session identifiers, so they are auto-added to the
+/// keyed `Vary` set at storage time (see `on_final_response_body`) and
+/// SHA-256-hashed by [`cache_key_vary_value`] when they appear in a cache key.
+/// Additional operator-configured or backend-supplied Vary headers are also
+/// hashed when their header name matches the centralized log-redaction
+/// sensitivity rules.
 const SENSITIVE_VARY_HEADERS: [&str; 3] = ["authorization", "proxy-authorization", "cookie"];
 
-fn is_sensitive_vary_header(header: &str) -> bool {
+fn is_auto_sensitive_vary_header(header: &str) -> bool {
     SENSITIVE_VARY_HEADERS
         .iter()
         .any(|sensitive| header.eq_ignore_ascii_case(sensitive))
 }
 
+fn should_hash_vary_header_value(header: &str) -> bool {
+    is_auto_sensitive_vary_header(header)
+        || super::utils::metadata_redaction::is_sensitive_metadata_key(header)
+}
+
 fn cache_key_vary_value(header: &str, value: &str) -> String {
-    if is_sensitive_vary_header(header) {
+    if should_hash_vary_header_value(header) {
         let digest = sha256_hex(value);
         let mut hashed = String::with_capacity(7 + digest.len());
         hashed.push_str("sha256-");
@@ -102,6 +108,18 @@ fn cache_key_vary_value(header: &str, value: &str) -> String {
     } else {
         value.to_string()
     }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct RequestHeaderSnapshotEntry {
+    header: String,
+    value: String,
+    value_is_cache_key_part: bool,
+}
+
+struct RestoredRequestHeadersView {
+    headers: HashMap<String, String>,
+    cache_key_ready_headers: HashSet<String>,
 }
 
 /// Cache keys use `:` as a structural delimiter, but URL paths legitimately
@@ -564,6 +582,16 @@ impl ResponseCaching {
         vary_headers: &[String],
         request_headers: &HashMap<String, String>,
     ) -> String {
+        self.build_cache_key_with_ready_values(ctx, vary_headers, request_headers, None)
+    }
+
+    fn build_cache_key_with_ready_values(
+        &self,
+        ctx: &RequestContext,
+        vary_headers: &[String],
+        request_headers: &HashMap<String, String>,
+        cache_key_ready_headers: Option<&HashSet<String>>,
+    ) -> String {
         let base_key = self.build_base_cache_key(ctx, request_headers);
         if vary_headers.is_empty() {
             return base_key;
@@ -579,10 +607,16 @@ impl ResponseCaching {
                 .get(header.as_str())
                 .map(String::as_str)
                 .unwrap_or("");
-            let value = cache_key_vary_value(header, value);
             cache_key.push_str(header);
             cache_key.push('=');
-            cache_key.push_str(&value);
+            if let Some(ready_headers) = cache_key_ready_headers
+                && ready_headers.contains(header)
+            {
+                cache_key.push_str(value);
+            } else {
+                let value = cache_key_vary_value(header, value);
+                cache_key.push_str(&value);
+            }
         }
 
         cache_key
@@ -852,10 +886,17 @@ impl ResponseCaching {
     /// would make the storage key disagree with the lookup key and the cache
     /// would never hit.
     ///
-    /// The sensitive headers are stashed unconditionally because the storage
-    /// path auto-Varies them (see `on_final_response_body`), so they are
-    /// load-bearing cache-key dimensions even when the operator never lists
-    /// them in `vary_by_headers`.
+    /// Values that match the centralized metadata-redaction sensitivity rules
+    /// are stashed as the same SHA-256 cache-key component
+    /// [`cache_key_vary_value`] would produce. The restore path marks those
+    /// headers as cache-key-ready so storage does not hash them a second time.
+    /// This keeps raw cookies, credentials, and operator-redacted header values
+    /// out of `ctx.metadata`, which is copied into transaction log metadata.
+    ///
+    /// The auto-sensitive headers are stashed unconditionally because the
+    /// storage path auto-Varies them (see `on_final_response_body`), so they are
+    /// load-bearing cache-key dimensions even when the operator never lists them
+    /// in `vary_by_headers`.
     ///
     /// Snapshot is intentionally narrow: only headers we know we will
     /// consume go into it. Headers that show up later via the response
@@ -868,12 +909,22 @@ impl ResponseCaching {
         ctx: &mut RequestContext,
         headers: &HashMap<String, String>,
     ) {
-        let mut snapshot: Vec<(String, String)> = Vec::with_capacity(
+        let mut snapshot: Vec<RequestHeaderSnapshotEntry> = Vec::with_capacity(
             self.config.vary_by_headers.len() + 1 + SENSITIVE_VARY_HEADERS.len(),
         );
         let mut push_if_present = |key: &str| {
             if let Some(value) = headers.get(key) {
-                snapshot.push((key.to_string(), value.clone()));
+                let value_is_cache_key_part = should_hash_vary_header_value(key);
+                let value = if value_is_cache_key_part {
+                    cache_key_vary_value(key, value)
+                } else {
+                    value.clone()
+                };
+                snapshot.push(RequestHeaderSnapshotEntry {
+                    header: key.to_string(),
+                    value,
+                    value_is_cache_key_part,
+                });
             }
         };
         push_if_present("host");
@@ -882,7 +933,7 @@ impl ResponseCaching {
         }
         for header in &self.config.vary_by_headers {
             // Skip duplicates that match the always-stashed keys above.
-            if header == "host" || is_sensitive_vary_header(header) {
+            if header == "host" || is_auto_sensitive_vary_header(header) {
                 continue;
             }
             push_if_present(header);
@@ -903,16 +954,24 @@ impl ResponseCaching {
     /// snapshotted keys reflect the transformed values seen at lookup
     /// time while any other key (typically a header added by the
     /// response's own `Vary` directive) falls back to the original.
-    fn restore_request_headers_view(&self, ctx: &RequestContext) -> HashMap<String, String> {
-        let mut view = ctx.headers.clone();
+    fn restore_request_headers_view(&self, ctx: &RequestContext) -> RestoredRequestHeadersView {
+        let mut headers = ctx.headers.clone();
+        let mut cache_key_ready_headers = HashSet::new();
         if let Some(serialized) = ctx.metadata.get(CACHE_REQUEST_HEADERS_SNAPSHOT)
-            && let Ok(snapshot) = serde_json::from_str::<Vec<(String, String)>>(serialized)
+            && let Ok(snapshot) =
+                serde_json::from_str::<Vec<RequestHeaderSnapshotEntry>>(serialized)
         {
-            for (key, value) in snapshot {
-                view.insert(key, value);
+            for entry in snapshot {
+                if entry.value_is_cache_key_part && should_hash_vary_header_value(&entry.header) {
+                    cache_key_ready_headers.insert(entry.header.clone());
+                }
+                headers.insert(entry.header, entry.value);
             }
         }
-        view
+        RestoredRequestHeadersView {
+            headers,
+            cache_key_ready_headers,
+        }
     }
 }
 
@@ -1223,12 +1282,9 @@ impl Plugin for ResponseCaching {
         // Vary list. Operators don't need to remember to set
         // `cache_key_include_consumer: true` or list these in
         // `vary_by_headers` — the safe default is to never share a cached
-        // response across distinct credentials or sessions. Driving the loop
-        // off `SENSITIVE_VARY_HEADERS` (the same list `is_sensitive_vary_header`
-        // uses to SHA-256-hash the value) keeps the auto-Vary set and the
-        // sensitivity list from drifting apart. The merged list is sorted and
-        // re-stored in `vary_index` so the same dimension applies to every
-        // subsequent lookup at this base key.
+        // response across distinct credentials or sessions. The merged list is
+        // sorted and re-stored in `vary_index` so the same dimension applies to
+        // every subsequent lookup at this base key.
         //
         // This is complementary to the per-principal `consumer_part` in
         // `build_base_cache_key`: that isolates *authenticated* principals
@@ -1246,7 +1302,7 @@ impl Plugin for ResponseCaching {
         // so the lookup/storage symmetry holds for those too.
         let mut added_sensitive_vary = false;
         for sensitive in SENSITIVE_VARY_HEADERS {
-            if lookup_headers.contains_key(sensitive)
+            if lookup_headers.headers.contains_key(sensitive)
                 && !vary_headers.iter().any(|h| h == sensitive)
             {
                 vary_headers.push(sensitive.to_string());
@@ -1257,7 +1313,12 @@ impl Plugin for ResponseCaching {
             vary_headers.sort();
         }
 
-        let cache_key = self.build_cache_key(ctx, &vary_headers, &lookup_headers);
+        let cache_key = self.build_cache_key_with_ready_values(
+            ctx,
+            &vary_headers,
+            &lookup_headers.headers,
+            Some(&lookup_headers.cache_key_ready_headers),
+        );
 
         if body.len() > self.config.max_entry_size_bytes {
             debug!(

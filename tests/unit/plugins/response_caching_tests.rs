@@ -2,6 +2,7 @@
 
 use super::plugin_utils::create_test_proxy;
 use chrono::Utc;
+use ferrum_edge::_test_support::clone_log_metadata;
 use ferrum_edge::config::types::Consumer;
 use ferrum_edge::plugins::response_caching::ResponseCaching;
 use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
@@ -959,6 +960,115 @@ async fn test_cookie_bearing_request_not_cross_served_across_sessions() {
     let mut h_a2 = ctx_a2.headers.clone();
     let (_, body, _) = expect_reject(plugin.before_proxy(&mut ctx_a2, &mut h_a2).await);
     assert_eq!(body, b"alice-dashboard");
+}
+
+#[tokio::test]
+async fn test_sensitive_header_snapshot_does_not_store_raw_session_headers() {
+    let plugin = default_plugin();
+
+    let mut public_response = HashMap::new();
+    public_response.insert(
+        "cache-control".to_string(),
+        "public, max-age=60".to_string(),
+    );
+
+    let cookie = "session=alice; csrf=raw-secret";
+    let proxy_auth = "Basic cHJveHk6c2VjcmV0";
+
+    let mut ctx = make_ctx("GET", "/dashboard");
+    ctx.headers.insert("cookie".to_string(), cookie.to_string());
+    ctx.headers
+        .insert("proxy-authorization".to_string(), proxy_auth.to_string());
+    let mut headers = ctx.headers.clone();
+
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+
+    let snapshot = ctx
+        .metadata
+        .get("cache_request_headers_snapshot")
+        .expect("cache header snapshot should be stashed");
+    assert!(snapshot.contains("cookie"));
+    assert!(snapshot.contains("proxy-authorization"));
+    assert!(snapshot.contains("sha256-"));
+    assert!(!snapshot.contains(cookie));
+    assert!(!snapshot.contains(proxy_auth));
+    assert!(!snapshot.contains("raw-secret"));
+
+    let log_metadata = clone_log_metadata(&ctx);
+    let log_metadata_json = serde_json::to_string(&log_metadata).unwrap();
+    assert!(!log_metadata_json.contains(cookie));
+    assert!(!log_metadata_json.contains(proxy_auth));
+    assert!(!log_metadata_json.contains("raw-secret"));
+
+    plugin
+        .on_final_response_body(&mut ctx, 200, &public_response, b"alice-dashboard")
+        .await;
+
+    let mut same_ctx = make_ctx("GET", "/dashboard");
+    same_ctx
+        .headers
+        .insert("cookie".to_string(), cookie.to_string());
+    same_ctx
+        .headers
+        .insert("proxy-authorization".to_string(), proxy_auth.to_string());
+    let mut same_headers = same_ctx.headers.clone();
+    let (_, body, _) = expect_reject(plugin.before_proxy(&mut same_ctx, &mut same_headers).await);
+    assert_eq!(body, b"alice-dashboard");
+}
+
+#[tokio::test]
+async fn test_sensitive_configured_vary_header_snapshot_hashes_without_breaking_hits() {
+    let plugin = plugin_with_config(json!({
+        "vary_by_headers": ["x-api-key"]
+    }));
+
+    let mut public_response = HashMap::new();
+    public_response.insert(
+        "cache-control".to_string(),
+        "public, max-age=60".to_string(),
+    );
+
+    let api_key = "raw-api-key-secret";
+    let mut ctx = make_ctx("GET", "/api/keyed");
+    ctx.headers
+        .insert("x-api-key".to_string(), api_key.to_string());
+    let mut headers = ctx.headers.clone();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    let snapshot = ctx
+        .metadata
+        .get("cache_request_headers_snapshot")
+        .expect("cache header snapshot should be stashed");
+    assert!(snapshot.contains("x-api-key"));
+    assert!(snapshot.contains("sha256-"));
+    assert!(!snapshot.contains(api_key));
+
+    plugin
+        .on_final_response_body(&mut ctx, 200, &public_response, b"keyed")
+        .await;
+
+    let mut same_ctx = make_ctx("GET", "/api/keyed");
+    same_ctx
+        .headers
+        .insert("x-api-key".to_string(), api_key.to_string());
+    let mut same_headers = same_ctx.headers.clone();
+    let (_, body, _) = expect_reject(plugin.before_proxy(&mut same_ctx, &mut same_headers).await);
+    assert_eq!(body, b"keyed");
+
+    let mut other_ctx = make_ctx("GET", "/api/keyed");
+    other_ctx
+        .headers
+        .insert("x-api-key".to_string(), "other-api-key".to_string());
+    let mut other_headers = other_ctx.headers.clone();
+    assert!(matches!(
+        plugin
+            .before_proxy(&mut other_ctx, &mut other_headers)
+            .await,
+        PluginResult::Continue
+    ));
 }
 
 // === X-Cache-Status header ===
