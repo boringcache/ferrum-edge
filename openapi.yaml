@@ -11822,7 +11822,11 @@ components:
           description: OpenAPI path template, used for metadata and path specificity ordering.
         path_regex:
           type: string
-          description: Full-match regex generated from the path template and compiled at plugin load.
+          description: >-
+            Regex used to match the request path, compiled at plugin load.
+            Auto-generated specs derive it from the path template; operator-supplied
+            patterns are automatically anchored as `^(?:...)$` (full-path match) so a
+            loose pattern cannot substring-match an unintended superstring path.
         operation_label:
           type: string
           description: Optional metadata label. Defaults to "`METHOD path_template`".

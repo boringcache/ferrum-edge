@@ -14,6 +14,7 @@ use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::config::types::OPENAPI_VALIDATOR_DEFAULT_CONTENT_TYPES;
 
@@ -21,9 +22,18 @@ use super::{HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, RequestContext};
 
 const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
 const DEFAULT_ERROR_TRUNCATE_CHARS: usize = 1024;
-const MATCHED_OPERATION_INDEX_KEY: &str = "openapi_validator.matched_operation_index";
-const MATCHED_OPERATION_METHOD_KEY: &str = "openapi_validator.matched_operation_method";
+/// Public, stable metadata key carrying the bypass/skip reason for loggers and
+/// observability. It is write-only output; control-flow read-back uses the
+/// per-instance key built in `new()` so sibling instances cannot cross-apply a
+/// bypass decision (see finding #17).
 const SKIP_REASON_KEY: &str = "openapi_validator.skip_reason";
+
+/// Monotonic source of per-instance ids. Multiple `openapi_validator` instances
+/// can run on one request and share `ctx.metadata`; namespacing the internal
+/// cache keys by instance id keeps each instance from reading another's matched
+/// operation (which is resolved against differently-ordered per-instance entry
+/// vectors) or its bypass decision. See finding #17.
+static INSTANCE_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EnforcementMode {
@@ -164,6 +174,12 @@ pub struct OpenapiValidator {
     response_error_status: u16,
     error_content_type: String,
     error_truncate_chars: usize,
+    /// Per-instance metadata keys for the internal request -> body-phase cache.
+    /// Built once in `new()` so the hot path never allocates them, and suffixed
+    /// with a unique instance id so co-located instances stay isolated (#17).
+    matched_operation_method_key: String,
+    matched_operation_index_key: String,
+    skip_reason_cache_key: String,
 }
 
 impl OpenapiValidator {
@@ -279,6 +295,17 @@ impl OpenapiValidator {
         let error_truncate_chars =
             optional_usize(object, "error_truncate_chars")?.unwrap_or(DEFAULT_ERROR_TRUNCATE_CHARS);
 
+        // Namespace the internal cache keys per instance so multiple
+        // openapi_validator instances on one request never read each other's
+        // matched-operation index (resolved against differently-ordered entry
+        // vectors) or bypass decision via shared ctx.metadata (finding #17).
+        let instance_id = INSTANCE_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let matched_operation_method_key =
+            format!("openapi_validator.matched_operation_method.{instance_id}");
+        let matched_operation_index_key =
+            format!("openapi_validator.matched_operation_index.{instance_id}");
+        let skip_reason_cache_key = format!("openapi_validator.skip_reason.{instance_id}");
+
         Ok(Self {
             mode,
             validate_request,
@@ -299,6 +326,9 @@ impl OpenapiValidator {
             response_error_status,
             error_content_type,
             error_truncate_chars,
+            matched_operation_method_key,
+            matched_operation_index_key,
+            skip_reason_cache_key,
         })
     }
 
@@ -320,13 +350,15 @@ impl OpenapiValidator {
     }
 
     fn cached_operation<'a>(&'a self, ctx: &RequestContext) -> Option<&'a OperationEntry> {
-        let method = ctx.metadata.get(MATCHED_OPERATION_METHOD_KEY)?;
+        // Keys are namespaced by instance id, so a value present here was
+        // written by THIS instance against THIS instance's entry vector (#17).
+        let method = ctx.metadata.get(&self.matched_operation_method_key)?;
         if !method.eq_ignore_ascii_case(&ctx.method) {
             return None;
         }
         let index = ctx
             .metadata
-            .get(MATCHED_OPERATION_INDEX_KEY)?
+            .get(&self.matched_operation_index_key)?
             .parse::<usize>()
             .ok()?;
         self.ops_by_method.get(method)?.entries.get(index)
@@ -341,12 +373,13 @@ impl OpenapiValidator {
 
     fn mark_operation(&self, ctx: &mut RequestContext, operation: OperationMatch<'_>) {
         self.mark_operation_entry(ctx, operation.entry);
+        // Internal cache, keyed per instance so siblings don't read our index.
         ctx.metadata.insert(
-            MATCHED_OPERATION_METHOD_KEY.to_string(),
+            self.matched_operation_method_key.clone(),
             operation.method.to_string(),
         );
         ctx.metadata.insert(
-            MATCHED_OPERATION_INDEX_KEY.to_string(),
+            self.matched_operation_index_key.clone(),
             operation.index.to_string(),
         );
     }
@@ -370,7 +403,14 @@ impl OpenapiValidator {
     }
 
     fn cached_bypass_reason(&self, ctx: &RequestContext) -> Option<&'static str> {
-        match ctx.metadata.get(SKIP_REASON_KEY).map(String::as_str) {
+        // Read the per-instance cache key, not the shared public key: bypass
+        // rules are instance-specific, so trusting a sibling instance's reason
+        // would silently skip THIS instance's validation (finding #17).
+        match ctx
+            .metadata
+            .get(&self.skip_reason_cache_key)
+            .map(String::as_str)
+        {
             Some("bypass_path") => Some("bypass_path"),
             Some("bypass_method") => Some("bypass_method"),
             Some("bypass_consumer") => Some("bypass_consumer"),
@@ -431,8 +471,13 @@ impl OpenapiValidator {
 
     fn mark_skip(&self, ctx: &mut RequestContext, reason: &'static str) {
         self.mark_mode(ctx);
+        // Public key for loggers/observability (last writer wins across
+        // instances; this is output only).
         ctx.metadata
             .insert(SKIP_REASON_KEY.to_string(), reason.to_string());
+        // Per-instance cache read back by cached_bypass_reason (#17).
+        ctx.metadata
+            .insert(self.skip_reason_cache_key.clone(), reason.to_string());
     }
 
     fn handle_violation(
@@ -740,6 +785,16 @@ impl Plugin for OpenapiValidator {
     }
 }
 
+/// Wrap an operator-supplied `path_regex` so it matches the full path rather
+/// than any substring. The non-capturing group keeps the anchors applied to the
+/// whole alternation: `a|b` becomes `^(?:a|b)$` (both branches anchored), not
+/// `^a|b$` (only the first branch anchored). Already-anchored patterns such as
+/// the auto-generated `^/orders/[^/]+$` remain equivalent after wrapping. See
+/// finding #89.
+fn anchor_path_regex(raw: &str) -> String {
+    format!("^(?:{raw})$")
+}
+
 fn parse_operation(
     value: &Value,
     index: usize,
@@ -761,7 +816,15 @@ fn parse_operation(
         .to_string();
     let path_regex_raw = optional_string(object, "path_regex")?
         .ok_or_else(|| format!("openapi_validator: operations[{index}].path_regex is required"))?;
-    Regex::new(path_regex_raw).map_err(|error| {
+    // Anchor operator-supplied patterns so a loose regex like `/users/\d+`
+    // cannot substring-match an unintended superstring path such as
+    // `/admin/users/1/secret` and thus validate a request against the wrong
+    // operation (finding #89). Ferrum's own generated specs already anchor via
+    // extractor.rs. The non-capturing group is required so a top-level
+    // alternation `a|b` becomes `^(?:a|b)$` (every branch anchored) rather than
+    // `^a|b$` (only the first branch anchored).
+    let path_regex_anchored = anchor_path_regex(path_regex_raw);
+    Regex::new(&path_regex_anchored).map_err(|error| {
         format!("openapi_validator: operations[{index}].path_regex is invalid: {error}")
     })?;
     let operation_label = optional_string(object, "operation_label")?
@@ -778,7 +841,7 @@ fn parse_operation(
 
     Ok(ParsedOperation {
         method,
-        path_regex: path_regex_raw.to_string(),
+        path_regex: path_regex_anchored,
         entry: OperationEntry {
             operation_label,
             literal_segments: literal_segment_count(&path_template),
@@ -1389,7 +1452,16 @@ fn multipart_part_to_schema_value(part: &MultipartPart, schema: &Value) -> Resul
             "size".to_string(),
             Value::Number(serde_json::Number::from(part.body.len() as u64)),
         );
-        if let Ok(text) = std::str::from_utf8(&part.body) {
+        // Only copy the part body into a JSON string when the schema can
+        // actually validate a `content` field. When it cannot (no `content`
+        // property and `additionalProperties` is absent/true), the copy is pure
+        // waste on a buffered request path, so skip it (finding #88). This is
+        // outcome-preserving: the cases where `content` affects validity --
+        // a declared `content` property, a constraining `additionalProperties`
+        // schema, or `additionalProperties: false` -- still materialize it.
+        if object_schema_validates_content(schema)
+            && let Ok(text) = std::str::from_utf8(&part.body)
+        {
             out.insert("content".to_string(), Value::String(text.to_string()));
         }
         return Ok(Value::Object(out));
@@ -1730,6 +1802,42 @@ fn schema_has_required(schema: &Value) -> bool {
         .get("required")
         .and_then(Value::as_array)
         .is_some_and(|values| values.iter().any(Value::is_string))
+}
+
+/// Whether a multipart-part object schema can validate the synthetic `content`
+/// field, so `multipart_part_to_schema_value` knows whether copying the part
+/// body into a JSON string is worthwhile (finding #88). True when `content` is a
+/// declared property, listed in `required`, when `additionalProperties` is a
+/// constraining schema, or when `additionalProperties: false` would reject an
+/// unexpected `content` field; false when `content` is unconstrained (no
+/// property, not required, and `additionalProperties` absent or `true`). The
+/// extra checks keep the optimization outcome-preserving: every case where the
+/// presence or shape of `content` could change validation still materializes it.
+fn object_schema_validates_content(schema: &Value) -> bool {
+    if schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .is_some_and(|properties| properties.contains_key("content"))
+    {
+        return true;
+    }
+    // `required: ["content"]` checks presence even without a declared property.
+    if schema
+        .get("required")
+        .and_then(Value::as_array)
+        .is_some_and(|values| values.iter().any(|value| value.as_str() == Some("content")))
+    {
+        return true;
+    }
+    match schema.get("additionalProperties") {
+        // A schema object constrains every undeclared field, including content.
+        Some(Value::Object(_)) => true,
+        // `false` rejects undeclared fields; keep emitting content so the
+        // existing reject outcome is preserved.
+        Some(Value::Bool(false)) => true,
+        // Absent or `true`: content is allowed but unvalidated -- skip the copy.
+        _ => false,
+    }
 }
 
 fn xml_name<'a>(schema: &'a Value, default: Option<&'a str>) -> Option<&'a str> {
