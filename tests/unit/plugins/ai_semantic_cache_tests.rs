@@ -112,6 +112,22 @@ async fn mount_google_gemini_embedding_mock(server: &MockServer, expected_calls:
         .await;
 }
 
+async fn mount_large_embedding_mock(server: &MockServer, expected_calls: u64) {
+    let mut embedding = vec![0.0; 128];
+    embedding[0] = 1.0;
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .and(header("authorization", "Bearer test-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [
+                {"embedding": embedding}
+            ]
+        })))
+        .expect(expected_calls)
+        .mount(server)
+        .await;
+}
+
 fn semantic_config(server: &MockServer) -> serde_json::Value {
     json!({
         "semantic_similarity_enabled": true,
@@ -363,6 +379,43 @@ async fn test_semantic_similarity_hit_after_exact_miss() {
 }
 
 #[tokio::test]
+async fn test_semantic_similarity_respects_system_message_scope() {
+    let mock_server = MockServer::start().await;
+    mount_embedding_mock(&mock_server, 2).await;
+    let plugin = make_plugin(semantic_config(&mock_server));
+
+    let body1 = json!({
+        "model": "gpt-4o",
+        "messages": [
+            {"role": "system", "content": "Return JSON only."},
+            {"role": "user", "content": "What is the capital of France?"}
+        ]
+    });
+    let body2 = json!({
+        "model": "gpt-4o",
+        "messages": [
+            {"role": "system", "content": "Return plain text only."},
+            {"role": "user", "content": "Which city is France's capital?"}
+        ]
+    });
+
+    store_response(
+        &plugin,
+        &serde_json::to_string(&body1).unwrap(),
+        None,
+        br#"{"answer":"Paris"}"#,
+    )
+    .await;
+
+    let hit =
+        run_before_proxy_get_status(&plugin, &serde_json::to_string(&body2).unwrap(), None).await;
+    assert!(
+        !hit,
+        "semantic cache must not cross system/developer instruction scopes"
+    );
+}
+
+#[tokio::test]
 async fn test_google_gemini_semantic_provider_uses_provider_response_shape() {
     let mock_server = MockServer::start().await;
     mount_google_gemini_embedding_mock(&mock_server, 2).await;
@@ -396,6 +449,37 @@ async fn test_google_gemini_semantic_provider_uses_provider_response_shape() {
     assert!(
         hit,
         "Gemini embedding.values responses should support semantic hits"
+    );
+}
+
+#[tokio::test]
+async fn test_semantic_embedding_size_counts_against_total_cache_limit() {
+    let mock_server = MockServer::start().await;
+    mount_large_embedding_mock(&mock_server, 1).await;
+    let plugin = make_plugin(json!({
+        "semantic_similarity_enabled": true,
+        "semantic_embedding_endpoint": format!("{}/embeddings", mock_server.uri()),
+        "semantic_embedding_api_key": "test-key",
+        "max_total_size_bytes": 512
+    }));
+
+    let body = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "What is the capital of France?"}]
+    });
+
+    store_response(
+        &plugin,
+        &serde_json::to_string(&body).unwrap(),
+        None,
+        b"Paris",
+    )
+    .await;
+
+    assert_eq!(
+        plugin.tracked_keys_count(),
+        Some(0),
+        "entry should be rejected when body plus semantic vector exceeds max_total_size_bytes"
     );
 }
 

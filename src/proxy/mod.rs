@@ -1264,6 +1264,8 @@ pub(crate) fn store_request_body_metadata(
 
 pub(crate) fn redact_request_body_from_log_metadata(metadata: &mut HashMap<String, String>) {
     metadata.remove("request_body");
+    metadata.remove("_ai_cache_embedding");
+    metadata.remove("_ai_cache_semantic_scope");
 }
 
 pub(crate) fn clone_log_metadata(ctx: &RequestContext) -> HashMap<String, String> {
@@ -16443,6 +16445,12 @@ mod tests {
         ctx.metadata
             .insert("request_body".to_string(), "secret body".to_string());
         ctx.metadata
+            .insert("_ai_cache_embedding".to_string(), "[0.1,0.2]".to_string());
+        ctx.metadata.insert(
+            "_ai_cache_semantic_scope".to_string(),
+            "scope-key".to_string(),
+        );
+        ctx.metadata
             .insert("waf.rule_hits".to_string(), "SPOOFED".to_string());
         ctx.metadata
             .insert("waf.action".to_string(), "blocked".to_string());
@@ -16450,6 +16458,8 @@ mod tests {
         let metadata = clone_log_metadata(&ctx);
 
         assert!(!metadata.contains_key("request_body"));
+        assert!(!metadata.contains_key("_ai_cache_embedding"));
+        assert!(!metadata.contains_key("_ai_cache_semantic_scope"));
         assert!(!metadata.contains_key("waf.rule_hits"));
         assert!(!metadata.contains_key("waf.action"));
 

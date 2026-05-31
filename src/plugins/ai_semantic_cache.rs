@@ -23,7 +23,8 @@
 //! (`instant-distance`), and returns cached responses whose cosine similarity is
 //! above the configured threshold. Semantic matches are scoped by the same
 //! safety-critical request dimensions as exact keys (proxy, consumer, model,
-//! params, tools, response format, stream flag, and system prompt).
+//! params, tools, response format, stream flag, system prompt, and
+//! system/developer message instructions).
 //!
 //! # Storage
 //!
@@ -40,8 +41,9 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::mem;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tracing::debug;
 
@@ -49,6 +51,8 @@ use super::utils::body_transform::is_json_content_type;
 use super::utils::cache_headers::sanitize_cached_headers;
 use super::utils::redis_rate_limiter::{RedisConfig, RedisRateLimitClient};
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
+
+const VECTOR_REBUILD_INTERVAL_SECONDS: u64 = 30;
 
 /// A cached LLM response.
 #[derive(Debug, Clone)]
@@ -164,6 +168,10 @@ impl EmbeddingPoint {
     fn to_vec(&self) -> Vec<f32> {
         self.values.clone()
     }
+
+    fn approx_size(&self) -> usize {
+        mem::size_of::<Self>() + self.values.capacity() * mem::size_of::<f32>()
+    }
 }
 
 impl HnswPoint for EmbeddingPoint {
@@ -220,6 +228,10 @@ pub struct AiSemanticCache {
     redis_client: Option<Arc<RedisRateLimitClient>>,
     /// Counter for periodic cleanup scheduling.
     last_cleanup: AtomicU64,
+    /// Last time the semantic vector snapshot was rebuilt.
+    last_vector_rebuild: AtomicU64,
+    /// Whether local semantic entries changed since the latest vector rebuild.
+    vector_index_dirty: AtomicBool,
 }
 
 /// Serializable form of CacheEntry for Redis storage.
@@ -294,6 +306,8 @@ impl AiSemanticCache {
             total_size: Arc::new(AtomicUsize::new(0)),
             redis_client,
             last_cleanup: AtomicU64::new(0),
+            last_vector_rebuild: AtomicU64::new(0),
+            vector_index_dirty: AtomicBool::new(false),
         })
     }
 
@@ -508,6 +522,32 @@ impl AiSemanticCache {
             push_ascii_lowercase(&mut key_input, role);
         }
 
+        let mut has_instruction_message = false;
+        for msg in messages {
+            let role = msg
+                .get("role")
+                .and_then(|r| r.as_str())
+                .unwrap_or("unknown");
+            if !matches!(role.to_ascii_lowercase().as_str(), "system" | "developer") {
+                continue;
+            }
+            let content = self.extract_message_content(msg);
+            if content.is_empty() {
+                continue;
+            }
+            if !has_instruction_message {
+                start_key_part(&mut key_input, &mut has_part);
+                key_input.push_str("instructions:");
+                has_instruction_message = true;
+            } else {
+                key_input.push('|');
+            }
+            push_ascii_lowercase(&mut key_input, role);
+            key_input.push(':');
+            let hash = Sha256::digest(content.as_bytes());
+            key_input.push_str(&hex::encode(hash));
+        }
+
         if let Some(system) = body.get("system") {
             start_key_part(&mut key_input, &mut has_part);
             key_input.push_str("sys:");
@@ -632,6 +672,42 @@ impl AiSemanticCache {
         None
     }
 
+    fn mark_vector_index_dirty(&self) {
+        if self.semantic.is_some() {
+            self.vector_index_dirty.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn refresh_vector_index_if_due(&self, force: bool) {
+        if self.semantic.is_none() || !self.vector_index_dirty.load(Ordering::Relaxed) {
+            return;
+        }
+
+        let now_epoch = current_epoch_seconds();
+        let has_snapshot = self.vector_index.load().is_some();
+        let last = self.last_vector_rebuild.load(Ordering::Relaxed);
+        if !force
+            && has_snapshot
+            && now_epoch.saturating_sub(last) < VECTOR_REBUILD_INTERVAL_SECONDS
+        {
+            return;
+        }
+
+        if self
+            .last_vector_rebuild
+            .compare_exchange(last, now_epoch, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+
+        // HnswMap is immutable, so local semantic inserts/removals are made
+        // visible in batches. This keeps normal cache stores from paying a
+        // full O(cache size) rebuild each time; entries inserted during a
+        // rebuild become searchable on the next scheduled refresh.
+        self.rebuild_vector_index();
+    }
+
     fn rebuild_vector_index(&self) {
         let Some(semantic) = self.semantic.as_ref() else {
             return;
@@ -659,6 +735,7 @@ impl AiSemanticCache {
 
         if points.is_empty() {
             self.vector_index.store(None);
+            self.vector_index_dirty.store(false, Ordering::Relaxed);
             return;
         }
 
@@ -669,14 +746,12 @@ impl AiSemanticCache {
             .build(points, values);
         self.vector_index
             .store(Some(Arc::new(VectorSnapshot { index })));
+        self.vector_index_dirty.store(false, Ordering::Relaxed);
     }
 
     /// Periodic cleanup of expired entries.
     fn cleanup_expired(&self) {
-        let now_epoch = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let now_epoch = current_epoch_seconds();
 
         let last = self.last_cleanup.load(Ordering::Relaxed);
         if now_epoch.saturating_sub(last) < 30 {
@@ -692,9 +767,11 @@ impl AiSemanticCache {
 
         let now = Instant::now();
         let mut removed_size = 0usize;
+        let mut removed_semantic_entry = false;
         self.cache.retain(|_, entry| {
             if now.duration_since(entry.inserted_at) >= self.ttl {
                 removed_size += entry.approx_size;
+                removed_semantic_entry |= entry.embedding.is_some();
                 false
             } else {
                 true
@@ -702,7 +779,10 @@ impl AiSemanticCache {
         });
         if removed_size > 0 {
             self.total_size.fetch_sub(removed_size, Ordering::Relaxed);
-            self.rebuild_vector_index();
+            if removed_semantic_entry {
+                self.mark_vector_index_dirty();
+                self.refresh_vector_index_if_due(false);
+            }
         }
 
         // Enforce max entries by removing oldest. Use partial-select
@@ -724,13 +804,18 @@ impl AiSemanticCache {
                 entries_with_time.select_nth_unstable_by_key(to_remove - 1, |(_, t)| *t);
             }
 
+            let mut removed_semantic_entry = false;
             for (key, _) in entries_with_time.into_iter().take(to_remove) {
                 if let Some((_, removed)) = self.cache.remove(&key) {
+                    removed_semantic_entry |= removed.embedding.is_some();
                     self.total_size
                         .fetch_sub(removed.approx_size, Ordering::Relaxed);
                 }
             }
-            self.rebuild_vector_index();
+            if removed_semantic_entry {
+                self.mark_vector_index_dirty();
+                self.refresh_vector_index_if_due(false);
+            }
         }
     }
 }
@@ -743,6 +828,13 @@ fn start_key_part(buffer: &mut String, has_part: &mut bool) {
     }
 }
 
+fn current_epoch_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 fn push_ascii_lowercase(buffer: &mut String, value: &str) {
     for ch in value.chars() {
         buffer.push(ch.to_ascii_lowercase());
@@ -751,6 +843,26 @@ fn push_ascii_lowercase(buffer: &mut String, value: &str) {
 
 fn canonical_param_value(value: &Value) -> String {
     value.to_string()
+}
+
+fn cache_entry_approx_size(
+    body_len: usize,
+    headers: &HashMap<String, String>,
+    semantic_scope_key: Option<&String>,
+    embedding: Option<&EmbeddingPoint>,
+) -> usize {
+    let header_size = headers
+        .iter()
+        .map(|(name, value)| name.len().saturating_add(value.len()))
+        .sum::<usize>();
+    let scope_size = semantic_scope_key.map(|scope| scope.len()).unwrap_or(0);
+    let embedding_size = embedding.map(EmbeddingPoint::approx_size).unwrap_or(0);
+
+    mem::size_of::<CacheEntry>()
+        .saturating_add(body_len)
+        .saturating_add(header_size)
+        .saturating_add(scope_size)
+        .saturating_add(embedding_size)
 }
 
 fn append_response_shape_fields(body: &Value, buffer: &mut String, has_part: &mut bool) {
@@ -1104,7 +1216,10 @@ impl Plugin for AiSemanticCache {
             if let Some((_, removed)) = self.cache.remove(&cache_key) {
                 self.total_size
                     .fetch_sub(removed.approx_size, Ordering::Relaxed);
-                self.rebuild_vector_index();
+                if removed.embedding.is_some() {
+                    self.mark_vector_index_dirty();
+                    self.refresh_vector_index_if_due(false);
+                }
             }
         }
 
@@ -1222,34 +1337,42 @@ impl Plugin for AiSemanticCache {
             return PluginResult::Continue;
         }
 
-        let current_total = self.total_size.load(Ordering::Relaxed);
-        if current_total.saturating_add(body.len()) > self.max_total_size_bytes {
-            debug!(
-                cache_key = %cache_key,
-                "ai_semantic_cache: total cache size would exceed limit, skipping"
-            );
-            return PluginResult::Continue;
-        }
-
         // Strip security-sensitive headers before caching. Cookies, auth
         // tokens, per-request trace IDs, and rate-limit counters from the
         // original response would otherwise be replayed verbatim to every
         // cache-hit consumer — leaking session state and misleading
         // downstream clients about their own rate-limit/trace context.
         let safe_headers = sanitize_cached_headers(response_headers);
-        let semantic_scope_key = ctx.metadata.get("_ai_cache_semantic_scope").cloned();
+        let semantic_scope_key = ctx.metadata.remove("_ai_cache_semantic_scope");
         let embedding = ctx
             .metadata
-            .get("_ai_cache_embedding")
-            .and_then(|raw| serde_json::from_str::<Vec<f32>>(raw).ok())
+            .remove("_ai_cache_embedding")
+            .and_then(|raw| serde_json::from_str::<Vec<f32>>(&raw).ok())
             .and_then(|values| EmbeddingPoint::from_raw(values).ok());
+        let approx_size = cache_entry_approx_size(
+            body.len(),
+            &safe_headers,
+            semantic_scope_key.as_ref(),
+            embedding.as_ref(),
+        );
+
+        let current_total = self.total_size.load(Ordering::Relaxed);
+        if current_total.saturating_add(approx_size) > self.max_total_size_bytes {
+            debug!(
+                cache_key = %cache_key,
+                entry_size = approx_size,
+                max_total = self.max_total_size_bytes,
+                "ai_semantic_cache: total cache size would exceed limit, skipping"
+            );
+            return PluginResult::Continue;
+        }
 
         let entry = CacheEntry {
             status_code: response_status,
             headers: safe_headers.clone(),
             body: Bytes::from(body.to_vec()),
             inserted_at: Instant::now(),
-            approx_size: body.len(),
+            approx_size,
             semantic_scope_key: semantic_scope_key.clone(),
             embedding: embedding.clone(),
         };
@@ -1265,7 +1388,8 @@ impl Plugin for AiSemanticCache {
             .fetch_add(entry.approx_size, Ordering::Relaxed);
         self.cache.insert(cache_key.clone(), entry);
         if replaced_semantic_entry || embedding.is_some() {
-            self.rebuild_vector_index();
+            self.mark_vector_index_dirty();
+            self.refresh_vector_index_if_due(false);
         }
 
         // Also store in Redis if configured

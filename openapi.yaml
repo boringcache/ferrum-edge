@@ -12475,9 +12475,9 @@ components:
           description: Enable embedding-based semantic lookup after exact Redis/local misses. Exact matching remains active when this is disabled or enabled.
         semantic_embedding_provider:
           type: string
-          enum: [openai, azure_openai, mistral, voyage, anthropic, claude, cohere, google_gemini, google_vertex, bedrock_titan, bedrock_cohere]
+          enum: [openai, openai_compatible, openai-compatible, azure, azure_openai, azure-openai, mistral, voyage, voyageai, voyage_ai, anthropic, claude, cohere, google, google_gemini, google-gemini, gemini, google_vertex, google-vertex, vertex, vertex_ai, vertex-ai, bedrock_titan, bedrock-titan, amazon_titan, amazon-titan, bedrock_cohere, bedrock-cohere, cohere_bedrock, cohere-bedrock]
           default: openai
-          description: Embedding provider request/response format. anthropic and claude are aliases for Voyage-compatible embeddings because Claude does not expose a native embedding model.
+          description: Embedding provider request/response format. Compatibility aliases mirror the plugin parser; anthropic and claude are aliases for Voyage-compatible embeddings because Claude does not expose a native embedding model.
         semantic_embedding_endpoint:
           type: string
           format: uri
