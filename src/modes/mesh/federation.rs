@@ -208,8 +208,10 @@ impl FederationStore {
     }
 
     /// Retire a cluster generation when its `RemoteCluster` is removed from the
-    /// slice (or its trust is withdrawn). When `remove_bundle` is true, also
-    /// remove the trust domain from the federated bundle map.
+    /// slice (or its trust is withdrawn). When `remove_bundle` is true, remove
+    /// the trust domain from the federated bundle map unconditionally. When it
+    /// is false, still remove the bundle if this cluster was the source of the
+    /// currently cached trust-domain entry.
     ///
     /// Called by [`FederationPollerManager`] so a once-fetched federated bundle
     /// stops being overlaid onto slice applies and the decommissioned peer
@@ -241,9 +243,16 @@ impl FederationStore {
 
         let mut published_snapshot = false;
         self.inner.rcu(|current| {
-            if retired_generation || (remove_bundle && current.bundles.contains_key(trust_domain)) {
+            let cached_bundle = current.bundles.get(trust_domain);
+            let has_cached_bundle = cached_bundle.is_some();
+            let cached_from_removed_cluster =
+                cached_bundle.is_some_and(|bundle| bundle.cluster_name == cluster_name);
+            if retired_generation
+                || (remove_bundle && has_cached_bundle)
+                || cached_from_removed_cluster
+            {
                 let mut next = (**current).clone();
-                if remove_bundle {
+                if remove_bundle || cached_from_removed_cluster {
                     next.bundles.remove(trust_domain);
                 }
                 published_snapshot = true;
@@ -474,6 +483,7 @@ impl FederationPollerConfig {
 }
 
 /// Holds the spawned tasks so callers can join during graceful shutdown.
+#[allow(dead_code)] // Integration tests call this through the lib crate; the bin target does not.
 pub struct FederationPollerHandles {
     pub tasks: Vec<JoinHandle<()>>,
 }
@@ -519,6 +529,7 @@ fn poll_targets_for_multi_cluster(
 /// there are no configured federation endpoints; otherwise returns the spawned
 /// task handles. The caller-supplied `store` is shared with the mesh runtime
 /// so successful polls are observable by the slice-apply path immediately.
+#[allow(dead_code)] // Integration tests call this through the lib crate; the bin target does not.
 pub fn spawn_federation_poller(
     multi_cluster: Option<&MultiClusterConfig>,
     config: Option<FederationPollerConfig>,
@@ -1677,7 +1688,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn manager_reconcile_keeps_shared_trust_domain_bundle_until_last_cluster_removed() {
+    async fn manager_reconcile_keeps_shared_trust_domain_bundle_from_remaining_cluster() {
         use crate::modes::mesh::config::RemoteCluster;
 
         let store = FederationStore::new();
@@ -1723,6 +1734,84 @@ mod tests {
                     refresh_hint_seconds: None,
                 },
                 fetched_at_unix_seconds: 1,
+                endpoint: "https://remote-b/.well-known/spiffe".to_string(),
+                cluster_name: "cluster-b".to_string(),
+            },
+        );
+        assert!(store.snapshot().bundles.contains_key(&shared_td));
+
+        let slice_with_b = MultiClusterConfig {
+            local_cluster: None,
+            federation_endpoint: None,
+            remote_clusters: vec![cluster("cluster-b", "https://remote-b/.well-known/spiffe")],
+            east_west_gateways: Vec::new(),
+        };
+        manager.reconcile(Some(&slice_with_b));
+        assert_eq!(
+            manager.running_cluster_names(),
+            vec!["cluster-b".to_string()]
+        );
+        assert!(
+            store.snapshot().bundles.contains_key(&shared_td),
+            "removing one poller must keep a bundle installed by a remaining same-domain cluster"
+        );
+
+        let empty_slice = MultiClusterConfig {
+            local_cluster: None,
+            federation_endpoint: None,
+            remote_clusters: Vec::new(),
+            east_west_gateways: Vec::new(),
+        };
+        manager.reconcile(Some(&empty_slice));
+        assert!(manager.running_cluster_names().is_empty());
+        assert!(
+            !store.snapshot().bundles.contains_key(&shared_td),
+            "the shared trust-domain bundle is removed only after the last poller is gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn manager_reconcile_removes_shared_trust_domain_bundle_from_removed_cluster() {
+        use crate::modes::mesh::config::RemoteCluster;
+
+        let store = FederationStore::new();
+        let shared_td = td("shared-source.local");
+        let config = FederationPollerConfig {
+            poll_interval: Duration::from_secs(3600),
+            request_timeout: Duration::from_secs(1),
+            fail_open: false,
+        };
+        let mut manager =
+            FederationPollerManager::new(Some(config), PluginHttpClient::default(), store.clone());
+
+        let cluster = |name: &str, endpoint: &str| RemoteCluster {
+            name: name.to_string(),
+            trust_domain: shared_td.clone(),
+            network: None,
+            control_plane_url: None,
+            federation_endpoint: Some(endpoint.to_string()),
+        };
+        let slice_with_both = MultiClusterConfig {
+            local_cluster: None,
+            federation_endpoint: None,
+            remote_clusters: vec![
+                cluster("cluster-a", "https://remote-a/.well-known/spiffe"),
+                cluster("cluster-b", "https://remote-b/.well-known/spiffe"),
+            ],
+            east_west_gateways: Vec::new(),
+        };
+        manager.reconcile(Some(&slice_with_both));
+
+        store.install_for_test(
+            shared_td.clone(),
+            FederatedBundle {
+                bundle: TrustBundle {
+                    trust_domain: shared_td.clone(),
+                    x509_authorities: vec!["old-a".to_string()],
+                    jwt_authorities: Vec::new(),
+                    refresh_hint_seconds: None,
+                },
+                fetched_at_unix_seconds: 1,
                 endpoint: "https://remote-a/.well-known/spiffe".to_string(),
                 cluster_name: "cluster-a".to_string(),
             },
@@ -1741,21 +1830,8 @@ mod tests {
             vec!["cluster-b".to_string()]
         );
         assert!(
-            store.snapshot().bundles.contains_key(&shared_td),
-            "removing one of multiple pollers for a trust domain must not withdraw the shared bundle"
-        );
-
-        let empty_slice = MultiClusterConfig {
-            local_cluster: None,
-            federation_endpoint: None,
-            remote_clusters: Vec::new(),
-            east_west_gateways: Vec::new(),
-        };
-        manager.reconcile(Some(&empty_slice));
-        assert!(manager.running_cluster_names().is_empty());
-        assert!(
             !store.snapshot().bundles.contains_key(&shared_td),
-            "the shared trust-domain bundle is removed only after the last poller is gone"
+            "bundle installed by the removed cluster must be withdrawn even while a same-domain sibling remains"
         );
     }
 
