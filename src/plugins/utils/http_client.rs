@@ -323,7 +323,7 @@ impl PluginHttpClient {
                  custom CA configured for exclusivity must not be silently widened to \
                  platform/webpki roots."
             );
-            build_dns_cached_fallback_client(Some(dns_cache_clone.clone()), &apply_tls_posture)
+            build_dns_cached_fallback_client(Some(dns_cache_clone.clone()), apply_tls_posture)
         });
 
         Self {
