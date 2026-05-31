@@ -1789,7 +1789,7 @@ fn count_wsu_id_occurrences(xml: &str, id: &str) -> usize {
             continue;
         }
 
-        let Some(tag_end_rel) = xml[tag_start..].find('>') else {
+        let Some(tag_end_rel) = find_start_tag_end(xml, tag_start) else {
             break;
         };
         let tag = &xml[tag_start + 1..tag_start + tag_end_rel];
@@ -1797,6 +1797,25 @@ fn count_wsu_id_occurrences(xml: &str, id: &str) -> usize {
         search_from = tag_start + tag_end_rel + 1;
     }
     count
+}
+
+fn find_start_tag_end(xml: &str, tag_start: usize) -> Option<usize> {
+    let bytes = xml.as_bytes().get(tag_start..)?;
+    let mut quote = None;
+    let mut i = 1usize;
+
+    while i < bytes.len() {
+        match quote {
+            Some(q) if bytes[i] == q => quote = None,
+            Some(_) => {}
+            None if matches!(bytes[i], b'\'' | b'"') => quote = Some(bytes[i]),
+            None if bytes[i] == b'>' => return Some(i),
+            None => {}
+        }
+        i += 1;
+    }
+
+    None
 }
 
 fn count_id_attributes_in_tag(tag: &str, id: &str) -> usize {
@@ -2171,6 +2190,19 @@ mod tests {
         "#;
 
         assert_eq!(count_wsu_id_occurrences(xml, "TS-1"), 5);
+    }
+
+    #[test]
+    fn count_wsu_id_occurrences_counts_ids_after_gt_in_quoted_attribute() {
+        let xml = r#"
+            <Envelope>
+                <wsu:Timestamp wsu:Id="TS-1"/>
+                <Injected pad=">" Id="TS-1">attacker</Injected>
+                <Other pad='>' xml:id='TS-1'>attacker</Other>
+            </Envelope>
+        "#;
+
+        assert_eq!(count_wsu_id_occurrences(xml, "TS-1"), 3);
     }
 
     #[test]
