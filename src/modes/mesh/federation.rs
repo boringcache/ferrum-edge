@@ -91,16 +91,15 @@ pub struct FederationStore {
     revision_tx: Arc<watch::Sender<u64>>,
     /// Monotonic generation counter. [`FederationPollerManager`] stamps each
     /// poll task with the generation registered at launch; `install` commits
-    /// only when the task's generation still matches the trust domain's
-    /// registered generation. This closes the abort→install race: an in-flight
-    /// poll that finishes its *synchronous* parse/install after `remove()` has
-    /// withdrawn the cluster finds a retired generation and is dropped, so a
-    /// decommissioned peer's trust anchor cannot be silently resurrected.
-    /// Mirrors `RemoteEndpointStore`'s generation guard.
+    /// only when the task's generation still matches the cluster's registered
+    /// generation. This closes the abort→install race without forcing a single
+    /// generation slot per trust domain: multiple remote clusters can share a
+    /// trust domain, but retiring one cluster must not stale every other
+    /// cluster polling the same bundle.
     generation: Arc<AtomicU64>,
-    /// Generation at which each trust domain was last registered, in an
+    /// Generation at which each cluster was last registered, in an
     /// `ArcSwap` so `install` can re-check it atomically inside its rcu.
-    td_generation: Arc<ArcSwap<HashMap<TrustDomain, u64>>>,
+    cluster_generation: Arc<ArcSwap<HashMap<String, u64>>>,
 }
 
 impl Default for FederationStore {
@@ -111,7 +110,7 @@ impl Default for FederationStore {
             first_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             revision_tx: Arc::new(revision_tx),
             generation: Arc::new(AtomicU64::new(0)),
-            td_generation: Arc::new(ArcSwap::new(Arc::new(HashMap::new()))),
+            cluster_generation: Arc::new(ArcSwap::new(Arc::new(HashMap::new()))),
         }
     }
 }
@@ -136,46 +135,54 @@ impl FederationStore {
         self.revision_tx.subscribe()
     }
 
-    /// Register a poll task for `trust_domain` and return its generation token.
+    /// Register a poll task for `cluster_name` and return its generation token.
     /// The task passes the token back to `install`; if it no longer matches the
-    /// trust domain's current generation (the cluster was removed, or removed +
+    /// cluster's current generation (the cluster was removed, or removed +
     /// re-registered) the install is silently dropped.
-    pub(crate) fn register(&self, trust_domain: &TrustDomain) -> u64 {
+    pub(crate) fn register(&self, cluster_name: &str) -> u64 {
         let new_gen = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
-        self.td_generation.rcu(|current| {
+        self.cluster_generation.rcu(|current| {
             let mut next = (**current).clone();
-            next.insert(trust_domain.clone(), new_gen);
+            next.insert(cluster_name.to_string(), new_gen);
             Arc::new(next)
         });
         new_gen
     }
 
-    fn td_generation_matches(&self, trust_domain: &TrustDomain, task_generation: u64) -> bool {
-        self.td_generation
+    fn cluster_generation_matches(&self, cluster_name: &str, task_generation: u64) -> bool {
+        self.cluster_generation
             .load()
-            .get(trust_domain)
+            .get(cluster_name)
             .is_some_and(|&g| g == task_generation)
     }
 
     /// Install a polled bundle, but ONLY when `task_generation` still matches the
-    /// trust domain's registered generation — so an in-flight poll cannot
-    /// reinstall after `remove()` withdrew the cluster (the abort→install race).
-    fn install(&self, trust_domain: TrustDomain, bundle: FederatedBundle, task_generation: u64) {
+    /// cluster's registered generation — so an in-flight poll cannot reinstall
+    /// after the manager withdrew the cluster (the abort→install race). Returns
+    /// `true` only when the bundle actually commits.
+    fn install(
+        &self,
+        cluster_name: &str,
+        trust_domain: TrustDomain,
+        bundle: FederatedBundle,
+        task_generation: u64,
+    ) -> bool {
         // Fast-path generation check (re-validated atomically in the rcu below).
-        if !self.td_generation_matches(&trust_domain, task_generation) {
-            return;
+        if !self.cluster_generation_matches(cluster_name, task_generation) {
+            return false;
         }
         // CAS loop so two concurrent successful polls (different trust domains)
         // cannot stomp each other. The generation is re-checked INSIDE the
-        // closure so check-and-insert is atomic w.r.t. `remove()`, which retires
-        // the generation (in `td_generation`) BEFORE clearing the bundle (in
+        // closure so check-and-insert is atomic w.r.t. cluster removal, which
+        // retires the generation (in `cluster_generation`) BEFORE clearing or
+        // republishing the bundle snapshot (in
         // `inner`): a racing `remove` either commits before this rcu (and its
         // subsequent clear drops the bundle) or wins the CAS, forcing this
         // closure to retry, observe the retired generation, and skip — never
         // resurrecting a withdrawn trust anchor.
         let mut installed = false;
         self.inner.rcu(|current| {
-            if !self.td_generation_matches(&trust_domain, task_generation) {
+            if !self.cluster_generation_matches(cluster_name, task_generation) {
                 installed = false;
                 return Arc::clone(current);
             }
@@ -188,47 +195,64 @@ impl FederationStore {
             self.first_ready.store(true, Ordering::Release);
             self.revision_tx.send_modify(|revision| *revision += 1);
         }
+        installed
     }
 
     /// Test helper: register + install in one step. Production code registers in
     /// the manager and threads the token through the poll task.
     #[cfg(test)]
     fn install_for_test(&self, trust_domain: TrustDomain, bundle: FederatedBundle) {
-        let task_generation = self.register(&trust_domain);
-        self.install(trust_domain, bundle, task_generation);
+        let cluster_name = bundle.cluster_name.clone();
+        let task_generation = self.register(&cluster_name);
+        self.install(&cluster_name, trust_domain, bundle, task_generation);
     }
 
-    /// Remove a trust domain from the federated bundle map when its
-    /// `RemoteCluster` is removed from the slice (or its trust is withdrawn).
+    /// Retire a cluster generation when its `RemoteCluster` is removed from the
+    /// slice (or its trust is withdrawn). When `remove_bundle` is true, also
+    /// remove the trust domain from the federated bundle map.
+    ///
     /// Called by [`FederationPollerManager`] so a once-fetched federated bundle
     /// stops being overlaid onto slice applies and the decommissioned peer
     /// stops being dial-eligible — without requiring a gateway restart. Bumps
-    /// the revision so the slice-apply task re-applies. No-op if the domain
-    /// isn't tracked.
-    pub fn remove(&self, trust_domain: &TrustDomain) {
-        // Retire the generation FIRST so any in-flight poll task for this trust
-        // domain sees a mismatch in `install` and cannot reinstall after removal.
-        self.td_generation.rcu(|current| {
-            if current.contains_key(trust_domain) {
+    /// the revision so the slice-apply task re-applies. Even when no bundle has
+    /// been cached yet, retiring a registered generation republishes `inner` so
+    /// any in-flight first-poll RCU based on the old snapshot loses its CAS,
+    /// retries, observes the retired generation, and drops the install.
+    pub fn remove_cluster(
+        &self,
+        cluster_name: &str,
+        trust_domain: &TrustDomain,
+        remove_bundle: bool,
+    ) {
+        // Retire the generation FIRST so any in-flight poll task for this
+        // cluster sees a mismatch in `install` and cannot reinstall after
+        // removal.
+        let mut retired_generation = false;
+        self.cluster_generation.rcu(|current| {
+            if current.contains_key(cluster_name) {
                 let mut next = (**current).clone();
-                next.remove(trust_domain);
+                next.remove(cluster_name);
+                retired_generation = true;
                 Arc::new(next)
             } else {
                 Arc::clone(current)
             }
         });
-        let mut changed = false;
+
+        let mut published_snapshot = false;
         self.inner.rcu(|current| {
-            if current.bundles.contains_key(trust_domain) {
+            if retired_generation || (remove_bundle && current.bundles.contains_key(trust_domain)) {
                 let mut next = (**current).clone();
-                next.bundles.remove(trust_domain);
-                changed = true;
+                if remove_bundle {
+                    next.bundles.remove(trust_domain);
+                }
+                published_snapshot = true;
                 Arc::new(next)
             } else {
                 Arc::clone(current)
             }
         });
-        if changed {
+        if published_snapshot {
             self.revision_tx.send_modify(|revision| *revision += 1);
         }
     }
@@ -532,7 +556,7 @@ pub fn spawn_federation_poller(
         // Register a generation token so the poll task's install is gated by it
         // (parity with the manager / RemoteEndpointStore). This one-shot startup
         // path never calls remove(), so the token simply stays current.
-        let task_generation = store.register(&trust_domain);
+        let task_generation = store.register(&cluster_name);
         let handle = tokio::spawn(async move {
             poll_federation_loop(
                 target,
@@ -563,10 +587,11 @@ struct RunningFederationPoller {
 /// slice update (mirroring `RemoteDiscoveryManager` for endpoint discovery): it
 /// starts pollers for federation endpoints **added** after startup, aborts
 /// pollers for clusters that are **removed** (or whose endpoint changed), and —
-/// critically — calls [`FederationStore::remove`] for a withdrawn cluster's
-/// trust domain so a once-fetched federated bundle stops being overlaid onto
-/// every slice apply (and stops keeping the decommissioned peer dial-eligible),
-/// without requiring a gateway restart.
+/// critically — calls [`FederationStore::remove_cluster`] for a withdrawn
+/// cluster so a once-fetched federated bundle stops being overlaid onto every
+/// slice apply once the last poller for that trust domain is gone (and stops
+/// keeping the decommissioned peer dial-eligible), without requiring a gateway
+/// restart.
 pub struct FederationPollerManager {
     config: Option<FederationPollerConfig>,
     http_client: PluginHttpClient,
@@ -659,10 +684,10 @@ impl FederationPollerManager {
             "Spawning SPIFFE federation poller"
         );
         // Register a generation token BEFORE spawning so the poll task's install
-        // is gated by it; stop_cluster's remove() retires the token, so a poll
-        // that completes its synchronous install after withdrawal cannot
-        // resurrect the bundle (mirrors RemoteEndpointStore's F6 guard).
-        let task_generation = self.store.register(&target.trust_domain);
+        // is gated by it; stop_cluster retires the token, so a poll that
+        // completes its synchronous install after withdrawal cannot resurrect
+        // the bundle (mirrors RemoteEndpointStore's F6 guard).
+        let task_generation = self.store.register(&target.cluster_name);
         let loop_target = target.clone();
         let handle = tokio::spawn(async move {
             poll_federation_loop(
@@ -690,7 +715,15 @@ impl FederationPollerManager {
             let _ = running.shutdown_tx.send(true);
             running.handle.abort();
             if remove_bundle {
-                self.store.remove(&running.target.trust_domain);
+                let remove_trust_domain_bundle = !self
+                    .running
+                    .values()
+                    .any(|other| other.target.trust_domain == running.target.trust_domain);
+                self.store.remove_cluster(
+                    &running.target.cluster_name,
+                    &running.target.trust_domain,
+                    remove_trust_domain_bundle,
+                );
             }
         }
     }
@@ -742,7 +775,7 @@ async fn poll_federation_loop(
         .await;
 
         let (succeeded, sleep_duration) = match result {
-            Ok(()) => {
+            Ok(true) => {
                 backoff_secs = FEDERATION_BACKOFF_INITIAL_SECS;
                 // After a success we wait at least one full poll interval —
                 // `attempt_started_at` lets a long round-trip eat into the
@@ -750,6 +783,15 @@ async fn poll_federation_loop(
                 // 60s mark, not 90s.
                 let elapsed = attempt_started_at.elapsed();
                 (true, config.poll_interval.saturating_sub(elapsed))
+            }
+            Ok(false) => {
+                debug!(
+                    cluster = %cluster_name,
+                    trust_domain = %trust_domain,
+                    endpoint = %endpoint_for_logs,
+                    "SPIFFE federation poll result was discarded because the poller generation is stale"
+                );
+                return;
             }
             Err(err) => {
                 warn!(
@@ -795,7 +837,7 @@ async fn fetch_and_install_bundle(
     http_client: &PluginHttpClient,
     store: &FederationStore,
     task_generation: u64,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     // Strip userinfo from the URL we use for logs / metrics so a
     // credentialed endpoint (`https://user:token@host/...`) does not leak
     // its token. The request itself still goes to the original URL via
@@ -838,7 +880,15 @@ async fn fetch_and_install_bundle(
         endpoint: endpoint.to_string(),
         cluster_name: cluster_name.to_string(),
     };
-    store.install(trust_domain.clone(), federated, task_generation);
+    let installed = store.install(
+        cluster_name,
+        trust_domain.clone(),
+        federated,
+        task_generation,
+    );
+    if !installed {
+        return Ok(false);
+    }
     crate::plugins::mesh::prometheus_helpers::record_mesh_federation_poll_success(
         trust_domain.as_str(),
         now,
@@ -849,7 +899,7 @@ async fn fetch_and_install_bundle(
         endpoint = %endpoint_for_logs,
         "Installed federated trust bundle"
     );
-    Ok(())
+    Ok(true)
 }
 
 /// Read the response body frame-by-frame and abort if it exceeds
@@ -1456,21 +1506,21 @@ mod tests {
             cluster_name: "b".to_string(),
         };
 
-        // Register each trust domain once and reuse its generation token across
+        // Register each cluster once and reuse its generation token across
         // all 50 concurrent installs, so this test exercises the RCU's
         // cross-trust-domain atomicity rather than generation churn.
-        let gen_a = store.register(&td_a);
-        let gen_b = store.register(&td_b);
+        let gen_a = store.register("cluster-a");
+        let gen_b = store.register("cluster-b");
         let store_a = store.clone();
         let store_b = store.clone();
         let h1 = tokio::spawn(async move {
             for _ in 0..50 {
-                store_a.install(td_a.clone(), bundle_a.clone(), gen_a);
+                store_a.install("cluster-a", td_a.clone(), bundle_a.clone(), gen_a);
             }
         });
         let h2 = tokio::spawn(async move {
             for _ in 0..50 {
-                store_b.install(td_b.clone(), bundle_b.clone(), gen_b);
+                store_b.install("cluster-b", td_b.clone(), bundle_b.clone(), gen_b);
             }
         });
         let _ = h1.await;
@@ -1488,7 +1538,7 @@ mod tests {
     #[test]
     fn install_with_stale_generation_after_remove_is_dropped() {
         // Mirrors the abort->install race: a poll task registered at generation
-        // G is withdrawn (remove() retires G), then completes its in-flight
+        // G is withdrawn (remove_cluster() retires G), then completes its in-flight
         // install with the now-stale G. That install MUST be dropped — it must
         // not resurrect the withdrawn trust anchor.
         let store = FederationStore::new();
@@ -1505,21 +1555,56 @@ mod tests {
             cluster_name: "eu".to_string(),
         };
 
-        let stale_gen = store.register(&domain);
-        store.remove(&domain); // withdrawal retires the generation
-        store.install(domain.clone(), federated(1), stale_gen);
+        let stale_gen = store.register("eu");
+        store.remove_cluster("eu", &domain, true); // withdrawal retires the generation
+        assert!(
+            !store.install("eu", domain.clone(), federated(1), stale_gen),
+            "stale-generation install must report that it did not commit"
+        );
         assert!(
             !store.snapshot().bundles.contains_key(&domain),
             "a stale-generation install after withdrawal must be dropped (no resurrection)"
         );
 
         // A fresh registration (cluster re-added) installs normally.
-        let fresh_gen = store.register(&domain);
-        store.install(domain.clone(), federated(2), fresh_gen);
+        let fresh_gen = store.register("eu");
+        assert!(store.install("eu", domain.clone(), federated(2), fresh_gen));
         assert!(
             store.snapshot().bundles.contains_key(&domain),
             "a current-generation install after re-registration must commit"
         );
+    }
+
+    #[test]
+    fn remove_without_cached_bundle_retires_generation_and_bumps_revision() {
+        let store = FederationStore::new();
+        let domain = td("first-poll-race.example.com");
+        let revision_rx = store.subscribe();
+        let stale_gen = store.register("race-cluster");
+
+        store.remove_cluster("race-cluster", &domain, true);
+
+        assert_eq!(
+            *revision_rx.borrow(),
+            1,
+            "removing a registered cluster without a cached bundle still republishes the snapshot"
+        );
+        let federated = FederatedBundle {
+            bundle: TrustBundle {
+                trust_domain: domain.clone(),
+                x509_authorities: vec!["a".to_string()],
+                jwt_authorities: Vec::new(),
+                refresh_hint_seconds: None,
+            },
+            fetched_at_unix_seconds: 1,
+            endpoint: "https://race/.well-known/spiffe".to_string(),
+            cluster_name: "race-cluster".to_string(),
+        };
+        assert!(
+            !store.install("race-cluster", domain.clone(), federated, stale_gen),
+            "first poll racing a remove must not commit after generation retirement"
+        );
+        assert!(!store.snapshot().bundles.contains_key(&domain));
     }
 
     #[tokio::test]
@@ -1588,6 +1673,89 @@ mod tests {
         assert!(
             !store.snapshot().bundles.contains_key(&td_a),
             "withdrawn cluster's federated bundle must be removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn manager_reconcile_keeps_shared_trust_domain_bundle_until_last_cluster_removed() {
+        use crate::modes::mesh::config::RemoteCluster;
+
+        let store = FederationStore::new();
+        let shared_td = td("shared.local");
+        let config = FederationPollerConfig {
+            poll_interval: Duration::from_secs(3600),
+            request_timeout: Duration::from_secs(1),
+            fail_open: false,
+        };
+        let mut manager =
+            FederationPollerManager::new(Some(config), PluginHttpClient::default(), store.clone());
+
+        let cluster = |name: &str, endpoint: &str| RemoteCluster {
+            name: name.to_string(),
+            trust_domain: shared_td.clone(),
+            network: None,
+            control_plane_url: None,
+            federation_endpoint: Some(endpoint.to_string()),
+        };
+        let slice_with_both = MultiClusterConfig {
+            local_cluster: None,
+            federation_endpoint: None,
+            remote_clusters: vec![
+                cluster("cluster-a", "https://remote-a/.well-known/spiffe"),
+                cluster("cluster-b", "https://remote-b/.well-known/spiffe"),
+            ],
+            east_west_gateways: Vec::new(),
+        };
+
+        manager.reconcile(Some(&slice_with_both));
+        assert_eq!(
+            manager.running_cluster_names(),
+            vec!["cluster-a".to_string(), "cluster-b".to_string()]
+        );
+
+        store.install_for_test(
+            shared_td.clone(),
+            FederatedBundle {
+                bundle: TrustBundle {
+                    trust_domain: shared_td.clone(),
+                    x509_authorities: vec!["shared".to_string()],
+                    jwt_authorities: Vec::new(),
+                    refresh_hint_seconds: None,
+                },
+                fetched_at_unix_seconds: 1,
+                endpoint: "https://remote-a/.well-known/spiffe".to_string(),
+                cluster_name: "cluster-a".to_string(),
+            },
+        );
+        assert!(store.snapshot().bundles.contains_key(&shared_td));
+
+        let slice_with_b = MultiClusterConfig {
+            local_cluster: None,
+            federation_endpoint: None,
+            remote_clusters: vec![cluster("cluster-b", "https://remote-b/.well-known/spiffe")],
+            east_west_gateways: Vec::new(),
+        };
+        manager.reconcile(Some(&slice_with_b));
+        assert_eq!(
+            manager.running_cluster_names(),
+            vec!["cluster-b".to_string()]
+        );
+        assert!(
+            store.snapshot().bundles.contains_key(&shared_td),
+            "removing one of multiple pollers for a trust domain must not withdraw the shared bundle"
+        );
+
+        let empty_slice = MultiClusterConfig {
+            local_cluster: None,
+            federation_endpoint: None,
+            remote_clusters: Vec::new(),
+            east_west_gateways: Vec::new(),
+        };
+        manager.reconcile(Some(&empty_slice));
+        assert!(manager.running_cluster_names().is_empty());
+        assert!(
+            !store.snapshot().bundles.contains_key(&shared_td),
+            "the shared trust-domain bundle is removed only after the last poller is gone"
         );
     }
 

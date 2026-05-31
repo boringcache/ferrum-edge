@@ -3708,10 +3708,10 @@ async fn serve_mesh_runtime(
     // apply task so the first slice apply observes whatever the poller has
     // already fetched. Unlike the old one-shot spawn, the reconciler watches
     // slice updates: it starts pollers for federation endpoints added after
-    // startup, stops pollers for removed clusters, and calls
-    // `FederationStore::remove` when a cluster is withdrawn so a stale federated
-    // trust anchor cannot keep being overlaid onto slice applies. No pollers run
-    // when `FERRUM_MESH_FEDERATION_POLL_INTERVAL_SECONDS=0` or no remote cluster
+    // startup, stops pollers for removed clusters, and retires a withdrawn
+    // cluster's federation store generation so stale poll results cannot keep
+    // being overlaid onto slice applies. No pollers run when
+    // `FERRUM_MESH_FEDERATION_POLL_INTERVAL_SECONDS=0` or no remote cluster
     // carries a federation endpoint.
     let federation_poller_config = federation::FederationPollerConfig::from_env(
         env_config.mesh_federation_poll_interval_seconds,
@@ -4949,7 +4949,8 @@ async fn apply_mesh_inbound_tls_reload(
 /// re-derives the federation poll targets and starts/stops per-cluster pollers,
 /// so a post-startup `federation_endpoint` addition is honored and a withdrawn
 /// cluster's stale federated trust bundle is dropped (via
-/// `FederationStore::remove`, which bumps the revision the apply task watches).
+/// `FederationStore::remove_cluster`, which bumps the revision the apply task
+/// watches).
 fn start_federation_poller_reconcile_task(
     mesh_state: MeshRuntimeState,
     mut manager: federation::FederationPollerManager,
