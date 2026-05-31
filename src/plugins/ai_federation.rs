@@ -293,7 +293,10 @@ struct ResolvedProvider {
     model_patterns: Vec<String>,
     model_mapping: HashMap<String, String>,
     default_model: Option<String>,
-    connect_timeout: Duration,
+    /// Overall per-request deadline applied via reqwest's `.timeout()`. The
+    /// connect phase is additionally bounded gateway-wide by the shared
+    /// `PluginHttpClient`'s connect timeout; there is no per-provider connect
+    /// timeout because the client is shared and built once at startup.
     read_timeout: Duration,
     /// Operator-supplied URL override. Used directly by Anthropic and Cohere
     /// dispatch paths that build their own URLs without going through
@@ -540,8 +543,10 @@ impl AiFederation {
 
             let default_model = pv["default_model"].as_str().map(String::from);
 
-            let connect_timeout =
-                Duration::from_secs(optional_u64(pv, "connect_timeout_seconds")?.unwrap_or(5));
+            // `read_timeout` is the overall per-request deadline (reqwest's
+            // `.timeout()`). There is intentionally no per-provider connect
+            // timeout: the shared HTTP client is built once at startup and its
+            // connect timeout applies gateway-wide. See finding #85.
             let read_timeout =
                 Duration::from_secs(optional_u64(pv, "read_timeout_seconds")?.unwrap_or(60));
 
@@ -599,7 +604,6 @@ impl AiFederation {
                 model_patterns,
                 model_mapping,
                 default_model,
-                connect_timeout,
                 read_timeout,
                 base_url,
                 url_template,
@@ -1017,6 +1021,28 @@ impl AiFederation {
 /// Translation result: (url, extra_headers, body_bytes)
 type TranslatedRequest = (String, Vec<(String, String)>, Vec<u8>);
 
+/// Detect whether an OpenAI-format request asks for a streamed response.
+///
+/// This plugin uses the "terminate and respond" pattern: it makes a single
+/// non-streaming HTTP call to the provider and buffers the whole body before
+/// normalizing it with `serde_json::from_slice`. A streaming request cannot be
+/// served by that pattern:
+///   - OpenAI-compatible providers receive the `stream` flag verbatim
+///     (`translate_openai_compatible` clones the body) and reply with an SSE
+///     `text/event-stream`, which is not a single JSON document — normalization
+///     fails and the client gets an opaque 502.
+///   - The translating providers (Anthropic/Gemini/Bedrock/Cohere) silently
+///     drop the flag, so the client asked for a stream but receives one
+///     buffered JSON object instead.
+///
+/// Rather than break either way, `before_proxy` rejects streaming requests it
+/// would otherwise intercept with a clear, OpenAI-shaped error. We only treat
+/// `stream: true` (a real boolean) as streaming; a stringly-typed `"true"` or a
+/// missing field is not streaming.
+fn request_wants_streaming(openai_body: &Value) -> bool {
+    openai_body["stream"].as_bool() == Some(true)
+}
+
 /// Translate an OpenAI Chat Completions request to the provider's native format.
 fn translate_request(
     provider: &ResolvedProvider,
@@ -1348,6 +1374,16 @@ fn build_provider_url(provider: &ResolvedProvider, model: &str) -> String {
 // Response normalization
 // ---------------------------------------------------------------------------
 
+/// Maximum number of raw upstream-response bytes reflected back to the caller.
+///
+/// Both the error-passthrough path and the parse-failure path truncate the
+/// provider's body to this many bytes before lossy UTF-8 conversion. Slicing
+/// the raw bytes (not the lossy `String`) keeps the cut on a byte boundary, and
+/// `from_utf8_lossy` then repairs any code point split by the cut. Bounding the
+/// reflected text avoids forwarding an unbounded, provider-controlled error
+/// body to arbitrary downstream callers. See finding #52.
+const MAX_UPSTREAM_ERROR_BYTES: usize = 512;
+
 /// Normalize a provider response to OpenAI Chat Completions format.
 fn normalize_response(
     provider_type: ProviderType,
@@ -1355,9 +1391,10 @@ fn normalize_response(
     body: &[u8],
     resolved_model: &str,
 ) -> Result<(Value, TokenCounts), String> {
-    // For error responses, pass through the raw error
+    // For error responses, pass through the raw error (capped — the upstream
+    // body is provider-controlled and may be large or detail-rich).
     if status >= 400 {
-        let error_text = String::from_utf8_lossy(body);
+        let error_text = String::from_utf8_lossy(&body[..body.len().min(MAX_UPSTREAM_ERROR_BYTES)]);
         return Ok((
             json!({
                 "error": {
@@ -1373,7 +1410,7 @@ fn normalize_response(
     let resp: Value = serde_json::from_slice(body).map_err(|e| {
         format!(
             "ai_federation: failed to parse provider response: {e} (body: {})",
-            String::from_utf8_lossy(&body[..body.len().min(200)])
+            String::from_utf8_lossy(&body[..body.len().min(MAX_UPSTREAM_ERROR_BYTES)])
         )
     })?;
 
@@ -1656,11 +1693,20 @@ impl AiFederation {
     ) -> Result<(u16, Vec<u8>), String> {
         let auth_headers = self.build_auth_headers(provider, url, body).await?;
 
+        // `read_timeout` is the overall per-request deadline. reqwest's
+        // per-request `.timeout()` is a *total* deadline (it overrides the
+        // client-level total timeout but not the client-level connect timeout),
+        // so there is no per-request connect-vs-read split available on the
+        // shared client. The connect phase is bounded gateway-wide by the
+        // shared `PluginHttpClient`'s fixed connect timeout. Previously this
+        // summed two phase-named config fields into one deadline, which did not
+        // match the field names; we now apply the named read budget directly.
+        // See finding #85.
         let req = self
             .http_client
             .get()
             .post(url)
-            .timeout(provider.connect_timeout + provider.read_timeout);
+            .timeout(provider.read_timeout);
 
         let mut req = req;
         for (k, v) in &auth_headers {
@@ -1846,6 +1892,24 @@ impl Plugin for AiFederation {
                 "ai_federation: no provider matches model, passing through"
             );
             return PluginResult::Continue;
+        }
+
+        // Streaming is not supported by the terminate-and-respond design. We
+        // only check once we know a provider matches (so requests we don't
+        // intercept still pass through untouched). Reject with a clear,
+        // OpenAI-shaped error rather than forwarding `stream: true` to the
+        // provider — which would either yield an SSE body that fails JSON
+        // normalization (opaque 502) or silently degrade to a single buffered
+        // object for the translating providers. See finding #11.
+        if request_wants_streaming(&openai_body) {
+            debug!(
+                model = %model,
+                "ai_federation: rejecting streaming request — streaming responses are not supported"
+            );
+            return self.error_response(
+                501,
+                "Streaming responses (\"stream\": true) are not supported by ai_federation",
+            );
         }
 
         // Try providers in priority order with fallback
@@ -2127,6 +2191,14 @@ pub mod test_helpers {
         super::flatten_openai_message_text(content)
     }
 
+    /// Expose the streaming-request detector for tests.
+    pub fn request_wants_streaming(openai_body: &Value) -> bool {
+        super::request_wants_streaming(openai_body)
+    }
+
+    /// Maximum raw upstream-error bytes reflected to callers (finding #52).
+    pub const MAX_UPSTREAM_ERROR_BYTES: usize = super::MAX_UPSTREAM_ERROR_BYTES;
+
     /// Expose request translation for tests.
     pub fn translate_request_test(
         provider_type: &str,
@@ -2171,7 +2243,6 @@ pub mod test_helpers {
             model_patterns: Vec::new(),
             model_mapping: HashMap::new(),
             default_model: None,
-            connect_timeout: Duration::from_secs(5),
             read_timeout: Duration::from_secs(60),
             base_url,
             url_template,

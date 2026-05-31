@@ -3214,6 +3214,8 @@ Validation follows the same per-mode tolerance model as other file-dependent con
 
 Universal AI gateway that routes requests in OpenAI Chat Completions format to any of 11 supported AI providers, translating requests to native provider format and normalizing responses back to OpenAI format. Uses the "terminate and respond" pattern — makes its own HTTP call to the matched provider and returns the response directly, bypassing the normal proxy dispatch.
 
+**Streaming is not supported.** Because of the terminate-and-respond design, the plugin buffers the full provider response and re-serializes it as a single JSON object. A request that asks for a streamed response (`"stream": true`) and matches a configured provider is rejected with HTTP `501` and an OpenAI-shaped error body rather than being silently downgraded to a buffered response or forwarded as a stream the gateway cannot relay. Requests that do not match any provider pass through untouched.
+
 **Priority:** 2985
 
 **Supported providers:**
@@ -3238,8 +3240,7 @@ Universal AI gateway that routes requests in OpenAI Chat Completions format to a
 | `model_patterns` | Array | `[]` (catch-all) | Glob patterns to match model names (e.g., `["claude-*"]`) |
 | `model_mapping` | Object | `{}` | Map client model names to provider-native names |
 | `default_model` | String | _(none)_ | Default model when no mapping matches |
-| `connect_timeout_seconds` | Integer | `5` | TCP + TLS handshake timeout |
-| `read_timeout_seconds` | Integer | `60` | Full response read timeout |
+| `read_timeout_seconds` | Integer | `60` | Overall per-request deadline (connect + response) for outbound provider calls. The connect phase is additionally bounded gateway-wide by the shared HTTP client's connect timeout; there is no per-provider connect timeout because the client is shared and built once at startup. |
 | `base_url` | String | _(provider default)_ | Custom endpoint URL (for self-hosted or proxy endpoints) |
 
 **Azure OpenAI additional fields:** `azure_resource`, `azure_deployment`, `azure_api_version` (default `"2024-06-01"`).

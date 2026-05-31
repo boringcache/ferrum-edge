@@ -1,11 +1,12 @@
 use ferrum_edge::plugins::ai_federation;
 use ferrum_edge::plugins::ai_federation::test_helpers;
-use ferrum_edge::plugins::{HTTP_GRPC_PROTOCOLS, Plugin, priority};
+use ferrum_edge::plugins::{HTTP_GRPC_PROTOCOLS, Plugin, PluginResult, RequestContext, priority};
 use ferrum_edge::{
     config::{BackendAllowIps, PoolConfig},
     dns::{DnsCache, DnsConfig},
 };
 use serde_json::{Value, json};
+use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
 // Config validation tests
@@ -300,7 +301,12 @@ fn test_default_fallback_config() {
 }
 
 #[test]
-fn test_custom_timeouts() {
+fn test_custom_read_timeout() {
+    // `read_timeout_seconds` is the overall per-request deadline. There is no
+    // per-provider connect timeout (finding #85) — the connect phase is bounded
+    // gateway-wide by the shared HTTP client. A leftover `connect_timeout_seconds`
+    // key is silently ignored (config is parsed field-by-field, not via a
+    // deny_unknown_fields struct), so old configs do not fail to load.
     let config = json!({
         "providers": [{
             "name": "openai",
@@ -1073,6 +1079,72 @@ fn test_normalize_error_response() {
     assert_eq!(total, 0);
 }
 
+// ---------------------------------------------------------------------------
+// #52: upstream error body must be capped, not reflected verbatim/unbounded.
+//
+// Before the fix the >=400 path interpolated the WHOLE upstream body into the
+// client-facing message (only the parse-failure path was capped). A large or
+// detail-rich provider error body was forwarded in full to the gateway's
+// downstream caller. Now both paths truncate to MAX_UPSTREAM_ERROR_BYTES.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_normalize_error_body_is_capped() {
+    // A provider error body far larger than the cap.
+    let big = "Z".repeat(test_helpers::MAX_UPSTREAM_ERROR_BYTES * 4);
+    let body = big.into_bytes();
+    let (normalized, _, _, _) =
+        test_helpers::normalize_response_test("openai", 500, &body, "gpt-4o").unwrap();
+
+    let message = normalized["error"]["message"].as_str().unwrap();
+    // The message is "Upstream provider returned 500: <capped body>". The
+    // reflected upstream text must not exceed the cap, so the whole message
+    // stays close to the cap plus the short fixed prefix — and is far smaller
+    // than the 4x-cap input.
+    assert!(
+        message.len() <= test_helpers::MAX_UPSTREAM_ERROR_BYTES + 64,
+        "error message not capped: {} bytes",
+        message.len()
+    );
+    assert!(
+        message.contains("500"),
+        "status should be present: {message}"
+    );
+    // It still reflects *some* of the upstream body (the leading bytes).
+    assert!(message.contains("ZZZ"), "leading body bytes should survive");
+}
+
+#[test]
+fn test_normalize_error_body_cap_handles_short_bodies() {
+    // Bodies shorter than the cap are reflected in full (no panic on the
+    // `body.len().min(cap)` slice).
+    let body = b"boom".to_vec();
+    let (normalized, _, _, _) =
+        test_helpers::normalize_response_test("openai", 503, &body, "gpt-4o").unwrap();
+    let message = normalized["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("boom"),
+        "short body should be reflected fully"
+    );
+    assert!(message.contains("503"));
+}
+
+#[test]
+fn test_normalize_error_body_cap_does_not_split_utf8() {
+    // The cap slices raw bytes; `from_utf8_lossy` then repairs a code point
+    // split by the cut. Build a body whose byte at the cap boundary is in the
+    // middle of a multi-byte char and assert normalization does not panic and
+    // produces a valid string.
+    let mut body = vec![b'a'; test_helpers::MAX_UPSTREAM_ERROR_BYTES - 1];
+    // '€' is 3 bytes (E2 82 AC); the cut at MAX_UPSTREAM_ERROR_BYTES lands
+    // inside it.
+    body.extend_from_slice("€€€".as_bytes());
+    let (normalized, _, _, _) =
+        test_helpers::normalize_response_test("anthropic", 502, &body, "claude-3").unwrap();
+    // Just reaching here without a panic proves the byte-boundary slice is safe.
+    assert!(normalized["error"]["message"].as_str().is_some());
+}
+
 #[test]
 fn test_normalize_missing_token_fields() {
     // OpenAI response without usage field
@@ -1426,6 +1498,161 @@ fn test_construction_accepts_https_base_url() {
     });
     let http_client = create_test_http_client();
     assert!(ferrum_edge::plugins::ai_federation::AiFederation::new(&config, http_client).is_ok());
+}
+
+// ---------------------------------------------------------------------------
+// #11: streaming requests must be rejected with a clear error, not silently
+// broken (opaque 502 for OpenAI-compatible SSE, or silent buffered downgrade
+// for the translating providers).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_request_wants_streaming_detection() {
+    // Only a real boolean `true` counts as streaming.
+    assert!(test_helpers::request_wants_streaming(
+        &json!({"stream": true})
+    ));
+    assert!(!test_helpers::request_wants_streaming(
+        &json!({"stream": false})
+    ));
+    // Stringly-typed and non-boolean values are NOT treated as streaming —
+    // they would not make the provider stream either.
+    assert!(!test_helpers::request_wants_streaming(
+        &json!({"stream": "true"})
+    ));
+    assert!(!test_helpers::request_wants_streaming(
+        &json!({"stream": 1})
+    ));
+    // Missing field → not streaming.
+    assert!(!test_helpers::request_wants_streaming(
+        &json!({"model": "gpt-4o"})
+    ));
+}
+
+fn streaming_plugin() -> ai_federation::AiFederation {
+    let config = json!({
+        "providers": [{
+            "name": "openai",
+            "provider_type": "openai",
+            "api_key": "sk-test",
+            "model_patterns": ["gpt-*"]
+        }]
+    });
+    ai_federation::AiFederation::new(&config, create_test_http_client()).unwrap()
+}
+
+fn post_json_ctx(body: &Value) -> RequestContext {
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/v1/chat".to_string(),
+    );
+    ctx.headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        serde_json::to_string(body).unwrap(),
+    );
+    ctx
+}
+
+fn json_headers() -> HashMap<String, String> {
+    let mut h = HashMap::new();
+    h.insert("content-type".to_string(), "application/json".to_string());
+    h
+}
+
+#[tokio::test]
+async fn test_before_proxy_rejects_streaming_request_for_matched_provider() {
+    let plugin = streaming_plugin();
+    let body = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "stream": true
+    });
+    let mut ctx = post_json_ctx(&body);
+    let mut headers = json_headers();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    match result {
+        PluginResult::RejectBinary {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 501, "streaming must be rejected with 501");
+            let parsed: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(parsed["error"]["type"], "ai_federation_error");
+            let msg = parsed["error"]["message"].as_str().unwrap();
+            assert!(
+                msg.to_lowercase().contains("stream"),
+                "error should mention streaming: {msg}"
+            );
+        }
+        other => panic!("expected RejectBinary 501, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_before_proxy_passes_through_streaming_for_unmatched_model() {
+    // A `stream: true` request whose model matches NO provider must NOT be
+    // rejected — the plugin does not intercept it, so there is nothing to
+    // break. Rejecting it would be over-restriction.
+    let plugin = streaming_plugin();
+    let body = json!({
+        "model": "claude-3-opus", // not matched by ["gpt-*"]
+        "messages": [{"role": "user", "content": "Hi"}],
+        "stream": true
+    });
+    let mut ctx = post_json_ctx(&body);
+    let mut headers = json_headers();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "unmatched streaming request should pass through, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_before_proxy_non_streaming_request_is_not_rejected_as_streaming() {
+    // A matched, non-streaming request must NOT hit the 501 path. We point the
+    // provider at a refused localhost port so dispatch fails fast (no real
+    // network egress and no 30s connect wait) and assert the result is *not*
+    // the streaming rejection — i.e. the #11 guard does not over-fire on
+    // ordinary requests. Before the fix, a `stream: true` request reached this
+    // same dispatch path; this is the complementary guard.
+    let config = json!({
+        "providers": [{
+            "name": "local",
+            "provider_type": "openai",
+            "api_key": "sk-test",
+            "model_patterns": ["gpt-*"],
+            // Port 1 refuses connections immediately on loopback.
+            "base_url": "https://127.0.0.1:1/v1/chat/completions"
+        }]
+    });
+    let plugin = ai_federation::AiFederation::new(&config, create_test_http_client()).unwrap();
+    let body = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "Hi"}]
+    });
+    let mut ctx = post_json_ctx(&body);
+    let mut headers = json_headers();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    match result {
+        // A failed dispatch surfaces as a 502 (provider request failed) — not
+        // the 501 streaming rejection.
+        PluginResult::RejectBinary { status_code, .. } => {
+            assert_ne!(
+                status_code, 501,
+                "non-streaming request must not be rejected as streaming"
+            );
+        }
+        PluginResult::Continue => {}
+        PluginResult::Reject { status_code, .. } => {
+            assert_ne!(status_code, 501);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
