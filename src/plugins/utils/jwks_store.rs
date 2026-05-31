@@ -160,7 +160,7 @@ impl JwksKeyStore {
         let req = self.http_client.get().get(&self.jwks_uri);
         let response = self
             .http_client
-            .execute(req, "jwks_fetch")
+            .execute_no_redirect(req, "jwks_fetch")
             .await
             .map_err(|e| format!("JWKS fetch failed: {}", e))?;
 
@@ -180,8 +180,16 @@ impl JwksKeyStore {
         // serving an empty JWKS). Overwriting a populated cache with an empty
         // map would make `has_keys()` false and reject every token for this
         // provider until the next non-empty fetch — a self-inflicted auth
-        // outage. Retain the existing cache and warn instead. An initially
-        // empty cache still accepts an empty fetch so backoff retries proceed.
+        // outage. Retain the existing cache and warn instead.
+        //
+        // Trade-off: an IdP cannot intentionally revoke by serving an empty
+        // JWKS; old keys remain trusted until a non-empty fetch replaces them
+        // or the process restarts. Because the store remains non-empty,
+        // background refresh also stays on the normal interval instead of the
+        // empty-store fast retry cadence, so recovery from a real rotation can
+        // take up to the configured interval. Token `exp` validation bounds
+        // stale-token exposure. An initially empty cache still accepts an empty
+        // fetch so backoff retries proceed.
         if new_keys.is_empty() && self.has_keys() {
             warn!(
                 "JWKS endpoint at {} returned 0 usable keys; retaining last-known-good cache",

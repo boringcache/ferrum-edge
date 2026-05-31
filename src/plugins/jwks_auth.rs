@@ -350,12 +350,11 @@ impl JwksAuth {
                                 return;
                             }
                             Err(e) => {
-                                if attempt == 0 {
-                                    warn!(
-                                        "jwks_auth OIDC discovery failed: {} — will keep retrying in background",
-                                        e
-                                    );
-                                }
+                                warn!(
+                                    "jwks_auth OIDC discovery attempt {} failed: {} — will keep retrying in background",
+                                    attempt + 1,
+                                    e
+                                );
                             }
                         }
                         attempt = attempt.saturating_add(1);
@@ -1372,7 +1371,7 @@ async fn discover_jwks_uri(
 ) -> Result<String, String> {
     let req = http_client.get().get(discovery_url);
     let response = http_client
-        .execute(req, "jwks_auth_oidc_discovery")
+        .execute_no_redirect(req, "jwks_auth_oidc_discovery")
         .await
         .map_err(|e| format!("OIDC discovery request failed: {}", e))?;
 
@@ -1403,28 +1402,18 @@ async fn discover_jwks_uri(
 ///    operator-configured `jwks_uri`/`discovery_url` already receive in
 ///    [`parse_url_field`]. Non-URL schemes (e.g. `file:`, `gopher:`) are
 ///    rejected.
-/// 3. The host must equal the `discovery_url` host (case-insensitive). This is
-///    the standard OIDC discovery hardening: it blocks a spoofed or tampered
-///    discovery document from redirecting the gateway to an attacker-chosen
-///    host such as a cloud metadata endpoint (`169.254.169.254`) or an internal
-///    service. Comparison is host-only (not host:port) because an IdP serves
-///    its JWKS and discovery endpoints on the same host. Operators whose IdP
-///    serves JWKS from a different host than discovery (e.g. Google:
-///    `accounts.google.com` vs `www.googleapis.com`) should configure
-///    `jwks_uri` directly instead of `discovery_url`.
+/// 3. The discovered JWKS URL must use the same origin as the `discovery_url`:
+///    scheme, host, and effective port must match. This blocks a spoofed or
+///    tampered discovery document from redirecting the gateway to an attacker-
+///    chosen host, downgrading HTTPS discovery to cleartext JWKS, or pivoting
+///    to a different service on the same host through an unexpected port.
+///    Operators whose IdP serves JWKS from a different origin than discovery
+///    (e.g. Google: `accounts.google.com` vs `www.googleapis.com`) should
+///    configure `jwks_uri` directly instead of `discovery_url`.
 ///
-/// Note: this validates the *initial* request host. IP-level screening of the
-/// resolved address (loopback/private/link-local) is enforced separately by the
-/// `PluginHttpClient` DNS resolver via `backend_allow_ips`, which also screens
-/// every redirect hop's resolved address — so a redirect to a private/metadata
-/// IP is blocked at the connect layer when `backend_allow_ips` is restrictive.
-/// `PluginHttpClient` does not currently disable HTTP redirect following, so the
-/// host equality enforced here applies to the first hop only; the DNS-layer IP
-/// policy is the backstop for redirected hops. Note that the default
-/// `FERRUM_BACKEND_ALLOW_IPS=both` does NOT screen any IPs — operators relying on
-/// discovery hardening against redirect-based SSRF should set it to
-/// `public`/`private`. (Disabling redirects on the shared client is tracked
-/// separately.)
+/// OIDC discovery and the follow-on JWKS fetch use the no-redirect plugin HTTP
+/// client path. The validated URL is therefore the URL actually fetched rather
+/// than only the first hop before an automatic 3xx follow.
 fn validate_discovered_jwks_uri(jwks_uri: &str, discovery_url: &str) -> Result<String, String> {
     let parsed = Url::parse(jwks_uri).map_err(|e| {
         format!("OIDC discovery returned an invalid jwks_uri (not a valid URL): {e}")
@@ -1439,20 +1428,52 @@ fn validate_discovered_jwks_uri(jwks_uri: &str, discovery_url: &str) -> Result<S
         }
     }
 
-    let jwks_host = hostname_from_parsed_url(&parsed)
-        .ok_or_else(|| "OIDC discovery returned a jwks_uri without a hostname".to_string())?;
-
-    let discovery_host = hostname_from_url(discovery_url).ok_or_else(|| {
-        "OIDC discovery_url has no parseable hostname for jwks_uri comparison".to_string()
+    let discovery = Url::parse(discovery_url)
+        .map_err(|e| format!("OIDC discovery_url is not parseable for jwks_uri comparison: {e}"))?;
+    let jwks_origin = origin_from_parsed_url(&parsed).ok_or_else(|| {
+        "OIDC discovery returned a jwks_uri without a parseable origin".to_string()
+    })?;
+    let discovery_origin = origin_from_parsed_url(&discovery).ok_or_else(|| {
+        "OIDC discovery_url has no parseable origin for jwks_uri comparison".to_string()
     })?;
 
-    if !jwks_host.eq_ignore_ascii_case(&discovery_host) {
+    if discovery_origin.scheme == "https" && jwks_origin.scheme == "http" {
+        return Err(
+            "OIDC discovery returned a jwks_uri that downgrades HTTPS discovery to HTTP"
+                .to_string(),
+        );
+    }
+
+    if jwks_origin != discovery_origin {
         return Err(format!(
-            "OIDC discovery returned a jwks_uri host '{jwks_host}' that does not match the discovery_url host '{discovery_host}'"
+            "OIDC discovery returned a jwks_uri origin '{}' that does not match the discovery_url origin '{}'",
+            jwks_origin.display(),
+            discovery_origin.display()
         ));
     }
 
     Ok(jwks_uri.to_string())
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct UrlOrigin {
+    scheme: String,
+    host: String,
+    port: u16,
+}
+
+impl UrlOrigin {
+    fn display(&self) -> String {
+        format!("{}://{}:{}", self.scheme, self.host, self.port)
+    }
+}
+
+fn origin_from_parsed_url(parsed: &Url) -> Option<UrlOrigin> {
+    Some(UrlOrigin {
+        scheme: parsed.scheme().to_ascii_lowercase(),
+        host: hostname_from_parsed_url(parsed)?.to_ascii_lowercase(),
+        port: parsed.port_or_known_default()?,
+    })
 }
 
 /// Set `mesh.request_principal` metadata to `{iss}/{sub}` when both claims are

@@ -446,14 +446,10 @@ async fn test_jwks_auth_warmup_hostnames_includes_discovery_url_before_resolutio
 #[tokio::test]
 async fn test_jwks_auth_oidc_discovery_eager_fetches_without_duplicate_jwks_call() {
     let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
-    let jwks_server = wiremock::MockServer::start().await;
-    let discovery_server = wiremock::MockServer::start().await;
+    let server = wiremock::MockServer::start().await;
     let jwks_path = unique_jwks_path("oidc-jwks");
-    let jwks_uri = format!("{}{}", jwks_server.uri(), jwks_path);
-    let discovery_url = format!(
-        "{}/.well-known/openid-configuration",
-        discovery_server.uri()
-    );
+    let jwks_uri = format!("{}{}", server.uri(), jwks_path);
+    let discovery_url = format!("{}/.well-known/openid-configuration", server.uri());
 
     wiremock::Mock::given(wiremock::matchers::method("GET"))
         .and(wiremock::matchers::path(jwks_path))
@@ -461,7 +457,7 @@ async fn test_jwks_auth_oidc_discovery_eager_fetches_without_duplicate_jwks_call
             wiremock::ResponseTemplate::new(200)
                 .set_body_json(build_rsa_jwks_from_pem(public_key_pem)),
         )
-        .mount(&jwks_server)
+        .mount(&server)
         .await;
     wiremock::Mock::given(wiremock::matchers::method("GET"))
         .and(wiremock::matchers::path(
@@ -470,7 +466,7 @@ async fn test_jwks_auth_oidc_discovery_eager_fetches_without_duplicate_jwks_call
         .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
             "jwks_uri": jwks_uri
         })))
-        .mount(&discovery_server)
+        .mount(&server)
         .await;
 
     let _plugin = JwksAuth::new(
@@ -482,16 +478,16 @@ async fn test_jwks_auth_oidc_discovery_eager_fetches_without_duplicate_jwks_call
     )
     .unwrap();
 
-    let initial_count = wait_for_received_request_count(&jwks_server, 1).await;
+    let initial_count = wait_for_received_request_count(&server, 2).await;
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-    let final_count = jwks_server
+    let final_count = server
         .received_requests()
         .await
         .map(|requests| requests.len())
         .unwrap_or(0);
-    assert_eq!(initial_count, 1);
-    assert_eq!(final_count, 1);
+    assert_eq!(initial_count, 2);
+    assert_eq!(final_count, 2);
 }
 
 /// Wait until the OIDC discovery endpoint has been hit at least once, proving
@@ -623,6 +619,116 @@ async fn test_jwks_auth_oidc_discovery_rejects_non_http_scheme_jwks_uri() {
         plugin.active_jwks_uris().is_empty(),
         "non-http-scheme discovery jwks_uri must not create an active store, got: {:?}",
         plugin.active_jwks_uris()
+    );
+}
+
+/// Defense-in-depth for discovered JWKS origin validation: same host is not
+/// sufficient if the discovery document pivots to a different port on that
+/// host. The OIDC-discovered JWKS URL must match scheme, host, and effective
+/// port with the discovery URL.
+#[tokio::test]
+async fn test_jwks_auth_oidc_discovery_rejects_same_host_different_port_jwks_uri() {
+    let jwks_server = wiremock::MockServer::start().await;
+    let jwks_uri = format!("{}/jwks.json", jwks_server.uri());
+    let (discovery_server, discovery_url) = start_oidc_discovery_server(&jwks_uri).await;
+
+    let plugin = JwksAuth::new(
+        &json!({
+            "providers": [{"discovery_url": discovery_url}],
+            "jwks_refresh_interval_secs": 3600
+        }),
+        default_client(),
+    )
+    .unwrap();
+
+    wait_for_discovery_request(&discovery_server).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    assert!(
+        plugin.active_jwks_uris().is_empty(),
+        "same-host different-port discovery jwks_uri must not create an active store, got: {:?}",
+        plugin.active_jwks_uris()
+    );
+    assert_eq!(
+        jwks_server
+            .received_requests()
+            .await
+            .map(|requests| requests.len())
+            .unwrap_or(0),
+        0,
+        "rejected different-port jwks_uri must not be fetched"
+    );
+}
+
+/// Regression coverage for the redirect bypass variant: a same-origin
+/// discovered JWKS URL that responds with a 3xx must not be followed to a
+/// different target. The JWKS fetch sees the 302 as the final response and
+/// fails closed without contacting the Location endpoint.
+#[tokio::test]
+async fn test_jwks_auth_oidc_discovery_does_not_follow_jwks_redirects() {
+    let discovery_server = wiremock::MockServer::start().await;
+    let redirect_target = wiremock::MockServer::start().await;
+    let redirect_path = unique_jwks_path("redirect-jwks");
+    let jwks_uri = format!("{}{}", discovery_server.uri(), redirect_path);
+
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(redirect_path))
+        .respond_with(wiremock::ResponseTemplate::new(302).insert_header(
+            "Location",
+            format!("{}/metadata-jwks", redirect_target.uri()),
+        ))
+        .mount(&discovery_server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(
+            "/.well-known/openid-configuration",
+        ))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+            "jwks_uri": jwks_uri.clone()
+        })))
+        .mount(&discovery_server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/metadata-jwks"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({ "keys": [] })))
+        .mount(&redirect_target)
+        .await;
+
+    let discovery_url = format!(
+        "{}/.well-known/openid-configuration",
+        discovery_server.uri()
+    );
+    let plugin = JwksAuth::new(
+        &json!({
+            "providers": [{"discovery_url": discovery_url}],
+            "jwks_refresh_interval_secs": 3600
+        }),
+        default_client(),
+    )
+    .unwrap();
+
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(2);
+    loop {
+        if plugin.active_jwks_uris() == vec![jwks_uri.clone()] {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for redirecting jwks_uri store to become active, got: {:?}",
+            plugin.active_jwks_uris()
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    assert_eq!(
+        redirect_target
+            .received_requests()
+            .await
+            .map(|requests| requests.len())
+            .unwrap_or(0),
+        0,
+        "discovered JWKS fetch must not follow redirects"
     );
 }
 
