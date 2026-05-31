@@ -276,34 +276,91 @@ struct PrivateSocketStage {
 #[cfg(unix)]
 fn create_private_socket_stage(socket_path: &str) -> std::io::Result<PrivateSocketStage> {
     use std::os::unix::fs::DirBuilderExt;
+    use std::os::unix::fs::MetadataExt;
 
     let final_path = Path::new(socket_path);
     let parent = final_path
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
+    let final_path_len = unix_path_len(final_path);
+    let parent_dev = std::fs::metadata(parent).ok().map(|meta| meta.dev());
+    let stage_parents = private_socket_stage_parent_candidates(parent, parent_dev, final_path_len);
 
+    let mut last_create_error = None;
     for _ in 0..16 {
-        let stage_dir = parent.join(format!(".f{:016x}", random_stage_suffix()));
-        let mut builder = std::fs::DirBuilder::new();
-        builder.mode(0o700);
-        match builder.create(&stage_dir) {
-            Ok(()) => {
-                let socket_path = stage_dir.join("s");
-                return Ok(PrivateSocketStage {
-                    dir: stage_dir,
-                    socket_path,
-                });
+        let stage_dir_name = format!(".f{:016x}", random_stage_suffix());
+        for stage_parent in &stage_parents {
+            let stage_dir = stage_parent.join(&stage_dir_name);
+            let socket_path = stage_dir.join("s");
+            let mut builder = std::fs::DirBuilder::new();
+            builder.mode(0o700);
+            match builder.create(&stage_dir) {
+                Ok(()) => {
+                    return Ok(PrivateSocketStage {
+                        dir: stage_dir,
+                        socket_path,
+                    });
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => {
+                    debug!(
+                        stage_parent = %stage_parent.display(),
+                        error = %err,
+                        "Failed to create candidate private CNI socket staging directory"
+                    );
+                    last_create_error = Some(err);
+                    continue;
+                }
             }
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(err) => return Err(err),
         }
     }
 
-    Err(std::io::Error::new(
-        std::io::ErrorKind::AlreadyExists,
-        "could not allocate unique private CNI socket staging directory",
-    ))
+    Err(last_create_error.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not allocate unique private CNI socket staging directory",
+        )
+    }))
+}
+
+#[cfg(unix)]
+fn private_socket_stage_parent_candidates(
+    final_parent: &Path,
+    final_parent_dev: Option<u64>,
+    final_path_len: usize,
+) -> Vec<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+
+    let mut candidates = Vec::new();
+    for ancestor in final_parent.ancestors() {
+        if ancestor.as_os_str().is_empty() {
+            continue;
+        }
+        if let Some(dev) = final_parent_dev {
+            let Ok(meta) = std::fs::metadata(ancestor) else {
+                continue;
+            };
+            if meta.dev() != dev {
+                continue;
+            }
+        }
+        let candidate_socket = ancestor.join(".f0000000000000000").join("s");
+        if unix_path_len(&candidate_socket) <= final_path_len {
+            candidates.push(ancestor.to_path_buf());
+        }
+    }
+
+    if candidates.is_empty() {
+        candidates.push(final_parent.to_path_buf());
+    }
+    candidates
+}
+
+#[cfg(unix)]
+fn unix_path_len(path: &Path) -> usize {
+    use std::os::unix::ffi::OsStrExt;
+    path.as_os_str().as_bytes().len()
 }
 
 #[cfg(unix)]
@@ -575,7 +632,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn cni_socket_stage_is_private_and_uses_bounded_path() {
-        use std::os::unix::ffi::OsStrExt;
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
@@ -587,8 +643,7 @@ mod tests {
         let mode = std::fs::metadata(&stage.dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700, "staging directory must be private");
         assert!(
-            stage.socket_path.as_os_str().as_bytes().len()
-                < socket_path.as_os_str().as_bytes().len(),
+            unix_path_len(&stage.socket_path) < unix_path_len(&socket_path),
             "stage socket path should use a bounded filename instead of suffixing the configured socket path"
         );
 
@@ -597,6 +652,28 @@ mod tests {
             !stage.dir.exists(),
             "stage directory should be removable during cleanup"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cni_socket_stage_does_not_lengthen_long_parent_short_filename() {
+        let dir = tempfile::tempdir().unwrap();
+        let long_parent = dir.path().join("p".repeat(80));
+        std::fs::create_dir_all(&long_parent).unwrap();
+        let socket_path = long_parent.join("s");
+        let socket_path_str = socket_path.to_string_lossy().to_string();
+
+        let stage = create_private_socket_stage(&socket_path_str).expect("stage dir");
+        assert!(
+            unix_path_len(&stage.socket_path) <= unix_path_len(&socket_path),
+            "stage socket path must not be longer than a near-limit final socket path"
+        );
+        assert!(
+            !stage.socket_path.starts_with(&long_parent),
+            "long final parent should not force the private staged socket under that same long path"
+        );
+
+        cleanup_private_socket_stage(&stage);
     }
 
     #[tokio::test]
