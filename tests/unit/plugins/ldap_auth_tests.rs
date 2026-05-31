@@ -613,15 +613,13 @@ async fn test_empty_password_rejected_without_contacting_ldap() {
 
 /// Minimal mock LDAP server: accepts one TCP connection, reads the client's
 /// first request (the simple bind), and replies with a `bindResponse` carrying
-/// `resultCode` 49 (`invalidCredentials`). This is the genuine wrong-password
-/// case, which finding #32 says must map to 401 — distinct from a backend
-/// failure (500). ldap3 assigns message ID 1 to the first operation on a fresh
-/// connection, so the response is encoded at message ID 1.
+/// the provided `resultCode`. ldap3 assigns message ID 1 to the first operation
+/// on a fresh connection, so the response is encoded at message ID 1.
 ///
 /// LDAPMessage ::= SEQUENCE { messageID INTEGER (1), BindResponse }
-/// BindResponse ::= [APPLICATION 1] SEQUENCE { resultCode ENUMERATED (49),
+/// BindResponse ::= [APPLICATION 1] SEQUENCE { resultCode ENUMERATED,
 ///                                             matchedDN "", diagnosticMessage "" }
-async fn spawn_invalid_credentials_ldap_server() -> (u16, tokio::task::JoinHandle<()>) {
+async fn spawn_bind_response_ldap_server(result_code: u8) -> (u16, tokio::task::JoinHandle<()>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -636,12 +634,12 @@ async fn spawn_invalid_credentials_ldap_server() -> (u16, tokio::task::JoinHandl
             let mut buf = [0u8; 1024];
             let _ = stream.read(&mut buf).await;
 
-            // bindResponse, messageID 1, resultCode 49 (invalidCredentials).
+            // bindResponse, messageID 1, caller-provided resultCode.
             let response: [u8; 14] = [
                 0x30, 0x0c, // LDAPMessage SEQUENCE, len 12
                 0x02, 0x01, 0x01, // messageID INTEGER 1
                 0x61, 0x07, // [APPLICATION 1] BindResponse, len 7
-                0x0a, 0x01, 0x31, // resultCode ENUMERATED 49
+                0x0a, 0x01, result_code, // resultCode ENUMERATED
                 0x04, 0x00, // matchedDN ""
                 0x04, 0x00, // diagnosticMessage ""
             ];
@@ -654,6 +652,10 @@ async fn spawn_invalid_credentials_ldap_server() -> (u16, tokio::task::JoinHandl
     });
 
     (port, task)
+}
+
+async fn spawn_invalid_credentials_ldap_server() -> (u16, tokio::task::JoinHandle<()>) {
+    spawn_bind_response_ldap_server(49).await
 }
 
 #[tokio::test]
@@ -682,6 +684,36 @@ async fn test_ldap_invalid_credentials_returns_401() {
 
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert_reject(result, Some(401));
+
+    task.abort();
+}
+
+#[tokio::test]
+async fn test_ldap_busy_bind_result_returns_500() {
+    // A directory can report operational failures as LDAP result codes after
+    // accepting the TCP connection. Only rc=49 is a credential failure; rc=51
+    // (`busy`) must surface as backend trouble.
+    let (port, task) = spawn_bind_response_ldap_server(51).await;
+
+    let plugin = LdapAuth::new(
+        &json!({
+            "ldap_url": format!("ldap://127.0.0.1:{port}"),
+            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "connect_timeout_seconds": 5
+        }),
+        http_client(),
+    )
+    .unwrap();
+
+    let mut ctx = make_ctx();
+    ctx.headers.insert(
+        "authorization".to_string(),
+        basic_header("alice", "password"),
+    );
+    let consumer_index = ConsumerIndex::new(&[]);
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_reject(result, Some(500));
 
     task.abort();
 }

@@ -84,6 +84,18 @@ impl AuthError {
     }
 }
 
+fn classify_user_bind_result(result: ldap3::LdapResult, context: &str) -> Result<(), AuthError> {
+    match result.rc {
+        0 => Ok(()),
+        49 => Err(AuthError::Credential(format!(
+            "ldap_auth: {context} rejected: {result}"
+        ))),
+        _ => Err(AuthError::Backend(format!(
+            "ldap_auth: {context} failed with directory result: {result}"
+        ))),
+    }
+}
+
 pub struct LdapAuth {
     ldap_url: String,
     /// Direct bind: "uid={username},ou=users,dc=example,dc=com"
@@ -392,11 +404,11 @@ impl LdapAuth {
         let user_dn = if let Some(ref template) = self.bind_dn_template {
             // Direct bind: substitute DN-escaped username into template (RFC 4514)
             let dn = template.replace("{username}", &escape_dn_value(username));
-            ldap.simple_bind(&dn, password)
+            let bind_result = ldap
+                .simple_bind(&dn, password)
                 .await
-                .map_err(|e| AuthError::Backend(format!("ldap_auth: bind failed: {e}")))?
-                .success()
-                .map_err(|e| AuthError::Credential(format!("ldap_auth: bind rejected: {e}")))?;
+                .map_err(|e| AuthError::Backend(format!("ldap_auth: bind failed: {e}")))?;
+            classify_user_bind_result(bind_result, "bind")?;
             dn
         } else {
             // Search-then-bind: find user DN via service account
@@ -445,14 +457,11 @@ impl LdapAuth {
             let _ = ldap.unbind().await;
 
             let mut user_ldap = self.connect().await?;
-            user_ldap
+            let user_bind_result = user_ldap
                 .simple_bind(&user_dn, password)
                 .await
-                .map_err(|e| AuthError::Backend(format!("ldap_auth: user bind failed: {e}")))?
-                .success()
-                .map_err(|e| {
-                    AuthError::Credential(format!("ldap_auth: user bind rejected: {e}"))
-                })?;
+                .map_err(|e| AuthError::Backend(format!("ldap_auth: user bind failed: {e}")))?;
+            classify_user_bind_result(user_bind_result, "user bind")?;
 
             let _ = user_ldap.unbind().await;
             user_dn
