@@ -243,11 +243,18 @@ async fn test_mtls_auth_success_by_serial() {
     let cert_der = create_test_cert("client.example.com", None, None);
 
     // Parse the cert to get the serial number. The identity is the lowercase
-    // hex of the raw DER integer bytes (finding #31), matching the lowercase
-    // of `openssl x509 -serial` output.
+    // hex of the DER integer value bytes, matching the lowercase of
+    // `openssl x509 -serial` output.
     use x509_parser::prelude::*;
     let (_, cert) = X509Certificate::from_der(&cert_der).unwrap();
-    let serial_hex = hex::encode(cert.raw_serial());
+    let raw_serial = cert.raw_serial();
+    let serial_bytes =
+        if raw_serial.len() > 1 && raw_serial[0] == 0 && (raw_serial[1] & 0x80) != 0 {
+            &raw_serial[1..]
+        } else {
+            raw_serial
+        };
+    let serial_hex = hex::encode(serial_bytes);
 
     let consumer = create_mtls_consumer("c1", "alice", &serial_hex);
     let index = ConsumerIndex::new(&[consumer]);
@@ -260,29 +267,27 @@ async fn test_mtls_auth_success_by_serial() {
     assert!(ctx.identified_consumer.is_some());
 }
 
-// Regression for finding #31: a serial whose leading DER byte has the high
-// bit set is encoded with a leading `00` byte. The identity must be the
-// even-length, zero-preserving lowercase hex (`00c001`, matching the lowercase
-// of `openssl x509 -serial`), NOT the `to_str_radix(16)` form that strips the
-// leading zero (`c001`).
+// Regression for finding #31: a serial whose leading value byte has the high
+// bit set is DER-encoded with a leading `00` sign pad. The identity must match
+// OpenSSL's value output (`c001`), not the DER content bytes (`00c001`).
 #[tokio::test]
-async fn test_mtls_auth_serial_preserves_leading_zero_byte() {
+async fn test_mtls_auth_serial_strips_der_sign_padding() {
     let cert_der = create_test_cert_with_serial("client.example.com", &[0xC0, 0x01]);
     let plugin = MtlsAuth::new(&json!({"cert_field": "serial"})).unwrap();
 
-    // Canonical identity (leading 00 preserved) authenticates.
-    let consumer = create_mtls_consumer("c1", "alice", "00c001");
+    // Canonical identity (DER sign pad stripped) authenticates.
+    let consumer = create_mtls_consumer("c1", "alice", "c001");
     let index = ConsumerIndex::new(&[consumer]);
     let mut ctx = create_ctx_with_cert(cert_der.clone());
     let result = plugin.authenticate(&mut ctx, &index).await;
     assert_continue(result);
     assert!(ctx.identified_consumer.is_some());
 
-    // The old `to_str_radix(16)` form (leading zero stripped) must NOT match.
-    let stripped = create_mtls_consumer("c2", "bob", "c001");
-    let stripped_index = ConsumerIndex::new(&[stripped]);
+    // The raw DER content form must NOT match.
+    let der_padded = create_mtls_consumer("c2", "bob", "00c001");
+    let der_padded_index = ConsumerIndex::new(&[der_padded]);
     let mut ctx2 = create_ctx_with_cert(cert_der);
-    let result2 = plugin.authenticate(&mut ctx2, &stripped_index).await;
+    let result2 = plugin.authenticate(&mut ctx2, &der_padded_index).await;
     assert_reject(result2, Some(401));
     assert!(ctx2.identified_consumer.is_none());
 }
