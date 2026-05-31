@@ -1949,18 +1949,17 @@ pub fn resolve_effective_mtls_mode<L: WorkloadLabels + ?Sized>(
 
         let scope = classify_peer_auth_scope(pa);
         // Higher tier wins; within the SAME tier the ASCII-smallest
-        // `(name, namespace)` wins. This same-tier tiebreak keeps policy name
-        // as the primary key, matching sibling single-winner resolvers
-        // (`resolved_proxy_config`, `resolve_applicable_sidecar_egress`) and
-        // makes the effective inbound mTLS posture deterministic. Without it,
-        // two equally-applicable PeerAuthentications in one tier resolve by
-        // slice iteration order, so the posture (STRICT vs PERMISSIVE/Disable)
-        // could differ across pods or flip across reconciles.
+        // `(namespace, name)` wins. Namespace must be the primary tiebreaker
+        // because root-namespace selector PeerAuthentications can intentionally
+        // apply across namespaces, while tenant namespace policies only apply
+        // locally. Considering namespace first keeps the decision deterministic
+        // without letting an attacker-controlled policy name outrank a trusted
+        // namespace policy in the same tier.
         let dominated = best.as_ref().is_none_or(|(current_scope, current_pa)| {
             scope > *current_scope
                 || (scope == *current_scope
-                    && (pa.name.as_str(), pa.namespace.as_str())
-                        < (current_pa.name.as_str(), current_pa.namespace.as_str()))
+                    && (pa.namespace.as_str(), pa.name.as_str())
+                        < (current_pa.namespace.as_str(), current_pa.name.as_str()))
         });
         if dominated {
             best = Some((scope, pa));
@@ -3427,10 +3426,10 @@ mod tests {
     }
 
     #[test]
-    fn same_tier_peer_auth_resolves_to_ascii_smallest_name_and_namespace_regardless_of_order() {
+    fn same_tier_peer_auth_resolves_to_ascii_smallest_namespace_and_name_regardless_of_order() {
         // Two namespace-tier PeerAuthentications match the same workload with
         // conflicting modes. The winner must be deterministic (ASCII-smallest
-        // name/namespace tuple) independent of slice iteration order, so the
+        // namespace/name tuple) independent of slice iteration order, so the
         // inbound mTLS posture can't flap (STRICT vs PERMISSIVE) across
         // pods/reconciles.
         let strict = pa(
@@ -3499,16 +3498,16 @@ mod tests {
     }
 
     #[test]
-    fn same_tier_peer_auth_prefers_ascii_smallest_name_before_namespace() {
+    fn same_tier_peer_auth_prefers_ascii_smallest_namespace_before_name() {
         let strict = pa_with_scope(
-            "aa-policy",
-            "zzz-root",
+            "zz-policy",
+            "aaa-root",
             PolicyScope::MeshWide,
             MtlsMode::Strict,
         );
         let permissive = pa_with_scope(
-            "zz-policy",
-            "aaa-root",
+            "aa-policy",
+            "zzz-root",
             PolicyScope::MeshWide,
             MtlsMode::Permissive,
         );
@@ -3518,7 +3517,7 @@ mod tests {
         assert_eq!(
             resolve_effective_mtls_mode(&forward, "default", &labels, 8080),
             MtlsMode::Strict,
-            "aa-policy/zzz-root must win before aaa-root/zz-policy"
+            "aaa-root/zz-policy must win before zzz-root/aa-policy"
         );
 
         let reversed = vec![strict, permissive];

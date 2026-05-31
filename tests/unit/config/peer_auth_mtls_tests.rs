@@ -146,13 +146,13 @@ fn mesh_slice_resolve_method_integration() {
     );
 }
 
-// ── Same-scope tie-breaking (deterministic ASCII-smallest name/namespace) ─
+// ── Same-scope tie-breaking (deterministic ASCII-smallest namespace/name) ─
 
 #[test]
-fn same_scope_tie_resolves_to_ascii_smallest_name_and_namespace_regardless_of_order() {
+fn same_scope_tie_resolves_to_ascii_smallest_namespace_and_name_regardless_of_order() {
     // Two WorkloadSelector-tier PeerAuthentications match the same workload
     // with conflicting modes. The winner is the ASCII-smallest policy
-    // name/namespace tuple, independent of slice iteration order. This makes
+    // namespace/name tuple, independent of slice iteration order. This makes
     // the inbound mTLS posture deterministic across pods/reconciles instead
     // of depending on order. (Two conflicting same-tier PeerAuthentications
     // are an operator misconfiguration; the contract here is determinism, not
@@ -226,16 +226,16 @@ fn same_scope_same_name_tie_resolves_to_ascii_smallest_namespace_regardless_of_o
 }
 
 #[test]
-fn same_scope_tie_prefers_ascii_smallest_name_before_namespace() {
+fn same_scope_tie_prefers_ascii_smallest_namespace_before_name() {
     let strict = peer_auth_with_scope(
-        "aa-policy",
-        "zzz-root",
+        "zz-policy",
+        "aaa-root",
         PolicyScope::MeshWide,
         MtlsMode::Strict,
     );
     let permissive = peer_auth_with_scope(
-        "zz-policy",
-        "aaa-root",
+        "aa-policy",
+        "zzz-root",
         PolicyScope::MeshWide,
         MtlsMode::Permissive,
     );
@@ -245,12 +245,53 @@ fn same_scope_tie_prefers_ascii_smallest_name_before_namespace() {
     assert_eq!(
         resolve_effective_mtls_mode(&forward, "default", &labels, 8080),
         MtlsMode::Strict,
-        "aa-policy/zzz-root wins before zz-policy/aaa-root"
+        "aaa-root/zz-policy wins before zzz-root/aa-policy"
     );
 
     let reversed = vec![strict, permissive];
     assert_eq!(
         resolve_effective_mtls_mode(&reversed, "default", &labels, 8080),
+        MtlsMode::Strict,
+        "reversed slice order resolves to the same winner"
+    );
+}
+
+#[test]
+fn root_selector_policy_name_cannot_be_overridden_by_tenant_policy_name() {
+    let trusted_root = peer_auth_with_scope(
+        "zz-root-strict",
+        "istio-system",
+        PolicyScope::WorkloadSelector {
+            selector: WorkloadSelector {
+                labels: HashMap::from([("app".into(), "api".into())]),
+                namespace: None,
+            },
+        },
+        MtlsMode::Strict,
+    );
+    let tenant_disable = peer_auth_with_scope(
+        "00-disable",
+        "tenant-a",
+        PolicyScope::WorkloadSelector {
+            selector: WorkloadSelector {
+                labels: HashMap::from([("app".into(), "api".into())]),
+                namespace: Some("tenant-a".into()),
+            },
+        },
+        MtlsMode::Disable,
+    );
+    let labels = HashMap::from([("app".to_string(), "api".to_string())]);
+
+    let forward = vec![trusted_root.clone(), tenant_disable.clone()];
+    assert_eq!(
+        resolve_effective_mtls_mode(&forward, "tenant-a", &labels, 8080),
+        MtlsMode::Strict,
+        "trusted namespace wins before tenant-controlled policy name"
+    );
+
+    let reversed = vec![tenant_disable, trusted_root];
+    assert_eq!(
+        resolve_effective_mtls_mode(&reversed, "tenant-a", &labels, 8080),
         MtlsMode::Strict,
         "reversed slice order resolves to the same winner"
     );
