@@ -795,6 +795,51 @@ async fn test_wildcard_subdomain_case_insensitive() {
     );
 }
 
+// Regression for finding #51: wildcard-subdomain matching must enforce the
+// same http(s) scheme allow-list as exact-origin matching. A non-http scheme
+// (e.g. `ftp://`) that suffix-matches the host must NOT be allowed/reflected.
+#[tokio::test]
+async fn test_wildcard_subdomain_rejects_non_http_scheme() {
+    let plugin = CorsPlugin::new(&json!({
+        "allowed_origins": ["*.company.com"]
+    }))
+    .unwrap();
+
+    let mut ctx = make_cors_ctx("GET", "ftp://app.company.com");
+    let result = plugin.on_request_received(&mut ctx).await;
+    match result {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 403);
+            assert_eq!(body, "CORS origin not allowed");
+        }
+        _ => panic!("Expected 403 Reject — non-http scheme must not match wildcard subdomain"),
+    }
+    assert!(ctx.metadata.get("cors_origin").is_none());
+}
+
+// No-regression guard for finding #51: `http://` (not just `https://`) must
+// still match a wildcard-subdomain rule.
+#[tokio::test]
+async fn test_wildcard_subdomain_allows_plain_http_scheme() {
+    let plugin = CorsPlugin::new(&json!({
+        "allowed_origins": ["*.company.com"]
+    }))
+    .unwrap();
+
+    let mut ctx = make_cors_ctx("GET", "http://app.company.com");
+    let result = plugin.on_request_received(&mut ctx).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "*.company.com should match http://app.company.com"
+    );
+    assert_eq!(
+        ctx.metadata.get("cors_origin").unwrap(),
+        "http://app.company.com"
+    );
+}
+
 #[tokio::test]
 async fn test_mixed_exact_and_wildcard_origins() {
     let plugin = CorsPlugin::new(&json!({
