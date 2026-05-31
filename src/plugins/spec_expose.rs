@@ -366,12 +366,15 @@ impl SpecExpose {
 /// legitimately uses are allowed through; anything else falls back to
 /// `application/octet-stream`. The operator-configured `content_type` override
 /// path is trusted and is not constrained by this list.
-const ALLOWED_SPEC_MEDIA_TYPES: [&str; 10] = [
+const ALLOWED_SPEC_MEDIA_TYPES: [&str; 13] = [
     "application/json",
     "application/openapi+json",
     "application/openapi+yaml",
+    "application/vnd.oai.openapi",
     "application/yaml",
     "application/vnd.oai.openapi+json",
+    "application/wsdl+xml",
+    "application/vnd.sun.wadl+xml",
     "text/yaml",
     "application/x-yaml",
     "application/xml",

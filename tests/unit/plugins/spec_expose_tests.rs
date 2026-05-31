@@ -514,7 +514,10 @@ fn test_sanitize_upstream_content_type_allow_list() {
         "application/openapi+json",
         "application/openapi+yaml",
         "application/yaml",
+        "application/vnd.oai.openapi",
         "application/vnd.oai.openapi+json",
+        "application/wsdl+xml",
+        "application/vnd.sun.wadl+xml",
         "text/yaml",
         "application/x-yaml",
         "application/xml",
@@ -531,6 +534,10 @@ fn test_sanitize_upstream_content_type_allow_list() {
     assert_eq!(
         sanitize("application/vnd.oai.openapi+json;version=3.0"),
         "application/vnd.oai.openapi+json;version=3.0"
+    );
+    assert_eq!(
+        sanitize("application/vnd.oai.openapi;version=3.0"),
+        "application/vnd.oai.openapi;version=3.0"
     );
     assert_eq!(
         sanitize("  application/yaml  ; q=1"),
