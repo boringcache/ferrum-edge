@@ -243,7 +243,7 @@ fn jwt_scalar_attribute_to_mesh_attribute(
 /// for ztunnel and waypoints), or a full SPIFFE ID to pin a specific
 /// assertor identity, trust domain, and namespace.
 #[derive(Debug, Clone)]
-enum TrustedAssertor {
+pub(crate) enum TrustedAssertor {
     /// Match any peer whose SPIFFE-ID path encodes this Kubernetes service
     /// account per the Istio convention `ns/<ns>/sa/<sa>`.
     ServiceAccount(String),
@@ -960,7 +960,7 @@ impl MeshAuthz {
                 .chain(ctx.headers.get(BAGGAGE_HEADER).map(String::as_str)),
         )
         .source_principal;
-        if !self.is_trusted_hbone_assertor(peer) {
+        if !is_trusted_hbone_assertor(&self.trusted_hbone_assertors, peer) {
             // Stamp `UntrustedAssertor` only when the request actually carried
             // a baggage source identity that we suppressed. Without that
             // signal there's nothing observable for operators to triage and
@@ -989,12 +989,16 @@ impl MeshAuthz {
                 .iter()
                 .any(|alias| alias == baggage_td)
     }
+}
 
-    fn is_trusted_hbone_assertor(&self, peer: &SpiffeId) -> bool {
-        self.trusted_hbone_assertors
-            .iter()
-            .any(|entry| entry.matches(peer))
-    }
+/// Whether `peer` is on the trusted-assertor allow-list.
+///
+/// Shared by `mesh_authz` and `workload_metrics` so the authorization decision
+/// and the telemetry attribution always apply the SAME baggage trust gate — a
+/// forked copy is exactly how a workload-to-workload baggage spoof could slip
+/// into dashboards / the service graph while authz still correctly rejects it.
+pub(crate) fn is_trusted_hbone_assertor(assertors: &[TrustedAssertor], peer: &SpiffeId) -> bool {
+    assertors.iter().any(|entry| entry.matches(peer))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1117,7 +1121,9 @@ fn has_baggage_header_from_request(ctx: &RequestContext) -> bool {
     ctx.raw_header_get(BAGGAGE_HEADER).is_some() || ctx.headers.contains_key(BAGGAGE_HEADER)
 }
 
-fn parse_trusted_hbone_assertors(config: &Value) -> Result<Vec<TrustedAssertor>, String> {
+pub(crate) fn parse_trusted_hbone_assertors(
+    config: &Value,
+) -> Result<Vec<TrustedAssertor>, String> {
     let items = match config.get("trusted_hbone_assertors") {
         None | Some(Value::Null) => {
             return Ok(default_trusted_hbone_assertors());

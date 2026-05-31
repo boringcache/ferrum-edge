@@ -10050,6 +10050,18 @@ components:
           items:
             type: string
           description: Additional SPIFFE trust domains accepted as equivalent to the workload's trust domain.
+        trusted_hbone_assertors:
+          type: array
+          items:
+            type: string
+          default: ["ztunnel", "waypoint"]
+          description: |
+            Allow-list of identity-asserting infrastructure components whose
+            HBONE baggage `source.principal` may be trusted for workload
+            metrics source attribution. Bare service-account names match any
+            peer whose SPIFFE path ends with `/sa/<name>`; full SPIFFE IDs
+            match exactly. Default is `["ztunnel", "waypoint"]`. Explicit
+            empty array disables baggage-derived source attribution.
         sampling_percentage:
           type: number
           format: double

@@ -2724,6 +2724,19 @@ fn inject_mesh_global_plugins(
         .iter()
         .map(|td| td.as_str().to_string())
         .collect();
+    let operator_mesh_authz_config = config
+        .plugin_configs
+        .iter()
+        .find(|plugin| {
+            plugin.scope == PluginScope::Global
+                && plugin.plugin_name == "mesh_authz"
+                && plugin.id != MESH_AUTHZ_PLUGIN_ID
+        })
+        .map(|plugin| plugin.config.clone());
+    let operator_mesh_authz_present = operator_mesh_authz_config.is_some();
+    let operator_mesh_authz_trusted_assertors = operator_mesh_authz_config
+        .as_ref()
+        .and_then(|cfg| cfg.get("trusted_hbone_assertors").cloned());
     let mut mesh_authz_config = serde_json::json!({
         "mesh_slice": mesh_slice,
         "trust_domain_aliases": trust_domain_aliases,
@@ -2800,6 +2813,24 @@ fn inject_mesh_global_plugins(
         "labels": mesh_slice.labels.clone(),
         "trust_domain_aliases": trust_domain_aliases,
     });
+    // Mirror the EFFECTIVE mesh_authz assertor gate so telemetry source-identity
+    // attribution honors HBONE baggage only from the same trusted assertors.
+    // If an operator-managed global mesh_authz overrides the mesh-managed
+    // instance, copy its `trusted_hbone_assertors` field verbatim (including
+    // `[]`); if it omits the field, workload_metrics also omits it so both
+    // plugins fall back to their shared defaults. Without an override, thread
+    // the runtime/env list exactly as the mesh-managed mesh_authz config does.
+    if let Some(value) = operator_mesh_authz_trusted_assertors {
+        workload_metrics_config["trusted_hbone_assertors"] = value;
+    } else if !operator_mesh_authz_present && !runtime.trusted_hbone_assertors.is_empty() {
+        workload_metrics_config["trusted_hbone_assertors"] = serde_json::Value::Array(
+            runtime
+                .trusted_hbone_assertors
+                .iter()
+                .map(|raw| serde_json::Value::String(raw.clone()))
+                .collect(),
+        );
+    }
     // Apply ProxyConfig sampling as a baseline. The more granular Telemetry
     // resource below may override on the `sampling_percentage` key.
     if let Some(proxy_cfg) = mesh_slice.resolved_proxy_config()
@@ -8159,6 +8190,91 @@ mod tests {
 
         assert!(registry.iter().any(|entry| entry == "ratings.default"));
         assert!(!registry.iter().any(|entry| entry == "stale.default"));
+    }
+
+    #[test]
+    fn inject_mesh_global_plugins_copies_operator_authz_assertor_override_to_workload_metrics() {
+        let mut runtime = test_mesh_runtime_config();
+        runtime.trusted_hbone_assertors =
+            vec!["spiffe://cluster.local/ns/istio-system/sa/env-assertor".to_string()];
+        let now = chrono::Utc::now();
+        let mut config = GatewayConfig {
+            plugin_configs: vec![crate::config::types::PluginConfig {
+                id: "operator-mesh-authz".to_string(),
+                plugin_name: "mesh_authz".to_string(),
+                namespace: "default".to_string(),
+                config: serde_json::json!({
+                    "trusted_hbone_assertors": []
+                }),
+                scope: PluginScope::Global,
+                proxy_id: None,
+                enabled: true,
+                priority_override: None,
+                api_spec_id: None,
+                created_at: now,
+                updated_at: now,
+            }],
+            ..GatewayConfig::default()
+        };
+
+        inject_mesh_global_plugins(&mut config, &runtime, &MeshSlice::default());
+
+        assert!(
+            config
+                .plugin_configs
+                .iter()
+                .all(|plugin| plugin.id != MESH_AUTHZ_PLUGIN_ID),
+            "operator-managed mesh_authz must remain the effective authz plugin"
+        );
+        let workload_metrics = config
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.id == MESH_WORKLOAD_METRICS_PLUGIN_ID)
+            .expect("workload_metrics plugin injected");
+        assert_eq!(
+            workload_metrics.config.get("trusted_hbone_assertors"),
+            Some(&serde_json::json!([])),
+            "workload_metrics must honor the operator mesh_authz empty allow-list instead of the runtime/env list"
+        );
+    }
+
+    #[test]
+    fn inject_mesh_global_plugins_omits_runtime_assertors_when_operator_authz_uses_defaults() {
+        let mut runtime = test_mesh_runtime_config();
+        runtime.trusted_hbone_assertors =
+            vec!["spiffe://cluster.local/ns/istio-system/sa/env-assertor".to_string()];
+        let now = chrono::Utc::now();
+        let mut config = GatewayConfig {
+            plugin_configs: vec![crate::config::types::PluginConfig {
+                id: "operator-mesh-authz".to_string(),
+                plugin_name: "mesh_authz".to_string(),
+                namespace: "default".to_string(),
+                config: serde_json::json!({}),
+                scope: PluginScope::Global,
+                proxy_id: None,
+                enabled: true,
+                priority_override: None,
+                api_spec_id: None,
+                created_at: now,
+                updated_at: now,
+            }],
+            ..GatewayConfig::default()
+        };
+
+        inject_mesh_global_plugins(&mut config, &runtime, &MeshSlice::default());
+
+        let workload_metrics = config
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.id == MESH_WORKLOAD_METRICS_PLUGIN_ID)
+            .expect("workload_metrics plugin injected");
+        assert!(
+            workload_metrics
+                .config
+                .get("trusted_hbone_assertors")
+                .is_none(),
+            "when operator mesh_authz omits trusted_hbone_assertors, workload_metrics must omit it too so both use shared defaults"
+        );
     }
 
     #[test]

@@ -1487,6 +1487,70 @@ async fn workload_metrics_drops_baggage_with_mismatched_trust_domain() {
     );
 }
 
+/// A non-assertor peer (an ordinary workload, not ztunnel/waypoint) cannot
+/// rewrite the telemetry source identity via forged HBONE baggage — even when
+/// the baggage trust domain matches the peer's. The baggage is dropped and the
+/// peer-cert identity is used, mirroring `mesh_authz`'s untrusted-assertor gate
+/// so dashboards/graph/spans cannot be made to mis-attribute source identity.
+#[tokio::test]
+async fn workload_metrics_ignores_baggage_from_untrusted_assertor() {
+    let plugin = WorkloadMetrics::new(&json!({})).expect("plugin config");
+    // sa/client is NOT a default trusted assertor (ztunnel/waypoint).
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/default/sa/client"));
+    ctx.metadata
+        .insert("request_protocol".to_string(), "hbone".to_string());
+    let mut headers = HashMap::from([(
+        "baggage".to_string(),
+        // Same trust domain as the peer, so ONLY the assertor gate (not the
+        // trust-domain check) can block this forged victim identity.
+        "source.principal=spiffe://cluster.local/ns/victim/sa/other".to_string(),
+    )]);
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    // Attribution falls back to the peer cert identity, NOT the forged baggage.
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.source.principal")
+            .map(String::as_str),
+        Some("spiffe://cluster.local/ns/default/sa/client")
+    );
+    assert_eq!(
+        ctx.metadata.get("mesh.ignored_baggage").map(String::as_str),
+        Some("untrusted_assertor")
+    );
+}
+
+/// A custom-configured assertor (matching the peer SA) honors the baggage,
+/// confirming the gate is the shared `mesh_authz` allow-list and configurable —
+/// not a hardcoded ztunnel/waypoint check.
+#[tokio::test]
+async fn workload_metrics_honors_baggage_from_configured_assertor() {
+    let plugin = WorkloadMetrics::new(&json!({
+        "trusted_hbone_assertors": ["client"]
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/default/sa/client"));
+    ctx.metadata
+        .insert("request_protocol".to_string(), "hbone".to_string());
+    let mut headers = HashMap::from([(
+        "baggage".to_string(),
+        "source.principal=spiffe://cluster.local/ns/web/sa/frontend".to_string(),
+    )]);
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.source.principal")
+            .map(String::as_str),
+        Some("spiffe://cluster.local/ns/web/sa/frontend")
+    );
+    assert!(!ctx.metadata.contains_key("mesh.ignored_baggage"));
+}
+
 #[tokio::test]
 async fn workload_metrics_sampling_zero_records_unsampled() {
     let plugin = WorkloadMetrics::new(&json!({
