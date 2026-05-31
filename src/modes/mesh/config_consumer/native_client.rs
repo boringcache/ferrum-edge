@@ -7,8 +7,8 @@ use tracing::{error, info, warn};
 
 use super::common::{
     BACKOFF_INITIAL_SECS, jittered_backoff, next_backoff_secs,
-    refresh_dp_grpc_tls_config_if_changed, should_race_primary_retry, tonic_tls_config,
-    wait_for_shutdown, wait_optional_tls_reload,
+    refresh_dp_grpc_tls_config_if_changed, tonic_tls_config, wait_for_shutdown,
+    wait_optional_tls_reload,
 };
 use crate::grpc::dp_client::{
     DpGrpcTlsConfig, DpGrpcTlsReload, GrpcJwtSecret, check_cp_version_compatibility,
@@ -93,17 +93,12 @@ pub async fn start_native_mesh_client_with_shutdown(
         let consumer = NativeMeshConfigConsumer::new(state.clone());
         let mut stream_shutdown_rx = shutdown_rx.clone();
         let is_fallback = current_cp_index != 0 && cp_urls.len() > 1;
-        let should_race_primary = should_race_primary_retry(
-            is_fallback,
-            config.primary_retry_secs,
-            state.has_first_slice(),
-        );
-        // On a fallback CP (after a first slice is installed) race the live
-        // stream against a primary-retry timer so the DP proactively returns to
-        // the primary CP, matching the xDS sibling and the documented HA failback
-        // model. On the primary CP, or before any slice arrives, skip the timer
-        // and keep the connection until it ends on its own.
-        let result = if should_race_primary {
+        let should_retry_primary = is_fallback && config.primary_retry_secs > 0;
+        // On a fallback CP, arm failback after a first slice is available. The
+        // fallback stream may itself deliver that first slice and then stay open
+        // indefinitely, so the timer must wait inside this select instead of
+        // being decided only before `connect_mesh_subscribe` starts.
+        let result = if should_retry_primary {
             tokio::select! {
                 result = connect_mesh_subscribe(
                     cp_url,
@@ -112,7 +107,10 @@ pub async fn start_native_mesh_client_with_shutdown(
                     &consumer,
                     tls_config.as_ref(),
                 ) => result,
-                _ = tokio::time::sleep(Duration::from_secs(config.primary_retry_secs)) => {
+                _ = wait_for_first_slice_then_primary_retry(
+                    state.clone(),
+                    Duration::from_secs(config.primary_retry_secs),
+                ) => {
                     info!(
                         primary_retry_secs = config.primary_retry_secs,
                         cp_url = %cp_url,
@@ -271,6 +269,11 @@ async fn connect_mesh_subscribe(
     Ok(())
 }
 
+async fn wait_for_first_slice_then_primary_retry(state: MeshRuntimeState, interval: Duration) {
+    state.wait_for_first_slice().await;
+    tokio::time::sleep(interval).await;
+}
+
 /// Applies native `MeshSubscribe` updates into the shared mesh runtime state.
 #[derive(Clone)]
 pub struct NativeMeshConfigConsumer {
@@ -329,15 +332,29 @@ mod tests {
         );
     }
 
-    #[test]
-    fn primary_retry_only_races_on_fallback_after_first_slice() {
-        // The native client honors FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS via
-        // the shared gate: race the primary-retry timer only on a fallback CP,
-        // with a non-zero interval, after a first slice is installed.
-        assert!(!should_race_primary_retry(true, 300, false)); // no first slice yet
-        assert!(should_race_primary_retry(true, 300, true)); // fallback + slice
-        assert!(!should_race_primary_retry(false, 300, true)); // already on primary
-        assert!(!should_race_primary_retry(true, 0, true)); // retry disabled (0)
+    #[tokio::test]
+    async fn primary_retry_waits_until_first_slice_on_fallback_stream() {
+        let state = MeshRuntimeState::new();
+        let retry = tokio::spawn(wait_for_first_slice_then_primary_retry(
+            state.clone(),
+            Duration::from_millis(1),
+        ));
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            !retry.is_finished(),
+            "timer must not run before the first slice arrives"
+        );
+
+        state.install_slice(MeshSlice {
+            version: "first".to_string(),
+            ..MeshSlice::default()
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), retry)
+            .await
+            .expect("primary retry wait should complete after first slice")
+            .expect("primary retry wait task should join");
     }
 
     #[test]
