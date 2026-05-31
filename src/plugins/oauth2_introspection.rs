@@ -861,6 +861,25 @@ fn parse_client_auth(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned);
+
+    // Credentialed methods transmit client credentials to the provider:
+    // `client_secret_basic` puts Base64(client_id:client_secret) in the
+    // Authorization header, `client_secret_post` puts `client_secret` in the
+    // form body, and `private_key_jwt` puts a signed `client_assertion` (a
+    // bearer credential the IdP accepts) in the form body. Reject configs that
+    // would send any of these over plaintext to a non-loopback host. Loopback
+    // `http://` is still permitted for local development, mirroring the
+    // `method='none'` gate below.
+    if matches!(
+        method,
+        "client_secret_basic" | "client_secret_post" | "private_key_jwt"
+    ) && endpoint.is_some_and(is_insecure_credentialed_endpoint)
+    {
+        return Err(format!(
+            "oauth2_introspection: provider[{provider_idx}].client_auth.method='{method}' requires an https introspection_endpoint/discovery_url (http is only allowed for localhost or loopback endpoints)"
+        ));
+    }
+
     match method {
         "client_secret_basic" => Ok(ClientAuth::Basic {
             client_id: client_id.ok_or_else(|| {
@@ -1232,6 +1251,7 @@ fn ranged_provider_usize(
 struct ParsedEndpoint {
     url: String,
     hostname: String,
+    scheme: String,
 }
 
 fn parse_url_field(
@@ -1268,6 +1288,7 @@ fn parse_url_field(
     Ok(Some(ParsedEndpoint {
         url: url.to_string(),
         hostname,
+        scheme: parsed.scheme().to_string(),
     }))
 }
 
@@ -1290,6 +1311,15 @@ fn is_local_introspection_host(hostname: &str) -> bool {
         || hostname
             .parse::<IpAddr>()
             .is_ok_and(|address| address.is_loopback())
+}
+
+/// True when the endpoint would transmit client credentials over plaintext to a
+/// non-loopback host (`http://` scheme + remote host). Loopback `http://` is
+/// permitted for local development, mirroring the `client_auth.method='none'`
+/// gate. The scheme comparison is case-insensitive because `url` lowercases
+/// schemes on parse, but we stay defensive.
+fn is_insecure_credentialed_endpoint(endpoint: &ParsedEndpoint) -> bool {
+    endpoint.scheme.eq_ignore_ascii_case("http") && !is_local_introspection_host(&endpoint.hostname)
 }
 
 fn audience_matches(claims: &Value, audiences: &[String]) -> bool {
@@ -1412,6 +1442,17 @@ fn validate_discovered_endpoint(
         .ok_or_else(|| "discovery_url must include a hostname".to_string())?;
     let endpoint_host = hostname_from_parsed_url(&parsed)
         .ok_or_else(|| format!("discovery {field} must include a hostname"))?;
+    // A non-loopback discovered endpoint must be https: client credentials may
+    // be sent to it, and an https discovery document advertising a plaintext
+    // introspection endpoint would otherwise downgrade the credential exchange
+    // to cleartext. Loopback http stays allowed for local development, mirroring
+    // the config-load gate in `parse_client_auth`.
+    if parsed.scheme().eq_ignore_ascii_case("http") && !is_local_introspection_host(&endpoint_host)
+    {
+        return Err(format!(
+            "discovery {field} must use https for non-loopback hosts"
+        ));
+    }
     if !endpoint_host.eq_ignore_ascii_case(&discovery_host) {
         return Err(format!(
             "discovery {field} host must match discovery_url host"
@@ -1518,6 +1559,125 @@ mod tests {
         assert_eq!(
             parse_private_key_alg(Some(&Value::String("EdDSA".to_string())), 0).unwrap(),
             Algorithm::EdDSA
+        );
+    }
+
+    fn endpoint(url: &str) -> ParsedEndpoint {
+        parse_url_field(
+            &Map::from_iter([("introspection_endpoint".to_string(), json!(url))]),
+            "introspection_endpoint",
+            0,
+        )
+        .expect("url should parse")
+        .expect("url field is present")
+    }
+
+    fn client_auth_config(method: &str) -> Map<String, Value> {
+        Map::from_iter([(
+            "client_auth".to_string(),
+            json!({
+                "method": method,
+                "client_id": "cid",
+                "client_secret": "shhh",
+                // Present so `private_key_jwt` would reach PEM parsing if the
+                // scheme guard did not short-circuit first; intentionally not a
+                // valid PEM.
+                "private_key_pem": "not-a-real-pem",
+            }),
+        )])
+    }
+
+    #[test]
+    fn credentialed_http_remote_endpoint_is_rejected() {
+        // Regression for finding #34: http:// to a non-loopback host would send
+        // client_secret / Basic auth / client_assertion in cleartext. All
+        // credentialed methods must be rejected at config load.
+        let http_remote = endpoint("http://idp.internal/introspect");
+        for method in [
+            "client_secret_basic",
+            "client_secret_post",
+            "private_key_jwt",
+        ] {
+            // `ClientAuth` deliberately has no `Debug` impl (it holds secrets),
+            // so match on the result rather than using `expect_err`.
+            match parse_client_auth(&client_auth_config(method), 0, Some(&http_remote)) {
+                Ok(_) => panic!("method {method}: http remote endpoint must be rejected"),
+                Err(err) => assert!(
+                    err.contains("requires an https"),
+                    "method {method} produced unexpected error: {err}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn credentialed_https_remote_endpoint_is_accepted() {
+        let https_remote = endpoint("https://idp.internal/introspect");
+        assert!(
+            parse_client_auth(
+                &client_auth_config("client_secret_basic"),
+                0,
+                Some(&https_remote),
+            )
+            .is_ok()
+        );
+        assert!(
+            parse_client_auth(
+                &client_auth_config("client_secret_post"),
+                0,
+                Some(&https_remote),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn credentialed_http_loopback_endpoint_is_allowed() {
+        // http is permitted for loopback/localhost development, mirroring the
+        // existing method='none' gate.
+        for url in [
+            "http://localhost:9000/introspect",
+            "http://127.0.0.1:9000/introspect",
+            "http://[::1]:9000/introspect",
+        ] {
+            let local = endpoint(url);
+            assert!(
+                parse_client_auth(&client_auth_config("client_secret_basic"), 0, Some(&local))
+                    .is_ok(),
+                "loopback http endpoint {url} must be allowed for credentialed auth"
+            );
+        }
+    }
+
+    #[test]
+    fn credentialed_endpoint_without_resolved_url_is_not_blocked() {
+        // When only discovery_url is configured the introspection endpoint is
+        // resolved at runtime; absence of a parsed endpoint here must not
+        // spuriously fail config load.
+        assert!(parse_client_auth(&client_auth_config("client_secret_basic"), 0, None).is_ok());
+    }
+
+    #[test]
+    fn discovery_downgrade_to_http_remote_endpoint_is_rejected() {
+        // An https discovery document must not be allowed to downgrade the
+        // credential exchange to a plaintext non-loopback introspection
+        // endpoint (finding #34 bypass via discovery).
+        assert!(
+            validate_discovered_endpoint(
+                "https://issuer.example.com/.well-known/openid-configuration",
+                "http://issuer.example.com/introspect",
+                "introspection_endpoint",
+            )
+            .is_err()
+        );
+        // Loopback http remains acceptable for local development.
+        assert!(
+            validate_discovered_endpoint(
+                "http://localhost:9000/.well-known/openid-configuration",
+                "http://localhost:9000/introspect",
+                "introspection_endpoint",
+            )
+            .is_ok()
         );
     }
 }
