@@ -145,9 +145,16 @@ impl std::fmt::Debug for PluginHttpClient {
 /// every reqwest::Client in production").
 ///
 /// If even this minimal builder fails, build a no-DNS fallback that still keeps
-/// redirects disabled. If that cannot be constructed either, fail closed rather
-/// than silently re-enabling reqwest's default redirect-following behavior.
-fn build_dns_cached_fallback_client(dns_cache: Option<DnsCache>) -> reqwest::Client {
+/// redirects disabled and applies the caller's TLS posture. If that cannot be
+/// constructed either, fail closed rather than silently re-enabling reqwest's
+/// default redirect-following behavior or widening TLS trust.
+fn build_dns_cached_fallback_client<F>(
+    dns_cache: Option<DnsCache>,
+    apply_client_posture: F,
+) -> reqwest::Client
+where
+    F: Fn(reqwest::ClientBuilder) -> reqwest::ClientBuilder,
+{
     // Never auto-follow redirects on a shared outbound client (SSRF posture,
     // matches src/connection_pool.rs and the configured clients above).
     let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
@@ -155,22 +162,24 @@ fn build_dns_cached_fallback_client(dns_cache: Option<DnsCache>) -> reqwest::Cli
         let resolver = DnsCacheResolver::new(dns_cache);
         builder = builder.dns_resolver(Arc::new(resolver));
     }
+    builder = apply_client_posture(builder);
     builder.build().unwrap_or_else(|e| {
         tracing::error!(
             "Failed to build minimal DNS-cached fallback plugin client: {}. \
-             Falling back to a no-redirect minimal plugin client as a last resort.",
+             Falling back to a no-redirect minimal plugin client with the same \
+             TLS posture as a last resort.",
             e
         );
-        match reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-        {
+        let builder = apply_client_posture(
+            reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()),
+        );
+        match builder.build() {
             Ok(client) => client,
             Err(e2) => {
                 tracing::error!(
-                    "Failed to build fallback plugin client with redirect policy set: {}. \
+                    "Failed to build fallback plugin client with redirect and TLS policy set: {}. \
                      Refusing to create a reqwest default client because it would re-enable \
-                     redirect following.",
+                     redirect following or widen TLS trust.",
                     e2
                 );
                 std::process::exit(1);
@@ -314,18 +323,7 @@ impl PluginHttpClient {
                  custom CA configured for exclusivity must not be silently widened to \
                  platform/webpki roots."
             );
-            let fallback = reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .dns_resolver(Arc::new(DnsCacheResolver::new(dns_cache_clone.clone())));
-            apply_tls_posture(fallback).build().unwrap_or_else(|e2| {
-                tracing::error!(
-                    "Minimal TLS-preserving plugin client also failed to build: {e2}. \
-                     Falling back to a DNS-cached client WITHOUT the custom CA / no-verify \
-                     settings — outbound TLS trust may be WIDER than configured until the \
-                     TLS configuration is fixed."
-                );
-                build_dns_cached_fallback_client(Some(dns_cache_clone.clone()))
-            })
+            build_dns_cached_fallback_client(Some(dns_cache_clone.clone()), &apply_tls_posture)
         });
 
         Self {
@@ -406,7 +404,7 @@ impl PluginHttpClient {
             // explicitly the cache-less constructor (tests / fallback). Use
             // the shared helper so the final no-DNS fallback is logged
             // uniformly across both `new()` and this code path.
-            build_dns_cached_fallback_client(None)
+            build_dns_cached_fallback_client(None, |builder| builder)
         });
 
         Self {
@@ -822,12 +820,12 @@ mod fallback_tests {
     #[test]
     fn fallback_client_builds_with_dns_cache() {
         let dns_cache = DnsCache::new(DnsConfig::default());
-        let _client = build_dns_cached_fallback_client(Some(dns_cache));
+        let _client = build_dns_cached_fallback_client(Some(dns_cache), |builder| builder);
     }
 
     #[test]
     fn fallback_client_builds_without_dns_cache() {
-        let _client = build_dns_cached_fallback_client(None);
+        let _client = build_dns_cached_fallback_client(None, |builder| builder);
     }
 
     #[tokio::test]
@@ -835,7 +833,7 @@ mod fallback_tests {
         // Verify the fallback client routes DNS through the gateway cache.
         let dns_cache = DnsCache::new(DnsConfig::default());
         let initial_len = dns_cache.cache_len();
-        let client = build_dns_cached_fallback_client(Some(dns_cache.clone()));
+        let client = build_dns_cached_fallback_client(Some(dns_cache.clone()), |builder| builder);
 
         let _ = client
             .get("http://localhost:1/")
