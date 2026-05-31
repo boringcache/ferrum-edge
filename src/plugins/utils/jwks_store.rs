@@ -174,8 +174,23 @@ impl JwksKeyStore {
             .map_err(|e| format!("JWKS parse failed: {}", e))?;
 
         let new_keys = Self::parse_jwks_response(&jwks)?;
-        let count = new_keys.len();
 
+        // Do not discard last-known-good keys when a successful fetch returns
+        // zero usable keys (e.g. a misbehaving or mid-rotation IdP momentarily
+        // serving an empty JWKS). Overwriting a populated cache with an empty
+        // map would make `has_keys()` false and reject every token for this
+        // provider until the next non-empty fetch — a self-inflicted auth
+        // outage. Retain the existing cache and warn instead. An initially
+        // empty cache still accepts an empty fetch so backoff retries proceed.
+        if new_keys.is_empty() && self.has_keys() {
+            warn!(
+                "JWKS endpoint at {} returned 0 usable keys; retaining last-known-good cache",
+                self.jwks_uri
+            );
+            return Ok(self.keys.load().len());
+        }
+
+        let count = new_keys.len();
         self.keys.store(Arc::new(new_keys));
         debug!("JWKS key store updated: {} keys cached", count);
         Ok(count)

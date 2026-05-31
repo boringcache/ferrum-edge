@@ -494,6 +494,162 @@ async fn test_jwks_auth_oidc_discovery_eager_fetches_without_duplicate_jwks_call
     assert_eq!(final_count, 1);
 }
 
+/// Wait until the OIDC discovery endpoint has been hit at least once, proving
+/// the discovery flow actually ran (so a "no jwks fetch" assertion reflects
+/// validation rejecting the discovered URI, not discovery never executing).
+async fn wait_for_discovery_request(server: &wiremock::MockServer) {
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(2);
+    loop {
+        let count = server
+            .received_requests()
+            .await
+            .map(|requests| requests.len())
+            .unwrap_or(0);
+        if count >= 1 {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for the OIDC discovery request"
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// Start an OIDC discovery server whose discovery document advertises the given
+/// `jwks_uri` value, and return `(server, discovery_url)`.
+async fn start_oidc_discovery_server(jwks_uri: &str) -> (wiremock::MockServer, String) {
+    let discovery_server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(
+            "/.well-known/openid-configuration",
+        ))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+            "jwks_uri": jwks_uri
+        })))
+        .mount(&discovery_server)
+        .await;
+    let discovery_url = format!(
+        "{}/.well-known/openid-configuration",
+        discovery_server.uri()
+    );
+    (discovery_server, discovery_url)
+}
+
+/// Regression test for finding #5 (SSRF): an OIDC discovery document whose
+/// `jwks_uri` points at a *different host* than the discovery endpoint — here
+/// the cloud metadata endpoint `169.254.169.254` — must be rejected. A spoofed,
+/// compromised, or tampered discovery document must not be able to steer the
+/// gateway into a server-side request to an attacker-chosen host inside the
+/// trust boundary. The provider's JWKS store must never be populated from it.
+#[tokio::test]
+async fn test_jwks_auth_oidc_discovery_rejects_metadata_endpoint_jwks_uri() {
+    // Different host than the loopback discovery server -> blocked by the
+    // same-host check before any fetch is attempted.
+    let malicious_jwks_uri = "http://169.254.169.254/latest/meta-data/jwks.json";
+    let (discovery_server, discovery_url) = start_oidc_discovery_server(malicious_jwks_uri).await;
+
+    let plugin = JwksAuth::new(
+        &json!({
+            "providers": [{"discovery_url": discovery_url}],
+            "jwks_refresh_interval_secs": 3600
+        }),
+        default_client(),
+    )
+    .unwrap();
+
+    wait_for_discovery_request(&discovery_server).await;
+    // Give any (incorrect) follow-on fetch a chance to publish a store.
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    assert!(
+        plugin.active_jwks_uris().is_empty(),
+        "cross-host discovery jwks_uri must not create an active store, got: {:?}",
+        plugin.active_jwks_uris()
+    );
+}
+
+/// Regression test for finding #5 (SSRF): an OIDC discovery document whose
+/// `jwks_uri` uses a non-URL scheme (`file:`) must be rejected.
+#[tokio::test]
+async fn test_jwks_auth_oidc_discovery_rejects_non_http_scheme_jwks_uri() {
+    let malicious_jwks_uri = "file:///etc/passwd";
+    let (discovery_server, discovery_url) = start_oidc_discovery_server(malicious_jwks_uri).await;
+
+    let plugin = JwksAuth::new(
+        &json!({
+            "providers": [{"discovery_url": discovery_url}],
+            "jwks_refresh_interval_secs": 3600
+        }),
+        default_client(),
+    )
+    .unwrap();
+
+    wait_for_discovery_request(&discovery_server).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    assert!(
+        plugin.active_jwks_uris().is_empty(),
+        "non-http-scheme discovery jwks_uri must not create an active store, got: {:?}",
+        plugin.active_jwks_uris()
+    );
+}
+
+/// Positive control for finding #5: a discovery document whose `jwks_uri` shares
+/// the discovery host (the normal OIDC case) is still accepted and fetched, so
+/// the SSRF hardening does not break legitimate same-host discovery. Both the
+/// discovery document and the JWKS are served by the same wiremock server, so
+/// they share host:port — the discovered jwks_uri passes the same-host check.
+#[tokio::test]
+async fn test_jwks_auth_oidc_discovery_accepts_same_host_jwks_uri() {
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+    let server = wiremock::MockServer::start().await;
+    let jwks_path = unique_jwks_path("same-host-jwks");
+    let jwks_uri = format!("{}{}", server.uri(), jwks_path);
+
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(jwks_path))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(build_rsa_jwks_from_pem(public_key_pem)),
+        )
+        .mount(&server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(
+            "/.well-known/openid-configuration",
+        ))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+            "jwks_uri": jwks_uri.clone()
+        })))
+        .mount(&server)
+        .await;
+
+    let discovery_url = format!("{}/.well-known/openid-configuration", server.uri());
+    let plugin = JwksAuth::new(
+        &json!({
+            "providers": [{"discovery_url": discovery_url}],
+            "jwks_refresh_interval_secs": 3600
+        }),
+        default_client(),
+    )
+    .unwrap();
+
+    // The store for the same-host jwks_uri must become active.
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(2);
+    loop {
+        if plugin.active_jwks_uris() == vec![jwks_uri.clone()] {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for same-host discovery jwks_uri to become active, got: {:?}",
+            plugin.active_jwks_uris()
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+    }
+}
+
 #[tokio::test]
 async fn test_jwks_auth_does_not_fetch_jwks_on_auth_hot_path_when_cache_empty() {
     let mock_server = wiremock::MockServer::start().await;

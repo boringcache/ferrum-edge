@@ -1353,7 +1353,19 @@ fn reject(status_code: u16, body: String) -> PluginResult {
     }
 }
 
-/// Fetch the OIDC discovery document and extract the `jwks_uri` field.
+/// Fetch the OIDC discovery document and extract a validated `jwks_uri`.
+///
+/// The discovery document is fetched from the operator-configured
+/// `discovery_url`, but its `jwks_uri` field is attacker-controlled if the
+/// IdP is spoofed, compromised, or the discovery response is tampered with in
+/// transit. Fetching that URL unvalidated is a server-side request forgery
+/// (SSRF) vector: it could steer the gateway at an internal service or a cloud
+/// metadata endpoint (e.g. `http://169.254.169.254/...`) from inside the trust
+/// boundary. We therefore screen the discovered URI before returning it, and
+/// the caller treats any rejection as a normal discovery failure (fail closed:
+/// retried in the background, no store created). The DNS-layer IP screening on
+/// `PluginHttpClient` is a backstop, not a substitute, so the host is validated
+/// here too.
 async fn discover_jwks_uri(
     http_client: &PluginHttpClient,
     discovery_url: &str,
@@ -1376,10 +1388,67 @@ async fn discover_jwks_uri(
         .await
         .map_err(|e| format!("OIDC discovery response parse failed: {}", e))?;
 
-    body["jwks_uri"]
+    let jwks_uri = body["jwks_uri"]
         .as_str()
-        .map(|s| s.to_string())
-        .ok_or_else(|| "OIDC discovery document missing 'jwks_uri' field".to_string())
+        .ok_or_else(|| "OIDC discovery document missing 'jwks_uri' field".to_string())?;
+
+    validate_discovered_jwks_uri(jwks_uri, discovery_url)
+}
+
+/// Validate a `jwks_uri` extracted from an OIDC discovery document against SSRF.
+///
+/// Hardening, in order:
+/// 1. The URI must parse as a URL with a non-empty hostname.
+/// 2. The scheme must be `http` or `https` — matching the validation the
+///    operator-configured `jwks_uri`/`discovery_url` already receive in
+///    [`parse_url_field`]. Non-URL schemes (e.g. `file:`, `gopher:`) are
+///    rejected.
+/// 3. The host must equal the `discovery_url` host (case-insensitive). This is
+///    the standard OIDC discovery hardening: it blocks a spoofed or tampered
+///    discovery document from redirecting the gateway to an attacker-chosen
+///    host such as a cloud metadata endpoint (`169.254.169.254`) or an internal
+///    service. Comparison is host-only (not host:port) because an IdP serves
+///    its JWKS and discovery endpoints on the same host. Operators whose IdP
+///    serves JWKS from a different host than discovery (e.g. Google:
+///    `accounts.google.com` vs `www.googleapis.com`) should configure
+///    `jwks_uri` directly instead of `discovery_url`.
+///
+/// Note: this validates the *initial* request host. IP-level screening of the
+/// resolved address (loopback/private/link-local) is enforced separately by the
+/// `PluginHttpClient` DNS resolver via `backend_allow_ips`, which also screens
+/// every redirect hop's resolved address — so a redirect to a private/metadata
+/// IP is blocked at the connect layer when `backend_allow_ips` is restrictive.
+/// `PluginHttpClient` does not currently disable HTTP redirect following, so the
+/// host equality enforced here applies to the first hop only; the DNS-layer IP
+/// policy is the backstop for redirected hops.
+fn validate_discovered_jwks_uri(jwks_uri: &str, discovery_url: &str) -> Result<String, String> {
+    let parsed = Url::parse(jwks_uri).map_err(|e| {
+        format!("OIDC discovery returned an invalid jwks_uri (not a valid URL): {e}")
+    })?;
+
+    match parsed.scheme() {
+        "http" | "https" => {}
+        scheme => {
+            return Err(format!(
+                "OIDC discovery returned a jwks_uri with disallowed scheme '{scheme}' (must be http or https)"
+            ));
+        }
+    }
+
+    let jwks_host = hostname_from_parsed_url(&parsed)
+        .ok_or_else(|| "OIDC discovery returned a jwks_uri without a hostname".to_string())?;
+
+    let discovery_host = hostname_from_url(discovery_url).ok_or_else(|| {
+        "OIDC discovery_url has no parseable hostname for jwks_uri comparison".to_string()
+    })?;
+
+    if !jwks_host.eq_ignore_ascii_case(&discovery_host) {
+        return Err(format!(
+            "OIDC discovery returned a jwks_uri host '{jwks_host}' that does not match the discovery_url host '{discovery_host}'"
+        ));
+    }
+
+    Ok(jwks_uri.to_string())
 }
 
 /// Set `mesh.request_principal` metadata to `{iss}/{sub}` when both claims are
