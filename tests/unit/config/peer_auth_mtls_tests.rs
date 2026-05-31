@@ -146,13 +146,13 @@ fn mesh_slice_resolve_method_integration() {
     );
 }
 
-// ── Same-scope tie-breaking (deterministic ASCII-smallest namespace/name) ─
+// ── Same-scope tie-breaking (deterministic ASCII-smallest name/namespace) ─
 
 #[test]
-fn same_scope_tie_resolves_to_ascii_smallest_namespace_and_name_regardless_of_order() {
+fn same_scope_tie_resolves_to_ascii_smallest_name_and_namespace_regardless_of_order() {
     // Two WorkloadSelector-tier PeerAuthentications match the same workload
     // with conflicting modes. The winner is the ASCII-smallest policy
-    // namespace/name tuple, independent of slice iteration order. This makes
+    // name/namespace tuple, independent of slice iteration order. This makes
     // the inbound mTLS posture deterministic across pods/reconciles instead
     // of depending on order. (Two conflicting same-tier PeerAuthentications
     // are an operator misconfiguration; the contract here is determinism, not
@@ -183,7 +183,7 @@ fn same_scope_tie_resolves_to_ascii_smallest_namespace_and_name_regardless_of_or
     assert_eq!(
         resolve_effective_mtls_mode(&forward, "default", &labels, 8080),
         MtlsMode::Disable,
-        "default/wl-disable (ASCII-smallest tuple) wins"
+        "wl-disable/default (ASCII-smallest tuple) wins"
     );
 
     let reversed = vec![disable, strict];
@@ -218,6 +218,37 @@ fn same_scope_same_name_tie_resolves_to_ascii_smallest_namespace_regardless_of_o
     );
 
     let reversed = vec![permissive, strict];
+    assert_eq!(
+        resolve_effective_mtls_mode(&reversed, "default", &labels, 8080),
+        MtlsMode::Strict,
+        "reversed slice order resolves to the same winner"
+    );
+}
+
+#[test]
+fn same_scope_tie_prefers_ascii_smallest_name_before_namespace() {
+    let strict = peer_auth_with_scope(
+        "aa-policy",
+        "zzz-root",
+        PolicyScope::MeshWide,
+        MtlsMode::Strict,
+    );
+    let permissive = peer_auth_with_scope(
+        "zz-policy",
+        "aaa-root",
+        PolicyScope::MeshWide,
+        MtlsMode::Permissive,
+    );
+    let labels = HashMap::<String, String>::new();
+
+    let forward = vec![permissive.clone(), strict.clone()];
+    assert_eq!(
+        resolve_effective_mtls_mode(&forward, "default", &labels, 8080),
+        MtlsMode::Strict,
+        "aa-policy/zzz-root wins before zz-policy/aaa-root"
+    );
+
+    let reversed = vec![strict, permissive];
     assert_eq!(
         resolve_effective_mtls_mode(&reversed, "default", &labels, 8080),
         MtlsMode::Strict,
