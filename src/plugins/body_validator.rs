@@ -353,9 +353,10 @@ impl BodyValidator {
                     n, ex_max
                 ));
             }
-            if let Some(multiple) = schema.get("multipleOf").and_then(|v| v.as_f64())
+            if let Some(divisor) = schema.get("multipleOf")
+                && let Some(multiple) = divisor.as_f64()
                 && multiple != 0.0
-                && (n % multiple).abs() > f64::EPSILON
+                && !value_is_multiple_of(data, divisor, n, multiple)
             {
                 return Err(format!("Value {} is not a multiple of {}", n, multiple));
             }
@@ -454,15 +455,21 @@ impl BodyValidator {
                 return Err(format!("Array has {} items, maximum is {}", arr.len(), max));
             }
             if schema.get("uniqueItems").and_then(|v| v.as_bool()) == Some(true) {
-                for i in 0..arr.len() {
-                    for j in (i + 1)..arr.len() {
-                        if arr[i] == arr[j] {
-                            return Err(format!(
-                                "Array items at index {} and {} are not unique",
-                                i, j
-                            ));
-                        }
+                // O(n) average uniqueness check: serde_json's `Value` implements
+                // `Hash`/`Eq` consistently (its `Map` hashes order-independently),
+                // so a hash set of element references detects the first duplicate
+                // with the same semantics as pairwise `Value` equality, without the
+                // O(n^2) blowup on attacker-controlled array breadth (finding #16).
+                let mut seen: HashMap<&Value, usize> =
+                    HashMap::with_capacity(arr.len().min(MAX_UNIQUE_ITEMS_PREALLOC));
+                for (j, item) in arr.iter().enumerate() {
+                    if let Some(&i) = seen.get(item) {
+                        return Err(format!(
+                            "Array items at index {} and {} are not unique",
+                            i, j
+                        ));
                     }
+                    seen.insert(item, j);
                 }
             }
         }
@@ -710,6 +717,14 @@ impl BodyValidator {
 /// DoS — without a cap, a tiny compressed payload can inflate into gigabytes and OOM
 /// the process.
 const DEFAULT_MAX_GRPC_DECOMPRESSED_SIZE: usize = 10 * 1024 * 1024;
+
+/// Upper bound on the initial capacity reserved for the `uniqueItems` hash set.
+/// The set still grows as needed for larger arrays; this only caps the single
+/// up-front reservation so a large declared array length cannot trigger one
+/// oversized allocation before any work is done (finding #16 defense-in-depth).
+/// The array length itself is already bounded by the request/response body-size
+/// limit, and the duplicate scan is O(n) average regardless of this value.
+const MAX_UNIQUE_ITEMS_PREALLOC: usize = 4096;
 
 fn parse_grpc_frame(
     body: &[u8],
@@ -1461,6 +1476,42 @@ fn is_self_closing_tag(bytes: &[u8], start_inclusive: usize, tag_end_exclusive: 
 
 fn is_xml_whitespace(byte: u8) -> bool {
     matches!(byte, b' ' | b'\t' | b'\r' | b'\n')
+}
+
+/// Returns the value of an integral JSON number as `i128`, or `None` when the
+/// value is not an integer that fits a signed/unsigned 64-bit integer (i.e. it
+/// is fractional or out of range and must be handled with float reasoning).
+fn json_integer_i128(v: &Value) -> Option<i128> {
+    v.as_i64()
+        .map(i128::from)
+        .or_else(|| v.as_u64().map(i128::from))
+}
+
+/// Evaluates JSON Schema `multipleOf` for a numeric instance (finding #65).
+///
+/// When both the instance value and the divisor are integral, exact integer
+/// modulo is used so neither float representation error nor a magnitude-blind
+/// absolute tolerance can flip the verdict (e.g. `u64::MAX` is correctly a
+/// multiple of 3, which the float path misjudges). Otherwise a magnitude-scaled
+/// relative tolerance is used, checking that the float remainder is near zero
+/// *or* near the divisor so values just under a clean multiple (e.g. 0.3 against
+/// `multipleOf: 0.1`, whose float remainder is ~0.0999…) are not wrongly
+/// rejected. `n`/`multiple` are the pre-extracted `f64` views of `data`/`divisor`.
+fn value_is_multiple_of(data: &Value, divisor: &Value, n: f64, multiple: f64) -> bool {
+    if let (Some(value_int), Some(divisor_int)) =
+        (json_integer_i128(data), json_integer_i128(divisor))
+        && divisor_int != 0
+    {
+        return value_int % divisor_int == 0;
+    }
+
+    // Float path: scale the tolerance by operand magnitude and allow a few ULPs
+    // of accumulated rounding. Accept when the remainder sits near 0 or near the
+    // divisor (the latter covers values just below an exact multiple).
+    let rem = (n % multiple).abs();
+    let abs_multiple = multiple.abs();
+    let tol = 4.0 * f64::EPSILON * n.abs().max(abs_multiple).max(1.0);
+    rem <= tol || (abs_multiple - rem).abs() <= tol
 }
 
 /// Validate common string formats (subset of JSON Schema format vocabulary).
