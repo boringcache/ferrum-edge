@@ -3707,10 +3707,13 @@ async fn serve_mesh_runtime(
     // Spawn the SPIFFE trust-bundle federation poller reconciler before the
     // apply task so the first slice apply observes whatever the poller has
     // already fetched. Unlike the old one-shot spawn, the reconciler watches
-    // slice updates: it starts pollers for federation endpoints added after
-    // startup, stops pollers for removed clusters, and retires a withdrawn
-    // cluster's federation store generation so stale poll results cannot keep
-    // being overlaid onto slice applies. No pollers run when
+    // accepted slice updates: it starts pollers for federation endpoints added
+    // after startup, stops pollers for removed clusters, and retires a
+    // withdrawn cluster's federation store generation so stale poll results
+    // cannot keep being overlaid onto slice applies. Reconcile is intentionally
+    // coupled to accepted slices, not merely received slices, so an invalid
+    // update rejected by the apply task cannot stop existing pollers or remove
+    // cached bundles still used by the live proxy config. No pollers run when
     // `FERRUM_MESH_FEDERATION_POLL_INTERVAL_SECONDS=0` or no remote cluster
     // carries a federation endpoint.
     let federation_poller_config = federation::FederationPollerConfig::from_env(
@@ -4944,27 +4947,24 @@ async fn apply_mesh_inbound_tls_reload(
     }
 }
 
-/// Reconcile the SPIFFE federation pollers against the live mesh slice. Mirrors
-/// [`start_remote_cluster_discovery_reconcile_task`]: on each slice update it
-/// re-derives the federation poll targets and starts/stops per-cluster pollers,
-/// so a post-startup `federation_endpoint` addition is honored and a withdrawn
-/// cluster's stale federated trust bundle is dropped (via
-/// `FederationStore::remove_cluster`, which bumps the revision the apply task
-/// watches).
+/// Reconcile the SPIFFE federation pollers against the latest accepted mesh
+/// slice. Destructive actions (stopping pollers / removing bundles) must not run
+/// from a merely received slice because the apply task may reject that slice and
+/// keep serving the previous accepted proxy config.
 fn start_federation_poller_reconcile_task(
     mesh_state: MeshRuntimeState,
     mut manager: federation::FederationPollerManager,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut updates = mesh_state.subscribe();
+        let mut updates = mesh_state.subscribe_applied();
         loop {
             if *shutdown_rx.borrow() {
                 manager.shutdown();
                 return;
             }
 
-            let snapshot = mesh_state.snapshot();
+            let snapshot = mesh_state.applied_snapshot();
             let multi_cluster = snapshot
                 .as_ref()
                 .as_ref()
