@@ -25,10 +25,105 @@ fn config(endpoint: &str) -> serde_json::Value {
     })
 }
 
+fn config_with_client_auth(endpoint: &str, method: &str) -> serde_json::Value {
+    json!({
+        "providers": [{
+            "introspection_endpoint": endpoint,
+            "client_auth": {
+                "method": method,
+                "client_id": "cid",
+                "client_secret": "shhh",
+                "private_key_pem": "not-a-real-pem"
+            }
+        }]
+    })
+}
+
+fn discovery_config_with_client_auth(discovery_url: &str, method: &str) -> serde_json::Value {
+    json!({
+        "providers": [{
+            "discovery_url": discovery_url,
+            "client_auth": {
+                "method": method,
+                "client_id": "cid",
+                "client_secret": "shhh"
+            }
+        }]
+    })
+}
+
 #[test]
 fn new_rejects_empty_providers() {
     assert!(
         Oauth2Introspection::new(&json!({"providers": []}), PluginHttpClient::default()).is_err()
+    );
+}
+
+#[test]
+fn new_rejects_credentialed_client_auth_for_remote_http_endpoint() {
+    // The invalid private-key PEM is intentional: private_key_jwt must fail on
+    // the plaintext remote endpoint before any secret material is parsed.
+    for method in [
+        "client_secret_basic",
+        "client_secret_post",
+        "private_key_jwt",
+    ] {
+        let err = Oauth2Introspection::new(
+            &config_with_client_auth("http://idp.internal/introspect", method),
+            PluginHttpClient::default(),
+        )
+        .err()
+        .expect("remote http endpoint should reject credentialed auth");
+        assert!(
+            err.contains("requires an https"),
+            "method {method} produced unexpected error: {err}"
+        );
+    }
+}
+
+#[test]
+fn new_accepts_credentialed_client_auth_for_remote_https_endpoint() {
+    for method in ["client_secret_basic", "client_secret_post"] {
+        assert!(
+            Oauth2Introspection::new(
+                &config_with_client_auth("https://idp.internal/introspect", method),
+                PluginHttpClient::default(),
+            )
+            .is_ok(),
+            "method {method} should accept remote https endpoint"
+        );
+    }
+}
+
+#[test]
+fn new_accepts_credentialed_client_auth_for_loopback_http_endpoint() {
+    for endpoint in [
+        "http://localhost:9000/introspect",
+        "http://127.0.0.1:9000/introspect",
+        "http://[::1]:9000/introspect",
+    ] {
+        assert!(
+            Oauth2Introspection::new(
+                &config_with_client_auth(endpoint, "client_secret_basic"),
+                PluginHttpClient::default(),
+            )
+            .is_ok(),
+            "loopback http endpoint {endpoint} should be accepted"
+        );
+    }
+}
+
+#[test]
+fn new_accepts_credentialed_client_auth_with_discovery_url() {
+    assert!(
+        Oauth2Introspection::new(
+            &discovery_config_with_client_auth(
+                "https://issuer.example.com/.well-known/openid-configuration",
+                "client_secret_basic",
+            ),
+            PluginHttpClient::default(),
+        )
+        .is_ok()
     );
 }
 
