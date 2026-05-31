@@ -3,8 +3,10 @@ use ferrum_edge::consumer_index::ConsumerIndex;
 use ferrum_edge::identity::spiffe::{SpiffeId, spiffe_id_to_san};
 use ferrum_edge::plugins::mesh::spiffe_identity::SpiffeIdentity;
 use ferrum_edge::plugins::{
-    HTTP_FAMILY_AND_STREAM_PROTOCOLS, Plugin, RequestContext, StreamConnectionContext, priority,
+    HTTP_FAMILY_AND_STREAM_PROTOCOLS, Plugin, PluginResult, RequestContext,
+    StreamConnectionContext, priority,
 };
+use rcgen::string::Ia5String;
 use rcgen::{CertificateParams, KeyPair, SanType};
 use serde_json::json;
 use std::sync::Arc;
@@ -20,6 +22,18 @@ fn build_cert(spiffe_uri: Option<&str>, dns: Option<&str>) -> Vec<u8> {
     if let Some(dns_name) = dns {
         params.subject_alt_names.push(SanType::DnsName(
             rcgen::string::Ia5String::try_from(dns_name.to_string()).unwrap(),
+        ));
+    }
+    let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    let cert = params.self_signed(&key_pair).unwrap();
+    cert.der().to_vec()
+}
+
+fn build_cert_with_uri_sans(uris: &[&str]) -> Vec<u8> {
+    let mut params = CertificateParams::default();
+    for uri in uris {
+        params.subject_alt_names.push(SanType::URI(
+            Ia5String::try_from((*uri).to_string()).unwrap(),
         ));
     }
     let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
@@ -112,6 +126,30 @@ async fn test_http_request_ignores_invalid_der() {
 }
 
 #[tokio::test]
+async fn test_http_request_rejects_duplicate_spiffe_uri_sans() {
+    let cert_der = build_cert_with_uri_sans(&[
+        "spiffe://prod.example.com/ns/api/sa/default",
+        "spiffe://prod.example.com/ns/admin/sa/default",
+    ]);
+    let plugin = SpiffeIdentity::new(&json!({})).unwrap();
+    let mut ctx = RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
+    ctx.tls_client_cert_der = Some(Arc::new(cert_der));
+
+    let result = plugin.on_request_received(&mut ctx).await;
+
+    match result {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 403);
+            assert!(body.contains("invalid SPIFFE identity"));
+        }
+        other => panic!("expected duplicate SPIFFE URI SANs to reject, got {other:?}"),
+    }
+    assert!(ctx.peer_spiffe_id.is_none());
+}
+
+#[tokio::test]
 async fn test_http_request_preserves_existing_spiffe_id() {
     let cert_der = build_cert(Some("spiffe://prod.example.com/ns/new/sa/default"), None);
     let existing = SpiffeId::new("spiffe://prod.example.com/ns/existing/sa/default").unwrap();
@@ -143,6 +181,27 @@ async fn test_stream_connect_extracts_spiffe_metadata() {
             .map(String::as_str),
         Some("spiffe://prod.example.com/ns/tcp/sa/default")
     );
+}
+
+#[tokio::test]
+async fn test_stream_connect_rejects_duplicate_spiffe_uri_sans() {
+    let cert_der = build_cert_with_uri_sans(&[
+        "spiffe://prod.example.com/ns/tcp/sa/default",
+        "spiffe://prod.example.com/ns/admin/sa/default",
+    ]);
+    let plugin = SpiffeIdentity::new(&json!({})).unwrap();
+    let mut ctx = empty_stream_ctx(Some(cert_der));
+
+    let result = plugin.on_stream_connect(&mut ctx).await;
+
+    assert!(matches!(
+        result,
+        PluginResult::Reject {
+            status_code: 403,
+            ..
+        }
+    ));
+    assert!(ctx.metadata.is_none());
 }
 
 #[tokio::test]

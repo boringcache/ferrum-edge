@@ -9,14 +9,14 @@
 //! `SanType::URI`; rcgen handles the IA5String wrapping.
 //!
 //! On the **verify** side we parse the peer certificate with `x509-parser`
-//! and walk the SAN extension's `general_names` looking for `URI` entries
-//! whose value parses as a [`SpiffeId`]. Per the SPIFFE X.509-SVID spec §4.1 an
-//! SVID has exactly one SPIFFE ID, so `extract_spiffe_id_from_parsed` itself
-//! enforces that rule — it REJECTS a certificate carrying more than one
-//! `spiffe://` URI rather than silently picking the first. No upstream layer
-//! does this: the chain verifier (`tls/spiffe.rs`) is chain-only and neither
-//! rustls nor x509-parser enforces the single-URI-SAN rule. A single
-//! `spiffe://` URI alongside non-SPIFFE SANs (e.g. a DNS SAN) is accepted.
+//! and walk the SAN extension's `general_names` looking for `URI` entries.
+//! Per the SPIFFE X.509-SVID spec §4.1 an SVID has exactly one URI SAN and that
+//! URI must contain the SPIFFE ID, so `extract_spiffe_id_from_parsed` itself
+//! enforces that rule — it REJECTS a certificate carrying more than one URI SAN
+//! rather than silently picking the first SPIFFE URI. No upstream layer does
+//! this: the chain verifier (`tls/spiffe.rs`) is chain-only and neither rustls
+//! nor x509-parser enforces the single-URI-SAN rule. A single `spiffe://` URI
+//! alongside non-URI SANs (e.g. a DNS SAN) is accepted.
 
 use rcgen::SanType;
 use rcgen::string::Ia5String;
@@ -32,8 +32,8 @@ pub enum UriSanError {
     NoSanExtension,
     #[error("certificate has no SPIFFE URI SAN")]
     NoSpiffeUri,
-    #[error("certificate has {count} SPIFFE URI SANs; an SVID must have exactly one")]
-    MultipleSpiffeUris { count: usize },
+    #[error("certificate has {count} URI SANs; an X.509-SVID must have exactly one")]
+    MultipleUriSans { count: usize },
     #[error("SPIFFE URI SAN '{uri}' is invalid: {source}")]
     InvalidSpiffeId {
         uri: String,
@@ -77,18 +77,20 @@ pub fn extract_spiffe_id_from_cert(cert_der: &[u8]) -> Result<SpiffeId, UriSanEr
 pub fn extract_spiffe_id_from_parsed(cert: &X509Certificate<'_>) -> Result<SpiffeId, UriSanError> {
     let mut saw_san = false;
     let mut first_spiffe_uri: Option<String> = None;
+    let mut uri_san_count = 0usize;
     let mut spiffe_uri_count = 0usize;
 
     for ext in cert.extensions() {
         if let ParsedExtension::SubjectAlternativeName(san) = ext.parsed_extension() {
             saw_san = true;
             for name in &san.general_names {
-                if let GeneralName::URI(uri) = name
-                    && uri.starts_with("spiffe://")
-                {
-                    spiffe_uri_count += 1;
-                    if first_spiffe_uri.is_none() {
-                        first_spiffe_uri = Some((*uri).to_string());
+                if let GeneralName::URI(uri) = name {
+                    uri_san_count += 1;
+                    if uri.starts_with("spiffe://") {
+                        spiffe_uri_count += 1;
+                        if first_spiffe_uri.is_none() {
+                            first_spiffe_uri = Some((*uri).to_string());
+                        }
                     }
                 }
             }
@@ -98,13 +100,14 @@ pub fn extract_spiffe_id_from_parsed(cert: &X509Certificate<'_>) -> Result<Spiff
     if !saw_san {
         return Err(UriSanError::NoSanExtension);
     }
-    if spiffe_uri_count > 1 {
-        // SPIFFE X.509-SVID §4.1: an SVID carries exactly one SPIFFE ID. Reject
-        // rather than silently picking the first, so a misconfigured (but
-        // trusted) CA leaf bearing two `spiffe://` URIs cannot have its identity
-        // attributed differently here than by a peer mesh implementation.
-        return Err(UriSanError::MultipleSpiffeUris {
-            count: spiffe_uri_count,
+    if spiffe_uri_count > 0 && uri_san_count > 1 {
+        // SPIFFE X.509-SVID §4.1: an SVID carries exactly one URI SAN, and
+        // that URI contains the SPIFFE ID. Reject rather than silently picking
+        // the first SPIFFE URI, so a trusted-but-misconfigured leaf with a
+        // second URI SAN cannot be attributed differently here than by a peer
+        // mesh implementation.
+        return Err(UriSanError::MultipleUriSans {
+            count: uri_san_count,
         });
     }
     let uri = first_spiffe_uri.ok_or(UriSanError::NoSpiffeUri)?;
@@ -156,7 +159,19 @@ mod tests {
         ]);
         assert!(matches!(
             extract_spiffe_id_from_cert(&der),
-            Err(UriSanError::MultipleSpiffeUris { count: 2 })
+            Err(UriSanError::MultipleUriSans { count: 2 })
+        ));
+    }
+
+    #[test]
+    fn rejects_spiffe_uri_alongside_other_uri_san() {
+        let der = cert_with_sans(vec![
+            uri_san("spiffe://prod.example.com/ns/a/sa/legit"),
+            uri_san("https://svc.example.com/identity"),
+        ]);
+        assert!(matches!(
+            extract_spiffe_id_from_cert(&der),
+            Err(UriSanError::MultipleUriSans { count: 2 })
         ));
     }
 
