@@ -4,9 +4,22 @@
 //! Provides frame-level observability without requiring packet captures.
 //!
 //! Each frame log entry includes: proxy_id, connection_id, direction,
-//! frame type, payload size in bytes, and an optional payload preview.
+//! frame type, payload size in bytes, and an optional payload fingerprint.
 //!
 //! This plugin never transforms or drops frames — it is purely observational.
+//!
+//! ## Payload privacy
+//!
+//! WebSocket application frames routinely carry credentials — bearer tokens,
+//! session cookies, API keys (e.g. a GraphQL-over-WS `connection_init` payload
+//! with `{"Authorization":"Bearer ..."}` or a custom auth handshake). To honor
+//! the project invariant "do not log secrets", this plugin NEVER logs raw frame
+//! contents. When `include_payload_preview` is enabled, the `preview` field
+//! carries only a non-reversible fingerprint of the form
+//! `sha256:<12 hex chars> len=<bytes>` (and `+` after the digest when only a
+//! prefix of the payload was hashed). The digest lets operators correlate
+//! identical payloads across frames without disclosing plaintext; the length is
+//! always also available as the dedicated `size_bytes` field.
 //!
 //! Config:
 //! ```json
@@ -79,7 +92,9 @@ impl WsFrameLogging {
             None => false,
         };
 
-        // Clamp to 64 KiB to prevent OOM from hex_encode on large binary frames
+        // Clamp to 64 KiB to bound the per-frame hashing work on the WS hot path.
+        // This is the number of leading payload bytes folded into the fingerprint
+        // digest; the raw bytes are never logged.
         const MAX_PREVIEW_BYTES: usize = 65_536;
         let payload_preview_bytes = match config.get("payload_preview_bytes") {
             Some(v) => v.as_u64().ok_or_else(|| {
@@ -132,63 +147,53 @@ impl WsFrameLogging {
         }
     }
 
-    /// Build a payload preview string, borrowing from the message where possible.
-    /// Returns None when previews are disabled or the message type has no payload.
+    /// Build a non-reversible payload fingerprint for the frame.
     ///
-    /// For text: truncates at a UTF-8 char boundary at or before `payload_preview_bytes`.
-    /// For binary: hex-encodes the first `payload_preview_bytes` bytes.
-    fn payload_preview<'a>(&self, message: &'a Message) -> Option<PreviewStr<'a>> {
+    /// Returns `None` when previews are disabled or the message type has no
+    /// application payload (only Text and Binary carry one).
+    ///
+    /// SECURITY: WebSocket payloads routinely carry credentials (bearer tokens,
+    /// cookies, API keys). We therefore NEVER emit the raw bytes. Instead we
+    /// fold up to `payload_preview_bytes` leading bytes into a SHA-256 digest
+    /// and emit a short, non-reversible fingerprint:
+    ///   `sha256:<12 hex chars> len=<total payload bytes>`
+    /// A trailing `+` is appended after the digest hex when only a prefix of the
+    /// payload was hashed (payload longer than `payload_preview_bytes`), so the
+    /// fingerprint is unambiguous about partial coverage. This gives operators
+    /// frame-correlation signal (identical payloads share a digest) and size
+    /// without disclosing plaintext. See the module-level "Payload privacy" note.
+    fn payload_preview(&self, message: &Message) -> Option<String> {
         if !self.include_payload_preview {
             return None;
         }
-        match message {
-            Message::Text(s) => {
-                if s.len() <= self.payload_preview_bytes {
-                    // Borrow the original string — zero allocation
-                    Some(PreviewStr::Borrowed(s.as_str()))
-                } else {
-                    // Truncate at a UTF-8 char boundary at or before the byte limit
-                    let mut end = self.payload_preview_bytes;
-                    while end > 0 && !s.is_char_boundary(end) {
-                        end -= 1;
-                    }
-                    Some(PreviewStr::Borrowed(&s[..end]))
-                }
-            }
-            Message::Binary(b) => {
-                let len = b.len().min(self.payload_preview_bytes);
-                Some(PreviewStr::Owned(hex_encode(&b[..len])))
-            }
-            _ => None,
-        }
+        let (full_len, bytes): (usize, &[u8]) = match message {
+            Message::Text(s) => (s.len(), s.as_bytes()),
+            Message::Binary(b) => (b.len(), b.as_ref()),
+            _ => return None,
+        };
+        let hashed_len = full_len.min(self.payload_preview_bytes);
+        let truncated = hashed_len < full_len;
+        Some(payload_fingerprint(
+            &bytes[..hashed_len],
+            full_len,
+            truncated,
+        ))
     }
 }
 
-/// A preview string that borrows from the message when possible (text),
-/// or owns a new allocation when required (binary hex encoding).
-enum PreviewStr<'a> {
-    Borrowed(&'a str),
-    Owned(String),
-}
-
-impl std::fmt::Display for PreviewStr<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            PreviewStr::Borrowed(s) => f.write_str(s),
-            PreviewStr::Owned(s) => f.write_str(s),
-        }
-    }
-}
-
-/// Simple hex encoding for binary payload previews.
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push(HEX[(b >> 4) as usize] as char);
-        s.push(HEX[(b & 0x0f) as usize] as char);
-    }
-    s
+/// Render a non-reversible payload fingerprint string.
+///
+/// `hashed` is the prefix of the payload that is folded into the digest,
+/// `full_len` is the total payload length reported to operators, and
+/// `truncated` indicates the digest only covers a prefix of the payload.
+fn payload_fingerprint(hashed: &[u8], full_len: usize, truncated: bool) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(hashed);
+    // 6 bytes -> 12 lowercase hex chars: enough entropy to correlate frames
+    // while staying compact in log lines and non-reversible.
+    let prefix = hex::encode(&digest[..6]);
+    let marker = if truncated { "+" } else { "" };
+    format!("sha256:{prefix}{marker} len={full_len}")
 }
 
 /// Emit a structured log at the given tracing level.
@@ -425,5 +430,180 @@ mod tests {
 
         let bin = Message::Binary(vec![1u8, 2, 3, 4, 5].into());
         assert_eq!(WsFrameLogging::frame_size(&bin), 5);
+    }
+
+    /// Build a plugin with payload previews enabled and a generous byte budget.
+    fn preview_plugin(preview_bytes: u64) -> WsFrameLogging {
+        WsFrameLogging::new(&serde_json::json!({
+            "include_payload_preview": true,
+            "payload_preview_bytes": preview_bytes,
+        }))
+        .expect("valid config")
+    }
+
+    /// Regression for finding #23: an auth-bearing Text frame must NOT have its
+    /// raw payload emitted in the preview. The preview must be a non-reversible
+    /// fingerprint, never the bearer token, cookie, or JSON contents.
+    #[test]
+    fn text_preview_does_not_leak_raw_auth_payload() {
+        let plugin = preview_plugin(4096);
+        let secret = "Bearer sk-live-supersecret-token-AKIA1234567890";
+        let raw = format!("{{\"type\":\"connection_init\",\"Authorization\":\"{secret}\"}}");
+        let msg = Message::Text(raw.clone().into());
+
+        let preview = plugin.payload_preview(&msg).expect("preview present");
+
+        // The fingerprint must be the only thing emitted.
+        assert!(
+            preview.starts_with("sha256:"),
+            "preview must be a sha256 fingerprint, got: {preview}"
+        );
+        // None of the sensitive substrings (nor the raw payload) may appear.
+        for leaked in [
+            secret,
+            "supersecret",
+            "Bearer",
+            "Authorization",
+            "connection_init",
+            raw.as_str(),
+        ] {
+            assert!(
+                !preview.contains(leaked),
+                "preview leaked sensitive content {leaked:?}: {preview}"
+            );
+        }
+        // Length signal is preserved.
+        assert!(
+            preview.contains(&format!("len={}", raw.len())),
+            "preview must report payload length, got: {preview}"
+        );
+    }
+
+    /// A binary frame must not be hex-dumped verbatim either — only fingerprinted.
+    #[test]
+    fn binary_preview_does_not_leak_raw_hex() {
+        let plugin = preview_plugin(4096);
+        // Bytes that, if hex-encoded as the old code did, would appear literally.
+        let payload: Vec<u8> = vec![0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe];
+        let msg = Message::Binary(payload.clone().into());
+
+        let preview = plugin.payload_preview(&msg).expect("preview present");
+
+        assert!(preview.starts_with("sha256:"), "got: {preview}");
+        // The old verbatim hex dump ("deadbeefcafe") must not be present.
+        assert!(
+            !preview.contains("deadbeefcafe"),
+            "binary payload hex leaked: {preview}"
+        );
+        assert!(
+            preview.contains(&format!("len={}", payload.len())),
+            "got: {preview}"
+        );
+    }
+
+    /// Identical payloads must produce identical fingerprints so operators can
+    /// still correlate frames; different payloads must differ.
+    #[test]
+    fn fingerprint_is_deterministic_for_correlation() {
+        let plugin = preview_plugin(4096);
+        let a1 = plugin
+            .payload_preview(&Message::Text("hello world".into()))
+            .unwrap();
+        let a2 = plugin
+            .payload_preview(&Message::Text("hello world".into()))
+            .unwrap();
+        let b = plugin
+            .payload_preview(&Message::Text("different".into()))
+            .unwrap();
+
+        assert_eq!(a1, a2, "identical payloads must share a fingerprint");
+        assert_ne!(a1, b, "different payloads must differ");
+    }
+
+    /// When the payload is longer than `payload_preview_bytes`, only a prefix is
+    /// hashed and the fingerprint must flag that with a trailing `+`, while still
+    /// reporting the full payload length.
+    #[test]
+    fn truncated_payload_is_flagged_and_reports_full_len() {
+        let plugin = preview_plugin(8);
+        let raw = "0123456789abcdef"; // 16 bytes, budget is 8
+        let preview = plugin
+            .payload_preview(&Message::Text(raw.into()))
+            .expect("preview present");
+
+        assert!(
+            preview.contains('+'),
+            "truncated digest must carry a '+' marker, got: {preview}"
+        );
+        assert!(
+            preview.contains(&format!("len={}", raw.len())),
+            "full payload length must be reported, got: {preview}"
+        );
+        // Still no raw content.
+        assert!(!preview.contains(raw), "raw content leaked: {preview}");
+
+        // A payload at or below the budget must NOT be flagged as truncated.
+        let small = plugin
+            .payload_preview(&Message::Text("12345678".into()))
+            .unwrap();
+        assert!(
+            !small.contains('+'),
+            "non-truncated digest must not carry '+': {small}"
+        );
+    }
+
+    /// Previews are off by default and when explicitly disabled.
+    #[test]
+    fn preview_disabled_returns_none() {
+        let off = WsFrameLogging::new(&serde_json::json!({})).expect("valid config");
+        assert!(
+            off.payload_preview(&Message::Text("anything".into()))
+                .is_none()
+        );
+
+        let explicit_off = WsFrameLogging::new(&serde_json::json!({
+            "include_payload_preview": false,
+        }))
+        .expect("valid config");
+        assert!(
+            explicit_off
+                .payload_preview(&Message::Binary(vec![1, 2, 3].into()))
+                .is_none()
+        );
+    }
+
+    /// Control frames (ping/pong/close) carry no application payload preview.
+    #[test]
+    fn control_frames_have_no_preview() {
+        let plugin = preview_plugin(4096);
+        assert!(
+            plugin
+                .payload_preview(&Message::Ping(vec![1, 2].into()))
+                .is_none()
+        );
+        assert!(
+            plugin
+                .payload_preview(&Message::Pong(vec![3, 4].into()))
+                .is_none()
+        );
+        assert!(plugin.payload_preview(&Message::Close(None)).is_none());
+    }
+
+    /// The fingerprint helper format is stable: `sha256:<12 hex> len=<n>`.
+    #[test]
+    fn fingerprint_format_shape() {
+        let fp = payload_fingerprint(b"abc", 3, false);
+        assert!(fp.starts_with("sha256:"), "got: {fp}");
+        assert!(fp.ends_with("len=3"), "got: {fp}");
+        // 12 lowercase hex chars between "sha256:" and " len=".
+        let hex_part = fp
+            .strip_prefix("sha256:")
+            .and_then(|s| s.split(' ').next())
+            .expect("hex segment");
+        assert_eq!(hex_part.len(), 12, "expected 12 hex chars, got: {hex_part}");
+        assert!(
+            hex_part.bytes().all(|b| b.is_ascii_hexdigit()),
+            "non-hex chars in fingerprint: {hex_part}"
+        );
     }
 }
