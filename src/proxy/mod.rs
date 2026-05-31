@@ -1581,10 +1581,10 @@ impl GrpcStreamingProbeRecorder {
             return;
         }
         let recorder = Arc::clone(self);
-        let _ = tokio::spawn(async move {
+        std::mem::drop(tokio::spawn(async move {
             tokio::time::sleep(timeout).await;
             recorder.record_neutral_if_upload_still_open();
-        });
+        }));
     }
 
     fn record_neutral_if_upload_still_open(&self) {
