@@ -186,9 +186,25 @@ impl CompressionPlugin {
     ///
     /// Selection: highest q-value wins. Ties broken by server preference order
     /// (the `algorithms` config array). Wildcard `*` matches all configured
-    /// algorithms at whatever q-value `*` carries.
+    /// algorithms at whatever q-value `*` carries, but per RFC 9110 §12.5.3 a
+    /// more specific entry takes precedence over `*` — so an explicit
+    /// `gzip;q=0` excludes gzip even when `*` is present with `q>0`.
+    ///
+    /// This is a two-pass parse rather than a single fused loop: pass 1 records
+    /// each codec's explicit q-value (when its exact token appears, capturing
+    /// `q=0` refusals) and the wildcard q-value; pass 2 resolves each configured
+    /// algorithm's effective q (explicit wins over wildcard) and applies the
+    /// `q <= 0` not-acceptable gate and the highest-q / server-preference
+    /// tie-break.
     fn select_algorithm(&self, accept_encoding: &str) -> Option<Algorithm> {
-        let mut best: Option<(Algorithm, f32, usize)> = None; // (algo, q, server_pref_index)
+        // Pass 1: scan every token once, recording the explicit q-value for each
+        // codec we support and the wildcard q-value. `None` means "no explicit
+        // entry for this codec". Later duplicate tokens overwrite earlier ones
+        // (last value wins), matching the previous single-loop behaviour for
+        // repeated identical tokens.
+        let mut explicit_gzip: Option<f32> = None;
+        let mut explicit_br: Option<f32> = None;
+        let mut wildcard: Option<f32> = None;
 
         for part in accept_encoding.split(',') {
             let part = part.trim();
@@ -197,25 +213,37 @@ impl CompressionPlugin {
             }
 
             let (encoding, quality) = parse_encoding_quality(part);
-            if quality <= 0.0 {
+            if encoding.eq_ignore_ascii_case("gzip") {
+                explicit_gzip = Some(quality);
+            } else if encoding.eq_ignore_ascii_case("br") {
+                explicit_br = Some(quality);
+            } else if encoding == "*" {
+                wildcard = Some(quality);
+            }
+        }
+
+        // Pass 2: resolve each configured algorithm's effective q (its explicit
+        // entry wins over the wildcard) and pick the best one.
+        let mut best: Option<(Algorithm, f32, usize)> = None; // (algo, q, server_pref_index)
+        for (pref_idx, &algo) in self.config.algorithms.iter().enumerate() {
+            let explicit = match algo {
+                Algorithm::Gzip => explicit_gzip,
+                Algorithm::Brotli => explicit_br,
+            };
+            // Explicit entry takes precedence over the wildcard fallback.
+            let effective_q = match explicit.or(wildcard) {
+                Some(q) => q,
+                None => continue,
+            };
+            if effective_q <= 0.0 {
                 continue;
             }
 
-            for (pref_idx, &algo) in self.config.algorithms.iter().enumerate() {
-                let matches = match algo {
-                    Algorithm::Gzip => encoding.eq_ignore_ascii_case("gzip"),
-                    Algorithm::Brotli => encoding.eq_ignore_ascii_case("br"),
-                };
-                if !matches && encoding != "*" {
-                    continue;
-                }
-
-                let dominated = best.is_some_and(|(_, best_q, best_pref)| {
-                    quality < best_q || (quality == best_q && pref_idx >= best_pref)
-                });
-                if !dominated {
-                    best = Some((algo, quality, pref_idx));
-                }
+            let dominated = best.is_some_and(|(_, best_q, best_pref)| {
+                effective_q < best_q || (effective_q == best_q && pref_idx >= best_pref)
+            });
+            if !dominated {
+                best = Some((algo, effective_q, pref_idx));
             }
         }
 
@@ -272,9 +300,14 @@ impl CompressionPlugin {
     }
 
     fn decompress_gzip(&self, data: &[u8], max_size: usize) -> Result<Vec<u8>, String> {
-        use flate2::read::GzDecoder;
+        use flate2::read::MultiGzDecoder;
 
-        let mut decoder = GzDecoder::new(data);
+        // `MultiGzDecoder` (not `GzDecoder`) decodes every member of a
+        // concatenated multi-member gzip stream (RFC 1952 §2.2 permits
+        // concatenation). `GzDecoder` stops after the first member and would
+        // silently truncate a valid multi-member request body. The
+        // `read_with_limit` cap still bounds total expansion.
+        let mut decoder = MultiGzDecoder::new(data);
         read_with_limit(&mut decoder, max_size, "gzip")
     }
 
@@ -412,6 +445,14 @@ fn read_with_limit(
 }
 
 /// Parse a single `Accept-Encoding` token like `gzip;q=0.8` or `br`.
+///
+/// Returns the encoding token and its effective quality value, clamped to
+/// `0.0..=1.0` per RFC 9110 §12.4.2. A `q=`/`Q=` parameter that is present but
+/// unparseable (e.g. `gzip;q=abc`, `gzip;q=`) or non-finite (e.g. `gzip;q=NaN`,
+/// `gzip;q=inf`) is treated as **not acceptable** (`q = 0.0`) rather than
+/// silently defaulting to the maximum preference of `1.0` — a malformed weight
+/// must not let a codec win the selection or poison the tie-break math. A token
+/// with no `q=` parameter at all defaults to `q = 1.0` as the spec requires.
 fn parse_encoding_quality(token: &str) -> (&str, f32) {
     // Split on ';' and look for q= parameter
     if let Some(semi_idx) = token.find(';') {
@@ -423,8 +464,18 @@ fn parse_encoding_quality(token: &str) -> (&str, f32) {
             if let Some(stripped) = param
                 .strip_prefix("q=")
                 .or_else(|| param.strip_prefix("Q="))
-                && let Ok(q) = stripped.trim().parse::<f32>()
             {
+                // A q-parameter is present: its value is authoritative. Parse
+                // and clamp to [0.0, 1.0]; reject unparseable/non-finite values
+                // as q=0.0 (not acceptable). Do NOT fall through to the q=1.0
+                // default — that is only for tokens with no q-parameter.
+                let q = stripped
+                    .trim()
+                    .parse::<f32>()
+                    .ok()
+                    .filter(|value| value.is_finite())
+                    .map(|value| value.clamp(0.0, 1.0))
+                    .unwrap_or(0.0);
                 return (encoding, q);
             }
         }
@@ -458,6 +509,23 @@ impl Plugin for CompressionPlugin {
 
     fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
         self.config.decompress_request && ctx.headers.contains_key("content-encoding")
+    }
+
+    /// Buffer the request body before `before_proxy` runs so the decompression
+    /// can be validated (and a malformed body cleanly rejected) before the
+    /// Content-Encoding/Content-Length headers are stripped. Without this the
+    /// body would only become available in `transform_request_body`, which
+    /// cannot reject. This stays gated by `should_buffer_request_body`, so only
+    /// requests that actually carry a `Content-Encoding` header buffer early.
+    fn requires_request_body_before_before_proxy(&self) -> bool {
+        self.config.decompress_request
+    }
+
+    /// The validation in `before_proxy` decompresses arbitrary (possibly
+    /// non-UTF-8) bytes, so it reads `ctx.request_body_bytes` rather than the
+    /// UTF-8 `ctx.metadata["request_body"]` view.
+    fn needs_request_body_bytes(&self) -> bool {
+        self.config.decompress_request
     }
 
     fn requires_response_body_buffering(&self) -> bool {
@@ -508,6 +576,39 @@ impl Plugin for CompressionPlugin {
             && let Some(ce) = headers.get("content-encoding")
             && let Some(encoding) = supported_request_encoding(ce)
         {
+            // Validate that the body actually decompresses BEFORE stripping the
+            // Content-Encoding/Content-Length headers. Stripping is gated on
+            // successful decompression so we never forward a body whose headers
+            // and contents disagree (RFC 9110 §8.4): if we removed
+            // Content-Encoding but left the body compressed (because decode
+            // later failed in transform_request_body, which has no way to
+            // reject), the backend would receive a gzip/brotli blob mislabeled
+            // as plaintext and emit confusing 400s / mis-parsed data instead of
+            // a clean gateway rejection.
+            //
+            // The body is buffered before before_proxy (see
+            // `requires_request_body_before_before_proxy`) and exposed binary
+            // safe via `ctx.request_body_bytes`. We only have it on the buffered
+            // request path; if it is absent (e.g. an HBONE CONNECT tunnel where
+            // pre-before_proxy buffering is skipped) we fall back to the prior
+            // best-effort behaviour and let transform_request_body handle it.
+            if let Some(body) = ctx.request_body_bytes.as_ref()
+                && !body.is_empty()
+                && let Err(e) =
+                    self.decompress(encoding, body, self.config.max_decompressed_request_size)
+            {
+                // Reject with a protocol-appropriate gateway error. The proxy
+                // normalizes this to a trailers-only gRPC error for
+                // application/grpc and a plain 400 otherwise. The detailed
+                // cause is logged, not leaked to the client.
+                warn!("compression: rejecting request with undecodable {encoding} body: {e}");
+                return PluginResult::Reject {
+                    status_code: 400,
+                    body: r#"{"error":"Malformed compressed request body"}"#.to_string(),
+                    headers: HashMap::new(),
+                };
+            }
+
             ctx.metadata.insert(
                 "compression:request_encoding".to_string(),
                 encoding.to_string(),
@@ -641,6 +742,13 @@ impl Plugin for CompressionPlugin {
                 Some(decompressed)
             }
             Err(e) => {
+                // On the normal buffered path `before_proxy` already validated
+                // decodability and rejected a malformed body before stripping
+                // Content-Encoding, so this branch is only reachable on the rare
+                // path where the body was not buffered before before_proxy (e.g.
+                // an HBONE CONNECT tunnel). There we cannot reject from this
+                // hook, so we leave the body unchanged (returning `None`) as a
+                // best-effort fallback.
                 warn!("compression: request decompression failed: {e}");
                 None
             }
