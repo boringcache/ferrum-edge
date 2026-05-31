@@ -85,6 +85,12 @@ struct CacheEntry {
     embedding: Option<EmbeddingPoint>,
 }
 
+struct CachedResponse {
+    status_code: u16,
+    headers: HashMap<String, String>,
+    body: Bytes,
+}
+
 #[derive(Debug, Clone)]
 struct SemanticConfig {
     provider: EmbeddingProvider,
@@ -240,7 +246,7 @@ pub struct AiSemanticCache {
     /// Local in-memory cache.
     cache: Arc<DashMap<String, CacheEntry>>,
     /// Immutable HNSW snapshot for semantic lookup.
-    vector_index: ArcSwapOption<VectorSnapshot>,
+    vector_index: Arc<ArcSwapOption<VectorSnapshot>>,
     /// Total approximate size of all cached entries.
     total_size: Arc<AtomicUsize>,
     /// Optional Redis client for centralized caching.
@@ -248,9 +254,11 @@ pub struct AiSemanticCache {
     /// Counter for periodic cleanup scheduling.
     last_cleanup: AtomicU64,
     /// Last time the semantic vector snapshot was rebuilt.
-    last_vector_rebuild: AtomicU64,
+    last_vector_rebuild: Arc<AtomicU64>,
     /// Whether local semantic entries changed since the latest vector rebuild.
-    vector_index_dirty: AtomicBool,
+    vector_index_dirty: Arc<AtomicBool>,
+    /// Guards detached HNSW rebuild scheduling.
+    vector_index_rebuild_running: Arc<AtomicBool>,
 }
 
 /// Serializable form of CacheEntry for Redis storage.
@@ -321,12 +329,13 @@ impl AiSemanticCache {
             semantic,
             http_client,
             cache: Arc::new(DashMap::new()),
-            vector_index: ArcSwapOption::empty(),
+            vector_index: Arc::new(ArcSwapOption::empty()),
             total_size: Arc::new(AtomicUsize::new(0)),
             redis_client,
             last_cleanup: AtomicU64::new(0),
-            last_vector_rebuild: AtomicU64::new(0),
-            vector_index_dirty: AtomicBool::new(false),
+            last_vector_rebuild: Arc::new(AtomicU64::new(0)),
+            vector_index_dirty: Arc::new(AtomicBool::new(false)),
+            vector_index_rebuild_running: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -659,7 +668,7 @@ impl AiSemanticCache {
         &self,
         scope_key: &str,
         embedding: &EmbeddingPoint,
-    ) -> Option<(CacheEntry, f32, String)> {
+    ) -> Option<(CachedResponse, f32, String)> {
         let semantic = self.semantic.as_ref()?;
         let snapshot = self.vector_index.load_full()?;
         let mut search = HnswSearch::default();
@@ -670,6 +679,10 @@ impl AiSemanticCache {
             if similarity < semantic.similarity_threshold {
                 break;
             }
+            // The HNSW snapshot is shared by all scopes, so nearest-neighbor
+            // search can surface other tenants/models first. Keep the exact
+            // scope check; the tradeoff is a safe false miss when same-scope
+            // candidates fall outside the configured search window.
             if item.value.scope_key != scope_key {
                 continue;
             }
@@ -679,7 +692,15 @@ impl AiSemanticCache {
             if now.duration_since(entry.inserted_at) >= self.ttl {
                 continue;
             }
-            return Some((entry.clone(), similarity, item.value.cache_key.clone()));
+            return Some((
+                CachedResponse {
+                    status_code: entry.status_code,
+                    headers: entry.headers.clone(),
+                    body: entry.body.clone(),
+                },
+                similarity,
+                item.value.cache_key.clone(),
+            ));
         }
 
         None
@@ -691,88 +712,100 @@ impl AiSemanticCache {
         }
     }
 
-    async fn refresh_vector_index_if_due(&self, force: bool) {
-        if self.semantic.is_none() || !self.vector_index_dirty.load(Ordering::Relaxed) {
+    fn refresh_vector_index_if_due(&self) {
+        let Some(semantic) = self.semantic.as_ref() else {
+            return;
+        };
+        if !self.vector_index_dirty.load(Ordering::Acquire) {
             return;
         }
 
         let now_epoch = current_epoch_seconds();
         let has_snapshot = self.vector_index.load().is_some();
         let last = self.last_vector_rebuild.load(Ordering::Relaxed);
-        if !force
-            && has_snapshot
-            && now_epoch.saturating_sub(last) < VECTOR_REBUILD_INTERVAL_SECONDS
-        {
+        if has_snapshot && now_epoch.saturating_sub(last) < VECTOR_REBUILD_INTERVAL_SECONDS {
             return;
         }
 
         if self
-            .last_vector_rebuild
-            .compare_exchange(last, now_epoch, Ordering::Relaxed, Ordering::Relaxed)
+            .vector_index_rebuild_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
             return;
         }
 
-        let Some(semantic) = self.semantic.as_ref() else {
-            return;
-        };
         if !self.vector_index_dirty.swap(false, Ordering::AcqRel) {
-            return;
-        };
-
-        // HnswMap is immutable, so local semantic inserts/removals are made
-        // visible in batches. Clear the dirty flag before snapshotting; any
-        // concurrent insert that races this scan will set it back to true and
-        // trigger the next scheduled rebuild.
-        let now = Instant::now();
-        let mut points = Vec::new();
-        let mut values = Vec::new();
-
-        for entry in self.cache.iter() {
-            if now.duration_since(entry.inserted_at) >= self.ttl {
-                continue;
-            }
-            let (Some(scope_key), Some(embedding)) =
-                (entry.semantic_scope_key.clone(), entry.embedding.clone())
-            else {
-                continue;
-            };
-            points.push(embedding);
-            values.push(VectorEntry {
-                cache_key: entry.key().clone(),
-                scope_key,
-            });
-        }
-
-        if points.is_empty() {
-            self.vector_index.store(None);
+            self.vector_index_rebuild_running
+                .store(false, Ordering::Release);
             return;
         }
 
+        self.last_vector_rebuild.store(now_epoch, Ordering::Release);
+        let cache = Arc::clone(&self.cache);
+        let vector_index = Arc::clone(&self.vector_index);
+        let dirty = Arc::clone(&self.vector_index_dirty);
+        let rebuild_running = Arc::clone(&self.vector_index_rebuild_running);
+        let ttl = self.ttl;
         let max_candidates = semantic.max_candidates;
-        let build_result = tokio::task::spawn_blocking(move || {
-            HnswBuilder::default()
-                .ef_search(max_candidates)
-                .ef_construction(max_candidates.max(100))
-                .seed(0)
-                .build(points, values)
-        })
-        .await;
 
-        match build_result {
-            Ok(index) => {
-                self.vector_index
-                    .store(Some(Arc::new(VectorSnapshot { index })));
+        tokio::spawn(async move {
+            let build_result = tokio::task::spawn_blocking(move || {
+                // HnswMap is immutable, so local semantic inserts/removals are
+                // made visible in batches. The dirty flag was cleared before
+                // this snapshot; any concurrent insert that races this scan
+                // re-dirties the index and schedules a later rebuild.
+                let now = Instant::now();
+                let mut points = Vec::new();
+                let mut values = Vec::new();
+
+                for entry in cache.iter() {
+                    if now.duration_since(entry.inserted_at) >= ttl {
+                        continue;
+                    }
+                    let (Some(scope_key), Some(embedding)) =
+                        (entry.semantic_scope_key.clone(), entry.embedding.clone())
+                    else {
+                        continue;
+                    };
+                    points.push(embedding);
+                    values.push(VectorEntry {
+                        cache_key: entry.key().clone(),
+                        scope_key,
+                    });
+                }
+
+                if points.is_empty() {
+                    return None;
+                }
+
+                Some(
+                    HnswBuilder::default()
+                        .ef_search(max_candidates)
+                        .ef_construction(max_candidates.max(100))
+                        .seed(0)
+                        .build(points, values),
+                )
+            })
+            .await;
+
+            match build_result {
+                Ok(Some(index)) => {
+                    vector_index.store(Some(Arc::new(VectorSnapshot { index })));
+                }
+                Ok(None) => {
+                    vector_index.store(None);
+                }
+                Err(err) => {
+                    dirty.store(true, Ordering::Release);
+                    debug!(
+                        error = %err,
+                        "ai_semantic_cache: semantic vector index rebuild task failed"
+                    );
+                }
             }
-            Err(err) => {
-                self.vector_index_dirty.store(true, Ordering::Relaxed);
-                debug!(
-                    error = %err,
-                    "ai_semantic_cache: semantic vector index rebuild task failed"
-                );
-            }
-        }
+            rebuild_running.store(false, Ordering::Release);
+        });
     }
 
     /// Periodic cleanup of expired entries.
@@ -882,6 +915,9 @@ fn cache_entry_approx_size(
     let scope_size = semantic_scope_key.map(|scope| scope.len()).unwrap_or(0);
     let embedding_size = embedding.map(EmbeddingPoint::approx_size).unwrap_or(0);
 
+    // This bounds retained response entries, including their semantic vector
+    // copy. The detached HNSW snapshot keeps a separate vector/graph copy and
+    // is documented as additional local memory outside this entry budget.
     mem::size_of::<CacheEntry>()
         .saturating_add(body_len)
         .saturating_add(header_size)
@@ -1236,12 +1272,12 @@ impl Plugin for AiSemanticCache {
                     .fetch_sub(removed.approx_size, Ordering::Relaxed);
                 if removed.embedding.is_some() {
                     self.mark_vector_index_dirty();
-                    self.refresh_vector_index_if_due(false).await;
+                    self.refresh_vector_index_if_due();
                 }
             }
         }
 
-        self.refresh_vector_index_if_due(false).await;
+        self.refresh_vector_index_if_due();
 
         if self.semantic.is_some()
             && let (Some(scope_key), Some(input)) = (
@@ -1404,7 +1440,7 @@ impl Plugin for AiSemanticCache {
         self.cache.insert(cache_key.clone(), entry);
         if replaced_semantic_entry || embedding.is_some() {
             self.mark_vector_index_dirty();
-            self.refresh_vector_index_if_due(false).await;
+            self.refresh_vector_index_if_due();
         }
 
         // Also store in Redis if configured

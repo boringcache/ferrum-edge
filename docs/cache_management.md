@@ -182,7 +182,7 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 
 **Config field:** `max_entries` (in plugin config JSON).
 
-**Cleanup mechanism:** TTL-based expiration (`ttl_seconds` config field). When the cache exceeds `max_entries`, oldest entries are evicted. The optional semantic vector snapshot is rebuilt in batches after local semantic entries are inserted or evicted, at most once every 30 seconds after the first indexed semantic entry. `max_total_size_bytes` includes retained embedding vectors and semantic scope keys; the HNSW snapshot keeps an additional local vector copy outside the response-entry budget.
+**Cleanup mechanism:** TTL-based expiration (`ttl_seconds` config field). When the cache exceeds `max_entries`, oldest entries are evicted. The optional semantic vector snapshot is rebuilt by a detached background task after local semantic entries are inserted or evicted, at most once every 30 seconds after the first indexed semantic entry. `max_total_size_bytes` includes retained embedding vectors and semantic scope keys; the HNSW snapshot keeps an additional local vector and graph copy outside the response-entry budget.
 
 ### Request Deduplication
 
