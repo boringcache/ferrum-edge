@@ -132,7 +132,7 @@ fn find_primary_config(
         }
         let json = match read_json_file(&path) {
             Ok(json) => json,
-            Err(error) => {
+            Err(error @ CniInstallError::Json { .. }) => {
                 // A malformed neighbour in the shared CNI conf dir (a
                 // half-written or vendor config another installer dropped) must
                 // not abort the scan — skip it and keep looking for the primary.
@@ -144,6 +144,7 @@ fn find_primary_config(
                 );
                 continue;
             }
+            Err(error) => return Err(error),
         };
         if contains_plugin_type(&json, FERRUM_PLUGIN_TYPE) {
             continue;
@@ -531,5 +532,54 @@ mod tests {
             serde_json::from_slice(&fs::read(written).unwrap()).expect("generated config parses");
         assert_eq!(generated["plugins"][0]["type"], "calico");
         assert_eq!(generated["plugins"][1]["type"], "ferrum-cni");
+    }
+
+    #[test]
+    fn install_propagates_io_error_while_scanning_primary_candidates() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source-ferrum-cni");
+        fs::write(&source, b"new binary").unwrap();
+        let bin_dir = root.path().join("bin");
+        let conf_dir = root.path().join("conf");
+        let socket_dir = root.path().join("run");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::create_dir_all(&conf_dir).unwrap();
+
+        // A directory with a CNI config extension sorts before the valid
+        // primary and makes fs::read return an I/O error. This must not be
+        // treated like malformed JSON or the installer could chain a later
+        // stale primary.
+        let unreadable_candidate = conf_dir.join("05-unreadable.conf");
+        fs::create_dir(&unreadable_candidate).unwrap();
+        fs::write(
+            conf_dir.join("10-calico.conflist"),
+            serde_json::to_vec(&serde_json::json!({
+                "cniVersion": "0.4.0",
+                "name": "calico",
+                "plugins": [{"type": "calico"}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let config = CniInstallConfig {
+            host_bin_dir: bin_dir.display().to_string(),
+            host_conf_dir: conf_dir.display().to_string(),
+            host_socket_dir: socket_dir.display().to_string(),
+            conf_file_name: "00-ferrum.conflist".to_string(),
+            chained_with: "calico".to_string(),
+            socket_path: "/var/run/ferrum/node-agent-cni.sock".to_string(),
+        };
+
+        let err = install(&config, &source).expect_err("I/O errors must propagate");
+        match err {
+            CniInstallError::Io { path, .. } => {
+                assert!(
+                    path.ends_with("05-unreadable.conf"),
+                    "reported path should be the unreadable candidate: {path}"
+                );
+            }
+            other => panic!("expected CNI scan I/O error, got {other:?}"),
+        }
     }
 }
