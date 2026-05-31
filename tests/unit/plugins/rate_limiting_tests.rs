@@ -1056,7 +1056,10 @@ async fn test_strips_spoofed_identity_header_before_backend() {
         "X-RateLimit-Identity".to_string(),
         "consumer:spoofed".to_string(),
     );
-    request_headers.insert("x-ratelimit-identity".to_string(), "spiffe:spoofed".to_string());
+    request_headers.insert(
+        "x-ratelimit-identity".to_string(),
+        "spiffe:spoofed".to_string(),
+    );
 
     let result = plugin.before_proxy(&mut ctx, &mut request_headers).await;
     assert_continue(result);
