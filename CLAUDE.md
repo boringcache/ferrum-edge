@@ -50,7 +50,7 @@ Prerequisite: `protoc`; `build.rs` runs `tonic_build` on `proto/ferrum.proto`.
 
 Test what changed and let CI run the full matrix. For Rust changes, run `cargo fmt --all -- --check`, targeted clippy, and relevant tests. Docs/comment-only changes usually need `git diff --check`. Config/schema/spec/template changes need validation of the changed surface and Rust checks only if Rust changed.
 
-Target by scope: private source functions use `cargo test --lib <module>::tests`; public APIs use `cargo test --test unit_tests <filter>`; cross-module behavior uses `cargo test --test integration_tests <filter>`; proxy hot-path changes use `cargo build --bin ferrum-edge && cargo test --test functional_tests <filter> -- --ignored`.
+Target by scope: public APIs use `cargo test --test unit_tests <filter>`; cross-module behavior uses `cargo test --test integration_tests <filter>`; proxy hot-path changes use `cargo build --bin ferrum-edge && cargo test --test functional_tests <filter> -- --ignored`. Avoid adding new inline source tests; prefer external unit tests, integration tests, or focused test-only helpers under `tests/`.
 
 Run the full local suite only for shared infrastructure, cross-module refactors, pre-release work, or when CI is congested. Leave `CARGO_TARGET_DIR` unset across parallel worktrees; inside one workspace, run fmt, clippy, and tests sequentially.
 
