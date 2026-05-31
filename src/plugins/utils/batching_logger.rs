@@ -1,7 +1,8 @@
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
@@ -10,6 +11,14 @@ const DROP_WARN_EVERY: u64 = 100;
 pub const MAX_BATCH_SIZE: usize = 10_000;
 pub const MAX_BUFFER_CAPACITY: usize = 1_000_000;
 const MAX_TOKIO_SLEEP_MS: u64 = i64::MAX as u64;
+static JITTER_COUNTER: AtomicU64 = AtomicU64::new(0);
+static JITTER_SEED: LazyLock<u64> = LazyLock::new(|| {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or(0);
+    nanos ^ u64::from(std::process::id()) ^ (&JITTER_COUNTER as *const AtomicU64 as usize as u64)
+});
 
 /// Strategy for retrying a failed flush. The flush closure owns its own
 /// status-code-aware logic (e.g. "don't retry 401/403, do retry 408/429") —
@@ -54,10 +63,7 @@ impl RetryPolicy {
     /// jitter). The jitter uses a lightweight counter-based PRNG — it does not
     /// need cryptographic quality — mirroring `crate::retry::retry_delay`.
     fn backoff_delay(&self, attempt: u32) -> Duration {
-        let base_ms = self
-            .delay
-            .as_millis()
-            .min(u128::from(MAX_TOKIO_SLEEP_MS)) as u64;
+        let base_ms = self.delay.as_millis().min(u128::from(MAX_TOKIO_SLEEP_MS)) as u64;
         let cap_ms = self
             .max_delay
             .as_millis()
@@ -70,9 +76,9 @@ impl RetryPolicy {
         let capped = grown.min(cap_ms);
 
         let final_ms = if self.jitter && capped > 0 {
-            use std::sync::atomic::AtomicU64;
-            static JITTER_COUNTER: AtomicU64 = AtomicU64::new(0);
-            let counter = JITTER_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let counter = JITTER_COUNTER
+                .fetch_add(1, Ordering::Relaxed)
+                .wrapping_add(*JITTER_SEED);
             // LCG-style hash to spread values (same constants as crate::retry).
             let hash = counter
                 .wrapping_mul(6364136223846793005)

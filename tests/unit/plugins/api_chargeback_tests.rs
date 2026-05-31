@@ -108,10 +108,28 @@ fn make_stream_summary(
 
 /// Build the same key format used by the registry internally.
 fn make_key(consumer: &str, proxy_id: &str, status_code: u16) -> String {
+    make_key_with_prices(consumer, proxy_id, status_code, 0.0, 0.0, 0.0)
+}
+
+fn make_key_with_prices(
+    consumer: &str,
+    proxy_id: &str,
+    status_code: u16,
+    call_price: f64,
+    bw_price_sent: f64,
+    bw_price_received: f64,
+) -> String {
     let scope = scope();
     format!(
-        "{}|{}|{}|{}|{}",
-        consumer, proxy_id, status_code, scope.currency, scope.namespace_label
+        "{}|{}|{}|{}|{}|{:016x}|{:016x}|{:016x}",
+        consumer,
+        proxy_id,
+        status_code,
+        scope.currency,
+        scope.namespace_label,
+        call_price.to_bits(),
+        bw_price_sent.to_bits(),
+        bw_price_received.to_bits()
     )
 }
 
@@ -301,7 +319,14 @@ async fn test_bandwidth_only_config_records_bytes() {
     let registry = ferrum_edge::plugins::api_chargeback::global_registry();
     let entry = registry
         .entries
-        .get(&make_key("bw-only-user", "bw-only-proxy", 404))
+        .get(&make_key_with_prices(
+            "bw-only-user",
+            "bw-only-proxy",
+            404,
+            0.0,
+            0.0000001,
+            0.0000002,
+        ))
         .expect("bandwidth-only entry recorded");
     assert!((entry.bandwidth_charge_sent() - 0.1).abs() < 1e-10);
     assert!((entry.bandwidth_charge_received() - 0.4).abs() < 1e-10);
@@ -325,7 +350,14 @@ async fn test_stream_only_config_charges_connection() {
     let registry = ferrum_edge::plugins::api_chargeback::global_registry();
     let entry = registry
         .entries
-        .get(&make_key("stream-only-user", "stream-only-proxy", 0))
+        .get(&make_key_with_prices(
+            "stream-only-user",
+            "stream-only-proxy",
+            0,
+            0.0005,
+            0.0,
+            0.0,
+        ))
         .expect("stream-only entry recorded");
     assert_eq!(entry.protocol_family, ProtocolFamily::Stream);
     assert!((entry.call_charge() - 0.0005).abs() < 1e-12);
@@ -385,7 +417,14 @@ async fn test_combined_pricing_applies_both_call_and_bandwidth_charges() {
     let registry = ferrum_edge::plugins::api_chargeback::global_registry();
     let entry = registry
         .entries
-        .get(&make_key("combined-user", "combined-proxy", 200))
+        .get(&make_key_with_prices(
+            "combined-user",
+            "combined-proxy",
+            200,
+            0.001,
+            0.000001,
+            0.000002,
+        ))
         .expect("combined entry recorded");
     let call_charge = entry.call_charge();
     let bw_sent = entry.bandwidth_charge_sent();
@@ -413,7 +452,7 @@ fn test_registry_records_charge() {
         0.0,
     );
 
-    let key = make_key("user-1", "proxy-a", 200);
+    let key = make_key_with_prices("user-1", "proxy-a", 200, 0.00001, 0.0, 0.0);
     let entry = registry.entries.get(&key).unwrap();
     assert_eq!(entry.call_count.load(Ordering::Relaxed), 1);
     assert!((entry.call_charge() - 0.00001).abs() < 1e-15);
@@ -443,7 +482,7 @@ fn test_registry_accumulates_charges() {
         );
     }
 
-    let key = make_key("user-1", "proxy-a", 200);
+    let key = make_key_with_prices("user-1", "proxy-a", 200, 0.00001, 0.0, 0.0);
     let entry = registry.entries.get(&key).unwrap();
     assert_eq!(entry.call_count.load(Ordering::Relaxed), 1000);
     assert!((entry.call_charge() - 0.01).abs() < 1e-10);
@@ -490,7 +529,7 @@ fn test_registry_zero_alloc_hot_path() {
     );
 
     assert_eq!(registry.entries.len(), 1);
-    let key = make_key("user-1", "proxy-a", 200);
+    let key = make_key_with_prices("user-1", "proxy-a", 200, 0.001, 0.0, 0.0);
     let entry = registry.entries.get(&key).unwrap();
     assert_eq!(entry.call_count.load(Ordering::Relaxed), 3);
 }
@@ -595,7 +634,7 @@ fn test_registry_records_bandwidth_for_http() {
         0.0000002,
     );
 
-    let key = make_key("alice", "proxy-1", 200);
+    let key = make_key_with_prices("alice", "proxy-1", 200, 0.0, 0.0000001, 0.0000002);
     let entry = registry.entries.get(&key).unwrap();
     assert_eq!(entry.bytes_sent_total.load(Ordering::Relaxed), 1_000_000);
     assert_eq!(
@@ -621,7 +660,7 @@ fn test_registry_records_stream_session() {
         0.0000002,
     );
 
-    let key = make_key("alice", "stream-proxy", 0);
+    let key = make_key_with_prices("alice", "stream-proxy", 0, 0.0005, 0.0000001, 0.0000002);
     let entry = registry.entries.get(&key).unwrap();
     assert_eq!(entry.protocol_family, ProtocolFamily::Stream);
     assert_eq!(entry.status_code, 0);
@@ -889,7 +928,7 @@ async fn test_log_charges_identified_consumer() {
     plugin.log(&summary).await;
 
     let registry = ferrum_edge::plugins::api_chargeback::global_registry();
-    let key = make_key("alice", "proxy-1", 200);
+    let key = make_key_with_prices("alice", "proxy-1", 200, 0.001, 0.0, 0.0);
     assert!(registry.entries.contains_key(&key));
 }
 
@@ -950,7 +989,7 @@ async fn test_log_records_bandwidth_even_when_status_is_uncharged() {
     plugin.log(&summary).await;
 
     let registry = ferrum_edge::plugins::api_chargeback::global_registry();
-    let key = make_key("derek", "proxy-bw", 404);
+    let key = make_key_with_prices("derek", "proxy-bw", 404, 0.0, 0.0000001, 0.0000002);
     let entry = registry
         .entries
         .get(&key)
@@ -983,7 +1022,14 @@ async fn test_on_stream_disconnect_records_bandwidth() {
     plugin.on_stream_disconnect(&summary).await;
 
     let registry = ferrum_edge::plugins::api_chargeback::global_registry();
-    let key = make_key("emma", "tcp-edge-stream-test", 0);
+    let key = make_key_with_prices(
+        "emma",
+        "tcp-edge-stream-test",
+        0,
+        0.001,
+        0.0000001,
+        0.0000002,
+    );
     let entry = registry.entries.get(&key).expect("stream entry recorded");
     assert_eq!(entry.protocol_family, ProtocolFamily::Stream);
     assert_eq!(entry.call_count.load(Ordering::Relaxed), 1);
@@ -1189,17 +1235,19 @@ fn test_same_proxy_records_stay_partitioned_by_instance_scope() {
 
     let prom = registry.render_prometheus_uncached();
     assert!(
-        prom.lines().any(|line| line.contains("proxy_id=\"shared-proxy\"")
-            && line.contains("currency=\"USD\"")
-            && line.contains(r#"namespace="team-a""#)
-            && line.ends_with("1.0000000000")),
+        prom.lines()
+            .any(|line| line.contains("proxy_id=\"shared-proxy\"")
+                && line.contains("currency=\"USD\"")
+                && line.contains(r#"namespace="team-a""#)
+                && line.ends_with("1.0000000000")),
         "USD/team-a call row missing\n{prom}"
     );
     assert!(
-        prom.lines().any(|line| line.contains("proxy_id=\"shared-proxy\"")
-            && line.contains("currency=\"EUR\"")
-            && line.contains(r#"namespace="team-b""#)
-            && line.ends_with("2.0000000000")),
+        prom.lines()
+            .any(|line| line.contains("proxy_id=\"shared-proxy\"")
+                && line.contains("currency=\"EUR\"")
+                && line.contains(r#"namespace="team-b""#)
+                && line.ends_with("2.0000000000")),
         "EUR/team-b call row missing\n{prom}"
     );
 
@@ -1341,7 +1389,9 @@ fn test_high_volume_charge_has_no_accumulation_drift() {
     }
     let entry = registry
         .entries
-        .get(&make_key("alice", "proxy-1", 200))
+        .get(&make_key_with_prices(
+            "alice", "proxy-1", 200, price, 0.0, 0.0,
+        ))
         .unwrap();
     assert_eq!(entry.call_count.load(Ordering::Relaxed), n);
     // Exact: equals n * price computed once, bit-for-bit.
@@ -1363,7 +1413,9 @@ fn test_bandwidth_charge_is_exact_from_byte_totals() {
     }
     let many_entry = many
         .entries
-        .get(&make_key("alice", "proxy-1", 200))
+        .get(&make_key_with_prices(
+            "alice", "proxy-1", 200, 0.0, price, 0.0,
+        ))
         .unwrap();
     assert_eq!(
         many_entry.bytes_sent_total.load(Ordering::Relaxed),

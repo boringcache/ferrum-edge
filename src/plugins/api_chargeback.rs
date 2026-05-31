@@ -315,6 +315,7 @@ pub struct ChargebackRegistry {
     render_cache_ttl_secs: AtomicU64,
     stale_entry_ttl_nanos: AtomicU64,
     cache_invalidation_min_age_nanos: AtomicU64,
+    configured_currency: ArcSwap<String>,
     /// Guards against spawning duplicate background cleanup tasks.
     cleanup_task_started: AtomicBool,
 }
@@ -337,8 +338,14 @@ impl ChargebackRegistry {
             cache_invalidation_min_age_nanos: AtomicU64::new(
                 DEFAULT_CACHE_INVALIDATION_MIN_AGE_NANOS,
             ),
+            configured_currency: ArcSwap::from_pointee("USD".to_string()),
             cleanup_task_started: AtomicBool::new(false),
         }
+    }
+
+    pub fn set_configured_currency(&self, currency: &str) {
+        self.configured_currency
+            .store(Arc::new(currency.to_string()));
     }
 
     /// Configure the process-global render/cleanup knobs that govern the SHARED
@@ -922,10 +929,8 @@ impl ChargebackRegistry {
             bandwidth_charge_received: f64,
         }
 
-        let mut consumers: HashMap<
-            String,
-            HashMap<(String, Arc<str>, Arc<str>), ProxyAggregate>,
-        > = HashMap::new();
+        let mut consumers: HashMap<String, HashMap<(String, Arc<str>, Arc<str>), ProxyAggregate>> =
+            HashMap::new();
         // Top-level currency: the single currency in use, or "mixed" when
         // instances disagree (consumers must then read per-proxy `currency`).
         let mut overall_currency: Option<Arc<str>> = None;
@@ -1070,11 +1075,7 @@ impl ChargebackRegistry {
                     });
                 }
 
-                let output_key = if proxy_id_counts
-                    .get(proxy_id.as_str())
-                    .copied()
-                    .unwrap_or(0)
-                    > 1
+                let output_key = if proxy_id_counts.get(proxy_id.as_str()).copied().unwrap_or(0) > 1
                 {
                     format!(
                         "{}|currency={}{}",
@@ -1103,9 +1104,13 @@ impl ChargebackRegistry {
         }
 
         let currency = if currency_mixed {
-            "mixed"
+            "mixed".to_string()
         } else {
-            overall_currency.as_deref().unwrap_or("USD")
+            let configured_currency = self.configured_currency.load();
+            overall_currency
+                .as_deref()
+                .map(str::to_string)
+                .unwrap_or_else(|| configured_currency.as_str().to_string())
         };
 
         let result = serde_json::json!({
@@ -1204,6 +1209,7 @@ impl ApiChargeback {
             stale_entry_ttl_secs,
             cache_invalidation_min_age_ms,
         );
+        registry.set_configured_currency(currency);
 
         let cleanup_interval_seconds = optional_u64(config, "cleanup_interval_seconds", 300)?;
         registry.start_cleanup_task(cleanup_interval_seconds);
