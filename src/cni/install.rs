@@ -121,16 +121,41 @@ fn find_primary_config(
             source,
         })?;
     entries.sort_by_key(|entry| entry.file_name());
+    let target_file_name = std::ffi::OsStr::new(target_file_name);
 
     for entry in entries {
         let path = entry.path();
         if !is_cni_config_file(&path) {
             continue;
         }
-        if path.file_name().and_then(|n| n.to_str()) == Some(target_file_name) {
+        let Some(file_name) = path.file_name() else {
+            continue;
+        };
+        if file_name == target_file_name {
             continue;
         }
-        let json = read_json_file(&path)?;
+        let sorts_before_target = file_name < target_file_name;
+        let json = match read_json_file(&path) {
+            Ok(json) => json,
+            Err(error @ CniInstallError::Json { .. }) => {
+                if sorts_before_target {
+                    return Err(error);
+                }
+                // A malformed neighbour in the shared CNI conf dir (a
+                // half-written or vendor config another installer dropped) must
+                // not abort the scan if the generated Ferrum file would sort
+                // before it. Malformed files that sort before the generated
+                // target remain fatal because the container runtime would pick
+                // them before Ferrum's chain.
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %error,
+                    "Skipping unparseable CNI config while searching for the primary to chain"
+                );
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         if contains_plugin_type(&json, FERRUM_PLUGIN_TYPE) {
             continue;
         }
@@ -472,5 +497,139 @@ mod tests {
                 .contains(".tmp")),
             "successful install should not leave temp config files"
         );
+    }
+
+    #[test]
+    fn install_skips_malformed_sibling_and_chains_valid_primary() {
+        // A malformed NON-target sibling that sorts BEFORE the valid primary
+        // must not abort the scan — install should still find and chain the
+        // valid primary. (Regression: the parse error previously propagated via
+        // `?` and aborted the whole install.)
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source-ferrum-cni");
+        fs::write(&source, b"new binary").unwrap();
+        let bin_dir = root.path().join("bin");
+        let conf_dir = root.path().join("conf");
+        let socket_dir = root.path().join("run");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::create_dir_all(&conf_dir).unwrap();
+        fs::write(bin_dir.join("ferrum-cni"), b"old binary").unwrap();
+        // Malformed sibling sorting before the valid primary.
+        fs::write(conf_dir.join("05-broken.conf"), b"{truncated").unwrap();
+        fs::write(
+            conf_dir.join("10-calico.conflist"),
+            serde_json::to_vec(&serde_json::json!({
+                "cniVersion": "0.4.0",
+                "name": "calico",
+                "plugins": [{"type": "calico", "ipam": {"type": "calico-ipam"}}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let config = CniInstallConfig {
+            host_bin_dir: bin_dir.display().to_string(),
+            host_conf_dir: conf_dir.display().to_string(),
+            host_socket_dir: socket_dir.display().to_string(),
+            conf_file_name: "00-ferrum.conflist".to_string(),
+            chained_with: "calico".to_string(),
+            socket_path: "/var/run/ferrum/node-agent-cni.sock".to_string(),
+        };
+
+        let written = install(&config, &source)
+            .expect("install should skip the malformed sibling and chain the valid primary");
+        let generated: Value =
+            serde_json::from_slice(&fs::read(written).unwrap()).expect("generated config parses");
+        assert_eq!(generated["plugins"][0]["type"], "calico");
+        assert_eq!(generated["plugins"][1]["type"], "ferrum-cni");
+    }
+
+    #[test]
+    fn install_rejects_malformed_config_that_sorts_before_generated_target() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source-ferrum-cni");
+        fs::write(&source, b"new binary").unwrap();
+        let bin_dir = root.path().join("bin");
+        let conf_dir = root.path().join("conf");
+        let socket_dir = root.path().join("run");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::create_dir_all(&conf_dir).unwrap();
+
+        fs::write(conf_dir.join("00-alpha.conf"), b"{truncated").unwrap();
+        fs::write(
+            conf_dir.join("10-calico.conflist"),
+            serde_json::to_vec(&serde_json::json!({
+                "cniVersion": "0.4.0",
+                "name": "calico",
+                "plugins": [{"type": "calico"}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let config = CniInstallConfig {
+            host_bin_dir: bin_dir.display().to_string(),
+            host_conf_dir: conf_dir.display().to_string(),
+            host_socket_dir: socket_dir.display().to_string(),
+            conf_file_name: "00-ferrum.conflist".to_string(),
+            chained_with: "calico".to_string(),
+            socket_path: "/var/run/ferrum/node-agent-cni.sock".to_string(),
+        };
+
+        let err = install(&config, &source)
+            .expect_err("malformed configs before the generated target must fail install");
+        assert!(
+            matches!(err, CniInstallError::Json { .. }),
+            "expected JSON error for earlier malformed config, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn install_propagates_io_error_while_scanning_primary_candidates() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source-ferrum-cni");
+        fs::write(&source, b"new binary").unwrap();
+        let bin_dir = root.path().join("bin");
+        let conf_dir = root.path().join("conf");
+        let socket_dir = root.path().join("run");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::create_dir_all(&conf_dir).unwrap();
+
+        // A directory with a CNI config extension sorts before the valid
+        // primary and makes fs::read return an I/O error. This must not be
+        // treated like malformed JSON or the installer could chain a later
+        // stale primary.
+        let unreadable_candidate = conf_dir.join("05-unreadable.conf");
+        fs::create_dir(&unreadable_candidate).unwrap();
+        fs::write(
+            conf_dir.join("10-calico.conflist"),
+            serde_json::to_vec(&serde_json::json!({
+                "cniVersion": "0.4.0",
+                "name": "calico",
+                "plugins": [{"type": "calico"}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let config = CniInstallConfig {
+            host_bin_dir: bin_dir.display().to_string(),
+            host_conf_dir: conf_dir.display().to_string(),
+            host_socket_dir: socket_dir.display().to_string(),
+            conf_file_name: "00-ferrum.conflist".to_string(),
+            chained_with: "calico".to_string(),
+            socket_path: "/var/run/ferrum/node-agent-cni.sock".to_string(),
+        };
+
+        let err = install(&config, &source).expect_err("I/O errors must propagate");
+        match err {
+            CniInstallError::Io { path, .. } => {
+                assert!(
+                    path.ends_with("05-unreadable.conf"),
+                    "reported path should be the unreadable candidate: {path}"
+                );
+            }
+            other => panic!("expected CNI scan I/O error, got {other:?}"),
+        }
     }
 }
