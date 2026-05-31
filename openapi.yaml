@@ -11958,7 +11958,8 @@ components:
               delay_ms:
                 type: integer
                 format: uint64
-                description: Simulated latency in milliseconds (default 0)
+                maximum: 3600000
+                description: "Simulated latency in milliseconds (default 0). Capped at 3600000 (1 hour); larger values are rejected at config validation."
         passthrough_on_no_match:
           type: boolean
           description: "If true, unmatched requests continue to the backend. If false (default), returns 404."
