@@ -6152,13 +6152,19 @@ components:
             digest. Clamped to 65 536 to bound per-frame hashing on the WebSocket
             hot path. Must be greater than zero when `include_payload_preview`
             is true; zero is accepted only when previews are disabled.
-            hot path. Only applies when `include_payload_preview` is true; the
-            raw bytes are never emitted. Must be greater than zero when payload
-            previews are enabled.
         log_ping_pong:
           type: boolean
           default: false
           description: Whether to log ping/pong frames in addition to text/binary frames.
+      allOf:
+        - if:
+            properties:
+              include_payload_preview:
+                const: true
+          then:
+            properties:
+              payload_preview_bytes:
+                minimum: 1
 
     WsRateLimitingConfig:
       type: object
