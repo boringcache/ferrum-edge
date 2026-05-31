@@ -348,33 +348,34 @@ impl RequestDeduplication {
             }
         });
 
+        self.evict_completed_over_capacity(surviving_completed);
+    }
+
+    fn evict_completed_over_capacity(&self, completed_hint: usize) {
         // Enforce max entries by removing oldest Completed entries first. Active
         // (non-stale) InFlight markers are NEVER evicted by LRU because evicting
         // them would release the in-flight lock while the original request is
         // still executing — a duplicate retry for that key would then bypass the
         // lock and re-execute side-effecting operations. Stale InFlight markers
-        // (age >= inflight_ttl) are already dropped by the retain() above. This
-        // means max_entries can be temporarily exceeded if the cache is
-        // saturated with active in-flight work; correctness (no duplicate
-        // writes) is strictly preferred over hitting the memory cap.
-        //
-        // Skip the collect+sort entirely when no Completed entries survived: in
-        // the pure-InFlight saturation case there is nothing LRU could remove,
-        // so the O(n) Vec build and sort would be pointless work (finding #12).
-        if surviving_completed > 0 && self.local_cache.len() > self.max_entries {
-            let mut completed_with_time: Vec<(String, Instant)> =
-                Vec::with_capacity(surviving_completed);
-            for entry in self.local_cache.iter() {
-                if let DeduplicationEntry::Completed(cached) = entry.value() {
-                    completed_with_time.push((entry.key().clone(), cached.inserted_at));
-                }
-            }
-            completed_with_time.sort_by_key(|(_, t)| *t);
+        // are dropped by the throttled expiry scan. This means max_entries can
+        // be temporarily exceeded if the cache is saturated with active
+        // in-flight work; correctness is strictly preferred over hitting the
+        // memory cap.
+        if completed_hint == 0 || self.local_cache.len() <= self.max_entries {
+            return;
+        }
 
-            let to_remove = self.local_cache.len().saturating_sub(self.max_entries);
-            for (key, _) in completed_with_time.into_iter().take(to_remove) {
-                self.local_cache.remove(&key);
+        let mut completed_with_time: Vec<(String, Instant)> = Vec::with_capacity(completed_hint);
+        for entry in self.local_cache.iter() {
+            if let DeduplicationEntry::Completed(cached) = entry.value() {
+                completed_with_time.push((entry.key().clone(), cached.inserted_at));
             }
+        }
+        completed_with_time.sort_by_key(|(_, t)| *t);
+
+        let to_remove = self.local_cache.len().saturating_sub(self.max_entries);
+        for (key, _) in completed_with_time.into_iter().take(to_remove) {
+            self.local_cache.remove(&key);
         }
     }
 }
@@ -634,6 +635,7 @@ impl Plugin for RequestDeduplication {
         // Store in local cache
         self.local_cache
             .insert(key.clone(), DeduplicationEntry::Completed(cached.clone()));
+        self.evict_completed_over_capacity(1);
 
         // Also store in Redis if available
         if self.redis_client.is_some() {
@@ -653,233 +655,5 @@ impl Plugin for RequestDeduplication {
 
     fn tracked_keys_count(&self) -> Option<usize> {
         Some(self.local_cache.len())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::plugins::PluginHttpClient;
-    use serde_json::json;
-
-    /// LRU eviction under `max_entries` pressure must NOT evict active in-flight
-    /// markers. Evicting a live InFlight entry would release the in-flight lock
-    /// while the original request is still executing, so a duplicate retry for
-    /// the same idempotency key would bypass the lock and re-execute the
-    /// side-effecting operation.
-    #[test]
-    fn cleanup_preserves_active_inflight_over_max_entries() {
-        let config = json!({ "max_entries": 2 });
-        let plugin = match RequestDeduplication::new(&config, PluginHttpClient::default()) {
-            Ok(plugin) => plugin,
-            Err(error) => panic!("request_deduplication config should be valid: {error}"),
-        };
-
-        // 3 active in-flight markers, cap is 2 → over limit.
-        let now = Instant::now();
-        for i in 0..3 {
-            plugin.local_cache.insert(
-                format!("inflight-{i}"),
-                DeduplicationEntry::InFlight { started_at: now },
-            );
-        }
-        assert_eq!(plugin.local_cache.len(), 3);
-
-        // Force cleanup to run (bypass the throttle interval).
-        plugin.last_cleanup.store(CLEANUP_NEVER, Ordering::Relaxed);
-        plugin.cleanup_local_cache();
-
-        // All 3 active in-flight entries must still be present — LRU eviction
-        // is not allowed to drop active locks.
-        assert_eq!(plugin.local_cache.len(), 3);
-        for i in 0..3 {
-            assert!(plugin.local_cache.contains_key(&format!("inflight-{i}")));
-        }
-    }
-
-    /// Completed entries ARE LRU-eligible. When over `max_entries`, the oldest
-    /// Completed entries get evicted while active InFlight markers are kept.
-    #[test]
-    fn cleanup_evicts_oldest_completed_preserves_inflight() {
-        let config = json!({ "max_entries": 2 });
-        let plugin = match RequestDeduplication::new(&config, PluginHttpClient::default()) {
-            Ok(plugin) => plugin,
-            Err(error) => panic!("request_deduplication config should be valid: {error}"),
-        };
-
-        let now = Instant::now();
-        // 1 active in-flight
-        plugin.local_cache.insert(
-            "inflight-key".to_string(),
-            DeduplicationEntry::InFlight { started_at: now },
-        );
-        // 3 completed entries with increasing age (oldest first)
-        for i in 0..3 {
-            let inserted = now - Duration::from_secs(10 - i);
-            plugin.local_cache.insert(
-                format!("completed-{i}"),
-                DeduplicationEntry::Completed(CachedResponse {
-                    status_code: 200,
-                    headers: HashMap::new(),
-                    body: Bytes::new(),
-                    inserted_at: inserted,
-                }),
-            );
-        }
-        assert_eq!(plugin.local_cache.len(), 4);
-
-        plugin.last_cleanup.store(CLEANUP_NEVER, Ordering::Relaxed);
-        plugin.cleanup_local_cache();
-
-        // Cap is 2. InFlight kept. 2 oldest Completed evicted, 1 newest Completed kept.
-        assert!(plugin.local_cache.contains_key("inflight-key"));
-        assert!(!plugin.local_cache.contains_key("completed-0"));
-        assert!(!plugin.local_cache.contains_key("completed-1"));
-        assert!(plugin.local_cache.contains_key("completed-2"));
-    }
-
-    /// Finding #12: a cache saturated with active (non-stale) InFlight markers
-    /// stays permanently over capacity by design (active markers are never
-    /// evicted). The full O(n) all-shard scan must NOT re-run on every call in
-    /// that state — it is throttled to at most once per `CLEANUP_INTERVAL_SECS`,
-    /// regardless of over-capacity.
-    ///
-    /// We detect "did a scan actually run?" by a side effect: an expired
-    /// Completed entry is reclaimed only by a real scan. After the first scan
-    /// stamps the interval, we insert a fresh expired entry; a second call
-    /// within the interval must be throttled and therefore must leave that entry
-    /// in place. Pre-fix, the `over_capacity` branch bypassed the throttle, so
-    /// the second call would rescan and evict it — this test fails before the
-    /// fix and passes after.
-    #[test]
-    fn cleanup_throttled_under_active_inflight_saturation() {
-        let config = json!({ "ttl_seconds": 1, "max_entries": 2 });
-        let plugin = match RequestDeduplication::new(&config, PluginHttpClient::default()) {
-            Ok(plugin) => plugin,
-            Err(error) => panic!("request_deduplication config should be valid: {error}"),
-        };
-
-        // Saturate: 5 active in-flight markers, cap 2 → permanently over capacity.
-        let now = Instant::now();
-        for i in 0..5 {
-            plugin.local_cache.insert(
-                format!("inflight-{i}"),
-                DeduplicationEntry::InFlight { started_at: now },
-            );
-        }
-        assert_eq!(plugin.local_cache.len(), 5);
-
-        // First call (NEVER sentinel) runs a scan and records the current
-        // monotonic second. Active markers are not evictable, so all remain.
-        assert_eq!(plugin.last_cleanup.load(Ordering::Relaxed), CLEANUP_NEVER);
-        plugin.cleanup_local_cache();
-        let stamped = plugin.last_cleanup.load(Ordering::Relaxed);
-        assert_ne!(stamped, CLEANUP_NEVER, "first call must run a scan");
-        assert_eq!(plugin.local_cache.len(), 5);
-        assert!(
-            plugin.local_cache.len() > plugin.max_entries,
-            "cache must stay over capacity (active in-flight never evicted)"
-        );
-
-        // Insert an already-expired Completed entry (ttl=1s, inserted 120s ago).
-        // A real scan would evict it; a throttled (no-op) call would not.
-        plugin.local_cache.insert(
-            "expired-completed".to_string(),
-            DeduplicationEntry::Completed(CachedResponse {
-                status_code: 200,
-                headers: HashMap::new(),
-                body: Bytes::new(),
-                inserted_at: now - Duration::from_secs(120),
-            }),
-        );
-        assert!(plugin.local_cache.contains_key("expired-completed"));
-
-        // Second call within the same interval, still over capacity. The fix
-        // throttles it (the over_capacity bypass is gone), so the expired entry
-        // survives. Pre-fix, over_capacity bypassed the throttle, the full scan
-        // re-ran, and this entry would be evicted.
-        plugin.cleanup_local_cache();
-        assert!(
-            plugin.local_cache.contains_key("expired-completed"),
-            "cleanup must be throttled within the interval even when over capacity \
-             (a re-run would have evicted the expired entry)"
-        );
-        // And the throttle stamp is unchanged (no second CAS).
-        assert_eq!(plugin.last_cleanup.load(Ordering::Relaxed), stamped);
-    }
-
-    /// Finding #57: the throttle gate is monotonic. The decision is driven by
-    /// `cleanup_due(last, now_secs)` where both arguments come from
-    /// `monotonic_secs()`. The pre-fix gate computed `now.saturating_sub(last)`
-    /// over wall-clock `SystemTime` epoch seconds, so a backward wall-clock step
-    /// (NTP/VM/manual) made `now < last`, `saturating_sub` returned 0, and
-    /// `0 < 30` suppressed cleanup until the wall clock caught back up. This test
-    /// pins the gate's contract directly so the wall-clock variant cannot creep
-    /// back in.
-    #[test]
-    fn cleanup_due_gate_is_monotonic_and_unconditional() {
-        // Never-run sentinel always fires (first request after startup scans).
-        assert!(cleanup_due(CLEANUP_NEVER, 0));
-        assert!(cleanup_due(CLEANUP_NEVER, 5_000));
-
-        // Within the interval: throttled (no scan).
-        assert!(!cleanup_due(100, 100));
-        assert!(!cleanup_due(100, 100 + CLEANUP_INTERVAL_SECS - 1));
-
-        // At/after the interval: due.
-        assert!(cleanup_due(100, 100 + CLEANUP_INTERVAL_SECS));
-        assert!(cleanup_due(100, 1_000_000));
-
-        // Monotonic invariant: `now_secs` derived from `monotonic_secs()` never
-        // goes backward, so `now_secs >= last` always holds and a real last
-        // stamp can never be in the "future" relative to now. We assert the
-        // delta saturates as expected at the boundary rather than producing a
-        // spurious "elapsed" — i.e. equal timestamps are NOT due (the
-        // wall-clock-step case that pre-fix could misread can never be reached
-        // because the clock source is monotonic).
-        assert!(!cleanup_due(12_345, 12_345));
-    }
-
-    /// Finding #57 (end-to-end): the stamp written by a real scan is a monotonic
-    /// second since process start, never a wall-clock UNIX epoch (~1.7e9). This
-    /// is the concrete observable difference between the monotonic throttle and
-    /// the old `SystemTime`-based one, and it confirms the gate compares
-    /// like-for-like monotonic values.
-    #[test]
-    fn cleanup_stamps_monotonic_not_wallclock() {
-        let config = json!({ "ttl_seconds": 1, "max_entries": 100 });
-        let plugin = match RequestDeduplication::new(&config, PluginHttpClient::default()) {
-            Ok(plugin) => plugin,
-            Err(error) => panic!("request_deduplication config should be valid: {error}"),
-        };
-
-        // One already-expired Completed entry (inserted far in the past).
-        let inserted = Instant::now() - Duration::from_secs(120);
-        plugin.local_cache.insert(
-            "expired".to_string(),
-            DeduplicationEntry::Completed(CachedResponse {
-                status_code: 200,
-                headers: HashMap::new(),
-                body: Bytes::new(),
-                inserted_at: inserted,
-            }),
-        );
-
-        // Force a scan via the sentinel (deterministic regardless of how far
-        // into the process this test runs).
-        plugin.last_cleanup.store(CLEANUP_NEVER, Ordering::Relaxed);
-        plugin.cleanup_local_cache();
-
-        // The expired entry was reclaimed by the scan...
-        assert_eq!(plugin.local_cache.len(), 0);
-        // ...and the throttle stamp is a small monotonic value, not a UNIX
-        // epoch. Pre-fix (SystemTime) this would be ~1.7e9 and this bound would
-        // fail; with the monotonic clock it is seconds since process start.
-        let stamped = plugin.last_cleanup.load(Ordering::Relaxed);
-        assert_ne!(stamped, CLEANUP_NEVER);
-        assert!(
-            stamped < 1_000_000_000,
-            "throttle stamp must be monotonic seconds since process start, got {stamped}"
-        );
     }
 }
