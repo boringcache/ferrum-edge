@@ -6,6 +6,8 @@ use ferrum_edge::plugins::{
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
+use wiremock::matchers::{header, method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Build a synthetic Consumer for cross-consumer scoping tests. Only
 /// `username` matters because that's what `effective_identity()` returns
@@ -82,6 +84,44 @@ fn make_plugin(config: serde_json::Value) -> AiSemanticCache {
     AiSemanticCache::new(&config, PluginHttpClient::default()).unwrap()
 }
 
+async fn mount_embedding_mock(server: &MockServer, expected_calls: u64) {
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .and(header("authorization", "Bearer test-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [
+                {"embedding": [1.0, 0.0, 0.0]}
+            ]
+        })))
+        .expect(expected_calls)
+        .mount(server)
+        .await;
+}
+
+async fn mount_google_gemini_embedding_mock(server: &MockServer, expected_calls: u64) {
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .and(header("x-goog-api-key", "test-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "embedding": {
+                "values": [1.0, 0.0, 0.0]
+            }
+        })))
+        .expect(expected_calls)
+        .mount(server)
+        .await;
+}
+
+fn semantic_config(server: &MockServer) -> serde_json::Value {
+    json!({
+        "semantic_similarity_enabled": true,
+        "semantic_embedding_endpoint": format!("{}/embeddings", server.uri()),
+        "semantic_embedding_model": "test-embedding-model",
+        "semantic_embedding_api_key": "test-key",
+        "semantic_similarity_threshold": 0.95
+    })
+}
+
 #[test]
 fn test_new_default_config() {
     let config = json!({});
@@ -131,10 +171,43 @@ fn test_new_invalid_config_shapes_fail() {
         json!({"include_model_in_key": "true"}),
         json!({"include_params_in_key": "true"}),
         json!({"scope_by_consumer": "false"}),
+        json!({"semantic_similarity_enabled": "true"}),
+        json!({"semantic_similarity_enabled": true}),
+        json!({"semantic_similarity_enabled": true, "semantic_embedding_endpoint": "not a url"}),
+        json!({"semantic_similarity_enabled": true, "semantic_embedding_endpoint": "file:///tmp/embed"}),
+        json!({"semantic_similarity_threshold": 0.0}),
+        json!({"semantic_similarity_threshold": 1.1}),
+        json!({"semantic_vector_max_candidates": 0}),
+        json!({"semantic_embedding_timeout_ms": 0}),
+        json!({"semantic_embedding_auth_header": "bad header"}),
+        json!({"semantic_embedding_provider": "bogus"}),
+        json!({"semantic_embedding_provider": ""}),
+        json!({"semantic_embedding_input_type": ""}),
+        json!({"semantic_embedding_output_dimension": 0}),
+        json!({"semantic_embedding_output_dimension": "1024"}),
     ] {
         let result = AiSemanticCache::new(&config, PluginHttpClient::default());
         assert!(result.is_err(), "config should be rejected: {config:?}");
     }
+}
+
+#[test]
+fn test_semantic_config_is_optional_and_valid_when_enabled() {
+    let exact_only = make_plugin(json!({}));
+    assert_eq!(exact_only.name(), "ai_semantic_cache");
+
+    let semantic = make_plugin(json!({
+        "semantic_similarity_enabled": true,
+        "semantic_embedding_endpoint": "http://127.0.0.1:12345/embeddings",
+        "semantic_embedding_model": "text-embedding-test",
+        "semantic_embedding_provider": "claude",
+        "semantic_embedding_input_type": "document",
+        "semantic_embedding_output_dimension": 1024,
+        "semantic_similarity_threshold": 0.90,
+        "semantic_vector_max_candidates": 8,
+        "semantic_embedding_timeout_ms": 2500
+    }));
+    assert_eq!(semantic.name(), "ai_semantic_cache");
 }
 
 #[test]
@@ -224,6 +297,155 @@ async fn test_cache_miss_then_hit() {
         }
         _ => panic!("Expected cache HIT (RejectBinary), got {:?}", result),
     }
+}
+
+#[tokio::test]
+async fn test_semantic_similarity_hit_after_exact_miss() {
+    let mock_server = MockServer::start().await;
+    mount_embedding_mock(&mock_server, 2).await;
+    let plugin = make_plugin(semantic_config(&mock_server));
+
+    let body1 = json!({
+        "model": "gpt-4o",
+        "messages": [
+            {"role": "user", "content": "What is the capital of France?"}
+        ]
+    });
+    let body2 = json!({
+        "model": "gpt-4o",
+        "messages": [
+            {"role": "user", "content": "Which city is France's capital?"}
+        ]
+    });
+
+    store_response(
+        &plugin,
+        &serde_json::to_string(&body1).unwrap(),
+        None,
+        b"Paris",
+    )
+    .await;
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/v1/chat/completions".to_string(),
+    );
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        serde_json::to_string(&body2).unwrap(),
+    );
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    match result {
+        PluginResult::RejectBinary { headers, body, .. } => {
+            assert_eq!(
+                headers.get("x-ai-cache-status").map(String::as_str),
+                Some("HIT")
+            );
+            assert_eq!(
+                headers.get("x-ai-cache-match").map(String::as_str),
+                Some("semantic")
+            );
+            assert_eq!(&body[..], b"Paris");
+            assert_eq!(
+                ctx.metadata.get("ai_cache_match").map(String::as_str),
+                Some("semantic")
+            );
+        }
+        _ => panic!(
+            "Expected semantic cache HIT (RejectBinary), got {:?}",
+            result
+        ),
+    }
+}
+
+#[tokio::test]
+async fn test_google_gemini_semantic_provider_uses_provider_response_shape() {
+    let mock_server = MockServer::start().await;
+    mount_google_gemini_embedding_mock(&mock_server, 2).await;
+    let plugin = make_plugin(json!({
+        "semantic_similarity_enabled": true,
+        "semantic_embedding_provider": "google_gemini",
+        "semantic_embedding_endpoint": format!("{}/embeddings", mock_server.uri()),
+        "semantic_embedding_api_key": "test-key",
+        "semantic_similarity_threshold": 0.95
+    }));
+
+    let body1 = json!({
+        "model": "gemini-embedding-test",
+        "messages": [{"role": "user", "content": "What is the capital of France?"}]
+    });
+    let body2 = json!({
+        "model": "gemini-embedding-test",
+        "messages": [{"role": "user", "content": "Which city is France's capital?"}]
+    });
+
+    store_response(
+        &plugin,
+        &serde_json::to_string(&body1).unwrap(),
+        None,
+        b"Paris",
+    )
+    .await;
+
+    let hit =
+        run_before_proxy_get_status(&plugin, &serde_json::to_string(&body2).unwrap(), None).await;
+    assert!(
+        hit,
+        "Gemini embedding.values responses should support semantic hits"
+    );
+}
+
+#[tokio::test]
+async fn test_semantic_similarity_respects_consumer_scope() {
+    let mock_server = MockServer::start().await;
+    mount_embedding_mock(&mock_server, 2).await;
+    let plugin = make_plugin(semantic_config(&mock_server));
+    let alice = make_consumer("alice");
+    let bob = make_consumer("bob");
+
+    let body1 = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "What is my account balance?"}]
+    });
+    let body2 = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "How much money is in my account?"}]
+    });
+
+    store_response(
+        &plugin,
+        &serde_json::to_string(&body1).unwrap(),
+        Some(alice),
+        b"alice-account-data",
+    )
+    .await;
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/v1/chat/completions".to_string(),
+    );
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        serde_json::to_string(&body2).unwrap(),
+    );
+    ctx.identified_consumer = Some(bob);
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "semantic match must not cross consumer scope"
+    );
+    assert_eq!(
+        ctx.metadata.get("ai_cache_status").map(String::as_str),
+        Some("MISS")
+    );
 }
 
 #[tokio::test]

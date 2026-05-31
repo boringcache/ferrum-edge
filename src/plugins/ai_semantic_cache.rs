@@ -1,4 +1,4 @@
-//! AI Semantic Cache Plugin (v1 — Exact-Match)
+//! AI Semantic Cache Plugin
 //!
 //! Caches LLM responses keyed by normalized prompts to avoid redundant API calls.
 //! When the same (or equivalently formatted) prompt arrives again within the TTL,
@@ -15,16 +15,15 @@
 //! This catches the most common duplicate case: identical or trivially reformatted
 //! prompts from different users/requests.
 //!
-//! # v2 Roadmap — Semantic Similarity (Future)
+//! # v2 — Optional Semantic Similarity
 //!
-//! A future v2 could add embedding-based similarity matching:
-//! - Compute embeddings via a configurable embedding endpoint (OpenAI, local model)
-//! - Store embeddings in an in-memory vector index (e.g., HNSW)
-//! - Match prompts by cosine similarity above a configurable threshold (e.g., 0.95)
-//! - This would require: an embedding API dependency (adds latency), a vector
-//!   similarity data structure (e.g., `instant-distance` or `hnsw` crate), and
-//!   careful concurrency handling for the index. The embedding call could be
-//!   amortized by batching or made async with a write-behind cache.
+//! When `semantic_similarity_enabled` is set, exact Redis/local lookups still run
+//! first. On an exact miss, the plugin computes an embedding through a
+//! configurable embedding provider, searches a local HNSW vector index
+//! (`instant-distance`), and returns cached responses whose cosine similarity is
+//! above the configured threshold. Semantic matches are scoped by the same
+//! safety-critical request dimensions as exact keys (proxy, consumer, model,
+//! params, tools, response format, stream flag, and system prompt).
 //!
 //! # Storage
 //!
@@ -32,10 +31,12 @@
 //! - **redis**: Centralized cache via Redis/Valkey for multi-instance deployments,
 //!   using the shared `RedisRateLimitClient` infrastructure
 
+use arc_swap::ArcSwapOption;
 use async_trait::async_trait;
 use bytes::Bytes;
 use dashmap::DashMap;
-use serde_json::Value;
+use instant_distance::{Builder as HnswBuilder, HnswMap, Point as HnswPoint, Search as HnswSearch};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -57,6 +58,137 @@ struct CacheEntry {
     body: Bytes,
     inserted_at: Instant,
     approx_size: usize,
+    semantic_scope_key: Option<String>,
+    embedding: Option<EmbeddingPoint>,
+}
+
+#[derive(Debug, Clone)]
+struct SemanticConfig {
+    provider: EmbeddingProvider,
+    endpoint: String,
+    model: Option<String>,
+    api_key: Option<String>,
+    auth_header: String,
+    auth_scheme: String,
+    input_type: Option<String>,
+    output_dimension: Option<usize>,
+    similarity_threshold: f32,
+    max_candidates: usize,
+    request_timeout: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmbeddingProvider {
+    OpenAi,
+    AzureOpenAi,
+    Mistral,
+    Voyage,
+    Cohere,
+    GoogleGemini,
+    GoogleVertex,
+    BedrockTitan,
+    BedrockCohere,
+}
+
+impl EmbeddingProvider {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "openai" | "openai_compatible" | "openai-compatible" => Ok(Self::OpenAi),
+            "azure" | "azure_openai" | "azure-openai" => Ok(Self::AzureOpenAi),
+            "mistral" => Ok(Self::Mistral),
+            "voyage" | "voyageai" | "voyage_ai" | "anthropic" | "claude" => Ok(Self::Voyage),
+            "cohere" => Ok(Self::Cohere),
+            "google" | "google_gemini" | "google-gemini" | "gemini" => Ok(Self::GoogleGemini),
+            "google_vertex" | "google-vertex" | "vertex" | "vertex_ai" | "vertex-ai" => {
+                Ok(Self::GoogleVertex)
+            }
+            "bedrock_titan" | "bedrock-titan" | "amazon_titan" | "amazon-titan" => {
+                Ok(Self::BedrockTitan)
+            }
+            "bedrock_cohere" | "bedrock-cohere" | "cohere_bedrock" | "cohere-bedrock" => {
+                Ok(Self::BedrockCohere)
+            }
+            other => Err(format!(
+                "ai_semantic_cache: unknown 'semantic_embedding_provider' value '{other}' \
+                 (expected openai, azure_openai, mistral, voyage, cohere, google_gemini, \
+                 google_vertex, bedrock_titan, or bedrock_cohere)"
+            )),
+        }
+    }
+
+    fn default_auth_header(self) -> &'static str {
+        match self {
+            Self::AzureOpenAi => "api-key",
+            Self::GoogleGemini => "x-goog-api-key",
+            _ => "Authorization",
+        }
+    }
+
+    fn default_auth_scheme(self) -> &'static str {
+        match self {
+            Self::AzureOpenAi | Self::GoogleGemini => "",
+            _ => "Bearer",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct EmbeddingPoint {
+    values: Vec<f32>,
+}
+
+impl EmbeddingPoint {
+    fn from_raw(values: Vec<f32>) -> Result<Self, String> {
+        if values.is_empty() {
+            return Err("embedding vector must not be empty".to_string());
+        }
+
+        let mut norm_squared = 0.0_f32;
+        for value in &values {
+            if !value.is_finite() {
+                return Err("embedding vector contains a non-finite value".to_string());
+            }
+            norm_squared += value * value;
+        }
+
+        if norm_squared <= f32::EPSILON {
+            return Err("embedding vector must not have zero length".to_string());
+        }
+
+        let norm = norm_squared.sqrt();
+        Ok(Self {
+            values: values.into_iter().map(|value| value / norm).collect(),
+        })
+    }
+
+    fn to_vec(&self) -> Vec<f32> {
+        self.values.clone()
+    }
+}
+
+impl HnswPoint for EmbeddingPoint {
+    fn distance(&self, other: &Self) -> f32 {
+        if self.values.len() != other.values.len() {
+            return 2.0;
+        }
+
+        let dot = self
+            .values
+            .iter()
+            .zip(&other.values)
+            .fold(0.0_f32, |acc, (left, right)| acc + left * right);
+        (1.0 - dot).clamp(0.0, 2.0)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct VectorEntry {
+    cache_key: String,
+    scope_key: String,
+}
+
+struct VectorSnapshot {
+    index: HnswMap<EmbeddingPoint, VectorEntry>,
 }
 
 pub struct AiSemanticCache {
@@ -74,8 +206,14 @@ pub struct AiSemanticCache {
     include_params_in_key: bool,
     /// Whether to scope cache entries by authenticated consumer.
     scope_by_consumer: bool,
+    /// Optional semantic-similarity configuration.
+    semantic: Option<SemanticConfig>,
+    /// Shared outbound HTTP client for embedding calls.
+    http_client: PluginHttpClient,
     /// Local in-memory cache.
     cache: Arc<DashMap<String, CacheEntry>>,
+    /// Immutable HNSW snapshot for semantic lookup.
+    vector_index: ArcSwapOption<VectorSnapshot>,
     /// Total approximate size of all cached entries.
     total_size: Arc<AtomicUsize>,
     /// Optional Redis client for centralized caching.
@@ -91,6 +229,10 @@ struct SerializableCacheEntry {
     status_code: u16,
     headers: HashMap<String, String>,
     body: Vec<u8>,
+    #[serde(default)]
+    semantic_scope_key: Option<String>,
+    #[serde(default)]
+    embedding: Option<Vec<f32>>,
 }
 
 impl AiSemanticCache {
@@ -120,6 +262,7 @@ impl AiSemanticCache {
         // shared cache (e.g., a public LLM proxy with no per-tenant data)
         // must set this to `false`.
         let scope_by_consumer = optional_bool(config, "scope_by_consumer")?.unwrap_or(true);
+        let semantic = parse_semantic_config(config)?;
 
         // Build optional Redis client
         let default_redis_prefix = default_redis_key_prefix(http_client.namespace());
@@ -144,7 +287,10 @@ impl AiSemanticCache {
             include_model_in_key,
             include_params_in_key,
             scope_by_consumer,
+            semantic,
+            http_client,
             cache: Arc::new(DashMap::new()),
+            vector_index: ArcSwapOption::empty(),
             total_size: Arc::new(AtomicUsize::new(0)),
             redis_client,
             last_cleanup: AtomicU64::new(0),
@@ -239,27 +385,7 @@ impl AiSemanticCache {
         // accepts either a string or an array of content blocks (e.g.
         // `[{"type": "text", "text": "..."}]`); we normalize both forms here.
         if let Some(system) = body.get("system") {
-            let normalized = if let Some(s) = system.as_str() {
-                normalize_text(s)
-            } else if let Some(parts) = system.as_array() {
-                // Array of content blocks. Extract the `text` field of every
-                // `{"type":"text","text":"..."}` block, joined by spaces, then
-                // normalize. This mirrors `extract_message_content`'s
-                // multimodal branch but operates directly on the array (the
-                // system field IS the array, not nested under `"content"`).
-                let mut texts = Vec::with_capacity(parts.len());
-                for part in parts {
-                    if part.get("type").and_then(|t| t.as_str()) == Some("text")
-                        && let Some(text) = part.get("text").and_then(|t| t.as_str())
-                    {
-                        texts.push(text);
-                    }
-                }
-                normalize_text(&texts.join(" "))
-            } else {
-                // Unknown shape — hash the JSON repr so any change breaks the key.
-                normalize_text(&system.to_string())
-            };
+            let normalized = normalize_system_value(system);
             start_key_part(&mut key_input, &mut has_part);
             key_input.push_str("sys:");
             key_input.push_str(&normalized);
@@ -327,6 +453,224 @@ impl AiSemanticCache {
         normalize_text(&raw)
     }
 
+    fn build_semantic_scope_key(&self, ctx: &RequestContext, body: &Value) -> Option<String> {
+        let messages = body.get("messages").and_then(|m| m.as_array())?;
+        let mut key_input = String::with_capacity(512);
+        let mut has_part = false;
+
+        if let Some(ref proxy) = ctx.matched_proxy {
+            start_key_part(&mut key_input, &mut has_part);
+            key_input.push_str(&proxy.id);
+        }
+
+        if self.scope_by_consumer
+            && let Some(identity) = ctx.effective_identity()
+        {
+            start_key_part(&mut key_input, &mut has_part);
+            let _ = write!(&mut key_input, "{identity}");
+        }
+
+        if self.include_model_in_key
+            && let Some(model) = body.get("model").and_then(|m| m.as_str())
+        {
+            start_key_part(&mut key_input, &mut has_part);
+            key_input.push_str("m:");
+            push_ascii_lowercase(&mut key_input, model);
+        }
+
+        if self.include_params_in_key {
+            if let Some(temp) = body.get("temperature") {
+                start_key_part(&mut key_input, &mut has_part);
+                key_input.push_str("t:");
+                key_input.push_str(&canonical_param_value(temp));
+            }
+            if let Some(top_p) = body.get("top_p") {
+                start_key_part(&mut key_input, &mut has_part);
+                key_input.push_str("p:");
+                key_input.push_str(&canonical_param_value(top_p));
+            }
+            if let Some(max_tokens) = body.get("max_tokens").and_then(|t| t.as_u64()) {
+                start_key_part(&mut key_input, &mut has_part);
+                let _ = write!(&mut key_input, "mt:{max_tokens}");
+            }
+        }
+
+        start_key_part(&mut key_input, &mut has_part);
+        key_input.push_str("roles:");
+        for (index, msg) in messages.iter().enumerate() {
+            if index > 0 {
+                key_input.push('|');
+            }
+            let role = msg
+                .get("role")
+                .and_then(|r| r.as_str())
+                .unwrap_or("unknown");
+            push_ascii_lowercase(&mut key_input, role);
+        }
+
+        if let Some(system) = body.get("system") {
+            start_key_part(&mut key_input, &mut has_part);
+            key_input.push_str("sys:");
+            key_input.push_str(&normalize_system_value(system));
+        }
+
+        append_response_shape_fields(body, &mut key_input, &mut has_part);
+
+        let hash = Sha256::digest(key_input.as_bytes());
+        Some(hex::encode(hash))
+    }
+
+    fn build_semantic_input(&self, body: &Value) -> Option<String> {
+        let messages = body.get("messages").and_then(|m| m.as_array())?;
+        let mut input = String::with_capacity(512);
+
+        if let Some(system) = body.get("system") {
+            let system = normalize_system_value(system);
+            if !system.is_empty() {
+                input.push_str("system: ");
+                input.push_str(&system);
+                input.push('\n');
+            }
+        }
+
+        for msg in messages {
+            let role = msg
+                .get("role")
+                .and_then(|r| r.as_str())
+                .unwrap_or("unknown");
+            let content = self.extract_message_content(msg);
+            if content.is_empty() {
+                continue;
+            }
+            push_ascii_lowercase(&mut input, role);
+            input.push_str(": ");
+            input.push_str(&content);
+            input.push('\n');
+        }
+
+        let normalized = input.trim();
+        if normalized.is_empty() {
+            None
+        } else {
+            Some(normalized.to_string())
+        }
+    }
+
+    async fn compute_embedding(&self, input: &str) -> Result<EmbeddingPoint, String> {
+        let semantic = self
+            .semantic
+            .as_ref()
+            .ok_or_else(|| "semantic similarity is disabled".to_string())?;
+
+        let payload = build_embedding_request_payload(semantic, input);
+
+        let mut request = self
+            .http_client
+            .get()
+            .post(&semantic.endpoint)
+            .timeout(semantic.request_timeout)
+            .json(&payload);
+
+        if let Some(api_key) = &semantic.api_key {
+            let header_value = if semantic.auth_scheme.is_empty() {
+                api_key.clone()
+            } else {
+                format!("{} {}", semantic.auth_scheme, api_key)
+            };
+            request = request.header(semantic.auth_header.as_str(), header_value);
+        }
+
+        let response = self
+            .http_client
+            .execute(request, "ai_semantic_cache_embedding")
+            .await
+            .map_err(|err| format!("embedding request failed: {err}"))?;
+
+        if !response.status().is_success() {
+            return Err(format!(
+                "embedding endpoint returned HTTP {}",
+                response.status()
+            ));
+        }
+
+        let body: Value = response
+            .json()
+            .await
+            .map_err(|err| format!("embedding response parse failed: {err}"))?;
+        parse_embedding_response(&body)
+            .and_then(EmbeddingPoint::from_raw)
+            .map_err(|err| format!("embedding response invalid: {err}"))
+    }
+
+    fn lookup_semantic(
+        &self,
+        scope_key: &str,
+        embedding: &EmbeddingPoint,
+    ) -> Option<(CacheEntry, f32, String)> {
+        let semantic = self.semantic.as_ref()?;
+        let snapshot = self.vector_index.load_full()?;
+        let mut search = HnswSearch::default();
+        let now = Instant::now();
+
+        for item in snapshot.index.search(embedding, &mut search) {
+            let similarity = 1.0 - item.distance;
+            if similarity < semantic.similarity_threshold {
+                break;
+            }
+            if item.value.scope_key != scope_key {
+                continue;
+            }
+            let Some(entry) = self.cache.get(&item.value.cache_key) else {
+                continue;
+            };
+            if now.duration_since(entry.inserted_at) >= self.ttl {
+                continue;
+            }
+            return Some((entry.clone(), similarity, item.value.cache_key.clone()));
+        }
+
+        None
+    }
+
+    fn rebuild_vector_index(&self) {
+        let Some(semantic) = self.semantic.as_ref() else {
+            return;
+        };
+
+        let now = Instant::now();
+        let mut points = Vec::new();
+        let mut values = Vec::new();
+
+        for entry in self.cache.iter() {
+            if now.duration_since(entry.inserted_at) >= self.ttl {
+                continue;
+            }
+            let (Some(scope_key), Some(embedding)) =
+                (entry.semantic_scope_key.clone(), entry.embedding.clone())
+            else {
+                continue;
+            };
+            points.push(embedding);
+            values.push(VectorEntry {
+                cache_key: entry.key().clone(),
+                scope_key,
+            });
+        }
+
+        if points.is_empty() {
+            self.vector_index.store(None);
+            return;
+        }
+
+        let index = HnswBuilder::default()
+            .ef_search(semantic.max_candidates)
+            .ef_construction(semantic.max_candidates.max(100))
+            .seed(0)
+            .build(points, values);
+        self.vector_index
+            .store(Some(Arc::new(VectorSnapshot { index })));
+    }
+
     /// Periodic cleanup of expired entries.
     fn cleanup_expired(&self) {
         let now_epoch = std::time::SystemTime::now()
@@ -358,6 +702,7 @@ impl AiSemanticCache {
         });
         if removed_size > 0 {
             self.total_size.fetch_sub(removed_size, Ordering::Relaxed);
+            self.rebuild_vector_index();
         }
 
         // Enforce max entries by removing oldest. Use partial-select
@@ -385,6 +730,7 @@ impl AiSemanticCache {
                         .fetch_sub(removed.approx_size, Ordering::Relaxed);
                 }
             }
+            self.rebuild_vector_index();
         }
     }
 }
@@ -406,6 +752,217 @@ fn push_ascii_lowercase(buffer: &mut String, value: &str) {
 fn canonical_param_value(value: &Value) -> String {
     value.to_string()
 }
+
+fn append_response_shape_fields(body: &Value, buffer: &mut String, has_part: &mut bool) {
+    for field in &[
+        "tools",
+        "tool_choice",
+        "response_format",
+        "seed",
+        "logit_bias",
+    ] {
+        if let Some(value) = body.get(*field) {
+            start_key_part(buffer, has_part);
+            buffer.push_str(field);
+            buffer.push(':');
+            let _ = write!(buffer, "{value}");
+        }
+    }
+
+    if let Some(stream) = body.get("stream").and_then(|s| s.as_bool()) {
+        start_key_part(buffer, has_part);
+        let _ = write!(buffer, "stream:{stream}");
+    }
+}
+
+fn insert_optional_model(payload: &mut Value, model: &Option<String>) {
+    if let (Value::Object(map), Some(model)) = (payload, model) {
+        map.insert("model".to_string(), Value::String(model.clone()));
+    }
+}
+
+fn insert_optional_string(payload: &mut Value, field: &str, value: &Option<String>) {
+    if let (Value::Object(map), Some(value)) = (payload, value) {
+        map.insert(field.to_string(), Value::String(value.clone()));
+    }
+}
+
+fn insert_optional_dimension(payload: &mut Value, field: &str, value: Option<usize>) {
+    if let (Value::Object(map), Some(value)) = (payload, value) {
+        map.insert(field.to_string(), json!(value));
+    }
+}
+
+fn build_openai_embedding_payload(semantic: &SemanticConfig, input: &str) -> Value {
+    let mut payload = json!({ "input": input });
+    insert_optional_model(&mut payload, &semantic.model);
+    insert_optional_dimension(&mut payload, "dimensions", semantic.output_dimension);
+    payload
+}
+
+fn build_embedding_request_payload(semantic: &SemanticConfig, input: &str) -> Value {
+    match semantic.provider {
+        EmbeddingProvider::OpenAi | EmbeddingProvider::AzureOpenAi | EmbeddingProvider::Mistral => {
+            build_openai_embedding_payload(semantic, input)
+        }
+        EmbeddingProvider::Voyage => {
+            let mut payload = json!({ "input": input });
+            insert_optional_model(&mut payload, &semantic.model);
+            insert_optional_string(&mut payload, "input_type", &semantic.input_type);
+            insert_optional_dimension(&mut payload, "output_dimension", semantic.output_dimension);
+            payload
+        }
+        EmbeddingProvider::Cohere => {
+            let input_type = semantic
+                .input_type
+                .as_deref()
+                .unwrap_or("search_query")
+                .to_string();
+            let mut payload = json!({
+                "texts": [input],
+                "input_type": input_type,
+                "embedding_types": ["float"],
+            });
+            insert_optional_model(&mut payload, &semantic.model);
+            insert_optional_dimension(&mut payload, "output_dimension", semantic.output_dimension);
+            payload
+        }
+        EmbeddingProvider::GoogleGemini => {
+            let mut payload = json!({
+                "content": {
+                    "parts": [
+                        { "text": input }
+                    ]
+                }
+            });
+            insert_optional_model(&mut payload, &semantic.model);
+            insert_optional_string(&mut payload, "taskType", &semantic.input_type);
+            insert_optional_dimension(
+                &mut payload,
+                "output_dimensionality",
+                semantic.output_dimension,
+            );
+            payload
+        }
+        EmbeddingProvider::GoogleVertex => {
+            let mut instance = json!({ "content": input });
+            insert_optional_string(&mut instance, "task_type", &semantic.input_type);
+
+            let mut payload = json!({ "instances": [instance] });
+            if let Some(output_dimension) = semantic.output_dimension
+                && let Value::Object(map) = &mut payload
+            {
+                map.insert(
+                    "parameters".to_string(),
+                    json!({ "outputDimensionality": output_dimension }),
+                );
+            }
+            payload
+        }
+        EmbeddingProvider::BedrockTitan => {
+            let mut payload = json!({ "inputText": input });
+            insert_optional_dimension(&mut payload, "dimensions", semantic.output_dimension);
+            payload
+        }
+        EmbeddingProvider::BedrockCohere => {
+            let input_type = semantic
+                .input_type
+                .as_deref()
+                .unwrap_or("search_query")
+                .to_string();
+            let mut payload = json!({
+                "texts": [input],
+                "input_type": input_type,
+                "embedding_types": ["float"],
+            });
+            insert_optional_dimension(&mut payload, "output_dimension", semantic.output_dimension);
+            payload
+        }
+    }
+}
+
+fn normalize_system_value(system: &Value) -> String {
+    if let Some(s) = system.as_str() {
+        normalize_text(s)
+    } else if let Some(parts) = system.as_array() {
+        let mut texts = Vec::with_capacity(parts.len());
+        for part in parts {
+            if part.get("type").and_then(|t| t.as_str()) == Some("text")
+                && let Some(text) = part.get("text").and_then(|t| t.as_str())
+            {
+                texts.push(text);
+            }
+        }
+        normalize_text(&texts.join(" "))
+    } else {
+        normalize_text(&system.to_string())
+    }
+}
+
+fn embedding_array_candidate(value: &Value) -> Option<&Value> {
+    let array = value.as_array()?;
+    if let Some(first) = array.first()
+        && first.as_array().is_some()
+    {
+        return Some(first);
+    }
+    Some(value)
+}
+
+fn first_embedding_array(body: &Value) -> Option<(&Value, &'static str)> {
+    for (path, label) in [
+        ("/data/0/embedding", "data[0].embedding"),
+        ("/embedding/values", "embedding.values"),
+        ("/embedding", "embedding"),
+        ("/embeddings/0/values", "embeddings[0].values"),
+        ("/embeddings/0", "embeddings[0]"),
+        ("/embeddings/float", "embeddings.float[0]"),
+        (
+            "/predictions/0/embeddings/values",
+            "predictions[0].embeddings.values",
+        ),
+        (
+            "/predictions/0/embeddings/float",
+            "predictions[0].embeddings.float[0]",
+        ),
+        ("/embeddingsByType/float", "embeddingsByType.float"),
+        ("/embeddingByTypes/float", "embeddingByTypes.float"),
+        ("/embeddings_by_type/float", "embeddings_by_type.float"),
+        ("/results/0/embedding", "results[0].embedding"),
+    ] {
+        if let Some(value) = body.pointer(path).and_then(embedding_array_candidate) {
+            return Some((value, label));
+        }
+    }
+    None
+}
+
+fn parse_embedding_response(body: &Value) -> Result<Vec<f32>, String> {
+    let (embedding, label) = first_embedding_array(body).ok_or_else(|| {
+        "missing embedding array at data[0].embedding, embedding, embedding.values, \
+         embeddings[0], embeddings.float[0], predictions[0].embeddings.values, \
+         embeddingsByType.float, or results[0].embedding"
+            .to_string()
+    })?;
+
+    let values = embedding
+        .as_array()
+        .ok_or_else(|| format!("embedding field at {label} must be an array"))?;
+    let mut result = Vec::with_capacity(values.len());
+    for value in values {
+        let Some(number) = value.as_f64() else {
+            return Err(format!("embedding array values at {label} must be numbers"));
+        };
+        if !number.is_finite() || number < f32::MIN as f64 || number > f32::MAX as f64 {
+            return Err(format!(
+                "embedding array at {label} contains an out-of-range value"
+            ));
+        }
+        result.push(number as f32);
+    }
+    Ok(result)
+}
+
 /// Normalize text: lowercase, collapse whitespace to single spaces, trim.
 ///
 /// Single-pass: previously called `to_ascii_lowercase()` first (one extra
@@ -547,6 +1104,58 @@ impl Plugin for AiSemanticCache {
             if let Some((_, removed)) = self.cache.remove(&cache_key) {
                 self.total_size
                     .fetch_sub(removed.approx_size, Ordering::Relaxed);
+                self.rebuild_vector_index();
+            }
+        }
+
+        if self.semantic.is_some()
+            && let (Some(scope_key), Some(input)) = (
+                self.build_semantic_scope_key(ctx, &json),
+                self.build_semantic_input(&json),
+            )
+        {
+            match self.compute_embedding(&input).await {
+                Ok(embedding) => {
+                    if let Some((entry, similarity, matched_key)) =
+                        self.lookup_semantic(&scope_key, &embedding)
+                    {
+                        debug!(
+                            cache_key = %matched_key,
+                            similarity = similarity,
+                            "ai_semantic_cache: semantic cache HIT, returning cached response"
+                        );
+                        let mut response_headers = entry.headers.clone();
+                        response_headers.insert("x-ai-cache-status".to_string(), "HIT".to_string());
+                        response_headers
+                            .insert("x-ai-cache-match".to_string(), "semantic".to_string());
+                        ctx.metadata
+                            .insert("ai_cache_status".to_string(), "HIT".to_string());
+                        ctx.metadata
+                            .insert("ai_cache_match".to_string(), "semantic".to_string());
+                        ctx.metadata.insert(
+                            "ai_cache_similarity".to_string(),
+                            format!("{similarity:.6}"),
+                        );
+                        return PluginResult::RejectBinary {
+                            status_code: entry.status_code,
+                            body: entry.body.clone(),
+                            headers: response_headers,
+                        };
+                    }
+
+                    if let Ok(serialized_embedding) = serde_json::to_string(&embedding.to_vec()) {
+                        ctx.metadata
+                            .insert("_ai_cache_embedding".to_string(), serialized_embedding);
+                        ctx.metadata
+                            .insert("_ai_cache_semantic_scope".to_string(), scope_key);
+                    }
+                }
+                Err(err) => {
+                    debug!(
+                        error = %err,
+                        "ai_semantic_cache: semantic embedding unavailable; continuing exact-cache miss"
+                    );
+                }
             }
         }
 
@@ -628,6 +1237,12 @@ impl Plugin for AiSemanticCache {
         // cache-hit consumer — leaking session state and misleading
         // downstream clients about their own rate-limit/trace context.
         let safe_headers = sanitize_cached_headers(response_headers);
+        let semantic_scope_key = ctx.metadata.get("_ai_cache_semantic_scope").cloned();
+        let embedding = ctx
+            .metadata
+            .get("_ai_cache_embedding")
+            .and_then(|raw| serde_json::from_str::<Vec<f32>>(raw).ok())
+            .and_then(|values| EmbeddingPoint::from_raw(values).ok());
 
         let entry = CacheEntry {
             status_code: response_status,
@@ -635,16 +1250,23 @@ impl Plugin for AiSemanticCache {
             body: Bytes::from(body.to_vec()),
             inserted_at: Instant::now(),
             approx_size: body.len(),
+            semantic_scope_key: semantic_scope_key.clone(),
+            embedding: embedding.clone(),
         };
 
+        let mut replaced_semantic_entry = false;
         // Remove old entry size if replacing
         if let Some((_, old)) = self.cache.remove(&cache_key) {
+            replaced_semantic_entry = old.embedding.is_some();
             self.total_size
                 .fetch_sub(old.approx_size, Ordering::Relaxed);
         }
         self.total_size
             .fetch_add(entry.approx_size, Ordering::Relaxed);
         self.cache.insert(cache_key.clone(), entry);
+        if replaced_semantic_entry || embedding.is_some() {
+            self.rebuild_vector_index();
+        }
 
         // Also store in Redis if configured
         if let Some(ref redis) = self.redis_client
@@ -654,6 +1276,8 @@ impl Plugin for AiSemanticCache {
                 status_code: response_status,
                 headers: safe_headers,
                 body: body.to_vec(),
+                semantic_scope_key,
+                embedding: embedding.map(|point| point.to_vec()),
             };
             if let Ok(data) = serde_json::to_vec(&serializable) {
                 let redis_key = redis.make_key(&[&cache_key]);
@@ -716,6 +1340,105 @@ fn optional_bool(config: &Value, field: &'static str) -> Result<Option<bool>, St
         .ok_or_else(|| format!("ai_semantic_cache: '{field}' must be a boolean"))
 }
 
+fn optional_string(config: &Value, field: &'static str) -> Result<Option<String>, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(None);
+    };
+    value
+        .as_str()
+        .map(|value| Some(value.to_string()))
+        .ok_or_else(|| format!("ai_semantic_cache: '{field}' must be a string"))
+}
+
+fn optional_non_empty_string(
+    config: &Value,
+    field: &'static str,
+) -> Result<Option<String>, String> {
+    let Some(value) = optional_string(config, field)? else {
+        return Ok(None);
+    };
+    if value.trim().is_empty() {
+        return Err(format!("ai_semantic_cache: '{field}' must not be empty"));
+    }
+    Ok(Some(value))
+}
+
+fn optional_threshold(config: &Value, field: &'static str) -> Result<Option<f32>, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(None);
+    };
+    let Some(number) = value.as_f64() else {
+        return Err(format!(
+            "ai_semantic_cache: '{field}' must be a number greater than 0 and at most 1"
+        ));
+    };
+    if !number.is_finite() || number <= 0.0 || number > 1.0 {
+        return Err(format!(
+            "ai_semantic_cache: '{field}' must be greater than 0 and at most 1"
+        ));
+    }
+    Ok(Some(number as f32))
+}
+
+fn parse_semantic_config(config: &Value) -> Result<Option<SemanticConfig>, String> {
+    let enabled = optional_bool(config, "semantic_similarity_enabled")?.unwrap_or(false);
+    let provider = optional_non_empty_string(config, "semantic_embedding_provider")?
+        .as_deref()
+        .map(EmbeddingProvider::parse)
+        .transpose()?
+        .unwrap_or(EmbeddingProvider::OpenAi);
+    let endpoint = optional_non_empty_string(config, "semantic_embedding_endpoint")?;
+    let model = optional_non_empty_string(config, "semantic_embedding_model")?;
+    let api_key = optional_non_empty_string(config, "semantic_embedding_api_key")?;
+    let auth_header = optional_non_empty_string(config, "semantic_embedding_auth_header")?
+        .unwrap_or_else(|| provider.default_auth_header().to_string());
+    let auth_scheme = optional_string(config, "semantic_embedding_auth_scheme")?
+        .unwrap_or_else(|| provider.default_auth_scheme().to_string());
+    let input_type = optional_non_empty_string(config, "semantic_embedding_input_type")?;
+    let output_dimension = optional_positive_usize(config, "semantic_embedding_output_dimension")?;
+    let similarity_threshold =
+        optional_threshold(config, "semantic_similarity_threshold")?.unwrap_or(0.95);
+    let max_candidates =
+        optional_positive_usize(config, "semantic_vector_max_candidates")?.unwrap_or(16);
+    let timeout_ms =
+        optional_positive_u64(config, "semantic_embedding_timeout_ms")?.unwrap_or(5_000);
+
+    reqwest::header::HeaderName::from_bytes(auth_header.as_bytes()).map_err(|_| {
+        "ai_semantic_cache: 'semantic_embedding_auth_header' must be a valid HTTP header name"
+            .to_string()
+    })?;
+
+    if !enabled {
+        return Ok(None);
+    }
+
+    let endpoint = endpoint.ok_or_else(|| {
+        "ai_semantic_cache: 'semantic_embedding_endpoint' is required when semantic_similarity_enabled=true"
+            .to_string()
+    })?;
+    let parsed_endpoint = url::Url::parse(&endpoint)
+        .map_err(|_| "ai_semantic_cache: 'semantic_embedding_endpoint' must be a valid URL")?;
+    if !matches!(parsed_endpoint.scheme(), "http" | "https") {
+        return Err(
+            "ai_semantic_cache: 'semantic_embedding_endpoint' must use http or https".to_string(),
+        );
+    }
+
+    Ok(Some(SemanticConfig {
+        provider,
+        endpoint,
+        model,
+        api_key,
+        auth_header,
+        auth_scheme,
+        input_type,
+        output_dimension,
+        similarity_threshold,
+        max_candidates,
+        request_timeout: Duration::from_millis(timeout_ms),
+    }))
+}
+
 fn default_redis_key_prefix(namespace: &str) -> String {
     let mut prefix = String::with_capacity(namespace.len() + 9);
     prefix.push_str(namespace);
@@ -740,6 +1463,8 @@ mod tests {
             headers: HashMap::new(),
             inserted_at,
             approx_size: 8,
+            semantic_scope_key: None,
+            embedding: None,
         };
         plugin
             .total_size
@@ -807,5 +1532,115 @@ mod tests {
         );
         assert_eq!(normalize_text(""), "");
         assert_eq!(normalize_text("   "), "");
+    }
+
+    #[test]
+    fn embedding_provider_aliases_cover_major_plugin_families() {
+        assert_eq!(
+            EmbeddingProvider::parse("openai-compatible").unwrap(),
+            EmbeddingProvider::OpenAi
+        );
+        assert_eq!(
+            EmbeddingProvider::parse("azure_openai").unwrap(),
+            EmbeddingProvider::AzureOpenAi
+        );
+        assert_eq!(
+            EmbeddingProvider::parse("mistral").unwrap(),
+            EmbeddingProvider::Mistral
+        );
+        assert_eq!(
+            EmbeddingProvider::parse("claude").unwrap(),
+            EmbeddingProvider::Voyage
+        );
+        assert_eq!(
+            EmbeddingProvider::parse("anthropic").unwrap(),
+            EmbeddingProvider::Voyage
+        );
+        assert_eq!(
+            EmbeddingProvider::parse("google_vertex").unwrap(),
+            EmbeddingProvider::GoogleVertex
+        );
+        assert_eq!(
+            EmbeddingProvider::parse("bedrock_cohere").unwrap(),
+            EmbeddingProvider::BedrockCohere
+        );
+        assert!(EmbeddingProvider::parse("unknown").is_err());
+    }
+
+    fn semantic_config_for(provider: EmbeddingProvider) -> SemanticConfig {
+        SemanticConfig {
+            provider,
+            endpoint: "http://127.0.0.1:1/embeddings".to_string(),
+            model: Some("test-embedding-model".to_string()),
+            api_key: Some("test-key".to_string()),
+            auth_header: provider.default_auth_header().to_string(),
+            auth_scheme: provider.default_auth_scheme().to_string(),
+            input_type: Some("SEMANTIC_SIMILARITY".to_string()),
+            output_dimension: Some(256),
+            similarity_threshold: 0.95,
+            max_candidates: 16,
+            request_timeout: Duration::from_secs(5),
+        }
+    }
+
+    #[test]
+    fn embedding_request_payloads_match_provider_shapes() {
+        let input = "user: where is paris?";
+
+        let openai =
+            build_embedding_request_payload(&semantic_config_for(EmbeddingProvider::OpenAi), input);
+        assert_eq!(openai["input"], input);
+        assert_eq!(openai["model"], "test-embedding-model");
+        assert_eq!(openai["dimensions"], 256);
+
+        let cohere =
+            build_embedding_request_payload(&semantic_config_for(EmbeddingProvider::Cohere), input);
+        assert_eq!(cohere["texts"][0], input);
+        assert_eq!(cohere["input_type"], "SEMANTIC_SIMILARITY");
+        assert_eq!(cohere["embedding_types"][0], "float");
+        assert_eq!(cohere["output_dimension"], 256);
+
+        let gemini = build_embedding_request_payload(
+            &semantic_config_for(EmbeddingProvider::GoogleGemini),
+            input,
+        );
+        assert_eq!(gemini["content"]["parts"][0]["text"], input);
+        assert_eq!(gemini["taskType"], "SEMANTIC_SIMILARITY");
+        assert_eq!(gemini["output_dimensionality"], 256);
+
+        let vertex = build_embedding_request_payload(
+            &semantic_config_for(EmbeddingProvider::GoogleVertex),
+            input,
+        );
+        assert_eq!(vertex["instances"][0]["content"], input);
+        assert_eq!(vertex["instances"][0]["task_type"], "SEMANTIC_SIMILARITY");
+        assert_eq!(vertex["parameters"]["outputDimensionality"], 256);
+
+        let titan = build_embedding_request_payload(
+            &semantic_config_for(EmbeddingProvider::BedrockTitan),
+            input,
+        );
+        assert_eq!(titan["inputText"], input);
+        assert_eq!(titan["dimensions"], 256);
+    }
+
+    #[test]
+    fn embedding_response_parser_accepts_major_provider_shapes() {
+        for body in [
+            json!({"data": [{"embedding": [1.0, 2.0, 3.0]}]}),
+            json!({"embedding": [1.0, 2.0, 3.0]}),
+            json!({"embedding": {"values": [1.0, 2.0, 3.0]}}),
+            json!({"embeddings": [[1.0, 2.0, 3.0]]}),
+            json!({"embeddings": [{"values": [1.0, 2.0, 3.0]}]}),
+            json!({"embeddings": {"float": [[1.0, 2.0, 3.0]]}}),
+            json!({"predictions": [{"embeddings": {"values": [1.0, 2.0, 3.0]}}]}),
+            json!({"embeddingsByType": {"float": [1.0, 2.0, 3.0]}}),
+            json!({"results": [{"embedding": [1.0, 2.0, 3.0]}]}),
+        ] {
+            assert_eq!(
+                parse_embedding_response(&body).unwrap(),
+                vec![1.0, 2.0, 3.0]
+            );
+        }
     }
 }

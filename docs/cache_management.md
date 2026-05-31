@@ -176,13 +176,13 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 
 ### AI Semantic Cache
 
-**What it stores:** Cached LLM responses keyed by normalized prompt text.
+**What it stores:** Cached LLM responses keyed by normalized prompt text. When `semantic_similarity_enabled` is true, local cache entries can also carry prompt embeddings and are indexed in a local HNSW vector snapshot for semantic lookup after exact misses.
 
 **Default limit:** 10,000 entries.
 
 **Config field:** `max_entries` (in plugin config JSON).
 
-**Cleanup mechanism:** TTL-based expiration (`ttl_seconds` config field). When the cache exceeds `max_entries`, oldest entries are evicted.
+**Cleanup mechanism:** TTL-based expiration (`ttl_seconds` config field). When the cache exceeds `max_entries`, oldest entries are evicted. The optional semantic vector snapshot is rebuilt after local semantic entries are inserted or evicted.
 
 ### Request Deduplication
 

@@ -3294,7 +3294,7 @@ plugins:
 
 ### `ai_semantic_cache`
 
-Caches LLM responses keyed by normalized prompts to reduce redundant API calls and latency. v1 uses exact-match with normalization: prompts are lowercased, whitespace is collapsed, and the result is SHA-256 hashed to produce the cache key. Supports local in-memory (DashMap) and centralized Redis storage backends.
+Caches LLM responses keyed by normalized prompts to reduce redundant API calls and latency. The default path uses exact-match normalization: prompts are lowercased, whitespace is collapsed, and the result is SHA-256 hashed to produce the cache key. Optional semantic similarity can be enabled to compute prompt embeddings through a configured embedding provider and search a local HNSW vector index (`instant-distance`) before forwarding exact misses to the backend. Exact response storage supports local in-memory (DashMap) and centralized Redis backends.
 
 **Priority:** 2700
 
@@ -3307,6 +3307,18 @@ Caches LLM responses keyed by normalized prompts to reduce redundant API calls a
 | `include_model_in_key` | bool | `true` | Include the model name in the cache key (different models get separate cache entries) |
 | `include_params_in_key` | bool | `true` | Include sampling parameters (temperature, top_p, max_tokens) in the cache key. Default `true` because different params produce different responses; set `false` only when cross-parameter reuse is intentional. |
 | `scope_by_consumer` | bool | `true` | Scope cache entries per authenticated consumer. Default `true` because cached responses must not be replayed across consumers; set `false` only for a public LLM proxy with no per-tenant data. |
+| `semantic_similarity_enabled` | bool | `false` | Enable embedding-based semantic lookup after exact Redis/local misses. Exact matching remains active either way. |
+| `semantic_embedding_provider` | String | `"openai"` | Embedding request/response format. Supports `openai`, `azure_openai`, `mistral`, `voyage` (`anthropic`/`claude` aliases), `cohere`, `google_gemini`, `google_vertex`, `bedrock_titan`, and `bedrock_cohere`. |
+| `semantic_embedding_endpoint` | String (optional) | -- | Embedding endpoint URL. Required when `semantic_similarity_enabled: true`. OpenAI-compatible endpoints use `{"input": "...", "model": "..."}`; other provider values send native provider JSON. |
+| `semantic_embedding_model` | String (optional) | -- | Model name sent in the embedding request body. Omit for local endpoints that do not require a model field. |
+| `semantic_embedding_input_type` | String (optional) | -- | Provider-specific input/task type. Used by Voyage (`query`/`document`), Cohere/Bedrock Cohere (`search_query`, `search_document`, `classification`, `clustering`), Gemini (`SEMANTIC_SIMILARITY`, etc.), and Vertex (`task_type`). |
+| `semantic_embedding_output_dimension` | u64 (optional) | -- | Provider-specific reduced embedding dimension when supported (`dimensions`, `output_dimension`, `output_dimensionality`, or Vertex `outputDimensionality`). |
+| `semantic_embedding_api_key` | String (optional) | -- | API key for the embedding endpoint. Sent in `semantic_embedding_auth_header` with `semantic_embedding_auth_scheme` when configured. |
+| `semantic_embedding_auth_header` | String | provider default | HTTP header used for `semantic_embedding_api_key`. Defaults to `Authorization`, except Azure OpenAI uses `api-key` and Google Gemini uses `x-goog-api-key`. |
+| `semantic_embedding_auth_scheme` | String | provider default | Prefix for the API key header value. Defaults to `Bearer`, except Azure OpenAI and Google Gemini send the raw key. Set to an empty string to send the raw key. |
+| `semantic_similarity_threshold` | number | `0.95` | Minimum cosine similarity for a semantic cache hit. Must be > 0 and <= 1. |
+| `semantic_vector_max_candidates` | u64 | `16` | Number of nearest HNSW candidates to inspect. Increase when semantic entries span many scopes. |
+| `semantic_embedding_timeout_ms` | u64 | `5000` | Per-request timeout for embedding calls. Embedding failures fall back to a normal cache miss. |
 | `sync_mode` | String | `"local"` | `"local"` (in-memory DashMap) or `"redis"` (centralized Redis) |
 | `redis_url` | String (optional) | -- | Redis connection URL (required when `sync_mode: "redis"`) |
 | `redis_tls` | bool | `false` | Enable TLS for Redis connection |
@@ -3321,9 +3333,15 @@ Caches LLM responses keyed by normalized prompts to reduce redundant API calls a
 
 - **Cache key normalization**: The prompt text is lowercased and whitespace is collapsed (multiple spaces, tabs, newlines reduced to a single space), then SHA-256 hashed. This ensures semantically identical prompts with minor formatting differences produce the same cache key.
 - **Cache key composition**: The hashed key includes the proxy ID, optionally the authenticated consumer (default on), the model name (default on), optionally sampling params (default on — `temperature`, `top_p`, `max_tokens`), the normalized `messages` array, the Anthropic top-level `system` prompt (string or array-of-content-blocks form), and any of `tools`, `tool_choice`, `response_format`, `seed`, `logit_bias`, `stream` that are present on the request. Any byte-level change to these fields produces a different cache entry — two requests with different system prompts, tool sets, response formats, seeds, logit biases, or streaming flags will never collide.
+- **Semantic lookup (optional)**: When enabled, the plugin computes an embedding only after exact Redis/local misses. It searches a local immutable HNSW snapshot and returns a cached response when cosine similarity meets `semantic_similarity_threshold`. Exact matching remains the first lookup path.
+- **Embedding provider formats**: `openai`, `azure_openai`, and `mistral` use OpenAI-compatible embedding JSON and parse `data[0].embedding`. `voyage` uses Voyage's `input`/`input_type`/`output_dimension` shape and also backs the `anthropic` and `claude` aliases because Claude does not expose a native embedding model. `cohere` and `bedrock_cohere` use `texts`, `input_type`, and `embedding_types: ["float"]`. `google_gemini` sends `content.parts[].text`; `google_vertex` sends `instances[].content`; `bedrock_titan` sends `inputText`. The parser accepts common response shapes including `embedding.values`, `embeddings.float[0]`, `predictions[0].embeddings.values`, and `embeddingsByType.float`.
+- **Embedding authentication**: The plugin sends a single configured API-key header. Direct Google Vertex and Amazon Bedrock endpoints usually require OAuth2 or SigV4; use a provider-side proxy, pre-signed/internal endpoint, or an auth-aware gateway in front of those endpoints unless the configured header is sufficient.
+- **Semantic scoping**: Semantic candidates must match the same proxy, consumer scope, model, sampling params, message role sequence, system prompt, tools, response format, seed, logit bias, and stream flag before they can hit. This prevents a similar prompt from crossing tenant or response-shape boundaries.
+- **Embedding failure behavior**: If the embedding endpoint is unavailable, returns a non-2xx status, or emits an invalid vector, the plugin logs at debug level and continues as a normal exact-cache miss. The backend request still proceeds.
 - **Cache status header**: Responses include an `X-Ai-Cache-Status` header: `HIT` when the response is served from cache, `MISS` when the response is fetched from the backend and stored.
+- **Semantic hit header**: Semantic hits also include `X-Ai-Cache-Match: semantic`; exact hits omit this header.
 - **SSE responses**: Server-Sent Events (streaming) responses are not cached because they arrive incrementally and cannot be reliably replayed from a stored buffer.
-- **Redis mode**: When `sync_mode: "redis"`, cache entries are stored in Redis with TTL-based expiration. If Redis becomes unreachable, the plugin falls back to local in-memory storage automatically. Compatible with any RESP-protocol server (Redis, Valkey, DragonflyDB, KeyDB, Garnet). Namespace-aware key prefix prevents cache collisions when gateways with different `FERRUM_NAMESPACE` values share the same Redis cluster.
+- **Redis mode**: When `sync_mode: "redis"`, exact cache entries are stored in Redis with TTL-based expiration. If Redis becomes unreachable, the plugin falls back to local in-memory storage automatically. Compatible with any RESP-protocol server (Redis, Valkey, DragonflyDB, KeyDB, Garnet). Namespace-aware key prefix prevents cache collisions when gateways with different `FERRUM_NAMESPACE` values share the same Redis cluster. The semantic HNSW vector index is local to each gateway process.
 - **Eviction (local mode)**: When the cache exceeds `max_entries`, eviction uses partial-select (`select_nth_unstable_by_key`) to identify the oldest entries in O(n) average time instead of a full O(n log n) sort. Oldest-first semantics by `inserted_at` are preserved.
 - **Sensitive header stripping**: Per-response identity headers (`Set-Cookie`, `Set-Cookie2`, `Authorization`, `WWW-Authenticate`, `X-API-Key`, AWS session tokens), per-request trace IDs (`X-Request-Id`, `X-Correlation-Id`, `X-Trace-Id`, `traceparent`/`tracestate`, `b3`, and all `X-B3-*` headers), and per-request rate-limit counters (`Retry-After`, plus all headers under the `X-RateLimit-*`, `X-AI-RateLimit-*`, and `Anthropic-RateLimit-*` prefixes — which covers OpenAI's suffix variants like `X-RateLimit-Limit-Requests`/`-Tokens` and Anthropic's `Anthropic-RateLimit-Requests-*`/`-Tokens-*`) are stripped from cached responses before storage. This prevents the cache from leaking the original consumer's session state to other consumers on a cache hit, and avoids replaying stale rate-limit / trace context to the new client. Filtering is case-insensitive. Hop-by-hop headers (RFC 9110 §7.6.1) including `Proxy-Authenticate` are not re-filtered here because the proxy response path strips them before plugins observe the response.
 
@@ -3337,6 +3355,43 @@ config:
   scope_by_consumer: true
 ```
 
+**Semantic similarity example:**
+
+```yaml
+plugin_name: ai_semantic_cache
+config:
+  ttl_seconds: 600
+  semantic_similarity_enabled: true
+  semantic_embedding_provider: openai
+  semantic_embedding_endpoint: "https://api.openai.com/v1/embeddings"
+  semantic_embedding_model: "text-embedding-3-small"
+  semantic_embedding_api_key: "<redacted>"
+  semantic_similarity_threshold: 0.95
+  semantic_vector_max_candidates: 16
+```
+
+**Provider-specific embedding examples:**
+
+```yaml
+# Claude/Anthropic workloads use Voyage-compatible embeddings.
+semantic_embedding_provider: voyage
+semantic_embedding_endpoint: "https://api.voyageai.com/v1/embeddings"
+semantic_embedding_model: "voyage-4"
+semantic_embedding_input_type: "query"
+
+# Cohere v2 / Bedrock Cohere-style text embeddings.
+semantic_embedding_provider: cohere
+semantic_embedding_endpoint: "https://api.cohere.com/v2/embed"
+semantic_embedding_model: "embed-v4.0"
+semantic_embedding_input_type: "search_query"
+semantic_embedding_output_dimension: 1024
+
+# Gemini API key auth defaults to x-goog-api-key with no Bearer prefix.
+semantic_embedding_provider: google_gemini
+semantic_embedding_endpoint: "https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-2:embedContent"
+semantic_embedding_api_key: "<redacted>"
+```
+
 **Redis mode example:**
 
 ```yaml
@@ -3347,10 +3402,6 @@ config:
   redis_url: "redis://redis-host:6379/3"
   redis_key_prefix: "myapp:ai_cache"
 ```
-
-#### v2 Roadmap
-
-A future v2 will add semantic similarity matching using embedding vectors. Instead of requiring exact normalized prompt matches, v2 will compute embeddings for prompts and use cosine similarity to find cached responses for semantically similar (but not identical) prompts. This will support configurable similarity thresholds and pluggable embedding providers.
 
 ### `ai_token_metrics`
 

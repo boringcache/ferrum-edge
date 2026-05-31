@@ -297,7 +297,7 @@ Seven plugins for AI gateway use cases — cost visibility, budget enforcement, 
 - **`ai_request_guard`** — Enforce model whitelists, token limits, and request policy
 - **`ai_rate_limiter`** — Rate-limit by token consumption instead of request count (supports centralized Redis mode; compatible with any RESP-protocol server: Redis, Valkey, DragonflyDB, KeyDB, Garnet)
 - **`ai_prompt_shield`** — Scan for PII and reject, redact, or warn
-- **`ai_semantic_cache`** — LLM response caching with normalized prompt matching (local or Redis)
+- **`ai_semantic_cache`** — LLM response caching with normalized exact-match keys, optional embedding-based semantic similarity, and local or Redis exact-response storage
 - **`ai_response_guard`** — Output-side content guardrails: PII detection, blocked phrases, response format validation
 - **`ai_federation`** — Universal AI gateway routing requests to 11+ providers with model-based routing and priority fallback
 
