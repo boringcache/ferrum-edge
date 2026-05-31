@@ -243,10 +243,9 @@ async fn literal_path_beats_parameter_path() {
         Some("GET /users/me")
     );
     assert!(
-        !ctx.metadata
-            .keys()
-            .any(|key| key.starts_with("openapi_validator.matched_operation_method.")
-                || key.starts_with("openapi_validator.matched_operation_index.")),
+        !ctx.metadata.keys().any(|key| key
+            .starts_with("openapi_validator.matched_operation_method.")
+            || key.starts_with("openapi_validator.matched_operation_index.")),
         "internal operation cache keys must not be exposed in metadata: {:?}",
         ctx.metadata
     );

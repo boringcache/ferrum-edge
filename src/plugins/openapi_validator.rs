@@ -316,7 +316,10 @@ impl OpenapiValidator {
             .iter()
             .find(|(key, _)| key.eq_ignore_ascii_case(method))?;
         let index = bucket.path_regexes.matches(path).into_iter().next()?;
-        bucket.entries.get(index).map(|entry| OperationMatch { entry })
+        bucket
+            .entries
+            .get(index)
+            .map(|entry| OperationMatch { entry })
     }
 
     fn operation_for_context<'a>(&'a self, ctx: &RequestContext) -> Option<&'a OperationEntry> {
