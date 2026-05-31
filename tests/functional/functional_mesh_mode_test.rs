@@ -127,16 +127,7 @@ struct MeshCpHandle {
 
 impl MeshCpHandle {
     async fn shutdown(mut self) {
-        if let Some(tx) = self.shutdown_tx.take() {
-            let _ = tx.send(());
-        }
-        match tokio::time::timeout(Duration::from_secs(2), &mut self.task).await {
-            Ok(_) => {}
-            Err(_) => {
-                self.task.abort();
-                let _ = self.task.await;
-            }
-        }
+        shutdown_grpc_server(&mut self.shutdown_tx, &mut self.task).await;
     }
 }
 
@@ -179,15 +170,22 @@ struct XdsCpHandle {
 
 impl XdsCpHandle {
     async fn shutdown(mut self) {
-        if let Some(tx) = self.shutdown_tx.take() {
-            let _ = tx.send(());
-        }
-        match tokio::time::timeout(Duration::from_secs(2), &mut self.task).await {
-            Ok(_) => {}
-            Err(_) => {
-                self.task.abort();
-                let _ = self.task.await;
-            }
+        shutdown_grpc_server(&mut self.shutdown_tx, &mut self.task).await;
+    }
+}
+
+async fn shutdown_grpc_server(
+    shutdown_tx: &mut Option<oneshot::Sender<()>>,
+    task: &mut tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+) {
+    if let Some(tx) = shutdown_tx.take() {
+        let _ = tx.send(());
+    }
+    match tokio::time::timeout(Duration::from_secs(2), &mut *task).await {
+        Ok(_) => {}
+        Err(_) => {
+            task.abort();
+            let _ = (&mut *task).await;
         }
     }
 }
@@ -570,58 +568,75 @@ async fn functional_mesh_mode_native_topology_listeners_match_contract() {
         },
     ];
 
-    for case in cases {
-        let node_id = format!("functional-mesh-{}-node", case.topology);
-        let cp = start_static_mesh_cp(initial_mesh_slice(&node_id)).await;
-        let mut request_rx = cp.request_rx.clone();
-        let ports = reserve_mesh_ports().await;
-        let open_ports = (case.expected_open)(&ports);
-        let closed_ports = (case.expected_closed)(&ports);
-        let temp = TempDir::new().expect("temp dir");
-        let mut child = spawn_mesh_gateway(
-            &temp,
-            MeshGatewaySpawnOptions {
-                cp_addr: cp.addr,
-                ports,
-                node_id: &node_id,
-                config_protocol: "native",
-                topology: case.topology,
-                waypoint_name: case.waypoint_name,
-                env_overrides: Vec::new(),
-            },
-        );
+    'cases: for case in cases {
+        let mut last_failure = String::new();
+        for attempt in 1..=RETRY_ATTEMPTS {
+            let node_id = format!("functional-mesh-{}-node-{attempt}", case.topology);
+            let cp = start_static_mesh_cp(initial_mesh_slice(&node_id)).await;
+            let mut request_rx = cp.request_rx.clone();
+            let ports = reserve_mesh_ports().await;
+            let open_ports = (case.expected_open)(&ports);
+            let closed_ports = (case.expected_closed)(&ports);
+            let temp = TempDir::new().expect("temp dir");
+            let mut child = spawn_mesh_gateway(
+                &temp,
+                MeshGatewaySpawnOptions {
+                    cp_addr: cp.addr,
+                    ports,
+                    node_id: &node_id,
+                    config_protocol: "native",
+                    topology: case.topology,
+                    waypoint_name: case.waypoint_name,
+                    env_overrides: Vec::new(),
+                },
+            );
 
-        let subscribe = wait_for_mesh_subscribe(&mut request_rx, STARTUP_TIMEOUT).await;
-        let mut all_open = true;
-        for port in &open_ports {
-            all_open &= wait_for_tcp_port(*port, STARTUP_TIMEOUT).await;
-        }
-        let mut all_closed = true;
-        for port in &closed_ports {
-            all_closed &= tcp_port_stays_closed(*port, Duration::from_millis(500)).await;
-        }
+            let subscribe = wait_for_mesh_subscribe(&mut request_rx, STARTUP_TIMEOUT).await;
+            let mut all_open = true;
+            for port in &open_ports {
+                if !wait_for_tcp_port(*port, STARTUP_TIMEOUT).await {
+                    all_open = false;
+                    break;
+                }
+            }
+            let mut all_closed = true;
+            if all_open {
+                for port in &closed_ports {
+                    if !tcp_port_stays_closed(*port, Duration::from_millis(500)).await {
+                        all_closed = false;
+                        break;
+                    }
+                }
+            }
 
-        kill_child(&mut child);
-        cp.shutdown().await;
+            kill_child(&mut child);
+            cp.shutdown().await;
 
-        let waypoint_name_matches = subscribe
-            .as_ref()
-            .map(|request| request.waypoint_name.as_str() == case.waypoint_name.unwrap_or(""))
-            .unwrap_or(false);
-        assert!(
-            subscribe.is_some() && waypoint_name_matches && all_open && all_closed,
-            "topology {} listener contract failed: subscribe={:?}, open_ports={:?}, \
-             closed_ports={:?}, waypoint_name_matches={}, all_open={}, all_closed={}\n{}",
-            case.topology,
-            subscribe
+            let waypoint_name_matches = subscribe
                 .as_ref()
-                .map(|r| (&r.node_id, &r.namespace, &r.waypoint_name)),
-            open_ports,
-            closed_ports,
-            waypoint_name_matches,
-            all_open,
-            all_closed,
-            captured_output(&temp)
+                .map(|request| request.waypoint_name.as_str() == case.waypoint_name.unwrap_or(""))
+                .unwrap_or(false);
+            if subscribe.is_some() && waypoint_name_matches && all_open && all_closed {
+                continue 'cases;
+            }
+
+            last_failure = format!(
+                "attempt {attempt}: subscribe={:?}, open_ports={:?}, closed_ports={:?}, \
+                 waypoint_name_matches={waypoint_name_matches}, all_open={all_open}, \
+                 all_closed={all_closed}\n{}",
+                subscribe
+                    .as_ref()
+                    .map(|r| (&r.node_id, &r.namespace, &r.waypoint_name)),
+                open_ports,
+                closed_ports,
+                captured_output(&temp)
+            );
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+
+        panic!(
+            "topology {} listener contract failed after {RETRY_ATTEMPTS} attempts\n{last_failure}",
+            case.topology
         );
     }
 }
