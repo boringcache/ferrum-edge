@@ -10,8 +10,8 @@ use tracing::{debug, error, info, warn};
 
 use super::common::{
     BACKOFF_INITIAL_SECS, jittered_backoff, next_backoff_secs,
-    refresh_dp_grpc_tls_config_if_changed, tonic_tls_config, wait_for_shutdown,
-    wait_optional_tls_reload,
+    refresh_dp_grpc_tls_config_if_changed, should_race_primary_retry, tonic_tls_config,
+    wait_for_shutdown, wait_optional_tls_reload,
 };
 use crate::grpc::dp_client::{
     DpGrpcTlsConfig, DpGrpcTlsReload, GrpcJwtSecret, generate_dp_jwt_with_issuer,
@@ -663,14 +663,6 @@ pub async fn start_xds_client_with_shutdown(
         }
         backoff_secs = next_backoff_secs(backoff_secs, increase_backoff);
     }
-}
-
-fn should_race_primary_retry(
-    is_fallback: bool,
-    primary_retry_secs: u64,
-    has_first_slice: bool,
-) -> bool {
-    is_fallback && primary_retry_secs > 0 && has_first_slice
 }
 
 async fn connect_ads(

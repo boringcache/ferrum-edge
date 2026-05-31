@@ -804,6 +804,7 @@ async fn test_native_mesh_client_installs_mesh_slice_from_cp() {
         workload_spiffe_id: Some("spiffe://cluster.local/ns/ferrum/sa/api".to_string()),
         waypoint_name: None,
         labels: HashMap::from([("app".to_string(), "api".to_string())]),
+        primary_retry_secs: 0,
     };
     let handle = tokio::spawn(start_native_mesh_client_with_shutdown(
         vec![format!("http://127.0.0.1:{}", addr.port())],

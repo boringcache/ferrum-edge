@@ -60,6 +60,21 @@ pub fn next_backoff_secs(current_secs: u64, increase: bool) -> u64 {
     }
 }
 
+/// Whether a live stream on a *fallback* CP should race a primary-CP retry timer.
+///
+/// Shared by the xDS and native `MeshSubscribe` clients so both honor
+/// `FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS` identically: only retry the primary
+/// when (a) we are currently connected to a fallback CP, (b) the operator
+/// configured a non-zero retry interval, and (c) a first slice has already been
+/// installed — so we never abandon the only reachable CP before we have config.
+pub fn should_race_primary_retry(
+    is_fallback: bool,
+    primary_retry_secs: u64,
+    has_first_slice: bool,
+) -> bool {
+    is_fallback && primary_retry_secs > 0 && has_first_slice
+}
+
 pub async fn sleep_or_shutdown(
     duration: Duration,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,

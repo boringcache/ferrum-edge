@@ -544,6 +544,9 @@ impl MeshRuntimeConfig {
             workload_spiffe_id: self.workload_spiffe_id.clone(),
             waypoint_name: self.service_waypoint_name(),
             labels: self.workload_labels.clone(),
+            // Same `FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS` interval the xDS
+            // client uses — the knob is protocol-agnostic failover/failback.
+            primary_retry_secs: self.xds_primary_retry_secs,
         }
     }
 
