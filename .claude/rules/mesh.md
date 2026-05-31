@@ -98,7 +98,7 @@ Full operator docs live in `docs/mesh.md`. Keep this file to implementation inva
 - Frontend cert/key paths remain restart-required inputs for mesh peer auth reload.
 - Coverage includes mesh HTTP/HBONE termination listeners and mesh-shared TCP+TLS / UDP+DTLS stream listeners.
 - `apply_mesh_inbound_tls_reload` publishes swapped `ServerConfig` into HBONE, shared stream TLS, and active `DtlsServer` frontend DTLS configs.
-- Failed rebuilds keep the previous config for that path and log a warning; do not reject the whole slice.
+- A failed inbound `ServerConfig` rebuild (or a client-CA-bundle snapshot read failure) is computed before proxy-config apply and **rejects the whole slice**, keeping the last good config in its entirety (the one `ServerConfig` backs both HTTP/HBONE and the shared TCP+TLS slot, so no authz/policy/ServiceEntry/endpoint update from that slice applies either) — fail-closed. Only the post-accept DTLS `FrontendDtlsConfig` rebuild keeps the previous config for that path and logs a warning without rejecting the slice. Do not reword the `ServerConfig`/snapshot warns back to a path-local "keeping previous TLS config" framing.
 - `Disable` is rejected for Ambient and EgressGateway slice updates and keeps the last good config.
 
 ## DestinationRule And Materialization
