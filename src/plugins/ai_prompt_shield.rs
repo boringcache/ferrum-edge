@@ -426,7 +426,7 @@ impl AiPromptShield {
         // reported as redacted but forwarded unredacted (a fail-open bypass).
         for field in CONTENT_SCAN_FIELDS {
             if let Some(value) = json.get_mut(field) {
-                redact_field_text(value, |text| self.redact_text(text));
+                redact_field_text(value, &|text| self.redact_text(text));
             }
         }
     }
@@ -721,6 +721,19 @@ fn optional_positive_usize(config: &Value, field: &'static str) -> Result<Option
 /// string, an array of strings, or an array of `{type:"text", text:"..."}`
 /// content parts (e.g. `prompt`, `input`, `system`). Pushes borrowed `&str`
 /// slices onto `texts`. Non-text array entries are ignored.
+/// Text content-part `type` values across the major LLM APIs. The OpenAI Chat
+/// API and Anthropic Messages API use `text`; the OpenAI Responses API uses
+/// `input_text` (request) and `output_text` (response).
+fn is_text_content_part_type(part_type: &str) -> bool {
+    matches!(part_type, "text" | "input_text" | "output_text")
+}
+
+/// Collect scannable text from a top-level LLM content field
+/// (`prompt`/`input`/`system`). Handles a plain string, an array of strings, an
+/// array of `{type: text|input_text|output_text, text}` content parts, and the
+/// structured OpenAI Responses `input` shape — an array of message objects
+/// `{role, content: <string | array of parts>}` — by recursing into each
+/// message's `content`.
 fn collect_field_text<'a>(value: &'a Value, texts: &mut Vec<&'a str>) {
     match value {
         Value::String(s) => texts.push(s.as_str()),
@@ -728,15 +741,29 @@ fn collect_field_text<'a>(value: &'a Value, texts: &mut Vec<&'a str>) {
             for item in items {
                 match item {
                     Value::String(s) => texts.push(s.as_str()),
-                    Value::Object(_) => {
-                        if item.get("type").and_then(|t| t.as_str()) == Some("text")
-                            && let Some(text) = item.get("text").and_then(|t| t.as_str())
+                    Value::Object(obj) => {
+                        if obj
+                            .get("type")
+                            .and_then(|t| t.as_str())
+                            .is_some_and(is_text_content_part_type)
                         {
-                            texts.push(text);
+                            if let Some(text) = obj.get("text").and_then(|t| t.as_str()) {
+                                texts.push(text);
+                            }
+                        } else if let Some(content) = obj.get("content") {
+                            // Message object `{role, content}` (structured
+                            // Responses `input`): scan its content.
+                            collect_field_text(content, texts);
                         }
                     }
                     _ => {}
                 }
+            }
+        }
+        // A field that is itself a single message object `{role, content}`.
+        Value::Object(obj) => {
+            if let Some(content) = obj.get("content") {
+                collect_field_text(content, texts);
             }
         }
         _ => {}
@@ -747,7 +774,7 @@ fn collect_field_text<'a>(value: &'a Value, texts: &mut Vec<&'a str>) {
 /// strings, or an array of `{type:"text", text:"..."}` content parts (e.g.
 /// `prompt`, `input`, `system`). Mirrors `collect_field_text` so detection
 /// and redaction stay symmetric — anything scanned for PII is also rewritten.
-fn redact_field_text(value: &mut Value, redact: impl Fn(&str) -> String) {
+fn redact_field_text(value: &mut Value, redact: &impl Fn(&str) -> String) {
     match value {
         Value::String(s) => {
             let redacted = redact(s);
@@ -764,18 +791,29 @@ fn redact_field_text(value: &mut Value, redact: impl Fn(&str) -> String) {
                             *s = redacted;
                         }
                     }
-                    Value::Object(_) => {
-                        if item.get("type").and_then(|t| t.as_str()) == Some("text")
-                            && let Some(text) = item.get("text").and_then(|t| t.as_str())
+                    Value::Object(obj) => {
+                        if obj
+                            .get("type")
+                            .and_then(|t| t.as_str())
+                            .is_some_and(is_text_content_part_type)
                         {
-                            let redacted = redact(text);
-                            if redacted != text {
-                                item["text"] = Value::String(redacted);
+                            if let Some(text) = obj.get("text").and_then(|t| t.as_str()) {
+                                let redacted = redact(text);
+                                if redacted != text {
+                                    obj.insert("text".to_string(), Value::String(redacted));
+                                }
                             }
+                        } else if let Some(content) = obj.get_mut("content") {
+                            redact_field_text(content, redact);
                         }
                     }
                     _ => {}
                 }
+            }
+        }
+        Value::Object(obj) => {
+            if let Some(content) = obj.get_mut("content") {
+                redact_field_text(content, redact);
             }
         }
         _ => {}

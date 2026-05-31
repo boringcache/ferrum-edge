@@ -927,6 +927,41 @@ async fn test_content_mode_scans_input_array_and_text_parts() {
 }
 
 #[tokio::test]
+async fn test_content_mode_scans_structured_responses_input() {
+    // The OpenAI Responses API uses `input_text`/`output_text` content-part
+    // types (not `text`) and a structured `input` array of message objects
+    // `{role, content: [parts]}`. Content mode must scan both shapes, else PII
+    // passes through on the default scan mode for the default Responses payload.
+    let plugin = AiPromptShield::new(&json!({"patterns": ["ssn"]})).unwrap();
+
+    // `input_text` content-part type.
+    let mut ctx = make_post_ctx(&json!({
+        "model": "gpt-4o",
+        "input": [{"type": "input_text", "text": "ssn 123-45-6789"}]
+    }));
+    let mut headers = make_post_headers();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+
+    // Structured message-object input with nested content parts.
+    let mut ctx = make_post_ctx(&json!({
+        "model": "gpt-4o",
+        "input": [
+            {"role": "user", "content": [{"type": "input_text", "text": "leak 123-45-6789"}]}
+        ]
+    }));
+    let mut headers = make_post_headers();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+
+    // Message-object input whose content is a plain string.
+    let mut ctx = make_post_ctx(&json!({
+        "model": "gpt-4o",
+        "input": [{"role": "user", "content": "leak 123-45-6789"}]
+    }));
+    let mut headers = make_post_headers();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+#[tokio::test]
 async fn test_content_mode_no_pii_in_prompt_passes() {
     // Negative case: clean prompt/input/system payloads still pass through.
     let plugin = AiPromptShield::new(&json!({"patterns": ["ssn", "email"]})).unwrap();
