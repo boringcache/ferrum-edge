@@ -6,7 +6,9 @@
 //! `resolve_effective_mtls_mode` and `MeshSlice::resolve_effective_mtls_mode`
 //! surface with scenarios that benefit from the external-crate perspective.
 
-use ferrum_edge::modes::mesh::config::{MtlsMode, PeerAuthentication, WorkloadSelector};
+use ferrum_edge::modes::mesh::config::{
+    MtlsMode, PeerAuthentication, PolicyScope, WorkloadSelector,
+};
 use ferrum_edge::modes::mesh::slice::{MeshSlice, resolve_effective_mtls_mode};
 use std::collections::{BTreeMap, HashMap};
 
@@ -24,6 +26,26 @@ fn peer_auth(
         selector,
         mtls_mode: mode,
         port_overrides,
+    }
+}
+
+fn peer_auth_with_scope(
+    name: &str,
+    namespace: &str,
+    scope: PolicyScope,
+    mode: MtlsMode,
+) -> PeerAuthentication {
+    let selector = match &scope {
+        PolicyScope::WorkloadSelector { selector } => Some(selector.clone()),
+        PolicyScope::MeshWide | PolicyScope::Namespace { .. } => None,
+    };
+    PeerAuthentication {
+        name: name.to_string(),
+        namespace: namespace.to_string(),
+        scope: Some(scope),
+        selector,
+        mtls_mode: mode,
+        port_overrides: HashMap::new(),
     }
 }
 
@@ -124,18 +146,17 @@ fn mesh_slice_resolve_method_integration() {
     );
 }
 
-// ── Same-scope tie-breaking (deterministic ASCII-smallest name) ─────────
+// ── Same-scope tie-breaking (deterministic ASCII-smallest namespace/name) ─
 
 #[test]
-fn same_scope_tie_resolves_to_ascii_smallest_name_regardless_of_order() {
+fn same_scope_tie_resolves_to_ascii_smallest_namespace_and_name_regardless_of_order() {
     // Two WorkloadSelector-tier PeerAuthentications match the same workload
-    // with conflicting modes. The winner is the ASCII-smallest policy name
-    // ("wl-disable" < "wl-strict"), independent of slice iteration order —
-    // matching the sibling single-winner resolvers (resolved_proxy_config,
-    // resolve_applicable_sidecar_egress). This makes the inbound mTLS posture
-    // deterministic across pods/reconciles instead of depending on order.
-    // (Two conflicting same-tier PeerAuthentications are an operator
-    // misconfiguration; the contract here is determinism, not mode preference.)
+    // with conflicting modes. The winner is the ASCII-smallest policy
+    // namespace/name tuple, independent of slice iteration order. This makes
+    // the inbound mTLS posture deterministic across pods/reconciles instead
+    // of depending on order. (Two conflicting same-tier PeerAuthentications
+    // are an operator misconfiguration; the contract here is determinism, not
+    // mode preference.)
     let strict = peer_auth(
         "wl-strict",
         "default",
@@ -162,13 +183,44 @@ fn same_scope_tie_resolves_to_ascii_smallest_name_regardless_of_order() {
     assert_eq!(
         resolve_effective_mtls_mode(&forward, "default", &labels, 8080),
         MtlsMode::Disable,
-        "wl-disable (ASCII-smallest name) wins"
+        "default/wl-disable (ASCII-smallest tuple) wins"
     );
 
     let reversed = vec![disable, strict];
     assert_eq!(
         resolve_effective_mtls_mode(&reversed, "default", &labels, 8080),
         MtlsMode::Disable,
+        "reversed slice order resolves to the same winner"
+    );
+}
+
+#[test]
+fn same_scope_same_name_tie_resolves_to_ascii_smallest_namespace_regardless_of_order() {
+    let strict = peer_auth_with_scope(
+        "mesh-default",
+        "aaa-root",
+        PolicyScope::MeshWide,
+        MtlsMode::Strict,
+    );
+    let permissive = peer_auth_with_scope(
+        "mesh-default",
+        "zzz-root",
+        PolicyScope::MeshWide,
+        MtlsMode::Permissive,
+    );
+    let labels = HashMap::<String, String>::new();
+
+    let forward = vec![strict.clone(), permissive.clone()];
+    assert_eq!(
+        resolve_effective_mtls_mode(&forward, "default", &labels, 8080),
+        MtlsMode::Strict,
+        "aaa-root/mesh-default (ASCII-smallest tuple) wins"
+    );
+
+    let reversed = vec![permissive, strict];
+    assert_eq!(
+        resolve_effective_mtls_mode(&reversed, "default", &labels, 8080),
+        MtlsMode::Strict,
         "reversed slice order resolves to the same winner"
     );
 }
