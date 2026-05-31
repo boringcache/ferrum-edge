@@ -6158,6 +6158,7 @@ components:
           description: Whether to log ping/pong frames in addition to text/binary frames.
       allOf:
         - if:
+            required: [include_payload_preview]
             properties:
               include_payload_preview:
                 const: true
