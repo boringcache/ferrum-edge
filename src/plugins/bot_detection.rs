@@ -13,8 +13,8 @@
 //! - The `User-Agent` is client-controlled and spoofable, so this plugin is a
 //!   coarse first filter; for strong bot verification prefer forward-confirmed
 //!   reverse DNS or published IP ranges.
-//! - A no-op config (empty `blocked_patterns` and no `allow_list`) is rejected
-//!   at construction.
+//! - A no-op config (empty `blocked_patterns` while missing User-Agent headers
+//!   are allowed) is rejected at construction.
 
 use async_trait::async_trait;
 use regex::{RegexSet, RegexSetBuilder};
@@ -42,16 +42,15 @@ impl BotDetection {
         let custom_response_code = parse_response_code(config)?;
         let allow_missing_user_agent = parse_bool(config, "allow_missing_user_agent", true)?;
 
-        // Reject a no-op config: a security plugin that blocks nothing and
-        // allow-lists nothing (e.g. an explicit `"blocked_patterns": []` with
-        // no `allow_list`) would silently match nothing and always Continue,
-        // appearing active while enforcing no policy. Fail loudly at
-        // construction per the project rule that `new()` rejects no-op config.
+        // Reject a no-op config: a security plugin with no blocked patterns
+        // and no missing-User-Agent rejection would silently always Continue,
+        // even if an allow-list is present. Fail loudly at construction per
+        // the project rule that `new()` rejects no-op config.
         // (The default path is unaffected: `blocked_patterns` defaults to a
         // non-empty list when the key is absent.)
-        if blocked_patterns.is_empty() && allow_list.is_empty() {
+        if blocked_patterns.is_empty() && allow_missing_user_agent {
             return Err(
-                "bot_detection: 'blocked_patterns' is empty and no 'allow_list' provided; \
+                "bot_detection: 'blocked_patterns' is empty and missing User-Agent headers are allowed; \
                  plugin would have no effect"
                     .to_string(),
             );

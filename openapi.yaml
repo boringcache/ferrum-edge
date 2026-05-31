@@ -10685,9 +10685,10 @@ components:
         permitting GoogleBot while blocking generic `bot` patterns). The
         word-boundary anchoring on the allow list prevents an allowed token
         from being smuggled inside an otherwise-blocked agent. A no-op config
-        (empty `blocked_patterns` with no `allow_list`) is rejected. The
-        User-Agent is client-controlled and spoofable, so this is a coarse
-        filter, not strong bot verification. HTTP-family only.
+        (empty `blocked_patterns` while missing User-Agent headers are allowed)
+        is rejected; an allow-list alone is not enforcement. The User-Agent is
+        client-controlled and spoofable, so this is a coarse filter, not strong
+        bot verification. HTTP-family only.
       properties:
         blocked_patterns:
           type: array
@@ -10706,8 +10707,9 @@ components:
             - php/
           description: >-
             User-Agent substrings to reject (case-insensitive). Specifying this
-            field replaces the defaults entirely. Setting it to `[]` requires a
-            non-empty `allow_list`, otherwise the config is rejected as a no-op.
+            field replaces the defaults entirely. Setting it to `[]` is valid
+            only when `allow_missing_user_agent: false` creates a missing-header
+            reject path; an allow-list alone is not enforcement.
         allow_list:
           type: array
           items:
