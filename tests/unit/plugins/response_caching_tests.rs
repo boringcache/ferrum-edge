@@ -963,6 +963,103 @@ async fn test_cookie_bearing_request_not_cross_served_across_sessions() {
 }
 
 #[tokio::test]
+async fn test_cookie_request_does_not_hit_preexisting_anonymous_entry() {
+    let plugin = default_plugin();
+
+    let mut public_response = HashMap::new();
+    public_response.insert(
+        "cache-control".to_string(),
+        "public, max-age=60".to_string(),
+    );
+
+    let mut anonymous_ctx = make_ctx("GET", "/dashboard");
+    let mut anonymous_headers = HashMap::new();
+    plugin
+        .before_proxy(&mut anonymous_ctx, &mut anonymous_headers)
+        .await;
+    plugin
+        .on_final_response_body(&mut anonymous_ctx, 200, &public_response, b"anon-dashboard")
+        .await;
+
+    let mut cookie_ctx = make_ctx("GET", "/dashboard");
+    cookie_ctx
+        .headers
+        .insert("cookie".to_string(), "session=alice".to_string());
+    let mut cookie_headers = cookie_ctx.headers.clone();
+    assert!(
+        matches!(
+            plugin
+                .before_proxy(&mut cookie_ctx, &mut cookie_headers)
+                .await,
+            PluginResult::Continue
+        ),
+        "cookie-bearing request must not hit the unvaried anonymous entry"
+    );
+}
+
+#[tokio::test]
+async fn test_anonymous_store_preserves_existing_cookie_vary_dimension() {
+    let plugin = default_plugin();
+
+    let mut public_response = HashMap::new();
+    public_response.insert(
+        "cache-control".to_string(),
+        "public, max-age=60".to_string(),
+    );
+
+    let mut cookie_ctx = make_ctx("GET", "/dashboard");
+    cookie_ctx
+        .headers
+        .insert("cookie".to_string(), "session=alice".to_string());
+    let mut cookie_headers = cookie_ctx.headers.clone();
+    plugin
+        .before_proxy(&mut cookie_ctx, &mut cookie_headers)
+        .await;
+    plugin
+        .on_final_response_body(&mut cookie_ctx, 200, &public_response, b"alice-dashboard")
+        .await;
+
+    let mut anonymous_ctx = make_ctx("GET", "/dashboard");
+    let mut anonymous_headers = HashMap::new();
+    assert!(matches!(
+        plugin
+            .before_proxy(&mut anonymous_ctx, &mut anonymous_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    plugin
+        .on_final_response_body(&mut anonymous_ctx, 200, &public_response, b"anon-dashboard")
+        .await;
+
+    let mut cookie_ctx_2 = make_ctx("GET", "/dashboard");
+    cookie_ctx_2
+        .headers
+        .insert("cookie".to_string(), "session=alice".to_string());
+    let mut cookie_headers_2 = cookie_ctx_2.headers.clone();
+    let (_, body, _) = expect_reject(
+        plugin
+            .before_proxy(&mut cookie_ctx_2, &mut cookie_headers_2)
+            .await,
+    );
+    assert_eq!(body, b"alice-dashboard");
+
+    let mut anonymous_ctx_2 = make_ctx("GET", "/dashboard");
+    let mut anonymous_headers_2 = HashMap::new();
+    let (_, body, response_headers) = expect_reject(
+        plugin
+            .before_proxy(&mut anonymous_ctx_2, &mut anonymous_headers_2)
+            .await,
+    );
+    assert_eq!(body, b"anon-dashboard");
+    assert!(
+        response_headers
+            .get("vary")
+            .is_some_and(|vary| vary.split(',').map(str::trim).any(|h| h == "cookie")),
+        "anonymous variant should keep the sticky cookie Vary dimension"
+    );
+}
+
+#[tokio::test]
 async fn test_sensitive_header_snapshot_does_not_store_raw_session_headers() {
     let plugin = default_plugin();
 

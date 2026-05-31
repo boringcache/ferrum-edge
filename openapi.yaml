@@ -12181,7 +12181,7 @@ components:
 
     ResponseCachingConfig:
       type: object
-      description: "Plugin: response_caching — In-memory HTTP response caching keyed by matched proxy, method, path, query, optional consumer, and Vary-selected request headers. Honors Cache-Control, ETag/Last-Modified revalidation (304), Vary, and never caches responses with Set-Cookie. Includes an LRU cacheability predictor that suppresses repeat cache lookups for variants known to be uncacheable. HTTP only."
+      description: "Plugin: response_caching — In-memory HTTP response caching keyed by matched proxy, method, path, query, authenticated identity when present, optional anonymous marker, and Vary/credential-selected request headers. Honors Cache-Control, ETag/Last-Modified revalidation (304), Vary, and never caches responses with Set-Cookie. Includes an LRU cacheability predictor that suppresses repeat cache lookups for variants known to be uncacheable. HTTP only."
       properties:
         ttl_seconds:
           type: integer
@@ -12237,7 +12237,7 @@ components:
         cache_key_include_consumer:
           type: boolean
           default: false
-          description: Partition the cache by authenticated identity / consumer. Required if you want to share-cache responses for Authorization-bearing requests without relying on Cache-Control public/s-maxage/must-revalidate.
+          description: Allow caching authenticated responses under their isolated identity key even when the backend does not send Cache-Control public/s-maxage/must-revalidate; also add an _anon cache-key partition for unauthenticated requests. Authenticated requests are always partitioned by hashed effective identity regardless of this flag.
         add_cache_status_header:
           type: boolean
           default: true

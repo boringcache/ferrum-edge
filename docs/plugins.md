@@ -2889,7 +2889,7 @@ For streaming responses without `Content-Length` where buffering is disabled, th
 
 ### `response_caching`
 
-Caches final client-visible HTTP responses in gateway memory. The cache key includes the matched proxy, request method, path, optional query string, optional authenticated identity, and any request headers selected by plugin config or backend `Vary`.
+Caches final client-visible HTTP responses in gateway memory. The cache key includes the matched proxy, request method, path, optional query string, authenticated identity when present, an optional anonymous marker, and any request headers selected by plugin config, backend `Vary`, or credential/session safety rules.
 
 **Priority:** 3500
 **Protocol:** HTTP only
@@ -2906,7 +2906,7 @@ Caches final client-visible HTTP responses in gateway memory. The cache key incl
 | `respect_no_cache` | bool | `true` | Bypass cache lookup when the client sends `Cache-Control: no-cache` or `no-store` |
 | `vary_by_headers` | String[] | `[]` | Additional request headers to include in the cache key even when the backend does not send `Vary` |
 | `cache_key_include_query` | bool | `true` | Include query parameters in the cache key |
-| `cache_key_include_consumer` | bool | `false` | Partition the cache by authenticated identity / consumer |
+| `cache_key_include_consumer` | bool | `false` | Allow caching authenticated responses under their isolated identity key even when the backend does not send `public`, `must-revalidate`, or `s-maxage`; also add an `_anon` key partition for unauthenticated requests. Authenticated requests are always keyed by the hashed effective identity. |
 | `add_cache_status_header` | bool | `true` | Add `X-Cache-Status` (`MISS`, `HIT`, `BYPASS`, `REVALIDATED`) to downstream responses |
 | `invalidate_on_unsafe_methods` | bool | `true` | Invalidate cached entries for the same path prefix on non-cacheable methods such as `POST`, `PUT`, `PATCH`, and `DELETE` |
 
@@ -2914,7 +2914,9 @@ Behavior:
 - The plugin caches the final post-transform response body and headers, so cached hits include `response_transformer` output rather than the raw backend payload.
 - Backend `Vary` is honored automatically. If the origin returns `Vary: Accept-Encoding`, compressed and uncompressed representations are cached separately.
 - Conditional requests are served from cache. Matching `If-None-Match` or `If-Modified-Since` requests return `304 Not Modified` directly from the edge cache when a fresh cached validator exists.
-- Responses with `Authorization` on the request are not shared-cached unless the backend explicitly allows it via `Cache-Control: public`, `must-revalidate`, or `s-maxage`, or you partition the key with `cache_key_include_consumer: true`.
+- Authenticated requests are always partitioned by hashed effective identity. Setting `cache_key_include_consumer: true` also permits caching authenticated responses that do not explicitly opt into shared caching and partitions unauthenticated requests under `_anon`.
+- Requests carrying `Authorization`, `Proxy-Authorization`, or `Cookie` are keyed by hashed header values for cacheable responses so distinct credentials or sessions cannot share one cached entry.
+- Authenticated responses are not cached unless the backend explicitly allows shared caching via `Cache-Control: public`, `must-revalidate`, or `s-maxage`, or `cache_key_include_consumer: true` stores them under an isolated identity key.
 - **Responses containing `Set-Cookie` headers are never cached.** Set-Cookie headers are per-client and replaying them from a shared cache would leak session cookies to other users (RFC 7234 §8).
 - The plugin stores arbitrary response bytes, so binary responses and backend-compressed payloads can be cached safely.
 
