@@ -161,6 +161,8 @@ struct SessionPayload {
     access_token_b64: String,
     refresh_token_b64: Option<String>,
     expires_at_unix: i64,
+    #[serde(default)]
+    claims_expires_at_unix: i64,
     refresh_after_unix: i64,
     issued_at_unix: i64,
     last_touch_unix: i64,
@@ -558,6 +560,9 @@ impl OidcRelyingParty {
             + token
                 .expires_in
                 .unwrap_or(self.session.ttl.as_secs() as i64);
+        let claims_expires_at = claim_expiry(&merged_claims)
+            .map(|exp| exp.min(expires_at))
+            .unwrap_or(expires_at);
         let payload = SessionPayload {
             version: 1,
             sub: extract_claim_string(&merged_claims, "sub").unwrap_or_default(),
@@ -565,6 +570,7 @@ impl OidcRelyingParty {
             access_token_b64: token.access_token,
             refresh_token_b64: token.refresh_token,
             expires_at_unix: expires_at,
+            claims_expires_at_unix: claims_expires_at,
             refresh_after_unix: next_refresh_after(
                 expires_at,
                 now,
@@ -790,8 +796,12 @@ impl OidcRelyingParty {
         }
 
         let leeway = self.provider.id_token_clock_skew.as_secs() as i64;
-        let claims_expired_before_refresh =
-            now > payload.expires_at_unix.saturating_add(leeway);
+        let claims_expires_at = if payload.claims_expires_at_unix > 0 {
+            payload.claims_expires_at_unix
+        } else {
+            payload.expires_at_unix
+        };
+        let claims_expired_before_refresh = now > claims_expires_at.saturating_add(leeway);
 
         // Keep the session live: refresh tokens when due (which also re-derives
         // claims from any new ID token), then slide the idle window. Any change
@@ -969,19 +979,19 @@ impl OidcRelyingParty {
             payload.sub =
                 extract_claim_string(&merged, "sub").unwrap_or_else(|| payload.sub.clone());
             payload.id_token_b64 = id_token.to_string();
+            payload.claims_expires_at_unix = claim_expiry(&merged)
+                .map(|exp| exp.min(expires_at_for_token(&token, now, self.session.ttl)))
+                .unwrap_or_else(|| expires_at_for_token(&token, now, self.session.ttl));
             payload.claims = merged;
             true
         } else {
             false
         };
+        let expires_at = expires_at_for_token(&token, now, self.session.ttl);
         payload.access_token_b64 = token.access_token;
         if let Some(rotated) = token.refresh_token {
             payload.refresh_token_b64 = Some(rotated);
         }
-        let expires_at = now
-            + token
-                .expires_in
-                .unwrap_or(self.session.ttl.as_secs() as i64);
         payload.expires_at_unix = expires_at;
         payload.refresh_after_unix =
             next_refresh_after(expires_at, now, self.behavior.refresh_skew.as_secs() as i64);
@@ -1705,6 +1715,14 @@ fn next_refresh_after(expires_at_unix: i64, now: i64, refresh_skew_secs: i64) ->
     (expires_at_unix - refresh_skew_secs).max(now + REFRESH_RETRY_BACKOFF_SECS)
 }
 
+fn expires_at_for_token(token: &RefreshTokenResponse, now: i64, session_ttl: Duration) -> i64 {
+    now + token.expires_in.unwrap_or(session_ttl.as_secs() as i64)
+}
+
+fn claim_expiry(claims: &Value) -> Option<i64> {
+    claims.get("exp").and_then(Value::as_i64)
+}
+
 fn is_browser_request(ctx: &RequestContext, behavior: &BehaviorConfig) -> bool {
     matches!(ctx.method.as_str(), "GET" | "HEAD")
         && ctx.headers.get("accept").is_some_and(|accept| {
@@ -2128,6 +2146,7 @@ mod tests {
             access_token_b64: "old-at".to_string(),
             refresh_token_b64: refresh_token.map(str::to_string),
             expires_at_unix: refresh_after + 30,
+            claims_expires_at_unix: refresh_after + 30,
             refresh_after_unix: refresh_after,
             issued_at_unix: issued,
             last_touch_unix: last_touch,
