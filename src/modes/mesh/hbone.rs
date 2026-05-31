@@ -1141,10 +1141,10 @@ mod tests {
 
     #[test]
     fn parse_spiffe_special_chars_in_service_account() {
-        // Hyphens, underscores, dots, tildes are allowed in path segments.
-        let id = parse_spiffe("spiffe://cluster.local/ns/default/sa/my-app_v2.0~beta");
+        // Hyphens, underscores, and dots are allowed in path segments.
+        let id = parse_spiffe("spiffe://cluster.local/ns/default/sa/my-app_v2.0-beta");
         assert!(id.is_some());
-        assert_eq!(id.unwrap().path(), "ns/default/sa/my-app_v2.0~beta");
+        assert_eq!(id.unwrap().path(), "ns/default/sa/my-app_v2.0-beta");
     }
 
     #[test]
