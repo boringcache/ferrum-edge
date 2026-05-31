@@ -564,6 +564,7 @@ jobs:
             nextest_jobs: 1
             filters: |
               functional_capability_registry_test
+              functional_admin_crud_resources_test
               functional_cp_dp_resilience_test
               functional_cp_dp_test
               functional_database_test
