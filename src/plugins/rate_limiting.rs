@@ -15,6 +15,7 @@ use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
 
 const MAX_STATE_ENTRIES: usize = 100_000;
 const EVICTION_CHECK_INTERVAL_REQUESTS: u64 = 1024;
+const RATE_LIMIT_IDENTITY_HEADER: &str = "x-ratelimit-identity";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LimitBy {
@@ -234,7 +235,7 @@ impl Plugin for RateLimiting {
     }
 
     fn modifies_request_headers(&self) -> bool {
-        self.expose_headers
+        true
     }
 
     fn warmup_hostnames(&self) -> Vec<String> {
@@ -279,6 +280,7 @@ impl Plugin for RateLimiting {
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
+        remove_rate_limit_identity_header(headers);
         if !self.expose_headers {
             return PluginResult::Continue;
         }
@@ -292,6 +294,7 @@ impl Plugin for RateLimiting {
         _response_status: u16,
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
+        remove_rate_limit_identity_header(response_headers);
         if !self.expose_headers {
             return PluginResult::Continue;
         }
@@ -644,4 +647,8 @@ fn inject_rate_limit_headers_from_metadata(
             headers.insert(header_name.to_string(), value.clone());
         }
     }
+}
+
+fn remove_rate_limit_identity_header(headers: &mut HashMap<String, String>) {
+    headers.retain(|name, _| !name.eq_ignore_ascii_case(RATE_LIMIT_IDENTITY_HEADER));
 }

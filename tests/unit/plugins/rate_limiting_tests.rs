@@ -56,7 +56,7 @@ async fn test_rate_limiting_plugin_creation() {
     assert_eq!(plugin.priority(), priority::RATE_LIMITING);
     assert_eq!(plugin.supported_protocols(), ALL_PROTOCOLS);
     assert!(!plugin.is_auth_plugin());
-    assert!(!plugin.modifies_request_headers());
+    assert!(plugin.modifies_request_headers());
     assert!(!plugin.modifies_request_body());
     assert!(!plugin.requires_request_body_buffering());
     assert!(!plugin.requires_response_body_buffering());
@@ -877,7 +877,7 @@ async fn test_expose_headers_disabled_by_default() {
         "limit_by": "ip"
     });
     let plugin = make_rate_limiter(config);
-    assert!(!plugin.modifies_request_headers());
+    assert!(plugin.modifies_request_headers());
 }
 
 #[tokio::test]
@@ -1036,6 +1036,72 @@ async fn test_expose_headers_disabled_no_headers_on_success() {
         .after_proxy(&mut ctx, 200, &mut response_headers)
         .await;
     assert!(response_headers.is_empty());
+}
+
+#[tokio::test]
+async fn test_strips_spoofed_identity_header_before_backend() {
+    let config = json!({
+        "window_seconds": 60,
+        "max_requests": 10,
+        "limit_by": "ip",
+        "expose_headers": false
+    });
+    let plugin = make_rate_limiter(config);
+
+    let mut ctx = create_test_context();
+    plugin.on_request_received(&mut ctx).await;
+
+    let mut request_headers: HashMap<String, String> = HashMap::new();
+    request_headers.insert(
+        "X-RateLimit-Identity".to_string(),
+        "consumer:spoofed".to_string(),
+    );
+    request_headers.insert("x-ratelimit-identity".to_string(), "spiffe:spoofed".to_string());
+
+    let result = plugin.before_proxy(&mut ctx, &mut request_headers).await;
+    assert_continue(result);
+    assert!(
+        !request_headers
+            .keys()
+            .any(|key| key.eq_ignore_ascii_case("x-ratelimit-identity")),
+        "spoofed identity header must be stripped before backend: {request_headers:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_strips_backend_identity_header_before_client() {
+    let config = json!({
+        "window_seconds": 60,
+        "max_requests": 10,
+        "limit_by": "ip",
+        "expose_headers": false
+    });
+    let plugin = make_rate_limiter(config);
+
+    let mut ctx = create_test_context();
+    plugin.on_request_received(&mut ctx).await;
+
+    let mut response_headers: HashMap<String, String> = HashMap::new();
+    response_headers.insert(
+        "X-RateLimit-Identity".to_string(),
+        "backend-user".to_string(),
+    );
+    response_headers.insert("content-type".to_string(), "application/json".to_string());
+
+    let result = plugin
+        .after_proxy(&mut ctx, 200, &mut response_headers)
+        .await;
+    assert_continue(result);
+    assert!(
+        !response_headers
+            .keys()
+            .any(|key| key.eq_ignore_ascii_case("x-ratelimit-identity")),
+        "backend identity header must be stripped before client: {response_headers:?}"
+    );
+    assert_eq!(
+        response_headers.get("content-type").map(String::as_str),
+        Some("application/json")
+    );
 }
 
 /// Regression test for finding #56: with limit_by=consumer the limiter key is
