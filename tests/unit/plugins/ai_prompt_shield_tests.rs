@@ -772,6 +772,244 @@ async fn test_all_mode_redacts_sibling_fields_when_messages_present() {
     );
 }
 
+// ─── #8: PII nested under a structural key is still redacted ────────────
+
+#[tokio::test]
+async fn test_all_mode_redacts_pii_nested_under_structural_key() {
+    // Finding #8 regression: redact_json_strings previously skipped the
+    // ENTIRE subtree under any STRUCTURAL_KEYS name, so PII hidden under a
+    // common key (e.g. "metadata"->"type", or "id"->"note") was reported as
+    // detected but forwarded unredacted (a fail-open bypass driven by
+    // attacker-controlled JSON structure). The fix preserves only TOP-LEVEL
+    // structural scalar values (model name, IDs, request params) and redacts
+    // everything nested below the top level, including nested occurrences of
+    // structural key names and any container hiding PII.
+    let plugin = AiPromptShield::new(&json!({
+        "patterns": ["credit_card", "ssn"],
+        "scan_fields": "all",
+        "action": "redact"
+    }))
+    .unwrap();
+
+    let body = json!({
+        // Scalar structural keys must stay intact even though their values
+        // could look like PII.
+        "model": "gpt-4",
+        "type": "chat.completion",
+        // PII hidden under structural keys at depth — must be redacted.
+        "metadata": {"type": "4111 1111 1111 1111"},
+        "id": {"note": "123-45-6789"},
+        // PII under a structural key inside an array — must be redacted.
+        "object": [{"role": "card 4111-1111-1111-1111"}]
+    });
+    let body_bytes = serde_json::to_vec(&body).unwrap();
+
+    let transformed = plugin
+        .transform_request_body(&body_bytes, Some("application/json"), &HashMap::new())
+        .await
+        .expect("expected redacted body when nested PII present");
+    let v: serde_json::Value = serde_json::from_slice(&transformed).unwrap();
+
+    // Scalar structural values preserved.
+    assert_eq!(v["model"], "gpt-4", "scalar structural model preserved");
+    assert_eq!(
+        v["type"], "chat.completion",
+        "scalar structural type preserved"
+    );
+
+    // PII nested under structural keys is redacted.
+    let nested_cc = v["metadata"]["type"].as_str().unwrap();
+    assert!(
+        nested_cc.contains("[REDACTED:credit_card]") && !nested_cc.contains("4111"),
+        "PII under metadata.type must be redacted, got: {nested_cc}"
+    );
+    let nested_ssn = v["id"]["note"].as_str().unwrap();
+    assert!(
+        nested_ssn.contains("[REDACTED:ssn]") && !nested_ssn.contains("123-45-6789"),
+        "PII under id.note must be redacted, got: {nested_ssn}"
+    );
+    let nested_arr = v["object"][0]["role"].as_str().unwrap();
+    assert!(
+        nested_arr.contains("[REDACTED:credit_card]") && !nested_arr.contains("4111"),
+        "PII under object[].role must be redacted, got: {nested_arr}"
+    );
+}
+
+#[tokio::test]
+async fn test_all_mode_redacts_deeply_nested_pii_under_structural_key() {
+    // The whole serialized body must not retain the raw PII anywhere even
+    // when it is buried several levels under a structural key name.
+    let plugin = AiPromptShield::new(&json!({
+        "patterns": ["ssn"],
+        "scan_fields": "all",
+        "action": "redact"
+    }))
+    .unwrap();
+
+    let body = json!({
+        "id": {"deep": {"value": "ssn 123-45-6789"}}
+    });
+    let body_bytes = serde_json::to_vec(&body).unwrap();
+
+    let transformed = plugin
+        .transform_request_body(&body_bytes, Some("application/json"), &HashMap::new())
+        .await
+        .expect("expected redacted body");
+    let serialized = String::from_utf8(transformed).unwrap();
+    assert!(
+        !serialized.contains("123-45-6789"),
+        "deeply nested PII under a structural key must not survive: {serialized}"
+    );
+    assert!(serialized.contains("[REDACTED:ssn]"));
+}
+
+// ─── #9: Content mode covers prompt / input / system shapes ─────────────
+
+#[tokio::test]
+async fn test_content_mode_scans_prompt_field() {
+    // OpenAI legacy /v1/completions uses a top-level `prompt` string and no
+    // `messages` array. Content mode (the default) must still detect PII.
+    let plugin = AiPromptShield::new(&json!({"patterns": ["ssn"]})).unwrap();
+    let mut ctx = make_post_ctx(&json!({
+        "model": "gpt-3.5-turbo-instruct",
+        "prompt": "My SSN is 123-45-6789"
+    }));
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(400));
+}
+
+#[tokio::test]
+async fn test_content_mode_scans_input_field() {
+    // Responses API / embeddings use a top-level `input` field.
+    let plugin = AiPromptShield::new(&json!({"patterns": ["email"]})).unwrap();
+    let mut ctx = make_post_ctx(&json!({
+        "model": "text-embedding-3-small",
+        "input": "Contact me at john@example.com"
+    }));
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(400));
+}
+
+#[tokio::test]
+async fn test_content_mode_scans_system_field() {
+    // Anthropic carries a top-level `system` string alongside messages.
+    let plugin = AiPromptShield::new(&json!({"patterns": ["ssn"]})).unwrap();
+    let mut ctx = make_post_ctx(&json!({
+        "model": "claude-3-5-sonnet",
+        "system": "The patient SSN is 123-45-6789",
+        "messages": [{"role": "user", "content": "Summarize."}]
+    }));
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(400));
+}
+
+#[tokio::test]
+async fn test_content_mode_scans_input_array_and_text_parts() {
+    // `input` may be an array of strings or of {type:"text", text} parts.
+    let plugin = AiPromptShield::new(&json!({"patterns": ["ssn"]})).unwrap();
+
+    let mut ctx = make_post_ctx(&json!({
+        "model": "text-embedding-3-small",
+        "input": ["benign", "leak 123-45-6789"]
+    }));
+    let mut headers = make_post_headers();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+
+    let mut ctx = make_post_ctx(&json!({
+        "model": "gpt-4o",
+        "input": [{"type": "text", "text": "ssn 123-45-6789"}]
+    }));
+    let mut headers = make_post_headers();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+#[tokio::test]
+async fn test_content_mode_no_pii_in_prompt_passes() {
+    // Negative case: clean prompt/input/system payloads still pass through.
+    let plugin = AiPromptShield::new(&json!({"patterns": ["ssn", "email"]})).unwrap();
+    let mut ctx = make_post_ctx(&json!({
+        "model": "gpt-3.5-turbo-instruct",
+        "prompt": "Write a haiku about spring",
+        "system": "You are a helpful assistant",
+        "input": ["nothing", "sensitive"]
+    }));
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+}
+
+#[tokio::test]
+async fn test_content_mode_redacts_prompt_input_system_fields() {
+    // Detection and redaction must stay symmetric: PII in prompt/input/system
+    // is not just detected but actually rewritten in redact mode.
+    let plugin = AiPromptShield::new(&json!({
+        "action": "redact",
+        "patterns": ["ssn", "email"]
+    }))
+    .unwrap();
+
+    let body = serde_json::to_vec(&json!({
+        "model": "gpt-3.5-turbo-instruct",
+        "prompt": "ssn 123-45-6789",
+        "system": "email a@b.com",
+        "input": ["card holder", "ssn 987-65-4321"]
+    }))
+    .unwrap();
+
+    let result = plugin
+        .transform_request_body(&body, Some("application/json"), &HashMap::new())
+        .await
+        .expect("expected redacted body");
+    let v: serde_json::Value = serde_json::from_slice(&result).unwrap();
+
+    let prompt = v["prompt"].as_str().unwrap();
+    assert!(
+        prompt.contains("[REDACTED:ssn]") && !prompt.contains("123-45-6789"),
+        "prompt must be redacted: {prompt}"
+    );
+    let system = v["system"].as_str().unwrap();
+    assert!(
+        system.contains("[REDACTED:email]") && !system.contains("a@b.com"),
+        "system must be redacted: {system}"
+    );
+    let input1 = v["input"][1].as_str().unwrap();
+    assert!(
+        input1.contains("[REDACTED:ssn]") && !input1.contains("987-65-4321"),
+        "input array element must be redacted: {input1}"
+    );
+}
+
+#[tokio::test]
+async fn test_content_mode_prompt_field_metadata_no_passthrough() {
+    // before_proxy must scrub the PII it reports as redacted from the
+    // buffered request_body metadata (consumed by downstream before_proxy
+    // plugins), not just rely on transform_request_body.
+    let plugin = AiPromptShield::new(&json!({
+        "action": "redact",
+        "patterns": ["ssn"]
+    }))
+    .unwrap();
+
+    let mut ctx = make_post_ctx(&json!({
+        "model": "gpt-3.5-turbo-instruct",
+        "prompt": "My SSN is 123-45-6789"
+    }));
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+    assert!(ctx.metadata.contains_key("ai_shield_redacted"));
+
+    let stored = ctx.metadata.get("request_body").unwrap();
+    assert!(
+        !stored.contains("123-45-6789"),
+        "PII must not survive in metadata body: {stored}"
+    );
+    assert!(stored.contains("[REDACTED:ssn]"));
+}
+
 // ─── Rejection body format ──────────────────────────────────────────────
 
 #[tokio::test]
