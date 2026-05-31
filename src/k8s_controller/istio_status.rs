@@ -349,6 +349,23 @@ fn merge_owned_conditions(
         .iter()
         .filter_map(|c| c.get("type").and_then(Value::as_str).map(ToOwned::to_owned))
         .collect();
+    // Index the LIVE conditions by type so a value-unchanged desired condition
+    // can carry the live `lastTransitionTime` forward. `condition()` computes
+    // the timestamp against the planning snapshot (the watch cache, which can
+    // lag the live status); without this second, live-status preservation layer
+    // a value-unchanged `FerrumAccepted` condition would be stamped with
+    // `now()` whenever the cache and live status diverge, making the
+    // K8s-standard `lastTransitionTime` flap (it should change only on a real
+    // status transition). The Gateway API writer already guards this via the
+    // same shared `preserve_unchanged_transition_time` helper.
+    let live_by_type: std::collections::HashMap<String, Value> = live_conditions
+        .iter()
+        .filter_map(|c| {
+            c.get("type")
+                .and_then(Value::as_str)
+                .map(|condition_type| (condition_type.to_owned(), c.clone()))
+        })
+        .collect();
     let mut merged: Vec<Value> = live_conditions
         .into_iter()
         .filter(|existing| {
@@ -367,7 +384,16 @@ fn merge_owned_conditions(
             true
         })
         .collect();
-    merged.extend(desired_conditions);
+    merged.extend(desired_conditions.into_iter().map(|desired| {
+        match desired
+            .get("type")
+            .and_then(Value::as_str)
+            .and_then(|condition_type| live_by_type.get(condition_type))
+        {
+            Some(live) => super::status::preserve_unchanged_transition_time(desired, live),
+            None => desired,
+        }
+    }));
     merged
 }
 
@@ -1220,6 +1246,65 @@ mod tests {
             .iter()
             .find(|c| c.get("type").and_then(Value::as_str) == Some(condition_type))
             .unwrap_or_else(|| panic!("missing condition {condition_type}"))
+    }
+
+    // ── lastTransitionTime preservation (vs live status) ───────────────────
+
+    #[test]
+    fn merge_owned_conditions_preserves_last_transition_time_for_unchanged_value() {
+        // Live status carries FerrumAccepted=True/Accepted/msg @ T1. The planning
+        // pass recomputed the SAME value but stamped @ T2 (the watch cache lagged
+        // the live write). The merge must carry T1 forward so lastTransitionTime
+        // does not flap on a value-unchanged reconcile (K8s Condition semantics).
+        let live = vec![json!({
+            "type": "FerrumAccepted",
+            "status": "True",
+            "reason": "Accepted",
+            "message": "translated",
+            "lastTransitionTime": "2026-01-01T00:00:00Z"
+        })];
+        let desired = vec![json!({
+            "type": "FerrumAccepted",
+            "status": "True",
+            "reason": "Accepted",
+            "message": "translated",
+            "lastTransitionTime": "2026-05-30T12:00:00Z"
+        })];
+        let merged = merge_owned_conditions(live, desired);
+        let c = find_condition(&merged, "FerrumAccepted");
+        assert_eq!(
+            c["lastTransitionTime"].as_str(),
+            Some("2026-01-01T00:00:00Z"),
+            "unchanged condition value must keep the live lastTransitionTime"
+        );
+    }
+
+    #[test]
+    fn merge_owned_conditions_advances_last_transition_time_on_changed_value() {
+        // A genuine transition (True/Accepted -> False/Invalid) must adopt the
+        // new timestamp.
+        let live = vec![json!({
+            "type": "FerrumAccepted",
+            "status": "True",
+            "reason": "Accepted",
+            "message": "translated",
+            "lastTransitionTime": "2026-01-01T00:00:00Z"
+        })];
+        let desired = vec![json!({
+            "type": "FerrumAccepted",
+            "status": "False",
+            "reason": "Invalid",
+            "message": "rejected",
+            "lastTransitionTime": "2026-05-30T12:00:00Z"
+        })];
+        let merged = merge_owned_conditions(live, desired);
+        let c = find_condition(&merged, "FerrumAccepted");
+        assert_eq!(c["status"].as_str(), Some("False"));
+        assert_eq!(
+            c["lastTransitionTime"].as_str(),
+            Some("2026-05-30T12:00:00Z"),
+            "a real status transition must advance lastTransitionTime"
+        );
     }
 
     // ── AuthorizationPolicy ────────────────────────────────────────────────

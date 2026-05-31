@@ -16,7 +16,7 @@ use crate::common::{
     configure_coverage_gateway_command, explicit_test_binary, shutdown_gateway_child,
 };
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -269,6 +269,20 @@ async fn tagged_round_trip(
     assert_eq!(buf, expected, "Tagged echo response should match");
 }
 
+async fn connect_tcp_proxy(proxy_port: u16) -> tokio::net::TcpStream {
+    let addr = format!("127.0.0.1:{proxy_port}");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match tokio::net::TcpStream::connect(&addr).await {
+            Ok(stream) => return stream,
+            Err(err) if Instant::now() >= deadline => {
+                panic!("Failed to connect to TCP proxy at {addr}: {err}")
+            }
+            Err(_) => sleep(Duration::from_millis(25)).await,
+        }
+    }
+}
+
 /// Start the gateway with retry on port-binding failures.
 ///
 /// Allocates fresh ephemeral proxy listen, HTTP, and admin ports on each attempt
@@ -451,9 +465,7 @@ plugin_configs: []
     .await;
 
     // Connect through the TCP proxy
-    let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", proxy_port))
-        .await
-        .expect("Failed to connect to TCP proxy");
+    let mut stream = connect_tcp_proxy(proxy_port).await;
 
     // Send data
     let test_data = b"Hello, TCP proxy!";
@@ -596,9 +608,7 @@ plugin_configs: []
     .await;
 
     // Connect with plain TCP — gateway handles TLS to backend
-    let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", proxy_port))
-        .await
-        .expect("Failed to connect to TCP proxy");
+    let mut stream = connect_tcp_proxy(proxy_port).await;
 
     let test_data = b"Hello through backend TLS!";
     stream.write_all(test_data).await.expect("Failed to send");
@@ -932,9 +942,7 @@ plugin_configs: []
     )
     .await;
 
-    let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", proxy_port))
-        .await
-        .expect("Failed to connect to TCP proxy");
+    let mut stream = connect_tcp_proxy(proxy_port).await;
 
     let test_data = b"global-idle";
     stream.write_all(test_data).await.expect("Failed to send");
