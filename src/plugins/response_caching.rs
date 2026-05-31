@@ -61,10 +61,21 @@ fn cache_key_host_part(host: &str) -> String {
     }
 }
 
+/// Request headers whose values are credentials or session identifiers.
+///
+/// These are SHA-256-hashed by [`cache_key_vary_value`] when they appear in a
+/// cache key (so the raw secret never lands in the key or debug logs) and are
+/// auto-added to the keyed `Vary` set at storage time (see
+/// `on_final_response_body`) so two requests bearing distinct credentials or
+/// sessions never collapse onto one shared cache entry. Driving both the
+/// auto-Vary loop and [`is_sensitive_vary_header`] off this single list keeps
+/// them from drifting apart.
+const SENSITIVE_VARY_HEADERS: [&str; 3] = ["authorization", "proxy-authorization", "cookie"];
+
 fn is_sensitive_vary_header(header: &str) -> bool {
-    header.eq_ignore_ascii_case("authorization")
-        || header.eq_ignore_ascii_case("proxy-authorization")
-        || header.eq_ignore_ascii_case("cookie")
+    SENSITIVE_VARY_HEADERS
+        .iter()
+        .any(|sensitive| header.eq_ignore_ascii_case(sensitive))
 }
 
 fn cache_key_vary_value(header: &str, value: &str) -> String {
@@ -479,10 +490,23 @@ impl ResponseCaching {
             }
         }
 
-        let consumer_part = if self.config.cache_key_include_consumer {
-            ctx.effective_identity().unwrap_or("_anon")
-        } else {
-            ""
+        // Bind the cache entry to the authenticated principal whenever the
+        // request is authenticated by ANY mechanism — a gateway Consumer
+        // (key_auth / mtls_auth / basic_auth / hmac_auth) or an external
+        // `authenticated_identity` emitted by jwks_auth / oidc. Without this,
+        // two principals authenticated by a non-`Authorization` scheme (API
+        // key, mTLS, JWT carried in a custom header) share one cache entry
+        // whenever the backend marks the response `public` / `s-maxage`,
+        // serving one principal's private response to another. The identity
+        // is SHA-256-hashed so a username or SPIFFE ID (which may contain the
+        // `:` / `|` key delimiters and can surface in debug logs) never lands
+        // in the key verbatim. `cache_key_include_consumer` remains an
+        // explicit opt-in that additionally keys *anonymous* requests as
+        // `_anon`.
+        let consumer_part: Cow<'_, str> = match ctx.effective_identity() {
+            Some(identity) => Cow::Owned(format!("sha256-{}", sha256_hex(identity))),
+            None if self.config.cache_key_include_consumer => Cow::Borrowed("_anon"),
+            None => Cow::Borrowed(""),
         };
 
         let encoded_path = encode_path_for_cache_key(&ctx.path);
@@ -505,7 +529,7 @@ impl ResponseCaching {
         key.push(':');
         key.push_str(&query_part);
         key.push(':');
-        key.push_str(consumer_part);
+        key.push_str(&consumer_part);
         key
     }
 
@@ -736,14 +760,21 @@ impl ResponseCaching {
     }
 
     /// Stash the transformed-header values `before_proxy` saw for every
-    /// key that can land in the cache key — `host`, `authorization`, and
-    /// each configured `vary_by_headers` entry. `on_final_response_body`
-    /// reads it back via [`Self::restore_request_headers_view`] so the
-    /// storage cache key is derived from the same header view as the
-    /// lookup. Without this, a request-side transformer that touches a
-    /// vary header (e.g. injecting `X-Tenant` from a consumer property)
-    /// would make the storage key disagree with the lookup key and the
-    /// cache would never hit.
+    /// key that can land in the cache key — `host`, the sensitive
+    /// credential/session headers in [`SENSITIVE_VARY_HEADERS`]
+    /// (`authorization`, `proxy-authorization`, `cookie`), and each configured
+    /// `vary_by_headers` entry. `on_final_response_body` reads it back via
+    /// [`Self::restore_request_headers_view`] so the storage cache key is
+    /// derived from the same header view as the lookup. Without this, a
+    /// request-side transformer that touches one of these headers (e.g.
+    /// injecting `X-Tenant` from a consumer property, or rewriting `cookie`)
+    /// would make the storage key disagree with the lookup key and the cache
+    /// would never hit.
+    ///
+    /// The sensitive headers are stashed unconditionally because the storage
+    /// path auto-Varies them (see `on_final_response_body`), so they are
+    /// load-bearing cache-key dimensions even when the operator never lists
+    /// them in `vary_by_headers`.
     ///
     /// Snapshot is intentionally narrow: only headers we know we will
     /// consume go into it. Headers that show up later via the response
@@ -756,18 +787,21 @@ impl ResponseCaching {
         ctx: &mut RequestContext,
         headers: &HashMap<String, String>,
     ) {
-        let mut snapshot: Vec<(String, String)> =
-            Vec::with_capacity(self.config.vary_by_headers.len() + 2);
+        let mut snapshot: Vec<(String, String)> = Vec::with_capacity(
+            self.config.vary_by_headers.len() + 1 + SENSITIVE_VARY_HEADERS.len(),
+        );
         let mut push_if_present = |key: &str| {
             if let Some(value) = headers.get(key) {
                 snapshot.push((key.to_string(), value.clone()));
             }
         };
         push_if_present("host");
-        push_if_present("authorization");
+        for header in SENSITIVE_VARY_HEADERS {
+            push_if_present(header);
+        }
         for header in &self.config.vary_by_headers {
-            // Skip duplicates that match the always-stashed pair above.
-            if header == "host" || header == "authorization" {
+            // Skip duplicates that match the always-stashed keys above.
+            if header == "host" || is_sensitive_vary_header(header) {
                 continue;
             }
             push_if_present(header);
@@ -1094,33 +1128,51 @@ impl Plugin for ResponseCaching {
             }
         };
 
-        // Per RFC 7234 §3.2, a shared cache MUST NOT serve a cached response
-        // to a request other than the one that produced it when the original
-        // request carried an `Authorization` header — unless the response
-        // explicitly opted-in via `Cache-Control: public` / `must-revalidate`
-        // / `s-maxage`. `shared_cache_allows_authorized_response` already
-        // gates that decision above. Once we've decided to cache, we MUST
-        // also key the cache entry by the Authorization value so two users
-        // presenting different bearer tokens land on different cache entries.
+        // Per RFC 7234 §3.2 / §8, a shared cache MUST NOT serve a stored
+        // response to a request other than the one that produced it when the
+        // original request carried credentials — unless the response
+        // explicitly opted in via `Cache-Control: public` / `must-revalidate`
+        // / `s-maxage`. `shared_cache_allows_authorized_response` gates that
+        // decision above. Once we've decided to cache, we MUST also key the
+        // entry by the credential so two clients presenting different
+        // credentials land on different cache entries.
         //
-        // Auto-merge `authorization` into the Vary list whenever the request
-        // had an Authorization header. Operators don't need to remember to
-        // configure `cache_key_include_consumer: true` or list `authorization`
-        // in `vary_by_headers` — the safe default is to never share cached
-        // authorized responses across distinct credentials. The merged list
-        // is sorted and re-stored in `vary_index` so the same dimension
-        // applies to every subsequent lookup at this base key.
+        // Auto-merge every credential/session header the request carried
+        // (`authorization`, `proxy-authorization`, `cookie`) into the keyed
+        // Vary list. Operators don't need to remember to set
+        // `cache_key_include_consumer: true` or list these in
+        // `vary_by_headers` — the safe default is to never share a cached
+        // response across distinct credentials or sessions. Driving the loop
+        // off `SENSITIVE_VARY_HEADERS` (the same list `is_sensitive_vary_header`
+        // uses to SHA-256-hash the value) keeps the auto-Vary set and the
+        // sensitivity list from drifting apart. The merged list is sorted and
+        // re-stored in `vary_index` so the same dimension applies to every
+        // subsequent lookup at this base key.
+        //
+        // This is complementary to the per-principal `consumer_part` in
+        // `build_base_cache_key`: that isolates *authenticated* principals
+        // (API key / mTLS / JWT) even when the credential rides a non-standard
+        // header; this isolates the raw credential/session headers themselves,
+        // including anonymous `Cookie`-only sessions that have no
+        // `effective_identity`.
         //
         // `lookup_headers` was built above from
         // `restore_request_headers_view`: it layers `before_proxy`'s header
         // snapshot on top of `ctx.headers`, so configured `vary_by_headers`
-        // / `host` / `authorization` reflect the transformed values that
+        // / `host` / the sensitive headers reflect the transformed values that
         // were live during lookup. Response-added Vary headers fall back to
-        // `ctx.headers`, the same source any future lookup would use for
-        // them, so the lookup/storage symmetry holds for those too.
-        let storage_auth_present = lookup_headers.contains_key("authorization");
-        if storage_auth_present && !vary_headers.iter().any(|h| h == "authorization") {
-            vary_headers.push("authorization".to_string());
+        // `ctx.headers`, the same source any future lookup would use for them,
+        // so the lookup/storage symmetry holds for those too.
+        let mut added_sensitive_vary = false;
+        for sensitive in SENSITIVE_VARY_HEADERS {
+            if lookup_headers.contains_key(sensitive)
+                && !vary_headers.iter().any(|h| h == sensitive)
+            {
+                vary_headers.push(sensitive.to_string());
+                added_sensitive_vary = true;
+            }
+        }
+        if added_sensitive_vary {
             vary_headers.sort();
         }
 
@@ -1251,6 +1303,86 @@ mod tests {
         assert!(!stored_key.contains(bearer));
         assert!(!stored_key.contains("reviewer-secret-token"));
         assert!(stored_key.contains("authorization=sha256-"));
+    }
+
+    #[tokio::test]
+    async fn cookie_is_auto_varied_and_hashed_without_explicit_config() {
+        // No `vary_by_headers` configured and no authenticated identity: the
+        // storage path must still auto-Vary `cookie` so distinct sessions
+        // never share one `public` entry, and the raw cookie value must be
+        // SHA-256-hashed out of the key. (finding #15)
+        let plugin = plugin_with_config(json!({ "ttl_seconds": 60 }));
+
+        let mut ctx = make_ctx("GET", "/dashboard");
+        ctx.headers
+            .insert("cookie".to_string(), "session=top-secret".to_string());
+        let mut request_headers = ctx.headers.clone();
+        let result = plugin.before_proxy(&mut ctx, &mut request_headers).await;
+        assert!(matches!(result, PluginResult::Continue));
+
+        let mut response_headers = HashMap::new();
+        response_headers.insert(
+            "cache-control".to_string(),
+            "public, max-age=60".to_string(),
+        );
+        plugin
+            .on_final_response_body(&mut ctx, 200, &response_headers, b"dashboard-body")
+            .await;
+
+        let cache_keys: Vec<String> = plugin
+            .cache
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+        assert_eq!(cache_keys.len(), 1);
+        let stored_key = &cache_keys[0];
+        assert!(
+            !stored_key.contains("top-secret"),
+            "raw cookie leaked into cache key: {stored_key}"
+        );
+        assert!(
+            stored_key.contains("cookie=sha256-"),
+            "cookie was not auto-varied into the cache key: {stored_key}"
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticated_principal_keyed_into_base_key_without_consumer_flag() {
+        // Default config (`cache_key_include_consumer: false`). An identity
+        // authenticated by a non-`Authorization` scheme must still be bound
+        // into the cache key (SHA-256-hashed), so a `public` per-user response
+        // is never shared across principals. (finding #1)
+        let plugin = plugin_with_config(json!({ "ttl_seconds": 60 }));
+
+        let mut ctx = make_ctx("GET", "/api/profile");
+        ctx.authenticated_identity = Some("alice@example.com".to_string());
+        let mut request_headers = ctx.headers.clone();
+        plugin.before_proxy(&mut ctx, &mut request_headers).await;
+
+        let mut response_headers = HashMap::new();
+        response_headers.insert(
+            "cache-control".to_string(),
+            "public, max-age=60".to_string(),
+        );
+        plugin
+            .on_final_response_body(&mut ctx, 200, &response_headers, b"alice-body")
+            .await;
+
+        let cache_keys: Vec<String> = plugin
+            .cache
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+        assert_eq!(cache_keys.len(), 1);
+        let stored_key = &cache_keys[0];
+        assert!(
+            !stored_key.contains("alice@example.com"),
+            "raw identity leaked into cache key: {stored_key}"
+        );
+        assert!(
+            stored_key.contains(&format!("sha256-{}", sha256_hex("alice@example.com"))),
+            "authenticated principal was not bound into the base key: {stored_key}"
+        );
     }
 
     #[test]
