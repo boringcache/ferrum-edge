@@ -1289,15 +1289,14 @@ fn test_request_transformer_overlay_gate_parsing() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn test_request_transformer_overlay_gate_observable_end_to_end() {
     // Single test that walks every overlay-gate behaviour serially to
     // avoid racing the process-global `request_transformer::runtime_overlay`
     // ArcSwap from parallel test cases.
     use ferrum_edge::modes::mesh::config::{MeshRuntimeOverlay, RuntimeValue};
     use ferrum_edge::plugins::request_transformer::runtime_overlay;
-    use tokio::sync::Mutex;
-    static GUARD: Mutex<()> = Mutex::const_new(());
-    let _guard = GUARD.lock().await;
+    let _guard = ferrum_edge::modes::mesh::runtime_overlay_consumers::test_lock();
 
     let plugin = RequestTransformer::new(&json!({
         "rules": [

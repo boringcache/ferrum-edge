@@ -948,12 +948,11 @@ fn test_response_transformer_overlay_gate_parsing_is_namespaced() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn test_response_transformer_overlay_gate_observable_end_to_end() {
     use ferrum_edge::modes::mesh::config::{MeshRuntimeOverlay, RuntimeValue};
     use ferrum_edge::plugins::response_transformer::runtime_overlay;
-    use tokio::sync::Mutex;
-    static GUARD: Mutex<()> = Mutex::const_new(());
-    let _guard = GUARD.lock().await;
+    let _guard = ferrum_edge::modes::mesh::runtime_overlay_consumers::test_lock();
 
     let plugin = ResponseTransformer::new(&json!({
         "rules": [

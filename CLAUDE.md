@@ -54,16 +54,6 @@ Target by scope: public APIs use `cargo test --test unit_tests <filter>`; cross-
 
 Run the full local suite only for shared infrastructure, cross-module refactors, pre-release work, or when CI is congested. Leave `CARGO_TARGET_DIR` unset across parallel worktrees; inside one workspace, run fmt, clippy, and tests sequentially.
 
-## Testing And Refactoring Guidelines
-
-- Do not add inline tests, ad hoc test runners, or test-only logic to production source files unless explicitly required to cover a private invariant without widening runtime APIs.
-- Place tests in `tests/` using the repository's established `unit`, `integration`, `functional`, `conformance`, and helper layouts.
-- Keep production files focused on runtime code; shared test fixtures, mocks, and helpers belong under test-specific helper directories.
-- When adding or updating tests, follow existing test framework, naming, and module registration conventions.
-- When refactoring duplicated logic, prefer small shared utilities over copy/paste and keep domain-specific logic near its domain.
-- Split large source files by responsibility only when it improves cohesion, readability, or ownership boundaries.
-- Preserve existing behavior during refactors unless a behavior change is explicitly requested or an obvious bug is documented.
-
 ## Operating Modes
 
 - `database`: R/W admin + proxy; PostgreSQL/MySQL/SQLite/MongoDB polling
