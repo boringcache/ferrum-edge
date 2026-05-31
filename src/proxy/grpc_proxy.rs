@@ -1966,6 +1966,15 @@ pub(crate) fn streaming_effective_timeout_ms(
 
 /// Build the same post-plugin header view that [`proxy_grpc_request_streaming`]
 /// uses, then derive its effective streaming timeout.
+///
+/// Test-only: production dispatch derives the timeout from the already-merged
+/// streaming headers via [`streaming_effective_timeout_ms`], and the HALF_OPEN
+/// probe guard uses
+/// [`streaming_post_header_upload_timeout_ms_after_proxy_headers`]. This wrapper
+/// is retained solely to assert — in contrast to the capped guard helper — that
+/// the end-to-end streaming RPC timeout is NOT capped by
+/// `backend_read_timeout_ms`.
+#[cfg(test)]
 pub(crate) fn streaming_effective_timeout_ms_after_proxy_headers(
     request_headers: &hyper::HeaderMap,
     proxy_headers: &HashMap<String, String>,
@@ -2173,6 +2182,42 @@ mod tests {
                 &proxy,
             ),
             Some(750),
+        );
+    }
+
+    #[test]
+    fn streaming_post_header_upload_timeout_disabled_read_timeout_is_opt_out() {
+        // `backend_read_timeout_ms == 0` is an explicit operator opt-out of the
+        // read timeout. With it disabled the guard cannot cap by it, so a client
+        // `grpc-timeout` passes through uncapped, and with no client deadline at
+        // all no guard is installed — the probe slot is then bounded only by the
+        // RPC itself, matching the operator's "no read timeout" choice.
+        let mut proxy = grpc_pool_test_proxy();
+        proxy.backend_read_timeout_ms = 0;
+
+        let mut request_headers = hyper::HeaderMap::new();
+        request_headers.insert(
+            "grpc-timeout",
+            hyper::header::HeaderValue::from_static("3S"),
+        );
+        assert_eq!(
+            streaming_post_header_upload_timeout_ms_after_proxy_headers(
+                &request_headers,
+                &HashMap::new(),
+                &proxy,
+            ),
+            Some(3_000),
+            "with backend_read_timeout_ms == 0 the client grpc-timeout is not capped"
+        );
+
+        assert_eq!(
+            streaming_post_header_upload_timeout_ms_after_proxy_headers(
+                &hyper::HeaderMap::new(),
+                &HashMap::new(),
+                &proxy,
+            ),
+            None,
+            "with backend_read_timeout_ms == 0 and no client deadline the guard is disabled (documented opt-out)"
         );
     }
 

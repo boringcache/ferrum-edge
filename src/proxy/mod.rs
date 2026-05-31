@@ -1518,7 +1518,14 @@ struct GrpcStreamingProbeRecorder {
     status_known: std::sync::atomic::AtomicBool,
     upload_terminated: std::sync::atomic::AtomicBool,
     recorded: std::sync::atomic::AtomicBool,
-    post_header_upload_deadline: Option<Instant>,
+    /// Post-header upload guard window in milliseconds, or `None` when no guard
+    /// applies. Stored as a duration rather than an absolute deadline so the
+    /// guard is measured from response-header arrival (in
+    /// `start_post_header_upload_timeout`) instead of from dispatch start —
+    /// otherwise a backend that returns headers slowly would burn the window
+    /// before the upload phase even begins and a healthy probe could never heal
+    /// the breaker.
+    post_header_upload_timeout_ms: Option<u64>,
 }
 
 impl GrpcStreamingProbeRecorder {
@@ -1526,7 +1533,7 @@ impl GrpcStreamingProbeRecorder {
         cb: Arc<crate::circuit_breaker::CircuitBreaker>,
         is_half_open_probe: bool,
         request_body_exceeded: Arc<std::sync::atomic::AtomicBool>,
-        post_header_upload_deadline: Option<Instant>,
+        post_header_upload_timeout_ms: Option<u64>,
     ) -> Self {
         Self {
             cb,
@@ -1536,7 +1543,7 @@ impl GrpcStreamingProbeRecorder {
             status_known: std::sync::atomic::AtomicBool::new(false),
             upload_terminated: std::sync::atomic::AtomicBool::new(false),
             recorded: std::sync::atomic::AtomicBool::new(false),
-            post_header_upload_deadline,
+            post_header_upload_timeout_ms,
         }
     }
 
@@ -1574,16 +1581,19 @@ impl GrpcStreamingProbeRecorder {
     }
 
     fn start_post_header_upload_timeout(self: &Arc<Self>) {
-        let Some(deadline) = self.post_header_upload_deadline else {
+        let Some(timeout_ms) = self.post_header_upload_timeout_ms else {
             return;
         };
         if self.upload_terminated.load(Ordering::Acquire) {
             return;
         }
-        let Some(timeout) = deadline.checked_duration_since(Instant::now()) else {
-            self.record_neutral_if_upload_still_open();
-            return;
-        };
+        // Measure the guard window from response-header arrival (now), because
+        // this method runs from `note_status` when the backend status is first
+        // known. Anchoring to dispatch start instead would let the time the
+        // backend spent producing headers consume the window, so a healthy
+        // probe behind a slow-header backend would be recorded NEUTRAL the
+        // instant headers arrive and could never heal the breaker.
+        let timeout = Duration::from_millis(timeout_ms);
         let recorder = Arc::clone(self);
         std::mem::drop(tokio::spawn(async move {
             tokio::time::sleep(timeout).await;
@@ -10192,22 +10202,20 @@ async fn handle_proxy_request_inner(
                                 grpc_final_cb_key.as_deref(),
                                 cb_config,
                             );
-                            let post_header_upload_deadline =
+                            // Pass the guard window as a duration; the recorder
+                            // anchors it to response-header arrival rather than
+                            // dispatch start (see `start_post_header_upload_timeout`).
+                            let post_header_upload_timeout_ms =
                                 grpc_proxy::streaming_post_header_upload_timeout_ms_after_proxy_headers(
                                     request.headers(),
                                     proxy_headers,
                                     proxy.as_ref(),
-                                )
-                                .map(|timeout_ms| {
-                                    Instant::now()
-                                        .checked_add(Duration::from_millis(timeout_ms))
-                                        .unwrap_or_else(Instant::now)
-                                });
+                                );
                             let recorder = Arc::new(GrpcStreamingProbeRecorder::new(
                                 cb,
                                 grpc_cb_probe_slot,
                                 Arc::clone(&body_size_exceeded),
-                                post_header_upload_deadline,
+                                post_header_upload_timeout_ms,
                             ));
                             grpc_streaming_probe_recorder = Some(Arc::clone(&recorder));
                             // `let`-binding the trait object drives the
@@ -16110,7 +16118,7 @@ mod tests {
                 std::sync::Arc::clone(&cb),
                 true,
                 request_body_exceeded,
-                std::time::Instant::now().checked_add(std::time::Duration::from_millis(10)),
+                Some(10),
             ));
 
             recorder.note_status(200);
@@ -16144,31 +16152,47 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn elapsed_post_header_upload_deadline_releases_probe_slot_neutral() {
+        async fn post_header_upload_guard_measures_window_from_header_arrival() {
+            // Regression guard: the post-header upload window must be counted
+            // from when response headers arrive, not from dispatch start. A
+            // backend that takes a while to return headers must not consume the
+            // guard window — otherwise a healthy probe would be recorded NEUTRAL
+            // the instant headers land and could never heal the breaker.
             let cb = std::sync::Arc::new(breaker_with_admitted_half_open_probe());
             let request_body_exceeded =
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let elapsed_deadline = std::time::Instant::now()
-                .checked_sub(std::time::Duration::from_millis(1))
-                .expect("small instant subtraction");
             let recorder = std::sync::Arc::new(super::super::GrpcStreamingProbeRecorder::new(
                 std::sync::Arc::clone(&cb),
                 true,
                 request_body_exceeded,
-                Some(elapsed_deadline),
+                Some(40),
             ));
 
+            // Simulate a slow-header backend: meaningful time elapses between
+            // recorder construction (dispatch start) and the status becoming
+            // known (header arrival).
+            tokio::time::sleep(std::time::Duration::from_millis(60)).await;
             recorder.note_status(200);
 
+            // Even though more than the 40ms window has elapsed since dispatch
+            // start, the guard has not fired: it starts counting now.
+            assert_eq!(
+                cb.half_open_in_flight(),
+                1,
+                "the pre-header delay must not consume the post-header upload window"
+            );
+
+            // The window does still bound an unended upload, measured from here.
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
             assert_eq!(
                 cb.state_name(),
                 "half_open",
-                "an elapsed post-header upload deadline is neutral and must not heal"
+                "an unended upload past the post-header guard is neutral and must not heal"
             );
             assert_eq!(
                 cb.half_open_in_flight(),
                 0,
-                "an elapsed deadline must release the probe slot immediately"
+                "the post-header upload guard must release the probe slot after its window"
             );
         }
 
