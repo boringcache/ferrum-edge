@@ -13503,7 +13503,11 @@ components:
             Action when the client IP cannot be resolved to a country. Applies
             to both genuine MaxMind misses (private IPs, unallocated ranges)
             and to the data plane fallback path when the `.mmdb` file is
-            missing on disk.
+            missing on disk. The default `allow` is fail-open: unresolved
+            traffic is permitted, so a missing or stale `.mmdb` silently
+            disables the geo gate. Set this explicitly to `deny` for fail-closed
+            behaviour. When the default is used, a one-time warning is logged at
+            startup, and the first request-time fail-open is logged at warn.
 
     RateSpec:
       type: object

@@ -6,8 +6,9 @@
 //!
 //! Supports:
 //! - Country allow/deny lists (ISO 3166-1 alpha-2 codes)
-//! - Optional geographic header injection (`X-Geo-Country`, `X-Geo-Region`)
-//! - Configurable default action when IP lookup fails
+//! - Optional geographic header injection (`X-Geo-Country`)
+//! - Configurable default action when IP lookup fails (defaults to `allow`,
+//!   i.e. fail-open — see `on_lookup_failure`)
 //!
 //! The `.mmdb` file is memory-mapped via `mmap(2)` at plugin construction time
 //! (`Reader::open_mmap`) for zero-copy lookups on the hot path without loading
@@ -24,7 +25,8 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tracing::warn;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tracing::{debug, warn};
 
 use super::{Plugin, PluginResult, RequestContext};
 
@@ -58,6 +60,10 @@ pub struct GeoRestriction {
     deny_countries: HashSet<String>,
     inject_headers: bool,
     on_lookup_failure: LookupFailureAction,
+    /// Set once the first request-time fail-open (lookup failed but policy is
+    /// Allow) has been logged at warn level, so subsequent occurrences drop to
+    /// debug and do not flood logs on the hot path.
+    fail_open_warned: AtomicBool,
 }
 
 impl GeoRestriction {
@@ -82,6 +88,23 @@ impl GeoRestriction {
 
         let inject_headers = bool_config(config, "inject_headers", false)?;
         let on_lookup_failure = lookup_failure_action(config)?;
+
+        // Nudge operators toward an explicit failure policy. When
+        // `on_lookup_failure` is omitted it defaults to `allow` (fail-open):
+        // any IP that cannot be resolved — not in the DB, unparseable, or a
+        // missing/stale .mmdb — is permitted. For an access-control plugin
+        // that silently disables the geo gate, so surface the default once at
+        // construction so it is a conscious choice.
+        let on_lookup_failure_explicit =
+            !matches!(config.get("on_lookup_failure"), None | Some(Value::Null));
+        if !on_lookup_failure_explicit && on_lookup_failure == LookupFailureAction::Allow {
+            warn!(
+                plugin = "geo_restriction",
+                "'on_lookup_failure' is not set; defaulting to 'allow' (fail-open) — \
+                 unresolved IPs and a missing/stale .mmdb will be permitted. Set \
+                 'on_lookup_failure' explicitly ('allow' or 'deny') to silence this warning"
+            );
+        }
 
         // Open the MaxMind database file. If the file is missing or unreadable,
         // log a warning but allow the plugin to be created — the file may exist
@@ -110,7 +133,31 @@ impl GeoRestriction {
             deny_countries,
             inject_headers,
             on_lookup_failure,
+            fail_open_warned: AtomicBool::new(false),
         })
+    }
+
+    /// Log a request-time fail-open (lookup failed, policy is Allow). The first
+    /// occurrence is logged at warn so operators get a visible signal that the
+    /// geo gate is permitting unresolved traffic; subsequent occurrences drop
+    /// to debug to avoid flooding the hot path.
+    fn log_fail_open(&self, client_ip: &str, reason: &'static str) {
+        if !self.fail_open_warned.swap(true, Ordering::Relaxed) {
+            warn!(
+                client_ip = %client_ip,
+                plugin = "geo_restriction",
+                reason = reason,
+                "GeoIP lookup failed; allowing request by on_lookup_failure policy (fail-open). \
+                 Further occurrences logged at debug"
+            );
+        } else {
+            debug!(
+                client_ip = %client_ip,
+                plugin = "geo_restriction",
+                reason = reason,
+                "GeoIP lookup failed; allowing request by on_lookup_failure policy (fail-open)"
+            );
+        }
     }
 
     /// Look up the country ISO code for a given IP address string.
@@ -139,24 +186,31 @@ impl GeoRestriction {
     fn check_ip(&self, client_ip: &str) -> (PluginResult, Option<String>) {
         if self.reader.is_none() {
             // Database file not loaded — apply the configured failure policy.
-            warn!(
-                client_ip = %client_ip,
-                db_path = %self.db_path,
-                plugin = "geo_restriction",
-                reason = "db_not_loaded",
-                "MaxMind database not loaded, applying on_lookup_failure policy"
-            );
             return match self.on_lookup_failure {
-                LookupFailureAction::Allow => (PluginResult::Continue, None),
-                LookupFailureAction::Deny => (
-                    PluginResult::Reject {
-                        status_code: 403,
-                        body: r#"{"error":"Access denied: GeoIP database not available"}"#
-                            .to_string(),
-                        headers: HashMap::new(),
-                    },
-                    None,
-                ),
+                LookupFailureAction::Allow => {
+                    // Fail-open: surface that the geo gate is disabled because
+                    // the .mmdb is absent (first occurrence at warn).
+                    self.log_fail_open(client_ip, "db_not_loaded");
+                    (PluginResult::Continue, None)
+                }
+                LookupFailureAction::Deny => {
+                    warn!(
+                        client_ip = %client_ip,
+                        db_path = %self.db_path,
+                        plugin = "geo_restriction",
+                        reason = "db_not_loaded",
+                        "MaxMind database not loaded, denying by on_lookup_failure policy"
+                    );
+                    (
+                        PluginResult::Reject {
+                            status_code: 403,
+                            body: r#"{"error":"Access denied: GeoIP database not available"}"#
+                                .to_string(),
+                            headers: HashMap::new(),
+                        },
+                        None,
+                    )
+                }
             };
         }
 
@@ -165,7 +219,14 @@ impl GeoRestriction {
             Ok(None) | Err(_) => {
                 // Lookup failed or IP not in database
                 match self.on_lookup_failure {
-                    LookupFailureAction::Allow => return (PluginResult::Continue, None),
+                    LookupFailureAction::Allow => {
+                        // Fail-open: the IP could not be resolved but policy
+                        // permits it. Previously silent — surface it so an
+                        // operator can detect unresolved traffic slipping past
+                        // the geo gate.
+                        self.log_fail_open(client_ip, "lookup_failed");
+                        return (PluginResult::Continue, None);
+                    }
                     LookupFailureAction::Deny => {
                         warn!(
                             client_ip = %client_ip,
