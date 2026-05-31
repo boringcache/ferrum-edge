@@ -9,10 +9,11 @@
 //! Run with:
 //!   cargo test --test functional_tests functional_mesh_mode -- --ignored --nocapture
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -33,6 +34,10 @@ use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::grpc::cp_server::DEFAULT_CP_DP_JWT_ISSUER;
 use ferrum_edge::grpc::proto::mesh_config_sync_server::{MeshConfigSync, MeshConfigSyncServer};
 use ferrum_edge::grpc::proto::{ConfigUpdate, MeshConfigUpdate, MeshSubscribeRequest};
+use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain};
+use ferrum_edge::modes::mesh::config::{
+    AppProtocol, MeshService, ServicePort, Workload, WorkloadPort, WorkloadRef, WorkloadSelector,
+};
 use ferrum_edge::modes::mesh::slice::MeshSlice;
 use ferrum_edge::xds::XdsAdsServer;
 
@@ -226,6 +231,55 @@ fn initial_mesh_slice(node_id: &str) -> MeshSlice {
     }
 }
 
+fn east_west_service_slice(node_id: &str) -> MeshSlice {
+    let spiffe_id = SpiffeId::new("spiffe://cluster.local/ns/ferrum/sa/reviews")
+        .expect("valid service SPIFFE ID");
+    MeshSlice {
+        node_id: node_id.to_string(),
+        namespace: "ferrum".to_string(),
+        version: Utc::now().to_rfc3339(),
+        workloads: vec![Workload {
+            spiffe_id: spiffe_id.clone(),
+            selector: WorkloadSelector::default(),
+            service_name: "reviews".to_string(),
+            addresses: vec!["127.0.0.1".to_string()],
+            ports: vec![WorkloadPort {
+                port: 18080,
+                protocol: AppProtocol::Http,
+                name: Some("http".to_string()),
+            }],
+            trust_domain: TrustDomain::new("cluster.local").expect("valid trust domain"),
+            namespace: "ferrum".to_string(),
+            network: None,
+            cluster: None,
+            weight: None,
+            locality: None,
+            service_account: Some("reviews".to_string()),
+            pod_uid: Some("functional-reviews-pod".to_string()),
+        }],
+        services: vec![MeshService {
+            name: "reviews".to_string(),
+            namespace: "ferrum".to_string(),
+            ports: vec![ServicePort {
+                port: 18080,
+                protocol: AppProtocol::Http,
+                name: Some("http".to_string()),
+            }],
+            workloads: vec![WorkloadRef { spiffe_id }],
+            protocol_overrides: HashMap::new(),
+        }],
+        ..MeshSlice::default()
+    }
+}
+
+fn test_cert_path(file_name: &str) -> String {
+    std::fs::canonicalize(PathBuf::from("tests/certs").join(file_name))
+        .expect("canonicalize test cert path")
+        .to_str()
+        .expect("test cert path is UTF-8")
+        .to_string()
+}
+
 fn scrub_ferrum_env(cmd: &mut Command) {
     for (key, _) in std::env::vars() {
         if key.starts_with("FERRUM_") {
@@ -239,6 +293,7 @@ struct MeshPorts {
     outbound: u16,
     hbone: u16,
     egress: u16,
+    east_west: u16,
 }
 
 async fn reserve_mesh_ports() -> MeshPorts {
@@ -259,6 +314,10 @@ async fn reserve_mesh_ports() -> MeshPorts {
             .await
             .expect("reserve mesh egress port")
             .drop_and_take_port(),
+        east_west: reserve_port()
+            .await
+            .expect("reserve mesh east-west port")
+            .drop_and_take_port(),
     }
 }
 
@@ -269,6 +328,7 @@ struct MeshGatewaySpawnOptions<'a> {
     config_protocol: &'a str,
     topology: &'a str,
     waypoint_name: Option<&'a str>,
+    env_overrides: Vec<(&'a str, String)>,
 }
 
 fn spawn_mesh_gateway(temp: &TempDir, options: MeshGatewaySpawnOptions<'_>) -> Child {
@@ -315,6 +375,10 @@ fn spawn_mesh_gateway(temp: &TempDir, options: MeshGatewaySpawnOptions<'_>) -> C
             "FERRUM_MESH_EGRESS_LISTEN_ADDR",
             format!("127.0.0.1:{}", options.ports.egress),
         )
+        .env(
+            "FERRUM_MESH_EAST_WEST_LISTEN_PORT",
+            options.ports.east_west.to_string(),
+        )
         .env("FERRUM_MESH_DNS_PROXY_ENABLED", "false")
         .env("FERRUM_MESH_FEDERATION_POLL_INTERVAL_SECONDS", "0")
         .env(
@@ -323,6 +387,9 @@ fn spawn_mesh_gateway(temp: &TempDir, options: MeshGatewaySpawnOptions<'_>) -> C
         );
     if let Some(waypoint_name) = options.waypoint_name {
         cmd.env("FERRUM_MESH_WAYPOINT_NAME", waypoint_name);
+    }
+    for (key, value) in options.env_overrides {
+        cmd.env(key, value);
     }
     cmd.spawn().expect("spawn mesh gateway")
 }
@@ -340,6 +407,19 @@ fn kill_child(child: &mut Child) {
         let _ = child.kill();
     }
     let _ = child.wait();
+}
+
+async fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait().expect("poll mesh gateway child") {
+            return Some(status);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 fn captured_output(temp: &TempDir) -> String {
@@ -420,6 +500,7 @@ async fn functional_mesh_mode_starts_after_native_mesh_subscribe() {
                 config_protocol: "native",
                 topology: "sidecar",
                 waypoint_name: None,
+                env_overrides: Vec::new(),
             },
         );
 
@@ -506,6 +587,7 @@ async fn functional_mesh_mode_native_topology_listeners_match_contract() {
                 config_protocol: "native",
                 topology: case.topology,
                 waypoint_name: case.waypoint_name,
+                env_overrides: Vec::new(),
             },
         );
 
@@ -522,19 +604,234 @@ async fn functional_mesh_mode_native_topology_listeners_match_contract() {
         kill_child(&mut child);
         cp.shutdown().await;
 
+        let waypoint_name_matches = subscribe
+            .as_ref()
+            .map(|request| request.waypoint_name.as_str() == case.waypoint_name.unwrap_or(""))
+            .unwrap_or(false);
         assert!(
-            subscribe.is_some() && all_open && all_closed,
+            subscribe.is_some() && waypoint_name_matches && all_open && all_closed,
             "topology {} listener contract failed: subscribe={:?}, open_ports={:?}, \
-             closed_ports={:?}, all_open={}, all_closed={}\n{}",
+             closed_ports={:?}, waypoint_name_matches={}, all_open={}, all_closed={}\n{}",
             case.topology,
-            subscribe.as_ref().map(|r| (&r.node_id, &r.namespace)),
+            subscribe
+                .as_ref()
+                .map(|r| (&r.node_id, &r.namespace, &r.waypoint_name)),
             open_ports,
             closed_ports,
+            waypoint_name_matches,
             all_open,
             all_closed,
             captured_output(&temp)
         );
     }
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_mode_east_west_gateway_materializes_service_listener() {
+    ensure_gateway_built().expect("gateway binary built");
+
+    let mut last_failure = String::new();
+    for attempt in 1..=RETRY_ATTEMPTS {
+        let node_id = format!("functional-mesh-east-west-node-{attempt}");
+        let cp = start_static_mesh_cp(east_west_service_slice(&node_id)).await;
+        let mut request_rx = cp.request_rx.clone();
+        let ports = reserve_mesh_ports().await;
+        let inbound_port = ports.inbound;
+        let outbound_port = ports.outbound;
+        let hbone_port = ports.hbone;
+        let egress_port = ports.egress;
+        let east_west_port = ports.east_west;
+        let temp = TempDir::new().expect("temp dir");
+        let mut child = spawn_mesh_gateway(
+            &temp,
+            MeshGatewaySpawnOptions {
+                cp_addr: cp.addr,
+                ports,
+                node_id: &node_id,
+                config_protocol: "native",
+                topology: "east_west_gateway",
+                waypoint_name: None,
+                env_overrides: Vec::new(),
+            },
+        );
+
+        let subscribe = wait_for_mesh_subscribe(&mut request_rx, STARTUP_TIMEOUT).await;
+        let east_west_listening = wait_for_tcp_port(east_west_port, STARTUP_TIMEOUT).await;
+        let direct_mesh_ports_closed =
+            tcp_port_stays_closed(inbound_port, Duration::from_millis(500)).await
+                && tcp_port_stays_closed(outbound_port, Duration::from_millis(500)).await
+                && tcp_port_stays_closed(hbone_port, Duration::from_millis(500)).await
+                && tcp_port_stays_closed(egress_port, Duration::from_millis(500)).await;
+
+        kill_child(&mut child);
+        cp.shutdown().await;
+
+        if subscribe.is_some() && east_west_listening && direct_mesh_ports_closed {
+            return;
+        }
+
+        last_failure = format!(
+            "attempt {attempt}: subscribe={:?}, east_west_listening={east_west_listening}, \
+             direct_mesh_ports_closed={direct_mesh_ports_closed}\n{}",
+            subscribe.as_ref().map(|r| (&r.node_id, &r.namespace)),
+            captured_output(&temp)
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+
+    panic!(
+        "east-west mesh gateway did not bind materialized service listener after {RETRY_ATTEMPTS} attempts\n{last_failure}"
+    );
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_mode_egress_gateway_binds_mtls_listener_with_tls_material() {
+    ensure_gateway_built().expect("gateway binary built");
+
+    let cert_path = test_cert_path("server.crt");
+    let key_path = test_cert_path("server.key");
+    let client_ca_path = cert_path.clone();
+    let mut last_failure = String::new();
+    for attempt in 1..=RETRY_ATTEMPTS {
+        let node_id = format!("functional-mesh-egress-node-{attempt}");
+        let cp = start_static_mesh_cp(initial_mesh_slice(&node_id)).await;
+        let mut request_rx = cp.request_rx.clone();
+        let ports = reserve_mesh_ports().await;
+        let egress_port = ports.egress;
+        let temp = TempDir::new().expect("temp dir");
+        let mut child = spawn_mesh_gateway(
+            &temp,
+            MeshGatewaySpawnOptions {
+                cp_addr: cp.addr,
+                ports,
+                node_id: &node_id,
+                config_protocol: "native",
+                topology: "egress_gateway",
+                waypoint_name: None,
+                env_overrides: vec![
+                    ("FERRUM_FRONTEND_TLS_CERT_PATH", cert_path.clone()),
+                    ("FERRUM_FRONTEND_TLS_KEY_PATH", key_path.clone()),
+                    (
+                        "FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH",
+                        client_ca_path.clone(),
+                    ),
+                ],
+            },
+        );
+
+        let subscribe = wait_for_mesh_subscribe(&mut request_rx, STARTUP_TIMEOUT).await;
+        let egress_listening = wait_for_tcp_port(egress_port, STARTUP_TIMEOUT).await;
+
+        kill_child(&mut child);
+        cp.shutdown().await;
+
+        if subscribe.is_some() && egress_listening {
+            return;
+        }
+
+        last_failure = format!(
+            "attempt {attempt}: subscribe={:?}, egress_listening={egress_listening}\n{}",
+            subscribe.as_ref().map(|r| (&r.node_id, &r.namespace)),
+            captured_output(&temp)
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+
+    panic!(
+        "egress mesh gateway did not bind mTLS listener after {RETRY_ATTEMPTS} attempts\n{last_failure}"
+    );
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_mode_rejects_service_waypoint_without_waypoint_name() {
+    ensure_gateway_built().expect("gateway binary built");
+
+    let node_id = "functional-mesh-service-waypoint-missing-name";
+    let cp = start_static_mesh_cp(initial_mesh_slice(node_id)).await;
+    let ports = reserve_mesh_ports().await;
+    let temp = TempDir::new().expect("temp dir");
+    let mut child = spawn_mesh_gateway(
+        &temp,
+        MeshGatewaySpawnOptions {
+            cp_addr: cp.addr,
+            ports,
+            node_id,
+            config_protocol: "native",
+            topology: "service_waypoint",
+            waypoint_name: None,
+            env_overrides: Vec::new(),
+        },
+    );
+
+    let status = wait_for_child_exit(&mut child, Duration::from_secs(10)).await;
+    if status.is_none() {
+        kill_child(&mut child);
+    }
+    cp.shutdown().await;
+
+    let output = captured_output(&temp);
+    assert!(
+        matches!(status, Some(status) if !status.success()),
+        "service_waypoint without waypoint name should exit non-zero; status={status:?}\n{output}"
+    );
+    assert!(
+        output.contains("FERRUM_MESH_WAYPOINT_NAME is required"),
+        "service_waypoint validation error missing from output\n{output}"
+    );
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_mode_rejects_egress_gateway_without_mtls_material() {
+    ensure_gateway_built().expect("gateway binary built");
+
+    let node_id = "functional-mesh-egress-missing-mtls";
+    let cp = start_static_mesh_cp(initial_mesh_slice(node_id)).await;
+    let mut request_rx = cp.request_rx.clone();
+    let ports = reserve_mesh_ports().await;
+    let egress_port = ports.egress;
+    let temp = TempDir::new().expect("temp dir");
+    let mut child = spawn_mesh_gateway(
+        &temp,
+        MeshGatewaySpawnOptions {
+            cp_addr: cp.addr,
+            ports,
+            node_id,
+            config_protocol: "native",
+            topology: "egress_gateway",
+            waypoint_name: None,
+            env_overrides: Vec::new(),
+        },
+    );
+
+    let subscribe = wait_for_mesh_subscribe(&mut request_rx, STARTUP_TIMEOUT).await;
+    let status = wait_for_child_exit(&mut child, STARTUP_TIMEOUT).await;
+    if status.is_none() {
+        kill_child(&mut child);
+    }
+    cp.shutdown().await;
+
+    let output = captured_output(&temp);
+    assert!(
+        subscribe.is_some(),
+        "egress gateway should consume the initial mesh slice before mTLS validation fails\n{output}"
+    );
+    assert!(
+        matches!(status, Some(status) if !status.success()),
+        "egress_gateway without TLS material should exit non-zero; status={status:?}\n{output}"
+    );
+    assert!(
+        output
+            .contains("FERRUM_MESH_TOPOLOGY=egress_gateway requires FERRUM_FRONTEND_TLS_CERT_PATH"),
+        "egress_gateway mTLS validation error missing from output\n{output}"
+    );
+    assert!(
+        tcp_port_stays_closed(egress_port, Duration::from_millis(500)).await,
+        "egress mTLS listener should not bind after failed validation\n{output}"
+    );
 }
 
 #[ignore]
@@ -559,6 +856,7 @@ async fn functional_mesh_mode_starts_after_xds_ads() {
                 config_protocol: "xds",
                 topology: "sidecar",
                 waypoint_name: None,
+                env_overrides: Vec::new(),
             },
         );
 
