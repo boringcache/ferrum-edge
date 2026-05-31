@@ -41,7 +41,7 @@ use crate::cni::rpc::{CniRpcRequest, CniRpcResponse};
 use crate::ebpf::NodeAgentMetrics;
 
 #[cfg(unix)]
-use std::path::Path;
+use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::time::Duration;
 #[cfg(unix)]
@@ -119,7 +119,26 @@ pub fn spawn_cni_listener(
             return;
         }
 
-        let listener = match UnixListener::bind(&socket_path) {
+        // bind() creates the socket inode world-reachable (mode 0777 & ~umask)
+        // and it is only narrowed to 0660 afterward. Close that window by
+        // binding under a freshly-created 0700 staging directory with a short,
+        // bounded socket filename, chmod-ing the socket to 0660, then
+        // ATOMICALLY renaming it into place. The staging directory lives under
+        // the final socket parent, so rename stays on the same filesystem, but
+        // the temporary listener path is not traversable by other local UIDs
+        // and does not append to a near-limit configured socket pathname.
+        let stage = match create_private_socket_stage(&socket_path) {
+            Ok(stage) => stage,
+            Err(err) => {
+                error!(
+                    socket_path = %socket_path,
+                    error = %err,
+                    "Failed to create private staging directory for node-agent CNI socket; CNI plugin path will fall back to kube-rs watcher"
+                );
+                return;
+            }
+        };
+        let listener = match UnixListener::bind(&stage.socket_path) {
             Ok(listener) => listener,
             Err(err) => {
                 error!(
@@ -127,16 +146,31 @@ pub fn spawn_cni_listener(
                     error = %err,
                     "Failed to bind node-agent CNI socket; CNI plugin path will fall back to kube-rs watcher"
                 );
+                cleanup_private_socket_stage(&stage);
                 return;
             }
         };
-        if let Err(err) = set_socket_perms(&socket_path) {
-            warn!(
+        // Narrow to 0660 BEFORE publishing under the well-known name. If this
+        // fails, abort rather than publish a world-reachable socket.
+        if let Err(err) = set_socket_perms(&stage.socket_path) {
+            error!(
                 socket_path = %socket_path,
                 error = %err,
-                "Failed to chmod node-agent CNI socket to 0660; continuing with default perms"
+                "Failed to chmod node-agent CNI socket to 0660 before publish; aborting CNI listener (falling back to kube-rs watcher)"
             );
+            cleanup_private_socket_stage(&stage);
+            return;
         }
+        if let Err(err) = std::fs::rename(&stage.socket_path, &socket_path) {
+            error!(
+                socket_path = %socket_path,
+                error = %err,
+                "Failed to publish node-agent CNI socket; CNI plugin path will fall back to kube-rs watcher"
+            );
+            cleanup_private_socket_stage(&stage);
+            return;
+        }
+        cleanup_private_socket_stage(&stage);
         info!(
             socket_path = %socket_path,
             "Node-agent CNI listener bound; ferrum-cni binary may now forward ADD/DEL/CHECK calls"
@@ -227,10 +261,128 @@ async fn prepare_socket_path(socket_path: &str) -> std::io::Result<()> {
 }
 
 #[cfg(unix)]
-fn set_socket_perms(socket_path: &str) -> std::io::Result<()> {
+fn set_socket_perms(socket_path: impl AsRef<Path>) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let perms = std::fs::Permissions::from_mode(0o660);
     std::fs::set_permissions(socket_path, perms)
+}
+
+#[cfg(unix)]
+struct PrivateSocketStage {
+    dir: PathBuf,
+    socket_path: PathBuf,
+}
+
+#[cfg(unix)]
+fn create_private_socket_stage(socket_path: &str) -> std::io::Result<PrivateSocketStage> {
+    use std::os::unix::fs::DirBuilderExt;
+    use std::os::unix::fs::MetadataExt;
+
+    let final_path = Path::new(socket_path);
+    let parent = final_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let final_path_len = unix_path_len(final_path);
+    let parent_dev = std::fs::metadata(parent).ok().map(|meta| meta.dev());
+    let stage_parents = private_socket_stage_parent_candidates(parent, parent_dev, final_path_len);
+
+    let mut last_create_error = None;
+    for _ in 0..16 {
+        let stage_dir_name = format!(".f{:016x}", random_stage_suffix());
+        for stage_parent in &stage_parents {
+            let stage_dir = stage_parent.join(&stage_dir_name);
+            let socket_path = stage_dir.join("s");
+            let mut builder = std::fs::DirBuilder::new();
+            builder.mode(0o700);
+            match builder.create(&stage_dir) {
+                Ok(()) => {
+                    return Ok(PrivateSocketStage {
+                        dir: stage_dir,
+                        socket_path,
+                    });
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => {
+                    debug!(
+                        stage_parent = %stage_parent.display(),
+                        error = %err,
+                        "Failed to create candidate private CNI socket staging directory"
+                    );
+                    last_create_error = Some(err);
+                    continue;
+                }
+            }
+        }
+    }
+
+    Err(last_create_error.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not allocate unique private CNI socket staging directory",
+        )
+    }))
+}
+
+#[cfg(unix)]
+fn private_socket_stage_parent_candidates(
+    final_parent: &Path,
+    final_parent_dev: Option<u64>,
+    final_path_len: usize,
+) -> Vec<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+
+    let mut candidates = Vec::new();
+    for ancestor in final_parent.ancestors() {
+        if ancestor.as_os_str().is_empty() {
+            continue;
+        }
+        if let Some(dev) = final_parent_dev {
+            let Ok(meta) = std::fs::metadata(ancestor) else {
+                continue;
+            };
+            if meta.dev() != dev {
+                continue;
+            }
+        }
+        let candidate_socket = ancestor.join(".f0000000000000000").join("s");
+        if unix_path_len(&candidate_socket) <= final_path_len {
+            candidates.push(ancestor.to_path_buf());
+        }
+    }
+
+    if candidates.is_empty() {
+        candidates.push(final_parent.to_path_buf());
+    }
+    candidates
+}
+
+#[cfg(unix)]
+fn unix_path_len(path: &Path) -> usize {
+    use std::os::unix::ffi::OsStrExt;
+    path.as_os_str().as_bytes().len()
+}
+
+#[cfg(unix)]
+fn random_stage_suffix() -> u64 {
+    use ring::rand::SecureRandom;
+
+    let rng = ring::rand::SystemRandom::new();
+    let mut bytes = [0u8; 8];
+    if rng.fill(&mut bytes).is_ok() {
+        return u64::from_ne_bytes(bytes);
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    nanos ^ u64::from(std::process::id())
+}
+
+#[cfg(unix)]
+fn cleanup_private_socket_stage(stage: &PrivateSocketStage) {
+    let _ = std::fs::remove_file(&stage.socket_path);
+    let _ = std::fs::remove_dir(&stage.dir);
 }
 
 /// Read one RPC, ship it to the main loop, write the response.
@@ -426,6 +578,102 @@ mod tests {
             event.pod_uid, "",
             "missing pod_uid should map to empty string so callers can short-circuit"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn published_cni_socket_is_never_world_permissive() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("node-agent-cni.sock");
+        let socket_path_str = socket_path.to_string_lossy().to_string();
+
+        let (tx, _rx) = cni_work_channel();
+        let metrics = Arc::new(NodeAgentMetrics::default());
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let handle = spawn_cni_listener(socket_path_str.clone(), tx, metrics, shutdown_rx);
+
+        // Wait for the listener to publish the socket at the well-known path.
+        let mut mode = None;
+        for _ in 0..200 {
+            if let Ok(meta) = std::fs::metadata(&socket_path) {
+                mode = Some(meta.permissions().mode() & 0o777);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let mode = mode.expect("listener should publish the socket");
+        assert_eq!(
+            mode, 0o660,
+            "published socket must be exactly 0660, got {mode:o}"
+        );
+        assert_eq!(
+            mode & 0o007,
+            0,
+            "published socket must never be world-accessible (even transiently at the well-known path)"
+        );
+
+        // The private staging directory must be cleaned up after the atomic
+        // rename.
+        assert!(
+            std::fs::read_dir(dir.path()).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".f")),
+            "private staging directory must not linger after publish"
+        );
+
+        let _ = shutdown_tx.send(true);
+        handle.abort();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cni_socket_stage_is_private_and_uses_bounded_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let long_socket_name = format!("{}{}", "n".repeat(72), ".sock");
+        let socket_path = dir.path().join(long_socket_name);
+        let socket_path_str = socket_path.to_string_lossy().to_string();
+
+        let stage = create_private_socket_stage(&socket_path_str).expect("stage dir");
+        let mode = std::fs::metadata(&stage.dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "staging directory must be private");
+        assert!(
+            unix_path_len(&stage.socket_path) < unix_path_len(&socket_path),
+            "stage socket path should use a bounded filename instead of suffixing the configured socket path"
+        );
+
+        cleanup_private_socket_stage(&stage);
+        assert!(
+            !stage.dir.exists(),
+            "stage directory should be removable during cleanup"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cni_socket_stage_does_not_lengthen_long_parent_short_filename() {
+        let dir = tempfile::tempdir().unwrap();
+        let long_parent = dir.path().join("p".repeat(80));
+        std::fs::create_dir_all(&long_parent).unwrap();
+        let socket_path = long_parent.join("s");
+        let socket_path_str = socket_path.to_string_lossy().to_string();
+
+        let stage = create_private_socket_stage(&socket_path_str).expect("stage dir");
+        assert!(
+            unix_path_len(&stage.socket_path) <= unix_path_len(&socket_path),
+            "stage socket path must not be longer than a near-limit final socket path"
+        );
+        assert!(
+            !stage.socket_path.starts_with(&long_parent),
+            "long final parent should not force the private staged socket under that same long path"
+        );
+
+        cleanup_private_socket_stage(&stage);
     }
 
     #[tokio::test]
