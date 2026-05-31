@@ -248,12 +248,12 @@ async fn test_mtls_auth_success_by_serial() {
     use x509_parser::prelude::*;
     let (_, cert) = X509Certificate::from_der(&cert_der).unwrap();
     let raw_serial = cert.raw_serial();
-    let serial_bytes =
-        if raw_serial.len() > 1 && raw_serial[0] == 0 && (raw_serial[1] & 0x80) != 0 {
-            &raw_serial[1..]
-        } else {
-            raw_serial
-        };
+    let serial_bytes = if raw_serial.len() > 1 && raw_serial[0] == 0 && (raw_serial[1] & 0x80) != 0
+    {
+        &raw_serial[1..]
+    } else {
+        raw_serial
+    };
     let serial_hex = hex::encode(serial_bytes);
 
     let consumer = create_mtls_consumer("c1", "alice", &serial_hex);
