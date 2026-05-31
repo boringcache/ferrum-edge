@@ -195,9 +195,10 @@ struct RefreshTokenResponse {
 }
 
 /// Result of a `maybe_refresh_session` attempt. `mutated` drives cookie re-sealing;
-/// `refreshed` is true only when the token endpoint returned fresh tokens, so the
-/// freshness gate can tell an actual refresh apart from a deferred failure or the
-/// no-refresh-token / not-yet-due cases (all of which leave the tokens stale).
+/// `refreshed` is true only when the token endpoint returned and we validated a
+/// fresh ID token, so the freshness gate can tell fresh claims apart from access
+/// token rotation, a deferred failure, or the no-refresh-token / not-yet-due
+/// cases (all of which leave claims stale).
 #[derive(Clone, Copy)]
 struct RefreshOutcome {
     mutated: bool,
@@ -863,9 +864,10 @@ impl OidcRelyingParty {
     /// Refresh the access/ID tokens via `grant_type=refresh_token` once the access
     /// token is within `refresh_skew` of expiry. Reports whether the payload changed
     /// (and therefore needs re-sealing) and, separately, whether a refresh actually
-    /// succeeded — the two differ on the deferred-failure branch, which mutates
-    /// `refresh_after_unix` without producing fresh tokens. The freshness gate in
-    /// `run_session_auth` relies on that distinction. Failures are non-fatal here:
+    /// produced freshly validated claims — the two differ on the deferred-failure
+    /// branch and on refresh responses that rotate access tokens without returning
+    /// a new ID token. The freshness gate in `run_session_auth` relies on that
+    /// distinction. Failures are non-fatal here:
     /// the next attempt is deferred by `REFRESH_RETRY_BACKOFF_SECS` so a flaky token
     /// endpoint is not retried on every request, and the freshness gate decides
     /// whether the still-expired session may keep serving.
@@ -887,9 +889,9 @@ impl OidcRelyingParty {
             .refresh_tokens(&discovery, &refresh_token, payload, now)
             .await
         {
-            Ok(()) => RefreshOutcome {
+            Ok(claims_refreshed) => RefreshOutcome {
                 mutated: true,
-                refreshed: true,
+                refreshed: claims_refreshed,
             },
             Err(error) => {
                 warn!(
@@ -912,7 +914,7 @@ impl OidcRelyingParty {
         refresh_token: &str,
         payload: &mut SessionPayload,
         now: i64,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         let params = vec![
             ("grant_type".to_string(), "refresh_token".to_string()),
             ("refresh_token".to_string(), refresh_token.to_string()),
@@ -934,7 +936,7 @@ impl OidcRelyingParty {
         // A refreshed ID token is optional; when present, re-validate it (bound to
         // the same subject, nonce only if carried) and adopt its claims so
         // scope/role checks and claim headers track current authorization.
-        if let Some(id_token) = token.id_token.as_deref() {
+        let claims_refreshed = if let Some(id_token) = token.id_token.as_deref() {
             let id_claims = self
                 .verify_refreshed_id_token(id_token, &payload.sub, &payload.nonce)
                 .await?;
@@ -965,7 +967,10 @@ impl OidcRelyingParty {
                 extract_claim_string(&merged, "sub").unwrap_or_else(|| payload.sub.clone());
             payload.id_token_b64 = id_token.to_string();
             payload.claims = merged;
-        }
+            true
+        } else {
+            false
+        };
         payload.access_token_b64 = token.access_token;
         if let Some(rotated) = token.refresh_token {
             payload.refresh_token_b64 = Some(rotated);
@@ -978,7 +983,7 @@ impl OidcRelyingParty {
         payload.refresh_after_unix =
             next_refresh_after(expires_at, now, self.behavior.refresh_skew.as_secs() as i64);
         payload.last_touch_unix = now;
-        Ok(())
+        Ok(claims_refreshed)
     }
 
     fn resolve_identity(&self, claims: &Value, consumer_index: &ConsumerIndex) -> VerifyOutcome {
@@ -2256,6 +2261,34 @@ mod tests {
         assert_eq!(refreshed.access_token_b64, "new-at");
         assert_eq!(refreshed.refresh_token_b64.as_deref(), Some("rt-2"));
         assert!(refreshed.refresh_after_unix > now);
+    }
+
+    #[tokio::test]
+    async fn expired_claims_with_refresh_without_id_token_re_challenge() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "new-at",
+                "token_type": "Bearer",
+                "refresh_token": "rt-2",
+                "expires_in": 3600
+            })))
+            .mount(&server)
+            .await;
+        let plugin = build_plugin(&format!("{}/token", server.uri()));
+        let now = chrono::Utc::now().timestamp();
+        let payload = session_payload(now - 2500, now - 100, Some("rt-1"), now - 200);
+        assert!(payload.expires_at_unix < now - 60);
+        let mut ctx = ctx_with_session(&plugin, &payload);
+
+        match plugin
+            .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+            .await
+        {
+            PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 401),
+            other => panic!("expected challenge reject, got {other:?}"),
+        }
     }
 
     #[tokio::test]
