@@ -7,7 +7,7 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDateTime, Utc};
 use dashmap::DashMap;
 use http::{HeaderName, Method};
 use serde::{Deserialize, Serialize};
@@ -500,6 +500,15 @@ impl ResponseCaching {
         })
     }
 
+    /// Current value of the running cache-size accountant.
+    ///
+    /// Exposed for tests so they can assert the size accounting never
+    /// underflow-wraps under concurrent stores/invalidations (finding #62).
+    #[doc(hidden)]
+    pub fn current_total_size_for_tests(&self) -> usize {
+        self.total_size.load(Ordering::Relaxed)
+    }
+
     /// Build the base cache key (proxy_id + Host + method + path + query + consumer).
     ///
     /// `request_headers` is supplied separately because in `before_proxy` the
@@ -772,7 +781,7 @@ impl ResponseCaching {
         });
 
         if removed_size > 0 {
-            self.total_size.fetch_sub(removed_size, Ordering::Relaxed);
+            sub_total_size(&self.total_size, removed_size);
         }
         self.vary_index.remove(base_key);
     }
@@ -792,7 +801,7 @@ impl ResponseCaching {
                 true
             }
         });
-        self.total_size.fetch_sub(removed_size, Ordering::Relaxed);
+        sub_total_size(&self.total_size, removed_size);
 
         if self.cache.len() > self.config.max_entries {
             let mut entries: Vec<(String, Instant)> = self
@@ -805,8 +814,7 @@ impl ResponseCaching {
             let to_remove = self.cache.len() - self.config.max_entries;
             for (key, _) in entries.into_iter().take(to_remove) {
                 if let Some((_, removed)) = self.cache.remove(&key) {
-                    self.total_size
-                        .fetch_sub(removed.approx_size(), Ordering::Relaxed);
+                    sub_total_size(&self.total_size, removed.approx_size());
                 }
             }
         }
@@ -895,7 +903,7 @@ impl ResponseCaching {
         });
 
         if removed_size > 0 {
-            self.total_size.fetch_sub(removed_size, Ordering::Relaxed);
+            sub_total_size(&self.total_size, removed_size);
         }
         // A path sweep can strand many base keys' `vary_index` mappings at once
         // (every principal/variant of the invalidated path); reclaim them now
@@ -1078,10 +1086,57 @@ fn if_none_match_matches(if_none_match: &str, etag: &str) -> bool {
         .any(|candidate| candidate == "*" || normalize_etag(candidate) == normalize_etag(etag))
 }
 
-fn parse_http_date(value: &str) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc2822(value)
-        .ok()
-        .map(|dt| dt.with_timezone(&Utc))
+/// Subtract `n` from the running cache-size accountant without ever wrapping.
+///
+/// Inserts use `fetch_add` while several removal paths (`invalidate_base_key`,
+/// `evict_if_needed`, expired-entry removal, the insert-replace path) subtract.
+/// A plain `fetch_sub` underflows to ~`usize::MAX` if accounting ever drifts
+/// (a double-subtract or a lost add), and because the store path rejects when
+/// `current_total + entry_size > max`, that wrap would permanently wedge the
+/// cap and disable all future stores. Saturating at `0` keeps any drift
+/// bounded and self-correcting instead of self-disabling.
+pub(crate) fn sub_total_size(total: &AtomicUsize, n: usize) {
+    if n == 0 {
+        return;
+    }
+    // `fetch_update` with a saturating closure cannot fail to converge: the
+    // closure always returns `Some`, so the CAS loop terminates and never
+    // produces an `Err`.
+    let _ = total.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+        Some(v.saturating_sub(n))
+    });
+}
+
+/// Parse an HTTP-date for conditional-request handling.
+///
+/// RFC 9110 §5.6.7 requires recipients to accept all three historic date
+/// formats. `parse_from_rfc2822` covers the dominant IMF-fixdate form
+/// (`Sun, 06 Nov 1994 08:49:37 GMT`), but rejects the two obsolete forms a
+/// recipient must still accept: RFC 850 (`Sunday, 06-Nov-94 08:49:37 GMT`)
+/// and asctime (`Sun Nov  6 08:49:37 1994`). Falling back across all three
+/// keeps conditional revalidation (`If-Modified-Since` → `304`) working
+/// against legacy origins and clients instead of silently serving a full
+/// `200` from cache. Each fixed-offset format is interpreted as UTC, matching
+/// the obsolete `GMT` zone these formats always use.
+pub(crate) fn parse_http_date(value: &str) -> Option<DateTime<Utc>> {
+    if let Ok(dt) = DateTime::parse_from_rfc2822(value) {
+        return Some(dt.with_timezone(&Utc));
+    }
+    // IMF-fixdate (e.g. `Sun, 06 Nov 1994 08:49:37 GMT`), RFC 850
+    // (`Sunday, 06-Nov-94 08:49:37 GMT`), then asctime
+    // (`Sun Nov  6 08:49:37 1994`). asctime has no zone; the dashed/comma
+    // forms always carry `GMT`, which these patterns consume literally.
+    const FORMATS: [&str; 3] = [
+        "%a, %d %b %Y %H:%M:%S GMT",
+        "%A, %d-%b-%y %H:%M:%S GMT",
+        "%a %b %e %H:%M:%S %Y",
+    ];
+    for format in FORMATS {
+        if let Ok(naive) = NaiveDateTime::parse_from_str(value, format) {
+            return Some(naive.and_utc());
+        }
+    }
+    None
 }
 
 #[async_trait]
@@ -1192,8 +1247,7 @@ impl Plugin for ResponseCaching {
             if entry.is_expired() {
                 drop(entry);
                 if let Some((_, removed)) = self.cache.remove(&cache_key) {
-                    self.total_size
-                        .fetch_sub(removed.approx_size(), Ordering::Relaxed);
+                    sub_total_size(&self.total_size, removed.approx_size());
                 }
             } else {
                 debug!(cache_key = %cache_key, "response_caching: cache HIT");
@@ -1428,8 +1482,7 @@ impl Plugin for ResponseCaching {
         }
 
         if let Some(old) = self.cache.insert(cache_key.clone(), entry) {
-            self.total_size
-                .fetch_sub(old.approx_size(), Ordering::Relaxed);
+            sub_total_size(&self.total_size, old.approx_size());
         }
         self.total_size.fetch_add(entry_size, Ordering::Relaxed);
         // Response was cacheable — remove from predictor if previously marked uncacheable
