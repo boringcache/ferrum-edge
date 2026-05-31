@@ -2743,7 +2743,7 @@ scanning the parsed key/value map and a best-effort reconstructed URL.
 | `score` | integer | severity weight | Anomaly-score contribution when `scoring` is enabled. |
 | `fp_filters` | string[] | `[]` | Regex filters that suppress known false-positive captured values for this rule. |
 | `paranoia_min` | u8 | `1` | Minimum paranoia level required for this rule. |
-| `conditions` | object | `{}` | Optional request conditions: `paths`, `methods`, `headers`, and `consumers`. Path entries use the same exact / trailing-`*` prefix / `~` regex grammar as `global_exemptions.paths`. |
+| `conditions` | object | `{}` | Optional request conditions: `paths`, `methods`, `headers`, and `consumers`. Path entries use the same exact / trailing-`*` prefix / `~` regex grammar as `global_exemptions.paths`; `~regex` entries are wrapped as `^(?:regex)`, so use `~.*pattern` for a floating substring match. |
 
 Supported targets: `header_names`, `header_values`, `query_keys`,
 `query_values`, `cookies`, `url_path`, `full_url`, `method`, `body_text`,
@@ -2756,9 +2756,10 @@ rules can match IPv6-shaped hex text from logs or diagnostics. Prefer narrow
 
 `global_exemptions` supports `paths`, `methods`, `consumers`, `ips`,
 `header_present`, and `fp_capture_filters`. Path entries ending in `*` are
-prefix matches; entries starting with `~` are treated as regex patterns; all
-other entries are exact-path matches (so `/health` exempts only `/health`, not
-`/healthz` or `/health-admin`).
+prefix matches; entries starting with `~` are start-anchored regex patterns
+wrapped as `^(?:regex)`; all other entries are exact-path matches (so `/health`
+exempts only `/health`, not `/healthz` or `/health-admin`). Use `~.*pattern`
+for a floating substring match.
 
 ```yaml
 config:

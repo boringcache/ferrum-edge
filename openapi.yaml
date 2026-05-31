@@ -11265,8 +11265,8 @@ components:
                     description: >-
                       Exact paths by default. A trailing `*` means prefix match,
                       and a leading `~` means a start-anchored regex (implicit
-                      leading `^`). Use `~.*pattern` for a floating substring
-                      match.
+                      `^(?:...)` wrapper so every alternation branch is
+                      anchored). Use `~.*pattern` for a floating substring match.
                     items:
                       type: string
                   methods:
@@ -11518,8 +11518,9 @@ components:
               type: array
               description: >-
                 Exact paths by default. A trailing `*` means prefix match, and a
-                leading `~` means a start-anchored regex (implicit leading `^`).
-                Use `~.*pattern` for a floating substring match.
+                leading `~` means a start-anchored regex (implicit `^(?:...)`
+                wrapper so every alternation branch is anchored). Use
+                `~.*pattern` for a floating substring match.
               items:
                 type: string
             methods:
@@ -11544,8 +11545,8 @@ components:
             Paths that short-circuit the entire WAF. Each entry matches from the
             start of the path: a plain string is an exact full-path match,
             `prefix*` is a prefix match, and `~regex` is a start-anchored regex
-            (implicit leading `^`). Use `~.*pattern` for a floating substring
-            match. Keep entries tight — an over-broad pattern silently disables
+            (implicit `^(?:...)` wrapper so every alternation branch is
+            anchored). Use `~.*pattern` for a floating substring match. Keep entries tight — an over-broad pattern silently disables
             the WAF on unintended routes.
           items:
             type: string

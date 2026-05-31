@@ -316,6 +316,11 @@ impl Waf {
         self.config.inspect_binary_body
     }
 
+    fn request_body_eligible_for_scan(&self, content_type: Option<&str>) -> bool {
+        self.body_encoding_specials_active()
+            || self.should_inspect_body_content_type(content_type)
+    }
+
     async fn run_body_scan_with_budget<F>(&self, scan: F) -> ScanOutcome
     where
         F: FnOnce() -> ScanOutcome,
@@ -661,7 +666,9 @@ impl Waf {
         // Response bodies with missing or malformed content-type are still
         // eligible when binary inspection is explicit; request bodies are
         // gated earlier by `should_buffer_request_body`.
-        self.config.inspect_binary_body || self.should_inspect_body_content_type(content_type)
+        self.body_encoding_specials_active()
+            || self.config.inspect_binary_body
+            || self.should_inspect_body_content_type(content_type)
     }
 }
 
@@ -963,7 +970,7 @@ impl Plugin for Waf {
         {
             return false;
         }
-        self.should_inspect_body_content_type(ctx.headers.get("content-type").map(String::as_str))
+        self.request_body_eligible_for_scan(ctx.headers.get("content-type").map(String::as_str))
     }
 
     fn needs_request_body_bytes(&self) -> bool {
@@ -991,7 +998,7 @@ impl Plugin for Waf {
                 .iter()
                 .any(|method| method.eq_ignore_ascii_case(&ctx.method))
             || !self
-                .should_inspect_body_content_type(headers.get("content-type").map(String::as_str))
+                .request_body_eligible_for_scan(headers.get("content-type").map(String::as_str))
         {
             return PluginResult::Continue;
         }
