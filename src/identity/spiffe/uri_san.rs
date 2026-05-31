@@ -128,6 +128,18 @@ pub fn try_extract_spiffe_id(cert_der: &[u8]) -> Result<Option<SpiffeId>, UriSan
     }
 }
 
+/// Parsed-cert variant of [`try_extract_spiffe_id`]: avoid double-parsing
+/// when callers already have an `X509Certificate`.
+pub fn try_extract_spiffe_id_from_parsed(
+    cert: &X509Certificate<'_>,
+) -> Result<Option<SpiffeId>, UriSanError> {
+    match extract_spiffe_id_from_parsed(cert) {
+        Ok(id) => Ok(Some(id)),
+        Err(UriSanError::NoSanExtension) | Err(UriSanError::NoSpiffeUri) => Ok(None),
+        Err(other) => Err(other),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,17 +206,5 @@ mod tests {
             extract_spiffe_id_from_cert(&der),
             Err(UriSanError::NoSpiffeUri)
         ));
-    }
-}
-
-/// Parsed-cert variant of [`try_extract_spiffe_id`]: avoid double-parsing
-/// when callers already have an `X509Certificate`.
-pub fn try_extract_spiffe_id_from_parsed(
-    cert: &X509Certificate<'_>,
-) -> Result<Option<SpiffeId>, UriSanError> {
-    match extract_spiffe_id_from_parsed(cert) {
-        Ok(id) => Ok(Some(id)),
-        Err(UriSanError::NoSanExtension) | Err(UriSanError::NoSpiffeUri) => Ok(None),
-        Err(other) => Err(other),
     }
 }

@@ -223,6 +223,24 @@ fn spiffe_id_rejects_empty_path_segment() {
 }
 
 #[test]
+fn spiffe_id_rejects_dot_only_path_segments() {
+    for raw in [
+        "spiffe://prod.example.com/.",
+        "spiffe://prod.example.com/..",
+        "spiffe://prod.example.com/ns/../sa/admin",
+        "spiffe://prod.example.com/ns/./sa/admin",
+    ] {
+        assert!(
+            matches!(
+                SpiffeId::new(raw),
+                Err(SpiffeIdError::DotPathSegment { .. })
+            ),
+            "{raw} should reject relative path modifiers"
+        );
+    }
+}
+
+#[test]
 fn spiffe_id_rejects_invalid_path_char() {
     assert!(matches!(
         SpiffeId::new("spiffe://prod.example.com/foo bar"),
