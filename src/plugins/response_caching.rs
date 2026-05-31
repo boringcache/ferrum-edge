@@ -13,7 +13,7 @@ use http::{HeaderName, Method};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -59,6 +59,20 @@ fn cache_key_host_part(host: &str) -> String {
         part.push_str(&digest);
         part
     }
+}
+
+/// Render an authenticated principal as the `sha256-<hex>` `consumer_part` of
+/// a cache key. SHA-256-hashing keeps a username or SPIFFE ID (which may carry
+/// the `:` / `|` key delimiters and can surface in debug logs) out of the key
+/// verbatim. Built with `String::with_capacity` + `push_str` rather than
+/// `format!` because `build_base_cache_key` runs on the `before_proxy` hot path
+/// for every authenticated request (mirrors [`cache_key_host_part`]).
+fn cache_key_identity_part(identity: &str) -> String {
+    let digest = sha256_hex(identity);
+    let mut part = String::with_capacity(7 + digest.len());
+    part.push_str("sha256-");
+    part.push_str(&digest);
+    part
 }
 
 /// Request headers whose values are credentials or session identifiers.
@@ -123,6 +137,17 @@ struct CacheEntry {
     body: Bytes,
     inserted_at: Instant,
     ttl: Duration,
+    /// Byte length of the base-key prefix of this entry's full cache key.
+    ///
+    /// A full cache key is always its base key optionally followed by
+    /// `:<vary dimensions>` (see [`ResponseCaching::build_cache_key`]), so
+    /// `&key[..base_key_len]` recovers the base key without re-parsing the
+    /// colon-delimited (and query-colon-bearing) structure. [`prune_vary_index`]
+    /// uses it to reclaim `vary_index` mappings whose base key has no surviving
+    /// variant.
+    ///
+    /// [`prune_vary_index`]: ResponseCaching::prune_vary_index
+    base_key_len: usize,
 }
 
 impl CacheEntry {
@@ -504,7 +529,7 @@ impl ResponseCaching {
         // explicit opt-in that additionally keys *anonymous* requests as
         // `_anon`.
         let consumer_part: Cow<'_, str> = match ctx.effective_identity() {
-            Some(identity) => Cow::Owned(format!("sha256-{}", sha256_hex(identity))),
+            Some(identity) => Cow::Owned(cache_key_identity_part(identity)),
             None if self.config.cache_key_include_consumer => Cow::Borrowed("_anon"),
             None => Cow::Borrowed(""),
         };
@@ -704,6 +729,58 @@ impl ResponseCaching {
         }
     }
 
+    /// Reclaim `vary_index` mappings whose base key has no surviving cache
+    /// variant.
+    ///
+    /// `vary_index` is keyed by base key and otherwise pruned only in
+    /// [`Self::invalidate_base_key`]; eviction, expiry, and path invalidation
+    /// drop entries from `self.cache` but leave their `vary_index` mapping
+    /// behind. Because the base key now embeds the per-principal `consumer_part`
+    /// (see [`Self::build_base_cache_key`]), a workload with high principal
+    /// cardinality (JWT `sub`s, ephemeral SPIFFE IDs) would otherwise grow
+    /// `vary_index` without bound even though `self.cache` stays capped at
+    /// `max_entries`. A stale mapping is only ever fail-safe — it over-specifies
+    /// the vary list for a base key with no live entry, so the next lookup
+    /// simply MISSes and re-stores — making this a pure memory reclaim, not a
+    /// correctness fix.
+    ///
+    /// The number of distinct live base keys can never exceed
+    /// `self.cache.len()`, so `vary_index.len() > self.cache.len()` is a
+    /// necessary precondition for any stale mapping to exist. Gating the
+    /// O(`self.cache`) sweep on that check keeps it O(1) in the steady state and
+    /// bounds `vary_index` to the cache's order of magnitude.
+    fn prune_vary_index(&self) {
+        if self.vary_index.len() <= self.cache.len() {
+            return;
+        }
+
+        // Materialize the live base keys (owned) before touching `vary_index`
+        // so no `self.cache` read guards are held across the `retain` below.
+        let live_base_keys: HashSet<String> = self
+            .cache
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .key()
+                    .get(..entry.value().base_key_len)
+                    .map(str::to_string)
+            })
+            .collect();
+
+        let before = self.vary_index.len();
+        self.vary_index
+            .retain(|base_key, _| live_base_keys.contains(base_key));
+
+        let removed = before.saturating_sub(self.vary_index.len());
+        if removed > 0 {
+            debug!(
+                removed = removed,
+                vary_index_len = self.vary_index.len(),
+                "response_caching: pruned stale vary_index entries"
+            );
+        }
+    }
+
     /// Invalidate cache entries matching a path pattern.
     /// Called when an unsafe method (POST/PUT/PATCH/DELETE) hits a path.
     fn invalidate_path(&self, ctx: &RequestContext) {
@@ -735,6 +812,10 @@ impl ResponseCaching {
         if removed_size > 0 {
             self.total_size.fetch_sub(removed_size, Ordering::Relaxed);
         }
+        // A path sweep can strand many base keys' `vary_index` mappings at once
+        // (every principal/variant of the invalidated path); reclaim them now
+        // rather than waiting for the next store.
+        self.prune_vary_index();
     }
 
     fn add_cache_status_header(&self, headers: &mut HashMap<String, String>, value: &str) {
@@ -1205,6 +1286,10 @@ impl Plugin for ResponseCaching {
             body: Bytes::copy_from_slice(body),
             inserted_at: Instant::now(),
             ttl,
+            // `cache_key` is `base_key` plus an optional `:<vary>` suffix, so
+            // `base_key.len()` is the prefix that `prune_vary_index` slices back
+            // out to recover this entry's base key.
+            base_key_len: base_key.len(),
         };
         let entry_size = entry.approx_size();
 
@@ -1237,6 +1322,9 @@ impl Plugin for ResponseCaching {
         );
 
         self.evict_if_needed();
+        // The store above is the only path that grows `vary_index`; prune here
+        // so a high-cardinality principal stream can't leak it unboundedly.
+        self.prune_vary_index();
         PluginResult::Continue
     }
 }
@@ -1382,6 +1470,71 @@ mod tests {
         assert!(
             stored_key.contains(&format!("sha256-{}", sha256_hex("alice@example.com"))),
             "authenticated principal was not bound into the base key: {stored_key}"
+        );
+    }
+
+    #[tokio::test]
+    async fn vary_index_stays_bounded_under_high_principal_cardinality() {
+        // Binding the principal into the base key (the fix above) means each
+        // distinct identity gets its own base key — and `vary_index` is keyed
+        // by base key. `vary_index` was only ever pruned in
+        // `invalidate_base_key`, so a stream of distinct principals (JWT `sub`s,
+        // ephemeral SPIFFE IDs) would leak it without bound even though
+        // `self.cache` stays capped at `max_entries`. `prune_vary_index` must
+        // reclaim mappings whose base key has no surviving cache variant.
+        let max_entries = 4;
+        let plugin = plugin_with_config(json!({
+            "ttl_seconds": 60,
+            "max_entries": max_entries,
+        }));
+
+        let principals = 40;
+        for i in 0..principals {
+            let mut ctx = make_ctx("GET", "/api/profile");
+            ctx.authenticated_identity = Some(format!("user-{i}"));
+            // A `cookie` makes the full key `base(principal):cookie=sha256-…`,
+            // so the base key is a strict prefix of the full key — this also
+            // exercises `base_key_len` slicing on a vary-suffixed key.
+            ctx.headers
+                .insert("cookie".to_string(), "session=shared".to_string());
+            let mut request_headers = ctx.headers.clone();
+            plugin.before_proxy(&mut ctx, &mut request_headers).await;
+
+            let mut response_headers = HashMap::new();
+            response_headers.insert(
+                "cache-control".to_string(),
+                "public, max-age=60".to_string(),
+            );
+            plugin
+                .on_final_response_body(&mut ctx, 200, &response_headers, b"profile-body")
+                .await;
+        }
+
+        // Cache is capped by eviction, and `vary_index` is reclaimed alongside
+        // it — not left at `principals` (40) entries as it would be without the
+        // prune. Distinct live base keys can never exceed the live cache.
+        //
+        // `== max_entries` (not `<=`): 40 distinct non-expiring entries must
+        // pin the cache exactly at its cap, which also proves the responses
+        // were actually stored — otherwise the `vary_index` bounds below would
+        // pass vacuously.
+        assert_eq!(
+            plugin.cache.len(),
+            max_entries,
+            "expected the cache pinned at max_entries; got {}",
+            plugin.cache.len()
+        );
+        assert!(
+            plugin.vary_index.len() <= max_entries,
+            "vary_index leaked past max_entries ({}): {} entries — prune_vary_index did not reclaim stale base keys",
+            max_entries,
+            plugin.vary_index.len()
+        );
+        assert!(
+            plugin.vary_index.len() <= plugin.cache.len(),
+            "vary_index ({}) outgrew the live cache ({})",
+            plugin.vary_index.len(),
+            plugin.cache.len()
         );
     }
 
