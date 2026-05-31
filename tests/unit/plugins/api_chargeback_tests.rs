@@ -108,7 +108,11 @@ fn make_stream_summary(
 
 /// Build the same key format used by the registry internally.
 fn make_key(consumer: &str, proxy_id: &str, status_code: u16) -> String {
-    format!("{}|{}|{}", consumer, proxy_id, status_code)
+    let scope = scope();
+    format!(
+        "{}|{}|{}|{}|{}",
+        consumer, proxy_id, status_code, scope.currency, scope.namespace_label
+    )
 }
 
 // --- Plugin config validation tests ---
@@ -1148,6 +1152,62 @@ fn test_per_instance_currency_and_namespace_not_last_writer_wins() {
         json["consumers"]["alice"]["proxies"]["proxy-b"]["currency"],
         "EUR"
     );
+}
+
+#[test]
+fn test_same_proxy_records_stay_partitioned_by_instance_scope() {
+    let registry = ChargebackRegistry::new();
+    let scope_usd = scope_for("USD", "team-a");
+    let scope_eur = scope_for("EUR", "team-b");
+
+    registry.record_http(
+        &scope_usd,
+        "alice",
+        "shared-proxy",
+        "Shared API",
+        200,
+        1.0,
+        100,
+        0,
+        0.01,
+        0.0,
+    );
+    registry.record_http(
+        &scope_eur,
+        "alice",
+        "shared-proxy",
+        "Shared API",
+        200,
+        2.0,
+        200,
+        0,
+        0.02,
+        0.0,
+    );
+
+    assert_eq!(registry.entries.len(), 2);
+
+    let prom = registry.render_prometheus_uncached();
+    assert!(
+        prom.lines().any(|line| line.contains("proxy_id=\"shared-proxy\"")
+            && line.contains("currency=\"USD\"")
+            && line.contains(r#"namespace="team-a""#)
+            && line.ends_with("1.0000000000")),
+        "USD/team-a call row missing\n{prom}"
+    );
+    assert!(
+        prom.lines().any(|line| line.contains("proxy_id=\"shared-proxy\"")
+            && line.contains("currency=\"EUR\"")
+            && line.contains(r#"namespace="team-b""#)
+            && line.ends_with("2.0000000000")),
+        "EUR/team-b call row missing\n{prom}"
+    );
+
+    let json: serde_json::Value = serde_json::from_str(&registry.render_json_uncached()).unwrap();
+    let proxy = &json["consumers"]["alice"]["proxies"]["shared-proxy"];
+    assert_eq!(proxy["currency"], "mixed");
+    assert_eq!(proxy["by_status"]["200"]["count"], 2);
+    assert_eq!(proxy["by_status"]["200"]["charges"], 3.0);
 }
 
 /// When every entry shares one currency, the top-level JSON `currency` reports

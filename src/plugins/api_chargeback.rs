@@ -124,6 +124,20 @@ impl InstanceScope {
     }
 }
 
+fn write_chargeback_key(
+    buf: &mut String,
+    consumer: &str,
+    proxy_id: &str,
+    status_code: u16,
+    scope: &InstanceScope,
+) {
+    let _ = write!(
+        buf,
+        "{}|{}|{}|{}|{}",
+        consumer, proxy_id, status_code, scope.currency, scope.namespace_label
+    );
+}
+
 /// Atomic chargeback entry. Tracks call counts, exact byte counters, staleness,
 /// and render metadata.
 ///
@@ -273,9 +287,9 @@ const STREAM_STATUS_SENTINEL: u16 = 0;
 /// Chargeback registry holding per-consumer, per-proxy charge accumulators.
 ///
 /// **Key design**: The DashMap uses plain `String` keys formatted as
-/// `"consumer|proxy_id|status_code"`. Render metadata (consumer, proxy_id,
-/// proxy_name, status_code, protocol_family) is stored in the `ChargebackEntry`
-/// value. This allows the hot-path recording methods to use
+/// `"consumer|proxy_id|status_code|currency|namespace_label"`. Render metadata
+/// (consumer, proxy_id, proxy_name, status_code, protocol_family) is stored in
+/// the `ChargebackEntry` value. This allows the hot-path recording methods to use
 /// `DashMap::get(&str)` with a thread-local buffer — zero allocation on cache
 /// hits. Only the cold path (first record per unique combination) allocates a
 /// `String` key and `Arc<str>` metadata. This matches the connection pool key
@@ -470,10 +484,11 @@ impl ChargebackRegistry {
     /// **Cold-path (first record per unique combination)**: Clones the per-instance
     /// `Arc<str>` render metadata (consumer/proxy/currency/namespace) and allocates
     /// the owned `String` key and a new `ChargebackEntry`. This runs once per unique
-    /// `(consumer, proxy, status_code)` combination (per `(consumer, proxy)` for
-    /// streams). The currency/namespace come from the recording plugin instance's
-    /// [`InstanceScope`], so each entry is scoped to the instance that created it
-    /// (finding #24).
+    /// `(consumer, proxy, status_code, currency, namespace)` combination (per
+    /// `(consumer, proxy, currency, namespace)` for streams). The
+    /// currency/namespace come from the recording plugin instance's
+    /// [`InstanceScope`], and are part of the key so multiple instances never
+    /// reuse an entry stamped with another instance's render scope.
     #[allow(clippy::too_many_arguments)]
     fn record_inner(
         &self,
@@ -500,7 +515,7 @@ impl ChargebackRegistry {
         let hit = KEY_BUF.with(|buf| {
             let mut buf = buf.borrow_mut();
             buf.clear();
-            let _ = write!(buf, "{}|{}|{}", consumer, proxy_id, status_code);
+            write_chargeback_key(&mut buf, consumer, proxy_id, status_code, scope);
 
             if let Some(entry) = self.entries.get(buf.as_str()) {
                 entry.record(bytes_sent, bytes_received, count_call, self.epoch);
@@ -513,7 +528,14 @@ impl ChargebackRegistry {
             // Cold path: allocate owned key + metadata for DashMap insertion.
             // Currency/namespace come from the recording instance's scope so the
             // entry is attributed to the instance that created it (finding #24).
-            let owned_key = format!("{}|{}|{}", consumer, proxy_id, status_code);
+            let mut owned_key = String::with_capacity(
+                consumer.len()
+                    + proxy_id.len()
+                    + scope.currency.len()
+                    + scope.namespace_label.len()
+                    + 16,
+            );
+            write_chargeback_key(&mut owned_key, consumer, proxy_id, status_code, scope);
             self.entries
                 .entry(owned_key)
                 .or_insert_with(|| {
@@ -680,11 +702,10 @@ impl ChargebackRegistry {
         }
 
         // --- Bandwidth metrics. Aggregated per (consumer, proxy_id,
-        //     protocol_family) so HTTP entries spread across status codes
-        //     collapse to one row per direction, while HTTP and stream activity
-        //     under the same proxy_id stay on separate, deterministically
-        //     labeled rows (finding #75). Currency/namespace come from the
-        //     recording instance and are carried per-aggregate (finding #24).
+        //     protocol_family, currency, namespace) so HTTP entries spread
+        //     across status codes collapse to one row per direction, while
+        //     HTTP/stream and distinct billing scopes under the same proxy_id
+        //     stay on separate, deterministically labeled rows.
         struct BandwidthAggregate {
             proxy_name: String,
             currency: Arc<str>,
@@ -695,8 +716,10 @@ impl ChargebackRegistry {
             charge_received: f64,
         }
 
-        let mut bw_aggregates: HashMap<(String, String, ProtocolFamily), BandwidthAggregate> =
-            HashMap::new();
+        let mut bw_aggregates: HashMap<
+            (String, String, ProtocolFamily, Arc<str>, Arc<str>),
+            BandwidthAggregate,
+        > = HashMap::new();
         for entry in self.entries.iter() {
             let v = entry.value();
             let agg = bw_aggregates
@@ -704,6 +727,8 @@ impl ChargebackRegistry {
                     v.consumer.to_string(),
                     v.proxy_id.to_string(),
                     v.protocol_family,
+                    Arc::clone(&v.currency),
+                    Arc::clone(&v.namespace_label),
                 ))
                 .or_insert_with(|| BandwidthAggregate {
                     proxy_name: v.proxy_name.to_string(),
@@ -724,7 +749,7 @@ impl ChargebackRegistry {
             "# HELP ferrum_api_bytes_sent_total Total bytes the gateway sent client->backend on this consumer's behalf.\n",
         );
         output.push_str("# TYPE ferrum_api_bytes_sent_total counter\n");
-        for ((consumer, proxy_id, family), agg) in &bw_aggregates {
+        for ((consumer, proxy_id, family, _, _), agg) in &bw_aggregates {
             output.push_str(&format!(
                 "ferrum_api_bytes_sent_total{{consumer=\"{}\",proxy_id=\"{}\",proxy_name=\"{}\",protocol_family=\"{}\"{}}} {}\n",
                 escape_label_value(consumer),
@@ -740,7 +765,7 @@ impl ChargebackRegistry {
             "# HELP ferrum_api_bytes_received_total Total bytes the gateway received backend->client and forwarded to this consumer.\n",
         );
         output.push_str("# TYPE ferrum_api_bytes_received_total counter\n");
-        for ((consumer, proxy_id, family), agg) in &bw_aggregates {
+        for ((consumer, proxy_id, family, _, _), agg) in &bw_aggregates {
             output.push_str(&format!(
                 "ferrum_api_bytes_received_total{{consumer=\"{}\",proxy_id=\"{}\",proxy_name=\"{}\",protocol_family=\"{}\"{}}} {}\n",
                 escape_label_value(consumer),
@@ -813,6 +838,7 @@ impl ChargebackRegistry {
         struct ProxyAggregate {
             proxy_name: String,
             currency: Arc<str>,
+            currency_mixed: bool,
             has_http: bool,
             has_stream: bool,
             by_status: HashMap<u16, (u64, f64)>,
@@ -856,6 +882,7 @@ impl ChargebackRegistry {
                     .or_insert_with(|| ProxyAggregate {
                         proxy_name: v.proxy_name.to_string(),
                         currency: Arc::clone(&v.currency),
+                        currency_mixed: false,
                         has_http: false,
                         has_stream: false,
                         by_status: HashMap::new(),
@@ -866,6 +893,9 @@ impl ChargebackRegistry {
                         bandwidth_charge_sent: 0.0,
                         bandwidth_charge_received: 0.0,
                     });
+            if proxy_entry.currency.as_ref() != v.currency.as_ref() {
+                proxy_entry.currency_mixed = true;
+            }
             proxy_entry.bytes_sent += bytes_sent;
             proxy_entry.bytes_received += bytes_received;
             proxy_entry.bandwidth_charge_sent += bw_sent;
@@ -874,14 +904,17 @@ impl ChargebackRegistry {
             match v.protocol_family {
                 ProtocolFamily::Http => {
                     proxy_entry.has_http = true;
-                    proxy_entry
+                    let status_entry = proxy_entry
                         .by_status
-                        .insert(v.status_code, (calls, call_charge));
+                        .entry(v.status_code)
+                        .or_insert((0, 0.0));
+                    status_entry.0 += calls;
+                    status_entry.1 += call_charge;
                 }
                 ProtocolFamily::Stream => {
                     proxy_entry.has_stream = true;
-                    proxy_entry.stream_connections = calls;
-                    proxy_entry.stream_charges = call_charge;
+                    proxy_entry.stream_connections += calls;
+                    proxy_entry.stream_charges += call_charge;
                 }
             }
         }
@@ -935,7 +968,7 @@ impl ChargebackRegistry {
 
                 let mut proxy_obj = serde_json::json!({
                     "proxy_name": agg.proxy_name,
-                    "currency": agg.currency.as_ref(),
+                    "currency": if agg.currency_mixed { "mixed" } else { agg.currency.as_ref() },
                     "protocol_family": protocol_family,
                     "total_calls": proxy_total_calls,
                     "total_charges": proxy_total_charges,
