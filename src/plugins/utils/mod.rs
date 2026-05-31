@@ -28,6 +28,7 @@ pub mod rate_limit;
 pub mod redis_rate_limiter;
 pub mod response_body;
 pub mod route_header_transform;
+pub mod runtime_bool_gate;
 pub mod scope_role_check;
 pub mod session_cookie;
 pub mod size_limit;
@@ -44,7 +45,7 @@ pub use batching_logger::{
 pub use http_client::PluginHttpClient;
 pub use log_helpers::{
     BatchConfigDefaults, SummaryLogEntry, build_batch_config, handle_http_batch_response,
-    parse_http_endpoint, validate_batch_config,
+    parse_custom_headers, parse_http_endpoint, validate_batch_config,
 };
 pub use socket_host::{parse_socket_host, socket_addr_lookup_input};
 pub use tcp_endpoint::resolve_tcp_endpoint;

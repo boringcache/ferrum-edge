@@ -34,7 +34,10 @@ paths:
 
 ## Test Placement
 
-- Private functions and structs use inline `#[cfg(test)] mod tests` in the source file. Do not make items `pub` only to test them externally.
+- Prefer external tests under `tests/` over new inline `#[cfg(test)] mod tests` in production source files.
+- Do not add ad hoc test runners, manually invoked assertions, mock fixtures, or test-only runtime branches to main source modules.
+- Existing inline tests may remain, but new coverage should use `tests/unit/<category>/<module>_tests.rs`, `tests/integration/`, `tests/functional/`, or `tests/conformance/` when possible.
+- If private-only behavior cannot be tested externally without widening a runtime API, keep any inline test module minimal and do not add production-visible test helpers.
 - Public API tests go in `tests/unit/<category>/<module>_tests.rs`.
 - Component interaction tests go in `tests/integration/`.
 - Full binary E2E tests go in `tests/functional/` with `#[ignore]` and require `cargo build --bin ferrum-edge`.
@@ -43,7 +46,7 @@ paths:
 
 ## Targeted Commands
 
-- Private source function: `cargo test --lib <module>::tests`
+- Existing inline source test: `cargo test --lib <module>::tests`
 - Public API: `cargo test --test unit_tests <filter>`
 - Cross-module behavior: `cargo test --test integration_tests <filter>`
 - Proxy hot path: `cargo build --bin ferrum-edge && cargo test --test functional_tests <filter> -- --ignored`

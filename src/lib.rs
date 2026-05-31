@@ -310,6 +310,13 @@ pub mod _test_support {
         .await
     }
 
+    // ── plugins/ai_semantic_cache ────────────────────────────────────────────
+    pub async fn rebuild_ai_semantic_cache_vector_index(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+    ) {
+        plugin.rebuild_vector_index_for_tests().await;
+    }
+
     // ── plugins/ws_rate_limiting ─────────────────────────────────────────────
     /// Create a fresh `WsRateLimiting` instance and return its Redis scope key.
     /// Each call returns a key from a new instance (unique UUID prefix), so two

@@ -2,6 +2,7 @@
 
 use super::plugin_utils::create_test_proxy;
 use chrono::Utc;
+use ferrum_edge::_test_support::clone_log_metadata;
 use ferrum_edge::config::types::Consumer;
 use ferrum_edge::plugins::response_caching::ResponseCaching;
 use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
@@ -811,6 +812,360 @@ async fn test_identity_without_authorization_header_not_cached_in_shared_cache()
         .before_proxy(&mut second_ctx, &mut second_headers)
         .await;
     assert!(matches!(result, PluginResult::Continue));
+}
+
+/// finding #1: an API-key-authenticated principal (gateway Consumer, no
+/// `Authorization` header) whose backend marks the response `Cache-Control:
+/// public` must NOT have that per-user response served to a different
+/// principal. Before the fix the principal was absent from the cache key
+/// (default `cache_key_include_consumer: false`, only `authorization`
+/// auto-varied), so Bob received Alice's private body on a HIT.
+#[tokio::test]
+async fn test_apikey_principal_public_response_not_cross_served() {
+    let plugin = default_plugin();
+
+    let mut public_response = HashMap::new();
+    public_response.insert(
+        "cache-control".to_string(),
+        "public, max-age=60".to_string(),
+    );
+
+    // Alice authenticates via API key and the backend returns a per-user
+    // `public` response that gets cached.
+    let mut ctx_alice = make_ctx("GET", "/api/profile");
+    ctx_alice.identified_consumer = Some(Arc::new(make_consumer("a", "alice")));
+    ctx_alice
+        .headers
+        .insert("x-api-key".to_string(), "alice-key".to_string());
+    let mut h_alice = ctx_alice.headers.clone();
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx_alice, &mut h_alice).await,
+        PluginResult::Continue
+    ));
+    plugin
+        .on_final_response_body(&mut ctx_alice, 200, &public_response, b"alice-private")
+        .await;
+
+    // Bob presents a different API key for the same route -> MUST miss.
+    let mut ctx_bob = make_ctx("GET", "/api/profile");
+    ctx_bob.identified_consumer = Some(Arc::new(make_consumer("b", "bob")));
+    ctx_bob
+        .headers
+        .insert("x-api-key".to_string(), "bob-key".to_string());
+    let mut h_bob = ctx_bob.headers.clone();
+    assert!(
+        matches!(
+            plugin.before_proxy(&mut ctx_bob, &mut h_bob).await,
+            PluginResult::Continue
+        ),
+        "Bob must not be served Alice's per-principal `public` response"
+    );
+
+    // Alice again -> HIT with her own body (entry is keyed per-principal, not
+    // suppressed entirely).
+    let mut ctx_alice2 = make_ctx("GET", "/api/profile");
+    ctx_alice2.identified_consumer = Some(Arc::new(make_consumer("a", "alice")));
+    ctx_alice2
+        .headers
+        .insert("x-api-key".to_string(), "alice-key".to_string());
+    let mut h_alice2 = ctx_alice2.headers.clone();
+    let (_, body, _) = expect_reject(plugin.before_proxy(&mut ctx_alice2, &mut h_alice2).await);
+    assert_eq!(body, b"alice-private");
+}
+
+/// finding #1: same cross-principal isolation guarantee for an external
+/// identity surfaced via `authenticated_identity` (e.g. an mTLS SPIFFE ID or
+/// a JWT carried in a custom header), which also has no `Authorization`
+/// header.
+#[tokio::test]
+async fn test_external_identity_public_response_not_cross_served() {
+    let plugin = default_plugin();
+
+    let mut public_response = HashMap::new();
+    public_response.insert(
+        "cache-control".to_string(),
+        "public, max-age=60".to_string(),
+    );
+
+    let mut ctx_a = make_ctx("GET", "/api/profile");
+    ctx_a.authenticated_identity = Some("spiffe://example.org/ns/team/sa/alice".to_string());
+    let mut h_a = ctx_a.headers.clone();
+    plugin.before_proxy(&mut ctx_a, &mut h_a).await;
+    plugin
+        .on_final_response_body(&mut ctx_a, 200, &public_response, b"alice-private")
+        .await;
+
+    let mut ctx_b = make_ctx("GET", "/api/profile");
+    ctx_b.authenticated_identity = Some("spiffe://example.org/ns/team/sa/bob".to_string());
+    let mut h_b = ctx_b.headers.clone();
+    assert!(
+        matches!(
+            plugin.before_proxy(&mut ctx_b, &mut h_b).await,
+            PluginResult::Continue
+        ),
+        "a different external identity must not hit the first principal's entry"
+    );
+
+    let mut ctx_a2 = make_ctx("GET", "/api/profile");
+    ctx_a2.authenticated_identity = Some("spiffe://example.org/ns/team/sa/alice".to_string());
+    let mut h_a2 = ctx_a2.headers.clone();
+    let (_, body, _) = expect_reject(plugin.before_proxy(&mut ctx_a2, &mut h_a2).await);
+    assert_eq!(body, b"alice-private");
+}
+
+/// finding #15: a `Cookie`-bearing request with no authenticated identity must
+/// vary by the cookie so distinct sessions never share a cached `public`
+/// response, even when the backend forgets `Vary: Cookie` and emits no
+/// `Set-Cookie`.
+#[tokio::test]
+async fn test_cookie_bearing_request_not_cross_served_across_sessions() {
+    let plugin = default_plugin();
+
+    let mut public_response = HashMap::new();
+    public_response.insert(
+        "cache-control".to_string(),
+        "public, max-age=60".to_string(),
+    );
+
+    // Session "alice" caches a per-session public response.
+    let mut ctx_a = make_ctx("GET", "/dashboard");
+    ctx_a
+        .headers
+        .insert("cookie".to_string(), "session=alice".to_string());
+    let mut h_a = ctx_a.headers.clone();
+    plugin.before_proxy(&mut ctx_a, &mut h_a).await;
+    plugin
+        .on_final_response_body(&mut ctx_a, 200, &public_response, b"alice-dashboard")
+        .await;
+
+    // A different session cookie -> MISS.
+    let mut ctx_b = make_ctx("GET", "/dashboard");
+    ctx_b
+        .headers
+        .insert("cookie".to_string(), "session=bob".to_string());
+    let mut h_b = ctx_b.headers.clone();
+    assert!(
+        matches!(
+            plugin.before_proxy(&mut ctx_b, &mut h_b).await,
+            PluginResult::Continue
+        ),
+        "a different session cookie must not hit another session's cached response"
+    );
+
+    // Same session cookie -> HIT with its own body.
+    let mut ctx_a2 = make_ctx("GET", "/dashboard");
+    ctx_a2
+        .headers
+        .insert("cookie".to_string(), "session=alice".to_string());
+    let mut h_a2 = ctx_a2.headers.clone();
+    let (_, body, _) = expect_reject(plugin.before_proxy(&mut ctx_a2, &mut h_a2).await);
+    assert_eq!(body, b"alice-dashboard");
+}
+
+#[tokio::test]
+async fn test_cookie_request_does_not_hit_preexisting_anonymous_entry() {
+    let plugin = default_plugin();
+
+    let mut public_response = HashMap::new();
+    public_response.insert(
+        "cache-control".to_string(),
+        "public, max-age=60".to_string(),
+    );
+
+    let mut anonymous_ctx = make_ctx("GET", "/dashboard");
+    let mut anonymous_headers = HashMap::new();
+    plugin
+        .before_proxy(&mut anonymous_ctx, &mut anonymous_headers)
+        .await;
+    plugin
+        .on_final_response_body(&mut anonymous_ctx, 200, &public_response, b"anon-dashboard")
+        .await;
+
+    let mut cookie_ctx = make_ctx("GET", "/dashboard");
+    cookie_ctx
+        .headers
+        .insert("cookie".to_string(), "session=alice".to_string());
+    let mut cookie_headers = cookie_ctx.headers.clone();
+    assert!(
+        matches!(
+            plugin
+                .before_proxy(&mut cookie_ctx, &mut cookie_headers)
+                .await,
+            PluginResult::Continue
+        ),
+        "cookie-bearing request must not hit the unvaried anonymous entry"
+    );
+}
+
+#[tokio::test]
+async fn test_anonymous_store_preserves_existing_cookie_vary_dimension() {
+    let plugin = default_plugin();
+
+    let mut public_response = HashMap::new();
+    public_response.insert(
+        "cache-control".to_string(),
+        "public, max-age=60".to_string(),
+    );
+
+    let mut cookie_ctx = make_ctx("GET", "/dashboard");
+    cookie_ctx
+        .headers
+        .insert("cookie".to_string(), "session=alice".to_string());
+    let mut cookie_headers = cookie_ctx.headers.clone();
+    plugin
+        .before_proxy(&mut cookie_ctx, &mut cookie_headers)
+        .await;
+    plugin
+        .on_final_response_body(&mut cookie_ctx, 200, &public_response, b"alice-dashboard")
+        .await;
+
+    let mut anonymous_ctx = make_ctx("GET", "/dashboard");
+    let mut anonymous_headers = HashMap::new();
+    assert!(matches!(
+        plugin
+            .before_proxy(&mut anonymous_ctx, &mut anonymous_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    plugin
+        .on_final_response_body(&mut anonymous_ctx, 200, &public_response, b"anon-dashboard")
+        .await;
+
+    let mut cookie_ctx_2 = make_ctx("GET", "/dashboard");
+    cookie_ctx_2
+        .headers
+        .insert("cookie".to_string(), "session=alice".to_string());
+    let mut cookie_headers_2 = cookie_ctx_2.headers.clone();
+    let (_, body, _) = expect_reject(
+        plugin
+            .before_proxy(&mut cookie_ctx_2, &mut cookie_headers_2)
+            .await,
+    );
+    assert_eq!(body, b"alice-dashboard");
+
+    let mut anonymous_ctx_2 = make_ctx("GET", "/dashboard");
+    let mut anonymous_headers_2 = HashMap::new();
+    let (_, body, response_headers) = expect_reject(
+        plugin
+            .before_proxy(&mut anonymous_ctx_2, &mut anonymous_headers_2)
+            .await,
+    );
+    assert_eq!(body, b"anon-dashboard");
+    assert!(
+        response_headers
+            .get("vary")
+            .is_some_and(|vary| vary.split(',').map(str::trim).any(|h| h == "cookie")),
+        "anonymous variant should keep the sticky cookie Vary dimension"
+    );
+}
+
+#[tokio::test]
+async fn test_sensitive_header_snapshot_does_not_store_raw_session_headers() {
+    let plugin = default_plugin();
+
+    let mut public_response = HashMap::new();
+    public_response.insert(
+        "cache-control".to_string(),
+        "public, max-age=60".to_string(),
+    );
+
+    let cookie = "session=alice; csrf=raw-secret";
+    let proxy_auth = "Basic cHJveHk6c2VjcmV0";
+
+    let mut ctx = make_ctx("GET", "/dashboard");
+    ctx.headers.insert("cookie".to_string(), cookie.to_string());
+    ctx.headers
+        .insert("proxy-authorization".to_string(), proxy_auth.to_string());
+    let mut headers = ctx.headers.clone();
+
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+
+    let snapshot = ctx
+        .metadata
+        .get("cache_request_headers_snapshot")
+        .expect("cache header snapshot should be stashed");
+    assert!(snapshot.contains("cookie"));
+    assert!(snapshot.contains("proxy-authorization"));
+    assert!(snapshot.contains("sha256-"));
+    assert!(!snapshot.contains(cookie));
+    assert!(!snapshot.contains(proxy_auth));
+    assert!(!snapshot.contains("raw-secret"));
+
+    let log_metadata = clone_log_metadata(&ctx);
+    let log_metadata_json = serde_json::to_string(&log_metadata).unwrap();
+    assert!(!log_metadata_json.contains(cookie));
+    assert!(!log_metadata_json.contains(proxy_auth));
+    assert!(!log_metadata_json.contains("raw-secret"));
+
+    plugin
+        .on_final_response_body(&mut ctx, 200, &public_response, b"alice-dashboard")
+        .await;
+
+    let mut same_ctx = make_ctx("GET", "/dashboard");
+    same_ctx
+        .headers
+        .insert("cookie".to_string(), cookie.to_string());
+    same_ctx
+        .headers
+        .insert("proxy-authorization".to_string(), proxy_auth.to_string());
+    let mut same_headers = same_ctx.headers.clone();
+    let (_, body, _) = expect_reject(plugin.before_proxy(&mut same_ctx, &mut same_headers).await);
+    assert_eq!(body, b"alice-dashboard");
+}
+
+#[tokio::test]
+async fn test_sensitive_configured_vary_header_snapshot_hashes_without_breaking_hits() {
+    let plugin = plugin_with_config(json!({
+        "vary_by_headers": ["x-api-key"]
+    }));
+
+    let mut public_response = HashMap::new();
+    public_response.insert(
+        "cache-control".to_string(),
+        "public, max-age=60".to_string(),
+    );
+
+    let api_key = "raw-api-key-secret";
+    let mut ctx = make_ctx("GET", "/api/keyed");
+    ctx.headers
+        .insert("x-api-key".to_string(), api_key.to_string());
+    let mut headers = ctx.headers.clone();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    let snapshot = ctx
+        .metadata
+        .get("cache_request_headers_snapshot")
+        .expect("cache header snapshot should be stashed");
+    assert!(snapshot.contains("x-api-key"));
+    assert!(snapshot.contains("sha256-"));
+    assert!(!snapshot.contains(api_key));
+
+    plugin
+        .on_final_response_body(&mut ctx, 200, &public_response, b"keyed")
+        .await;
+
+    let mut same_ctx = make_ctx("GET", "/api/keyed");
+    same_ctx
+        .headers
+        .insert("x-api-key".to_string(), api_key.to_string());
+    let mut same_headers = same_ctx.headers.clone();
+    let (_, body, _) = expect_reject(plugin.before_proxy(&mut same_ctx, &mut same_headers).await);
+    assert_eq!(body, b"keyed");
+
+    let mut other_ctx = make_ctx("GET", "/api/keyed");
+    other_ctx
+        .headers
+        .insert("x-api-key".to_string(), "other-api-key".to_string());
+    let mut other_headers = other_ctx.headers.clone();
+    assert!(matches!(
+        plugin
+            .before_proxy(&mut other_ctx, &mut other_headers)
+            .await,
+        PluginResult::Continue
+    ));
 }
 
 // === X-Cache-Status header ===
