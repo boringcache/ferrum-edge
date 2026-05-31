@@ -29,15 +29,18 @@
 //!
 //! Because verification is substring-based rather than DOM + exclusive-c14n,
 //! the X.509 path enforces that every signed `#id` Reference resolves to a
-//! UNIQUE `wsu:Id` across the whole envelope (see `count_wsu_id_occurrences`),
-//! rejecting any envelope carrying a duplicate id — the classic XSW vector
-//! where an attacker keeps the legitimately-signed element and injects a second
-//! element with the same id that the backend consumes. The SAML path retains
-//! its single-`<Assertion>` guard plus the Reference-URI-equals-assertion-id
-//! check. A residual risk remains for a backend that selects a *different*
-//! same-local-name element than the gateway digested; reducing the forwarded
-//! body to only the signed subtree (or full DOM + exclusive-c14n) is the
-//! long-term fix.
+//! UNIQUE XML id-bearing attribute across the whole envelope (see
+//! `count_wsu_id_occurrences`), rejecting any envelope carrying a duplicate id —
+//! the classic XSW vector where an attacker keeps the legitimately-signed
+//! element and injects a second element with the same id that the backend
+//! consumes. The duplicate scan includes WS-Security `wsu:Id` / prefixed `Id`,
+//! bare `Id`, and common alternative spellings (`xml:id`, `ID`, `id`) so
+//! backends with broader fragment-id rules fail closed instead of seeing a
+//! forwarded alternate referent. The SAML path retains its single-`<Assertion>`
+//! guard plus the Reference-URI-equals-assertion-id check. A residual risk
+//! remains for a backend that selects a *different* same-local-name element than
+//! the gateway digested; reducing the forwarded body to only the signed subtree
+//! (or full DOM + exclusive-c14n) is the long-term fix.
 
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -1020,6 +1023,7 @@ impl SoapWsSecurity {
     fn validate_saml_assertion(
         &self,
         security_block: &str,
+        envelope: &str,
         now: DateTime<Utc>,
     ) -> Result<Option<String>, String> {
         let assertion = match find_element_block(security_block, "Assertion") {
@@ -1034,11 +1038,11 @@ impl SoapWsSecurity {
         };
 
         // Defense in depth: only ever validate a single assertion. If an
-        // attacker can wedge a second Assertion into the WS-Security block,
+        // attacker can wedge a second Assertion anywhere in the SOAP envelope,
         // downstream consumers that walk all assertions could see an
         // identity we never verified. Cheap insurance — reject and let the
         // operator deal with malformed/multi-assertion messages explicitly.
-        if count_elements(security_block, "Assertion") > 1 {
+        if count_elements(envelope, "Assertion") > 1 {
             return Err(
                 "WS-Security: multiple SAML Assertion elements are not allowed".to_string(),
             );
@@ -1245,6 +1249,12 @@ impl SoapWsSecurity {
             find_element_block_from_with_end(signed_info, "Reference", search_from)
         {
             reference_count += 1;
+            if reference_count > MAX_SIGNED_REFERENCES {
+                return Err(format!(
+                    "WS-Security: too many SAML Signature References (> {})",
+                    MAX_SIGNED_REFERENCES
+                ));
+            }
             search_from = next_start.max(search_from + 1);
 
             let uri = find_attribute(&ref_block, "URI").unwrap_or_default();
@@ -1486,7 +1496,7 @@ impl Plugin for SoapWsSecurity {
 
         // Validate SAML assertion
         if self.saml_enabled {
-            match self.validate_saml_assertion(&security_block, now) {
+            match self.validate_saml_assertion(&security_block, envelope, now) {
                 Ok(name_id) => {
                     if let Some(subject) = name_id {
                         ctx.metadata
@@ -1756,45 +1766,104 @@ fn find_wsu_id(element: &str) -> Option<String> {
     find_attribute(element, "wsu:Id").or_else(|| find_attribute(element, "Id"))
 }
 
-/// Count how many elements in `xml` bear the given `wsu:Id` / `Id` attribute
-/// value. Used to reject XML Signature Wrapping (XSW): a signed reference whose
-/// id resolves to more than one element means an attacker injected a duplicate,
-/// so the byte range the signature covers may differ from the element a backend
+/// Count how many start tags in `xml` bear the given XML id attribute value.
+/// Used to reject XML Signature Wrapping (XSW): a signed reference whose id
+/// appears on more than one element means an attacker injected a duplicate, so
+/// the byte range the signature covers may differ from the element a backend
 /// consumes.
 ///
-/// Every `wsu:Id="X"` contains the substring `Id="X"`, so counting the
-/// unprefixed form (both quote styles) counts each physical attribute exactly
-/// once whether or not it carries the `wsu:` prefix. Any over-count (e.g. a
-/// hypothetical `FooId="X"` attribute) only ever causes a fail-closed
-/// rejection, never a missed wrapping.
+/// The resolver still accepts WS-Security `wsu:Id` / bare `Id`, but the counter
+/// intentionally counts broader id spellings (`xml:id`, `ID`, `id`) so a backend
+/// with broader fragment resolution fails closed. Scanning only start tags avoids
+/// rejecting a legitimate request merely because body text contains `Id="..."`.
 fn count_wsu_id_occurrences(xml: &str, id: &str) -> usize {
-    // Every `wsu:Id="X"` / `Id="X"` contains the trailing substring `Id="X"`,
-    // so we scan for that (both quote styles) and accept a match only when the
-    // byte immediately before `Id` is NOT an XML name character — i.e. it is the
-    // `:` of a `wsu:` (or other) prefix, or attribute-separating whitespace.
-    // This counts standalone and prefixed id attributes exactly once each while
-    // ignoring unrelated attributes whose name merely ends in `Id`
-    // (`CorrelationId`, `MessageId`, …), which would otherwise reject a
-    // legitimately-signed envelope. It also matches exactly what a DOM parser
-    // treats as an id attribute, so it never undercounts a real duplicate —
-    // staying sound against wrapping while avoiding false positives.
-    fn is_xml_name_char(b: u8) -> bool {
-        b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')
-    }
-    let count_anchored = |needle: &str| -> usize {
-        let bytes = xml.as_bytes();
-        let mut count = 0;
-        let mut from = 0;
-        while let Some(rel) = xml[from..].find(needle) {
-            let pos = from + rel;
-            if pos == 0 || !is_xml_name_char(bytes[pos - 1]) {
-                count += 1;
-            }
-            from = pos + needle.len();
+    let mut count = 0usize;
+    let mut search_from = 0usize;
+    while let Some(rel) = xml[search_from..].find('<') {
+        let tag_start = search_from + rel;
+        let Some(after_lt) = xml.as_bytes().get(tag_start + 1) else {
+            break;
+        };
+        if matches!(after_lt, b'/' | b'!' | b'?') {
+            search_from = tag_start + 1;
+            continue;
         }
-        count
-    };
-    count_anchored(&format!("Id=\"{}\"", id)) + count_anchored(&format!("Id='{}'", id))
+
+        let Some(tag_end_rel) = xml[tag_start..].find('>') else {
+            break;
+        };
+        let tag = &xml[tag_start + 1..tag_start + tag_end_rel];
+        count += count_id_attributes_in_tag(tag, id);
+        search_from = tag_start + tag_end_rel + 1;
+    }
+    count
+}
+
+fn count_id_attributes_in_tag(tag: &str, id: &str) -> usize {
+    let bytes = tag.as_bytes();
+    let mut count = 0usize;
+    let mut i = 0usize;
+
+    while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b'/' {
+        i += 1;
+    }
+
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] == b'/' {
+            break;
+        }
+
+        let name_start = i;
+        while i < bytes.len() && !bytes[i].is_ascii_whitespace() && !matches!(bytes[i], b'=' | b'/')
+        {
+            i += 1;
+        }
+        let name = &tag[name_start..i];
+
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] != b'=' {
+            continue;
+        }
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+
+        let Some(&quote) = bytes.get(i) else {
+            break;
+        };
+        if !matches!(quote, b'\'' | b'"') {
+            continue;
+        }
+        i += 1;
+        let value_start = i;
+        while i < bytes.len() && bytes[i] != quote {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let value = &tag[value_start..i];
+        i += 1;
+
+        if is_xml_id_attribute_name(name) && value == id {
+            count += 1;
+        }
+    }
+
+    count
+}
+
+fn is_xml_id_attribute_name(name: &str) -> bool {
+    matches!(name, "Id" | "xml:id" | "ID" | "id")
+        || name
+            .rsplit_once(':')
+            .is_some_and(|(_, local_name)| local_name == "Id")
 }
 
 /// Resolve the signing certificate from a SAML `<Signature>` block.
@@ -2085,6 +2154,75 @@ mod tests {
 
         assert_eq!(parsed["error"], raw);
         assert!(!escape_json_chars(raw).chars().any(|ch| ch < '\u{20}'));
+    }
+
+    #[test]
+    fn count_wsu_id_occurrences_counts_mixed_id_spellings_once_each() {
+        let xml = r#"
+            <Envelope>
+                <a:Timestamp a:Id='TS-1'/>
+                <Header Id="TS-1"/>
+                <Assertion xml:id='TS-1'/>
+                <Legacy ID="TS-1"/>
+                <Lower id='TS-1'/>
+                <Business CorrelationId="TS-1" Message_Id='TS-1' Audit-Id="TS-1" Trace.Id='TS-1'/>
+                <Body>literal Id="TS-1" and wsu:Id='TS-1' text must not count</Body>
+            </Envelope>
+        "#;
+
+        assert_eq!(count_wsu_id_occurrences(xml, "TS-1"), 5);
+    }
+
+    #[test]
+    fn too_many_x509_signature_references_are_rejected() {
+        let plugin = SoapWsSecurity::new(&serde_json::json!({
+            "timestamp": { "require": true }
+        }))
+        .expect("timestamp-only config should construct");
+        let timestamp = r#"<wsu:Timestamp wsu:Id="TS-1"></wsu:Timestamp>"#;
+        let digest = digest::digest(&digest::SHA256, timestamp.as_bytes());
+        let digest_b64 = BASE64.encode(digest.as_ref());
+        let reference = format!(
+            r##"<Reference URI="#TS-1"><DigestMethod Algorithm="{}"/><DigestValue>{}</DigestValue></Reference>"##,
+            XMLDSIG_SHA256, digest_b64
+        );
+        let references =
+            std::iter::repeat_n(reference.as_str(), MAX_SIGNED_REFERENCES + 1).collect::<String>();
+        let signed_info = format!("<SignedInfo>{}</SignedInfo>", references);
+
+        let err = plugin
+            .verify_reference_digests(&signed_info, timestamp, "", timestamp)
+            .expect_err("reference cap must reject");
+
+        assert!(err.contains("too many Signature References"), "got: {err}");
+    }
+
+    #[test]
+    fn too_many_saml_signature_references_are_rejected() {
+        let plugin = SoapWsSecurity::new(&serde_json::json!({
+            "timestamp": { "require": true }
+        }))
+        .expect("timestamp-only config should construct");
+        let assertion = r#"<Assertion ID="assertion-1"><Issuer>https://idp.example.com</Issuer><Signature></Signature><Subject><NameID>alice@example.com</NameID></Subject></Assertion>"#;
+        let assertion_without_signature = remove_envelope_signature(assertion);
+        let digest = digest::digest(&digest::SHA256, assertion_without_signature.as_bytes());
+        let digest_b64 = BASE64.encode(digest.as_ref());
+        let reference = format!(
+            r##"<Reference URI="#assertion-1"><DigestMethod Algorithm="{}"/><DigestValue>{}</DigestValue></Reference>"##,
+            XMLDSIG_SHA256, digest_b64
+        );
+        let references =
+            std::iter::repeat_n(reference.as_str(), MAX_SIGNED_REFERENCES + 1).collect::<String>();
+        let signed_info = format!("<SignedInfo>{}</SignedInfo>", references);
+
+        let err = plugin
+            .verify_saml_reference_digests(&signed_info, assertion)
+            .expect_err("SAML reference cap must reject");
+
+        assert!(
+            err.contains("too many SAML Signature References"),
+            "got: {err}"
+        );
     }
 
     /// Iterating over multiple `<Reference>` elements with

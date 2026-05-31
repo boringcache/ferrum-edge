@@ -1595,6 +1595,35 @@ async fn test_saml_multiple_assertions_rejected() {
     );
 }
 
+#[tokio::test]
+async fn test_saml_assertion_in_body_is_rejected() {
+    let bundle = saml_fixtures::IdpBundle::new();
+    let plugin = SoapWsSecurity::new(&saml_config(&bundle, None)).unwrap();
+
+    let valid = saml_fixtures::AssertionBuilder::new(
+        "_assertion-valid",
+        "https://idp.example.com/metadata",
+        "alice@example.com",
+    )
+    .build();
+
+    let body = wrap_saml_assertion(&valid).replace(
+        "<soap:Body>",
+        "<soap:Body><Assertion ID=\"body-assertion\"><Issuer>https://evil.example.com</Issuer>\
+         <Subject><NameID>mallory@example.com</NameID></Subject></Assertion>",
+    );
+    let mut ctx = make_ctx_with_soap_body(&body);
+    let mut headers = soap_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert!(is_reject(&result));
+    assert!(
+        reject_body(&result).contains("multiple SAML Assertion elements"),
+        "expected envelope-wide multi-assertion rejection, got: {}",
+        reject_body(&result)
+    );
+}
+
 // ── Body buffering flag tests ───────────────────────────────────────────────
 
 #[test]
@@ -2014,6 +2043,43 @@ mod x509_roundtrip {
                 );
             }
             other => panic!("expected Reject for duplicate wsu:Id, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_bare_single_quoted_id_is_rejected_as_signature_wrapping() {
+        // The signed element uses wsu:Id="TS-1"; this injects a bare Id='TS-1'
+        // duplicate to prove the mixed-prefix and mixed-quote count is covered
+        // end-to-end, not just in the double-quoted wsu:Id case.
+        let cert = mint_rsa_cert();
+        let cert_file = write_pem_to_tempfile(&cert.cert_pem);
+        let plugin = SoapWsSecurity::new(&x509_plugin_config(cert_file.path())).unwrap();
+
+        let valid = build_signed_soap_envelope(&cert);
+        let wrapped = valid.replace(
+            "<soap:Body>",
+            "<soap:Body><Injected Id='TS-1'>attacker-controlled</Injected>",
+        );
+        assert_ne!(
+            valid, wrapped,
+            "bare duplicate-id injection must modify the envelope"
+        );
+
+        let mut ctx = make_ctx_with_soap_body(&wrapped);
+        let mut headers = soap_headers();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+        match result {
+            PluginResult::Reject {
+                status_code, body, ..
+            } => {
+                assert_eq!(status_code, 401);
+                assert!(
+                    body.contains("signature wrapping") || body.contains("not unique"),
+                    "expected XML-signature-wrapping rejection, got: {body}"
+                );
+            }
+            other => panic!("expected Reject for duplicate bare Id, got {other:?}"),
         }
     }
 
