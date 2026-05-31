@@ -14,6 +14,7 @@ use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::config::types::OPENAPI_VALIDATOR_DEFAULT_CONTENT_TYPES;
 
@@ -26,6 +27,7 @@ const DEFAULT_ERROR_TRUNCATE_CHARS: usize = 1024;
 /// decisions per instance so sibling instances cannot cross-apply a bypass
 /// decision (see finding #17).
 const SKIP_REASON_KEY: &str = "openapi_validator.skip_reason";
+static INSTANCE_ID_COUNTER: AtomicUsize = AtomicUsize::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EnforcementMode {
@@ -145,6 +147,7 @@ impl ResponseValidators {
 }
 
 pub struct OpenapiValidator {
+    instance_id: usize,
     mode: EnforcementMode,
     validate_request: bool,
     validate_response: bool,
@@ -280,6 +283,7 @@ impl OpenapiValidator {
             optional_usize(object, "error_truncate_chars")?.unwrap_or(DEFAULT_ERROR_TRUNCATE_CHARS);
 
         Ok(Self {
+            instance_id: INSTANCE_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
             mode,
             validate_request,
             validate_response,
@@ -316,6 +320,11 @@ impl OpenapiValidator {
     }
 
     fn operation_for_context<'a>(&'a self, ctx: &RequestContext) -> Option<&'a OperationEntry> {
+        if let Some((method, path)) = ctx.openapi_validator_matches.get(&self.instance_id) {
+            return self
+                .match_operation(method, path)
+                .map(|matched| matched.entry);
+        }
         self.match_operation(&ctx.method, &ctx.path)
             .map(|matched| matched.entry)
     }
@@ -326,20 +335,13 @@ impl OpenapiValidator {
 
     fn mark_operation_entry(&self, ctx: &mut RequestContext, operation: &OperationEntry) {
         self.mark_mode(ctx);
+        ctx.openapi_validator_matches
+            .entry(self.instance_id)
+            .or_insert_with(|| (ctx.method.clone(), ctx.path.clone()));
         ctx.metadata.insert(
             "openapi_validator.matched_operation".to_string(),
             operation.operation_label.clone(),
         );
-    }
-
-    fn match_and_mark_operation<'a>(
-        &'a self,
-        ctx: &mut RequestContext,
-    ) -> Option<&'a OperationEntry> {
-        let matched = self.match_operation(&ctx.method, &ctx.path)?;
-        let entry = matched.entry;
-        self.mark_operation(ctx, matched);
-        Some(entry)
     }
 
     fn bypass_reason_for_headers(
@@ -391,6 +393,7 @@ impl OpenapiValidator {
 
     fn mark_skip(&self, ctx: &mut RequestContext, reason: &'static str) {
         self.mark_mode(ctx);
+        ctx.openapi_validator_matches.remove(&self.instance_id);
         // Public key for loggers/observability (last writer wins across
         // instances; this is output only).
         ctx.metadata
@@ -563,7 +566,7 @@ impl Plugin for OpenapiValidator {
             self.mark_skip(ctx, reason);
             return PluginResult::Continue;
         }
-        let Some(operation) = self.match_and_mark_operation(ctx) else {
+        let Some(operation) = self.operation_for_context(ctx) else {
             if self.fail_on_unknown_operation {
                 return self.handle_violation(
                     ctx,
@@ -579,6 +582,7 @@ impl Plugin for OpenapiValidator {
             self.mark_skip(ctx, "no_match");
             return PluginResult::Continue;
         };
+        self.mark_operation_entry(ctx, operation);
         if body.is_empty() {
             return if operation.request_required {
                 self.handle_violation(
@@ -638,7 +642,7 @@ impl Plugin for OpenapiValidator {
             self.mark_skip(ctx, reason);
             return PluginResult::Continue;
         }
-        let Some(operation) = self.match_and_mark_operation(ctx) else {
+        let Some(operation) = self.operation_for_context(ctx) else {
             if self.fail_on_unknown_operation {
                 return self.handle_violation(
                     ctx,
@@ -654,6 +658,7 @@ impl Plugin for OpenapiValidator {
             self.mark_skip(ctx, "no_match");
             return PluginResult::Continue;
         };
+        self.mark_operation_entry(ctx, operation);
         if body.is_empty() {
             return PluginResult::Continue;
         }

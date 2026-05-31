@@ -425,6 +425,10 @@ pub struct RequestContext {
     pub(crate) ai_semantic_cache_embedding: Option<Vec<f32>>,
     /// Semantic-cache scope key paired with `ai_semantic_cache_embedding`.
     pub(crate) ai_semantic_cache_scope_key: Option<String>,
+    /// OpenAPI validator operation matches staged between `before_proxy` and
+    /// final body hooks. Kept out of public metadata so per-instance state does
+    /// not leak into transaction logs.
+    pub(crate) openapi_validator_matches: HashMap<usize, (String, String)>,
     /// Whether reserved `waf.*` metadata has been cleared for this request.
     ///
     /// `metadata` is intentionally public plugin scratch space. WAF-owned log
@@ -619,6 +623,7 @@ impl RequestContext {
             metadata: HashMap::new(),
             ai_semantic_cache_embedding: None,
             ai_semantic_cache_scope_key: None,
+            openapi_validator_matches: HashMap::new(),
             waf_metadata_initialized: false,
             waf_owned_metadata: HashMap::new(),
             waf_score: 0,
@@ -675,6 +680,7 @@ impl RequestContext {
             metadata: self.metadata.clone(),
             ai_semantic_cache_embedding: self.ai_semantic_cache_embedding.clone(),
             ai_semantic_cache_scope_key: self.ai_semantic_cache_scope_key.clone(),
+            openapi_validator_matches: self.openapi_validator_matches.clone(),
             waf_metadata_initialized: self.waf_metadata_initialized,
             waf_owned_metadata: self.waf_owned_metadata.clone(),
             waf_score: self.waf_score,
