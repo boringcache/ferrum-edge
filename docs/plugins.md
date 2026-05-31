@@ -2162,15 +2162,15 @@ See [cors_plugin.md](cors_plugin.md) for detailed configuration and troubleshoot
 
 ### `bot_detection`
 
-Detects and blocks bot traffic based on case-insensitive User-Agent substring matching. The allow list is consulted before blocked patterns, so a User-Agent containing a blocked substring can still pass when it also matches an allow-list entry.
+Detects and blocks bot traffic based on the User-Agent header. `blocked_patterns` are case-insensitive substring matches; `allow_list` entries are case-insensitive word-boundary matches and are consulted before blocked patterns, so a User-Agent containing a blocked substring can still pass when it also matches an allow-list entry as a standalone token. The User-Agent is client-controlled and spoofable, so treat this as a coarse first filter rather than strong bot verification.
 
 **Priority:** 200
 **Supported protocols:** HTTP, gRPC, WebSocket
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `blocked_patterns` | String[] | `["curl","wget","python-requests","python-urllib","scrapy","httpclient","java/","libwww-perl","mechanize","php/"]` | User-Agent substrings to reject. Case-insensitive. Setting this field replaces the defaults — pass `[]` to disable substring blocking. |
-| `allow_list` | String[] | `[]` | User-Agent substrings that always pass. Evaluated before `blocked_patterns`. Case-insensitive. |
+| `blocked_patterns` | String[] | `["curl","wget","python-requests","python-urllib","scrapy","httpclient","java/","libwww-perl","mechanize","php/"]` | User-Agent substrings to reject. Case-insensitive. Setting this field replaces the defaults. Setting it to `[]` requires a non-empty `allow_list`, otherwise the config is rejected as a no-op. |
+| `allow_list` | String[] | `[]` | User-Agent tokens that always pass, evaluated before `blocked_patterns` (allow wins). Case-insensitive and word-boundary anchored, so an entry only matches when it appears as a standalone token. |
 | `allow_missing_user_agent` | bool | `true` | Allow requests with no `User-Agent` header. Default keeps health checks and load-balancer probes working. |
 | `custom_response_code` | u16 | `403` | HTTP status code for blocked requests. Values outside 100–599 (or non-numeric) are coerced to 403. |
 
