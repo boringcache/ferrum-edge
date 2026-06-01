@@ -3,10 +3,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
 
 use crate::identity::ca::PublishedTrustBundle;
 use crate::identity::spiffe::SpiffeId;
@@ -556,14 +557,64 @@ fn mesh_cert_expiry_series_is_stale(expires_at: u64, last_observed_at: u64, now:
 
 /// Build a `MeshRequestKey` from a transaction summary.
 ///
-/// Performance follow-up: this allocates ~11 `Arc<str>` values per call from
-/// `metadata_arc` / `metadata_arc_or_clone` / `metadata_arc_any`, called from
-/// three hot paths (RED metrics, service-graph aggregation, log shaping). The
-/// label space is small and bounded (workload / namespace / principal /
-/// app / service / protocol / response-flags / security-policy), so a process-
-/// wide interning pool keyed by `&str -> Arc<str>` would let these become a
-/// single hash lookup per call. Tracked as a follow-up to keep the W1 slice
-/// focused on routing parity.
+/// Hard cap on the number of distinct interned mesh-label values.
+///
+/// The legitimate mesh label space (workload / namespace / principal / app /
+/// service / protocol / response-flags / security-policy) is small and
+/// bounded, so this comfortably covers steady-state cardinality. Some label
+/// values (e.g. workload / namespace) are attacker-influenceable in certain
+/// topologies, so the pool is capped to stay a bounded memory cost rather than
+/// an unbounded growth vector: once full it simply stops interning new values
+/// and falls back to a per-call allocation (no worse than the prior behavior).
+const MESH_LABEL_INTERN_CAP: usize = 4096;
+
+/// Process-wide intern pool that turns repeated mesh-label `&str` values into a
+/// shared `Arc<str>` so [`mesh_request_key`] can clone (atomic increment)
+/// instead of heap-allocating a fresh `Arc` per field on every call.
+static MESH_LABEL_INTERN: LazyLock<DashMap<Box<str>, Arc<str>>> = LazyLock::new(DashMap::new);
+static MESH_LABEL_INTERN_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Intern a mesh label value into a shared `Arc<str>`.
+///
+/// On the steady-state hot path (a previously-seen value) this is a single
+/// hash lookup plus a cheap `Arc::clone`. A first-seen value allocates once and
+/// is cached. Once the pool reaches [`MESH_LABEL_INTERN_CAP`] distinct values
+/// it stops growing and falls back to a plain `Arc::from`, keeping memory
+/// bounded under adversarial cardinality.
+fn intern_label(value: &str) -> Arc<str> {
+    if let Some(existing) = MESH_LABEL_INTERN.get(value) {
+        return Arc::clone(existing.value());
+    }
+    if MESH_LABEL_INTERN_COUNT
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+            (count < MESH_LABEL_INTERN_CAP).then_some(count + 1)
+        })
+        .is_err()
+    {
+        return Arc::from(value);
+    }
+
+    match MESH_LABEL_INTERN.entry(Box::from(value)) {
+        Entry::Occupied(entry) => {
+            MESH_LABEL_INTERN_COUNT.fetch_sub(1, Ordering::Relaxed);
+            Arc::clone(entry.get())
+        }
+        Entry::Vacant(entry) => {
+            let interned = Arc::from(value);
+            entry.insert(Arc::clone(&interned));
+            interned
+        }
+    }
+}
+
+/// Build the RED/service-graph metric key for a mesh request.
+///
+/// Per-field label values are interned via [`intern_label`] so repeated label
+/// values (the common case — a bounded set of workloads / namespaces /
+/// protocols) become a hash lookup plus an `Arc` clone rather than ~11 fresh
+/// heap allocations per call. This runs on the `log` phase (RED metrics,
+/// service-graph aggregation, log shaping) and is gated off unless mesh
+/// metrics / the service graph are enabled.
 pub fn mesh_request_key(summary: &TransactionSummary) -> Option<MeshRequestKey> {
     if !summary.metadata.keys().any(|key| key.starts_with("mesh.")) {
         return None;
@@ -631,7 +682,7 @@ pub fn mesh_request_key(summary: &TransactionSummary) -> Option<MeshRequestKey> 
 }
 
 fn metadata_arc(metadata: &HashMap<String, String>, key: &str, default: &str) -> Arc<str> {
-    Arc::from(metadata.get(key).map(String::as_str).unwrap_or(default))
+    intern_label(metadata.get(key).map(String::as_str).unwrap_or(default))
 }
 
 fn trust_bundle_fingerprint(roots_der: &[Vec<u8>]) -> u64 {
@@ -648,7 +699,7 @@ fn trust_bundle_fingerprint(roots_der: &[Vec<u8>]) -> u64 {
 }
 
 fn metadata_arc_any(metadata: &HashMap<String, String>, keys: &[&str], default: &str) -> Arc<str> {
-    Arc::from(
+    intern_label(
         keys.iter()
             .find_map(|key| metadata.get(*key).map(String::as_str))
             .unwrap_or(default),
@@ -662,7 +713,7 @@ fn metadata_arc_or_clone(
 ) -> Arc<str> {
     metadata
         .get(key)
-        .map(|value| Arc::from(value.as_str()))
+        .map(|value| intern_label(value.as_str()))
         .unwrap_or_else(|| Arc::clone(default))
 }
 

@@ -715,10 +715,14 @@ pub fn is_json_content_type(content_type: &str) -> bool {
 
 /// Check if a response Content-Type is Server-Sent Events.
 ///
-/// ASCII case-insensitive and allocation-free.
+/// ASCII case-insensitive and allocation-free. A substring (not exact
+/// media-type) match is intentional here: callers use this only to skip
+/// buffering/transforming streaming responses, so erring toward "leave it
+/// streaming" is the safe default — vendor-prefixed SSE types (e.g.
+/// `application/vnd.*-event-stream`) are also treated as SSE. The `event-stream`
+/// substring already covers `text/event-stream`, so no second check is needed.
 pub fn is_event_stream_content_type(content_type: &str) -> bool {
-    ascii_contains_ignore_case(content_type, "text/event-stream")
-        || ascii_contains_ignore_case(content_type, "event-stream")
+    ascii_contains_ignore_case(content_type, "event-stream")
 }
 
 /// ASCII-insensitive substring check. Zero allocation.

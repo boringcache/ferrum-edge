@@ -348,8 +348,22 @@ impl super::Plugin for SsePlugin {
 
         // Build the SSE event. Per the spec, multi-line data uses one
         // `data:` field per line, and a blank line terminates the event.
+        //
+        // The WHATWG/W3C EventSource wire format treats CR, LF, *or* CRLF as a
+        // line terminator, but `str::lines()` only splits on `\n` and `\r\n`. A
+        // lone `\r` would therefore survive verbatim into the output and be
+        // re-interpreted by the client's parser as a field/line boundary,
+        // letting upstream-controlled bytes inject arbitrary `data:`/`event:`/
+        // `id:`/`retry:` fields or forge an event boundary (blank line). Since
+        // this hook wraps untrusted non-SSE upstream bytes into trusted SSE
+        // framing, normalize every terminator (CRLF and lone CR) to LF first so
+        // no bare CR ever reaches the wire and each upstream logical line maps
+        // to exactly one escaped `data:` field. The `\r\n` pass runs before the
+        // lone-`\r` pass so a CRLF does not become a double LF (spurious empty
+        // data line).
         let body_str = String::from_utf8_lossy(body);
-        let mut output = Vec::with_capacity(body.len() + 64);
+        let normalized = body_str.replace("\r\n", "\n").replace('\r', "\n");
+        let mut output = Vec::with_capacity(normalized.len() + 64);
 
         // Prepend `retry:` field if configured — tells the EventSource client
         // how long to wait before reconnecting after a disconnect.
@@ -357,7 +371,7 @@ impl super::Plugin for SsePlugin {
             output.extend_from_slice(retry_field);
         }
 
-        for line in body_str.lines() {
+        for line in normalized.lines() {
             output.extend_from_slice(b"data: ");
             output.extend_from_slice(line.as_bytes());
             output.push(b'\n');

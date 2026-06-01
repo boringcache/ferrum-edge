@@ -903,3 +903,59 @@ async fn test_namespace_label_with_stream_metrics() {
         r#"ferrum_stream_duration_ms_bucket{proxy_id="stream-ns",le="+Inf",namespace="prod"} 1"#
     ));
 }
+
+/// Finding #78: `mesh_request_key` interns label values, so two calls with the
+/// same metadata return `Arc<str>` handles backed by the *same* allocation
+/// rather than 11 fresh heap allocations per call. Before interning, every call
+/// did `Arc::from(&str)`, so the pointers would differ.
+#[test]
+fn test_mesh_request_key_interns_repeated_label_values() {
+    fn mesh_summary() -> TransactionSummary {
+        let mut summary = make_summary("payments-proxy", "GET", 200, 42.0, 35.0);
+        summary.metadata = HashMap::from([
+            ("mesh.source.workload".to_string(), "frontend".to_string()),
+            ("mesh.source.namespace".to_string(), "default".to_string()),
+            (
+                "mesh.destination.workload".to_string(),
+                "payments".to_string(),
+            ),
+            ("mesh.request_protocol".to_string(), "grpc".to_string()),
+            (
+                "mesh.connection_security_policy".to_string(),
+                "mutual_tls".to_string(),
+            ),
+        ]);
+        summary
+    }
+
+    let first = prometheus_helpers::mesh_request_key(&mesh_summary())
+        .expect("mesh metadata present yields a key");
+    let second = prometheus_helpers::mesh_request_key(&mesh_summary())
+        .expect("mesh metadata present yields a key");
+
+    // Same interned allocation across calls (present values and defaults alike).
+    assert!(
+        Arc::ptr_eq(&first.source_workload, &second.source_workload),
+        "present label values should be interned to one allocation"
+    );
+    assert!(Arc::ptr_eq(
+        &first.request_protocol,
+        &second.request_protocol
+    ));
+    assert!(Arc::ptr_eq(
+        &first.connection_security_policy,
+        &second.connection_security_policy
+    ));
+    // A default-filled field (no `mesh.source.principal` key → "unknown") is
+    // also interned across calls.
+    assert!(Arc::ptr_eq(
+        &first.source_principal,
+        &second.source_principal
+    ));
+
+    // Sanity: the key still carries the expected values.
+    assert_eq!(&*first.source_workload, "frontend");
+    assert_eq!(&*first.destination_workload, "payments");
+    assert_eq!(&*first.request_protocol, "grpc");
+    assert_eq!(&*first.source_principal, "unknown");
+}

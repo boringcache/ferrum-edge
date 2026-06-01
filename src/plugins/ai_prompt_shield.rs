@@ -34,6 +34,15 @@ const STRUCTURAL_KEYS: &[&str] = &[
     "tool_call_id",
 ];
 
+/// Top-level request fields that carry prompt text in non-`messages` LLM
+/// request shapes. Scanned in `ScanMode::Content` in addition to
+/// `messages[].content`: OpenAI legacy completions use `prompt`, the
+/// Responses API and embeddings use `input`, OpenAI Responses uses
+/// `instructions`, and Anthropic carries a top-level `system` string. Each may
+/// be a string, an array of strings, or an array of `{type:"text", text:"..."}`
+/// parts.
+const CONTENT_SCAN_FIELDS: &[&str] = &["prompt", "input", "instructions", "system"];
+
 /// Action to take when PII is detected.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ShieldAction {
@@ -268,6 +277,21 @@ impl AiPromptShield {
                         }
                     }
                 }
+                // Many widely-used LLM request shapes do not use a `messages`
+                // array: OpenAI legacy completions use `prompt`, the Responses
+                // API and embeddings use `input`, and Anthropic carries a
+                // top-level `system` string alongside `messages`. Without
+                // scanning these, Content mode silently passes PII through on
+                // those endpoints. Each field may be a string, an array of
+                // strings, or an array of `{type:"text", text:"..."}` parts.
+                for field in CONTENT_SCAN_FIELDS {
+                    if *field == "system" && self.exclude_roles.contains("system") {
+                        continue;
+                    }
+                    if let Some(value) = json.get(field) {
+                        collect_field_text(value, &self.exclude_roles, &mut texts);
+                    }
+                }
                 texts
             }
         }
@@ -339,10 +363,12 @@ impl AiPromptShield {
             // recursive walker to cover any PII in sibling fields
             // (metadata, tool arguments, custom top-level strings) that
             // the structured redactor doesn't touch. The recursive walker
-            // honors STRUCTURAL_KEYS so model names, IDs, and system
-            // parameters remain untouched. Running structured first is
-            // safe because its [REDACTED:...] placeholders do not match
-            // any PII regex on the subsequent recursive pass.
+            // preserves only TOP-LEVEL structural scalar values (model
+            // names, IDs, request parameters) so they remain untouched
+            // while PII hidden under nested structural keys is still
+            // redacted. Running structured first is safe because its
+            // [REDACTED:...] placeholders do not match any PII regex on the
+            // subsequent recursive pass.
             let has_known_messages = json
                 .get("messages")
                 .and_then(|m| m.as_array())
@@ -350,7 +376,7 @@ impl AiPromptShield {
             if has_known_messages {
                 self.redact_body(&mut json);
             }
-            redact_json_strings(&mut json, &self.patterns);
+            redact_json_strings(&mut json, &self.patterns, true);
             return Some(json);
         }
 
@@ -395,6 +421,19 @@ impl AiPromptShield {
                         }
                     }
                 }
+            }
+        }
+
+        // Redact the same non-`messages` prompt fields scanned by
+        // `extract_scan_text` so Content-mode detection and redaction stay
+        // symmetric — otherwise PII in `prompt`/`input`/`system` would be
+        // reported as redacted but forwarded unredacted (a fail-open bypass).
+        for field in CONTENT_SCAN_FIELDS {
+            if *field == "system" && self.exclude_roles.contains("system") {
+                continue;
+            }
+            if let Some(value) = json.get_mut(field) {
+                redact_field_text(value, &self.exclude_roles, &|text| self.redact_text(text));
             }
         }
     }
@@ -685,11 +724,159 @@ fn optional_positive_usize(config: &Value, field: &'static str) -> Result<Option
         .map_err(|_| format!("ai_prompt_shield: '{field}' is too large for this platform"))
 }
 
-/// Recursively redact PII in all string values within a JSON Value,
-/// skipping fields with structural keys (model name, IDs, roles, parameters)
-/// that should never be rewritten even when their values incidentally match
-/// a PII regex.
-fn redact_json_strings(value: &mut Value, patterns: &[PiiPattern]) {
+/// Collect scannable prompt text from a top-level LLM field that may be a
+/// string, an array of strings, or an array of `{type:"text", text:"..."}`
+/// content parts (e.g. `prompt`, `input`, `system`). Pushes borrowed `&str`
+/// slices onto `texts`. Non-text array entries are ignored.
+/// Text content-part `type` values across the major LLM APIs. The OpenAI Chat
+/// API and Anthropic Messages API use `text`; the OpenAI Responses API uses
+/// `input_text` (request) and `output_text` (response).
+fn is_text_content_part_type(part_type: &str) -> bool {
+    matches!(part_type, "text" | "input_text" | "output_text")
+}
+
+/// Collect scannable text from a top-level LLM content field
+/// (`prompt`/`input`/`instructions`/`system`). Handles a plain string, an array
+/// of strings, an array of `{type: text|input_text|output_text, text}` content
+/// parts, and the structured OpenAI Responses `input` shape — an array of
+/// message objects `{role, content: <string | array of parts>}` — by recursing
+/// into each message's `content`.
+fn collect_field_text<'a>(
+    value: &'a Value,
+    exclude_roles: &HashSet<String>,
+    texts: &mut Vec<&'a str>,
+) {
+    match value {
+        Value::String(s) => texts.push(s.as_str()),
+        Value::Array(items) => {
+            for item in items {
+                match item {
+                    Value::String(s) => texts.push(s.as_str()),
+                    Value::Object(obj) => {
+                        if obj
+                            .get("type")
+                            .and_then(|t| t.as_str())
+                            .is_some_and(is_text_content_part_type)
+                        {
+                            if let Some(text) = obj.get("text").and_then(|t| t.as_str()) {
+                                texts.push(text);
+                            }
+                        } else if let Some(content) = obj.get("content") {
+                            if obj
+                                .get("role")
+                                .and_then(|r| r.as_str())
+                                .is_some_and(|role| exclude_roles.contains(role))
+                            {
+                                continue;
+                            }
+                            // Message object `{role, content}` (structured
+                            // Responses `input`): scan its content.
+                            collect_field_text(content, exclude_roles, texts);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // A field that is itself a single message object `{role, content}`.
+        Value::Object(obj) => {
+            if let Some(content) = obj.get("content") {
+                if obj
+                    .get("role")
+                    .and_then(|r| r.as_str())
+                    .is_some_and(|role| exclude_roles.contains(role))
+                {
+                    return;
+                }
+                collect_field_text(content, exclude_roles, texts);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Redact PII in a top-level LLM field that may be a string, an array of
+/// strings, or an array of `{type:"text", text:"..."}` content parts (e.g.
+/// `prompt`, `input`, `instructions`, `system`). Mirrors `collect_field_text`
+/// so detection and redaction stay symmetric — anything scanned for PII is
+/// also rewritten.
+fn redact_field_text(
+    value: &mut Value,
+    exclude_roles: &HashSet<String>,
+    redact: &impl Fn(&str) -> String,
+) {
+    match value {
+        Value::String(s) => {
+            let redacted = redact(s);
+            if redacted != *s {
+                *s = redacted;
+            }
+        }
+        Value::Array(items) => {
+            for item in items.iter_mut() {
+                match item {
+                    Value::String(s) => {
+                        let redacted = redact(s);
+                        if redacted != *s {
+                            *s = redacted;
+                        }
+                    }
+                    Value::Object(obj) => {
+                        if obj
+                            .get("type")
+                            .and_then(|t| t.as_str())
+                            .is_some_and(is_text_content_part_type)
+                        {
+                            if let Some(text) = obj.get("text").and_then(|t| t.as_str()) {
+                                let redacted = redact(text);
+                                if redacted != text {
+                                    obj.insert("text".to_string(), Value::String(redacted));
+                                }
+                            }
+                        } else if obj
+                            .get("role")
+                            .and_then(|r| r.as_str())
+                            .is_some_and(|role| exclude_roles.contains(role))
+                        {
+                            continue;
+                        } else if let Some(content) = obj.get_mut("content") {
+                            redact_field_text(content, exclude_roles, redact);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Value::Object(obj) => {
+            let excluded = obj
+                .get("role")
+                .and_then(|r| r.as_str())
+                .is_some_and(|role| exclude_roles.contains(role));
+            if !excluded && let Some(content) = obj.get_mut("content") {
+                redact_field_text(content, exclude_roles, redact);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Recursively redact PII in all string values within a JSON Value.
+///
+/// `STRUCTURAL_KEYS` (model name, IDs, roles, request parameters) exists to
+/// protect *top-level* request fields whose scalar values may incidentally
+/// match a PII regex (e.g. a `model` name or an `id`) from being corrupted.
+/// That protection is applied ONLY to a scalar string held directly by a
+/// structural key at the top level of the body. Below the top level, those
+/// same key names are attacker-controllable hiding spots, so PII nested under
+/// them — e.g. `{"metadata":{"type":"<PII>"}}` or `{"id":{"note":"<PII>"}}` —
+/// is still redacted. The walker also always recurses into nested objects and
+/// arrays even under a top-level structural key, so PII cannot be hidden by
+/// wrapping it in a container. Without this, redaction was fail-open: PII was
+/// reported as detected but forwarded to the provider unredacted purely
+/// because of attacker-controlled JSON structure.
+///
+/// `top_level` is true only for the root object's direct fields.
+fn redact_json_strings(value: &mut Value, patterns: &[PiiPattern], top_level: bool) {
     match value {
         Value::String(s) => {
             let mut result = s.clone();
@@ -705,15 +892,20 @@ fn redact_json_strings(value: &mut Value, patterns: &[PiiPattern]) {
         }
         Value::Array(arr) => {
             for item in arr.iter_mut() {
-                redact_json_strings(item, patterns);
+                redact_json_strings(item, patterns, false);
             }
         }
         Value::Object(map) => {
             for (k, val) in map.iter_mut() {
-                if STRUCTURAL_KEYS.contains(&k.as_str()) {
+                // Preserve only top-level structural scalar strings (the
+                // model name, IDs, roles, and request parameters an operator
+                // legitimately sends). Always recurse into nested
+                // objects/arrays, and never skip nested occurrences of these
+                // key names, so PII cannot hide under a structural key.
+                if top_level && STRUCTURAL_KEYS.contains(&k.as_str()) && val.is_string() {
                     continue;
                 }
-                redact_json_strings(val, patterns);
+                redact_json_strings(val, patterns, false);
             }
         }
         _ => {}

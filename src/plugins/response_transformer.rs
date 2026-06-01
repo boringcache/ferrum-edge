@@ -336,13 +336,25 @@ impl Plugin for ResponseTransformer {
     }
 
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
+        // Honor the RTDS runtime kill-switch here, mirroring the early
+        // `return None` in `transform_response_body`. When the overlay disables
+        // this scope the transform is a no-op, so we must not pin the response
+        // into the buffered path — otherwise a disabled transform still buffers
+        // a large/streaming non-SSE response until the max-response-body limit
+        // and then 502s, defeating the very buffering relief the kill-switch is
+        // meant to provide. `rules_enabled()` reads request-time overlay state,
+        // so it belongs in this per-request gate (not the cache-level
+        // `requires_response_body_buffering` upper bound). (Finding #64.)
+        //
         // Skip body buffering for SSE requests (`Accept: text/event-stream`).
         // Body transforms operate on the assembled response body — applying
         // them to an unbounded event stream would buffer until the
         // max-response-body limit is hit and then 502. SSE transforms are
         // out of scope; operators should configure body transforms only for
         // non-SSE proxies, or layer a frame-level plugin on top.
-        !self.body_rules.is_empty() && !super::utils::sse::is_sse_request(ctx)
+        !self.body_rules.is_empty()
+            && self.rules_enabled()
+            && !super::utils::sse::is_sse_request(ctx)
     }
 
     async fn after_proxy(

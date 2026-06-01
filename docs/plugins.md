@@ -185,6 +185,8 @@ Retries fire on transport errors and 5xx responses. A **4xx response other than 
 
 `endpoint_url` must be a valid `http://` or `https://` URL with a hostname. Malformed or non-HTTP URLs reject plugin creation at config load time instead of failing later in the background flush task.
 
+The `endpoint_url` is also subject to the gateway's outbound SSRF policy `FERRUM_BACKEND_ALLOW_IPS` (default `both`, see [Configuration](configuration.md)): a literal-IP endpoint is screened at config-load time, and every resolved address is screened at send time, the same way proxy backends are. With the default `both` this is a no-op (internal/loopback sinks like a local agent are allowed); under `private`/`public` a sink pointing at a disallowed address (e.g. a public IP under `private`, or loopback/RFC1918/`169.254.169.254` under `public`) is rejected. The same applies to `loki_logging`'s endpoint.
+
 `custom_headers` accepts a JSON object of header name → value pairs. All headers are sent with every batch POST request. This supports services that require non-standard authentication headers (e.g., `DD-API-KEY` for Datadog, `Api-Key` for New Relic, `X-Sumo-Category` for Sumo Logic). Use `Authorization` as a key for services that authenticate via the standard Authorization header (e.g., Splunk HEC, Logtail).
 
 ```yaml
@@ -1271,6 +1273,8 @@ Authenticates requests using the client's TLS/DTLS certificate, matching a confi
 
 **Supported `cert_field` values:** `subject_cn`, `subject_ou`, `subject_o`, `san_dns`, `san_email`, `fingerprint_sha256`, `serial`
 
+> **`serial` format.** The serial identity is the lowercase hex serial number value — no separators, matching the lowercase of `openssl x509 -serial -noout -in cert.pem` output. DER may include a leading `00` sign-padding byte for positive serials whose high bit is set, but OpenSSL's serial value omits that DER-only pad and Ferrum strips it before lookup (for example, DER bytes `00 C0 01` match stored identity `c001`). Preserve real serial value zeros, but do not add DER sign padding and do not use the colon-separated form from `openssl x509 -text`.
+
 **Consumer credential** (`mtls_auth`) — array:
 ```yaml
 credentials:
@@ -1604,6 +1608,20 @@ plugins:
 ```
 
 The plugin sets `ctx.authenticated_identity` to the LDAP username. When `consumer_mapping` is enabled (default), it also attempts to find a matching gateway Consumer for ACL and rate-limiting integration.
+
+**Status codes:** The plugin distinguishes failure classes so clients and operators get an accurate signal:
+
+| Outcome | Status |
+|---|---|
+| Invalid credentials, or user not found | `401` |
+| Authenticated but not in any `required_groups` | `403` |
+| Backend/config failure — directory unreachable, service-account bind failure/rejection, or search RPC error | `500` |
+
+A directory outage or a misconfigured service account therefore returns `500` (`LDAP authentication temporarily unavailable`), **not** `401` — returning `401` would tell the client its credentials are wrong, prompting useless re-submission and masking the operational problem. The specific cause is logged (via `warn!`) but never sent to the client.
+
+**Group search and service accounts:** When `required_groups` is set, the group-membership search binds with the service account if one is configured. With direct bind and **no** service account, the search runs over an **anonymous** bind — many directories deny anonymous reads of group objects / `member` attributes, in which case the search returns no entries and an entitled user is wrongly denied (`403`). The plugin logs a startup warning for this configuration and a per-request warning when an anonymous group search returns zero entries. **Configure a service account whenever you use `required_groups`** unless the directory is known to permit anonymous group searches.
+
+**TLS and revocation:** `ldaps://` and STARTTLS connections use rustls with the gateway's CA settings (`FERRUM_TLS_CA_BUNDLE_PATH`, `FERRUM_TLS_NO_VERIFY`). When a CRL is configured (`FERRUM_TLS_CRL_FILE_PATH`) and verification is not disabled, revoked LDAP server certificates are rejected — the same revocation guarantee as the proxy backend, DTLS, frontend mTLS, and rustls logging-sink surfaces.
 
 **Input escaping:** Usernames are automatically escaped before interpolation into LDAP queries — DN values are escaped per RFC 4514 and filter values per RFC 4515. This prevents LDAP injection attacks from usernames containing special characters like `*`, `(`, `)`, `\`, `,`, or `=`.
 
@@ -2171,15 +2189,15 @@ See [cors_plugin.md](cors_plugin.md) for detailed configuration and troubleshoot
 
 ### `bot_detection`
 
-Detects and blocks bot traffic based on case-insensitive User-Agent substring matching. The allow list is consulted before blocked patterns, so a User-Agent containing a blocked substring can still pass when it also matches an allow-list entry.
+Detects and blocks bot traffic based on the User-Agent header. `blocked_patterns` are case-insensitive substring matches; `allow_list` entries are case-insensitive word-boundary matches and are consulted before blocked patterns, so a User-Agent containing a blocked substring can still pass when it also matches an allow-list entry as a standalone token. The User-Agent is client-controlled and spoofable, so treat this as a coarse first filter rather than strong bot verification.
 
 **Priority:** 200
 **Supported protocols:** HTTP, gRPC, WebSocket
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `blocked_patterns` | String[] | `["curl","wget","python-requests","python-urllib","scrapy","httpclient","java/","libwww-perl","mechanize","php/"]` | User-Agent substrings to reject. Case-insensitive. Setting this field replaces the defaults — pass `[]` to disable substring blocking. |
-| `allow_list` | String[] | `[]` | User-Agent substrings that always pass. Evaluated before `blocked_patterns`. Case-insensitive. |
+| `blocked_patterns` | String[] | `["curl","wget","python-requests","python-urllib","scrapy","httpclient","java/","libwww-perl","mechanize","php/"]` | User-Agent substrings to reject. Case-insensitive. Setting this field replaces the defaults. Setting it to `[]` is valid only when `allow_missing_user_agent: false` creates a missing-header reject path; an allow-list alone is not enforcement. |
+| `allow_list` | String[] | `[]` | User-Agent tokens that always pass, evaluated before `blocked_patterns` (allow wins). Case-insensitive and word-boundary anchored, so an entry only matches when it appears as a standalone token. |
 | `allow_missing_user_agent` | bool | `true` | Allow requests with no `User-Agent` header. Default keeps health checks and load-balancer probes working. |
 | `custom_response_code` | u16 | `403` | HTTP status code for blocked requests. Values outside 100–599 (or non-numeric) are coerced to 403. |
 
@@ -3539,7 +3557,7 @@ Request buffering is only enabled for matching JSON `POST` requests when the plu
 | `action` | String | `"reject"` | `reject`, `redact`, or `warn` |
 | `patterns` | String[] | `["ssn", "credit_card", "api_key", "aws_key"]` | Built-in patterns to enable |
 | `custom_patterns` | Object[] | `[]` | Custom `{name, regex}` patterns |
-| `scan_fields` | String | `"content"` | `content` or `all` |
+| `scan_fields` | String | `"content"` | `content` (LLM prompt fields only) or `all` (entire body) |
 | `exclude_roles` | String[] | `[]` | Message roles to skip scanning |
 | `redaction_placeholder` | String | `"[REDACTED:{type}]"` | Template for redacted text |
 | `max_scan_bytes` | Integer | `1048576` | Skip scanning if body exceeds this size |
@@ -3548,7 +3566,9 @@ Request buffering is only enabled for matching JSON `POST` requests when the plu
 
 Unknown built-in pattern names and built-in patterns that fail to compile are now fatal at construction time (previously they silently dropped detection coverage). All configured patterns are merged into a single `RegexSet` for O(text_len) detection per scan, regardless of pattern count.
 
-In `scan_fields: "all"` mode, the recursive walker skips JSON object keys that hold structural data (`model`, `id`, `role`, `type`, `temperature`, `top_p`, `max_tokens`, etc.) so values that incidentally match a PII regex are not corrupted. When the body has a recognized chat shape (`messages` array), the structured redactor that only touches `messages[].content` is preferred even in `all` mode.
+`scan_fields: "content"` (default) scans LLM prompt text across the common request shapes: chat `messages[].content` (string or multimodal text parts), plus the top-level `prompt` (OpenAI legacy completions), `input` (Responses API and embeddings), and `system` (Anthropic) fields — each accepted as a string, an array of strings, or an array of `{type: "text", text}` parts. Both detection and redaction cover these fields. For request bodies that carry prompt text in other, non-standard fields, use `scan_fields: "all"`.
+
+In `scan_fields: "all"` mode, the recursive walker preserves JSON values that hold structural data (`model`, `id`, `role`, `type`, `temperature`, `top_p`, `max_tokens`, etc.) **only when the structural key is a top-level field holding a scalar string** — i.e. the request parameters an operator legitimately sends. It always recurses into nested objects and arrays and never skips nested occurrences of those key names, so PII hidden under a structural key (e.g. `{"metadata": {"type": "<PII>"}}` or `{"id": {"note": "<PII>"}}`) is still redacted rather than passed through. When the body has a recognized chat shape (`messages` array), the structured redactor that touches `messages[].content` runs first and the recursive walker then covers sibling fields.
 
 ```yaml
 plugin_name: ai_prompt_shield
@@ -3579,7 +3599,7 @@ Validates and filters LLM response content before it reaches the client. Complem
 | `max_scan_bytes` | Integer | `1048576` | Skip scanning if body exceeds this size |
 | `require_json` | bool | `false` | Reject responses that are not valid JSON |
 | `required_fields` | String[] | `[]` | Required top-level JSON fields (rejects with 502 if missing) |
-| `max_completion_length` | Integer | `0` | Maximum completion text length in characters (0 = unlimited) |
+| `max_completion_length` | Integer | `0` | Maximum completion text length in characters — Unicode scalar values, not UTF-8 bytes (0 = unlimited) |
 
 At least one of `pii_patterns`, `blocked_phrases`, `blocked_patterns`, `require_json`, `required_fields`, or `max_completion_length` must be configured.
 
@@ -3587,7 +3607,11 @@ At least one of `pii_patterns`, `blocked_phrases`, `blocked_patterns`, `require_
 
 Unknown built-in pattern names and built-in patterns that fail to compile are fatal at construction time (previously they silently dropped detection coverage). All configured patterns are merged into a single `RegexSet` for O(text_len) detection per scan.
 
-In `scan_fields: "all"` mode, the recursive redactor skips JSON object keys that hold structural data (`id`, `model`, `created`, `role`, `type`, `index`, `finish_reason`, `usage`, etc.) so timestamps and identifiers that look like dotted-quad IPs or other PII patterns are not corrupted. When the body has a recognized AI response shape (`choices`, `content`, or `candidates`), the structured redactor that only touches completion fields is preferred.
+In `scan_fields: "all"` mode, the recursive redactor preserves only **top-level scalar** structural fields (`id`, `model`, `created`, `role`, `type`, `index`, `finish_reason`, `usage`, etc.) so timestamps and identifiers that look like dotted-quad IPs or other PII patterns are not corrupted. It always recurses into nested objects and arrays — including nested occurrences of those same key names — so PII cannot evade redaction by being nested under a structural key (e.g. `{"choices":[{"message":{"type":"<SSN>"}}]}` is still redacted). When the body has a recognized AI response shape (`choices`, `content`, or `candidates`), the structured redactor that only touches completion fields is preferred.
+
+The `redaction_placeholder` template is emitted literally: any `$`-sequences in it (or in a pattern/phrase name interpolated into `{type}`, such as a blocked phrase `cost $5`) are written verbatim and are never interpreted as regex capture-group references.
+
+**Streaming (SSE) limitation:** In `redact` mode over `text/event-stream`, redaction is applied per `data:` frame. PII that spans two or more consecutive frames (e.g. half of a credit-card number per chunk) is detected on the accumulated stream but cannot be redacted per-frame, so it passes through to the client and only a `warn` log is emitted. Use `action: reject` for a hard guarantee that frame-straddling PII is blocked. (Note that genuine streaming clients — `Accept: text/event-stream` or upstream-detected streaming — are not buffered, so this redaction path runs only for buffered SSE-framed responses.)
 
 **Multi-provider support:** Extracts completion text from OpenAI (`choices[].message.content`), Anthropic (`content[].text`), and Google Gemini (`candidates[].content.parts[].text`) response formats.
 
