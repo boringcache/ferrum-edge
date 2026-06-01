@@ -1006,3 +1006,78 @@ async fn test_response_transformer_overlay_gate_observable_end_to_end() {
     runtime_overlay::reset_for_test();
     ferrum_edge::plugins::request_transformer::runtime_overlay::reset_for_test();
 }
+
+// Regression for finding #64: when the RTDS overlay disables the scope, the
+// transform is a no-op, so `should_buffer_response_body` must NOT pin the
+// response into the buffered path (otherwise a disabled transform still buffers
+// a large non-SSE response until the max-response-body limit and 502s). The
+// cache-level `requires_response_body_buffering` upper bound stays true since
+// it cannot consult request-time overlay state.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn test_response_transformer_disabled_overlay_skips_response_buffering() {
+    use ferrum_edge::modes::mesh::config::{MeshRuntimeOverlay, RuntimeValue};
+    use ferrum_edge::plugins::response_transformer::runtime_overlay;
+    let _guard = ferrum_edge::modes::mesh::runtime_overlay_consumers::test_lock();
+
+    let plugin = ResponseTransformer::new(&json!({
+        "rules": [
+            {"operation": "rename", "target": "body", "key": "old", "new_key": "new"}
+        ],
+        "runtime_overlay_scope": "gated-buffer",
+        "default_enabled": true
+    }))
+    .unwrap();
+
+    // Cache-level upper bound is unconditional on rule shape.
+    assert!(plugin.requires_response_body_buffering());
+
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("accept".to_string(), "application/json".to_string());
+
+    // ── Overlay missing → default_enabled=true → still buffers.
+    runtime_overlay::reset_for_test();
+    assert!(
+        plugin.should_buffer_response_body(&ctx),
+        "enabled transform with body rules should buffer a non-SSE response"
+    );
+
+    // ── Overlay disables the scope → transform is a no-op → must NOT buffer.
+    let mut fields = HashMap::new();
+    fields.insert(
+        "ferrum.response_transformer.gated-buffer.enabled".to_string(),
+        RuntimeValue::Bool(false),
+    );
+    runtime_overlay::apply_overlay(&MeshRuntimeOverlay { fields });
+    assert!(
+        !plugin.should_buffer_response_body(&ctx),
+        "disabled overlay must not pin the response into the buffered path"
+    );
+
+    runtime_overlay::reset_for_test();
+}
+
+// Companion to #64 using the static fallback (no overlay state needed): a body
+// transform whose scope falls back to default_enabled=false must not buffer.
+#[tokio::test]
+async fn test_response_transformer_default_disabled_skips_response_buffering() {
+    let plugin = ResponseTransformer::new(&json!({
+        "rules": [
+            {"operation": "rename", "target": "body", "key": "old", "new_key": "new"}
+        ],
+        "runtime_overlay_scope": "absent-scope",
+        "default_enabled": false
+    }))
+    .unwrap();
+
+    assert!(plugin.requires_response_body_buffering());
+
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("accept".to_string(), "application/json".to_string());
+    assert!(
+        !plugin.should_buffer_response_body(&ctx),
+        "default_enabled=false scope must not buffer the response"
+    );
+}
