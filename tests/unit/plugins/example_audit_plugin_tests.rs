@@ -51,9 +51,7 @@ fn test_new_accepts_valid_values() {
 }
 
 fn new_err(config: serde_json::Value) -> String {
-    create_example_audit_plugin(&config)
-        .err()
-        .expect("config should be rejected")
+    create_example_audit_plugin(&config).expect_err("config should be rejected")
 }
 
 #[test]
