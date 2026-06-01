@@ -58,10 +58,7 @@ fn test_logger_config(
         batch_size,
         flush_interval: Duration::from_millis(25),
         buffer_capacity,
-        retry: RetryPolicy {
-            max_attempts: 3,
-            delay: Duration::from_millis(10),
-        },
+        retry: RetryPolicy::fixed(3, Duration::from_millis(10)),
         plugin_name,
     }
 }
@@ -338,10 +335,7 @@ async fn oversized_batch_size_is_capped_before_flush_loop() {
             batch_size: MAX_BATCH_SIZE + 1024,
             flush_interval: Duration::from_secs(60),
             buffer_capacity: MAX_BATCH_SIZE + 16,
-            retry: RetryPolicy {
-                max_attempts: 1,
-                delay: Duration::from_millis(0),
-            },
+            retry: RetryPolicy::fixed(1, Duration::from_millis(0)),
             plugin_name: "batching_logger_capped",
         },
         move |batch: Vec<usize>| {
@@ -530,10 +524,7 @@ async fn high_water_hook_fires_without_overflow_hook() {
             batch_size: 10,
             flush_interval: Duration::from_secs(60),
             buffer_capacity: 1,
-            retry: RetryPolicy {
-                max_attempts: 1,
-                delay: Duration::from_millis(0),
-            },
+            retry: RetryPolicy::fixed(1, Duration::from_millis(0)),
             plugin_name: "batching_logger_high_water",
         },
         LoggerHooks {
@@ -584,10 +575,7 @@ async fn single_attempt_flush_reuses_owned_batch_without_clone() {
 
     let logger = BatchingLogger::spawn(
         BatchConfig {
-            retry: RetryPolicy {
-                max_attempts: 1,
-                delay: Duration::from_millis(0),
-            },
+            retry: RetryPolicy::fixed(1, Duration::from_millis(0)),
             ..test_logger_config("batching_logger_single_attempt", 1, 8)
         },
         move |batch: Vec<CloneTracked>| {

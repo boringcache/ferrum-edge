@@ -1,7 +1,8 @@
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
@@ -9,14 +10,87 @@ use tracing::{debug, warn};
 const DROP_WARN_EVERY: u64 = 100;
 pub const MAX_BATCH_SIZE: usize = 10_000;
 pub const MAX_BUFFER_CAPACITY: usize = 1_000_000;
+const MAX_TOKIO_SLEEP_MS: u64 = i64::MAX as u64;
+static JITTER_COUNTER: AtomicU64 = AtomicU64::new(0);
+static JITTER_SEED: LazyLock<u64> = LazyLock::new(|| {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or(0);
+    nanos ^ u64::from(std::process::id()) ^ (&JITTER_COUNTER as *const AtomicU64 as usize as u64)
+});
 
 /// Strategy for retrying a failed flush. The flush closure owns its own
 /// status-code-aware logic (e.g. "don't retry 401/403, do retry 408/429") —
-/// `BatchingLogger` just enforces attempt count and inter-attempt delay.
+/// `BatchingLogger` enforces the attempt count and the inter-attempt delay.
+///
+/// The delay grows exponentially from `delay` (doubling each attempt), capped
+/// at `max_delay`. When `jitter` is set, the computed delay is replaced with a
+/// uniformly random value in `[0, computed_delay]` (full jitter) to avoid a
+/// thundering-herd retry storm against a struggling backend. Callers that want
+/// a constant delay set `max_delay == delay` and `jitter = false`; use
+/// [`RetryPolicy::fixed`] for that. See finding #77.
 #[derive(Clone, Copy)]
 pub struct RetryPolicy {
     pub max_attempts: u32,
+    /// Initial (and, for fixed policies, constant) inter-attempt delay.
     pub delay: Duration,
+    /// Upper bound for the exponential backoff. Must be `>= delay`; if it is
+    /// smaller it is treated as equal to `delay` (constant delay).
+    pub max_delay: Duration,
+    /// When true, apply full jitter to each backoff delay.
+    pub jitter: bool,
+}
+
+impl RetryPolicy {
+    /// A constant inter-attempt delay with no exponential growth and no jitter.
+    /// This preserves the historical `RetryPolicy { max_attempts, delay }`
+    /// behavior for callers that do not want backoff.
+    pub fn fixed(max_attempts: u32, delay: Duration) -> Self {
+        Self {
+            max_attempts,
+            delay,
+            max_delay: delay,
+            jitter: false,
+        }
+    }
+
+    /// Compute the delay to sleep AFTER a failed attempt `attempt`
+    /// (1-based: the delay following the first failure uses `attempt == 1`).
+    ///
+    /// Exponential backoff: `delay * 2^(attempt - 1)`, capped at `max_delay`.
+    /// With `jitter`, returns a uniform random value in `[0, capped]` (full
+    /// jitter). The jitter uses a lightweight counter-based PRNG — it does not
+    /// need cryptographic quality — mirroring `crate::retry::retry_delay`.
+    fn backoff_delay(&self, attempt: u32) -> Duration {
+        let base_ms = self.delay.as_millis().min(u128::from(MAX_TOKIO_SLEEP_MS)) as u64;
+        let cap_ms = self
+            .max_delay
+            .as_millis()
+            .min(u128::from(MAX_TOKIO_SLEEP_MS))
+            .max(u128::from(base_ms)) as u64;
+
+        // delay * 2^(attempt-1), saturating, then capped at max_delay.
+        let shift = attempt.saturating_sub(1).min(63);
+        let grown = base_ms.saturating_mul(1u64 << shift);
+        let capped = grown.min(cap_ms);
+
+        let final_ms = if self.jitter && capped > 0 {
+            let counter = JITTER_COUNTER
+                .fetch_add(1, Ordering::Relaxed)
+                .wrapping_add(*JITTER_SEED);
+            // LCG-style hash to spread values (same constants as crate::retry).
+            let hash = counter
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            // Full jitter: uniform in [0, capped].
+            hash % capped.saturating_add(1)
+        } else {
+            capped
+        };
+
+        Duration::from_millis(final_ms)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -284,7 +358,10 @@ async fn flush_with_retry<T, F, Fut>(
                     attempts,
                     error,
                 );
-                tokio::time::sleep(cfg.retry.delay).await;
+                // Exponential backoff (capped, optionally jittered) so a
+                // struggling backend is not hammered with a fixed-delay,
+                // no-jitter retry storm (finding #77).
+                tokio::time::sleep(cfg.retry.backoff_delay(attempt)).await;
             }
             Err(error) => {
                 if let Some(on_failed_batch) = on_failed_batch {
@@ -312,5 +389,109 @@ async fn flush_with_retry<T, F, Fut>(
                 return;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fixed_policy_has_constant_delay_no_jitter() {
+        let policy = RetryPolicy::fixed(5, Duration::from_millis(250));
+        assert_eq!(policy.max_delay, Duration::from_millis(250));
+        assert!(!policy.jitter);
+        // No growth, no jitter: every attempt yields exactly the base delay.
+        for attempt in 1..=5 {
+            assert_eq!(policy.backoff_delay(attempt), Duration::from_millis(250));
+        }
+    }
+
+    #[test]
+    fn backoff_grows_exponentially_and_caps_at_max_delay() {
+        let policy = RetryPolicy {
+            max_attempts: 10,
+            delay: Duration::from_millis(100),
+            max_delay: Duration::from_millis(1_000),
+            jitter: false,
+        };
+        // 100 * 2^(attempt-1): 100, 200, 400, 800, then capped at 1000.
+        assert_eq!(policy.backoff_delay(1), Duration::from_millis(100));
+        assert_eq!(policy.backoff_delay(2), Duration::from_millis(200));
+        assert_eq!(policy.backoff_delay(3), Duration::from_millis(400));
+        assert_eq!(policy.backoff_delay(4), Duration::from_millis(800));
+        // 100 * 2^4 = 1600 -> capped to 1000.
+        assert_eq!(policy.backoff_delay(5), Duration::from_millis(1_000));
+        assert_eq!(policy.backoff_delay(6), Duration::from_millis(1_000));
+    }
+
+    #[test]
+    fn very_large_attempt_does_not_overflow_and_stays_capped() {
+        let policy = RetryPolicy {
+            max_attempts: u32::MAX,
+            delay: Duration::from_millis(100),
+            max_delay: Duration::from_millis(5_000),
+            jitter: false,
+        };
+        // The shift is clamped and the multiply saturates, so a huge attempt
+        // index never panics and the result stays at the cap.
+        assert_eq!(policy.backoff_delay(u32::MAX), Duration::from_millis(5_000));
+        assert_eq!(
+            policy.backoff_delay(1_000_000),
+            Duration::from_millis(5_000)
+        );
+    }
+
+    #[test]
+    fn jitter_stays_within_zero_and_capped_bound() {
+        let policy = RetryPolicy {
+            max_attempts: 10,
+            delay: Duration::from_millis(100),
+            max_delay: Duration::from_millis(1_000),
+            jitter: true,
+        };
+        // At attempt 5 the capped (pre-jitter) delay is 1000ms; full jitter must
+        // produce a value in [0, 1000].
+        for _ in 0..1_000 {
+            let d = policy.backoff_delay(5);
+            assert!(
+                d <= Duration::from_millis(1_000),
+                "jittered delay {d:?} exceeded cap"
+            );
+        }
+        // Over many samples jitter must actually vary (not collapse to a constant).
+        let samples: std::collections::HashSet<u128> = (0..256)
+            .map(|_| policy.backoff_delay(5).as_millis())
+            .collect();
+        assert!(samples.len() > 1, "jitter produced no variation");
+    }
+
+    #[test]
+    fn max_delay_below_initial_is_treated_as_constant() {
+        // Defensive: if max_delay < delay, backoff_delay clamps the cap up to
+        // the base so the delay never shrinks below the configured initial.
+        let policy = RetryPolicy {
+            max_attempts: 5,
+            delay: Duration::from_millis(500),
+            max_delay: Duration::from_millis(100),
+            jitter: false,
+        };
+        assert_eq!(policy.backoff_delay(1), Duration::from_millis(500));
+        assert_eq!(policy.backoff_delay(3), Duration::from_millis(500));
+    }
+
+    #[test]
+    fn backoff_delay_is_capped_to_tokio_timer_range() {
+        let policy = RetryPolicy {
+            max_attempts: 2,
+            delay: Duration::from_millis(u64::MAX),
+            max_delay: Duration::from_millis(u64::MAX),
+            jitter: false,
+        };
+
+        assert_eq!(
+            policy.backoff_delay(1),
+            Duration::from_millis(MAX_TOKIO_SLEEP_MS)
+        );
     }
 }

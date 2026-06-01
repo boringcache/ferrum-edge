@@ -144,6 +144,37 @@ impl PluginTestHarness {
     async fn wait_for_poll(&self) {
         tokio::time::sleep(Duration::from_secs(3)).await;
     }
+
+    /// Wait until a newly-created route can complete a proxied request.
+    async fn get_until_success(&self, client: &reqwest::Client, path: &str) -> reqwest::Response {
+        let url = format!("{}{}", self.proxy_base_url, path);
+        let deadline = SystemTime::now() + Duration::from_secs(15);
+        let mut last_observation = None;
+
+        loop {
+            if SystemTime::now() >= deadline {
+                panic!(
+                    "Gateway route '{}' did not return success within 15 seconds; {}",
+                    path,
+                    last_observation
+                        .as_deref()
+                        .unwrap_or("no attempts completed")
+                );
+            }
+
+            match client.get(&url).send().await {
+                Ok(resp) if resp.status().is_success() => return resp,
+                Ok(resp) => {
+                    last_observation = Some(format!("status={}", resp.status()));
+                }
+                Err(err) => {
+                    last_observation = Some(format!("error={err}"));
+                }
+            }
+
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
 }
 
 // Drop impl omitted: `self.gw` is a TestGateway which kills the gateway
@@ -917,15 +948,8 @@ async fn test_plugin_correlation_id() {
     .await
     .unwrap();
 
-    harness.wait_for_poll().await;
-
     // Test 1: No correlation ID provided — should generate one
-    let resp = client
-        .get(format!("{}/corrid/test", harness.proxy_base_url))
-        .send()
-        .await
-        .expect("Request failed");
-    assert!(resp.status().is_success());
+    let resp = harness.get_until_success(&client, "/corrid/test").await;
 
     let request_id = resp
         .headers()
