@@ -1385,6 +1385,9 @@ fn build_provider_url(provider: &ResolvedProvider, model: &str) -> String {
 const MAX_UPSTREAM_ERROR_BYTES: usize = 512;
 
 fn cap_upstream_error_body(body: Vec<u8>) -> Vec<u8> {
+    // Return a complete JSON error document even when the upstream body is
+    // truncated, so fallback exhaustion never sends malformed JSON with an
+    // application/json content type.
     let error_text = String::from_utf8_lossy(&body[..body.len().min(MAX_UPSTREAM_ERROR_BYTES)]);
     serde_json::json!({
         "error": {
@@ -2095,7 +2098,7 @@ impl Plugin for AiFederation {
 
         // All providers exhausted
         if let Some(body) = last_body {
-            // Return the last provider's actual error response
+            // Return the last provider's capped error as valid JSON.
             let status = last_status.unwrap_or(502);
             let mut resp_headers = HashMap::new();
             resp_headers.insert("content-type".to_string(), "application/json".to_string());
