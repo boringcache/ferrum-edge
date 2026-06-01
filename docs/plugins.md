@@ -1331,7 +1331,7 @@ Authenticates using Bearer JWTs validated against one or more Identity Provider 
 | `providers[].claim_headers` | Object (optional) | Per-provider claim-to-header mappings; keys are claim paths and values are upstream header names |
 | `providers[].claim_headers_separator` | String (optional) | Separator for array claim header values |
 | `providers[].require_mtls_binding` | Boolean (optional) | Require JWT `cnf.x5t#S256` to match the frontend client certificate SHA-256 thumbprint |
-| `providers[].require_dpop` | Boolean (optional) | Require and validate a DPoP proof bound to the access token |
+| `providers[].require_dpop` | Boolean (optional) | Require and validate an RFC 9449 DPoP proof bound to the access token. The proof must carry an `ath` claim matching the SHA-256 of the presented token (§4.3); proofs without `ath` are rejected. The `htu` claim is compared after normalizing scheme/host case and default ports and ignoring query/fragment |
 | `providers[].dpop_clock_skew_secs` | u64 (optional) | DPoP `iat`/`exp` clock skew in seconds (default: `30`, max: `300`) |
 | `providers[].dpop_jti_cache_max_entries` | usize (optional) | Per-provider DPoP replay cache capacity (default: `10000`) |
 | `providers[].dpop_jti_ttl_secs` | u64 (optional) | DPoP `jti` replay cache TTL (default: `300`, must be at least twice clock skew) |
