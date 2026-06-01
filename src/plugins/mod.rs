@@ -1961,6 +1961,30 @@ pub trait Plugin: Send + Sync {
         self.requires_response_body_buffering()
     }
 
+    /// Content-type-aware refinement of [`should_buffer_response_body`].
+    ///
+    /// Evaluated once per response *after* the backend response headers arrive,
+    /// so plugins that only need the body for certain content-types (e.g. `waf`
+    /// skipping non-allowlisted/binary bodies) can release a response the proxy
+    /// would otherwise buffer and then immediately discard. The response
+    /// `Content-Type` is unknown at the pre-flight `should_buffer_response_body`
+    /// decision, which is why this is a separate hook.
+    ///
+    /// Contract: this MUST only narrow `should_buffer_response_body` — it may
+    /// return `false` where the unconditional check returned `true`, but never
+    /// the reverse. The proxy uses it solely to downgrade buffer -> stream and
+    /// never to force buffering. The default returns the content-type-agnostic
+    /// decision, so plugins that do not override it are unchanged.
+    ///
+    /// [`should_buffer_response_body`]: Plugin::should_buffer_response_body
+    fn should_buffer_response_body_for_content_type(
+        &self,
+        ctx: &RequestContext,
+        _content_type: Option<&str>,
+    ) -> bool {
+        self.should_buffer_response_body(ctx)
+    }
+
     /// Called after the full response body has been received from the backend.
     ///
     /// Only invoked when `requires_response_body_buffering()` returns `true` for

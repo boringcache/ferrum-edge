@@ -822,6 +822,56 @@ pub(crate) fn should_stream_response_body(
     }
 }
 
+/// Refine the pre-flight `stream_response` decision once the backend response
+/// headers — and therefore the response `Content-Type` — are known.
+///
+/// [`should_stream_response_body`] runs before the backend request is sent, so
+/// it cannot consult the response content-type and conservatively buffers
+/// whenever any plugin *might* need the body. This downgrades buffer -> stream
+/// when no plugin actually needs to inspect the body for THIS content-type
+/// (e.g. `waf` with `response_body_inspection` skips non-allowlisted/binary
+/// bodies), avoiding a full-body collection that would be discarded unscanned.
+///
+/// Only ever downgrades (buffer -> stream); it never forces buffering, so a
+/// plugin that needs the body (caching/compression/transform, or `waf` for an
+/// allowlisted content-type) is never affected. An explicit
+/// [`ResponseBodyMode::Buffer`] is always honored, and a `None` context leaves
+/// the pre-flight decision unchanged — callers pass `None` when retries are
+/// configured, since a retry may need to replay the response body and a
+/// non-final attempt must stay buffered.
+///
+/// The decision keys off the *backend's* response `Content-Type`. An
+/// `after_proxy` plugin can still rewrite `content-type` afterward; if it
+/// relabels a non-inspectable type as an inspectable one after a downgrade, the
+/// WAF body scan (which runs only on buffered responses) is skipped. This is an
+/// accepted, narrow trade-off: a fully consistent decision would require
+/// deferring buffer/stream selection until after `after_proxy`, and
+/// body-transforming plugins (which force buffering) are unaffected.
+pub(crate) fn refine_stream_response_for_content_type(
+    stream_response: bool,
+    proxy: &Proxy,
+    plugins: &[Arc<dyn Plugin>],
+    ctx: Option<&RequestContext>,
+    response_headers: &HashMap<String, String>,
+) -> bool {
+    if stream_response {
+        return true;
+    }
+    // Operator explicitly forced buffering for every response — honor it.
+    if !matches!(proxy.response_body_mode, ResponseBodyMode::Stream) {
+        return false;
+    }
+    let Some(ctx) = ctx else {
+        return false;
+    };
+    let content_type = response_headers.get("content-type").map(String::as_str);
+    // Keep buffering only while at least one plugin still needs the body for
+    // this content-type; otherwise stream it straight through.
+    !plugins
+        .iter()
+        .any(|plugin| plugin.should_buffer_response_body_for_content_type(ctx, content_type))
+}
+
 /// Fix 5: decide whether a plain-HTTPS direct-H2 response body should skip
 /// the `CoalescingH2Body` adapter and stream through hyper's `Incoming`
 /// directly.
@@ -11290,6 +11340,7 @@ async fn handle_proxy_request_inner(
             upstream_target.as_deref(),
             &plugins,
             body_hook_ctx.as_mut(),
+            &ctx,
             should_stream,
             requires_request_body_buffering,
             stream_request_body,
@@ -11480,6 +11531,7 @@ async fn handle_proxy_request_inner(
             upstream_target.as_deref(),
             &plugins,
             body_hook_ctx.as_mut(),
+            &ctx,
             should_stream,
             requires_request_body_buffering,
             stream_request_body,
@@ -12776,8 +12828,12 @@ async fn proxy_to_backend(
     headers: &HashMap<String, String>,
     client_request_body: ClientRequestBody,
     upstream_target: Option<&UpstreamTarget>,
-    #[allow(unused_variables)] plugins: &[Arc<dyn crate::plugins::Plugin>],
+    plugins: &[Arc<dyn crate::plugins::Plugin>],
     ctx: Option<&mut RequestContext>,
+    // Real, read-only request context for the response-side buffering decision.
+    // Distinct from `ctx` above, which is the request-body-hook clone and is
+    // `None` unless request-body buffering is active.
+    request_ctx: &RequestContext,
     stream_response: bool,
     requires_request_body_buffering: bool,
     stream_request_body: bool,
@@ -12803,6 +12859,19 @@ async fn proxy_to_backend(
     // the effective timeout automatically.
     let effective_proxy = resolve_effective_proxy_for_target(proxy, upstream_target);
     let proxy: &Proxy = effective_proxy.as_ref();
+
+    // Context for the response-side buffer->stream downgrade. Use the real
+    // request context (not the request-body-hook clone), but suppress the
+    // downgrade entirely when retries are configured: a retry may need to
+    // replay the response body, so every attempt must stay buffered rather than
+    // stream a non-final response. Non-retry requests get the real context so
+    // response-inspection-only configs (e.g. `waf` `response_body_inspection`)
+    // actually benefit.
+    let response_decision_ctx = if retain_request_body {
+        None
+    } else {
+        Some(request_ctx)
+    };
 
     // When retain_request_body is true (retries configured), the collected
     // body bytes are retained alongside the response so the caller can replay
@@ -12845,6 +12914,8 @@ async fn proxy_to_backend(
             headers,
             client_request_body,
             upstream_target,
+            plugins,
+            response_decision_ctx,
             stream_response,
             client_ip,
             is_tls,
@@ -13042,6 +13113,8 @@ async fn proxy_to_backend(
                             method,
                             headers,
                             request,
+                            plugins,
+                            response_decision_ctx,
                             stream_response,
                             client_ip,
                             is_tls,
@@ -13430,6 +13503,19 @@ async fn proxy_to_backend(
             let status = response.status().as_u16();
             let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
             collect_response_headers(response.headers(), &mut resp_headers);
+
+            // The pre-flight buffering decision could not see the response
+            // content-type. Now that headers are known, downgrade buffer ->
+            // stream for a response no plugin will inspect at this content-type
+            // (e.g. binary downloads under `waf` response inspection), so we do
+            // not collect a body that would be discarded unscanned.
+            let stream_response = refine_stream_response_for_content_type(
+                stream_response,
+                proxy,
+                plugins,
+                response_decision_ctx,
+                &resp_headers,
+            );
 
             // Enforce response body size limit
             if state.max_response_body_size_bytes > 0 {
@@ -14413,6 +14499,8 @@ async fn proxy_to_backend_hbone(
     headers: &HashMap<String, String>,
     client_request_body: ClientRequestBody,
     upstream_target: Option<&UpstreamTarget>,
+    plugins: &[Arc<dyn crate::plugins::Plugin>],
+    ctx: Option<&RequestContext>,
     stream_response: bool,
     client_ip: &str,
     is_tls: bool,
@@ -14743,6 +14831,16 @@ async fn proxy_to_backend_hbone(
     }
     let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
     collect_hyper_response_headers(response.headers(), &mut resp_headers);
+
+    // Content-type-aware buffer -> stream downgrade (see `proxy_to_backend`).
+    let stream_response = refine_stream_response_for_content_type(
+        stream_response,
+        proxy,
+        plugins,
+        ctx,
+        &resp_headers,
+    );
+
     if stream_response {
         (
             retry::BackendResponse {
@@ -14801,6 +14899,8 @@ async fn proxy_to_backend_http2(
     method: &str,
     headers: &HashMap<String, String>,
     original_req: Request<Incoming>,
+    plugins: &[Arc<dyn crate::plugins::Plugin>],
+    ctx: Option<&RequestContext>,
     stream_response: bool,
     client_ip: &str,
     is_tls: bool,
@@ -14992,6 +15092,15 @@ async fn proxy_to_backend_http2(
     let status = response.status().as_u16();
     let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
     collect_hyper_response_headers(response.headers(), &mut resp_headers);
+
+    // Content-type-aware buffer -> stream downgrade (see `proxy_to_backend`).
+    let stream_response = refine_stream_response_for_content_type(
+        stream_response,
+        proxy,
+        plugins,
+        ctx,
+        &resp_headers,
+    );
 
     if stream_response {
         retry::BackendResponse {
@@ -16238,6 +16347,36 @@ mod tests {
         }
     }
 
+    /// Buffers unconditionally at the pre-flight check but only needs the body
+    /// for one content-type once headers are known — mirrors how `waf` narrows
+    /// to its inspectable content-types.
+    struct ContentTypeBufferPlugin {
+        buffer_content_type: &'static str,
+    }
+
+    #[async_trait]
+    impl Plugin for ContentTypeBufferPlugin {
+        fn name(&self) -> &str {
+            "content_type_buffer_plugin"
+        }
+
+        fn requires_response_body_buffering(&self) -> bool {
+            true
+        }
+
+        fn should_buffer_response_body(&self, _ctx: &RequestContext) -> bool {
+            true
+        }
+
+        fn should_buffer_response_body_for_content_type(
+            &self,
+            _ctx: &RequestContext,
+            content_type: Option<&str>,
+        ) -> bool {
+            content_type == Some(self.buffer_content_type)
+        }
+    }
+
     #[async_trait]
     impl Plugin for RejectHeaderPlugin {
         fn name(&self) -> &str {
@@ -16670,6 +16809,103 @@ mod tests {
         assert_eq!(
             resp.headers.get("gateway-error-reason").map(String::as_str),
             Some(BACKEND_TLS_SNI_REQUIRES_DIRECT_H2_REASON)
+        );
+    }
+
+    /// End-to-end wiring guard for the content-type-aware buffer->stream
+    /// downgrade: drives `proxy_to_backend` against a real backend with a
+    /// response-inspecting WAF and asserts a non-inspectable (binary) response
+    /// is streamed (downgraded) while an allowlisted (json) one stays buffered.
+    /// A refactor that drops the `refine_stream_response_for_content_type` call
+    /// site would regress the binary case back to `Buffered` and fail here —
+    /// which the helper-level unit tests cannot catch.
+    #[tokio::test]
+    async fn proxy_to_backend_downgrades_non_inspectable_response_under_waf_inspection() {
+        async fn dispatch_body(
+            state: &ProxyState,
+            proxy: &Proxy,
+            plugins: &[Arc<dyn Plugin>],
+            backend_url: &str,
+        ) -> ResponseBody {
+            let ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
+            let bytes_sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let (resp, _) = proxy_to_backend(
+                state,
+                proxy,
+                backend_url,
+                "GET",
+                &HashMap::new(),
+                ClientRequestBody::Buffered(Vec::new()),
+                None,
+                plugins,
+                None,  // body-hook ctx (absent for response-only configs)
+                &ctx,  // real read-only request context
+                false, // stream_response: WAF requested buffering pre-flight
+                false, // requires_request_body_buffering
+                true,  // stream_request_body
+                false, // retain_request_body (non-retry -> downgrade active)
+                "127.0.0.1",
+                false, // is_tls
+                false, // dispatch_hbone
+                false, // dispatch_h3
+                &bytes_sent,
+                hyper::Version::HTTP_11,
+            )
+            .await;
+            resp.body
+        }
+
+        let server = wiremock::MockServer::start().await;
+        // 128 KiB > the 64 KiB eager-buffer cutoff, so a downgraded response
+        // actually streams instead of being eagerly collected as a small body.
+        wiremock::Mock::given(wiremock::matchers::path("/binary"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .set_body_bytes(vec![0u8; 131_072]),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::path("/json"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_bytes(vec![b' '; 131_072]),
+            )
+            .mount(&server)
+            .await;
+
+        let state = make_test_proxy_state(GatewayConfig::default());
+        let mut proxy = test_proxy(ResponseBodyMode::Stream);
+        proxy.backend_scheme = Some(BackendScheme::Http);
+        proxy.backend_host = server.address().ip().to_string();
+        proxy.backend_port = server.address().port();
+
+        let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(
+            crate::plugins::waf::Waf::new(&json!({
+                "response_inspection": true,
+                "response_body_inspection": true,
+            }))
+            .unwrap(),
+        )];
+
+        let binary = dispatch_body(
+            &state,
+            &proxy,
+            &plugins,
+            &format!("{}/binary", server.uri()),
+        )
+        .await;
+        assert!(
+            matches!(binary, ResponseBody::Streaming { .. }),
+            "non-inspectable (octet-stream) response should be downgraded to streaming"
+        );
+
+        let json_body =
+            dispatch_body(&state, &proxy, &plugins, &format!("{}/json", server.uri())).await;
+        assert!(
+            matches!(json_body, ResponseBody::Buffered(_)),
+            "allowlisted (json) response must stay buffered so the WAF can scan it"
         );
     }
 
@@ -17505,6 +17741,82 @@ mod tests {
             &plugin_skips,
             &ctx,
             false,
+        ));
+    }
+
+    #[test]
+    fn refine_stream_response_for_content_type_downgrades_unscanned_bodies() {
+        let ctx = RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
+        let proxy = test_proxy(ResponseBodyMode::Stream);
+        let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(ContentTypeBufferPlugin {
+            buffer_content_type: "application/json",
+        })];
+
+        let json_headers =
+            HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+        let binary_headers = HashMap::from([(
+            "content-type".to_string(),
+            "application/octet-stream".to_string(),
+        )]);
+
+        // Inspectable content-type: keep buffering (no downgrade).
+        assert!(!refine_stream_response_for_content_type(
+            false,
+            &proxy,
+            &plugins,
+            Some(&ctx),
+            &json_headers,
+        ));
+
+        // Non-inspectable content-type: downgrade buffer -> stream.
+        assert!(refine_stream_response_for_content_type(
+            false,
+            &proxy,
+            &plugins,
+            Some(&ctx),
+            &binary_headers,
+        ));
+
+        // An already-streaming response stays streaming.
+        assert!(refine_stream_response_for_content_type(
+            true,
+            &proxy,
+            &plugins,
+            Some(&ctx),
+            &json_headers,
+        ));
+
+        // Explicit Buffer mode is never downgraded.
+        let buffered_proxy = test_proxy(ResponseBodyMode::Buffer);
+        assert!(!refine_stream_response_for_content_type(
+            false,
+            &buffered_proxy,
+            &plugins,
+            Some(&ctx),
+            &binary_headers,
+        ));
+
+        // No request context (the proxy passes None when retries are
+        // configured): keep the pre-flight buffering decision.
+        assert!(!refine_stream_response_for_content_type(
+            false,
+            &proxy,
+            &plugins,
+            None,
+            &binary_headers,
+        ));
+
+        // A plugin that needs the body for every content-type (default method)
+        // blocks the downgrade even for a binary content-type.
+        let always: Vec<Arc<dyn Plugin>> = vec![Arc::new(ResponseBufferPlugin {
+            should_buffer: true,
+        })];
+        assert!(!refine_stream_response_for_content_type(
+            false,
+            &proxy,
+            &always,
+            Some(&ctx),
+            &binary_headers,
         ));
     }
 

@@ -1462,6 +1462,37 @@ async fn inspect_multipart_gates_body_scanning() {
     assert!(matches!(result, PluginResult::Reject { .. }));
 }
 
+#[test]
+fn response_body_buffering_narrows_to_inspectable_content_types() {
+    // With response body inspection enabled, the WAF requests buffering at the
+    // pre-flight check (content-type unknown), but once the response
+    // content-type is known it only needs the body for inspectable
+    // (allowlisted) types. The proxy uses this to stream non-allowlisted/binary
+    // responses instead of buffering-then-skipping them.
+    let plugin = Waf::new(&json!({
+        "response_inspection": true,
+        "response_body_inspection": true,
+    }))
+    .unwrap();
+    let ctx = ctx("GET", "/download");
+
+    // Pre-flight (content-type-agnostic) decision buffers.
+    assert!(plugin.should_buffer_response_body(&ctx));
+
+    // Allowlisted content-types stay buffered (they will be scanned).
+    assert!(plugin.should_buffer_response_body_for_content_type(&ctx, Some("text/html")));
+    assert!(plugin.should_buffer_response_body_for_content_type(&ctx, Some("application/json")));
+
+    // Non-allowlisted / binary / missing content-types narrow to false so the
+    // proxy streams them instead of buffering a body the WAF will not scan.
+    assert!(
+        !plugin
+            .should_buffer_response_body_for_content_type(&ctx, Some("application/octet-stream"))
+    );
+    assert!(!plugin.should_buffer_response_body_for_content_type(&ctx, Some("image/png")));
+    assert!(!plugin.should_buffer_response_body_for_content_type(&ctx, None));
+}
+
 #[tokio::test]
 async fn oversized_body_skip_mode_does_not_scan_truncated_prefix() {
     let plugin = Waf::new(&json!({

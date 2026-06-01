@@ -195,6 +195,42 @@ let should_stream = match proxy.response_body_mode {
 };
 ```
 
+### Content-Type-Aware Downgrade (after response headers)
+
+The pre-flight decision above runs *before* the backend request is sent, so it
+cannot see the response `Content-Type` and conservatively buffers whenever any
+plugin *might* need the body. Once the backend response headers arrive, the
+gateway re-checks the decision per response: if **no** plugin needs the body for
+the actual `Content-Type`, a response that was going to be buffered is
+**downgraded to streaming** instead. The main beneficiary is `waf` with
+`response_body_inspection` enabled — a non-allowlisted/binary response
+(`application/octet-stream`, images, video, …) is streamed rather than buffered
+and then skipped, saving memory and latency for bodies the WAF would not scan.
+
+This downgrade is **narrowing-only**: it never forces buffering, so plugins that
+need the body (caching, compression, response transforms, or `waf` for an
+allowlisted type) are unaffected. It is also **suppressed when retries are
+configured** — a retry may need to replay the response body, so every attempt
+stays buffered.
+
+**Protocol coverage.** The downgrade applies on the HTTP/1.1 + HTTP/2 (reqwest),
+direct-HTTP/2, and HBONE backend paths. **Native HTTP/3**, the **HTTP/3
+cross-protocol bridge**, and **gRPC** keep the pre-flight buffering decision —
+the HTTP/3 pool selects streaming vs. buffered at request time, before headers
+exist. As a result, the *same* WAF + `response_body_mode` configuration can show
+different memory/latency behavior depending on the backend protocol: an
+HTTP/3-served binary response may be buffered where the HTTP/1.1/2-served one
+streams.
+
+**WAF trade-off.** The downgrade keys off the **backend's** response
+`Content-Type`. A header-only plugin that relabels a non-inspectable type as an
+inspectable one in `after_proxy` (e.g. a `response_transformer` rewriting
+`application/octet-stream` → `application/json`) runs *after* this decision, so
+the WAF body scan — which runs only on buffered responses — is skipped for that
+relabeled response. Body-transforming plugins force buffering and are
+unaffected. If a WAF policy depends on scanning relabeled response bodies, set
+`response_body_mode: buffer` on that proxy.
+
 ### Built-in Plugin Compatibility
 
 All built-in plugins work with streaming mode because they only modify response **headers**, not the body:
