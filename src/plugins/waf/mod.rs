@@ -108,6 +108,7 @@ impl ScoringConfig {
 #[derive(Debug)]
 struct SpecialRuleIndices {
     encoding: Option<usize>,
+    overlong_utf8: Option<usize>,
     hpp: Option<usize>,
     method: Option<usize>,
     method_override: Option<usize>,
@@ -129,6 +130,10 @@ pub struct Waf {
 }
 
 impl Waf {
+    fn body_encoding_specials_active(&self) -> bool {
+        self.specials.encoding.is_some() || self.specials.overlong_utf8.is_some()
+    }
+
     pub fn new(config: &Value) -> Result<Self, String> {
         let object = config
             .as_object()
@@ -258,6 +263,7 @@ impl Waf {
 
         let specials = SpecialRuleIndices {
             encoding: compiled.find_rule_index("FE-ENCODING-001"),
+            overlong_utf8: compiled.find_rule_index("FE-ENCODING-002"),
             hpp: compiled.find_rule_index("FE-HPP-001"),
             method: compiled.find_rule_index("FE-METHOD-001"),
             method_override: compiled.find_rule_index("FE-HEADER-002"),
@@ -308,6 +314,10 @@ impl Waf {
             return true;
         }
         self.config.inspect_binary_body
+    }
+
+    fn request_body_eligible_for_scan(&self, content_type: Option<&str>) -> bool {
+        self.should_inspect_body_content_type(content_type)
     }
 
     async fn run_body_scan_with_budget<F>(&self, scan: F) -> ScanOutcome
@@ -935,7 +945,7 @@ impl Plugin for Waf {
         self.active
             && self.config.request_inspection
             && self.config.request_body_inspection
-            && self.compiled.request_body_rules_active
+            && (self.compiled.request_body_rules_active || self.body_encoding_specials_active())
     }
 
     fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
@@ -957,7 +967,7 @@ impl Plugin for Waf {
         {
             return false;
         }
-        self.should_inspect_body_content_type(ctx.headers.get("content-type").map(String::as_str))
+        self.request_body_eligible_for_scan(ctx.headers.get("content-type").map(String::as_str))
     }
 
     fn needs_request_body_bytes(&self) -> bool {
@@ -984,8 +994,7 @@ impl Plugin for Waf {
                 .body_methods
                 .iter()
                 .any(|method| method.eq_ignore_ascii_case(&ctx.method))
-            || !self
-                .should_inspect_body_content_type(headers.get("content-type").map(String::as_str))
+            || !self.request_body_eligible_for_scan(headers.get("content-type").map(String::as_str))
         {
             return PluginResult::Continue;
         }
@@ -1025,7 +1034,7 @@ impl Plugin for Waf {
         self.active
             && self.config.response_inspection
             && self.config.response_body_inspection
-            && self.compiled.response_body_rules_active
+            && (self.compiled.response_body_rules_active || self.body_encoding_specials_active())
     }
 
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
