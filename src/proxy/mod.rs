@@ -12377,10 +12377,21 @@ pub(crate) fn resolve_effective_proxy_for_target<'a>(
         .map(u64::from)
         .filter(|new| Some(*new) != proxy.pool_max_requests_per_connection);
 
+    // Per-port backend TLS (DestinationRule `portLevelSettings[].tls`), resolved
+    // at apply time. Overrides the proxy's upstream-/subset-level `resolved_tls`
+    // for dials to this port. `resolved_tls` identity fields are part of the
+    // backend pool key (built from this effective proxy), so a distinct per-port
+    // TLS posture fragments its own pool instead of sharing a connection.
+    let tls_override = override_config
+        .tls
+        .as_ref()
+        .filter(|t| **t != proxy.resolved_tls);
+
     if connect_override.is_none()
         && h2_streams_override.is_none()
         && idle_seconds_override.is_none()
         && max_reqs_override.is_none()
+        && tls_override.is_none()
     {
         return std::borrow::Cow::Borrowed(proxy);
     }
@@ -12397,6 +12408,9 @@ pub(crate) fn resolve_effective_proxy_for_target<'a>(
     }
     if let Some(n) = max_reqs_override {
         owned.pool_max_requests_per_connection = Some(n);
+    }
+    if let Some(tls) = tls_override {
+        owned.resolved_tls = tls.clone();
     }
     std::borrow::Cow::Owned(owned)
 }
@@ -20188,6 +20202,45 @@ mod tests {
             "port-not-in-overrides must take the borrowed branch"
         );
         assert_eq!(effective.backend_connect_timeout_ms, 5000);
+    }
+
+    #[test]
+    fn resolve_effective_proxy_applies_per_port_tls() {
+        // DestinationRule portLevelSettings[].tls projects onto the effective
+        // proxy's resolved_tls for dials to that port. resolved_tls is part of
+        // the backend pool key, so this fragments the per-port pool by TLS
+        // identity (no accidental cross-port connection reuse).
+        let mut proxy = proxy_with_port_overrides_for_test(5000, &[]);
+        let port_tls = crate::config::types::BackendTlsConfig {
+            server_ca_cert_path: Some("/etc/certs/port-8443-ca.pem".to_string()),
+            sni: Some("p8443.internal".to_string()),
+            verify_server_cert: true,
+            ..Default::default()
+        };
+        proxy.dispatch_port_overrides = Some(HashMap::from([(
+            8443u16,
+            crate::config::types::ResolvedPortOverride {
+                tls: Some(port_tls.clone()),
+                ..Default::default()
+            },
+        )]));
+
+        // Matching port → owned clone with resolved_tls swapped to per-port TLS.
+        let target = target_for_test(8443);
+        let effective = resolve_effective_proxy_for_target(&proxy, Some(&target));
+        assert!(
+            matches!(effective, std::borrow::Cow::Owned(_)),
+            "per-port TLS override must produce an owned clone"
+        );
+        assert_eq!(effective.resolved_tls, port_tls);
+
+        // Non-matching port → borrowed; base resolved_tls untouched.
+        let other = target_for_test(9090);
+        let effective_other = resolve_effective_proxy_for_target(&proxy, Some(&other));
+        assert!(
+            matches!(effective_other, std::borrow::Cow::Borrowed(_)),
+            "a port with no override must take the zero-alloc borrowed branch"
+        );
     }
 
     #[test]

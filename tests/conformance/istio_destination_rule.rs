@@ -439,6 +439,33 @@ fn dr_port_level_settings() {
     assert_eq!(p9090.connect_timeout_ms, Some(5000));
 }
 
+/// `trafficPolicy.portLevelSettings[].tls` — per-port backend TLS. Resolved at
+/// apply time onto `Upstream.port_overrides[port].tls` and projected onto the
+/// effective proxy's `resolved_tls` for dials to that port (apply behavior is
+/// pinned by `dr_port_level_tls_resolves_onto_port_override` and
+/// `resolve_effective_proxy_applies_per_port_tls` in the source crate).
+#[test]
+fn dr_port_level_tls() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "trafficPolicy.portLevelSettings[].tls",
+        status = Status::Supported,
+        notes = "Per-port backend TLS: resolved onto port_overrides[port].tls and projected onto the effective proxy's resolved_tls. resolved_tls is part of the backend pool key, so a distinct per-port TLS posture fragments its own pool.",
+    );
+    let dr = translated(json!({
+        "host": "secure.default.svc.cluster.local",
+        "trafficPolicy": {
+            "portLevelSettings": [
+                {"port": {"number": 8443}, "tls": {"mode": "SIMPLE", "caCertificates": "/etc/certs/ca.pem"}}
+            ]
+        }
+    }));
+    let port = dr.port_level_settings.get(&8443).expect("port 8443 entry");
+    let tls = port.tls.as_ref().expect("port 8443 tls translated");
+    assert_eq!(tls.mode, MtlsMode::Simple);
+    assert_eq!(tls.ca_certificates.as_deref(), Some("/etc/certs/ca.pem"));
+}
+
 /// `subsets[]` with per-subset `trafficPolicy` → `SubsetDefinition` +
 /// `SubsetTrafficPolicy.tls` per CLAUDE.md "subsets[].trafficPolicy.tls is
 /// projected onto Upstream.resolved_subset_tls[subset_name] and partitions

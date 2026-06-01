@@ -1407,6 +1407,12 @@ fn apply_destination_rules(
             // to that port's pool entry. The top-level policy is still applied
             // first so per-port acts as an additive override of the same
             // fields.
+            //
+            // The upstream-level TLS base (this DR's top-level tls, applied
+            // above) is captured owned so the per-port `entry()` mutable borrow
+            // below doesn't conflict with the immutable `from_upstream` read.
+            let upstream_base_tls = BackendTlsConfig::from_upstream(upstream);
+            let upstream_id_for_tls = upstream.id.clone();
             for (port, port_policy) in &dr.port_level_settings {
                 if !has_service_discovery && !upstream_target_ports.contains(port) {
                     warn!(
@@ -1417,17 +1423,34 @@ fn apply_destination_rules(
                     );
                     continue;
                 }
-                if port_policy.tls.is_some() {
-                    warn!(
-                        rule = %dr.name,
-                        upstream = %upstream.id,
-                        port = port,
-                        "DestinationRule portLevelSettings.tls is parsed but not enforced per-port today (gateway applies backend TLS policy at upstream/subset scope); non-TLS port-level traffic policy fields are still applied"
-                    );
-                }
+                // Resolve per-port backend TLS over the upstream base, mirroring
+                // the per-subset TLS overlay. Computed before the `override_slot`
+                // mutable borrow. Fail-closed: an unresolvable per-port TLS
+                // (e.g. ISTIO_MUTUAL without SVID material) rejects the slice
+                // rather than silently downgrading the port's backend posture.
+                let resolved_port_tls = if let Some(ref port_tls) = port_policy.tls {
+                    let mut slot = upstream_base_tls.clone();
+                    apply_traffic_policy_tls_to_backend_config(
+                        &mut slot,
+                        port_tls,
+                        runtime,
+                        &format!("{upstream_id_for_tls}/port-{port}"),
+                    )
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "DestinationRule portLevelSettings.tls projection failed for upstream={upstream_id_for_tls} port={port}: {e}"
+                        )
+                    })?;
+                    Some(slot)
+                } else {
+                    None
+                };
 
                 let override_slot = upstream.port_overrides.entry(*port).or_default();
                 apply_traffic_policy_to_port_override(override_slot, port_policy);
+                if let Some(slot) = resolved_port_tls {
+                    override_slot.tls = Some(slot);
+                }
             }
 
             if !dr.subsets.is_empty() {
@@ -7171,6 +7194,64 @@ mod tests {
             p2.backend_connect_timeout_ms, 2000,
             "subset-bound proxy uses its subset's connectTimeout (overrides top-level)"
         );
+    }
+
+    #[test]
+    fn dr_port_level_tls_resolves_onto_port_override() {
+        // portLevelSettings[].tls is resolved per-port (over the upstream-level
+        // TLS base) and lands on Upstream.port_overrides[port].tls, ready to
+        // project onto the effective proxy's resolved_tls at dispatch.
+        let mut config = GatewayConfig {
+            upstreams: vec![destination_rule_test_upstream(
+                "u1",
+                "secure.default.svc.cluster.local",
+            )],
+            ..GatewayConfig::default()
+        };
+        // The test upstream serves port 8080; use it so the entry is not skipped
+        // as a phantom port.
+        let mut port_level = HashMap::new();
+        port_level.insert(
+            8080u16,
+            MeshTrafficPolicy {
+                tls: Some(MeshTrafficPolicyTls {
+                    mode: MtlsMode::Simple,
+                    ca_certificates: Some("/etc/certs/port-8080-ca.pem".to_string()),
+                    sni: Some("port8080.secure.internal".to_string()),
+                    ..MeshTrafficPolicyTls::default()
+                }),
+                ..MeshTrafficPolicy::default()
+            },
+        );
+        let slice = MeshSlice {
+            destination_rules: vec![MeshDestinationRule {
+                name: "secure".to_string(),
+                namespace: "default".to_string(),
+                host: "secure.default.svc.cluster.local".to_string(),
+                traffic_policy: None,
+                port_level_settings: port_level,
+                subsets: Vec::new(),
+            }],
+            ..MeshSlice::default()
+        };
+
+        apply_destination_rules(&mut config, &test_mesh_runtime_config(), &slice)
+            .expect("destination rules apply");
+
+        let override_slot = config.upstreams[0]
+            .port_overrides
+            .get(&8080)
+            .expect("port 8080 override exists");
+        let tls = override_slot
+            .tls
+            .as_ref()
+            .expect("port 8080 resolved backend TLS");
+        assert_eq!(
+            tls.server_ca_cert_path.as_deref(),
+            Some("/etc/certs/port-8080-ca.pem"),
+            "per-port TLS resolves the CA for port 8080"
+        );
+        assert_eq!(tls.sni.as_deref(), Some("port8080.secure.internal"));
     }
 
     #[test]

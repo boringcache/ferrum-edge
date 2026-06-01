@@ -559,18 +559,16 @@ fn destination_rule_status(
 
     let (accepted, reason, message, detail) = match result {
         Ok(_translation) => {
-            // T1-C deferred fields: portLevelSettings.tls (parsed but
-            // not enforced), per-subset outlierDetection, and the
+            // T1-C deferred fields: per-subset outlierDetection, and the
             // parsed-but-dropped connectionPool.http knobs the translator only
             // warns on (http1MaxPendingRequests / maxRetries / h2UpgradePolicy).
-            // Per-subset connectionPool.tcp.connectTimeout is now APPLIED (it
-            // overrides backend_connect_timeout_ms for subset-bound proxies),
-            // so it is no longer reported as deferred.
-            // Surface them so operators see the gap in `kubectl describe`.
+            // Now APPLIED (no longer deferred): per-subset
+            // connectionPool.tcp.connectTimeout (overrides
+            // backend_connect_timeout_ms for subset-bound proxies) and
+            // portLevelSettings[].tls (per-port backend TLS projected onto the
+            // effective proxy's resolved_tls).
+            // Surface the rest so operators see the gap in `kubectl describe`.
             let mut deferred: Vec<&'static str> = Vec::new();
-            if has_port_level_tls(&object.spec) {
-                deferred.push("portLevelSettings[].tls (parsed but not enforced)");
-            }
             if has_subset_outlier_detection(&object.spec) {
                 deferred.push("subsets[].trafficPolicy.outlierDetection");
             }
@@ -611,13 +609,6 @@ fn destination_rule_status(
     };
 
     accepted_status(object, accepted, reason, &message, detail)
-}
-
-fn has_port_level_tls(spec: &Value) -> bool {
-    spec.get("trafficPolicy")
-        .and_then(|tp| tp.get("portLevelSettings"))
-        .and_then(Value::as_array)
-        .is_some_and(|entries| entries.iter().any(|e| e.get("tls").is_some()))
 }
 
 fn has_subset_outlier_detection(spec: &Value) -> bool {
@@ -1559,7 +1550,10 @@ mod tests {
     }
 
     #[test]
-    fn destination_rule_with_port_level_tls_surfaces_deferred_field() {
+    fn destination_rule_with_port_level_tls_is_applied_not_deferred() {
+        // portLevelSettings[].tls is now applied per-port (resolved onto the
+        // effective proxy's resolved_tls at dispatch), so it must NOT be
+        // reported as a deferred field.
         let obj = object(
             "networking.istio.io/v1",
             "DestinationRule",
@@ -1574,6 +1568,11 @@ mod tests {
             }),
         );
         let updates = plan_istio_status_updates(&[obj], options());
+        let c = find_condition(
+            updates[0].status["conditions"].as_array().unwrap(),
+            "FerrumAccepted",
+        );
+        assert_eq!(c["status"].as_str(), Some("True"));
         let detail = updates[0].ferrum_detail.as_ref().unwrap();
         let deferred: Vec<&str> = detail["translation"]["deferred_fields"]
             .as_array()
@@ -1582,10 +1581,10 @@ mod tests {
             .filter_map(Value::as_str)
             .collect();
         assert!(
-            deferred
+            !deferred
                 .iter()
                 .any(|f| f.contains("portLevelSettings[].tls")),
-            "deferred_fields should mention portLevelSettings[].tls, got {deferred:?}"
+            "portLevelSettings[].tls is applied now and must not be deferred, got {deferred:?}"
         );
     }
 

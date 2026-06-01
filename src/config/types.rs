@@ -337,6 +337,16 @@ pub struct UpstreamPortOverride {
     /// not expose the same builder knob today.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub h2_max_concurrent_streams: Option<u32>,
+    /// Per-port backend TLS posture, mapped from DestinationRule
+    /// `portLevelSettings[].tls`. Resolved against the upstream-level TLS at
+    /// apply time and projected onto the per-target effective proxy's
+    /// `resolved_tls` by `resolve_effective_proxy_for_target`, taking
+    /// precedence over the upstream-/subset-level TLS for dials to this port.
+    /// `resolved_tls` identity fields (CA, cert/key, SNI, SAN, verify) are part
+    /// of the backend pool key, so a distinct per-port TLS posture fragments
+    /// its own pool rather than sharing a connection with another port.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<BackendTlsConfig>,
 }
 
 /// Per-target TCP keepalive override. Mirrors Istio's
@@ -391,6 +401,7 @@ pub struct ResolvedPortOverride {
     pub http_max_requests_per_connection: Option<u32>,
     pub http_idle_timeout_ms: Option<u64>,
     pub h2_max_concurrent_streams: Option<u32>,
+    pub tls: Option<BackendTlsConfig>,
 }
 
 impl ResolvedPortOverride {
@@ -406,6 +417,7 @@ impl ResolvedPortOverride {
             http_max_requests_per_connection: value.http_max_requests_per_connection,
             http_idle_timeout_ms: value.http_idle_timeout_ms,
             h2_max_concurrent_streams: value.h2_max_concurrent_streams,
+            tls: value.tls.clone(),
         };
         (!resolved.is_empty()).then_some(resolved)
     }
@@ -421,6 +433,7 @@ impl ResolvedPortOverride {
             && self.http_max_requests_per_connection.is_none()
             && self.http_idle_timeout_ms.is_none()
             && self.h2_max_concurrent_streams.is_none()
+            && self.tls.is_none()
     }
 }
 
