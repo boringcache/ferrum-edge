@@ -835,8 +835,18 @@ pub(crate) fn should_stream_response_body(
 /// Only ever downgrades (buffer -> stream); it never forces buffering, so a
 /// plugin that needs the body (caching/compression/transform, or `waf` for an
 /// allowlisted content-type) is never affected. An explicit
-/// [`ResponseBodyMode::Buffer`] is always honored, and with no per-request
-/// context (e.g. the mesh hbone path) the pre-flight decision is unchanged.
+/// [`ResponseBodyMode::Buffer`] is always honored, and a `None` context leaves
+/// the pre-flight decision unchanged — callers pass `None` when retries are
+/// configured, since a retry may need to replay the response body and a
+/// non-final attempt must stay buffered.
+///
+/// The decision keys off the *backend's* response `Content-Type`. An
+/// `after_proxy` plugin can still rewrite `content-type` afterward; if it
+/// relabels a non-inspectable type as an inspectable one after a downgrade, the
+/// WAF body scan (which runs only on buffered responses) is skipped. This is an
+/// accepted, narrow trade-off: a fully consistent decision would require
+/// deferring buffer/stream selection until after `after_proxy`, and
+/// body-transforming plugins (which force buffering) are unaffected.
 pub(crate) fn refine_stream_response_for_content_type(
     stream_response: bool,
     proxy: &Proxy,
@@ -11330,6 +11340,7 @@ async fn handle_proxy_request_inner(
             upstream_target.as_deref(),
             &plugins,
             body_hook_ctx.as_mut(),
+            &ctx,
             should_stream,
             requires_request_body_buffering,
             stream_request_body,
@@ -11477,8 +11488,6 @@ async fn handle_proxy_request_inner(
                     proxy_headers,
                     current_target.as_deref(),
                     retained_body.as_deref(),
-                    &plugins,
-                    Some(&ctx),
                     should_stream && is_last_attempt,
                     &ctx.client_ip,
                     is_tls,
@@ -11522,6 +11531,7 @@ async fn handle_proxy_request_inner(
             upstream_target.as_deref(),
             &plugins,
             body_hook_ctx.as_mut(),
+            &ctx,
             should_stream,
             requires_request_body_buffering,
             stream_request_body,
@@ -12468,8 +12478,6 @@ pub(crate) async fn proxy_to_backend_retry(
     headers: &HashMap<String, String>,
     upstream_target: Option<&UpstreamTarget>,
     request_body: Option<&[u8]>,
-    plugins: &[Arc<dyn crate::plugins::Plugin>],
-    ctx: Option<&RequestContext>,
     stream_response: bool,
     client_ip: &str,
     is_tls: bool,
@@ -12632,18 +12640,6 @@ pub(crate) async fn proxy_to_backend_retry(
             let status = response.status().as_u16();
             let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
             collect_response_headers(response.headers(), &mut resp_headers);
-
-            // Mirror `proxy_to_backend`: now that the response content-type is
-            // known, downgrade buffer -> stream for a response no plugin will
-            // inspect at this content-type (see
-            // `refine_stream_response_for_content_type`).
-            let stream_response = refine_stream_response_for_content_type(
-                stream_response,
-                proxy,
-                plugins,
-                ctx,
-                &resp_headers,
-            );
 
             // Enforce response body size limit — mirrors the logic in
             // `proxy_to_backend`. Without this the retry path would accept
@@ -12833,7 +12829,11 @@ async fn proxy_to_backend(
     client_request_body: ClientRequestBody,
     upstream_target: Option<&UpstreamTarget>,
     plugins: &[Arc<dyn crate::plugins::Plugin>],
-    mut ctx: Option<&mut RequestContext>,
+    ctx: Option<&mut RequestContext>,
+    // Real, read-only request context for the response-side buffering decision.
+    // Distinct from `ctx` above, which is the request-body-hook clone and is
+    // `None` unless request-body buffering is active.
+    request_ctx: &RequestContext,
     stream_response: bool,
     requires_request_body_buffering: bool,
     stream_request_body: bool,
@@ -12859,6 +12859,19 @@ async fn proxy_to_backend(
     // the effective timeout automatically.
     let effective_proxy = resolve_effective_proxy_for_target(proxy, upstream_target);
     let proxy: &Proxy = effective_proxy.as_ref();
+
+    // Context for the response-side buffer->stream downgrade. Use the real
+    // request context (not the request-body-hook clone), but suppress the
+    // downgrade entirely when retries are configured: a retry may need to
+    // replay the response body, so every attempt must stay buffered rather than
+    // stream a non-final response. Non-retry requests get the real context so
+    // response-inspection-only configs (e.g. `waf` `response_body_inspection`)
+    // actually benefit.
+    let response_decision_ctx = if retain_request_body {
+        None
+    } else {
+        Some(request_ctx)
+    };
 
     // When retain_request_body is true (retries configured), the collected
     // body bytes are retained alongside the response so the caller can replay
@@ -12902,7 +12915,7 @@ async fn proxy_to_backend(
             client_request_body,
             upstream_target,
             plugins,
-            ctx.as_deref(),
+            response_decision_ctx,
             stream_response,
             client_ip,
             is_tls,
@@ -13101,7 +13114,7 @@ async fn proxy_to_backend(
                             headers,
                             request,
                             plugins,
-                            ctx.as_deref(),
+                            response_decision_ctx,
                             stream_response,
                             client_ip,
                             is_tls,
@@ -13307,14 +13320,7 @@ async fn proxy_to_backend(
                     std::sync::atomic::Ordering::Release,
                 );
                 let body_bytes = apply_request_body_plugins(plugins, headers, body_bytes).await;
-                match run_final_request_body_hooks(
-                    plugins,
-                    ctx.as_deref_mut(),
-                    headers,
-                    &body_bytes,
-                )
-                .await
-                {
+                match run_final_request_body_hooks(plugins, ctx, headers, &body_bytes).await {
                     PluginResult::Continue => {}
                     reject @ PluginResult::Reject { .. }
                     | reject @ PluginResult::RejectBinary { .. } => {
@@ -13431,14 +13437,7 @@ async fn proxy_to_backend(
 
                 // Transform request body via plugins (JSON field rename, add, remove, etc.)
                 let body_bytes = apply_request_body_plugins(plugins, headers, body_bytes).await;
-                match run_final_request_body_hooks(
-                    plugins,
-                    ctx.as_deref_mut(),
-                    headers,
-                    &body_bytes,
-                )
-                .await
-                {
+                match run_final_request_body_hooks(plugins, ctx, headers, &body_bytes).await {
                     PluginResult::Continue => {}
                     reject @ PluginResult::Reject { .. }
                     | reject @ PluginResult::RejectBinary { .. } => {
@@ -13514,7 +13513,7 @@ async fn proxy_to_backend(
                 stream_response,
                 proxy,
                 plugins,
-                ctx.as_deref(),
+                response_decision_ctx,
                 &resp_headers,
             );
 
@@ -16792,8 +16791,6 @@ mod tests {
             "GET",
             &HashMap::new(),
             None,
-            None,
-            &[],
             None,
             true,
             "127.0.0.1",
