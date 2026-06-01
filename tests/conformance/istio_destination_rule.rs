@@ -18,7 +18,7 @@ use ferrum_edge::modes::mesh::config::{
 };
 use serde_json::{Value, json};
 
-use crate::conformance::registry::Status;
+use crate::conformance::registry::{Maturity, Status};
 
 const CATEGORY: &str = "istio_destination_rule";
 
@@ -63,6 +63,7 @@ fn dr_connection_pool_tcp_connect_timeout() {
         category = CATEGORY,
         feature = "trafficPolicy.connectionPool.tcp.connectTimeout",
         status = Status::Supported,
+        maturity = Maturity::Ga,
         notes = "Translated to MeshTrafficPolicy.connect_timeout_ms; applied across HTTP/H2/H3/gRPC/TCP/HBONE dispatch.",
     );
     let dr = translated(json!({
@@ -83,6 +84,7 @@ fn dr_connection_pool_tcp_max_connections() {
         category = CATEGORY,
         feature = "trafficPolicy.connectionPool.tcp.maxConnections",
         status = Status::Supported,
+        maturity = Maturity::Ga,
         notes = "T1-D (PR #897): translated to MeshConnectionPoolTcp.max_connections; enforced by stream-family (TCP/TCP+TLS) dispatch and by HTTP-family WebSocket dispatch (one dedicated backend connection per session). Pooled multiplexed HTTP transports (reqwest H1/H2, direct H2, gRPC, H3, HBONE) do not enforce it — see docs/mesh.md.",
     );
     let dr = translated(json!({

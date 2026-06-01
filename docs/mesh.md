@@ -62,6 +62,8 @@ Ferrum's mesh subsystem is in active build-out. The paths below ship in one bina
 - **Experimental** — usable but with a safety-relevant caveat (plaintext, unauthenticated, or partial enforcement); opt-in and not recommended without compensating controls.
 - **Dev-only** — gated behind a build feature or an explicit dev opt-in; not present in the published image's default behavior.
 
+> For the one-screen **product contract** (what to rely on, the GA promise, and the explicit non-goals), see [docs/mesh_supported_matrix.md](mesh_supported_matrix.md). The **Stable** label below corresponds to the contract's **GA** tier, which is machine-enforced: a GA feature that regresses fails the conformance suite (`tests/conformance/ga_scope.rs`). The live, auto-generated coverage matrix is written to `target/conformance/coverage.md`.
+
 ### Config-source maturity
 
 | Capability | Status | Notes |
