@@ -78,19 +78,32 @@ impl JwtAuth {
         validation.validate_exp = true;
         validation.validate_nbf = true;
         validation.leeway = leeway_secs;
-        if require_exp {
-            validation.required_spec_claims = HashSet::from(["exp".to_string()]);
+        // Build `required_spec_claims` additively. `jsonwebtoken`'s
+        // `set_issuer`/`set_audience` reject only a *mismatching* claim — a
+        // token that simply OMITS `iss`/`aud` is still accepted. When an
+        // operator configures `expected_issuers`/`audiences` they intend those
+        // claims to be mandatory, so insert them into `required_spec_claims`
+        // (the only mechanism that enforces presence) to align enforcement with
+        // operator intent. (jsonwebtoken `validation.rs`: "Adding `aud` to
+        // `required_spec_claims` will make it required"; same for `iss`.)
+        // Severity is low because each token is still bound to a per-consumer
+        // HMAC secret; this is a defense-in-depth / correctness fix.
+        let mut required: HashSet<String> = if require_exp {
+            HashSet::from(["exp".to_string()])
         } else {
-            validation.required_spec_claims.clear();
-        }
+            HashSet::new()
+        };
         if !expected_issuers.is_empty() {
             validation.set_issuer(&expected_issuers);
+            required.insert("iss".to_string());
         }
         if !audiences.is_empty() {
             validation.set_audience(&audiences);
+            required.insert("aud".to_string());
         } else {
             validation.validate_aud = false;
         }
+        validation.required_spec_claims = required;
 
         Ok(Self {
             token_lookup,

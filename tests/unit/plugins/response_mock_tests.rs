@@ -136,6 +136,28 @@ fn test_creation_rejects_invalid_field_shapes() {
     }
 }
 
+// Regression for finding #63: delay_ms feeds tokio::time::sleep on the request
+// path, so an unbounded value (operator typo / wrong unit) would pin a request
+// open. It must be capped at construction.
+#[test]
+fn test_creation_rejects_delay_ms_over_cap() {
+    let err = ResponseMock::new(&json!({
+        "rules": [{ "path": "/test", "delay_ms": 3_600_001u64 }]
+    }))
+    .err()
+    .expect("delay_ms over 1h must be rejected");
+    assert!(err.contains("'delay_ms' must be <= 3600000"), "got: {err}");
+}
+
+#[test]
+fn test_creation_accepts_delay_ms_at_cap() {
+    // The boundary (exactly 1 hour) must be accepted.
+    let plugin = ResponseMock::new(&json!({
+        "rules": [{ "path": "/test", "delay_ms": 3_600_000u64 }]
+    }));
+    assert!(plugin.is_ok(), "delay_ms == cap should be accepted");
+}
+
 // === Path stripping — mock rules are relative to proxy listen_path ===
 
 #[tokio::test]

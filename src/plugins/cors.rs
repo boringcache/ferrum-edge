@@ -592,7 +592,15 @@ fn u64_config(config: &Value, key: &str, default: u64) -> Result<u64, String> {
 }
 
 fn origin_host(origin: &str) -> Option<&str> {
-    let (_, rest) = origin.split_once("://")?;
+    let (scheme, rest) = origin.split_once("://")?;
+    // Enforce the same http(s) scheme allow-list that `validate_exact_origin`
+    // applies to exact origins, so wildcard-subdomain matching is not looser
+    // than exact matching. Without this, an Origin like `ftp://app.company.com`
+    // would satisfy a `*.company.com` rule and be reflected into
+    // Access-Control-Allow-Origin. (Finding #51.)
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return None;
+    }
     if rest.starts_with('[') {
         return None;
     }

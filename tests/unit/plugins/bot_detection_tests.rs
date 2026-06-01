@@ -183,15 +183,52 @@ async fn test_custom_patterns_replace_defaults() {
 }
 
 #[tokio::test]
-async fn test_empty_custom_patterns_blocks_nothing() {
-    let plugin = BotDetection::new(&json!({
+async fn test_empty_blocked_patterns_with_missing_user_agent_allowed_rejected() {
+    // #49: an explicit empty `blocked_patterns` while missing User-Agent
+    // headers are allowed is a no-op (matches nothing, always Continue), so
+    // the constructor must reject it rather than silently disabling the control.
+    let err = BotDetection::new(&json!({
         "blocked_patterns": []
     }))
-    .unwrap();
+    .err()
+    .expect("empty blocked_patterns with no allow_list must be rejected");
+    assert!(
+        err.contains("no effect") || err.contains("blocked_patterns"),
+        "got: {err}"
+    );
+}
 
+#[tokio::test]
+async fn test_empty_blocked_patterns_with_allow_list_still_rejected() {
+    // An allow-list alone only permits requests; it does not create a reject
+    // path when there are no blocked patterns.
+    let err = BotDetection::new(&json!({
+        "blocked_patterns": [],
+        "allow_list": ["googlebot"]
+    }))
+    .err()
+    .expect("allow-list-only config should be rejected");
+    assert!(err.contains("no effect"), "got: {err}");
+}
+
+#[tokio::test]
+async fn test_empty_blocked_patterns_with_missing_user_agent_rejection_accepted() {
+    // Missing User-Agent rejection is an actual enforcement path even without
+    // blocked pattern matches.
+    let plugin = BotDetection::new(&json!({
+        "blocked_patterns": [],
+        "allow_missing_user_agent": false
+    }))
+    .expect("presence-only config should be accepted");
+
+    // Present arbitrary UAs pass because there are no blocked patterns.
     let mut ctx = make_ctx_with_ua("curl/7.88.1");
     let result = plugin.on_request_received(&mut ctx).await;
     plugin_utils::assert_continue(result);
+
+    let mut missing = make_ctx_without_ua();
+    let missing_result = plugin.on_request_received(&mut missing).await;
+    plugin_utils::assert_reject(missing_result, Some(403));
 }
 
 // ── Allow-list overrides blocked patterns ───────────────────────────────
@@ -238,6 +275,31 @@ async fn test_allow_list_with_custom_patterns() {
     let mut ctx = make_ctx_with_ua("EvilBot/1.0");
     let result = plugin.on_request_received(&mut ctx).await;
     plugin_utils::assert_reject(result, Some(403));
+}
+
+#[tokio::test]
+async fn test_allow_list_word_boundary_blocks_embedded_token_smuggling() {
+    // #50: allow-list entries are word-boundary anchored, so an attacker
+    // cannot smuggle an allowed token as a substring of an otherwise-blocked
+    // User-Agent. With the old unanchored substring match, "curl evilChrome"
+    // would match allow="Chrome" and bypass the "curl" block.
+    let plugin = BotDetection::new(&json!({
+        "allow_list": ["Chrome"]
+    }))
+    .unwrap();
+
+    // "Chrome" only appears embedded inside "evilChrome" (no word boundary),
+    // so the allow-list does NOT match and the default "curl" block applies.
+    let mut ctx = make_ctx_with_ua("curl evilChrome");
+    let result = plugin.on_request_received(&mut ctx).await;
+    plugin_utils::assert_reject(result, Some(403));
+
+    // A real browser UA where "Chrome" is a standalone token is still allowed
+    // (allow-list wins over the blocked "curl" substring), confirming the
+    // legitimate whole-token allow-list use keeps working.
+    let mut ctx = make_ctx_with_ua("Mozilla/5.0 curl Chrome/120.0");
+    let result = plugin.on_request_received(&mut ctx).await;
+    plugin_utils::assert_continue(result);
 }
 
 // ── Missing user-agent header ───────────────────────────────────────────

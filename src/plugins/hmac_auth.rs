@@ -8,17 +8,34 @@
 //!
 //! ## Signing string
 //!
-//! The signature is computed over four newline-separated fields:
+//! The signature is computed over five newline-separated fields:
 //!
 //!   ```text
-//!   {METHOD}\n{PATH}\n{DATE}\n{DIGEST_HEADER_VALUE}
+//!   {METHOD}\n{PATH}\n{QUERY}\n{DATE}\n{DIGEST_HEADER_VALUE}
 //!   ```
+//!
+//! `{PATH}` is the request path component only; `{QUERY}` is the raw query
+//! string as received (percent-encoded, without the leading `?`, empty when
+//! there is no query). Binding the query means query parameters cannot be
+//! altered or added without invalidating the signature. Clients must sign the
+//! byte-for-byte raw query string the gateway receives.
 //!
 //! The client must also include a `Digest:` (RFC 3230) or `Content-Digest:`
 //! (RFC 9421) header whose value matches the SHA-256 / SHA-512 of the request
 //! body, formatted as `sha-256=<base64>` or `sha-512=<base64>`. The plugin
 //! verifies that the digest matches the actual buffered body bytes; tampering
-//! with either the body or the digest header invalidates the HMAC.
+//! with the body, the query string, or the digest header invalidates the HMAC.
+//!
+//! ## Replay protection (limitation)
+//!
+//! The signed `Date` header provides only a bounded *freshness window*, not
+//! single-use replay prevention. A request is accepted while its `Date` is
+//! within `now ± clock_skew_seconds` (default 300s). There is no nonce or
+//! seen-signature store, so a captured, fully valid signed request can be
+//! replayed verbatim any number of times until the window elapses. For
+//! non-idempotent routes, keep `clock_skew_seconds` tight and do not rely on
+//! `hmac_auth` alone. (A future enhancement could add an optional client nonce
+//! plus a bounded TTL replay cache, mirroring `utils/dpop.rs`.)
 //!
 //! Consumer credentials should include:
 //!   { "hmac_auth": { "secret": "<shared-secret>" } }
@@ -86,9 +103,14 @@ impl HmacAuth {
     }
 
     /// Validate that the Date header is within the allowed clock skew window.
+    ///
+    /// This enforces a bounded freshness window (`now ± clock_skew_seconds`),
+    /// not single-use replay prevention — there is no nonce store, so a
+    /// captured valid request can be replayed within the window. See the
+    /// module-level "Replay protection (limitation)" note.
     fn validate_date(&self, date_str: &str) -> bool {
         if date_str.is_empty() {
-            // No Date header means no replay protection — reject
+            // No Date header means no freshness bound at all — reject.
             return false;
         }
 
@@ -256,13 +278,18 @@ impl AuthMechanism for HmacAuth {
             }
         };
 
-        ExtractedCredential::HmacAuth {
+        ExtractedCredential::HmacAuth(Box::new(auth_flow::HmacAuthCredential {
             username,
             algorithm,
             signature,
             date: ctx.headers.get("date").cloned().unwrap_or_default(),
             method: ctx.method.clone(),
             path: ctx.path.clone(),
+            // Bind the raw query string (verbatim, as received) so query
+            // parameters are covered by the HMAC. `ctx.path` is the path
+            // component only, so without this an attacker could replay a
+            // captured signed request with altered/added query parameters.
+            query: ctx.raw_query_string().unwrap_or_default().to_string(),
             digest_header,
             // Prefer binary-safe bytes; fall back to UTF-8 metadata for older
             // buffering paths. Empty body (GET/HEAD) → empty Vec.
@@ -276,7 +303,7 @@ impl AuthMechanism for HmacAuth {
                         .map(|s| s.as_bytes().to_vec())
                 })
                 .unwrap_or_default(),
-        }
+        }))
     }
 
     async fn verify(
@@ -284,19 +311,20 @@ impl AuthMechanism for HmacAuth {
         credential: ExtractedCredential,
         consumer_index: &ConsumerIndex,
     ) -> VerifyOutcome {
-        let ExtractedCredential::HmacAuth {
+        let ExtractedCredential::HmacAuth(credential) = credential else {
+            return VerifyOutcome::NotApplicable;
+        };
+        let auth_flow::HmacAuthCredential {
             username,
             algorithm,
             signature,
             date,
             method,
             path,
+            query,
             digest_header,
             request_body,
-        } = credential
-        else {
-            return VerifyOutcome::NotApplicable;
-        };
+        } = *credential;
 
         if !self.validate_date(&date) {
             return VerifyOutcome::Invalid(
@@ -333,7 +361,9 @@ impl AuthMechanism for HmacAuth {
 
         // Tampering with the digest header itself (without re-signing with
         // the secret) breaks the HMAC because the digest value is signed.
-        let signing_string = build_signing_string(&method, &path, &date, &digest_header);
+        // The query string is bound too, so altering query params invalidates
+        // the signature.
+        let signing_string = build_signing_string(&method, &path, &query, &date, &digest_header);
 
         let expected_signature = match base64::engine::general_purpose::STANDARD.decode(&signature)
         {
@@ -393,12 +423,29 @@ fn parse_u64_field(value: Option<&Value>, field: &str, default_value: u64) -> Re
         .ok_or_else(|| format!("hmac_auth: '{field}' must be an unsigned integer, got: {value}"))
 }
 
-fn build_signing_string(method: &str, path: &str, date: &str, digest_header: &str) -> String {
-    let mut signing_string =
-        String::with_capacity(method.len() + path.len() + date.len() + digest_header.len() + 3);
+/// Build the HMAC signing string. Fields are newline-separated:
+/// `{METHOD}\n{PATH}\n{QUERY}\n{DATE}\n{DIGEST_HEADER_VALUE}`.
+///
+/// `query` is the raw request query string as received (percent-encoded, no
+/// leading `?`), empty when the request has no query. Binding it prevents an
+/// attacker from replaying a captured signature against the same path with
+/// altered or added query parameters. Clients must sign the byte-for-byte raw
+/// query string the gateway receives.
+fn build_signing_string(
+    method: &str,
+    path: &str,
+    query: &str,
+    date: &str,
+    digest_header: &str,
+) -> String {
+    let mut signing_string = String::with_capacity(
+        method.len() + path.len() + query.len() + date.len() + digest_header.len() + 4,
+    );
     signing_string.push_str(method);
     signing_string.push('\n');
     signing_string.push_str(path);
+    signing_string.push('\n');
+    signing_string.push_str(query);
     signing_string.push('\n');
     signing_string.push_str(date);
     signing_string.push('\n');

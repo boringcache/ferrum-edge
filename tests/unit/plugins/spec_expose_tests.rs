@@ -440,8 +440,120 @@ async fn test_specz_request_fetches_mocked_spec_and_preserves_content_type() {
             assert_eq!(status_code, 200);
             assert_eq!(body, bytes::Bytes::from_static(b"openapi: 3.0.0\n"));
             assert_eq!(headers.get("content-type").unwrap(), "application/yaml");
+            // Finding #68: the served /specz response always carries nosniff.
+            assert_eq!(
+                headers.get("x-content-type-options").map(String::as_str),
+                Some("nosniff")
+            );
         }
         other => panic!("expected RejectBinary, got {other:?}"),
+    }
+}
+
+/// Finding #68: an attacker-controllable upstream must not be able to make the
+/// unauthenticated /specz endpoint serve `text/html`. The upstream-derived
+/// content-type is constrained to an allow-list of spec media types and falls
+/// back to `application/octet-stream` for anything else, and `nosniff` is set.
+#[tokio::test]
+async fn test_specz_sanitizes_untrusted_upstream_content_type() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/openapi.yaml"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(b"<script>alert(1)</script>".to_vec())
+                .insert_header("content-type", "text/html; charset=utf-8"),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let plugin = SpecExpose::new(
+        &json!({
+            "spec_url": format!("{}/openapi.yaml", mock_server.uri()),
+            "cache_ttl_seconds": 60
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = make_ctx("GET", "/api/specz", "/api");
+    let result = plugin.on_request_received(&mut ctx).await;
+    match result {
+        PluginResult::RejectBinary {
+            status_code,
+            headers,
+            ..
+        } => {
+            assert_eq!(status_code, 200);
+            // text/html is NOT in the spec allow-list → inert fallback.
+            assert_eq!(
+                headers.get("content-type").map(String::as_str),
+                Some("application/octet-stream")
+            );
+            assert_eq!(
+                headers.get("x-content-type-options").map(String::as_str),
+                Some("nosniff")
+            );
+        }
+        other => panic!("expected RejectBinary, got {other:?}"),
+    }
+}
+
+/// Unit-level coverage of the allow-list itself (finding #68).
+#[test]
+fn test_sanitize_upstream_content_type_allow_list() {
+    use ferrum_edge::plugins::spec_expose::sanitize_upstream_content_type as sanitize;
+
+    // Allowed spec media types pass through verbatim, including parameters.
+    for allowed in [
+        "application/json",
+        "application/openapi+json",
+        "application/openapi+yaml",
+        "application/yaml",
+        "application/vnd.oai.openapi",
+        "application/vnd.oai.openapi+json",
+        "application/wsdl+xml",
+        "application/vnd.sun.wadl+xml",
+        "text/yaml",
+        "application/x-yaml",
+        "application/xml",
+        "text/xml",
+        "text/plain",
+    ] {
+        assert_eq!(sanitize(allowed), allowed);
+    }
+    // Case-insensitive media type, charset parameter preserved.
+    assert_eq!(
+        sanitize("Application/JSON; charset=utf-8"),
+        "Application/JSON; charset=utf-8"
+    );
+    assert_eq!(
+        sanitize("application/vnd.oai.openapi+json;version=3.0"),
+        "application/vnd.oai.openapi+json;version=3.0"
+    );
+    assert_eq!(
+        sanitize("application/vnd.oai.openapi;version=3.0"),
+        "application/vnd.oai.openapi;version=3.0"
+    );
+    assert_eq!(
+        sanitize("  application/yaml  ; q=1"),
+        "  application/yaml  ; q=1"
+    );
+
+    // Anything outside the allow-list collapses to the inert fallback.
+    for bad in [
+        "text/html",
+        "text/html; charset=utf-8",
+        "application/javascript",
+        "image/svg+xml",
+        "",
+        "garbage",
+    ] {
+        assert_eq!(sanitize(bad), "application/octet-stream");
     }
 }
 

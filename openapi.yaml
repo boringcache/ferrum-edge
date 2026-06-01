@@ -8909,7 +8909,12 @@ components:
                 description: Direct URL to the IdP's JWKS endpoint
               discovery_url:
                 type: string
-                description: OIDC discovery URL (auto-discovers jwks_uri)
+                description: >-
+                  OIDC discovery URL (auto-discovers jwks_uri). The discovered
+                  jwks_uri must use the same origin as the discovery URL
+                  (scheme, host, and effective port). For IdPs that serve JWKS
+                  from a different origin than discovery, configure jwks_uri
+                  directly instead.
               jwks:
                 oneOf:
                   - type: string
@@ -9390,7 +9395,19 @@ components:
 
     LdapAuthConfig:
       type: object
-      description: "Plugin: ldap_auth — LDAP directory authentication with optional AD group filtering."
+      description: >-
+        Plugin: ldap_auth — LDAP directory authentication with optional AD group
+        filtering. Status codes distinguish failure classes: invalid credentials
+        or unknown user return 401; a user authorized by bind but not in any
+        `required_groups` returns 403; backend/configuration failures (directory
+        unreachable, service-account bind failure, or search RPC error) return 500
+        rather than 401, so clients are not falsely told their credentials are
+        wrong. When `required_groups` is set without a service account
+        (`service_account_dn`/`service_account_password`), the group-membership
+        search uses an ANONYMOUS bind; group enforcement then only works if the
+        directory permits anonymous reads of group objects, so a service account
+        is recommended. TLS connections (`ldaps://`/STARTTLS) honor the gateway
+        CRL (`FERRUM_TLS_CRL_FILE_PATH`), rejecting revoked server certificates.
       required:
         - ldap_url
       properties:
@@ -9453,13 +9470,13 @@ components:
 
     HmacAuthConfig:
       type: object
-      description: "Plugin: hmac_auth — HMAC signature verification with mandatory request-body integrity protection (RFC 9421 / RFC 3230). Requests must include a Digest or Content-Digest header that matches the request body; the digest header value is folded into the HMAC signing string (METHOD\\nPATH\\nDATE\\nDIGEST). Consumer credentials store the shared secret."
+      description: "Plugin: hmac_auth — HMAC signature verification with mandatory request-body integrity protection (RFC 9421 / RFC 3230). Requests must include a Digest or Content-Digest header that matches the request body; the digest header value and the raw query string are folded into the HMAC signing string (METHOD\\nPATH\\nQUERY\\nDATE\\nDIGEST), so altering query parameters or the body invalidates the signature. Note: the signed Date header provides a bounded freshness window (now ± clock_skew_seconds), not single-use replay prevention — there is no nonce store, so a captured valid request can be replayed within the window. Consumer credentials store the shared secret."
       properties:
         clock_skew_seconds:
           type: integer
           format: uint64
           default: 300
-          description: Maximum allowed clock skew in seconds for the Date header replay protection window
+          description: Maximum allowed clock skew in seconds for the Date header freshness window. The Date header bounds replay to this window but does not prevent in-window replay (no nonce store); keep it tight for non-idempotent routes.
 
     # ── Mesh / Service-Mesh Plugins ─────────────────────────────────
     # These plugins are primarily auto-injected by mesh mode (sidecar / ambient /
@@ -10677,11 +10694,18 @@ components:
     BotDetectionConfig:
       type: object
       description: >-
-        Plugin: bot_detection — case-insensitive User-Agent substring matching.
-        The allow list is consulted before blocked patterns, so a User-Agent
-        that contains a blocked substring can still pass if it also contains an
-        allow-list entry (useful for permitting GoogleBot while blocking
-        generic `bot` patterns). HTTP-family only.
+        Plugin: bot_detection — case-insensitive User-Agent matching.
+        `blocked_patterns` are substring matches; `allow_list` entries are
+        word-boundary matches and are consulted before blocked patterns, so a
+        User-Agent that contains a blocked substring can still pass if it also
+        contains an allow-list entry as a standalone token (useful for
+        permitting GoogleBot while blocking generic `bot` patterns). The
+        word-boundary anchoring on the allow list prevents an allowed token
+        from being smuggled inside an otherwise-blocked agent. A no-op config
+        (empty `blocked_patterns` while missing User-Agent headers are allowed)
+        is rejected; an allow-list alone is not enforcement. The User-Agent is
+        client-controlled and spoofable, so this is a coarse filter, not strong
+        bot verification. HTTP-family only.
       properties:
         blocked_patterns:
           type: array
@@ -10699,17 +10723,20 @@ components:
             - mechanize
             - php/
           description: >-
-            User-Agent substrings to reject. Matching is case-insensitive.
-            Specifying this field replaces the defaults entirely — set to
-            `[]` to disable blocking and rely solely on `allow_missing_user_agent`.
+            User-Agent substrings to reject (case-insensitive). Specifying this
+            field replaces the defaults entirely. Setting it to `[]` is valid
+            only when `allow_missing_user_agent: false` creates a missing-header
+            reject path; an allow-list alone is not enforcement.
         allow_list:
           type: array
           items:
             type: string
           default: []
           description: >-
-            User-Agent substrings that always pass, evaluated before
-            `blocked_patterns`. Matching is case-insensitive.
+            User-Agent tokens that always pass, evaluated before
+            `blocked_patterns` (allow wins). Matching is case-insensitive and
+            word-boundary anchored, so an entry only matches when it appears as
+            a standalone token in the User-Agent.
         allow_missing_user_agent:
           type: boolean
           default: true
@@ -11262,6 +11289,11 @@ components:
                 properties:
                   paths:
                     type: array
+                    description: >-
+                      Exact paths by default. A trailing `*` means prefix match,
+                      and a leading `~` means a start-anchored regex (implicit
+                      `^(?:...)` wrapper so every alternation branch is
+                      anchored). Use `~.*pattern` for a floating substring match.
                     items:
                       type: string
                   methods:
@@ -11511,7 +11543,11 @@ components:
           properties:
             paths:
               type: array
-              description: Exact paths by default; trailing * means prefix match and leading ~ means regex.
+              description: >-
+                Exact paths by default. A trailing `*` means prefix match, and a
+                leading `~` means a start-anchored regex (implicit `^(?:...)`
+                wrapper so every alternation branch is anchored). Use
+                `~.*pattern` for a floating substring match.
               items:
                 type: string
             methods:
@@ -11532,6 +11568,13 @@ components:
       properties:
         paths:
           type: array
+          description: >-
+            Paths that short-circuit the entire WAF. Each entry matches from the
+            start of the path: a plain string is an exact full-path match,
+            `prefix*` is a prefix match, and `~regex` is a start-anchored regex
+            (implicit `^(?:...)` wrapper so every alternation branch is
+            anchored). Use `~.*pattern` for a floating substring match. Keep entries tight — an over-broad pattern silently disables
+            the WAF on unintended routes.
           items:
             type: string
         methods:
@@ -12001,7 +12044,8 @@ components:
               delay_ms:
                 type: integer
                 format: uint64
-                description: Simulated latency in milliseconds (default 0)
+                maximum: 3600000
+                description: "Simulated latency in milliseconds (default 0). Capped at 3600000 (1 hour); larger values are rejected at config validation."
         passthrough_on_no_match:
           type: boolean
           description: "If true, unmatched requests continue to the backend. If false (default), returns 404."
@@ -12781,7 +12825,7 @@ components:
           type: string
           enum: [content, all]
           default: content
-          description: Which message fields to scan
+          description: "Which parts of the request to scan. 'content' scans LLM prompt fields only: chat messages[].content plus top-level prompt, input, and system (completions/responses/embeddings/Anthropic-system shapes). 'all' scans the entire request body recursively (structural keys like model/id/role excepted). Use 'all' for request shapes that carry prompt text in non-standard fields."
         exclude_roles:
           type: array
           items:
@@ -12805,7 +12849,7 @@ components:
           type: string
           enum: [reject, redact, warn]
           default: reject
-          description: Action when a violation is detected in the response body
+          description: "Action when a violation is detected in the response body. NOTE: in redact mode over Server-Sent Events (text/event-stream), PII that spans two or more consecutive `data:` frames is detected on the accumulated stream but cannot be redacted per-frame and passes through to the client (only a warn log is emitted). Use action=reject for a hard guarantee that frame-straddling PII is blocked."
         pii_patterns:
           type: array
           items:
@@ -12872,7 +12916,7 @@ components:
         max_completion_length:
           type: integer
           default: 0
-          description: Maximum allowed character length of completion content. 0 = no limit
+          description: "Maximum allowed length of completion content, measured in characters (Unicode scalar values, not UTF-8 bytes). 0 = no limit"
 
     AiFederationConfig:
       type: object
@@ -13546,7 +13590,11 @@ components:
             Action when the client IP cannot be resolved to a country. Applies
             to both genuine MaxMind misses (private IPs, unallocated ranges)
             and to the data plane fallback path when the `.mmdb` file is
-            missing on disk.
+            missing on disk. The default `allow` is fail-open: unresolved
+            traffic is permitted, so a missing or stale `.mmdb` silently
+            disables the geo gate. Set this explicitly to `deny` for fail-closed
+            behaviour. When the default is used, a one-time warning is logged at
+            startup, and the first request-time fail-open is logged at warn.
 
     RateSpec:
       type: object

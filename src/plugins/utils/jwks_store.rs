@@ -15,12 +15,25 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 use tracing::{debug, warn};
+use url::Url;
 
 use super::PluginHttpClient;
 
 const EMPTY_STORE_RETRY_1: Duration = Duration::from_secs(5);
 const EMPTY_STORE_RETRY_2: Duration = Duration::from_secs(15);
 const EMPTY_STORE_RETRY_MAX: Duration = Duration::from_secs(30);
+
+fn redacted_jwks_uri(raw: &str) -> String {
+    let Ok(mut url) = Url::parse(raw) else {
+        return "redacted-jwks-url".to_string();
+    };
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_query(None);
+    url.set_fragment(None);
+    url.set_path("/");
+    url.to_string()
+}
 
 /// A cached JWKS key with its algorithm and decoding key.
 #[derive(Clone)]
@@ -155,12 +168,13 @@ impl JwksKeyStore {
             return Ok(self.keys.load().len());
         }
 
-        debug!("Fetching JWKS keys from {}", self.jwks_uri);
+        let redacted_uri = redacted_jwks_uri(&self.jwks_uri);
+        debug!("Fetching JWKS keys from {}", redacted_uri);
 
         let req = self.http_client.get().get(&self.jwks_uri);
         let response = self
             .http_client
-            .execute(req, "jwks_fetch")
+            .execute_redacted(req, "jwks_fetch", &redacted_uri)
             .await
             .map_err(|e| format!("JWKS fetch failed: {}", e))?;
 
@@ -174,8 +188,31 @@ impl JwksKeyStore {
             .map_err(|e| format!("JWKS parse failed: {}", e))?;
 
         let new_keys = Self::parse_jwks_response(&jwks)?;
-        let count = new_keys.len();
 
+        // Do not discard last-known-good keys when a successful fetch returns
+        // zero usable keys (e.g. a misbehaving or mid-rotation IdP momentarily
+        // serving an empty JWKS). Overwriting a populated cache with an empty
+        // map would make `has_keys()` false and reject every token for this
+        // provider until the next non-empty fetch — a self-inflicted auth
+        // outage. Retain the existing cache and warn instead.
+        //
+        // Trade-off: an IdP cannot intentionally revoke by serving an empty
+        // JWKS; old keys remain trusted until a non-empty fetch replaces them
+        // or the process restarts. Because the store remains non-empty,
+        // background refresh also stays on the normal interval instead of the
+        // empty-store fast retry cadence, so recovery from a real rotation can
+        // take up to the configured interval. Token `exp` validation bounds
+        // stale-token exposure. An initially empty cache still accepts an empty
+        // fetch so backoff retries proceed.
+        if new_keys.is_empty() && self.has_keys() {
+            warn!(
+                "JWKS endpoint at {} returned 0 usable keys; retaining last-known-good cache",
+                redacted_uri
+            );
+            return Ok(self.keys.load().len());
+        }
+
+        let count = new_keys.len();
         self.keys.store(Arc::new(new_keys));
         debug!("JWKS key store updated: {} keys cached", count);
         Ok(count)

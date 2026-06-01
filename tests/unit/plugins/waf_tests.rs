@@ -93,6 +93,89 @@ async fn path_exemption_short_circuits_and_writes_no_waf_metadata() {
 }
 
 #[tokio::test]
+async fn short_regex_exemption_does_not_disable_waf_on_unintended_paths() {
+    // Regression for finding #7: a `~regex` exemption was matched UNANCHORED,
+    // so a short pattern like `~api` exempted (and thus silently disabled the
+    // entire WAF on) ANY path merely containing "api" — e.g. `/v1/api-keys`.
+    // After start-anchoring, the exemption only applies to paths that BEGIN
+    // with "api", so a SQLi payload on `/v1/api-keys` is still enforced.
+    let plugin = Waf::new(&json!({
+        "global_exemptions": { "paths": ["~api"] },
+        "rule_modes": { "FE-SQLI-002": "enforce" }
+    }))
+    .unwrap();
+
+    // Unintended path that merely CONTAINS "api": WAF must NOT be exempted.
+    let mut unintended = ctx("GET", "/v1/api-keys");
+    unintended.set_raw_query_string("q=%27%20OR%201%3D1".into());
+    let result = plugin.authorize(&mut unintended).await;
+    match result {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 403),
+        other => panic!("expected WAF to enforce on unintended path, got {other:?}"),
+    }
+    assert!(
+        unintended
+            .metadata
+            .get("waf.rule_hits")
+            .is_some_and(|hits| hits.contains("FE-SQLI-002")),
+        "WAF must still inspect a path that only contains the exemption substring"
+    );
+
+    // Intended path that BEGINS with the pattern: still exempt (no WAF metadata).
+    let mut intended = ctx("GET", "api/v1/list");
+    intended.set_raw_query_string("q=%27%20OR%201%3D1".into());
+    let result = plugin.authorize(&mut intended).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(
+        !intended.metadata.keys().any(|key| key.starts_with("waf.")),
+        "a path beginning with the `~regex` exemption must still short-circuit"
+    );
+}
+
+#[tokio::test]
+async fn regex_alternation_exemption_anchors_all_branches() {
+    // Regression for finding #7 (residual): a `~regex` exemption with a
+    // top-level alternation must anchor EVERY branch. Before the `^(?:...)`
+    // wrap, `~health|metrics` compiled to `^health|metrics` == `(^health)|
+    // (metrics)`, leaving the `metrics` branch UNANCHORED — so it exempted (and
+    // silently disabled the WAF on) any path merely containing "metrics", e.g.
+    // `/v1/metrics-internal`.
+    let plugin = Waf::new(&json!({
+        "global_exemptions": { "paths": ["~health|metrics"] },
+        "rule_modes": { "FE-SQLI-002": "enforce" }
+    }))
+    .unwrap();
+
+    // Path containing the second alternation branch as a substring: NOT exempt.
+    let mut unintended = ctx("GET", "/v1/metrics-internal");
+    unintended.set_raw_query_string("q=%27%20OR%201%3D1".into());
+    let result = plugin.authorize(&mut unintended).await;
+    match result {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 403),
+        other => panic!(
+            "expected WAF to enforce on a path merely containing an alternation branch, got {other:?}"
+        ),
+    }
+    assert!(
+        unintended
+            .metadata
+            .get("waf.rule_hits")
+            .is_some_and(|hits| hits.contains("FE-SQLI-002")),
+        "WAF must inspect a path that only contains an alternation branch substring"
+    );
+
+    // A path that BEGINS with an anchored branch is still exempt.
+    let mut intended = ctx("GET", "metrics/list");
+    intended.set_raw_query_string("q=%27%20OR%201%3D1".into());
+    let result = plugin.authorize(&mut intended).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(
+        !intended.metadata.keys().any(|key| key.starts_with("waf.")),
+        "a path beginning with an alternation branch must still short-circuit"
+    );
+}
+
+#[tokio::test]
 async fn waf_clears_preexisting_reserved_metadata_before_evaluation() {
     let plugin = Waf::new(&json!({})).unwrap();
     let mut ctx = ctx("GET", "/search");
@@ -237,6 +320,81 @@ async fn request_body_scan_uses_context_aware_final_body_hook() {
             .get("waf.rule_hits")
             .is_some_and(|hits| hits.contains("FE-CMD-002"))
     );
+}
+
+#[tokio::test]
+async fn body_encoding_specials_trigger_buffering_without_body_rules() {
+    let plugin = Waf::new(&json!({
+        "include_default_rules": false,
+        "response_inspection": true,
+        "response_body_inspection": true,
+        "custom_rules": [{
+            "id": "FE-ENCODING-001",
+            "name": "Double URL encoding",
+            "category": "encoding_evasion",
+            "severity": "medium",
+            "target": "full_url",
+            "match_kind": "contains",
+            "pattern": "%25",
+            "action": "enforce"
+        }]
+    }))
+    .unwrap();
+
+    let mut req_ctx = ctx("POST", "/submit");
+    req_ctx
+        .headers
+        .insert("content-type".into(), "text/plain".into());
+    assert!(plugin.requires_request_body_buffering());
+    assert!(plugin.should_buffer_request_body(&req_ctx));
+    let headers = req_ctx.headers.clone();
+    let result = plugin
+        .on_final_request_body_with_context(&mut req_ctx, &headers, b"file=%252e%252e%252fetc")
+        .await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert_eq!(
+        req_ctx.metadata.get("waf.rule_hits").map(String::as_str),
+        Some("FE-ENCODING-001")
+    );
+
+    let mut binary_req_ctx = ctx("POST", "/upload");
+    binary_req_ctx
+        .headers
+        .insert("content-type".into(), "application/octet-stream".into());
+    assert!(!plugin.should_buffer_request_body(&binary_req_ctx));
+
+    let mut resp_ctx = ctx("GET", "/download");
+    let response_headers = HashMap::from([("content-type".to_string(), "text/plain".to_string())]);
+    assert!(plugin.requires_response_body_buffering());
+    assert!(plugin.should_buffer_response_body(&resp_ctx));
+    let result = plugin
+        .on_final_response_body(
+            &mut resp_ctx,
+            200,
+            &response_headers,
+            b"file=%252e%252e%252fetc",
+        )
+        .await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert_eq!(
+        resp_ctx.metadata.get("waf.rule_hits").map(String::as_str),
+        Some("FE-ENCODING-001")
+    );
+
+    let mut binary_resp_ctx = ctx("GET", "/download");
+    let response_headers = HashMap::from([(
+        "content-type".to_string(),
+        "application/octet-stream".to_string(),
+    )]);
+    let result = plugin
+        .on_final_response_body(
+            &mut binary_resp_ctx,
+            200,
+            &response_headers,
+            b"file=%252e%252e%252fetc",
+        )
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
 }
 
 #[tokio::test]
@@ -492,6 +650,158 @@ async fn decoded_body_rules_scan_lossy_utf8_bodies() {
             .metadata
             .get("waf.rule_hits")
             .is_some_and(|hits| hits.contains("CUSTOM-LUHN-LOSSY"))
+    );
+}
+
+#[tokio::test]
+async fn body_overlong_utf8_marker_is_flagged_as_encoding_evasion() {
+    // Regression for finding #40: the overlong-UTF8 / double-encoding /
+    // null-byte markers were only checked on the URL/path, never on bodies.
+    // An overlong-UTF8-encoded body payload is lossy-decoded to U+FFFD rather
+    // than the dangerous char and previously raised no signal. The body
+    // encoding-evasion check now flags it via the dedicated FE-ENCODING-002
+    // overlong marker rule, so rule_modes and overrides for that rule apply.
+    let plugin = Waf::new(&json!({
+        "include_default_rules": false,
+        "custom_rules": [{
+            "id": "FE-ENCODING-002",
+            "name": "Overlong UTF-8 marker",
+            "category": "encoding_evasion",
+            "severity": "medium",
+            "target": "full_url",
+            "match_kind": "contains",
+            "pattern": "%c0",
+            "action": "enforce"
+        }]
+    }))
+    .unwrap();
+    let mut ctx = ctx("POST", "/submit");
+    ctx.headers
+        .insert("content-type".into(), "text/plain".into());
+    let headers = ctx.headers.clone();
+
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, b"path=%c0%ae%c0%aetarget")
+        .await;
+
+    match result {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 403),
+        other => panic!("expected encoding-evasion enforce on body, got {other:?}"),
+    }
+    assert!(
+        ctx.metadata
+            .get("waf.rule_hits")
+            .is_some_and(|hits| hits.contains("FE-ENCODING-002")),
+        "overlong-UTF8 marker in a body must raise the encoding-evasion signal"
+    );
+}
+
+#[tokio::test]
+async fn body_double_encoding_marker_is_flagged_as_encoding_evasion() {
+    // Companion to #40: a double-encoded marker (`%252e`) in a body — which
+    // the URL-only check never inspected — is now flagged.
+    let plugin = Waf::new(&json!({
+        "rule_modes": { "FE-ENCODING-001": "enforce" }
+    }))
+    .unwrap();
+    let mut ctx = ctx("POST", "/submit");
+    ctx.headers
+        .insert("content-type".into(), "text/plain".into());
+    let headers = ctx.headers.clone();
+
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, b"file=%252e%252e%252fetc")
+        .await;
+
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(
+        ctx.metadata
+            .get("waf.rule_hits")
+            .is_some_and(|hits| hits.contains("FE-ENCODING-001"))
+    );
+}
+
+#[tokio::test]
+async fn body_beyond_cap_stacked_encoding_is_flagged_as_encoding_evasion() {
+    // Regression for finding #39: an encoding stacked deeper than the layered-
+    // decode round cap never reduces to its literal payload, so the body regex
+    // set could not see it. The residual-encoding check now surfaces it as an
+    // encoding-evasion signal instead of forwarding it silently.
+    let plugin = Waf::new(&json!({
+        "rule_modes": { "FE-ENCODING-001": "enforce" }
+    }))
+    .unwrap();
+
+    // Quadruply-nested HTML entity (`&amp;amp;amp;lt;` -> ... -> `&lt;` after
+    // the cap, never reaching `<`). This isolates the residual-encoding logic
+    // from finding #40's byte markers: the payload contains NO `%`, so the
+    // overlong/double/null marker checks cannot fire — only the beyond-cap
+    // residual signal can flag it.
+    let mut deep_ctx = ctx("POST", "/submit");
+    deep_ctx
+        .headers
+        .insert("content-type".into(), "text/plain".into());
+    let headers = deep_ctx.headers.clone();
+    let result = plugin
+        .on_final_request_body_with_context(
+            &mut deep_ctx,
+            &headers,
+            b"q=&amp;amp;amp;lt;script&amp;amp;amp;gt;",
+        )
+        .await;
+    match result {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 403),
+        other => panic!("expected beyond-cap stacked encoding to be flagged, got {other:?}"),
+    }
+    assert!(
+        deep_ctx
+            .metadata
+            .get("waf.rule_hits")
+            .is_some_and(|hits| hits.contains("FE-ENCODING-001"))
+    );
+
+    // A quad percent-encoded payload is also still encoded after the cap and is
+    // flagged too (here both the residual and the `%25` double-encoding marker
+    // apply, but the assertion only needs the FE-ENCODING signal to fire).
+    let mut deep_pct = ctx("POST", "/submit");
+    deep_pct
+        .headers
+        .insert("content-type".into(), "text/plain".into());
+    let headers = deep_pct.headers.clone();
+    let result = plugin
+        .on_final_request_body_with_context(
+            &mut deep_pct,
+            &headers,
+            b"q=%2525253Cscript%2525253Ealert(1)",
+        )
+        .await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(
+        deep_pct
+            .metadata
+            .get("waf.rule_hits")
+            .is_some_and(|hits| hits.contains("FE-ENCODING-001"))
+    );
+
+    // Negative control: a body with no encoding markers and no deep stacking
+    // must NOT raise the encoding-evasion signal (the residual check is precise
+    // and does not false-positive on benign text). A bare `+` is a decodable
+    // marker but decodes cleanly within the cap.
+    let mut clean_ctx = ctx("POST", "/submit");
+    clean_ctx
+        .headers
+        .insert("content-type".into(), "text/plain".into());
+    let headers = clean_ctx.headers.clone();
+    let result = plugin
+        .on_final_request_body_with_context(&mut clean_ctx, &headers, b"q=hello+world")
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(
+        clean_ctx
+            .metadata
+            .get("waf.rule_hits")
+            .is_none_or(|hits| !hits.contains("FE-ENCODING-001")),
+        "a body that decodes cleanly within the cap must not raise the residual signal"
     );
 }
 
