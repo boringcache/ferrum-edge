@@ -8909,7 +8909,12 @@ components:
                 description: Direct URL to the IdP's JWKS endpoint
               discovery_url:
                 type: string
-                description: OIDC discovery URL (auto-discovers jwks_uri)
+                description: >-
+                  OIDC discovery URL (auto-discovers jwks_uri). The discovered
+                  jwks_uri must use the same origin as the discovery URL
+                  (scheme, host, and effective port). For IdPs that serve JWKS
+                  from a different origin than discovery, configure jwks_uri
+                  directly instead.
               jwks:
                 oneOf:
                   - type: string
@@ -9465,13 +9470,13 @@ components:
 
     HmacAuthConfig:
       type: object
-      description: "Plugin: hmac_auth — HMAC signature verification with mandatory request-body integrity protection (RFC 9421 / RFC 3230). Requests must include a Digest or Content-Digest header that matches the request body; the digest header value is folded into the HMAC signing string (METHOD\\nPATH\\nDATE\\nDIGEST). Consumer credentials store the shared secret."
+      description: "Plugin: hmac_auth — HMAC signature verification with mandatory request-body integrity protection (RFC 9421 / RFC 3230). Requests must include a Digest or Content-Digest header that matches the request body; the digest header value and the raw query string are folded into the HMAC signing string (METHOD\\nPATH\\nQUERY\\nDATE\\nDIGEST), so altering query parameters or the body invalidates the signature. Note: the signed Date header provides a bounded freshness window (now ± clock_skew_seconds), not single-use replay prevention — there is no nonce store, so a captured valid request can be replayed within the window. Consumer credentials store the shared secret."
       properties:
         clock_skew_seconds:
           type: integer
           format: uint64
           default: 300
-          description: Maximum allowed clock skew in seconds for the Date header replay protection window
+          description: Maximum allowed clock skew in seconds for the Date header freshness window. The Date header bounds replay to this window but does not prevent in-window replay (no nonce store); keep it tight for non-idempotent routes.
 
     # ── Mesh / Service-Mesh Plugins ─────────────────────────────────
     # These plugins are primarily auto-injected by mesh mode (sidecar / ambient /
@@ -11284,6 +11289,11 @@ components:
                 properties:
                   paths:
                     type: array
+                    description: >-
+                      Exact paths by default. A trailing `*` means prefix match,
+                      and a leading `~` means a start-anchored regex (implicit
+                      `^(?:...)` wrapper so every alternation branch is
+                      anchored). Use `~.*pattern` for a floating substring match.
                     items:
                       type: string
                   methods:
@@ -11533,7 +11543,11 @@ components:
           properties:
             paths:
               type: array
-              description: Exact paths by default; trailing * means prefix match and leading ~ means regex.
+              description: >-
+                Exact paths by default. A trailing `*` means prefix match, and a
+                leading `~` means a start-anchored regex (implicit `^(?:...)`
+                wrapper so every alternation branch is anchored). Use
+                `~.*pattern` for a floating substring match.
               items:
                 type: string
             methods:
@@ -11554,6 +11568,13 @@ components:
       properties:
         paths:
           type: array
+          description: >-
+            Paths that short-circuit the entire WAF. Each entry matches from the
+            start of the path: a plain string is an exact full-path match,
+            `prefix*` is a prefix match, and `~regex` is a start-anchored regex
+            (implicit `^(?:...)` wrapper so every alternation branch is
+            anchored). Use `~.*pattern` for a floating substring match. Keep entries tight — an over-broad pattern silently disables
+            the WAF on unintended routes.
           items:
             type: string
         methods:
@@ -12023,7 +12044,8 @@ components:
               delay_ms:
                 type: integer
                 format: uint64
-                description: Simulated latency in milliseconds (default 0)
+                maximum: 3600000
+                description: "Simulated latency in milliseconds (default 0). Capped at 3600000 (1 hour); larger values are rejected at config validation."
         passthrough_on_no_match:
           type: boolean
           description: "If true, unmatched requests continue to the backend. If false (default), returns 404."

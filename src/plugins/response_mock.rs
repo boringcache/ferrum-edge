@@ -50,7 +50,8 @@
 //!   - **status_code**: HTTP status to return (default: 200)
 //!   - **headers**: Response headers (default: `{"content-type": "application/json"}`)
 //!   - **body**: Response body string (default: empty)
-//!   - **delay_ms**: Simulated latency in milliseconds (default: 0)
+//!   - **delay_ms**: Simulated latency in milliseconds (default: 0, max
+//!     3,600,000 = 1 hour; larger values are rejected at construction)
 //! - **passthrough_on_no_match**: If true, requests not matching any rule
 //!   continue to the backend. If false (default), unmatched requests get 404.
 
@@ -64,6 +65,13 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 use super::{Plugin, PluginResult, RequestContext};
+
+/// Upper bound for a rule's `delay_ms` (1 hour). `delay_ms` feeds
+/// `tokio::time::sleep` on the request hot path, so an unbounded value
+/// (operator typo / wrong unit) would pin a request open and hold a draining
+/// slot during graceful shutdown. Matches `fault_injection` and
+/// `mesh_route_dispatch`. (Finding #63.)
+const MAX_DELAY_MS: u64 = 3_600_000;
 
 enum PathMatcher {
     Exact(String),
@@ -191,6 +199,11 @@ impl ResponseMock {
             };
 
             let delay_ms = optional_u64(rule_val, "delay_ms", i)?.unwrap_or(0);
+            if delay_ms > MAX_DELAY_MS {
+                return Err(format!(
+                    "response_mock: rule[{i}] 'delay_ms' must be <= {MAX_DELAY_MS}, got {delay_ms}"
+                ));
+            }
 
             rules.push(MockRule {
                 method,

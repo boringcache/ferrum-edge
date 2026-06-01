@@ -134,7 +134,13 @@ pub fn verify(input: DpopVerifyInput<'_>) -> Result<(), &'static str> {
     if claims.htm != input.method.to_ascii_uppercase() {
         return Err("DPoP method mismatch");
     }
-    if claims.htu != input.htu {
+    // RFC 9449 §4.3: compare `htu` ignoring query and fragment, and normalize
+    // scheme/host case and default ports. `input.htu` is already canonical (the
+    // caller built it via `canonical_htu`), so normalize the client-supplied
+    // proof `htu` the same way before comparing. Reject if the proof's `htu`
+    // cannot be parsed/normalized.
+    let proof_htu = canonical_htu_from_url(&claims.htu).ok_or("DPoP URL mismatch")?;
+    if proof_htu != input.htu {
         return Err("DPoP URL mismatch");
     }
     let now = chrono::Utc::now().timestamp();
@@ -145,11 +151,19 @@ pub fn verify(input: DpopVerifyInput<'_>) -> Result<(), &'static str> {
     if claims.exp < now.saturating_sub(skew) {
         return Err("Invalid DPoP proof");
     }
-    if let Some(ath) = claims.ath {
-        let expected = access_token_hash(input.access_token);
-        if !constant_time_eq(ath.as_bytes(), expected.as_bytes()) {
-            return Err("DPoP access token hash mismatch");
-        }
+    // RFC 9449 §4.3: when a DPoP proof is presented alongside an access token at
+    // a protected resource, the resource server MUST verify that the proof's
+    // `ath` claim matches the SHA-256 of the presented access token. This input
+    // always carries a presented access token (and requires its `cnf.jkt`
+    // binding above), so `ath` is mandatory here: a proof that omits it would
+    // otherwise be bound only to the key, not to the specific token, letting a
+    // proof minted for one token authorize use of a different token under the
+    // same key. (A token-endpoint PoP flow without `ath` would need its own code
+    // path, not a relaxation of this one.)
+    let ath = claims.ath.ok_or("DPoP proof missing ath")?;
+    let expected = access_token_hash(input.access_token);
+    if !constant_time_eq(ath.as_bytes(), expected.as_bytes()) {
+        return Err("DPoP access token hash mismatch");
     }
     if !input
         .cache
@@ -185,6 +199,27 @@ pub fn canonical_htu(scheme: &str, host: &str, path: &str) -> Option<String> {
         format!("/{raw_path}")
     };
     Some(format!("{scheme}://{host}{path}"))
+}
+
+/// Normalize a full `htu` URL string (e.g. the `htu` claim from a DPoP proof)
+/// into the same canonical form as [`canonical_htu`]. Parses the URL, then
+/// reconstructs `host[:port]` (the `url` crate omits default :80/:443 ports and
+/// lowercases the host) and routes scheme/host/path through [`canonical_htu`] so
+/// both sides of the comparison share one normalizer. Returns `None` if the URL
+/// fails to parse, has no host, or contains userinfo. Per RFC 9449 §4.3, query
+/// and fragment are ignored (dropped by `canonical_htu`), but userinfo is part
+/// of the authority and must not be normalized away.
+pub fn canonical_htu_from_url(raw: &str) -> Option<String> {
+    let parsed = url::Url::parse(raw).ok()?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return None;
+    }
+    let host = parsed.host_str()?;
+    let host_with_port = match parsed.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    };
+    canonical_htu(parsed.scheme(), &host_with_port, parsed.path())
 }
 
 pub fn jwk_thumbprint_sha256(jwk: &Jwk) -> Result<String, String> {

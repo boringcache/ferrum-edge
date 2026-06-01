@@ -87,6 +87,25 @@ content-type-agnostic (an attacker controls the declared `Content-Type`), and
 bounded to a small number of variants. Query values are percent-decoded before
 matching as well.
 
+The layered decode runs a bounded number of rounds (a cost guard against
+decompression-style blowups), so double- and triple-stacked encodings are fully
+reduced but a payload stacked deeper than the cap is not. Rather than silently
+forwarding such a body, the WAF raises the `encoding_evasion` signal
+(`FE-ENCODING-001`) for it — the same rule that flags URL double-encoding. The
+overlong-UTF8 (`FE-ENCODING-002`), double-encoding, and null-byte
+(`FE-ENCODING-001`) markers are likewise checked against request and response
+**bodies**, not just the URL/path, so an overlong-encoded body payload that
+lossy percent-decoding cannot recover to its literal character is still flagged
+as an evasion attempt.
+
+Note that body marker detection is a heuristic: a benign body that legitimately
+contains a literal encoded marker (e.g. `code=SAVE50%25`, a `%00` in free text,
+or `%c0%ae` in a paste) can raise `FE-ENCODING-001` or `FE-ENCODING-002`.
+This is why both rules default to **Monitor** (they record `waf.rule_hits`
+metadata rather than blocking) even when the WAF is in `enforce` mode —
+operators opt a rule into blocking explicitly via `rule_modes` once they have
+confirmed it is clean for their traffic.
+
 ## Rule targets
 
 A rule's `target` selects what it inspects:
@@ -172,12 +191,20 @@ paranoia, change severity/score, or set a per-rule `action`:
 Per-rule `action: "enforce"` only blocks when global `mode` is also
 `enforce`; with `mode: "monitor"` the match is logged but allowed.
 
-`global_exemptions` short-circuits the entire WAF for matching requests:
+`global_exemptions` short-circuits the entire WAF for matching requests, so keep
+the entries tight — an over-broad `paths` entry silently disables the WAF on
+unintended routes:
 
-- `paths` — exact, `prefix*`, or `~regex`
+- `paths` — exact, `prefix*`, or `~regex`. All three match from the **start** of
+  the path: a non-wildcard entry is an exact full-path match, `prefix*` is a
+  prefix match, and `~regex` is start-anchored (an implicit leading `^`). So
+  `~/internal/` exempts only paths beginning with `/internal/`, not every path
+  containing it. Use `~^/a|^/b` for alternation, or `~.*pattern` if you really
+  need a floating substring match.
 - `methods`, `consumers`, `ips` (CIDR)
 - `header_present` — suppress rules when a header is present/equal
 - `fp_capture_filters` — suppress any matched value matching these patterns
+  (these match anywhere in the value by design and are **not** anchored)
 
 ## Custom rules
 
@@ -220,6 +247,26 @@ data-leak rules.
 
 `scan_budget_ms` bounds total scan time; `on_scan_timeout` (`allow`, `block`,
 `log_and_allow`) decides the outcome when the budget is exceeded.
+
+### Detection limits
+
+A few detections trade exhaustiveness for bounded, attacker-resistant cost.
+These are deliberate and documented so operators can layer additional controls
+where the residual risk matters:
+
+- **Luhn / credit-card scan (`FE-DATA-LEAK-001`)** caps a single *contiguous*
+  digit run at 4096 digits. The run-length cap prevents quadratic Luhn work on
+  an attacker-supplied page-long digit run. As a consequence, a valid card
+  number embedded **after** more than 4096 unbroken digits in one run (where the
+  only separators are spaces, dashes, or dots, which do not break the run) is
+  not detected. Real card data is not preceded by thousands of digits, so this
+  bounds cost without affecting normal leak detection; treat it as a known gap
+  only against deliberately crafted padding. The cap is the
+  `MAX_LUHN_DIGIT_RUN_SCAN` constant in `src/plugins/waf/scan.rs`.
+- **Layered body decode** peels a bounded number of stacked encoding rounds (see
+  *Decode / normalization*). Encodings stacked deeper than the cap are not
+  decoded to their literal payload, but the body is flagged with the
+  `encoding_evasion` signal instead of passing silently.
 
 ## Stream (TCP/UDP) inspection
 
