@@ -43,11 +43,11 @@ The gateway session has two bounds, both enforced on every request:
 - **Absolute lifetime** — `session.ttl_secs` (default `3600`) measured from login. A session is never valid past this, regardless of activity.
 - **Idle timeout** — `session.idle_ttl_secs` (default `1800`) of inactivity. This is a *sliding* window: each request advances the session's last-touch time, so an actively used session stays valid until the absolute lifetime. To keep the per-request cost and `Set-Cookie` churn low, the cookie is re-issued at most about twice per idle window (once more than half of `idle_ttl_secs` has elapsed since the last update), not on every request.
 
-When the provider issues a refresh token (typically by adding the `offline_access` scope), the plugin proactively refreshes the tokens `behavior.refresh_skew_secs` (default `30`) before the access token expires:
+When the provider issues a refresh token (typically by adding the `offline_access` scope), the plugin proactively refreshes the tokens `behavior.refresh_skew_secs` (default `30`) before the earlier of the access-token expiry and the stored ID-token/UserInfo claims expiry:
 
 - A new access token, a rotated refresh token, and an optional new ID token are accepted. A returned ID token is re-validated against the provider JWKS and must bind to the same subject; if it carries a `nonce` it must match the original login.
-- On success, the refreshed claims drive scope/role checks and claim-header fan-out, and the session cookie is re-issued.
-- Refresh is best-effort. A failure is not fatal: the existing session stays valid by its own ttl/idle bounds and the next attempt is deferred briefly so a flaky token endpoint is not retried on every request. The gateway session lifetime is governed by the cookie bounds above, not by access-token expiry.
+- On success, refreshed claims drive scope/role checks and claim-header fan-out, and the session cookie is re-issued. If the provider refreshes only the access token, the previous claims remain usable only until their stored claims expiry.
+- Refresh is best-effort while the stored claims are still fresh. If the token endpoint remains unavailable or the provider omits fresh claims until the stored claims pass expiry plus clock skew, the plugin fails closed and re-challenges instead of serving stale authorization claims.
 
 Both a sliding update and a refresh re-issue the session cookie on the proxied response via `Set-Cookie`, preserving any cookie the backend also set.
 

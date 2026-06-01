@@ -105,9 +105,8 @@ pub fn parse_max_response_body_bytes(
             if raw == 0 {
                 return Err(format!("{plugin_name}: '{key}' must be greater than zero"));
             }
-            usize::try_from(raw).map_err(|_| {
-                format!("{plugin_name}: '{key}' is too large for this platform: {raw}")
-            })
+            usize::try_from(raw)
+                .map_err(|_| format!("{plugin_name}: '{key}' is too large for this platform"))
         }
     }
 }

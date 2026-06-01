@@ -64,6 +64,42 @@ async fn test_execute_returns_error_response() {
 }
 
 #[tokio::test]
+async fn test_execute_returns_redirect_response_without_following() {
+    let redirect_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/target"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("followed"))
+        .mount(&target_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/redirect"))
+        .respond_with(
+            ResponseTemplate::new(302)
+                .insert_header("Location", format!("{}/target", target_server.uri())),
+        )
+        .mount(&redirect_server)
+        .await;
+
+    let client = default_client();
+    let req = client
+        .get()
+        .get(format!("{}/redirect", redirect_server.uri()));
+    let resp = client.execute(req, "test_plugin").await.unwrap();
+    assert_eq!(resp.status(), 302);
+    assert_eq!(
+        target_server
+            .received_requests()
+            .await
+            .map(|requests| requests.len())
+            .unwrap_or(0),
+        0,
+        "no-redirect execution must not request the Location target"
+    );
+}
+
+#[tokio::test]
 async fn test_execute_propagates_connection_error() {
     let client = default_client();
     // Port 1 should be unreachable on any test machine

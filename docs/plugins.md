@@ -1273,6 +1273,8 @@ Authenticates requests using the client's TLS/DTLS certificate, matching a confi
 
 **Supported `cert_field` values:** `subject_cn`, `subject_ou`, `subject_o`, `san_dns`, `san_email`, `fingerprint_sha256`, `serial`
 
+> **`serial` format.** The serial identity is the lowercase hex serial number value — no separators, matching the lowercase of `openssl x509 -serial -noout -in cert.pem` output. DER may include a leading `00` sign-padding byte for positive serials whose high bit is set, but OpenSSL's serial value omits that DER-only pad and Ferrum strips it before lookup (for example, DER bytes `00 C0 01` match stored identity `c001`). Preserve real serial value zeros, but do not add DER sign padding and do not use the colon-separated form from `openssl x509 -text`.
+
 **Consumer credential** (`mtls_auth`) — array:
 ```yaml
 credentials:
@@ -1311,7 +1313,7 @@ Authenticates using Bearer JWTs validated against one or more Identity Provider 
 |---|---|---|
 | `providers` | Array | Array of identity provider configurations (required) |
 | `providers[].jwks_uri` | String | Direct URL to the IdP's JWKS endpoint |
-| `providers[].discovery_url` | String | OIDC discovery URL (auto-discovers `jwks_uri`) |
+| `providers[].discovery_url` | String | OIDC discovery URL (auto-discovers `jwks_uri`). SSRF hardening: the discovered `jwks_uri` must use the **same origin** as the discovery URL (scheme, host, and effective port). For IdPs that serve JWKS from a different origin than discovery (e.g. Google `accounts.google.com` → `www.googleapis.com`, and some Azure AD / Okta / Auth0 setups), set `providers[].jwks_uri` directly instead of `discovery_url`. |
 | `providers[].jwks` | String/Object (optional) | Inline JWKS JSON; useful for mesh-provided or static key sets |
 | `providers[].issuer` | String (optional) | Expected JWT `iss` claim — routes tokens to this provider |
 | `providers[].audience` | String (optional) | Expected JWT `aud` claim |
@@ -1329,7 +1331,7 @@ Authenticates using Bearer JWTs validated against one or more Identity Provider 
 | `providers[].claim_headers` | Object (optional) | Per-provider claim-to-header mappings; keys are claim paths and values are upstream header names |
 | `providers[].claim_headers_separator` | String (optional) | Separator for array claim header values |
 | `providers[].require_mtls_binding` | Boolean (optional) | Require JWT `cnf.x5t#S256` to match the frontend client certificate SHA-256 thumbprint |
-| `providers[].require_dpop` | Boolean (optional) | Require and validate a DPoP proof bound to the access token |
+| `providers[].require_dpop` | Boolean (optional) | Require and validate an RFC 9449 DPoP proof bound to the access token. The proof must carry an `ath` claim matching the SHA-256 of the presented token (§4.3); proofs without `ath` are rejected. The `htu` claim is compared after normalizing scheme/host case and default ports and ignoring query/fragment |
 | `providers[].dpop_clock_skew_secs` | u64 (optional) | DPoP `iat`/`exp` clock skew in seconds (default: `30`, max: `300`) |
 | `providers[].dpop_jti_cache_max_entries` | usize (optional) | Per-provider DPoP replay cache capacity (default: `10000`) |
 | `providers[].dpop_jti_ttl_secs` | u64 (optional) | DPoP `jti` replay cache TTL (default: `300`, must be at least twice clock skew) |
@@ -1520,7 +1522,7 @@ Authenticates requests using HMAC signatures with mandatory request-body integri
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `clock_skew_seconds` | u64 | `300` | Maximum allowed skew for the `Date` header replay window |
+| `clock_skew_seconds` | u64 | `300` | Maximum allowed skew for the `Date` header freshness window |
 
 Expected `Authorization` header format:
 
@@ -1536,10 +1538,12 @@ hmac username="<username>", algorithm="hmac-sha256", signature="<base64>"
 **Signing string**:
 
 ```text
-{METHOD}\n{PATH}\n{DATE}\n{DIGEST_HEADER_VALUE}
+{METHOD}\n{PATH}\n{QUERY}\n{DATE}\n{DIGEST_HEADER_VALUE}
 ```
 
-where `DIGEST_HEADER_VALUE` is the literal value of the `Digest:` or `Content-Digest:` header (e.g., `sha-256=<base64-of-sha256-of-body>`). Including the digest header in the signing string means a tampered digest header (without re-signing) breaks the HMAC, and a tampered body (without recomputing the digest) breaks the digest verification.
+where `{PATH}` is the request path component only, `{QUERY}` is the raw query string as received (percent-encoded, without the leading `?`, empty when there is no query), and `DIGEST_HEADER_VALUE` is the literal value of the `Digest:` or `Content-Digest:` header (e.g., `sha-256=<base64-of-sha256-of-body>`). Binding the query string means altering or adding query parameters invalidates the signature; clients must sign the byte-for-byte raw query string the gateway receives. Including the digest header means a tampered digest header (without re-signing) breaks the HMAC, and a tampered body (without recomputing the digest) breaks the digest verification.
+
+> **Replay protection is a freshness window, not single-use.** The signed `Date` header bounds requests to `now ± clock_skew_seconds`; there is no nonce/seen-signature store, so a captured valid request can be replayed verbatim until the window elapses. Keep `clock_skew_seconds` tight for non-idempotent routes and do not rely on `hmac_auth` alone for them.
 
 **Consumer credential** (`hmac_auth`) — array:
 ```yaml
@@ -1606,6 +1610,20 @@ plugins:
 ```
 
 The plugin sets `ctx.authenticated_identity` to the LDAP username. When `consumer_mapping` is enabled (default), it also attempts to find a matching gateway Consumer for ACL and rate-limiting integration.
+
+**Status codes:** The plugin distinguishes failure classes so clients and operators get an accurate signal:
+
+| Outcome | Status |
+|---|---|
+| Invalid credentials, or user not found | `401` |
+| Authenticated but not in any `required_groups` | `403` |
+| Backend/config failure — directory unreachable, service-account bind failure/rejection, or search RPC error | `500` |
+
+A directory outage or a misconfigured service account therefore returns `500` (`LDAP authentication temporarily unavailable`), **not** `401` — returning `401` would tell the client its credentials are wrong, prompting useless re-submission and masking the operational problem. The specific cause is logged (via `warn!`) but never sent to the client.
+
+**Group search and service accounts:** When `required_groups` is set, the group-membership search binds with the service account if one is configured. With direct bind and **no** service account, the search runs over an **anonymous** bind — many directories deny anonymous reads of group objects / `member` attributes, in which case the search returns no entries and an entitled user is wrongly denied (`403`). The plugin logs a startup warning for this configuration and a per-request warning when an anonymous group search returns zero entries. **Configure a service account whenever you use `required_groups`** unless the directory is known to permit anonymous group searches.
+
+**TLS and revocation:** `ldaps://` and STARTTLS connections use rustls with the gateway's CA settings (`FERRUM_TLS_CA_BUNDLE_PATH`, `FERRUM_TLS_NO_VERIFY`). When a CRL is configured (`FERRUM_TLS_CRL_FILE_PATH`) and verification is not disabled, revoked LDAP server certificates are rejected — the same revocation guarantee as the proxy backend, DTLS, frontend mTLS, and rustls logging-sink surfaces.
 
 **Input escaping:** Usernames are automatically escaped before interpolation into LDAP queries — DN values are escaped per RFC 4514 and filter values per RFC 4515. This prevents LDAP injection attacks from usernames containing special characters like `*`, `(`, `)`, `\`, `,`, or `=`.
 
@@ -2745,7 +2763,7 @@ scanning the parsed key/value map and a best-effort reconstructed URL.
 | `score` | integer | severity weight | Anomaly-score contribution when `scoring` is enabled. |
 | `fp_filters` | string[] | `[]` | Regex filters that suppress known false-positive captured values for this rule. |
 | `paranoia_min` | u8 | `1` | Minimum paranoia level required for this rule. |
-| `conditions` | object | `{}` | Optional request conditions: `paths`, `methods`, `headers`, and `consumers`. Path entries use the same exact / trailing-`*` prefix / `~` regex grammar as `global_exemptions.paths`. |
+| `conditions` | object | `{}` | Optional request conditions: `paths`, `methods`, `headers`, and `consumers`. Path entries use the same exact / trailing-`*` prefix / `~` regex grammar as `global_exemptions.paths`; `~regex` entries are wrapped as `^(?:regex)`, so use `~.*pattern` for a floating substring match. |
 
 Supported targets: `header_names`, `header_values`, `query_keys`,
 `query_values`, `cookies`, `url_path`, `full_url`, `method`, `body_text`,
@@ -2758,9 +2776,10 @@ rules can match IPv6-shaped hex text from logs or diagnostics. Prefer narrow
 
 `global_exemptions` supports `paths`, `methods`, `consumers`, `ips`,
 `header_present`, and `fp_capture_filters`. Path entries ending in `*` are
-prefix matches; entries starting with `~` are treated as regex patterns; all
-other entries are exact-path matches (so `/health` exempts only `/health`, not
-`/healthz` or `/health-admin`).
+prefix matches; entries starting with `~` are start-anchored regex patterns
+wrapped as `^(?:regex)`; all other entries are exact-path matches (so `/health`
+exempts only `/health`, not `/healthz` or `/health-admin`). Use `~.*pattern`
+for a floating substring match.
 
 ```yaml
 config:
@@ -3541,7 +3560,7 @@ Request buffering is only enabled for matching JSON `POST` requests when the plu
 | `action` | String | `"reject"` | `reject`, `redact`, or `warn` |
 | `patterns` | String[] | `["ssn", "credit_card", "api_key", "aws_key"]` | Built-in patterns to enable |
 | `custom_patterns` | Object[] | `[]` | Custom `{name, regex}` patterns |
-| `scan_fields` | String | `"content"` | `content` or `all` |
+| `scan_fields` | String | `"content"` | `content` (LLM prompt fields only) or `all` (entire body) |
 | `exclude_roles` | String[] | `[]` | Message roles to skip scanning |
 | `redaction_placeholder` | String | `"[REDACTED:{type}]"` | Template for redacted text |
 | `max_scan_bytes` | Integer | `1048576` | Skip scanning if body exceeds this size |
@@ -3550,7 +3569,9 @@ Request buffering is only enabled for matching JSON `POST` requests when the plu
 
 Unknown built-in pattern names and built-in patterns that fail to compile are now fatal at construction time (previously they silently dropped detection coverage). All configured patterns are merged into a single `RegexSet` for O(text_len) detection per scan, regardless of pattern count.
 
-In `scan_fields: "all"` mode, the recursive walker skips JSON object keys that hold structural data (`model`, `id`, `role`, `type`, `temperature`, `top_p`, `max_tokens`, etc.) so values that incidentally match a PII regex are not corrupted. When the body has a recognized chat shape (`messages` array), the structured redactor that only touches `messages[].content` is preferred even in `all` mode.
+`scan_fields: "content"` (default) scans LLM prompt text across the common request shapes: chat `messages[].content` (string or multimodal text parts), plus the top-level `prompt` (OpenAI legacy completions), `input` (Responses API and embeddings), and `system` (Anthropic) fields — each accepted as a string, an array of strings, or an array of `{type: "text", text}` parts. Both detection and redaction cover these fields. For request bodies that carry prompt text in other, non-standard fields, use `scan_fields: "all"`.
+
+In `scan_fields: "all"` mode, the recursive walker preserves JSON values that hold structural data (`model`, `id`, `role`, `type`, `temperature`, `top_p`, `max_tokens`, etc.) **only when the structural key is a top-level field holding a scalar string** — i.e. the request parameters an operator legitimately sends. It always recurses into nested objects and arrays and never skips nested occurrences of those key names, so PII hidden under a structural key (e.g. `{"metadata": {"type": "<PII>"}}` or `{"id": {"note": "<PII>"}}`) is still redacted rather than passed through. When the body has a recognized chat shape (`messages` array), the structured redactor that touches `messages[].content` runs first and the recursive walker then covers sibling fields.
 
 ```yaml
 plugin_name: ai_prompt_shield
