@@ -1607,6 +1607,20 @@ plugins:
 
 The plugin sets `ctx.authenticated_identity` to the LDAP username. When `consumer_mapping` is enabled (default), it also attempts to find a matching gateway Consumer for ACL and rate-limiting integration.
 
+**Status codes:** The plugin distinguishes failure classes so clients and operators get an accurate signal:
+
+| Outcome | Status |
+|---|---|
+| Invalid credentials, or user not found | `401` |
+| Authenticated but not in any `required_groups` | `403` |
+| Backend/config failure — directory unreachable, service-account bind failure/rejection, or search RPC error | `500` |
+
+A directory outage or a misconfigured service account therefore returns `500` (`LDAP authentication temporarily unavailable`), **not** `401` — returning `401` would tell the client its credentials are wrong, prompting useless re-submission and masking the operational problem. The specific cause is logged (via `warn!`) but never sent to the client.
+
+**Group search and service accounts:** When `required_groups` is set, the group-membership search binds with the service account if one is configured. With direct bind and **no** service account, the search runs over an **anonymous** bind — many directories deny anonymous reads of group objects / `member` attributes, in which case the search returns no entries and an entitled user is wrongly denied (`403`). The plugin logs a startup warning for this configuration and a per-request warning when an anonymous group search returns zero entries. **Configure a service account whenever you use `required_groups`** unless the directory is known to permit anonymous group searches.
+
+**TLS and revocation:** `ldaps://` and STARTTLS connections use rustls with the gateway's CA settings (`FERRUM_TLS_CA_BUNDLE_PATH`, `FERRUM_TLS_NO_VERIFY`). When a CRL is configured (`FERRUM_TLS_CRL_FILE_PATH`) and verification is not disabled, revoked LDAP server certificates are rejected — the same revocation guarantee as the proxy backend, DTLS, frontend mTLS, and rustls logging-sink surfaces.
+
 **Input escaping:** Usernames are automatically escaped before interpolation into LDAP queries — DN values are escaped per RFC 4514 and filter values per RFC 4515. This prevents LDAP injection attacks from usernames containing special characters like `*`, `(`, `)`, `\`, `,`, or `=`.
 
 ### `soap_ws_security`
