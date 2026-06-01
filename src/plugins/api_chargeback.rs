@@ -80,6 +80,17 @@ impl ProtocolFamily {
     }
 }
 
+#[derive(Clone, Copy)]
+struct EntryPrices {
+    call: f64,
+    bandwidth_sent: f64,
+    bandwidth_received: f64,
+}
+
+type HttpChargeAggregateKey = (String, String, u16, Arc<str>, Arc<str>);
+type StreamChargeAggregateKey = (String, String, Arc<str>, Arc<str>);
+type BandwidthAggregateKey = (String, String, ProtocolFamily, Arc<str>, Arc<str>);
+
 /// Currency and namespace of a single `api_chargeback` plugin instance
 /// (finding #24).
 ///
@@ -130,9 +141,7 @@ fn write_chargeback_key(
     proxy_id: &str,
     status_code: u16,
     scope: &InstanceScope,
-    call_price: f64,
-    bw_price_sent: f64,
-    bw_price_received: f64,
+    prices: EntryPrices,
 ) {
     let _ = write!(
         buf,
@@ -142,9 +151,9 @@ fn write_chargeback_key(
         status_code,
         scope.currency,
         scope.namespace_label,
-        call_price.to_bits(),
-        bw_price_sent.to_bits(),
-        bw_price_received.to_bits()
+        prices.call.to_bits(),
+        prices.bandwidth_sent.to_bits(),
+        prices.bandwidth_received.to_bits()
     );
 }
 
@@ -541,9 +550,11 @@ impl ChargebackRegistry {
                 proxy_id,
                 status_code,
                 scope,
-                call_price,
-                bw_price_sent,
-                bw_price_received,
+                EntryPrices {
+                    call: call_price,
+                    bandwidth_sent: bw_price_sent,
+                    bandwidth_received: bw_price_received,
+                },
             );
 
             if let Some(entry) = self.entries.get(buf.as_str()) {
@@ -570,9 +581,11 @@ impl ChargebackRegistry {
                 proxy_id,
                 status_code,
                 scope,
-                call_price,
-                bw_price_sent,
-                bw_price_received,
+                EntryPrices {
+                    call: call_price,
+                    bandwidth_sent: bw_price_sent,
+                    bandwidth_received: bw_price_received,
+                },
             );
             self.entries
                 .entry(owned_key)
@@ -666,11 +679,8 @@ impl ChargebackRegistry {
         // stale prices, but Prometheus label sets intentionally omit those
         // bits. Aggregate by the exposed labels before rendering so a scrape
         // never contains duplicate series after pricing changes.
-        let mut http_aggregates: HashMap<
-            (String, String, u16, Arc<str>, Arc<str>),
-            ChargeAggregate,
-        > = HashMap::new();
-        let mut stream_aggregates: HashMap<(String, String, Arc<str>, Arc<str>), ChargeAggregate> =
+        let mut http_aggregates: HashMap<HttpChargeAggregateKey, ChargeAggregate> = HashMap::new();
+        let mut stream_aggregates: HashMap<StreamChargeAggregateKey, ChargeAggregate> =
             HashMap::new();
 
         for entry in self.entries.iter() {
@@ -799,10 +809,7 @@ impl ChargebackRegistry {
             charge_received: f64,
         }
 
-        let mut bw_aggregates: HashMap<
-            (String, String, ProtocolFamily, Arc<str>, Arc<str>),
-            BandwidthAggregate,
-        > = HashMap::new();
+        let mut bw_aggregates: HashMap<BandwidthAggregateKey, BandwidthAggregate> = HashMap::new();
         for entry in self.entries.iter() {
             let v = entry.value();
             let agg = bw_aggregates
@@ -934,8 +941,10 @@ impl ChargebackRegistry {
             bandwidth_charge_received: f64,
         }
 
-        let mut consumers: HashMap<String, HashMap<(String, Arc<str>, Arc<str>), ProxyAggregate>> =
-            HashMap::new();
+        type ProxyAggregateKey = (String, Arc<str>, Arc<str>);
+        type ConsumerProxyAggregates = HashMap<ProxyAggregateKey, ProxyAggregate>;
+
+        let mut consumers: HashMap<String, ConsumerProxyAggregates> = HashMap::new();
         // Top-level currency: the single currency in use, or "mixed" when
         // instances disagree (consumers must then read per-proxy `currency`).
         let mut overall_currency: Option<Arc<str>> = None;
@@ -1016,7 +1025,7 @@ impl ChargebackRegistry {
                 *proxy_id_counts.entry(proxy_id.as_str()).or_default() += 1;
             }
 
-            for ((proxy_id, _, _), agg) in proxies {
+            for ((proxy_id, _, namespace_label), agg) in proxies {
                 let mut proxy_per_call_charges = 0.0f64;
                 let mut proxy_calls = 0u64;
                 let mut status_objects = serde_json::Map::new();
@@ -1086,7 +1095,7 @@ impl ChargebackRegistry {
                         "{}|currency={}{}",
                         proxy_id,
                         agg.currency.as_ref(),
-                        agg.namespace_label.as_ref()
+                        namespace_label.as_ref()
                     )
                 } else {
                     proxy_id.clone()
