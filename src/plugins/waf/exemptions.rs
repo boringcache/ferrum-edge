@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::plugins::RequestContext;
 
-use super::rules::{IpCidr, anchor_condition_path_regex};
+use super::rules::IpCidr;
 
 #[derive(Debug, Default)]
 pub struct CompiledExemptions {
@@ -116,6 +116,12 @@ impl CompiledExemptions {
     }
 }
 
+fn anchor_exemption_path_regex(regex: &str) -> String {
+    // Wrap instead of prefixing a bare `^` so every top-level alternation
+    // branch is anchored: `~a|b` becomes `^(?:a|b)`, not `^a|b`.
+    format!("^(?:{regex})")
+}
+
 fn exemption_path_pattern(raw: String) -> String {
     if let Some(regex) = raw.strip_prefix('~') {
         // Start-anchor `~regex` exemptions so they match from the beginning of
@@ -126,8 +132,9 @@ fn exemption_path_pattern(raw: String) -> String {
         // `/secret/api/admin`) — short-circuiting the entire WAF on those
         // routes via the early return in `request_short_circuits`. Operators
         // who genuinely want a substring/floating match can still write
-        // `~.*pattern`; an explicit leading `^` is preserved as-is.
-        anchor_condition_path_regex(regex).into_owned()
+        // `~.*pattern`; an explicit leading `^` remains compatible inside the
+        // wrapper.
+        anchor_exemption_path_regex(regex)
     } else if let Some(prefix) = raw.strip_suffix('*') {
         format!("^{}", regex::escape(prefix))
     } else {

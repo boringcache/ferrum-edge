@@ -235,12 +235,9 @@ impl KafkaLogging {
                 batch_size: 1,
                 flush_interval: Duration::from_millis(1000),
                 buffer_capacity,
-                retry: RetryPolicy {
-                    // librdkafka handles its own delivery retries; keep the
-                    // shared logger at a single attempt for each message.
-                    max_attempts: 1,
-                    delay: Duration::from_millis(0),
-                },
+                // librdkafka handles its own delivery retries; keep the
+                // shared logger at a single attempt for each message.
+                retry: RetryPolicy::fixed(1, Duration::from_millis(0)),
                 plugin_name: "kafka_logging",
             },
             move |batch| {

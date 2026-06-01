@@ -1,12 +1,24 @@
 //! Tests for api_chargeback plugin
 
-use ferrum_edge::plugins::api_chargeback::{ApiChargeback, ChargebackRegistry, ProtocolFamily};
+use ferrum_edge::plugins::api_chargeback::{
+    ApiChargeback, ChargebackRegistry, InstanceScope, ProtocolFamily,
+};
 use ferrum_edge::plugins::{
     ALL_PROTOCOLS, Direction, DisconnectCause, Plugin, StreamTransactionSummary, TransactionSummary,
 };
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
+
+/// Default per-instance scope used by registry tests (USD / "ferrum").
+fn scope() -> InstanceScope {
+    InstanceScope::new("USD", "ferrum")
+}
+
+/// Build an instance scope with an explicit currency + namespace.
+fn scope_for(currency: &str, namespace: &str) -> InstanceScope {
+    InstanceScope::new(currency, namespace)
+}
 
 fn make_summary(
     proxy_id: &str,
@@ -96,7 +108,29 @@ fn make_stream_summary(
 
 /// Build the same key format used by the registry internally.
 fn make_key(consumer: &str, proxy_id: &str, status_code: u16) -> String {
-    format!("{}|{}|{}", consumer, proxy_id, status_code)
+    make_key_with_prices(consumer, proxy_id, status_code, 0.0, 0.0, 0.0)
+}
+
+fn make_key_with_prices(
+    consumer: &str,
+    proxy_id: &str,
+    status_code: u16,
+    call_price: f64,
+    bw_price_sent: f64,
+    bw_price_received: f64,
+) -> String {
+    let scope = scope();
+    format!(
+        "{}|{}|{}|{}|{}|{:016x}|{:016x}|{:016x}",
+        consumer,
+        proxy_id,
+        status_code,
+        scope.currency,
+        scope.namespace_label,
+        call_price.to_bits(),
+        bw_price_sent.to_bits(),
+        bw_price_received.to_bits()
+    )
 }
 
 // --- Plugin config validation tests ---
@@ -285,12 +319,17 @@ async fn test_bandwidth_only_config_records_bytes() {
     let registry = ferrum_edge::plugins::api_chargeback::global_registry();
     let entry = registry
         .entries
-        .get(&make_key("bw-only-user", "bw-only-proxy", 404))
+        .get(&make_key_with_prices(
+            "bw-only-user",
+            "bw-only-proxy",
+            404,
+            0.0,
+            0.0000001,
+            0.0000002,
+        ))
         .expect("bandwidth-only entry recorded");
-    let charge_sent = f64::from_bits(entry.bandwidth_charge_sent_bits.load(Ordering::Relaxed));
-    let charge_recv = f64::from_bits(entry.bandwidth_charge_received_bits.load(Ordering::Relaxed));
-    assert!((charge_sent - 0.1).abs() < 1e-10);
-    assert!((charge_recv - 0.4).abs() < 1e-10);
+    assert!((entry.bandwidth_charge_sent() - 0.1).abs() < 1e-10);
+    assert!((entry.bandwidth_charge_received() - 0.4).abs() < 1e-10);
 }
 
 #[tokio::test]
@@ -311,11 +350,17 @@ async fn test_stream_only_config_charges_connection() {
     let registry = ferrum_edge::plugins::api_chargeback::global_registry();
     let entry = registry
         .entries
-        .get(&make_key("stream-only-user", "stream-only-proxy", 0))
+        .get(&make_key_with_prices(
+            "stream-only-user",
+            "stream-only-proxy",
+            0,
+            0.0005,
+            0.0,
+            0.0,
+        ))
         .expect("stream-only entry recorded");
     assert_eq!(entry.protocol_family, ProtocolFamily::Stream);
-    let charge = f64::from_bits(entry.charge_total_bits.load(Ordering::Relaxed));
-    assert!((charge - 0.0005).abs() < 1e-12);
+    assert!((entry.call_charge() - 0.0005).abs() < 1e-12);
 }
 
 #[test]
@@ -372,11 +417,18 @@ async fn test_combined_pricing_applies_both_call_and_bandwidth_charges() {
     let registry = ferrum_edge::plugins::api_chargeback::global_registry();
     let entry = registry
         .entries
-        .get(&make_key("combined-user", "combined-proxy", 200))
+        .get(&make_key_with_prices(
+            "combined-user",
+            "combined-proxy",
+            200,
+            0.001,
+            0.000001,
+            0.000002,
+        ))
         .expect("combined entry recorded");
-    let call_charge = f64::from_bits(entry.charge_total_bits.load(Ordering::Relaxed));
-    let bw_sent = f64::from_bits(entry.bandwidth_charge_sent_bits.load(Ordering::Relaxed));
-    let bw_recv = f64::from_bits(entry.bandwidth_charge_received_bits.load(Ordering::Relaxed));
+    let call_charge = entry.call_charge();
+    let bw_sent = entry.bandwidth_charge_sent();
+    let bw_recv = entry.bandwidth_charge_received();
     assert!((call_charge - 0.001).abs() < 1e-12);
     assert!((bw_sent - 0.001).abs() < 1e-12); // 1_000 * 0.000001
     assert!((bw_recv - 0.004).abs() < 1e-12); // 2_000 * 0.000002
@@ -387,13 +439,23 @@ async fn test_combined_pricing_applies_both_call_and_bandwidth_charges() {
 #[test]
 fn test_registry_records_charge() {
     let registry = ChargebackRegistry::new();
-    registry.record_http("user-1", "proxy-a", "My API", 200, 0.00001, 0, 0, 0.0, 0.0);
+    registry.record_http(
+        &scope(),
+        "user-1",
+        "proxy-a",
+        "My API",
+        200,
+        0.00001,
+        0,
+        0,
+        0.0,
+        0.0,
+    );
 
-    let key = make_key("user-1", "proxy-a", 200);
+    let key = make_key_with_prices("user-1", "proxy-a", 200, 0.00001, 0.0, 0.0);
     let entry = registry.entries.get(&key).unwrap();
     assert_eq!(entry.call_count.load(Ordering::Relaxed), 1);
-    let charge = f64::from_bits(entry.charge_total_bits.load(Ordering::Relaxed));
-    assert!((charge - 0.00001).abs() < 1e-15);
+    assert!((entry.call_charge() - 0.00001).abs() < 1e-15);
     // Verify render metadata is stored correctly
     assert_eq!(&*entry.consumer, "user-1");
     assert_eq!(&*entry.proxy_id, "proxy-a");
@@ -406,25 +468,68 @@ fn test_registry_records_charge() {
 fn test_registry_accumulates_charges() {
     let registry = ChargebackRegistry::new();
     for _ in 0..1000 {
-        registry.record_http("user-1", "proxy-a", "My API", 200, 0.00001, 0, 0, 0.0, 0.0);
+        registry.record_http(
+            &scope(),
+            "user-1",
+            "proxy-a",
+            "My API",
+            200,
+            0.00001,
+            0,
+            0,
+            0.0,
+            0.0,
+        );
     }
 
-    let key = make_key("user-1", "proxy-a", 200);
+    let key = make_key_with_prices("user-1", "proxy-a", 200, 0.00001, 0.0, 0.0);
     let entry = registry.entries.get(&key).unwrap();
     assert_eq!(entry.call_count.load(Ordering::Relaxed), 1000);
-    let charge = f64::from_bits(entry.charge_total_bits.load(Ordering::Relaxed));
-    assert!((charge - 0.01).abs() < 1e-10);
+    assert!((entry.call_charge() - 0.01).abs() < 1e-10);
 }
 
 #[test]
 fn test_registry_zero_alloc_hot_path() {
     let registry = ChargebackRegistry::new();
-    registry.record_http("user-1", "proxy-a", "API", 200, 0.001, 0, 0, 0.0, 0.0);
-    registry.record_http("user-1", "proxy-a", "API", 200, 0.001, 0, 0, 0.0, 0.0);
-    registry.record_http("user-1", "proxy-a", "API", 200, 0.001, 0, 0, 0.0, 0.0);
+    registry.record_http(
+        &scope(),
+        "user-1",
+        "proxy-a",
+        "API",
+        200,
+        0.001,
+        0,
+        0,
+        0.0,
+        0.0,
+    );
+    registry.record_http(
+        &scope(),
+        "user-1",
+        "proxy-a",
+        "API",
+        200,
+        0.001,
+        0,
+        0,
+        0.0,
+        0.0,
+    );
+    registry.record_http(
+        &scope(),
+        "user-1",
+        "proxy-a",
+        "API",
+        200,
+        0.001,
+        0,
+        0,
+        0.0,
+        0.0,
+    );
 
     assert_eq!(registry.entries.len(), 1);
-    let key = make_key("user-1", "proxy-a", 200);
+    let key = make_key_with_prices("user-1", "proxy-a", 200, 0.001, 0.0, 0.0);
     let entry = registry.entries.get(&key).unwrap();
     assert_eq!(entry.call_count.load(Ordering::Relaxed), 3);
 }
@@ -432,8 +537,30 @@ fn test_registry_zero_alloc_hot_path() {
 #[test]
 fn test_registry_separates_by_consumer() {
     let registry = ChargebackRegistry::new();
-    registry.record_http("user-1", "proxy-a", "API", 200, 0.001, 0, 0, 0.0, 0.0);
-    registry.record_http("user-2", "proxy-a", "API", 200, 0.002, 0, 0, 0.0, 0.0);
+    registry.record_http(
+        &scope(),
+        "user-1",
+        "proxy-a",
+        "API",
+        200,
+        0.001,
+        0,
+        0,
+        0.0,
+        0.0,
+    );
+    registry.record_http(
+        &scope(),
+        "user-2",
+        "proxy-a",
+        "API",
+        200,
+        0.002,
+        0,
+        0,
+        0.0,
+        0.0,
+    );
 
     assert_eq!(registry.entries.len(), 2);
 }
@@ -441,8 +568,30 @@ fn test_registry_separates_by_consumer() {
 #[test]
 fn test_registry_separates_by_status_code() {
     let registry = ChargebackRegistry::new();
-    registry.record_http("user-1", "proxy-a", "API", 200, 0.001, 0, 0, 0.0, 0.0);
-    registry.record_http("user-1", "proxy-a", "API", 201, 0.002, 0, 0, 0.0, 0.0);
+    registry.record_http(
+        &scope(),
+        "user-1",
+        "proxy-a",
+        "API",
+        200,
+        0.001,
+        0,
+        0,
+        0.0,
+        0.0,
+    );
+    registry.record_http(
+        &scope(),
+        "user-1",
+        "proxy-a",
+        "API",
+        201,
+        0.002,
+        0,
+        0,
+        0.0,
+        0.0,
+    );
 
     assert_eq!(registry.entries.len(), 2);
 }
@@ -450,7 +599,18 @@ fn test_registry_separates_by_status_code() {
 #[test]
 fn test_registry_stale_eviction() {
     let registry = ChargebackRegistry::new();
-    registry.record_http("user-1", "proxy-a", "API", 200, 0.001, 0, 0, 0.0, 0.0);
+    registry.record_http(
+        &scope(),
+        "user-1",
+        "proxy-a",
+        "API",
+        200,
+        0.001,
+        0,
+        0,
+        0.0,
+        0.0,
+    );
 
     // Evict with zero TTL should remove everything
     let evicted = registry.evict_stale(0);
@@ -462,26 +622,34 @@ fn test_registry_stale_eviction() {
 fn test_registry_records_bandwidth_for_http() {
     let registry = ChargebackRegistry::new();
     registry.record_http(
-        "alice", "proxy-1", "API", 200, 0.0, 1_000_000, 2_000_000, 0.0000001, 0.0000002,
+        &scope(),
+        "alice",
+        "proxy-1",
+        "API",
+        200,
+        0.0,
+        1_000_000,
+        2_000_000,
+        0.0000001,
+        0.0000002,
     );
 
-    let key = make_key("alice", "proxy-1", 200);
+    let key = make_key_with_prices("alice", "proxy-1", 200, 0.0, 0.0000001, 0.0000002);
     let entry = registry.entries.get(&key).unwrap();
     assert_eq!(entry.bytes_sent_total.load(Ordering::Relaxed), 1_000_000);
     assert_eq!(
         entry.bytes_received_total.load(Ordering::Relaxed),
         2_000_000
     );
-    let bw_sent = f64::from_bits(entry.bandwidth_charge_sent_bits.load(Ordering::Relaxed));
-    let bw_recv = f64::from_bits(entry.bandwidth_charge_received_bits.load(Ordering::Relaxed));
-    assert!((bw_sent - 0.1).abs() < 1e-10);
-    assert!((bw_recv - 0.4).abs() < 1e-10);
+    assert!((entry.bandwidth_charge_sent() - 0.1).abs() < 1e-10);
+    assert!((entry.bandwidth_charge_received() - 0.4).abs() < 1e-10);
 }
 
 #[test]
 fn test_registry_records_stream_session() {
     let registry = ChargebackRegistry::new();
     registry.record_stream(
+        &scope(),
         "alice",
         "stream-proxy",
         "TCP Edge",
@@ -492,13 +660,12 @@ fn test_registry_records_stream_session() {
         0.0000002,
     );
 
-    let key = make_key("alice", "stream-proxy", 0);
+    let key = make_key_with_prices("alice", "stream-proxy", 0, 0.0005, 0.0000001, 0.0000002);
     let entry = registry.entries.get(&key).unwrap();
     assert_eq!(entry.protocol_family, ProtocolFamily::Stream);
     assert_eq!(entry.status_code, 0);
     assert_eq!(entry.call_count.load(Ordering::Relaxed), 1);
-    let connection_charge = f64::from_bits(entry.charge_total_bits.load(Ordering::Relaxed));
-    assert!((connection_charge - 0.0005).abs() < 1e-12);
+    assert!((entry.call_charge() - 0.0005).abs() < 1e-12);
     assert_eq!(entry.bytes_sent_total.load(Ordering::Relaxed), 500_000);
     assert_eq!(entry.bytes_received_total.load(Ordering::Relaxed), 750_000);
 }
@@ -508,21 +675,26 @@ fn test_registry_does_not_charge_bandwidth_when_price_zero() {
     // Bytes flow but no bandwidth pricing configured -> bytes accumulate,
     // bandwidth charges stay at zero.
     let registry = ChargebackRegistry::new();
-    registry.record_http("alice", "proxy", "API", 200, 0.0, 1_000, 2_000, 0.0, 0.0);
+    registry.record_http(
+        &scope(),
+        "alice",
+        "proxy",
+        "API",
+        200,
+        0.0,
+        1_000,
+        2_000,
+        0.0,
+        0.0,
+    );
     let entry = registry
         .entries
         .get(&make_key("alice", "proxy", 200))
         .unwrap();
     assert_eq!(entry.bytes_sent_total.load(Ordering::Relaxed), 1_000);
     assert_eq!(entry.bytes_received_total.load(Ordering::Relaxed), 2_000);
-    assert_eq!(
-        f64::from_bits(entry.bandwidth_charge_sent_bits.load(Ordering::Relaxed)),
-        0.0
-    );
-    assert_eq!(
-        f64::from_bits(entry.bandwidth_charge_received_bits.load(Ordering::Relaxed)),
-        0.0
-    );
+    assert_eq!(entry.bandwidth_charge_sent(), 0.0);
+    assert_eq!(entry.bandwidth_charge_received(), 0.0);
 }
 
 // --- Prometheus render tests ---
@@ -542,8 +714,10 @@ fn test_prometheus_render_empty() {
 #[test]
 fn test_prometheus_render_with_data() {
     let registry = ChargebackRegistry::new();
-    registry.configure("USD", 5, 3600, 500, "ferrum");
+    registry.configure(5, 3600, 500);
+    let s = scope();
     registry.record_http(
+        &s,
         "alice",
         "proxy-1",
         "Payments API",
@@ -555,6 +729,7 @@ fn test_prometheus_render_with_data() {
         0.0,
     );
     registry.record_http(
+        &s,
         "alice",
         "proxy-1",
         "Payments API",
@@ -580,9 +755,17 @@ fn test_prometheus_render_with_data() {
 #[test]
 fn test_prometheus_render_emits_stream_metrics() {
     let registry = ChargebackRegistry::new();
-    registry.configure("USD", 5, 3600, 500, "ferrum");
+    registry.configure(5, 3600, 500);
     registry.record_stream(
-        "bob", "tcp-edge", "TCP Edge", 0.0, 1_024, 2_048, 0.000001, 0.000002,
+        &scope(),
+        "bob",
+        "tcp-edge",
+        "TCP Edge",
+        0.0,
+        1_024,
+        2_048,
+        0.000001,
+        0.000002,
     );
 
     let output = registry.render_prometheus_uncached();
@@ -595,12 +778,13 @@ fn test_prometheus_render_emits_stream_metrics() {
 #[test]
 fn test_prometheus_render_bandwidth_aggregates_across_status_codes() {
     let registry = ChargebackRegistry::new();
-    registry.configure("USD", 5, 3600, 500, "ferrum");
+    registry.configure(5, 3600, 500);
+    let s = scope();
     registry.record_http(
-        "charlie", "proxy-x", "API", 200, 0.0, 1_000, 10_000, 0.0000001, 0.0000002,
+        &s, "charlie", "proxy-x", "API", 200, 0.0, 1_000, 10_000, 0.0000001, 0.0000002,
     );
     registry.record_http(
-        "charlie", "proxy-x", "API", 500, 0.0, 500, 5_000, 0.0000001, 0.0000002,
+        &s, "charlie", "proxy-x", "API", 500, 0.0, 500, 5_000, 0.0000001, 0.0000002,
     );
 
     let output = registry.render_prometheus_uncached();
@@ -630,12 +814,35 @@ fn test_json_render_empty() {
 #[test]
 fn test_json_render_with_data() {
     let registry = ChargebackRegistry::new();
-    registry.configure("EUR", 5, 3600, 500, "ferrum");
+    registry.configure(5, 3600, 500);
+    let s = scope_for("EUR", "ferrum");
 
     for _ in 0..100 {
-        registry.record_http("bob", "proxy-2", "Orders API", 200, 0.00001, 0, 0, 0.0, 0.0);
+        registry.record_http(
+            &s,
+            "bob",
+            "proxy-2",
+            "Orders API",
+            200,
+            0.00001,
+            0,
+            0,
+            0.0,
+            0.0,
+        );
     }
-    registry.record_http("bob", "proxy-2", "Orders API", 201, 0.00002, 0, 0, 0.0, 0.0);
+    registry.record_http(
+        &s,
+        "bob",
+        "proxy-2",
+        "Orders API",
+        201,
+        0.00002,
+        0,
+        0,
+        0.0,
+        0.0,
+    );
 
     let output = registry.render_json_uncached();
     let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
@@ -649,6 +856,8 @@ fn test_json_render_with_data() {
     assert_eq!(proxy["proxy_name"], "Orders API");
     assert_eq!(proxy["total_calls"], 101);
     assert_eq!(proxy["protocol_family"], "http");
+    // Per-proxy currency reflects the recording instance (finding #24).
+    assert_eq!(proxy["currency"], "EUR");
 
     let status_200 = &proxy["by_status"]["200"];
     assert_eq!(status_200["calls"], 100);
@@ -657,9 +866,18 @@ fn test_json_render_with_data() {
 #[test]
 fn test_json_render_includes_bandwidth() {
     let registry = ChargebackRegistry::new();
-    registry.configure("USD", 5, 3600, 500, "ferrum");
+    registry.configure(5, 3600, 500);
     registry.record_http(
-        "alice", "proxy-1", "API", 200, 0.001, 1_000, 4_000, 0.0000001, 0.0000002,
+        &scope(),
+        "alice",
+        "proxy-1",
+        "API",
+        200,
+        0.001,
+        1_000,
+        4_000,
+        0.0000001,
+        0.0000002,
     );
 
     let output = registry.render_json_uncached();
@@ -672,9 +890,17 @@ fn test_json_render_includes_bandwidth() {
 #[test]
 fn test_json_render_includes_stream_section() {
     let registry = ChargebackRegistry::new();
-    registry.configure("USD", 5, 3600, 500, "ferrum");
+    registry.configure(5, 3600, 500);
     registry.record_stream(
-        "alice", "tcp-1", "TCP API", 0.0005, 2_048, 8_192, 0.0000001, 0.0000002,
+        &scope(),
+        "alice",
+        "tcp-1",
+        "TCP API",
+        0.0005,
+        2_048,
+        8_192,
+        0.0000001,
+        0.0000002,
     );
 
     let output = registry.render_json_uncached();
@@ -702,7 +928,7 @@ async fn test_log_charges_identified_consumer() {
     plugin.log(&summary).await;
 
     let registry = ferrum_edge::plugins::api_chargeback::global_registry();
-    let key = make_key("alice", "proxy-1", 200);
+    let key = make_key_with_prices("alice", "proxy-1", 200, 0.001, 0.0, 0.0);
     assert!(registry.entries.contains_key(&key));
 }
 
@@ -763,14 +989,13 @@ async fn test_log_records_bandwidth_even_when_status_is_uncharged() {
     plugin.log(&summary).await;
 
     let registry = ferrum_edge::plugins::api_chargeback::global_registry();
-    let key = make_key("derek", "proxy-bw", 404);
+    let key = make_key_with_prices("derek", "proxy-bw", 404, 0.0, 0.0000001, 0.0000002);
     let entry = registry
         .entries
         .get(&key)
         .expect("bandwidth entry recorded");
-    // 404 has no per-call price, so charge_total_bits stays at zero.
-    let call_charge = f64::from_bits(entry.charge_total_bits.load(Ordering::Relaxed));
-    assert!(call_charge.abs() < 1e-15);
+    // 404 has no per-call price, so the per-call charge stays at zero.
+    assert!(entry.call_charge().abs() < 1e-15);
     assert_eq!(entry.bytes_sent_total.load(Ordering::Relaxed), 1_024);
     assert_eq!(entry.bytes_received_total.load(Ordering::Relaxed), 4_096);
 }
@@ -797,12 +1022,18 @@ async fn test_on_stream_disconnect_records_bandwidth() {
     plugin.on_stream_disconnect(&summary).await;
 
     let registry = ferrum_edge::plugins::api_chargeback::global_registry();
-    let key = make_key("emma", "tcp-edge-stream-test", 0);
+    let key = make_key_with_prices(
+        "emma",
+        "tcp-edge-stream-test",
+        0,
+        0.001,
+        0.0000001,
+        0.0000002,
+    );
     let entry = registry.entries.get(&key).expect("stream entry recorded");
     assert_eq!(entry.protocol_family, ProtocolFamily::Stream);
     assert_eq!(entry.call_count.load(Ordering::Relaxed), 1);
-    let connection_charge = f64::from_bits(entry.charge_total_bits.load(Ordering::Relaxed));
-    assert!((connection_charge - 0.001).abs() < 1e-12);
+    assert!((entry.call_charge() - 0.001).abs() < 1e-12);
     assert_eq!(entry.bytes_sent_total.load(Ordering::Relaxed), 10_000);
     assert_eq!(entry.bytes_received_total.load(Ordering::Relaxed), 20_000);
 }
@@ -866,8 +1097,19 @@ fn test_multiple_pricing_tiers() {
 #[test]
 fn test_prometheus_render_namespace_present_for_default() {
     let registry = ChargebackRegistry::new();
-    registry.configure("USD", 5, 3600, 500, "ferrum");
-    registry.record_http("alice", "proxy-1", "API", 200, 0.001, 0, 0, 0.0, 0.0);
+    registry.configure(5, 3600, 500);
+    registry.record_http(
+        &scope_for("USD", "ferrum"),
+        "alice",
+        "proxy-1",
+        "API",
+        200,
+        0.001,
+        0,
+        0,
+        0.0,
+        0.0,
+    );
 
     let output = registry.render_prometheus_uncached();
     assert!(output.contains(r#"namespace="ferrum""#));
@@ -877,10 +1119,312 @@ fn test_prometheus_render_namespace_present_for_default() {
 #[test]
 fn test_prometheus_render_namespace_present_for_non_default() {
     let registry = ChargebackRegistry::new();
-    registry.configure("USD", 5, 3600, 500, "staging");
-    registry.record_http("bob", "proxy-2", "API", 200, 0.001, 0, 0, 0.0, 0.0);
+    registry.configure(5, 3600, 500);
+    registry.record_http(
+        &scope_for("USD", "staging"),
+        "bob",
+        "proxy-2",
+        "API",
+        200,
+        0.001,
+        0,
+        0,
+        0.0,
+        0.0,
+    );
 
     let output = registry.render_prometheus_uncached();
     assert!(output.contains(r#"namespace="staging""#));
     assert!(output.contains("consumer=\"bob\""));
+}
+
+// --- Finding #24: per-instance currency/namespace scoping ---
+
+/// Two plugin instances with different currencies AND namespaces record onto
+/// the SAME shared registry. Each proxy's exported rows must carry the currency
+/// and namespace of the instance that recorded them — NOT a single
+/// last-writer-wins value (the pre-fix behavior, where `configure()` overwrote
+/// one global currency/namespace_label for the whole process).
+#[test]
+fn test_per_instance_currency_and_namespace_not_last_writer_wins() {
+    let registry = ChargebackRegistry::new();
+    registry.configure(5, 3600, 500);
+
+    // Instance A: USD / namespace "team-a", recording for proxy-a.
+    let scope_a = scope_for("USD", "team-a");
+    // Instance B: EUR / namespace "team-b", recording for proxy-b.
+    let scope_b = scope_for("EUR", "team-b");
+
+    registry.record_http(
+        &scope_a, "alice", "proxy-a", "API A", 200, 1.0, 0, 0, 0.0, 0.0,
+    );
+    // B is constructed/records LAST — under the old last-writer-wins design its
+    // currency/namespace would have clobbered A's on the shared registry.
+    registry.record_http(
+        &scope_b, "alice", "proxy-b", "API B", 200, 2.0, 0, 0, 0.0, 0.0,
+    );
+
+    // Prometheus: each proxy keeps its own currency + namespace label.
+    let prom = registry.render_prometheus_uncached();
+    assert!(
+        prom.lines().any(|l| l.contains("proxy_id=\"proxy-a\"")
+            && l.contains("currency=\"USD\"")
+            && l.contains(r#"namespace="team-a""#)),
+        "proxy-a must render under USD/team-a\n{prom}"
+    );
+    assert!(
+        prom.lines().any(|l| l.contains("proxy_id=\"proxy-b\"")
+            && l.contains("currency=\"EUR\"")
+            && l.contains(r#"namespace="team-b""#)),
+        "proxy-b must render under EUR/team-b\n{prom}"
+    );
+    // The pre-fix bug: both proxies sharing one (last) currency. proxy-a must
+    // NOT be mislabeled with EUR.
+    assert!(
+        !prom
+            .lines()
+            .any(|l| l.contains("proxy_id=\"proxy-a\"") && l.contains("currency=\"EUR\"")),
+        "proxy-a must not be misattributed to EUR (last-writer-wins regression)\n{prom}"
+    );
+
+    // JSON: per-proxy currency, and top-level currency signals "mixed".
+    let json: serde_json::Value = serde_json::from_str(&registry.render_json_uncached()).unwrap();
+    assert_eq!(json["currency"], "mixed");
+    assert_eq!(
+        json["consumers"]["alice"]["proxies"]["proxy-a"]["currency"],
+        "USD"
+    );
+    assert_eq!(
+        json["consumers"]["alice"]["proxies"]["proxy-b"]["currency"],
+        "EUR"
+    );
+}
+
+#[test]
+fn test_same_proxy_records_stay_partitioned_by_instance_scope() {
+    let registry = ChargebackRegistry::new();
+    let scope_usd = scope_for("USD", "team-a");
+    let scope_eur = scope_for("EUR", "team-b");
+
+    registry.record_http(
+        &scope_usd,
+        "alice",
+        "shared-proxy",
+        "Shared API",
+        200,
+        1.0,
+        100,
+        0,
+        0.01,
+        0.0,
+    );
+    registry.record_http(
+        &scope_eur,
+        "alice",
+        "shared-proxy",
+        "Shared API",
+        200,
+        2.0,
+        200,
+        0,
+        0.02,
+        0.0,
+    );
+
+    assert_eq!(registry.entries.len(), 2);
+
+    let prom = registry.render_prometheus_uncached();
+    assert!(
+        prom.lines()
+            .any(|line| line.contains("proxy_id=\"shared-proxy\"")
+                && line.contains("currency=\"USD\"")
+                && line.contains(r#"namespace="team-a""#)
+                && line.ends_with("1.0000000000")),
+        "USD/team-a call row missing\n{prom}"
+    );
+    assert!(
+        prom.lines()
+            .any(|line| line.contains("proxy_id=\"shared-proxy\"")
+                && line.contains("currency=\"EUR\"")
+                && line.contains(r#"namespace="team-b""#)
+                && line.ends_with("2.0000000000")),
+        "EUR/team-b call row missing\n{prom}"
+    );
+
+    let json: serde_json::Value = serde_json::from_str(&registry.render_json_uncached()).unwrap();
+    let proxies = json["consumers"]["alice"]["proxies"].as_object().unwrap();
+    assert_eq!(proxies.len(), 2);
+    assert!(proxies.values().any(|proxy| {
+        proxy["proxy_id"] == "shared-proxy"
+            && proxy["currency"] == "USD"
+            && proxy["by_status"]["200"]["calls"] == 1
+            && proxy["by_status"]["200"]["charges"] == 1.0
+    }));
+    assert!(proxies.values().any(|proxy| {
+        proxy["proxy_id"] == "shared-proxy"
+            && proxy["currency"] == "EUR"
+            && proxy["by_status"]["200"]["calls"] == 1
+            && proxy["by_status"]["200"]["charges"] == 2.0
+    }));
+}
+
+/// When every entry shares one currency, the top-level JSON `currency` reports
+/// that single currency (not "mixed").
+#[test]
+fn test_json_top_level_currency_single_when_uniform() {
+    let registry = ChargebackRegistry::new();
+    registry.configure(5, 3600, 500);
+    let s = scope_for("GBP", "ferrum");
+    registry.record_http(&s, "alice", "proxy-a", "API", 200, 1.0, 0, 0, 0.0, 0.0);
+    registry.record_http(&s, "bob", "proxy-b", "API", 200, 1.0, 0, 0, 0.0, 0.0);
+
+    let json: serde_json::Value = serde_json::from_str(&registry.render_json_uncached()).unwrap();
+    assert_eq!(json["currency"], "GBP");
+}
+
+// --- Finding #75: deterministic protocol_family + stream detail not dropped ---
+
+/// HTTP and stream activity sharing the same (consumer, proxy_id). The
+/// Prometheus bandwidth rows must split into separate, deterministically
+/// labeled `protocol_family="http"` and `protocol_family="stream"` rows, and
+/// the JSON proxy object must always include the `stream` sub-object (it was
+/// previously dropped when the HTTP entry was iterated first), label the proxy
+/// `"mixed"`, and reconcile its totals.
+#[test]
+fn test_http_and_stream_share_proxy_id_render_is_deterministic() {
+    let registry = ChargebackRegistry::new();
+    registry.configure(5, 3600, 500);
+    let s = scope();
+
+    // HTTP entry: 100 bytes sent / 200 received under (alice, proxy-1, 200).
+    registry.record_http(
+        &s, "alice", "proxy-1", "Edge", 200, 0.0, 100, 200, 0.001, 0.001,
+    );
+    // Stream entry: 60 bytes sent / 95 received under (alice, proxy-1, sentinel).
+    registry.record_stream(&s, "alice", "proxy-1", "Edge", 0.0005, 60, 95, 0.001, 0.001);
+
+    // --- Prometheus: separate, deterministic per-family bandwidth rows. ---
+    // Render several times; the label set must be identical every time.
+    let mut http_sent_seen = false;
+    let mut stream_sent_seen = false;
+    for _ in 0..8 {
+        let prom = registry.render_prometheus_uncached();
+        let http_sent = prom.lines().any(|l| {
+            l.starts_with("ferrum_api_bytes_sent_total{")
+                && l.contains("proxy_id=\"proxy-1\"")
+                && l.contains("protocol_family=\"http\"")
+                && l.ends_with(" 100")
+        });
+        let stream_sent = prom.lines().any(|l| {
+            l.starts_with("ferrum_api_bytes_sent_total{")
+                && l.contains("proxy_id=\"proxy-1\"")
+                && l.contains("protocol_family=\"stream\"")
+                && l.ends_with(" 60")
+        });
+        assert!(
+            http_sent,
+            "missing deterministic http bytes_sent row\n{prom}"
+        );
+        assert!(
+            stream_sent,
+            "missing deterministic stream bytes_sent row\n{prom}"
+        );
+        // Exactly two bytes_sent rows for this proxy (one per family), so the
+        // families never collapse onto a single ambiguous row.
+        let sent_rows = prom
+            .lines()
+            .filter(|l| {
+                l.starts_with("ferrum_api_bytes_sent_total{") && l.contains("proxy_id=\"proxy-1\"")
+            })
+            .count();
+        assert_eq!(
+            sent_rows, 2,
+            "expected one bytes_sent row per family\n{prom}"
+        );
+        http_sent_seen |= http_sent;
+        stream_sent_seen |= stream_sent;
+    }
+    assert!(http_sent_seen && stream_sent_seen);
+
+    // --- JSON: stream sub-object always present, label "mixed", totals reconcile. ---
+    let json: serde_json::Value = serde_json::from_str(&registry.render_json_uncached()).unwrap();
+    let proxy = &json["consumers"]["alice"]["proxies"]["proxy-1"];
+    assert_eq!(proxy["protocol_family"], "mixed");
+    // The stream sub-object must be present regardless of iteration order.
+    assert_eq!(proxy["stream"]["connections"], 1);
+    let conn_charges = proxy["stream"]["connection_charges"].as_f64().unwrap();
+    assert!((conn_charges - 0.0005).abs() < 1e-12);
+    // HTTP breakdown still present.
+    assert_eq!(proxy["by_status"]["200"]["calls"], 1);
+    // Bandwidth bytes fold BOTH families: 100+60 sent, 200+95 received.
+    assert_eq!(proxy["bandwidth"]["bytes_sent"], 160);
+    assert_eq!(proxy["bandwidth"]["bytes_received"], 295);
+
+    // total_charges must reconcile with the visible breakdown:
+    //   bandwidth (160+295)*0.001 = 0.455  + stream connection 0.0005 = 0.4555
+    let total = proxy["total_charges"].as_f64().unwrap();
+    assert!(
+        (total - 0.4555).abs() < 1e-9,
+        "totals must reconcile, got {total}"
+    );
+    assert_eq!(proxy["total_calls"], 2); // 1 HTTP call + 1 stream session
+}
+
+// --- Finding #76: monetary totals do not drift over high volume ---
+
+/// Recording a small per-call price across a large number of calls must yield
+/// exactly `count * price` (computed once from the exact integer call count) —
+/// no order-dependent f64 accumulation drift.
+#[test]
+fn test_high_volume_charge_has_no_accumulation_drift() {
+    let registry = ChargebackRegistry::new();
+    // 0.1 is not exactly representable in binary floating point, so repeatedly
+    // ADDING it (the pre-fix design) accumulates rounding error; multiplying the
+    // exact integer count by it once does not.
+    let price = 0.1f64;
+    let n: u64 = 1_000_000;
+    let s = scope();
+    for _ in 0..n {
+        registry.record_http(&s, "alice", "proxy-1", "API", 200, price, 0, 0, 0.0, 0.0);
+    }
+    let entry = registry
+        .entries
+        .get(&make_key_with_prices(
+            "alice", "proxy-1", 200, price, 0.0, 0.0,
+        ))
+        .unwrap();
+    assert_eq!(entry.call_count.load(Ordering::Relaxed), n);
+    // Exact: equals n * price computed once, bit-for-bit.
+    assert_eq!(entry.call_charge(), n as f64 * price);
+}
+
+/// Bandwidth charge is computed from the exact accumulated byte count, so many
+/// small transfers reconcile exactly with one bulk transfer of the same bytes.
+#[test]
+fn test_bandwidth_charge_is_exact_from_byte_totals() {
+    let price = 0.000_001f64;
+    let s = scope();
+
+    // Many small 7-byte transfers.
+    let many = ChargebackRegistry::new();
+    let chunks: u64 = 100_000;
+    for _ in 0..chunks {
+        many.record_http(&s, "alice", "proxy-1", "API", 200, 0.0, 7, 0, price, 0.0);
+    }
+    let many_entry = many
+        .entries
+        .get(&make_key_with_prices(
+            "alice", "proxy-1", 200, 0.0, price, 0.0,
+        ))
+        .unwrap();
+    assert_eq!(
+        many_entry.bytes_sent_total.load(Ordering::Relaxed),
+        7 * chunks
+    );
+    // Charge derives from the (exact) total byte count, so it equals the bulk
+    // computation exactly — no per-add drift.
+    assert_eq!(
+        many_entry.bandwidth_charge_sent(),
+        (7 * chunks) as f64 * price
+    );
 }

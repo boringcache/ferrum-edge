@@ -51,9 +51,38 @@ pub struct ExampleAuditPlugin {
 
 impl ExampleAuditPlugin {
     pub fn new(config: &Value) -> Result<Self, String> {
+        // Demonstrates the `new()`-returns-`Err` contract from
+        // `custom_plugins/mod.rs`: a missing/null key falls back to the
+        // default, but a key that is *present* with the wrong type or an
+        // invalid value is rejected rather than silently swallowed by
+        // `unwrap_or(...)`. Derived plugins should copy this validating
+        // pattern, not the swallowing one.
+
+        // `log_request_headers`: optional bool, default false.
+        let log_request_headers = match config.get("log_request_headers") {
+            None | Some(Value::Null) => false,
+            Some(value) => value
+                .as_bool()
+                .ok_or_else(|| "log_request_headers must be a boolean".to_string())?,
+        };
+
+        // `retention_days`: optional positive integer, default 90.
+        let retention_days = match config.get("retention_days") {
+            None | Some(Value::Null) => 90,
+            Some(value) => {
+                let days = value
+                    .as_u64()
+                    .ok_or_else(|| "retention_days must be a positive integer".to_string())?;
+                if days == 0 {
+                    return Err("retention_days must be greater than zero".to_string());
+                }
+                days
+            }
+        };
+
         Ok(Self {
-            log_request_headers: config["log_request_headers"].as_bool().unwrap_or(false),
-            retention_days: config["retention_days"].as_u64().unwrap_or(90),
+            log_request_headers,
+            retention_days,
         })
     }
 }
@@ -193,10 +222,16 @@ pub fn plugin_migrations() -> Vec<CustomPluginMigration> {
             version: 2,
             name: "add_status_timestamp_index",
             checksum: "v2_add_status_timestamp_idx_b7c4d2",
+            // SQLite and Postgres support `IF NOT EXISTS` on `CREATE INDEX`.
             sql: "CREATE INDEX IF NOT EXISTS idx_audit_log_status_ts ON audit_log (response_status, timestamp)",
             sql_postgres: None,
-            // MySQL: no IF NOT EXISTS for CREATE INDEX before 8.0.29
-            sql_mysql: None,
+            // MySQL has no `IF NOT EXISTS` for `CREATE INDEX` before 8.0.29, so
+            // it must NOT inherit the base `sql` (which would be a syntax error
+            // there). Provide a MySQL-specific override without `IF NOT EXISTS`,
+            // matching the V1 pattern above.
+            sql_mysql: Some(
+                "CREATE INDEX idx_audit_log_status_ts ON audit_log (response_status, timestamp)",
+            ),
         },
     ]
 }

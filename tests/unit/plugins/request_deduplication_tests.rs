@@ -501,6 +501,74 @@ async fn test_inflight_marker_carries_timestamp() {
     assert_eq!(plugin.tracked_keys_count(), Some(5));
 }
 
+#[tokio::test]
+async fn test_completed_entries_evict_over_capacity_on_insert() {
+    let config = json!({
+        "ttl_seconds": 300,
+        "max_entries": 2
+    });
+    let plugin = make_plugin(config);
+
+    for i in 0..3 {
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "POST".to_string(),
+            "/api".to_string(),
+        );
+        let mut headers = HashMap::new();
+        headers.insert("idempotency-key".to_string(), format!("completed-{i}"));
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert!(matches!(result, PluginResult::Continue));
+
+        let response_headers = HashMap::new();
+        let result = plugin
+            .on_final_response_body(&mut ctx, 200, &response_headers, b"cached")
+            .await;
+        assert!(matches!(result, PluginResult::Continue));
+    }
+
+    assert_eq!(plugin.tracked_keys_count(), Some(2));
+}
+
+#[tokio::test]
+async fn test_active_inflight_entries_survive_capacity_pressure() {
+    let config = json!({
+        "ttl_seconds": 300,
+        "max_entries": 2
+    });
+    let plugin = make_plugin(config);
+
+    for i in 0..3 {
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "POST".to_string(),
+            "/api".to_string(),
+        );
+        let mut headers = HashMap::new();
+        headers.insert("idempotency-key".to_string(), format!("inflight-{i}"));
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert!(matches!(result, PluginResult::Continue));
+    }
+
+    assert_eq!(plugin.tracked_keys_count(), Some(3));
+
+    let mut duplicate_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut duplicate_headers = HashMap::new();
+    duplicate_headers.insert("idempotency-key".to_string(), "inflight-0".to_string());
+    let result = plugin
+        .before_proxy(&mut duplicate_ctx, &mut duplicate_headers)
+        .await;
+
+    match result {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 409),
+        other => panic!("Expected duplicate in-flight request to be rejected, got {other:?}"),
+    }
+}
+
 /// A cached response with `Set-Cookie: session=A` from the first client must
 /// NOT be replayed verbatim to a second client sharing the same idempotency
 /// key. Without sanitization, the second client would receive the first

@@ -11,6 +11,81 @@ fn default_client() -> PluginHttpClient {
     PluginHttpClient::default()
 }
 
+/// `tls: true` now builds a rustls `ClientConfig` in `TcpLogging::new` (finding
+/// #74), which requires an installed crypto provider — normally done in
+/// `main.rs` at startup.
+fn ensure_crypto_provider() {
+    let _ =
+        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+}
+
+/// Build a `PluginHttpClient` that advertises `ca_path` as its TLS CA bundle.
+/// `PluginHttpClient::new` only `warn!`s (does not error) on a bad bundle, so
+/// the path flows through to `TcpLogging::new`.
+fn client_with_ca(ca_path: &str) -> PluginHttpClient {
+    use ferrum_edge::config::BackendAllowIps;
+    use ferrum_edge::config::PoolConfig;
+    use ferrum_edge::config::types::DEFAULT_NAMESPACE;
+    use ferrum_edge::dns::{DnsCache, DnsConfig};
+
+    PluginHttpClient::new(
+        &PoolConfig::default(),
+        DnsCache::new(DnsConfig::default()),
+        1000,
+        0,
+        100,
+        false,
+        Some(ca_path),
+        std::sync::Arc::new(Vec::new()),
+        DEFAULT_NAMESPACE,
+        BackendAllowIps::Both,
+        std::sync::Arc::new(Vec::new()),
+        0,
+    )
+}
+
+/// Finding #74: the CA bundle is now parsed once in `TcpLogging::new` (off the
+/// async flush task) instead of synchronously on every TLS reconnect. A bad CA
+/// bundle therefore fails at construction/admission time rather than silently
+/// inside the background batching task on first connect.
+#[tokio::test]
+async fn test_tcp_logging_tls_rejects_invalid_ca_bundle_at_construction() {
+    ensure_crypto_provider();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ca_path = dir.path().join("not-a-cert.pem");
+    std::fs::write(&ca_path, b"this is not a PEM certificate").expect("write garbage CA");
+
+    let result = TcpLogging::new(
+        &json!({
+            "host": "logstash.example.com",
+            "port": 5141,
+            "tls": true,
+        }),
+        client_with_ca(ca_path.to_str().expect("utf8 path")),
+    );
+    assert!(
+        result.is_err(),
+        "an unparseable CA bundle must be rejected when the plugin is constructed"
+    );
+}
+
+/// Counterpart to the above: TLS with no custom CA (system/webpki roots) still
+/// constructs successfully — the connector is prebuilt without touching the
+/// filesystem.
+#[tokio::test]
+async fn test_tcp_logging_tls_without_ca_bundle_constructs() {
+    ensure_crypto_provider();
+    let plugin = TcpLogging::new(
+        &json!({
+            "host": "logstash.example.com",
+            "port": 5141,
+            "tls": true,
+        }),
+        default_client(),
+    );
+    assert!(plugin.is_ok(), "TLS with default roots should construct");
+}
+
 #[tokio::test]
 async fn test_tcp_logging_plugin_creation() {
     let plugin = TcpLogging::new(
@@ -28,6 +103,7 @@ async fn test_tcp_logging_plugin_creation() {
 
 #[tokio::test]
 async fn test_tcp_logging_plugin_creation_with_tls() {
+    ensure_crypto_provider();
     let plugin = TcpLogging::new(
         &json!({
             "host": "logstash.example.com",

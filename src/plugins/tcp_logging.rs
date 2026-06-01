@@ -24,6 +24,7 @@ use std::sync::{Arc, Mutex};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::time::Duration;
+use tracing::warn;
 
 use super::utils::log_schema::{SummaryLogEntryView, SummarySchema, resolve_schema};
 use super::utils::{
@@ -38,15 +39,16 @@ use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 struct TcpFlushConfig {
     host: String,
     port: u16,
-    tls_enabled: bool,
     tls_server_name: Option<String>,
-    tls_no_verify: bool,
-    tls_ca_bundle_path: Option<String>,
-    /// Gateway CRL list (`FERRUM_TLS_CRL_FILE_PATH`). Applied to the rustls
-    /// `WebPkiServerVerifier` for TLS-enabled connections so that revoked
-    /// log-sink certificates are rejected, matching the proxy backend / DTLS /
-    /// frontend mTLS surfaces. Empty when no CRL file is configured.
-    tls_crls: Vec<CertificateRevocationListDer<'static>>,
+    /// Prebuilt TLS connector, or `None` when TLS is disabled.
+    ///
+    /// The CA-bundle read + PEM parse and the `WebPkiServerVerifier` build
+    /// (which applies the gateway CRL list, `FERRUM_TLS_CRL_FILE_PATH`, so
+    /// revoked log-sink certificates are rejected) all happen once in
+    /// `TcpLogging::new` — off the async flush task. Reconnects clone this
+    /// cheap `Arc<ClientConfig>`-backed connector instead of re-reading the
+    /// filesystem and re-parsing PEM synchronously on a tokio worker thread.
+    tls_connector: Option<tokio_rustls::TlsConnector>,
     connect_timeout: Duration,
     /// Gateway-shared DNS cache for endpoint resolution. Pre-warmed at startup
     /// via `Plugin::warmup_hostnames`, refreshed in the background. `None` only
@@ -109,14 +111,25 @@ impl TcpLogging {
         validate_batch_config(config, "tcp_logging", batch_defaults)?;
 
         let schema = resolve_schema(config, "tcp_logging")?;
+        // Build the TLS connector once, here on the cold construction path. The
+        // CA bundle is read + PEM-parsed synchronously inside
+        // `build_tls_connector`; doing it now (rather than per reconnect inside
+        // the async flush task) keeps blocking filesystem I/O off the tokio
+        // runtime and surfaces a bad CA bundle at admission time.
+        let tls_connector = if tls_enabled {
+            Some(build_tls_connector(
+                http_client.tls_no_verify(),
+                http_client.tls_ca_bundle_path(),
+                http_client.tls_crls(),
+            )?)
+        } else {
+            None
+        };
         let flush_config = TcpFlushConfig {
             host: host.clone(),
             port,
-            tls_enabled,
             tls_server_name,
-            tls_no_verify: http_client.tls_no_verify(),
-            tls_ca_bundle_path: http_client.tls_ca_bundle_path().map(|s| s.to_string()),
-            tls_crls: http_client.tls_crls().to_vec(),
+            tls_connector,
             connect_timeout: Duration::from_millis(connect_timeout_ms),
             dns_cache: http_client.dns_cache().cloned(),
             schema,
@@ -253,61 +266,10 @@ async fn connect_tcp(cfg: &TcpFlushConfig) -> Result<TcpWriter, String> {
         .await
         .map_err(|_| format!("TCP logging: connect timeout to {host_log}:{port}"))??;
 
-    if !cfg.tls_enabled {
+    let Some(connector) = cfg.tls_connector.clone() else {
         return Ok(TcpWriter::Plain(stream));
-    }
-
-    let mut root_store = rustls::RootCertStore::empty();
-
-    if !cfg.tls_no_verify {
-        if let Some(ca_path) = &cfg.tls_ca_bundle_path {
-            let source = CertSource::parse(ca_path, MaterialKind::CaBundle);
-            match load_material_blocking(&source, MaterialKind::CaBundle) {
-                Ok(ca_material) => {
-                    let source_id = ca_material.source_id.clone();
-                    let mut reader = ca_material.bytes.expose_secret();
-                    let certs = rustls_pemfile::certs(&mut reader)
-                        .filter_map(|cert| cert.ok())
-                        .collect::<Vec<_>>();
-                    if certs.is_empty() {
-                        return Err(format!(
-                            "TCP logging: no valid certificates found in CA bundle {source_id}"
-                        ));
-                    }
-                    for cert in certs {
-                        root_store.add(cert).map_err(|error| {
-                            format!("TCP logging: failed to add CA cert from {source_id}: {error}")
-                        })?;
-                    }
-                }
-                Err(error) => {
-                    return Err(format!("TCP logging: failed to load CA bundle: {error}"));
-                }
-            }
-        } else {
-            root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        }
-    }
-
-    let tls_config = if cfg.tls_no_verify {
-        rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(NoVerifier))
-            .with_no_client_auth()
-    } else {
-        // Apply gateway CRL list (`FERRUM_TLS_CRL_FILE_PATH`) so that revoked
-        // log-sink certificates are rejected, matching the proxy backend / DTLS
-        // / frontend mTLS surfaces. The verifier uses
-        // `allow_unknown_revocation_status() + only_check_end_entity_revocation()`
-        // (set inside `build_server_verifier_with_crls`).
-        let verifier = crate::tls::build_server_verifier_with_crls(root_store, &cfg.tls_crls)
-            .map_err(|error| format!("TCP logging: failed to build TLS verifier: {error}"))?;
-        rustls::ClientConfig::builder()
-            .with_webpki_verifier(verifier)
-            .with_no_client_auth()
     };
 
-    let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
     let server_name_str = cfg.tls_server_name.as_deref().unwrap_or(&cfg.host);
     let server_name = rustls::pki_types::ServerName::try_from(server_name_str.to_string())
         .map_err(|error| {
@@ -320,6 +282,63 @@ async fn connect_tcp(cfg: &TcpFlushConfig) -> Result<TcpWriter, String> {
         .map_err(|error| format!("TCP logging: TLS handshake failed with {addr_log}: {error}"))?;
 
     Ok(TcpWriter::Tls(Box::new(tls_stream)))
+}
+
+/// Build the TLS connector for the TCP log sink.
+///
+/// Performs the synchronous CA-bundle read + PEM parse and the verifier build
+/// exactly once, on the cold construction path, so the async flush task never
+/// blocks a tokio worker thread re-reading the filesystem on reconnect
+/// (finding #74). The result is an `Arc<ClientConfig>`-backed connector that is
+/// cheap to clone per reconnect.
+fn build_tls_connector(
+    tls_no_verify: bool,
+    tls_ca_bundle_path: Option<&str>,
+    tls_crls: &[CertificateRevocationListDer<'static>],
+) -> Result<tokio_rustls::TlsConnector, String> {
+    let tls_config = if tls_no_verify {
+        rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerifier))
+            .with_no_client_auth()
+    } else {
+        let mut root_store = rustls::RootCertStore::empty();
+        if let Some(ca_path) = tls_ca_bundle_path {
+            let source = CertSource::parse(ca_path, MaterialKind::CaBundle);
+            let ca_material = load_material_blocking(&source, MaterialKind::CaBundle)
+                .map_err(|error| format!("TCP logging: failed to load CA bundle: {error}"))?;
+            let source_id = ca_material.source_id.clone();
+            let mut reader = ca_material.bytes.expose_secret();
+            let certs = rustls_pemfile::certs(&mut reader)
+                .filter_map(|cert| cert.ok())
+                .collect::<Vec<_>>();
+            if certs.is_empty() {
+                return Err(format!(
+                    "TCP logging: no valid certificates found in CA bundle {source_id}"
+                ));
+            }
+            for cert in certs {
+                root_store.add(cert).map_err(|error| {
+                    format!("TCP logging: failed to add CA cert from {source_id}: {error}")
+                })?;
+            }
+        } else {
+            root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        }
+
+        // Apply gateway CRL list (`FERRUM_TLS_CRL_FILE_PATH`) so that revoked
+        // log-sink certificates are rejected, matching the proxy backend / DTLS
+        // / frontend mTLS surfaces. The verifier uses
+        // `allow_unknown_revocation_status() + only_check_end_entity_revocation()`
+        // (set inside `build_server_verifier_with_crls`).
+        let verifier = crate::tls::build_server_verifier_with_crls(root_store, tls_crls)
+            .map_err(|error| format!("TCP logging: failed to build TLS verifier: {error}"))?;
+        rustls::ClientConfig::builder()
+            .with_webpki_verifier(verifier)
+            .with_no_client_auth()
+    };
+
+    Ok(tokio_rustls::TlsConnector::from(Arc::new(tls_config)))
 }
 
 /// No-op TLS certificate verifier for `tls_no_verify` mode.
@@ -379,15 +398,36 @@ async fn send_batch(
     batch: Vec<SummaryLogEntry>,
 ) -> Result<(), String> {
     let mut payload = Vec::with_capacity(batch.len() * 256);
+    let mut dropped = 0usize;
+    let mut first_error: Option<String> = None;
     for entry in &batch {
         let result = match cfg.schema.as_deref() {
             Some(schema) => serde_json::to_vec(&SummaryLogEntryView { entry, schema }),
             None => serde_json::to_vec(entry),
         };
-        if let Ok(json) = result {
-            payload.extend_from_slice(&json);
-            payload.push(b'\n');
+        match result {
+            Ok(json) => {
+                payload.extend_from_slice(&json);
+                payload.push(b'\n');
+            }
+            Err(error) => {
+                // Skip only the bad entry and keep shipping the rest, but
+                // surface the loss instead of swallowing it silently (the UDP
+                // sink already warns on serialize failure). Aggregate per batch
+                // so a recurring bad entry shape cannot flood the logs:
+                // `send_batch` runs at most once per flush interval.
+                dropped += 1;
+                if first_error.is_none() {
+                    first_error = Some(error.to_string());
+                }
+            }
         }
+    }
+    if let Some(error) = first_error {
+        warn!(
+            dropped_entries = dropped,
+            "tcp_logging: dropped log entries that failed to serialize: {error}"
+        );
     }
 
     let mut connection = writer_state
@@ -642,14 +682,15 @@ mod tests {
 
         // Reach into `connect_tcp` directly so the handshake error surfaces
         // synchronously rather than being swallowed by the batching task.
+        let tls_connector = must(
+            build_tls_connector(false, Some(path_str(&ca_path)), &crl_list),
+            "build TLS connector",
+        );
         let cfg = TcpFlushConfig {
             host: "127.0.0.1".to_string(),
             port,
-            tls_enabled: true,
             tls_server_name: Some("localhost".to_string()),
-            tls_no_verify: false,
-            tls_ca_bundle_path: Some(path_str(&ca_path).to_string()),
-            tls_crls: (*crl_list).clone(),
+            tls_connector: Some(tls_connector),
             connect_timeout: Duration::from_secs(2),
             dns_cache: None,
             schema: None,
@@ -684,14 +725,15 @@ mod tests {
 
         let port = spawn_tls_server(&leaf_pem, &leaf_key_pem).await;
 
+        let tls_connector = must(
+            build_tls_connector(false, Some(path_str(&ca_path)), &[]),
+            "build TLS connector",
+        );
         let cfg = TcpFlushConfig {
             host: "127.0.0.1".to_string(),
             port,
-            tls_enabled: true,
             tls_server_name: Some("localhost".to_string()),
-            tls_no_verify: false,
-            tls_ca_bundle_path: Some(path_str(&ca_path).to_string()),
-            tls_crls: Vec::new(),
+            tls_connector: Some(tls_connector),
             connect_timeout: Duration::from_secs(2),
             dns_cache: None,
             schema: None,

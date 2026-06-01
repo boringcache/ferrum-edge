@@ -692,9 +692,14 @@ impl ApiChargebackSink {
                 batch_size: config.batch.size,
                 flush_interval: Duration::from_millis(config.batch.flush_interval_ms),
                 buffer_capacity: config.batch.buffer_capacity,
+                // Honor the advertised retry schema: bounded exponential
+                // backoff from initial_delay_ms up to max_delay_ms, with
+                // optional full jitter (finding #77).
                 retry: RetryPolicy {
                     max_attempts: config.retry.max_attempts.max(1),
                     delay: Duration::from_millis(config.retry.initial_delay_ms),
+                    max_delay: Duration::from_millis(config.retry.max_delay_ms),
+                    jitter: config.retry.jitter,
                 },
                 plugin_name: PLUGIN_NAME,
             },

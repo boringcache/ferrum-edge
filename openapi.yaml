@@ -1335,19 +1335,19 @@ paths:
               example: |
                 # HELP ferrum_api_chargeable_calls_total Total chargeable HTTP-family API calls per consumer.
                 # TYPE ferrum_api_chargeable_calls_total counter
-                ferrum_api_chargeable_calls_total{consumer="alice",proxy_id="proxy-1",proxy_name="Payments API",status_code="200",namespace="ferrum"} 150000
+                ferrum_api_chargeable_calls_total{consumer="alice",proxy_id="proxy-1",proxy_name="Payments API",status_code="200",currency="USD",namespace="ferrum"} 150000
                 # HELP ferrum_api_charges_total Total per-call charges accumulated per consumer.
                 # TYPE ferrum_api_charges_total counter
                 ferrum_api_charges_total{consumer="alice",proxy_id="proxy-1",proxy_name="Payments API",status_code="200",currency="USD",namespace="ferrum"} 1.5000000000
                 # HELP ferrum_api_bytes_sent_total Total bytes the gateway sent client->backend on this consumer's behalf.
                 # TYPE ferrum_api_bytes_sent_total counter
-                ferrum_api_bytes_sent_total{consumer="alice",proxy_id="proxy-1",proxy_name="Payments API",protocol_family="http",namespace="ferrum"} 4500000
+                ferrum_api_bytes_sent_total{consumer="alice",proxy_id="proxy-1",proxy_name="Payments API",currency="USD",protocol_family="http",namespace="ferrum"} 4500000
                 # HELP ferrum_api_bandwidth_charges_total Total bandwidth charges per consumer, split by direction.
                 # TYPE ferrum_api_bandwidth_charges_total counter
                 ferrum_api_bandwidth_charges_total{consumer="alice",proxy_id="proxy-1",proxy_name="Payments API",direction="received",currency="USD",protocol_family="http",namespace="ferrum"} 0.0900000000
                 # HELP ferrum_api_stream_connections_total Total stream sessions (TCP/UDP/DTLS) per consumer.
                 # TYPE ferrum_api_stream_connections_total counter
-                ferrum_api_stream_connections_total{consumer="alice",proxy_id="tcp-edge",proxy_name="TCP Edge",namespace="ferrum"} 42
+                ferrum_api_stream_connections_total{consumer="alice",proxy_id="tcp-edge",proxy_name="TCP Edge",currency="USD",namespace="ferrum"} 42
             application/json:
               schema:
                 $ref: "#/components/schemas/ChargebackResponse"
@@ -11315,9 +11315,9 @@ components:
                     type: array
                     description: >-
                       Exact paths by default. A trailing `*` means prefix match,
-                      and a leading `~` means a start-anchored regex (implicit
-                      `^(?:...)` wrapper so every alternation branch is
-                      anchored). Use `~.*pattern` for a floating substring match.
+                      and a leading `~` means an operator-authored regex matched
+                      with regex `is_match`; regex conditions may match anywhere
+                      in the path unless the pattern itself is anchored.
                     items:
                       type: string
                   methods:
@@ -11569,9 +11569,9 @@ components:
               type: array
               description: >-
                 Exact paths by default. A trailing `*` means prefix match, and a
-                leading `~` means a start-anchored regex (implicit `^(?:...)`
-                wrapper so every alternation branch is anchored). Use
-                `~.*pattern` for a floating substring match.
+                leading `~` means an operator-authored regex matched with regex
+                `is_match`; regex conditions may match anywhere in the path
+                unless the pattern itself is anchored.
               items:
                 type: string
             methods:
@@ -13354,6 +13354,11 @@ components:
       properties:
         currency:
           type: string
+          description: |
+            Currency in use across all recorded charges. Each `api_chargeback`
+            plugin instance carries its own currency (per global/proxy/proxy_group
+            scope), so this is `"mixed"` when instances disagree — read the
+            per-proxy `currency` field for the authoritative value in that case.
           example: "USD"
         generated_at:
           type: string
@@ -13385,10 +13390,20 @@ components:
                   properties:
                     proxy_name:
                       type: string
+                    currency:
+                      type: string
+                      description: |
+                        Currency of the `api_chargeback` instance that recorded
+                        this proxy's charges. Authoritative even when the
+                        top-level `currency` is `"mixed"`.
+                      example: "USD"
                     protocol_family:
                       type: string
-                      enum: [http, stream]
-                      description: Protocol family this proxy serves. Bandwidth metrics and the JSON breakdown are scoped per family.
+                      enum: [http, stream, mixed]
+                      description: |
+                        Protocol family this proxy serves. `"mixed"` when the same
+                        proxy_id carries both HTTP and stream activity. Bandwidth
+                        metrics and the JSON breakdown are scoped per family.
                     total_charges:
                       type: number
                       description: Per-proxy sum of per-call, stream-connection, and bandwidth charges.
@@ -13397,7 +13412,7 @@ components:
                       description: Per-proxy sum of HTTP calls + stream sessions.
                     by_status:
                       type: object
-                      description: HTTP per-status breakdown (empty for stream proxies).
+                      description: HTTP per-status breakdown (empty for stream-only proxies; populated for `http` and `mixed`).
                       additionalProperties:
                         type: object
                         properties:
@@ -13422,7 +13437,7 @@ components:
                           description: Accumulated bandwidth charge for backend->client bytes.
                     stream:
                       type: object
-                      description: Present only for stream proxies (TCP/UDP/DTLS).
+                      description: Present whenever the proxy recorded stream activity (TCP/UDP/DTLS), including `mixed` proxies that also serve HTTP.
                       properties:
                         connections:
                           type: integer

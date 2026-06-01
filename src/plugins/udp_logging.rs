@@ -327,7 +327,13 @@ async fn send_batch(
         current_addr = Some(new_addr);
     }
 
-    if !cfg.dtls_enabled && last_resolve.elapsed() >= UDP_RE_RESOLVE_INTERVAL {
+    // Periodically re-resolve DNS and rebuild the sender when the endpoint
+    // address actually changes (DNS rollover, pod reschedule, LB failover).
+    // This applies to DTLS too: a connected DTLS association established once
+    // at startup would otherwise keep sending to a stale peer forever. The
+    // `current_addr != Some(new_addr)` guard ensures a fresh DTLS handshake
+    // only runs when the resolved address moved, not on every interval.
+    if last_resolve.elapsed() >= UDP_RE_RESOLVE_INTERVAL {
         last_resolve = Instant::now();
         if let Ok(new_addr) =
             resolve_udp_endpoint(&cfg.host, cfg.port, cfg.dns_cache.as_ref(), "udp_logging").await
@@ -343,6 +349,16 @@ async fn send_batch(
         Some(sender) => sender.send(&payload).await,
         None => Err("udp_logging: sender unavailable after initialization".to_string()),
     };
+
+    // On send failure, tear down the sender so the next batch's
+    // `sender.is_none()` branch forces a fresh resolve + handshake. UDP/DTLS
+    // sends frequently succeed at the socket layer even when the peer is gone,
+    // so error-triggered teardown is the most robust recovery trigger and also
+    // covers plain-UDP socket errors that the periodic re-resolve would miss.
+    if result.is_err() {
+        sender = None;
+        current_addr = None;
+    }
 
     let mut state = state
         .lock()
