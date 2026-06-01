@@ -1716,46 +1716,55 @@ fn find_attribute(element: &str, attr_name: &str) -> Option<String> {
 }
 
 /// Find an element by its wsu:Id attribute value.
-fn find_element_by_wsu_id(xml: &str, id: &str) -> Option<String> {
-    // Search for wsu:Id="id" or Id="id"
-    let patterns = [
-        format!("wsu:Id=\"{}\"", id),
-        format!("Id=\"{}\"", id),
-        format!("wsu:Id='{}'", id),
-        format!("Id='{}'", id),
-    ];
-
-    for pattern in &patterns {
-        if let Some(pos) = xml.find(pattern.as_str()) {
-            // Walk backwards to find the '<' that starts this element
-            let before = &xml[..pos];
-            let tag_start = before.rfind('<')?;
-
-            // Extract the full tag name
-            let from_tag = &xml[tag_start..];
-            let full_tag_name = extract_full_tag_name(from_tag)?;
-
-            // Get the local name for finding the closing tag
-            let local_name = if let Some(colon_pos) = full_tag_name.find(':') {
-                &full_tag_name[colon_pos + 1..]
-            } else {
-                &full_tag_name
-            };
-
-            // Find the closing tag
-            let closing = format!("</{}>", full_tag_name);
-            if let Some(close_pos) = xml[tag_start..].find(&closing) {
-                let end = tag_start + close_pos + closing.len();
-                return Some(xml[tag_start..end].to_string());
-            }
-
-            // Try without prefix in closing tag
-            let closing_no_prefix = format!("</{}>", local_name);
-            if let Some(close_pos) = xml[tag_start..].find(&closing_no_prefix) {
-                let end = tag_start + close_pos + closing_no_prefix.len();
-                return Some(xml[tag_start..end].to_string());
-            }
+pub(crate) fn find_element_by_wsu_id(xml: &str, id: &str) -> Option<String> {
+    let mut search_from = 0usize;
+    while let Some(rel) = xml[search_from..].find('<') {
+        let tag_start = search_from + rel;
+        let after_lt = xml.as_bytes().get(tag_start + 1)?;
+        if *after_lt == b'/' {
+            search_from = tag_start + 1;
+            continue;
         }
+        if *after_lt == b'!' {
+            search_from = skip_markup_declaration(xml, tag_start).ok()?;
+            continue;
+        }
+        if *after_lt == b'?' {
+            search_from = skip_processing_instruction(xml, tag_start).ok()?;
+            continue;
+        }
+
+        let tag_end_rel = find_start_tag_end(xml, tag_start)?;
+        let tag = &xml[tag_start + 1..tag_start + tag_end_rel];
+        if !tag_has_resolvable_wsu_id(tag, id) {
+            search_from = tag_start + tag_end_rel + 1;
+            continue;
+        }
+
+        if tag.trim_end().ends_with('/') {
+            return Some(xml[tag_start..tag_start + tag_end_rel + 1].to_string());
+        }
+
+        let full_tag_name = extract_full_tag_name(&xml[tag_start..])?;
+        let local_name = if let Some(colon_pos) = full_tag_name.find(':') {
+            &full_tag_name[colon_pos + 1..]
+        } else {
+            &full_tag_name
+        };
+
+        let closing = format!("</{}>", full_tag_name);
+        if let Some(close_pos) = xml[tag_start..].find(&closing) {
+            let end = tag_start + close_pos + closing.len();
+            return Some(xml[tag_start..end].to_string());
+        }
+
+        let closing_no_prefix = format!("</{}>", local_name);
+        if let Some(close_pos) = xml[tag_start..].find(&closing_no_prefix) {
+            let end = tag_start + close_pos + closing_no_prefix.len();
+            return Some(xml[tag_start..end].to_string());
+        }
+
+        search_from = tag_start + tag_end_rel + 1;
     }
 
     None
@@ -1764,6 +1773,65 @@ fn find_element_by_wsu_id(xml: &str, id: &str) -> Option<String> {
 /// Extract the wsu:Id (or plain Id) attribute from an element.
 fn find_wsu_id(element: &str) -> Option<String> {
     find_attribute(element, "wsu:Id").or_else(|| find_attribute(element, "Id"))
+}
+
+fn tag_has_resolvable_wsu_id(tag: &str, id: &str) -> bool {
+    let bytes = tag.as_bytes();
+    let mut i = 0usize;
+
+    while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b'/' {
+        i += 1;
+    }
+
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] == b'/' {
+            break;
+        }
+
+        let name_start = i;
+        while i < bytes.len() && !bytes[i].is_ascii_whitespace() && !matches!(bytes[i], b'=' | b'/')
+        {
+            i += 1;
+        }
+        let name = &tag[name_start..i];
+
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] != b'=' {
+            continue;
+        }
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+
+        let Some(&quote) = bytes.get(i) else {
+            break;
+        };
+        if !matches!(quote, b'\'' | b'"') {
+            continue;
+        }
+        i += 1;
+        let value_start = i;
+        while i < bytes.len() && bytes[i] != quote {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let value = &tag[value_start..i];
+        i += 1;
+
+        if matches!(name, "wsu:Id" | "Id") && value == id {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// Count how many start tags in `xml` bear the given XML id attribute value.
@@ -1780,7 +1848,7 @@ fn find_wsu_id(element: &str) -> Option<String> {
 /// declarations are skipped as non-element spans. Unlike the narrower extraction
 /// helpers, this full-envelope scan treats malformed start tags as errors
 /// rather than returning a partial count.
-fn count_wsu_id_occurrences(xml: &str, id: &str) -> Result<usize, String> {
+pub(crate) fn count_wsu_id_occurrences(xml: &str, id: &str) -> Result<usize, String> {
     let mut count = 0usize;
     let mut search_from = 0usize;
     while let Some(rel) = xml[search_from..].find('<') {
@@ -2268,104 +2336,6 @@ mod tests {
 
         assert_eq!(parsed["error"], raw);
         assert!(!escape_json_chars(raw).chars().any(|ch| ch < '\u{20}'));
-    }
-
-    #[test]
-    fn count_wsu_id_occurrences_counts_mixed_id_spellings_once_each() {
-        let xml = r#"
-            <Envelope>
-                <a:Timestamp a:Id='TS-1'/>
-                <Header Id="TS-1"/>
-                <Assertion xml:id='TS-1'/>
-                <Legacy ID="TS-1"/>
-                <Lower id='TS-1'/>
-                <Business CorrelationId="TS-1" Message_Id='TS-1' Audit-Id="TS-1" Trace.Id='TS-1'/>
-                <Body>literal Id="TS-1" and wsu:Id='TS-1' text must not count</Body>
-            </Envelope>
-        "#;
-
-        assert_eq!(
-            count_wsu_id_occurrences(xml, "TS-1")
-                .expect("well-formed XML should count id occurrences"),
-            5
-        );
-    }
-
-    #[test]
-    fn count_wsu_id_occurrences_counts_ids_after_gt_in_quoted_attribute() {
-        let xml = r#"
-            <Envelope>
-                <wsu:Timestamp wsu:Id="TS-1"/>
-                <Injected pad=">" Id="TS-1">attacker</Injected>
-                <Other pad='>' xml:id='TS-1'>attacker</Other>
-            </Envelope>
-        "#;
-
-        assert_eq!(
-            count_wsu_id_occurrences(xml, "TS-1")
-                .expect("well-formed XML should count id occurrences"),
-            3
-        );
-    }
-
-    #[test]
-    fn count_wsu_id_occurrences_fails_closed_after_unbalanced_quote() {
-        let xml = r#"<a Id="X"/><b z="><c Id="X"/>"#;
-
-        let err = count_wsu_id_occurrences(xml, "X")
-            .expect_err("unterminated quoted start tag must reject instead of undercounting");
-
-        assert!(
-            err.contains("malformed XML start tag"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn count_wsu_id_occurrences_skips_comment_content() {
-        let xml = r#"
-            <Envelope>
-                <First Id="X"/>
-                <!-- <debug note=" Id="X" -->
-                <Second Id="X"/>
-            </Envelope>
-        "#;
-
-        assert_eq!(
-            count_wsu_id_occurrences(xml, "X")
-                .expect("comment content should not be scanned as start tags"),
-            2
-        );
-    }
-
-    #[test]
-    fn count_wsu_id_occurrences_skips_cdata_content() {
-        let xml = r#"
-            <Envelope>
-                <First Id="X"/>
-                <![CDATA[<debug note=" Id="X">]]>
-                <Second Id="X"/>
-            </Envelope>
-        "#;
-
-        assert_eq!(
-            count_wsu_id_occurrences(xml, "X")
-                .expect("CDATA content should not be scanned as start tags"),
-            2
-        );
-    }
-
-    #[test]
-    fn count_wsu_id_occurrences_fails_closed_on_unterminated_comment() {
-        let xml = r#"<a Id="X"/><!-- <b Id="X"/>"#;
-
-        let err = count_wsu_id_occurrences(xml, "X")
-            .expect_err("unterminated comments must reject instead of hiding ids");
-
-        assert!(
-            err.contains("malformed XML comment"),
-            "unexpected error: {err}"
-        );
     }
 
     #[test]
