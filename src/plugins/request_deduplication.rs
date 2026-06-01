@@ -172,6 +172,7 @@ impl RequestDeduplication {
         let applicable_methods = parse_applicable_methods(config)?;
         let scope_by_consumer = optional_bool(config, "scope_by_consumer")?.unwrap_or(true);
         let enforce_required = optional_bool(config, "enforce_required")?.unwrap_or(false);
+        let shard_amount = http_client.pool_shard_amount();
 
         // Build optional Redis client
         let default_prefix = default_redis_key_prefix(http_client.namespace());
@@ -196,12 +197,12 @@ impl RequestDeduplication {
             applicable_methods,
             scope_by_consumer,
             enforce_required,
-            local_cache: Arc::new(DashMap::new()),
+            local_cache: Arc::new(DashMap::with_shard_amount(shard_amount)),
             completed_count: AtomicUsize::new(0),
             inflight_count: AtomicUsize::new(0),
             completed_sequence: AtomicU64::new(0),
             next_completed_evict_sequence: AtomicU64::new(0),
-            completed_order: Arc::new(DashMap::new()),
+            completed_order: Arc::new(DashMap::with_shard_amount(shard_amount)),
             eviction_lock: Mutex::new(()),
             redis_client,
             last_cleanup: AtomicU64::new(CLEANUP_NEVER),
@@ -398,7 +399,9 @@ impl RequestDeduplication {
         if completed_hint == 0 || completed_hint.saturating_add(inflight_hint) <= self.max_entries {
             return;
         }
-        let Ok(_guard) = self.eviction_lock.lock() else {
+        // Eviction is opportunistic on proxy paths; if another caller is
+        // already trimming, skip instead of parking a Tokio worker.
+        let Ok(_guard) = self.eviction_lock.try_lock() else {
             return;
         };
         self.evict_completed_over_capacity_locked(
@@ -533,7 +536,7 @@ impl RequestDeduplication {
     }
 
     fn advance_completed_evict_cursor(&self) {
-        let Ok(_guard) = self.eviction_lock.lock() else {
+        let Ok(_guard) = self.eviction_lock.try_lock() else {
             return;
         };
         self.advance_completed_evict_cursor_locked();
