@@ -608,6 +608,74 @@ async fn test_does_not_wrap_empty_body() {
     assert!(result.is_none());
 }
 
+#[tokio::test]
+async fn test_wrap_lone_cr_does_not_inject_sse_fields() {
+    // Security regression for finding #20 (SSE event/field injection): a lone
+    // CR (`\r`) in an untrusted upstream body must NOT survive into the wrapped
+    // output, where the client EventSource parser would re-split on it and let
+    // the upstream inject extra `data:`/`event:`/`id:`/`retry:` fields and a
+    // forged event boundary (blank line from `\r\r`).
+    let plugin = make_plugin(json!({"wrap_non_sse_responses": true}));
+    // `\r\r` would forge an event boundary; embedded field names would be
+    // parsed as real fields if the CR reached the wire.
+    let body = b"foo\rdata: injected\r\rid: spoofed";
+    let headers = HashMap::new();
+
+    let result = plugin
+        .transform_response_body(body, Some("application/json"), &headers)
+        .await;
+
+    let transformed = result.expect("should wrap body");
+    let output = String::from_utf8(transformed).unwrap();
+
+    // No bare CR may reach the wire — that is the injection vector.
+    assert!(
+        !output.contains('\r'),
+        "wrapped output must not contain a bare CR: {output:?}"
+    );
+
+    // Every upstream logical line (split on CR/LF/CRLF) becomes exactly one
+    // escaped `data:` field, so the injected `data:`/`id:` text is inert
+    // content, not new SSE fields, and `\r\r` yields an empty `data:` line
+    // (which does NOT terminate the event) rather than a blank-line boundary.
+    assert_eq!(
+        output,
+        "data: foo\ndata: data: injected\ndata: \ndata: id: spoofed\n\n"
+    );
+
+    // The only event-terminating blank line is the trailing one this code
+    // appends; the upstream `\r\r` must not have introduced an earlier one.
+    let body_section = output
+        .strip_suffix("\n\n")
+        .expect("event must end with a blank line");
+    assert!(
+        !body_section.contains("\n\n"),
+        "upstream content must not forge an interior event boundary: {output:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_wrap_crlf_and_lf_produce_identical_framing() {
+    // CRLF and lone-CR normalization must not regress the existing LF/CRLF
+    // framing: one `data:` field per line, no spurious empty lines, no bare CR.
+    let plugin = make_plugin(json!({"wrap_non_sse_responses": true}));
+    let headers = HashMap::new();
+
+    let crlf = plugin
+        .transform_response_body(b"a\r\nb\r\nc", Some("text/plain"), &headers)
+        .await
+        .expect("should wrap body");
+    let lf = plugin
+        .transform_response_body(b"a\nb\nc", Some("text/plain"), &headers)
+        .await
+        .expect("should wrap body");
+
+    assert_eq!(crlf, lf, "CRLF and LF bodies must frame identically");
+    let output = String::from_utf8(lf).unwrap();
+    assert_eq!(output, "data: a\ndata: b\ndata: c\n\n");
+    assert!(!output.contains('\r'));
+}
+
 // ── Full lifecycle: on_request_received → before_proxy → after_proxy ──────────
 
 #[tokio::test]

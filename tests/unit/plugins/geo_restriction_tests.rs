@@ -176,6 +176,55 @@ async fn test_missing_reader_uses_deny_lookup_failure_policy() {
     ));
 }
 
+#[tokio::test]
+async fn test_missing_reader_uses_allow_lookup_failure_policy_fail_open() {
+    // #47: with an explicit `allow` policy and a missing .mmdb, the geo gate
+    // fails open — the request is permitted (Continue). The fix surfaces this
+    // via logging (a one-time warn) without changing the behavior, so we lock
+    // the fail-open behavior here.
+    let config = json!({
+        "db_path": "/nonexistent/path/to/test.mmdb",
+        "allow_countries": ["US"],
+        "on_lookup_failure": "allow"
+    });
+    let plugin = GeoRestriction::new(&config).unwrap();
+    let mut ctx = RequestContext::new(
+        "203.0.113.1".to_string(),
+        "GET".to_string(),
+        "/test".to_string(),
+    );
+
+    let result = plugin.on_request_received(&mut ctx).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "explicit allow policy must fail open (Continue) when the .mmdb is missing"
+    );
+}
+
+#[tokio::test]
+async fn test_default_on_lookup_failure_is_allow_fail_open() {
+    // #47: when `on_lookup_failure` is omitted it defaults to `allow`
+    // (fail-open). A missing .mmdb therefore permits all traffic. The
+    // constructor logs a one-time startup warning in this case; behavior is
+    // unchanged (Continue), which we assert here.
+    let config = json!({
+        "db_path": "/nonexistent/path/to/test.mmdb",
+        "deny_countries": ["CN"]
+    });
+    let plugin = GeoRestriction::new(&config).unwrap();
+    let mut ctx = RequestContext::new(
+        "203.0.113.1".to_string(),
+        "GET".to_string(),
+        "/test".to_string(),
+    );
+
+    let result = plugin.on_request_received(&mut ctx).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "omitted on_lookup_failure defaults to allow (fail-open → Continue)"
+    );
+}
+
 // --- validate_mmdb_file tests ---
 
 #[test]

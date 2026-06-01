@@ -79,6 +79,20 @@ fn is_valid_http_header_name(name: &str) -> bool {
     })
 }
 
+/// Validate an untrusted inbound correlation id value.
+///
+/// Accepts a non-empty value composed solely of ASCII alphanumerics and a
+/// small allowlist (`-`, `_`, `.`). This covers UUIDs, ULIDs, and typical
+/// trace/span ids while rejecting control characters (HTAB, DEL), obs-text
+/// (0x80-0xFF), spaces, and other non-token bytes that `http::HeaderValue`
+/// permits but that should not be reflected into logs/headers verbatim.
+fn is_valid_correlation_id(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
 #[async_trait]
 impl Plugin for CorrelationId {
     fn name(&self) -> &str {
@@ -108,7 +122,17 @@ impl Plugin for CorrelationId {
 
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
         let request_id = if let Some(existing) = ctx.headers.get(&self.header_name) {
-            if existing.len() <= 256 {
+            // Preserve the client-supplied id only when it is both within the
+            // length cap AND made up of safe correlation-id characters. The
+            // inbound value is untrusted and is reflected downstream, forwarded
+            // upstream, and stored in `ctx.metadata["request_id"]` (consumed by
+            // logging sinks). `http::HeaderValue` already blocks CR/LF/NUL, but
+            // it legally permits HTAB, DEL (0x7F), and obs-text (0x80-0xFF),
+            // which could pollute a plain-text log sink or a downstream consumer
+            // expecting a token. Reject those by regenerating a fresh UUID —
+            // mirroring the over-length branch and the RFC 7230 strictness
+            // already applied to `header_name`. (Finding #69.)
+            if existing.len() <= 256 && is_valid_correlation_id(existing) {
                 existing.clone()
             } else {
                 let id = Uuid::new_v4().to_string();
