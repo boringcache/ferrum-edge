@@ -862,7 +862,7 @@ impl SoapWsSecurity {
                 // backend consumes. The count spans the FULL envelope, not just
                 // the regions the resolver searches, so a duplicate injected
                 // anywhere is caught. Mirrors the SAML single-Assertion guard.
-                let occurrences = count_wsu_id_occurrences(envelope, ref_id);
+                let occurrences = count_wsu_id_occurrences(envelope, ref_id)?;
                 if occurrences > 1 {
                     return Err(format!(
                         "WS-Security: referenced id '{}' is not unique in the envelope \
@@ -1716,92 +1716,100 @@ fn find_attribute(element: &str, attr_name: &str) -> Option<String> {
 }
 
 /// Find an element by its wsu:Id attribute value.
-fn find_element_by_wsu_id(xml: &str, id: &str) -> Option<String> {
-    // Search for wsu:Id="id" or Id="id"
-    let patterns = [
-        format!("wsu:Id=\"{}\"", id),
-        format!("Id=\"{}\"", id),
-        format!("wsu:Id='{}'", id),
-        format!("Id='{}'", id),
-    ];
-
-    for pattern in &patterns {
-        if let Some(pos) = xml.find(pattern.as_str()) {
-            // Walk backwards to find the '<' that starts this element
-            let before = &xml[..pos];
-            let tag_start = before.rfind('<')?;
-
-            // Extract the full tag name
-            let from_tag = &xml[tag_start..];
-            let full_tag_name = extract_full_tag_name(from_tag)?;
-
-            // Get the local name for finding the closing tag
-            let local_name = if let Some(colon_pos) = full_tag_name.find(':') {
-                &full_tag_name[colon_pos + 1..]
-            } else {
-                &full_tag_name
-            };
-
-            // Find the closing tag
-            let closing = format!("</{}>", full_tag_name);
-            if let Some(close_pos) = xml[tag_start..].find(&closing) {
-                let end = tag_start + close_pos + closing.len();
-                return Some(xml[tag_start..end].to_string());
-            }
-
-            // Try without prefix in closing tag
-            let closing_no_prefix = format!("</{}>", local_name);
-            if let Some(close_pos) = xml[tag_start..].find(&closing_no_prefix) {
-                let end = tag_start + close_pos + closing_no_prefix.len();
-                return Some(xml[tag_start..end].to_string());
-            }
+pub(crate) fn find_element_by_wsu_id(xml: &str, id: &str) -> Option<String> {
+    let mut search_from = 0usize;
+    while let Some(rel) = xml[search_from..].find('<') {
+        let tag_start = search_from + rel;
+        let after_lt = xml.as_bytes().get(tag_start + 1)?;
+        if *after_lt == b'/' {
+            search_from = tag_start + 1;
+            continue;
         }
+        if *after_lt == b'!' {
+            search_from = skip_markup_declaration(xml, tag_start).ok()?;
+            continue;
+        }
+        if *after_lt == b'?' {
+            search_from = skip_processing_instruction(xml, tag_start).ok()?;
+            continue;
+        }
+
+        let tag_end_rel = find_start_tag_end(xml, tag_start)?;
+        let tag = &xml[tag_start + 1..tag_start + tag_end_rel];
+        if !tag_has_resolvable_wsu_id(tag, id) {
+            search_from = tag_start + tag_end_rel + 1;
+            continue;
+        }
+
+        if tag.trim_end().ends_with('/') {
+            return Some(xml[tag_start..tag_start + tag_end_rel + 1].to_string());
+        }
+
+        let full_tag_name = extract_full_tag_name(&xml[tag_start..])?;
+        let local_name = if let Some(colon_pos) = full_tag_name.find(':') {
+            &full_tag_name[colon_pos + 1..]
+        } else {
+            &full_tag_name
+        };
+
+        let closing = format!("</{}>", full_tag_name);
+        if let Some(close_pos) = xml[tag_start..].find(&closing) {
+            let end = tag_start + close_pos + closing.len();
+            return Some(xml[tag_start..end].to_string());
+        }
+
+        let closing_no_prefix = format!("</{}>", local_name);
+        if let Some(close_pos) = xml[tag_start..].find(&closing_no_prefix) {
+            let end = tag_start + close_pos + closing_no_prefix.len();
+            return Some(xml[tag_start..end].to_string());
+        }
+
+        search_from = tag_start + tag_end_rel + 1;
     }
 
     None
 }
 
-/// Extract the wsu:Id (or plain Id) attribute from an element.
+/// Extract the wsu:Id (or any prefixed local-name Id / plain Id) attribute from
+/// an element.
 fn find_wsu_id(element: &str) -> Option<String> {
-    find_attribute(element, "wsu:Id").or_else(|| find_attribute(element, "Id"))
+    let tag_start = element.find('<')?;
+    let tag_end_rel = find_start_tag_end(element, tag_start)?;
+    let tag = element.get(tag_start + 1..tag_start + tag_end_rel)?;
+    find_resolvable_wsu_id_value_in_tag(tag)
 }
 
-/// Count how many start tags in `xml` bear the given XML id attribute value.
-/// Used to reject XML Signature Wrapping (XSW): a signed reference whose id
-/// appears on more than one element means an attacker injected a duplicate, so
-/// the byte range the signature covers may differ from the element a backend
-/// consumes.
-///
-/// The resolver still accepts WS-Security `wsu:Id` / bare `Id`, but the counter
-/// intentionally counts broader id spellings (`xml:id`, `ID`, `id`) so a backend
-/// with broader fragment resolution fails closed. Scanning only start tags avoids
-/// rejecting a legitimate request merely because body text contains `Id="..."`.
-fn count_wsu_id_occurrences(xml: &str, id: &str) -> usize {
-    let mut count = 0usize;
-    let mut search_from = 0usize;
-    while let Some(rel) = xml[search_from..].find('<') {
-        let tag_start = search_from + rel;
-        let Some(after_lt) = xml.as_bytes().get(tag_start + 1) else {
-            break;
-        };
-        if matches!(after_lt, b'/' | b'!' | b'?') {
-            search_from = tag_start + 1;
-            continue;
+fn tag_has_resolvable_wsu_id(tag: &str, id: &str) -> bool {
+    scan_tag_attributes(tag, |name, value| {
+        is_resolvable_wsu_id_attribute_name(name) && value == id
+    })
+}
+
+fn find_resolvable_wsu_id_value_in_tag(tag: &str) -> Option<String> {
+    let mut found = None;
+    scan_tag_attributes(tag, |name, value| {
+        if is_resolvable_wsu_id_attribute_name(name) {
+            found = Some(value.to_string());
+            true
+        } else {
+            false
         }
-
-        let Some(tag_end_rel) = xml[tag_start..].find('>') else {
-            break;
-        };
-        let tag = &xml[tag_start + 1..tag_start + tag_end_rel];
-        count += count_id_attributes_in_tag(tag, id);
-        search_from = tag_start + tag_end_rel + 1;
-    }
-    count
+    });
+    found
 }
 
-fn count_id_attributes_in_tag(tag: &str, id: &str) -> usize {
+fn is_resolvable_wsu_id_attribute_name(name: &str) -> bool {
+    name == "Id"
+        || name
+            .rsplit_once(':')
+            .is_some_and(|(_, local_name)| local_name == "Id")
+}
+
+fn scan_tag_attributes<F>(tag: &str, mut on_attr: F) -> bool
+where
+    F: FnMut(&str, &str) -> bool,
+{
     let bytes = tag.as_bytes();
-    let mut count = 0usize;
     let mut i = 0usize;
 
     while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b'/' {
@@ -1851,11 +1859,169 @@ fn count_id_attributes_in_tag(tag: &str, id: &str) -> usize {
         let value = &tag[value_start..i];
         i += 1;
 
-        if is_xml_id_attribute_name(name) && value == id {
-            count += 1;
+        if on_attr(name, value) {
+            return true;
         }
     }
 
+    false
+}
+
+/// Count how many start tags in `xml` bear the given XML id attribute value.
+/// Used to reject XML Signature Wrapping (XSW): a signed reference whose id
+/// appears on more than one element means an attacker injected a duplicate, so
+/// the byte range the signature covers may differ from the element a backend
+/// consumes.
+///
+/// The resolver still accepts WS-Security `*:Id` / bare `Id`, but this security
+/// gate intentionally counts broader id spellings (`xml:id`, `ID`, `id`) so a
+/// backend with broader fragment resolution fails closed. Scanning only start
+/// tags avoids rejecting a legitimate request merely because body text contains
+/// `Id="..."`. Comments, CDATA, processing instructions, and declarations are
+/// skipped as non-element spans. Unlike the narrower extraction helpers, this
+/// full-envelope scan treats malformed start tags as errors rather than
+/// returning a partial count.
+pub(crate) fn count_wsu_id_occurrences(xml: &str, id: &str) -> Result<usize, String> {
+    let mut count = 0usize;
+    let mut search_from = 0usize;
+    while let Some(rel) = xml[search_from..].find('<') {
+        let tag_start = search_from + rel;
+        let Some(after_lt) = xml.as_bytes().get(tag_start + 1) else {
+            return Err(
+                "WS-Security: malformed XML start tag while scanning referenced ids".into(),
+            );
+        };
+        if *after_lt == b'/' {
+            search_from = tag_start + 1;
+            continue;
+        }
+        if *after_lt == b'!' {
+            search_from = skip_markup_declaration(xml, tag_start)?;
+            continue;
+        }
+        if *after_lt == b'?' {
+            search_from = skip_processing_instruction(xml, tag_start)?;
+            continue;
+        }
+
+        let tag_end_rel = find_start_tag_end(xml, tag_start).ok_or_else(|| {
+            "WS-Security: malformed XML start tag while scanning referenced ids".to_string()
+        })?;
+        let tag = &xml[tag_start + 1..tag_start + tag_end_rel];
+        count += count_id_attributes_in_tag(tag, id);
+        search_from = tag_start + tag_end_rel + 1;
+    }
+    Ok(count)
+}
+
+fn skip_markup_declaration(xml: &str, tag_start: usize) -> Result<usize, String> {
+    let from_start = xml.get(tag_start..).ok_or_else(|| {
+        "WS-Security: malformed XML declaration while scanning referenced ids".to_string()
+    })?;
+
+    if from_start.starts_with("<!--") {
+        return from_start
+            .find("-->")
+            .map(|end_rel| tag_start + end_rel + "-->".len())
+            .ok_or_else(|| {
+                "WS-Security: malformed XML comment while scanning referenced ids".to_string()
+            });
+    }
+
+    if from_start.starts_with("<![CDATA[") {
+        return from_start
+            .find("]]>")
+            .map(|end_rel| tag_start + end_rel + "]]>".len())
+            .ok_or_else(|| {
+                "WS-Security: malformed XML CDATA while scanning referenced ids".to_string()
+            });
+    }
+
+    let decl_end_rel = find_markup_declaration_end(xml, tag_start).ok_or_else(|| {
+        "WS-Security: malformed XML declaration while scanning referenced ids".to_string()
+    })?;
+    Ok(tag_start + decl_end_rel + 1)
+}
+
+fn skip_processing_instruction(xml: &str, tag_start: usize) -> Result<usize, String> {
+    let from_start = xml.get(tag_start..).ok_or_else(|| {
+        "WS-Security: malformed XML processing instruction while scanning referenced ids"
+            .to_string()
+    })?;
+
+    from_start
+        .find("?>")
+        .map(|end_rel| tag_start + end_rel + "?>".len())
+        .ok_or_else(|| {
+            "WS-Security: malformed XML processing instruction while scanning referenced ids"
+                .to_string()
+        })
+}
+
+/// Return the byte offset, relative to `tag_start`, of the end of a `<!...>`
+/// declaration. Comments and CDATA have custom terminators and are handled
+/// before this helper is called.
+fn find_markup_declaration_end(xml: &str, tag_start: usize) -> Option<usize> {
+    debug_assert_eq!(xml.as_bytes().get(tag_start), Some(&b'<'));
+    let bytes = xml.as_bytes().get(tag_start..)?;
+    if !bytes.starts_with(b"<!") {
+        return None;
+    }
+
+    let mut quote = None;
+    let mut bracket_depth = 0usize;
+    let mut i = 2usize;
+
+    while i < bytes.len() {
+        match quote {
+            Some(q) if bytes[i] == q => quote = None,
+            Some(_) => {}
+            None if matches!(bytes[i], b'\'' | b'"') => quote = Some(bytes[i]),
+            None if bytes[i] == b'[' => bracket_depth = bracket_depth.saturating_add(1),
+            None if bytes[i] == b']' => bracket_depth = bracket_depth.saturating_sub(1),
+            None if bytes[i] == b'>' && bracket_depth == 0 => return Some(i),
+            None => {}
+        }
+        i += 1;
+    }
+
+    None
+}
+
+/// Return the byte offset, relative to `tag_start`, of the first unquoted `>`.
+/// `tag_start` must point at `<`; malformed or unterminated start tags return
+/// `None` so callers can fail closed instead of scanning a partial envelope.
+fn find_start_tag_end(xml: &str, tag_start: usize) -> Option<usize> {
+    debug_assert_eq!(xml.as_bytes().get(tag_start), Some(&b'<'));
+    let bytes = xml.as_bytes().get(tag_start..)?;
+    if bytes.first() != Some(&b'<') {
+        return None;
+    }
+    let mut quote = None;
+    let mut i = 1usize;
+
+    while i < bytes.len() {
+        match quote {
+            Some(q) if bytes[i] == q => quote = None,
+            Some(_) => {}
+            None if matches!(bytes[i], b'\'' | b'"') => quote = Some(bytes[i]),
+            None if bytes[i] == b'>' => return Some(i),
+            None => {}
+        }
+        i += 1;
+    }
+
+    None
+}
+
+fn count_id_attributes_in_tag(tag: &str, id: &str) -> usize {
+    let mut count = 0usize;
+    scan_tag_attributes(tag, |name, value| {
+        if is_xml_id_attribute_name(name) && value == id {
+            count += 1;
+        }
+        false
+    });
     count
 }
 
@@ -2154,23 +2320,6 @@ mod tests {
 
         assert_eq!(parsed["error"], raw);
         assert!(!escape_json_chars(raw).chars().any(|ch| ch < '\u{20}'));
-    }
-
-    #[test]
-    fn count_wsu_id_occurrences_counts_mixed_id_spellings_once_each() {
-        let xml = r#"
-            <Envelope>
-                <a:Timestamp a:Id='TS-1'/>
-                <Header Id="TS-1"/>
-                <Assertion xml:id='TS-1'/>
-                <Legacy ID="TS-1"/>
-                <Lower id='TS-1'/>
-                <Business CorrelationId="TS-1" Message_Id='TS-1' Audit-Id="TS-1" Trace.Id='TS-1'/>
-                <Body>literal Id="TS-1" and wsu:Id='TS-1' text must not count</Body>
-            </Envelope>
-        "#;
-
-        assert_eq!(count_wsu_id_occurrences(xml, "TS-1"), 5);
     }
 
     #[test]

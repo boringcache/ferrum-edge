@@ -1,3 +1,6 @@
+use ferrum_edge::_test_support::{
+    soap_count_wsu_id_occurrences_for_test, soap_find_element_by_wsu_id_for_test,
+};
 use ferrum_edge::plugins::soap_ws_security::SoapWsSecurity;
 use ferrum_edge::plugins::{HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, RequestContext, priority};
 use serde_json::{Value, json};
@@ -241,6 +244,164 @@ fn test_plugin_contract() {
     assert!(plugin.requires_request_body_buffering());
     assert!(!plugin.requires_response_body_buffering());
     assert!(!plugin.applies_after_proxy_on_reject());
+}
+
+#[test]
+fn count_wsu_id_occurrences_counts_mixed_id_spellings_once_each() {
+    let xml = r#"
+        <Envelope>
+            <a:Timestamp a:Id='TS-1'/>
+            <Header Id="TS-1"/>
+            <Assertion xml:id='TS-1'/>
+            <Legacy ID="TS-1"/>
+            <Lower id='TS-1'/>
+            <Business CorrelationId="TS-1" Message_Id='TS-1' Audit-Id="TS-1" Trace.Id='TS-1'/>
+            <Body>literal Id="TS-1" and wsu:Id='TS-1' text must not count</Body>
+        </Envelope>
+    "#;
+
+    assert_eq!(
+        soap_count_wsu_id_occurrences_for_test(xml, "TS-1")
+            .expect("well-formed XML should count id occurrences"),
+        5
+    );
+}
+
+#[test]
+fn count_wsu_id_occurrences_counts_ids_after_gt_in_quoted_attribute() {
+    let xml = r#"
+        <Envelope>
+            <wsu:Timestamp wsu:Id="TS-1"/>
+            <Injected pad=">" Id="TS-1">attacker</Injected>
+            <Other pad='>' xml:id='TS-1'>attacker</Other>
+        </Envelope>
+    "#;
+
+    assert_eq!(
+        soap_count_wsu_id_occurrences_for_test(xml, "TS-1")
+            .expect("well-formed XML should count id occurrences"),
+        3
+    );
+}
+
+#[test]
+fn count_wsu_id_occurrences_fails_closed_after_unbalanced_quote() {
+    let xml = r#"<a Id="X"/><b z="><c Id="X"/>"#;
+
+    let err = soap_count_wsu_id_occurrences_for_test(xml, "X")
+        .expect_err("unterminated quoted start tag must reject instead of undercounting");
+
+    assert!(
+        err.contains("malformed XML start tag"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn count_wsu_id_occurrences_skips_comment_content() {
+    let xml = r#"
+        <Envelope>
+            <First Id="X"/>
+            <!-- <debug note=" Id="X" -->
+            <Second Id="X"/>
+        </Envelope>
+    "#;
+
+    assert_eq!(
+        soap_count_wsu_id_occurrences_for_test(xml, "X")
+            .expect("comment content should not be scanned as start tags"),
+        2
+    );
+}
+
+#[test]
+fn count_wsu_id_occurrences_skips_cdata_content() {
+    let xml = r#"
+        <Envelope>
+            <First Id="X"/>
+            <![CDATA[<debug note=" Id="X">]]>
+            <Second Id="X"/>
+        </Envelope>
+    "#;
+
+    assert_eq!(
+        soap_count_wsu_id_occurrences_for_test(xml, "X")
+            .expect("CDATA content should not be scanned as start tags"),
+        2
+    );
+}
+
+#[test]
+fn count_wsu_id_occurrences_fails_closed_on_unterminated_comment() {
+    let xml = r#"<a Id="X"/><!-- <b Id="X"/>"#;
+
+    let err = soap_count_wsu_id_occurrences_for_test(xml, "X")
+        .expect_err("unterminated comments must reject instead of hiding ids");
+
+    assert!(
+        err.contains("malformed XML comment"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn find_element_by_wsu_id_skips_comment_content_like_counter() {
+    let xml = r#"
+        <!-- <Signed wsu:Id="X">signed bytes</Signed> -->
+        <Unsigned wsu:Id="X">backend bytes</Unsigned>
+    "#;
+
+    assert_eq!(
+        soap_count_wsu_id_occurrences_for_test(xml, "X").expect("comment content should not count"),
+        1
+    );
+    let resolved = soap_find_element_by_wsu_id_for_test(xml, "X")
+        .expect("real unsigned element should resolve");
+
+    assert!(resolved.starts_with("<Unsigned"));
+    assert!(resolved.contains("backend bytes"));
+    assert!(!resolved.contains("signed bytes"));
+}
+
+#[test]
+fn find_element_by_wsu_id_skips_cdata_and_pi_content_like_counter() {
+    let xml = r#"
+        <![CDATA[<Signed wsu:Id="X">signed bytes</Signed>]]>
+        <?debug <Other wsu:Id="X">signed bytes</Other>?>
+        <Real Id="X">backend bytes</Real>
+    "#;
+
+    assert_eq!(
+        soap_count_wsu_id_occurrences_for_test(xml, "X")
+            .expect("CDATA and PI content should not count"),
+        1
+    );
+    let resolved =
+        soap_find_element_by_wsu_id_for_test(xml, "X").expect("real element should resolve");
+
+    assert!(resolved.starts_with("<Real"));
+    assert!(resolved.contains("backend bytes"));
+    assert!(!resolved.contains("signed bytes"));
+}
+
+#[test]
+fn find_element_by_wsu_id_resolves_arbitrary_prefixed_id() {
+    let xml = r#"
+        <soap:Body xmlns:u="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">
+            <Target u:Id="B">signed body bytes</Target>
+        </soap:Body>
+    "#;
+
+    assert_eq!(
+        soap_count_wsu_id_occurrences_for_test(xml, "B")
+            .expect("prefixed local-name Id should count"),
+        1
+    );
+    let resolved = soap_find_element_by_wsu_id_for_test(xml, "B")
+        .expect("prefixed local-name Id should resolve");
+
+    assert!(resolved.starts_with("<Target"));
+    assert!(resolved.contains("signed body bytes"));
 }
 
 #[test]
@@ -1906,6 +2067,13 @@ mod x509_roundtrip {
     /// what `validate_x509_signature` extracts via `find_element_block`, so
     /// the signature computed here will match what the verifier checks.
     fn build_signed_soap_envelope(cert: &TestRsaCert) -> String {
+        build_signed_soap_envelope_with_timestamp_prefix(cert, "wsu")
+    }
+
+    fn build_signed_soap_envelope_with_timestamp_prefix(
+        cert: &TestRsaCert,
+        timestamp_prefix: &str,
+    ) -> String {
         let now = chrono::Utc::now();
         let created = now.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
         let expires = (now + chrono::Duration::minutes(5))
@@ -1913,8 +2081,10 @@ mod x509_roundtrip {
             .to_string();
 
         let timestamp_xml = format!(
-            r#"<wsu:Timestamp wsu:Id="TS-1"><wsu:Created>{}</wsu:Created><wsu:Expires>{}</wsu:Expires></wsu:Timestamp>"#,
-            created, expires
+            r#"<{prefix}:Timestamp {prefix}:Id="TS-1"><{prefix}:Created>{created}</{prefix}:Created><{prefix}:Expires>{expires}</{prefix}:Expires></{prefix}:Timestamp>"#,
+            prefix = timestamp_prefix,
+            created = created,
+            expires = expires,
         );
 
         // verify_reference_digests hashes the raw bytes of the referenced
@@ -1953,7 +2123,7 @@ mod x509_roundtrip {
             r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
   <soap:Header>
     <wsse:Security xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
-                   xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">
+                   xmlns:{timestamp_prefix}="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">
       {timestamp}
       <wsse:BinarySecurityToken EncodingType="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary" ValueType="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-x509-token-profile-1.0#X509v3">{cert_b64}</wsse:BinarySecurityToken>
       <Signature xmlns="http://www.w3.org/2000/09/xmldsig#">
@@ -1965,6 +2135,7 @@ mod x509_roundtrip {
   <soap:Body><GetPrice xmlns="http://example.com/prices"><Item>Widget</Item></GetPrice></soap:Body>
 </soap:Envelope>"#,
             timestamp = timestamp_xml,
+            timestamp_prefix = timestamp_prefix,
             cert_b64 = cert.cert_der_b64,
             signed_info = signed_info,
             sig_b64 = signature_b64,
@@ -1999,6 +2170,25 @@ mod x509_roundtrip {
         assert!(
             matches!(result, PluginResult::Continue),
             "expected Continue with valid RSA signature, got {:?}",
+            result,
+        );
+    }
+
+    #[tokio::test]
+    async fn valid_rsa_signature_with_arbitrary_wsu_prefix_is_accepted() {
+        let cert = mint_rsa_cert();
+        let cert_file = write_pem_to_tempfile(&cert.cert_pem);
+        let plugin = SoapWsSecurity::new(&x509_plugin_config(cert_file.path()))
+            .expect("plugin should construct with valid RSA cert");
+
+        let body = build_signed_soap_envelope_with_timestamp_prefix(&cert, "u");
+        let mut ctx = make_ctx_with_soap_body(&body);
+        let mut headers = soap_headers();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+        assert!(
+            matches!(result, PluginResult::Continue),
+            "expected Continue with non-wsu WSU namespace prefix, got {:?}",
             result,
         );
     }

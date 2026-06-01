@@ -84,6 +84,15 @@ pub mod _test_support {
     use crate::config::types::{AuthMode, BackendScheme};
     use crate::plugins::Plugin;
 
+    // ── plugins/soap_ws_security ────────────────────────────────────────────
+    pub fn soap_count_wsu_id_occurrences_for_test(xml: &str, id: &str) -> Result<usize, String> {
+        crate::plugins::soap_ws_security::count_wsu_id_occurrences(xml, id)
+    }
+
+    pub fn soap_find_element_by_wsu_id_for_test(xml: &str, id: &str) -> Option<String> {
+        crate::plugins::soap_ws_security::find_element_by_wsu_id(xml, id)
+    }
+
     // ── proxy/tcp_proxy ──────────────────────────────────────────────────────
     pub fn classify_stream_error(error: &anyhow::Error) -> crate::retry::ErrorClass {
         crate::proxy::tcp_proxy::classify_stream_error(error)
