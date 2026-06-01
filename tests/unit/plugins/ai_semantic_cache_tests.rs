@@ -1235,6 +1235,45 @@ async fn test_sub_cent_sampling_params_do_not_collapse() {
 }
 
 #[tokio::test]
+async fn test_numerically_equivalent_sampling_params_collapse() {
+    // #55: semantically identical sampling-parameter encodings must canonicalize
+    // to the same cache key. Integer vs float (`1` vs `1.0`) and trailing-zero
+    // (`0.5` vs `0.50`) forms previously produced different key fragments
+    // ("1" vs "1.0", "0.5" vs "0.50") and missed the cache; canonicalizing
+    // through the f64 form collapses them.
+    let plugin = make_plugin(json!({"ttl_seconds": 300}));
+
+    let stored = json!({
+        "model": "gpt-4o",
+        "temperature": 1,
+        "top_p": 0.5,
+        "messages": [{"role": "user", "content": "draft a poem"}]
+    });
+    let equivalent = json!({
+        "model": "gpt-4o",
+        "temperature": 1.0,
+        "top_p": 0.50,
+        "messages": [{"role": "user", "content": "draft a poem"}]
+    });
+
+    store_response(
+        &plugin,
+        &serde_json::to_string(&stored).unwrap(),
+        None,
+        b"poem-from-temp-1",
+    )
+    .await;
+
+    let hit =
+        run_before_proxy_get_status(&plugin, &serde_json::to_string(&equivalent).unwrap(), None)
+            .await;
+    assert!(
+        hit,
+        "numerically equivalent sampling params (1 vs 1.0, 0.5 vs 0.50) must hit the same entry"
+    );
+}
+
+#[tokio::test]
 async fn test_same_request_different_consumer_no_cache_hit_with_default_config() {
     // SECURITY: With the new `scope_by_consumer=true` default, two requests
     // from different authenticated consumers must NOT share a cache entry.
