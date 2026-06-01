@@ -6125,9 +6125,11 @@ components:
         Raw frame contents are never logged: WebSocket payloads routinely carry
         credentials (bearer tokens, cookies, API keys), so when
         `include_payload_preview` is enabled the `preview` field contains only a
-        non-reversible fingerprint of the form `sha256:<12 hex chars> len=<bytes>`
-        (with a trailing `+` after the digest when only a prefix of the payload
-        was hashed).
+        keyed, non-reversible fingerprint of the form
+        `hmac-sha256:<12 hex chars> len=<bytes>` (with a trailing `+` after the
+        digest when only a prefix of the payload was hashed). The key is
+        generated per plugin instance and is not exposed in logs, so log access
+        alone cannot confirm guessed payloads offline.
       properties:
         log_level:
           type: string
@@ -6140,8 +6142,9 @@ components:
           type: boolean
           default: false
           description: >-
-            Emit a non-reversible payload fingerprint (`sha256:<prefix> len=<n>`)
-            in the `preview` field. Raw frame bytes are never logged.
+            Emit a keyed, non-reversible payload fingerprint
+            (`hmac-sha256:<prefix> len=<n>`) in the `preview` field. Raw frame
+            bytes are never logged.
         payload_preview_bytes:
           type: integer
           default: 128

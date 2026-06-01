@@ -3747,7 +3747,7 @@ Logs metadata for every WebSocket frame passing through the proxy. Provides fram
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `log_level` | String | `"info"` | Log level for frame entries: `trace`, `debug`, or `info` (case-sensitive — unknown values are rejected at config load time) |
-| `include_payload_preview` | bool | `false` | Emit a non-reversible payload fingerprint (`sha256:<prefix> len=<n>`) in the `preview` field. Raw frame bytes are never logged |
+| `include_payload_preview` | bool | `false` | Emit a keyed, non-reversible payload fingerprint (`hmac-sha256:<prefix> len=<n>`) in the `preview` field. Raw frame bytes are never logged |
 | `payload_preview_bytes` | u64 | `128` | Maximum leading payload bytes folded into the fingerprint digest (clamped to 64 KiB; must be greater than zero when previews are enabled; zero is accepted when previews are disabled) |
 | `log_ping_pong` | bool | `false` | Log Ping and Pong control frames |
 
@@ -3762,7 +3762,7 @@ config:
 
 Frame log entries are emitted to the `ws_frame_log` tracing target with structured fields: `proxy_id`, `connection_id`, `direction` (`client->backend` or `backend->client`), `frame_type` (`text`, `binary`, `ping`, `pong`, `close`, `frame`), `size_bytes`, and (when `include_payload_preview` is true) `preview`. Fingerprint computation is skipped when the configured tracing level is filtered out, so disabling logging at the tracing layer eliminates per-frame work.
 
-**Raw frame contents are never logged.** WebSocket payloads routinely carry credentials — bearer tokens, session cookies, API keys (for example a GraphQL-over-WS `connection_init` payload or a custom auth handshake). To honor the project's never-log-secrets invariant, `preview` contains only a non-reversible fingerprint of the form `sha256:<12 hex chars> len=<bytes>` (with a trailing `+` after the digest when only the first `payload_preview_bytes` of the payload were hashed). The digest lets operators correlate identical payloads across frames without disclosing plaintext; the payload byte length is also always available as `size_bytes`.
+**Raw frame contents are never logged.** WebSocket payloads routinely carry credentials — bearer tokens, session cookies, API keys (for example a GraphQL-over-WS `connection_init` payload or a custom auth handshake). To honor the project's never-log-secrets invariant, `preview` contains only a keyed, non-reversible fingerprint of the form `hmac-sha256:<12 hex chars> len=<bytes>` (with a trailing `+` after the digest when only the first `payload_preview_bytes` of the payload were hashed). The key is generated per plugin instance and is not exposed in logs, so log access alone cannot confirm guessed payloads offline. The digest lets operators correlate identical payloads observed by that plugin instance without disclosing plaintext; the payload byte length is also always available as `size_bytes`.
 
 ---
 

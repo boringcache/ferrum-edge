@@ -15,10 +15,11 @@
 //! with `{"Authorization":"Bearer ..."}` or a custom auth handshake). To honor
 //! the project invariant "do not log secrets", this plugin NEVER logs raw frame
 //! contents. When `include_payload_preview` is enabled, the `preview` field
-//! carries only a non-reversible fingerprint of the form
-//! `sha256:<12 hex chars> len=<bytes>` (and `+` after the digest when only a
-//! prefix of the payload was hashed). The digest lets operators correlate
-//! identical payloads across frames without disclosing plaintext; the length is
+//! carries only a keyed, non-reversible fingerprint of the form
+//! `hmac-sha256:<12 hex chars> len=<bytes>` (and `+` after the digest when only
+//! a prefix of the payload was hashed). The per-plugin-instance key prevents
+//! offline payload guessing from log access alone while still letting operators
+//! correlate identical payloads observed by that plugin instance; the length is
 //! always also available as the dedicated `size_bytes` field.
 //!
 //! Config:
@@ -32,6 +33,7 @@
 //! ```
 
 use async_trait::async_trait;
+use ring::rand::SecureRandom;
 use serde_json::Value;
 use tokio_tungstenite::tungstenite::protocol::Message;
 
@@ -52,6 +54,7 @@ pub struct WsFrameLogging {
     log_level: LogLevel,
     include_payload_preview: bool,
     payload_preview_bytes: usize,
+    payload_fingerprint_key: Option<[u8; 32]>,
     log_ping_pong: bool,
 }
 
@@ -110,6 +113,17 @@ impl WsFrameLogging {
                     .to_string(),
             );
         }
+        let payload_fingerprint_key = if include_payload_preview {
+            let mut key = [0u8; 32];
+            ring::rand::SystemRandom::new()
+                .fill(&mut key)
+                .map_err(|_| {
+                    "ws_frame_logging: failed to generate payload fingerprint key".to_string()
+                })?;
+            Some(key)
+        } else {
+            None
+        };
 
         let log_ping_pong = match config.get("log_ping_pong") {
             Some(v) => v
@@ -122,6 +136,7 @@ impl WsFrameLogging {
             log_level,
             include_payload_preview,
             payload_preview_bytes,
+            payload_fingerprint_key,
             log_ping_pong,
         })
     }
@@ -160,18 +175,19 @@ impl WsFrameLogging {
     ///
     /// SECURITY: WebSocket payloads routinely carry credentials (bearer tokens,
     /// cookies, API keys). We therefore NEVER emit the raw bytes. Instead we
-    /// fold up to `payload_preview_bytes` leading bytes into a SHA-256 digest
-    /// and emit a short, non-reversible fingerprint:
-    ///   `sha256:<12 hex chars> len=<total payload bytes>`
+    /// fold up to `payload_preview_bytes` leading bytes into a keyed HMAC-SHA256
+    /// digest and emit a short, non-reversible fingerprint:
+    ///   `hmac-sha256:<12 hex chars> len=<total payload bytes>`
     /// A trailing `+` is appended after the digest hex when only a prefix of the
     /// payload was hashed (payload longer than `payload_preview_bytes`), so the
-    /// fingerprint is unambiguous about partial coverage. This gives operators
-    /// frame-correlation signal (identical payloads share a digest) and size
-    /// without disclosing plaintext. See the module-level "Payload privacy" note.
+    /// fingerprint is unambiguous about partial coverage. The key is generated
+    /// during plugin construction, so log access alone is not enough to verify
+    /// guessed credentials offline. See the module-level "Payload privacy" note.
     fn payload_preview(&self, message: &Message) -> Option<String> {
         if !self.include_payload_preview {
             return None;
         }
+        let key = self.payload_fingerprint_key.as_ref()?;
         let (full_len, bytes): (usize, &[u8]) = match message {
             Message::Text(s) => (s.len(), s.as_bytes()),
             Message::Binary(b) => (b.len(), b.as_ref()),
@@ -180,6 +196,7 @@ impl WsFrameLogging {
         let hashed_len = full_len.min(self.payload_preview_bytes);
         let truncated = hashed_len < full_len;
         Some(payload_fingerprint(
+            key,
             &bytes[..hashed_len],
             full_len,
             truncated,
@@ -187,24 +204,26 @@ impl WsFrameLogging {
     }
 }
 
-/// Render a non-reversible payload fingerprint string.
+/// Render a keyed, non-reversible payload fingerprint string.
 ///
+/// `key` is generated on the plugin construction path and intentionally never
+/// logged or exposed.
 /// `hashed` is the prefix of the payload that is folded into the digest,
 /// `full_len` is the total payload length reported to operators, and
 /// `truncated` indicates the digest only covers a prefix of the payload.
-fn payload_fingerprint(hashed: &[u8], full_len: usize, truncated: bool) -> String {
-    use sha2::{Digest, Sha256};
-    // Unsalted digest by design: operators aggregate WS logs across workers and
-    // rolling restarts, so identical payloads must keep the same fingerprint
-    // across process lifetimes. The raw payload is still never logged.
-    let mut hasher = Sha256::new();
-    hasher.update(hashed);
-    let digest = hasher.finalize();
+fn payload_fingerprint(
+    key: &[u8; 32],
+    hashed: &[u8],
+    full_len: usize,
+    truncated: bool,
+) -> String {
+    let hmac_key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, key);
+    let digest = ring::hmac::sign(&hmac_key, hashed);
     // 6 bytes -> 12 lowercase hex chars: enough entropy to correlate frames
-    // within a process while staying compact in log lines.
-    let prefix = hex::encode(&digest[..6]);
+    // within a plugin instance while staying compact in log lines.
+    let prefix = hex::encode(&digest.as_ref()[..6]);
     let marker = if truncated { "+" } else { "" };
-    format!("sha256:{prefix}{marker} len={full_len}")
+    format!("hmac-sha256:{prefix}{marker} len={full_len}")
 }
 
 /// Emit a structured log at the given tracing level.
@@ -466,8 +485,8 @@ mod tests {
 
         // The fingerprint must be the only thing emitted.
         assert!(
-            preview.starts_with("sha256:"),
-            "preview must be a sha256 fingerprint, got: {preview}"
+            preview.starts_with("hmac-sha256:"),
+            "preview must be an hmac-sha256 fingerprint, got: {preview}"
         );
         // None of the sensitive substrings (nor the raw payload) may appear.
         for leaked in [
@@ -500,7 +519,7 @@ mod tests {
 
         let preview = plugin.payload_preview(&msg).expect("preview present");
 
-        assert!(preview.starts_with("sha256:"), "got: {preview}");
+        assert!(preview.starts_with("hmac-sha256:"), "got: {preview}");
         // The old verbatim hex dump ("deadbeefcafe") must not be present.
         assert!(
             !preview.contains("deadbeefcafe"),
@@ -512,8 +531,9 @@ mod tests {
         );
     }
 
-    /// Identical payloads must produce identical fingerprints so operators can
-    /// still correlate frames; different payloads must differ.
+    /// Identical payloads must produce identical fingerprints within one plugin
+    /// instance so operators can still correlate frames; different payloads must
+    /// differ.
     #[test]
     fn fingerprint_is_deterministic_for_correlation() {
         let plugin = preview_plugin(4096);
@@ -600,21 +620,34 @@ mod tests {
         assert!(plugin.payload_preview(&Message::Close(None)).is_none());
     }
 
-    /// The fingerprint helper format is stable: `sha256:<12 hex> len=<n>`.
+    /// The fingerprint helper format is stable: `hmac-sha256:<12 hex> len=<n>`.
     #[test]
     fn fingerprint_format_shape() {
-        let fp = payload_fingerprint(b"abc", 3, false);
-        assert!(fp.starts_with("sha256:"), "got: {fp}");
+        let key = [7u8; 32];
+        let fp = payload_fingerprint(&key, b"abc", 3, false);
+        assert!(fp.starts_with("hmac-sha256:"), "got: {fp}");
         assert!(fp.ends_with("len=3"), "got: {fp}");
-        // 12 lowercase hex chars between "sha256:" and " len=".
+        // 12 lowercase hex chars between "hmac-sha256:" and " len=".
         let hex_part = fp
-            .strip_prefix("sha256:")
+            .strip_prefix("hmac-sha256:")
             .and_then(|s| s.split(' ').next())
             .expect("hex segment");
         assert_eq!(hex_part.len(), 12, "expected 12 hex chars, got: {hex_part}");
         assert!(
             hex_part.bytes().all(|b| b.is_ascii_hexdigit()),
             "non-hex chars in fingerprint: {hex_part}"
+        );
+    }
+
+    #[test]
+    fn fingerprint_is_keyed_to_prevent_offline_guess_confirmation() {
+        let payload = b"{\"type\":\"connection_init\",\"password\":\"guessable\"}";
+        let fp_a = payload_fingerprint(&[1u8; 32], payload, payload.len(), false);
+        let fp_b = payload_fingerprint(&[2u8; 32], payload, payload.len(), false);
+
+        assert_ne!(
+            fp_a, fp_b,
+            "same payload must not be confirmable without the fingerprint key"
         );
     }
 }
