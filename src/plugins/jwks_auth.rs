@@ -350,12 +350,11 @@ impl JwksAuth {
                                 return;
                             }
                             Err(e) => {
-                                if attempt == 0 {
-                                    warn!(
-                                        "jwks_auth OIDC discovery failed: {} — will keep retrying in background",
-                                        e
-                                    );
-                                }
+                                warn!(
+                                    "jwks_auth OIDC discovery attempt {} failed: {} — will keep retrying in background",
+                                    attempt + 1,
+                                    e
+                                );
                             }
                         }
                         attempt = attempt.saturating_add(1);
@@ -1353,7 +1352,19 @@ fn reject(status_code: u16, body: String) -> PluginResult {
     }
 }
 
-/// Fetch the OIDC discovery document and extract the `jwks_uri` field.
+/// Fetch the OIDC discovery document and extract a validated `jwks_uri`.
+///
+/// The discovery document is fetched from the operator-configured
+/// `discovery_url`, but its `jwks_uri` field is attacker-controlled if the
+/// IdP is spoofed, compromised, or the discovery response is tampered with in
+/// transit. Fetching that URL unvalidated is a server-side request forgery
+/// (SSRF) vector: it could steer the gateway at an internal service or a cloud
+/// metadata endpoint (e.g. `http://169.254.169.254/...`) from inside the trust
+/// boundary. We therefore screen the discovered URI before returning it, and
+/// the caller treats any rejection as a normal discovery failure (fail closed:
+/// retried in the background, no store created). The DNS-layer IP screening on
+/// `PluginHttpClient` is a backstop, not a substitute, so the host is validated
+/// here too.
 async fn discover_jwks_uri(
     http_client: &PluginHttpClient,
     discovery_url: &str,
@@ -1376,10 +1387,93 @@ async fn discover_jwks_uri(
         .await
         .map_err(|e| format!("OIDC discovery response parse failed: {}", e))?;
 
-    body["jwks_uri"]
+    let jwks_uri = body["jwks_uri"]
         .as_str()
-        .map(|s| s.to_string())
-        .ok_or_else(|| "OIDC discovery document missing 'jwks_uri' field".to_string())
+        .ok_or_else(|| "OIDC discovery document missing 'jwks_uri' field".to_string())?;
+
+    validate_discovered_jwks_uri(jwks_uri, discovery_url)
+}
+
+/// Validate a `jwks_uri` extracted from an OIDC discovery document against SSRF.
+///
+/// Hardening, in order:
+/// 1. The URI must parse as a URL with a non-empty hostname.
+/// 2. The scheme must be `http` or `https` — matching the validation the
+///    operator-configured `jwks_uri`/`discovery_url` already receive in
+///    [`parse_url_field`]. Non-URL schemes (e.g. `file:`, `gopher:`) are
+///    rejected.
+/// 3. The discovered JWKS URL must use the same origin as the `discovery_url`:
+///    scheme, host, and effective port must match. This blocks a spoofed or
+///    tampered discovery document from redirecting the gateway to an attacker-
+///    chosen host, downgrading HTTPS discovery to cleartext JWKS, or pivoting
+///    to a different service on the same host through an unexpected port.
+///    Operators whose IdP serves JWKS from a different origin than discovery
+///    (e.g. Google: `accounts.google.com` vs `www.googleapis.com`) should
+///    configure `jwks_uri` directly instead of `discovery_url`.
+///
+/// OIDC discovery and the follow-on JWKS fetch use the no-redirect plugin HTTP
+/// client path. The validated URL is therefore the URL actually fetched rather
+/// than only the first hop before an automatic 3xx follow.
+fn validate_discovered_jwks_uri(jwks_uri: &str, discovery_url: &str) -> Result<String, String> {
+    let parsed = Url::parse(jwks_uri).map_err(|e| {
+        format!("OIDC discovery returned an invalid jwks_uri (not a valid URL): {e}")
+    })?;
+
+    match parsed.scheme() {
+        "http" | "https" => {}
+        scheme => {
+            return Err(format!(
+                "OIDC discovery returned a jwks_uri with disallowed scheme '{scheme}' (must be http or https)"
+            ));
+        }
+    }
+
+    let discovery = Url::parse(discovery_url)
+        .map_err(|e| format!("OIDC discovery_url is not parseable for jwks_uri comparison: {e}"))?;
+    let jwks_origin = origin_from_parsed_url(&parsed).ok_or_else(|| {
+        "OIDC discovery returned a jwks_uri without a parseable origin".to_string()
+    })?;
+    let discovery_origin = origin_from_parsed_url(&discovery).ok_or_else(|| {
+        "OIDC discovery_url has no parseable origin for jwks_uri comparison".to_string()
+    })?;
+
+    if discovery_origin.scheme == "https" && jwks_origin.scheme == "http" {
+        return Err(
+            "OIDC discovery returned a jwks_uri that downgrades HTTPS discovery to HTTP"
+                .to_string(),
+        );
+    }
+
+    if jwks_origin != discovery_origin {
+        return Err(format!(
+            "OIDC discovery returned a jwks_uri origin '{}' that does not match the discovery_url origin '{}'",
+            jwks_origin.display(),
+            discovery_origin.display()
+        ));
+    }
+
+    Ok(jwks_uri.to_string())
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct UrlOrigin {
+    scheme: String,
+    host: String,
+    port: u16,
+}
+
+impl UrlOrigin {
+    fn display(&self) -> String {
+        format!("{}://{}:{}", self.scheme, self.host, self.port)
+    }
+}
+
+fn origin_from_parsed_url(parsed: &Url) -> Option<UrlOrigin> {
+    Some(UrlOrigin {
+        scheme: parsed.scheme().to_ascii_lowercase(),
+        host: hostname_from_parsed_url(parsed)?.to_ascii_lowercase(),
+        port: parsed.port_or_known_default()?,
+    })
 }
 
 /// Set `mesh.request_principal` metadata to `{iss}/{sub}` when both claims are

@@ -1313,7 +1313,7 @@ Authenticates using Bearer JWTs validated against one or more Identity Provider 
 |---|---|---|
 | `providers` | Array | Array of identity provider configurations (required) |
 | `providers[].jwks_uri` | String | Direct URL to the IdP's JWKS endpoint |
-| `providers[].discovery_url` | String | OIDC discovery URL (auto-discovers `jwks_uri`) |
+| `providers[].discovery_url` | String | OIDC discovery URL (auto-discovers `jwks_uri`). SSRF hardening: the discovered `jwks_uri` must use the **same origin** as the discovery URL (scheme, host, and effective port). For IdPs that serve JWKS from a different origin than discovery (e.g. Google `accounts.google.com` → `www.googleapis.com`, and some Azure AD / Okta / Auth0 setups), set `providers[].jwks_uri` directly instead of `discovery_url`. |
 | `providers[].jwks` | String/Object (optional) | Inline JWKS JSON; useful for mesh-provided or static key sets |
 | `providers[].issuer` | String (optional) | Expected JWT `iss` claim — routes tokens to this provider |
 | `providers[].audience` | String (optional) | Expected JWT `aud` claim |
