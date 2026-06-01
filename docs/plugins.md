@@ -3249,7 +3249,8 @@ Universal AI gateway that routes requests in OpenAI Chat Completions format to a
 | `model_patterns` | Array | `[]` (catch-all) | Glob patterns to match model names (e.g., `["claude-*"]`) |
 | `model_mapping` | Object | `{}` | Map client model names to provider-native names |
 | `default_model` | String | _(none)_ | Default model when no mapping matches |
-| `read_timeout_seconds` | Integer | `60` | Overall per-request deadline (connect + response) for outbound provider calls. The connect phase is additionally bounded gateway-wide by the shared HTTP client's connect timeout; there is no per-provider connect timeout because the client is shared and built once at startup. |
+| `connect_timeout_seconds` | Integer | `5` | Per-provider TCP + TLS handshake timeout for outbound provider calls |
+| `read_timeout_seconds` | Integer | `60` | Overall per-request deadline for outbound provider calls |
 | `base_url` | String | _(provider default)_ | Custom endpoint URL (for self-hosted or proxy endpoints) |
 
 **Azure OpenAI additional fields:** `azure_resource`, `azure_deployment`, `azure_api_version` (default `"2024-06-01"`).

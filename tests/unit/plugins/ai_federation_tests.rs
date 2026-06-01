@@ -301,12 +301,7 @@ fn test_default_fallback_config() {
 }
 
 #[test]
-fn test_custom_read_timeout() {
-    // `read_timeout_seconds` is the overall per-request deadline. There is no
-    // per-provider connect timeout (finding #85) — the connect phase is bounded
-    // gateway-wide by the shared HTTP client. A leftover `connect_timeout_seconds`
-    // key is silently ignored (config is parsed field-by-field, not via a
-    // deny_unknown_fields struct), so old configs do not fail to load.
+fn test_custom_timeouts() {
     let config = json!({
         "providers": [{
             "name": "openai",

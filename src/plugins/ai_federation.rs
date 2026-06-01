@@ -293,10 +293,10 @@ struct ResolvedProvider {
     model_patterns: Vec<String>,
     model_mapping: HashMap<String, String>,
     default_model: Option<String>,
-    /// Overall per-request deadline applied via reqwest's `.timeout()`. The
-    /// connect phase is additionally bounded gateway-wide by the shared
-    /// `PluginHttpClient`'s connect timeout; there is no per-provider connect
-    /// timeout because the client is shared and built once at startup.
+    /// Per-provider connect deadline applied via Ferrum's patched reqwest
+    /// per-request override.
+    connect_timeout: Duration,
+    /// Overall per-request deadline applied via reqwest's `.timeout()`.
     read_timeout: Duration,
     /// Operator-supplied URL override. Used directly by Anthropic and Cohere
     /// dispatch paths that build their own URLs without going through
@@ -543,10 +543,8 @@ impl AiFederation {
 
             let default_model = pv["default_model"].as_str().map(String::from);
 
-            // `read_timeout` is the overall per-request deadline (reqwest's
-            // `.timeout()`). There is intentionally no per-provider connect
-            // timeout: the shared HTTP client is built once at startup and its
-            // connect timeout applies gateway-wide. See finding #85.
+            let connect_timeout =
+                Duration::from_secs(optional_u64(pv, "connect_timeout_seconds")?.unwrap_or(5));
             let read_timeout =
                 Duration::from_secs(optional_u64(pv, "read_timeout_seconds")?.unwrap_or(60));
 
@@ -604,6 +602,7 @@ impl AiFederation {
                 model_patterns,
                 model_mapping,
                 default_model,
+                connect_timeout,
                 read_timeout,
                 base_url,
                 url_template,
@@ -1708,19 +1707,11 @@ impl AiFederation {
     ) -> Result<(u16, Vec<u8>), String> {
         let auth_headers = self.build_auth_headers(provider, url, body).await?;
 
-        // `read_timeout` is the overall per-request deadline. reqwest's
-        // per-request `.timeout()` is a *total* deadline (it overrides the
-        // client-level total timeout but not the client-level connect timeout),
-        // so there is no per-request connect-vs-read split available on the
-        // shared client. The connect phase is bounded gateway-wide by the
-        // shared `PluginHttpClient`'s fixed connect timeout. Previously this
-        // summed two phase-named config fields into one deadline, which did not
-        // match the field names; we now apply the named read budget directly.
-        // See finding #85.
         let req = self
             .http_client
             .get()
             .post(url)
+            .connect_timeout(provider.connect_timeout)
             .timeout(provider.read_timeout);
 
         let mut req = req;
@@ -2262,6 +2253,7 @@ pub mod test_helpers {
             model_patterns: Vec::new(),
             model_mapping: HashMap::new(),
             default_model: None,
+            connect_timeout: Duration::from_secs(5),
             read_timeout: Duration::from_secs(60),
             base_url,
             url_template,

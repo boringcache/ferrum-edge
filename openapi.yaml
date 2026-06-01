@@ -12927,10 +12927,14 @@ components:
               default_model:
                 type: string
                 description: Model to send to the provider when no mapping matches.
+              connect_timeout_seconds:
+                type: integer
+                default: 5
+                description: Per-provider TCP + TLS handshake timeout for outbound provider calls.
               read_timeout_seconds:
                 type: integer
                 default: 60
-                description: Overall per-request deadline for outbound provider calls (connect plus response). The connect phase is additionally bounded gateway-wide by the shared HTTP client's connect timeout; there is no per-provider connect timeout because the client is shared and built once at startup.
+                description: Overall per-request deadline for outbound provider calls.
               base_url:
                 type: string
                 description: Override the provider's default endpoint URL (for self-hosted models, internal proxies, or pinned regional endpoints).
