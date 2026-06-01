@@ -22,10 +22,59 @@ use dashmap::mapref::entry::Entry;
 use http::{HeaderName, Method};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing::debug;
+
+/// Process-relative monotonic anchor for the cleanup throttle. Captured once
+/// per process so the throttle and the entry-expiry checks (which use
+/// `Instant`) share the same monotonic clock. Using a wall clock here would let
+/// a backward NTP/VM/manual clock step suppress periodic cleanup until the wall
+/// clock caught back up. See finding #57.
+static PROCESS_START: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+/// Default minimum seconds between full local-cache cleanup scans. The scan
+/// takes write locks across all `DashMap` shards, so it must run at most once
+/// per interval regardless of cache pressure (finding #12). Shorter
+/// `inflight_ttl_seconds` values lower the interval so stale in-flight markers
+/// do not outlive their configured TTL under key churn.
+const CLEANUP_INTERVAL_SECS: u64 = 30;
+
+/// Sentinel `last_cleanup` value meaning "no cleanup has run yet"; forces the
+/// first applicable request to perform a scan. Tests also store this to force a
+/// scan deterministically without depending on how far into the process they
+/// run.
+const CLEANUP_NEVER: u64 = u64::MAX;
+
+/// Monotonic seconds since process start. Immune to wall-clock steps, matching
+/// the `Instant`-based entry expiry.
+fn monotonic_secs() -> u64 {
+    PROCESS_START.elapsed().as_secs()
+}
+
+/// Whether a full cleanup scan is due, given the last scan's recorded monotonic
+/// second (`last`) and the current monotonic second (`now_secs`).
+///
+/// `now_secs` is always derived from `monotonic_secs()`, so `now_secs >= last`
+/// holds for any real `last` and a backward wall-clock step cannot make the
+/// elapsed delta appear to be zero — the wall-clock-suppression defect of the
+/// previous `SystemTime`-based gate (finding #57). The gate is unconditional:
+/// it does not depend on cache occupancy, so an over-capacity cache cannot
+/// force a per-request scan (finding #12).
+fn cleanup_due(last: u64, now_secs: u64, interval_secs: u64) -> bool {
+    last == CLEANUP_NEVER || now_secs.saturating_sub(last) >= interval_secs
+}
+
+fn decrement_atomic(value: &AtomicUsize) -> usize {
+    value
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            Some(current.saturating_sub(1))
+        })
+        .map(|previous| previous.saturating_sub(1))
+        .unwrap_or(0)
+}
 
 use super::utils::cache_headers::sanitize_cached_headers;
 use super::utils::redis_rate_limiter::{RedisConfig, RedisRateLimitClient};
@@ -52,7 +101,10 @@ enum DeduplicationEntry {
     /// detection so abandoned in-flight entries don't permanently block retries.
     InFlight { started_at: Instant },
     /// Response has been cached.
-    Completed(CachedResponse),
+    Completed {
+        cached: CachedResponse,
+        sequence: u64,
+    },
 }
 
 enum LocalDeduplicationAction {
@@ -83,9 +135,18 @@ pub struct RequestDeduplication {
     enforce_required: bool,
     /// Local in-memory cache.
     local_cache: Arc<DashMap<String, DeduplicationEntry>>,
+    completed_count: AtomicUsize,
+    inflight_count: AtomicUsize,
+    completed_sequence: AtomicU64,
+    next_completed_evict_sequence: AtomicU64,
+    completed_order: Arc<DashMap<u64, CompletedOrderEntry>>,
+    eviction_lock: Mutex<()>,
     /// Optional Redis client for centralized deduplication.
     redis_client: Option<Arc<RedisRateLimitClient>>,
-    /// Counter for background cleanup scheduling.
+    /// Monotonic-seconds timestamp (relative to `PROCESS_START`) of the last
+    /// full cleanup scan, used to throttle scans to at most once per
+    /// `CLEANUP_INTERVAL_SECS`. Initialized to `CLEANUP_NEVER` so the first
+    /// applicable request runs a scan.
     last_cleanup: AtomicU64,
 }
 
@@ -111,6 +172,7 @@ impl RequestDeduplication {
         let applicable_methods = parse_applicable_methods(config)?;
         let scope_by_consumer = optional_bool(config, "scope_by_consumer")?.unwrap_or(true);
         let enforce_required = optional_bool(config, "enforce_required")?.unwrap_or(false);
+        let shard_amount = http_client.pool_shard_amount();
 
         // Build optional Redis client
         let default_prefix = default_redis_key_prefix(http_client.namespace());
@@ -135,9 +197,15 @@ impl RequestDeduplication {
             applicable_methods,
             scope_by_consumer,
             enforce_required,
-            local_cache: Arc::new(DashMap::new()),
+            local_cache: Arc::new(DashMap::with_shard_amount(shard_amount)),
+            completed_count: AtomicUsize::new(0),
+            inflight_count: AtomicUsize::new(0),
+            completed_sequence: AtomicU64::new(0),
+            next_completed_evict_sequence: AtomicU64::new(0),
+            completed_order: Arc::new(DashMap::with_shard_amount(shard_amount)),
+            eviction_lock: Mutex::new(()),
             redis_client,
-            last_cleanup: AtomicU64::new(0),
+            last_cleanup: AtomicU64::new(CLEANUP_NEVER),
         })
     }
 
@@ -174,13 +242,17 @@ impl RequestDeduplication {
         match self.local_cache.entry(key.to_string()) {
             Entry::Vacant(entry) => {
                 entry.insert(DeduplicationEntry::InFlight { started_at: now });
+                self.inflight_count.fetch_add(1, Ordering::Relaxed);
                 LocalDeduplicationAction::Fresh
             }
             Entry::Occupied(mut entry) => match entry.get() {
-                DeduplicationEntry::Completed(cached) => {
+                DeduplicationEntry::Completed { cached, sequence } => {
                     if now.duration_since(cached.inserted_at) < self.ttl {
                         LocalDeduplicationAction::Replay(cached.clone())
                     } else {
+                        self.mark_completed_sequence_pruned(*sequence);
+                        decrement_atomic(&self.completed_count);
+                        self.inflight_count.fetch_add(1, Ordering::Relaxed);
                         entry.insert(DeduplicationEntry::InFlight { started_at: now });
                         LocalDeduplicationAction::Fresh
                     }
@@ -251,31 +323,56 @@ impl RequestDeduplication {
         }
     }
 
-    /// Evict expired entries from local cache.
-    fn cleanup_local_cache(&self) {
-        let now_epoch = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+    fn next_completed_sequence(&self) -> u64 {
+        self.completed_sequence.fetch_add(1, Ordering::Relaxed)
+    }
 
-        // Only run cleanup every 30 seconds
+    /// Evict expired entries from local cache.
+    ///
+    /// Called from `before_proxy` on every applicable request, so the expensive
+    /// part (an all-shard `DashMap::retain`) is throttled to at most once per
+    /// cleanup interval. The throttle is
+    /// unconditional: it is NOT bypassed by over-capacity. A cache saturated
+    /// with active (non-stale) `InFlight` markers — which are never evicted by
+    /// design — would otherwise stay over capacity indefinitely and force the
+    /// full O(n), all-shard-locking scan on every request, an
+    /// attacker-influenceable hot-path amplification (finding #12). The throttle
+    /// clock is monotonic (finding #57).
+    fn cleanup_local_cache(&self) {
+        let now_secs = monotonic_secs();
+
+        // Throttle full scans to once per interval. This gate is unconditional
+        // (no over-capacity bypass), and because callers within the interval
+        // return here, the compare_exchange below can never be a same-value
+        // no-op: any thread that reaches it loaded a `last` at least
+        // CLEANUP_INTERVAL_SECS older than `now_secs` (or the NEVER sentinel),
+        // so exactly one thread per interval wins the CAS and runs the scan.
         let last = self.last_cleanup.load(Ordering::Relaxed);
-        let over_capacity = self.local_cache.len() > self.max_entries;
-        if !over_capacity && now_epoch.saturating_sub(last) < 30 {
+        let cleanup_interval_secs = CLEANUP_INTERVAL_SECS.min(self.inflight_ttl.as_secs().max(1));
+        if !cleanup_due(last, now_secs, cleanup_interval_secs) {
             return;
         }
         if self
             .last_cleanup
-            .compare_exchange(last, now_epoch, Ordering::Relaxed, Ordering::Relaxed)
+            .compare_exchange(last, now_secs, Ordering::Relaxed, Ordering::Relaxed)
             .is_err()
         {
-            return; // Another thread is doing cleanup
+            return; // Another thread is doing cleanup this interval
         }
 
         let now = Instant::now();
+        // Single all-shard pass: drop expired Completed entries and stale
+        // InFlight markers. Decrement counters for entries actually removed
+        // instead of storing a full-scan snapshot, so concurrent inserts cannot
+        // be overwritten by stale counts from this cleanup pass.
         self.local_cache.retain(|_, entry| match entry {
-            DeduplicationEntry::Completed(cached) => {
-                now.duration_since(cached.inserted_at) < self.ttl
+            DeduplicationEntry::Completed { cached, sequence } => {
+                let keep = now.duration_since(cached.inserted_at) < self.ttl;
+                if !keep {
+                    self.mark_completed_sequence_pruned(*sequence);
+                    decrement_atomic(&self.completed_count);
+                }
+                keep
             }
             // Drop in-flight markers that have exceeded inflight_ttl — the
             // originating request must have died (timeout, downstream reject,
@@ -283,38 +380,210 @@ impl RequestDeduplication {
             // Without this, duplicate requests would receive 409 Conflict
             // forever (until LRU max-entries eviction).
             DeduplicationEntry::InFlight { started_at } => {
-                now.duration_since(*started_at) < self.inflight_ttl
+                let keep = now.duration_since(*started_at) < self.inflight_ttl;
+                if !keep {
+                    decrement_atomic(&self.inflight_count);
+                }
+                keep
             }
         });
 
+        self.evict_completed_over_capacity(
+            self.completed_count.load(Ordering::Relaxed),
+            self.inflight_count.load(Ordering::Relaxed),
+        );
+        self.advance_completed_evict_cursor();
+    }
+
+    fn evict_completed_over_capacity(&self, completed_hint: usize, inflight_hint: usize) {
+        if completed_hint == 0 || completed_hint.saturating_add(inflight_hint) <= self.max_entries {
+            return;
+        }
+        // Eviction is opportunistic on proxy paths; if another caller is
+        // already trimming, skip instead of parking a Tokio worker.
+        let Ok(_guard) = self.eviction_lock.try_lock() else {
+            return;
+        };
+        self.evict_completed_over_capacity_locked(
+            self.completed_count.load(Ordering::Relaxed),
+            self.inflight_count.load(Ordering::Relaxed),
+        );
+    }
+
+    fn evict_completed_over_capacity_locked(&self, completed_hint: usize, inflight_hint: usize) {
         // Enforce max entries by removing oldest Completed entries first. Active
         // (non-stale) InFlight markers are NEVER evicted by LRU because evicting
         // them would release the in-flight lock while the original request is
         // still executing — a duplicate retry for that key would then bypass the
         // lock and re-execute side-effecting operations. Stale InFlight markers
-        // (age >= inflight_ttl) are already dropped by the retain() above. This
-        // means max_entries can be temporarily exceeded if the cache is
-        // saturated with active in-flight work; correctness (no duplicate
-        // writes) is strictly preferred over hitting the memory cap.
-        if self.local_cache.len() > self.max_entries {
-            let mut completed_with_time: Vec<(String, Instant)> = self
-                .local_cache
-                .iter()
-                .filter_map(|entry| match entry.value() {
-                    DeduplicationEntry::Completed(cached) => {
-                        Some((entry.key().clone(), cached.inserted_at))
-                    }
-                    DeduplicationEntry::InFlight { .. } => None,
-                })
-                .collect();
-            completed_with_time.sort_by_key(|(_, t)| *t);
+        // are dropped by the throttled expiry scan. This means max_entries can
+        // be temporarily exceeded if the cache is saturated with active
+        // in-flight work; correctness is strictly preferred over hitting the
+        // memory cap.
+        let mut to_remove = completed_hint
+            .saturating_add(inflight_hint)
+            .saturating_sub(self.max_entries)
+            .min(completed_hint);
+        if to_remove == 0 {
+            return;
+        }
 
-            let to_remove = self.local_cache.len().saturating_sub(self.max_entries);
-            for (key, _) in completed_with_time.into_iter().take(to_remove) {
-                self.local_cache.remove(&key);
+        let mut sequence = self.next_completed_evict_sequence.load(Ordering::Relaxed);
+        let limit = self.completed_sequence.load(Ordering::Relaxed);
+        while to_remove > 0 && sequence < limit {
+            let current_sequence = sequence;
+            match self.remove_completed_sequence(sequence) {
+                CompletedSequenceRemoval::Removed => {
+                    to_remove -= 1;
+                    sequence += 1;
+                    self.next_completed_evict_sequence
+                        .store(sequence, Ordering::Relaxed);
+                    self.remove_pruned_completed_order(current_sequence);
+                }
+                CompletedSequenceRemoval::Stale => {
+                    sequence += 1;
+                    self.next_completed_evict_sequence
+                        .store(sequence, Ordering::Relaxed);
+                    self.remove_pruned_completed_order(current_sequence);
+                }
+                CompletedSequenceRemoval::NotPublished => {
+                    break;
+                }
             }
         }
+        self.next_completed_evict_sequence
+            .store(sequence, Ordering::Relaxed);
     }
+
+    fn remove_completed_sequence(&self, sequence: u64) -> CompletedSequenceRemoval {
+        let Some(order_entry) = self.completed_order.get(&sequence) else {
+            return CompletedSequenceRemoval::NotPublished;
+        };
+        let key = match order_entry.value() {
+            CompletedOrderEntry::Pending => return CompletedSequenceRemoval::NotPublished,
+            CompletedOrderEntry::Pruned => {
+                drop(order_entry);
+                self.completed_order.remove_if(&sequence, |_, entry| {
+                    matches!(entry, CompletedOrderEntry::Pruned)
+                });
+                return CompletedSequenceRemoval::Stale;
+            }
+            CompletedOrderEntry::Published(key) => key.clone(),
+        };
+        drop(order_entry);
+
+        let still_current = self.local_cache.get(&key).is_some_and(|entry| {
+            matches!(
+                entry.value(),
+                DeduplicationEntry::Completed {
+                    sequence: current,
+                    ..
+                } if *current == sequence
+            )
+        });
+        if !still_current {
+            self.remove_stale_completed_order(sequence, &key);
+            return CompletedSequenceRemoval::Stale;
+        }
+
+        if self
+            .local_cache
+            .remove_if(&key, |_, entry| {
+                matches!(
+                    entry,
+                    DeduplicationEntry::Completed {
+                        sequence: current,
+                        ..
+                    } if *current == sequence
+                )
+            })
+            .is_some()
+        {
+            decrement_atomic(&self.completed_count);
+            self.remove_stale_completed_order(sequence, &key);
+            CompletedSequenceRemoval::Removed
+        } else {
+            self.remove_stale_completed_order(sequence, &key);
+            CompletedSequenceRemoval::Stale
+        }
+    }
+
+    fn remove_stale_completed_order(&self, sequence: u64, key: &str) {
+        self.completed_order
+            .remove_if(&sequence, |_, entry| match entry {
+                CompletedOrderEntry::Pending => false,
+                CompletedOrderEntry::Published(published) => published.as_str() == key,
+                CompletedOrderEntry::Pruned => true,
+            });
+    }
+
+    fn mark_completed_sequence_pruned(&self, sequence: u64) {
+        if sequence < self.next_completed_evict_sequence.load(Ordering::Relaxed) {
+            self.completed_order.remove(&sequence);
+            return;
+        }
+        self.completed_order
+            .insert(sequence, CompletedOrderEntry::Pruned);
+        if sequence < self.next_completed_evict_sequence.load(Ordering::Relaxed) {
+            self.remove_pruned_completed_order(sequence);
+        }
+    }
+
+    fn remove_pruned_completed_order(&self, sequence: u64) {
+        self.completed_order.remove_if(&sequence, |_, entry| {
+            matches!(entry, CompletedOrderEntry::Pruned)
+        });
+    }
+
+    fn advance_completed_evict_cursor(&self) {
+        let Ok(_guard) = self.eviction_lock.try_lock() else {
+            return;
+        };
+        self.advance_completed_evict_cursor_locked();
+    }
+
+    fn advance_completed_evict_cursor_locked(&self) {
+        let mut sequence = self.next_completed_evict_sequence.load(Ordering::Relaxed);
+        let limit = self.completed_sequence.load(Ordering::Relaxed);
+        while sequence < limit {
+            let current_sequence = sequence;
+            let Some(order_entry) = self.completed_order.get(&sequence) else {
+                break;
+            };
+            if !matches!(order_entry.value(), CompletedOrderEntry::Pruned) {
+                break;
+            }
+            drop(order_entry);
+            if self
+                .completed_order
+                .remove_if(&sequence, |_, entry| {
+                    matches!(entry, CompletedOrderEntry::Pruned)
+                })
+                .is_some()
+            {
+                sequence += 1;
+                self.next_completed_evict_sequence
+                    .store(sequence, Ordering::Relaxed);
+                self.remove_pruned_completed_order(current_sequence);
+            } else {
+                break;
+            }
+        }
+        self.next_completed_evict_sequence
+            .store(sequence, Ordering::Relaxed);
+    }
+}
+
+enum CompletedOrderEntry {
+    Pending,
+    Published(String),
+    Pruned,
+}
+
+enum CompletedSequenceRemoval {
+    Removed,
+    Stale,
+    NotPublished,
 }
 
 /// Serializable form of CachedResponse for Redis storage.
@@ -569,9 +838,42 @@ impl Plugin for RequestDeduplication {
             inserted_at: Instant::now(),
         };
 
-        // Store in local cache
-        self.local_cache
-            .insert(key.clone(), DeduplicationEntry::Completed(cached.clone()));
+        // Reserve the sequence before storing the response. Eviction treats
+        // Pending as not-yet-published and stops there, then the entry is
+        // changed to Published after the Completed cache entry is visible.
+        let sequence = self.next_completed_sequence();
+        self.completed_order
+            .insert(sequence, CompletedOrderEntry::Pending);
+        let previous = self.local_cache.insert(
+            key.clone(),
+            DeduplicationEntry::Completed {
+                cached: cached.clone(),
+                sequence,
+            },
+        );
+        self.completed_order
+            .insert(sequence, CompletedOrderEntry::Published(key.clone()));
+        let (completed, inflight) = match previous {
+            Some(DeduplicationEntry::Completed {
+                sequence: old_sequence,
+                ..
+            }) => {
+                self.mark_completed_sequence_pruned(old_sequence);
+                (
+                    self.completed_count.load(Ordering::Relaxed),
+                    self.inflight_count.load(Ordering::Relaxed),
+                )
+            }
+            Some(DeduplicationEntry::InFlight { .. }) => (
+                self.completed_count.fetch_add(1, Ordering::Relaxed) + 1,
+                decrement_atomic(&self.inflight_count),
+            ),
+            None => (
+                self.completed_count.fetch_add(1, Ordering::Relaxed) + 1,
+                self.inflight_count.load(Ordering::Relaxed),
+            ),
+        };
+        self.evict_completed_over_capacity(completed, inflight);
 
         // Also store in Redis if available
         if self.redis_client.is_some() {
@@ -591,88 +893,5 @@ impl Plugin for RequestDeduplication {
 
     fn tracked_keys_count(&self) -> Option<usize> {
         Some(self.local_cache.len())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::plugins::PluginHttpClient;
-    use serde_json::json;
-
-    /// LRU eviction under `max_entries` pressure must NOT evict active in-flight
-    /// markers. Evicting a live InFlight entry would release the in-flight lock
-    /// while the original request is still executing, so a duplicate retry for
-    /// the same idempotency key would bypass the lock and re-execute the
-    /// side-effecting operation.
-    #[test]
-    fn cleanup_preserves_active_inflight_over_max_entries() {
-        let config = json!({ "max_entries": 2 });
-        let plugin = match RequestDeduplication::new(&config, PluginHttpClient::default()) {
-            Ok(plugin) => plugin,
-            Err(error) => panic!("request_deduplication config should be valid: {error}"),
-        };
-
-        // 3 active in-flight markers, cap is 2 → over limit.
-        let now = Instant::now();
-        for i in 0..3 {
-            plugin.local_cache.insert(
-                format!("inflight-{i}"),
-                DeduplicationEntry::InFlight { started_at: now },
-            );
-        }
-        assert_eq!(plugin.local_cache.len(), 3);
-
-        // Force cleanup to run (bypass the 30s gate).
-        plugin.last_cleanup.store(0, Ordering::Relaxed);
-        plugin.cleanup_local_cache();
-
-        // All 3 active in-flight entries must still be present — LRU eviction
-        // is not allowed to drop active locks.
-        assert_eq!(plugin.local_cache.len(), 3);
-        for i in 0..3 {
-            assert!(plugin.local_cache.contains_key(&format!("inflight-{i}")));
-        }
-    }
-
-    /// Completed entries ARE LRU-eligible. When over `max_entries`, the oldest
-    /// Completed entries get evicted while active InFlight markers are kept.
-    #[test]
-    fn cleanup_evicts_oldest_completed_preserves_inflight() {
-        let config = json!({ "max_entries": 2 });
-        let plugin = match RequestDeduplication::new(&config, PluginHttpClient::default()) {
-            Ok(plugin) => plugin,
-            Err(error) => panic!("request_deduplication config should be valid: {error}"),
-        };
-
-        let now = Instant::now();
-        // 1 active in-flight
-        plugin.local_cache.insert(
-            "inflight-key".to_string(),
-            DeduplicationEntry::InFlight { started_at: now },
-        );
-        // 3 completed entries with increasing age (oldest first)
-        for i in 0..3 {
-            let inserted = now - Duration::from_secs(10 - i);
-            plugin.local_cache.insert(
-                format!("completed-{i}"),
-                DeduplicationEntry::Completed(CachedResponse {
-                    status_code: 200,
-                    headers: HashMap::new(),
-                    body: Bytes::new(),
-                    inserted_at: inserted,
-                }),
-            );
-        }
-        assert_eq!(plugin.local_cache.len(), 4);
-
-        plugin.last_cleanup.store(0, Ordering::Relaxed);
-        plugin.cleanup_local_cache();
-
-        // Cap is 2. InFlight kept. 2 oldest Completed evicted, 1 newest Completed kept.
-        assert!(plugin.local_cache.contains_key("inflight-key"));
-        assert!(!plugin.local_cache.contains_key("completed-0"));
-        assert!(!plugin.local_cache.contains_key("completed-1"));
-        assert!(plugin.local_cache.contains_key("completed-2"));
     }
 }
