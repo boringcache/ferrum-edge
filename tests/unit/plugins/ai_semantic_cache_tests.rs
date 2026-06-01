@@ -1,5 +1,7 @@
 use ferrum_edge::_test_support::rebuild_ai_semantic_cache_vector_index;
 use ferrum_edge::config::types::Consumer;
+use ferrum_edge::config::{BackendAllowIps, PoolConfig};
+use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::plugins::ai_semantic_cache::AiSemanticCache;
 use ferrum_edge::plugins::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext, priority,
@@ -9,6 +11,28 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use wiremock::matchers::{body_string_contains, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+fn plugin_http_client_with_ip_policy(policy: BackendAllowIps) -> PluginHttpClient {
+    let dns_cache = DnsCache::new(DnsConfig {
+        backend_allow_ips: policy.clone(),
+        ..DnsConfig::default()
+    });
+
+    PluginHttpClient::new(
+        &PoolConfig::default(),
+        dns_cache,
+        1000,
+        0,
+        100,
+        false,
+        None,
+        Arc::new(Vec::new()),
+        ferrum_edge::config::types::DEFAULT_NAMESPACE,
+        policy,
+        Arc::new(Vec::new()),
+        0,
+    )
+}
 
 /// Build a synthetic Consumer for cross-consumer scoping tests. Only
 /// `username` matters because that's what `effective_identity()` returns
@@ -237,6 +261,50 @@ fn test_new_invalid_config_shapes_fail() {
         let result = AiSemanticCache::new(&config, PluginHttpClient::default());
         assert!(result.is_err(), "config should be rejected: {config:?}");
     }
+}
+
+#[test]
+fn test_semantic_endpoint_rejects_literal_ips_denied_by_backend_policy() {
+    let http_client = plugin_http_client_with_ip_policy(BackendAllowIps::Public);
+
+    for endpoint in [
+        "http://127.0.0.1:12345/embeddings",
+        "http://169.254.169.254/latest/meta-data/",
+        "http://[::1]:12345/embeddings",
+    ] {
+        let result = AiSemanticCache::new(
+            &json!({
+                "semantic_similarity_enabled": true,
+                "semantic_embedding_endpoint": endpoint,
+            }),
+            http_client.clone(),
+        );
+
+        let Err(error) = result else {
+            panic!("literal internal endpoint should be rejected: {endpoint}");
+        };
+        assert!(
+            error.contains("denied by FERRUM_BACKEND_ALLOW_IPS=public policy"),
+            "unexpected error for {endpoint}: {error}"
+        );
+    }
+}
+
+#[test]
+fn test_semantic_endpoint_allows_literal_ips_permitted_by_backend_policy() {
+    let public_client = plugin_http_client_with_ip_policy(BackendAllowIps::Public);
+    let public_endpoint = json!({
+        "semantic_similarity_enabled": true,
+        "semantic_embedding_endpoint": "http://8.8.8.8/embeddings",
+    });
+    assert!(AiSemanticCache::new(&public_endpoint, public_client).is_ok());
+
+    let private_client = plugin_http_client_with_ip_policy(BackendAllowIps::Private);
+    let private_endpoint = json!({
+        "semantic_similarity_enabled": true,
+        "semantic_embedding_endpoint": "http://127.0.0.1:12345/embeddings",
+    });
+    assert!(AiSemanticCache::new(&private_endpoint, private_client).is_ok());
 }
 
 #[test]
