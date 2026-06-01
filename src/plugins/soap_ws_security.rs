@@ -1770,12 +1770,45 @@ pub(crate) fn find_element_by_wsu_id(xml: &str, id: &str) -> Option<String> {
     None
 }
 
-/// Extract the wsu:Id (or plain Id) attribute from an element.
+/// Extract the wsu:Id (or any prefixed local-name Id / plain Id) attribute from
+/// an element.
 fn find_wsu_id(element: &str) -> Option<String> {
-    find_attribute(element, "wsu:Id").or_else(|| find_attribute(element, "Id"))
+    let tag_start = element.find('<')?;
+    let tag_end_rel = find_start_tag_end(element, tag_start)?;
+    let tag = element.get(tag_start + 1..tag_start + tag_end_rel)?;
+    find_resolvable_wsu_id_value_in_tag(tag)
 }
 
 fn tag_has_resolvable_wsu_id(tag: &str, id: &str) -> bool {
+    scan_tag_attributes(tag, |name, value| {
+        is_resolvable_wsu_id_attribute_name(name) && value == id
+    })
+}
+
+fn find_resolvable_wsu_id_value_in_tag(tag: &str) -> Option<String> {
+    let mut found = None;
+    scan_tag_attributes(tag, |name, value| {
+        if is_resolvable_wsu_id_attribute_name(name) {
+            found = Some(value.to_string());
+            true
+        } else {
+            false
+        }
+    });
+    found
+}
+
+fn is_resolvable_wsu_id_attribute_name(name: &str) -> bool {
+    name == "Id"
+        || name
+            .rsplit_once(':')
+            .is_some_and(|(_, local_name)| local_name == "Id")
+}
+
+fn scan_tag_attributes<F>(tag: &str, mut on_attr: F) -> bool
+where
+    F: FnMut(&str, &str) -> bool,
+{
     let bytes = tag.as_bytes();
     let mut i = 0usize;
 
@@ -1826,7 +1859,7 @@ fn tag_has_resolvable_wsu_id(tag: &str, id: &str) -> bool {
         let value = &tag[value_start..i];
         i += 1;
 
-        if matches!(name, "wsu:Id" | "Id") && value == id {
+        if on_attr(name, value) {
             return true;
         }
     }
@@ -1840,14 +1873,14 @@ fn tag_has_resolvable_wsu_id(tag: &str, id: &str) -> bool {
 /// the byte range the signature covers may differ from the element a backend
 /// consumes.
 ///
-/// The resolver still accepts WS-Security `wsu:Id` / bare `Id`, but this
-/// security gate intentionally counts broader id spellings (`xml:id`, `ID`,
-/// `id`) so a backend with broader fragment resolution fails closed. Scanning
-/// only start tags avoids rejecting a legitimate request merely because body
-/// text contains `Id="..."`. Comments, CDATA, processing instructions, and
-/// declarations are skipped as non-element spans. Unlike the narrower extraction
-/// helpers, this full-envelope scan treats malformed start tags as errors
-/// rather than returning a partial count.
+/// The resolver still accepts WS-Security `*:Id` / bare `Id`, but this security
+/// gate intentionally counts broader id spellings (`xml:id`, `ID`, `id`) so a
+/// backend with broader fragment resolution fails closed. Scanning only start
+/// tags avoids rejecting a legitimate request merely because body text contains
+/// `Id="..."`. Comments, CDATA, processing instructions, and declarations are
+/// skipped as non-element spans. Unlike the narrower extraction helpers, this
+/// full-envelope scan treats malformed start tags as errors rather than
+/// returning a partial count.
 pub(crate) fn count_wsu_id_occurrences(xml: &str, id: &str) -> Result<usize, String> {
     let mut count = 0usize;
     let mut search_from = 0usize;
@@ -1982,62 +2015,13 @@ fn find_start_tag_end(xml: &str, tag_start: usize) -> Option<usize> {
 }
 
 fn count_id_attributes_in_tag(tag: &str, id: &str) -> usize {
-    let bytes = tag.as_bytes();
     let mut count = 0usize;
-    let mut i = 0usize;
-
-    while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b'/' {
-        i += 1;
-    }
-
-    while i < bytes.len() {
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        if i >= bytes.len() || bytes[i] == b'/' {
-            break;
-        }
-
-        let name_start = i;
-        while i < bytes.len() && !bytes[i].is_ascii_whitespace() && !matches!(bytes[i], b'=' | b'/')
-        {
-            i += 1;
-        }
-        let name = &tag[name_start..i];
-
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        if i >= bytes.len() || bytes[i] != b'=' {
-            continue;
-        }
-        i += 1;
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-
-        let Some(&quote) = bytes.get(i) else {
-            break;
-        };
-        if !matches!(quote, b'\'' | b'"') {
-            continue;
-        }
-        i += 1;
-        let value_start = i;
-        while i < bytes.len() && bytes[i] != quote {
-            i += 1;
-        }
-        if i >= bytes.len() {
-            break;
-        }
-        let value = &tag[value_start..i];
-        i += 1;
-
+    scan_tag_attributes(tag, |name, value| {
         if is_xml_id_attribute_name(name) && value == id {
             count += 1;
         }
-    }
-
+        false
+    });
     count
 }
 

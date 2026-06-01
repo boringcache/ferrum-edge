@@ -385,6 +385,26 @@ fn find_element_by_wsu_id_skips_cdata_and_pi_content_like_counter() {
 }
 
 #[test]
+fn find_element_by_wsu_id_resolves_arbitrary_prefixed_id() {
+    let xml = r#"
+        <soap:Body xmlns:u="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">
+            <Target u:Id="B">signed body bytes</Target>
+        </soap:Body>
+    "#;
+
+    assert_eq!(
+        soap_count_wsu_id_occurrences_for_test(xml, "B")
+            .expect("prefixed local-name Id should count"),
+        1
+    );
+    let resolved = soap_find_element_by_wsu_id_for_test(xml, "B")
+        .expect("prefixed local-name Id should resolve");
+
+    assert!(resolved.starts_with("<Target"));
+    assert!(resolved.contains("signed body bytes"));
+}
+
+#[test]
 fn test_valid_username_token_config() {
     let plugin = SoapWsSecurity::new(&username_token_config()).unwrap();
     assert_eq!(plugin.name(), "soap_ws_security");
@@ -2047,6 +2067,13 @@ mod x509_roundtrip {
     /// what `validate_x509_signature` extracts via `find_element_block`, so
     /// the signature computed here will match what the verifier checks.
     fn build_signed_soap_envelope(cert: &TestRsaCert) -> String {
+        build_signed_soap_envelope_with_timestamp_prefix(cert, "wsu")
+    }
+
+    fn build_signed_soap_envelope_with_timestamp_prefix(
+        cert: &TestRsaCert,
+        timestamp_prefix: &str,
+    ) -> String {
         let now = chrono::Utc::now();
         let created = now.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
         let expires = (now + chrono::Duration::minutes(5))
@@ -2054,8 +2081,10 @@ mod x509_roundtrip {
             .to_string();
 
         let timestamp_xml = format!(
-            r#"<wsu:Timestamp wsu:Id="TS-1"><wsu:Created>{}</wsu:Created><wsu:Expires>{}</wsu:Expires></wsu:Timestamp>"#,
-            created, expires
+            r#"<{prefix}:Timestamp {prefix}:Id="TS-1"><{prefix}:Created>{created}</{prefix}:Created><{prefix}:Expires>{expires}</{prefix}:Expires></{prefix}:Timestamp>"#,
+            prefix = timestamp_prefix,
+            created = created,
+            expires = expires,
         );
 
         // verify_reference_digests hashes the raw bytes of the referenced
@@ -2094,7 +2123,7 @@ mod x509_roundtrip {
             r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
   <soap:Header>
     <wsse:Security xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
-                   xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">
+                   xmlns:{timestamp_prefix}="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">
       {timestamp}
       <wsse:BinarySecurityToken EncodingType="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary" ValueType="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-x509-token-profile-1.0#X509v3">{cert_b64}</wsse:BinarySecurityToken>
       <Signature xmlns="http://www.w3.org/2000/09/xmldsig#">
@@ -2106,6 +2135,7 @@ mod x509_roundtrip {
   <soap:Body><GetPrice xmlns="http://example.com/prices"><Item>Widget</Item></GetPrice></soap:Body>
 </soap:Envelope>"#,
             timestamp = timestamp_xml,
+            timestamp_prefix = timestamp_prefix,
             cert_b64 = cert.cert_der_b64,
             signed_info = signed_info,
             sig_b64 = signature_b64,
@@ -2140,6 +2170,25 @@ mod x509_roundtrip {
         assert!(
             matches!(result, PluginResult::Continue),
             "expected Continue with valid RSA signature, got {:?}",
+            result,
+        );
+    }
+
+    #[tokio::test]
+    async fn valid_rsa_signature_with_arbitrary_wsu_prefix_is_accepted() {
+        let cert = mint_rsa_cert();
+        let cert_file = write_pem_to_tempfile(&cert.cert_pem);
+        let plugin = SoapWsSecurity::new(&x509_plugin_config(cert_file.path()))
+            .expect("plugin should construct with valid RSA cert");
+
+        let body = build_signed_soap_envelope_with_timestamp_prefix(&cert, "u");
+        let mut ctx = make_ctx_with_soap_body(&body);
+        let mut headers = soap_headers();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+        assert!(
+            matches!(result, PluginResult::Continue),
+            "expected Continue with non-wsu WSU namespace prefix, got {:?}",
             result,
         );
     }
