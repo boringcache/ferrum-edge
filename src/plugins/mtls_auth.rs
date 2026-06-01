@@ -36,7 +36,9 @@ enum CertField {
     SanEmail,
     /// SHA-256 fingerprint of the DER-encoded certificate (lowercase hex)
     FingerprintSha256,
-    /// Certificate serial number (lowercase hex)
+    /// Certificate serial number as lowercase hex of the DER integer value
+    /// bytes, no separators, DER sign padding removed (i.e. the lowercase of
+    /// `openssl x509 -serial` output).
     Serial,
 }
 
@@ -52,6 +54,14 @@ impl CertField {
             "serial" => Some(Self::Serial),
             _ => None,
         }
+    }
+}
+
+fn canonical_serial_bytes(raw_serial: &[u8]) -> &[u8] {
+    if raw_serial.len() > 1 && raw_serial[0] == 0 && (raw_serial[1] & 0x80) != 0 {
+        &raw_serial[1..]
+    } else {
+        raw_serial
     }
 }
 
@@ -185,7 +195,10 @@ impl IssuerFilter {
 /// - `san_dns` — First DNS Subject Alternative Name
 /// - `san_email` — First email Subject Alternative Name
 /// - `fingerprint_sha256` — SHA-256 fingerprint (lowercase hex)
-/// - `serial` — Certificate serial number (lowercase hex)
+/// - `serial` — Certificate serial number as lowercase hex of the DER integer
+///   value bytes, no separators, DER sign padding removed. Store the lowercase
+///   of `openssl x509 -serial` output (e.g. `0a1b2c`, or `ab…` for serials
+///   whose high bit required a DER sign pad).
 ///
 /// # Consumer Credentials
 ///
@@ -400,7 +413,13 @@ impl MtlsAuth {
             CertField::FingerprintSha256 => {
                 Ok(super::utils::cert_hash::sha256_hex_lower(der_bytes))
             }
-            CertField::Serial => Ok(cert.serial.to_str_radix(16)),
+            // Render the serial from its DER INTEGER value bytes as lowercase
+            // hex with no separators. `BigUint::to_str_radix(16)` strips
+            // meaningful leading zero nibbles and can produce an odd-length
+            // string, while `raw_serial()` includes a DER-only `00` sign pad
+            // for positive values whose high bit is set. OpenSSL's `-serial`
+            // output uses the value bytes without that sign pad.
+            CertField::Serial => Ok(hex::encode(canonical_serial_bytes(cert.raw_serial()))),
         }
     }
 
