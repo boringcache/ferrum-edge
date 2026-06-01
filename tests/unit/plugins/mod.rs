@@ -55,6 +55,7 @@ mod otel_tracing_tests;
 mod plugin_cache_tests;
 mod plugin_http_client_tests;
 mod plugin_integration_tests;
+mod plugin_utils_core_tests;
 mod prometheus_metrics_tests;
 mod proxy_alerts_tests;
 mod rate_limiting_tests;

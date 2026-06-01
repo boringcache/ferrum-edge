@@ -85,30 +85,3 @@ fn build_validation(algorithm: Algorithm, params: &JwtVerifyParams<'_>) -> Valid
     }
     validation
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use jsonwebtoken::{EncodingKey, Header, encode};
-    use serde_json::json;
-
-    #[test]
-    fn peeks_issuer_without_verifying_signature() {
-        let token = encode(
-            &Header::default(),
-            &json!({"iss": "https://issuer", "exp": 9_999_999_999u64}),
-            &EncodingKey::from_secret(b"secret"),
-        )
-        .expect("test token should encode");
-
-        assert_eq!(
-            peek_unverified_issuer(&token).as_deref(),
-            Some("https://issuer")
-        );
-    }
-
-    #[test]
-    fn malformed_token_has_no_issuer() {
-        assert!(peek_unverified_issuer("not.a.jwt.extra").is_none());
-    }
-}

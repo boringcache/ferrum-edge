@@ -126,36 +126,3 @@ fn extract_location_value(value: &str, prefix: Option<&str>) -> TokenLocationExt
 
     TokenLocationExtract::Credential(ExtractedCredential::BearerToken(token.to_string()))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn ctx_with_header(name: &str, value: &str) -> RequestContext {
-        let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
-        ctx.headers.insert(name.to_string(), value.to_string());
-        ctx
-    }
-
-    #[test]
-    fn extracts_bearer_token_from_authorization() {
-        let ctx = ctx_with_header("authorization", "Bearer abc");
-        assert!(matches!(
-            extract_authorization_bearer(&ctx),
-            ExtractedCredential::BearerToken(token) if token == "abc"
-        ));
-    }
-
-    #[test]
-    fn configured_header_prefix_mismatch_is_missing() {
-        let ctx = ctx_with_header("x-token", "Token abc");
-        let location = TokenLocation::Header(TokenHeaderLocation {
-            name: "x-token".to_string(),
-            prefix: Some("Bearer ".to_string()),
-        });
-        assert!(matches!(
-            extract_from_location(&location, &ctx),
-            TokenLocationExtract::Missing
-        ));
-    }
-}
