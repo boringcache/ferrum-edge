@@ -1496,7 +1496,7 @@ fn pow10_i128(exp: u32) -> Option<i128> {
 }
 
 fn parse_json_decimal_number(text: &str) -> Option<(i128, i128)> {
-    let (mantissa, exponent) = match text.find(|ch| ch == 'e' || ch == 'E') {
+    let (mantissa, exponent) = match text.find(['e', 'E']) {
         Some(index) => {
             let exponent = text[index + 1..].parse::<i32>().ok()?;
             (&text[..index], exponent)
