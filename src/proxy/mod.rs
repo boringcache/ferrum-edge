@@ -16812,6 +16812,103 @@ mod tests {
         );
     }
 
+    /// End-to-end wiring guard for the content-type-aware buffer->stream
+    /// downgrade: drives `proxy_to_backend` against a real backend with a
+    /// response-inspecting WAF and asserts a non-inspectable (binary) response
+    /// is streamed (downgraded) while an allowlisted (json) one stays buffered.
+    /// A refactor that drops the `refine_stream_response_for_content_type` call
+    /// site would regress the binary case back to `Buffered` and fail here —
+    /// which the helper-level unit tests cannot catch.
+    #[tokio::test]
+    async fn proxy_to_backend_downgrades_non_inspectable_response_under_waf_inspection() {
+        async fn dispatch_body(
+            state: &ProxyState,
+            proxy: &Proxy,
+            plugins: &[Arc<dyn Plugin>],
+            backend_url: &str,
+        ) -> ResponseBody {
+            let ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
+            let bytes_sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let (resp, _) = proxy_to_backend(
+                state,
+                proxy,
+                backend_url,
+                "GET",
+                &HashMap::new(),
+                ClientRequestBody::Buffered(Vec::new()),
+                None,
+                plugins,
+                None,  // body-hook ctx (absent for response-only configs)
+                &ctx,  // real read-only request context
+                false, // stream_response: WAF requested buffering pre-flight
+                false, // requires_request_body_buffering
+                true,  // stream_request_body
+                false, // retain_request_body (non-retry -> downgrade active)
+                "127.0.0.1",
+                false, // is_tls
+                false, // dispatch_hbone
+                false, // dispatch_h3
+                &bytes_sent,
+                hyper::Version::HTTP_11,
+            )
+            .await;
+            resp.body
+        }
+
+        let server = wiremock::MockServer::start().await;
+        // 128 KiB > the 64 KiB eager-buffer cutoff, so a downgraded response
+        // actually streams instead of being eagerly collected as a small body.
+        wiremock::Mock::given(wiremock::matchers::path("/binary"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .set_body_bytes(vec![0u8; 131_072]),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::path("/json"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_bytes(vec![b' '; 131_072]),
+            )
+            .mount(&server)
+            .await;
+
+        let state = make_test_proxy_state(GatewayConfig::default());
+        let mut proxy = test_proxy(ResponseBodyMode::Stream);
+        proxy.backend_scheme = Some(BackendScheme::Http);
+        proxy.backend_host = server.address().ip().to_string();
+        proxy.backend_port = server.address().port();
+
+        let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(
+            crate::plugins::waf::Waf::new(&json!({
+                "response_inspection": true,
+                "response_body_inspection": true,
+            }))
+            .unwrap(),
+        )];
+
+        let binary = dispatch_body(
+            &state,
+            &proxy,
+            &plugins,
+            &format!("{}/binary", server.uri()),
+        )
+        .await;
+        assert!(
+            matches!(binary, ResponseBody::Streaming { .. }),
+            "non-inspectable (octet-stream) response should be downgraded to streaming"
+        );
+
+        let json_body =
+            dispatch_body(&state, &proxy, &plugins, &format!("{}/json", server.uri())).await;
+        assert!(
+            matches!(json_body, ResponseBody::Buffered(_)),
+            "allowlisted (json) response must stay buffered so the WAF can scan it"
+        );
+    }
+
     #[tokio::test]
     async fn h1_to_native_h3_backend_headers_preserve_frontend_forwarding_metadata() {
         let env_config = crate::config::env_config::EnvConfig {
