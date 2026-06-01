@@ -1776,19 +1776,30 @@ fn find_wsu_id(element: &str) -> Option<String> {
 /// security gate intentionally counts broader id spellings (`xml:id`, `ID`,
 /// `id`) so a backend with broader fragment resolution fails closed. Scanning
 /// only start tags avoids rejecting a legitimate request merely because body
-/// text contains `Id="..."`. Unlike the narrower extraction helpers, this
-/// full-envelope scan treats malformed start tags as errors rather than
-/// returning a partial count.
+/// text contains `Id="..."`. Comments, CDATA, processing instructions, and
+/// declarations are skipped as non-element spans. Unlike the narrower extraction
+/// helpers, this full-envelope scan treats malformed start tags as errors
+/// rather than returning a partial count.
 fn count_wsu_id_occurrences(xml: &str, id: &str) -> Result<usize, String> {
     let mut count = 0usize;
     let mut search_from = 0usize;
     while let Some(rel) = xml[search_from..].find('<') {
         let tag_start = search_from + rel;
         let Some(after_lt) = xml.as_bytes().get(tag_start + 1) else {
-            break;
+            return Err(
+                "WS-Security: malformed XML start tag while scanning referenced ids".into(),
+            );
         };
-        if matches!(after_lt, b'/' | b'!' | b'?') {
+        if *after_lt == b'/' {
             search_from = tag_start + 1;
+            continue;
+        }
+        if *after_lt == b'!' {
+            search_from = skip_markup_declaration(xml, tag_start)?;
+            continue;
+        }
+        if *after_lt == b'?' {
+            search_from = skip_processing_instruction(xml, tag_start)?;
             continue;
         }
 
@@ -1800,6 +1811,80 @@ fn count_wsu_id_occurrences(xml: &str, id: &str) -> Result<usize, String> {
         search_from = tag_start + tag_end_rel + 1;
     }
     Ok(count)
+}
+
+fn skip_markup_declaration(xml: &str, tag_start: usize) -> Result<usize, String> {
+    let from_start = xml.get(tag_start..).ok_or_else(|| {
+        "WS-Security: malformed XML declaration while scanning referenced ids".to_string()
+    })?;
+
+    if from_start.starts_with("<!--") {
+        return from_start
+            .find("-->")
+            .map(|end_rel| tag_start + end_rel + "-->".len())
+            .ok_or_else(|| {
+                "WS-Security: malformed XML comment while scanning referenced ids".to_string()
+            });
+    }
+
+    if from_start.starts_with("<![CDATA[") {
+        return from_start
+            .find("]]>")
+            .map(|end_rel| tag_start + end_rel + "]]>".len())
+            .ok_or_else(|| {
+                "WS-Security: malformed XML CDATA while scanning referenced ids".to_string()
+            });
+    }
+
+    let decl_end_rel = find_markup_declaration_end(xml, tag_start).ok_or_else(|| {
+        "WS-Security: malformed XML declaration while scanning referenced ids".to_string()
+    })?;
+    Ok(tag_start + decl_end_rel + 1)
+}
+
+fn skip_processing_instruction(xml: &str, tag_start: usize) -> Result<usize, String> {
+    let from_start = xml.get(tag_start..).ok_or_else(|| {
+        "WS-Security: malformed XML processing instruction while scanning referenced ids"
+            .to_string()
+    })?;
+
+    from_start
+        .find("?>")
+        .map(|end_rel| tag_start + end_rel + "?>".len())
+        .ok_or_else(|| {
+            "WS-Security: malformed XML processing instruction while scanning referenced ids"
+                .to_string()
+        })
+}
+
+/// Return the byte offset, relative to `tag_start`, of the end of a `<!...>`
+/// declaration. Comments and CDATA have custom terminators and are handled
+/// before this helper is called.
+fn find_markup_declaration_end(xml: &str, tag_start: usize) -> Option<usize> {
+    debug_assert_eq!(xml.as_bytes().get(tag_start), Some(&b'<'));
+    let bytes = xml.as_bytes().get(tag_start..)?;
+    if !bytes.starts_with(b"<!") {
+        return None;
+    }
+
+    let mut quote = None;
+    let mut bracket_depth = 0usize;
+    let mut i = 2usize;
+
+    while i < bytes.len() {
+        match quote {
+            Some(q) if bytes[i] == q => quote = None,
+            Some(_) => {}
+            None if matches!(bytes[i], b'\'' | b'"') => quote = Some(bytes[i]),
+            None if bytes[i] == b'[' => bracket_depth = bracket_depth.saturating_add(1),
+            None if bytes[i] == b']' => bracket_depth = bracket_depth.saturating_sub(1),
+            None if bytes[i] == b'>' && bracket_depth == 0 => return Some(i),
+            None => {}
+        }
+        i += 1;
+    }
+
+    None
 }
 
 /// Return the byte offset, relative to `tag_start`, of the first unquoted `>`.
@@ -2232,6 +2317,53 @@ mod tests {
 
         assert!(
             err.contains("malformed XML start tag"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn count_wsu_id_occurrences_skips_comment_content() {
+        let xml = r#"
+            <Envelope>
+                <First Id="X"/>
+                <!-- <debug note=" Id="X" -->
+                <Second Id="X"/>
+            </Envelope>
+        "#;
+
+        assert_eq!(
+            count_wsu_id_occurrences(xml, "X")
+                .expect("comment content should not be scanned as start tags"),
+            2
+        );
+    }
+
+    #[test]
+    fn count_wsu_id_occurrences_skips_cdata_content() {
+        let xml = r#"
+            <Envelope>
+                <First Id="X"/>
+                <![CDATA[<debug note=" Id="X">]]>
+                <Second Id="X"/>
+            </Envelope>
+        "#;
+
+        assert_eq!(
+            count_wsu_id_occurrences(xml, "X")
+                .expect("CDATA content should not be scanned as start tags"),
+            2
+        );
+    }
+
+    #[test]
+    fn count_wsu_id_occurrences_fails_closed_on_unterminated_comment() {
+        let xml = r#"<a Id="X"/><!-- <b Id="X"/>"#;
+
+        let err = count_wsu_id_occurrences(xml, "X")
+            .expect_err("unterminated comments must reject instead of hiding ids");
+
+        assert!(
+            err.contains("malformed XML comment"),
             "unexpected error: {err}"
         );
     }
