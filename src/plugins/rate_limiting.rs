@@ -15,6 +15,7 @@ use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
 
 const MAX_STATE_ENTRIES: usize = 100_000;
 const EVICTION_CHECK_INTERVAL_REQUESTS: u64 = 1024;
+const RATE_LIMIT_IDENTITY_HEADER: &str = "x-ratelimit-identity";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LimitBy {
@@ -139,8 +140,14 @@ impl RateLimiting {
         &self.default_limit
     }
 
-    fn reject(&self, key: &str, outcome: &RateLimitOutcome) -> PluginResult {
-        let mut headers = HashMap::with_capacity(4);
+    fn reject(&self, outcome: &RateLimitOutcome) -> PluginResult {
+        // Never reflect the rate-limit key (limiter identity) back to the
+        // downstream client. For limit_by=consumer/spiffe the key embeds the
+        // gateway's internal notion of the caller identity (consumer username) or
+        // the peer workload SVID — information the client did not necessarily
+        // supply in that form. Only the standard, non-sensitive
+        // limit/remaining/window headers are exposed.
+        let mut headers = HashMap::with_capacity(3);
         if self.expose_headers {
             if let Some(limit) = outcome.limit {
                 headers.insert("x-ratelimit-limit".to_string(), limit.to_string());
@@ -149,7 +156,6 @@ impl RateLimiting {
             if let Some(window) = outcome.window_seconds {
                 headers.insert("x-ratelimit-window".to_string(), window.to_string());
             }
-            headers.insert("x-ratelimit-identity".to_string(), key.to_string());
         }
 
         PluginResult::Reject {
@@ -159,11 +165,14 @@ impl RateLimiting {
         }
     }
 
-    fn store_metadata(&self, key: &str, outcome: &RateLimitOutcome, ctx: &mut RequestContext) {
+    fn store_metadata(&self, outcome: &RateLimitOutcome, ctx: &mut RequestContext) {
         if !self.expose_headers {
             return;
         }
 
+        // Intentionally does not store the rate-limit key/identity: it would be
+        // injected onto the downstream response by after_proxy and disclose the
+        // gateway's internal consumer/SPIFFE identity to the client.
         if let Some(limit) = outcome.limit {
             ctx.metadata
                 .insert("ratelimit_limit".to_string(), limit.to_string());
@@ -176,8 +185,6 @@ impl RateLimiting {
             ctx.metadata
                 .insert("ratelimit_window".to_string(), window.to_string());
         }
-        ctx.metadata
-            .insert("ratelimit_identity".to_string(), key.to_string());
     }
 
     async fn check_rate(
@@ -190,10 +197,10 @@ impl RateLimiting {
         self.maybe_evict_stale_entries();
         if !outcome.allowed {
             warn!(rate_limit_key = %key, plugin = "rate_limiting", "Rate limit exceeded");
-            return self.reject(&key, &outcome);
+            return self.reject(&outcome);
         }
 
-        self.store_metadata(&key, &outcome, ctx);
+        self.store_metadata(&outcome, ctx);
         PluginResult::Continue
     }
 
@@ -202,7 +209,7 @@ impl RateLimiting {
         self.maybe_evict_stale_entries();
         if !outcome.allowed {
             warn!(rate_limit_key = %key, plugin = "rate_limiting", "Rate limit exceeded (stream)");
-            return self.reject(&key, &outcome);
+            return self.reject(&outcome);
         }
 
         PluginResult::Continue
@@ -228,7 +235,7 @@ impl Plugin for RateLimiting {
     }
 
     fn modifies_request_headers(&self) -> bool {
-        self.expose_headers
+        true
     }
 
     fn warmup_hostnames(&self) -> Vec<String> {
@@ -273,6 +280,7 @@ impl Plugin for RateLimiting {
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
+        remove_rate_limit_identity_header(headers);
         if !self.expose_headers {
             return PluginResult::Continue;
         }
@@ -286,6 +294,7 @@ impl Plugin for RateLimiting {
         _response_status: u16,
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
+        remove_rate_limit_identity_header(response_headers);
         if !self.expose_headers {
             return PluginResult::Continue;
         }
@@ -624,11 +633,13 @@ fn inject_rate_limit_headers_from_metadata(
     metadata: &HashMap<String, String>,
     headers: &mut HashMap<String, String>,
 ) {
+    // x-ratelimit-identity is intentionally NOT mapped: injecting the limiter key
+    // here would echo the gateway's internal consumer/SPIFFE identity to the
+    // downstream client (after_proxy) — an information-disclosure surface.
     static KEYS: &[(&str, &str)] = &[
         ("ratelimit_limit", "x-ratelimit-limit"),
         ("ratelimit_remaining", "x-ratelimit-remaining"),
         ("ratelimit_window", "x-ratelimit-window"),
-        ("ratelimit_identity", "x-ratelimit-identity"),
     ];
 
     for &(meta_key, header_name) in KEYS {
@@ -636,4 +647,8 @@ fn inject_rate_limit_headers_from_metadata(
             headers.insert(header_name.to_string(), value.clone());
         }
     }
+}
+
+fn remove_rate_limit_identity_header(headers: &mut HashMap<String, String>) {
+    headers.retain(|name, _| !name.eq_ignore_ascii_case(RATE_LIMIT_IDENTITY_HEADER));
 }

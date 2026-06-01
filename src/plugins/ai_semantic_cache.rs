@@ -46,6 +46,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tracing::debug;
+use url::Host;
 
 use super::utils::body_transform::is_json_content_type;
 use super::utils::cache_headers::sanitize_cached_headers;
@@ -53,6 +54,10 @@ use super::utils::redis_rate_limiter::{RedisConfig, RedisRateLimitClient};
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
 
 const VECTOR_REBUILD_INTERVAL_SECONDS: u64 = 30;
+
+/// Minimum interval between expired-entry cleanup passes, measured against a
+/// monotonic clock so the throttle is immune to wall-clock jumps.
+const CLEANUP_INTERVAL_SECONDS: u64 = 30;
 
 const RESPONSE_SHAPE_FIELDS: &[&str] = &[
     "tools",
@@ -231,7 +236,12 @@ pub struct AiSemanticCache {
     max_entries: usize,
     /// Maximum size of a single cached response body in bytes.
     max_entry_size_bytes: usize,
-    /// Maximum total cache size in bytes.
+    /// Approximate (soft) ceiling on the total cache size in bytes. The total
+    /// is checked without a lock before each insert, so under concurrent
+    /// inserts the cap may be briefly exceeded by up to
+    /// `(concurrent inserts) * max_entry_size_bytes` before periodic
+    /// `cleanup_expired` reconciliation brings it back down. It is not a hard
+    /// guarantee, but the overshoot is bounded and self-healing.
     max_total_size_bytes: usize,
     /// Whether to include the model name in the cache key.
     include_model_in_key: bool,
@@ -251,7 +261,13 @@ pub struct AiSemanticCache {
     total_size: Arc<AtomicUsize>,
     /// Optional Redis client for centralized caching.
     redis_client: Option<Arc<RedisRateLimitClient>>,
-    /// Counter for periodic cleanup scheduling.
+    /// Monotonic reference instant captured at construction. Cleanup
+    /// scheduling measures elapsed time against this rather than the wall
+    /// clock so a backward/forward `SystemTime` jump cannot stall or
+    /// spuriously trigger cleanup.
+    created_at: Instant,
+    /// Seconds elapsed (against `created_at`) at the last cleanup pass, used to
+    /// throttle cleanup to once per `CLEANUP_INTERVAL_SECONDS`.
     last_cleanup: AtomicU64,
     /// Last time the semantic vector snapshot was rebuilt.
     last_vector_rebuild: Arc<AtomicU64>,
@@ -301,7 +317,7 @@ impl AiSemanticCache {
         // shared cache (e.g., a public LLM proxy with no per-tenant data)
         // must set this to `false`.
         let scope_by_consumer = optional_bool(config, "scope_by_consumer")?.unwrap_or(true);
-        let semantic = parse_semantic_config(config)?;
+        let semantic = parse_semantic_config(config, http_client.backend_allow_ips())?;
 
         // Build optional Redis client
         let default_redis_prefix = default_redis_key_prefix(http_client.namespace());
@@ -332,7 +348,9 @@ impl AiSemanticCache {
             vector_index: Arc::new(ArcSwapOption::empty()),
             total_size: Arc::new(AtomicUsize::new(0)),
             redis_client,
-            last_cleanup: AtomicU64::new(0),
+            created_at: Instant::now(),
+            // Sentinel: never cleaned, so the first cleanup pass always runs.
+            last_cleanup: AtomicU64::new(u64::MAX),
             last_vector_rebuild: Arc::new(AtomicU64::new(0)),
             vector_index_dirty: Arc::new(AtomicBool::new(false)),
             vector_index_rebuild_running: Arc::new(AtomicBool::new(false)),
@@ -779,7 +797,13 @@ impl AiSemanticCache {
         }
     }
 
-    #[allow(dead_code)] // Used by external tests through crate::_test_support; the bin target has no such caller.
+    /// Synchronously rebuild the semantic vector snapshot. Used only by the
+    /// external test crate via `_test_support::rebuild_ai_semantic_cache_vector_index`.
+    /// The `--lib --tests` build cannot see that caller (it lives in a separate
+    /// integration-test crate), so it would otherwise flag this as dead code
+    /// and fail `clippy -D warnings`; `allow(dead_code)` documents the real
+    /// (external) use site.
+    #[allow(dead_code)]
     pub(crate) async fn rebuild_vector_index_for_tests(&self) {
         let Some(semantic) = self.semantic.as_ref() else {
             return;
@@ -853,22 +877,32 @@ impl AiSemanticCache {
     }
 
     /// Periodic cleanup of expired entries.
+    ///
+    /// Throttled to once per `CLEANUP_INTERVAL_SECONDS` using a monotonic
+    /// elapsed-seconds clock (`created_at`) rather than the wall clock, so a
+    /// `SystemTime` jump cannot stall or spuriously trigger cleanup. The CAS
+    /// guarantees exactly one caller wins per interval; concurrent callers
+    /// that lose the race return without scanning.
     fn cleanup_expired(&self) {
-        let now_epoch = current_epoch_seconds();
+        let now = Instant::now();
+        let now_secs = now.saturating_duration_since(self.created_at).as_secs();
 
+        // `last_cleanup` starts at `u64::MAX` (never cleaned) so the first
+        // call always runs; afterwards it holds the monotonic second at which
+        // the most recent pass ran.
         let last = self.last_cleanup.load(Ordering::Relaxed);
-        if now_epoch.saturating_sub(last) < 30 {
+        if last != u64::MAX && now_secs.saturating_sub(last) < CLEANUP_INTERVAL_SECONDS {
             return;
         }
         if self
             .last_cleanup
-            .compare_exchange(last, now_epoch, Ordering::Relaxed, Ordering::Relaxed)
+            .compare_exchange(last, now_secs, Ordering::Relaxed, Ordering::Relaxed)
             .is_err()
         {
+            // Another caller already claimed this interval.
             return;
         }
 
-        let now = Instant::now();
         let mut removed_size = 0usize;
         let mut removed_semantic_entry = false;
         self.cache.retain(|_, entry| {
@@ -942,7 +976,38 @@ fn push_ascii_lowercase(buffer: &mut String, value: &str) {
     }
 }
 
+/// Produce a canonical key fragment for a sampling parameter value.
+///
+/// Numeric values are normalized through their `f64` form so that
+/// semantically identical encodings collapse to a single representation:
+/// `1`, `1.0`, and `1e0` all render to `"1"`, and `0.70`/`0.7` both render to
+/// `"0.7"`. Without this, two requests with the same effective temperature or
+/// top_p would produce different cache keys and miss each other.
+///
+/// `f64::to_string` emits the shortest round-trippable decimal, so distinct
+/// values (e.g. `0.7` vs `0.71`) are preserved. Integers that cannot be
+/// represented exactly as `f64` (magnitude beyond 2^53) fall back to the raw
+/// `Value` serialization to avoid collapsing distinct large integers; sampling
+/// parameters are always small floats, so this fallback is only a safety net.
 fn canonical_param_value(value: &Value) -> String {
+    if let Some(n) = value.as_f64()
+        && n.is_finite()
+    {
+        // Only trust the f64 normalization when it round-trips the original
+        // integer exactly; otherwise keep the raw representation.
+        if let Some(i) = value.as_i64() {
+            if i as f64 as i64 == i {
+                return n.to_string();
+            }
+        } else if let Some(u) = value.as_u64() {
+            if u as f64 as u64 == u {
+                return n.to_string();
+            }
+        } else {
+            // Floating-point input: f64 already captures it exactly.
+            return n.to_string();
+        }
+    }
     value.to_string()
 }
 
@@ -1451,6 +1516,12 @@ impl Plugin for AiSemanticCache {
             embedding.as_ref(),
         );
 
+        // Soft total-size enforcement: this load is separate from the
+        // fetch_add/insert below, so concurrent inserts can each observe an
+        // under-limit total and overshoot the cap transiently. The overshoot
+        // is bounded (each entry is <= max_entry_size_bytes, checked above)
+        // and reclaimed by `cleanup_expired`, so `max_total_size_bytes` is an
+        // approximate ceiling rather than a hard guarantee — see its field doc.
         let current_total = self.total_size.load(Ordering::Relaxed);
         if current_total.saturating_add(approx_size) > self.max_total_size_bytes {
             debug!(
@@ -1599,7 +1670,10 @@ fn optional_threshold(config: &Value, field: &'static str) -> Result<Option<f32>
     Ok(Some(number as f32))
 }
 
-fn parse_semantic_config(config: &Value) -> Result<Option<SemanticConfig>, String> {
+fn parse_semantic_config(
+    config: &Value,
+    backend_allow_ips: &crate::config::BackendAllowIps,
+) -> Result<Option<SemanticConfig>, String> {
     let enabled = optional_bool(config, "semantic_similarity_enabled")?.unwrap_or(false);
     let provider = optional_non_empty_string(config, "semantic_embedding_provider")?
         .as_deref()
@@ -1635,13 +1709,7 @@ fn parse_semantic_config(config: &Value) -> Result<Option<SemanticConfig>, Strin
         "ai_semantic_cache: 'semantic_embedding_endpoint' is required when semantic_similarity_enabled=true"
             .to_string()
     })?;
-    let parsed_endpoint = url::Url::parse(&endpoint)
-        .map_err(|_| "ai_semantic_cache: 'semantic_embedding_endpoint' must be a valid URL")?;
-    if !matches!(parsed_endpoint.scheme(), "http" | "https") {
-        return Err(
-            "ai_semantic_cache: 'semantic_embedding_endpoint' must use http or https".to_string(),
-        );
-    }
+    validate_semantic_embedding_endpoint(&endpoint, backend_allow_ips)?;
 
     Ok(Some(SemanticConfig {
         provider,
@@ -1656,6 +1724,39 @@ fn parse_semantic_config(config: &Value) -> Result<Option<SemanticConfig>, Strin
         max_candidates,
         request_timeout: Duration::from_millis(timeout_ms),
     }))
+}
+
+fn validate_semantic_embedding_endpoint(
+    endpoint: &str,
+    backend_allow_ips: &crate::config::BackendAllowIps,
+) -> Result<(), String> {
+    let parsed_endpoint = url::Url::parse(endpoint)
+        .map_err(|_| "ai_semantic_cache: 'semantic_embedding_endpoint' must be a valid URL")?;
+    if !matches!(parsed_endpoint.scheme(), "http" | "https") {
+        return Err(
+            "ai_semantic_cache: 'semantic_embedding_endpoint' must use http or https".to_string(),
+        );
+    }
+
+    let host = parsed_endpoint.host().ok_or_else(|| {
+        "ai_semantic_cache: 'semantic_embedding_endpoint' must include a host".to_string()
+    })?;
+
+    let literal_ip = match host {
+        Host::Ipv4(ip) => Some(std::net::IpAddr::V4(ip)),
+        Host::Ipv6(ip) => Some(std::net::IpAddr::V6(ip)),
+        Host::Domain(_) => None,
+    };
+
+    if let Some(ip) = literal_ip
+        && !crate::config::check_backend_ip_allowed(&ip, backend_allow_ips)
+    {
+        return Err(format!(
+            "ai_semantic_cache: 'semantic_embedding_endpoint' IP {ip} denied by FERRUM_BACKEND_ALLOW_IPS={backend_allow_ips} policy"
+        ));
+    }
+
+    Ok(())
 }
 
 fn default_redis_key_prefix(namespace: &str) -> String {
@@ -1691,10 +1792,10 @@ mod tests {
         plugin.cache.insert(key.to_string(), entry);
     }
 
-    /// Force cleanup to run regardless of the 30-second cooldown gate by
-    /// resetting the gate before the call.
+    /// Force cleanup to run regardless of the cooldown gate by resetting the
+    /// gate to the "never cleaned" sentinel before the call.
     fn force_cleanup(plugin: &AiSemanticCache) {
-        plugin.last_cleanup.store(0, Ordering::Relaxed);
+        plugin.last_cleanup.store(u64::MAX, Ordering::Relaxed);
         plugin.cleanup_expired();
     }
 

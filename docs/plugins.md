@@ -2059,7 +2059,7 @@ At least one rate window must be configured in every rule. Do not combine the cu
 - `limit_by: "spiffe_identity"` — Enforces in `authorize` phase (after `spiffe_identity`), keyed by `ctx.peer_spiffe_id`. Falls back to client IP if no peer SPIFFE identity exists.
 - Stream (`on_stream_connect`) — `consumer` mode uses the stream Consumer identity when available. `spiffe_identity` mode uses `peer_spiffe_id` metadata written by the stream `spiffe_identity` hook. Both modes fall back to client IP when their identity is absent.
 
-**Rate limit headers** (when `expose_headers: true`): `x-ratelimit-limit`, `x-ratelimit-remaining`, `x-ratelimit-window`, `x-ratelimit-identity`
+**Rate limit headers** (when `expose_headers: true`): `x-ratelimit-limit`, `x-ratelimit-remaining`, `x-ratelimit-window`. The limiter key/identity is never exposed: for `limit_by: "consumer"`/`"spiffe_identity"` it would echo the gateway's internal caller identity (consumer username) or the peer workload SVID back to the client.
 
 Returns HTTP `429 Too Many Requests` when exceeded.
 
@@ -3244,6 +3244,8 @@ Validation follows the same per-mode tolerance model as other file-dependent con
 
 Universal AI gateway that routes requests in OpenAI Chat Completions format to any of 11 supported AI providers, translating requests to native provider format and normalizing responses back to OpenAI format. Uses the "terminate and respond" pattern — makes its own HTTP call to the matched provider and returns the response directly, bypassing the normal proxy dispatch.
 
+**Streaming is not supported.** Because of the terminate-and-respond design, the plugin buffers the full provider response and re-serializes it as a single JSON object. A request that asks for a streamed response (`"stream": true`) and matches a configured provider is rejected with HTTP `501` and an OpenAI-shaped error body rather than being silently downgraded to a buffered response or forwarded as a stream the gateway cannot relay. Requests that do not match any provider pass through untouched.
+
 **Priority:** 2985
 
 **Supported providers:**
@@ -3268,8 +3270,8 @@ Universal AI gateway that routes requests in OpenAI Chat Completions format to a
 | `model_patterns` | Array | `[]` (catch-all) | Glob patterns to match model names (e.g., `["claude-*"]`) |
 | `model_mapping` | Object | `{}` | Map client model names to provider-native names |
 | `default_model` | String | _(none)_ | Default model when no mapping matches |
-| `connect_timeout_seconds` | Integer | `5` | TCP + TLS handshake timeout |
-| `read_timeout_seconds` | Integer | `60` | Full response read timeout |
+| `connect_timeout_seconds` | Integer | `5` | Per-provider TCP + TLS handshake timeout for outbound provider calls |
+| `read_timeout_seconds` | Integer | `60` | Overall per-request deadline for outbound provider calls |
 | `base_url` | String | _(provider default)_ | Custom endpoint URL (for self-hosted or proxy endpoints) |
 
 **Azure OpenAI additional fields:** `azure_resource`, `azure_deployment`, `azure_api_version` (default `"2024-06-01"`).
@@ -3774,8 +3776,8 @@ Logs metadata for every WebSocket frame passing through the proxy. Provides fram
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `log_level` | String | `"info"` | Log level for frame entries: `trace`, `debug`, or `info` (case-sensitive — unknown values are rejected at config load time) |
-| `include_payload_preview` | bool | `false` | Include a payload preview in log entries |
-| `payload_preview_bytes` | u64 | `128` | Maximum payload bytes to preview (clamped to 64 KiB) |
+| `include_payload_preview` | bool | `false` | Emit a keyed, non-reversible payload fingerprint (`hmac-sha256:<prefix> len=<n>`) in the `preview` field. Raw frame bytes are never logged |
+| `payload_preview_bytes` | u64 | `128` | Maximum leading payload bytes folded into the fingerprint digest (clamped to 64 KiB; must be greater than zero when previews are enabled; zero is accepted when previews are disabled) |
 | `log_ping_pong` | bool | `false` | Log Ping and Pong control frames |
 
 ```yaml
@@ -3787,7 +3789,9 @@ config:
   log_ping_pong: false
 ```
 
-Frame log entries are emitted to the `ws_frame_log` tracing target with structured fields: `proxy_id`, `connection_id`, `direction` (`client->backend` or `backend->client`), `frame_type` (`text`, `binary`, `ping`, `pong`, `close`, `frame`), `size_bytes`, and (when `include_payload_preview` is true) `preview` (text borrowed from the frame, or hex-encoded for binary). Preview computation is skipped when the configured tracing level is filtered out, so disabling logging at the tracing layer eliminates per-frame allocation.
+Frame log entries are emitted to the `ws_frame_log` tracing target with structured fields: `proxy_id`, `connection_id`, `direction` (`client->backend` or `backend->client`), `frame_type` (`text`, `binary`, `ping`, `pong`, `close`, `frame`), `size_bytes`, and (when `include_payload_preview` is true) `preview`. Fingerprint computation is skipped when the configured tracing level is filtered out, so disabling logging at the tracing layer eliminates per-frame work.
+
+**Raw frame contents are never logged.** WebSocket payloads routinely carry credentials — bearer tokens, session cookies, API keys (for example a GraphQL-over-WS `connection_init` payload or a custom auth handshake). To honor the project's never-log-secrets invariant, `preview` contains only a keyed, non-reversible fingerprint of the form `hmac-sha256:<12 hex chars> len=<bytes>` (with a trailing `+` after the digest when only the first `payload_preview_bytes` of the payload were hashed). The key is generated per plugin instance and is not exposed in logs, so log access alone cannot confirm guessed payloads offline. The digest lets operators correlate identical payloads observed by that plugin instance without disclosing plaintext; the payload byte length is also always available as `size_bytes`.
 
 ---
 

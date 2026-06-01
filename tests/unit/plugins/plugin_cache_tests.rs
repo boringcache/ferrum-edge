@@ -323,7 +323,7 @@ fn test_request_view_stays_on_single_generation_after_rebuild() {
         vec![make_proxy("p1", "/api", vec!["ps1"])],
         vec![make_plugin_config(
             "ps1",
-            "rate_limiting",
+            "stdout_logging",
             PluginScope::Proxy,
             Some("p1"),
             true,
@@ -362,7 +362,7 @@ fn test_request_view_stays_on_single_generation_after_rebuild() {
 
     let view_plugins = request_view.plugins();
     let view_names: Vec<&str> = view_plugins.iter().map(|p| p.name()).collect();
-    assert_eq!(view_names, vec!["rate_limiting"]);
+    assert_eq!(view_names, vec!["stdout_logging"]);
     assert!(!request_view.requires_request_body_buffering());
     assert!(!request_view.requires_response_body_buffering());
     assert!(

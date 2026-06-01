@@ -851,6 +851,186 @@ async fn test_json_schema_unique_items_invalid() {
     assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
 }
 
+// ─── uniqueItems O(n) DoS-resistance and equality semantics (finding #16) ──
+
+// A large all-distinct array must validate quickly. The previous O(n^2) scan did
+// ~N^2/2 deep `Value` comparisons (~1.25e9 for N=50k), taking many seconds; the
+// O(n) hash-set scan finishes in well under the generous bound below. The bound
+// is loose enough to be CI-stable yet far below the old quadratic cost, so this
+// regression test fails against the pre-fix implementation.
+#[tokio::test]
+async fn test_json_schema_unique_items_large_distinct_is_linear_and_accepted() {
+    let plugin = json_schema_plugin(serde_json::json!({"type": "array", "uniqueItems": true}));
+    let n = 50_000;
+    let mut body = String::with_capacity(n * 7);
+    body.push('[');
+    for i in 0..n {
+        if i > 0 {
+            body.push(',');
+        }
+        body.push_str(&i.to_string());
+    }
+    body.push(']');
+
+    let mut ctx = make_json_ctx(&body);
+    let mut headers = make_json_headers();
+    let start = std::time::Instant::now();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "uniqueItems scan over {n} distinct items took {elapsed:?}; expected sub-second O(n)"
+    );
+}
+
+// A large array that does contain a duplicate must still be rejected, and quickly.
+#[tokio::test]
+async fn test_json_schema_unique_items_large_with_duplicate_is_rejected() {
+    let plugin = json_schema_plugin(serde_json::json!({"type": "array", "uniqueItems": true}));
+    let n = 50_000;
+    let mut body = String::with_capacity(n * 7);
+    body.push('[');
+    for i in 0..n {
+        if i > 0 {
+            body.push(',');
+        }
+        // Duplicate the very last element so the duplicate is found late.
+        let v = if i == n - 1 { n - 2 } else { i };
+        body.push_str(&v.to_string());
+    }
+    body.push(']');
+
+    let mut ctx = make_json_ctx(&body);
+    let mut headers = make_json_headers();
+    let start = std::time::Instant::now();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "uniqueItems duplicate detection over {n} items took {elapsed:?}; expected sub-second O(n)"
+    );
+}
+
+// Equality semantics are preserved for nested objects/arrays: two structurally
+// equal objects (even with differently-ordered keys) count as duplicates.
+#[tokio::test]
+async fn test_json_schema_unique_items_detects_nested_object_duplicates() {
+    let plugin = json_schema_plugin(serde_json::json!({"type": "array", "uniqueItems": true}));
+    let mut ctx = make_json_ctx(r#"[{"a": 1, "b": [2, 3]}, {"b": [2, 3], "a": 1}]"#);
+    let mut headers = make_json_headers();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+// Structurally distinct nested values are accepted.
+#[tokio::test]
+async fn test_json_schema_unique_items_accepts_distinct_nested_values() {
+    let plugin = json_schema_plugin(serde_json::json!({"type": "array", "uniqueItems": true}));
+    let mut ctx =
+        make_json_ctx(r#"[{"a": 1, "b": [2, 3]}, {"a": 1, "b": [3, 2]}, [1, 2], [2, 1]]"#);
+    let mut headers = make_json_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+}
+
+// ─── multipleOf correctness for large/fractional values (finding #65) ──
+
+// Fractional divisor: 0.3 IS a multiple of 0.1. The old absolute-EPSILON
+// tolerance wrongly rejected this because 0.3 % 0.1 ≈ 0.0999… in IEEE-754.
+#[tokio::test]
+async fn test_json_schema_multiple_of_fractional_divisor_accepts_true_multiple() {
+    let plugin = json_schema_plugin(serde_json::json!({"type": "number", "multipleOf": 0.1}));
+    for value in ["0.3", "0.6", "1.0", "10", "12345.6"] {
+        let mut ctx = make_json_ctx(value);
+        let mut headers = make_json_headers();
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    }
+}
+
+// Fractional divisor: a genuine non-multiple is still rejected.
+#[tokio::test]
+async fn test_json_schema_multiple_of_fractional_divisor_rejects_non_multiple() {
+    let plugin = json_schema_plugin(serde_json::json!({"type": "number", "multipleOf": 0.1}));
+    let mut ctx = make_json_ctx("0.35");
+    let mut headers = make_json_headers();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+#[tokio::test]
+async fn test_json_schema_multiple_of_large_fractional_non_multiple_rejected() {
+    let plugin = json_schema_plugin(serde_json::json!({"type": "number", "multipleOf": 0.1}));
+    let mut ctx = make_json_ctx("100000000000000.05");
+    let mut headers = make_json_headers();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+// Currency-style divisor (0.01): valid amount accepted, invalid rejected.
+#[tokio::test]
+async fn test_json_schema_multiple_of_currency_divisor() {
+    let plugin = json_schema_plugin(serde_json::json!({"type": "number", "multipleOf": 0.01}));
+    let mut ok = make_json_ctx("19.99");
+    let mut headers = make_json_headers();
+    assert_continue(plugin.before_proxy(&mut ok, &mut headers).await);
+
+    let mut bad = make_json_ctx("19.999");
+    let mut headers = make_json_headers();
+    assert_reject(plugin.before_proxy(&mut bad, &mut headers).await, Some(400));
+}
+
+// Large integral value: u64::MAX is exactly divisible by 3. The float path
+// misjudges this (u64::MAX as f64 rounds up), so the exact integer path is
+// required. The old absolute-EPSILON tolerance also wrongly rejected it.
+#[tokio::test]
+async fn test_json_schema_multiple_of_large_integral_value_uses_exact_modulo() {
+    let plugin = json_schema_plugin(serde_json::json!({"type": "integer", "multipleOf": 3}));
+    // u64::MAX = 18446744073709551615 = 3 * 6148914691236517205.
+    let mut ctx = make_json_ctx("18446744073709551615");
+    let mut headers = make_json_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+}
+
+// Large integral non-multiple is rejected.
+#[tokio::test]
+async fn test_json_schema_multiple_of_large_integral_non_multiple_rejected() {
+    let plugin = json_schema_plugin(serde_json::json!({"type": "integer", "multipleOf": 7}));
+    // 1_000_000_000_000_007 mod 7 == 6, so not a multiple.
+    let mut ctx = make_json_ctx("1000000000000007");
+    let mut headers = make_json_headers();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+// Small integer multiples (the common case) still behave correctly.
+#[tokio::test]
+async fn test_json_schema_multiple_of_small_integers() {
+    let plugin = json_schema_plugin(serde_json::json!({"type": "integer", "multipleOf": 2}));
+    let mut ok = make_json_ctx("10");
+    let mut headers = make_json_headers();
+    assert_continue(plugin.before_proxy(&mut ok, &mut headers).await);
+
+    let mut bad = make_json_ctx("7");
+    let mut headers = make_json_headers();
+    assert_reject(plugin.before_proxy(&mut bad, &mut headers).await, Some(400));
+}
+
+// A fractional value against an integral divisor must take the float path and be
+// rejected (0.5 is not a multiple of 2). Guards against the integer fast-path
+// being entered when only the divisor is integral.
+#[tokio::test]
+async fn test_json_schema_multiple_of_fractional_value_integral_divisor_rejected() {
+    let plugin = json_schema_plugin(serde_json::json!({"type": "number", "multipleOf": 2}));
+    let mut ctx = make_json_ctx("0.5");
+    let mut headers = make_json_headers();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+// An integral value that is a true multiple of a fractional divisor must be
+// accepted via the float near-divisor branch (10 is a multiple of 0.1).
+#[tokio::test]
+async fn test_json_schema_multiple_of_integral_value_fractional_divisor_accepted() {
+    let plugin = json_schema_plugin(serde_json::json!({"type": "number", "multipleOf": 0.1}));
+    let mut ctx = make_json_ctx("100");
+    let mut headers = make_json_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+}
+
 // ─── Object constraints ──────────────────────────────────────────────
 
 #[tokio::test]

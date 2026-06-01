@@ -56,7 +56,7 @@ async fn test_rate_limiting_plugin_creation() {
     assert_eq!(plugin.priority(), priority::RATE_LIMITING);
     assert_eq!(plugin.supported_protocols(), ALL_PROTOCOLS);
     assert!(!plugin.is_auth_plugin());
-    assert!(!plugin.modifies_request_headers());
+    assert!(plugin.modifies_request_headers());
     assert!(!plugin.modifies_request_body());
     assert!(!plugin.requires_request_body_buffering());
     assert!(!plugin.requires_response_body_buffering());
@@ -877,7 +877,7 @@ async fn test_expose_headers_disabled_by_default() {
         "limit_by": "ip"
     });
     let plugin = make_rate_limiter(config);
-    assert!(!plugin.modifies_request_headers());
+    assert!(plugin.modifies_request_headers());
 }
 
 #[tokio::test]
@@ -910,10 +910,9 @@ async fn test_expose_headers_on_success_response() {
     assert_eq!(ctx.metadata.get("ratelimit_limit").unwrap(), "5");
     assert_eq!(ctx.metadata.get("ratelimit_remaining").unwrap(), "4");
     assert_eq!(ctx.metadata.get("ratelimit_window").unwrap(), "60");
-    assert_eq!(
-        ctx.metadata.get("ratelimit_identity").unwrap(),
-        "ip:127.0.0.1"
-    );
+    // The limiter key/identity must never be stored as metadata — it would be
+    // injected onto the downstream response and disclose internal identity.
+    assert!(!ctx.metadata.contains_key("ratelimit_identity"));
 
     // after_proxy should inject headers into response
     let mut response_headers: HashMap<String, String> = HashMap::new();
@@ -925,10 +924,8 @@ async fn test_expose_headers_on_success_response() {
     assert_eq!(response_headers.get("x-ratelimit-limit").unwrap(), "5");
     assert_eq!(response_headers.get("x-ratelimit-remaining").unwrap(), "4");
     assert_eq!(response_headers.get("x-ratelimit-window").unwrap(), "60");
-    assert_eq!(
-        response_headers.get("x-ratelimit-identity").unwrap(),
-        "ip:127.0.0.1"
-    );
+    // x-ratelimit-identity must never be reflected to the client.
+    assert!(!response_headers.contains_key("x-ratelimit-identity"));
 }
 
 #[tokio::test]
@@ -952,10 +949,8 @@ async fn test_expose_headers_on_success_request_to_backend() {
 
     assert_eq!(request_headers.get("x-ratelimit-limit").unwrap(), "5");
     assert_eq!(request_headers.get("x-ratelimit-remaining").unwrap(), "4");
-    assert_eq!(
-        request_headers.get("x-ratelimit-identity").unwrap(),
-        "ip:127.0.0.1"
-    );
+    // The limiter identity is no longer exposed on the upstream request either.
+    assert!(!request_headers.contains_key("x-ratelimit-identity"));
 }
 
 #[tokio::test]
@@ -986,7 +981,8 @@ async fn test_expose_headers_on_rejection() {
             assert_eq!(headers.get("x-ratelimit-limit").unwrap(), "1");
             assert_eq!(headers.get("x-ratelimit-remaining").unwrap(), "0");
             assert_eq!(headers.get("x-ratelimit-window").unwrap(), "60");
-            assert_eq!(headers.get("x-ratelimit-identity").unwrap(), "ip:127.0.0.1");
+            // The 429 response must not echo the limiter identity to the client.
+            assert!(!headers.contains_key("x-ratelimit-identity"));
         }
         _ => panic!("Expected Reject, got {:?}", result),
     }
@@ -1043,7 +1039,81 @@ async fn test_expose_headers_disabled_no_headers_on_success() {
 }
 
 #[tokio::test]
-async fn test_expose_headers_consumer_identity() {
+async fn test_strips_spoofed_identity_header_before_backend() {
+    let config = json!({
+        "window_seconds": 60,
+        "max_requests": 10,
+        "limit_by": "ip",
+        "expose_headers": false
+    });
+    let plugin = make_rate_limiter(config);
+
+    let mut ctx = create_test_context();
+    plugin.on_request_received(&mut ctx).await;
+
+    let mut request_headers: HashMap<String, String> = HashMap::new();
+    request_headers.insert(
+        "X-RateLimit-Identity".to_string(),
+        "consumer:spoofed".to_string(),
+    );
+    request_headers.insert(
+        "x-ratelimit-identity".to_string(),
+        "spiffe:spoofed".to_string(),
+    );
+
+    let result = plugin.before_proxy(&mut ctx, &mut request_headers).await;
+    assert_continue(result);
+    assert!(
+        !request_headers
+            .keys()
+            .any(|key| key.eq_ignore_ascii_case("x-ratelimit-identity")),
+        "spoofed identity header must be stripped before backend: {request_headers:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_strips_backend_identity_header_before_client() {
+    let config = json!({
+        "window_seconds": 60,
+        "max_requests": 10,
+        "limit_by": "ip",
+        "expose_headers": false
+    });
+    let plugin = make_rate_limiter(config);
+
+    let mut ctx = create_test_context();
+    plugin.on_request_received(&mut ctx).await;
+
+    let mut response_headers: HashMap<String, String> = HashMap::new();
+    response_headers.insert(
+        "X-RateLimit-Identity".to_string(),
+        "backend-user".to_string(),
+    );
+    response_headers.insert("content-type".to_string(), "application/json".to_string());
+
+    let result = plugin
+        .after_proxy(&mut ctx, 200, &mut response_headers)
+        .await;
+    assert_continue(result);
+    assert!(
+        !response_headers
+            .keys()
+            .any(|key| key.eq_ignore_ascii_case("x-ratelimit-identity")),
+        "backend identity header must be stripped before client: {response_headers:?}"
+    );
+    assert_eq!(
+        response_headers.get("content-type").map(String::as_str),
+        Some("application/json")
+    );
+}
+
+/// Regression test for finding #56: with limit_by=consumer the limiter key is
+/// `consumer:<username>`, which is the gateway's internal notion of the caller
+/// identity. It must NEVER be reflected back to the downstream client (nor the
+/// upstream request) via x-ratelimit-identity, even when expose_headers=true.
+/// The standard, non-sensitive x-ratelimit-* headers must still be emitted.
+#[tokio::test]
+async fn test_expose_headers_consumer_identity_not_leaked() {
     let config = json!({
         "window_seconds": 60,
         "max_requests": 5,
@@ -1059,24 +1129,40 @@ async fn test_expose_headers_consumer_identity() {
     let result = plugin.authorize(&mut ctx).await;
     assert_continue(result);
 
-    // Identity should reflect consumer, not IP
-    assert_eq!(
-        ctx.metadata.get("ratelimit_identity").unwrap(),
-        "consumer:testuser"
-    );
+    // The consumer identity must not be retained as metadata (it would otherwise
+    // be injected onto the response by after_proxy).
+    assert!(!ctx.metadata.contains_key("ratelimit_identity"));
+    // Standard rate-limit metadata still present.
+    assert_eq!(ctx.metadata.get("ratelimit_limit").unwrap(), "5");
 
+    // Downstream client response: identity must be absent, standard headers kept.
     let mut response_headers: HashMap<String, String> = HashMap::new();
     plugin
         .after_proxy(&mut ctx, 200, &mut response_headers)
         .await;
-    assert_eq!(
-        response_headers.get("x-ratelimit-identity").unwrap(),
-        "consumer:testuser"
+    assert!(
+        !response_headers.contains_key("x-ratelimit-identity"),
+        "consumer identity leaked to downstream client: {response_headers:?}"
     );
+    assert_eq!(response_headers.get("x-ratelimit-limit").unwrap(), "5");
+    assert_eq!(response_headers.get("x-ratelimit-remaining").unwrap(), "4");
+    assert_eq!(response_headers.get("x-ratelimit-window").unwrap(), "60");
+
+    // Upstream request to the backend must not carry the identity either.
+    let mut request_headers: HashMap<String, String> = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut request_headers).await;
+    assert!(
+        !request_headers.contains_key("x-ratelimit-identity"),
+        "consumer identity leaked to upstream request: {request_headers:?}"
+    );
+    assert_eq!(request_headers.get("x-ratelimit-limit").unwrap(), "5");
 }
 
+/// Regression test for finding #56 (SPIFFE variant): with limit_by=spiffe the
+/// limiter key is `spiffe:<peer SVID>`, the peer workload's verbatim SPIFFE id.
+/// It must NEVER be reflected back to the client (nor the upstream request).
 #[tokio::test]
-async fn test_expose_headers_spiffe_identity() {
+async fn test_expose_headers_spiffe_identity_not_leaked() {
     let config = json!({
         "window_seconds": 60,
         "max_requests": 5,
@@ -1091,19 +1177,63 @@ async fn test_expose_headers_spiffe_identity() {
     let result = plugin.authorize(&mut ctx).await;
     assert_continue(result);
 
-    assert_eq!(
-        ctx.metadata.get("ratelimit_identity").unwrap(),
-        "spiffe:spiffe://example.test/ns/app/sa/api"
-    );
+    assert!(!ctx.metadata.contains_key("ratelimit_identity"));
 
     let mut response_headers: HashMap<String, String> = HashMap::new();
     plugin
         .after_proxy(&mut ctx, 200, &mut response_headers)
         .await;
-    assert_eq!(
-        response_headers.get("x-ratelimit-identity").unwrap(),
-        "spiffe:spiffe://example.test/ns/app/sa/api"
+    assert!(
+        !response_headers.contains_key("x-ratelimit-identity"),
+        "peer SVID leaked to downstream client: {response_headers:?}"
     );
+    assert_eq!(response_headers.get("x-ratelimit-limit").unwrap(), "5");
+
+    let mut request_headers: HashMap<String, String> = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut request_headers).await;
+    assert!(
+        !request_headers.contains_key("x-ratelimit-identity"),
+        "peer SVID leaked to upstream request: {request_headers:?}"
+    );
+}
+
+/// Regression test for finding #56 (429 path): the rejection response must not
+/// echo the consumer limiter identity even though expose_headers=true.
+#[tokio::test]
+async fn test_expose_headers_rejection_consumer_identity_not_leaked() {
+    let config = json!({
+        "window_seconds": 60,
+        "max_requests": 1,
+        "limit_by": "consumer",
+        "expose_headers": true
+    });
+    let plugin = make_rate_limiter(config);
+
+    // First request for the consumer consumes the single allowed slot.
+    let mut ctx = create_test_context();
+    ctx.identified_consumer = Some(Arc::new(create_test_consumer()));
+    assert_continue(plugin.authorize(&mut ctx).await);
+
+    // Second request for the same consumer is rejected.
+    let mut ctx2 = create_test_context();
+    ctx2.identified_consumer = Some(Arc::new(create_test_consumer()));
+    let result = plugin.authorize(&mut ctx2).await;
+    match result {
+        PluginResult::Reject {
+            status_code,
+            headers,
+            ..
+        } => {
+            assert_eq!(status_code, 429);
+            assert_eq!(headers.get("x-ratelimit-limit").unwrap(), "1");
+            assert_eq!(headers.get("x-ratelimit-remaining").unwrap(), "0");
+            assert!(
+                !headers.contains_key("x-ratelimit-identity"),
+                "consumer identity leaked on 429 response: {headers:?}"
+            );
+        }
+        _ => panic!("Expected Reject, got {result:?}"),
+    }
 }
 
 #[tokio::test]

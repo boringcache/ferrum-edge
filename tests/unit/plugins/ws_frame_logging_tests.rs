@@ -1,9 +1,124 @@
 //! Tests for ws_frame_logging plugin
 
+use std::sync::{Arc, Mutex};
+
 use ferrum_edge::plugins::ws_frame_logging::WsFrameLogging;
 use ferrum_edge::plugins::{Plugin, ProxyProtocol, WS_ONLY_PROTOCOLS, WebSocketFrameDirection};
 use serde_json::json;
 use tokio_tungstenite::tungstenite::protocol::Message;
+use tracing::{Event, Subscriber};
+use tracing_subscriber::layer::{Context, SubscriberExt};
+use tracing_subscriber::registry::LookupSpan;
+
+#[derive(Clone, Debug, Default)]
+struct CapturedWsLog {
+    preview: Option<String>,
+}
+
+#[derive(Clone, Default)]
+struct WsLogCapture {
+    events: Arc<Mutex<Vec<CapturedWsLog>>>,
+}
+
+impl WsLogCapture {
+    fn layer(&self) -> WsLogCaptureLayer {
+        WsLogCaptureLayer {
+            events: Arc::clone(&self.events),
+        }
+    }
+
+    fn events(&self) -> Vec<CapturedWsLog> {
+        self.events.lock().unwrap().clone()
+    }
+
+    fn previews(&self) -> Vec<String> {
+        self.events()
+            .into_iter()
+            .filter_map(|event| event.preview)
+            .collect()
+    }
+}
+
+struct WsLogCaptureLayer {
+    events: Arc<Mutex<Vec<CapturedWsLog>>>,
+}
+
+impl<S> tracing_subscriber::Layer<S> for WsLogCaptureLayer
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+{
+    fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+        if event.metadata().target() != "ws_frame_log" {
+            return;
+        }
+
+        let mut visitor = WsLogVisitor::default();
+        event.record(&mut visitor);
+        self.events.lock().unwrap().push(CapturedWsLog {
+            preview: visitor.preview,
+        });
+    }
+}
+
+#[derive(Default)]
+struct WsLogVisitor {
+    preview: Option<String>,
+}
+
+impl tracing::field::Visit for WsLogVisitor {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "preview" {
+            self.preview = Some(value.to_string());
+        }
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "preview" {
+            self.preview = Some(format!("{value:?}").trim_matches('"').to_string());
+        }
+    }
+}
+
+fn preview_plugin(preview_bytes: u64) -> WsFrameLogging {
+    WsFrameLogging::new(&json!({
+        "include_payload_preview": true,
+        "payload_preview_bytes": preview_bytes,
+    }))
+    .expect("valid config")
+}
+
+fn install_ws_log_capture(capture: &WsLogCapture) -> tracing::subscriber::DefaultGuard {
+    let subscriber = tracing_subscriber::registry().with(capture.layer());
+    tracing::subscriber::set_default(subscriber)
+}
+
+async fn log_frame(plugin: &WsFrameLogging, connection_id: u64, message: &Message) {
+    plugin
+        .on_ws_frame(
+            "test-proxy",
+            connection_id,
+            WebSocketFrameDirection::ClientToBackend,
+            message,
+        )
+        .await;
+}
+
+fn assert_fingerprint_shape(preview: &str, len: usize) {
+    let len_suffix = format!(" len={len}");
+    assert!(preview.starts_with("hmac-sha256:"), "got: {preview}");
+    assert!(preview.ends_with(&len_suffix), "got: {preview}");
+
+    let digest = preview
+        .strip_prefix("hmac-sha256:")
+        .and_then(|value| value.strip_suffix(&len_suffix))
+        .expect("fingerprint digest segment");
+    let hex_part = digest.strip_suffix('+').unwrap_or(digest);
+    assert_eq!(hex_part.len(), 12, "expected 12 hex chars, got: {hex_part}");
+    assert!(
+        hex_part.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "non-hex chars in fingerprint: {hex_part}"
+    );
+}
 
 // === Plugin creation and metadata ===
 
@@ -279,18 +394,18 @@ async fn test_different_connection_ids_all_passthrough() {
     }
 }
 
-// === UTF-8 boundary truncation ===
+// === UTF-8 payload fingerprinting ===
 
 #[tokio::test]
 async fn test_payload_preview_truncates_at_utf8_boundary() {
     // "héllo" is 6 bytes: h(1) é(2) l(1) l(1) o(1)
-    // With payload_preview_bytes=3, the boundary at 3 is inside the 'é' (bytes 1-2).
-    // The code should back up to byte 1 ("h") rather than splitting mid-character.
+    // With payload_preview_bytes=3, the hashed byte prefix lands on a UTF-8 boundary.
+    // The fingerprint path must not interpret the prefix as text or panic.
     let plugin =
         WsFrameLogging::new(&json!({"include_payload_preview": true, "payload_preview_bytes": 3}))
             .unwrap();
     let msg = Message::Text("héllo".into());
-    // Should not panic — produces a valid UTF-8 slice
+    // Should not panic even though earlier raw-preview logic had to slice text.
     let result = plugin
         .on_ws_frame(
             "test-proxy",
@@ -304,7 +419,8 @@ async fn test_payload_preview_truncates_at_utf8_boundary() {
 
 #[tokio::test]
 async fn test_payload_preview_with_4byte_emoji() {
-    // 🦀 is 4 bytes. With preview_bytes=2, should truncate to empty (can't split emoji).
+    // The emoji is 4 bytes. A 2-byte fingerprint budget cuts through it, which
+    // is safe because the preview hashes bytes instead of slicing a string.
     let plugin =
         WsFrameLogging::new(&json!({"include_payload_preview": true, "payload_preview_bytes": 2}))
             .unwrap();
@@ -322,7 +438,7 @@ async fn test_payload_preview_with_4byte_emoji() {
 
 #[tokio::test]
 async fn test_payload_preview_exact_char_boundary() {
-    // "abc" is 3 bytes. With preview_bytes=3, should get full "abc" without "...".
+    // "abc" is 3 bytes. With preview_bytes=3, the full text is hashed.
     let plugin =
         WsFrameLogging::new(&json!({"include_payload_preview": true, "payload_preview_bytes": 3}))
             .unwrap();
@@ -338,22 +454,13 @@ async fn test_payload_preview_exact_char_boundary() {
     assert!(result.is_none());
 }
 
-#[tokio::test]
-async fn test_payload_preview_bytes_zero_produces_empty() {
-    // payload_preview_bytes=0 should not panic, produces empty preview
-    let plugin =
+#[test]
+fn test_payload_preview_bytes_zero_rejected_when_preview_enabled() {
+    let err =
         WsFrameLogging::new(&json!({"include_payload_preview": true, "payload_preview_bytes": 0}))
-            .unwrap();
-    let msg = Message::Text("hello".into());
-    let result = plugin
-        .on_ws_frame(
-            "test-proxy",
-            1,
-            WebSocketFrameDirection::ClientToBackend,
-            &msg,
-        )
-        .await;
-    assert!(result.is_none());
+            .err()
+            .expect("zero-byte payload fingerprints must be rejected");
+    assert!(err.contains("payload_preview_bytes"), "got: {err}");
 }
 
 #[tokio::test]
@@ -378,7 +485,7 @@ async fn test_payload_preview_bytes_clamped_to_max() {
 #[tokio::test]
 async fn test_payload_preview_all_multibyte_chars() {
     // All 2-byte characters: "ñ" = 2 bytes each. "ñññ" = 6 bytes.
-    // With preview_bytes=5, the boundary at 5 splits "ñ" (bytes 4-5), should back up to byte 4 ("ññ").
+    // With preview_bytes=5, the hashed byte prefix cuts through the final char.
     let plugin =
         WsFrameLogging::new(&json!({"include_payload_preview": true, "payload_preview_bytes": 5}))
             .unwrap();
@@ -424,4 +531,150 @@ async fn test_empty_binary_frame() {
         )
         .await;
     assert!(result.is_none());
+}
+
+// === Payload fingerprint logging ===
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_text_payload_preview_logs_fingerprint_without_raw_payload() {
+    let capture = WsLogCapture::default();
+    let _guard = install_ws_log_capture(&capture);
+    let plugin = preview_plugin(4096);
+    let secret = "Bearer sk-live-supersecret-token-AKIA1234567890";
+    let raw = format!("{{\"type\":\"connection_init\",\"Authorization\":\"{secret}\"}}");
+
+    log_frame(&plugin, 1, &Message::Text(raw.clone().into())).await;
+
+    let previews = capture.previews();
+    assert_eq!(previews.len(), 1, "expected one preview log");
+    let preview = &previews[0];
+    assert_fingerprint_shape(preview, raw.len());
+    for leaked in [
+        secret,
+        "supersecret",
+        "Bearer",
+        "Authorization",
+        "connection_init",
+        raw.as_str(),
+    ] {
+        assert!(
+            !preview.contains(leaked),
+            "preview leaked sensitive content {leaked:?}: {preview}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_binary_payload_preview_logs_fingerprint_without_raw_hex() {
+    let capture = WsLogCapture::default();
+    let _guard = install_ws_log_capture(&capture);
+    let plugin = preview_plugin(4096);
+    let payload: Vec<u8> = vec![0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe];
+
+    log_frame(&plugin, 1, &Message::Binary(payload.clone().into())).await;
+
+    let previews = capture.previews();
+    assert_eq!(previews.len(), 1, "expected one preview log");
+    let preview = &previews[0];
+    assert_fingerprint_shape(preview, payload.len());
+    assert!(
+        !preview.contains("deadbeefcafe"),
+        "binary payload hex leaked: {preview}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_payload_preview_correlates_within_plugin_instance() {
+    let capture = WsLogCapture::default();
+    let _guard = install_ws_log_capture(&capture);
+    let plugin = preview_plugin(4096);
+
+    log_frame(&plugin, 1, &Message::Text("hello world".into())).await;
+    log_frame(&plugin, 2, &Message::Text("hello world".into())).await;
+    log_frame(&plugin, 3, &Message::Text("different".into())).await;
+
+    let previews = capture.previews();
+    assert_eq!(previews.len(), 3, "expected three preview logs");
+    assert_eq!(
+        previews[0], previews[1],
+        "identical payloads must share a fingerprint"
+    );
+    assert_ne!(
+        previews[0], previews[2],
+        "different payloads must not share a fingerprint"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_payload_preview_key_differs_between_plugin_instances() {
+    let capture = WsLogCapture::default();
+    let _guard = install_ws_log_capture(&capture);
+    let first = preview_plugin(4096);
+    let second = preview_plugin(4096);
+    let payload = Message::Text("{\"type\":\"connection_init\",\"password\":\"guessable\"}".into());
+
+    log_frame(&first, 1, &payload).await;
+    log_frame(&second, 2, &payload).await;
+
+    let previews = capture.previews();
+    assert_eq!(previews.len(), 2, "expected two preview logs");
+    assert_ne!(
+        previews[0], previews[1],
+        "same payload should not be confirmable across plugin keys"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_truncated_payload_preview_is_flagged_and_reports_full_len() {
+    let capture = WsLogCapture::default();
+    let _guard = install_ws_log_capture(&capture);
+    let plugin = preview_plugin(8);
+    let raw = "0123456789abcdef";
+
+    log_frame(&plugin, 1, &Message::Text(raw.into())).await;
+    log_frame(&plugin, 2, &Message::Text("12345678".into())).await;
+
+    let previews = capture.previews();
+    assert_eq!(previews.len(), 2, "expected two preview logs");
+    assert_fingerprint_shape(&previews[0], raw.len());
+    assert!(
+        previews[0].contains("+ len=16"),
+        "truncated digest must carry a '+' marker, got: {}",
+        previews[0]
+    );
+    assert!(
+        !previews[0].contains(raw),
+        "raw content leaked: {}",
+        previews[0]
+    );
+    assert_fingerprint_shape(&previews[1], 8);
+    assert!(
+        !previews[1].contains('+'),
+        "non-truncated digest must not carry '+': {}",
+        previews[1]
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_payload_preview_omitted_when_disabled_or_control_frame() {
+    let capture = WsLogCapture::default();
+    let _guard = install_ws_log_capture(&capture);
+    let disabled = WsFrameLogging::new(&json!({})).expect("valid config");
+    let control = WsFrameLogging::new(&json!({
+        "include_payload_preview": true,
+        "log_ping_pong": true,
+    }))
+    .expect("valid config");
+
+    log_frame(&disabled, 1, &Message::Text("anything".into())).await;
+    log_frame(&control, 2, &Message::Ping(vec![1, 2].into())).await;
+    log_frame(&control, 3, &Message::Pong(vec![3, 4].into())).await;
+    log_frame(&control, 4, &Message::Close(None)).await;
+
+    let events = capture.events();
+    assert_eq!(events.len(), 4, "expected four ws_frame_log events");
+    assert!(
+        events.iter().all(|event| event.preview.is_none()),
+        "preview should be omitted for disabled previews and control frames: {events:?}"
+    );
 }

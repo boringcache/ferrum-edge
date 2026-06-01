@@ -293,7 +293,10 @@ struct ResolvedProvider {
     model_patterns: Vec<String>,
     model_mapping: HashMap<String, String>,
     default_model: Option<String>,
+    /// Per-provider connect deadline applied via Ferrum's patched reqwest
+    /// per-request override.
     connect_timeout: Duration,
+    /// Overall per-request deadline applied via reqwest's `.timeout()`.
     read_timeout: Duration,
     /// Operator-supplied URL override. Used directly by Anthropic and Cohere
     /// dispatch paths that build their own URLs without going through
@@ -1017,6 +1020,28 @@ impl AiFederation {
 /// Translation result: (url, extra_headers, body_bytes)
 type TranslatedRequest = (String, Vec<(String, String)>, Vec<u8>);
 
+/// Detect whether an OpenAI-format request asks for a streamed response.
+///
+/// This plugin uses the "terminate and respond" pattern: it makes a single
+/// non-streaming HTTP call to the provider and buffers the whole body before
+/// normalizing it with `serde_json::from_slice`. A streaming request cannot be
+/// served by that pattern:
+///   - OpenAI-compatible providers receive the `stream` flag verbatim
+///     (`translate_openai_compatible` clones the body) and reply with an SSE
+///     `text/event-stream`, which is not a single JSON document — normalization
+///     fails and the client gets an opaque 502.
+///   - The translating providers (Anthropic/Gemini/Bedrock/Cohere) silently
+///     drop the flag, so the client asked for a stream but receives one
+///     buffered JSON object instead.
+///
+/// Rather than break either way, `before_proxy` rejects streaming requests it
+/// would otherwise intercept with a clear, OpenAI-shaped error. We only treat
+/// `stream: true` (a real boolean) as streaming; a stringly-typed `"true"` or a
+/// missing field is not streaming.
+fn request_wants_streaming(openai_body: &Value) -> bool {
+    openai_body["stream"].as_bool() == Some(true)
+}
+
 /// Translate an OpenAI Chat Completions request to the provider's native format.
 fn translate_request(
     provider: &ResolvedProvider,
@@ -1348,6 +1373,31 @@ fn build_provider_url(provider: &ResolvedProvider, model: &str) -> String {
 // Response normalization
 // ---------------------------------------------------------------------------
 
+/// Maximum number of raw upstream-response bytes reflected back to the caller.
+///
+/// Both the error-passthrough path and the parse-failure path truncate the
+/// provider's body to this many bytes before lossy UTF-8 conversion. Slicing
+/// the raw bytes (not the lossy `String`) keeps the cut on a byte boundary, and
+/// `from_utf8_lossy` then repairs any code point split by the cut. Bounding the
+/// reflected text avoids forwarding an unbounded, provider-controlled error
+/// body to arbitrary downstream callers. See finding #52.
+const MAX_UPSTREAM_ERROR_BYTES: usize = 512;
+
+fn cap_upstream_error_body(body: Vec<u8>) -> Vec<u8> {
+    // Return a complete JSON error document even when the upstream body is
+    // truncated, so fallback exhaustion never sends malformed JSON with an
+    // application/json content type.
+    let error_text = String::from_utf8_lossy(&body[..body.len().min(MAX_UPSTREAM_ERROR_BYTES)]);
+    serde_json::json!({
+        "error": {
+            "message": format!("Upstream provider error: {error_text}"),
+            "type": "upstream_error",
+        }
+    })
+    .to_string()
+    .into_bytes()
+}
+
 /// Normalize a provider response to OpenAI Chat Completions format.
 fn normalize_response(
     provider_type: ProviderType,
@@ -1355,9 +1405,10 @@ fn normalize_response(
     body: &[u8],
     resolved_model: &str,
 ) -> Result<(Value, TokenCounts), String> {
-    // For error responses, pass through the raw error
+    // For error responses, pass through the raw error (capped — the upstream
+    // body is provider-controlled and may be large or detail-rich).
     if status >= 400 {
-        let error_text = String::from_utf8_lossy(body);
+        let error_text = String::from_utf8_lossy(&body[..body.len().min(MAX_UPSTREAM_ERROR_BYTES)]);
         return Ok((
             json!({
                 "error": {
@@ -1373,7 +1424,7 @@ fn normalize_response(
     let resp: Value = serde_json::from_slice(body).map_err(|e| {
         format!(
             "ai_federation: failed to parse provider response: {e} (body: {})",
-            String::from_utf8_lossy(&body[..body.len().min(200)])
+            String::from_utf8_lossy(&body[..body.len().min(MAX_UPSTREAM_ERROR_BYTES)])
         )
     })?;
 
@@ -1660,7 +1711,8 @@ impl AiFederation {
             .http_client
             .get()
             .post(url)
-            .timeout(provider.connect_timeout + provider.read_timeout);
+            .connect_timeout(provider.connect_timeout)
+            .timeout(provider.read_timeout);
 
         let mut req = req;
         for (k, v) in &auth_headers {
@@ -1848,6 +1900,24 @@ impl Plugin for AiFederation {
             return PluginResult::Continue;
         }
 
+        // Streaming is not supported by the terminate-and-respond design. We
+        // only check once we know a provider matches (so requests we don't
+        // intercept still pass through untouched). Reject with a clear,
+        // OpenAI-shaped error rather than forwarding `stream: true` to the
+        // provider — which would either yield an SSE body that fails JSON
+        // normalization (opaque 502) or silently degrade to a single buffered
+        // object for the translating providers. See finding #11.
+        if request_wants_streaming(&openai_body) {
+            debug!(
+                model = %model,
+                "ai_federation: rejecting streaming request — streaming responses are not supported"
+            );
+            return self.error_response(
+                501,
+                "Streaming responses (\"stream\": true) are not supported by ai_federation",
+            );
+        }
+
         // Try providers in priority order with fallback
         let mut last_error: Option<String> = None;
         let mut last_status: Option<u16> = None;
@@ -1933,7 +2003,7 @@ impl Plugin for AiFederation {
                             "ai_federation: provider returned fallback-eligible status"
                         );
                         last_status = Some(*status);
-                        last_body = Some(body.clone());
+                        last_body = Some(cap_upstream_error_body(body.clone()));
                     }
                 }
                 continue;
@@ -2019,7 +2089,7 @@ impl Plugin for AiFederation {
 
         // All providers exhausted
         if let Some(body) = last_body {
-            // Return the last provider's actual error response
+            // Return the last provider's capped error as valid JSON.
             let status = last_status.unwrap_or(502);
             let mut resp_headers = HashMap::new();
             resp_headers.insert("content-type".to_string(), "application/json".to_string());
@@ -2125,6 +2195,18 @@ pub mod test_helpers {
     /// Expose the multimodal content-flattening helper for tests.
     pub fn flatten_openai_message_text(content: &Value) -> String {
         super::flatten_openai_message_text(content)
+    }
+
+    /// Expose the streaming-request detector for tests.
+    pub fn request_wants_streaming(openai_body: &Value) -> bool {
+        super::request_wants_streaming(openai_body)
+    }
+
+    /// Maximum raw upstream-error bytes reflected to callers (finding #52).
+    pub const MAX_UPSTREAM_ERROR_BYTES: usize = super::MAX_UPSTREAM_ERROR_BYTES;
+
+    pub fn cap_upstream_error_body(body: Vec<u8>) -> Vec<u8> {
+        super::cap_upstream_error_body(body)
     }
 
     /// Expose request translation for tests.

@@ -4,9 +4,23 @@
 //! Provides frame-level observability without requiring packet captures.
 //!
 //! Each frame log entry includes: proxy_id, connection_id, direction,
-//! frame type, payload size in bytes, and an optional payload preview.
+//! frame type, payload size in bytes, and an optional payload fingerprint.
 //!
 //! This plugin never transforms or drops frames — it is purely observational.
+//!
+//! ## Payload privacy
+//!
+//! WebSocket application frames routinely carry credentials — bearer tokens,
+//! session cookies, API keys (e.g. a GraphQL-over-WS `connection_init` payload
+//! with `{"Authorization":"Bearer ..."}` or a custom auth handshake). To honor
+//! the project invariant "do not log secrets", this plugin NEVER logs raw frame
+//! contents. When `include_payload_preview` is enabled, the `preview` field
+//! carries only a keyed, non-reversible fingerprint of the form
+//! `hmac-sha256:<12 hex chars> len=<bytes>` (and `+` after the digest when only
+//! a prefix of the payload was hashed). The per-plugin-instance key prevents
+//! offline payload guessing from log access alone while still letting operators
+//! correlate identical payloads observed by that plugin instance; the length is
+//! always also available as the dedicated `size_bytes` field.
 //!
 //! Config:
 //! ```json
@@ -19,6 +33,7 @@
 //! ```
 
 use async_trait::async_trait;
+use ring::rand::SecureRandom;
 use serde_json::Value;
 use tokio_tungstenite::tungstenite::protocol::Message;
 
@@ -39,6 +54,7 @@ pub struct WsFrameLogging {
     log_level: LogLevel,
     include_payload_preview: bool,
     payload_preview_bytes: usize,
+    payload_fingerprint_key: Option<[u8; 32]>,
     log_ping_pong: bool,
 }
 
@@ -79,7 +95,9 @@ impl WsFrameLogging {
             None => false,
         };
 
-        // Clamp to 64 KiB to prevent OOM from hex_encode on large binary frames
+        // Clamp to 64 KiB to bound the per-frame hashing work on the WS hot path.
+        // This is the number of leading payload bytes folded into the fingerprint
+        // digest; the raw bytes are never logged.
         const MAX_PREVIEW_BYTES: usize = 65_536;
         let payload_preview_bytes = match config.get("payload_preview_bytes") {
             Some(v) => v.as_u64().ok_or_else(|| {
@@ -89,6 +107,23 @@ impl WsFrameLogging {
             None => 128,
         }
         .min(MAX_PREVIEW_BYTES as u64) as usize;
+        if include_payload_preview && payload_preview_bytes == 0 {
+            return Err(
+                "ws_frame_logging: 'payload_preview_bytes' must be greater than zero when payload previews are enabled"
+                    .to_string(),
+            );
+        }
+        let payload_fingerprint_key = if include_payload_preview {
+            let mut key = [0u8; 32];
+            ring::rand::SystemRandom::new()
+                .fill(&mut key)
+                .map_err(|_| {
+                    "ws_frame_logging: failed to generate payload fingerprint key".to_string()
+                })?;
+            Some(key)
+        } else {
+            None
+        };
 
         let log_ping_pong = match config.get("log_ping_pong") {
             Some(v) => v
@@ -101,6 +136,7 @@ impl WsFrameLogging {
             log_level,
             include_payload_preview,
             payload_preview_bytes,
+            payload_fingerprint_key,
             log_ping_pong,
         })
     }
@@ -132,63 +168,57 @@ impl WsFrameLogging {
         }
     }
 
-    /// Build a payload preview string, borrowing from the message where possible.
-    /// Returns None when previews are disabled or the message type has no payload.
+    /// Build a non-reversible payload fingerprint for the frame.
     ///
-    /// For text: truncates at a UTF-8 char boundary at or before `payload_preview_bytes`.
-    /// For binary: hex-encodes the first `payload_preview_bytes` bytes.
-    fn payload_preview<'a>(&self, message: &'a Message) -> Option<PreviewStr<'a>> {
+    /// Returns `None` when previews are disabled or the message type has no
+    /// application payload (only Text and Binary carry one).
+    ///
+    /// SECURITY: WebSocket payloads routinely carry credentials (bearer tokens,
+    /// cookies, API keys). We therefore NEVER emit the raw bytes. Instead we
+    /// fold up to `payload_preview_bytes` leading bytes into a keyed HMAC-SHA256
+    /// digest and emit a short, non-reversible fingerprint:
+    ///   `hmac-sha256:<12 hex chars> len=<total payload bytes>`
+    /// A trailing `+` is appended after the digest hex when only a prefix of the
+    /// payload was hashed (payload longer than `payload_preview_bytes`), so the
+    /// fingerprint is unambiguous about partial coverage. The key is generated
+    /// during plugin construction, so log access alone is not enough to verify
+    /// guessed credentials offline. See the module-level "Payload privacy" note.
+    fn payload_preview(&self, message: &Message) -> Option<String> {
         if !self.include_payload_preview {
             return None;
         }
-        match message {
-            Message::Text(s) => {
-                if s.len() <= self.payload_preview_bytes {
-                    // Borrow the original string — zero allocation
-                    Some(PreviewStr::Borrowed(s.as_str()))
-                } else {
-                    // Truncate at a UTF-8 char boundary at or before the byte limit
-                    let mut end = self.payload_preview_bytes;
-                    while end > 0 && !s.is_char_boundary(end) {
-                        end -= 1;
-                    }
-                    Some(PreviewStr::Borrowed(&s[..end]))
-                }
-            }
-            Message::Binary(b) => {
-                let len = b.len().min(self.payload_preview_bytes);
-                Some(PreviewStr::Owned(hex_encode(&b[..len])))
-            }
-            _ => None,
-        }
+        let key = self.payload_fingerprint_key.as_ref()?;
+        let (full_len, bytes): (usize, &[u8]) = match message {
+            Message::Text(s) => (s.len(), s.as_bytes()),
+            Message::Binary(b) => (b.len(), b.as_ref()),
+            _ => return None,
+        };
+        let hashed_len = full_len.min(self.payload_preview_bytes);
+        let truncated = hashed_len < full_len;
+        Some(payload_fingerprint(
+            key,
+            &bytes[..hashed_len],
+            full_len,
+            truncated,
+        ))
     }
 }
 
-/// A preview string that borrows from the message when possible (text),
-/// or owns a new allocation when required (binary hex encoding).
-enum PreviewStr<'a> {
-    Borrowed(&'a str),
-    Owned(String),
-}
-
-impl std::fmt::Display for PreviewStr<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            PreviewStr::Borrowed(s) => f.write_str(s),
-            PreviewStr::Owned(s) => f.write_str(s),
-        }
-    }
-}
-
-/// Simple hex encoding for binary payload previews.
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push(HEX[(b >> 4) as usize] as char);
-        s.push(HEX[(b & 0x0f) as usize] as char);
-    }
-    s
+/// Render a keyed, non-reversible payload fingerprint string.
+///
+/// `key` is generated on the plugin construction path and intentionally never
+/// logged or exposed.
+/// `hashed` is the prefix of the payload that is folded into the digest,
+/// `full_len` is the total payload length reported to operators, and
+/// `truncated` indicates the digest only covers a prefix of the payload.
+fn payload_fingerprint(key: &[u8; 32], hashed: &[u8], full_len: usize, truncated: bool) -> String {
+    let hmac_key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, key);
+    let digest = ring::hmac::sign(&hmac_key, hashed);
+    // 6 bytes -> 12 lowercase hex chars: enough entropy to correlate frames
+    // within a plugin instance while staying compact in log lines.
+    let prefix = hex::encode(&digest.as_ref()[..6]);
+    let marker = if truncated { "+" } else { "" };
+    format!("hmac-sha256:{prefix}{marker} len={full_len}")
 }
 
 /// Emit a structured log at the given tracing level.
