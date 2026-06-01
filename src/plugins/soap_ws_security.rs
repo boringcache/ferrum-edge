@@ -862,7 +862,7 @@ impl SoapWsSecurity {
                 // backend consumes. The count spans the FULL envelope, not just
                 // the regions the resolver searches, so a duplicate injected
                 // anywhere is caught. Mirrors the SAML single-Assertion guard.
-                let occurrences = count_wsu_id_occurrences(envelope, ref_id);
+                let occurrences = count_wsu_id_occurrences(envelope, ref_id)?;
                 if occurrences > 1 {
                     return Err(format!(
                         "WS-Security: referenced id '{}' is not unique in the envelope \
@@ -1772,11 +1772,14 @@ fn find_wsu_id(element: &str) -> Option<String> {
 /// the byte range the signature covers may differ from the element a backend
 /// consumes.
 ///
-/// The resolver still accepts WS-Security `wsu:Id` / bare `Id`, but the counter
-/// intentionally counts broader id spellings (`xml:id`, `ID`, `id`) so a backend
-/// with broader fragment resolution fails closed. Scanning only start tags avoids
-/// rejecting a legitimate request merely because body text contains `Id="..."`.
-fn count_wsu_id_occurrences(xml: &str, id: &str) -> usize {
+/// The resolver still accepts WS-Security `wsu:Id` / bare `Id`, but this
+/// security gate intentionally counts broader id spellings (`xml:id`, `ID`,
+/// `id`) so a backend with broader fragment resolution fails closed. Scanning
+/// only start tags avoids rejecting a legitimate request merely because body
+/// text contains `Id="..."`. Unlike the narrower extraction helpers, this
+/// full-envelope scan treats malformed start tags as errors rather than
+/// returning a partial count.
+fn count_wsu_id_occurrences(xml: &str, id: &str) -> Result<usize, String> {
     let mut count = 0usize;
     let mut search_from = 0usize;
     while let Some(rel) = xml[search_from..].find('<') {
@@ -1789,18 +1792,25 @@ fn count_wsu_id_occurrences(xml: &str, id: &str) -> usize {
             continue;
         }
 
-        let Some(tag_end_rel) = find_start_tag_end(xml, tag_start) else {
-            break;
-        };
+        let tag_end_rel = find_start_tag_end(xml, tag_start).ok_or_else(|| {
+            "WS-Security: malformed XML start tag while scanning referenced ids".to_string()
+        })?;
         let tag = &xml[tag_start + 1..tag_start + tag_end_rel];
         count += count_id_attributes_in_tag(tag, id);
         search_from = tag_start + tag_end_rel + 1;
     }
-    count
+    Ok(count)
 }
 
+/// Return the byte offset, relative to `tag_start`, of the first unquoted `>`.
+/// `tag_start` must point at `<`; malformed or unterminated start tags return
+/// `None` so callers can fail closed instead of scanning a partial envelope.
 fn find_start_tag_end(xml: &str, tag_start: usize) -> Option<usize> {
+    debug_assert_eq!(xml.as_bytes().get(tag_start), Some(&b'<'));
     let bytes = xml.as_bytes().get(tag_start..)?;
+    if bytes.first() != Some(&b'<') {
+        return None;
+    }
     let mut quote = None;
     let mut i = 1usize;
 
@@ -2189,7 +2199,11 @@ mod tests {
             </Envelope>
         "#;
 
-        assert_eq!(count_wsu_id_occurrences(xml, "TS-1"), 5);
+        assert_eq!(
+            count_wsu_id_occurrences(xml, "TS-1")
+                .expect("well-formed XML should count id occurrences"),
+            5
+        );
     }
 
     #[test]
@@ -2202,7 +2216,24 @@ mod tests {
             </Envelope>
         "#;
 
-        assert_eq!(count_wsu_id_occurrences(xml, "TS-1"), 3);
+        assert_eq!(
+            count_wsu_id_occurrences(xml, "TS-1")
+                .expect("well-formed XML should count id occurrences"),
+            3
+        );
+    }
+
+    #[test]
+    fn count_wsu_id_occurrences_fails_closed_after_unbalanced_quote() {
+        let xml = r#"<a Id="X"/><b z="><c Id="X"/>"#;
+
+        let err = count_wsu_id_occurrences(xml, "X")
+            .expect_err("unterminated quoted start tag must reject instead of undercounting");
+
+        assert!(
+            err.contains("malformed XML start tag"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
