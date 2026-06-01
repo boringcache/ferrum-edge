@@ -2331,6 +2331,17 @@ fn virtual_service_routes(
                 route_plugins.push(mirror_plugin);
             }
 
+            // Istio `http[].corsPolicy`: translate to a proxy-scoped `cors`
+            // plugin when the origins are representable (allowOrigins[].exact /
+            // legacy allowOrigin). prefix/regex origin matchers have no `cors`
+            // plugin equivalent, so they are left unprojected (warned + reported
+            // as a deferred field) rather than silently approximated. Like
+            // mirror this is a route-local plugin, so a route that must collapse
+            // with siblings fails closed via `route_has_uncollapsible_local_policy`.
+            if let Some(cors_plugin) = route_cors_plugin(object, http, &proxy_id) {
+                route_plugins.push(cors_plugin);
+            }
+
             // Project the VirtualService `http[].fault` (if any) onto every
             // emitted dispatch rule rather than spinning up a separate
             // proxy-scoped `fault_injection` plugin. The per-rule
@@ -3068,6 +3079,128 @@ fn route_mirror_plugin(
 
 fn parse_istio_duration_secs(raw: &str) -> Option<u64> {
     parse_istio_duration_ms(raw).map(|ms| if ms == 0 { 0 } else { ms.div_ceil(1000) })
+}
+
+/// Collect a non-empty list of strings from a `corsPolicy` array field
+/// (`allowMethods` / `allowHeaders` / `exposeHeaders`). Returns `None` when the
+/// field is absent or has no string entries so the caller omits the key and the
+/// `cors` plugin applies its own default.
+fn cors_string_array(cors: &Value, key: &str) -> Option<Vec<String>> {
+    let values: Vec<String> = cors
+        .get(key)
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
+    (!values.is_empty()).then_some(values)
+}
+
+/// Extract CORS allowed origins from an Istio `corsPolicy`, mapped to the
+/// `cors` plugin's `allowed_origins` form. Supports `allowOrigins[].exact` (and
+/// the literal `"*"`) plus the legacy `allowOrigin` string list. Returns `None`
+/// if no origins are present or any matcher is unrepresentable (`prefix` /
+/// `regex` / non-string): Ferrum's `cors` plugin has no prefix or regex origin
+/// form, so those are left for the `cors` plugin configured directly rather
+/// than silently approximated.
+fn cors_allowed_origins(cors: &Value) -> Option<Vec<String>> {
+    if let Some(arr) = cors.get("allowOrigins").and_then(Value::as_array) {
+        let mut origins = Vec::with_capacity(arr.len());
+        for entry in arr {
+            // Istio StringMatch: only `exact` maps cleanly to the cors plugin.
+            let exact = entry.get("exact").and_then(Value::as_str)?;
+            origins.push(exact.to_string());
+        }
+        (!origins.is_empty()).then_some(origins)
+    } else if let Some(arr) = cors.get("allowOrigin").and_then(Value::as_array) {
+        // Deprecated Istio field: a plain list of exact origin strings.
+        let mut origins = Vec::with_capacity(arr.len());
+        for entry in arr {
+            origins.push(entry.as_str()?.to_string());
+        }
+        (!origins.is_empty()).then_some(origins)
+    } else {
+        None
+    }
+}
+
+/// Whether a VirtualService `http[].corsPolicy` can be faithfully translated to
+/// a `cors` plugin. Shared by the translator (emit vs. warn-and-skip) and the
+/// Istio status writer (deferred-field reporting) so the two never disagree on
+/// whether a given policy is projected. A policy is translatable when it has at
+/// least one representable origin and any `maxAge` parses as a duration.
+pub(crate) fn cors_policy_translatable(cors: &Value) -> bool {
+    let origins_ok = cors_allowed_origins(cors).is_some();
+    let max_age_ok = match cors.get("maxAge") {
+        None | Some(Value::Null) => true,
+        Some(Value::String(s)) => parse_istio_duration_secs(s).is_some(),
+        _ => false,
+    };
+    origins_ok && max_age_ok
+}
+
+/// Build a proxy-scoped `cors` plugin for an Istio `VirtualService.http[].corsPolicy`.
+/// Returns `None` when there is no `corsPolicy`, or when the policy is not
+/// faithfully representable (`prefix`/`regex` origins, or an unparseable
+/// `maxAge`) — in that case it is left unprojected (warned, and reported as a
+/// deferred field by the status writer) rather than failing the whole
+/// VirtualService or silently approximating. This reuses the existing `cors`
+/// plugin instead of duplicating preflight/header logic, mirroring the
+/// `request_mirror` approach for `http[].mirror`.
+fn route_cors_plugin(object: &K8sObject, http: &Value, proxy_id: &str) -> Option<PluginConfig> {
+    let cors = http.get("corsPolicy")?;
+    if !cors_policy_translatable(cors) {
+        tracing::warn!(
+            namespace = %object.metadata.namespace,
+            name = %object.metadata.name,
+            "VirtualService http[].corsPolicy is not faithfully translatable (only \
+             allowOrigins[].exact / the legacy allowOrigin list and a parseable maxAge are \
+             supported); leaving it unprojected. Configure the `cors` plugin directly for \
+             prefix/regex origins."
+        );
+        return None;
+    }
+    // Guaranteed `Some` by `cors_policy_translatable`.
+    let origins = cors_allowed_origins(cors).unwrap_or_default();
+
+    let mut config = serde_json::Map::new();
+    config.insert("allowed_origins".to_string(), serde_json::json!(origins));
+    if let Some(methods) = cors_string_array(cors, "allowMethods") {
+        config.insert("allowed_methods".to_string(), serde_json::json!(methods));
+    }
+    if let Some(headers) = cors_string_array(cors, "allowHeaders") {
+        config.insert("allowed_headers".to_string(), serde_json::json!(headers));
+    }
+    if let Some(expose) = cors_string_array(cors, "exposeHeaders") {
+        config.insert("exposed_headers".to_string(), serde_json::json!(expose));
+    }
+    if let Some(max_age) = cors
+        .get("maxAge")
+        .and_then(Value::as_str)
+        .and_then(parse_istio_duration_secs)
+    {
+        config.insert("max_age".to_string(), serde_json::json!(max_age));
+    }
+    if let Some(allow_creds) = cors.get("allowCredentials").and_then(Value::as_bool) {
+        config.insert(
+            "allow_credentials".to_string(),
+            serde_json::json!(allow_creds),
+        );
+    }
+
+    let now = chrono::Utc::now();
+    Some(PluginConfig {
+        id: format!("istio-vs-cors-{proxy_id}"),
+        plugin_name: "cors".to_string(),
+        namespace: object.metadata.namespace.clone(),
+        config: Value::Object(config),
+        scope: crate::config::types::PluginScope::Proxy,
+        proxy_id: Some(proxy_id.to_string()),
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: now,
+        updated_at: now,
+    })
 }
 
 pub(super) fn path_match(uri: &Value) -> Option<String> {

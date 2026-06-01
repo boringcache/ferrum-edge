@@ -795,20 +795,32 @@ fn virtual_service_status(
 /// VirtualService HTTP-route fields the translator parses past but never
 /// projects. `tcp` / `tls` route arrays are not listed here: they are
 /// rejected fail-closed by the translator and reported via the `Invalid`
-/// status arm. `corsPolicy` is the only remaining parsed-but-dropped field.
+/// status arm. `corsPolicy` is now translated to a `cors` plugin when its
+/// origins are representable; it is deferred only when they are not.
 fn virtual_service_deferred_fields(spec: &Value) -> Vec<&'static str> {
     let mut deferred: Vec<&'static str> = Vec::new();
     // `spec.tcp[]` / `spec.tls[]` are NOT listed as deferred: the translator
     // rejects them fail-closed with a `K8sTranslateError`, so they surface
     // through the `Invalid` arm of `virtual_service_status`. `mirror` /
-    // `mirrorPercentage` / `redirect` / `rewrite` are now translated
-    // (request_mirror plugin + dispatch-rule rewrite/redirect), leaving
-    // `corsPolicy` as the only parsed-but-unprojected HTTP-route field.
+    // `mirrorPercentage` / `redirect` / `rewrite` are translated, and
+    // `corsPolicy` is translated to a proxy-scoped `cors` plugin when its
+    // origins are representable (allowOrigins[].exact / legacy allowOrigin and
+    // a parseable maxAge). It remains a deferred field only when it uses an
+    // origin matcher Ferrum cannot map (prefix/regex) or an unparseable maxAge,
+    // in which case the translator leaves it unprojected. The shared
+    // `cors_policy_translatable` predicate keeps the translator and this report
+    // in lockstep.
     let http_routes = spec.get("http").and_then(Value::as_array);
-    if http_routes
-        .is_some_and(|routes| routes.iter().any(|route| route.get("corsPolicy").is_some()))
-    {
-        deferred.push("http[].corsPolicy (parsed but not projected)");
+    if http_routes.is_some_and(|routes| {
+        routes.iter().any(|route| {
+            route
+                .get("corsPolicy")
+                .is_some_and(|cors| !crate::config_sources::k8s::cors_policy_translatable(cors))
+        })
+    }) {
+        deferred.push(
+            "http[].corsPolicy with prefix/regex origins (not projected; use the cors plugin)",
+        );
     }
     deferred
 }
@@ -1997,9 +2009,9 @@ mod tests {
     }
 
     #[test]
-    fn virtual_service_cors_policy_deferred_but_mirror_is_not() {
-        // `mirror` is now translated (request_mirror plugin), so it must NOT
-        // be reported as deferred. `corsPolicy` is still parsed-but-dropped.
+    fn virtual_service_cors_policy_exact_origin_not_deferred() {
+        // `mirror` and an exact-origin `corsPolicy` are both translated now, so
+        // neither is reported as deferred.
         let obj = object(
             "networking.istio.io/v1",
             "VirtualService",
@@ -2029,12 +2041,50 @@ mod tests {
             .filter_map(Value::as_str)
             .collect();
         assert!(
-            deferred.iter().any(|f| f.contains("corsPolicy")),
-            "http[].corsPolicy should be flagged as deferred, got {deferred:?}"
+            !deferred.iter().any(|f| f.contains("corsPolicy")),
+            "exact-origin http[].corsPolicy is translated and must not be deferred, got {deferred:?}"
         );
         assert!(
             !deferred.iter().any(|f| f.contains("mirror")),
             "http[].mirror is translated and must not be deferred, got {deferred:?}"
+        );
+    }
+
+    #[test]
+    fn virtual_service_cors_policy_regex_origin_deferred() {
+        // A `regex`/`prefix` origin matcher has no `cors` plugin equivalent, so
+        // the translator leaves the policy unprojected and the status writer
+        // reports it as a deferred field (routing still applies, FerrumAccepted=True).
+        let obj = object(
+            "networking.istio.io/v1",
+            "VirtualService",
+            "cors-vs-regex",
+            json!({
+                "hosts": ["reviews.default.svc.cluster.local"],
+                "http": [
+                    {
+                        "route": [ { "destination": { "host": "reviews.default.svc.cluster.local" } } ],
+                        "corsPolicy": { "allowOrigins": [ { "regex": "https://.*\\.example\\.com" } ] }
+                    }
+                ]
+            }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options());
+        let c = find_condition(
+            updates[0].status["conditions"].as_array().unwrap(),
+            "FerrumAccepted",
+        );
+        assert_eq!(c["status"].as_str(), Some("True"));
+        let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        let deferred: Vec<&str> = detail["translation"]["deferred_fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            deferred.iter().any(|f| f.contains("corsPolicy")),
+            "regex-origin http[].corsPolicy should be flagged as deferred, got {deferred:?}"
         );
     }
 
