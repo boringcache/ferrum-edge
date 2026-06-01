@@ -1043,6 +1043,19 @@ impl Plugin for Waf {
             && !self.exemptions.request_short_circuits(ctx)
     }
 
+    fn should_buffer_response_body_for_content_type(
+        &self,
+        ctx: &RequestContext,
+        content_type: Option<&str>,
+    ) -> bool {
+        // Narrow the pre-flight buffering decision once the response
+        // content-type is known: a body whose content-type is not eligible for
+        // scanning (non-allowlisted / binary with `inspect_binary_body=false`)
+        // would be buffered and then skipped by `on_final_response_body`, so let
+        // the proxy stream it instead of collecting bytes nothing will inspect.
+        self.should_buffer_response_body(ctx) && self.response_body_eligible_for_scan(content_type)
+    }
+
     async fn on_final_response_body(
         &self,
         ctx: &mut RequestContext,
