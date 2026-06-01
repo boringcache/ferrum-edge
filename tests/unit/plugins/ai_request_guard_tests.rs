@@ -406,6 +406,33 @@ async fn test_multimodal_content_character_counting() {
     assert_reject(result, Some(400));
 }
 
+#[tokio::test]
+async fn test_max_prompt_characters_counts_unicode_scalars_not_bytes() {
+    // Regression for #41: the limit must count Unicode scalar values, not
+    // UTF-8 bytes. Each CJK char is 3 bytes, so this 5-character prompt is
+    // 15 bytes. Under a 10-character budget it must PASS (5 <= 10); a
+    // byte-based count (15 > 10) would wrongly reject it.
+    let plugin = AiRequestGuard::new(&json!({"max_prompt_characters": 10})).unwrap();
+    let mut ctx = make_post_ctx(&json!({
+        "model": "gpt-4",
+        "messages": [{"role": "user", "content": "你好世界!"}]
+    }));
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+
+    // And the same prompt exceeding the character budget is still rejected,
+    // confirming the cap is enforced on character count (6 chars > 5).
+    let plugin = AiRequestGuard::new(&json!({"max_prompt_characters": 5})).unwrap();
+    let mut ctx = make_post_ctx(&json!({
+        "model": "gpt-4",
+        "messages": [{"role": "user", "content": "你好世界!!"}]
+    }));
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(400));
+}
+
 // ─── Temperature range ──────────────────────────────────────────────────
 
 #[tokio::test]
@@ -435,6 +462,37 @@ fn test_temperature_range_rejects_inverted_bounds() {
         .err()
         .unwrap();
     assert!(err.contains("min must be <= max"), "got: {err}");
+}
+
+#[test]
+fn test_default_max_tokens_exceeding_limit_rejected() {
+    // Regression for #42: a default_max_tokens above max_tokens_limit is a
+    // contradictory cost-control config — the gateway would inject a value
+    // that violates its own cap. Reject at construction time.
+    let err = AiRequestGuard::new(&json!({
+        "max_tokens_limit": 1000,
+        "default_max_tokens": 4000
+    }))
+    .err()
+    .unwrap();
+    assert!(
+        err.contains("'default_max_tokens'") && err.contains("max_tokens_limit"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn test_default_max_tokens_within_limit_accepted() {
+    // A default at or below the limit is a valid config and must construct.
+    assert!(
+        AiRequestGuard::new(&json!({
+            "max_tokens_limit": 1000,
+            "default_max_tokens": 1000
+        }))
+        .is_ok()
+    );
+    // default with no limit is also fine (nothing to contradict).
+    assert!(AiRequestGuard::new(&json!({"default_max_tokens": 4000})).is_ok());
 }
 
 #[test]

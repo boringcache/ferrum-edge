@@ -2,10 +2,10 @@
 //!
 //! The body regex set runs over raw bytes, so a payload hidden behind an
 //! encoding the rules never see slips through: JSON `<script>`,
-//! HTML `&lt;script&gt;`, or form `%3Cscript%3E`. `decoded_variants` returns
-//! up to [`MAX_VARIANTS`] normalized forms of a value (deduped, and excluding
-//! the raw input which the caller scans separately) so the same rule set
-//! matches the decoded payload without per-rule changes.
+//! HTML `&lt;script&gt;`, or form `%3Cscript%3E`. `decoded_variants_with_residual`
+//! returns up to [`MAX_VARIANTS`] normalized forms of a value (deduped, and
+//! excluding the raw input which the caller scans separately) so the same rule
+//! set matches the decoded payload without per-rule changes.
 //!
 //! Decoders are deliberately content-type-agnostic: an attacker controls the
 //! declared `Content-Type`, so we apply every transformation regardless. Each
@@ -22,21 +22,42 @@ use percent_encoding::percent_decode_str;
 const MAX_VARIANTS: usize = 4;
 const MAX_NUMERIC_ENTITY_DIGITS: usize = 16;
 
-/// Produce normalized decodings of `text` distinct from the raw input.
+/// Maximum decode rounds in [`layered_decode_inner`]. Each round peels at most one
+/// percent layer plus one unicode/HTML layer, so a token stacked deeper than
+/// this many percent layers is not fully reduced. The cap is a deliberate cost
+/// guard against decompression-style blowups; deeper stacks are flagged as an
+/// encoding-evasion residual rather than decoded indefinitely (see the residual
+/// flag returned by [`decoded_variants_with_residual`]).
+const MAX_DECODE_ROUNDS: usize = 3;
+
+/// Produce normalized decodings of `text` distinct from the raw input, and
+/// report whether the layered decode left an actively-decoding residual.
 ///
 /// The caller already scans the raw bytes; these variants surface payloads
 /// hidden behind percent-, HTML-entity-, and JSON/JS-unicode encoding,
 /// including stacked combinations via the fully layered decode.
-pub(super) fn decoded_variants(text: &str) -> Vec<String> {
+///
+/// The second return value is the residual flag: a payload deliberately stacked
+/// deeper than [`MAX_DECODE_ROUNDS`] (e.g. quad-or-deeper percent-encoding) is
+/// not reduced to its literal injection token within the cap, so the body regex
+/// set never sees the decoded payload. Callers surface this as an
+/// encoding-evasion signal so deeply-stacked body encodings are flagged the
+/// same way URL double-encoding is, instead of being silently forwarded. It is
+/// precise: true only when decoding genuinely did not converge within the cap,
+/// not merely because a literal `%`/`&` survived in an already-decoded body
+/// (which would false-positive on benign text). The variant set and the
+/// residual flag share a single layered decode pass rather than running it
+/// twice.
+pub(super) fn decoded_variants_with_residual(text: &str) -> (Vec<String>, bool) {
     if !has_decodable_marker(text) {
-        return Vec::new();
+        return (Vec::new(), false);
     }
 
     // Layered decode catches stacked encodings (e.g. percent-encoded HTML
     // entities). The single-layer decodes are kept as well because a layered
     // percent-decode can mangle a body that merely contains a literal `%`,
     // and we still want the JSON/HTML-only decode to fire in that case.
-    let layered = layered_decode(text);
+    let (layered, converged) = layered_decode_inner(text);
     let candidates = [
         Cow::Owned(layered),
         unicode_unescape(text),
@@ -54,7 +75,7 @@ pub(super) fn decoded_variants(text: &str) -> Vec<String> {
             out.push(candidate.into_owned());
         }
     }
-    out
+    (out, !converged)
 }
 
 fn has_decodable_marker(text: &str) -> bool {
@@ -63,18 +84,39 @@ fn has_decodable_marker(text: &str) -> bool {
         .any(|byte| matches!(byte, b'%' | b'+' | b'\\' | b'&'))
 }
 
-fn layered_decode(text: &str) -> String {
+/// One round of the layered decode: percent, then unicode, then HTML entity.
+fn decode_round(text: &str) -> String {
+    let percent = percent_decode_plus(text).into_owned();
+    let unicode = unicode_unescape(&percent).into_owned();
+    html_entity_decode(&unicode).into_owned()
+}
+
+/// Run the layered decode and report whether it reached a fixed point within
+/// [`MAX_DECODE_ROUNDS`]. Returns `(decoded, converged)`; `converged == false`
+/// means the value was still actively decoding when the round cap was reached,
+/// i.e. it carries an encoding stacked deeper than the cap can peel.
+///
+/// Convergence is judged by whether the *last* round made progress, not merely
+/// by exhausting the iteration count: a payload that finishes decoding on the
+/// final allowed round (e.g. triple percent-encoding with a 3-round cap) has
+/// converged and must not be reported as a residual.
+fn layered_decode_inner(text: &str) -> (String, bool) {
     let mut current = text.to_string();
-    for _ in 0..3 {
-        let percent = percent_decode_plus(&current).into_owned();
-        let unicode = unicode_unescape(&percent).into_owned();
-        let html = html_entity_decode(&unicode).into_owned();
-        if html == current {
+    let mut converged = true;
+    for round in 0..MAX_DECODE_ROUNDS {
+        let next = decode_round(&current);
+        if next == current {
+            // Reached a fixed point before the cap — fully reduced.
             break;
         }
-        current = html;
+        current = next;
+        // The last permitted round still changed the value; if a further round
+        // would change it again the payload is stacked deeper than the cap.
+        if round + 1 == MAX_DECODE_ROUNDS {
+            converged = decode_round(&current) == current;
+        }
     }
-    current
+    (current, converged)
 }
 
 /// Percent-decode (`%XX`) and translate `+` to space (form-encoding). Lossy on
@@ -380,11 +422,11 @@ mod tests {
     #[test]
     fn decoded_variants_skips_raw_and_dedups() {
         // Plain text yields no variants (raw is scanned by the caller).
-        assert!(decoded_variants("nothing to decode").is_empty());
+        assert!(variants("nothing to decode").is_empty());
         // A stacked encoding is recovered by the layered decode.
-        let variants = decoded_variants("%26lt%3Bscript%26gt%3B");
-        assert!(variants.iter().any(|v| v == "<script>"));
-        assert!(variants.len() <= MAX_VARIANTS);
+        let decoded = variants("%26lt%3Bscript%26gt%3B");
+        assert!(decoded.iter().any(|v| v == "<script>"));
+        assert!(decoded.len() <= MAX_VARIANTS);
     }
 
     #[test]
@@ -396,16 +438,54 @@ mod tests {
         assert!(has_decodable_marker("a+b"));
     }
 
+    fn residual(text: &str) -> bool {
+        decoded_variants_with_residual(text).1
+    }
+
+    fn variants(text: &str) -> Vec<String> {
+        decoded_variants_with_residual(text).0
+    }
+
+    #[test]
+    fn residual_encoding_only_fires_beyond_the_round_cap() {
+        // No markers / plain text: never a residual.
+        assert!(!residual("nothing to decode"));
+        // A literal `%`/`&` that does not actually decode further must NOT be
+        // reported (precision: avoid false positives on benign text).
+        assert!(!residual("100% sure & done"));
+
+        // Single / double / triple percent-encoding all fully reduce within the
+        // 3-round cap, so none is a residual. In particular the triple case
+        // finishes on the *last* allowed round and must not be misreported.
+        assert!(!residual("%3Cscript%3E"));
+        assert!(!residual("%253Cscript%253E"));
+        assert!(!residual("%25253Cscript%25253E"));
+
+        // Quad-or-deeper percent-encoding is still encoded after the cap, so it
+        // is flagged as an encoding-evasion residual.
+        assert!(residual("%2525253Cscript"));
+        assert!(residual("%252525253Cscript"));
+    }
+
+    #[test]
+    fn layered_decode_reduces_within_cap_and_caps_deep_stacks() {
+        // The decoded value a caller scans: a within-cap stack reduces fully,
+        // and a beyond-cap stack reduces by exactly MAX_DECODE_ROUNDS layers
+        // (leaving residual encoding the caller flags as evasion).
+        assert_eq!(layered_decode_inner("%25253Cx").0, "<x");
+        assert_eq!(layered_decode_inner("%2525253Cx").0, "%3Cx");
+    }
+
     #[test]
     fn decoded_variants_recovers_escaped_script() {
         // `\x`-escaped `<script>` — the raw byte scan never sees the tag.
-        let variants = decoded_variants(r"{q:\x3cscript\x3ealert(1)}");
-        assert!(variants.iter().any(|v| v.contains("<script>")));
+        let decoded = variants(r"{q:\x3cscript\x3ealert(1)}");
+        assert!(decoded.iter().any(|v| v.contains("<script>")));
     }
 
     #[test]
     fn decoded_variants_redecodes_unicode_escaped_html_entities() {
-        let variants = decoded_variants(r#"\u0026lt;script\u0026gt;"#);
-        assert!(variants.iter().any(|v| v.contains("<script>")));
+        let decoded = variants(r#"\u0026lt;script\u0026gt;"#);
+        assert!(decoded.iter().any(|v| v.contains("<script>")));
     }
 }

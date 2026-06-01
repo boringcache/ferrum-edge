@@ -42,7 +42,8 @@ impl HttpLogging {
             return Err("http_logging: config must be an object".to_string());
         }
 
-        let (endpoint_url, endpoint_hostname) = parse_http_endpoint(config, "http_logging")?;
+        let (endpoint_url, endpoint_hostname) =
+            parse_http_endpoint(config, "http_logging", http_client.backend_allow_ips())?;
 
         let custom_headers = parse_custom_headers(config, "http_logging")?;
 

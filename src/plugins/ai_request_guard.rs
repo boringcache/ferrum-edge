@@ -62,6 +62,20 @@ impl AiRequestGuard {
         };
         let default_max_tokens = optional_u64(config, "default_max_tokens")?;
 
+        // Reject a contradictory cost-control config: the injected default must
+        // not exceed the configured cap. `default_max_tokens` is injected when a
+        // request omits all token fields and is never clamped, so a default
+        // above `max_tokens_limit` would make the gateway itself emit a
+        // `max_tokens` value that violates the operator's own limit. Fail fast
+        // at construction, consistent with the temperature_range validation.
+        if let (Some(default), Some(limit)) = (default_max_tokens, max_tokens_limit)
+            && default > limit
+        {
+            return Err(format!(
+                "ai_request_guard: 'default_max_tokens' ({default}) must be <= 'max_tokens_limit' ({limit})"
+            ));
+        }
+
         let allowed_models = optional_lowercase_set(config, "allowed_models")?.unwrap_or_default();
         let blocked_models = optional_lowercase_set(config, "blocked_models")?.unwrap_or_default();
 
@@ -290,9 +304,15 @@ impl AiRequestGuard {
 
 /// Count total characters in a message's content field.
 /// Handles both string content and multimodal array content.
+///
+/// Counts Unicode scalar values (via `chars().count()`), not UTF-8 byte
+/// length, so the value matches the `max_prompt_characters` field name and the
+/// "...characters" rejection message. Using `len()` would over-count multibyte
+/// input (CJK, emoji, accented Latin) by 2-4x and wrongly reject prompts that
+/// are under the operator's character budget.
 fn count_message_characters(msg: &Value) -> u64 {
     match msg.get("content") {
-        Some(Value::String(s)) => s.len() as u64,
+        Some(Value::String(s)) => s.chars().count() as u64,
         Some(Value::Array(parts)) => parts
             .iter()
             .filter_map(|part| {
@@ -300,7 +320,7 @@ fn count_message_characters(msg: &Value) -> u64 {
                 if part.get("type").and_then(|t| t.as_str()) == Some("text") {
                     part.get("text")
                         .and_then(|t| t.as_str())
-                        .map(|s| s.len() as u64)
+                        .map(|s| s.chars().count() as u64)
                 } else {
                     None
                 }

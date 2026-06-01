@@ -240,6 +240,58 @@ async fn token_with_wrong_audience_rejects_with_401() {
     assert_reject(result, Some(401));
 }
 
+// Regression for finding #27: when an operator configures an expected issuer,
+// a validly-signed token that simply OMITS the `iss` claim must be rejected
+// (not accepted), because `set_issuer` alone only rejects a *mismatching* iss.
+#[tokio::test]
+async fn token_missing_issuer_rejects_when_issuer_configured() {
+    let plugin = JwtAuth::new(&json!({"expected_issuer": "https://issuer"})).unwrap();
+    let consumer_index = ConsumerIndex::new(&[create_test_consumer()]);
+    // No `iss` claim at all.
+    let token = create_jwt_token(&json!({"sub": "testuser"}), "test-jwt-secret");
+
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("authorization".to_string(), format!("Bearer {}", token));
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_reject(result, Some(401));
+}
+
+// Regression for finding #27: when an operator configures expected audiences,
+// a validly-signed token that OMITS the `aud` claim must be rejected.
+#[tokio::test]
+async fn token_missing_audience_rejects_when_audience_configured() {
+    let plugin = JwtAuth::new(&json!({"audiences": ["my-api"]})).unwrap();
+    let consumer_index = ConsumerIndex::new(&[create_test_consumer()]);
+    // No `aud` claim at all.
+    let token = create_jwt_token(&json!({"sub": "testuser"}), "test-jwt-secret");
+
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("authorization".to_string(), format!("Bearer {}", token));
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_reject(result, Some(401));
+}
+
+// No-regression guard for finding #27: when neither issuer nor audience is
+// configured, a token lacking `iss`/`aud` must still be accepted (the fix must
+// only require the claims that the operator explicitly opted into).
+#[tokio::test]
+async fn token_missing_issuer_and_audience_succeeds_when_not_configured() {
+    let plugin = JwtAuth::new(&json!({})).unwrap();
+    let consumer_index = ConsumerIndex::new(&[create_test_consumer()]);
+    let token = create_jwt_token(&json!({"sub": "testuser"}), "test-jwt-secret");
+
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("authorization".to_string(), format!("Bearer {}", token));
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_continue(result);
+}
+
 #[tokio::test]
 async fn leeway_allows_token_within_skew_window() {
     let plugin = JwtAuth::new(&json!({"leeway_secs": 60})).unwrap();

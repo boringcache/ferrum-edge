@@ -80,27 +80,52 @@ fn make_ctx(method: &str, path: &str) -> RequestContext {
     ctx
 }
 
+/// Like `make_ctx` but also sets the raw query string (as the proxy would on
+/// request init), so the query string is bound into the HMAC signing string.
+fn make_ctx_with_query(method: &str, path: &str, query: &str) -> RequestContext {
+    let mut ctx = make_ctx(method, path);
+    ctx.set_raw_query_string(query.to_string());
+    ctx
+}
+
 /// Generate a current RFC 2822 date string.
 fn current_date() -> String {
     Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string()
 }
 
-/// Compute an HMAC-SHA256 signature over an empty-body request and return base64.
+/// The signing string binds the query string between PATH and DATE:
+/// `METHOD\nPATH\nQUERY\nDATE\nDIGEST`. `make_ctx` produces requests with no
+/// query, so the helpers below sign an empty query by default; tests that set
+/// a query string use `sign_sha256_with_query`.
+fn build_signing_string(
+    method: &str,
+    path: &str,
+    query: &str,
+    date: &str,
+    digest_header: &str,
+) -> String {
+    format!(
+        "{}\n{}\n{}\n{}\n{}",
+        method, path, query, date, digest_header
+    )
+}
+
+/// Compute an HMAC-SHA256 signature over an empty-body, no-query request.
 fn sign_sha256(secret: &str, method: &str, path: &str, date: &str) -> String {
     sign_sha256_with_digest(secret, method, path, date, &sha256_digest_header(&[]))
 }
 
-/// Compute an HMAC-SHA512 signature over an empty-body request and return base64.
+/// Compute an HMAC-SHA512 signature over an empty-body, no-query request.
 fn sign_sha512(secret: &str, method: &str, path: &str, date: &str) -> String {
     let digest_header = sha256_digest_header(&[]);
-    let signing_string = format!("{}\n{}\n{}\n{}", method, path, date, digest_header);
+    let signing_string = build_signing_string(method, path, "", date, &digest_header);
     let mut mac = HmacSha512::new_from_slice(secret.as_bytes()).unwrap();
     mac.update(signing_string.as_bytes());
     base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
 }
 
-/// Compute an HMAC-SHA256 signature over the new 4-field signing string
-/// (`METHOD\nPATH\nDATE\nDIGEST`).
+/// Compute an HMAC-SHA256 signature over the 5-field signing string with an
+/// empty query (`METHOD\nPATH\n\nDATE\nDIGEST`).
 fn sign_sha256_with_digest(
     secret: &str,
     method: &str,
@@ -108,7 +133,22 @@ fn sign_sha256_with_digest(
     date: &str,
     digest_header: &str,
 ) -> String {
-    let signing_string = format!("{}\n{}\n{}\n{}", method, path, date, digest_header);
+    let signing_string = build_signing_string(method, path, "", date, digest_header);
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
+    mac.update(signing_string.as_bytes());
+    base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
+}
+
+/// Compute an HMAC-SHA256 signature binding a specific raw query string.
+fn sign_sha256_with_query(
+    secret: &str,
+    method: &str,
+    path: &str,
+    query: &str,
+    date: &str,
+) -> String {
+    let digest_header = sha256_digest_header(&[]);
+    let signing_string = build_signing_string(method, path, query, date, &digest_header);
     let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
     mac.update(signing_string.as_bytes());
     base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
@@ -617,6 +657,90 @@ async fn test_signature_wrong_path() {
     let signature = sign_sha256(TEST_SECRET, method, "/other", &date);
 
     let mut ctx = make_ctx(method, path);
+    ctx.headers.insert(
+        "authorization".to_string(),
+        hmac_auth_header("hmacuser", Some("hmac-sha256"), &signature),
+    );
+    ctx.headers.insert("date".to_string(), date);
+    ctx.identified_consumer = None;
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_reject(result, Some(401));
+}
+
+// ── Query-string binding (#30) ───────────────────────────────────────
+
+#[tokio::test]
+async fn test_valid_signature_with_query_string() {
+    // A signature that binds the request's query string verifies when the
+    // request carries exactly that query.
+    let plugin = HmacAuth::new(&default_config()).unwrap();
+    let consumer = create_hmac_consumer();
+    let consumer_index = ConsumerIndex::new(&[consumer]);
+
+    let method = "GET";
+    let path = "/transfer";
+    let query = "account=alice&amount=100";
+    let date = current_date();
+    let signature = sign_sha256_with_query(TEST_SECRET, method, path, query, &date);
+
+    let mut ctx = make_ctx_with_query(method, path, query);
+    ctx.headers.insert(
+        "authorization".to_string(),
+        hmac_auth_header("hmacuser", Some("hmac-sha256"), &signature),
+    );
+    ctx.headers.insert("date".to_string(), date);
+    ctx.identified_consumer = None;
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_continue(result);
+    assert!(ctx.identified_consumer.is_some());
+}
+
+#[tokio::test]
+async fn test_signature_query_param_tampering_rejected() {
+    // #30: the signing string binds the query string, so replaying a captured
+    // signature against the same path with an altered query parameter
+    // (account=alice -> account=victim) must fail verification.
+    let plugin = HmacAuth::new(&default_config()).unwrap();
+    let consumer = create_hmac_consumer();
+    let consumer_index = ConsumerIndex::new(&[consumer]);
+
+    let method = "GET";
+    let path = "/transfer";
+    let date = current_date();
+    // Client legitimately signed `account=alice`...
+    let signature = sign_sha256_with_query(TEST_SECRET, method, path, "account=alice", &date);
+
+    // ...but the request arrives with the query tampered to `account=victim`.
+    let mut ctx = make_ctx_with_query(method, path, "account=victim");
+    ctx.headers.insert(
+        "authorization".to_string(),
+        hmac_auth_header("hmacuser", Some("hmac-sha256"), &signature),
+    );
+    ctx.headers.insert("date".to_string(), date);
+    ctx.identified_consumer = None;
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_reject(result, Some(401));
+}
+
+#[tokio::test]
+async fn test_signature_added_query_param_rejected() {
+    // #30: a signature computed over a request with no query must not verify
+    // when an attacker adds query parameters to the replayed request.
+    let plugin = HmacAuth::new(&default_config()).unwrap();
+    let consumer = create_hmac_consumer();
+    let consumer_index = ConsumerIndex::new(&[consumer]);
+
+    let method = "GET";
+    let path = "/transfer";
+    let date = current_date();
+    // Signed with no query string.
+    let signature = sign_sha256(TEST_SECRET, method, path, &date);
+
+    // Replayed with an added query parameter.
+    let mut ctx = make_ctx_with_query(method, path, "admin=true");
     ctx.headers.insert(
         "authorization".to_string(),
         hmac_auth_header("hmacuser", Some("hmac-sha256"), &signature),

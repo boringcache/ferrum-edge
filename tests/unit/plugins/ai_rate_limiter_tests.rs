@@ -901,3 +901,132 @@ async fn test_tracked_keys_count_grows_with_distinct_keys() {
         .await;
     assert_eq!(plugin.tracked_keys_count(), Some(2));
 }
+
+// ─── SSE token accounting: absent vs zero (#53, #54) ───────────────────
+
+fn sse_headers() -> HashMap<String, String> {
+    let mut h = HashMap::new();
+    h.insert("content-type".to_string(), "text/event-stream".to_string());
+    h
+}
+
+/// Read the current-window usage the limiter would charge, by issuing a
+/// follow-up `before_proxy` and reading the exposed `ai_ratelimit_usage`.
+async fn observed_usage(plugin: &AiRateLimiter) -> u64 {
+    let mut ctx = create_test_context();
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    ctx.metadata
+        .get("ai_ratelimit_usage")
+        .map(|v| v.parse::<u64>().unwrap_or(0))
+        .unwrap_or(0)
+}
+
+#[tokio::test]
+async fn test_sse_with_usage_block_still_recorded() {
+    // Non-regression for #54: the saw_usage gating must NOT break extraction
+    // when a usage block IS present. A streamed OpenAI-style response that
+    // reports prompt_tokens must still be charged in prompt_tokens mode.
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 1000,
+            "window_seconds": 60,
+            "count_mode": "prompt_tokens",
+            "limit_by": "ip",
+            "expose_headers": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = create_test_context();
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
+               data: {\"usage\":{\"prompt_tokens\":42,\"completion_tokens\":8,\"total_tokens\":50}}\n\n\
+               data: [DONE]\n\n";
+    plugin
+        .on_response_body(&mut ctx, 200, &sse_headers(), sse.as_bytes())
+        .await;
+
+    assert_eq!(
+        observed_usage(&plugin).await,
+        42,
+        "prompt_tokens from the SSE usage block should be charged"
+    );
+}
+
+#[tokio::test]
+async fn test_sse_without_usage_block_not_charged() {
+    // #54: when an SSE stream is walked but carries no recognizable usage
+    // block, prompt_tokens/completion_tokens modes must NOT charge a count
+    // (previously they substituted Some(0) and recorded 0 without any
+    // operator signal; now they return None so the caller's warn fires).
+    // Either way the window must be unaffected — assert no usage is charged
+    // and the request is allowed through.
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 1000,
+            "window_seconds": 60,
+            "count_mode": "prompt_tokens",
+            "limit_by": "ip",
+            "expose_headers": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = create_test_context();
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    // Content-only deltas, no usage block anywhere.
+    let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"he\"}}]}\n\n\
+               data: {\"choices\":[{\"delta\":{\"content\":\"llo\"}}]}\n\n\
+               data: [DONE]\n\n";
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &sse_headers(), sse.as_bytes())
+        .await;
+    assert_continue(result);
+
+    assert_eq!(
+        observed_usage(&plugin).await,
+        0,
+        "no usage block means nothing is charged to the window"
+    );
+}
+
+#[tokio::test]
+async fn test_unparseable_2xx_json_not_charged() {
+    // #53: a 2xx whose token count cannot be resolved (unrecognized response
+    // shape) must not panic and must not be charged; the request continues.
+    // The fail-open is now surfaced at warn-level for operators.
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 1000,
+            "window_seconds": 60,
+            "limit_by": "ip",
+            "expose_headers": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = create_test_context();
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    // Valid JSON, but no usage block the extractor understands.
+    let body = serde_json::to_vec(&json!({"id": "x", "object": "thing"})).unwrap();
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &json_headers(), &body)
+        .await;
+    assert_continue(result);
+
+    assert_eq!(
+        observed_usage(&plugin).await,
+        0,
+        "an unparseable 2xx must not advance the rate-limit window"
+    );
+}

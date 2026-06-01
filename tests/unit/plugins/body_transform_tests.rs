@@ -1,6 +1,6 @@
 use ferrum_edge::plugins::utils::body_transform::{
-    get_nested_value, is_json_content_type, parse_body_rules, remove_nested_value,
-    rename_nested_field, set_nested_value,
+    get_nested_value, is_event_stream_content_type, is_json_content_type, parse_body_rules,
+    remove_nested_value, rename_nested_field, set_nested_value,
 };
 use serde_json::json;
 
@@ -118,6 +118,27 @@ fn test_is_json_content_type() {
     assert!(!is_json_content_type("application/notjson"));
     assert!(!is_json_content_type("text/application/json"));
     assert!(!is_json_content_type("application/json-seq"));
+}
+
+/// Finding #91: simplifying the SSE check to a single `event-stream` substring
+/// match must not change behavior — `text/event-stream` (and its parameterized
+/// / case-variant forms) still match, and the intentionally-conservative
+/// substring match still treats vendor-prefixed SSE types as SSE.
+#[test]
+fn test_is_event_stream_content_type() {
+    assert!(is_event_stream_content_type("text/event-stream"));
+    assert!(is_event_stream_content_type(
+        "text/event-stream; charset=utf-8"
+    ));
+    assert!(is_event_stream_content_type("TEXT/EVENT-STREAM"));
+    // Substring match is intentional: vendor-prefixed SSE types count too.
+    assert!(is_event_stream_content_type(
+        "application/vnd.my-event-stream"
+    ));
+    // Non-SSE types do not match.
+    assert!(!is_event_stream_content_type("application/json"));
+    assert!(!is_event_stream_content_type("text/plain"));
+    assert!(!is_event_stream_content_type(""));
 }
 
 #[test]

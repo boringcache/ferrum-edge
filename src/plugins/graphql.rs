@@ -2,15 +2,26 @@
 //!
 //! Adds GraphQL-aware proxying capabilities:
 //! - Query parsing and operation extraction
-//! - Query depth limiting (prevents deeply nested queries)
-//! - Query complexity limiting (caps total field count)
-//! - Alias count limiting (prevents alias-based DoS)
+//! - Query depth limiting (bounds selection-set nesting)
+//! - Query complexity limiting (bounds approximate field count)
+//! - Alias count limiting (mitigates alias-based DoS)
 //! - Per-operation-type rate limiting (query vs mutation vs subscription)
 //! - Per-named-operation rate limiting (e.g., "getUser" vs "createOrder")
 //! - Introspection control (allow/deny __schema/__type queries)
 //!
 //! GraphQL requests are expected as POST with `application/json` body
 //! containing `{"query": "...", "operationName": "..."}`.
+//!
+//! The analyzer is a lightweight, allocation-light parser rather than a full
+//! GraphQL AST. It selects the operation to analyze using `operationName` (per
+//! the GraphQL spec, `operationName` is required for multi-operation documents)
+//! so per-type rate limits and depth/complexity caps apply to the operation the
+//! backend will actually execute. Fragment spreads (`...Frag`) are expanded at
+//! their use sites when computing depth/complexity — with cycle detection and a
+//! byte budget so expansion cannot itself become a DoS — so those limits cannot
+//! be bypassed by hiding nesting or fields behind fragments. It is still a
+//! heuristic (e.g. it does not type-check or validate against a schema) and is
+//! intended as an edge filter layered in front of the backend GraphQL server.
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -277,43 +288,656 @@ fn required_positive_u64(
     Ok(value)
 }
 
-/// Parse a GraphQL query string to extract operation info.
+/// Bound on the total bytes scanned while expanding fragment spreads for a
+/// single request. Fragment expansion can multiply work (a wide fragment
+/// spread at many sites, or chained fragments), so the resolver itself must be
+/// bounded or it becomes a DoS vector. The request body is already size-limited
+/// upstream (buffering + size_limiting), so this budget only ever trips for
+/// pathological documents; exceeding it is treated as a depth/complexity
+/// violation (400) rather than analyzed further.
+const MAX_FRAGMENT_EXPANSION_BYTES: usize = 4 * 1024 * 1024;
+
+/// Bound on the analyzer's recursion depth. Each nested selection set, fragment
+/// spread, and inline fragment recurses one frame; without a cap a pathological
+/// document (e.g. a long non-cyclic chain of single-spread fragments) could
+/// recurse deeply enough to overflow the stack — turning the limiter into its
+/// own DoS. This bound is far above any legitimate query's resolved nesting and
+/// comfortably below stack-exhaustion territory on a default worker stack.
+/// Exceeding it yields a 400.
+const MAX_ANALYSIS_RECURSION: u32 = 512;
+
+/// Outcome of parsing a GraphQL document into the operation to analyze.
+enum ParsedQuery {
+    /// The selected operation, ready for limit checks.
+    Operation(GraphqlOperation),
+    /// The document is invalid per the GraphQL spec or exceeds the expansion
+    /// budget and must be rejected before reaching the backend.
+    Reject { status_code: u16, message: String },
+}
+
+/// A top-level operation definition located in the document.
+struct OperationDef<'a> {
+    op_type: &'static str,
+    /// Operation name as written in the document, if any.
+    name: Option<&'a str>,
+    /// The operation's top-level selection set body (the bytes between the
+    /// outermost `{` and its matching `}`), borrowed from the document.
+    selection_set: &'a str,
+}
+
+/// Parse a GraphQL query string and select the operation to analyze.
 ///
 /// This is a lightweight parser that handles the subset of GraphQL syntax
-/// needed for depth/complexity/alias analysis without a full AST.
-fn parse_graphql_query(query: &str, operation_name: Option<&str>) -> GraphqlOperation {
-    let trimmed = trim_leading_ignored(query);
+/// needed for depth/complexity/alias analysis without a full AST. Unlike a raw
+/// text scan it (1) splits the document into individual operation and fragment
+/// definitions, (2) selects which operation is analyzed using `operation_name`
+/// (per the GraphQL spec: `operationName` is required when a document defines
+/// more than one operation), and (3) expands fragment spreads (`...Frag`) at
+/// their use sites when computing depth/complexity so those limits cannot be
+/// bypassed by hiding nesting/fields behind fragments. Fragment expansion is
+/// cycle-safe and byte-budgeted so the expansion itself cannot be turned into a
+/// DoS.
+fn parse_graphql_query(query: &str, operation_name: Option<&str>) -> ParsedQuery {
+    let operation_name = operation_name.filter(|n| !n.is_empty());
+    let (operations, fragments) = parse_document(query);
 
-    // Determine operation type from query text
-    let (op_type, rest) = if let Some(rest) = strip_operation_keyword(trimmed, "mutation") {
-        ("mutation", rest)
-    } else if let Some(rest) = strip_operation_keyword(trimmed, "subscription") {
-        ("subscription", rest)
-    } else if let Some(rest) = strip_operation_keyword(trimmed, "query") {
-        ("query", rest)
-    } else {
-        // Shorthand query: `{ ... }`
-        ("query", trimmed)
+    // Select the operation to analyze.
+    let selected: Option<&OperationDef> = match operation_name {
+        Some(name) => {
+            // Explicit operationName: it must match exactly one operation.
+            match operations.iter().find(|op| op.name == Some(name)) {
+                Some(op) => Some(op),
+                None if operations.is_empty() => None, // fall back to whole-document scan
+                None => {
+                    return ParsedQuery::Reject {
+                        status_code: 400,
+                        message: format!("Unknown operation named \"{name}\""),
+                    };
+                }
+            }
+        }
+        None => {
+            // No operationName: the GraphQL spec requires it for multi-operation
+            // documents. Reject those rather than silently analyzing the wrong
+            // operation (which would let per-type limits be bypassed).
+            if operations.len() > 1 {
+                return ParsedQuery::Reject {
+                    status_code: 400,
+                    message:
+                        "operationName is required when the document contains multiple operations"
+                            .to_string(),
+                };
+            }
+            operations.first()
+        }
     };
 
-    // Extract operation name from query if not provided
-    let parsed_name = extract_operation_name(rest);
-    let op_name = operation_name
-        .filter(|n| !n.is_empty())
-        .map(String::from)
-        .or(parsed_name);
+    match selected {
+        Some(op) => {
+            let op_name = operation_name
+                .map(String::from)
+                .or_else(|| op.name.map(String::from));
 
-    // Calculate depth and complexity by scanning braces and fields
-    let (depth, complexity, alias_count, is_introspection) = analyze_query(trimmed);
-
-    GraphqlOperation {
-        op_type,
-        op_name,
-        depth,
-        complexity,
-        alias_count,
-        is_introspection,
+            match analyze_operation(op.selection_set, &fragments) {
+                Some((depth, complexity, alias_count, is_introspection)) => {
+                    ParsedQuery::Operation(GraphqlOperation {
+                        op_type: op.op_type,
+                        op_name,
+                        depth,
+                        complexity,
+                        alias_count,
+                        is_introspection,
+                    })
+                }
+                None => ParsedQuery::Reject {
+                    status_code: 400,
+                    message: "Query is too large to analyze (fragment expansion budget exceeded)"
+                        .to_string(),
+                },
+            }
+        }
+        None => {
+            // The structured parser found no operation (e.g. a non-standard or
+            // unparseable body). Fall back to the legacy whole-document scan so
+            // we do not introduce false rejections; op_type comes from the
+            // leading keyword as before.
+            let trimmed = trim_leading_ignored(query);
+            let op_type = if strip_operation_keyword(trimmed, "mutation").is_some() {
+                "mutation"
+            } else if strip_operation_keyword(trimmed, "subscription").is_some() {
+                "subscription"
+            } else {
+                "query"
+            };
+            let op_name = operation_name.map(String::from);
+            let (depth, complexity, alias_count, is_introspection) = analyze_query(trimmed);
+            ParsedQuery::Operation(GraphqlOperation {
+                op_type,
+                op_name,
+                depth,
+                complexity,
+                alias_count,
+                is_introspection,
+            })
+        }
     }
+}
+
+/// Split a GraphQL document into its top-level operation definitions and a
+/// `name -> selection-set body` map of its fragment definitions.
+///
+/// String literals, block strings, comments, and argument lists are respected
+/// so keywords/braces inside them are never mistaken for structure.
+fn parse_document(query: &str) -> (Vec<OperationDef<'_>>, HashMap<&str, &str>) {
+    let bytes = query.as_bytes();
+    let len = bytes.len();
+    let mut operations: Vec<OperationDef<'_>> = Vec::new();
+    let mut fragments: HashMap<&str, &str> = HashMap::new();
+    let mut i = 0;
+
+    while i < len {
+        let c = bytes[i];
+
+        // Skip ignored tokens (whitespace, commas, comments).
+        if c.is_ascii_whitespace() || c == b',' {
+            i += 1;
+            continue;
+        }
+        if c == b'#' {
+            i = skip_line_comment(bytes, i);
+            continue;
+        }
+
+        // A bare selection set is an anonymous (shorthand) query operation.
+        if c == b'{' {
+            if let Some(end) = find_matching_brace(bytes, i) {
+                operations.push(OperationDef {
+                    op_type: "query",
+                    name: None,
+                    selection_set: &query[i + 1..end],
+                });
+                i = end + 1;
+            } else {
+                // Unbalanced braces: stop structured parsing.
+                break;
+            }
+            continue;
+        }
+
+        // Identifier at the top level: an operation or fragment keyword.
+        if is_graphql_name_start(c) {
+            let (ident, after_ident) = read_name(bytes, i);
+            let op_type = match ident {
+                "query" => Some("query"),
+                "mutation" => Some("mutation"),
+                "subscription" => Some("subscription"),
+                _ => None,
+            };
+
+            if let Some(op_type) = op_type {
+                // Optional name, optional variable defs `(...)` and directives,
+                // then the selection-set `{ ... }`.
+                let (name, after_name) = read_optional_name(bytes, after_ident, query);
+                match find_next_top_level_brace(bytes, after_name) {
+                    Some(brace) => match find_matching_brace(bytes, brace) {
+                        Some(end) => {
+                            operations.push(OperationDef {
+                                op_type,
+                                name,
+                                selection_set: &query[brace + 1..end],
+                            });
+                            i = end + 1;
+                        }
+                        None => break,
+                    },
+                    None => break,
+                }
+                continue;
+            }
+
+            if ident == "fragment" {
+                // `fragment Name on Type { ... }`
+                let (name, after_name) = read_optional_name(bytes, after_ident, query);
+                match find_next_top_level_brace(bytes, after_name) {
+                    Some(brace) => match find_matching_brace(bytes, brace) {
+                        Some(end) => {
+                            if let Some(name) = name {
+                                // First definition wins on duplicate names.
+                                fragments.entry(name).or_insert(&query[brace + 1..end]);
+                            }
+                            i = end + 1;
+                        }
+                        None => break,
+                    },
+                    None => break,
+                }
+                continue;
+            }
+
+            // Unknown leading identifier: not something we model; advance past
+            // it to avoid an infinite loop and keep scanning.
+            i = after_ident;
+            continue;
+        }
+
+        i += 1;
+    }
+
+    (operations, fragments)
+}
+
+/// Read a GraphQL name starting at `start` (must be a name-start byte).
+/// Returns the name slice and the index just past it.
+fn read_name(bytes: &[u8], start: usize) -> (&str, usize) {
+    let mut end = start + 1;
+    while end < bytes.len() && is_graphql_name_continue(bytes[end]) {
+        end += 1;
+    }
+    // SAFETY of from_utf8: names are ASCII (name-start/continue are ASCII), so
+    // this slice is valid UTF-8; use the checked conversion regardless.
+    let name = std::str::from_utf8(&bytes[start..end]).unwrap_or("");
+    (name, end)
+}
+
+/// After an operation/fragment keyword, skip ignored tokens and read an
+/// optional name. Returns the name (if present) and the index to continue from.
+///
+/// The name borrows from `query` (not the temporary `bytes` slice) so it shares
+/// the document's lifetime. The first name after `query`/`mutation`/
+/// `subscription` is the operation name; the first name after `fragment` is the
+/// fragment name (the `on Type` condition comes after and is skipped by the
+/// brace search).
+fn read_optional_name<'a>(bytes: &[u8], i: usize, query: &'a str) -> (Option<&'a str>, usize) {
+    let i = skip_ignored(bytes, i);
+    if i < bytes.len() && is_graphql_name_start(bytes[i]) {
+        let (_, after) = read_name(bytes, i);
+        return (Some(&query[i..after]), after);
+    }
+    (None, i)
+}
+
+/// Find the next top-level `{` starting at `i`, skipping balanced parentheses
+/// (variable definitions / arguments), strings, and comments. Returns `None`
+/// if a `}` or end-of-input is reached first (which would be malformed).
+fn find_next_top_level_brace(bytes: &[u8], mut i: usize) -> Option<usize> {
+    let len = bytes.len();
+    while i < len {
+        let c = bytes[i];
+        match c {
+            b'{' => return Some(i),
+            b'}' => return None,
+            b'#' => i = skip_line_comment(bytes, i),
+            b'"' => i = skip_string(bytes, i),
+            b'(' => i = skip_parens(bytes, i),
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// Given `bytes[open] == b'{'`, return the index of the matching `}`,
+/// respecting nested braces, strings, comments, and argument parens. Returns
+/// `None` if the document ends before the brace is closed.
+fn find_matching_brace(bytes: &[u8], open: usize) -> Option<usize> {
+    let len = bytes.len();
+    let mut depth = 0u32;
+    let mut i = open;
+    while i < len {
+        match bytes[i] {
+            b'#' => {
+                i = skip_line_comment(bytes, i);
+                continue;
+            }
+            b'"' => {
+                i = skip_string(bytes, i);
+                continue;
+            }
+            b'(' => {
+                i = skip_parens(bytes, i);
+                continue;
+            }
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Skip a balanced parenthesized group starting at `bytes[i] == b'('`.
+/// Returns the index just past the matching `)`. Respects strings and comments
+/// inside the group; braces inside arguments are ignored by the caller.
+fn skip_parens(bytes: &[u8], i: usize) -> usize {
+    let len = bytes.len();
+    let mut depth = 0u32;
+    let mut j = i;
+    while j < len {
+        match bytes[j] {
+            b'#' => {
+                j = skip_line_comment(bytes, j);
+                continue;
+            }
+            b'"' => {
+                j = skip_string(bytes, j);
+                continue;
+            }
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return j + 1;
+                }
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+    len
+}
+
+/// Skip a string literal (regular or block) starting at `bytes[i] == b'"'`.
+/// Returns the index just past the closing quote(s).
+fn skip_string(bytes: &[u8], i: usize) -> usize {
+    let len = bytes.len();
+    // Block string """ ... """
+    if i + 2 < len && bytes[i..i + 3] == *b"\"\"\"" {
+        let mut j = i + 3;
+        while j < len {
+            if j + 2 < len && bytes[j..j + 3] == *b"\"\"\"" {
+                return j + 3;
+            }
+            // Block strings allow escaped triple-quote via backslash; treat any
+            // backslash as escaping the next byte to stay conservative.
+            if bytes[j] == b'\\' {
+                j = (j + 2).min(len);
+                continue;
+            }
+            j += 1;
+        }
+        return len;
+    }
+    // Regular string
+    let mut j = i + 1;
+    while j < len {
+        match bytes[j] {
+            b'\\' => {
+                j = (j + 2).min(len);
+                continue;
+            }
+            b'"' => return j + 1,
+            _ => j += 1,
+        }
+    }
+    len
+}
+
+/// Skip a `#` line comment starting at `bytes[i] == b'#'`. Returns the index of
+/// the line terminator (or end-of-input).
+fn skip_line_comment(bytes: &[u8], i: usize) -> usize {
+    let len = bytes.len();
+    let mut j = i + 1;
+    while j < len && bytes[j] != b'\n' && bytes[j] != b'\r' {
+        j += 1;
+    }
+    j
+}
+
+/// Skip ignored tokens (whitespace, commas, comments) starting at `i`.
+fn skip_ignored(bytes: &[u8], mut i: usize) -> usize {
+    let len = bytes.len();
+    while i < len {
+        let c = bytes[i];
+        if c.is_ascii_whitespace() || c == b',' {
+            i += 1;
+        } else if c == b'#' {
+            i = skip_line_comment(bytes, i);
+        } else {
+            break;
+        }
+    }
+    i
+}
+
+/// Analyze a selected operation's selection set, expanding fragment spreads.
+///
+/// Returns `(max_depth, complexity, alias_count, is_introspection)` measured
+/// over the operation with all reachable fragments expanded in place, or `None`
+/// if the byte-expansion budget was exceeded (which the caller turns into a
+/// 400). Cyclic fragment spreads are detected via a per-path visited set so the
+/// expansion always terminates.
+fn analyze_operation(
+    selection_set: &str,
+    fragments: &HashMap<&str, &str>,
+) -> Option<(u32, u32, u32, bool)> {
+    let mut acc = AnalysisAcc::default();
+    let mut visited: Vec<&str> = Vec::new();
+    let mut budget = MAX_FRAGMENT_EXPANSION_BYTES;
+    // The operation selection set sits one level inside the operation's
+    // outermost braces, so its fields are at depth 1.
+    analyze_selection_set(
+        selection_set,
+        1,
+        0,
+        fragments,
+        &mut visited,
+        &mut acc,
+        &mut budget,
+    )?;
+    Some((
+        acc.max_depth,
+        acc.complexity,
+        acc.alias_count,
+        acc.is_introspection,
+    ))
+}
+
+/// Mutable accumulator for an analysis pass.
+#[derive(Default)]
+struct AnalysisAcc {
+    max_depth: u32,
+    complexity: u32,
+    alias_count: u32,
+    is_introspection: bool,
+}
+
+/// Scan one selection-set body (the bytes between a matched `{` `}`), with the
+/// enclosing brace already accounted for as `base_depth`. Fields are counted
+/// into `acc.complexity`; nested selection sets recurse; `...Frag` spreads
+/// expand the named fragment's selection set at the current depth (guarded
+/// against cycles via `visited` and bounded by `budget`).
+///
+/// `call_depth` is the analyzer's recursion depth (independent of `base_depth`,
+/// since fragment spreads recurse without adding GraphQL nesting); it caps stack
+/// usage. Returns `None` if either the byte budget or the recursion bound is
+/// exceeded.
+fn analyze_selection_set<'a>(
+    body: &'a str,
+    base_depth: u32,
+    call_depth: u32,
+    fragments: &HashMap<&'a str, &'a str>,
+    visited: &mut Vec<&'a str>,
+    acc: &mut AnalysisAcc,
+    budget: &mut usize,
+) -> Option<()> {
+    if call_depth >= MAX_ANALYSIS_RECURSION {
+        return None;
+    }
+    *budget = budget.checked_sub(body.len())?;
+    if base_depth > acc.max_depth {
+        acc.max_depth = base_depth;
+    }
+
+    let bytes = body.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+
+    while i < len {
+        let c = bytes[i];
+
+        match c {
+            b'#' => {
+                i = skip_line_comment(bytes, i);
+                continue;
+            }
+            b'"' => {
+                i = skip_string(bytes, i);
+                continue;
+            }
+            b'(' => {
+                // Argument list: skip entirely (matches the original scanner,
+                // which ignored everything inside arguments).
+                i = skip_parens(bytes, i);
+                continue;
+            }
+            b'{' => {
+                // Nested selection set: recurse one level deeper.
+                let end = find_matching_brace(bytes, i)?;
+                analyze_selection_set(
+                    &body[i + 1..end],
+                    base_depth + 1,
+                    call_depth + 1,
+                    fragments,
+                    visited,
+                    acc,
+                    budget,
+                )?;
+                i = end + 1;
+                continue;
+            }
+            b'}' => {
+                // Should not appear at this level (bodies are pre-balanced), but
+                // tolerate it.
+                i += 1;
+                continue;
+            }
+            b'.' => {
+                // Fragment spread `...Name` or inline fragment
+                // (`... on Type { ... }`, `... { ... }`, `... @dir { ... }`).
+                if i + 2 < len && bytes[i + 1] == b'.' && bytes[i + 2] == b'.' {
+                    let after_dots = skip_ignored(bytes, i + 3);
+                    // A named fragment spread is `...` followed by a name that is
+                    // not the `on` keyword. Anything else is an inline fragment.
+                    if after_dots < len && is_graphql_name_start(bytes[after_dots]) {
+                        let (name, after_name) = read_name(bytes, after_dots);
+                        if name != "on" {
+                            // Named fragment spread: expand the fragment body at
+                            // the current depth. A spread whose name is already on
+                            // the current path is a cycle (invalid GraphQL); we
+                            // simply do not recurse into it, which guarantees the
+                            // expansion terminates.
+                            if let Some(frag_body) = fragments.get(name)
+                                && !visited.contains(&name)
+                            {
+                                visited.push(name);
+                                let frag_body = *frag_body;
+                                let result = analyze_selection_set(
+                                    frag_body,
+                                    base_depth,
+                                    call_depth + 1,
+                                    fragments,
+                                    visited,
+                                    acc,
+                                    budget,
+                                );
+                                visited.pop();
+                                result?;
+                            }
+                            i = after_name;
+                            continue;
+                        }
+                    }
+                    // Inline fragment: its selection set is spliced in at the
+                    // SAME depth (an inline fragment adds no nesting level). Skip
+                    // any `on Type` / directives, then analyze the `{ ... }` body
+                    // at the current base_depth.
+                    match find_next_top_level_brace(bytes, i + 3) {
+                        Some(brace) => {
+                            let end = find_matching_brace(bytes, brace)?;
+                            analyze_selection_set(
+                                &body[brace + 1..end],
+                                base_depth,
+                                call_depth + 1,
+                                fragments,
+                                visited,
+                                acc,
+                                budget,
+                            )?;
+                            i = end + 1;
+                        }
+                        None => {
+                            // No selection set found (malformed); skip the dots.
+                            i += 3;
+                        }
+                    }
+                    continue;
+                }
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+
+        if is_graphql_name_start(c) {
+            let (ident, after_ident) = read_name(bytes, i);
+
+            // Skip keywords/literals that are not fields.
+            if matches!(
+                ident,
+                "query"
+                    | "mutation"
+                    | "subscription"
+                    | "fragment"
+                    | "on"
+                    | "true"
+                    | "false"
+                    | "null"
+            ) {
+                i = after_ident;
+                continue;
+            }
+
+            // Look past whitespace for an alias `:`.
+            let j = skip_ws_only(bytes, after_ident);
+            if j < len && bytes[j] == b':' {
+                acc.alias_count += 1;
+                // The aliased field name follows and is counted on a later
+                // iteration.
+                i = j + 1;
+                continue;
+            }
+
+            // A field. Skip directive names (prefixed by `@`).
+            if i > 0 && bytes[i - 1] == b'@' {
+                i = after_ident;
+                continue;
+            }
+            if ident == "__schema" || ident == "__type" {
+                acc.is_introspection = true;
+            }
+            acc.complexity += 1;
+            i = after_ident;
+            continue;
+        }
+
+        i += 1;
+    }
+
+    Some(())
+}
+
+/// Skip only ASCII whitespace (not commas/comments) starting at `i`.
+fn skip_ws_only(bytes: &[u8], mut i: usize) -> usize {
+    let len = bytes.len();
+    while i < len && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    i
 }
 
 fn trim_leading_ignored(mut query: &str) -> &str {
@@ -339,26 +963,6 @@ fn strip_operation_keyword<'a>(query: &'a str, keyword: &str) -> Option<&'a str>
         return None;
     }
     Some(rest)
-}
-
-/// Extract the operation name from the text after the operation keyword.
-/// e.g., "GetUser($id: ID!) { ... }" -> Some("GetUser")
-fn extract_operation_name(after_keyword: &str) -> Option<String> {
-    let trimmed = after_keyword.trim_start();
-    if trimmed.starts_with('{') || trimmed.is_empty() {
-        return None;
-    }
-
-    let bytes = trimmed.as_bytes();
-    if !bytes.first().is_some_and(|b| is_graphql_name_start(*b)) {
-        return None;
-    }
-
-    let mut end = 1;
-    while end < bytes.len() && is_graphql_name_continue(bytes[end]) {
-        end += 1;
-    }
-    Some(trimmed[..end].to_string())
 }
 
 /// Analyze a GraphQL query string for depth, complexity, and alias count.
@@ -640,8 +1244,23 @@ impl Plugin for GraphqlPlugin {
 
         let operation_name = parsed.get("operationName").and_then(|n| n.as_str());
 
-        // Parse the GraphQL query
-        let op = parse_graphql_query(query, operation_name);
+        // Parse the GraphQL query and select the operation to analyze. The
+        // parser rejects spec-invalid documents (e.g. multiple operations
+        // without operationName) and over-budget fragment expansion.
+        let op = match parse_graphql_query(query, operation_name) {
+            ParsedQuery::Operation(op) => op,
+            ParsedQuery::Reject {
+                status_code,
+                message,
+            } => {
+                debug!(status_code, %message, "graphql: query rejected during parsing");
+                return PluginResult::Reject {
+                    status_code,
+                    body: graphql_error_body(&message),
+                    headers: json_content_type_header(),
+                };
+            }
+        };
 
         // Store operation info in metadata for logging/downstream plugins
         ctx.metadata
