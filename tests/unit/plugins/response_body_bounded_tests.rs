@@ -51,10 +51,14 @@ fn test_parse_max_response_body_bytes_defaults_and_validates() {
     if let Ok(max_usize) = usize::try_from(u64::MAX) {
         assert_eq!(max_u64_result.unwrap(), max_usize);
     } else {
+        // Regression for finding #92: the platform-overflow message must honor
+        // the documented invariant that error messages never echo the
+        // offending value, matching the sibling `ai_response_guard` wording.
+        let err = max_u64_result.unwrap_err();
+        assert!(err.contains("too large for this platform"));
         assert!(
-            max_u64_result
-                .unwrap_err()
-                .contains("too large for this platform")
+            !err.chars().any(|c| c.is_ascii_digit()),
+            "overflow message must not echo the offending value: {err}"
         );
     }
 }

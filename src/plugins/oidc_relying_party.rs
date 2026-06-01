@@ -161,6 +161,8 @@ struct SessionPayload {
     access_token_b64: String,
     refresh_token_b64: Option<String>,
     expires_at_unix: i64,
+    #[serde(default)]
+    claims_expires_at_unix: i64,
     refresh_after_unix: i64,
     issued_at_unix: i64,
     last_touch_unix: i64,
@@ -192,6 +194,24 @@ struct RefreshTokenResponse {
     refresh_token: Option<String>,
     #[serde(default)]
     expires_in: Option<i64>,
+}
+
+/// Result of a `maybe_refresh_session` attempt. `mutated` drives cookie re-sealing;
+/// `refreshed` is true only when the token endpoint returned and we validated a
+/// fresh ID token, so the freshness gate can tell fresh claims apart from access
+/// token rotation, a deferred failure, or the no-refresh-token / not-yet-due
+/// cases (all of which leave claims stale).
+#[derive(Clone, Copy)]
+struct RefreshOutcome {
+    mutated: bool,
+    refreshed: bool,
+}
+
+impl RefreshOutcome {
+    const UNCHANGED: Self = Self {
+        mutated: false,
+        refreshed: false,
+    };
 }
 
 impl OidcRelyingParty {
@@ -406,6 +426,16 @@ impl OidcRelyingParty {
             provider_obj,
             token_endpoint.as_deref().or(discovery_url.as_deref()),
         )?;
+        // Validate like the other endpoint fields (a parseable http(s) URL with
+        // a host) so a malformed or non-http(s) value is rejected at config load
+        // instead of being forwarded to the IdP and browser at logout. Uses the
+        // lenient validate_url_string (not validate_redirect_uri) so localhost/dev
+        // setups are not over-constrained. Do this before spawning discovery so
+        // rejected plugin configs have no background side effects.
+        let post_logout_redirect_uri =
+            optional_string(provider_obj, "post_logout_redirect_uri", "provider[0]")?
+                .map(|url| validate_url_string(&url, "provider[0].post_logout_redirect_uri"))
+                .transpose()?;
         let jwks_store = Arc::new(ArcSwap::from_pointee(jwks_uri.as_ref().map(|uri| {
             get_or_create_jwks_store(uri, &http_client, DEFAULT_JWKS_REFRESH_INTERVAL)
         })));
@@ -429,11 +459,7 @@ impl OidcRelyingParty {
             redirect_uri,
             callback_path,
             logout_path,
-            post_logout_redirect_uri: optional_string(
-                provider_obj,
-                "post_logout_redirect_uri",
-                "provider[0]",
-            )?,
+            post_logout_redirect_uri,
             consumer_identity_claim: optional_string(
                 provider_obj,
                 "consumer_identity_claim",
@@ -533,6 +559,7 @@ impl OidcRelyingParty {
             + token
                 .expires_in
                 .unwrap_or(self.session.ttl.as_secs() as i64);
+        let claims_expires_at = claim_expiry(&merged_claims).unwrap_or(expires_at);
         let payload = SessionPayload {
             version: 1,
             sub: extract_claim_string(&merged_claims, "sub").unwrap_or_default(),
@@ -540,8 +567,9 @@ impl OidcRelyingParty {
             access_token_b64: token.access_token,
             refresh_token_b64: token.refresh_token,
             expires_at_unix: expires_at,
+            claims_expires_at_unix: claims_expires_at,
             refresh_after_unix: next_refresh_after(
-                expires_at,
+                expires_at.min(claims_expires_at),
                 now,
                 self.behavior.refresh_skew.as_secs() as i64,
             ),
@@ -764,10 +792,33 @@ impl OidcRelyingParty {
             return self.challenge(ctx, true);
         }
 
+        let leeway = self.provider.id_token_clock_skew.as_secs() as i64;
+        let claims_expires_at = effective_claims_expires_at(&payload);
+        let backfilled_claims_expiry = payload.claims_expires_at_unix <= 0;
+        if backfilled_claims_expiry {
+            payload.claims_expires_at_unix = claims_expires_at;
+        }
+        let claims_expired_before_refresh = now > claims_expires_at.saturating_add(leeway);
+        if claims_expired_before_refresh && payload.refresh_token_b64.is_some() {
+            payload.refresh_after_unix = now;
+        }
+
         // Keep the session live: refresh tokens when due (which also re-derives
         // claims from any new ID token), then slide the idle window. Any change
         // is re-sealed and emitted as a `Set-Cookie` by `after_proxy`.
-        let mut mutated = self.maybe_refresh_session(&mut payload, now).await;
+        let refresh = self.maybe_refresh_session(&mut payload, now).await;
+
+        // Token-freshness gate: the ID token was validly verified at login, but
+        // its claims must not be served as live authorization past their
+        // effective expiry. If they are still expired after any forced/due
+        // refresh attempt, fail closed and force re-auth rather than emitting
+        // stale claim headers and scope/role decisions.
+        let claims_expires_at = effective_claims_expires_at(&payload);
+        if now > claims_expires_at.saturating_add(leeway) {
+            return self.challenge(ctx, true);
+        }
+
+        let mut mutated = refresh.mutated || refresh.refreshed || backfilled_claims_expiry;
         mutated |= self.maybe_slide_session(&mut payload, now);
         if mutated {
             match self.seal_session_cookie(&payload) {
@@ -823,34 +874,48 @@ impl OidcRelyingParty {
     }
 
     /// Refresh the access/ID tokens via `grant_type=refresh_token` once the access
-    /// token is within `refresh_skew` of expiry. Returns whether the payload
-    /// changed (and therefore needs re-sealing). Failures are non-fatal: the
-    /// existing session stays valid by its own ttl/idle bounds and the next
-    /// attempt is deferred by `REFRESH_RETRY_BACKOFF_SECS` so a flaky token
-    /// endpoint is not retried on every request.
-    async fn maybe_refresh_session(&self, payload: &mut SessionPayload, now: i64) -> bool {
+    /// token is within `refresh_skew` of expiry. Reports whether the payload changed
+    /// (and therefore needs re-sealing) and, separately, whether a refresh actually
+    /// produced freshly validated claims — the two differ on the deferred-failure
+    /// branch and on refresh responses that rotate access tokens without returning
+    /// a new ID token. The freshness gate in `run_session_auth` relies on that
+    /// distinction. Failures are non-fatal here:
+    /// the next attempt is deferred by `REFRESH_RETRY_BACKOFF_SECS` so a flaky token
+    /// endpoint is not retried on every request, and the freshness gate decides
+    /// whether the still-expired session may keep serving.
+    async fn maybe_refresh_session(
+        &self,
+        payload: &mut SessionPayload,
+        now: i64,
+    ) -> RefreshOutcome {
         if now < payload.refresh_after_unix {
-            return false;
+            return RefreshOutcome::UNCHANGED;
         }
         let Some(refresh_token) = payload.refresh_token_b64.clone() else {
-            return false;
+            return RefreshOutcome::UNCHANGED;
         };
         let Some(discovery) = self.provider.discovery.load().as_ref().as_ref().cloned() else {
-            return false;
+            return RefreshOutcome::UNCHANGED;
         };
         match self
             .refresh_tokens(&discovery, &refresh_token, payload, now)
             .await
         {
-            Ok(()) => true,
+            Ok(claims_refreshed) => RefreshOutcome {
+                mutated: true,
+                refreshed: claims_refreshed,
+            },
             Err(error) => {
                 warn!(
                     plugin = "oidc_relying_party",
                     error = %error,
-                    "OIDC token refresh failed; serving with the existing session until ttl/idle"
+                    "OIDC token refresh failed; the freshness gate decides whether the existing session may keep serving"
                 );
                 payload.refresh_after_unix = now + REFRESH_RETRY_BACKOFF_SECS;
-                true
+                RefreshOutcome {
+                    mutated: true,
+                    refreshed: false,
+                }
             }
         }
     }
@@ -861,7 +926,7 @@ impl OidcRelyingParty {
         refresh_token: &str,
         payload: &mut SessionPayload,
         now: i64,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         let params = vec![
             ("grant_type".to_string(), "refresh_token".to_string()),
             ("refresh_token".to_string(), refresh_token.to_string()),
@@ -880,10 +945,12 @@ impl OidcRelyingParty {
         if !token.token_type.eq_ignore_ascii_case("bearer") {
             return Err(r#"{"error":"Invalid refresh token type"}"#.to_string());
         }
+        let existing_claims_expires_at = stored_claims_expires_at(payload);
+        let expires_at = expires_at_for_token(&token, now, self.session.ttl);
         // A refreshed ID token is optional; when present, re-validate it (bound to
         // the same subject, nonce only if carried) and adopt its claims so
         // scope/role checks and claim headers track current authorization.
-        if let Some(id_token) = token.id_token.as_deref() {
+        let claims_refreshed = if let Some(id_token) = token.id_token.as_deref() {
             let id_claims = self
                 .verify_refreshed_id_token(id_token, &payload.sub, &payload.nonce)
                 .await?;
@@ -913,21 +980,25 @@ impl OidcRelyingParty {
             payload.sub =
                 extract_claim_string(&merged, "sub").unwrap_or_else(|| payload.sub.clone());
             payload.id_token_b64 = id_token.to_string();
+            payload.claims_expires_at_unix = claim_expiry(&merged).unwrap_or(expires_at);
             payload.claims = merged;
-        }
+            true
+        } else {
+            payload.claims_expires_at_unix = existing_claims_expires_at.min(expires_at);
+            false
+        };
         payload.access_token_b64 = token.access_token;
         if let Some(rotated) = token.refresh_token {
             payload.refresh_token_b64 = Some(rotated);
         }
-        let expires_at = now
-            + token
-                .expires_in
-                .unwrap_or(self.session.ttl.as_secs() as i64);
         payload.expires_at_unix = expires_at;
-        payload.refresh_after_unix =
-            next_refresh_after(expires_at, now, self.behavior.refresh_skew.as_secs() as i64);
+        payload.refresh_after_unix = next_refresh_after(
+            expires_at.min(payload.claims_expires_at_unix),
+            now,
+            self.behavior.refresh_skew.as_secs() as i64,
+        );
         payload.last_touch_unix = now;
-        Ok(())
+        Ok(claims_refreshed)
     }
 
     fn resolve_identity(&self, claims: &Value, consumer_index: &ConsumerIndex) -> VerifyOutcome {
@@ -951,7 +1022,15 @@ impl OidcRelyingParty {
                 Ok(flow) => flow,
                 Err(body) => return reject(503, body),
             };
-            let location = self.authorization_url(&state, &flow);
+            // Fail closed when no absolute IdP authorization URL can be built
+            // (discovery not loaded yet or a malformed authorization_endpoint).
+            // Redirecting to the relative post_login_default_path would send the
+            // browser back to the protected app root and loop. Drop the just-inserted
+            // state slot so an outage cannot exhaust the state cache.
+            let Some(location) = self.authorization_url(&state, &flow) else {
+                self.session.state_cache.take(&state);
+                return reject(503, r#"{"error":"OIDC discovery unavailable"}"#.to_string());
+            };
             let cookie = clear.then(|| self.clear_cookie());
             redirect(self.behavior.challenge_html_status, &location, cookie)
         } else {
@@ -988,14 +1067,14 @@ impl OidcRelyingParty {
         Ok((state, flow))
     }
 
-    fn authorization_url(&self, state: &str, flow: &FlowState) -> String {
-        let Some(discovery) = self.provider.discovery.load().as_ref().as_ref().cloned() else {
-            return self.behavior.post_login_default_path.clone();
-        };
+    /// Build the absolute IdP authorization URL for a browser challenge. Returns
+    /// `None` when discovery has not loaded yet or the discovered
+    /// `authorization_endpoint` fails to parse, so the caller fails closed instead
+    /// of redirecting the browser to the protected app root (which would loop).
+    fn authorization_url(&self, state: &str, flow: &FlowState) -> Option<String> {
+        let discovery = self.provider.discovery.load().as_ref().as_ref().cloned()?;
         let challenge = pkce_challenge(&flow.code_verifier);
-        let Ok(mut url) = Url::parse(&discovery.authorization_endpoint) else {
-            return self.behavior.post_login_default_path.clone();
-        };
+        let mut url = Url::parse(&discovery.authorization_endpoint).ok()?;
         url.query_pairs_mut()
             .append_pair("response_type", "code")
             .append_pair("client_id", &self.provider.client_id)
@@ -1005,7 +1084,7 @@ impl OidcRelyingParty {
             .append_pair("nonce", &flow.nonce)
             .append_pair("code_challenge", &challenge)
             .append_pair("code_challenge_method", "S256");
-        url.to_string()
+        Some(url.to_string())
     }
 
     fn seal_session_cookie(&self, payload: &SessionPayload) -> Result<String, String> {
@@ -1630,12 +1709,33 @@ fn encoded_session_cookie_len(plaintext_len: usize) -> usize {
     sealed_len.div_ceil(3) * 4
 }
 
-/// Schedule the next proactive refresh `refresh_skew` before access-token expiry,
-/// but never sooner than `REFRESH_RETRY_BACKOFF_SECS` from now. The floor stops a
-/// refresh storm when a provider issues very short-lived access tokens (so
+/// Schedule the next proactive refresh `refresh_skew` before the earliest
+/// token/claim expiry passed by the caller, but never sooner than
+/// `REFRESH_RETRY_BACKOFF_SECS` from now. The floor stops a refresh storm when
+/// a provider issues very short-lived access tokens or ID-token claims (so
 /// `expires_at - refresh_skew` would already be in the past).
 fn next_refresh_after(expires_at_unix: i64, now: i64, refresh_skew_secs: i64) -> i64 {
     (expires_at_unix - refresh_skew_secs).max(now + REFRESH_RETRY_BACKOFF_SECS)
+}
+
+fn expires_at_for_token(token: &RefreshTokenResponse, now: i64, session_ttl: Duration) -> i64 {
+    now + token.expires_in.unwrap_or(session_ttl.as_secs() as i64)
+}
+
+fn claim_expiry(claims: &Value) -> Option<i64> {
+    claims.get("exp").and_then(Value::as_i64)
+}
+
+fn effective_claims_expires_at(payload: &SessionPayload) -> i64 {
+    stored_claims_expires_at(payload).min(payload.expires_at_unix)
+}
+
+fn stored_claims_expires_at(payload: &SessionPayload) -> i64 {
+    if payload.claims_expires_at_unix > 0 {
+        payload.claims_expires_at_unix
+    } else {
+        claim_expiry(&payload.claims).unwrap_or(payload.expires_at_unix)
+    }
 }
 
 fn is_browser_request(ctx: &RequestContext, behavior: &BehaviorConfig) -> bool {
@@ -2061,6 +2161,7 @@ mod tests {
             access_token_b64: "old-at".to_string(),
             refresh_token_b64: refresh_token.map(str::to_string),
             expires_at_unix: refresh_after + 30,
+            claims_expires_at_unix: refresh_after + 30,
             refresh_after_unix: refresh_after,
             issued_at_unix: issued,
             last_touch_unix: last_touch,
@@ -2197,6 +2298,34 @@ mod tests {
         assert_eq!(refreshed.access_token_b64, "new-at");
         assert_eq!(refreshed.refresh_token_b64.as_deref(), Some("rt-2"));
         assert!(refreshed.refresh_after_unix > now);
+    }
+
+    #[tokio::test]
+    async fn expired_claims_with_refresh_without_id_token_re_challenge() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "new-at",
+                "token_type": "Bearer",
+                "refresh_token": "rt-2",
+                "expires_in": 3600
+            })))
+            .mount(&server)
+            .await;
+        let plugin = build_plugin(&format!("{}/token", server.uri()));
+        let now = chrono::Utc::now().timestamp();
+        let payload = session_payload(now - 2500, now - 100, Some("rt-1"), now - 200);
+        assert!(payload.expires_at_unix < now - 60);
+        let mut ctx = ctx_with_session(&plugin, &payload);
+
+        match plugin
+            .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+            .await
+        {
+            PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 401),
+            other => panic!("expected challenge reject, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -2425,5 +2554,184 @@ mod tests {
             "UserInfo-only claim must survive a token refresh"
         );
         assert_eq!(refreshed.access_token_b64, "new-at");
+    }
+
+    // Finding #6 regression: a session whose access/ID token has expired must not
+    // keep serving cached claims when no refresh token is available. Before the
+    // freshness gate this returned Continue (stale authorization) for the full
+    // absolute ttl; now it re-challenges.
+    #[tokio::test]
+    async fn expired_token_without_refresh_token_re_challenges() {
+        let plugin = build_plugin("https://idp.example.com/token");
+        let now = chrono::Utc::now().timestamp();
+        // Within absolute/idle ttl, but expires_at_unix is well past now+leeway
+        // (default id_token_clock_skew is 60s; refresh_after + 30 = now - 170), and
+        // there is no refresh token so maybe_refresh_session cannot refresh.
+        let payload = session_payload(now - 100, now - 100, None, now - 200);
+        assert!(
+            payload.expires_at_unix < now - 60,
+            "fixture must place the token past expiry + leeway"
+        );
+        let mut ctx = ctx_with_session(&plugin, &payload);
+        match plugin
+            .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+            .await
+        {
+            // Non-browser request -> 401 challenge, cookie cleared.
+            PluginResult::Reject {
+                status_code,
+                headers,
+                ..
+            } => {
+                assert_eq!(status_code, 401);
+                assert!(
+                    headers
+                        .get("set-cookie")
+                        .is_some_and(|c| c.contains("Max-Age=0")),
+                    "expired session cookie must be cleared on re-challenge"
+                );
+            }
+            other => panic!("expected re-challenge on expired token, got {other:?}"),
+        }
+    }
+
+    // Finding #6: a session still within token expiry keeps its
+    // validly-verified-at-login behavior even without a refresh token.
+    #[tokio::test]
+    async fn unexpired_token_without_refresh_token_still_authenticates() {
+        let plugin = build_plugin("https://idp.example.com/token");
+        let now = chrono::Utc::now().timestamp();
+        // expires_at_unix = now + 100_030 (refresh_after + 30), comfortably in future.
+        let payload = session_payload(now - 100, now - 100, None, now + 100_000);
+        assert!(payload.expires_at_unix > now);
+        let mut ctx = ctx_with_session(&plugin, &payload);
+        assert!(matches!(
+            plugin
+                .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+                .await,
+            PluginResult::Continue
+        ));
+    }
+
+    // Finding #36 regression: during a discovery outage a browser challenge must
+    // fail closed with 503 rather than 302-redirecting to the relative
+    // post_login_default_path (the protected app root), which would loop. The
+    // wasted state-cache slot must also be reclaimed.
+    #[tokio::test]
+    async fn browser_challenge_fails_closed_when_discovery_unavailable() {
+        let plugin = build_plugin("https://idp.example.com/token");
+        // Simulate a discovery outage: clear the loaded discovery snapshot.
+        plugin.provider.discovery.store(Arc::new(None));
+        let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/app".into());
+        ctx.headers
+            .insert("accept".to_string(), "text/html".to_string());
+        let before = plugin.session.state_cache.entries.len();
+        match plugin.challenge(&mut ctx, false) {
+            PluginResult::Reject {
+                status_code,
+                body,
+                headers,
+            } => {
+                assert_eq!(status_code, 503);
+                assert_eq!(body, r#"{"error":"OIDC discovery unavailable"}"#);
+                assert!(
+                    !headers.contains_key("location"),
+                    "must not redirect to the app root during a discovery outage"
+                );
+            }
+            other => panic!("expected 503 fail-closed, got {other:?}"),
+        }
+        assert_eq!(
+            plugin.session.state_cache.entries.len(),
+            before,
+            "the unused state slot must be reclaimed on the fail-closed path"
+        );
+    }
+
+    // Finding #36: when discovery is loaded, a browser challenge still 302-redirects
+    // to the absolute IdP authorization URL (no regression to the happy path).
+    #[tokio::test]
+    async fn browser_challenge_redirects_to_idp_when_discovery_loaded() {
+        let plugin = build_plugin("https://idp.example.com/token");
+        let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/app".into());
+        ctx.headers
+            .insert("accept".to_string(), "text/html".to_string());
+        match plugin.challenge(&mut ctx, false) {
+            PluginResult::Reject {
+                status_code,
+                headers,
+                ..
+            } => {
+                assert_eq!(status_code, 302);
+                let location = headers.get("location").expect("location header");
+                assert!(
+                    location.starts_with("https://idp.example.com/authorize?"),
+                    "must redirect to the IdP authorization endpoint, got {location}"
+                );
+            }
+            other => panic!("expected 302 redirect to IdP, got {other:?}"),
+        }
+    }
+
+    // Finding #35: post_logout_redirect_uri is validated like the other endpoints.
+    // tokio runtime required: building the plugin spawns the background JWKS task.
+    #[tokio::test]
+    async fn invalid_post_logout_redirect_uri_is_rejected_at_construction() {
+        for bad in [
+            "javascript:alert(1)",
+            "/relative/path",
+            "not a url",
+            "http://", // no host
+        ] {
+            let result = OidcRelyingParty::new(
+                &json!({
+                    "providers": [{
+                        "issuer": "https://idp.example.com",
+                        "client_id": "client-1",
+                        "authorization_endpoint": "https://idp.example.com/authorize",
+                        "token_endpoint": "https://idp.example.com/token",
+                        "jwks_uri": "https://idp.example.com/jwks",
+                        "scopes": ["openid"],
+                        "redirect_uri": "https://app.example.com/oauth/callback",
+                        "callback_path": "/oauth/callback",
+                        "post_logout_redirect_uri": bad,
+                        "client_auth": {"method": "client_secret_basic", "client_secret": "shhh"}
+                    }],
+                    "session": {"encryption_secret": "0123456789012345678901234567890123"}
+                }),
+                PluginHttpClient::default(),
+            );
+            assert!(
+                result.is_err(),
+                "post_logout_redirect_uri {bad:?} should be rejected"
+            );
+        }
+    }
+
+    // Finding #35: a valid https post_logout_redirect_uri is accepted.
+    #[tokio::test]
+    async fn valid_post_logout_redirect_uri_is_accepted() {
+        let result = OidcRelyingParty::new(
+            &json!({
+                "providers": [{
+                    "issuer": "https://idp.example.com",
+                    "client_id": "client-1",
+                    "authorization_endpoint": "https://idp.example.com/authorize",
+                    "token_endpoint": "https://idp.example.com/token",
+                    "jwks_uri": "https://idp.example.com/jwks",
+                    "scopes": ["openid"],
+                    "redirect_uri": "https://app.example.com/oauth/callback",
+                    "callback_path": "/oauth/callback",
+                    "post_logout_redirect_uri": "https://app.example.com/goodbye",
+                    "client_auth": {"method": "client_secret_basic", "client_secret": "shhh"}
+                }],
+                "session": {"encryption_secret": "0123456789012345678901234567890123"}
+            }),
+            PluginHttpClient::default(),
+        );
+        assert!(
+            result.is_ok(),
+            "valid https post_logout_redirect_uri should be accepted"
+        );
     }
 }

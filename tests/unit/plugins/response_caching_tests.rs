@@ -1865,3 +1865,117 @@ async fn test_sse_in_accept_list_skips_buffering() {
 
     assert!(!plugin.should_buffer_response_body(&ctx));
 }
+
+/// Finding #61: conditional-request HTTP-date parsing must accept all three
+/// RFC 9110 §5.6.7 formats, not just RFC 2822 / IMF-fixdate. Before the fix the
+/// obsolete RFC 850 and asctime forms returned `None`, which made
+/// `If-Modified-Since` revalidation silently serve a full 200 from cache.
+#[test]
+fn test_parse_http_date_accepts_all_rfc9110_formats() {
+    use ferrum_edge::_test_support::response_caching_parse_http_date as parse;
+
+    // All three forms encode the same instant: 1994-11-06 08:49:37 UTC.
+    let expected = chrono::DateTime::parse_from_rfc3339("1994-11-06T08:49:37Z")
+        .unwrap()
+        .with_timezone(&Utc);
+
+    // IMF-fixdate (the dominant, already-supported form).
+    assert_eq!(
+        parse("Sun, 06 Nov 1994 08:49:37 GMT"),
+        Some(expected),
+        "IMF-fixdate must parse"
+    );
+    // RFC 850 (obsolete): full weekday, 2-digit dashed year.
+    assert_eq!(
+        parse("Sunday, 06-Nov-94 08:49:37 GMT"),
+        Some(expected),
+        "RFC 850 date must parse"
+    );
+    // asctime (obsolete): no commas, space-padded day, trailing year.
+    assert_eq!(
+        parse("Sun Nov  6 08:49:37 1994"),
+        Some(expected),
+        "asctime date must parse"
+    );
+
+    // Genuinely malformed input still yields None.
+    assert_eq!(parse("not a date"), None);
+    assert_eq!(parse(""), None);
+}
+
+/// Finding #62: cache-size subtraction must be underflow-safe. A drift larger
+/// than the current total previously wrapped a `usize` to ~`usize::MAX`, which
+/// permanently wedged the size cap (every later store was rejected). The
+/// saturating subtraction floors at 0 instead.
+#[test]
+fn test_sub_total_size_saturates_instead_of_wrapping() {
+    use ferrum_edge::_test_support::response_caching_sub_total_size as sub;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let total = AtomicUsize::new(100);
+
+    // Subtracting more than the current total must floor at 0, not wrap.
+    sub(&total, 250);
+    assert_eq!(
+        total.load(Ordering::Relaxed),
+        0,
+        "underflow must saturate at 0, not wrap to usize::MAX"
+    );
+
+    // Subtracting from 0 stays at 0.
+    sub(&total, 10);
+    assert_eq!(total.load(Ordering::Relaxed), 0);
+
+    // Normal subtraction still works.
+    total.store(100, Ordering::Relaxed);
+    sub(&total, 40);
+    assert_eq!(total.load(Ordering::Relaxed), 60);
+}
+
+/// Finding #62: under many concurrent stores plus interleaved invalidations
+/// the size accountant must never underflow-wrap and must stay within a small
+/// multiple of the configured `max_total_size_bytes`.
+#[tokio::test]
+async fn test_concurrent_stores_keep_size_bounded_and_non_wrapping() {
+    let plugin = Arc::new(
+        ResponseCaching::new(&json!({
+            "ttl_seconds": 60,
+            // Small cap so concurrent stores actively race the ceiling check.
+            "max_total_size_bytes": 4096,
+            "max_entries": 64
+        }))
+        .expect("config should be valid"),
+    );
+
+    let mut response_headers = HashMap::new();
+    response_headers.insert("content-type".to_string(), "application/json".to_string());
+
+    let mut tasks = Vec::new();
+    for n in 0..64u32 {
+        let plugin = Arc::clone(&plugin);
+        let response_headers = response_headers.clone();
+        tasks.push(tokio::spawn(async move {
+            // A bounded set of paths so stores, replacements, and unsafe-method
+            // invalidations all collide on the same keys.
+            let path = format!("/api/item-{}", n % 16);
+            let body = vec![b'x'; 512];
+            cache_response(&plugin, "GET", &path, 200, &response_headers, &body).await;
+
+            // Interleave an invalidation via an unsafe method on the same path.
+            let mut inv_ctx = make_ctx("POST", &path);
+            let mut inv_headers = HashMap::new();
+            let _ = plugin.before_proxy(&mut inv_ctx, &mut inv_headers).await;
+        }));
+    }
+    for task in tasks {
+        task.await.expect("store task panicked");
+    }
+
+    // The accountant must never have wrapped: a wrapped usize would be a vast
+    // value far above any small multiple of the cap.
+    let total = plugin.current_total_size_for_tests();
+    assert!(
+        total <= 4096 * 8,
+        "total_size drifted/overshot unexpectedly: {total}"
+    );
+}
