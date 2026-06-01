@@ -798,7 +798,7 @@ impl JwksAuth {
             },
             ExtractedCredential::ApiKey(_)
             | ExtractedCredential::BasicAuth { .. }
-            | ExtractedCredential::HmacAuth { .. }
+            | ExtractedCredential::HmacAuth(_)
             | ExtractedCredential::MtlsCert { .. } => JwksExtractedCredential::Missing,
         }
     }

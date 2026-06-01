@@ -16,20 +16,10 @@ pub enum ExtractedCredential {
         username: String,
         password: String,
     },
-    HmacAuth {
-        username: String,
-        algorithm: String,
-        signature: String,
-        date: String,
-        method: String,
-        path: String,
-        /// Value of the `Digest:` (RFC 3230) or `Content-Digest:` (RFC 9421)
-        /// header.
-        digest_header: String,
-        /// Buffered request body bytes used to verify `digest_header`. Empty
-        /// when the request has no body.
-        request_body: Vec<u8>,
-    },
+    /// Boxed because this variant is much larger than the others; an
+    /// `ExtractedCredential` is also wrapped by other enums (e.g.
+    /// `TokenLocationExtract`), so keeping it small avoids inflating them.
+    HmacAuth(Box<HmacAuthCredential>),
     MtlsCert {
         der_bytes: Arc<Vec<u8>>,
         chain_der: Option<Arc<Vec<Vec<u8>>>>,
@@ -39,6 +29,29 @@ pub enum ExtractedCredential {
     InvalidFormat(String),
     /// No credential present — multi-auth can continue with the next plugin.
     Missing,
+}
+
+/// HMAC credential fields extracted from a request, used to reconstruct the
+/// signing string and verify the body digest. Boxed inside
+/// [`ExtractedCredential::HmacAuth`].
+#[derive(Debug, Clone)]
+pub struct HmacAuthCredential {
+    pub username: String,
+    pub algorithm: String,
+    pub signature: String,
+    pub date: String,
+    pub method: String,
+    pub path: String,
+    /// Raw request query string (verbatim, percent-encoded as received), bound
+    /// into the signing string so query parameters cannot be altered without
+    /// invalidating the HMAC. Empty when the request had no query.
+    pub query: String,
+    /// Value of the `Digest:` (RFC 3230) or `Content-Digest:` (RFC 9421)
+    /// header.
+    pub digest_header: String,
+    /// Buffered request body bytes used to verify `digest_header`. Empty when
+    /// the request has no body.
+    pub request_body: Vec<u8>,
 }
 
 /// Shared auth verification result, mapped to PluginResult by the dispatcher.
