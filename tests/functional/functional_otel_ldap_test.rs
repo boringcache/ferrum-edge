@@ -2,8 +2,9 @@
 //!
 //! - **OTel Tracing**: Verifies the plugin injects a `traceparent` response header
 //!   (W3C Trace Context) when configured in propagation-only mode.
-//! - **LDAP Auth**: Verifies the plugin rejects requests when the configured LDAP
-//!   server is unreachable (no silent bypass of authentication).
+//! - **LDAP Auth**: Verifies the plugin fails closed when the configured LDAP
+//!   server is unreachable (no silent bypass of authentication) — returning a
+//!   500 (backend failure) rather than a 401 (bad credentials), per finding #32.
 //!
 //! Both tests use file mode with ephemeral ports.
 //!
@@ -437,7 +438,7 @@ async fn start_ldap_gateway_with_retry(
 
 #[ignore]
 #[tokio::test]
-async fn test_ldap_auth_rejects_when_server_unreachable() {
+async fn test_ldap_auth_returns_500_when_server_unreachable() {
     let config_template = r#"
 version: "1"
 proxies:
@@ -486,18 +487,20 @@ plugin_configs:
         sleep(Duration::from_millis(250)).await;
     };
 
-    // The LDAP plugin should reject with 401 (LDAP authentication failed)
+    // Finding #32: an unreachable LDAP server is a backend/infrastructure
+    // failure, not an invalid-credential outcome, so the plugin returns 500 —
+    // not 401 — to avoid falsely telling the client its credentials are wrong.
     assert_eq!(
         response.status().as_u16(),
-        401,
-        "Expected 401 when LDAP server is unreachable, got {}",
+        500,
+        "Expected 500 when LDAP server is unreachable, got {}",
         response.status()
     );
 
     let body = response.text().await.unwrap_or_default();
     assert!(
-        body.contains("LDAP authentication failed"),
-        "Error body should contain 'LDAP authentication failed', got: {}",
+        body.contains("temporarily unavailable"),
+        "Error body should indicate LDAP is temporarily unavailable, got: {}",
         body
     );
 

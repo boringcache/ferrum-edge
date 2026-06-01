@@ -849,6 +849,15 @@ async fn dpop_valid_proof_with_matching_jkt_succeeds() {
         private_key_pem,
     );
     let now = chrono::Utc::now().timestamp();
+    // RFC 9449 §4.3: the proof must bind to the presented access token via the
+    // `ath` claim (SHA-256 of the token, base64url no-pad).
+    let ath = {
+        use base64::Engine;
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(access_token.as_bytes());
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hasher.finalize())
+    };
     let mut dpop_header = Header::new(jsonwebtoken::Algorithm::RS256);
     dpop_header.typ = Some("dpop+jwt".to_string());
     dpop_header.jwk = Some(jwk);
@@ -859,7 +868,8 @@ async fn dpop_valid_proof_with_matching_jkt_succeeds() {
             "htu": "http://example.com/test",
             "iat": now,
             "exp": now + 60,
-            "jti": "proof-1"
+            "jti": "proof-1",
+            "ath": ath
         }),
         &EncodingKey::from_rsa_pem(private_key_pem).unwrap(),
     )
