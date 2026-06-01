@@ -994,8 +994,7 @@ impl Plugin for Waf {
                 .body_methods
                 .iter()
                 .any(|method| method.eq_ignore_ascii_case(&ctx.method))
-            || !self
-                .request_body_eligible_for_scan(headers.get("content-type").map(String::as_str))
+            || !self.request_body_eligible_for_scan(headers.get("content-type").map(String::as_str))
         {
             return PluginResult::Continue;
         }
