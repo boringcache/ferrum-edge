@@ -2059,7 +2059,7 @@ At least one rate window must be configured in every rule. Do not combine the cu
 - `limit_by: "spiffe_identity"` — Enforces in `authorize` phase (after `spiffe_identity`), keyed by `ctx.peer_spiffe_id`. Falls back to client IP if no peer SPIFFE identity exists.
 - Stream (`on_stream_connect`) — `consumer` mode uses the stream Consumer identity when available. `spiffe_identity` mode uses `peer_spiffe_id` metadata written by the stream `spiffe_identity` hook. Both modes fall back to client IP when their identity is absent.
 
-**Rate limit headers** (when `expose_headers: true`): `x-ratelimit-limit`, `x-ratelimit-remaining`, `x-ratelimit-window`, `x-ratelimit-identity`
+**Rate limit headers** (when `expose_headers: true`): `x-ratelimit-limit`, `x-ratelimit-remaining`, `x-ratelimit-window`. The limiter key/identity is never exposed: for `limit_by: "consumer"`/`"spiffe_identity"` it would echo the gateway's internal caller identity (consumer username) or the peer workload SVID back to the client.
 
 Returns HTTP `429 Too Many Requests` when exceeded.
 
