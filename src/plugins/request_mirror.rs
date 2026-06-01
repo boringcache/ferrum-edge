@@ -387,12 +387,19 @@ impl Plugin for RequestMirror {
         self.http_client
             .strip_egress_baggage_in_vec(&mut mirror_headers);
 
+        // Strip query params before ANY logging of the mirror URL — it is built
+        // from the original request's query string and can carry secrets
+        // (`?access_token=`, `?api_key=`, `?sig=`). Computed here, before the
+        // permit-exhaustion drop path, so every log site uses the stripped form
+        // (the full `mirror_url` is still used for the actual mirror request).
+        let mirror_url_for_log = strip_query_params(&mirror_url).to_string();
+
         let permit = match self.mirror_in_flight.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
                 warn!(
                     "request_mirror: dropping mirror request for {} {} because max_in_flight limit was reached",
-                    method, mirror_url
+                    method, mirror_url_for_log
                 );
                 return PluginResult::Continue;
             }
@@ -429,7 +436,6 @@ impl Plugin for RequestMirror {
         ctx.mirror_result_rx = Some(rx);
 
         let http_client = self.http_client.clone();
-        let mirror_url_for_log = strip_query_params(&mirror_url).to_string();
         let max_response_body_bytes = self.max_response_body_bytes;
 
         // Fire-and-forget: spawn an async task to send the mirror request.
@@ -458,7 +464,17 @@ impl Plugin for RequestMirror {
 
             // Forward all headers from the original (transformed) request
             for (key, value) in &mirror_headers {
-                // Skip hop-by-hop and connection-specific headers
+                // Skip hop-by-hop and connection-specific headers. Also skip
+                // `content-length`: when the body is not mirrored
+                // (`mirror_request_body = false`) or simply unavailable, no
+                // `.body()` is attached, so forwarding the original
+                // `content-length: N` would declare N body bytes with a
+                // zero-length body — a malformed request that makes many mirror
+                // servers block awaiting the bytes until timeout or reject it,
+                // wasting an in-flight permit / pooled connection and corrupting
+                // mirror analytics. Dropping it lets reqwest set the correct
+                // Content-Length from the actual mirror body (0 when no body is
+                // attached, exact length when one is).
                 match key.as_str() {
                     "host"
                     | "connection"
@@ -466,6 +482,7 @@ impl Plugin for RequestMirror {
                     | "transfer-encoding"
                     | "te"
                     | "upgrade"
+                    | "content-length"
                     | "proxy-authorization"
                     | "proxy-connection" => continue,
                     _ => {
@@ -478,8 +495,17 @@ impl Plugin for RequestMirror {
                 req_builder = req_builder.body(body);
             }
 
+            // Route through `execute_redacted` so the mirror URL used in logs
+            // and the returned error string is the query-stripped
+            // `mirror_url_for_log`, never the full `mirror_url`. The full URL is
+            // built from the original request's query params and can carry
+            // credentials (`?access_token=...`, `?api_key=...`, `?sig=...`); a
+            // raw `reqwest::Error` renders the full request URL in its Display
+            // output, so stringifying it into `mirror_error` would leak those
+            // secrets to every logging sink. `execute_redacted` reduces the
+            // transport error to an `ErrorClass` plus the stripped URL.
             let (status_code, response_size, error_msg) = match http_client
-                .execute(req_builder, "request_mirror")
+                .execute_redacted(req_builder, "request_mirror", &mirror_url_for_log)
                 .await
             {
                 Ok(resp) => {
@@ -509,11 +535,15 @@ impl Plugin for RequestMirror {
                     (Some(status), size, None)
                 }
                 Err(err) => {
+                    // `err` is already sanitized by `execute_redacted`
+                    // (ErrorClass + stripped URL); it never contains the query
+                    // string. Use the same string for the log line and the
+                    // structured `mirror_error` field.
                     warn!(
                         "request_mirror: failed to mirror {} {} → {}",
                         method, mirror_url_for_log, err
                     );
-                    (None, None, Some(err.to_string()))
+                    (None, None, Some(err))
                 }
             };
 

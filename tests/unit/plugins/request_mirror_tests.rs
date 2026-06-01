@@ -804,3 +804,210 @@ async fn test_mirror_response_body_uses_content_length_fast_path() {
         .expect("size should be reported");
     assert_eq!(size, 4096, "CL fast-path should report the full 4 KiB size");
 }
+
+// === Finding #13: query-string secrets must not leak into mirror_error ===
+//
+// The mirror URL is built from the original request's query params and can
+// carry credentials (`?access_token=...`, `?api_key=...`, `?sig=...`). A raw
+// `reqwest::Error` renders the full request URL — including the query string —
+// in its Display output. On a mirror failure (DNS error, connection refused,
+// TLS error, timeout — all routine, attacker-influenceable conditions) the
+// error string is stored verbatim in `MirrorResponseMeta.mirror_error`, which
+// is serialized into every logging sink. Routing the call through
+// `execute_redacted` reduces the transport error to an `ErrorClass` plus the
+// query-stripped URL, so the secret never reaches the logs.
+
+/// A mirror failure (connection refused) must produce a `mirror_error` that
+/// contains neither the query string nor any secret value carried in it.
+#[tokio::test]
+async fn test_mirror_error_does_not_leak_query_string_secret() {
+    use tokio::net::TcpListener;
+
+    // Bind to an ephemeral port, capture it, then drop the listener so that a
+    // connection to that port is refused immediately (deterministic, fast — no
+    // dependence on the proxy timeout budget).
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+
+    let plugin = RequestMirror::new(
+        &json!({
+            "mirror_host": addr.ip().to_string(),
+            "mirror_port": addr.port(),
+            "mirror_request_body": false
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    // Use a short backend_read_timeout so that, if the platform does not
+    // produce an immediate connection-refused, the test still finishes quickly.
+    let mut ctx = make_ctx_with_proxy();
+    let proxy: ferrum_edge::config::types::Proxy = serde_json::from_value(json!({
+        "id": "proxy-123",
+        "name": "test-proxy",
+        "listen_path": "/api",
+        "backend_host": "backend.local",
+        "backend_port": 8080,
+        "backend_scheme": "http",
+        "backend_read_timeout_ms": 1000
+    }))
+    .unwrap();
+    ctx.matched_proxy = Some(Arc::new(proxy));
+
+    // Secrets in the query string. `make_ctx` already inserts `page=1`; add a
+    // bearer-style token and an api key that MUST NOT appear in any log field.
+    ctx.query_params.insert(
+        "access_token".to_string(),
+        "super-secret-token-value".to_string(),
+    );
+    ctx.query_params
+        .insert("sig".to_string(), "deadbeefsignature".to_string());
+
+    let mut headers: HashMap<String, String> = HashMap::new();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    plugin_utils::assert_continue(result);
+
+    let meta = ctx
+        .collect_mirror_result()
+        .await
+        .expect("mirror should report metadata for a failed request");
+
+    let error = meta
+        .mirror_error
+        .expect("a refused/timed-out mirror must record an error");
+
+    // The error must describe the failure but must NOT embed the credentials.
+    assert!(
+        !error.contains("super-secret-token-value"),
+        "mirror_error leaked the access_token value: {error}"
+    );
+    assert!(
+        !error.contains("deadbeefsignature"),
+        "mirror_error leaked the sig value: {error}"
+    );
+    assert!(
+        !error.contains("access_token"),
+        "mirror_error leaked the access_token query key: {error}"
+    );
+    assert!(
+        !error.contains("sig="),
+        "mirror_error leaked a query parameter: {error}"
+    );
+    // No query string at all (the '?' separator) should survive.
+    assert!(
+        !error.contains('?'),
+        "mirror_error must not contain a query string: {error}"
+    );
+
+    // The redacted-but-informative target URL should still be carried in the
+    // dedicated field, query-stripped.
+    assert!(
+        !meta.mirror_target_url.contains('?'),
+        "mirror_target_url must be query-stripped: {}",
+        meta.mirror_target_url
+    );
+}
+
+// === Finding #14: stale content-length must not be forwarded to the mirror ===
+//
+// When `mirror_request_body` is false (or the body is otherwise unavailable),
+// no body is attached to the mirror request. Forwarding the original request's
+// `content-length: N` header would then declare N body bytes with a zero-length
+// body — a malformed request that makes many mirror servers block awaiting the
+// bytes until timeout or reject it. Dropping `content-length` from the forwarded
+// header set lets reqwest set the correct Content-Length from the actual body.
+
+/// With `mirror_request_body = false` and a request carrying
+/// `content-length: 99`, the outgoing mirror request must NOT declare 99 body
+/// bytes. reqwest sets Content-Length to 0 (or omits it) for the empty body.
+#[tokio::test]
+async fn test_stale_content_length_not_forwarded_when_body_not_mirrored() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    // The server captures the raw request head and reports the parsed
+    // content-length (if any) back over a oneshot channel.
+    let (tx, rx) = oneshot::channel::<Option<u64>>();
+    tokio::spawn(async move {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            // Read the request head. A bodyless request (or CL: 0) means the
+            // headers terminate at the first \r\n\r\n with nothing after.
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 1024];
+            // Read until we see the header terminator or the peer closes.
+            loop {
+                match stream.read(&mut chunk).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        buf.extend_from_slice(&chunk[..n]);
+                        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+
+            let head = String::from_utf8_lossy(&buf);
+            // Find the content-length header value, if present (case-insensitive).
+            let content_length = head.lines().find_map(|line| {
+                let lower = line.to_ascii_lowercase();
+                lower
+                    .strip_prefix("content-length:")
+                    .map(|v| v.trim().parse::<u64>().unwrap_or(u64::MAX))
+            });
+
+            // Reply with a tiny valid response so the client side completes
+            // cleanly (no error path), then close.
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await;
+            let _ = stream.shutdown().await;
+
+            let _ = tx.send(content_length);
+        } else {
+            let _ = tx.send(None);
+        }
+    });
+
+    let plugin = RequestMirror::new(
+        &json!({
+            "mirror_host": addr.ip().to_string(),
+            "mirror_port": addr.port(),
+            // Body is NOT mirrored — this is the broken path.
+            "mirror_request_body": false
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = make_ctx_with_proxy();
+    let mut headers: HashMap<String, String> = HashMap::new();
+    // A POST that arrived with a body declares content-length. This is the
+    // stale header that must NOT be forwarded since no body is mirrored.
+    headers.insert("content-length".to_string(), "99".to_string());
+    headers.insert("content-type".to_string(), "application/json".to_string());
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    plugin_utils::assert_continue(result);
+
+    // Drain the mirror task so the request is actually sent.
+    let _ = ctx.collect_mirror_result().await;
+
+    let observed = rx.await.expect("server should report content-length");
+    // The mirror request must NOT declare the stale 99 bytes. reqwest sets
+    // Content-Length: 0 for an empty body (or omits it entirely).
+    match observed {
+        None => { /* no content-length declared — acceptable */ }
+        Some(0) => { /* reqwest set the correct zero length — acceptable */ }
+        Some(other) => panic!(
+            "mirror request forwarded a stale/incorrect content-length: {other} (expected 0 or absent)"
+        ),
+    }
+}

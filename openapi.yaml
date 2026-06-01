@@ -10692,11 +10692,18 @@ components:
     BotDetectionConfig:
       type: object
       description: >-
-        Plugin: bot_detection — case-insensitive User-Agent substring matching.
-        The allow list is consulted before blocked patterns, so a User-Agent
-        that contains a blocked substring can still pass if it also contains an
-        allow-list entry (useful for permitting GoogleBot while blocking
-        generic `bot` patterns). HTTP-family only.
+        Plugin: bot_detection — case-insensitive User-Agent matching.
+        `blocked_patterns` are substring matches; `allow_list` entries are
+        word-boundary matches and are consulted before blocked patterns, so a
+        User-Agent that contains a blocked substring can still pass if it also
+        contains an allow-list entry as a standalone token (useful for
+        permitting GoogleBot while blocking generic `bot` patterns). The
+        word-boundary anchoring on the allow list prevents an allowed token
+        from being smuggled inside an otherwise-blocked agent. A no-op config
+        (empty `blocked_patterns` while missing User-Agent headers are allowed)
+        is rejected; an allow-list alone is not enforcement. The User-Agent is
+        client-controlled and spoofable, so this is a coarse filter, not strong
+        bot verification. HTTP-family only.
       properties:
         blocked_patterns:
           type: array
@@ -10714,17 +10721,20 @@ components:
             - mechanize
             - php/
           description: >-
-            User-Agent substrings to reject. Matching is case-insensitive.
-            Specifying this field replaces the defaults entirely — set to
-            `[]` to disable blocking and rely solely on `allow_missing_user_agent`.
+            User-Agent substrings to reject (case-insensitive). Specifying this
+            field replaces the defaults entirely. Setting it to `[]` is valid
+            only when `allow_missing_user_agent: false` creates a missing-header
+            reject path; an allow-list alone is not enforcement.
         allow_list:
           type: array
           items:
             type: string
           default: []
           description: >-
-            User-Agent substrings that always pass, evaluated before
-            `blocked_patterns`. Matching is case-insensitive.
+            User-Agent tokens that always pass, evaluated before
+            `blocked_patterns` (allow wins). Matching is case-insensitive and
+            word-boundary anchored, so an entry only matches when it appears as
+            a standalone token in the User-Agent.
         allow_missing_user_agent:
           type: boolean
           default: true
@@ -12820,7 +12830,7 @@ components:
           type: string
           enum: [reject, redact, warn]
           default: reject
-          description: Action when a violation is detected in the response body
+          description: "Action when a violation is detected in the response body. NOTE: in redact mode over Server-Sent Events (text/event-stream), PII that spans two or more consecutive `data:` frames is detected on the accumulated stream but cannot be redacted per-frame and passes through to the client (only a warn log is emitted). Use action=reject for a hard guarantee that frame-straddling PII is blocked."
         pii_patterns:
           type: array
           items:
@@ -12887,7 +12897,7 @@ components:
         max_completion_length:
           type: integer
           default: 0
-          description: Maximum allowed character length of completion content. 0 = no limit
+          description: "Maximum allowed length of completion content, measured in characters (Unicode scalar values, not UTF-8 bytes). 0 = no limit"
 
     AiFederationConfig:
       type: object
@@ -13561,7 +13571,11 @@ components:
             Action when the client IP cannot be resolved to a country. Applies
             to both genuine MaxMind misses (private IPs, unallocated ranges)
             and to the data plane fallback path when the `.mmdb` file is
-            missing on disk.
+            missing on disk. The default `allow` is fail-open: unresolved
+            traffic is permitted, so a missing or stale `.mmdb` silently
+            disables the geo gate. Set this explicitly to `deny` for fail-closed
+            behaviour. When the default is used, a one-time warning is logged at
+            startup, and the first request-time fail-open is logged at warn.
 
     RateSpec:
       type: object
