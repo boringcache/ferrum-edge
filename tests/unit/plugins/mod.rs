@@ -22,6 +22,7 @@ mod compression_tests;
 mod correlation_id_tests;
 mod cors_tests;
 mod dpop_tests;
+mod example_audit_plugin_tests;
 mod fault_injection_tests;
 mod geo_restriction_tests;
 mod graphql_tests;
