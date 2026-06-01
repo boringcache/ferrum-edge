@@ -432,13 +432,10 @@ impl OidcRelyingParty {
         // lenient validate_url_string (not validate_redirect_uri) so localhost/dev
         // setups are not over-constrained. Do this before spawning discovery so
         // rejected plugin configs have no background side effects.
-        let post_logout_redirect_uri = optional_string(
-            provider_obj,
-            "post_logout_redirect_uri",
-            "provider[0]",
-        )?
-        .map(|url| validate_url_string(&url, "provider[0].post_logout_redirect_uri"))
-        .transpose()?;
+        let post_logout_redirect_uri =
+            optional_string(provider_obj, "post_logout_redirect_uri", "provider[0]")?
+                .map(|url| validate_url_string(&url, "provider[0].post_logout_redirect_uri"))
+                .transpose()?;
         let jwks_store = Arc::new(ArcSwap::from_pointee(jwks_uri.as_ref().map(|uri| {
             get_or_create_jwks_store(uri, &http_client, DEFAULT_JWKS_REFRESH_INTERVAL)
         })));
@@ -1712,9 +1709,10 @@ fn encoded_session_cookie_len(plaintext_len: usize) -> usize {
     sealed_len.div_ceil(3) * 4
 }
 
-/// Schedule the next proactive refresh `refresh_skew` before access-token expiry,
-/// but never sooner than `REFRESH_RETRY_BACKOFF_SECS` from now. The floor stops a
-/// refresh storm when a provider issues very short-lived access tokens (so
+/// Schedule the next proactive refresh `refresh_skew` before the earliest
+/// token/claim expiry passed by the caller, but never sooner than
+/// `REFRESH_RETRY_BACKOFF_SECS` from now. The floor stops a refresh storm when
+/// a provider issues very short-lived access tokens or ID-token claims (so
 /// `expires_at - refresh_skew` would already be in the past).
 fn next_refresh_after(expires_at_unix: i64, now: i64, refresh_skew_secs: i64) -> i64 {
     (expires_at_unix - refresh_skew_secs).max(now + REFRESH_RETRY_BACKOFF_SECS)
