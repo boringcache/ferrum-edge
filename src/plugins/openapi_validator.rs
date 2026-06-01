@@ -14,6 +14,7 @@ use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::config::types::OPENAPI_VALIDATOR_DEFAULT_CONTENT_TYPES;
 
@@ -21,9 +22,12 @@ use super::{HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, RequestContext};
 
 const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
 const DEFAULT_ERROR_TRUNCATE_CHARS: usize = 1024;
-const MATCHED_OPERATION_INDEX_KEY: &str = "openapi_validator.matched_operation_index";
-const MATCHED_OPERATION_METHOD_KEY: &str = "openapi_validator.matched_operation_method";
+/// Public, stable metadata key carrying the bypass/skip reason for loggers and
+/// observability. It is write-only output; control flow recomputes bypass
+/// decisions per instance so sibling instances cannot cross-apply a bypass
+/// decision (see finding #17).
 const SKIP_REASON_KEY: &str = "openapi_validator.skip_reason";
+static INSTANCE_ID_COUNTER: AtomicUsize = AtomicUsize::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EnforcementMode {
@@ -93,8 +97,6 @@ struct ParsedOperation {
 }
 
 struct OperationMatch<'a> {
-    method: &'a str,
-    index: usize,
     entry: &'a OperationEntry,
 }
 
@@ -145,6 +147,7 @@ impl ResponseValidators {
 }
 
 pub struct OpenapiValidator {
+    instance_id: usize,
     mode: EnforcementMode,
     validate_request: bool,
     validate_response: bool,
@@ -280,6 +283,7 @@ impl OpenapiValidator {
             optional_usize(object, "error_truncate_chars")?.unwrap_or(DEFAULT_ERROR_TRUNCATE_CHARS);
 
         Ok(Self {
+            instance_id: INSTANCE_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
             mode,
             validate_request,
             validate_response,
@@ -307,76 +311,40 @@ impl OpenapiValidator {
     }
 
     fn match_operation(&self, method: &str, path: &str) -> Option<OperationMatch<'_>> {
-        let (method, bucket) = self
+        let (_, bucket) = self
             .ops_by_method
             .iter()
             .find(|(key, _)| key.eq_ignore_ascii_case(method))?;
         let index = bucket.path_regexes.matches(path).into_iter().next()?;
-        bucket.entries.get(index).map(|entry| OperationMatch {
-            method,
-            index,
-            entry,
-        })
-    }
-
-    fn cached_operation<'a>(&'a self, ctx: &RequestContext) -> Option<&'a OperationEntry> {
-        let method = ctx.metadata.get(MATCHED_OPERATION_METHOD_KEY)?;
-        if !method.eq_ignore_ascii_case(&ctx.method) {
-            return None;
-        }
-        let index = ctx
-            .metadata
-            .get(MATCHED_OPERATION_INDEX_KEY)?
-            .parse::<usize>()
-            .ok()?;
-        self.ops_by_method.get(method)?.entries.get(index)
+        bucket
+            .entries
+            .get(index)
+            .map(|entry| OperationMatch { entry })
     }
 
     fn operation_for_context<'a>(&'a self, ctx: &RequestContext) -> Option<&'a OperationEntry> {
-        self.cached_operation(ctx).or_else(|| {
-            self.match_operation(&ctx.method, &ctx.path)
-                .map(|matched| matched.entry)
-        })
+        if let Some((method, path)) = ctx.openapi_validator_matches.get(&self.instance_id) {
+            return self
+                .match_operation(method, path)
+                .map(|matched| matched.entry);
+        }
+        self.match_operation(&ctx.method, &ctx.path)
+            .map(|matched| matched.entry)
     }
 
     fn mark_operation(&self, ctx: &mut RequestContext, operation: OperationMatch<'_>) {
         self.mark_operation_entry(ctx, operation.entry);
-        ctx.metadata.insert(
-            MATCHED_OPERATION_METHOD_KEY.to_string(),
-            operation.method.to_string(),
-        );
-        ctx.metadata.insert(
-            MATCHED_OPERATION_INDEX_KEY.to_string(),
-            operation.index.to_string(),
-        );
     }
 
     fn mark_operation_entry(&self, ctx: &mut RequestContext, operation: &OperationEntry) {
         self.mark_mode(ctx);
+        ctx.openapi_validator_matches
+            .entry(self.instance_id)
+            .or_insert_with(|| (ctx.method.clone(), ctx.path.clone()));
         ctx.metadata.insert(
             "openapi_validator.matched_operation".to_string(),
             operation.operation_label.clone(),
         );
-    }
-
-    fn match_and_mark_operation<'a>(
-        &'a self,
-        ctx: &mut RequestContext,
-    ) -> Option<&'a OperationEntry> {
-        let matched = self.match_operation(&ctx.method, &ctx.path)?;
-        let entry = matched.entry;
-        self.mark_operation(ctx, matched);
-        Some(entry)
-    }
-
-    fn cached_bypass_reason(&self, ctx: &RequestContext) -> Option<&'static str> {
-        match ctx.metadata.get(SKIP_REASON_KEY).map(String::as_str) {
-            Some("bypass_path") => Some("bypass_path"),
-            Some("bypass_method") => Some("bypass_method"),
-            Some("bypass_consumer") => Some("bypass_consumer"),
-            Some("bypass_header") => Some("bypass_header"),
-            _ => None,
-        }
     }
 
     fn bypass_reason_for_headers(
@@ -384,9 +352,6 @@ impl OpenapiValidator {
         ctx: &RequestContext,
         headers: &HashMap<String, String>,
     ) -> Option<&'static str> {
-        if let Some(reason) = self.cached_bypass_reason(ctx) {
-            return Some(reason);
-        }
         if self
             .bypass_paths
             .as_ref()
@@ -431,6 +396,9 @@ impl OpenapiValidator {
 
     fn mark_skip(&self, ctx: &mut RequestContext, reason: &'static str) {
         self.mark_mode(ctx);
+        ctx.openapi_validator_matches.remove(&self.instance_id);
+        // Public key for loggers/observability (last writer wins across
+        // instances; this is output only).
         ctx.metadata
             .insert(SKIP_REASON_KEY.to_string(), reason.to_string());
     }
@@ -601,10 +569,7 @@ impl Plugin for OpenapiValidator {
             self.mark_skip(ctx, reason);
             return PluginResult::Continue;
         }
-        let Some(operation) = self
-            .cached_operation(ctx)
-            .or_else(|| self.match_and_mark_operation(ctx))
-        else {
+        let Some(operation) = self.operation_for_context(ctx) else {
             if self.fail_on_unknown_operation {
                 return self.handle_violation(
                     ctx,
@@ -620,6 +585,7 @@ impl Plugin for OpenapiValidator {
             self.mark_skip(ctx, "no_match");
             return PluginResult::Continue;
         };
+        self.mark_operation_entry(ctx, operation);
         if body.is_empty() {
             return if operation.request_required {
                 self.handle_violation(
@@ -679,10 +645,7 @@ impl Plugin for OpenapiValidator {
             self.mark_skip(ctx, reason);
             return PluginResult::Continue;
         }
-        let Some(operation) = self
-            .cached_operation(ctx)
-            .or_else(|| self.match_and_mark_operation(ctx))
-        else {
+        let Some(operation) = self.operation_for_context(ctx) else {
             if self.fail_on_unknown_operation {
                 return self.handle_violation(
                     ctx,
@@ -698,6 +661,7 @@ impl Plugin for OpenapiValidator {
             self.mark_skip(ctx, "no_match");
             return PluginResult::Continue;
         };
+        self.mark_operation_entry(ctx, operation);
         if body.is_empty() {
             return PluginResult::Continue;
         }
@@ -740,6 +704,16 @@ impl Plugin for OpenapiValidator {
     }
 }
 
+/// Wrap an operator-supplied `path_regex` so it matches the full path rather
+/// than any substring. The non-capturing group keeps the anchors applied to the
+/// whole alternation: `a|b` becomes `^(?:a|b)$` (both branches anchored), not
+/// `^a|b$` (only the first branch anchored). Already-anchored patterns such as
+/// the auto-generated `^/orders/[^/]+$` remain equivalent after wrapping. See
+/// finding #89.
+fn anchor_path_regex(raw: &str) -> String {
+    format!("^(?:{raw})$")
+}
+
 fn parse_operation(
     value: &Value,
     index: usize,
@@ -761,7 +735,15 @@ fn parse_operation(
         .to_string();
     let path_regex_raw = optional_string(object, "path_regex")?
         .ok_or_else(|| format!("openapi_validator: operations[{index}].path_regex is required"))?;
-    Regex::new(path_regex_raw).map_err(|error| {
+    // Anchor operator-supplied patterns so a loose regex like `/users/\d+`
+    // cannot substring-match an unintended superstring path such as
+    // `/admin/users/1/secret` and thus validate a request against the wrong
+    // operation (finding #89). Ferrum's own generated specs already anchor via
+    // extractor.rs. The non-capturing group is required so a top-level
+    // alternation `a|b` becomes `^(?:a|b)$` (every branch anchored) rather than
+    // `^a|b$` (only the first branch anchored).
+    let path_regex_anchored = anchor_path_regex(path_regex_raw);
+    Regex::new(&path_regex_anchored).map_err(|error| {
         format!("openapi_validator: operations[{index}].path_regex is invalid: {error}")
     })?;
     let operation_label = optional_string(object, "operation_label")?
@@ -778,7 +760,7 @@ fn parse_operation(
 
     Ok(ParsedOperation {
         method,
-        path_regex: path_regex_raw.to_string(),
+        path_regex: path_regex_anchored,
         entry: OperationEntry {
             operation_label,
             literal_segments: literal_segment_count(&path_template),
@@ -1389,6 +1371,13 @@ fn multipart_part_to_schema_value(part: &MultipartPart, schema: &Value) -> Resul
             "size".to_string(),
             Value::Number(serde_json::Number::from(part.body.len() as u64)),
         );
+        // Materialize the part body as a `content` string so the schema can
+        // validate it. (A finding-#88 micro-optimization that skipped this copy
+        // when the schema "couldn't validate content" was reverted: it was NOT
+        // outcome-preserving — for `maxProperties` / `minProperties` /
+        // `propertyNames` / `patternProperties` / `dependentRequired` / `not` /
+        // `oneOf`-`anyOf` part schemas the mere presence of `content` changes
+        // validity. The body is already bounded, so the copy is cheap.)
         if let Ok(text) = std::str::from_utf8(&part.body) {
             out.insert("content".to_string(), Value::String(text.to_string()));
         }

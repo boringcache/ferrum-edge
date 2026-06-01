@@ -242,6 +242,13 @@ async fn literal_path_beats_parameter_path() {
             .map(String::as_str),
         Some("GET /users/me")
     );
+    assert!(
+        !ctx.metadata.keys().any(|key| key
+            .starts_with("openapi_validator.matched_operation_method.")
+            || key.starts_with("openapi_validator.matched_operation_index.")),
+        "internal operation cache keys must not be exposed in metadata: {:?}",
+        ctx.metadata
+    );
 }
 
 #[tokio::test]
@@ -269,6 +276,13 @@ async fn bypass_header_skips_buffering_and_validation() {
             .get("openapi_validator.skip_reason")
             .map(String::as_str),
         Some("bypass_header")
+    );
+    assert!(
+        !ctx.metadata
+            .keys()
+            .any(|key| key.starts_with("openapi_validator.skip_reason.")),
+        "internal skip cache keys must not be exposed in metadata: {:?}",
+        ctx.metadata
     );
 }
 
@@ -637,5 +651,247 @@ async fn text_and_binary_response_validation_use_matching_schema_rules() {
         plugin
             .on_final_response_body(&mut ctx, 404, &json_headers(), br#"{"error":"missing"}"#)
             .await,
+    );
+}
+
+// Finding #17: two openapi_validator instances on the same request share
+// ctx.metadata. Before the per-instance cache keys, the instance that marks its
+// matched operation FIRST would have its (method, index) overwritten by a
+// sibling and then resolve the sibling's index against its OWN differently
+// ordered entry vector -- validating the request against the wrong operation
+// schema. This test reproduces that ordering: instance A matches `/items` at
+// sorted index 1 (because the more-specific `/items/extra` sorts first), while
+// instance B matches `/items` at index 0. With the bug, A's body phase reads
+// B's index 0 and validates against A's `/items/extra` schema (requires "z"),
+// rejecting a body that is valid for `/items` (requires "a").
+#[tokio::test]
+async fn sibling_instances_do_not_cross_apply_operation_schemas() {
+    let instance_a = OpenapiValidator::new(&json!({
+        "operations": [
+            {
+                "method": "POST",
+                "path_template": "/items/extra",
+                "path_regex": "^/items/extra$",
+                "request_required": true,
+                "request_body": {
+                    "content": {"application/json": {
+                        "type": "object",
+                        "required": ["z"],
+                        "properties": {"z": {"type": "string"}}
+                    }}
+                }
+            },
+            {
+                "method": "POST",
+                "path_template": "/items",
+                "path_regex": "^/items$",
+                "request_required": true,
+                "request_body": {
+                    "content": {"application/json": {
+                        "type": "object",
+                        "required": ["a"],
+                        "properties": {"a": {"type": "string"}}
+                    }}
+                }
+            }
+        ]
+    }))
+    .unwrap();
+    let instance_b = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/items",
+            "path_regex": "^/items$",
+            "request_required": true,
+            "request_body": {
+                "content": {"application/json": {
+                    "type": "object",
+                    "required": ["b"],
+                    "properties": {"b": {"type": "string"}}
+                }}
+            }
+        }]
+    }))
+    .unwrap();
+
+    // Production order: every instance's before_proxy runs before any body
+    // phase. A marks first, then B overwrites the shared (legacy) keys.
+    let mut ctx = post_ctx("/items");
+    let mut headers = json_headers();
+    assert_continue(instance_a.before_proxy(&mut ctx, &mut headers).await);
+    assert_continue(instance_b.before_proxy(&mut ctx, &mut headers).await);
+
+    // Body valid for A's `/items` operation ("a"), invalid for `/items/extra`
+    // ("z"). A must validate against its own matched operation and continue.
+    assert_continue(
+        instance_a
+            .on_final_request_body_with_context(&mut ctx, &json_headers(), br#"{"a":"ok"}"#)
+            .await,
+    );
+}
+
+// Finding #17 (bypass facet): cached_bypass_reason must read a per-instance key.
+// A sibling that bypasses the request must not cause a non-bypassing instance to
+// silently skip its own validation.
+#[tokio::test]
+async fn sibling_bypass_does_not_skip_other_instance_validation() {
+    let bypassing = OpenapiValidator::new(&json!({
+        "bypass": {"paths": ["^/items$"]},
+        "operations": [{
+            "method": "POST",
+            "path_template": "/items",
+            "path_regex": "^/items$",
+            "request_body": {"content": {"application/json": {"type": "object"}}}
+        }]
+    }))
+    .unwrap();
+    let enforcing = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/items",
+            "path_regex": "^/items$",
+            "request_required": true,
+            "request_body": {
+                "content": {"application/json": {
+                    "type": "object",
+                    "required": ["a"],
+                    "properties": {"a": {"type": "string"}}
+                }}
+            }
+        }]
+    }))
+    .unwrap();
+
+    let mut ctx = post_ctx("/items");
+    let mut headers = json_headers();
+    // The bypassing instance runs first and records its skip reason.
+    assert_continue(bypassing.before_proxy(&mut ctx, &mut headers).await);
+    // The enforcing instance must still reject a body missing the required "a".
+    assert_reject(
+        enforcing
+            .on_final_request_body_with_context(&mut ctx, &json_headers(), br#"{}"#)
+            .await,
+        Some(400),
+    );
+}
+
+// Finding #89: operator-supplied path_regex must be anchored so a loose pattern
+// cannot substring-match an unintended superstring path.
+#[tokio::test]
+async fn unanchored_operator_path_regex_does_not_substring_match() {
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "GET",
+            "path_template": "/users/{id}",
+            "path_regex": "/users/[0-9]+"
+        }]
+    }))
+    .unwrap();
+
+    // Legitimate full-path request still matches.
+    let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/users/1".into());
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+    // Superstring path must NOT match -> unknown operation -> reject.
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".into(),
+        "GET".into(),
+        "/admin/users/1/secret".into(),
+    );
+    let mut headers = HashMap::new();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+// Finding #89 (alternation): a top-level alternation must be wrapped as
+// `^(?:a|b)$` so every branch is anchored. A bare `^a|b$` would leave the `/b`
+// branch suffix-anchored only, wrongly matching `/zzz/b`.
+#[tokio::test]
+async fn alternation_path_regex_anchors_every_branch() {
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "GET",
+            "path_template": "/a",
+            "path_regex": "/a|/b"
+        }]
+    }))
+    .unwrap();
+
+    // Both alternation branches match when they are the whole path.
+    for path in ["/a", "/b"] {
+        let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), path.into());
+        let mut headers = HashMap::new();
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    }
+
+    // A path that merely ends with `/b` must NOT match (would match a bare
+    // `^a|b$`). Unknown operation -> reject.
+    let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/zzz/b".into());
+    let mut headers = HashMap::new();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+// Finding #88: skipping the multipart `content` copy must stay
+// outcome-preserving. A schema that validates `content` -- here via `required`
+// plus a `pattern` constraint -- must still see the materialized content and
+// enforce it.
+#[tokio::test]
+async fn multipart_content_validation_preserved_when_schema_requires_it() {
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/upload",
+            "path_regex": "^/upload$",
+            "request_body": {
+                "content": {
+                    "multipart/form-data": {
+                        "type": "object",
+                        "required": ["doc"],
+                        "properties": {
+                            "doc": {
+                                "type": "object",
+                                "required": ["content", "size"],
+                                "properties": {
+                                    "content": {"type": "string", "pattern": "^ok:"},
+                                    "size": {"type": "integer"}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let valid = concat!(
+        "--abc\r\n",
+        "Content-Disposition: form-data; name=\"doc\"\r\n\r\n",
+        "ok: ready\r\n",
+        "--abc--\r\n"
+    );
+    let mut ctx = post_ctx("/upload");
+    ctx.headers = content_type_headers("multipart/form-data; boundary=abc");
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &content_type_headers("multipart/form-data; boundary=abc"),
+                valid.as_bytes(),
+            )
+            .await,
+    );
+
+    let invalid = valid.replace("ok: ready", "nope");
+    let mut ctx = post_ctx("/upload");
+    ctx.headers = content_type_headers("multipart/form-data; boundary=abc");
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &content_type_headers("multipart/form-data; boundary=abc"),
+                invalid.as_bytes(),
+            )
+            .await,
+        Some(400),
     );
 }
