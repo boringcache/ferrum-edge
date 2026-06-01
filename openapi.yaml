@@ -12974,11 +12974,11 @@ components:
               connect_timeout_seconds:
                 type: integer
                 default: 5
-                description: TCP + TLS handshake timeout for outbound provider calls.
+                description: Per-provider TCP + TLS handshake timeout for outbound provider calls.
               read_timeout_seconds:
                 type: integer
                 default: 60
-                description: Full response read timeout for outbound provider calls.
+                description: Overall per-request deadline for outbound provider calls.
               base_url:
                 type: string
                 description: Override the provider's default endpoint URL (for self-hosted models, internal proxies, or pinned regional endpoints).
