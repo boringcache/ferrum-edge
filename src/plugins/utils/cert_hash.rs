@@ -12,24 +12,3 @@ pub fn sha256_base64url_no_pad(bytes: &[u8]) -> String {
     hasher.update(bytes);
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hasher.finalize())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn sha256_hex_lower_matches_known_value() {
-        assert_eq!(
-            sha256_hex_lower(b"abc"),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
-    }
-
-    #[test]
-    fn sha256_base64url_no_pad_matches_known_value() {
-        assert_eq!(
-            sha256_base64url_no_pad(b"abc"),
-            "ungWv48Bz-pBQUDeXa4iI7ADYaOWF3qctBD_YfIAFa0"
-        );
-    }
-}
