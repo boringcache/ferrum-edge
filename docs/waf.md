@@ -191,6 +191,13 @@ paranoia, change severity/score, or set a per-rule `action`:
 Per-rule `action: "enforce"` only blocks when global `mode` is also
 `enforce`; with `mode: "monitor"` the match is logged but allowed.
 
+For per-rule `conditions.paths`, plain strings are exact matches, trailing `*`
+means prefix match, and leading `~` means the remaining text is compiled as the
+operator-authored regex. Regex conditions are evaluated with Rust regex
+`is_match`, so they may match anywhere in the path unless the pattern itself is
+anchored (for example `~^/api/`). This preserves existing scoped protections
+such as `~api` matching `/api/v1` and `/v1/api-keys`.
+
 `global_exemptions` short-circuits the entire WAF for matching requests, so keep
 the entries tight — an over-broad `paths` entry silently disables the WAF on
 unintended routes:

@@ -294,6 +294,41 @@ async fn custom_rule_path_conditions_are_exact_unless_marked_as_prefix_or_regex(
 }
 
 #[tokio::test]
+async fn custom_rule_regex_path_conditions_remain_unanchored() {
+    let plugin = Waf::new(&json!({
+        "include_default_rules": false,
+        "custom_rules": [{
+            "id": "CUSTOM-API-QUERY",
+            "name": "api query marker",
+            "category": "custom",
+            "severity": "high",
+            "target": "query_values",
+            "match_kind": "contains",
+            "pattern": "needle",
+            "conditions": { "paths": ["~api"] },
+            "action": "enforce"
+        }]
+    }))
+    .unwrap();
+
+    let mut leading_slash_ctx = ctx("GET", "/api/users");
+    leading_slash_ctx.set_raw_query_string("q=needle".into());
+    let result = plugin.authorize(&mut leading_slash_ctx).await;
+    assert!(
+        matches!(result, PluginResult::Reject { .. }),
+        "operator-authored `~api` rule conditions must still match normal paths containing api"
+    );
+
+    let mut embedded_ctx = ctx("GET", "/v1/api-keys");
+    embedded_ctx.set_raw_query_string("q=needle".into());
+    let result = plugin.authorize(&mut embedded_ctx).await;
+    assert!(
+        matches!(result, PluginResult::Reject { .. }),
+        "rule conditions scope protections and must preserve unanchored regex semantics"
+    );
+}
+
+#[tokio::test]
 async fn request_body_scan_uses_context_aware_final_body_hook() {
     let plugin = Waf::new(&json!({
         "rule_modes": { "FE-CMD-002": "enforce" }
