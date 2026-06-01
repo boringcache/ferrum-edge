@@ -34,6 +34,21 @@ fn create_test_cert(cn: &str, ou: Option<&str>, san_dns: Option<&str>) -> Vec<u8
     cert.der().to_vec()
 }
 
+/// Create a self-signed test certificate with the given CN and an explicit
+/// serial number (raw big-endian integer bytes). Returns DER-encoded bytes.
+fn create_test_cert_with_serial(cn: &str, serial_bytes: &[u8]) -> Vec<u8> {
+    let mut params = rcgen::CertificateParams::default();
+    let mut dn = rcgen::DistinguishedName::new();
+    dn.push(rcgen::DnType::CommonName, cn);
+    params.distinguished_name = dn;
+    params.serial_number = Some(rcgen::SerialNumber::from_slice(serial_bytes));
+
+    let cert = params
+        .self_signed(&rcgen::KeyPair::generate().unwrap())
+        .unwrap();
+    cert.der().to_vec()
+}
+
 /// Create a CA certificate and a client certificate signed by that CA.
 /// Returns (ca_der, client_der) — both DER-encoded.
 fn create_ca_signed_cert(
@@ -227,10 +242,19 @@ async fn test_mtls_auth_success_by_fingerprint() {
 async fn test_mtls_auth_success_by_serial() {
     let cert_der = create_test_cert("client.example.com", None, None);
 
-    // Parse the cert to get the serial number
+    // Parse the cert to get the serial number. The identity is the lowercase
+    // hex of the DER integer value bytes, matching the lowercase of
+    // `openssl x509 -serial` output.
     use x509_parser::prelude::*;
     let (_, cert) = X509Certificate::from_der(&cert_der).unwrap();
-    let serial_hex = cert.serial.to_str_radix(16);
+    let raw_serial = cert.raw_serial();
+    let serial_bytes = if raw_serial.len() > 1 && raw_serial[0] == 0 && (raw_serial[1] & 0x80) != 0
+    {
+        &raw_serial[1..]
+    } else {
+        raw_serial
+    };
+    let serial_hex = hex::encode(serial_bytes);
 
     let consumer = create_mtls_consumer("c1", "alice", &serial_hex);
     let index = ConsumerIndex::new(&[consumer]);
@@ -238,6 +262,47 @@ async fn test_mtls_auth_success_by_serial() {
     let plugin = MtlsAuth::new(&json!({"cert_field": "serial"})).unwrap();
     let mut ctx = create_ctx_with_cert(cert_der);
 
+    let result = plugin.authenticate(&mut ctx, &index).await;
+    assert_continue(result);
+    assert!(ctx.identified_consumer.is_some());
+}
+
+// Regression for finding #31: a serial whose leading value byte has the high
+// bit set is DER-encoded with a leading `00` sign pad. The identity must match
+// OpenSSL's value output (`c001`), not the DER content bytes (`00c001`).
+#[tokio::test]
+async fn test_mtls_auth_serial_strips_der_sign_padding() {
+    let cert_der = create_test_cert_with_serial("client.example.com", &[0xC0, 0x01]);
+    let plugin = MtlsAuth::new(&json!({"cert_field": "serial"})).unwrap();
+
+    // Canonical identity (DER sign pad stripped) authenticates.
+    let consumer = create_mtls_consumer("c1", "alice", "c001");
+    let index = ConsumerIndex::new(&[consumer]);
+    let mut ctx = create_ctx_with_cert(cert_der.clone());
+    let result = plugin.authenticate(&mut ctx, &index).await;
+    assert_continue(result);
+    assert!(ctx.identified_consumer.is_some());
+
+    // The raw DER content form must NOT match.
+    let der_padded = create_mtls_consumer("c2", "bob", "00c001");
+    let der_padded_index = ConsumerIndex::new(&[der_padded]);
+    let mut ctx2 = create_ctx_with_cert(cert_der);
+    let result2 = plugin.authenticate(&mut ctx2, &der_padded_index).await;
+    assert_reject(result2, Some(401));
+    assert!(ctx2.identified_consumer.is_none());
+}
+
+// Regression for finding #31: a serial that `to_str_radix(16)` would render
+// with an odd number of hex digits (`10203`) must produce even-length,
+// zero-padded hex (`010203`).
+#[tokio::test]
+async fn test_mtls_auth_serial_is_even_length_zero_padded() {
+    let cert_der = create_test_cert_with_serial("client.example.com", &[0x01, 0x02, 0x03]);
+    let plugin = MtlsAuth::new(&json!({"cert_field": "serial"})).unwrap();
+
+    let consumer = create_mtls_consumer("c1", "alice", "010203");
+    let index = ConsumerIndex::new(&[consumer]);
+    let mut ctx = create_ctx_with_cert(cert_der);
     let result = plugin.authenticate(&mut ctx, &index).await;
     assert_continue(result);
     assert!(ctx.identified_consumer.is_some());

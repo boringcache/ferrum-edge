@@ -9405,7 +9405,19 @@ components:
 
     LdapAuthConfig:
       type: object
-      description: "Plugin: ldap_auth — LDAP directory authentication with optional AD group filtering."
+      description: >-
+        Plugin: ldap_auth — LDAP directory authentication with optional AD group
+        filtering. Status codes distinguish failure classes: invalid credentials
+        or unknown user return 401; a user authorized by bind but not in any
+        `required_groups` returns 403; backend/configuration failures (directory
+        unreachable, service-account bind failure, or search RPC error) return 500
+        rather than 401, so clients are not falsely told their credentials are
+        wrong. When `required_groups` is set without a service account
+        (`service_account_dn`/`service_account_password`), the group-membership
+        search uses an ANONYMOUS bind; group enforcement then only works if the
+        directory permits anonymous reads of group objects, so a service account
+        is recommended. TLS connections (`ldaps://`/STARTTLS) honor the gateway
+        CRL (`FERRUM_TLS_CRL_FILE_PATH`), rejecting revoked server certificates.
       required:
         - ldap_url
       properties:
@@ -12806,7 +12818,7 @@ components:
           type: string
           enum: [content, all]
           default: content
-          description: Which message fields to scan
+          description: "Which parts of the request to scan. 'content' scans LLM prompt fields only: chat messages[].content plus top-level prompt, input, and system (completions/responses/embeddings/Anthropic-system shapes). 'all' scans the entire request body recursively (structural keys like model/id/role excepted). Use 'all' for request shapes that carry prompt text in non-standard fields."
         exclude_roles:
           type: array
           items:
