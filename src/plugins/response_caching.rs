@@ -505,6 +505,7 @@ impl ResponseCaching {
     /// Exposed for tests so they can assert the size accounting never
     /// underflow-wraps under concurrent stores/invalidations (finding #62).
     #[doc(hidden)]
+    #[allow(dead_code)]
     pub fn current_total_size_for_tests(&self) -> usize {
         self.total_size.load(Ordering::Relaxed)
     }
