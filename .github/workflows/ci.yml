@@ -394,9 +394,15 @@ jobs:
         # Covers the Istio/xDS compatibility matrix under tests/conformance.
         # This is a separate job so mesh conformance gates PRs without adding
         # latency to the unit or integration shards.
-        run: cargo test --test conformance_tests
+        #
+        # FERRUM_CONFORMANCE_STRICT_GATE enables the GA-contract presence check
+        # (a deleted/renamed GA test fails CI); --test-threads=1 guarantees the
+        # `zz_`-named gate runs last with a fully populated registry. The
+        # ordering-independent per-call GA assertion runs regardless.
+        run: cargo test --test conformance_tests -- --test-threads=1
         env:
           RUST_BACKTRACE: 1
+          FERRUM_CONFORMANCE_STRICT_GATE: "1"
 
       - name: Upload mesh conformance artifacts
         if: always()

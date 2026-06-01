@@ -9,6 +9,7 @@ pub(crate) mod registry;
 
 pub(crate) mod report;
 
+mod ga_scope;
 mod istio_authorization_policy;
 mod istio_destination_rule;
 mod istio_peer_authentication;
@@ -25,4 +26,14 @@ mod xds_type_urls;
 #[test]
 fn z_emit_coverage_artifacts() {
     report::emit_artifacts().expect("coverage artifacts must serialize cleanly");
+}
+
+// GA-scope contract gate. Lives at the top level (not in `ga_scope`) so its
+// path `conformance::zz_ga_scope_contract_gate` sorts after every submodule
+// test and after `z_emit_coverage_artifacts` — under `--test-threads=1` it runs
+// strictly last, so the registry is fully populated when it checks the
+// contract. See `ga_scope` module docs for the two-layer gate design.
+#[test]
+fn zz_ga_scope_contract_gate() {
+    ga_scope::enforce_contract_gate();
 }

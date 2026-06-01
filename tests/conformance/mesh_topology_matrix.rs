@@ -15,7 +15,7 @@ use ferrum_edge::modes::mesh::{
     MeshConfigProtocol, MeshRuntimeConfig, MeshTopology, prepare_gateway_config_for_mesh,
 };
 
-use crate::conformance::registry::Status;
+use crate::conformance::registry::{Maturity, Status};
 
 const CATEGORY: &str = "mesh_topology_matrix";
 
@@ -111,7 +111,8 @@ fn topology_node_waypoint() {
         category = CATEGORY,
         feature = "NodeWaypoint topology",
         status = Status::Supported,
-        notes = "One HBONE listener serves multiple node-local pods; per-pod policy scoping.",
+        maturity = Maturity::Experimental,
+        notes = "One HBONE listener serves multiple node-local pods; per-pod policy scoping. Experimental: GAP-2M cookie bridge is IPv4-only and the full capture datapath is live-datapath-unverified (CI compile/load-tested only).",
     );
     assert_topology_apply_succeeds(MeshTopology::NodeWaypoint);
 }

@@ -17,7 +17,7 @@ use std::path::PathBuf;
 
 use serde::Serialize;
 
-use super::registry::{Feature, Status, snapshot};
+use super::registry::{Feature, Maturity, Status, snapshot};
 
 const ARTIFACT_DIR: &str = "target/conformance";
 
@@ -33,6 +33,10 @@ struct CoverageSummary {
     supported: usize,
     deferred: usize,
     out_of_scope: usize,
+    /// Count of GA-tier features. Every one is `Supported` by construction (the
+    /// registry's per-call assertion guarantees it), so this doubles as the
+    /// size of the prescriptive GA contract.
+    ga: usize,
     /// Per-category histogram so operators can drill down without parsing the
     /// full feature list.
     by_category: BTreeMap<String, CategorySummary>,
@@ -56,6 +60,7 @@ struct CategoryReport {
 struct FeatureEntry {
     name: String,
     status: String,
+    maturity: String,
     test: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     notes: Option<String>,
@@ -83,6 +88,7 @@ pub(crate) fn emit_artifacts() -> std::io::Result<()> {
     let mut supported = 0;
     let mut deferred = 0;
     let mut out_of_scope = 0;
+    let mut ga = 0;
 
     let mut category_reports = Vec::with_capacity(categories.len());
     for (category, items) in &categories {
@@ -106,10 +112,14 @@ pub(crate) fn emit_artifacts() -> std::io::Result<()> {
                     cat_summary.out_of_scope += 1;
                 }
             }
+            if feature.maturity == Maturity::Ga {
+                ga += 1;
+            }
             total += 1;
             feature_entries.push(FeatureEntry {
                 name: feature.feature.clone(),
                 status: status_str(feature.status).to_string(),
+                maturity: maturity_str(feature.maturity).to_string(),
                 test: feature.test_name.to_string(),
                 notes: feature.notes.clone(),
             });
@@ -127,6 +137,7 @@ pub(crate) fn emit_artifacts() -> std::io::Result<()> {
             supported,
             deferred,
             out_of_scope,
+            ga,
             by_category,
         },
         categories: category_reports,
@@ -149,6 +160,14 @@ fn status_str(status: Status) -> &'static str {
         Status::Supported => "supported",
         Status::Deferred => "deferred",
         Status::OutOfScope => "out_of_scope",
+    }
+}
+
+fn maturity_str(maturity: Maturity) -> &'static str {
+    match maturity {
+        Maturity::Ga => "ga",
+        Maturity::Beta => "beta",
+        Maturity::Experimental => "experimental",
     }
 }
 
@@ -189,6 +208,7 @@ fn render_markdown(w: &mut std::fs::File, report: &CoverageReport) -> std::io::R
     writeln!(w, "| Supported | {} |", report.summary.supported)?;
     writeln!(w, "| Deferred | {} |", report.summary.deferred)?;
     writeln!(w, "| Out of scope | {} |", report.summary.out_of_scope)?;
+    writeln!(w, "| GA contract (prescriptive) | {} |", report.summary.ga)?;
     writeln!(w)?;
 
     writeln!(w, "## Status reference")?;
@@ -224,15 +244,16 @@ fn render_markdown(w: &mut std::fs::File, report: &CoverageReport) -> std::io::R
             )?;
             writeln!(w)?;
         }
-        writeln!(w, "| Feature | Status | Test | Notes |")?;
-        writeln!(w, "|---|---|---|---|")?;
+        writeln!(w, "| Feature | Status | Maturity | Test | Notes |")?;
+        writeln!(w, "|---|---|---|---|---|")?;
         for feature in &category.features {
             let notes = feature.notes.as_deref().unwrap_or("");
             writeln!(
                 w,
-                "| `{}` | {} | `{}` | {} |",
+                "| `{}` | {} | {} | `{}` | {} |",
                 escape_md(&feature.name),
                 feature.status,
+                feature.maturity,
                 escape_md(&feature.test),
                 escape_md(notes)
             )?;
