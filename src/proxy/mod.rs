@@ -17699,8 +17699,8 @@ mod tests {
             &binary_headers,
         ));
 
-        // No request context (e.g. the hbone path without ctx): keep the
-        // pre-flight buffering decision.
+        // No request context (the proxy passes None when retries are
+        // configured): keep the pre-flight buffering decision.
         assert!(!refine_stream_response_for_content_type(
             false,
             &proxy,
