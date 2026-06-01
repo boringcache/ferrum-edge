@@ -22,6 +22,12 @@ conformance suite was observational ("all-green by design") and a promised
 feature could be silently downgraded. Now a GA feature that regresses breaks its
 own test. See `tests/conformance/ga_scope.rs` for the gate.
 
+The GA contract is **seeded and grows incrementally** — a feature is enrolled
+only once we are prepared to fail CI on its regression. So the contract does not
+yet enroll every row the maturity tables label *Stable*; `coverage.md` lists the
+currently enrolled (machine-gated) set, which is the authoritative answer to
+"what regression fails CI today."
+
 ## Current headline state
 
 - **GA track — Ferrum-native sidecar mesh.** `Sidecar` topology + native
