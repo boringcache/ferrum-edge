@@ -22,10 +22,10 @@
 //! **Hot-path optimization**: The recording methods use a thread-local `String`
 //! buffer for the DashMap lookup key, achieving **zero heap allocation on cache
 //! hits** (99%+ of requests). Only the first record per unique
-//! (consumer, proxy, status_code) combination allocates — subsequent records
-//! reuse the existing DashMap entry via a read-lock `get()` on a borrowed `&str`.
-//! Stream entries use a `status_code` sentinel of `0` to share the same key
-//! format and code path.
+//! (consumer, proxy, status_code, currency, namespace, pricing) combination
+//! allocates — subsequent records reuse the existing DashMap entry via a
+//! read-lock `get()` on a borrowed `&str`. Stream entries use a `status_code`
+//! sentinel of `0` to share the same key format and code path.
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
@@ -299,13 +299,14 @@ const STREAM_STATUS_SENTINEL: u16 = 0;
 /// Chargeback registry holding per-consumer, per-proxy charge accumulators.
 ///
 /// **Key design**: The DashMap uses plain `String` keys formatted as
-/// `"consumer|proxy_id|status_code|currency|namespace_label"`. Render metadata
-/// (consumer, proxy_id, proxy_name, status_code, protocol_family) is stored in
-/// the `ChargebackEntry` value. This allows the hot-path recording methods to use
-/// `DashMap::get(&str)` with a thread-local buffer — zero allocation on cache
-/// hits. Only the cold path (first record per unique combination) allocates a
-/// `String` key and `Arc<str>` metadata. This matches the connection pool key
-/// pattern in `connection_pool.rs`.
+/// `"consumer|proxy_id|status_code|currency|namespace_label|price_bits..."`.
+/// Render metadata (consumer, proxy_id, proxy_name, status_code,
+/// protocol_family) is stored in the `ChargebackEntry` value. This allows the
+/// hot-path recording methods to use `DashMap::get(&str)` with a thread-local
+/// buffer — zero allocation on cache hits. Only the cold path (first record per
+/// unique billing/pricing combination) allocates a `String` key and `Arc<str>`
+/// metadata. This matches the connection pool key pattern in
+/// `connection_pool.rs`.
 pub struct ChargebackRegistry {
     epoch: Instant,
     pub entries: DashMap<String, ChargebackEntry>,
@@ -661,6 +662,10 @@ impl ChargebackRegistry {
             charges: f64,
         }
 
+        // Entries are keyed by pricing bits so config reloads do not reuse
+        // stale prices, but Prometheus label sets intentionally omit those
+        // bits. Aggregate by the exposed labels before rendering so a scrape
+        // never contains duplicate series after pricing changes.
         let mut http_aggregates: HashMap<
             (String, String, u16, Arc<str>, Arc<str>),
             ChargeAggregate,

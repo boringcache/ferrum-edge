@@ -537,14 +537,14 @@ curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/charges?format=json
 ```
 
 **Prometheus format** returns counter families:
-- `ferrum_api_chargeable_calls_total` — HTTP call counts with labels `consumer`, `proxy_id`, `proxy_name`, `status_code` (HTTP-family proxies only)
-- `ferrum_api_charges_total` — HTTP per-call monetary charges with an additional `currency` label
-- `ferrum_api_stream_connections_total` — stream session counts (TCP/TCP+TLS/UDP/DTLS proxies)
-- `ferrum_api_stream_connection_charges_total` — stream per-session monetary charges
-- `ferrum_api_bytes_sent_total` / `ferrum_api_bytes_received_total` — bandwidth byte counters aggregated per `consumer`/`proxy_id`/`protocol_family`
+- `ferrum_api_chargeable_calls_total` — HTTP call counts with labels `consumer`, `proxy_id`, `proxy_name`, `status_code`, and `currency` (HTTP-family proxies only)
+- `ferrum_api_charges_total` — HTTP per-call monetary charges with the same HTTP labels
+- `ferrum_api_stream_connections_total` — stream session counts (TCP/TCP+TLS/UDP/DTLS proxies) with labels `consumer`, `proxy_id`, `proxy_name`, and `currency`
+- `ferrum_api_stream_connection_charges_total` — stream per-session monetary charges with the same stream labels
+- `ferrum_api_bytes_sent_total` / `ferrum_api_bytes_received_total` — bandwidth byte counters aggregated per `consumer`/`proxy_id`/`currency`/`protocol_family`
 - `ferrum_api_bandwidth_charges_total` — bandwidth monetary charges, labelled with `direction="sent"`/`"received"` and `protocol_family="http"`/`"stream"`
 
-All families include a `namespace` label.
+All families include a `namespace` label when the plugin instance has a namespace.
 
 **JSON format** returns a nested breakdown:
 ```json
