@@ -1798,23 +1798,19 @@ fn translate_subset(
         .map(|tp| translate_traffic_policy(acc, object, tp))
         .transpose()?;
 
-    if let Some(ref policy) = traffic_policy {
-        if policy.connect_timeout_ms.is_some() {
-            acc.warnings.push(format!(
-                "DestinationRule {}/{} subset '{}' connectionPool.tcp.connectTimeout is currently ignored; only the top-level trafficPolicy connectTimeout applies",
-                object.metadata.namespace, object.metadata.name, name
-            ));
-        }
-        if policy.outlier_detection.is_some() {
-            acc.warnings.push(format!(
-                "DestinationRule {}/{} subset '{}' outlierDetection is currently ignored; only the top-level trafficPolicy outlierDetection applies",
-                object.metadata.namespace, object.metadata.name, name
-            ));
-        }
-        // `policy.tls` is now applied per-subset by the cold-path apply in
-        // `src/modes/mesh/mod.rs::resolve_subset_traffic_policy_tls` and
-        // projected onto `Proxy.resolved_tls` for proxies that select this
-        // subset via `upstream_subset`. No warn needed.
+    // A subset's `connectionPool.tcp.connectTimeout` is now applied per-subset
+    // by the cold-path apply in `src/modes/mesh/mod.rs::apply_destination_rules`
+    // (projected onto `backend_connect_timeout_ms` of proxies that select this
+    // subset via `upstream_subset`, overriding the DR top-level connectTimeout),
+    // and `tls` by `resolve_subset_traffic_policy_tls` — neither needs a warn.
+    // `outlierDetection` remains deferred per-subset, so warn it is ignored.
+    if let Some(ref policy) = traffic_policy
+        && policy.outlier_detection.is_some()
+    {
+        acc.warnings.push(format!(
+            "DestinationRule {}/{} subset '{}' outlierDetection is currently ignored; only the top-level trafficPolicy outlierDetection applies",
+            object.metadata.namespace, object.metadata.name, name
+        ));
     }
 
     Ok(MeshSubset {
@@ -7563,7 +7559,7 @@ extensionProviders:
     }
 
     #[test]
-    fn destination_rule_subset_unsupported_fields_warn() {
+    fn destination_rule_subset_connect_timeout_applied_outlier_still_warns() {
         let result = translate_k8s_objects(
             &[object(
                 "DestinationRule",
@@ -7581,15 +7577,30 @@ extensionProviders:
             )],
             options(),
         )
-        .expect("subset with unsupported fields still translates");
+        .expect("subset traffic policy still translates");
+
+        // Per-subset connectTimeout is now applied (overrides backend connect
+        // timeout for subset-bound proxies), so it carries onto the mesh DR
+        // subset and is NOT warned as ignored.
+        let mesh = result.config.mesh.as_ref().expect("mesh config");
+        let subset_tp = mesh.destination_rules[0].subsets[0]
+            .traffic_policy
+            .as_ref()
+            .expect("subset traffic policy translated");
+        assert_eq!(
+            subset_tp.connect_timeout_ms,
+            Some(5000),
+            "subset connectTimeout 5s translates to 5000ms on the mesh DR subset"
+        );
         assert!(
-            result
+            !result
                 .warnings
                 .iter()
                 .any(|w| w.contains("subset 'v1'") && w.contains("connectTimeout")),
-            "expected subset connectTimeout warning, got {:?}",
+            "subset connectTimeout is applied now and must not warn, got {:?}",
             result.warnings
         );
+        // outlierDetection remains deferred per-subset, so it still warns.
         assert!(
             result
                 .warnings

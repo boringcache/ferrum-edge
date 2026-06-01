@@ -76,6 +76,40 @@ fn dr_connection_pool_tcp_connect_timeout() {
     assert_eq!(policy.connect_timeout_ms, Some(2000));
 }
 
+/// `subsets[].trafficPolicy.connectionPool.tcp.connectTimeout` — per-subset
+/// connect timeout. Translated onto the mesh DR subset; at slice apply it
+/// overrides `backend_connect_timeout_ms` for proxies whose `upstream_subset`
+/// selects this subset (taking precedence over the DR top-level connectTimeout,
+/// verified by `dr_subset_connect_timeout_overrides_top_level_for_subset_bound_proxies`
+/// in `src/modes/mesh/mod.rs`).
+#[test]
+fn dr_subset_connect_timeout() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "subsets[].trafficPolicy.connectionPool.tcp.connectTimeout",
+        status = Status::Supported,
+        notes = "Per-subset connect timeout: overrides backend_connect_timeout_ms for proxies bound to the subset, taking precedence over the DR top-level connectTimeout.",
+    );
+    let dr = translated(json!({
+        "host": "api.default.svc.cluster.local",
+        "subsets": [{
+            "name": "v1",
+            "labels": {"version": "v1"},
+            "trafficPolicy": {"connectionPool": {"tcp": {"connectTimeout": "2s"}}}
+        }]
+    }));
+    let subset = dr
+        .subsets
+        .iter()
+        .find(|s| s.name == "v1")
+        .expect("v1 subset emitted");
+    let tp = subset
+        .traffic_policy
+        .as_ref()
+        .expect("subset traffic policy emitted");
+    assert_eq!(tp.connect_timeout_ms, Some(2000));
+}
+
 /// `trafficPolicy.connectionPool.tcp.maxConnections` — T1-D (PR #897).
 /// Lands on `MeshConnectionPoolTcp.max_connections`.
 #[test]

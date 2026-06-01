@@ -560,17 +560,16 @@ fn destination_rule_status(
     let (accepted, reason, message, detail) = match result {
         Ok(_translation) => {
             // T1-C deferred fields: portLevelSettings.tls (parsed but
-            // not enforced), per-subset connectionPool.tcp.connectTimeout,
-            // per-subset outlierDetection, and the parsed-but-dropped
-            // connectionPool.http knobs the translator only warns on
-            // (http1MaxPendingRequests / maxRetries / h2UpgradePolicy).
+            // not enforced), per-subset outlierDetection, and the
+            // parsed-but-dropped connectionPool.http knobs the translator only
+            // warns on (http1MaxPendingRequests / maxRetries / h2UpgradePolicy).
+            // Per-subset connectionPool.tcp.connectTimeout is now APPLIED (it
+            // overrides backend_connect_timeout_ms for subset-bound proxies),
+            // so it is no longer reported as deferred.
             // Surface them so operators see the gap in `kubectl describe`.
             let mut deferred: Vec<&'static str> = Vec::new();
             if has_port_level_tls(&object.spec) {
                 deferred.push("portLevelSettings[].tls (parsed but not enforced)");
-            }
-            if has_subset_port_overrides(&object.spec) {
-                deferred.push("subsets[].trafficPolicy.connectionPool.tcp.connectTimeout");
             }
             if has_subset_outlier_detection(&object.spec) {
                 deferred.push("subsets[].trafficPolicy.outlierDetection");
@@ -619,21 +618,6 @@ fn has_port_level_tls(spec: &Value) -> bool {
         .and_then(|tp| tp.get("portLevelSettings"))
         .and_then(Value::as_array)
         .is_some_and(|entries| entries.iter().any(|e| e.get("tls").is_some()))
-}
-
-fn has_subset_port_overrides(spec: &Value) -> bool {
-    spec.get("subsets")
-        .and_then(Value::as_array)
-        .is_some_and(|subsets| {
-            subsets.iter().any(|subset| {
-                subset
-                    .get("trafficPolicy")
-                    .and_then(|tp| tp.get("connectionPool"))
-                    .and_then(|cp| cp.get("tcp"))
-                    .and_then(|tcp| tcp.get("connectTimeout"))
-                    .is_some()
-            })
-        })
 }
 
 fn has_subset_outlier_detection(spec: &Value) -> bool {

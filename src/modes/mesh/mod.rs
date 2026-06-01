@@ -1448,6 +1448,7 @@ fn apply_destination_rules(
                             SubsetTrafficPolicy {
                                 load_balancer_algorithm: mesh_lb_to_ferrum(&sp.load_balancer),
                                 tls: sp.tls.clone(),
+                                connect_timeout_ms: sp.connect_timeout_ms,
                             }
                         }),
                     })
@@ -1460,17 +1461,56 @@ fn apply_destination_rules(
                 upstream.resolved_subset_tls.clear();
             }
 
-            if let Some(timeout_ms) = connect_timeout_ms {
+            // Per-subset `connectionPool.tcp.connectTimeout` overrides the DR
+            // top-level connectTimeout for proxies bound to that subset (Istio:
+            // a subset trafficPolicy field-overrides the DR top-level for that
+            // subset). Captured as owned data so the `upstream` borrow ends
+            // before the `config.proxies` loop below.
+            let subset_connect_timeouts: Vec<(String, u64)> = upstream
+                .subsets
+                .as_ref()
+                .map(|subsets| {
+                    subsets
+                        .iter()
+                        .filter_map(|s| {
+                            s.traffic_policy
+                                .as_ref()
+                                .and_then(|tp| tp.connect_timeout_ms)
+                                .map(|ms| (s.name.clone(), ms))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            if connect_timeout_ms.is_some() || !subset_connect_timeouts.is_empty() {
                 let upstream_id = upstream.id.clone();
                 let upstream_namespace = upstream.namespace.clone();
                 for proxy in &mut config.proxies {
-                    if proxy.upstream_id.as_deref() == Some(upstream_id.as_str())
-                        && proxy.namespace == upstream_namespace
+                    if proxy.upstream_id.as_deref() != Some(upstream_id.as_str())
+                        || proxy.namespace != upstream_namespace
+                    {
+                        continue;
+                    }
+                    // A subset-bound proxy uses its subset's connectTimeout when
+                    // the subset sets one; otherwise the DR top-level applies
+                    // (as it does to every proxy referencing this upstream).
+                    let effective_ms = proxy
+                        .upstream_subset
+                        .as_deref()
+                        .and_then(|name| {
+                            subset_connect_timeouts
+                                .iter()
+                                .find(|(n, _)| n == name)
+                                .map(|(_, ms)| *ms)
+                        })
+                        .or(connect_timeout_ms);
+                    if let Some(timeout_ms) = effective_ms
                         && proxy.backend_connect_timeout_ms != timeout_ms
                     {
                         debug!(
                             proxy = %proxy.id,
                             upstream = %upstream_id,
+                            subset = proxy.upstream_subset.as_deref().unwrap_or(""),
                             previous_ms = proxy.backend_connect_timeout_ms,
                             new_ms = timeout_ms,
                             rule = %dr.name,
@@ -7066,6 +7106,71 @@ mod tests {
             "subset overlay also wins on SNI"
         );
         assert!(subset_tls.verify_server_cert);
+    }
+
+    #[test]
+    fn dr_subset_connect_timeout_overrides_top_level_for_subset_bound_proxies() {
+        // Istio precedence: a subset's `trafficPolicy.connectionPool.tcp.connectTimeout`
+        // overrides the DR top-level connectTimeout for proxies bound to that
+        // subset, while proxies with no subset keep the top-level value.
+        let mut config = GatewayConfig {
+            // p1 has no upstream_subset — keeps the top-level connectTimeout.
+            proxies: vec![destination_rule_test_proxy("p1", "u1")],
+            upstreams: vec![destination_rule_test_upstream(
+                "u1",
+                "reviews.default.svc.cluster.local",
+            )],
+            ..GatewayConfig::default()
+        };
+        // p2 selects subset v1 — picks up the subset's connectTimeout.
+        let mut p2: Proxy = serde_json::from_value(serde_json::json!({
+            "id": "p2",
+            "namespace": "default",
+            "hosts": ["p2.example.com"],
+            "backend_host": "",
+            "backend_port": 0,
+            "upstream_id": "u1",
+            "upstream_subset": "v1",
+        }))
+        .expect("test proxy with subset");
+        p2.normalize_fields();
+        config.proxies.push(p2);
+
+        let slice = MeshSlice {
+            destination_rules: vec![MeshDestinationRule {
+                name: "reviews".to_string(),
+                namespace: "default".to_string(),
+                host: "reviews.default.svc.cluster.local".to_string(),
+                traffic_policy: Some(MeshTrafficPolicy {
+                    connect_timeout_ms: Some(5000),
+                    ..MeshTrafficPolicy::default()
+                }),
+                port_level_settings: HashMap::new(),
+                subsets: vec![MeshSubset {
+                    name: "v1".to_string(),
+                    labels: HashMap::from([("version".to_string(), "v1".to_string())]),
+                    traffic_policy: Some(MeshTrafficPolicy {
+                        connect_timeout_ms: Some(2000),
+                        ..MeshTrafficPolicy::default()
+                    }),
+                }],
+            }],
+            ..MeshSlice::default()
+        };
+
+        apply_destination_rules(&mut config, &test_mesh_runtime_config(), &slice)
+            .expect("destination rules apply");
+
+        let p1 = config.proxies.iter().find(|p| p.id == "p1").expect("p1");
+        let p2 = config.proxies.iter().find(|p| p.id == "p2").expect("p2");
+        assert_eq!(
+            p1.backend_connect_timeout_ms, 5000,
+            "non-subset proxy uses the DR top-level connectTimeout"
+        );
+        assert_eq!(
+            p2.backend_connect_timeout_ms, 2000,
+            "subset-bound proxy uses its subset's connectTimeout (overrides top-level)"
+        );
     }
 
     #[test]

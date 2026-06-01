@@ -237,6 +237,13 @@ pub struct SubsetTrafficPolicy {
     /// upstream-level apply.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<crate::modes::mesh::config::MeshTrafficPolicyTls>,
+    /// Override the upstream's backend connect timeout (ms) for this subset
+    /// (Istio `subsets[].trafficPolicy.connectionPool.tcp.connectTimeout`).
+    /// `apply_destination_rules` projects this onto `backend_connect_timeout_ms`
+    /// of every proxy whose `upstream_subset` selects this subset, taking
+    /// precedence over the DestinationRule's top-level `connectTimeout`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_timeout_ms: Option<u64>,
 }
 
 /// Per-destination-port traffic policy overrides on an upstream.

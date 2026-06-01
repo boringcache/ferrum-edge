@@ -1869,6 +1869,7 @@ fn subset_traffic_policy_overrides_parent_algorithm() {
         traffic_policy: Some(SubsetTrafficPolicy {
             load_balancer_algorithm: Some(LoadBalancerAlgorithm::LeastConnections),
             tls: None,
+            connect_timeout_ms: None,
         }),
     }];
 
