@@ -206,8 +206,9 @@ pub fn canonical_htu(scheme: &str, host: &str, path: &str) -> Option<String> {
 /// reconstructs `host[:port]` (the `url` crate omits default :80/:443 ports and
 /// lowercases the host) and routes scheme/host/path through [`canonical_htu`] so
 /// both sides of the comparison share one normalizer. Returns `None` if the URL
-/// fails to parse or has no host. Per RFC 9449 §4.3, query and fragment are
-/// ignored (dropped by `canonical_htu`).
+/// fails to parse, has no host, or contains userinfo. Per RFC 9449 §4.3, query
+/// and fragment are ignored (dropped by `canonical_htu`), but userinfo is part
+/// of the authority and must not be normalized away.
 pub fn canonical_htu_from_url(raw: &str) -> Option<String> {
     let parsed = url::Url::parse(raw).ok()?;
     if !parsed.username().is_empty() || parsed.password().is_some() {
