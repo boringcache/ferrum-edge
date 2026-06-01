@@ -1357,8 +1357,8 @@ Validates opaque or structured OAuth2 bearer tokens against RFC 7662 introspecti
 | Parameter | Type | Description |
 |---|---|---|
 | `providers` | Array | Introspection provider configurations (required) |
-| `providers[].introspection_endpoint` | String | Direct token introspection endpoint URL |
-| `providers[].discovery_url` | String | OIDC discovery URL used to resolve `introspection_endpoint` |
+| `providers[].introspection_endpoint` | String | Direct token introspection endpoint URL (`https` required for non-loopback hosts) |
+| `providers[].discovery_url` | String | OIDC discovery URL used to resolve `introspection_endpoint` (`https` required for non-loopback hosts) |
 | `providers[].issuer` | String (optional) | Expected `iss` claim in active introspection responses |
 | `providers[].audiences` | String[] (optional) | Accepted `aud` values; OR-matched |
 | `providers[].client_auth.method` | String | `client_secret_basic`, `client_secret_post`, `private_key_jwt`, or `none` |
@@ -1382,7 +1382,7 @@ Validates opaque or structured OAuth2 bearer tokens against RFC 7662 introspecti
 | `consumer_identity_claim` | String | Global claim used for consumer lookup (default: `"username"`) |
 | `consumer_header_claim` | String | Global claim used for `X-Consumer-Username` when no consumer maps |
 
-`client_auth.method: "none"` is accepted only for localhost or loopback endpoints. Discovery-provided introspection endpoints must stay on the discovery host. Claim header mappings reject reserved headers.
+Credentialed `client_auth.method` values (`client_secret_basic`, `client_secret_post`, `private_key_jwt`) and `none` all require an `https` `introspection_endpoint`/`discovery_url` when the host is not loopback/localhost; `http` is only accepted for loopback endpoints so client credentials are never sent over plaintext to a remote host. Discovery-provided introspection endpoints must stay on the discovery host and are also held to the same https-for-non-loopback rule. Claim header mappings reject reserved headers.
 
 ```yaml
 plugin_name: oauth2_introspection

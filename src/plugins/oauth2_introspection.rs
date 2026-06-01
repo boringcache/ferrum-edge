@@ -861,6 +861,25 @@ fn parse_client_auth(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned);
+
+    // Credentialed methods transmit client credentials to the provider:
+    // `client_secret_basic` puts Base64(client_id:client_secret) in the
+    // Authorization header, `client_secret_post` puts `client_secret` in the
+    // form body, and `private_key_jwt` puts a signed `client_assertion` (a
+    // bearer credential the IdP accepts) in the form body. Reject configs that
+    // would send any of these over plaintext to a non-loopback host. Loopback
+    // `http://` is still permitted for local development, mirroring the
+    // `method='none'` gate below.
+    if matches!(
+        method,
+        "client_secret_basic" | "client_secret_post" | "private_key_jwt"
+    ) && endpoint.is_some_and(is_insecure_credentialed_endpoint)
+    {
+        return Err(format!(
+            "oauth2_introspection: provider[{provider_idx}].client_auth.method='{method}' requires an https introspection_endpoint/discovery_url (http is only allowed for localhost or loopback endpoints)"
+        ));
+    }
+
     match method {
         "client_secret_basic" => Ok(ClientAuth::Basic {
             client_id: client_id.ok_or_else(|| {
@@ -1232,6 +1251,7 @@ fn ranged_provider_usize(
 struct ParsedEndpoint {
     url: String,
     hostname: String,
+    scheme: String,
 }
 
 fn parse_url_field(
@@ -1268,6 +1288,7 @@ fn parse_url_field(
     Ok(Some(ParsedEndpoint {
         url: url.to_string(),
         hostname,
+        scheme: parsed.scheme().to_string(),
     }))
 }
 
@@ -1290,6 +1311,15 @@ fn is_local_introspection_host(hostname: &str) -> bool {
         || hostname
             .parse::<IpAddr>()
             .is_ok_and(|address| address.is_loopback())
+}
+
+/// True when the endpoint would transmit client credentials over plaintext to a
+/// non-loopback host (`http://` scheme + remote host). Loopback `http://` is
+/// permitted for local development, mirroring the `client_auth.method='none'`
+/// gate. The scheme comparison is case-insensitive because `url` lowercases
+/// schemes on parse, but we stay defensive.
+fn is_insecure_credentialed_endpoint(endpoint: &ParsedEndpoint) -> bool {
+    endpoint.scheme.eq_ignore_ascii_case("http") && !is_local_introspection_host(&endpoint.hostname)
 }
 
 fn audience_matches(claims: &Value, audiences: &[String]) -> bool {
@@ -1412,6 +1442,17 @@ fn validate_discovered_endpoint(
         .ok_or_else(|| "discovery_url must include a hostname".to_string())?;
     let endpoint_host = hostname_from_parsed_url(&parsed)
         .ok_or_else(|| format!("discovery {field} must include a hostname"))?;
+    // A non-loopback discovered endpoint must be https: client credentials may
+    // be sent to it, and an https discovery document advertising a plaintext
+    // introspection endpoint would otherwise downgrade the credential exchange
+    // to cleartext. Loopback http stays allowed for local development, mirroring
+    // the config-load gate in `parse_client_auth`.
+    if parsed.scheme().eq_ignore_ascii_case("http") && !is_local_introspection_host(&endpoint_host)
+    {
+        return Err(format!(
+            "discovery {field} must use https for non-loopback hosts"
+        ));
+    }
     if !endpoint_host.eq_ignore_ascii_case(&discovery_host) {
         return Err(format!(
             "discovery {field} host must match discovery_url host"
@@ -1518,6 +1559,30 @@ mod tests {
         assert_eq!(
             parse_private_key_alg(Some(&Value::String("EdDSA".to_string())), 0).unwrap(),
             Algorithm::EdDSA
+        );
+    }
+
+    #[test]
+    fn discovery_downgrade_to_http_remote_endpoint_is_rejected() {
+        // An https discovery document must not be allowed to downgrade the
+        // credential exchange to a plaintext non-loopback introspection
+        // endpoint (finding #34 bypass via discovery).
+        assert!(
+            validate_discovered_endpoint(
+                "https://issuer.example.com/.well-known/openid-configuration",
+                "http://issuer.example.com/introspect",
+                "introspection_endpoint",
+            )
+            .is_err()
+        );
+        // Loopback http remains acceptable for local development.
+        assert!(
+            validate_discovered_endpoint(
+                "http://localhost:9000/.well-known/openid-configuration",
+                "http://localhost:9000/introspect",
+                "introspection_endpoint",
+            )
+            .is_ok()
         );
     }
 }
