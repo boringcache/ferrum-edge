@@ -211,3 +211,39 @@ async fn test_execute_does_not_retry_non_idempotent_methods() {
     assert_eq!(attempts.load(Ordering::SeqCst), 1);
     server_task.await.unwrap();
 }
+
+#[tokio::test]
+async fn test_shared_client_does_not_follow_redirects() {
+    // finding #80: the shared outbound client must not auto-follow redirects,
+    // so a 30x from a permitted host can't transparently redirect a plugin call
+    // (jwks/oidc discovery, webhooks, request_mirror, …) to an internal service
+    // or cloud-metadata endpoint. With redirect::Policy::none() the caller
+    // receives the 3xx response itself rather than the followed target.
+    let mock_server = MockServer::start().await;
+    let target = format!("{}/target", mock_server.uri());
+    Mock::given(method("GET"))
+        .and(path("/redirect"))
+        .respond_with(ResponseTemplate::new(302).insert_header("location", target.as_str()))
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/target"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("followed-the-redirect"))
+        .mount(&mock_server)
+        .await;
+
+    let client = default_client();
+    let req = client.get().get(format!("{}/redirect", mock_server.uri()));
+    let resp = client.execute(req, "redirect_test").await.unwrap();
+
+    assert_eq!(
+        resp.status(),
+        302,
+        "shared client must surface the 3xx, not follow it"
+    );
+    let body = resp.text().await.unwrap_or_default();
+    assert_ne!(
+        body, "followed-the-redirect",
+        "the redirect target must not have been fetched"
+    );
+}

@@ -3,9 +3,13 @@
 //!
 //! When a `GET` request arrives at `{listen_path}/specz`, the plugin fetches
 //! the specification document from the configured `spec_url` and returns it to
-//! the caller with the upstream's `Content-Type` preserved. The `/specz`
-//! endpoint is unauthenticated — it short-circuits before the authentication
-//! phase so consumers can discover API contracts without credentials.
+//! the caller. The `/specz` endpoint is unauthenticated — it short-circuits
+//! before the authentication phase so consumers can discover API contracts
+//! without credentials. Because it is anonymous and the upstream may be a
+//! distinct, less-trusted service, the served response sets
+//! `X-Content-Type-Options: nosniff` and constrains an upstream-derived
+//! `Content-Type` to an allow-list of spec media types (the operator-set
+//! `content_type` override is trusted and forwarded as-is).
 //!
 //! Only compatible with prefix-based `listen_path` proxies (not regex, not
 //! host-only or port-only routing) and HTTP protocol types.
@@ -301,7 +305,10 @@ impl SpecExpose {
         }
 
         // Determine content-type: plugin override > upstream response > default.
-        // Computed before consuming the response.
+        // Computed before consuming the response. The operator-configured
+        // override is trusted; the upstream-derived value is sanitized against
+        // an allow-list of spec media types so a compromised/untrusted upstream
+        // cannot make this unauthenticated endpoint serve e.g. `text/html`.
         let content_type = self
             .content_type_override
             .clone()
@@ -310,7 +317,7 @@ impl SpecExpose {
                     .headers()
                     .get("content-type")
                     .and_then(|v| v.to_str().ok())
-                    .map(|s| s.to_string())
+                    .map(sanitize_upstream_content_type)
             })
             .unwrap_or_else(|| "application/octet-stream".to_string());
 
@@ -346,6 +353,54 @@ impl SpecExpose {
             self.cache.store(Arc::new(Some(entry.clone())));
         }
         Ok(entry)
+    }
+}
+
+/// Media types `spec_expose` will forward verbatim from an upstream response.
+///
+/// `/specz` is served unauthenticated and short-circuits before the auth
+/// phase, so the upstream (a distinct, potentially less-trusted service)
+/// must not be able to dictate an arbitrary `Content-Type` — e.g. `text/html`
+/// with an attacker-influenced body would let the gateway's own origin serve
+/// reflected HTML/JS to anonymous browsers. Only the media types an API spec
+/// legitimately uses are allowed through; anything else falls back to
+/// `application/octet-stream`. The operator-configured `content_type` override
+/// path is trusted and is not constrained by this list.
+const ALLOWED_SPEC_MEDIA_TYPES: [&str; 13] = [
+    "application/json",
+    "application/openapi+json",
+    "application/openapi+yaml",
+    "application/vnd.oai.openapi",
+    "application/yaml",
+    "application/vnd.oai.openapi+json",
+    "application/wsdl+xml",
+    "application/vnd.sun.wadl+xml",
+    "text/yaml",
+    "application/x-yaml",
+    "application/xml",
+    "text/xml",
+    "text/plain",
+];
+
+/// Constrain an upstream-derived `content-type` to a known spec media type.
+///
+/// Compares the media type (the part before any `;` parameters, trimmed and
+/// case-insensitive) against [`ALLOWED_SPEC_MEDIA_TYPES`]. On a match the
+/// original header value is preserved (including any `charset` parameter); on
+/// any other value it falls back to `application/octet-stream` so the browser
+/// receives an inert type rather than an attacker-chosen one.
+///
+/// Exposed (like [`SpecExpose::is_specz_request`]) so the allow-list can be
+/// unit-tested directly.
+pub fn sanitize_upstream_content_type(raw: &str) -> String {
+    let media_type = raw.split(';').next().unwrap_or("").trim();
+    if ALLOWED_SPEC_MEDIA_TYPES
+        .iter()
+        .any(|allowed| media_type.eq_ignore_ascii_case(allowed))
+    {
+        raw.to_string()
+    } else {
+        "application/octet-stream".to_string()
     }
 }
 
@@ -482,6 +537,10 @@ impl Plugin for SpecExpose {
 
         let mut headers = HashMap::new();
         headers.insert("content-type".to_string(), entry.content_type);
+        // `/specz` is unauthenticated and serves an upstream-influenced body, so
+        // prevent browsers from MIME-sniffing it into HTML/JS execution in the
+        // gateway's own origin even if the (sanitized) content-type is permissive.
+        headers.insert("x-content-type-options".to_string(), "nosniff".to_string());
         PluginResult::RejectBinary {
             status_code: 200,
             body: entry.body,

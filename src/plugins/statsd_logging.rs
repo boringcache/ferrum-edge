@@ -106,16 +106,28 @@ fn resolve_tag_key<'a>(
     Some(schema.rename_for_tag(native).unwrap_or(default_key))
 }
 
+/// Upper bound on the length of a single sanitized tag value. Request-derived
+/// tag values (e.g. the proxy name, or any future client-influenced tag) are
+/// capped so a hostile/oversized input cannot bloat each emitted datagram or,
+/// on tag-aware backends, balloon a single time series' label length.
+const MAX_TAG_VALUE_LEN: usize = 64;
+
 /// Sanitize a value used in a StatsD tag: strip the delimiters that would break
 /// the line protocol (`,`, `|`, `#`, `:`) and trim surrounding whitespace.
-/// Replaces disallowed chars with `_` so the tag remains parseable.
+/// Replaces disallowed chars with `_` so the tag remains parseable, and caps
+/// the result at [`MAX_TAG_VALUE_LEN`] bytes (on a char boundary) as
+/// defense-in-depth against oversized request-derived values.
 fn sanitize_tag_value(input: &str) -> String {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return "none".to_string();
     }
-    let mut out = String::with_capacity(trimmed.len());
+    let mut out = String::with_capacity(trimmed.len().min(MAX_TAG_VALUE_LEN));
     for c in trimmed.chars() {
+        // Stop before exceeding the cap; never split a multi-byte char.
+        if out.len() + c.len_utf8() > MAX_TAG_VALUE_LEN {
+            break;
+        }
         match c {
             ',' | '|' | '#' | ':' | '\n' | '\r' => out.push('_'),
             c if c.is_whitespace() => out.push('_'),
@@ -123,6 +135,53 @@ fn sanitize_tag_value(input: &str) -> String {
         }
     }
     out
+}
+
+/// Sanitize a StatsD metric-name prefix so every emitted metric name is
+/// line-protocol-safe. The prefix is interpolated raw into each line
+/// (`"{prefix}.request.count:1|c{tags}"`), so a prefix containing the
+/// metric-name/value delimiter (`:`), the tag delimiters (`|`, `#`, `,`), a
+/// newline, or other control/whitespace chars would corrupt the line —
+/// splitting one datagram into several metrics or injecting an arbitrary
+/// metric line. Disallowed chars are replaced with `_`. Returns `None` when
+/// the prefix is empty (or whitespace-only) after trimming, so the caller can
+/// surface a clear configuration error rather than emit `.request.count`.
+fn sanitize_metric_name(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut out = String::with_capacity(trimmed.len());
+    for c in trimmed.chars() {
+        match c {
+            ',' | '|' | '#' | ':' | '\n' | '\r' => out.push('_'),
+            c if c.is_control() || c.is_whitespace() => out.push('_'),
+            c => out.push(c),
+        }
+    }
+    Some(out)
+}
+
+/// Canonical HTTP methods emitted verbatim as the `method` tag. Any other
+/// method token — clients may send an arbitrary RFC 9110 `token` — collapses
+/// to [`OTHER_METHOD`] so a hostile client cannot drive unbounded `method`
+/// tag cardinality (one time series per distinct method) on tag-aware
+/// backends. Matched case-sensitively: standard methods are uppercase, and an
+/// off-case variant is treated as non-standard and bucketed as "other".
+const KNOWN_HTTP_METHODS: &[&str] = &[
+    "GET", "HEAD", "POST", "PUT", "DELETE", "CONNECT", "OPTIONS", "TRACE", "PATCH",
+];
+
+const OTHER_METHOD: &str = "other";
+
+/// Map a request method to a bounded `method` tag value: a known method
+/// passes through, anything else becomes [`OTHER_METHOD`].
+fn bounded_method_tag(method: &str) -> &'static str {
+    KNOWN_HTTP_METHODS
+        .iter()
+        .find(|known| **known == method)
+        .copied()
+        .unwrap_or(OTHER_METHOD)
 }
 
 type MetricEntry = SummaryLogEntry;
@@ -179,18 +238,21 @@ impl StatsdLogging {
         }
 
         let ns = http_client.namespace();
+        // The prefix is interpolated raw into every metric line, so it must be
+        // line-protocol-safe. Sanitize both an explicit `prefix` and the
+        // namespace-derived fallback (a namespace can contain characters that
+        // are legal there but not in a StatsD metric name).
         let prefix = match config.get("prefix") {
             Some(value) => {
-                let prefix = value
+                let raw = value
                     .as_str()
-                    .ok_or_else(|| "statsd_logging: 'prefix' must be a string".to_string())?
-                    .trim();
-                if prefix.is_empty() {
-                    return Err("statsd_logging: 'prefix' must not be empty".to_string());
-                }
-                prefix.to_string()
+                    .ok_or_else(|| "statsd_logging: 'prefix' must be a string".to_string())?;
+                sanitize_metric_name(raw)
+                    .ok_or_else(|| "statsd_logging: 'prefix' must not be empty".to_string())?
             }
-            None => ns.to_string(),
+            None => sanitize_metric_name(ns).ok_or_else(|| {
+                "statsd_logging: namespace used as the metric prefix must not be empty".to_string()
+            })?,
         };
         let global_tags = {
             let mut pairs = Vec::new();
@@ -310,7 +372,11 @@ fn format_http_metrics(
     // Only consult HTTP schemas for HTTP metrics — a stream-only schema
     // is unrelated.
     let effective_schema = schema.filter(|s| s.applies_to_http());
-    let method = sanitize_tag_value(&summary.http_method);
+    // `http_method` is client-controlled (any RFC 9110 token), so bound it to a
+    // known-method allowlist before tagging — otherwise hostile clients drive
+    // unbounded `method` tag cardinality on tag-aware backends. The result is
+    // already a safe constant, so no further sanitization is needed.
+    let method = bounded_method_tag(&summary.http_method);
     let status = summary.response_status_code;
     let status_class = format!("{}xx", status / 100);
     let proxy_raw = summary
@@ -633,5 +699,145 @@ mod tests {
     #[test]
     fn sanitize_tag_value_mixed_attack_string() {
         assert_eq!(sanitize_tag_value("evil,|#:proxy"), "evil____proxy");
+    }
+
+    #[test]
+    fn sanitize_tag_value_caps_length() {
+        // Oversized request-derived values are capped (defense-in-depth, #72).
+        let long = "a".repeat(500);
+        let out = sanitize_tag_value(&long);
+        assert_eq!(out.len(), MAX_TAG_VALUE_LEN);
+        assert!(out.bytes().all(|b| b == b'a'));
+    }
+
+    #[test]
+    fn sanitize_tag_value_cap_never_splits_multibyte_char() {
+        // A multi-byte char straddling the cap boundary is dropped whole, so
+        // the output stays valid UTF-8 and never exceeds the cap.
+        let input = "é".repeat(MAX_TAG_VALUE_LEN);
+        let out = sanitize_tag_value(&input);
+        assert!(out.len() <= MAX_TAG_VALUE_LEN);
+        assert!(std::str::from_utf8(out.as_bytes()).is_ok());
+    }
+
+    // --- #71: StatsD metric-name prefix sanitization ---
+
+    #[test]
+    fn sanitize_metric_name_replaces_line_protocol_delimiters() {
+        // ':' would split metric name from value; '|'/'#'/',' break tags.
+        assert_eq!(sanitize_metric_name("foo:bar").as_deref(), Some("foo_bar"));
+        assert_eq!(sanitize_metric_name("foo|bar").as_deref(), Some("foo_bar"));
+        assert_eq!(sanitize_metric_name("foo#bar").as_deref(), Some("foo_bar"));
+        assert_eq!(sanitize_metric_name("foo,bar").as_deref(), Some("foo_bar"));
+    }
+
+    #[test]
+    fn sanitize_metric_name_replaces_newlines_and_whitespace() {
+        // A newline would inject an arbitrary metric line into the datagram.
+        assert_eq!(sanitize_metric_name("foo\nbar").as_deref(), Some("foo_bar"));
+        assert_eq!(
+            sanitize_metric_name("foo\r\nbar").as_deref(),
+            Some("foo__bar")
+        );
+        assert_eq!(sanitize_metric_name("foo bar").as_deref(), Some("foo_bar"));
+        // Surrounding whitespace is trimmed before sanitizing.
+        assert_eq!(sanitize_metric_name("  foo  ").as_deref(), Some("foo"));
+    }
+
+    #[test]
+    fn sanitize_metric_name_rejects_a_line_injection_prefix() {
+        // Concrete attack from the finding: a prefix that closes one metric
+        // and injects another is neutralized to a single safe name.
+        assert_eq!(
+            sanitize_metric_name("p:1|c\nevil.metric").as_deref(),
+            Some("p_1_c_evil.metric")
+        );
+    }
+
+    #[test]
+    fn sanitize_metric_name_preserves_normal_dotted_prefix() {
+        assert_eq!(
+            sanitize_metric_name("ferrum.gateway").as_deref(),
+            Some("ferrum.gateway")
+        );
+    }
+
+    #[test]
+    fn sanitize_metric_name_empty_is_none() {
+        assert_eq!(sanitize_metric_name(""), None);
+        assert_eq!(sanitize_metric_name("   "), None);
+        // Whitespace-only after trim still yields None (caller surfaces an error).
+        assert_eq!(sanitize_metric_name("\n\t"), None);
+    }
+
+    // Construction spawns a `BatchingLogger` (needs a Tokio runtime).
+    #[tokio::test]
+    async fn statsd_prefix_with_delimiters_constructs_sanitized() {
+        // A prefix carrying line-protocol delimiters / a newline must not abort
+        // construction — it is sanitized to a safe metric name (#71).
+        let cfg = serde_json::json!({ "host": "127.0.0.1", "prefix": "ev:il|p\n" });
+        assert!(
+            StatsdLogging::new(&cfg, PluginHttpClient::default()).is_ok(),
+            "a sanitizable prefix should construct, not fail"
+        );
+    }
+
+    #[tokio::test]
+    async fn statsd_prefix_collapsing_to_empty_is_rejected() {
+        // A prefix that is only illegal/whitespace chars has no safe metric
+        // name and must be a clear config error, not a silent `.request.count`.
+        let cfg = serde_json::json!({ "host": "127.0.0.1", "prefix": " \n\t " });
+        // `StatsdLogging` is not `Debug`, so match instead of `expect_err`.
+        match StatsdLogging::new(&cfg, PluginHttpClient::default()) {
+            Ok(_) => panic!("an empty-after-trim prefix must be rejected"),
+            Err(err) => assert!(err.contains("prefix"), "got: {err}"),
+        }
+    }
+
+    // --- #72: bounded HTTP method tag cardinality ---
+
+    #[test]
+    fn bounded_method_tag_passes_known_methods() {
+        for m in [
+            "GET", "HEAD", "POST", "PUT", "DELETE", "CONNECT", "OPTIONS", "TRACE", "PATCH",
+        ] {
+            assert_eq!(bounded_method_tag(m), m);
+        }
+    }
+
+    #[test]
+    fn bounded_method_tag_collapses_unknown_methods() {
+        // Hostile / non-standard tokens collapse to a single bucket so tag
+        // cardinality stays bounded on tag-aware backends.
+        assert_eq!(bounded_method_tag("FOOBAR"), "other");
+        assert_eq!(bounded_method_tag("get"), "other"); // case-sensitive
+        assert_eq!(bounded_method_tag("PROPFIND"), "other");
+        assert_eq!(bounded_method_tag(""), "other");
+        assert_eq!(bounded_method_tag("GET\nPOST"), "other");
+        assert_eq!(bounded_method_tag(&"X".repeat(10_000)), "other");
+    }
+
+    #[test]
+    fn format_http_metrics_bounds_method_tag() {
+        // A hostile method token must not appear verbatim in the emitted line.
+        let summary = http_summary("EVILMETHODabcdefghijklmnop");
+        let mut buf = String::new();
+        format_http_metrics(&summary, "ferrum", "", None, &mut buf);
+        assert!(buf.contains("method:other"), "got: {buf}");
+        assert!(!buf.contains("EVILMETHOD"), "got: {buf}");
+
+        // A standard method still passes through.
+        let summary = http_summary("POST");
+        let mut buf = String::new();
+        format_http_metrics(&summary, "ferrum", "", None, &mut buf);
+        assert!(buf.contains("method:POST"), "got: {buf}");
+    }
+
+    fn http_summary(method: &str) -> TransactionSummary {
+        TransactionSummary {
+            http_method: method.to_string(),
+            response_status_code: 200,
+            ..TransactionSummary::default()
+        }
     }
 }

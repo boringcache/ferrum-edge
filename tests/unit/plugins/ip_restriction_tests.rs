@@ -698,3 +698,188 @@ async fn deny_mode_ipv4_mapped_ipv6_cidr_rule_rejects_canonicalized_ipv4_client(
     let result = plugin.on_request_received(&mut ctx).await;
     plugin_utils::assert_reject(result, Some(403));
 }
+
+// ── Fail closed on unparseable client IP (finding #10) ──────────────
+// An unparseable client IP (e.g. a malformed X-Forwarded-For token that
+// survives upstream sourcing) must NOT bypass a deny rule. Before the fix,
+// a deny-only config fell through to Continue because Unknown matched no
+// rule and the allow-enforcement branch was skipped for an empty allow list.
+
+#[tokio::test]
+async fn deny_first_deny_only_rejects_unparseable_client_ip() {
+    // Classic "block these bad IPs" config: deny list, no allow list,
+    // deny_first mode. An unparseable IP previously fell through to Continue.
+    let plugin = IpRestriction::new(&json!({
+        "deny": ["10.0.0.0/8"],
+        "mode": "deny_first"
+    }))
+    .unwrap();
+
+    let mut ctx = create_context_with_ip("not-an-ip");
+    let result = plugin.on_request_received(&mut ctx).await;
+    plugin_utils::assert_reject(result, Some(403));
+}
+
+#[tokio::test]
+async fn allow_first_deny_only_rejects_unparseable_client_ip() {
+    // Deny-only config in the default allow_first mode also failed open for
+    // Unknown because the allow-enforcement branch was guarded by a non-empty
+    // allow list.
+    let plugin = IpRestriction::new(&json!({
+        "deny": ["10.0.0.0/8"]
+    }))
+    .unwrap();
+
+    let mut ctx = create_context_with_ip("garbage value");
+    let result = plugin.on_request_received(&mut ctx).await;
+    plugin_utils::assert_reject(result, Some(403));
+}
+
+#[tokio::test]
+async fn empty_string_client_ip_is_rejected() {
+    // An empty client IP is unparseable and must fail closed under a
+    // deny-only config rather than silently pass.
+    let plugin = IpRestriction::new(&json!({
+        "deny": ["10.0.0.0/8"],
+        "mode": "deny_first"
+    }))
+    .unwrap();
+
+    let mut ctx = create_context_with_ip("");
+    let result = plugin.on_request_received(&mut ctx).await;
+    plugin_utils::assert_reject(result, Some(403));
+}
+
+#[tokio::test]
+async fn unparseable_client_ip_rejected_on_stream_path() {
+    // The stream (TCP/UDP) path goes through the same check_ip, so it must
+    // also fail closed on an unparseable client IP under a deny-only config.
+    let plugin = IpRestriction::new(&json!({
+        "deny": ["10.0.0.0/8"],
+        "mode": "deny_first"
+    }))
+    .unwrap();
+
+    let mut ctx = create_stream_context_with_ip("not-an-ip");
+    let result = plugin.on_stream_connect(&mut ctx).await;
+    plugin_utils::assert_reject(result, Some(403));
+}
+
+#[tokio::test]
+async fn allow_list_still_rejects_unparseable_client_ip() {
+    // Allow-list configs already failed closed for Unknown; confirm the fix
+    // does not regress that behavior (still rejected, now via the up-front
+    // unparseable-IP guard).
+    let plugin = IpRestriction::new(&json!({
+        "allow": ["10.0.0.0/8"]
+    }))
+    .unwrap();
+
+    let mut ctx = create_context_with_ip("not-an-ip");
+    let result = plugin.on_request_received(&mut ctx).await;
+    plugin_utils::assert_reject(result, Some(403));
+}
+
+#[tokio::test]
+async fn parseable_client_ip_not_affected_by_fail_closed_guard() {
+    // Regression guard: a normal parseable IP that is not denied must still
+    // pass under a deny-only config — the fail-closed branch must only trigger
+    // for genuinely unparseable input.
+    let plugin = IpRestriction::new(&json!({
+        "deny": ["10.0.0.0/8"],
+        "mode": "deny_first"
+    }))
+    .unwrap();
+
+    let mut ctx = create_context_with_ip("192.168.1.1");
+    let result = plugin.on_request_received(&mut ctx).await;
+    plugin_utils::assert_continue(result);
+}
+
+// ── Cross-family catch-all (finding #46) ────────────────────────────
+// `0.0.0.0/0` and `::/0` are zero-length prefixes meaning "match
+// everything". They must span BOTH address families on a dual-stack
+// listener, not just the family they were written in.
+
+#[tokio::test]
+async fn ipv4_zero_cidr_allow_matches_ipv6_client() {
+    // `0.0.0.0/0` as an allow rule must permit an IPv6 client.
+    let plugin = IpRestriction::new(&json!({
+        "allow": ["0.0.0.0/0"]
+    }))
+    .unwrap();
+
+    let mut ctx = create_context_with_ip("2001:db8::1");
+    let result = plugin.on_request_received(&mut ctx).await;
+    plugin_utils::assert_continue(result);
+}
+
+#[tokio::test]
+async fn ipv6_zero_cidr_allow_matches_ipv4_client() {
+    // `::/0` as an allow rule must permit an IPv4 client.
+    let plugin = IpRestriction::new(&json!({
+        "allow": ["::/0"]
+    }))
+    .unwrap();
+
+    let mut ctx = create_context_with_ip("192.168.1.1");
+    let result = plugin.on_request_received(&mut ctx).await;
+    plugin_utils::assert_continue(result);
+}
+
+#[tokio::test]
+async fn ipv6_zero_cidr_deny_blocks_ipv4_client() {
+    // An operator writing deny `::/0` to "block everything" must also block
+    // IPv4 clients. This was the silent policy gap reported in finding #46.
+    let plugin = IpRestriction::new(&json!({
+        "deny": ["::/0"],
+        "mode": "deny_first"
+    }))
+    .unwrap();
+
+    let mut ctx = create_context_with_ip("192.168.1.1");
+    let result = plugin.on_request_received(&mut ctx).await;
+    plugin_utils::assert_reject(result, Some(403));
+}
+
+#[tokio::test]
+async fn ipv4_zero_cidr_deny_blocks_ipv6_client() {
+    // The mirror case: deny `0.0.0.0/0` must also block IPv6 clients.
+    let plugin = IpRestriction::new(&json!({
+        "deny": ["0.0.0.0/0"],
+        "mode": "deny_first"
+    }))
+    .unwrap();
+
+    let mut ctx = create_context_with_ip("2001:db8::1");
+    let result = plugin.on_request_received(&mut ctx).await;
+    plugin_utils::assert_reject(result, Some(403));
+}
+
+#[tokio::test]
+async fn zero_cidr_catch_all_matches_same_family_client() {
+    // Sanity: the catch-all still matches its own family too.
+    let plugin = IpRestriction::new(&json!({
+        "deny": ["0.0.0.0/0"],
+        "mode": "deny_first"
+    }))
+    .unwrap();
+
+    let mut ctx = create_context_with_ip("203.0.113.5");
+    let result = plugin.on_request_received(&mut ctx).await;
+    plugin_utils::assert_reject(result, Some(403));
+}
+
+#[test]
+fn ip_matches_zero_cidr_is_cross_family() {
+    use ferrum_edge::plugins::ip_restriction::ip_matches;
+
+    // The string-based public API reflects the cross-family catch-all too.
+    assert!(ip_matches("2001:db8::1", "0.0.0.0/0"));
+    assert!(ip_matches("192.168.1.1", "::/0"));
+    assert!(ip_matches("10.0.0.1", "0.0.0.0/0"));
+    assert!(ip_matches("fe80::1", "::/0"));
+    // An unparseable client still matches nothing, even a catch-all.
+    assert!(!ip_matches("not-an-ip", "0.0.0.0/0"));
+    assert!(!ip_matches("not-an-ip", "::/0"));
+}

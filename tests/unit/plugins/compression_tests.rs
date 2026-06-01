@@ -873,3 +873,338 @@ async fn test_no_matching_algorithm() {
     plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
     assert!(!resp_headers.contains_key("content-encoding"));
 }
+
+// ──────────── Accept-Encoding specificity & malformed q (RFC 9110) ────────────
+
+/// Drive the response-side algorithm negotiation for a given Accept-Encoding
+/// and configured algorithm list, returning the selected `Content-Encoding`
+/// (or `None` when no encoding was applied).
+async fn negotiate_encoding(
+    algorithms: serde_json::Value,
+    accept_encoding: &str,
+) -> Option<String> {
+    let plugin = make_plugin(json!({ "algorithms": algorithms }));
+    let mut ctx = make_ctx(Some(accept_encoding));
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "application/json".to_string());
+    resp_headers.insert("content-length".to_string(), "1000".to_string());
+    plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+    resp_headers.get("content-encoding").cloned()
+}
+
+/// #58: an explicit `gzip;q=0` must exclude gzip even when a wildcard `*` is
+/// present at q>0 — the more specific entry wins over `*` (RFC 9110 §12.5.3).
+/// With brotli also configured, brotli is selected through the wildcard.
+#[tokio::test]
+async fn test_explicit_q_zero_not_reenabled_by_wildcard_selects_other() {
+    let selected = negotiate_encoding(json!(["gzip", "br"]), "gzip;q=0, *").await;
+    assert_eq!(
+        selected.as_deref(),
+        Some("br"),
+        "explicit gzip;q=0 must not be re-enabled by the wildcard; brotli should win"
+    );
+}
+
+/// #58: an explicit `gzip;q=0` with a wildcard, when gzip is the ONLY configured
+/// algorithm, must apply no encoding — the wildcard cannot resurrect the
+/// specifically-refused codec.
+#[tokio::test]
+async fn test_explicit_q_zero_with_wildcard_gzip_only_applies_nothing() {
+    let selected = negotiate_encoding(json!(["gzip"]), "gzip;q=0, *").await;
+    assert_eq!(
+        selected, None,
+        "explicit gzip;q=0 must stay refused even with a wildcard when gzip is the only codec"
+    );
+}
+
+/// #58: a bare wildcard (no explicit refusal) still re-enables a codec — this is
+/// the pre-existing behaviour and must not regress.
+#[tokio::test]
+async fn test_bare_wildcard_still_enables_codec() {
+    let selected = negotiate_encoding(json!(["gzip"]), "*").await;
+    assert_eq!(selected.as_deref(), Some("gzip"));
+}
+
+/// #87: a present-but-unparseable q-value (`gzip;q=abc`) is treated as not
+/// acceptable (q=0), so gzip must NOT be selected when it is the only codec.
+#[tokio::test]
+async fn test_malformed_q_value_treated_as_not_acceptable() {
+    let selected = negotiate_encoding(json!(["gzip"]), "gzip;q=abc").await;
+    assert_eq!(
+        selected, None,
+        "a garbage q-value must be treated as q=0 (not acceptable), not q=1.0"
+    );
+}
+
+/// #87: an empty q-value (`gzip;q=`) is likewise not acceptable.
+#[tokio::test]
+async fn test_empty_q_value_treated_as_not_acceptable() {
+    let selected = negotiate_encoding(json!(["gzip"]), "gzip;q=").await;
+    assert_eq!(selected, None);
+}
+
+/// #87: a malformed q on one codec must not let it beat a well-formed,
+/// genuinely-preferred codec. `gzip;q=abc` (→ q=0) loses to `br;q=1`.
+#[tokio::test]
+async fn test_malformed_q_value_does_not_outrank_valid_codec() {
+    // Server preference is gzip-first; without the fix gzip;q=abc would parse as
+    // q=1.0 and win the tie. With the fix it is q=0 and excluded, so br wins.
+    let selected = negotiate_encoding(json!(["gzip", "br"]), "gzip;q=abc, br;q=1").await;
+    assert_eq!(selected.as_deref(), Some("br"));
+}
+
+/// #87: `q=NaN` parses to a float in Rust but must be rejected as non-finite
+/// (q=0) so it neither wins selection nor poisons the highest-q tie-break math.
+#[tokio::test]
+async fn test_nan_q_value_does_not_poison_selection() {
+    // gzip;q=NaN must be excluded; br;q=0.5 is the only acceptable codec.
+    let selected = negotiate_encoding(json!(["gzip", "br"]), "gzip;q=NaN, br;q=0.5").await;
+    assert_eq!(
+        selected.as_deref(),
+        Some("br"),
+        "NaN q must be treated as not acceptable and must not dominate the tie-break"
+    );
+
+    // And when NaN is the only entry for the only codec, nothing is applied.
+    let none = negotiate_encoding(json!(["gzip"]), "gzip;q=NaN").await;
+    assert_eq!(none, None);
+}
+
+/// #87: a q-value above 1.0 is clamped to 1.0 (still acceptable) rather than
+/// rejected — clamping must not turn a valid (if out-of-range) weight into a
+/// refusal.
+#[tokio::test]
+async fn test_out_of_range_q_value_is_clamped_not_refused() {
+    let selected = negotiate_encoding(json!(["gzip"]), "gzip;q=5").await;
+    assert_eq!(selected.as_deref(), Some("gzip"));
+}
+
+// ──────────────── #60: multi-member gzip request decompression ────────────────
+
+/// #60: a concatenated multi-member gzip request body must be decoded in full.
+/// `GzDecoder` would stop after the first member and silently truncate the body;
+/// `MultiGzDecoder` decodes every member.
+#[tokio::test]
+async fn test_multi_member_gzip_request_decompression() {
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+
+    let part_a = b"first gzip member payload; ";
+    let part_b = b"second gzip member payload!";
+
+    // Build two independent gzip members and concatenate them — a valid
+    // multi-member stream per RFC 1952 §2.2.
+    let mut compressed = Vec::new();
+    for part in [part_a.as_slice(), part_b.as_slice()] {
+        let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(part).unwrap();
+        compressed.extend_from_slice(&encoder.finish().unwrap());
+    }
+
+    let plugin = make_plugin(json!({"decompress_request": true}));
+    let mut headers = HashMap::new();
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+
+    let decompressed = plugin
+        .transform_request_body(&compressed, Some("application/octet-stream"), &headers)
+        .await
+        .expect("multi-member gzip should decompress");
+
+    let mut expected = Vec::new();
+    expected.extend_from_slice(part_a);
+    expected.extend_from_slice(part_b);
+    assert_eq!(
+        decompressed, expected,
+        "both gzip members must be decoded; the body must not be truncated to the first member"
+    );
+}
+
+// ──────── #59: malformed compressed request body is rejected, not forwarded ────
+
+/// Build a `RequestContext` carrying a `Content-Encoding` header and the given
+/// raw request-body bytes exposed via `request_body_bytes` (as the proxy does
+/// when buffering before `before_proxy`).
+fn make_request_ctx_with_body(content_encoding: &str, body: &[u8]) -> RequestContext {
+    let mut ctx = make_ctx(None);
+    ctx.headers
+        .insert("content-encoding".to_string(), content_encoding.to_string());
+    ctx.request_body_bytes = Some(bytes::Bytes::copy_from_slice(body));
+    ctx
+}
+
+#[tokio::test]
+async fn test_empty_gzip_request_body_is_rejected() {
+    let plugin = make_plugin(json!({"decompress_request": true}));
+    let mut ctx = make_request_ctx_with_body("gzip", &[]);
+    let mut headers = HashMap::new();
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    headers.insert("content-length".to_string(), "0".to_string());
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    match result {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 400),
+        other => panic!("expected Reject for empty gzip body, got {other:?}"),
+    }
+    assert_eq!(
+        headers.get("content-encoding").map(String::as_str),
+        Some("gzip")
+    );
+    assert_eq!(headers.get("content-length").map(String::as_str), Some("0"));
+}
+
+/// #59: a corrupt gzip request body must be rejected with a clean 400 in
+/// `before_proxy`, and the `Content-Encoding`/`Content-Length` headers must NOT
+/// be stripped (so we never forward a still-compressed body mislabeled as
+/// plaintext to the backend).
+#[tokio::test]
+async fn test_corrupt_gzip_request_body_is_rejected() {
+    let plugin = make_plugin(json!({"decompress_request": true}));
+    // Valid gzip magic but truncated/garbage stream -> decode fails.
+    let corrupt = [0x1f, 0x8b, 0x08, 0x00, 0xde, 0xad, 0xbe, 0xef, 0x00];
+    let mut ctx = make_request_ctx_with_body("gzip", &corrupt);
+    let mut headers = HashMap::new();
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    headers.insert("content-length".to_string(), corrupt.len().to_string());
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    match result {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 400),
+        other => panic!("expected Reject for corrupt gzip body, got {other:?}"),
+    }
+    // Headers must remain intact since the request is being rejected — never
+    // forward a body whose Content-Encoding was stripped while still compressed.
+    assert_eq!(
+        headers.get("content-encoding").map(String::as_str),
+        Some("gzip")
+    );
+    assert!(headers.contains_key("content-length"));
+}
+
+/// #59: an oversize (zip-bomb) gzip request body must also be rejected cleanly
+/// rather than silently forwarded.
+#[tokio::test]
+async fn test_oversize_gzip_request_body_is_rejected() {
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+
+    let plugin = make_plugin(json!({
+        "decompress_request": true,
+        "max_decompressed_request_size": 100,
+    }));
+    let big_body = vec![b'A'; 500];
+    let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&big_body).unwrap();
+    let compressed = encoder.finish().unwrap();
+
+    let mut ctx = make_request_ctx_with_body("gzip", &compressed);
+    let mut headers = HashMap::new();
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    match result {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 400),
+        other => panic!("expected Reject for oversize gzip body, got {other:?}"),
+    }
+    assert_eq!(
+        headers.get("content-encoding").map(String::as_str),
+        Some("gzip")
+    );
+}
+
+/// #59: a VALID compressed request body must NOT be rejected — `before_proxy`
+/// continues and strips the now-stale Content-Encoding/Content-Length headers.
+#[tokio::test]
+async fn test_valid_gzip_request_body_is_accepted_and_headers_stripped() {
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+
+    let plugin = make_plugin(json!({"decompress_request": true}));
+    let original = b"a perfectly valid gzip request body";
+    let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(original).unwrap();
+    let compressed = encoder.finish().unwrap();
+
+    let mut ctx = make_request_ctx_with_body("gzip", &compressed);
+    let mut headers = HashMap::new();
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    headers.insert("content-length".to_string(), compressed.len().to_string());
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(
+        !headers.contains_key("content-encoding"),
+        "stale encoding must be stripped on success"
+    );
+    assert!(
+        !headers.contains_key("content-length"),
+        "stale length must be stripped on success"
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("compression:request_encoding")
+            .map(String::as_str),
+        Some("gzip")
+    );
+}
+
+/// #59: a double-compressed body whose decompressed payload is ITSELF valid
+/// gzip (e.g. a client uploading a `.gz` file with `Content-Encoding: gzip`)
+/// must be accepted — the gateway decodes exactly one transport layer and must
+/// not false-positive reject it as "still compressed".
+#[tokio::test]
+async fn test_decompressed_payload_that_is_itself_gzip_is_accepted() {
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+
+    let plugin = make_plugin(json!({"decompress_request": true}));
+    // Inner gzip "file".
+    let inner_plain = b"the original file contents";
+    let mut inner_enc = GzEncoder::new(Vec::new(), flate2::Compression::default());
+    inner_enc.write_all(inner_plain).unwrap();
+    let inner_gz = inner_enc.finish().unwrap();
+    // Transport-encode the .gz file with another gzip layer.
+    let mut outer_enc = GzEncoder::new(Vec::new(), flate2::Compression::default());
+    outer_enc.write_all(&inner_gz).unwrap();
+    let outer_gz = outer_enc.finish().unwrap();
+
+    let mut ctx = make_request_ctx_with_body("gzip", &outer_gz);
+    let mut headers = HashMap::new();
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "one transport gzip layer is valid even when the payload is itself gzip"
+    );
+
+    // And the body transform yields exactly the inner .gz file bytes (one layer
+    // removed), not a rejection or truncation.
+    let decoded = plugin
+        .transform_request_body(&outer_gz, Some("application/octet-stream"), &headers)
+        .await
+        .expect("one gzip layer should decode to the inner .gz bytes");
+    assert_eq!(decoded, inner_gz);
+}
+
+/// #59: when the request body was NOT buffered before `before_proxy`
+/// (`request_body_bytes` is None — e.g. an HBONE CONNECT tunnel), `before_proxy`
+/// cannot validate, so it falls back to the prior behaviour: continue and strip
+/// headers (no spurious reject).
+#[tokio::test]
+async fn test_before_proxy_without_buffered_body_falls_back_to_strip() {
+    let plugin = make_plugin(json!({"decompress_request": true}));
+    let mut ctx = make_ctx(None); // no request_body_bytes set
+    let mut headers = HashMap::new();
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    headers.insert("content-length".to_string(), "42".to_string());
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!headers.contains_key("content-encoding"));
+    assert!(!headers.contains_key("content-length"));
+}
