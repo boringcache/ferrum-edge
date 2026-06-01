@@ -139,7 +139,7 @@ pub struct RequestDeduplication {
     inflight_count: AtomicUsize,
     completed_sequence: AtomicU64,
     next_completed_evict_sequence: AtomicU64,
-    completed_order: Arc<DashMap<u64, String>>,
+    completed_order: Arc<DashMap<u64, CompletedOrderEntry>>,
     eviction_lock: Mutex<()>,
     /// Optional Redis client for centralized deduplication.
     redis_client: Option<Arc<RedisRateLimitClient>>,
@@ -245,18 +245,11 @@ impl RequestDeduplication {
                 LocalDeduplicationAction::Fresh
             }
             Entry::Occupied(mut entry) => match entry.get() {
-                DeduplicationEntry::Completed {
-                    cached,
-                    sequence: _,
-                } => {
+                DeduplicationEntry::Completed { cached, sequence } => {
                     if now.duration_since(cached.inserted_at) < self.ttl {
                         LocalDeduplicationAction::Replay(cached.clone())
                     } else {
-                        // Leave the old sequence in completed_order. Capacity
-                        // eviction will discard it as stale when it reaches the
-                        // sequence, which prevents the eviction cursor from
-                        // stopping permanently on a missing-but-not-yet-published
-                        // sequence.
+                        self.mark_completed_sequence_pruned(*sequence);
                         decrement_atomic(&self.completed_count);
                         self.inflight_count.fetch_add(1, Ordering::Relaxed);
                         entry.insert(DeduplicationEntry::InFlight { started_at: now });
@@ -372,9 +365,10 @@ impl RequestDeduplication {
         // instead of storing a full-scan snapshot, so concurrent inserts cannot
         // be overwritten by stale counts from this cleanup pass.
         self.local_cache.retain(|_, entry| match entry {
-            DeduplicationEntry::Completed { cached, .. } => {
+            DeduplicationEntry::Completed { cached, sequence } => {
                 let keep = now.duration_since(cached.inserted_at) < self.ttl;
                 if !keep {
+                    self.mark_completed_sequence_pruned(*sequence);
                     decrement_atomic(&self.completed_count);
                 }
                 keep
@@ -397,6 +391,7 @@ impl RequestDeduplication {
             self.completed_count.load(Ordering::Relaxed),
             self.inflight_count.load(Ordering::Relaxed),
         );
+        self.advance_completed_evict_cursor();
     }
 
     fn evict_completed_over_capacity(&self, completed_hint: usize, inflight_hint: usize) {
@@ -433,13 +428,20 @@ impl RequestDeduplication {
         let mut sequence = self.next_completed_evict_sequence.load(Ordering::Relaxed);
         let limit = self.completed_sequence.load(Ordering::Relaxed);
         while to_remove > 0 && sequence < limit {
+            let current_sequence = sequence;
             match self.remove_completed_sequence(sequence) {
                 CompletedSequenceRemoval::Removed => {
                     to_remove -= 1;
                     sequence += 1;
+                    self.next_completed_evict_sequence
+                        .store(sequence, Ordering::Relaxed);
+                    self.remove_pruned_completed_order(current_sequence);
                 }
                 CompletedSequenceRemoval::Stale => {
                     sequence += 1;
+                    self.next_completed_evict_sequence
+                        .store(sequence, Ordering::Relaxed);
+                    self.remove_pruned_completed_order(current_sequence);
                 }
                 CompletedSequenceRemoval::NotPublished => {
                     break;
@@ -451,9 +453,21 @@ impl RequestDeduplication {
     }
 
     fn remove_completed_sequence(&self, sequence: u64) -> CompletedSequenceRemoval {
-        let Some((_, key)) = self.completed_order.remove(&sequence) else {
+        let Some(order_entry) = self.completed_order.get(&sequence) else {
             return CompletedSequenceRemoval::NotPublished;
         };
+        let key = match order_entry.value() {
+            CompletedOrderEntry::Pending => return CompletedSequenceRemoval::NotPublished,
+            CompletedOrderEntry::Pruned => {
+                drop(order_entry);
+                self.completed_order.remove_if(&sequence, |_, entry| {
+                    matches!(entry, CompletedOrderEntry::Pruned)
+                });
+                return CompletedSequenceRemoval::Stale;
+            }
+            CompletedOrderEntry::Published(key) => key.clone(),
+        };
+        drop(order_entry);
 
         let still_current = self.local_cache.get(&key).is_some_and(|entry| {
             matches!(
@@ -465,6 +479,7 @@ impl RequestDeduplication {
             )
         });
         if !still_current {
+            self.remove_stale_completed_order(sequence, &key);
             return CompletedSequenceRemoval::Stale;
         }
 
@@ -482,11 +497,84 @@ impl RequestDeduplication {
             .is_some()
         {
             decrement_atomic(&self.completed_count);
+            self.remove_stale_completed_order(sequence, &key);
             CompletedSequenceRemoval::Removed
         } else {
+            self.remove_stale_completed_order(sequence, &key);
             CompletedSequenceRemoval::Stale
         }
     }
+
+    fn remove_stale_completed_order(&self, sequence: u64, key: &str) {
+        self.completed_order
+            .remove_if(&sequence, |_, entry| match entry {
+                CompletedOrderEntry::Pending => false,
+                CompletedOrderEntry::Published(published) => published.as_str() == key,
+                CompletedOrderEntry::Pruned => true,
+            });
+    }
+
+    fn mark_completed_sequence_pruned(&self, sequence: u64) {
+        if sequence < self.next_completed_evict_sequence.load(Ordering::Relaxed) {
+            self.completed_order.remove(&sequence);
+            return;
+        }
+        self.completed_order
+            .insert(sequence, CompletedOrderEntry::Pruned);
+        if sequence < self.next_completed_evict_sequence.load(Ordering::Relaxed) {
+            self.remove_pruned_completed_order(sequence);
+        }
+    }
+
+    fn remove_pruned_completed_order(&self, sequence: u64) {
+        self.completed_order.remove_if(&sequence, |_, entry| {
+            matches!(entry, CompletedOrderEntry::Pruned)
+        });
+    }
+
+    fn advance_completed_evict_cursor(&self) {
+        let Ok(_guard) = self.eviction_lock.lock() else {
+            return;
+        };
+        self.advance_completed_evict_cursor_locked();
+    }
+
+    fn advance_completed_evict_cursor_locked(&self) {
+        let mut sequence = self.next_completed_evict_sequence.load(Ordering::Relaxed);
+        let limit = self.completed_sequence.load(Ordering::Relaxed);
+        while sequence < limit {
+            let current_sequence = sequence;
+            let Some(order_entry) = self.completed_order.get(&sequence) else {
+                break;
+            };
+            if !matches!(order_entry.value(), CompletedOrderEntry::Pruned) {
+                break;
+            }
+            drop(order_entry);
+            if self
+                .completed_order
+                .remove_if(&sequence, |_, entry| {
+                    matches!(entry, CompletedOrderEntry::Pruned)
+                })
+                .is_some()
+            {
+                sequence += 1;
+                self.next_completed_evict_sequence
+                    .store(sequence, Ordering::Relaxed);
+                self.remove_pruned_completed_order(current_sequence);
+            } else {
+                break;
+            }
+        }
+        self.next_completed_evict_sequence
+            .store(sequence, Ordering::Relaxed);
+    }
+}
+
+enum CompletedOrderEntry {
+    Pending,
+    Published(String),
+    Pruned,
 }
 
 enum CompletedSequenceRemoval {
@@ -747,11 +835,12 @@ impl Plugin for RequestDeduplication {
             inserted_at: Instant::now(),
         };
 
-        // Store in local cache. The ordering map is published after the
-        // Completed entry is visible; eviction stops at not-yet-published
-        // sequences instead of advancing past them, so independent completions
-        // do not need to serialize behind the eviction mutex.
+        // Reserve the sequence before storing the response. Eviction treats
+        // Pending as not-yet-published and stops there, then the entry is
+        // changed to Published after the Completed cache entry is visible.
         let sequence = self.next_completed_sequence();
+        self.completed_order
+            .insert(sequence, CompletedOrderEntry::Pending);
         let previous = self.local_cache.insert(
             key.clone(),
             DeduplicationEntry::Completed {
@@ -759,12 +848,19 @@ impl Plugin for RequestDeduplication {
                 sequence,
             },
         );
-        self.completed_order.insert(sequence, key.clone());
+        self.completed_order
+            .insert(sequence, CompletedOrderEntry::Published(key.clone()));
         let (completed, inflight) = match previous {
-            Some(DeduplicationEntry::Completed { .. }) => (
-                self.completed_count.load(Ordering::Relaxed),
-                self.inflight_count.load(Ordering::Relaxed),
-            ),
+            Some(DeduplicationEntry::Completed {
+                sequence: old_sequence,
+                ..
+            }) => {
+                self.mark_completed_sequence_pruned(old_sequence);
+                (
+                    self.completed_count.load(Ordering::Relaxed),
+                    self.inflight_count.load(Ordering::Relaxed),
+                )
+            }
             Some(DeduplicationEntry::InFlight { .. }) => (
                 self.completed_count.fetch_add(1, Ordering::Relaxed) + 1,
                 decrement_atomic(&self.inflight_count),
