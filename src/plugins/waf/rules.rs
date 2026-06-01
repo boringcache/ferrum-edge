@@ -1,5 +1,6 @@
 use regex::{Regex, RegexSet, RegexSetBuilder, bytes::RegexSet as BytesRegexSet};
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -142,7 +143,14 @@ impl CompiledConditions {
             .iter()
             .map(|pattern| {
                 if let Some(regex) = pattern.strip_prefix('~') {
-                    Regex::new(regex)
+                    // Start-anchor `~regex` path conditions (parity with
+                    // `global_exemptions.paths` and the `prefix*` branch below):
+                    // `is_match` is unanchored, so an entry like `~api` would
+                    // otherwise scope a rule to every path merely containing
+                    // `api`. Operators wanting a floating match write `~.*api`;
+                    // an explicit leading `^` is preserved.
+                    let anchored = anchor_condition_path_regex(regex);
+                    Regex::new(&anchored)
                         .map(PathMatcher::Regex)
                         .map_err(|e| format!("waf: invalid conditions.paths regex: {e}"))
                 } else if let Some(prefix) = pattern.strip_suffix('*') {
@@ -196,6 +204,26 @@ impl CompiledConditions {
         }
         true
     }
+}
+
+/// Start-anchor a user-supplied `~regex` path pattern. The WAF evaluates path
+/// regexes with `is_match`, which is unanchored (substring) by default; without
+/// anchoring a short pattern like `api` silently matches every path containing
+/// it (`/v1/api-keys`, `/secret/api/admin`). This mirrors the `prefix*`
+/// branch's start-anchored semantics. Shared by `global_exemptions.paths` and
+/// rule `conditions.paths` so both `~` path syntaxes behave identically.
+/// Callers wanting a floating match write `~.*pattern`.
+///
+/// The whole pattern is wrapped in `^(?:...)` rather than just prefixed with
+/// `^`, so that EVERY branch of a top-level alternation is anchored. A bare `^`
+/// prefix only anchors the first branch — `a|b` becomes `^a|b` == `(^a)|(b)`,
+/// leaving `b` unanchored (substring). For an exemption that re-opens the exact
+/// WAF-disabling over-match this guard exists to close (a `~a|b` exemption
+/// would still exempt any path merely containing `b`). Double-anchoring an
+/// already-`^`-prefixed pattern (`^(?:^/api)`) is harmless for single-line path
+/// matching.
+pub(super) fn anchor_condition_path_regex(regex: &str) -> Cow<'_, str> {
+    Cow::Owned(format!("^(?:{regex})"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -1313,7 +1313,7 @@ Authenticates using Bearer JWTs validated against one or more Identity Provider 
 |---|---|---|
 | `providers` | Array | Array of identity provider configurations (required) |
 | `providers[].jwks_uri` | String | Direct URL to the IdP's JWKS endpoint |
-| `providers[].discovery_url` | String | OIDC discovery URL (auto-discovers `jwks_uri`) |
+| `providers[].discovery_url` | String | OIDC discovery URL (auto-discovers `jwks_uri`). SSRF hardening: the discovered `jwks_uri` must use the **same origin** as the discovery URL (scheme, host, and effective port). For IdPs that serve JWKS from a different origin than discovery (e.g. Google `accounts.google.com` → `www.googleapis.com`, and some Azure AD / Okta / Auth0 setups), set `providers[].jwks_uri` directly instead of `discovery_url`. |
 | `providers[].jwks` | String/Object (optional) | Inline JWKS JSON; useful for mesh-provided or static key sets |
 | `providers[].issuer` | String (optional) | Expected JWT `iss` claim — routes tokens to this provider |
 | `providers[].audience` | String (optional) | Expected JWT `aud` claim |
@@ -1331,7 +1331,7 @@ Authenticates using Bearer JWTs validated against one or more Identity Provider 
 | `providers[].claim_headers` | Object (optional) | Per-provider claim-to-header mappings; keys are claim paths and values are upstream header names |
 | `providers[].claim_headers_separator` | String (optional) | Separator for array claim header values |
 | `providers[].require_mtls_binding` | Boolean (optional) | Require JWT `cnf.x5t#S256` to match the frontend client certificate SHA-256 thumbprint |
-| `providers[].require_dpop` | Boolean (optional) | Require and validate a DPoP proof bound to the access token |
+| `providers[].require_dpop` | Boolean (optional) | Require and validate an RFC 9449 DPoP proof bound to the access token. The proof must carry an `ath` claim matching the SHA-256 of the presented token (§4.3); proofs without `ath` are rejected. The `htu` claim is compared after normalizing scheme/host case and default ports and ignoring query/fragment |
 | `providers[].dpop_clock_skew_secs` | u64 (optional) | DPoP `iat`/`exp` clock skew in seconds (default: `30`, max: `300`) |
 | `providers[].dpop_jti_cache_max_entries` | usize (optional) | Per-provider DPoP replay cache capacity (default: `10000`) |
 | `providers[].dpop_jti_ttl_secs` | u64 (optional) | DPoP `jti` replay cache TTL (default: `300`, must be at least twice clock skew) |
@@ -1522,7 +1522,7 @@ Authenticates requests using HMAC signatures with mandatory request-body integri
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `clock_skew_seconds` | u64 | `300` | Maximum allowed skew for the `Date` header replay window |
+| `clock_skew_seconds` | u64 | `300` | Maximum allowed skew for the `Date` header freshness window |
 
 Expected `Authorization` header format:
 
@@ -1538,10 +1538,12 @@ hmac username="<username>", algorithm="hmac-sha256", signature="<base64>"
 **Signing string**:
 
 ```text
-{METHOD}\n{PATH}\n{DATE}\n{DIGEST_HEADER_VALUE}
+{METHOD}\n{PATH}\n{QUERY}\n{DATE}\n{DIGEST_HEADER_VALUE}
 ```
 
-where `DIGEST_HEADER_VALUE` is the literal value of the `Digest:` or `Content-Digest:` header (e.g., `sha-256=<base64-of-sha256-of-body>`). Including the digest header in the signing string means a tampered digest header (without re-signing) breaks the HMAC, and a tampered body (without recomputing the digest) breaks the digest verification.
+where `{PATH}` is the request path component only, `{QUERY}` is the raw query string as received (percent-encoded, without the leading `?`, empty when there is no query), and `DIGEST_HEADER_VALUE` is the literal value of the `Digest:` or `Content-Digest:` header (e.g., `sha-256=<base64-of-sha256-of-body>`). Binding the query string means altering or adding query parameters invalidates the signature; clients must sign the byte-for-byte raw query string the gateway receives. Including the digest header means a tampered digest header (without re-signing) breaks the HMAC, and a tampered body (without recomputing the digest) breaks the digest verification.
+
+> **Replay protection is a freshness window, not single-use.** The signed `Date` header bounds requests to `now ± clock_skew_seconds`; there is no nonce/seen-signature store, so a captured valid request can be replayed verbatim until the window elapses. Keep `clock_skew_seconds` tight for non-idempotent routes and do not rely on `hmac_auth` alone for them.
 
 **Consumer credential** (`hmac_auth`) — array:
 ```yaml
@@ -2761,7 +2763,7 @@ scanning the parsed key/value map and a best-effort reconstructed URL.
 | `score` | integer | severity weight | Anomaly-score contribution when `scoring` is enabled. |
 | `fp_filters` | string[] | `[]` | Regex filters that suppress known false-positive captured values for this rule. |
 | `paranoia_min` | u8 | `1` | Minimum paranoia level required for this rule. |
-| `conditions` | object | `{}` | Optional request conditions: `paths`, `methods`, `headers`, and `consumers`. Path entries use the same exact / trailing-`*` prefix / `~` regex grammar as `global_exemptions.paths`. |
+| `conditions` | object | `{}` | Optional request conditions: `paths`, `methods`, `headers`, and `consumers`. Path entries use the same exact / trailing-`*` prefix / `~` regex grammar as `global_exemptions.paths`; `~regex` entries are wrapped as `^(?:regex)`, so use `~.*pattern` for a floating substring match. |
 
 Supported targets: `header_names`, `header_values`, `query_keys`,
 `query_values`, `cookies`, `url_path`, `full_url`, `method`, `body_text`,
@@ -2774,9 +2776,10 @@ rules can match IPv6-shaped hex text from logs or diagnostics. Prefer narrow
 
 `global_exemptions` supports `paths`, `methods`, `consumers`, `ips`,
 `header_present`, and `fp_capture_filters`. Path entries ending in `*` are
-prefix matches; entries starting with `~` are treated as regex patterns; all
-other entries are exact-path matches (so `/health` exempts only `/health`, not
-`/healthz` or `/health-admin`).
+prefix matches; entries starting with `~` are start-anchored regex patterns
+wrapped as `^(?:regex)`; all other entries are exact-path matches (so `/health`
+exempts only `/health`, not `/healthz` or `/health-admin`). Use `~.*pattern`
+for a floating substring match.
 
 ```yaml
 config:
