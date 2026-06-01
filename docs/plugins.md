@@ -3579,7 +3579,7 @@ Validates and filters LLM response content before it reaches the client. Complem
 | `max_scan_bytes` | Integer | `1048576` | Skip scanning if body exceeds this size |
 | `require_json` | bool | `false` | Reject responses that are not valid JSON |
 | `required_fields` | String[] | `[]` | Required top-level JSON fields (rejects with 502 if missing) |
-| `max_completion_length` | Integer | `0` | Maximum completion text length in characters (0 = unlimited) |
+| `max_completion_length` | Integer | `0` | Maximum completion text length in characters — Unicode scalar values, not UTF-8 bytes (0 = unlimited) |
 
 At least one of `pii_patterns`, `blocked_phrases`, `blocked_patterns`, `require_json`, `required_fields`, or `max_completion_length` must be configured.
 
@@ -3587,7 +3587,11 @@ At least one of `pii_patterns`, `blocked_phrases`, `blocked_patterns`, `require_
 
 Unknown built-in pattern names and built-in patterns that fail to compile are fatal at construction time (previously they silently dropped detection coverage). All configured patterns are merged into a single `RegexSet` for O(text_len) detection per scan.
 
-In `scan_fields: "all"` mode, the recursive redactor skips JSON object keys that hold structural data (`id`, `model`, `created`, `role`, `type`, `index`, `finish_reason`, `usage`, etc.) so timestamps and identifiers that look like dotted-quad IPs or other PII patterns are not corrupted. When the body has a recognized AI response shape (`choices`, `content`, or `candidates`), the structured redactor that only touches completion fields is preferred.
+In `scan_fields: "all"` mode, the recursive redactor preserves only **top-level scalar** structural fields (`id`, `model`, `created`, `role`, `type`, `index`, `finish_reason`, `usage`, etc.) so timestamps and identifiers that look like dotted-quad IPs or other PII patterns are not corrupted. It always recurses into nested objects and arrays — including nested occurrences of those same key names — so PII cannot evade redaction by being nested under a structural key (e.g. `{"choices":[{"message":{"type":"<SSN>"}}]}` is still redacted). When the body has a recognized AI response shape (`choices`, `content`, or `candidates`), the structured redactor that only touches completion fields is preferred.
+
+The `redaction_placeholder` template is emitted literally: any `$`-sequences in it (or in a pattern/phrase name interpolated into `{type}`, such as a blocked phrase `cost $5`) are written verbatim and are never interpreted as regex capture-group references.
+
+**Streaming (SSE) limitation:** In `redact` mode over `text/event-stream`, redaction is applied per `data:` frame. PII that spans two or more consecutive frames (e.g. half of a credit-card number per chunk) is detected on the accumulated stream but cannot be redacted per-frame, so it passes through to the client and only a `warn` log is emitted. Use `action: reject` for a hard guarantee that frame-straddling PII is blocked. (Note that genuine streaming clients — `Accept: text/event-stream` or upstream-detected streaming — are not buffered, so this redaction path runs only for buffered SSE-framed responses.)
 
 **Multi-provider support:** Extracts completion text from OpenAI (`choices[].message.content`), Anthropic (`content[].text`), and Google Gemini (`candidates[].content.parts[].text`) response formats.
 

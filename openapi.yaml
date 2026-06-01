@@ -12805,7 +12805,7 @@ components:
           type: string
           enum: [reject, redact, warn]
           default: reject
-          description: Action when a violation is detected in the response body
+          description: "Action when a violation is detected in the response body. NOTE: in redact mode over Server-Sent Events (text/event-stream), PII that spans two or more consecutive `data:` frames is detected on the accumulated stream but cannot be redacted per-frame and passes through to the client (only a warn log is emitted). Use action=reject for a hard guarantee that frame-straddling PII is blocked."
         pii_patterns:
           type: array
           items:
@@ -12872,7 +12872,7 @@ components:
         max_completion_length:
           type: integer
           default: 0
-          description: Maximum allowed character length of completion content. 0 = no limit
+          description: "Maximum allowed length of completion content, measured in characters (Unicode scalar values, not UTF-8 bytes). 0 = no limit"
 
     AiFederationConfig:
       type: object
