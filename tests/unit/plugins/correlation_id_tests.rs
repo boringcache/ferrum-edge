@@ -277,6 +277,72 @@ async fn test_oversized_id_metadata_matches_replaced_header() {
     );
 }
 
+// ── Rejects ids with unsafe characters (finding #69) ────────────────
+
+#[tokio::test]
+async fn test_replaces_inbound_id_with_control_chars() {
+    let plugin = CorrelationId::new(&json!({})).unwrap();
+    let mut ctx = make_ctx();
+    // HTAB and DEL are permitted by http::HeaderValue but are not safe
+    // correlation-id characters; the value must be regenerated, not reflected.
+    let unsafe_id = "abc\u{09}def\u{7f}".to_string();
+    ctx.headers
+        .insert("x-request-id".to_string(), unsafe_id.clone());
+
+    let result = plugin.on_request_received(&mut ctx).await;
+    plugin_utils::assert_continue(result);
+
+    let new_id = ctx.headers.get("x-request-id").unwrap();
+    assert_ne!(
+        new_id, &unsafe_id,
+        "ID with control characters should be replaced"
+    );
+    assert!(
+        uuid::Uuid::parse_str(new_id).is_ok(),
+        "Replacement should be a valid UUID, got: {new_id:?}"
+    );
+    // Metadata must carry the sanitized (regenerated) value, not the raw input.
+    let metadata_id = ctx.metadata.get("request_id").unwrap();
+    assert_eq!(metadata_id, new_id);
+    assert_ne!(metadata_id, &unsafe_id);
+}
+
+#[tokio::test]
+async fn test_replaces_inbound_id_with_obs_text_byte() {
+    let plugin = CorrelationId::new(&json!({})).unwrap();
+    let mut ctx = make_ctx();
+    // obs-text (0x80-0xFF) is legal in a header value but not a token char.
+    let unsafe_id = "trace-\u{00e9}".to_string();
+    ctx.headers
+        .insert("x-request-id".to_string(), unsafe_id.clone());
+
+    plugin.on_request_received(&mut ctx).await;
+
+    let new_id = ctx.headers.get("x-request-id").unwrap();
+    assert_ne!(new_id, &unsafe_id, "ID with obs-text should be replaced");
+    assert!(uuid::Uuid::parse_str(new_id).is_ok());
+}
+
+#[tokio::test]
+async fn test_preserves_well_formed_uuid_inbound_id() {
+    // No-over-restriction guard: a well-formed token id (UUID with hyphens)
+    // must still be preserved verbatim.
+    let plugin = CorrelationId::new(&json!({})).unwrap();
+    let mut ctx = make_ctx();
+    let good_id = "550e8400-e29b-41d4-a716-446655440000".to_string();
+    ctx.headers
+        .insert("x-request-id".to_string(), good_id.clone());
+
+    plugin.on_request_received(&mut ctx).await;
+
+    assert_eq!(
+        ctx.headers.get("x-request-id").unwrap(),
+        &good_id,
+        "Well-formed UUID id should be preserved"
+    );
+    assert_eq!(ctx.metadata.get("request_id").unwrap(), &good_id);
+}
+
 // ── Custom header name ──────────────────────────────────────────────
 
 #[tokio::test]

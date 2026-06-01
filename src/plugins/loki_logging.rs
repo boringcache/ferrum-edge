@@ -80,7 +80,8 @@ impl LokiLogging {
             return Err("loki_logging: config must be an object".to_string());
         }
 
-        let (endpoint_url, endpoint_hostname) = parse_http_endpoint(config, "loki_logging")?;
+        let (endpoint_url, endpoint_hostname) =
+            parse_http_endpoint(config, "loki_logging", http_client.backend_allow_ips())?;
         let gzip = optional_bool(config, "gzip")?.unwrap_or(true);
 
         // Parse static labels from config.
