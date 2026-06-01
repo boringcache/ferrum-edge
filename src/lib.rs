@@ -317,6 +317,21 @@ pub mod _test_support {
         plugin.rebuild_vector_index_for_tests().await;
     }
 
+    // ── plugins/response_caching ─────────────────────────────────────────────
+    /// Parse an HTTP-date the way `response_caching` does for conditional
+    /// requests. Exposes the crate-private helper so tests can assert all
+    /// three RFC 9110 §5.6.7 date formats are accepted.
+    pub fn response_caching_parse_http_date(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+        crate::plugins::response_caching::parse_http_date(value)
+    }
+
+    /// Apply `response_caching`'s underflow-safe cache-size subtraction to a
+    /// standalone counter so tests can prove a drift larger than the current
+    /// total saturates at `0` instead of wrapping to `usize::MAX`.
+    pub fn response_caching_sub_total_size(total: &std::sync::atomic::AtomicUsize, n: usize) {
+        crate::plugins::response_caching::sub_total_size(total, n);
+    }
+
     // ── plugins/ws_rate_limiting ─────────────────────────────────────────────
     /// Create a fresh `WsRateLimiting` instance and return its Redis scope key.
     /// Each call returns a key from a new instance (unique UUID prefix), so two
