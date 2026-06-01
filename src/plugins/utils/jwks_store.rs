@@ -15,12 +15,25 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 use tracing::{debug, warn};
+use url::Url;
 
 use super::PluginHttpClient;
 
 const EMPTY_STORE_RETRY_1: Duration = Duration::from_secs(5);
 const EMPTY_STORE_RETRY_2: Duration = Duration::from_secs(15);
 const EMPTY_STORE_RETRY_MAX: Duration = Duration::from_secs(30);
+
+fn redacted_jwks_uri(raw: &str) -> String {
+    let Ok(mut url) = Url::parse(raw) else {
+        return "redacted-jwks-url".to_string();
+    };
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_query(None);
+    url.set_fragment(None);
+    url.set_path("/");
+    url.to_string()
+}
 
 /// A cached JWKS key with its algorithm and decoding key.
 #[derive(Clone)]
@@ -155,12 +168,13 @@ impl JwksKeyStore {
             return Ok(self.keys.load().len());
         }
 
-        debug!("Fetching JWKS keys from {}", self.jwks_uri);
+        let redacted_uri = redacted_jwks_uri(&self.jwks_uri);
+        debug!("Fetching JWKS keys from {}", redacted_uri);
 
         let req = self.http_client.get().get(&self.jwks_uri);
         let response = self
             .http_client
-            .execute(req, "jwks_fetch")
+            .execute_redacted(req, "jwks_fetch", &redacted_uri)
             .await
             .map_err(|e| format!("JWKS fetch failed: {}", e))?;
 
@@ -193,7 +207,7 @@ impl JwksKeyStore {
         if new_keys.is_empty() && self.has_keys() {
             warn!(
                 "JWKS endpoint at {} returned 0 usable keys; retaining last-known-good cache",
-                self.jwks_uri
+                redacted_uri
             );
             return Ok(self.keys.load().len());
         }
