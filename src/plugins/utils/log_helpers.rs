@@ -125,6 +125,7 @@ pub fn validate_batch_config(
 pub fn parse_http_endpoint(
     config: &Value,
     plugin_name: &'static str,
+    backend_allow_ips: &crate::config::BackendAllowIps,
 ) -> Result<(String, String), String> {
     let endpoint_url = config["endpoint_url"]
         .as_str()
@@ -161,7 +162,55 @@ pub fn parse_http_endpoint(
         Host::Ipv6(address) => address.to_string(),
     };
 
+    screen_endpoint_ip_policy(plugin_name, &host, backend_allow_ips)?;
+
     Ok((endpoint_url, hostname))
+}
+
+/// SSRF / internal-address screening for a configured log-sink `endpoint_url`,
+/// using the gateway's outbound IP policy (`FERRUM_BACKEND_ALLOW_IPS`).
+///
+/// Logger sinks POST `TransactionSummary` / `StreamTransactionSummary` batches
+/// (client IPs, consumer/auth metadata) plus any operator `custom_headers`
+/// (which may carry the sink's bearer token) on every flush, so a mistyped or
+/// copy-pasted endpoint that points at an internal address — loopback,
+/// link-local / cloud-metadata (`169.254.0.0/16`, `fe80::/10`), unique-local
+/// (`fc00::/7`), or RFC1918 — can exfiltrate that data to an unintended host.
+///
+/// This mirrors how the gateway screens every other outbound connection: a
+/// **literal-IP** endpoint host is checked with the same
+/// [`check_backend_ip_allowed`](crate::config::check_backend_ip_allowed) used
+/// by the proxy's `DnsCacheResolver`. Under the default `Both` policy nothing
+/// is rejected (internal logging sinks — a local agent or in-cluster collector
+/// reached by IP — are a legitimate common case); operators who set
+/// `FERRUM_BACKEND_ALLOW_IPS=public` to forbid private egress get their log
+/// sinks screened too, closing the SSRF gap consistently across the gateway.
+///
+/// Only literal-IP hosts are screened here. A `Host::Domain` can still resolve
+/// to an internal address, but construction-time validation cannot know that;
+/// at send time the shared `PluginHttpClient`'s `DnsCacheResolver` applies the
+/// same policy to the resolved IP.
+fn screen_endpoint_ip_policy(
+    plugin_name: &'static str,
+    host: &Host<&str>,
+    backend_allow_ips: &crate::config::BackendAllowIps,
+) -> Result<(), String> {
+    let ip = match host {
+        Host::Ipv4(address) => std::net::IpAddr::V4(*address),
+        Host::Ipv6(address) => std::net::IpAddr::V6(*address),
+        // Domain hosts are resolved (and IP-policy screened) at send time.
+        Host::Domain(_) => return Ok(()),
+    };
+
+    if crate::config::check_backend_ip_allowed(&ip, backend_allow_ips) {
+        return Ok(());
+    }
+
+    Err(format!(
+        "{plugin_name}: 'endpoint_url' address {ip} is blocked by the backend IP \
+         policy ({backend_allow_ips}); refusing to send log data there. Adjust \
+         FERRUM_BACKEND_ALLOW_IPS or point the sink at an allowed address."
+    ))
 }
 
 pub fn parse_custom_headers(
@@ -231,5 +280,119 @@ pub fn handle_http_batch_response(
             }
         }
         Err(error) => Err(format!("{plugin_label} batch failed: {error}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    use crate::config::BackendAllowIps;
+
+    // Screen with the SSRF-hardening policy (forbid private egress).
+    fn parse_public(url: &str) -> Result<(String, String), String> {
+        parse_http_endpoint(
+            &json!({ "endpoint_url": url }),
+            "http_logging",
+            &BackendAllowIps::Public,
+        )
+    }
+
+    // Screen with the default policy (no restriction).
+    fn parse_both(url: &str) -> Result<(String, String), String> {
+        parse_http_endpoint(
+            &json!({ "endpoint_url": url }),
+            "http_logging",
+            &BackendAllowIps::Both,
+        )
+    }
+
+    #[test]
+    fn parse_http_endpoint_accepts_public_host_and_ip() {
+        let (url, host) = parse_public("https://logs.example.com/ingest").expect("public host ok");
+        assert_eq!(url, "https://logs.example.com/ingest");
+        assert_eq!(host, "logs.example.com");
+
+        let (_, host) = parse_public("http://93.184.216.34:8080").expect("public IP ok");
+        assert_eq!(host, "93.184.216.34");
+    }
+
+    #[test]
+    fn parse_http_endpoint_public_policy_rejects_loopback_ip() {
+        let err = parse_public("http://127.0.0.1:9000/ingest").expect_err("loopback must reject");
+        assert!(
+            err.contains("blocked by the backend IP policy"),
+            "got: {err}"
+        );
+        assert!(err.contains("public"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_http_endpoint_public_policy_rejects_cloud_metadata_ip() {
+        // 169.254.169.254 is the classic cloud-metadata SSRF target.
+        let err = parse_public("http://169.254.169.254/latest/meta-data/")
+            .expect_err("link-local / metadata must reject");
+        assert!(
+            err.contains("blocked by the backend IP policy"),
+            "got: {err}"
+        );
+        assert!(err.contains("169.254.169.254"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_http_endpoint_public_policy_rejects_rfc1918_and_ipv6_internal() {
+        assert!(parse_public("http://10.0.0.5/log").is_err());
+        assert!(parse_public("http://192.168.1.10:514").is_err());
+        assert!(parse_public("https://172.16.4.4").is_err());
+        // IPv6 loopback and unique-local.
+        assert!(parse_public("http://[::1]:9000").is_err());
+        assert!(parse_public("http://[fc00::1]/log").is_err());
+        // IPv6 link-local.
+        assert!(parse_public("http://[fe80::1]/log").is_err());
+    }
+
+    #[test]
+    fn parse_http_endpoint_default_policy_allows_internal_sink() {
+        // Default `Both` policy preserves the common local-sink case (a local
+        // agent / sidecar reached by loopback or RFC1918 IP).
+        let (url, host) = parse_both("http://127.0.0.1:9000/ingest").expect("loopback allowed");
+        assert_eq!(url, "http://127.0.0.1:9000/ingest");
+        assert_eq!(host, "127.0.0.1");
+        assert!(parse_both("http://10.0.0.5/log").is_ok());
+        assert!(parse_both("http://169.254.169.254/").is_ok());
+    }
+
+    #[test]
+    fn parse_http_endpoint_private_policy_rejects_public_ip() {
+        // `Private` is the mirror case: a public endpoint is blocked.
+        let err = parse_http_endpoint(
+            &json!({ "endpoint_url": "https://93.184.216.34/ingest" }),
+            "http_logging",
+            &BackendAllowIps::Private,
+        )
+        .expect_err("public IP must reject under Private policy");
+        assert!(
+            err.contains("blocked by the backend IP policy"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_http_endpoint_domain_is_not_screened_at_construction() {
+        // A domain that *resolves* internally cannot be screened here; that is
+        // handled at send time by the DnsCache IP policy. `localhost` is a
+        // domain host, so even the strict `Public` policy passes it through at
+        // config time.
+        let (_, host) = parse_public("http://localhost:9000/ingest").expect("domain host ok");
+        assert_eq!(host, "localhost");
+    }
+
+    #[test]
+    fn parse_http_endpoint_still_enforces_scheme_and_authority() {
+        assert!(parse_public("ftp://logs.example.com").is_err());
+        assert!(parse_public("https:///no-host").is_err());
+        // Scheme/authority checks run regardless of IP policy.
+        assert!(parse_both("ftp://logs.example.com").is_err());
     }
 }

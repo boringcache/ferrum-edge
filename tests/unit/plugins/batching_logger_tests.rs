@@ -158,8 +158,16 @@ fn parse_http_endpoint_accepts_http_https_host_forms() {
         ),
     ];
 
+    // `Both` keeps this focused on host parsing rather than IP policy (one
+    // case below is the IPv6 documentation range, which the policy treats as
+    // private). IP-policy screening is covered by the log_helpers unit tests.
     for (config, expected_endpoint, expected_host) in cases {
-        let (endpoint, host) = parse_http_endpoint(&config, "batching_logger_endpoint").unwrap();
+        let (endpoint, host) = parse_http_endpoint(
+            &config,
+            "batching_logger_endpoint",
+            &ferrum_edge::config::BackendAllowIps::Both,
+        )
+        .unwrap();
         assert_eq!(endpoint, expected_endpoint);
         assert_eq!(host, expected_host);
     }
@@ -176,7 +184,12 @@ fn parse_http_endpoint_rejects_unusable_endpoint_forms() {
         json!({"endpoint_url": "http:///logs"}),
     ] {
         assert!(
-            parse_http_endpoint(&config, "batching_logger_endpoint").is_err(),
+            parse_http_endpoint(
+                &config,
+                "batching_logger_endpoint",
+                &ferrum_edge::config::BackendAllowIps::Both,
+            )
+            .is_err(),
             "expected unusable endpoint to be rejected: {config}"
         );
     }

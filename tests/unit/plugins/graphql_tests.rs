@@ -760,3 +760,309 @@ async fn test_rejection_uses_graphql_error_format() {
         _ => panic!("Expected Reject"),
     }
 }
+
+// ── Operation selection by operationName (finding #18) ──
+
+#[tokio::test]
+async fn test_operation_name_selects_correct_op_type() {
+    // Multi-operation document: a leading query and a trailing mutation. With
+    // operationName="B" the executed operation is the MUTATION, so op_type must
+    // be "mutation" — not the first operation's "query".
+    let config = json!({ "max_depth": 100 });
+    let plugin = create_plugin("graphql", &config).unwrap().unwrap();
+
+    let query = "query A { user { name } } mutation B { createUser(name: \"x\") { id } }";
+    let mut ctx = create_graphql_context(query, Some("B"));
+    let mut headers = make_graphql_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+    assert_eq!(
+        ctx.metadata.get("graphql_operation_type").unwrap(),
+        "mutation",
+        "op_type must reflect the operation selected by operationName, not the first operation"
+    );
+    assert_eq!(ctx.metadata.get("graphql_operation_name").unwrap(), "B");
+}
+
+#[tokio::test]
+async fn test_operation_name_selects_first_op_type() {
+    // Same document, but operationName="A" selects the leading query.
+    let config = json!({ "max_depth": 100 });
+    let plugin = create_plugin("graphql", &config).unwrap().unwrap();
+
+    let query = "query A { user { name } } mutation B { createUser(name: \"x\") { id } }";
+    let mut ctx = create_graphql_context(query, Some("A"));
+    let mut headers = make_graphql_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+    assert_eq!(ctx.metadata.get("graphql_operation_type").unwrap(), "query");
+    assert_eq!(ctx.metadata.get("graphql_operation_name").unwrap(), "A");
+}
+
+#[tokio::test]
+async fn test_per_type_rate_limit_not_bypassed_by_operation_selection() {
+    // Regression for the per-type rate-limit bypass: a mutation limit must apply
+    // when operationName selects the mutation in a multi-operation document.
+    // Before the fix op_type was always "query" (the first op), so the mutation
+    // bucket was never checked and the limit was silently bypassed.
+    let config = json!({
+        "type_rate_limits": {
+            "mutation": { "max_requests": 2, "window_seconds": 60 }
+        }
+    });
+    let plugin = create_plugin("graphql", &config).unwrap().unwrap();
+
+    let query = "query A { user { name } } mutation B { createUser(name: \"x\") { id } }";
+
+    // First two mutation invocations pass.
+    for _ in 0..2 {
+        let mut ctx = create_graphql_context(query, Some("B"));
+        let mut headers = make_graphql_headers();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_continue(result);
+    }
+
+    // Third is rate limited because the mutation bucket is now enforced.
+    let mut ctx = create_graphql_context(query, Some("B"));
+    let mut headers = make_graphql_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(429));
+}
+
+#[tokio::test]
+async fn test_unrelated_large_operation_does_not_inflate_selected_op() {
+    // The selected operation is small; an unrelated, deeply nested operation in
+    // the same document must NOT cause a false-positive depth rejection. Before
+    // the fix, depth was measured over the whole document.
+    let config = json!({ "max_depth": 2, "max_complexity": 3 });
+    let plugin = create_plugin("graphql", &config).unwrap().unwrap();
+
+    let query = "query Small { user { id } } \
+                 query Huge { a { b { c { d { e { f } } } } } }";
+    let mut ctx = create_graphql_context(query, Some("Small"));
+    let mut headers = make_graphql_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+    // Selected op depth is 2 (user{ id }), well within the limit.
+    assert_eq!(ctx.metadata.get("graphql_depth").unwrap(), "2");
+
+    // And selecting the huge operation IS rejected.
+    let mut ctx = create_graphql_context(query, Some("Huge"));
+    let mut headers = make_graphql_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(400));
+}
+
+#[tokio::test]
+async fn test_multi_operation_without_operation_name_rejected() {
+    // The GraphQL spec requires operationName when a document defines more than
+    // one operation. Omitting it must be rejected rather than silently analyzing
+    // (and rate-limiting against) the wrong operation.
+    let config = json!({ "max_depth": 100 });
+    let plugin = create_plugin("graphql", &config).unwrap().unwrap();
+
+    let query = "query A { user { name } } mutation B { createUser(name: \"x\") { id } }";
+    let mut ctx = create_graphql_context(query, None);
+    let mut headers = make_graphql_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(400));
+}
+
+#[tokio::test]
+async fn test_unknown_operation_name_rejected() {
+    // operationName that matches no operation in the document is a client error.
+    let config = json!({ "max_depth": 100 });
+    let plugin = create_plugin("graphql", &config).unwrap().unwrap();
+
+    let query = "query A { user { name } } mutation B { createUser(name: \"x\") { id } }";
+    let mut ctx = create_graphql_context(query, Some("DoesNotExist"));
+    let mut headers = make_graphql_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(400));
+}
+
+#[tokio::test]
+async fn test_single_named_operation_without_operation_name_allowed() {
+    // A single named operation does not require operationName (only multi-op
+    // documents do), so this must still be analyzed normally.
+    let config = json!({ "max_depth": 100 });
+    let plugin = create_plugin("graphql", &config).unwrap().unwrap();
+
+    let query = "query OnlyOne { user { name } }";
+    let mut ctx = create_graphql_context(query, None);
+    let mut headers = make_graphql_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+    assert_eq!(ctx.metadata.get("graphql_operation_type").unwrap(), "query");
+    assert_eq!(
+        ctx.metadata.get("graphql_operation_name").unwrap(),
+        "OnlyOne"
+    );
+}
+
+// ── Fragment-aware depth/complexity (finding #66) ──
+
+#[tokio::test]
+async fn test_fragment_spread_counts_toward_depth_limit() {
+    // The operation spreads a fragment whose resolved nesting pushes total depth
+    // past the limit. Each literal block (the operation and the fragment) nests
+    // only 3 levels — within max_depth=4 — but the RESOLVED depth at the spread
+    // site is 5. Before the fix fragments were not expanded, so the measured
+    // depth was 3 and this bypassed the limit; now it is rejected.
+    let config = json!({ "max_depth": 4 });
+    let plugin = create_plugin("graphql", &config).unwrap().unwrap();
+
+    let query = "query { a { b { ...Deep } } } fragment Deep on T { c { d { e } } }";
+    let mut ctx = create_graphql_context(query, None);
+    let mut headers = make_graphql_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(400));
+    assert_eq!(
+        ctx.metadata.get("graphql_depth").unwrap(),
+        "5",
+        "resolved depth must include the expanded fragment's nesting"
+    );
+}
+
+#[tokio::test]
+async fn test_fragment_spread_under_depth_limit_allowed() {
+    // The same query passes when the limit accommodates the resolved depth,
+    // confirming the expansion is accurate rather than blanket-rejecting
+    // fragment-using queries.
+    let config = json!({ "max_depth": 5 });
+    let plugin = create_plugin("graphql", &config).unwrap().unwrap();
+
+    let query = "query { a { b { ...Deep } } } fragment Deep on T { c { d { e } } }";
+    let mut ctx = create_graphql_context(query, None);
+    let mut headers = make_graphql_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+}
+
+#[tokio::test]
+async fn test_fragment_fanout_counts_toward_complexity_limit() {
+    // A wide fragment spread at multiple sites: measured complexity before the
+    // fix counted the fragment's fields once (~5) plus 3 spread tokens (~8);
+    // the resolved complexity is 5 fields x 3 spreads = 15. With max_complexity
+    // 10 the pre-fix value passed but the resolved value must be rejected.
+    let config = json!({ "max_complexity": 10 });
+    let plugin = create_plugin("graphql", &config).unwrap().unwrap();
+
+    let query = "query { ...F ...F ...F } fragment F on T { a b c d e }";
+    let mut ctx = create_graphql_context(query, None);
+    let mut headers = make_graphql_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(400));
+    assert_eq!(
+        ctx.metadata.get("graphql_complexity").unwrap(),
+        "15",
+        "each fragment spread site must contribute the fragment's full field count"
+    );
+}
+
+#[tokio::test]
+async fn test_nested_fragment_chain_expands() {
+    // Chained fragments (A spreads B spreads C) must compose their depth.
+    let config = json!({ "max_depth": 3 });
+    let plugin = create_plugin("graphql", &config).unwrap().unwrap();
+
+    let query = "query { ...A } \
+                 fragment A on T { a { ...B } } \
+                 fragment B on T { b { ...C } } \
+                 fragment C on T { c { d } }";
+    let mut ctx = create_graphql_context(query, None);
+    let mut headers = make_graphql_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    // Resolved depth: a(1) > b(2) > c(3) > d(4) = 4 > max_depth 3 -> reject.
+    assert_reject(result, Some(400));
+    assert_eq!(ctx.metadata.get("graphql_depth").unwrap(), "4");
+}
+
+#[tokio::test]
+async fn test_cyclic_fragment_terminates() {
+    // Cyclic fragment spreads (A -> B -> A) are invalid GraphQL but a hostile
+    // client can still send them. The analyzer MUST terminate (cycle-safe) and
+    // not recurse forever, which would turn the limiter into its own DoS.
+    let config = json!({ "max_depth": 100, "max_complexity": 100 });
+    let plugin = create_plugin("graphql", &config).unwrap().unwrap();
+
+    let query = "query { ...A } \
+                 fragment A on T { x ...B } \
+                 fragment B on T { y ...A }";
+    let mut ctx = create_graphql_context(query, None);
+    let mut headers = make_graphql_headers();
+    // Completes without hanging; tiny resolved cost is within the limits.
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+}
+
+#[tokio::test]
+async fn test_self_referential_fragment_terminates() {
+    // A fragment that spreads itself must also terminate.
+    let config = json!({ "max_depth": 100, "max_complexity": 100 });
+    let plugin = create_plugin("graphql", &config).unwrap().unwrap();
+
+    let query = "query { ...Loop } fragment Loop on T { f ...Loop }";
+    let mut ctx = create_graphql_context(query, None);
+    let mut headers = make_graphql_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+}
+
+#[tokio::test]
+async fn test_inline_fragment_does_not_add_depth() {
+    // Inline fragments (`... on Type { ... }`) select fields on the same level;
+    // they must not add an extra nesting level.
+    let config = json!({ "max_depth": 2 });
+    let plugin = create_plugin("graphql", &config).unwrap().unwrap();
+
+    // user { ... on Admin { name } } : depth is 2 (user -> name), not 3.
+    let query = "{ user { ... on Admin { name } } }";
+    let mut ctx = create_graphql_context(query, None);
+    let mut headers = make_graphql_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+    assert_eq!(ctx.metadata.get("graphql_depth").unwrap(), "2");
+}
+
+#[tokio::test]
+async fn test_introspection_inside_fragment_is_detected() {
+    // __schema hidden behind a fragment spread must still trip introspection
+    // control once fragments are expanded into the selected operation.
+    let config = json!({ "introspection_allowed": false });
+    let plugin = create_plugin("graphql", &config).unwrap().unwrap();
+
+    let query =
+        "query { ...Introspect } fragment Introspect on Query { __schema { types { name } } }";
+    let mut ctx = create_graphql_context(query, None);
+    let mut headers = make_graphql_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(403));
+}
+
+#[tokio::test]
+async fn test_deep_non_cyclic_fragment_chain_is_bounded() {
+    // A long, non-cyclic chain of single-spread fragments (F0 -> F1 -> ... ->
+    // Fn) would, if expanded naively, recurse once per link and could overflow
+    // the stack — a DoS in the limiter itself. The analyzer caps recursion and
+    // must reject (400) rather than panic/hang. The chain has no braces, so
+    // measured depth stays 1; only the recursion bound stops it.
+    let config = json!({ "max_depth": 1000, "max_complexity": 1_000_000 });
+    let plugin = create_plugin("graphql", &config).unwrap().unwrap();
+
+    let chain_len = 4000;
+    let mut query = String::from("query { ...F0 }");
+    for n in 0..chain_len {
+        if n + 1 < chain_len {
+            query.push_str(&format!(" fragment F{n} on T {{ ...F{} }}", n + 1));
+        } else {
+            query.push_str(&format!(" fragment F{n} on T {{ leaf }}"));
+        }
+    }
+
+    let mut ctx = create_graphql_context(&query, None);
+    let mut headers = make_graphql_headers();
+    // Must complete (no stack overflow / hang) and reject the over-deep chain.
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(400));
+}
