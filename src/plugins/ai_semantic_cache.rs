@@ -46,6 +46,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tracing::debug;
+use url::Host;
 
 use super::utils::body_transform::is_json_content_type;
 use super::utils::cache_headers::sanitize_cached_headers;
@@ -301,7 +302,7 @@ impl AiSemanticCache {
         // shared cache (e.g., a public LLM proxy with no per-tenant data)
         // must set this to `false`.
         let scope_by_consumer = optional_bool(config, "scope_by_consumer")?.unwrap_or(true);
-        let semantic = parse_semantic_config(config)?;
+        let semantic = parse_semantic_config(config, http_client.backend_allow_ips())?;
 
         // Build optional Redis client
         let default_redis_prefix = default_redis_key_prefix(http_client.namespace());
@@ -1598,7 +1599,10 @@ fn optional_threshold(config: &Value, field: &'static str) -> Result<Option<f32>
     Ok(Some(number as f32))
 }
 
-fn parse_semantic_config(config: &Value) -> Result<Option<SemanticConfig>, String> {
+fn parse_semantic_config(
+    config: &Value,
+    backend_allow_ips: &crate::config::BackendAllowIps,
+) -> Result<Option<SemanticConfig>, String> {
     let enabled = optional_bool(config, "semantic_similarity_enabled")?.unwrap_or(false);
     let provider = optional_non_empty_string(config, "semantic_embedding_provider")?
         .as_deref()
@@ -1634,13 +1638,7 @@ fn parse_semantic_config(config: &Value) -> Result<Option<SemanticConfig>, Strin
         "ai_semantic_cache: 'semantic_embedding_endpoint' is required when semantic_similarity_enabled=true"
             .to_string()
     })?;
-    let parsed_endpoint = url::Url::parse(&endpoint)
-        .map_err(|_| "ai_semantic_cache: 'semantic_embedding_endpoint' must be a valid URL")?;
-    if !matches!(parsed_endpoint.scheme(), "http" | "https") {
-        return Err(
-            "ai_semantic_cache: 'semantic_embedding_endpoint' must use http or https".to_string(),
-        );
-    }
+    validate_semantic_embedding_endpoint(&endpoint, backend_allow_ips)?;
 
     Ok(Some(SemanticConfig {
         provider,
@@ -1655,6 +1653,39 @@ fn parse_semantic_config(config: &Value) -> Result<Option<SemanticConfig>, Strin
         max_candidates,
         request_timeout: Duration::from_millis(timeout_ms),
     }))
+}
+
+fn validate_semantic_embedding_endpoint(
+    endpoint: &str,
+    backend_allow_ips: &crate::config::BackendAllowIps,
+) -> Result<(), String> {
+    let parsed_endpoint = url::Url::parse(endpoint)
+        .map_err(|_| "ai_semantic_cache: 'semantic_embedding_endpoint' must be a valid URL")?;
+    if !matches!(parsed_endpoint.scheme(), "http" | "https") {
+        return Err(
+            "ai_semantic_cache: 'semantic_embedding_endpoint' must use http or https".to_string(),
+        );
+    }
+
+    let host = parsed_endpoint.host().ok_or_else(|| {
+        "ai_semantic_cache: 'semantic_embedding_endpoint' must include a host".to_string()
+    })?;
+
+    let literal_ip = match host {
+        Host::Ipv4(ip) => Some(std::net::IpAddr::V4(ip)),
+        Host::Ipv6(ip) => Some(std::net::IpAddr::V6(ip)),
+        Host::Domain(_) => None,
+    };
+
+    if let Some(ip) = literal_ip
+        && !crate::config::check_backend_ip_allowed(&ip, backend_allow_ips)
+    {
+        return Err(format!(
+            "ai_semantic_cache: 'semantic_embedding_endpoint' IP {ip} denied by FERRUM_BACKEND_ALLOW_IPS={backend_allow_ips} policy"
+        ));
+    }
+
+    Ok(())
 }
 
 fn default_redis_key_prefix(namespace: &str) -> String {
