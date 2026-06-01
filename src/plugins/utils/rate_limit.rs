@@ -661,6 +661,36 @@ fn check_http_windows(
     outcome
 }
 
+/// Distributed (Redis-backed) multi-window admission check.
+///
+/// Unlike [`check_http_windows`], which does an explicit check-then-increment
+/// across all windows so an earlier (looser) window's budget is never consumed
+/// when a later (tighter) window denies, the Redis path **couples the increment
+/// to the admission decision**: it `INCR`s each window as it iterates and
+/// returns deny as soon as one window's weighted count exceeds its limit.
+///
+/// # Known limitation (documented phantom increment)
+///
+/// For a multi-window config (e.g. `100/min` + `10/sec`), a request that is
+/// ultimately denied by a later window has *already* incremented every earlier
+/// window's Redis counter. So under sustained load the effective limit on the
+/// looser windows is slightly *tighter* than configured. This is a deliberate
+/// trade-off, not a bug:
+///
+/// * The increment must be coupled to the decision because multiple gateway
+///   instances race on the same key; a separate check-then-increment would
+///   open a cross-instance over-admission window (TOCTOU) that a single
+///   `INCR`-and-compare avoids without a Lua/`EVAL` script.
+/// * The error direction is conservative: it over-counts looser windows and
+///   can only make them stricter — it never over-admits, so there is no
+///   security or limit-bypass exposure.
+///
+/// Exactness across multi-window Redis configs would require moving the
+/// admission into a single Lua/`EVAL` script that pre-checks every window's
+/// projected `(current + cost)` weighted count and only `INCR`s all windows
+/// when every window admits (otherwise `INCR`s none and returns the denying
+/// window). Tracked as a follow-up enhancement; the current behavior is correct
+/// and safe in the conservative direction.
 async fn check_http_windows_redis(
     specs: &[RateLimitWindowSpec],
     redis: &RedisRateLimitClient,
@@ -668,10 +698,11 @@ async fn check_http_windows_redis(
 ) -> Result<RateLimitOutcome, ()> {
     let mut tightest: Option<(u64, u64, u64)> = None;
 
-    // Redis must couple the admission decision to the increment because
-    // multiple gateway instances can race on the same key. For multi-window
-    // configs this may consume an earlier window before a later window
-    // denies, but it prevents cross-instance over-admission without Lua.
+    // See the function doc: the increment is intentionally coupled to the
+    // admission decision (INCR-then-compare per window) to prevent
+    // cross-instance over-admission. For multi-window configs this can consume
+    // an earlier (looser) window's budget when a later (tighter) window denies
+    // — a conservative over-count, never an over-admit.
     for spec in specs {
         let window = FixedWindow::new(spec.limit, spec.duration.as_secs());
         let curr_idx = RedisRateLimitClient::window_index(window.window_seconds);

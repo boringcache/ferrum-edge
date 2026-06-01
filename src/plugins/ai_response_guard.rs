@@ -12,7 +12,7 @@
 //! or warn (add metadata/headers but pass through).
 
 use async_trait::async_trait;
-use regex::{Regex, RegexSet};
+use regex::{NoExpand, Regex, RegexSet};
 use serde_json::Value;
 use std::collections::HashMap;
 use tracing::{debug, warn};
@@ -452,12 +452,17 @@ impl AiResponseGuard {
     /// Replace all pattern matches with the redaction placeholder.
     /// Placeholders are pre-rendered at construction time so each call is one
     /// `replace_all` per pattern, with no template formatting on the hot path.
+    ///
+    /// The placeholder is wrapped in `regex::NoExpand` so `$`-sequences in it
+    /// (e.g. an operator pattern name like `cost $5`, or a malicious `$1` in
+    /// `redaction_placeholder`) are emitted literally rather than being
+    /// interpreted as capture-group references by the regex `Replacer`.
     fn redact_text(&self, text: &str) -> String {
         let mut result = text.to_string();
         for pattern in self.pii_patterns.iter().chain(self.blocked_phrases.iter()) {
             result = pattern
                 .regex
-                .replace_all(&result, pattern.placeholder.as_str())
+                .replace_all(&result, NoExpand(pattern.placeholder.as_str()))
                 .to_string();
         }
         result
@@ -565,16 +570,22 @@ impl AiResponseGuard {
     }
 
     /// Check max completion length constraint.
+    ///
+    /// `max_completion_length` is documented and configured in **characters**
+    /// (Unicode scalar values), so the measurement uses `chars().count()`
+    /// rather than `str::len()` (UTF-8 bytes). Counting bytes would trip the
+    /// guard early for multibyte completions (CJK, emoji, accented Latin),
+    /// rejecting or warning before the operator-configured character limit.
     fn check_completion_length(&self, texts: &[&str]) -> Option<String> {
         if self.max_completion_length == 0 {
             return None;
         }
         for text in texts {
-            if text.len() > self.max_completion_length {
+            let char_len = text.chars().count();
+            if char_len > self.max_completion_length {
                 return Some(format!(
                     "Completion length {} exceeds maximum {}",
-                    text.len(),
-                    self.max_completion_length
+                    char_len, self.max_completion_length
                 ));
             }
         }
@@ -735,7 +746,12 @@ impl AiResponseGuard {
                     && let Ok(mut json) = serde_json::from_str::<Value>(trimmed)
                 {
                     if self.scan_mode == ScanMode::All {
-                        redact_json_strings(&mut json, &self.pii_patterns, &self.blocked_phrases);
+                        redact_json_strings(
+                            &mut json,
+                            &self.pii_patterns,
+                            &self.blocked_phrases,
+                            true,
+                        );
                     } else {
                         self.redact_sse_frame(&mut json);
                     }
@@ -762,8 +778,9 @@ impl AiResponseGuard {
         // single-frame redaction can't reach it. Surface this explicitly so
         // operators know to switch to action="reject" when they need a hard
         // guarantee. Scan-all mode walks the full JSON tree per frame, so a
-        // no-op there usually means the regex hit a STRUCTURAL_KEYS field
-        // (id/timestamp/etc.) — we don't warn for that.
+        // no-op there usually means the regex only hit a top-level scalar
+        // STRUCTURAL_KEYS field (id/timestamp/etc.) that is intentionally
+        // preserved — we don't warn for that.
         if self.scan_mode != ScanMode::All {
             let frames = parse_sse_data_frames(body);
             let accumulated = self.extract_sse_completion_texts(&frames);
@@ -1005,7 +1022,7 @@ impl Plugin for AiResponseGuard {
             if !known_texts.is_empty() {
                 self.redact_response_json(&mut json);
             }
-            redact_json_strings(&mut json, &self.pii_patterns, &self.blocked_phrases);
+            redact_json_strings(&mut json, &self.pii_patterns, &self.blocked_phrases, true);
         } else {
             let texts = self.extract_completion_texts(&json);
             let has_match = !self.detect_matches(&texts).is_empty();
@@ -1125,14 +1142,31 @@ fn required_non_empty_string<'a>(
     Ok(value)
 }
 
-/// Recursively redact matches in all string values within a JSON Value,
-/// skipping fields with structural keys (IDs, timestamps, model names, etc.)
-/// that should never be rewritten even when their values incidentally match
-/// a PII regex.
+/// Recursively redact matches in all string values within a JSON Value.
+///
+/// `STRUCTURAL_KEYS` (IDs, timestamps, model names, roles, token counts, etc.)
+/// exists to protect *top-level* response fields whose scalar values may
+/// incidentally match a PII regex (e.g. a `model` name or a dotted-quad-looking
+/// `id`) from being corrupted. That protection is applied ONLY to a scalar
+/// string held directly by a structural key at the top level of the body.
+/// Below the top level, those same key names are author-controllable hiding
+/// spots, so PII nested under them — e.g. `{"choices":[{"message":{"type":
+/// "<PII>"}}]}` or `{"id":{"note":"<PII>"}}` — is still redacted. The walker
+/// also always recurses into nested objects and arrays even under a top-level
+/// structural key, so PII cannot be hidden by wrapping it in a container.
+/// Without this, redaction was fail-open on the response side: PII was reported
+/// as detected (`ai_response_guard_redacted` set) but forwarded to the client
+/// unredacted purely because of attacker/model-controlled JSON structure.
+///
+/// Placeholders are wrapped in `regex::NoExpand` so `$`-sequences in them are
+/// emitted literally rather than interpreted as capture-group references.
+///
+/// `top_level` is true only for the root object's direct fields.
 fn redact_json_strings(
     value: &mut Value,
     pii_patterns: &[ContentPattern],
     blocked_phrases: &[ContentPattern],
+    top_level: bool,
 ) {
     match value {
         Value::String(s) => {
@@ -1140,7 +1174,7 @@ fn redact_json_strings(
             for pattern in pii_patterns.iter().chain(blocked_phrases.iter()) {
                 result = pattern
                     .regex
-                    .replace_all(&result, pattern.placeholder.as_str())
+                    .replace_all(&result, NoExpand(pattern.placeholder.as_str()))
                     .to_string();
             }
             if result != *s {
@@ -1149,15 +1183,19 @@ fn redact_json_strings(
         }
         Value::Array(arr) => {
             for item in arr.iter_mut() {
-                redact_json_strings(item, pii_patterns, blocked_phrases);
+                redact_json_strings(item, pii_patterns, blocked_phrases, false);
             }
         }
         Value::Object(map) => {
             for (k, val) in map.iter_mut() {
-                if STRUCTURAL_KEYS.contains(&k.as_str()) {
+                // Preserve only top-level structural scalar strings (model
+                // name, IDs, roles, token counts). Always recurse into nested
+                // objects/arrays, and never skip nested occurrences of these
+                // key names, so PII cannot hide under a structural key.
+                if top_level && STRUCTURAL_KEYS.contains(&k.as_str()) && val.is_string() {
                     continue;
                 }
-                redact_json_strings(val, pii_patterns, blocked_phrases);
+                redact_json_strings(val, pii_patterns, blocked_phrases, false);
             }
         }
         _ => {}

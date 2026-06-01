@@ -137,33 +137,129 @@ impl std::fmt::Debug for PluginHttpClient {
     }
 }
 
+#[derive(Clone)]
+enum PluginTlsPosture {
+    PlatformRoots,
+    SkipVerification,
+    CustomCaBundle(Vec<reqwest::Certificate>),
+    FailClosedCaBundle { source_id: String, reason: String },
+}
+
+impl PluginTlsPosture {
+    fn from_config(tls_no_verify: bool, tls_ca_bundle_path: Option<&str>) -> Self {
+        if tls_no_verify {
+            return Self::SkipVerification;
+        }
+
+        let Some(ca_path) = tls_ca_bundle_path else {
+            return Self::PlatformRoots;
+        };
+
+        let source = CertSource::parse(ca_path, MaterialKind::CaBundle);
+        let source_id = source.source_id();
+        let ca_material = match load_material_blocking(&source, MaterialKind::CaBundle) {
+            Ok(ca_material) => ca_material,
+            Err(error) => {
+                return Self::fail_closed(source_id, error.to_string());
+            }
+        };
+
+        match reqwest::Certificate::from_pem_bundle(ca_material.bytes.expose_secret()) {
+            Ok(certs) if !certs.is_empty() => Self::CustomCaBundle(certs),
+            Ok(_) => Self::fail_closed(
+                ca_material.source_id,
+                "CA bundle did not contain any PEM certificates".to_string(),
+            ),
+            Err(error) => Self::fail_closed(ca_material.source_id, error.to_string()),
+        }
+    }
+
+    fn fail_closed(source_id: String, reason: String) -> Self {
+        tracing::error!(
+            ca_bundle = %source_id,
+            error = %reason,
+            "Failed to load configured plugin HTTP CA bundle; failing closed with an empty trust store"
+        );
+        Self::FailClosedCaBundle { source_id, reason }
+    }
+
+    fn apply(&self, builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+        match self {
+            Self::PlatformRoots => builder,
+            Self::SkipVerification => builder.danger_accept_invalid_certs(true),
+            Self::CustomCaBundle(certs) => builder.tls_certs_only(certs.clone()),
+            Self::FailClosedCaBundle { source_id, reason } => {
+                tracing::debug!(
+                    ca_bundle = %source_id,
+                    error = %reason,
+                    "Applying empty trust store for invalid plugin HTTP CA bundle"
+                );
+                builder.tls_certs_only(Vec::<reqwest::Certificate>::new())
+            }
+        }
+    }
+}
+
 /// Build a minimal `reqwest::Client` that still uses the gateway's DNS cache
 /// when available.
 ///
 /// Used as a fallback when a fully-configured builder fails (e.g., due to
-/// invalid TLS material). Keeps the DNS cache attached so plugin outbound
-/// calls do not silently fall through to system DNS — every call would
-/// otherwise burn an ephemeral port through a fresh OS resolver, which
-/// CLAUDE.md explicitly forbids ("DnsCacheResolver must be plugged into
+/// unsupported pool/keep-alive settings). Keeps the DNS cache attached so
+/// plugin outbound calls do not silently fall through to system DNS — every
+/// call would otherwise burn an ephemeral port through a fresh OS resolver,
+/// which CLAUDE.md explicitly forbids ("DnsCacheResolver must be plugged into
 /// every reqwest::Client in production").
 ///
-/// If even this minimal builder fails, only then fall back to
-/// `reqwest::Client::new()` (an exceptional, doubly-degraded path).
-fn build_dns_cached_fallback_client(dns_cache: Option<DnsCache>) -> reqwest::Client {
-    // Even this degraded fallback must not follow redirects — see
-    // `PluginHttpClient::new()` for the SSRF rationale.
+/// TLS posture is already resolved by the startup-only caller and is applied
+/// again here so falling back never widens trust from a configured custom CA
+/// bundle to platform/webpki roots.
+///
+/// If even this minimal builder fails, build a no-DNS fallback that still keeps
+/// redirects disabled and applies the caller's TLS posture. If that cannot be
+/// constructed either, keep redirects disabled while dropping custom TLS posture
+/// before the final exceptional `reqwest::Client::new()` escape hatch.
+fn build_dns_cached_fallback_client(
+    dns_cache: Option<DnsCache>,
+    tls_posture: &PluginTlsPosture,
+) -> reqwest::Client {
+    // Never auto-follow redirects on a shared outbound client (SSRF posture,
+    // matches src/connection_pool.rs and the configured clients above).
     let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
     if let Some(dns_cache) = dns_cache {
         let resolver = DnsCacheResolver::new(dns_cache);
         builder = builder.dns_resolver(Arc::new(resolver));
     }
+    builder = tls_posture.apply(builder);
     builder.build().unwrap_or_else(|e| {
         tracing::error!(
             "Failed to build minimal DNS-cached fallback plugin client: {}. \
-             Using reqwest::Client::new() as a last resort — DNS will bypass the gateway cache.",
+             Falling back to a no-redirect minimal plugin client with the same \
+             TLS posture as a last resort.",
             e
         );
-        reqwest::Client::new()
+        let builder = tls_posture
+            .apply(reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()));
+        match builder.build() {
+            Ok(client) => client,
+            Err(e2) => {
+                tracing::error!(
+                    "Failed to build fallback plugin client with redirect and TLS policy set: {}. \
+                     Retrying without custom TLS posture while keeping redirects disabled.",
+                    e2
+                );
+                reqwest::Client::builder()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .build()
+                    .unwrap_or_else(|e3| {
+                        tracing::error!(
+                            "Failed to build no-redirect fallback plugin client: {}. \
+                             Using reqwest::Client::new() as an exceptional last resort.",
+                            e3
+                        );
+                        reqwest::Client::new()
+                    })
+            }
+        }
     })
 }
 
@@ -202,6 +298,8 @@ impl PluginHttpClient {
         let dns_cache_clone = dns_cache.clone();
         let resolver = DnsCacheResolver::new(dns_cache);
 
+        let tls_posture = PluginTlsPosture::from_config(tls_no_verify, tls_ca_bundle_path);
+
         let mut builder = reqwest::Client::builder()
             .pool_max_idle_per_host(pool_config.max_idle_per_host)
             .pool_idle_timeout(Duration::from_secs(pool_config.idle_timeout_seconds))
@@ -219,52 +317,13 @@ impl PluginHttpClient {
             // `FERRUM_BACKEND_ALLOW_IPS` (not the default `Both`). Mirrors the
             // backend proxy client in `connection_pool.rs`.
             .redirect(reqwest::redirect::Policy::none())
-            .danger_accept_invalid_certs(tls_no_verify)
             .dns_resolver(Arc::new(resolver));
-
-        // Load custom CA bundle for verifying internal/corporate CAs.
         // Trust resolution:
-        //   - tls_no_verify=true                 → skip verification entirely
-        //                                          (handled above via
-        //                                          danger_accept_invalid_certs)
-        //   - Custom CA configured               → trust ONLY that CA
-        //                                          (CA exclusivity via
-        //                                          tls_certs_only — replaces the
-        //                                          trust store wholesale)
-        //   - No CA configured (this branch       → fall through to reqwest 0.13's
-        //     skipped)                              rustls feature default, which
-        //                                          uses rustls-platform-verifier:
-        //                                          OS keychain on macOS, Windows
-        //                                          cert store on Windows, bundled
-        //                                          webpki on Linux. The backend
-        //                                          proxy path in src/tls/backend.rs
-        //                                          uses bundled webpki on every
-        //                                          platform via use_preconfigured_tls;
-        //                                          this helper-client path differs.
-        if !tls_no_verify && let Some(ca_path) = tls_ca_bundle_path {
-            let source = CertSource::parse(ca_path, MaterialKind::CaBundle);
-            match load_material_blocking(&source, MaterialKind::CaBundle) {
-                Ok(ca_material) => {
-                    match reqwest::Certificate::from_pem(ca_material.bytes.expose_secret()) {
-                        Ok(cert) => {
-                            // reqwest 0.13: `tls_certs_only` replaces the trust
-                            // store entirely (CA exclusivity).
-                            builder = builder.tls_certs_only([cert]);
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "Failed to parse CA bundle from {}: {}",
-                                ca_material.source_id,
-                                e
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to load CA bundle: {}", e);
-                }
-            }
-        }
+        //   - tls_no_verify=true   -> skip verification entirely
+        //   - custom CA configured -> trust ONLY that parsed bundle
+        //   - invalid custom CA    -> empty trust store (fail closed)
+        //   - no CA configured     -> reqwest 0.13 defaults
+        builder = tls_posture.apply(builder);
 
         if pool_config.enable_http_keep_alive {
             builder = builder.tcp_keepalive(Duration::from_secs(pool_config.tcp_keepalive_seconds));
@@ -282,11 +341,13 @@ impl PluginHttpClient {
 
         let client = builder.build().unwrap_or_else(|e| {
             tracing::error!(
-                "Failed to build plugin HTTP client: {}. \
-                 Falling back to a minimal DNS-cached client (TLS/pool/keepalive settings will not apply).",
-                e
+                "Failed to build fully-configured plugin HTTP client: {e}. Retrying a \
+                 minimal builder that preserves the TLS trust posture (custom CA / \
+                 no-verify) and DNS cache, dropping only pool/keepalive tuning — a \
+                 custom CA configured for exclusivity must not be silently widened to \
+                 platform/webpki roots."
             );
-            build_dns_cached_fallback_client(Some(dns_cache_clone.clone()))
+            build_dns_cached_fallback_client(Some(dns_cache_clone.clone()), &tls_posture)
         });
 
         Self {
@@ -367,9 +428,9 @@ impl PluginHttpClient {
             );
             // No DNS cache to attach on this path — `from_pool_config` is
             // explicitly the cache-less constructor (tests / fallback). Use
-            // the shared helper so the last-resort `Client::new()` path is
-            // logged uniformly across both `new()` and this code path.
-            build_dns_cached_fallback_client(None)
+            // the shared helper so the final no-DNS fallback is logged
+            // uniformly across both `new()` and this code path.
+            build_dns_cached_fallback_client(None, &PluginTlsPosture::PlatformRoots)
         });
 
         Self {
@@ -785,12 +846,57 @@ mod fallback_tests {
     #[test]
     fn fallback_client_builds_with_dns_cache() {
         let dns_cache = DnsCache::new(DnsConfig::default());
-        let _client = build_dns_cached_fallback_client(Some(dns_cache));
+        let _client =
+            build_dns_cached_fallback_client(Some(dns_cache), &PluginTlsPosture::PlatformRoots);
     }
 
     #[test]
     fn fallback_client_builds_without_dns_cache() {
-        let _client = build_dns_cached_fallback_client(None);
+        let _client = build_dns_cached_fallback_client(None, &PluginTlsPosture::PlatformRoots);
+    }
+
+    #[test]
+    fn fallback_client_preserves_fail_closed_tls_posture() {
+        let posture = PluginTlsPosture::FailClosedCaBundle {
+            source_id: "invalid-ca.pem".to_string(),
+            reason: "test invalid CA".to_string(),
+        };
+        let _client = build_dns_cached_fallback_client(None, &posture);
+    }
+
+    #[test]
+    fn tls_posture_parses_configured_ca_bundle_once() {
+        let cert_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/certs/server.crt");
+        let posture = PluginTlsPosture::from_config(false, cert_path.to_str());
+
+        match posture {
+            PluginTlsPosture::CustomCaBundle(certs) => assert_eq!(certs.len(), 1),
+            _ => panic!("expected configured CA bundle to parse"),
+        }
+    }
+
+    #[test]
+    fn tls_posture_fails_closed_for_invalid_ca_bundle() {
+        let tempdir = tempfile::tempdir().expect("create tempdir");
+        let ca_path = tempdir.path().join("invalid-ca.pem");
+        std::fs::write(&ca_path, "not a pem certificate").expect("write invalid CA");
+
+        let posture = PluginTlsPosture::from_config(false, ca_path.to_str());
+
+        match posture {
+            PluginTlsPosture::FailClosedCaBundle { source_id, reason } => {
+                assert_eq!(source_id, ca_path.display().to_string());
+                assert!(reason.contains("did not contain any PEM certificates"));
+            }
+            _ => panic!("expected invalid configured CA bundle to fail closed"),
+        }
+    }
+
+    #[test]
+    fn tls_no_verify_takes_precedence_over_ca_bundle() {
+        let posture = PluginTlsPosture::from_config(true, Some("/does/not/exist.pem"));
+        assert!(matches!(posture, PluginTlsPosture::SkipVerification));
     }
 
     #[tokio::test]
@@ -798,7 +904,10 @@ mod fallback_tests {
         // Verify the fallback client routes DNS through the gateway cache.
         let dns_cache = DnsCache::new(DnsConfig::default());
         let initial_len = dns_cache.cache_len();
-        let client = build_dns_cached_fallback_client(Some(dns_cache.clone()));
+        let client = build_dns_cached_fallback_client(
+            Some(dns_cache.clone()),
+            &PluginTlsPosture::PlatformRoots,
+        );
 
         let _ = client
             .get("http://localhost:1/")
@@ -811,7 +920,7 @@ mod fallback_tests {
             after_len > initial_len,
             "DNS cache should have populated via the cached resolver \
              (initial={}, after={}). If the fallback bypassed the resolver \
-             via Client::new(), the cache would stay empty.",
+             via a default reqwest client, the cache would stay empty.",
             initial_len,
             after_len
         );

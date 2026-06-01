@@ -2,6 +2,19 @@
 //!
 //! Blocks requests from known bot user agents by matching against
 //! configurable patterns. Supports an allow-list for legitimate bots.
+//!
+//! Matching semantics:
+//! - `blocked_patterns` are case-insensitive **substring** matches against the
+//!   `User-Agent` header.
+//! - `allow_list` entries are case-insensitive **word-boundary** matches and
+//!   are evaluated **before** `blocked_patterns` (an allow-list match wins).
+//!   Word-boundary anchoring prevents an allowed token from being smuggled as
+//!   a substring of an otherwise-blocked agent.
+//! - The `User-Agent` is client-controlled and spoofable, so this plugin is a
+//!   coarse first filter; for strong bot verification prefer forward-confirmed
+//!   reverse DNS or published IP ranges.
+//! - A no-op config (empty `blocked_patterns` while missing User-Agent headers
+//!   are allowed) is rejected at construction.
 
 use async_trait::async_trait;
 use regex::{RegexSet, RegexSetBuilder};
@@ -29,9 +42,23 @@ impl BotDetection {
         let custom_response_code = parse_response_code(config)?;
         let allow_missing_user_agent = parse_bool(config, "allow_missing_user_agent", true)?;
 
+        // Reject a no-op config: a security plugin with no blocked patterns
+        // and no missing-User-Agent rejection would silently always Continue,
+        // even if an allow-list is present. Fail loudly at construction per
+        // the project rule that `new()` rejects no-op config.
+        // (The default path is unaffected: `blocked_patterns` defaults to a
+        // non-empty list when the key is absent.)
+        if blocked_patterns.is_empty() && allow_missing_user_agent {
+            return Err(
+                "bot_detection: 'blocked_patterns' is empty and missing User-Agent headers are allowed; \
+                 plugin would have no effect"
+                    .to_string(),
+            );
+        }
+
         Ok(Self {
             blocked_patterns: compile_literal_pattern_set("blocked_patterns", &blocked_patterns)?,
-            allow_list: compile_literal_pattern_set("allow_list", &allow_list)?,
+            allow_list: compile_word_boundary_pattern_set("allow_list", &allow_list)?,
             custom_response_code,
             allow_missing_user_agent,
         })
@@ -108,6 +135,37 @@ fn compile_literal_pattern_set(key: &str, patterns: &[String]) -> Result<Option<
         .map_err(|e| format!("bot_detection: failed to compile '{key}' patterns: {e}"))
 }
 
+/// Compile allow-list patterns with word-boundary anchors (`\b…\b`).
+///
+/// The allow-list is evaluated BEFORE the blocked patterns and returns
+/// `Continue` on any match, so unanchored substring matching against the
+/// client-controlled, spoofable User-Agent let an attacker smuggle an allowed
+/// token inside an otherwise-blocked agent (e.g. allow `Chrome` matching
+/// `evilChromebot`). Anchoring to word boundaries closes the embedded-token
+/// bypass class so an allow token only matches when it appears as a standalone
+/// token, while legitimate whole-token allow-list entries (e.g. `Googlebot`,
+/// `Slackbot`) keep matching real UAs. Note this does not make a self-asserted
+/// User-Agent substring trustworthy — for strong bot verification prefer
+/// forward-confirmed reverse DNS or published IP ranges.
+fn compile_word_boundary_pattern_set(
+    key: &str,
+    patterns: &[String],
+) -> Result<Option<RegexSet>, String> {
+    if patterns.is_empty() {
+        return Ok(None);
+    }
+
+    let anchored_patterns = patterns
+        .iter()
+        .map(|pattern| format!(r"\b{}\b", regex::escape(pattern)));
+    let mut builder = RegexSetBuilder::new(anchored_patterns);
+    builder.case_insensitive(true);
+    builder
+        .build()
+        .map(Some)
+        .map_err(|e| format!("bot_detection: failed to compile '{key}' patterns: {e}"))
+}
+
 fn parse_response_code(config: &Value) -> Result<u16, String> {
     match config.get("custom_response_code") {
         None | Some(Value::Null) => Ok(403),
@@ -177,7 +235,14 @@ impl Plugin for BotDetection {
             }
         };
 
-        // Check allow-list first
+        // Allow-list takes precedence over blocked patterns: a User-Agent that
+        // matches an allow-list entry is permitted even if it would otherwise
+        // match a blocked pattern. Allow-list entries are word-boundary
+        // anchored (see `compile_word_boundary_pattern_set`) so an allowed
+        // token cannot be smuggled as a substring of a blocked agent. The
+        // User-Agent is client-controlled and spoofable; allow-list entries
+        // should be specific tokens and are not a substitute for reverse-DNS
+        // bot verification.
         if self
             .allow_list
             .as_ref()
