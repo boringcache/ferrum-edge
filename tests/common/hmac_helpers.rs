@@ -8,7 +8,8 @@ use sha2::{Digest, Sha256};
 type HmacSha256 = Hmac<Sha256>;
 
 /// Generate an HMAC-SHA256 signature for a request, matching the signing
-/// string format expected by the `hmac_auth` plugin.
+/// string format expected by the `hmac_auth` plugin. No-query requests still
+/// include the empty query field in the signed string.
 pub fn generate_hmac_signature(method: &str, path: &str, date: &str, secret: &str) -> String {
     generate_hmac_signature_with_query(method, path, "", date, secret)
 }
