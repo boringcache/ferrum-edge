@@ -3555,7 +3555,7 @@ Request buffering is only enabled for matching JSON `POST` requests when the plu
 | `action` | String | `"reject"` | `reject`, `redact`, or `warn` |
 | `patterns` | String[] | `["ssn", "credit_card", "api_key", "aws_key"]` | Built-in patterns to enable |
 | `custom_patterns` | Object[] | `[]` | Custom `{name, regex}` patterns |
-| `scan_fields` | String | `"content"` | `content` or `all` |
+| `scan_fields` | String | `"content"` | `content` (LLM prompt fields only) or `all` (entire body) |
 | `exclude_roles` | String[] | `[]` | Message roles to skip scanning |
 | `redaction_placeholder` | String | `"[REDACTED:{type}]"` | Template for redacted text |
 | `max_scan_bytes` | Integer | `1048576` | Skip scanning if body exceeds this size |
@@ -3564,7 +3564,9 @@ Request buffering is only enabled for matching JSON `POST` requests when the plu
 
 Unknown built-in pattern names and built-in patterns that fail to compile are now fatal at construction time (previously they silently dropped detection coverage). All configured patterns are merged into a single `RegexSet` for O(text_len) detection per scan, regardless of pattern count.
 
-In `scan_fields: "all"` mode, the recursive walker skips JSON object keys that hold structural data (`model`, `id`, `role`, `type`, `temperature`, `top_p`, `max_tokens`, etc.) so values that incidentally match a PII regex are not corrupted. When the body has a recognized chat shape (`messages` array), the structured redactor that only touches `messages[].content` is preferred even in `all` mode.
+`scan_fields: "content"` (default) scans LLM prompt text across the common request shapes: chat `messages[].content` (string or multimodal text parts), plus the top-level `prompt` (OpenAI legacy completions), `input` (Responses API and embeddings), and `system` (Anthropic) fields — each accepted as a string, an array of strings, or an array of `{type: "text", text}` parts. Both detection and redaction cover these fields. For request bodies that carry prompt text in other, non-standard fields, use `scan_fields: "all"`.
+
+In `scan_fields: "all"` mode, the recursive walker preserves JSON values that hold structural data (`model`, `id`, `role`, `type`, `temperature`, `top_p`, `max_tokens`, etc.) **only when the structural key is a top-level field holding a scalar string** — i.e. the request parameters an operator legitimately sends. It always recurses into nested objects and arrays and never skips nested occurrences of those key names, so PII hidden under a structural key (e.g. `{"metadata": {"type": "<PII>"}}` or `{"id": {"note": "<PII>"}}`) is still redacted rather than passed through. When the body has a recognized chat shape (`messages` array), the structured redactor that touches `messages[].content` runs first and the recursive walker then covers sibling fields.
 
 ```yaml
 plugin_name: ai_prompt_shield

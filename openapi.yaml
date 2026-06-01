@@ -12803,7 +12803,7 @@ components:
           type: string
           enum: [content, all]
           default: content
-          description: Which message fields to scan
+          description: "Which parts of the request to scan. 'content' scans LLM prompt fields only: chat messages[].content plus top-level prompt, input, and system (completions/responses/embeddings/Anthropic-system shapes). 'all' scans the entire request body recursively (structural keys like model/id/role excepted). Use 'all' for request shapes that carry prompt text in non-standard fields."
         exclude_roles:
           type: array
           items:
