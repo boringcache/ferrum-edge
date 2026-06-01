@@ -140,7 +140,7 @@ pub struct RequestDeduplication {
     completed_sequence: AtomicU64,
     next_completed_evict_sequence: AtomicU64,
     completed_order: Arc<DashMap<u64, String>>,
-    completed_order_lock: Mutex<()>,
+    eviction_lock: Mutex<()>,
     /// Optional Redis client for centralized deduplication.
     redis_client: Option<Arc<RedisRateLimitClient>>,
     /// Monotonic-seconds timestamp (relative to `PROCESS_START`) of the last
@@ -202,7 +202,7 @@ impl RequestDeduplication {
             completed_sequence: AtomicU64::new(0),
             next_completed_evict_sequence: AtomicU64::new(0),
             completed_order: Arc::new(DashMap::new()),
-            completed_order_lock: Mutex::new(()),
+            eviction_lock: Mutex::new(()),
             redis_client,
             last_cleanup: AtomicU64::new(CLEANUP_NEVER),
         })
@@ -245,11 +245,18 @@ impl RequestDeduplication {
                 LocalDeduplicationAction::Fresh
             }
             Entry::Occupied(mut entry) => match entry.get() {
-                DeduplicationEntry::Completed { cached, sequence } => {
+                DeduplicationEntry::Completed {
+                    cached,
+                    sequence: _,
+                } => {
                     if now.duration_since(cached.inserted_at) < self.ttl {
                         LocalDeduplicationAction::Replay(cached.clone())
                     } else {
-                        self.completed_order.remove(&*sequence);
+                        // Leave the old sequence in completed_order. Capacity
+                        // eviction will discard it as stale when it reaches the
+                        // sequence, which prevents the eviction cursor from
+                        // stopping permanently on a missing-but-not-yet-published
+                        // sequence.
                         decrement_atomic(&self.completed_count);
                         self.inflight_count.fetch_add(1, Ordering::Relaxed);
                         entry.insert(DeduplicationEntry::InFlight { started_at: now });
@@ -361,18 +368,14 @@ impl RequestDeduplication {
 
         let now = Instant::now();
         // Single all-shard pass: drop expired Completed entries and stale
-        // InFlight markers, and count surviving Completed entries so the LRU
-        // pass below can be skipped entirely when there is nothing it could
-        // evict.
-        let mut surviving_completed: usize = 0;
-        let mut surviving_inflight: usize = 0;
+        // InFlight markers. Decrement counters for entries actually removed
+        // instead of storing a full-scan snapshot, so concurrent inserts cannot
+        // be overwritten by stale counts from this cleanup pass.
         self.local_cache.retain(|_, entry| match entry {
-            DeduplicationEntry::Completed { cached, sequence } => {
+            DeduplicationEntry::Completed { cached, .. } => {
                 let keep = now.duration_since(cached.inserted_at) < self.ttl;
-                if keep {
-                    surviving_completed += 1;
-                } else {
-                    self.completed_order.remove(&*sequence);
+                if !keep {
+                    decrement_atomic(&self.completed_count);
                 }
                 keep
             }
@@ -383,21 +386,30 @@ impl RequestDeduplication {
             // forever (until LRU max-entries eviction).
             DeduplicationEntry::InFlight { started_at } => {
                 let keep = now.duration_since(*started_at) < self.inflight_ttl;
-                if keep {
-                    surviving_inflight += 1;
+                if !keep {
+                    decrement_atomic(&self.inflight_count);
                 }
                 keep
             }
         });
 
-        self.completed_count
-            .store(surviving_completed, Ordering::Relaxed);
-        self.inflight_count
-            .store(surviving_inflight, Ordering::Relaxed);
-        let Ok(_guard) = self.completed_order_lock.lock() else {
+        self.evict_completed_over_capacity(
+            self.completed_count.load(Ordering::Relaxed),
+            self.inflight_count.load(Ordering::Relaxed),
+        );
+    }
+
+    fn evict_completed_over_capacity(&self, completed_hint: usize, inflight_hint: usize) {
+        if completed_hint == 0 || completed_hint.saturating_add(inflight_hint) <= self.max_entries {
+            return;
+        }
+        let Ok(_guard) = self.eviction_lock.lock() else {
             return;
         };
-        self.evict_completed_over_capacity_locked(surviving_completed, surviving_inflight);
+        self.evict_completed_over_capacity_locked(
+            self.completed_count.load(Ordering::Relaxed),
+            self.inflight_count.load(Ordering::Relaxed),
+        );
     }
 
     fn evict_completed_over_capacity_locked(&self, completed_hint: usize, inflight_hint: usize) {
@@ -421,18 +433,26 @@ impl RequestDeduplication {
         let mut sequence = self.next_completed_evict_sequence.load(Ordering::Relaxed);
         let limit = self.completed_sequence.load(Ordering::Relaxed);
         while to_remove > 0 && sequence < limit {
-            if self.remove_completed_sequence(sequence) {
-                to_remove -= 1;
+            match self.remove_completed_sequence(sequence) {
+                CompletedSequenceRemoval::Removed => {
+                    to_remove -= 1;
+                    sequence += 1;
+                }
+                CompletedSequenceRemoval::Stale => {
+                    sequence += 1;
+                }
+                CompletedSequenceRemoval::NotPublished => {
+                    break;
+                }
             }
-            sequence += 1;
         }
         self.next_completed_evict_sequence
             .store(sequence, Ordering::Relaxed);
     }
 
-    fn remove_completed_sequence(&self, sequence: u64) -> bool {
+    fn remove_completed_sequence(&self, sequence: u64) -> CompletedSequenceRemoval {
         let Some((_, key)) = self.completed_order.remove(&sequence) else {
-            return false;
+            return CompletedSequenceRemoval::NotPublished;
         };
 
         let still_current = self.local_cache.get(&key).is_some_and(|entry| {
@@ -445,7 +465,7 @@ impl RequestDeduplication {
             )
         });
         if !still_current {
-            return false;
+            return CompletedSequenceRemoval::Stale;
         }
 
         if self
@@ -462,11 +482,17 @@ impl RequestDeduplication {
             .is_some()
         {
             decrement_atomic(&self.completed_count);
-            true
+            CompletedSequenceRemoval::Removed
         } else {
-            false
+            CompletedSequenceRemoval::Stale
         }
     }
+}
+
+enum CompletedSequenceRemoval {
+    Removed,
+    Stale,
+    NotPublished,
 }
 
 /// Serializable form of CachedResponse for Redis storage.
@@ -721,10 +747,10 @@ impl Plugin for RequestDeduplication {
             inserted_at: Instant::now(),
         };
 
-        // Store in local cache
-        let Ok(_guard) = self.completed_order_lock.lock() else {
-            return PluginResult::Continue;
-        };
+        // Store in local cache. The ordering map is published after the
+        // Completed entry is visible; eviction stops at not-yet-published
+        // sequences instead of advancing past them, so independent completions
+        // do not need to serialize behind the eviction mutex.
         let sequence = self.next_completed_sequence();
         let previous = self.local_cache.insert(
             key.clone(),
@@ -735,16 +761,10 @@ impl Plugin for RequestDeduplication {
         );
         self.completed_order.insert(sequence, key.clone());
         let (completed, inflight) = match previous {
-            Some(DeduplicationEntry::Completed {
-                sequence: previous_sequence,
-                ..
-            }) => {
-                self.completed_order.remove(&previous_sequence);
-                (
-                    self.completed_count.load(Ordering::Relaxed),
-                    self.inflight_count.load(Ordering::Relaxed),
-                )
-            }
+            Some(DeduplicationEntry::Completed { .. }) => (
+                self.completed_count.load(Ordering::Relaxed),
+                self.inflight_count.load(Ordering::Relaxed),
+            ),
             Some(DeduplicationEntry::InFlight { .. }) => (
                 self.completed_count.fetch_add(1, Ordering::Relaxed) + 1,
                 decrement_atomic(&self.inflight_count),
@@ -754,7 +774,7 @@ impl Plugin for RequestDeduplication {
                 self.inflight_count.load(Ordering::Relaxed),
             ),
         };
-        self.evict_completed_over_capacity_locked(completed, inflight);
+        self.evict_completed_over_capacity(completed, inflight);
 
         // Also store in Redis if available
         if self.redis_client.is_some() {
