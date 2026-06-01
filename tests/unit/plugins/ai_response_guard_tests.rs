@@ -1294,3 +1294,344 @@ async fn test_sse_accumulated_text_order_is_deterministic() {
         "max_completion_length must be enforced regardless of frame order"
     );
 }
+
+// ─── #43: redaction placeholder must not undergo $-capture expansion ──
+
+#[tokio::test]
+async fn test_redaction_placeholder_dollar_sequence_emitted_literally() {
+    // A blocked phrase containing `$5` becomes the pattern name and is
+    // interpolated into the placeholder as `[REDACTED:blocked_phrase:cost $5]`.
+    // If the placeholder were passed to `replace_all` as a plain &str, the
+    // regex Replacer would interpret `$5` as a capture-group reference and
+    // (since there is no group 5) expand it to empty, corrupting the marker.
+    // With NoExpand the placeholder is emitted verbatim.
+    let plugin = make_plugin(json!({
+        "blocked_phrases": ["cost $5"],
+        "action": "redact"
+    }));
+
+    let body = serde_json::to_vec(&json!({
+        "choices": [{
+            "message": {"content": "the total cost $5 today"}
+        }]
+    }))
+    .unwrap();
+
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+
+    let transformed = plugin
+        .transform_response_body(&body, Some("application/json"), &headers)
+        .await
+        .expect("body should be redacted");
+    let s = String::from_utf8(transformed).unwrap();
+    assert!(
+        s.contains("[REDACTED:blocked_phrase:cost $5]"),
+        "placeholder must be emitted literally, got: {s}"
+    );
+    // The bug would have produced the mangled marker with `$5` stripped.
+    assert!(
+        !s.contains("[REDACTED:blocked_phrase:cost ]"),
+        "the $5 must not be expanded away: {s}"
+    );
+}
+
+#[tokio::test]
+async fn test_redaction_placeholder_dollar_one_not_reinjected() {
+    // A `redaction_placeholder` containing `$1` must NOT re-inject a captured
+    // substring of the matched (sensitive) content. With NoExpand, `$1` is
+    // literal text in the output.
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["email"],
+        "redaction_placeholder": "[REDACTED:{type}:$1]",
+        "action": "redact"
+    }));
+
+    let body = serde_json::to_vec(&json!({
+        "choices": [{
+            "message": {"content": "reach me at user@example.com please"}
+        }]
+    }))
+    .unwrap();
+
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+
+    let transformed = plugin
+        .transform_response_body(&body, Some("application/json"), &headers)
+        .await
+        .expect("body should be redacted");
+    let s = String::from_utf8(transformed).unwrap();
+    assert!(
+        s.contains("[REDACTED:pii:email:$1]"),
+        "$1 must be emitted literally, got: {s}"
+    );
+    // The original PII must be gone (detection/removal still works).
+    assert!(
+        !s.contains("user@example.com"),
+        "matched PII must still be removed: {s}"
+    );
+}
+
+#[tokio::test]
+async fn test_redaction_placeholder_dollar_literal_in_scan_all_walker() {
+    // The recursive scan-all walker (redact_json_strings) is a separate
+    // replace_all call site; verify it is also NoExpand-safe. Body has no
+    // recognized AI shape so the recursive walker runs.
+    let plugin = make_plugin(json!({
+        "blocked_phrases": ["cost $5"],
+        "scan_fields": "all",
+        "action": "redact"
+    }));
+
+    let body = serde_json::to_vec(&json!({
+        "note": "the cost $5 was billed"
+    }))
+    .unwrap();
+
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    let mut ctx = super::plugin_utils::create_test_context();
+    ctx.method = "POST".to_string();
+
+    let _ = plugin
+        .on_response_body(&mut ctx, 200, &headers, &body)
+        .await;
+    let transformed = plugin
+        .transform_response_body(&body, Some("application/json"), &headers)
+        .await
+        .expect("body should be redacted");
+    let s = String::from_utf8(transformed).unwrap();
+    assert!(
+        s.contains("[REDACTED:blocked_phrase:cost $5]"),
+        "scan-all walker must emit placeholder literally, got: {s}"
+    );
+}
+
+// ─── twin of finding #8: structural-key nesting must not hide PII ─────
+
+#[tokio::test]
+async fn test_all_mode_redacts_pii_nested_under_structural_key() {
+    // The structural-key skip must apply ONLY to a top-level scalar value.
+    // PII nested under a structural key name (`type`, `id`, ...) at any depth
+    // below the root must still be redacted. Previously the walker skipped the
+    // entire subtree under such keys, letting PII reach the client in redact
+    // mode even though detection (ai_response_guard_redacted) fired.
+    let plugin = ipv4_redact_plugin();
+
+    // No recognized AI shape (no choices/content/candidates) so the recursive
+    // walker is exercised. `id` and `object` here are CONTAINERS (objects),
+    // and `metadata` nests a scalar under the structural key `type`.
+    let body = serde_json::to_vec(&json!({
+        "id": "10.0.0.1",                          // top-level scalar — preserved
+        "model": "127.0.0.1",                      // top-level scalar — preserved
+        "metadata": {"type": "leak at 8.8.8.8"},   // scalar under structural key — redact
+        "id_block": {"note": "see 1.2.3.4"},        // nested under non-top-level
+        "object": {"role": "host 172.16.0.9 here"}  // nested structural keys — redact
+    }))
+    .unwrap();
+
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    let mut ctx = super::plugin_utils::create_test_context();
+    ctx.method = "POST".to_string();
+
+    let _ = plugin
+        .on_response_body(&mut ctx, 200, &headers, &body)
+        .await;
+    let transformed = plugin
+        .transform_response_body(&body, Some("application/json"), &headers)
+        .await
+        .expect("expected redaction when match present");
+    let v: serde_json::Value = serde_json::from_slice(&transformed).unwrap();
+
+    // Top-level scalar structural values are still preserved.
+    assert_eq!(v["id"], "10.0.0.1", "top-level scalar id preserved");
+    assert_eq!(v["model"], "127.0.0.1", "top-level scalar model preserved");
+
+    // PII nested under structural key names must be redacted.
+    assert!(
+        v["metadata"]["type"]
+            .as_str()
+            .unwrap()
+            .contains("[REDACTED:pii:ip_address]"),
+        "PII under nested structural key `type` must be redacted: {}",
+        v["metadata"]["type"]
+    );
+    assert!(
+        v["id_block"]["note"]
+            .as_str()
+            .unwrap()
+            .contains("[REDACTED:pii:ip_address]"),
+        "PII nested below root must be redacted: {}",
+        v["id_block"]["note"]
+    );
+    assert!(
+        v["object"]["role"]
+            .as_str()
+            .unwrap()
+            .contains("[REDACTED:pii:ip_address]"),
+        "PII under nested structural keys (object.role) must be redacted: {}",
+        v["object"]["role"]
+    );
+}
+
+#[tokio::test]
+async fn test_all_mode_redacts_deeply_nested_pii_under_structural_key() {
+    // PII cannot be hidden by wrapping it deep inside arrays/objects under a
+    // top-level structural key.
+    let plugin = ipv4_redact_plugin();
+
+    let body = serde_json::to_vec(&json!({
+        "model": "10.0.0.1", // top-level scalar — preserved
+        // `usage` is a structural key, but it is an OBJECT here, so the walker
+        // must recurse into it and redact the nested PII.
+        "usage": {
+            "details": [
+                {"type": {"inner": "host 192.168.1.50 logged"}}
+            ]
+        }
+    }))
+    .unwrap();
+
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    let mut ctx = super::plugin_utils::create_test_context();
+    ctx.method = "POST".to_string();
+
+    let _ = plugin
+        .on_response_body(&mut ctx, 200, &headers, &body)
+        .await;
+    let transformed = plugin
+        .transform_response_body(&body, Some("application/json"), &headers)
+        .await
+        .expect("expected redaction when match present");
+    let v: serde_json::Value = serde_json::from_slice(&transformed).unwrap();
+
+    assert_eq!(v["model"], "10.0.0.1", "top-level scalar model preserved");
+    assert!(
+        v["usage"]["details"][0]["type"]["inner"]
+            .as_str()
+            .unwrap()
+            .contains("[REDACTED:pii:ip_address]"),
+        "deeply nested PII under structural keys must be redacted: {}",
+        v["usage"]["details"][0]["type"]["inner"]
+    );
+}
+
+#[tokio::test]
+async fn test_sse_scan_all_redacts_pii_nested_under_structural_key() {
+    // The SSE scan-all path also routes through redact_json_strings; verify
+    // the depth-aware fix applies there too. The frame's top-level `id` scalar
+    // is preserved while PII nested under a structural key is redacted.
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["ip_address"],
+        "scan_fields": "all",
+        "action": "redact"
+    }));
+
+    // One self-contained frame: top-level `id` is IP-shaped (preserved),
+    // `metadata.type` nests PII under a structural key (must be redacted).
+    let frame = json!({
+        "id": "10.0.0.1",
+        "object": "chat.completion.chunk",
+        "metadata": {"type": "host 8.8.8.8 saw it"}
+    });
+    let body = format!("data: {}\n\n", serde_json::to_string(&frame).unwrap()).into_bytes();
+
+    let transformed = plugin
+        .transform_response_body(&body, Some("text/event-stream"), &sse_headers())
+        .await
+        .expect("expected redaction when nested PII present");
+    let s = String::from_utf8(transformed).unwrap();
+    let data = s
+        .lines()
+        .find_map(|l| l.strip_prefix("data: "))
+        .expect("data frame present");
+    let v: serde_json::Value = serde_json::from_str(data).unwrap();
+
+    assert_eq!(
+        v["id"], "10.0.0.1",
+        "top-level scalar id preserved in SSE frame"
+    );
+    assert!(
+        v["metadata"]["type"]
+            .as_str()
+            .unwrap()
+            .contains("[REDACTED:pii:ip_address]"),
+        "nested PII under structural key in SSE frame must be redacted: {}",
+        v["metadata"]["type"]
+    );
+}
+
+// ─── #44: max_completion_length is measured in characters, not bytes ──
+
+#[tokio::test]
+async fn test_max_completion_length_counts_characters_not_bytes() {
+    // A multibyte completion whose CHARACTER count is within the limit but
+    // whose BYTE length exceeds it must NOT be rejected. Each `あ` is 3 UTF-8
+    // bytes: 5 chars = 15 bytes. With a limit of 10 characters, a 5-char
+    // string is allowed (the old byte-based check, 15 > 10, wrongly rejected).
+    let plugin = make_plugin(json!({
+        "max_completion_length": 10,
+        "action": "reject"
+    }));
+
+    let content = "あいうえお"; // 5 chars, 15 bytes
+    assert_eq!(content.chars().count(), 5);
+    assert!(content.len() > 10, "byte length exceeds the limit");
+
+    let body = serde_json::to_vec(&json!({
+        "choices": [{ "message": { "content": content } }]
+    }))
+    .unwrap();
+
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &headers, &body)
+        .await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "multibyte completion within the character limit must pass"
+    );
+}
+
+#[tokio::test]
+async fn test_max_completion_length_rejects_when_chars_exceed() {
+    // Conversely, a multibyte completion whose character count exceeds the
+    // limit must be rejected, and the reported figure is the character count.
+    let plugin = make_plugin(json!({
+        "max_completion_length": 4,
+        "action": "reject"
+    }));
+
+    let content = "あいうえお"; // 5 chars > 4
+    let body = serde_json::to_vec(&json!({
+        "choices": [{ "message": { "content": content } }]
+    }))
+    .unwrap();
+
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &headers, &body)
+        .await;
+    match result {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 502);
+            // The message must report the CHARACTER count (5), not bytes (15).
+            assert!(
+                body.contains("Completion length 5 exceeds maximum 4"),
+                "error must report character count, got: {body}"
+            );
+        }
+        other => panic!("expected reject for over-limit char count, got {other:?}"),
+    }
+}

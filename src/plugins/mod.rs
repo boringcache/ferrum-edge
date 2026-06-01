@@ -1095,7 +1095,11 @@ impl RequestContext {
     }
 
     /// Materialize the raw query string into `self.query_params` without
-    /// percent-decoding.
+    /// percent-decoding. Empty pairs are skipped and parameters without `=`
+    /// (e.g., `?flag`) are stored with an empty-string value, matching the
+    /// decoded variant so the only plugin-visible difference between the two is
+    /// percent-decoding (and duplicate-pair collapse via the retained raw
+    /// query string).
     ///
     /// HTTP/3 uses this by default to preserve its legacy plugin-visible query
     /// representation unless an active plugin explicitly opts into decoded
@@ -1106,9 +1110,11 @@ impl RequestContext {
         }
         if let Some(raw) = self.raw_query_string.as_deref() {
             for pair in raw.split('&') {
-                if let Some((k, v)) = pair.split_once('=') {
-                    self.query_params.insert(k.to_string(), v.to_string());
+                if pair.is_empty() {
+                    continue;
                 }
+                let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+                self.query_params.insert(k.to_string(), v.to_string());
             }
         }
         self.query_params_materialized = true;
