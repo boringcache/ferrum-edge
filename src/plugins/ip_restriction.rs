@@ -32,11 +32,6 @@ pub(super) enum ParsedRule {
     ExactV6(u128),
     /// IPv6 CIDR range (network & mask pre-computed).
     CidrV6 { network: u128, mask: u128 },
-    /// Cross-family catch-all from a zero-length prefix (`0.0.0.0/0` or `::/0`).
-    /// Matches any parseable client IP regardless of address family, so an
-    /// operator's "match everything" rule is not silently confined to one
-    /// family on a dual-stack listener.
-    Any,
 }
 
 /// The client IP parsed once per request for matching against all rules.
@@ -223,13 +218,12 @@ pub(super) fn parse_rule(rule: &str) -> Option<ParsedRule> {
             if prefix_len > 32 {
                 return None;
             }
-            if prefix_len == 0 {
-                // `0.0.0.0/0` — treat as a cross-family catch-all so it also
-                // covers IPv6 clients on a dual-stack listener (finding #46).
-                return Some(ParsedRule::Any);
-            }
             let network = u32::from_be_bytes(octets);
-            let mask = !0u32 << (32 - prefix_len);
+            let mask = if prefix_len == 0 {
+                0
+            } else {
+                !0u32 << (32 - prefix_len)
+            };
             return Some(ParsedRule::CidrV4 {
                 network: network & mask,
                 mask,
@@ -240,13 +234,6 @@ pub(super) fn parse_rule(rule: &str) -> Option<ParsedRule> {
         if let Some(parts) = parse_ipv6(network_str) {
             if prefix_len > 128 {
                 return None;
-            }
-
-            if prefix_len == 0 {
-                // `::/0` (or any `/0` written in IPv6 form) — treat as a
-                // cross-family catch-all so it also covers IPv4 clients on a
-                // dual-stack listener (finding #46).
-                return Some(ParsedRule::Any);
             }
 
             if let Some(v4_bits) = ipv6_parts_to_ipv4_mapped_u32(&parts)
@@ -265,7 +252,11 @@ pub(super) fn parse_rule(rule: &str) -> Option<ParsedRule> {
             }
 
             let network = ipv6_to_u128(&parts);
-            let mask = !0u128 << (128 - prefix_len);
+            let mask = if prefix_len == 0 {
+                0
+            } else {
+                !0u128 << (128 - prefix_len)
+            };
             return Some(ParsedRule::CidrV6 {
                 network: network & mask,
                 mask,
@@ -324,10 +315,6 @@ pub(super) fn rule_matches(client: &ParsedClientIp, rule: &ParsedRule) -> bool {
         (ParsedClientIp::V6(client_bits), ParsedRule::CidrV6 { network, mask }) => {
             (client_bits & mask) == *network
         }
-        // Cross-family catch-all (`0.0.0.0/0` / `::/0`) matches any parseable
-        // client IP regardless of address family. An `Unknown` client still
-        // matches nothing here; `check_ip` rejects unparseable IPs up front.
-        (ParsedClientIp::V4(_) | ParsedClientIp::V6(_), ParsedRule::Any) => true,
         // Unknown or cross-family typed rules never match.
         _ => false,
     }
