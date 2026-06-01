@@ -113,8 +113,8 @@ fn new_accepts_credentialed_client_auth_for_loopback_http_endpoint() {
     }
 }
 
-#[test]
-fn new_accepts_credentialed_client_auth_with_discovery_url() {
+#[tokio::test]
+async fn new_accepts_credentialed_client_auth_with_discovery_url() {
     assert!(
         Oauth2Introspection::new(
             &discovery_config_with_client_auth(
