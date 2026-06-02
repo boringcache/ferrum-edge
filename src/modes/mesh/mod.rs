@@ -1468,10 +1468,19 @@ fn apply_destination_rules(
                         name: subset.name.clone(),
                         labels: subset.labels.clone(),
                         traffic_policy: subset.traffic_policy.as_ref().map(|sp| {
+                            // Resolve the subset's outlierDetection into a
+                            // PassiveHealthCheck (ejection thresholds) up front,
+                            // the same projection the upstream-level path uses.
+                            let passive_health_check = sp.outlier_detection.as_ref().map(|od| {
+                                let mut passive = PassiveHealthCheck::default();
+                                apply_outlier_detection_to_passive(&mut passive, od);
+                                passive
+                            });
                             SubsetTrafficPolicy {
                                 load_balancer_algorithm: mesh_lb_to_ferrum(&sp.load_balancer),
                                 tls: sp.tls.clone(),
                                 connect_timeout_ms: sp.connect_timeout_ms,
+                                passive_health_check,
                             }
                         }),
                     })
@@ -1582,27 +1591,28 @@ fn resolve_subset_traffic_policy_tls(
         let upstream_base_tls = BackendTlsConfig::from_upstream(upstream);
         let mut resolved_map: HashMap<String, ResolvedSubsetTrafficPolicy> = HashMap::new();
         for subset in subsets {
-            let Some(subset_tls) = subset
-                .traffic_policy
-                .as_ref()
-                .and_then(|tp| tp.tls.as_ref())
-            else {
-                continue;
+            let tp = subset.traffic_policy.as_ref();
+            // Per-subset TLS overlay, resolved over the upstream-level TLS.
+            let resolved_tls = if let Some(subset_tls) = tp.and_then(|tp| tp.tls.as_ref()) {
+                let identity = format!("{}/{}", upstream.id, subset.name);
+                let mut slot = upstream_base_tls.clone();
+                apply_traffic_policy_tls_to_backend_config(&mut slot, subset_tls, runtime, &identity)
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "DestinationRule subset trafficPolicy.tls projection failed for upstream={} subset={}: {}",
+                            upstream.id,
+                            subset.name,
+                            e
+                        )
+                    })?;
+                Some(slot)
+            } else {
+                None
             };
-            let identity = format!("{}/{}", upstream.id, subset.name);
-            let mut slot = upstream_base_tls.clone();
-            apply_traffic_policy_tls_to_backend_config(
-                &mut slot, subset_tls, runtime, &identity,
-            )
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "DestinationRule subset trafficPolicy.tls projection failed for upstream={} subset={}: {}",
-                    upstream.id,
-                    subset.name,
-                    e
-                )
-            })?;
-            if let Some(resolved) = ResolvedSubsetTrafficPolicy::from_tls(Some(slot)) {
+            // Per-subset passive health (ejection thresholds), already resolved
+            // from the subset's outlierDetection in apply_destination_rules.
+            let passive = tp.and_then(|tp| tp.passive_health_check.clone());
+            if let Some(resolved) = ResolvedSubsetTrafficPolicy::new(resolved_tls, passive) {
                 resolved_map.insert(subset.name.clone(), resolved);
             }
         }
@@ -7255,6 +7265,57 @@ mod tests {
     }
 
     #[test]
+    fn dr_subset_outlier_resolves_passive_health_thresholds() {
+        // A subset's outlierDetection thresholds resolve into the subset's
+        // passive-health overlay on `Upstream.resolved_subset_tls`, consulted by
+        // `passive_health_for_target` for proxies bound to the subset.
+        let mut config = GatewayConfig {
+            upstreams: vec![destination_rule_test_upstream(
+                "u1",
+                "reviews.default.svc.cluster.local",
+            )],
+            ..GatewayConfig::default()
+        };
+        let slice = MeshSlice {
+            destination_rules: vec![MeshDestinationRule {
+                name: "reviews".to_string(),
+                namespace: "default".to_string(),
+                host: "reviews.default.svc.cluster.local".to_string(),
+                traffic_policy: None,
+                port_level_settings: HashMap::new(),
+                subsets: vec![MeshSubset {
+                    name: "v1".to_string(),
+                    labels: HashMap::from([("version".to_string(), "v1".to_string())]),
+                    traffic_policy: Some(MeshTrafficPolicy {
+                        outlier_detection: Some(MeshOutlierDetection {
+                            consecutive_errors: Some(5),
+                            interval_seconds: Some(20),
+                            base_ejection_seconds: None,
+                            max_ejection_percent: None,
+                        }),
+                        ..MeshTrafficPolicy::default()
+                    }),
+                }],
+            }],
+            ..MeshSlice::default()
+        };
+
+        apply_destination_rules(&mut config, &test_mesh_runtime_config(), &slice)
+            .expect("destination rules apply");
+
+        let resolved = config.upstreams[0]
+            .resolved_subset_tls
+            .get("v1")
+            .expect("v1 subset resolved");
+        let passive = resolved
+            .passive_health_check
+            .as_ref()
+            .expect("v1 subset passive health resolved from outlierDetection");
+        assert_eq!(passive.unhealthy_threshold, 5);
+        assert_eq!(passive.unhealthy_window_seconds, 20);
+    }
+
+    #[test]
     fn dr_subset_tls_projects_onto_proxy_resolved_tls_via_resolve_upstream_tls() {
         // End-to-end: subset overlay reaches `Proxy.resolved_tls` so the pool
         // key construction (which consumes `proxy.resolved_tls`) naturally
@@ -7409,6 +7470,7 @@ mod tests {
                     server_ca_cert_path: Some("/etc/certs/stale-ca.pem".to_string()),
                     ..BackendTlsConfig::default_verify()
                 }),
+                passive_health_check: None,
             },
         );
         let mut config = GatewayConfig {

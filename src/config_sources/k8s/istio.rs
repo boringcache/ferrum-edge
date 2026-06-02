@@ -1798,17 +1798,18 @@ fn translate_subset(
         .map(|tp| translate_traffic_policy(acc, object, tp))
         .transpose()?;
 
-    // A subset's `connectionPool.tcp.connectTimeout` is now applied per-subset
-    // by the cold-path apply in `src/modes/mesh/mod.rs::apply_destination_rules`
-    // (projected onto `backend_connect_timeout_ms` of proxies that select this
-    // subset via `upstream_subset`, overriding the DR top-level connectTimeout),
-    // and `tls` by `resolve_subset_traffic_policy_tls` — neither needs a warn.
-    // `outlierDetection` remains deferred per-subset, so warn it is ignored.
+    // A subset's `connectionPool.tcp.connectTimeout`, `tls`, and
+    // `outlierDetection` *thresholds* (consecutive errors / interval /
+    // base-ejection / min-health) are now applied per-subset by the cold-path
+    // apply in `src/modes/mesh/mod.rs`. The one residual is the
+    // `outlierDetection.maxEjectionPercent` *cap*, still resolved at the
+    // upstream level (LoadBalancerCache), so warn when a subset sets outlier
+    // detection that its ejection cap is not yet per-subset.
     if let Some(ref policy) = traffic_policy
         && policy.outlier_detection.is_some()
     {
         acc.warnings.push(format!(
-            "DestinationRule {}/{} subset '{}' outlierDetection is currently ignored; only the top-level trafficPolicy outlierDetection applies",
+            "DestinationRule {}/{} subset '{}' outlierDetection thresholds are applied per-subset, but the maxEjectionPercent cap uses the upstream-level value",
             object.metadata.namespace, object.metadata.name, name
         ));
     }

@@ -559,18 +559,23 @@ fn destination_rule_status(
 
     let (accepted, reason, message, detail) = match result {
         Ok(_translation) => {
-            // T1-C deferred fields: per-subset outlierDetection, and the
-            // parsed-but-dropped connectionPool.http knobs the translator only
-            // warns on (http1MaxPendingRequests / maxRetries / h2UpgradePolicy).
+            // T1-C deferred fields: the per-subset outlierDetection
+            // maxEjectionPercent cap, and the parsed-but-dropped connectionPool.http
+            // knobs the translator only warns on (http1MaxPendingRequests /
+            // maxRetries / h2UpgradePolicy).
             // Now APPLIED (no longer deferred): per-subset
-            // connectionPool.tcp.connectTimeout (overrides
-            // backend_connect_timeout_ms for subset-bound proxies) and
-            // portLevelSettings[].tls (per-port backend TLS projected onto the
-            // effective proxy's resolved_tls).
+            // connectionPool.tcp.connectTimeout (overrides backend_connect_timeout_ms
+            // for subset-bound proxies), portLevelSettings[].tls (per-port backend
+            // TLS projected onto the effective proxy's resolved_tls), and per-subset
+            // outlierDetection *thresholds* (consecutive errors / interval /
+            // base-ejection / min-health) — only the maxEjectionPercent cap remains
+            // upstream-level.
             // Surface the rest so operators see the gap in `kubectl describe`.
             let mut deferred: Vec<&'static str> = Vec::new();
             if has_subset_outlier_detection(&object.spec) {
-                deferred.push("subsets[].trafficPolicy.outlierDetection");
+                deferred.push(
+                    "subsets[].trafficPolicy.outlierDetection.maxEjectionPercent (thresholds applied per-subset; ejection cap uses upstream-level)",
+                );
             }
             deferred.extend(deferred_connection_pool_http_fields(&object.spec));
             let message = if deferred.is_empty() {

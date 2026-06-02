@@ -20244,6 +20244,58 @@ mod tests {
     }
 
     #[test]
+    fn passive_health_for_target_prefers_subset_over_upstream() {
+        // A subset-bound proxy (no per-port override) uses its subset's
+        // outlierDetection thresholds over the upstream-level passive health.
+        let proxy: Proxy = serde_json::from_value(serde_json::json!({
+            "id": "p",
+            "hosts": ["p.example.com"],
+            "backend_host": "",
+            "backend_port": 0,
+            "upstream_id": "u1",
+            "upstream_subset": "v1",
+        }))
+        .expect("subset-bound proxy");
+        let mut upstream: crate::config::types::Upstream =
+            serde_json::from_value(serde_json::json!({
+                "id": "u1",
+                "targets": [{"host": "10.0.0.1", "port": 9090}],
+                "algorithm": "round_robin",
+            }))
+            .expect("upstream");
+        // Upstream-level passive health (the fallback tier).
+        upstream.health_checks = Some(crate::config::types::HealthCheckConfig {
+            passive: Some(crate::config::types::PassiveHealthCheck {
+                unhealthy_threshold: 99,
+                unhealthy_window_seconds: 99,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        // Subset overlay with distinct thresholds.
+        upstream.resolved_subset_tls.insert(
+            "v1".to_string(),
+            crate::config::types::ResolvedSubsetTrafficPolicy {
+                tls: None,
+                passive_health_check: Some(crate::config::types::PassiveHealthCheck {
+                    unhealthy_threshold: 3,
+                    unhealthy_window_seconds: 10,
+                    ..Default::default()
+                }),
+            },
+        );
+        let target = target_for_test(9090);
+        let passive =
+            crate::proxy::backend_dispatch::passive_health_for_target(&proxy, &upstream, &target)
+                .expect("passive health resolved");
+        assert_eq!(
+            passive.unhealthy_threshold, 3,
+            "subset thresholds win over upstream-level"
+        );
+        assert_eq!(passive.unhealthy_window_seconds, 10);
+    }
+
+    #[test]
     fn resolve_effective_proxy_returns_borrowed_when_override_matches_default() {
         // Override equals proxy default → no work needed.
         let proxy = proxy_with_port_overrides_for_test(5000, &[(8080, 5000)]);

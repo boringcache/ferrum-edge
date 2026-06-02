@@ -110,6 +110,45 @@ fn dr_subset_connect_timeout() {
     assert_eq!(tp.connect_timeout_ms, Some(2000));
 }
 
+/// `subsets[].trafficPolicy.outlierDetection` — per-subset passive health. The
+/// ejection *thresholds* (consecutive errors / interval / base-ejection /
+/// min-health) are applied per-subset at slice apply, overriding the
+/// upstream-level passive health for subset-bound proxies; the
+/// `maxEjectionPercent` *cap* remains upstream-level. Apply behavior is pinned
+/// by `dr_subset_outlier_resolves_passive_health_thresholds` and
+/// `passive_health_for_target_prefers_subset_over_upstream` in the source crate.
+#[test]
+fn dr_subset_outlier_detection() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "subsets[].trafficPolicy.outlierDetection",
+        status = Status::Supported,
+        notes = "Per-subset outlier thresholds (consecutive errors / interval / base-ejection / min-health) applied per-subset, overriding upstream-level passive health; the maxEjectionPercent cap is still resolved at the upstream level.",
+    );
+    let dr = translated(json!({
+        "host": "api.default.svc.cluster.local",
+        "subsets": [{
+            "name": "v1",
+            "labels": {"version": "v1"},
+            "trafficPolicy": {"outlierDetection": {"consecutive5xxErrors": 5, "interval": "30s"}}
+        }]
+    }));
+    let subset = dr
+        .subsets
+        .iter()
+        .find(|s| s.name == "v1")
+        .expect("v1 subset emitted");
+    let tp = subset
+        .traffic_policy
+        .as_ref()
+        .expect("subset traffic policy emitted");
+    let od = tp
+        .outlier_detection
+        .as_ref()
+        .expect("subset outlierDetection translated");
+    assert_eq!(od.consecutive_errors, Some(5));
+}
+
 /// `trafficPolicy.connectionPool.tcp.maxConnections` — T1-D (PR #897).
 /// Lands on `MeshConnectionPoolTcp.max_connections`.
 #[test]
