@@ -5645,6 +5645,8 @@ mod tests {
             "FERRUM_MESH_XDS_CONNECT_TIMEOUT_SECONDS",
             "FERRUM_POOL_WARMUP_ENABLED",
             "FERRUM_SHUTDOWN_DRAIN_SECONDS",
+            "FERRUM_MESH_CA_BACKEND",
+            "FERRUM_MESH_ALLOW_NO_CA",
         ];
 
         for key in keys {
@@ -5652,6 +5654,16 @@ mod tests {
         }
         for (key, value) in vars {
             unsafe { std::env::set_var(key, value) };
+        }
+        // These tests build mesh runtime configs without exercising the
+        // PERMISSIVE-no-CA startup gate; unless the caller pins CA settings,
+        // acknowledge the no-CA dev posture so that gate does not reject the
+        // config under test.
+        if !vars
+            .iter()
+            .any(|(k, _)| *k == "FERRUM_MESH_CA_BACKEND" || *k == "FERRUM_MESH_ALLOW_NO_CA")
+        {
+            unsafe { std::env::set_var("FERRUM_MESH_ALLOW_NO_CA", "true") };
         }
 
         f();
