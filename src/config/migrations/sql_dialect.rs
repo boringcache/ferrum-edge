@@ -130,6 +130,23 @@ impl V001SqlBuilder {
             "CREATE INDEX IF NOT EXISTS idx_consumers_ns_updated ON consumers (namespace, updated_at)",
             "CREATE INDEX IF NOT EXISTS idx_plugin_configs_ns_updated ON plugin_configs (namespace, updated_at)",
             "CREATE INDEX IF NOT EXISTS idx_upstreams_ns_updated ON upstreams (namespace, updated_at)",
+            // Covering indexes for the incremental-poll deletion diff. Every
+            // poll cycle runs `SELECT id ... WHERE namespace = ?` on these four
+            // tables to detect deletions (see `db_loader::load_table_ids`). The
+            // `(namespace, updated_at)` compounds above satisfy the namespace
+            // filter, but since `id` is not in them the engine must still visit
+            // each table row to read it — an O(rows) table walk on every poll.
+            // A `(namespace, id)` index makes the query index-only, so the diff
+            // never touches the table b-tree. This matters most for SQLite,
+            // where the scan runs in-process and competes with the proxy hot
+            // path; on a 30k-resource scale benchmark it is the dominant cause
+            // of SQLite's per-poll cost. Width matches the existing
+            // `(namespace, name)` unique indexes, so MySQL key-length limits
+            // are already proven by those.
+            "CREATE INDEX IF NOT EXISTS idx_proxies_ns_id ON proxies (namespace, id)",
+            "CREATE INDEX IF NOT EXISTS idx_consumers_ns_id ON consumers (namespace, id)",
+            "CREATE INDEX IF NOT EXISTS idx_plugin_configs_ns_id ON plugin_configs (namespace, id)",
+            "CREATE INDEX IF NOT EXISTS idx_upstreams_ns_id ON upstreams (namespace, id)",
             "CREATE INDEX IF NOT EXISTS idx_plugin_configs_ns_scope ON plugin_configs (namespace, scope)",
             "CREATE INDEX IF NOT EXISTS idx_plugin_configs_ns_plugin_name ON plugin_configs (namespace, plugin_name)",
             // Cold-path index for cross-namespace mesh_route_dispatch lookups in
