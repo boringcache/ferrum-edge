@@ -731,13 +731,6 @@ pub struct EnvConfig {
     /// disk); `spire` delegates to a SPIRE Agent over UDS; `none` (default)
     /// disables mesh identity features.
     pub mesh_ca_backend: String,
-    /// When `true`, permit `mesh` mode to start with
-    /// `FERRUM_MESH_CA_BACKEND=none` (no workload identity, no mTLS).
-    /// Defaults to `false`: a no-CA mesh fails closed at startup because
-    /// PeerAuthentication's PERMISSIVE default would otherwise silently accept
-    /// unauthenticated plaintext. Intended for dev/test only — never set in
-    /// production.
-    pub mesh_allow_no_ca: bool,
     /// Path to the SPIRE Agent's Workload API Unix domain socket. Only used
     /// when `mesh_ca_backend` is `spire`.
     pub mesh_spire_agent_socket: String,
@@ -1690,7 +1683,6 @@ impl Default for EnvConfig {
             xds_stream_channel_capacity: 32,
             xds_max_streams_per_node: 4,
             mesh_ca_backend: "none".to_string(),
-            mesh_allow_no_ca: false,
             mesh_spire_agent_socket: "/run/spire/sockets/agent.sock".to_string(),
             mesh_cert_ttl_seconds: 3600,
             mesh_config_protocol: "native".to_string(),
@@ -2037,7 +2029,6 @@ impl EnvConfig {
             xds_stream_channel_capacity: usize = "FERRUM_XDS_STREAM_CHANNEL_CAPACITY" => 32usize;
             xds_max_streams_per_node: usize = "FERRUM_XDS_MAX_STREAMS_PER_NODE" => 4usize;
             mesh_ca_backend: String = "FERRUM_MESH_CA_BACKEND" => "none".to_string();
-            mesh_allow_no_ca: bool = "FERRUM_MESH_ALLOW_NO_CA" => false;
             mesh_spire_agent_socket: String = "FERRUM_MESH_SPIRE_AGENT_SOCKET" => "/run/spire/sockets/agent.sock".to_string();
             mesh_cert_ttl_seconds: u64 = "FERRUM_MESH_CERT_TTL_SECONDS" => 3600u64;
             mesh_config_protocol: String = "FERRUM_MESH_CONFIG_PROTOCOL" => "native".to_string();
@@ -2618,7 +2609,6 @@ impl EnvConfig {
             xds_stream_channel_capacity,
             xds_max_streams_per_node,
             mesh_ca_backend,
-            mesh_allow_no_ca,
             mesh_spire_agent_socket,
             mesh_cert_ttl_seconds,
             mesh_config_protocol,
@@ -3293,45 +3283,59 @@ impl EnvConfig {
                         Ok(backend) => backend,
                         Err(e) => return Err(format!("Invalid FERRUM_MESH_CA_BACKEND: {e}")),
                     };
-                // Security gate: a mesh with no CA backend has no workload
-                // identity and can neither establish nor verify mTLS, so
-                // PeerAuthentication's PERMISSIVE default would silently accept
-                // unauthenticated plaintext. This is the same class of insecure
-                // dev posture as the self-signed CA bootstrap and the static
-                // attestor, so it joins that guardrail family (see
-                // .claude/rules/tls-security.md): production mode refuses it
-                // unconditionally; otherwise it is fail-closed unless the
-                // operator explicitly acknowledges the dev/test-only posture.
-                if ca_backend == crate::identity::ca::CaBackend::None {
+                // A mesh has a workload identity if a CA backend issues SVIDs
+                // (`internal` / `spire`) OR file-based gateway SVID material is
+                // supplied (cert + key). Only a mesh with NO identity source at
+                // all hits the gate below — anything with an identity can
+                // establish/verify mTLS, so the PERMISSIVE default is safe.
+                let has_file_svid =
+                    self.gateway_svid_cert_path.is_some() && self.gateway_svid_key_path.is_some();
+                // Security gate: a no-identity mesh can neither establish nor
+                // verify mTLS, so PeerAuthentication's PERMISSIVE default would
+                // silently accept unauthenticated plaintext. This is the same
+                // class of insecure dev posture as the self-signed CA bootstrap
+                // and the static attestor, so it joins that guardrail family
+                // (see .claude/rules/tls-security.md). The production guard and
+                // the opt-out are BOTH read directly from the environment (not
+                // ferrum.conf / EnvConfig) so a config-file-only value can never
+                // make them disagree and silently re-open the posture.
+                if ca_backend == crate::identity::ca::CaBackend::None && !has_file_svid {
                     if crate::identity::production_mode() {
                         // Master prod guardrail: like bootstrap_dev_root and
                         // StaticAttestor, refuse unconditionally — the
                         // FERRUM_MESH_ALLOW_NO_CA dev opt-out does not apply.
                         return Err(
-                            "FERRUM_MESH_PRODUCTION_MODE=true with FERRUM_MESH_CA_BACKEND=none: a \
-                             production mesh has no workload identity and cannot establish or \
-                             verify mTLS. Configure a CA backend — FERRUM_MESH_CA_BACKEND=spire \
-                             (see docs/spire_deployment.md), or =internal with a provided root \
-                             (FERRUM_MESH_CA_CERT_PATH / FERRUM_MESH_CA_KEY_PATH)."
+                            "FERRUM_MESH_PRODUCTION_MODE=true with no mesh workload identity \
+                             (FERRUM_MESH_CA_BACKEND=none and no FERRUM_GATEWAY_SVID_CERT_PATH / \
+                             FERRUM_GATEWAY_SVID_KEY_PATH): a production mesh cannot establish or \
+                             verify mTLS. Configure a CA backend (FERRUM_MESH_CA_BACKEND=spire, \
+                             see docs/spire_deployment.md) or supply file-based gateway SVID \
+                             material."
                                 .into(),
                         );
                     }
-                    if self.mesh_allow_no_ca {
+                    // Env-only read, matching the rest of the guardrail family.
+                    let allow_no_ca = std::env::var("FERRUM_MESH_ALLOW_NO_CA")
+                        .map(|v| v.eq_ignore_ascii_case("true"))
+                        .unwrap_or(false);
+                    if allow_no_ca {
                         tracing::warn!(
-                            "FERRUM_MESH_ALLOW_NO_CA=true: mesh is starting WITHOUT a CA backend \
-                             (FERRUM_MESH_CA_BACKEND=none). Workload identity is disabled; the \
-                             sidecar cannot establish or verify mTLS and will accept \
-                             unauthenticated plaintext traffic. Dev/test only — set \
-                             FERRUM_MESH_PRODUCTION_MODE=true (with a CA backend) for production."
+                            "FERRUM_MESH_ALLOW_NO_CA=true: mesh is starting with NO workload \
+                             identity (FERRUM_MESH_CA_BACKEND=none and no gateway SVID material). \
+                             It cannot establish or verify mTLS and will accept unauthenticated \
+                             plaintext traffic. Dev/test only — set FERRUM_MESH_PRODUCTION_MODE=true \
+                             (with a CA backend or gateway SVID material) for production."
                         );
                     } else {
                         return Err(
-                            "FERRUM_MESH_CA_BACKEND=none in mesh mode: the mesh has no workload \
-                             identity and cannot establish or verify mTLS, so it would accept \
-                             unauthenticated plaintext traffic (PeerAuthentication defaults to \
-                             PERMISSIVE). Configure a CA backend (FERRUM_MESH_CA_BACKEND=spire or \
-                             internal), or, for dev/test only, acknowledge the insecure posture \
-                             with FERRUM_MESH_ALLOW_NO_CA=true."
+                            "mesh mode has no workload identity: FERRUM_MESH_CA_BACKEND=none and \
+                             no FERRUM_GATEWAY_SVID_CERT_PATH / FERRUM_GATEWAY_SVID_KEY_PATH. \
+                             Without identity the mesh cannot establish or verify mTLS, so it \
+                             would accept unauthenticated plaintext traffic (PeerAuthentication \
+                             defaults to PERMISSIVE). Configure a CA backend \
+                             (FERRUM_MESH_CA_BACKEND=spire or internal) or gateway SVID material, \
+                             or — for dev/test only — set the FERRUM_MESH_ALLOW_NO_CA=true \
+                             environment variable (not honored from ferrum.conf)."
                                 .into(),
                         );
                     }

@@ -5,9 +5,10 @@
 
 use ferrum_edge::config::{DbTlsMode, EnvConfig, OperatingMode};
 use ferrum_edge::ebpf::NodeAgentProxyMode;
-use std::sync::Mutex;
 
-static ENV_LOCK: Mutex<()> = Mutex::new(());
+// Shared process-wide env lock: serializes against the identity guardrail
+// tests that also mutate `FERRUM_MESH_PRODUCTION_MODE` (see tests/unit/env_lock.rs).
+use crate::unit::env_lock::ENV_LOCK;
 
 /// Helper to set env vars, run a closure, then clean them up.
 /// Holds a mutex to prevent concurrent env var mutations.
@@ -450,7 +451,6 @@ fn test_env_config_mesh_mode_no_ca_allowed_with_explicit_opt_out() {
             remove_var("FERRUM_MESH_CA_BACKEND");
             let config = EnvConfig::from_env().unwrap();
             assert_eq!(config.mode, OperatingMode::Mesh);
-            assert!(config.mesh_allow_no_ca);
         },
     );
 }
@@ -472,7 +472,6 @@ fn test_env_config_mesh_mode_internal_ca_passes_without_opt_out() {
             remove_var("FERRUM_MESH_ALLOW_NO_CA");
             let config = EnvConfig::from_env().unwrap();
             assert_eq!(config.mode, OperatingMode::Mesh);
-            assert!(!config.mesh_allow_no_ca);
         },
     );
 }
@@ -567,6 +566,32 @@ fn test_env_config_mesh_mode_production_mode_ignores_no_ca_opt_out() {
                 "production mode must refuse no-CA even with the opt-out set"
             );
             assert!(result.unwrap_err().contains("FERRUM_MESH_PRODUCTION_MODE"));
+        },
+    );
+}
+
+#[test]
+fn test_env_config_mesh_mode_no_ca_with_gateway_svid_passes() {
+    // File-based gateway SVID material is a workload identity independent of
+    // the CA backend, so a CA=none mesh that supplies it is NOT identity-less
+    // and must start without any opt-out — even though the CA backend is none.
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "mesh"),
+            ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+            (
+                "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                "secret-padding-for-32-char-min!!",
+            ),
+            ("FERRUM_GATEWAY_SVID_CERT_PATH", "/tmp/ferrum-svid.crt"),
+            ("FERRUM_GATEWAY_SVID_KEY_PATH", "/tmp/ferrum-svid.key"),
+        ],
+        || {
+            remove_var("FERRUM_MESH_PRODUCTION_MODE");
+            remove_var("FERRUM_MESH_CA_BACKEND");
+            remove_var("FERRUM_MESH_ALLOW_NO_CA");
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.mode, OperatingMode::Mesh);
         },
     );
 }
