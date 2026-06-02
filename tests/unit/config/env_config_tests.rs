@@ -341,9 +341,10 @@ fn test_env_config_mesh_mode_valid() {
                 "FERRUM_CP_DP_GRPC_JWT_SECRET",
                 "secret-padding-for-32-char-min!!",
             ),
-            // A real CA backend keeps this a valid prod-like mesh config; the
-            // no-CA posture is exercised separately by the gate tests below.
-            ("FERRUM_MESH_CA_BACKEND", "internal"),
+            // The CA backend does not load a runtime SVID yet, so a valid mesh
+            // config needs actual identity or the dev opt-out; the gate itself
+            // is exercised by the tests below.
+            ("FERRUM_MESH_ALLOW_NO_CA", "true"),
         ],
         || {
             let config = EnvConfig::from_env().unwrap();
@@ -456,8 +457,11 @@ fn test_env_config_mesh_mode_no_ca_allowed_with_explicit_opt_out() {
 }
 
 #[test]
-fn test_env_config_mesh_mode_internal_ca_passes_without_opt_out() {
-    // A configured CA backend provides workload identity, so the gate is inert.
+fn test_env_config_mesh_mode_ca_backend_without_svid_is_refused() {
+    // A CA backend value alone (e.g. `internal`) does NOT load a runtime SVID
+    // today (it is parsed/validated but not wired to the data plane), so with
+    // no gateway SVID material and no opt-out the mesh has no identity and must
+    // fail closed.
     with_env_vars(
         &[
             ("FERRUM_MODE", "mesh"),
@@ -469,15 +473,27 @@ fn test_env_config_mesh_mode_internal_ca_passes_without_opt_out() {
             ("FERRUM_MESH_CA_BACKEND", "internal"),
         ],
         || {
+            remove_var("FERRUM_MESH_PRODUCTION_MODE");
             remove_var("FERRUM_MESH_ALLOW_NO_CA");
-            let config = EnvConfig::from_env().unwrap();
-            assert_eq!(config.mode, OperatingMode::Mesh);
+            remove_var("FERRUM_GATEWAY_SVID_CERT_PATH");
+            remove_var("FERRUM_GATEWAY_SVID_KEY_PATH");
+            remove_var("FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH");
+            let result = EnvConfig::from_env();
+            assert!(
+                result.is_err(),
+                "a CA backend without gateway SVID material has no runtime identity"
+            );
+            assert!(result.unwrap_err().contains("FERRUM_MESH_ALLOW_NO_CA"));
         },
     );
 }
 
 #[test]
-fn test_env_config_mesh_mode_spire_ca_passes_without_opt_out() {
+fn test_env_config_mesh_mode_spire_without_svid_refused_in_production() {
+    // The documented production command
+    // `FERRUM_MESH_PRODUCTION_MODE=true FERRUM_MESH_CA_BACKEND=spire` must NOT
+    // start without gateway SVID material: the CA backend does not yet load an
+    // SVID into the data plane, so there is no runtime identity.
     with_env_vars(
         &[
             ("FERRUM_MODE", "mesh"),
@@ -487,11 +503,16 @@ fn test_env_config_mesh_mode_spire_ca_passes_without_opt_out() {
                 "secret-padding-for-32-char-min!!",
             ),
             ("FERRUM_MESH_CA_BACKEND", "spire"),
+            ("FERRUM_MESH_PRODUCTION_MODE", "true"),
         ],
         || {
             remove_var("FERRUM_MESH_ALLOW_NO_CA");
-            let config = EnvConfig::from_env().unwrap();
-            assert_eq!(config.mode, OperatingMode::Mesh);
+            remove_var("FERRUM_GATEWAY_SVID_CERT_PATH");
+            remove_var("FERRUM_GATEWAY_SVID_KEY_PATH");
+            remove_var("FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH");
+            let result = EnvConfig::from_env();
+            assert!(result.is_err());
+            assert!(result.unwrap_err().contains("FERRUM_MESH_PRODUCTION_MODE"));
         },
     );
 }
@@ -585,6 +606,10 @@ fn test_env_config_mesh_mode_no_ca_with_gateway_svid_passes() {
             ),
             ("FERRUM_GATEWAY_SVID_CERT_PATH", "/tmp/ferrum-svid.crt"),
             ("FERRUM_GATEWAY_SVID_KEY_PATH", "/tmp/ferrum-svid.key"),
+            (
+                "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+                "/tmp/ferrum-svid-bundle.pem",
+            ),
         ],
         || {
             remove_var("FERRUM_MESH_PRODUCTION_MODE");
@@ -592,6 +617,36 @@ fn test_env_config_mesh_mode_no_ca_with_gateway_svid_passes() {
             remove_var("FERRUM_MESH_ALLOW_NO_CA");
             let config = EnvConfig::from_env().unwrap();
             assert_eq!(config.mode, OperatingMode::Mesh);
+        },
+    );
+}
+
+#[test]
+fn test_env_config_mesh_mode_production_mode_accepts_numeric_one() {
+    // FERRUM_MESH_PRODUCTION_MODE=1 must be honored (same truthy spelling as
+    // EnvConfig bools), so the opt-out cannot re-open the no-identity posture.
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "mesh"),
+            ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+            (
+                "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                "secret-padding-for-32-char-min!!",
+            ),
+            ("FERRUM_MESH_PRODUCTION_MODE", "1"),
+            ("FERRUM_MESH_ALLOW_NO_CA", "true"),
+        ],
+        || {
+            remove_var("FERRUM_MESH_CA_BACKEND");
+            remove_var("FERRUM_GATEWAY_SVID_CERT_PATH");
+            remove_var("FERRUM_GATEWAY_SVID_KEY_PATH");
+            remove_var("FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH");
+            let result = EnvConfig::from_env();
+            assert!(
+                result.is_err(),
+                "PRODUCTION_MODE=1 must be treated as production and ignore the opt-out"
+            );
+            assert!(result.unwrap_err().contains("FERRUM_MESH_PRODUCTION_MODE"));
         },
     );
 }

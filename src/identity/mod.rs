@@ -49,7 +49,13 @@ pub use spiffe::{SpiffeId, SpiffeIdError, TrustDomain, TrustDomainError};
 /// must not be collapsed (see `.claude/rules/tls-security.md`).
 pub fn production_mode() -> bool {
     std::env::var("FERRUM_MESH_PRODUCTION_MODE")
-        .map(|v| v.eq_ignore_ascii_case("true"))
+        .map(|v| {
+            // Accept the same truthy spellings as `EnvConfig`'s bool parser
+            // (`true` / `1`, case-insensitive) so a guardrail can't be bypassed
+            // by a common boolean form.
+            let v = v.trim();
+            v.eq_ignore_ascii_case("true") || v == "1"
+        })
         .unwrap_or(false)
 }
 
