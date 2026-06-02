@@ -162,6 +162,70 @@ fn vs_cors_policy_regex_origin_not_projected() {
     );
 }
 
+/// VS `spec.tls[]` L4 routing → passthrough TCP stream proxy keyed by SNI
+/// (encrypted bytes forwarded, no TLS termination), reusing the gateway /
+/// east-west stream + SNI machinery.
+#[test]
+fn vs_tls_l4_sni_passthrough() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "spec.tls[] SNI L4 routing",
+        status = Status::Supported,
+        notes = "Passthrough TCP proxy keyed by sniHosts. Unsupported matches (sourceLabels/subnets/gateways) and weighted splitting fail closed.",
+    );
+    let result = translate_k8s_objects(
+        &[virtual_service(json!({
+            "hosts": ["tls.example.com"],
+            "tls": [{
+                "match": [{"sniHosts": ["secure.example.com"], "port": 8443}],
+                "route": [{"destination": {"host": "backend.default.svc.cluster.local", "port": {"number": 8443}}}]
+            }]
+        }))],
+        options(),
+    )
+    .expect("tls[] L4 translates");
+    let proxy = result
+        .config
+        .proxies
+        .iter()
+        .find(|p| p.listen_port == Some(8443))
+        .expect("tls[] materializes a passthrough proxy");
+    assert!(proxy.passthrough, "tls[] SNI routing is passthrough");
+    assert_eq!(proxy.hosts, vec!["secure.example.com".to_string()]);
+    assert_eq!(proxy.backend_host, "backend.default.svc.cluster.local");
+}
+
+/// VS `spec.tcp[]` L4 routing → plain TCP stream proxy keyed by `listen_port`.
+#[test]
+fn vs_tcp_l4_port_routing() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "spec.tcp[] L4 routing",
+        status = Status::Supported,
+        notes = "Plain TCP proxy keyed by listen_port. Unsupported matches (sourceLabels/subnets/gateways) and weighted splitting fail closed.",
+    );
+    let result = translate_k8s_objects(
+        &[virtual_service(json!({
+            "hosts": ["db.example.com"],
+            "tcp": [{
+                "match": [{"port": 3306}],
+                "route": [{"destination": {"host": "mysql.default.svc.cluster.local", "port": {"number": 3306}}}]
+            }]
+        }))],
+        options(),
+    )
+    .expect("tcp[] L4 translates");
+    let proxy = result
+        .config
+        .proxies
+        .iter()
+        .find(|p| p.listen_port == Some(3306))
+        .expect("tcp[] materializes a stream proxy");
+    assert!(!proxy.passthrough, "plain tcp[] is not passthrough");
+    assert_eq!(proxy.backend_host, "mysql.default.svc.cluster.local");
+    assert_eq!(proxy.backend_port, 3306);
+}
+
 /// VS predicate: `uri.exact`. The translator collapses this onto a single
 /// proxy with an exact-listen-path (`=/path`) match and no dispatch plugin —
 /// classical Ferrum routing handles it. The conformance assertion is that

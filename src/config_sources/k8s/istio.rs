@@ -2192,47 +2192,209 @@ fn dispatch_rules_carry_transform(dispatch_rules: &[Value], field: &str) -> bool
     })
 }
 
+/// Reject the L4 (`tcp[]`/`tls[]`) match predicates Ferrum's stream layer cannot
+/// express. A stream proxy routes by `listen_port` (plus SNI for passthrough
+/// TLS) and has no source-identity or CIDR matching, so silently dropping these
+/// would mis-route — fail closed instead. `sniHosts`/`port` are consumed by the
+/// caller.
+fn reject_unsupported_l4_match(
+    object: &K8sObject,
+    m: &Value,
+    kind: &str,
+) -> Result<(), K8sTranslateError> {
+    for field in [
+        "sourceLabels",
+        "sourceSubnets",
+        "destinationSubnets",
+        "gateways",
+        "sourceNamespace",
+    ] {
+        if m.get(field).is_some() {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "VirtualService {kind}[] match.{field} is not supported (Ferrum stream routing keys on port{} only); remove it or model the route as an explicit stream Proxy",
+                    if kind == "tls" { " and SNI" } else { "" }
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Resolve the single backend `(host, port)` of an L4 route block. Weighted
+/// multi-destination L4 splitting is rejected fail-closed: a Ferrum stream proxy
+/// forwards to one backend, so splitting would need an upstream-backed stream
+/// proxy (a separate feature) rather than being silently collapsed to one leg.
+fn l4_route_destination(
+    object: &K8sObject,
+    block: &Value,
+    kind: &str,
+    acc: &K8sAccumulator,
+) -> Result<(String, u16), K8sTranslateError> {
+    let routes = block
+        .get("route")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            invalid_resource(
+                object,
+                format!("VirtualService {kind}[] block requires a route destination"),
+            )
+        })?;
+    if routes.len() > 1 {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "VirtualService {kind}[] weighted multi-destination splitting is not supported; use a single destination"
+            ),
+        ));
+    }
+    let dest = routes
+        .first()
+        .and_then(|r| r.get("destination"))
+        .ok_or_else(|| {
+            invalid_resource(
+                object,
+                format!("VirtualService {kind}[] route requires a destination"),
+            )
+        })?;
+    let host = string_field(dest, "host").ok_or_else(|| {
+        invalid_resource(
+            object,
+            format!("VirtualService {kind}[] route.destination.host is required"),
+        )
+    })?;
+    let port = resolve_destination_port(object, dest, host, acc)?.ok_or_else(|| {
+        invalid_resource(
+            object,
+            format!(
+                "VirtualService {kind}[] route.destination.port is required for stream routing"
+            ),
+        )
+    })?;
+    Ok((host.to_string(), port))
+}
+
+/// Translate VirtualService L4 routes into Ferrum stream proxies, reusing the
+/// same stream + SNI machinery as gateway / east-west passthrough:
+///   - `spec.tls[]` → a **passthrough** TCP proxy keyed by SNI (`hosts =
+///     match.sniHosts`), forwarding the encrypted bytes to the destination (no
+///     TLS termination).
+///   - `spec.tcp[]` → a plain TCP proxy keyed by `listen_port`.
+///
+/// `match.port` selects the listen port (falling back to the destination port
+/// when omitted). Unsupported match predicates (source-identity / CIDR /
+/// gateways) and weighted splitting fail closed via the helpers above.
+fn virtual_service_l4_proxies(
+    object: &K8sObject,
+    acc: &K8sAccumulator,
+) -> Result<Vec<Proxy>, K8sTranslateError> {
+    let namespace = &object.metadata.namespace;
+    let vs_name = &object.metadata.name;
+    let mut proxies = Vec::new();
+
+    if let Some(blocks) = object.spec.get("tls").and_then(Value::as_array) {
+        for (bi, block) in blocks.iter().enumerate() {
+            let (backend_host, backend_port) = l4_route_destination(object, block, "tls", acc)?;
+            let matches = block
+                .get("match")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    invalid_resource(
+                        object,
+                        "VirtualService tls[] route requires a match with sniHosts",
+                    )
+                })?;
+            for (mi, m) in matches.iter().enumerate() {
+                reject_unsupported_l4_match(object, m, "tls")?;
+                let sni_hosts = string_array(m, "sniHosts");
+                if sni_hosts.is_empty() {
+                    return Err(invalid_resource(
+                        object,
+                        "VirtualService tls[] match requires sniHosts for SNI routing",
+                    ));
+                }
+                let listen_port = optional_port_field(object, m.get("port"), "tls[].match.port")?
+                    .unwrap_or(backend_port);
+                let mut proxy = super::proxy_for_route(super::RouteProxySpec {
+                    id: format!("__istio-vs-tls-{namespace}-{vs_name}-{bi}-{mi}")
+                        .replace(['/', '.'], "-"),
+                    namespace: namespace.clone(),
+                    hosts: sni_hosts,
+                    listen_path: None,
+                    strip_listen_path: false,
+                    backend_host: backend_host.clone(),
+                    backend_port,
+                    upstream_id: None,
+                    backend_scheme: crate::config::types::BackendScheme::Tcp,
+                    listen_port: Some(listen_port),
+                    retry: None,
+                    backend_read_timeout_ms: None,
+                });
+                proxy.passthrough = true;
+                proxies.push(proxy);
+            }
+        }
+    }
+
+    if let Some(blocks) = object.spec.get("tcp").and_then(Value::as_array) {
+        for (bi, block) in blocks.iter().enumerate() {
+            let (backend_host, backend_port) = l4_route_destination(object, block, "tcp", acc)?;
+            let listen_ports: Vec<u16> = match block.get("match").and_then(Value::as_array) {
+                Some(ms) if !ms.is_empty() => {
+                    let mut ports = Vec::with_capacity(ms.len());
+                    for m in ms {
+                        reject_unsupported_l4_match(object, m, "tcp")?;
+                        if m.get("sniHosts").is_some() {
+                            return Err(invalid_resource(
+                                object,
+                                "VirtualService tcp[] match must not set sniHosts; use tls[] for SNI routing",
+                            ));
+                        }
+                        ports.push(
+                            optional_port_field(object, m.get("port"), "tcp[].match.port")?
+                                .unwrap_or(backend_port),
+                        );
+                    }
+                    ports
+                }
+                _ => vec![backend_port],
+            };
+            for (mi, port) in listen_ports.into_iter().enumerate() {
+                let proxy = super::proxy_for_route(super::RouteProxySpec {
+                    id: format!("__istio-vs-tcp-{namespace}-{vs_name}-{bi}-{mi}")
+                        .replace(['/', '.'], "-"),
+                    namespace: namespace.clone(),
+                    hosts: Vec::new(),
+                    listen_path: None,
+                    strip_listen_path: false,
+                    backend_host: backend_host.clone(),
+                    backend_port,
+                    upstream_id: None,
+                    backend_scheme: crate::config::types::BackendScheme::Tcp,
+                    listen_port: Some(port),
+                    retry: None,
+                    backend_read_timeout_ms: None,
+                });
+                proxies.push(proxy);
+            }
+        }
+    }
+
+    Ok(proxies)
+}
+
 fn virtual_service_routes(
     object: &K8sObject,
     acc: &mut K8sAccumulator,
 ) -> Result<VsRouteResult, K8sTranslateError> {
-    // L4 routing (`spec.tcp[]` SNI/port → destination and `spec.tls[]` SNI →
-    // destination) is not yet materialized into Ferrum stream/SNI proxies.
-    // FAIL CLOSED rather than silently dropping these routes: a VirtualService
-    // that relies on L4 routing must not appear to translate cleanly while its
-    // TCP/TLS traffic is blackholed. Surface a warning for operator visibility
-    // and reject the resource (consistent with how EnvoyFilter is rejected).
-    let tcp_routes = object.spec.get("tcp").and_then(Value::as_array);
-    let tls_routes = object.spec.get("tls").and_then(Value::as_array);
-    let has_tcp = tcp_routes.is_some_and(|r| !r.is_empty());
-    let has_tls = tls_routes.is_some_and(|r| !r.is_empty());
-    if has_tcp || has_tls {
-        let mut kinds = Vec::with_capacity(2);
-        if has_tcp {
-            kinds.push("spec.tcp");
-        }
-        if has_tls {
-            kinds.push("spec.tls");
-        }
-        let kinds = kinds.join(" / ");
-        acc.warnings.push(format!(
-            "VirtualService '{}/{}' declares L4 routes ({}); Ferrum does not yet materialize \
-             VirtualService L4 (TCP/TLS-SNI) routing and fails closed rather than silently \
-             dropping them. Model L4 routing with an explicit stream Proxy / east-west gateway \
-             SNI passthrough instead.",
-            object.metadata.namespace, object.metadata.name, kinds
-        ));
-        return Err(invalid_resource(
-            object,
-            format!(
-                "VirtualService L4 routing ({kinds}) is not supported; remove the L4 routes or \
-                 model them as a stream Proxy. Failing closed to avoid silently dropping L4 traffic."
-            ),
-        ));
-    }
-
+    // L4 routing: `spec.tls[]` (SNI passthrough) and `spec.tcp[]` (port) are
+    // materialized into Ferrum stream proxies below, reusing the gateway /
+    // east-west stream + SNI machinery. Match predicates Ferrum's stream layer
+    // cannot express (source-identity / CIDR / gateways) and weighted splitting
+    // fail closed inside `virtual_service_l4_proxies`.
     let hosts = string_array(&object.spec, "hosts");
-    let mut proxies = Vec::new();
+    let mut proxies = virtual_service_l4_proxies(object, acc)?;
     let mut upstreams = Vec::new();
     let mut plugins = Vec::new();
     let mut deferred_uri_less_proxies = Vec::new();
@@ -7884,8 +8046,8 @@ extensionProviders:
     }
 
     #[test]
-    fn virtual_service_tcp_route_fails_closed() {
-        let err = translate_k8s_objects(
+    fn virtual_service_tcp_route_materializes_stream_proxy() {
+        let result = translate_k8s_objects(
             &[object(
                 "VirtualService",
                 serde_json::json!({
@@ -7898,13 +8060,29 @@ extensionProviders:
             )],
             options(),
         )
-        .expect_err("VirtualService L4 tcp routing must fail closed");
-        assert!(format!("{err}").contains("L4 routing"), "got: {err}");
+        .expect("VirtualService L4 tcp routing now translates to a stream proxy");
+        let proxy = result
+            .config
+            .proxies
+            .iter()
+            .find(|p| p.listen_port == Some(3306))
+            .expect("tcp[] materializes a stream proxy on the matched port");
+        assert_eq!(proxy.backend_host, "mysql.default.svc.cluster.local");
+        assert_eq!(proxy.backend_port, 3306);
+        assert_eq!(
+            proxy.backend_scheme,
+            Some(crate::config::types::BackendScheme::Tcp)
+        );
+        assert!(!proxy.passthrough, "plain tcp[] is not passthrough");
+        assert!(
+            proxy.listen_path.is_none(),
+            "stream proxy has no listen_path"
+        );
     }
 
     #[test]
-    fn virtual_service_tls_route_fails_closed() {
-        let err = translate_k8s_objects(
+    fn virtual_service_tls_route_materializes_passthrough_proxy() {
+        let result = translate_k8s_objects(
             &[object(
                 "VirtualService",
                 serde_json::json!({
@@ -7917,8 +8095,18 @@ extensionProviders:
             )],
             options(),
         )
-        .expect_err("VirtualService L4 tls routing must fail closed");
-        assert!(format!("{err}").contains("spec.tls"), "got: {err}");
+        .expect("VirtualService L4 tls routing now translates to a passthrough proxy");
+        // No match.port → listen port falls back to the destination port (443).
+        let proxy = result
+            .config
+            .proxies
+            .iter()
+            .find(|p| p.listen_port == Some(443))
+            .expect("tls[] materializes a passthrough proxy");
+        assert!(proxy.passthrough, "tls[] SNI routing is passthrough");
+        assert_eq!(proxy.hosts, vec!["secure.example.com".to_string()]);
+        assert_eq!(proxy.backend_host, "backend.default.svc.cluster.local");
+        assert_eq!(proxy.backend_port, 443);
     }
 
     // -- VirtualService fault injection / retry / timeout ----------------

@@ -16,10 +16,11 @@
 //!   (UNSET → PERMISSIVE in Istio) and surfaces port-level overrides.
 //! - `DestinationRule` — status reports whether the rule's host could be
 //!   matched and which `connectionPool` knobs landed vs. were deferred.
-//! - `VirtualService` — status reports host/HTTP-route counts. `tcp`/`tls`
-//!   route blocks are rejected fail-closed (reported as `Invalid`); HTTP
-//!   `mirror`/`rewrite`/`redirect` are translated; only `corsPolicy` is
-//!   flagged as a deferred field.
+//! - `VirtualService` — status reports host/HTTP-route counts. `tcp`/`tls` L4
+//!   route blocks are translated to stream proxies (port / SNI-passthrough);
+//!   HTTP `mirror`/`rewrite`/`redirect`/`corsPolicy` are translated. Unsupported
+//!   L4 match predicates (source/CIDR/gateways) and weighted splitting are
+//!   rejected fail-closed (`Invalid`).
 //! - `ServiceEntry` — status reports the resolved `resolution`/`location`
 //!   and host/endpoint/port counts.
 //! - `RequestAuthentication` — status reports the resolved scope and the
@@ -713,11 +714,11 @@ fn accepted_status(
 }
 
 /// Status for `VirtualService`. The translator consumes `spec.http` routes
-/// including `mirror` / `rewrite` / `redirect`. `spec.tcp` / `spec.tls`
-/// route blocks are rejected fail-closed and surface through the `Invalid`
-/// arm (as does any `K8sTranslateError` for an unsupported match predicate,
-/// bad backend, etc.). The only HTTP-route field still parsed-but-dropped is
-/// `corsPolicy`, surfaced as a deferred field.
+/// (incl. `mirror` / `rewrite` / `redirect` / `corsPolicy`) and `spec.tcp` /
+/// `spec.tls` L4 route blocks (translated to stream proxies: port / SNI
+/// passthrough). Unsupported L4 match predicates / weighted splitting and any
+/// other `K8sTranslateError` (bad backend, etc.) surface through the `Invalid`
+/// arm. `corsPolicy` with prefix/regex origins is the remaining deferred field.
 fn virtual_service_status(
     object: &K8sObject,
     result: Result<&K8sTranslation, &K8sTranslateError>,
@@ -774,14 +775,15 @@ fn virtual_service_status(
 
 /// VirtualService HTTP-route fields the translator parses past but never
 /// projects. `tcp` / `tls` route arrays are not listed here: they are
-/// rejected fail-closed by the translator and reported via the `Invalid`
-/// status arm. `corsPolicy` is now translated to a `cors` plugin when its
-/// origins are representable; it is deferred only when they are not.
+/// translated to stream proxies (unsupported matches / weighted splitting
+/// surface via the `Invalid` arm, not as deferred). `corsPolicy` is translated
+/// to a `cors` plugin when its origins are representable; it is deferred only
+/// when they are not.
 fn virtual_service_deferred_fields(spec: &Value) -> Vec<&'static str> {
     let mut deferred: Vec<&'static str> = Vec::new();
     // `spec.tcp[]` / `spec.tls[]` are NOT listed as deferred: the translator
-    // rejects them fail-closed with a `K8sTranslateError`, so they surface
-    // through the `Invalid` arm of `virtual_service_status`. `mirror` /
+    // materializes them as stream proxies, and unsupported matches surface via
+    // the `Invalid` arm of `virtual_service_status`. `mirror` /
     // `mirrorPercentage` / `redirect` / `rewrite` are translated, and
     // `corsPolicy` is translated to a proxy-scoped `cors` plugin when its
     // origins are representable (allowOrigins[].exact / legacy allowOrigin and
@@ -1969,16 +1971,21 @@ mod tests {
     }
 
     #[test]
-    fn virtual_service_tcp_routes_are_rejected() {
-        // Tier 3 makes `spec.tcp[]` / `spec.tls[]` fail-closed translator
-        // errors rather than silently-dropped (deferred) fields.
+    fn virtual_service_tcp_unsupported_match_rejected() {
+        // `spec.tcp[]` / `spec.tls[]` are translated to Ferrum stream proxies
+        // (port / SNI-passthrough routing), but match predicates the stream
+        // layer cannot express (here `sourceLabels`) fail closed as `Invalid`
+        // rather than mis-routing.
         let obj = object(
             "networking.istio.io/v1",
             "VirtualService",
             "tcp-vs",
             json!({
                 "hosts": ["db.default.svc.cluster.local"],
-                "tcp": [ { "route": [ { "destination": { "host": "db.default.svc.cluster.local" } } ] } ]
+                "tcp": [ {
+                    "match": [ { "port": 3306, "sourceLabels": { "app": "billing" } } ],
+                    "route": [ { "destination": { "host": "db.default.svc.cluster.local", "port": { "number": 3306 } } } ]
+                } ]
             }),
         );
         let updates = plan_istio_status_updates(&[obj], options());
@@ -1991,9 +1998,33 @@ mod tests {
         let detail = updates[0].ferrum_detail.as_ref().unwrap();
         let error = detail["translation"]["error"].as_str().unwrap();
         assert!(
-            error.contains("tcp"),
-            "rejection error should mention tcp, got: {error}"
+            error.contains("sourceLabels"),
+            "rejection error should mention the unsupported match, got: {error}"
         );
+    }
+
+    #[test]
+    fn virtual_service_supported_tcp_route_is_accepted() {
+        // A plain port-routed `spec.tcp[]` block translates to a stream proxy
+        // and is accepted.
+        let obj = object(
+            "networking.istio.io/v1",
+            "VirtualService",
+            "tcp-ok-vs",
+            json!({
+                "hosts": ["db.default.svc.cluster.local"],
+                "tcp": [ {
+                    "match": [ { "port": 3306 } ],
+                    "route": [ { "destination": { "host": "db.default.svc.cluster.local", "port": { "number": 3306 } } } ]
+                } ]
+            }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options());
+        let c = find_condition(
+            updates[0].status["conditions"].as_array().unwrap(),
+            "FerrumAccepted",
+        );
+        assert_eq!(c["status"].as_str(), Some("True"));
     }
 
     #[test]
