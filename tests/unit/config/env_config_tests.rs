@@ -652,6 +652,36 @@ fn test_env_config_mesh_mode_production_mode_accepts_numeric_one() {
 }
 
 #[test]
+fn test_env_config_mesh_mode_rejects_malformed_production_mode() {
+    // A typo in the production flag must fail loudly (matching EnvConfig bool
+    // parsing), not silently fall through to the non-production posture.
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "mesh"),
+            ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+            (
+                "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                "secret-padding-for-32-char-min!!",
+            ),
+            ("FERRUM_MESH_PRODUCTION_MODE", "yes"),
+            ("FERRUM_MESH_ALLOW_NO_CA", "true"),
+        ],
+        || {
+            remove_var("FERRUM_MESH_CA_BACKEND");
+            remove_var("FERRUM_GATEWAY_SVID_CERT_PATH");
+            remove_var("FERRUM_GATEWAY_SVID_KEY_PATH");
+            remove_var("FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH");
+            let result = EnvConfig::from_env();
+            assert!(result.is_err());
+            assert!(
+                result.unwrap_err().contains("FERRUM_MESH_PRODUCTION_MODE"),
+                "a malformed production flag must be rejected loudly"
+            );
+        },
+    );
+}
+
+#[test]
 fn test_env_config_mesh_mode_blank_gateway_svid_paths_are_not_identity() {
     // Empty / whitespace SVID paths (`Some("")`) provide no usable cert/key, so
     // they must NOT satisfy the identity check — production mode must still

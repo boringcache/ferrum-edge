@@ -3298,6 +3298,19 @@ impl EnvConfig {
                 {
                     return Err(format!("Invalid FERRUM_MESH_CA_BACKEND: {e}"));
                 }
+                // Validate the production-mode flag value loudly — like
+                // `EnvConfig`'s bool parser — so a typo (e.g. `tru` / `yes`)
+                // can't silently fall through to the non-production posture and
+                // let the dev opt-out re-open the no-identity gate.
+                if let Ok(raw) = std::env::var("FERRUM_MESH_PRODUCTION_MODE") {
+                    let v = raw.trim().to_ascii_lowercase();
+                    if !matches!(v.as_str(), "" | "true" | "false" | "1" | "0") {
+                        return Err(format!(
+                            "Invalid FERRUM_MESH_PRODUCTION_MODE value '{raw}'. \
+                             Expected true, false, 1, or 0"
+                        ));
+                    }
+                }
                 // The running mesh's workload identity comes only from file-based
                 // gateway SVID material today (all three FERRUM_GATEWAY_SVID_*
                 // paths, loaded together by `load_gateway_svid_bundle`). Blank
@@ -3315,6 +3328,16 @@ impl EnvConfig {
                 // the opt-out are BOTH read directly from the environment (not
                 // ferrum.conf / EnvConfig) so a config-file-only value can never
                 // make them disagree and silently re-open the posture.
+                //
+                // LIMITATION (tracked in #1523): this is a config-time *presence*
+                // check. It does NOT verify the SVID files actually load, nor
+                // that the inbound listener will present a server cert / require
+                // mTLS at runtime — `build_mesh_inbound_spiffe_slot` turns load
+                // failures into `None` and `load_mesh_frontend_tls` returns `None`
+                // under PERMISSIVE with no frontend identity, so a listener can
+                // still come up plaintext. Making that runtime path fail closed in
+                // production (and wiring the CA backend to issue SVIDs) is the
+                // robust follow-up.
                 if !has_workload_identity {
                     if crate::identity::production_mode() {
                         // Master prod guardrail: like bootstrap_dev_root and
