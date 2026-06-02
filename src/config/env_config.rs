@@ -3288,8 +3288,14 @@ impl EnvConfig {
                 // supplied (cert + key). Only a mesh with NO identity source at
                 // all hits the gate below — anything with an identity can
                 // establish/verify mTLS, so the PERMISSIVE default is safe.
-                let has_file_svid =
-                    self.gateway_svid_cert_path.is_some() && self.gateway_svid_key_path.is_some();
+                // Blank/whitespace paths (`Some("")`, e.g. an env var set to an
+                // empty string) provide no usable cert/key, so they do NOT count
+                // as identity — otherwise the gate could be skipped with no real
+                // SVID material, even in production mode.
+                let svid_path_set =
+                    |p: &Option<String>| p.as_deref().is_some_and(|s| !s.trim().is_empty());
+                let has_file_svid = svid_path_set(&self.gateway_svid_cert_path)
+                    && svid_path_set(&self.gateway_svid_key_path);
                 // Security gate: a no-identity mesh can neither establish nor
                 // verify mTLS, so PeerAuthentication's PERMISSIVE default would
                 // silently accept unauthenticated plaintext. This is the same

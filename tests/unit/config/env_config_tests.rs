@@ -597,6 +597,36 @@ fn test_env_config_mesh_mode_no_ca_with_gateway_svid_passes() {
 }
 
 #[test]
+fn test_env_config_mesh_mode_blank_gateway_svid_paths_are_not_identity() {
+    // Empty / whitespace SVID paths (`Some("")`) provide no usable cert/key, so
+    // they must NOT satisfy the identity check — production mode must still
+    // refuse the identity-less posture.
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "mesh"),
+            ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+            (
+                "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                "secret-padding-for-32-char-min!!",
+            ),
+            ("FERRUM_GATEWAY_SVID_CERT_PATH", ""),
+            ("FERRUM_GATEWAY_SVID_KEY_PATH", "   "),
+            ("FERRUM_MESH_PRODUCTION_MODE", "true"),
+        ],
+        || {
+            remove_var("FERRUM_MESH_CA_BACKEND");
+            remove_var("FERRUM_MESH_ALLOW_NO_CA");
+            let result = EnvConfig::from_env();
+            assert!(
+                result.is_err(),
+                "blank SVID paths must not count as identity; production mode must refuse"
+            );
+            assert!(result.unwrap_err().contains("FERRUM_MESH_PRODUCTION_MODE"));
+        },
+    );
+}
+
+#[test]
 fn test_env_config_cp_mode_missing_grpc_listen() {
     with_env_vars(
         &[
