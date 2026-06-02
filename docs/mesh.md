@@ -1542,6 +1542,8 @@ Both gates must agree before a self-signed root is minted: `FERRUM_MESH_CA_BOOTS
 
 For production mesh identity, run the SPIRE Agent backend (`FERRUM_MESH_CA_BACKEND=spire_agent`) so SVID issuance and trust-bundle distribution are anchored to a separately operated trust root. There is no `FERRUM_MESH_CA_CERT_PATH` / `FERRUM_MESH_CA_KEY_PATH` env var today — those names appear only in the bootstrap helper's refusal message as guidance for a future externally-provided-root path and are not currently read by any code path.
 
+**No-CA startup gate.** A third member of this guardrail family is enforced at config-validation time rather than inside the identity helpers. Running `mesh` mode with `FERRUM_MESH_CA_BACKEND=none` means the data plane has no workload identity and can neither present nor verify an mTLS peer certificate, so PeerAuthentication's PERMISSIVE default would silently accept unauthenticated plaintext. `EnvConfig` validation therefore **fails startup closed** in that configuration unless the operator sets `FERRUM_MESH_ALLOW_NO_CA=true` to acknowledge the dev/test-only posture (a loud `warn!` is logged when it does start that way). As with the other shortcuts, `FERRUM_MESH_PRODUCTION_MODE=true` refuses `none` **unconditionally** — the opt-out is ignored — so a production mesh can never come up without identity. Configure a real CA backend (`spire`, or `internal` with a provided root) instead.
+
 ## Node Agent Mode
 
 `FERRUM_MODE=node_agent` runs a per-node DaemonSet agent that manages eBPF-based traffic capture for mesh sidecars. The node agent replaces the per-pod privileged init container used by iptables capture mode, providing lower-privilege pod injection and centralized capture management. The node-agent/proxy ABI is documented in [node_agent.md](node_agent.md).
@@ -1939,6 +1941,7 @@ Mesh-specific environment variables are listed below. For the full reference of 
 | `FERRUM_MESH_PRODUCTION_MODE` | `false` | Master production guardrail. When `true`, the dev-only self-signed CA bootstrap and the dev-only static attestor are refused unconditionally. Read directly by the identity helpers (not parsed into `EnvConfig`). Set in every production deployment. See [Internal Dev CA and Production Guardrails](#internal-dev-ca-and-production-guardrails) |
 | `FERRUM_MESH_CA_BOOTSTRAP_DEV` | `false` | Dev-only opt-in to mint a self-signed mesh root for the `internal` CA backend. The bootstrap helper refuses unless this is `true` **and** `FERRUM_MESH_PRODUCTION_MODE` is not `true`. Lab/test only |
 | `FERRUM_MESH_ALLOW_STATIC_ID` | `false` | Dev-only opt-in for the `StaticAttestor` (hard-coded SPIFFE ID for any peer). Refused unless `true` and `FERRUM_MESH_PRODUCTION_MODE` is not `true`. Lab/test only |
+| `FERRUM_MESH_ALLOW_NO_CA` | `false` | Dev/test opt-in to start `mesh` mode with `FERRUM_MESH_CA_BACKEND=none`. Without it, a no-CA mesh fails startup closed (no identity ⇒ no mTLS ⇒ PERMISSIVE accepts plaintext). Refused unconditionally when `FERRUM_MESH_PRODUCTION_MODE=true`. Lab/test only — see [Internal Dev CA and Production Guardrails](#internal-dev-ca-and-production-guardrails) |
 
 ### xDS
 

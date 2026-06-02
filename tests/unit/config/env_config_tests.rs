@@ -340,6 +340,9 @@ fn test_env_config_mesh_mode_valid() {
                 "FERRUM_CP_DP_GRPC_JWT_SECRET",
                 "secret-padding-for-32-char-min!!",
             ),
+            // A real CA backend keeps this a valid prod-like mesh config; the
+            // no-CA posture is exercised separately by the gate tests below.
+            ("FERRUM_MESH_CA_BACKEND", "internal"),
         ],
         || {
             let config = EnvConfig::from_env().unwrap();
@@ -392,6 +395,178 @@ fn test_env_config_mesh_mode_missing_jwt_secret() {
             let result = EnvConfig::from_env();
             assert!(result.is_err());
             assert!(result.unwrap_err().contains("FERRUM_CP_DP_GRPC_JWT_SECRET"));
+        },
+    );
+}
+
+#[test]
+fn test_env_config_mesh_mode_no_ca_backend_fails_closed() {
+    // The default CA backend is `none`. A mesh with no CA cannot establish or
+    // verify mTLS, so PeerAuthentication's PERMISSIVE default would silently
+    // accept unauthenticated plaintext. Startup must fail closed.
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "mesh"),
+            ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+            (
+                "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                "secret-padding-for-32-char-min!!",
+            ),
+        ],
+        || {
+            remove_var("FERRUM_MESH_PRODUCTION_MODE");
+            remove_var("FERRUM_MESH_CA_BACKEND");
+            remove_var("FERRUM_MESH_ALLOW_NO_CA");
+            let result = EnvConfig::from_env();
+            assert!(result.is_err());
+            let err = result.unwrap_err();
+            assert!(
+                err.contains("FERRUM_MESH_CA_BACKEND"),
+                "error should name the CA backend var, got: {err}"
+            );
+            assert!(
+                err.contains("FERRUM_MESH_ALLOW_NO_CA"),
+                "error should name the opt-out var, got: {err}"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_env_config_mesh_mode_no_ca_allowed_with_explicit_opt_out() {
+    // Operators may explicitly acknowledge the insecure dev/test posture.
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "mesh"),
+            ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+            (
+                "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                "secret-padding-for-32-char-min!!",
+            ),
+            ("FERRUM_MESH_ALLOW_NO_CA", "true"),
+        ],
+        || {
+            remove_var("FERRUM_MESH_PRODUCTION_MODE");
+            remove_var("FERRUM_MESH_CA_BACKEND");
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.mode, OperatingMode::Mesh);
+            assert!(config.mesh_allow_no_ca);
+        },
+    );
+}
+
+#[test]
+fn test_env_config_mesh_mode_internal_ca_passes_without_opt_out() {
+    // A configured CA backend provides workload identity, so the gate is inert.
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "mesh"),
+            ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+            (
+                "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                "secret-padding-for-32-char-min!!",
+            ),
+            ("FERRUM_MESH_CA_BACKEND", "internal"),
+        ],
+        || {
+            remove_var("FERRUM_MESH_ALLOW_NO_CA");
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.mode, OperatingMode::Mesh);
+            assert!(!config.mesh_allow_no_ca);
+        },
+    );
+}
+
+#[test]
+fn test_env_config_mesh_mode_spire_ca_passes_without_opt_out() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "mesh"),
+            ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+            (
+                "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                "secret-padding-for-32-char-min!!",
+            ),
+            ("FERRUM_MESH_CA_BACKEND", "spire"),
+        ],
+        || {
+            remove_var("FERRUM_MESH_ALLOW_NO_CA");
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.mode, OperatingMode::Mesh);
+        },
+    );
+}
+
+#[test]
+fn test_env_config_non_mesh_mode_no_ca_backend_not_gated() {
+    // The gate is mesh-mode specific: a non-mesh mode with no CA backend must
+    // not be blocked by it.
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            (
+                "FERRUM_FILE_CONFIG_PATH",
+                "/tmp/ferrum-no-ca-gate-test.yaml",
+            ),
+            ("FERRUM_MESH_CA_BACKEND", "none"),
+        ],
+        || {
+            remove_var("FERRUM_MESH_ALLOW_NO_CA");
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.mode, OperatingMode::File);
+        },
+    );
+}
+
+#[test]
+fn test_env_config_mesh_mode_no_ca_refused_in_production_mode() {
+    // FERRUM_MESH_PRODUCTION_MODE=true refuses an identity-less mesh
+    // unconditionally, mirroring the bootstrap / static-attestor guardrails.
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "mesh"),
+            ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+            (
+                "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                "secret-padding-for-32-char-min!!",
+            ),
+            ("FERRUM_MESH_PRODUCTION_MODE", "true"),
+        ],
+        || {
+            remove_var("FERRUM_MESH_CA_BACKEND");
+            remove_var("FERRUM_MESH_ALLOW_NO_CA");
+            let result = EnvConfig::from_env();
+            assert!(result.is_err());
+            assert!(
+                result.unwrap_err().contains("FERRUM_MESH_PRODUCTION_MODE"),
+                "production-mode refusal should name the guardrail var"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_env_config_mesh_mode_production_mode_ignores_no_ca_opt_out() {
+    // In production mode the dev opt-out must NOT re-open the no-CA posture.
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "mesh"),
+            ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+            (
+                "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                "secret-padding-for-32-char-min!!",
+            ),
+            ("FERRUM_MESH_PRODUCTION_MODE", "true"),
+            ("FERRUM_MESH_ALLOW_NO_CA", "true"),
+        ],
+        || {
+            remove_var("FERRUM_MESH_CA_BACKEND");
+            let result = EnvConfig::from_env();
+            assert!(
+                result.is_err(),
+                "production mode must refuse no-CA even with the opt-out set"
+            );
+            assert!(result.unwrap_err().contains("FERRUM_MESH_PRODUCTION_MODE"));
         },
     );
 }
