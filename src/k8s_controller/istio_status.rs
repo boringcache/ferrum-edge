@@ -573,7 +573,7 @@ fn destination_rule_status(
             // upstream-level.
             // Surface the rest so operators see the gap in `kubectl describe`.
             let mut deferred: Vec<&'static str> = Vec::new();
-            if has_subset_outlier_detection(&object.spec) {
+            if has_subset_outlier_max_ejection_percent(&object.spec) {
                 deferred.push(
                     "subsets[].trafficPolicy.outlierDetection.maxEjectionPercent (thresholds applied per-subset; ejection cap uses upstream-level)",
                 );
@@ -617,7 +617,12 @@ fn destination_rule_status(
     accepted_status(object, accepted, reason, &message, detail)
 }
 
-fn has_subset_outlier_detection(spec: &Value) -> bool {
+/// True only when some subset's `outlierDetection` sets `maxEjectionPercent`.
+/// The thresholds (consecutive errors / interval / base-ejection / min-health)
+/// are applied per-subset, so they are NOT deferred; only the ejection *cap*
+/// still resolves at the upstream level, so a threshold-only subset policy must
+/// not surface a misleading deferred-field warning.
+fn has_subset_outlier_max_ejection_percent(spec: &Value) -> bool {
     spec.get("subsets")
         .and_then(Value::as_array)
         .is_some_and(|subsets| {
@@ -625,6 +630,7 @@ fn has_subset_outlier_detection(spec: &Value) -> bool {
                 subset
                     .get("trafficPolicy")
                     .and_then(|tp| tp.get("outlierDetection"))
+                    .and_then(|od| od.get("maxEjectionPercent"))
                     .is_some()
             })
         })
@@ -1592,6 +1598,73 @@ mod tests {
                 .iter()
                 .any(|f| f.contains("portLevelSettings[].tls")),
             "portLevelSettings[].tls is applied now and must not be deferred, got {deferred:?}"
+        );
+    }
+
+    #[test]
+    fn destination_rule_threshold_only_subset_outlier_not_deferred() {
+        // A subset outlierDetection that sets only thresholds (no
+        // maxEjectionPercent) is applied per-subset, so the status must NOT
+        // surface the maxEjectionPercent deferred field.
+        let obj = object(
+            "networking.istio.io/v1",
+            "DestinationRule",
+            "outlier-thresholds-dr",
+            json!({
+                "host": "reviews.default.svc.cluster.local",
+                "subsets": [{
+                    "name": "v1",
+                    "labels": {"version": "v1"},
+                    "trafficPolicy": {
+                        "outlierDetection": {"consecutive5xxErrors": 3, "interval": "5s"}
+                    }
+                }]
+            }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options());
+        let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        let deferred: Vec<&str> = detail["translation"]["deferred_fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            !deferred.iter().any(|f| f.contains("maxEjectionPercent")),
+            "threshold-only subset outlierDetection must not surface a maxEjectionPercent deferred field, got {deferred:?}"
+        );
+    }
+
+    #[test]
+    fn destination_rule_subset_outlier_max_ejection_percent_is_deferred() {
+        // Only the maxEjectionPercent *cap* remains upstream-level, so a subset
+        // that sets it surfaces the residual deferred field.
+        let obj = object(
+            "networking.istio.io/v1",
+            "DestinationRule",
+            "outlier-cap-dr",
+            json!({
+                "host": "reviews.default.svc.cluster.local",
+                "subsets": [{
+                    "name": "v1",
+                    "labels": {"version": "v1"},
+                    "trafficPolicy": {
+                        "outlierDetection": {"consecutive5xxErrors": 3, "maxEjectionPercent": 50}
+                    }
+                }]
+            }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options());
+        let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        let deferred: Vec<&str> = detail["translation"]["deferred_fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            deferred.iter().any(|f| f.contains("maxEjectionPercent")),
+            "subset with maxEjectionPercent must surface the deferred cap field, got {deferred:?}"
         );
     }
 

@@ -1498,21 +1498,23 @@ fn apply_destination_rules(
             // a subset trafficPolicy field-overrides the DR top-level for that
             // subset). Captured as owned data so the `upstream` borrow ends
             // before the `config.proxies` loop below.
-            let subset_connect_timeouts: Vec<(String, u64)> = upstream
+            // Derive subset connectTimeouts from THIS DR's own subsets, not the
+            // accumulated `upstream.subsets` an earlier sorted rule may have
+            // populated. Reading the accumulated set would let a stale subset
+            // timeout from a previous rule shadow this rule's top-level
+            // connectTimeout at the `.or(connect_timeout_ms)` below, breaking
+            // deterministic last-writer-wins for a later rule that defines no
+            // subsets of its own.
+            let subset_connect_timeouts: Vec<(String, u64)> = dr
                 .subsets
-                .as_ref()
-                .map(|subsets| {
-                    subsets
-                        .iter()
-                        .filter_map(|s| {
-                            s.traffic_policy
-                                .as_ref()
-                                .and_then(|tp| tp.connect_timeout_ms)
-                                .map(|ms| (s.name.clone(), ms))
-                        })
-                        .collect()
+                .iter()
+                .filter_map(|s| {
+                    s.traffic_policy
+                        .as_ref()
+                        .and_then(|tp| tp.connect_timeout_ms)
+                        .map(|ms| (s.name.clone(), ms))
                 })
-                .unwrap_or_default();
+                .collect();
 
             if connect_timeout_ms.is_some() || !subset_connect_timeouts.is_empty() {
                 let upstream_id = upstream.id.clone();
@@ -7203,6 +7205,85 @@ mod tests {
         assert_eq!(
             p2.backend_connect_timeout_ms, 2000,
             "subset-bound proxy uses its subset's connectTimeout (overrides top-level)"
+        );
+    }
+
+    #[test]
+    fn dr_later_rule_top_level_connect_timeout_overrides_earlier_subset() {
+        // Two DestinationRules match the same upstream. The earlier-sorted rule
+        // defines subset v1 with its own connectTimeout; the later-sorted rule
+        // has no subsets but sets a top-level connectTimeout. Last-writer-wins:
+        // the later top-level must override the subset-bound proxy even though an
+        // earlier rule already populated upstream.subsets. Regression guard for
+        // reading the accumulated upstream.subsets instead of the current rule's.
+        let mut config = GatewayConfig {
+            proxies: vec![destination_rule_test_proxy("p1", "u1")],
+            upstreams: vec![destination_rule_test_upstream(
+                "u1",
+                "reviews.default.svc.cluster.local",
+            )],
+            ..GatewayConfig::default()
+        };
+        let mut p2: Proxy = serde_json::from_value(serde_json::json!({
+            "id": "p2",
+            "namespace": "default",
+            "hosts": ["p2.example.com"],
+            "backend_host": "",
+            "backend_port": 0,
+            "upstream_id": "u1",
+            "upstream_subset": "v1",
+        }))
+        .expect("test proxy with subset");
+        p2.normalize_fields();
+        config.proxies.push(p2);
+
+        let slice = MeshSlice {
+            destination_rules: vec![
+                // Earlier (name "reviews-a"): defines subset v1, no top-level.
+                MeshDestinationRule {
+                    name: "reviews-a".to_string(),
+                    namespace: "default".to_string(),
+                    host: "reviews.default.svc.cluster.local".to_string(),
+                    traffic_policy: None,
+                    port_level_settings: HashMap::new(),
+                    subsets: vec![MeshSubset {
+                        name: "v1".to_string(),
+                        labels: HashMap::from([("version".to_string(), "v1".to_string())]),
+                        traffic_policy: Some(MeshTrafficPolicy {
+                            connect_timeout_ms: Some(2000),
+                            ..MeshTrafficPolicy::default()
+                        }),
+                    }],
+                },
+                // Later (name "reviews-b"): no subsets, top-level connectTimeout.
+                MeshDestinationRule {
+                    name: "reviews-b".to_string(),
+                    namespace: "default".to_string(),
+                    host: "reviews.default.svc.cluster.local".to_string(),
+                    traffic_policy: Some(MeshTrafficPolicy {
+                        connect_timeout_ms: Some(8000),
+                        ..MeshTrafficPolicy::default()
+                    }),
+                    port_level_settings: HashMap::new(),
+                    subsets: Vec::new(),
+                },
+            ],
+            ..MeshSlice::default()
+        };
+
+        apply_destination_rules(&mut config, &test_mesh_runtime_config(), &slice)
+            .expect("destination rules apply");
+
+        let p1 = config.proxies.iter().find(|p| p.id == "p1").expect("p1");
+        let p2 = config.proxies.iter().find(|p| p.id == "p2").expect("p2");
+        assert_eq!(
+            p1.backend_connect_timeout_ms, 8000,
+            "non-subset proxy uses the later rule's top-level connectTimeout"
+        );
+        assert_eq!(
+            p2.backend_connect_timeout_ms, 8000,
+            "subset-bound proxy must adopt the later rule's top-level connectTimeout, \
+             not a stale subset timeout from the earlier rule"
         );
     }
 

@@ -973,13 +973,6 @@ fn translate_port_level_settings(
         }
         let port = port_u64 as u16;
 
-        if entry.get("tls").is_some() {
-            acc.warnings.push(format!(
-                "DestinationRule {}/{}: trafficPolicy.portLevelSettings[].tls is parsed but not enforced per-port today (gateway applies backend TLS policy at upstream/subset scope); non-TLS port-level traffic policy fields are still applied",
-                object.metadata.namespace, object.metadata.name
-            ));
-        }
-
         let policy = translate_traffic_policy(acc, object, entry)?;
 
         if out.insert(port, policy).is_some() {
@@ -1805,8 +1798,11 @@ fn translate_subset(
     // `outlierDetection.maxEjectionPercent` *cap*, still resolved at the
     // upstream level (LoadBalancerCache), so warn when a subset sets outlier
     // detection that its ejection cap is not yet per-subset.
-    if let Some(ref policy) = traffic_policy
-        && policy.outlier_detection.is_some()
+    if let Some(policy) = traffic_policy.as_ref()
+        && policy
+            .outlier_detection
+            .as_ref()
+            .is_some_and(|od| od.max_ejection_percent.is_some())
     {
         acc.warnings.push(format!(
             "DestinationRule {}/{} subset '{}' outlierDetection thresholds are applied per-subset, but the maxEjectionPercent cap uses the upstream-level value",
@@ -2299,10 +2295,11 @@ fn virtual_service_l4_proxies(
             let matches = block
                 .get("match")
                 .and_then(Value::as_array)
+                .filter(|matches| !matches.is_empty())
                 .ok_or_else(|| {
                     invalid_resource(
                         object,
-                        "VirtualService tls[] route requires a match with sniHosts",
+                        "VirtualService tls[] route requires a non-empty match with sniHosts",
                     )
                 })?;
             for (mi, m) in matches.iter().enumerate() {
@@ -2317,8 +2314,7 @@ fn virtual_service_l4_proxies(
                 let listen_port = optional_port_field(object, m.get("port"), "tls[].match.port")?
                     .unwrap_or(backend_port);
                 let mut proxy = super::proxy_for_route(super::RouteProxySpec {
-                    id: format!("__istio-vs-tls-{namespace}-{vs_name}-{bi}-{mi}")
-                        .replace(['/', '.'], "-"),
+                    id: resource_id("istio-vs", namespace, vs_name, &format!("tls-{bi}-{mi}")),
                     namespace: namespace.clone(),
                     hosts: sni_hosts,
                     listen_path: None,
@@ -2362,8 +2358,7 @@ fn virtual_service_l4_proxies(
             };
             for (mi, port) in listen_ports.into_iter().enumerate() {
                 let proxy = super::proxy_for_route(super::RouteProxySpec {
-                    id: format!("__istio-vs-tcp-{namespace}-{vs_name}-{bi}-{mi}")
-                        .replace(['/', '.'], "-"),
+                    id: resource_id("istio-vs", namespace, vs_name, &format!("tcp-{bi}-{mi}")),
                     namespace: namespace.clone(),
                     hosts: Vec::new(),
                     listen_path: None,
@@ -7722,7 +7717,7 @@ extensionProviders:
     }
 
     #[test]
-    fn destination_rule_subset_connect_timeout_applied_outlier_still_warns() {
+    fn destination_rule_subset_connect_timeout_applied_threshold_only_outlier_no_warn() {
         let result = translate_k8s_objects(
             &[object(
                 "DestinationRule",
@@ -7763,13 +7758,49 @@ extensionProviders:
             "subset connectTimeout is applied now and must not warn, got {:?}",
             result.warnings
         );
-        // outlierDetection remains deferred per-subset, so it still warns.
+        // A threshold-only subset outlierDetection (no maxEjectionPercent) is
+        // fully applied per-subset, so it must NOT warn about the ejection cap.
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|w| w.contains("subset 'v1'") && w.contains("outlierDetection")),
+            "threshold-only subset outlierDetection must not warn, got {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn destination_rule_subset_outlier_max_ejection_percent_warns() {
+        let result = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "subsets": [{
+                        "name": "v1",
+                        "labels": {"version": "v1"},
+                        "trafficPolicy": {
+                            "outlierDetection": {
+                                "consecutive5xxErrors": 3,
+                                "maxEjectionPercent": 50
+                            }
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("subset traffic policy translates");
+
+        // Only the maxEjectionPercent *cap* remains upstream-level, so a subset
+        // that sets it surfaces the residual warning; the thresholds still apply.
         assert!(
             result
                 .warnings
                 .iter()
-                .any(|w| w.contains("subset 'v1'") && w.contains("outlierDetection")),
-            "expected subset outlierDetection warning, got {:?}",
+                .any(|w| w.contains("subset 'v1'") && w.contains("maxEjectionPercent cap")),
+            "subset with maxEjectionPercent must warn about the upstream-level cap, got {:?}",
             result.warnings
         );
     }
@@ -8107,6 +8138,70 @@ extensionProviders:
         assert_eq!(proxy.hosts, vec!["secure.example.com".to_string()]);
         assert_eq!(proxy.backend_host, "backend.default.svc.cluster.local");
         assert_eq!(proxy.backend_port, 443);
+    }
+
+    #[test]
+    fn virtual_service_tls_route_empty_match_fails_closed() {
+        // An empty `match: []` on a tls[] route carries no sniHosts to key SNI
+        // routing on. It must be rejected (same as a missing match) rather than
+        // silently emitting no proxy while status reports the VS accepted.
+        let err = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["secure.example.com"],
+                    "tls": [{
+                        "match": [],
+                        "route": [{"destination": {"host": "backend.default.svc.cluster.local", "port": {"number": 443}}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("empty tls[] match must fail closed, not silently drop the route");
+        assert!(
+            format!("{err:?}").contains("non-empty match"),
+            "expected a non-empty-match rejection, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn virtual_service_l4_proxy_ids_use_managed_prefix() {
+        // Generated L4 stream proxies must carry the `istio-vs-` managed prefix
+        // so the K8s reconciler's cleanup allowlist removes them on VS
+        // delete/change instead of leaking + duplicating across reconciles.
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["secure.example.com"],
+                    "tls": [{
+                        "match": [{"sniHosts": ["secure.example.com"], "port": 8443}],
+                        "route": [{"destination": {"host": "backend.default.svc.cluster.local", "port": {"number": 443}}}]
+                    }],
+                    "tcp": [{
+                        "match": [{"port": 9000}],
+                        "route": [{"destination": {"host": "raw.default.svc.cluster.local", "port": {"number": 9000}}}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("VS L4 routing translates");
+        let l4: Vec<&str> = result
+            .config
+            .proxies
+            .iter()
+            .filter(|p| p.listen_port == Some(8443) || p.listen_port == Some(9000))
+            .map(|p| p.id.as_str())
+            .collect();
+        assert_eq!(l4.len(), 2, "both L4 proxies materialize, got {l4:?}");
+        for id in &l4 {
+            assert!(
+                id.starts_with("istio-vs-") && !id.starts_with("__"),
+                "L4 proxy id must use the managed istio-vs- prefix for reconciler cleanup, got {id}"
+            );
+        }
     }
 
     // -- VirtualService fault injection / retry / timeout ----------------
@@ -14263,12 +14358,19 @@ extensionProviders:
             policy.load_balancer,
             Some(MeshLoadBalancer::Simple(MeshSimpleLb::LeastRequest))
         ));
+        // portLevelSettings[].tls is now resolved onto the per-port override and
+        // applied per-port (see src/modes/mesh/mod.rs), so it parses into the
+        // port policy and must NOT emit the old "not enforced per-port" warning.
         assert!(
-            result
+            policy.tls.is_some(),
+            "port-level tls must parse into the port policy, got {policy:?}"
+        );
+        assert!(
+            !result
                 .warnings
                 .iter()
-                .any(|w| w.contains("portLevelSettings[].tls is parsed but not enforced per-port")),
-            "expected warning for unenforced per-port tls, got {:?}",
+                .any(|w| w.contains("not enforced per-port")),
+            "stale per-port tls warning must be gone, got {:?}",
             result.warnings
         );
     }
