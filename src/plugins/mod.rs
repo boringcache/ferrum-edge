@@ -49,6 +49,7 @@ pub mod key_auth;
 pub mod ldap_auth;
 pub mod load_testing;
 pub mod loki_logging;
+pub mod mcp_gateway;
 pub mod mesh;
 pub mod mesh_route_dispatch;
 pub mod mtls_auth;
@@ -100,7 +101,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::config::types::{
-    BackendScheme, BackendTlsConfig, Consumer, Proxy, ResolvedPortOverride, RetryConfig, Upstream,
+    BackendScheme, BackendTlsConfig, Consumer, DispatchKind, Proxy, ResolvedPortOverride,
+    RetryConfig, Upstream,
 };
 use crate::consumer_index::ConsumerIndex;
 use crate::modes::mesh::MeshTrafficDirection;
@@ -511,6 +513,12 @@ pub struct RequestContext {
     /// `route_override_upstream_id`; the dispatch path falls back to
     /// `proxy.backend_host` when this is `None`.
     pub route_override_backend_host: Option<String>,
+    /// Plugin-set override for the proxy's HTTP-family backend wire scheme.
+    ///
+    /// Used by body-aware routers such as `mcp_gateway` when a request-selected
+    /// direct upstream URL carries a different `http`/`https` scheme than the
+    /// placeholder proxy. Stream schemes are intentionally not accepted here.
+    pub route_override_backend_scheme: Option<BackendScheme>,
     /// Plugin-set override for the proxy's `backend_port`. Same contract as
     /// `route_override_upstream_id`.
     pub route_override_backend_port: Option<u16>,
@@ -553,6 +561,11 @@ pub struct RequestContext {
     /// path; VS-derived proxies never set `strip_listen_path`, so the override
     /// is the literal forwarded path.
     pub route_override_path: Option<String>,
+    /// Treat `route_override_path` as an absolute backend path by disabling
+    /// `strip_listen_path` on the effective proxy. Used by direct upstream
+    /// routers when the override is already the final upstream URL path rather
+    /// than a virtual-service rewrite relative to the selected public route.
+    pub route_override_path_is_absolute: bool,
     /// Plugin-set override for the `Host` / `:authority` forwarded to the
     /// backend. Set by `mesh_route_dispatch` for an Istio
     /// `VirtualService.http[].rewrite.authority`. The proxy dispatch path
@@ -640,6 +653,7 @@ impl RequestContext {
             is_early_data: false,
             route_override_upstream_id: None,
             route_override_backend_host: None,
+            route_override_backend_scheme: None,
             route_override_backend_port: None,
             route_override_resolved_tls: None,
             route_override_backend_read_timeout_ms: None,
@@ -647,6 +661,7 @@ impl RequestContext {
             route_override_request_transform: None,
             route_override_response_transform: None,
             route_override_path: None,
+            route_override_path_is_absolute: false,
             route_override_authority: None,
             node_waypoint_pod_uid: None,
             node_waypoint_policy_scope: None,
@@ -697,6 +712,7 @@ impl RequestContext {
             is_early_data: self.is_early_data,
             route_override_upstream_id: self.route_override_upstream_id.clone(),
             route_override_backend_host: self.route_override_backend_host.clone(),
+            route_override_backend_scheme: self.route_override_backend_scheme,
             route_override_backend_port: self.route_override_backend_port,
             route_override_resolved_tls: self.route_override_resolved_tls.clone(),
             route_override_backend_read_timeout_ms: self.route_override_backend_read_timeout_ms,
@@ -704,6 +720,7 @@ impl RequestContext {
             route_override_request_transform: self.route_override_request_transform.clone(),
             route_override_response_transform: self.route_override_response_transform.clone(),
             route_override_path: self.route_override_path.clone(),
+            route_override_path_is_absolute: self.route_override_path_is_absolute,
             route_override_authority: self.route_override_authority.clone(),
             node_waypoint_pod_uid: self.node_waypoint_pod_uid,
             node_waypoint_policy_scope: self.node_waypoint_policy_scope.clone(),
@@ -799,6 +816,7 @@ impl RequestContext {
     pub fn has_route_overrides(&self) -> bool {
         self.route_override_upstream_id.is_some()
             || self.route_override_backend_host.is_some()
+            || self.route_override_backend_scheme.is_some()
             || self.route_override_backend_port.is_some()
             || self.route_override_resolved_tls.is_some()
             || self.route_override_backend_read_timeout_ms.is_some()
@@ -854,6 +872,7 @@ impl RequestContext {
     ) -> Arc<Proxy> {
         let direct_backend_override = self.route_override_upstream_id.is_none()
             && (self.route_override_backend_host.is_some()
+                || self.route_override_backend_scheme.is_some()
                 || self.route_override_backend_port.is_some());
         let upstream_id_changed = if direct_backend_override {
             proxy.upstream_id.is_some()
@@ -866,6 +885,9 @@ impl RequestContext {
             .route_override_backend_host
             .as_deref()
             .is_some_and(|host| proxy.backend_host != host);
+        let backend_scheme_changed = self
+            .route_override_backend_scheme
+            .is_some_and(|scheme| proxy.effective_scheme() != scheme);
         let backend_port_changed = self
             .route_override_backend_port
             .is_some_and(|port| proxy.backend_port != port);
@@ -878,12 +900,12 @@ impl RequestContext {
         } else {
             None
         };
-        let direct_backend_tls_override = if direct_backend_override && proxy.upstream_id.is_some()
-        {
-            Some(BackendTlsConfig::from_proxy(&proxy))
-        } else {
-            None
-        };
+        let direct_backend_tls_override =
+            if direct_backend_override && (proxy.upstream_id.is_some() || backend_scheme_changed) {
+                Some(BackendTlsConfig::from_proxy(&proxy))
+            } else {
+                None
+            };
         let resolved_tls_override = self
             .route_override_resolved_tls
             .clone()
@@ -924,15 +946,22 @@ impl RequestContext {
         // it with the backend's own host.
         let preserve_host_changed =
             self.route_override_authority.is_some() && !proxy.preserve_host_header;
+        let strip_listen_path_changed =
+            self.route_override_path_is_absolute && proxy.strip_listen_path;
+        let backend_path_changed =
+            self.route_override_path_is_absolute && proxy.backend_path.is_some();
 
         if !upstream_id_changed
             && !backend_host_changed
+            && !backend_scheme_changed
             && !backend_port_changed
             && !resolved_tls_changed
             && !dispatch_port_overrides_changed
             && !backend_read_timeout_changed
             && !retry_changed
             && !preserve_host_changed
+            && !strip_listen_path_changed
+            && !backend_path_changed
         {
             return proxy;
         }
@@ -949,6 +978,10 @@ impl RequestContext {
         }
         if let Some(host) = &self.route_override_backend_host {
             overridden.backend_host = host.clone();
+        }
+        if let Some(scheme) = self.route_override_backend_scheme {
+            overridden.backend_scheme = Some(scheme);
+            overridden.dispatch_kind = DispatchKind::from(scheme);
         }
         if let Some(port) = self.route_override_backend_port {
             overridden.backend_port = port;
@@ -967,6 +1000,12 @@ impl RequestContext {
         }
         if preserve_host_changed {
             overridden.preserve_host_header = true;
+        }
+        if strip_listen_path_changed {
+            overridden.strip_listen_path = false;
+        }
+        if backend_path_changed {
+            overridden.backend_path = None;
         }
         Arc::new(overridden)
     }
@@ -1688,7 +1727,7 @@ pub struct StreamTransactionSummary {
 /// |-----------|-------------|-------------------------------------------|---------|
 /// | Early     | 0–949       | Pre-routing, tracing, and preflight       | otel_tracing (25), correlation_id (50), cors (100), request_termination (125), mesh_outbound_registry (130), ip_restriction (150), bot_detection (200), sse (250), grpc_web (260), grpc_method_router (275), spiffe_identity (940) |
 /// | AuthN     | 950–1999    | Authentication / identity verification    | mtls_auth (950), jwks_auth (1000), oauth2_introspection (1050), oidc_relying_party (1075), jwt_auth (1100), key_auth (1200), ldap_auth (1250), basic_auth (1300), hmac_auth (1400), soap_ws_security (1500) |
-/// | AuthZ     | 2000–2999   | Authorization and admission control       | access_control (2000), tcp_connection_throttle (2050), mesh_authz (2075), opa (2080), request_size_limiting (2800), graphql (2850), rate_limiting (2900), ai_prompt_shield (2925), waf (2930), body_validator (2950), openapi_validator (2960), ai_semantic_firewall (2968), ai_request_guard (2975), ai_federation (2985) |
+/// | AuthZ     | 2000–2999   | Authorization and admission control       | access_control (2000), tcp_connection_throttle (2050), mesh_authz (2075), opa (2080), request_size_limiting (2800), graphql (2850), rate_limiting (2900), ai_prompt_shield (2925), waf (2930), body_validator (2950), openapi_validator (2960), ai_semantic_firewall (2968), ai_request_guard (2975), ai_federation (2985), mcp_gateway (2992) |
 /// | Transform | 3000–3999   | Request shaping and response buffering    | request_transformer (3000), serverless_function (3025), response_mock (3030), grpc_deadline (3050), request_mirror (3075), response_size_limiting (3490), response_caching (3500) |
 /// | Response  | 4000–4999   | Response transformation, security headers, and AI accounting | response_transformer (4000), security_headers (4080), ai_token_metrics (4100), ai_rate_limiter (4200) |
 /// | Logging   | 9000–9999   | Observability and frame logging           | stdout_logging (9000), ws_frame_logging (9050), statsd_logging (9075), http_logging (9100), tcp_logging (9125), kafka_logging (9150), loki_logging (9155), udp_logging (9160), ws_logging (9175), transaction_debugger (9200), prometheus_metrics (9300), api_chargeback (9350), api_chargeback_sink (9351), workload_metrics (9360), __mesh_bpf_metrics (9365) |
@@ -1739,6 +1778,9 @@ pub mod priority {
     pub const AI_REQUEST_GUARD: u16 = 2975;
     pub const AI_SEMANTIC_CACHE: u16 = 2980;
     pub const AI_FEDERATION: u16 = 2985;
+    /// `mcp_gateway`: parses MCP JSON-RPC bodies and applies MCP-aware route
+    /// overrides after generic admission/auth plugins but before final dispatch.
+    pub const MCP_GATEWAY: u16 = 2992;
     /// `mesh_route_dispatch`: rewrites `route_override_*` on `RequestContext`
     /// based on Istio VirtualService method/header/query-param predicates.
     /// Runs after admission plugins and immediately before request-transform
@@ -2028,6 +2070,23 @@ pub trait Plugin: Send + Sync {
         _request_headers: &HashMap<String, String>,
     ) -> Option<Vec<u8>> {
         None
+    }
+
+    /// Context-aware variant of `transform_request_body`.
+    ///
+    /// Existing plugins can keep overriding `transform_request_body`. Plugins
+    /// that need to use decisions or metadata from earlier hooks can override
+    /// this method and the proxy will call it when a mutable request context is
+    /// available.
+    async fn transform_request_body_with_context(
+        &self,
+        _ctx: &mut RequestContext,
+        body: &[u8],
+        content_type: Option<&str>,
+        request_headers: &HashMap<String, String>,
+    ) -> Option<Vec<u8>> {
+        self.transform_request_body(body, content_type, request_headers)
+            .await
     }
 
     /// Called after all `transform_request_body` hooks on buffered requests.
@@ -2512,6 +2571,10 @@ pub fn create_plugin_with_http_client(
             config,
             http_client.clone(),
         )?))),
+        "mcp_gateway" => Ok(Some(Arc::new(mcp_gateway::McpGateway::new(
+            config,
+            http_client.clone(),
+        )?))),
         "ws_message_size_limiting" => Ok(Some(Arc::new(
             ws_message_size_limiting::WsMessageSizeLimiting::new(config)?,
         ))),
@@ -2602,6 +2665,7 @@ pub fn is_security_plugin(name: &str) -> bool {
             | "semantic_ai_firewall"
             | "security_headers"
             | "openapi_validator"
+            | "mcp_gateway"
             | "soap_ws_security"
     )
 }
@@ -2672,6 +2736,7 @@ pub fn available_plugins() -> Vec<&'static str> {
         "ai_response_guard",
         "ai_semantic_cache",
         "ai_federation",
+        "mcp_gateway",
         "ws_message_size_limiting",
         "ws_frame_logging",
         "ws_rate_limiting",
@@ -2750,5 +2815,29 @@ mod tests {
             Some("/certs/canary-ca.pem")
         );
         assert!(!result.resolved_tls.verify_server_cert);
+    }
+
+    #[test]
+    fn absolute_route_override_path_disables_listen_path_stripping() {
+        let proxy: Proxy = serde_json::from_value(json!({
+            "backend_host": "stable.svc",
+            "backend_port": 8080,
+            "listen_path": "/mcp",
+            "backend_path": "/placeholder",
+            "strip_listen_path": true
+        }))
+        .expect("minimal proxy should deserialize");
+
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "POST".to_string(),
+            "/mcp".to_string(),
+        );
+        ctx.route_override_path = Some("/mcp".to_string());
+        ctx.route_override_path_is_absolute = true;
+
+        let result = ctx.apply_route_overrides(Arc::new(proxy));
+        assert!(!result.strip_listen_path);
+        assert_eq!(result.backend_path, None);
     }
 }

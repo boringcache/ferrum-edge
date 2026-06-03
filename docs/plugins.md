@@ -1,6 +1,6 @@
 # Plugin Reference
 
-Ferrum Edge includes 67 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
+Ferrum Edge includes 68 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
 
 For execution order, protocol support matrix, and design rationale, see [plugin_execution_order.md](plugin_execution_order.md).
 
@@ -3892,6 +3892,64 @@ plugins:
 ```
 
 > **Note:** When `ai_federation` is active, it short-circuits the proxy via `RejectBinary`, so `ai_token_metrics`, `ai_response_guard`, and `ai_semantic_cache` do not fire on the response path. The federation plugin writes the same metadata keys directly. The `ai_rate_limiter` records token usage via `applies_after_proxy_on_reject` on the rejection path.
+
+---
+
+## MCP / Agent Tool Gateway Plugin
+
+### `mcp_gateway`
+
+HTTP-only Model Context Protocol gateway for AI agent tool traffic. `transparent_proxy` mode preserves MCP JSON-RPC and session headers while routing one Ferrum endpoint to one upstream MCP server. `aggregate_router` mode exposes one Ferrum MCP endpoint for multiple upstream MCP servers, synthesizes downstream `initialize`, lazily initializes upstream sessions, aggregates `tools/list`, `resources/list`, and `prompts/list`, namespaces public names, routes `tools/call`, `resources/read`, and `prompts/get`, rewrites public names back to upstream names, validates tool arguments against discovered `inputSchema`, and emits `mcp.*` metadata for existing Ferrum authz, logging, tracing, chargeback, and alert plugins.
+
+The plugin deliberately does not implement generic auth, rate limiting, retry, timeout, WAF, tracing, DLP, or semantic safety behavior.
+
+**Priority:** 2992
+
+```yaml
+plugin_name: mcp_gateway
+scope: proxy
+config:
+  enabled: true
+  mode: aggregate_router
+  endpoint:
+    path: /mcp
+    protocol_versions: ["2025-11-25"]
+  discovery:
+    namespace_separator: "."
+    cache_ttl_seconds: 300
+    on_new_tool: hide_until_configured
+    on_schema_change: hide_until_configured
+  sessions:
+    downstream_session_header: mcp-session-id
+    upstream_session_header: mcp-session-id
+    initialize_upstreams: lazy
+    session_ttl_seconds: 3600
+    max_sessions: 16384
+  servers:
+    github:
+      upstream_url: http://github-mcp.example/mcp
+      namespace: github
+      expose_tools: true
+    jira:
+      upstream_url: http://jira-mcp.example/mcp
+      namespace: jira
+      expose_tools: true
+  policy:
+    default_action: deny
+    tools:
+      github.create_pr:
+        action: allow
+      jira.create_issue:
+        action: allow
+  validation:
+    validate_tool_arguments: true
+```
+
+`sessions.max_sessions` and `sessions.session_ttl_seconds` bound downstream MCP sessions; idle or oldest sessions are evicted before accepting new `initialize` calls. The cap check, in-memory eviction, and insert are serialized (so concurrent `initialize` calls cannot grow the store past `max_sessions`) in a single scan, while the evicted sessions' upstream `DELETE` cleanup is issued concurrently *after* that critical section so eviction never blocks new sessions behind upstream network round trips. In `aggregate_router` mode the gateway mints a synthetic downstream session id and never forwards it upstream: routed calls strip the downstream session header and carry only a mediated upstream session id when one exists. Server ids must be URI-safe (`[A-Za-z0-9._-]`) because they appear in public `mcp://` resource URIs, and `sessions.downstream_session_header`/`sessions.upstream_session_header` must be valid HTTP header names; both are checked at config validation. `validation.validate_tool_results` is reserved and rejected if set to `true` until result validation is implemented. `initialize_upstreams: startup` is accepted as a V1 alias for `lazy` because MCP upstream initialization requires a downstream client session. In `aggregate_router` mode, advertising a capability with no dedicated dispatch — `capabilities.advertise_completions`, `capabilities.advertise_logging`, or `capabilities.advertise_tasks` — requires `capabilities.passthrough_unknown_methods: true` so those methods (`completion/complete`, `logging/*`, `tasks/*`) are routed to the primary upstream instead of advertised without support. If `observability.log_raw_arguments` is enabled, raw MCP tool arguments are copied into request metadata and may contain secrets or PII; prefer the default argument hashing unless the logging path is explicitly protected.
+
+**Discovery, catalogs, and locking.** Discovery catalogs are cached **per downstream session**, not gateway-wide, because an upstream MCP server may expose different tools/resources/prompts per initialized session (client identity/capabilities); a shared catalog could leak or hide entries across users. Catalog refresh is serialized per session (not globally) and upstream `initialize` is serialized per `(session, server)`, so a slow upstream throttles only the affected session/server rather than blocking discovery or initialization for unrelated clients. A consequence of per-session catalogs is that each new session performs its own upstream discovery. When two upstreams produce the same public tool/prompt/resource name after namespacing, the colliding name is skipped from discovery for **all** colliding upstreams (logged as a warning) so it can never route to the wrong upstream, while the rest of the catalog stays usable.
+
+**V1 limitation — no response-side rewriting.** The gateway rewrites request bodies public→upstream (tool/prompt names, resource URIs) but does **not** reverse-map responses. A `resources/read` response therefore echoes the upstream's native `contents[].uri` rather than the public `mcp://{server}/...` URI the client requested, and resource URIs embedded in tool-call results are not rewritten. Clients that correlate response URIs against the request must tolerate the upstream's native scheme; response-side reverse mapping is deferred to a later version.
 
 ---
 

@@ -1,0 +1,3747 @@
+//! MCP Gateway plugin.
+//!
+//! Makes HTTP-based Model Context Protocol JSON-RPC traffic visible to Ferrum:
+//! it extracts `mcp.*` metadata, preserves MCP session headers, aggregates
+//! discovery catalogs in aggregate-router mode, and routes namespaced MCP tool,
+//! resource, and prompt calls to configured upstream MCP servers.
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use dashmap::DashMap;
+use futures_util::StreamExt;
+use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
+use regex::Regex;
+use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::{Mutex, RwLock};
+use tracing::warn;
+use url::Url;
+
+use crate::config::types::{BackendScheme, BackendTlsConfig};
+
+use super::{HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext};
+
+const DEFAULT_PROTOCOL_VERSION: &str = "2025-11-25";
+const DEFAULT_SESSION_TTL_SECONDS: u64 = 3600;
+const DEFAULT_MAX_SESSIONS: usize = 16_384;
+const METADATA_REWRITE_KEY: &str = "mcp.needs_request_rewrite";
+const METADATA_REWRITE_METHOD_KEY: &str = "mcp.rewrite.method";
+const METADATA_REWRITE_PARAM_KEY: &str = "mcp.rewrite.param";
+const METADATA_REWRITE_PUBLIC_VALUE_KEY: &str = "mcp.rewrite.public_value";
+const METADATA_REWRITE_UPSTREAM_VALUE_KEY: &str = "mcp.rewrite.upstream_value";
+const MAX_MCP_PAGINATION_PAGES: usize = 100;
+const MAX_UPSTREAM_SSE_EVENT_BYTES: usize = 1024 * 1024;
+const MCP_STREAMABLE_HTTP_ACCEPT: &str = "application/json, text/event-stream";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum McpGatewayMode {
+    TransparentProxy,
+    AggregateRouter,
+}
+
+impl McpGatewayMode {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "transparent_proxy" => Ok(Self::TransparentProxy),
+            "aggregate_router" => Ok(Self::AggregateRouter),
+            other => Err(format!(
+                "mcp_gateway: 'mode' must be transparent_proxy or aggregate_router, got {other:?}"
+            )),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::TransparentProxy => "transparent_proxy",
+            Self::AggregateRouter => "aggregate_router",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InitializeStrategy {
+    Lazy,
+    Startup,
+    Passthrough,
+}
+
+impl InitializeStrategy {
+    fn parse(value: &str, field: &str) -> Result<Self, String> {
+        match value {
+            "lazy" => Ok(Self::Lazy),
+            "startup" => Ok(Self::Startup),
+            "passthrough" => Ok(Self::Passthrough),
+            other => Err(format!(
+                "mcp_gateway: '{field}' must be lazy, startup, or passthrough, got {other:?}"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PolicyAction {
+    Allow,
+    Deny,
+    HideFromDiscovery,
+}
+
+impl PolicyAction {
+    fn parse(value: &str, field: &str) -> Result<Self, String> {
+        match value {
+            "allow" => Ok(Self::Allow),
+            "deny" => Ok(Self::Deny),
+            "hide_from_discovery" => Ok(Self::HideFromDiscovery),
+            other => Err(format!(
+                "mcp_gateway: '{field}' must be allow, deny, or hide_from_discovery, got {other:?}"
+            )),
+        }
+    }
+
+    fn as_policy_decision(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+            Self::HideFromDiscovery => "hide",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiscoveryBehavior {
+    Allow,
+    HideUntilConfigured,
+}
+
+impl DiscoveryBehavior {
+    fn parse(value: &str, field: &str) -> Result<Self, String> {
+        match value {
+            "allow" | "allow_immediately" | "expose" => Ok(Self::Allow),
+            "hide_until_configured" => Ok(Self::HideUntilConfigured),
+            other => Err(format!(
+                "mcp_gateway: '{field}' must be allow or hide_until_configured, got {other:?}"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct McpDiscoveryConfig {
+    aggregate_tools: bool,
+    aggregate_resources: bool,
+    aggregate_prompts: bool,
+    namespace_separator: String,
+    cache_ttl: Duration,
+    hide_denied_items: bool,
+    on_new_tool: DiscoveryBehavior,
+    on_schema_change: DiscoveryBehavior,
+}
+
+#[derive(Debug, Clone)]
+struct McpSessionConfig {
+    downstream_session_header: String,
+    upstream_session_header: String,
+    initialize_upstreams: InitializeStrategy,
+    session_ttl: Duration,
+    max_sessions: usize,
+}
+
+#[derive(Debug, Clone)]
+struct McpCapabilitiesConfig {
+    advertise_tools: bool,
+    advertise_resources: bool,
+    advertise_prompts: bool,
+    advertise_logging: bool,
+    advertise_completions: bool,
+    advertise_tasks: bool,
+    passthrough_unknown_methods: bool,
+}
+
+#[derive(Debug, Clone)]
+struct McpPolicy {
+    default_action: PolicyAction,
+    hide_denied_tools: bool,
+    tools: HashMap<String, PolicyAction>,
+}
+
+impl McpPolicy {
+    fn action_for_tool(&self, public_name: &str) -> PolicyAction {
+        self.tools
+            .get(public_name)
+            .copied()
+            .unwrap_or(self.default_action)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct McpValidationConfig {
+    validate_tool_arguments: bool,
+}
+
+#[derive(Debug, Clone)]
+struct McpObservabilityConfig {
+    emit_metadata: bool,
+    log_raw_arguments: bool,
+    log_argument_hash: bool,
+    #[allow(dead_code)] // Parsed for V1 config compatibility; result logging is not emitted in V1.
+    log_raw_results: bool,
+    #[allow(dead_code)] // Parsed for V1 config compatibility; result hashing is not emitted in V1.
+    log_result_hash: bool,
+}
+
+#[derive(Debug, Clone)]
+struct McpUpstreamTarget {
+    scheme: BackendScheme,
+    host: String,
+    port: u16,
+    path: String,
+    authority: String,
+}
+
+#[derive(Debug, Clone)]
+struct McpServerConfig {
+    server_id: String,
+    namespace: String,
+    upstream_url: String,
+    target: McpUpstreamTarget,
+    enabled: bool,
+    expose_tools: bool,
+    expose_resources: bool,
+    expose_prompts: bool,
+    initialize_strategy: InitializeStrategy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum McpMessageKind {
+    Request,
+    Notification,
+    Response,
+    ErrorResponse,
+}
+
+impl McpMessageKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Request => "request",
+            Self::Notification => "notification",
+            Self::Response => "response",
+            Self::ErrorResponse => "error_response",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct McpEnvelope {
+    jsonrpc: String,
+    id: Option<Value>,
+    method: Option<String>,
+    params: Option<Value>,
+    #[allow(dead_code)] // Kept in the parsed envelope shape for response classification.
+    result: Option<Value>,
+    #[allow(dead_code)] // Kept in the parsed envelope shape for error-response classification.
+    error: Option<Value>,
+    message_kind: McpMessageKind,
+}
+
+#[derive(Clone)]
+struct ToolCatalogEntry {
+    public_name: String,
+    upstream_name: String,
+    server_id: String,
+    namespace: String,
+    input_schema: Value,
+    output_schema: Option<Value>,
+    title: Option<String>,
+    description: Option<String>,
+    annotations: Option<Value>,
+    enabled: bool,
+    hidden_by_discovery: bool,
+    hidden_from_discovery: bool,
+    // Sticky: once a tool is hidden because its inputSchema drifted under
+    // on_schema_change=hide_until_configured, it stays hidden across refreshes
+    // (the new hash becomes the baseline, so schema_changed is only true once)
+    // until an operator reconfigures/reloads — including explicitly-configured
+    // tools, which the per-refresh schema check would otherwise re-enable.
+    hidden_by_schema_change: bool,
+    input_validator: Arc<jsonschema::Validator>,
+    #[allow(dead_code)] // Stored for drift/operational metadata extensions.
+    discovered_at: DateTime<Utc>,
+    schema_hash: String,
+    #[allow(dead_code)] // Stored for description-only drift detection extensions.
+    description_hash: String,
+}
+
+#[derive(Debug, Clone)]
+struct PromptCatalogEntry {
+    public_name: String,
+    upstream_name: String,
+    server_id: String,
+    namespace: String,
+    description: Option<String>,
+    arguments_schema: Option<Value>,
+    enabled: bool,
+    #[allow(dead_code)] // Stored for drift/operational metadata extensions.
+    discovered_at: DateTime<Utc>,
+    #[allow(dead_code)] // Stored for prompt schema drift metadata extensions.
+    schema_hash: String,
+}
+
+#[derive(Debug, Clone)]
+struct ResourceCatalogEntry {
+    public_uri: String,
+    upstream_uri: String,
+    server_id: String,
+    namespace: String,
+    name: Option<String>,
+    description: Option<String>,
+    mime_type: Option<String>,
+    enabled: bool,
+    #[allow(dead_code)] // Stored for drift/operational metadata extensions.
+    discovered_at: DateTime<Utc>,
+    #[allow(dead_code)] // Stored for resource drift metadata extensions.
+    uri_hash: String,
+}
+
+#[derive(Clone)]
+struct ResourceTemplateCatalogEntry {
+    public_uri_template: String,
+    server_id: String,
+    namespace: String,
+    name: Option<String>,
+    title: Option<String>,
+    description: Option<String>,
+    mime_type: Option<String>,
+    annotations: Option<Value>,
+    icons: Option<Value>,
+    enabled: bool,
+    #[allow(dead_code)] // Stored for drift/operational metadata extensions.
+    discovered_at: DateTime<Utc>,
+    uri_template_regex: Arc<Regex>,
+}
+
+#[derive(Clone)]
+struct McpCatalog {
+    tools: HashMap<String, ToolCatalogEntry>,
+    prompts: HashMap<String, PromptCatalogEntry>,
+    resources: HashMap<String, ResourceCatalogEntry>,
+    resource_templates: HashMap<String, ResourceTemplateCatalogEntry>,
+    version: u64,
+    last_refreshed_at: Option<Instant>,
+    resource_templates_refreshed_at: Option<Instant>,
+    last_refreshed_wall: DateTime<Utc>,
+}
+
+impl Default for McpCatalog {
+    fn default() -> Self {
+        Self {
+            tools: HashMap::new(),
+            prompts: HashMap::new(),
+            resources: HashMap::new(),
+            resource_templates: HashMap::new(),
+            version: 0,
+            last_refreshed_at: None,
+            resource_templates_refreshed_at: None,
+            last_refreshed_wall: Utc::now(),
+        }
+    }
+}
+
+impl McpCatalog {
+    fn is_stale(&self, ttl: Duration) -> bool {
+        match self.last_refreshed_at {
+            Some(refreshed) => refreshed.elapsed() >= ttl,
+            None => true,
+        }
+    }
+
+    fn resource_templates_are_stale(&self, ttl: Duration) -> bool {
+        match self.resource_templates_refreshed_at {
+            Some(refreshed) => refreshed.elapsed() >= ttl,
+            None => true,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum McpCatalogError {
+    SessionNotFound,
+    Refresh(String),
+}
+
+#[derive(Clone)]
+struct DownstreamMcpSession {
+    #[allow(dead_code)] // Useful in snapshots/debug views; map key is used for lookup.
+    downstream_session_id: String,
+    protocol_version: String,
+    client_info: Option<Value>,
+    client_capabilities: Option<Value>,
+    upstream_sessions: HashMap<String, UpstreamMcpSession>,
+    catalog: Arc<RwLock<McpCatalog>>,
+    // Per-session catalog refresh lock: serializes discovery for *this* session's
+    // catalog only, so a slow upstream refreshing one session does not block
+    // discovery for unrelated sessions (the catalog is per-session by design).
+    catalog_refresh_lock: Arc<Mutex<()>>,
+    last_seen: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct UpstreamMcpSession {
+    #[allow(dead_code)] // Useful in snapshots/debug views; map key is used for lookup.
+    server_id: String,
+    upstream_session_id: Option<String>,
+    protocol_version: Option<String>,
+    initialized: bool,
+    // Per-(session, server) initialize lock: serializes the upstream initialize +
+    // notifications/initialized round trip for this one upstream session, so a slow
+    // upstream does not stall initialization for other sessions or other servers.
+    init_lock: Arc<Mutex<()>>,
+}
+
+/// MCP-aware gateway/router plugin.
+pub struct McpGateway {
+    enabled: bool,
+    mode: McpGatewayMode,
+    endpoint_path: String,
+    supported_protocol_versions: Vec<String>,
+    discovery: McpDiscoveryConfig,
+    sessions: McpSessionConfig,
+    capabilities: McpCapabilitiesConfig,
+    servers: HashMap<String, McpServerConfig>,
+    primary_server_id: String,
+    // Catalog-refresh and upstream-initialize locks are scoped per-session and
+    // per-(session, server) respectively (see DownstreamMcpSession /
+    // UpstreamMcpSession), not globally, so one slow upstream cannot serialize
+    // discovery or initialization across unrelated client sessions.
+    session_admission_lock: Arc<Mutex<()>>,
+    session_store: Arc<DashMap<String, DownstreamMcpSession>>,
+    policy: McpPolicy,
+    validation: McpValidationConfig,
+    observability: McpObservabilityConfig,
+    http_client: PluginHttpClient,
+}
+
+impl McpGateway {
+    pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
+        let object = config
+            .as_object()
+            .ok_or_else(|| "mcp_gateway: config must be an object".to_string())?;
+
+        let enabled = optional_bool(object, "enabled")?.unwrap_or(true);
+        let mode = McpGatewayMode::parse(
+            optional_string(object, "mode")?
+                .ok_or_else(|| "mcp_gateway: 'mode' is required".to_string())?,
+        )?;
+
+        let endpoint = optional_object(object, "endpoint")?;
+        let endpoint_path = optional_string_from_object(endpoint, "path")?
+            .ok_or_else(|| "mcp_gateway: 'endpoint.path' is required".to_string())?;
+        validate_path(&endpoint_path, "endpoint.path")?;
+
+        let supported_protocol_versions =
+            optional_string_vec_from_object(endpoint, "protocol_versions")?
+                .unwrap_or_else(|| vec![DEFAULT_PROTOCOL_VERSION.to_string()]);
+        if supported_protocol_versions.is_empty() {
+            return Err("mcp_gateway: 'endpoint.protocol_versions' must not be empty".to_string());
+        }
+        if supported_protocol_versions
+            .iter()
+            .any(|version| version.trim().is_empty())
+        {
+            return Err(
+                "mcp_gateway: 'endpoint.protocol_versions' entries must not be empty".to_string(),
+            );
+        }
+        if supported_protocol_versions
+            .iter()
+            .any(|version| version == "2025-03-26")
+        {
+            return Err(
+                "mcp_gateway: endpoint.protocol_versions cannot include 2025-03-26 because JSON-RPC batch messages are not supported in V1"
+                    .to_string(),
+            );
+        }
+
+        let discovery = parse_discovery(object)?;
+        let sessions = parse_sessions(object)?;
+        let capabilities = parse_capabilities(object)?;
+        let policy = parse_policy(object)?;
+        let validation = parse_validation(object)?;
+        let observability = parse_observability(object)?;
+        let servers = parse_servers(object, sessions.initialize_upstreams)?;
+        if servers.is_empty() {
+            return Err("mcp_gateway: 'servers' must not be empty".to_string());
+        }
+        if sessions.initialize_upstreams == InitializeStrategy::Startup
+            || servers
+                .values()
+                .any(|server| server.initialize_strategy == InitializeStrategy::Startup)
+        {
+            warn!(
+                "mcp_gateway startup upstream initialization is treated as lazy in V1 because MCP initialize requires a downstream session"
+            );
+        }
+        let mut enabled_server_ids: Vec<String> = servers
+            .values()
+            .filter(|server| server.enabled)
+            .map(|server| server.server_id.clone())
+            .collect();
+        enabled_server_ids.sort();
+        if enabled_server_ids.is_empty() {
+            return Err("mcp_gateway: at least one server must be enabled".to_string());
+        }
+        if mode == McpGatewayMode::TransparentProxy && enabled_server_ids.len() != 1 {
+            return Err(
+                "mcp_gateway: transparent_proxy mode requires exactly one enabled server"
+                    .to_string(),
+            );
+        }
+        if mode == McpGatewayMode::AggregateRouter
+            && !servers.values().any(|server| {
+                server.enabled
+                    && (server.expose_tools || server.expose_resources || server.expose_prompts)
+            })
+        {
+            return Err(
+                "mcp_gateway: aggregate_router mode requires at least one enabled exposed item"
+                    .to_string(),
+            );
+        }
+        if mode == McpGatewayMode::AggregateRouter && !capabilities.passthrough_unknown_methods {
+            // These capabilities have no dedicated dispatch in V1. Advertising them
+            // in the synthetic initialize response would make compliant clients call
+            // methods (completion/complete, logging/setLevel, tasks/*) that the
+            // dispatcher answers with -32601. Require passthrough so they are at
+            // least routed to the primary upstream until they are implemented.
+            for (advertised, capability) in [
+                (capabilities.advertise_completions, "advertise_completions"),
+                (capabilities.advertise_logging, "advertise_logging"),
+                (capabilities.advertise_tasks, "advertise_tasks"),
+            ] {
+                if advertised {
+                    return Err(format!(
+                        "mcp_gateway: capabilities.{capability} requires capabilities.passthrough_unknown_methods=true in aggregate_router mode until that method is routed or implemented"
+                    ));
+                }
+            }
+        }
+
+        let primary_server_id = enabled_server_ids
+            .first()
+            .ok_or_else(|| "mcp_gateway: at least one server must be enabled".to_string())?
+            .clone();
+
+        // session_store is read/touched on every aggregate request and written on
+        // initialize/eviction, so size its shards per the hot-path DashMap invariant
+        // (honors FERRUM_POOL_SHARD_AMOUNT via the shared http client).
+        let session_shard_amount = http_client.pool_shard_amount();
+
+        Ok(Self {
+            enabled,
+            mode,
+            endpoint_path,
+            supported_protocol_versions,
+            discovery,
+            sessions,
+            capabilities,
+            servers,
+            primary_server_id,
+            session_admission_lock: Arc::new(Mutex::new(())),
+            session_store: Arc::new(DashMap::with_shard_amount(session_shard_amount)),
+            policy,
+            validation,
+            observability,
+            http_client,
+        })
+    }
+
+    fn matches_endpoint(&self, ctx: &RequestContext) -> bool {
+        ctx.path == self.endpoint_path
+    }
+
+    fn content_type_is_json(headers: &HashMap<String, String>) -> bool {
+        header_value(headers, "content-type").is_none_or(|value| {
+            let media_type = value.split(';').next().unwrap_or(value).trim();
+            media_type.eq_ignore_ascii_case("application/json")
+                || media_type.eq_ignore_ascii_case("application/json-rpc")
+                || media_type.ends_with("+json")
+        })
+    }
+
+    fn request_body<'a>(&self, ctx: &'a RequestContext) -> Option<&'a [u8]> {
+        ctx.request_body_bytes
+            .as_ref()
+            .map(|body| body.as_ref())
+            .or_else(|| ctx.metadata.get("request_body").map(|body| body.as_bytes()))
+    }
+
+    fn emit_base_metadata(&self, ctx: &mut RequestContext) {
+        if !self.observability.emit_metadata {
+            return;
+        }
+        ctx.metadata
+            .insert("mcp.enabled".to_string(), "true".to_string());
+        ctx.metadata
+            .insert("mcp.mode".to_string(), self.mode.as_str().to_string());
+        ctx.metadata
+            .entry("mcp.route_decision".to_string())
+            .or_insert_with(|| "not_applicable".to_string());
+        ctx.metadata
+            .entry("mcp.policy_decision".to_string())
+            .or_insert_with(|| "not_applicable".to_string());
+        ctx.metadata
+            .entry("mcp.schema_validation".to_string())
+            .or_insert_with(|| "skipped".to_string());
+    }
+
+    fn emit_envelope_metadata(&self, ctx: &mut RequestContext, envelope: &McpEnvelope) {
+        if !self.observability.emit_metadata {
+            return;
+        }
+        ctx.metadata.insert(
+            "mcp.message.kind".to_string(),
+            envelope.message_kind.as_str().to_string(),
+        );
+        ctx.metadata
+            .insert("mcp.jsonrpc".to_string(), envelope.jsonrpc.clone());
+        if let Some(method) = envelope.method.as_deref() {
+            ctx.metadata
+                .insert("mcp.method".to_string(), method.to_string());
+        }
+    }
+
+    fn mark_protocol_version(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &HashMap<String, String>,
+        envelope: Option<&McpEnvelope>,
+    ) -> Option<String> {
+        let version = header_value(headers, "mcp-protocol-version")
+            .map(ToOwned::to_owned)
+            .or_else(|| {
+                envelope.and_then(|env| {
+                    env.params
+                        .as_ref()
+                        .and_then(|params| params.get("protocolVersion"))
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
+                })
+            });
+        if let Some(version) = version.as_deref() {
+            ctx.metadata
+                .insert("mcp.protocol_version".to_string(), version.to_string());
+        }
+        version
+    }
+
+    fn downstream_session_id_from_headers(
+        &self,
+        headers: &HashMap<String, String>,
+    ) -> Option<String> {
+        header_value(headers, &self.sessions.downstream_session_header).map(ToOwned::to_owned)
+    }
+
+    fn upstream_session_id(&self, downstream_id: &str, server_id: &str) -> Option<String> {
+        self.downstream_session_clone(downstream_id)
+            .and_then(|session| {
+                session
+                    .upstream_sessions
+                    .get(server_id)
+                    .and_then(|upstream| upstream.upstream_session_id.clone())
+            })
+    }
+
+    fn set_route_to_server(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &mut HashMap<String, String>,
+        server: &McpServerConfig,
+        downstream_session_id: Option<&str>,
+    ) {
+        ctx.route_override_backend_scheme = Some(server.target.scheme);
+        ctx.route_override_backend_host = Some(server.target.host.clone());
+        ctx.route_override_backend_port = Some(server.target.port);
+        ctx.route_override_resolved_tls = Some(BackendTlsConfig::default_verify());
+        ctx.route_override_path = Some(server.target.path.clone());
+        ctx.route_override_path_is_absolute = true;
+        ctx.route_override_authority = Some(server.target.authority.clone());
+        headers.insert("host".to_string(), server.target.authority.clone());
+        if self.mode == McpGatewayMode::AggregateRouter {
+            // Session headers and the protocol version are gateway-owned in aggregate
+            // mode. Strip any client-supplied session value — the synthetic downstream
+            // id and any forged upstream id (including a differently-cased header
+            // key) — before re-adding only the gateway's mediated upstream session id.
+            // This stops passthrough / stateless upstreams (no mediated upstream
+            // session id) from binding to or rejecting a client-injected session.
+            // Transparent mode passes the client's session header straight through to
+            // its single upstream.
+            remove_header(headers, &self.sessions.downstream_session_header);
+            remove_header(headers, &self.sessions.upstream_session_header);
+            if let Some(downstream_id) = downstream_session_id {
+                // Forward the version the upstream session negotiated, which can
+                // differ from the downstream-negotiated version when both are
+                // supported. Sending the client's version could be rejected by an
+                // upstream that initialized to a different one.
+                remove_header(headers, "mcp-protocol-version");
+                headers.insert(
+                    "mcp-protocol-version".to_string(),
+                    self.protocol_version_for_upstream(downstream_id, &server.server_id),
+                );
+                if let Some(upstream_id) =
+                    self.upstream_session_id(downstream_id, &server.server_id)
+                {
+                    headers.insert(
+                        self.sessions.upstream_session_header.to_ascii_lowercase(),
+                        upstream_id,
+                    );
+                }
+            }
+        }
+        if self.observability.emit_metadata {
+            ctx.metadata
+                .insert("mcp.server_id".to_string(), server.server_id.clone());
+            ctx.metadata
+                .insert("mcp.route_decision".to_string(), "forward".to_string());
+        }
+    }
+
+    fn mark_request_rewrite(
+        ctx: &mut RequestContext,
+        method: &str,
+        param: &str,
+        public_value: &str,
+        upstream_value: &str,
+    ) {
+        ctx.metadata
+            .insert(METADATA_REWRITE_KEY.to_string(), "true".to_string());
+        ctx.metadata
+            .insert(METADATA_REWRITE_METHOD_KEY.to_string(), method.to_string());
+        ctx.metadata
+            .insert(METADATA_REWRITE_PARAM_KEY.to_string(), param.to_string());
+        ctx.metadata.insert(
+            METADATA_REWRITE_PUBLIC_VALUE_KEY.to_string(),
+            public_value.to_string(),
+        );
+        ctx.metadata.insert(
+            METADATA_REWRITE_UPSTREAM_VALUE_KEY.to_string(),
+            upstream_value.to_string(),
+        );
+    }
+
+    fn primary_server(&self) -> Option<&McpServerConfig> {
+        self.servers.get(&self.primary_server_id)
+    }
+
+    fn session_is_expired(&self, session: &DownstreamMcpSession) -> bool {
+        session.last_seen.elapsed() >= self.sessions.session_ttl
+    }
+
+    async fn touch_downstream_session(
+        &self,
+        downstream_session_id: &str,
+        ctx: &RequestContext,
+    ) -> bool {
+        let expired = self
+            .session_store
+            .get(downstream_session_id)
+            .is_some_and(|session| self.session_is_expired(&session));
+        if expired {
+            self.remove_downstream_session(downstream_session_id, ctx)
+                .await;
+            return false;
+        }
+        if let Some(mut session) = self.session_store.get_mut(downstream_session_id) {
+            session.last_seen = Instant::now();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn downstream_session_clone(
+        &self,
+        downstream_session_id: &str,
+    ) -> Option<DownstreamMcpSession> {
+        self.session_store
+            .get(downstream_session_id)
+            .map(|session| session.clone())
+    }
+
+    fn catalog_for_session(&self, downstream_session_id: &str) -> Option<Arc<RwLock<McpCatalog>>> {
+        self.downstream_session_clone(downstream_session_id)
+            .map(|session| session.catalog)
+    }
+
+    async fn require_live_downstream_session(
+        &self,
+        headers: &HashMap<String, String>,
+        id: Option<Value>,
+        ctx: &RequestContext,
+    ) -> Result<String, PluginResult> {
+        let Some(session_id) = self.downstream_session_id_from_headers(headers) else {
+            // No session header at all: the client never initialized (or dropped
+            // the header). Per MCP Streamable HTTP this is HTTP 400, distinct from
+            // the 404 that signals a terminated/unknown session and prompts re-init.
+            return Err(missing_session_response(id));
+        };
+        if !self.touch_downstream_session(&session_id, ctx).await {
+            return Err(session_not_found_response());
+        }
+        Ok(session_id)
+    }
+
+    async fn create_downstream_session(
+        &self,
+        ctx: &RequestContext,
+        protocol_version: String,
+        client_info: Option<Value>,
+        client_capabilities: Option<Value>,
+    ) -> String {
+        let downstream_session_id = uuid::Uuid::new_v4().to_string();
+
+        // Enforce the cap and reclaim sessions atomically, but keep upstream
+        // DELETE I/O *out* of the critical section. Under the admission lock we do
+        // only the in-memory work — a single scan that partitions sessions into
+        // expired (always reclaimed) and live (cap-eviction candidates), the
+        // store removals, and the insert — so concurrent `initialize` calls can't
+        // exceed `max_sessions` yet don't serialize behind each other's network
+        // cleanup. The evicted sessions' upstream DELETEs are issued concurrently
+        // after the lock is released.
+        let evicted = {
+            let _admission_guard = self.session_admission_lock.lock().await;
+
+            let mut expired_keys: Vec<String> = Vec::new();
+            let mut live: Vec<(Instant, String)> = Vec::new();
+            for entry in self.session_store.iter() {
+                if self.session_is_expired(entry.value()) {
+                    expired_keys.push(entry.key().clone());
+                } else {
+                    live.push((entry.value().last_seen, entry.key().clone()));
+                }
+            }
+
+            let mut evicted: Vec<DownstreamMcpSession> = Vec::new();
+            for key in expired_keys {
+                if let Some(session) = self.take_downstream_session(&key) {
+                    evicted.push(session);
+                }
+            }
+
+            // After reclaiming expired sessions, evict the oldest live sessions if
+            // still at the cap so there is room for exactly one new session.
+            let target = self.sessions.max_sessions.saturating_sub(1);
+            if live.len() > target {
+                let to_remove = live.len() - target;
+                live.sort_unstable_by_key(|(last_seen, _)| *last_seen);
+                for (_, key) in live.into_iter().take(to_remove) {
+                    if let Some(session) = self.take_downstream_session(&key) {
+                        evicted.push(session);
+                    }
+                }
+            }
+
+            let upstream_sessions = self
+                .servers
+                .values()
+                .filter(|server| server.enabled)
+                .map(|server| {
+                    (
+                        server.server_id.clone(),
+                        UpstreamMcpSession {
+                            server_id: server.server_id.clone(),
+                            upstream_session_id: None,
+                            protocol_version: None,
+                            initialized: false,
+                            init_lock: Arc::new(Mutex::new(())),
+                        },
+                    )
+                })
+                .collect();
+            self.session_store.insert(
+                downstream_session_id.clone(),
+                DownstreamMcpSession {
+                    downstream_session_id: downstream_session_id.clone(),
+                    protocol_version,
+                    client_info,
+                    client_capabilities,
+                    upstream_sessions,
+                    catalog: Arc::new(RwLock::new(McpCatalog::default())),
+                    catalog_refresh_lock: Arc::new(Mutex::new(())),
+                    last_seen: Instant::now(),
+                },
+            );
+            evicted
+        };
+
+        // Tear down evicted sessions' upstreams concurrently, outside the lock, so
+        // eviction never serializes new sessions behind upstream DELETE round trips.
+        if !evicted.is_empty() {
+            futures_util::future::join_all(
+                evicted
+                    .into_iter()
+                    .map(|session| self.delete_upstream_sessions(session, ctx)),
+            )
+            .await;
+        }
+
+        downstream_session_id
+    }
+
+    async fn ensure_upstream_initialized(
+        &self,
+        downstream_session_id: &str,
+        server_id: &str,
+        ctx: &RequestContext,
+    ) -> Result<Option<String>, String> {
+        let server = self
+            .servers
+            .get(server_id)
+            .ok_or_else(|| format!("unknown MCP upstream server {server_id:?}"))?;
+        if server.initialize_strategy == InitializeStrategy::Passthrough {
+            return Ok(None);
+        }
+        // Per-(session, server) lock: only the same upstream session serializes
+        // here, so concurrent first-touch of different sessions/servers proceeds
+        // in parallel and a slow upstream does not block unrelated initializes.
+        let init_lock = self
+            .downstream_session_clone(downstream_session_id)
+            .and_then(|session| {
+                session
+                    .upstream_sessions
+                    .get(server_id)
+                    .map(|upstream| Arc::clone(&upstream.init_lock))
+            })
+            .ok_or_else(|| "downstream MCP session is not initialized".to_string())?;
+        let _guard = init_lock.lock().await;
+        if let Some(upstream_session_id) = self
+            .downstream_session_clone(downstream_session_id)
+            .and_then(|session| {
+                session
+                    .upstream_sessions
+                    .get(server_id)
+                    .filter(|upstream| upstream.initialized)
+                    .map(|upstream| upstream.upstream_session_id.clone())
+            })
+        {
+            return Ok(upstream_session_id);
+        }
+
+        let session = self
+            .downstream_session_clone(downstream_session_id)
+            .ok_or_else(|| "downstream MCP session is not initialized".to_string())?;
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": uuid::Uuid::new_v4().to_string(),
+            "method": "initialize",
+            "params": {
+                "protocolVersion": session.protocol_version,
+                "capabilities": session.client_capabilities.unwrap_or_else(|| json!({})),
+                "clientInfo": session.client_info.unwrap_or_else(|| json!({
+                    "name": "ferrum-mcp-gateway",
+                    "version": env!("CARGO_PKG_VERSION")
+                })),
+            }
+        });
+        let request = self
+            .http_client
+            .get()
+            .post(&server.upstream_url)
+            .header("content-type", "application/json")
+            .header("accept", MCP_STREAMABLE_HTTP_ACCEPT)
+            .header(
+                "mcp-protocol-version",
+                self.protocol_version_for_session(downstream_session_id),
+            )
+            .json(&body);
+        let response = self
+            .http_client
+            .execute_tracked(request, "mcp_gateway.initialize", &ctx.plugin_http_call_ns)
+            .await
+            .map_err(|error| {
+                warn!(
+                    server_id = %server.server_id,
+                    method = "initialize",
+                    error = %error,
+                    "MCP upstream initialize request failed"
+                );
+                format!("failed to initialize upstream MCP server: {error}")
+            })?;
+        if !response.status().is_success() {
+            warn!(
+                server_id = %server.server_id,
+                method = "initialize",
+                status = %response.status(),
+                "MCP upstream initialize returned non-success status"
+            );
+            return Err(format!(
+                "upstream MCP initialize returned HTTP {}",
+                response.status()
+            ));
+        }
+        let upstream_session_id = response
+            .headers()
+            .get(&self.sessions.upstream_session_header)
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned);
+        let response_body =
+            upstream_response_json(response, &server.server_id, "initialize").await?;
+        if let Some(error) = response_body.get("error") {
+            let error_code = error.get("code").and_then(Value::as_i64);
+            let error_message = error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown MCP JSON-RPC error");
+            warn!(
+                server_id = %server.server_id,
+                method = "initialize",
+                error_code,
+                error_message = %error_message,
+                "MCP upstream initialize returned JSON-RPC error"
+            );
+            return Err("upstream MCP initialize returned JSON-RPC error".to_string());
+        }
+        if response_body.get("result").is_none() {
+            warn!(
+                server_id = %server.server_id,
+                method = "initialize",
+                "MCP upstream initialize response missing result"
+            );
+            return Err("upstream MCP initialize response missing result".to_string());
+        }
+        let negotiated_protocol_version = response_body
+            .get("result")
+            .and_then(|result| result.get("protocolVersion"))
+            .and_then(Value::as_str)
+            .unwrap_or(session.protocol_version.as_str())
+            .to_string();
+        if !self
+            .supported_protocol_versions
+            .iter()
+            .any(|supported| supported == &negotiated_protocol_version)
+        {
+            warn!(
+                server_id = %server.server_id,
+                method = "initialize",
+                protocol_version = %negotiated_protocol_version,
+                "MCP upstream initialize negotiated unsupported protocol version"
+            );
+            return Err(format!(
+                "upstream MCP initialize negotiated unsupported protocol version {negotiated_protocol_version}"
+            ));
+        }
+
+        self.send_upstream_initialized_notification(
+            ctx,
+            server,
+            &negotiated_protocol_version,
+            upstream_session_id.as_deref(),
+        )
+        .await?;
+
+        if let Some(mut session) = self.session_store.get_mut(downstream_session_id) {
+            session.last_seen = Instant::now();
+            if let Some(upstream) = session.upstream_sessions.get_mut(server_id) {
+                upstream.initialized = true;
+                upstream.upstream_session_id = upstream_session_id.clone();
+                upstream.protocol_version = Some(negotiated_protocol_version);
+            }
+        }
+        Ok(upstream_session_id)
+    }
+
+    async fn send_upstream_initialized_notification(
+        &self,
+        ctx: &RequestContext,
+        server: &McpServerConfig,
+        protocol_version: &str,
+        upstream_session_id: Option<&str>,
+    ) -> Result<(), String> {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+            "params": {}
+        });
+        let mut request = self
+            .http_client
+            .get()
+            .post(&server.upstream_url)
+            .header("content-type", "application/json")
+            .header("accept", MCP_STREAMABLE_HTTP_ACCEPT)
+            .header("mcp-protocol-version", protocol_version);
+        if let Some(session_id) = upstream_session_id {
+            request = request.header(&self.sessions.upstream_session_header, session_id);
+        }
+        let response = self
+            .http_client
+            .execute_tracked(
+                request.json(&body),
+                "mcp_gateway.initialized_notification",
+                &ctx.plugin_http_call_ns,
+            )
+            .await
+            .map_err(|error| {
+                warn!(
+                    server_id = %server.server_id,
+                    method = "notifications/initialized",
+                    error = %error,
+                    "MCP upstream initialized notification failed"
+                );
+                format!("failed to send upstream MCP initialized notification: {error}")
+            })?;
+        if !response.status().is_success() {
+            warn!(
+                server_id = %server.server_id,
+                method = "notifications/initialized",
+                status = %response.status(),
+                "MCP upstream initialized notification returned non-success status"
+            );
+            return Err(format!(
+                "upstream MCP initialized notification returned HTTP {}",
+                response.status()
+            ));
+        }
+        Ok(())
+    }
+
+    fn protocol_version_for_session(&self, downstream_session_id: &str) -> String {
+        self.downstream_session_clone(downstream_session_id)
+            .map(|session| session.protocol_version.clone())
+            .unwrap_or_else(|| self.supported_protocol_versions[0].clone())
+    }
+
+    fn protocol_version_for_upstream(
+        &self,
+        downstream_session_id: &str,
+        server_id: &str,
+    ) -> String {
+        self.downstream_session_clone(downstream_session_id)
+            .and_then(|session| {
+                session
+                    .upstream_sessions
+                    .get(server_id)
+                    .and_then(|upstream| upstream.protocol_version.clone())
+                    .or(Some(session.protocol_version))
+            })
+            .unwrap_or_else(|| self.supported_protocol_versions[0].clone())
+    }
+
+    /// Remove a session from the store without any upstream I/O. Splitting the
+    /// store removal from the upstream `DELETE` lets eviction take sessions under
+    /// the admission lock and issue the network cleanup after releasing it.
+    fn take_downstream_session(&self, downstream_session_id: &str) -> Option<DownstreamMcpSession> {
+        self.session_store
+            .remove(downstream_session_id)
+            .map(|(_, session)| session)
+    }
+
+    /// Issue the upstream `DELETE` for each initialized upstream session of an
+    /// already-removed downstream session. Failures are logged, not fatal.
+    async fn delete_upstream_sessions(&self, session: DownstreamMcpSession, ctx: &RequestContext) {
+        for (server_id, upstream) in session.upstream_sessions {
+            let Some(upstream_session_id) = upstream.upstream_session_id.clone() else {
+                continue;
+            };
+            if !upstream.initialized {
+                continue;
+            }
+            let Some(server) = self.servers.get(&server_id) else {
+                continue;
+            };
+            let request = self
+                .http_client
+                .get()
+                .delete(&server.upstream_url)
+                .header(&self.sessions.upstream_session_header, upstream_session_id)
+                .header(
+                    "mcp-protocol-version",
+                    upstream
+                        .protocol_version
+                        .as_deref()
+                        .unwrap_or(session.protocol_version.as_str()),
+                );
+            match self
+                .http_client
+                .execute_tracked(
+                    request,
+                    "mcp_gateway.session_delete",
+                    &ctx.plugin_http_call_ns,
+                )
+                .await
+            {
+                Ok(response) if response.status().is_success() => {}
+                Ok(response) => {
+                    warn!(
+                        server_id = %server.server_id,
+                        status = %response.status(),
+                        "MCP upstream session delete returned non-success status"
+                    );
+                }
+                Err(error) => {
+                    warn!(
+                        server_id = %server.server_id,
+                        error = %error,
+                        "MCP upstream session delete failed"
+                    );
+                }
+            }
+        }
+    }
+
+    async fn remove_downstream_session(
+        &self,
+        downstream_session_id: &str,
+        ctx: &RequestContext,
+    ) -> bool {
+        let Some(session) = self.take_downstream_session(downstream_session_id) else {
+            return false;
+        };
+        self.delete_upstream_sessions(session, ctx).await;
+        true
+    }
+
+    async fn request_upstream_json(
+        &self,
+        ctx: &RequestContext,
+        downstream_session_id: &str,
+        server: &McpServerConfig,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, String> {
+        let upstream_session_id = self
+            .ensure_upstream_initialized(downstream_session_id, &server.server_id, ctx)
+            .await?;
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": uuid::Uuid::new_v4().to_string(),
+            "method": method,
+            "params": params,
+        });
+        let mut request = self
+            .http_client
+            .get()
+            .post(&server.upstream_url)
+            .header("content-type", "application/json")
+            .header("accept", MCP_STREAMABLE_HTTP_ACCEPT)
+            .header(
+                "mcp-protocol-version",
+                self.protocol_version_for_upstream(downstream_session_id, &server.server_id),
+            );
+        if let Some(session_id) = upstream_session_id {
+            request = request.header(&self.sessions.upstream_session_header, session_id);
+        }
+        let response = self
+            .http_client
+            .execute_tracked(
+                request.json(&body),
+                "mcp_gateway.discovery",
+                &ctx.plugin_http_call_ns,
+            )
+            .await
+            .map_err(|error| {
+                warn!(
+                    server_id = %server.server_id,
+                    method,
+                    error = %error,
+                    "MCP upstream request failed"
+                );
+                format!("upstream MCP request failed: {error}")
+            })?;
+        if !response.status().is_success() {
+            warn!(
+                server_id = %server.server_id,
+                method,
+                status = %response.status(),
+                "MCP upstream request returned non-success status"
+            );
+            return Err(format!(
+                "upstream MCP request returned HTTP {}",
+                response.status()
+            ));
+        }
+        let response_body = upstream_response_json(response, &server.server_id, method).await?;
+        if let Some(error) = response_body.get("error") {
+            let error_code = error.get("code").and_then(Value::as_i64);
+            let error_message = error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown MCP JSON-RPC error");
+            warn!(
+                server_id = %server.server_id,
+                method,
+                error_code,
+                error_message = %error_message,
+                "MCP upstream returned JSON-RPC error"
+            );
+            return Err(format!("upstream MCP {method} returned JSON-RPC error"));
+        }
+        Ok(response_body)
+    }
+
+    async fn request_upstream_list_pages(
+        &self,
+        ctx: &RequestContext,
+        downstream_session_id: &str,
+        server: &McpServerConfig,
+        method: &str,
+        result_key: &str,
+    ) -> Result<Vec<Value>, String> {
+        let mut items = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..MAX_MCP_PAGINATION_PAGES {
+            let params = match cursor.as_deref() {
+                Some(cursor) => json!({ "cursor": cursor }),
+                None => json!({}),
+            };
+            let response = self
+                .request_upstream_json(ctx, downstream_session_id, server, method, params)
+                .await?;
+            let result = response
+                .get("result")
+                .and_then(Value::as_object)
+                .ok_or_else(|| format!("upstream MCP {method} response missing result"))?;
+            let page_items = result
+                .get(result_key)
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    format!("upstream MCP {method} response missing result.{result_key}")
+                })?;
+            items.extend(page_items.iter().cloned());
+            cursor = result
+                .get("nextCursor")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            if cursor.is_none() {
+                return Ok(items);
+            }
+        }
+        warn!(
+            server_id = %server.server_id,
+            method,
+            max_pages = MAX_MCP_PAGINATION_PAGES,
+            "MCP upstream pagination exceeded maximum page count"
+        );
+        Err(format!(
+            "upstream MCP {method} pagination exceeded {MAX_MCP_PAGINATION_PAGES} pages"
+        ))
+    }
+
+    async fn ensure_catalog(
+        &self,
+        ctx: &RequestContext,
+        downstream_session_id: &str,
+    ) -> Result<(), McpCatalogError> {
+        let session = self
+            .downstream_session_clone(downstream_session_id)
+            .ok_or(McpCatalogError::SessionNotFound)?;
+        let catalog_lock = &session.catalog;
+        {
+            let catalog = catalog_lock.read().await;
+            if !catalog.is_stale(self.discovery.cache_ttl) {
+                return Ok(());
+            }
+        }
+        let _guard = session.catalog_refresh_lock.lock().await;
+        {
+            let catalog = catalog_lock.read().await;
+            if !catalog.is_stale(self.discovery.cache_ttl) {
+                return Ok(());
+            }
+        }
+        self.refresh_catalog(ctx, downstream_session_id, catalog_lock)
+            .await
+            .map_err(McpCatalogError::Refresh)
+    }
+
+    async fn ensure_resource_templates(
+        &self,
+        ctx: &RequestContext,
+        downstream_session_id: &str,
+    ) -> Result<(), McpCatalogError> {
+        let session = self
+            .downstream_session_clone(downstream_session_id)
+            .ok_or(McpCatalogError::SessionNotFound)?;
+        let catalog_lock = &session.catalog;
+        {
+            let catalog = catalog_lock.read().await;
+            if !catalog.resource_templates_are_stale(self.discovery.cache_ttl) {
+                return Ok(());
+            }
+        }
+        let _guard = session.catalog_refresh_lock.lock().await;
+        {
+            let catalog = catalog_lock.read().await;
+            if !catalog.resource_templates_are_stale(self.discovery.cache_ttl) {
+                return Ok(());
+            }
+        }
+        self.refresh_resource_templates(ctx, downstream_session_id, catalog_lock)
+            .await
+            .map_err(McpCatalogError::Refresh)
+    }
+
+    async fn refresh_catalog(
+        &self,
+        ctx: &RequestContext,
+        downstream_session_id: &str,
+        catalog_lock: &Arc<RwLock<McpCatalog>>,
+    ) -> Result<(), String> {
+        let old_catalog = catalog_lock.read().await.clone();
+        let mut tools = HashMap::new();
+        let mut prompts = HashMap::new();
+        let mut resources = HashMap::new();
+        let mut collided_tools = HashSet::new();
+        let mut collided_prompts = HashSet::new();
+        let mut collided_resources = HashSet::new();
+        let discovered_at = Utc::now();
+
+        for server in self.servers.values().filter(|server| server.enabled) {
+            if self.discovery.aggregate_tools && server.expose_tools {
+                let items = self
+                    .request_upstream_list_pages(
+                        ctx,
+                        downstream_session_id,
+                        server,
+                        "tools/list",
+                        "tools",
+                    )
+                    .await?;
+                for item in items {
+                    if let Some(entry) =
+                        self.tool_entry_from_value(server, item, discovered_at, &old_catalog)
+                    {
+                        let public_name = entry.public_name.clone();
+                        insert_catalog_entry(
+                            &mut tools,
+                            &mut collided_tools,
+                            public_name,
+                            entry,
+                            &server.server_id,
+                            "tool",
+                        );
+                    }
+                }
+            }
+            if self.discovery.aggregate_prompts && server.expose_prompts {
+                let items = self
+                    .request_upstream_list_pages(
+                        ctx,
+                        downstream_session_id,
+                        server,
+                        "prompts/list",
+                        "prompts",
+                    )
+                    .await?;
+                for item in items {
+                    if let Some(entry) = self.prompt_entry_from_value(server, item, discovered_at) {
+                        let public_name = entry.public_name.clone();
+                        insert_catalog_entry(
+                            &mut prompts,
+                            &mut collided_prompts,
+                            public_name,
+                            entry,
+                            &server.server_id,
+                            "prompt",
+                        );
+                    }
+                }
+            }
+            if self.discovery.aggregate_resources && server.expose_resources {
+                let items = self
+                    .request_upstream_list_pages(
+                        ctx,
+                        downstream_session_id,
+                        server,
+                        "resources/list",
+                        "resources",
+                    )
+                    .await?;
+                for item in items {
+                    if let Some(entry) = self.resource_entry_from_value(server, item, discovered_at)
+                    {
+                        let public_uri = entry.public_uri.clone();
+                        insert_catalog_entry(
+                            &mut resources,
+                            &mut collided_resources,
+                            public_uri,
+                            entry,
+                            &server.server_id,
+                            "resource",
+                        );
+                    }
+                }
+            }
+        }
+
+        let mut catalog = catalog_lock.write().await;
+        let changed = catalog.tools.keys().collect::<HashSet<_>>() != tools.keys().collect()
+            || catalog.prompts.keys().collect::<HashSet<_>>() != prompts.keys().collect()
+            || catalog.resources.keys().collect::<HashSet<_>>() != resources.keys().collect()
+            || catalog.tools.iter().any(|(name, old)| {
+                tools
+                    .get(name)
+                    .is_some_and(|new| new.schema_hash != old.schema_hash)
+            });
+        catalog.tools = tools;
+        catalog.prompts = prompts;
+        catalog.resources = resources;
+        if changed || catalog.version == 0 {
+            catalog.version = catalog.version.saturating_add(1);
+        }
+        catalog.last_refreshed_at = Some(Instant::now());
+        catalog.last_refreshed_wall = discovered_at;
+        Ok(())
+    }
+
+    async fn refresh_resource_templates(
+        &self,
+        ctx: &RequestContext,
+        downstream_session_id: &str,
+        catalog_lock: &Arc<RwLock<McpCatalog>>,
+    ) -> Result<(), String> {
+        let mut resource_templates = HashMap::new();
+        let discovered_at = Utc::now();
+
+        if self.discovery.aggregate_resources {
+            for server in self
+                .servers
+                .values()
+                .filter(|server| server.enabled && server.expose_resources)
+            {
+                let items = self
+                    .request_upstream_list_pages(
+                        ctx,
+                        downstream_session_id,
+                        server,
+                        "resources/templates/list",
+                        "resourceTemplates",
+                    )
+                    .await?;
+                for item in items {
+                    if let Some(entry) =
+                        self.resource_template_entry_from_value(server, item, discovered_at)
+                    {
+                        resource_templates.insert(entry.public_uri_template.clone(), entry);
+                    }
+                }
+            }
+        }
+
+        let mut catalog = catalog_lock.write().await;
+        let changed = catalog.resource_templates.keys().collect::<HashSet<_>>()
+            != resource_templates.keys().collect();
+        catalog.resource_templates = resource_templates;
+        if changed || catalog.version == 0 {
+            catalog.version = catalog.version.saturating_add(1);
+        }
+        catalog.resource_templates_refreshed_at = Some(Instant::now());
+        catalog.last_refreshed_wall = discovered_at;
+        Ok(())
+    }
+
+    fn tool_entry_from_value(
+        &self,
+        server: &McpServerConfig,
+        item: Value,
+        discovered_at: DateTime<Utc>,
+        old_catalog: &McpCatalog,
+    ) -> Option<ToolCatalogEntry> {
+        let name = item.get("name")?.as_str()?.to_string();
+        let public_name = namespaced(
+            &server.namespace,
+            &self.discovery.namespace_separator,
+            &name,
+        );
+        let input_schema = item
+            .get("inputSchema")
+            .cloned()
+            .unwrap_or_else(|| json!({"type": "object"}));
+        let schema_hash = hash_value(&input_schema);
+        let input_validator = match jsonschema::validator_for(&input_schema) {
+            Ok(validator) => Arc::new(validator),
+            Err(error) => {
+                warn!(
+                    server_id = %server.server_id,
+                    tool = %name,
+                    error = %error,
+                    "Skipping MCP tool with invalid inputSchema"
+                );
+                return None;
+            }
+        };
+        let description = item
+            .get("description")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        let description_hash = hash_value(&Value::String(description.clone().unwrap_or_default()));
+        let policy_action = self.policy.action_for_tool(&public_name);
+        let explicitly_configured = self.policy.tools.contains_key(&public_name);
+        let schema_changed = old_catalog
+            .tools
+            .get(&public_name)
+            .is_some_and(|old| old.schema_hash != schema_hash);
+        let previously_hidden_by_discovery = old_catalog
+            .tools
+            .get(&public_name)
+            .is_some_and(|old| old.hidden_by_discovery);
+        let new_tool = !old_catalog.tools.contains_key(&public_name);
+        // Schema-change hiding must persist across refreshes (the changed schema
+        // becomes the new baseline, so `schema_changed` is only true on the first
+        // refresh after the drift). Carry it forward stickily so the gate is not
+        // lifted on the next refresh. This is what keeps explicitly-configured
+        // tools hidden too: they can only become hidden via schema change (the
+        // new-tool gate below exempts configured tools), so retaining their hidden
+        // state here never traps a freshly-configured tool.
+        let previously_hidden_by_schema_change = old_catalog
+            .tools
+            .get(&public_name)
+            .is_some_and(|old| old.hidden_by_schema_change);
+        let hidden_by_schema_change = previously_hidden_by_schema_change
+            || (schema_changed
+                && self.discovery.on_schema_change == DiscoveryBehavior::HideUntilConfigured);
+        let hidden_by_discovery = (previously_hidden_by_discovery && !explicitly_configured)
+            || (new_tool
+                && self.discovery.on_new_tool == DiscoveryBehavior::HideUntilConfigured
+                && !explicitly_configured)
+            || hidden_by_schema_change;
+        let hidden_from_discovery =
+            hidden_by_discovery || policy_action == PolicyAction::HideFromDiscovery;
+        let enabled = policy_action == PolicyAction::Allow && !hidden_by_discovery;
+        Some(ToolCatalogEntry {
+            public_name,
+            upstream_name: name,
+            server_id: server.server_id.clone(),
+            namespace: server.namespace.clone(),
+            input_schema,
+            output_schema: item.get("outputSchema").cloned(),
+            title: item
+                .get("title")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+            description,
+            annotations: item.get("annotations").cloned(),
+            enabled,
+            hidden_by_discovery,
+            hidden_from_discovery,
+            hidden_by_schema_change,
+            input_validator,
+            discovered_at,
+            schema_hash,
+            description_hash,
+        })
+    }
+
+    fn prompt_entry_from_value(
+        &self,
+        server: &McpServerConfig,
+        item: Value,
+        discovered_at: DateTime<Utc>,
+    ) -> Option<PromptCatalogEntry> {
+        let name = item.get("name")?.as_str()?.to_string();
+        let public_name = namespaced(
+            &server.namespace,
+            &self.discovery.namespace_separator,
+            &name,
+        );
+        let arguments_schema = item.get("argumentsSchema").cloned();
+        let schema_hash = hash_value(arguments_schema.as_ref().unwrap_or(&Value::Null));
+        Some(PromptCatalogEntry {
+            public_name,
+            upstream_name: name,
+            server_id: server.server_id.clone(),
+            namespace: server.namespace.clone(),
+            description: item
+                .get("description")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+            arguments_schema,
+            enabled: true,
+            discovered_at,
+            schema_hash,
+        })
+    }
+
+    fn resource_entry_from_value(
+        &self,
+        server: &McpServerConfig,
+        item: Value,
+        discovered_at: DateTime<Utc>,
+    ) -> Option<ResourceCatalogEntry> {
+        let upstream_uri = item.get("uri")?.as_str()?.to_string();
+        let public_uri = public_resource_uri(&server.server_id, &upstream_uri);
+        Some(ResourceCatalogEntry {
+            uri_hash: hash_str(&upstream_uri),
+            public_uri,
+            upstream_uri,
+            server_id: server.server_id.clone(),
+            namespace: server.namespace.clone(),
+            name: item
+                .get("name")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+            description: item
+                .get("description")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+            mime_type: item
+                .get("mimeType")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+            enabled: true,
+            discovered_at,
+        })
+    }
+
+    fn resource_template_entry_from_value(
+        &self,
+        server: &McpServerConfig,
+        item: Value,
+        discovered_at: DateTime<Utc>,
+    ) -> Option<ResourceTemplateCatalogEntry> {
+        let upstream_uri_template = item.get("uriTemplate")?.as_str()?.to_string();
+        let uri_template_regex = match uri_template_regex(&upstream_uri_template) {
+            Ok(regex) => Arc::new(regex),
+            Err(error) => {
+                warn!(
+                    server_id = %server.server_id,
+                    uri_template_hash = %hash_str(&upstream_uri_template),
+                    error = %error,
+                    "Skipping MCP resource template with invalid URI template"
+                );
+                return None;
+            }
+        };
+        Some(ResourceTemplateCatalogEntry {
+            public_uri_template: public_resource_template_uri(
+                &server.server_id,
+                &upstream_uri_template,
+            ),
+            server_id: server.server_id.clone(),
+            namespace: server.namespace.clone(),
+            name: item
+                .get("name")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+            title: item
+                .get("title")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+            description: item
+                .get("description")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+            mime_type: item
+                .get("mimeType")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+            annotations: item.get("annotations").cloned(),
+            icons: item.get("icons").cloned(),
+            enabled: true,
+            discovered_at,
+            uri_template_regex,
+        })
+    }
+
+    fn synthetic_initialize_response(
+        &self,
+        envelope: &McpEnvelope,
+        protocol_version: &str,
+        downstream_session_id: &str,
+    ) -> PluginResult {
+        let mut capabilities = Map::new();
+        if self.capabilities.advertise_tools {
+            capabilities.insert("tools".to_string(), json!({"listChanged": true}));
+        }
+        if self.capabilities.advertise_resources {
+            capabilities.insert("resources".to_string(), json!({"listChanged": true}));
+        }
+        if self.capabilities.advertise_prompts {
+            capabilities.insert("prompts".to_string(), json!({"listChanged": true}));
+        }
+        if self.capabilities.advertise_logging {
+            capabilities.insert("logging".to_string(), json!({}));
+        }
+        if self.capabilities.advertise_completions {
+            capabilities.insert("completions".to_string(), json!({}));
+        }
+        if self.capabilities.advertise_tasks {
+            capabilities.insert("tasks".to_string(), json!({}));
+        }
+
+        json_response(
+            200,
+            json!({
+                "jsonrpc": "2.0",
+                "id": envelope.id.clone().unwrap_or(Value::Null),
+                "result": {
+                    "protocolVersion": protocol_version,
+                    "capabilities": Value::Object(capabilities),
+                    "serverInfo": {
+                        "name": "ferrum-mcp-gateway",
+                        "title": "Ferrum MCP Gateway",
+                        "version": env!("CARGO_PKG_VERSION")
+                    }
+                }
+            }),
+            Some((
+                &self.sessions.downstream_session_header,
+                downstream_session_id,
+            )),
+        )
+    }
+
+    async fn aggregate_tools_list(
+        &self,
+        ctx: &mut RequestContext,
+        envelope: &McpEnvelope,
+        downstream_session_id: &str,
+    ) -> PluginResult {
+        if let Err(error) = self.ensure_catalog(ctx, downstream_session_id).await {
+            return catalog_error_response(envelope.id.clone(), "MCP catalog unavailable", error);
+        }
+        let Some(catalog_lock) = self.catalog_for_session(downstream_session_id) else {
+            return session_not_found_response();
+        };
+        let catalog = catalog_lock.read().await;
+        if self.observability.emit_metadata {
+            ctx.metadata.insert(
+                "mcp.route_decision".to_string(),
+                "synthetic_response".to_string(),
+            );
+            ctx.metadata.insert(
+                "mcp.catalog_version".to_string(),
+                catalog.version.to_string(),
+            );
+        }
+        let tools: Vec<Value> = catalog
+            .tools
+            .values()
+            .filter(|entry| {
+                !entry.hidden_from_discovery
+                    && (entry.enabled
+                        || !(self.discovery.hide_denied_items || self.policy.hide_denied_tools))
+            })
+            .map(tool_entry_to_public_value)
+            .collect();
+        json_response(
+            200,
+            json!({
+                "jsonrpc": "2.0",
+                "id": envelope.id.clone().unwrap_or(Value::Null),
+                "result": { "tools": tools }
+            }),
+            None,
+        )
+    }
+
+    async fn aggregate_prompts_list(
+        &self,
+        ctx: &mut RequestContext,
+        envelope: &McpEnvelope,
+        downstream_session_id: &str,
+    ) -> PluginResult {
+        if let Err(error) = self.ensure_catalog(ctx, downstream_session_id).await {
+            return catalog_error_response(envelope.id.clone(), "MCP catalog unavailable", error);
+        }
+        let Some(catalog_lock) = self.catalog_for_session(downstream_session_id) else {
+            return session_not_found_response();
+        };
+        let catalog = catalog_lock.read().await;
+        if self.observability.emit_metadata {
+            ctx.metadata.insert(
+                "mcp.route_decision".to_string(),
+                "synthetic_response".to_string(),
+            );
+            ctx.metadata.insert(
+                "mcp.catalog_version".to_string(),
+                catalog.version.to_string(),
+            );
+        }
+        let prompts: Vec<Value> = catalog
+            .prompts
+            .values()
+            .filter(|entry| entry.enabled)
+            .map(prompt_entry_to_public_value)
+            .collect();
+        json_response(
+            200,
+            json!({
+                "jsonrpc": "2.0",
+                "id": envelope.id.clone().unwrap_or(Value::Null),
+                "result": { "prompts": prompts }
+            }),
+            None,
+        )
+    }
+
+    async fn aggregate_resources_list(
+        &self,
+        ctx: &mut RequestContext,
+        envelope: &McpEnvelope,
+        downstream_session_id: &str,
+    ) -> PluginResult {
+        if let Err(error) = self.ensure_catalog(ctx, downstream_session_id).await {
+            return catalog_error_response(envelope.id.clone(), "MCP catalog unavailable", error);
+        }
+        let Some(catalog_lock) = self.catalog_for_session(downstream_session_id) else {
+            return session_not_found_response();
+        };
+        let catalog = catalog_lock.read().await;
+        if self.observability.emit_metadata {
+            ctx.metadata.insert(
+                "mcp.route_decision".to_string(),
+                "synthetic_response".to_string(),
+            );
+            ctx.metadata.insert(
+                "mcp.catalog_version".to_string(),
+                catalog.version.to_string(),
+            );
+        }
+        let resources: Vec<Value> = catalog
+            .resources
+            .values()
+            .filter(|entry| entry.enabled)
+            .map(resource_entry_to_public_value)
+            .collect();
+        json_response(
+            200,
+            json!({
+                "jsonrpc": "2.0",
+                "id": envelope.id.clone().unwrap_or(Value::Null),
+                "result": { "resources": resources }
+            }),
+            None,
+        )
+    }
+
+    async fn aggregate_resource_templates_list(
+        &self,
+        ctx: &mut RequestContext,
+        envelope: &McpEnvelope,
+        downstream_session_id: &str,
+    ) -> PluginResult {
+        if let Err(error) = self
+            .ensure_resource_templates(ctx, downstream_session_id)
+            .await
+        {
+            return catalog_error_response(
+                envelope.id.clone(),
+                "MCP resource template catalog unavailable",
+                error,
+            );
+        }
+        let Some(catalog_lock) = self.catalog_for_session(downstream_session_id) else {
+            return session_not_found_response();
+        };
+        let catalog = catalog_lock.read().await;
+        let resource_templates: Vec<Value> = catalog
+            .resource_templates
+            .values()
+            .filter(|entry| entry.enabled)
+            .map(resource_template_entry_to_public_value)
+            .collect();
+        if self.observability.emit_metadata {
+            ctx.metadata.insert(
+                "mcp.route_decision".to_string(),
+                "synthetic_response".to_string(),
+            );
+            ctx.metadata.insert(
+                "mcp.catalog_version".to_string(),
+                catalog.version.to_string(),
+            );
+        }
+        json_response(
+            200,
+            json!({
+                "jsonrpc": "2.0",
+                "id": envelope.id.clone().unwrap_or(Value::Null),
+                "result": { "resourceTemplates": resource_templates }
+            }),
+            None,
+        )
+    }
+
+    async fn route_tool_call(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &mut HashMap<String, String>,
+        envelope: &McpEnvelope,
+        downstream_session_id: &str,
+    ) -> PluginResult {
+        if let Err(error) = self.ensure_catalog(ctx, downstream_session_id).await {
+            return catalog_error_response(envelope.id.clone(), "MCP catalog unavailable", error);
+        }
+        let public_name = match envelope
+            .params
+            .as_ref()
+            .and_then(|params| params.get("name"))
+            .and_then(Value::as_str)
+        {
+            Some(name) => name.to_string(),
+            None => {
+                return json_rpc_error(
+                    envelope.id.clone(),
+                    -32602,
+                    "Invalid MCP tool call params",
+                    None,
+                );
+            }
+        };
+        if self.observability.emit_metadata {
+            ctx.metadata
+                .insert("mcp.public_tool_name".to_string(), public_name.clone());
+            ctx.metadata
+                .insert("mcp.item_type".to_string(), "tool".to_string());
+            ctx.metadata
+                .insert("mcp.item_name".to_string(), public_name.clone());
+        }
+        let Some(catalog_lock) = self.catalog_for_session(downstream_session_id) else {
+            return session_not_found_response();
+        };
+        let catalog = catalog_lock.read().await;
+        let Some(entry) = catalog.tools.get(&public_name).cloned() else {
+            if self.observability.emit_metadata {
+                ctx.metadata
+                    .insert("mcp.catalog_hit".to_string(), "false".to_string());
+                ctx.metadata
+                    .insert("mcp.policy_decision".to_string(), "deny".to_string());
+            }
+            return json_rpc_error(envelope.id.clone(), -32003, "Unknown MCP tool", None);
+        };
+        drop(catalog);
+        if self.observability.emit_metadata {
+            ctx.metadata
+                .insert("mcp.catalog_hit".to_string(), "true".to_string());
+            ctx.metadata
+                .insert("mcp.server_id".to_string(), entry.server_id.clone());
+            ctx.metadata.insert(
+                "mcp.upstream_tool_name".to_string(),
+                entry.upstream_name.clone(),
+            );
+            ctx.metadata.insert(
+                "mcp.input_schema_hash".to_string(),
+                entry.schema_hash.clone(),
+            );
+        }
+        let policy_action = self.policy.action_for_tool(&public_name);
+        if policy_action != PolicyAction::Allow || !entry.enabled {
+            if self.observability.emit_metadata {
+                ctx.metadata.insert(
+                    "mcp.policy_decision".to_string(),
+                    policy_action.as_policy_decision().to_string(),
+                );
+                ctx.metadata
+                    .insert("mcp.route_decision".to_string(), "deny".to_string());
+            }
+            return json_rpc_error(
+                envelope.id.clone(),
+                -32001,
+                "MCP tool call denied by gateway policy",
+                None,
+            );
+        }
+        if self.observability.emit_metadata {
+            ctx.metadata
+                .insert("mcp.policy_decision".to_string(), "allow".to_string());
+        }
+
+        if self.validation.validate_tool_arguments {
+            let empty_arguments;
+            let arguments = match envelope
+                .params
+                .as_ref()
+                .and_then(|params| params.get("arguments"))
+            {
+                Some(arguments) => arguments,
+                None => {
+                    empty_arguments = json!({});
+                    &empty_arguments
+                }
+            };
+            if self.observability.log_argument_hash {
+                ctx.metadata
+                    .insert("mcp.arguments_hash".to_string(), hash_value(arguments));
+            }
+            if self.observability.log_raw_arguments {
+                ctx.metadata
+                    .insert("mcp.arguments".to_string(), arguments.to_string());
+            }
+            match validate_json_schema(&entry.input_validator, arguments) {
+                Ok(()) => {
+                    if self.observability.emit_metadata {
+                        ctx.metadata
+                            .insert("mcp.schema_validation".to_string(), "pass".to_string());
+                    }
+                }
+                Err(_) => {
+                    if self.observability.emit_metadata {
+                        ctx.metadata
+                            .insert("mcp.schema_validation".to_string(), "fail".to_string());
+                        ctx.metadata
+                            .insert("mcp.route_decision".to_string(), "deny".to_string());
+                    }
+                    return json_rpc_error(
+                        envelope.id.clone(),
+                        -32602,
+                        "Invalid MCP tool arguments",
+                        None,
+                    );
+                }
+            }
+        }
+
+        let Some(server) = self.servers.get(&entry.server_id) else {
+            return json_rpc_error(
+                envelope.id.clone(),
+                -32002,
+                "Unknown upstream MCP server",
+                None,
+            );
+        };
+        if let Err(error) = self
+            .ensure_upstream_initialized(downstream_session_id, &server.server_id, ctx)
+            .await
+        {
+            return json_rpc_error(
+                envelope.id.clone(),
+                -32005,
+                "Upstream MCP session unavailable",
+                Some(error),
+            );
+        }
+        self.set_route_to_server(ctx, headers, server, Some(downstream_session_id));
+        Self::mark_request_rewrite(
+            ctx,
+            "tools/call",
+            "name",
+            &public_name,
+            &entry.upstream_name,
+        );
+        PluginResult::Continue
+    }
+
+    async fn route_prompt_get(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &mut HashMap<String, String>,
+        envelope: &McpEnvelope,
+        downstream_session_id: &str,
+    ) -> PluginResult {
+        if let Err(error) = self.ensure_catalog(ctx, downstream_session_id).await {
+            return catalog_error_response(envelope.id.clone(), "MCP catalog unavailable", error);
+        }
+        let public_name = match envelope
+            .params
+            .as_ref()
+            .and_then(|params| params.get("name"))
+            .and_then(Value::as_str)
+        {
+            Some(name) => name.to_string(),
+            None => {
+                return json_rpc_error(
+                    envelope.id.clone(),
+                    -32602,
+                    "Invalid MCP prompt params",
+                    None,
+                );
+            }
+        };
+        let Some(catalog_lock) = self.catalog_for_session(downstream_session_id) else {
+            return session_not_found_response();
+        };
+        let catalog = catalog_lock.read().await;
+        let Some(entry) = catalog.prompts.get(&public_name).cloned() else {
+            return json_rpc_error(envelope.id.clone(), -32008, "Unknown MCP prompt", None);
+        };
+        drop(catalog);
+        let Some(server) = self.servers.get(&entry.server_id) else {
+            return json_rpc_error(
+                envelope.id.clone(),
+                -32002,
+                "Unknown upstream MCP server",
+                None,
+            );
+        };
+        if let Err(error) = self
+            .ensure_upstream_initialized(downstream_session_id, &server.server_id, ctx)
+            .await
+        {
+            return json_rpc_error(
+                envelope.id.clone(),
+                -32005,
+                "Upstream MCP session unavailable",
+                Some(error),
+            );
+        }
+        if self.observability.emit_metadata {
+            ctx.metadata
+                .insert("mcp.item_type".to_string(), "prompt".to_string());
+            ctx.metadata
+                .insert("mcp.prompt_name".to_string(), public_name.clone());
+            ctx.metadata
+                .insert("mcp.server_id".to_string(), entry.server_id.clone());
+            ctx.metadata.insert(
+                "mcp.upstream_prompt_name".to_string(),
+                entry.upstream_name.clone(),
+            );
+        }
+        self.set_route_to_server(ctx, headers, server, Some(downstream_session_id));
+        Self::mark_request_rewrite(
+            ctx,
+            "prompts/get",
+            "name",
+            &public_name,
+            &entry.upstream_name,
+        );
+        PluginResult::Continue
+    }
+
+    async fn route_resource_read(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &mut HashMap<String, String>,
+        envelope: &McpEnvelope,
+        downstream_session_id: &str,
+    ) -> PluginResult {
+        let catalog_error = match self.ensure_catalog(ctx, downstream_session_id).await {
+            Ok(()) => None,
+            Err(McpCatalogError::SessionNotFound) => return session_not_found_response(),
+            Err(error) => Some(error),
+        };
+        let public_uri = match envelope
+            .params
+            .as_ref()
+            .and_then(|params| params.get("uri"))
+            .and_then(Value::as_str)
+        {
+            Some(uri) => uri.to_string(),
+            None => {
+                return json_rpc_error(
+                    envelope.id.clone(),
+                    -32602,
+                    "Invalid MCP resource params",
+                    None,
+                );
+            }
+        };
+        let route = if catalog_error.is_none() {
+            let Some(catalog_lock) = self.catalog_for_session(downstream_session_id) else {
+                return session_not_found_response();
+            };
+            let catalog = catalog_lock.read().await;
+            catalog
+                .resources
+                .get(&public_uri)
+                .map(|entry| (entry.server_id.clone(), entry.upstream_uri.clone()))
+        } else {
+            None
+        };
+        let (server_id, upstream_uri) = match route {
+            Some(route) => route,
+            None => {
+                if let Err(error) = self
+                    .ensure_resource_templates(ctx, downstream_session_id)
+                    .await
+                {
+                    return catalog_error_response(
+                        envelope.id.clone(),
+                        "MCP resource template catalog unavailable",
+                        error,
+                    );
+                }
+                let Some(catalog_lock) = self.catalog_for_session(downstream_session_id) else {
+                    return session_not_found_response();
+                };
+                let catalog = catalog_lock.read().await;
+                let Some(route) = resource_template_route(&catalog, &public_uri) else {
+                    if let Some(error) = catalog_error {
+                        return catalog_error_response(
+                            envelope.id.clone(),
+                            "MCP catalog unavailable",
+                            error,
+                        );
+                    }
+                    return json_rpc_error(
+                        envelope.id.clone(),
+                        -32007,
+                        "Unknown MCP resource",
+                        None,
+                    );
+                };
+                route
+            }
+        };
+        let Some(server) = self.servers.get(&server_id) else {
+            return json_rpc_error(
+                envelope.id.clone(),
+                -32002,
+                "Unknown upstream MCP server",
+                None,
+            );
+        };
+        if let Err(error) = self
+            .ensure_upstream_initialized(downstream_session_id, &server.server_id, ctx)
+            .await
+        {
+            return json_rpc_error(
+                envelope.id.clone(),
+                -32005,
+                "Upstream MCP session unavailable",
+                Some(error),
+            );
+        }
+        if self.observability.emit_metadata {
+            ctx.metadata
+                .insert("mcp.item_type".to_string(), "resource".to_string());
+            ctx.metadata
+                .insert("mcp.resource_uri".to_string(), public_uri.clone());
+            ctx.metadata
+                .insert("mcp.server_id".to_string(), server_id.clone());
+            ctx.metadata.insert(
+                "mcp.upstream_resource_uri".to_string(),
+                upstream_uri.clone(),
+            );
+        }
+        self.set_route_to_server(ctx, headers, server, Some(downstream_session_id));
+        Self::mark_request_rewrite(ctx, "resources/read", "uri", &public_uri, &upstream_uri);
+        PluginResult::Continue
+    }
+
+    fn handle_transparent_post(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &mut HashMap<String, String>,
+        envelope: &McpEnvelope,
+    ) -> PluginResult {
+        let Some(server) = self.primary_server() else {
+            return json_rpc_error(
+                envelope.id.clone(),
+                -32002,
+                "Unknown upstream MCP server",
+                None,
+            );
+        };
+        if self.observability.emit_metadata {
+            ctx.metadata
+                .insert("mcp.server_id".to_string(), server.server_id.clone());
+        }
+        let downstream_session_id = self.downstream_session_id_from_headers(headers);
+        self.set_route_to_server(ctx, headers, server, downstream_session_id.as_deref());
+        PluginResult::Continue
+    }
+}
+
+#[async_trait]
+impl Plugin for McpGateway {
+    fn name(&self) -> &str {
+        "mcp_gateway"
+    }
+
+    fn priority(&self) -> u16 {
+        super::priority::MCP_GATEWAY
+    }
+
+    fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
+        HTTP_ONLY_PROTOCOLS
+    }
+
+    fn modifies_request_headers(&self) -> bool {
+        self.enabled
+    }
+
+    fn modifies_request_body(&self) -> bool {
+        self.enabled && self.mode == McpGatewayMode::AggregateRouter
+    }
+
+    fn requires_request_body_before_before_proxy(&self) -> bool {
+        self.enabled
+    }
+
+    fn needs_request_body_bytes(&self) -> bool {
+        self.enabled
+    }
+
+    fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
+        self.enabled && self.matches_endpoint(ctx) && ctx.method.eq_ignore_ascii_case("POST")
+    }
+
+    fn needs_final_request_body_context(&self) -> bool {
+        self.enabled && self.mode == McpGatewayMode::AggregateRouter
+    }
+
+    async fn before_proxy(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        if !self.enabled || !self.matches_endpoint(ctx) {
+            return PluginResult::Continue;
+        }
+        self.emit_base_metadata(ctx);
+
+        if ctx.method.eq_ignore_ascii_case("GET") {
+            if self.mode == McpGatewayMode::TransparentProxy {
+                if let Some(server) = self.primary_server() {
+                    let downstream_session_id = self.downstream_session_id_from_headers(headers);
+                    self.set_route_to_server(
+                        ctx,
+                        headers,
+                        server,
+                        downstream_session_id.as_deref(),
+                    );
+                }
+                return PluginResult::Continue;
+            }
+            ctx.metadata
+                .insert("mcp.route_decision".to_string(), "deny".to_string());
+            return PluginResult::Reject {
+                status_code: 405,
+                body: json!({"error": "aggregate MCP SSE multiplexing is not supported in V1"})
+                    .to_string(),
+                headers: HashMap::from([(
+                    "content-type".to_string(),
+                    "application/json".to_string(),
+                )]),
+            };
+        }
+
+        if ctx.method.eq_ignore_ascii_case("DELETE") {
+            if self.mode == McpGatewayMode::TransparentProxy {
+                if let Some(server) = self.primary_server() {
+                    let downstream_session_id = self.downstream_session_id_from_headers(headers);
+                    self.set_route_to_server(
+                        ctx,
+                        headers,
+                        server,
+                        downstream_session_id.as_deref(),
+                    );
+                }
+                return PluginResult::Continue;
+            }
+            if let Some(session_id) = self.downstream_session_id_from_headers(headers) {
+                if !self.touch_downstream_session(&session_id, ctx).await {
+                    return session_not_found_response();
+                }
+                self.remove_downstream_session(&session_id, ctx).await;
+                ctx.metadata
+                    .insert("mcp.session.downstream".to_string(), hash_str(&session_id));
+            }
+            ctx.metadata.insert(
+                "mcp.route_decision".to_string(),
+                "synthetic_response".to_string(),
+            );
+            return PluginResult::Reject {
+                status_code: 200,
+                body: "{}".to_string(),
+                headers: HashMap::from([(
+                    "content-type".to_string(),
+                    "application/json".to_string(),
+                )]),
+            };
+        }
+
+        if !ctx.method.eq_ignore_ascii_case("POST") {
+            if self.mode == McpGatewayMode::AggregateRouter {
+                ctx.metadata
+                    .insert("mcp.route_decision".to_string(), "deny".to_string());
+                return PluginResult::Reject {
+                    status_code: 405,
+                    body: json!({"error": "unsupported MCP aggregate HTTP method"}).to_string(),
+                    headers: HashMap::from([(
+                        "content-type".to_string(),
+                        "application/json".to_string(),
+                    )]),
+                };
+            }
+            return PluginResult::Continue;
+        }
+        if !Self::content_type_is_json(headers) {
+            return json_rpc_error(None, -32600, "Invalid MCP JSON-RPC request", None);
+        }
+        let Some(body) = self.request_body(ctx) else {
+            return json_rpc_error(None, -32600, "Invalid MCP JSON-RPC request", None);
+        };
+        let envelope = match parse_mcp_envelope(body) {
+            Ok(envelope) => envelope,
+            Err(_) => return json_rpc_error(None, -32600, "Invalid MCP JSON-RPC request", None),
+        };
+        self.emit_envelope_metadata(ctx, &envelope);
+        let protocol_version = self.mark_protocol_version(ctx, headers, Some(&envelope));
+        let method = envelope.method.as_deref().unwrap_or_default();
+        // Methods the aggregate router handles itself are all JSON-RPC requests.
+        // A notification-form one (no id) is accepted with 202/no body and must run
+        // none of the request-side side effects, so this guard precedes protocol
+        // validation and the session touch/validation below: a stale session header
+        // must not turn it into a 404, a live one must not bump last_seen, and no
+        // catalog refresh or routing may occur. Genuine notifications/*,
+        // notification-form ping, and passthrough/unknown methods keep their handling
+        // in the match below. Transparent mode forwards notifications to its single
+        // upstream, so this only applies in aggregate mode.
+        if self.mode == McpGatewayMode::AggregateRouter
+            && envelope.message_kind == McpMessageKind::Notification
+            && matches!(
+                method,
+                "initialize"
+                    | "tools/list"
+                    | "tools/call"
+                    | "prompts/list"
+                    | "prompts/get"
+                    | "resources/list"
+                    | "resources/templates/list"
+                    | "resources/read"
+            )
+        {
+            ctx.metadata.insert(
+                "mcp.route_decision".to_string(),
+                "synthetic_response".to_string(),
+            );
+            return empty_response(202);
+        }
+        if method != "initialize"
+            && let Some(version) = protocol_version.as_deref()
+            && !self
+                .supported_protocol_versions
+                .iter()
+                .any(|supported| supported.as_str() == version)
+        {
+            ctx.metadata
+                .insert("mcp.route_decision".to_string(), "deny".to_string());
+            return json_response(
+                400,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": envelope.id.clone().unwrap_or(Value::Null),
+                    "error": {
+                        "code": -32600,
+                        "message": "Unsupported MCP protocol version"
+                    }
+                }),
+                None,
+            );
+        }
+        if let Some(session_id) = self.downstream_session_id_from_headers(headers) {
+            if self.mode == McpGatewayMode::AggregateRouter
+                && method != "initialize"
+                && !self.touch_downstream_session(&session_id, ctx).await
+            {
+                return session_not_found_response();
+            }
+            ctx.metadata
+                .insert("mcp.session.downstream".to_string(), hash_str(&session_id));
+        }
+
+        if self.mode == McpGatewayMode::TransparentProxy {
+            return self.handle_transparent_post(ctx, headers, &envelope);
+        }
+
+        match method {
+            "initialize" => {
+                let version =
+                    protocol_version.unwrap_or_else(|| self.supported_protocol_versions[0].clone());
+                if !self.supported_protocol_versions.contains(&version) {
+                    return json_rpc_error(
+                        envelope.id.clone(),
+                        -32602,
+                        "Unsupported MCP protocol version",
+                        None,
+                    );
+                }
+                let client_info = envelope
+                    .params
+                    .as_ref()
+                    .and_then(|params| params.get("clientInfo"))
+                    .cloned();
+                let client_capabilities = envelope
+                    .params
+                    .as_ref()
+                    .and_then(|params| params.get("capabilities"))
+                    .cloned();
+                let downstream_session_id = self
+                    .create_downstream_session(
+                        ctx,
+                        version.clone(),
+                        client_info,
+                        client_capabilities,
+                    )
+                    .await;
+                ctx.metadata.insert(
+                    "mcp.session.downstream".to_string(),
+                    hash_str(&downstream_session_id),
+                );
+                ctx.metadata.insert(
+                    "mcp.route_decision".to_string(),
+                    "synthetic_response".to_string(),
+                );
+                self.synthetic_initialize_response(&envelope, &version, &downstream_session_id)
+            }
+            "notifications/initialized" | "ping" => {
+                ctx.metadata.insert(
+                    "mcp.route_decision".to_string(),
+                    "synthetic_response".to_string(),
+                );
+                if envelope.message_kind == McpMessageKind::Notification {
+                    return empty_response(202);
+                }
+                json_response(
+                    200,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": envelope.id.clone().unwrap_or(Value::Null),
+                        "result": {}
+                    }),
+                    None,
+                )
+            }
+            "tools/list" => {
+                let session_id = match self
+                    .require_live_downstream_session(headers, envelope.id.clone(), ctx)
+                    .await
+                {
+                    Ok(session_id) => session_id,
+                    Err(result) => return result,
+                };
+                self.aggregate_tools_list(ctx, &envelope, &session_id).await
+            }
+            "tools/call" => {
+                let session_id = match self
+                    .require_live_downstream_session(headers, envelope.id.clone(), ctx)
+                    .await
+                {
+                    Ok(session_id) => session_id,
+                    Err(result) => return result,
+                };
+                self.route_tool_call(ctx, headers, &envelope, &session_id)
+                    .await
+            }
+            "prompts/list" => {
+                let session_id = match self
+                    .require_live_downstream_session(headers, envelope.id.clone(), ctx)
+                    .await
+                {
+                    Ok(session_id) => session_id,
+                    Err(result) => return result,
+                };
+                self.aggregate_prompts_list(ctx, &envelope, &session_id)
+                    .await
+            }
+            "prompts/get" => {
+                let session_id = match self
+                    .require_live_downstream_session(headers, envelope.id.clone(), ctx)
+                    .await
+                {
+                    Ok(session_id) => session_id,
+                    Err(result) => return result,
+                };
+                self.route_prompt_get(ctx, headers, &envelope, &session_id)
+                    .await
+            }
+            "resources/list" => {
+                let session_id = match self
+                    .require_live_downstream_session(headers, envelope.id.clone(), ctx)
+                    .await
+                {
+                    Ok(session_id) => session_id,
+                    Err(result) => return result,
+                };
+                self.aggregate_resources_list(ctx, &envelope, &session_id)
+                    .await
+            }
+            "resources/templates/list" => {
+                let session_id = match self
+                    .require_live_downstream_session(headers, envelope.id.clone(), ctx)
+                    .await
+                {
+                    Ok(session_id) => session_id,
+                    Err(result) => return result,
+                };
+                self.aggregate_resource_templates_list(ctx, &envelope, &session_id)
+                    .await
+            }
+            "resources/read" => {
+                let session_id = match self
+                    .require_live_downstream_session(headers, envelope.id.clone(), ctx)
+                    .await
+                {
+                    Ok(session_id) => session_id,
+                    Err(result) => return result,
+                };
+                self.route_resource_read(ctx, headers, &envelope, &session_id)
+                    .await
+            }
+            _ if self.capabilities.passthrough_unknown_methods => {
+                if let Some(server) = self.primary_server() {
+                    let session_id = match self
+                        .require_live_downstream_session(headers, envelope.id.clone(), ctx)
+                        .await
+                    {
+                        Ok(session_id) => session_id,
+                        Err(result) => return result,
+                    };
+                    if let Err(error) = self
+                        .ensure_upstream_initialized(&session_id, &server.server_id, ctx)
+                        .await
+                    {
+                        return json_rpc_error(
+                            envelope.id.clone(),
+                            -32005,
+                            "Upstream MCP session unavailable",
+                            Some(error),
+                        );
+                    }
+                    self.set_route_to_server(ctx, headers, server, Some(&session_id));
+                    PluginResult::Continue
+                } else {
+                    json_rpc_error(
+                        envelope.id.clone(),
+                        -32002,
+                        "Unknown upstream MCP server",
+                        None,
+                    )
+                }
+            }
+            _ if envelope.message_kind == McpMessageKind::Notification => {
+                ctx.metadata.insert(
+                    "mcp.route_decision".to_string(),
+                    "synthetic_response".to_string(),
+                );
+                empty_response(202)
+            }
+            _ => json_rpc_error(envelope.id.clone(), -32601, "MCP method not found", None),
+        }
+    }
+
+    async fn transform_request_body_with_context(
+        &self,
+        ctx: &mut RequestContext,
+        body: &[u8],
+        _content_type: Option<&str>,
+        _request_headers: &HashMap<String, String>,
+    ) -> Option<Vec<u8>> {
+        if !self.enabled || self.mode != McpGatewayMode::AggregateRouter {
+            return None;
+        }
+        if ctx.metadata.remove(METADATA_REWRITE_KEY).as_deref() != Some("true") {
+            return None;
+        }
+        let method = ctx.metadata.remove(METADATA_REWRITE_METHOD_KEY)?;
+        let param = ctx.metadata.remove(METADATA_REWRITE_PARAM_KEY)?;
+        let public_value = ctx.metadata.remove(METADATA_REWRITE_PUBLIC_VALUE_KEY)?;
+        let upstream_value = ctx.metadata.remove(METADATA_REWRITE_UPSTREAM_VALUE_KEY)?;
+
+        let mut value: Value = serde_json::from_slice(body).ok()?;
+        let request_method = value.get("method")?.as_str()?;
+        if request_method != method {
+            warn!(
+                expected_method = %method,
+                actual_method = %request_method,
+                "Skipping MCP request rewrite because routed method does not match buffered body"
+            );
+            return None;
+        }
+        let params = value.get_mut("params")?.as_object_mut()?;
+        let current_value = params.get(&param)?.as_str()?;
+        if current_value != public_value {
+            warn!(
+                method = %method,
+                param = %param,
+                expected_value_hash = %hash_str(&public_value),
+                actual_value_hash = %hash_str(current_value),
+                "Skipping MCP request rewrite because routed value does not match buffered body"
+            );
+            return None;
+        }
+        params.insert(param, Value::String(upstream_value));
+        serde_json::to_vec(&value).ok()
+    }
+
+    fn warmup_hostnames(&self) -> Vec<String> {
+        self.servers
+            .values()
+            .filter(|server| server.enabled)
+            .map(|server| server.target.host.clone())
+            .collect()
+    }
+}
+
+fn parse_mcp_envelope(body: &[u8]) -> Result<McpEnvelope, String> {
+    let value: Value = serde_json::from_slice(body).map_err(|error| error.to_string())?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "JSON-RPC envelope must be an object".to_string())?;
+    let jsonrpc = object
+        .get("jsonrpc")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "JSON-RPC envelope missing jsonrpc".to_string())?
+        .to_string();
+    if jsonrpc != "2.0" {
+        return Err("JSON-RPC version must be 2.0".to_string());
+    }
+    let id = object.get("id").cloned();
+    let method = object
+        .get("method")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let params = object.get("params").cloned();
+    let result = object.get("result").cloned();
+    let error = object.get("error").cloned();
+    let message_kind = if error.is_some() {
+        McpMessageKind::ErrorResponse
+    } else if result.is_some() {
+        McpMessageKind::Response
+    } else if method.is_some() && id.is_none() {
+        McpMessageKind::Notification
+    } else if method.is_some() {
+        McpMessageKind::Request
+    } else {
+        return Err("JSON-RPC envelope must contain method, result, or error".to_string());
+    };
+    Ok(McpEnvelope {
+        jsonrpc,
+        id,
+        method,
+        params,
+        result,
+        error,
+        message_kind,
+    })
+}
+
+async fn upstream_response_json(
+    response: reqwest::Response,
+    server_id: &str,
+    method: &str,
+) -> Result<Value, String> {
+    let is_sse = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|content_type| {
+            content_type
+                .trim()
+                .eq_ignore_ascii_case("text/event-stream")
+        });
+    if is_sse {
+        return upstream_sse_json_rpc_response(response, server_id, method).await;
+    }
+
+    let body = response.text().await.map_err(|error| {
+        warn!(
+            server_id,
+            method,
+            error = %error,
+            "MCP upstream response body could not be read"
+        );
+        format!("upstream MCP response body could not be read: {error}")
+    })?;
+
+    serde_json::from_str::<Value>(&body)
+        .or_else(|error| parse_sse_json_rpc_response(&body).ok_or(error))
+        .map_err(|error| {
+            warn!(
+                server_id,
+                method,
+                error = %error,
+                "MCP upstream response was neither JSON nor SSE JSON-RPC"
+            );
+            format!("upstream MCP response was neither JSON nor SSE JSON-RPC: {error}")
+        })
+}
+
+async fn upstream_sse_json_rpc_response(
+    response: reqwest::Response,
+    server_id: &str,
+    method: &str,
+) -> Result<Value, String> {
+    let mut stream = response.bytes_stream();
+    let mut buffer = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| {
+            warn!(
+                server_id,
+                method,
+                error = %error,
+                "MCP upstream SSE response body could not be read"
+            );
+            format!("upstream MCP SSE response body could not be read: {error}")
+        })?;
+        buffer.extend_from_slice(&chunk);
+        if buffer.len() > MAX_UPSTREAM_SSE_EVENT_BYTES {
+            warn!(
+                server_id,
+                method,
+                max_bytes = MAX_UPSTREAM_SSE_EVENT_BYTES,
+                "MCP upstream SSE event exceeded size limit"
+            );
+            return Err(format!(
+                "upstream MCP SSE event exceeded {MAX_UPSTREAM_SSE_EVENT_BYTES} bytes"
+            ));
+        }
+        while let Some((event_end, delimiter_len)) = find_sse_event_delimiter(&buffer) {
+            let event = buffer[..event_end].to_vec();
+            buffer.drain(..event_end + delimiter_len);
+            let event = std::str::from_utf8(&event).map_err(|error| {
+                warn!(
+                    server_id,
+                    method,
+                    error = %error,
+                    "MCP upstream SSE event was not UTF-8"
+                );
+                format!("upstream MCP SSE event was not UTF-8: {error}")
+            })?;
+            if let Some(value) = parse_sse_json_rpc_response(event) {
+                return Ok(value);
+            }
+        }
+    }
+
+    if !buffer.is_empty() {
+        let event = std::str::from_utf8(&buffer).map_err(|error| {
+            warn!(
+                server_id,
+                method,
+                error = %error,
+                "MCP upstream SSE event was not UTF-8"
+            );
+            format!("upstream MCP SSE event was not UTF-8: {error}")
+        })?;
+        if let Some(value) = parse_sse_json_rpc_response(event) {
+            return Ok(value);
+        }
+    }
+
+    warn!(
+        server_id,
+        method, "MCP upstream SSE response did not contain a JSON-RPC response"
+    );
+    Err("upstream MCP SSE response did not contain a JSON-RPC response".to_string())
+}
+
+fn find_sse_event_delimiter(buffer: &[u8]) -> Option<(usize, usize)> {
+    [
+        b"\n\n".as_slice(),
+        b"\r\n\r\n".as_slice(),
+        b"\r\r".as_slice(),
+    ]
+    .into_iter()
+    .filter_map(|delimiter| {
+        buffer
+            .windows(delimiter.len())
+            .position(|window| window == delimiter)
+            .map(|position| (position, delimiter.len()))
+    })
+    .min_by_key(|(position, _)| *position)
+}
+
+fn parse_sse_json_rpc_response(body: &str) -> Option<Value> {
+    let normalized = body.replace("\r\n", "\n");
+    for event in normalized.split("\n\n") {
+        let data = event
+            .lines()
+            .filter_map(|line| {
+                line.trim_start()
+                    .strip_prefix("data:")
+                    .map(|data| data.strip_prefix(' ').unwrap_or(data))
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if data.trim().is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&data) else {
+            continue;
+        };
+        if value.get("id").is_some()
+            && (value.get("result").is_some() || value.get("error").is_some())
+        {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn validate_json_schema(validator: &jsonschema::Validator, instance: &Value) -> Result<(), String> {
+    validator
+        .validate(instance)
+        .map_err(|error| format!("schema validation failed: {error}"))
+}
+
+fn json_rpc_error(
+    id: Option<Value>,
+    code: i64,
+    message: &str,
+    internal_detail: Option<String>,
+) -> PluginResult {
+    let mut metadata = Map::new();
+    if let Some(detail) = internal_detail.as_deref() {
+        warn!(
+            code,
+            message,
+            internal_detail = %detail,
+            "MCP gateway returning JSON-RPC error"
+        );
+        metadata.insert(
+            "gateway".to_string(),
+            Value::String("mcp_gateway".to_string()),
+        );
+    }
+    let error = if metadata.is_empty() {
+        json!({ "code": code, "message": message })
+    } else {
+        json!({ "code": code, "message": message, "data": metadata })
+    };
+    json_response(
+        200,
+        json!({
+            "jsonrpc": "2.0",
+            "id": id.unwrap_or(Value::Null),
+            "error": error,
+        }),
+        None,
+    )
+}
+
+fn catalog_error_response(
+    id: Option<Value>,
+    message: &str,
+    error: McpCatalogError,
+) -> PluginResult {
+    match error {
+        McpCatalogError::SessionNotFound => session_not_found_response(),
+        McpCatalogError::Refresh(error) => json_rpc_error(id, -32006, message, Some(error)),
+    }
+}
+
+fn json_response(
+    status_code: u16,
+    body: Value,
+    session_header: Option<(&str, &str)>,
+) -> PluginResult {
+    let mut headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    if let Some((name, value)) = session_header {
+        headers.insert(name.to_ascii_lowercase(), value.to_string());
+    }
+    PluginResult::Reject {
+        status_code,
+        body: body.to_string(),
+        headers,
+    }
+}
+
+fn empty_response(status_code: u16) -> PluginResult {
+    PluginResult::Reject {
+        status_code,
+        body: String::new(),
+        headers: HashMap::new(),
+    }
+}
+
+fn session_not_found_response() -> PluginResult {
+    empty_response(404)
+}
+
+/// Insert a discovered catalog entry under `key`, skipping (and warning on) any
+/// public-name collision across upstreams. A colliding name is exposed by
+/// *neither* upstream: that prevents silent routing to the wrong upstream (the
+/// original collision concern) while keeping the rest of the catalog usable
+/// rather than failing discovery wholesale. Applied uniformly to tools, prompts,
+/// and resources so collision behavior is consistent across item types.
+fn insert_catalog_entry<T>(
+    map: &mut HashMap<String, T>,
+    collided: &mut HashSet<String>,
+    key: String,
+    entry: T,
+    server_id: &str,
+    item_kind: &str,
+) {
+    if collided.contains(&key) {
+        warn!(
+            public_name = %key,
+            server_id,
+            item_kind,
+            "skipping MCP catalog entry: public name already collided across upstreams"
+        );
+        return;
+    }
+    if map.remove(&key).is_some() {
+        collided.insert(key.clone());
+        warn!(
+            public_name = %key,
+            server_id,
+            item_kind,
+            "skipping colliding MCP catalog entries: duplicate public name across upstreams"
+        );
+        return;
+    }
+    map.insert(key, entry);
+}
+
+/// HTTP 400 for a request that requires an MCP session but carried no session
+/// header. Distinct from `session_not_found_response` (404 = terminated/unknown
+/// session): the message reflects the real cause (the client never sent
+/// `Mcp-Session-Id`) rather than attributing it to the upstream.
+fn missing_session_response(id: Option<Value>) -> PluginResult {
+    json_response(
+        400,
+        json!({
+            "jsonrpc": "2.0",
+            "id": id.unwrap_or(Value::Null),
+            "error": {
+                "code": -32600,
+                "message": "Missing Mcp-Session-Id header; call initialize to obtain a session"
+            }
+        }),
+        None,
+    )
+}
+
+fn tool_entry_to_public_value(entry: &ToolCatalogEntry) -> Value {
+    let mut object = Map::new();
+    object.insert("name".to_string(), Value::String(entry.public_name.clone()));
+    if let Some(title) = &entry.title {
+        object.insert("title".to_string(), Value::String(title.clone()));
+    }
+    if let Some(description) = &entry.description {
+        object.insert(
+            "description".to_string(),
+            Value::String(format!("[{}] {}", entry.namespace, description)),
+        );
+    }
+    object.insert("inputSchema".to_string(), entry.input_schema.clone());
+    if let Some(output_schema) = &entry.output_schema {
+        object.insert("outputSchema".to_string(), output_schema.clone());
+    }
+    if let Some(annotations) = &entry.annotations {
+        object.insert("annotations".to_string(), annotations.clone());
+    }
+    Value::Object(object)
+}
+
+fn prompt_entry_to_public_value(entry: &PromptCatalogEntry) -> Value {
+    let mut object = Map::new();
+    object.insert("name".to_string(), Value::String(entry.public_name.clone()));
+    if let Some(description) = &entry.description {
+        object.insert(
+            "description".to_string(),
+            Value::String(format!("[{}] {}", entry.namespace, description)),
+        );
+    }
+    if let Some(arguments_schema) = &entry.arguments_schema {
+        object.insert("argumentsSchema".to_string(), arguments_schema.clone());
+    }
+    Value::Object(object)
+}
+
+fn resource_entry_to_public_value(entry: &ResourceCatalogEntry) -> Value {
+    let mut object = Map::new();
+    object.insert("uri".to_string(), Value::String(entry.public_uri.clone()));
+    if let Some(name) = &entry.name {
+        object.insert("name".to_string(), Value::String(name.clone()));
+    }
+    if let Some(description) = &entry.description {
+        object.insert(
+            "description".to_string(),
+            Value::String(format!("[{}] {}", entry.namespace, description)),
+        );
+    }
+    if let Some(mime_type) = &entry.mime_type {
+        object.insert("mimeType".to_string(), Value::String(mime_type.clone()));
+    }
+    Value::Object(object)
+}
+
+fn resource_template_entry_to_public_value(entry: &ResourceTemplateCatalogEntry) -> Value {
+    let mut object = Map::new();
+    object.insert(
+        "uriTemplate".to_string(),
+        Value::String(entry.public_uri_template.clone()),
+    );
+    if let Some(name) = &entry.name {
+        object.insert("name".to_string(), Value::String(name.clone()));
+    }
+    if let Some(title) = &entry.title {
+        object.insert("title".to_string(), Value::String(title.clone()));
+    }
+    if let Some(description) = &entry.description {
+        object.insert(
+            "description".to_string(),
+            Value::String(format!("[{}] {}", entry.namespace, description)),
+        );
+    }
+    if let Some(mime_type) = &entry.mime_type {
+        object.insert("mimeType".to_string(), Value::String(mime_type.clone()));
+    }
+    if let Some(annotations) = &entry.annotations {
+        object.insert("annotations".to_string(), annotations.clone());
+    }
+    if let Some(icons) = &entry.icons {
+        object.insert("icons".to_string(), icons.clone());
+    }
+    Value::Object(object)
+}
+
+fn namespaced(namespace: &str, separator: &str, upstream_name: &str) -> String {
+    let mut value = String::with_capacity(namespace.len() + separator.len() + upstream_name.len());
+    value.push_str(namespace);
+    value.push_str(separator);
+    value.push_str(upstream_name);
+    value
+}
+
+fn public_resource_uri(server_id: &str, upstream_uri: &str) -> String {
+    format!(
+        "mcp://{}/{}",
+        server_id,
+        utf8_percent_encode(upstream_uri, NON_ALPHANUMERIC)
+    )
+}
+
+fn public_resource_template_uri(server_id: &str, upstream_uri_template: &str) -> String {
+    let mut encoded = String::new();
+    let mut index = 0;
+    while let Some(open_offset) = upstream_uri_template[index..].find('{') {
+        let open = index + open_offset;
+        encoded.push_str(
+            &utf8_percent_encode(&upstream_uri_template[index..open], NON_ALPHANUMERIC).to_string(),
+        );
+        let Some(close_offset) = upstream_uri_template[open + 1..].find('}') else {
+            encoded.push_str(
+                &utf8_percent_encode(&upstream_uri_template[open..], NON_ALPHANUMERIC).to_string(),
+            );
+            return format!("mcp://{server_id}/{encoded}");
+        };
+        let close = open + 1 + close_offset;
+        encoded.push_str(&upstream_uri_template[open..=close]);
+        index = close + 1;
+    }
+    encoded.push_str(
+        &utf8_percent_encode(&upstream_uri_template[index..], NON_ALPHANUMERIC).to_string(),
+    );
+    format!("mcp://{server_id}/{encoded}")
+}
+
+fn public_resource_uri_parts(public_uri: &str) -> Option<(&str, String)> {
+    let rest = public_uri.strip_prefix("mcp://")?;
+    let (server_id, encoded_upstream_uri) = rest.split_once('/')?;
+    let upstream_uri = percent_decode_str(encoded_upstream_uri)
+        .decode_utf8()
+        .ok()?
+        .into_owned();
+    Some((server_id, upstream_uri))
+}
+
+fn uri_template_regex(uri_template: &str) -> Result<Regex, String> {
+    let mut pattern = String::from("^");
+    let mut index = 0;
+    while let Some(open_offset) = uri_template[index..].find('{') {
+        let open = index + open_offset;
+        pattern.push_str(&regex::escape(&uri_template[index..open]));
+        let close_offset = uri_template[open + 1..]
+            .find('}')
+            .ok_or_else(|| "unclosed URI template expression".to_string())?;
+        let close = open + 1 + close_offset;
+        let expression = &uri_template[open + 1..close];
+        if expression.trim().is_empty() || expression.contains('{') {
+            return Err("invalid URI template expression".to_string());
+        }
+        pattern.push_str(".*");
+        index = close + 1;
+    }
+    if uri_template[index..].contains('}') {
+        return Err("unmatched URI template close brace".to_string());
+    }
+    pattern.push_str(&regex::escape(&uri_template[index..]));
+    pattern.push('$');
+    Regex::new(&pattern).map_err(|error| error.to_string())
+}
+
+fn resource_template_route(catalog: &McpCatalog, public_uri: &str) -> Option<(String, String)> {
+    let (server_id, upstream_uri) = public_resource_uri_parts(public_uri)?;
+    catalog
+        .resource_templates
+        .values()
+        .find(|entry| {
+            entry.enabled
+                && entry.server_id == server_id
+                && entry.uri_template_regex.is_match(&upstream_uri)
+        })
+        .map(|entry| (entry.server_id.clone(), upstream_uri))
+}
+
+fn hash_value(value: &Value) -> String {
+    match serde_json::to_vec(value) {
+        Ok(bytes) => hex::encode(Sha256::digest(bytes)),
+        Err(_) => hash_str(&value.to_string()),
+    }
+}
+
+fn hash_str(value: &str) -> String {
+    hex::encode(Sha256::digest(value.as_bytes()))
+}
+
+fn header_value<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<&'a str> {
+    headers
+        .get(&name.to_ascii_lowercase())
+        .or_else(|| {
+            headers
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value)
+        })
+        .map(String::as_str)
+}
+
+/// Remove every header entry whose name matches `name` case-insensitively.
+/// Header map keys are not guaranteed to be lowercased (see `header_value`'s
+/// fallback), so match by `eq_ignore_ascii_case` rather than a single lookup.
+fn remove_header(headers: &mut HashMap<String, String>, name: &str) {
+    headers.retain(|key, _| !key.eq_ignore_ascii_case(name));
+}
+
+fn optional_object<'a>(
+    object: &'a Map<String, Value>,
+    key: &str,
+) -> Result<Option<&'a Map<String, Value>>, String> {
+    match object.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Object(value)) => Ok(Some(value)),
+        Some(other) => Err(format!(
+            "mcp_gateway: '{key}' must be an object, got {other}"
+        )),
+    }
+}
+
+fn optional_bool(object: &Map<String, Value>, key: &str) -> Result<Option<bool>, String> {
+    match object.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(value)) => Ok(Some(*value)),
+        Some(other) => Err(format!(
+            "mcp_gateway: '{key}' must be a boolean, got {other}"
+        )),
+    }
+}
+
+fn optional_string<'a>(
+    object: &'a Map<String, Value>,
+    key: &str,
+) -> Result<Option<&'a str>, String> {
+    match object.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.as_str())),
+        Some(other) => Err(format!(
+            "mcp_gateway: '{key}' must be a string, got {other}"
+        )),
+    }
+}
+
+fn optional_string_from_object(
+    object: Option<&Map<String, Value>>,
+    key: &str,
+) -> Result<Option<String>, String> {
+    match object.and_then(|object| object.get(key)) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(other) => Err(format!(
+            "mcp_gateway: '{key}' must be a string, got {other}"
+        )),
+    }
+}
+
+fn optional_bool_from_object(
+    object: Option<&Map<String, Value>>,
+    key: &str,
+) -> Result<Option<bool>, String> {
+    match object.and_then(|object| object.get(key)) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(value)) => Ok(Some(*value)),
+        Some(other) => Err(format!(
+            "mcp_gateway: '{key}' must be a boolean, got {other}"
+        )),
+    }
+}
+
+fn optional_u64_from_object(
+    object: Option<&Map<String, Value>>,
+    key: &str,
+) -> Result<Option<u64>, String> {
+    match object.and_then(|object| object.get(key)) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(value)) => value
+            .as_u64()
+            .ok_or_else(|| format!("mcp_gateway: '{key}' must be a positive integer"))
+            .map(Some),
+        Some(other) => Err(format!(
+            "mcp_gateway: '{key}' must be a positive integer, got {other}"
+        )),
+    }
+}
+
+fn optional_string_vec_from_object(
+    object: Option<&Map<String, Value>>,
+    key: &str,
+) -> Result<Option<Vec<String>>, String> {
+    let Some(value) = object.and_then(|object| object.get(key)) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let array = value
+        .as_array()
+        .ok_or_else(|| format!("mcp_gateway: '{key}' must be an array"))?;
+    let mut values = Vec::with_capacity(array.len());
+    for (idx, item) in array.iter().enumerate() {
+        values.push(
+            item.as_str()
+                .ok_or_else(|| format!("mcp_gateway: '{key}[{idx}]' must be a string"))?
+                .to_string(),
+        );
+    }
+    Ok(Some(values))
+}
+
+fn parse_discovery(object: &Map<String, Value>) -> Result<McpDiscoveryConfig, String> {
+    let discovery = optional_object(object, "discovery")?;
+    let namespace_separator = optional_string_from_object(discovery, "namespace_separator")?
+        .unwrap_or_else(|| ".".to_string());
+    if namespace_separator.is_empty() {
+        return Err("mcp_gateway: 'discovery.namespace_separator' must not be empty".to_string());
+    }
+    let cache_ttl_seconds =
+        optional_u64_from_object(discovery, "cache_ttl_seconds")?.unwrap_or(300);
+    if cache_ttl_seconds == 0 {
+        return Err(
+            "mcp_gateway: 'discovery.cache_ttl_seconds' must be greater than zero".to_string(),
+        );
+    }
+    let on_new_tool = DiscoveryBehavior::parse(
+        optional_string_from_object(discovery, "on_new_tool")?
+            .as_deref()
+            .unwrap_or("hide_until_configured"),
+        "discovery.on_new_tool",
+    )?;
+    let on_schema_change = DiscoveryBehavior::parse(
+        optional_string_from_object(discovery, "on_schema_change")?
+            .as_deref()
+            .unwrap_or("hide_until_configured"),
+        "discovery.on_schema_change",
+    )?;
+    Ok(McpDiscoveryConfig {
+        aggregate_tools: optional_bool_from_object(discovery, "aggregate_tools")?.unwrap_or(true),
+        aggregate_resources: optional_bool_from_object(discovery, "aggregate_resources")?
+            .unwrap_or(true),
+        aggregate_prompts: optional_bool_from_object(discovery, "aggregate_prompts")?
+            .unwrap_or(true),
+        namespace_separator,
+        cache_ttl: Duration::from_secs(cache_ttl_seconds),
+        hide_denied_items: optional_bool_from_object(discovery, "hide_denied_items")?
+            .unwrap_or(true),
+        on_new_tool,
+        on_schema_change,
+    })
+}
+
+fn parse_sessions(object: &Map<String, Value>) -> Result<McpSessionConfig, String> {
+    let sessions = optional_object(object, "sessions")?;
+    let initialize_upstreams = InitializeStrategy::parse(
+        optional_string_from_object(sessions, "initialize_upstreams")?
+            .as_deref()
+            .unwrap_or("lazy"),
+        "sessions.initialize_upstreams",
+    )?;
+    let session_ttl_seconds = optional_u64_from_object(sessions, "session_ttl_seconds")?
+        .unwrap_or(DEFAULT_SESSION_TTL_SECONDS);
+    if session_ttl_seconds == 0 {
+        return Err(
+            "mcp_gateway: 'sessions.session_ttl_seconds' must be greater than zero".to_string(),
+        );
+    }
+    let max_sessions =
+        optional_u64_from_object(sessions, "max_sessions")?.unwrap_or(DEFAULT_MAX_SESSIONS as u64);
+    if max_sessions == 0 {
+        return Err("mcp_gateway: 'sessions.max_sessions' must be greater than zero".to_string());
+    }
+    let max_sessions = usize::try_from(max_sessions)
+        .map_err(|_| "mcp_gateway: 'sessions.max_sessions' is too large".to_string())?;
+    let downstream_session_header =
+        optional_string_from_object(sessions, "downstream_session_header")?
+            .unwrap_or_else(|| "mcp-session-id".to_string());
+    validate_session_header_name(
+        &downstream_session_header,
+        "sessions.downstream_session_header",
+    )?;
+    let upstream_session_header = optional_string_from_object(sessions, "upstream_session_header")?
+        .unwrap_or_else(|| "mcp-session-id".to_string());
+    validate_session_header_name(&upstream_session_header, "sessions.upstream_session_header")?;
+    Ok(McpSessionConfig {
+        downstream_session_header,
+        upstream_session_header,
+        initialize_upstreams,
+        session_ttl: Duration::from_secs(session_ttl_seconds),
+        max_sessions,
+    })
+}
+
+fn parse_capabilities(object: &Map<String, Value>) -> Result<McpCapabilitiesConfig, String> {
+    let capabilities = optional_object(object, "capabilities")?;
+    Ok(McpCapabilitiesConfig {
+        advertise_tools: optional_bool_from_object(capabilities, "advertise_tools")?
+            .unwrap_or(true),
+        advertise_resources: optional_bool_from_object(capabilities, "advertise_resources")?
+            .unwrap_or(true),
+        advertise_prompts: optional_bool_from_object(capabilities, "advertise_prompts")?
+            .unwrap_or(true),
+        advertise_logging: optional_bool_from_object(capabilities, "advertise_logging")?
+            .unwrap_or(false),
+        advertise_completions: optional_bool_from_object(capabilities, "advertise_completions")?
+            .unwrap_or(false),
+        advertise_tasks: optional_bool_from_object(capabilities, "advertise_tasks")?
+            .unwrap_or(false),
+        passthrough_unknown_methods: optional_bool_from_object(
+            capabilities,
+            "passthrough_unknown_methods",
+        )?
+        .unwrap_or(false),
+    })
+}
+
+fn parse_policy(object: &Map<String, Value>) -> Result<McpPolicy, String> {
+    let policy = optional_object(object, "policy")?;
+    let default_action = match optional_string_from_object(policy, "default_action")?
+        .as_deref()
+        .unwrap_or("deny")
+    {
+        "allow" => PolicyAction::Allow,
+        "deny" => PolicyAction::Deny,
+        other => {
+            return Err(format!(
+                "mcp_gateway: 'policy.default_action' must be allow or deny, got {other:?}"
+            ));
+        }
+    };
+    let hide_denied_tools = optional_bool_from_object(policy, "hide_denied_tools")?.unwrap_or(true);
+    let mut tools = HashMap::new();
+    if let Some(tools_object) = policy
+        .and_then(|policy| policy.get("tools"))
+        .and_then(Value::as_object)
+    {
+        for (tool_name, tool_policy) in tools_object {
+            let object = tool_policy.as_object().ok_or_else(|| {
+                format!("mcp_gateway: policy.tools[{tool_name:?}] must be an object")
+            })?;
+            let action = PolicyAction::parse(
+                optional_string(object, "action")?.ok_or_else(|| {
+                    format!("mcp_gateway: policy.tools[{tool_name:?}].action is required")
+                })?,
+                &format!("policy.tools[{tool_name:?}].action"),
+            )?;
+            tools.insert(tool_name.clone(), action);
+        }
+    } else if policy
+        .and_then(|policy| policy.get("tools"))
+        .is_some_and(|value| !value.is_null())
+    {
+        return Err("mcp_gateway: 'policy.tools' must be an object".to_string());
+    }
+    Ok(McpPolicy {
+        default_action,
+        hide_denied_tools,
+        tools,
+    })
+}
+
+fn parse_validation(object: &Map<String, Value>) -> Result<McpValidationConfig, String> {
+    let validation = optional_object(object, "validation")?;
+    // Tool result validation is not implemented in V1. Reject it rather than
+    // silently accepting a config that advertises enforcement that never runs.
+    if optional_bool_from_object(validation, "validate_tool_results")?.unwrap_or(false) {
+        return Err(
+            "mcp_gateway: 'validation.validate_tool_results' is not supported yet; tool result validation is not implemented"
+                .to_string(),
+        );
+    }
+    Ok(McpValidationConfig {
+        validate_tool_arguments: optional_bool_from_object(validation, "validate_tool_arguments")?
+            .unwrap_or(true),
+    })
+}
+
+fn parse_observability(object: &Map<String, Value>) -> Result<McpObservabilityConfig, String> {
+    let observability = optional_object(object, "observability")?;
+    Ok(McpObservabilityConfig {
+        emit_metadata: optional_bool_from_object(observability, "emit_metadata")?.unwrap_or(true),
+        log_raw_arguments: optional_bool_from_object(observability, "log_raw_arguments")?
+            .unwrap_or(false),
+        log_argument_hash: optional_bool_from_object(observability, "log_argument_hash")?
+            .unwrap_or(true),
+        log_raw_results: optional_bool_from_object(observability, "log_raw_results")?
+            .unwrap_or(false),
+        log_result_hash: optional_bool_from_object(observability, "log_result_hash")?
+            .unwrap_or(false),
+    })
+}
+
+fn parse_servers(
+    object: &Map<String, Value>,
+    default_initialize_strategy: InitializeStrategy,
+) -> Result<HashMap<String, McpServerConfig>, String> {
+    let servers_value = object
+        .get("servers")
+        .ok_or_else(|| "mcp_gateway: 'servers' is required".to_string())?;
+    let servers_object = servers_value
+        .as_object()
+        .ok_or_else(|| "mcp_gateway: 'servers' must be an object".to_string())?;
+    if servers_object.is_empty() {
+        return Err("mcp_gateway: 'servers' must not be empty".to_string());
+    }
+    let mut namespaces = HashSet::new();
+    let mut servers = HashMap::with_capacity(servers_object.len());
+    for (server_id, value) in servers_object {
+        if server_id.trim().is_empty() {
+            return Err("mcp_gateway: server IDs must not be empty".to_string());
+        }
+        validate_server_id(server_id)?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| format!("mcp_gateway: server {server_id:?} must be an object"))?;
+        let upstream_url = optional_string(object, "upstream_url")?
+            .ok_or_else(|| format!("mcp_gateway: server {server_id:?} requires 'upstream_url'"))?
+            .to_string();
+        let namespace = optional_string(object, "namespace")?
+            .ok_or_else(|| format!("mcp_gateway: server {server_id:?} requires 'namespace'"))?
+            .to_string();
+        if namespace.trim().is_empty() {
+            return Err(format!(
+                "mcp_gateway: server {server_id:?} namespace must not be empty"
+            ));
+        }
+        if !namespaces.insert(namespace.clone()) {
+            return Err(format!(
+                "mcp_gateway: duplicate server namespace {namespace:?}"
+            ));
+        }
+        let initialize_strategy = optional_string(object, "initialize_strategy")?
+            .map(|value| InitializeStrategy::parse(value, "servers.*.initialize_strategy"))
+            .transpose()?
+            .unwrap_or(default_initialize_strategy);
+        servers.insert(
+            server_id.clone(),
+            McpServerConfig {
+                server_id: server_id.clone(),
+                namespace,
+                target: parse_upstream_target(&upstream_url, server_id)?,
+                upstream_url,
+                enabled: optional_bool(object, "enabled")?.unwrap_or(true),
+                expose_tools: optional_bool(object, "expose_tools")?.unwrap_or(true),
+                expose_resources: optional_bool(object, "expose_resources")?.unwrap_or(false),
+                expose_prompts: optional_bool(object, "expose_prompts")?.unwrap_or(false),
+                initialize_strategy,
+            },
+        );
+    }
+    Ok(servers)
+}
+
+fn parse_upstream_target(url: &str, server_id: &str) -> Result<McpUpstreamTarget, String> {
+    let parsed = Url::parse(url).map_err(|error| {
+        format!("mcp_gateway: server {server_id:?} upstream_url invalid: {error}")
+    })?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(format!(
+            "mcp_gateway: server {server_id:?} upstream_url must not contain credentials"
+        ));
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(format!(
+            "mcp_gateway: server {server_id:?} upstream_url must not contain query or fragment"
+        ));
+    }
+    let scheme = match parsed.scheme() {
+        "http" => BackendScheme::Http,
+        "https" => BackendScheme::Https,
+        other => {
+            return Err(format!(
+                "mcp_gateway: server {server_id:?} upstream_url scheme must be http or https, got {other:?}"
+            ));
+        }
+    };
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| format!("mcp_gateway: server {server_id:?} upstream_url missing host"))?
+        .to_string();
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| format!("mcp_gateway: server {server_id:?} upstream_url missing port"))?;
+    let path = if parsed.path().is_empty() {
+        "/".to_string()
+    } else {
+        parsed.path().to_string()
+    };
+    let authority = authority_for_host_port(&host, parsed.port(), scheme);
+    Ok(McpUpstreamTarget {
+        scheme,
+        host,
+        port,
+        path,
+        authority,
+    })
+}
+
+fn authority_for_host_port(
+    host: &str,
+    explicit_port: Option<u16>,
+    scheme: BackendScheme,
+) -> String {
+    let rendered_host = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    let default_port = match scheme {
+        BackendScheme::Http => 80,
+        BackendScheme::Https => 443,
+        _ => 0,
+    };
+    match explicit_port {
+        Some(port) if port != default_port => format!("{rendered_host}:{port}"),
+        _ => rendered_host,
+    }
+}
+
+fn validate_path(path: &str, field: &str) -> Result<(), String> {
+    if path.is_empty() || !path.starts_with('/') {
+        return Err(format!("mcp_gateway: '{field}' must be a non-empty path"));
+    }
+    Ok(())
+}
+
+/// Server ids are embedded verbatim into public `mcp://{server_id}/...` resource
+/// and resource-template URIs that `public_resource_uri_parts` later parses back
+/// by splitting at the first `/`. Restrict them to a URI-safe identifier subset
+/// so a `/` (or other reserved delimiter) cannot make an advertised resource URI
+/// parse back to the wrong server id and become unroutable.
+fn validate_server_id(server_id: &str) -> Result<(), String> {
+    if !server_id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        return Err(format!(
+            "mcp_gateway: server id {server_id:?} must contain only ASCII alphanumerics, '.', '_', or '-'"
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a configured MCP session header name as a syntactically valid HTTP
+/// header name, so invalid characters (spaces, control bytes) are rejected at
+/// config time instead of failing every routed upstream request at runtime.
+fn validate_session_header_name(value: &str, field: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err(format!("mcp_gateway: '{field}' must not be empty"));
+    }
+    http::header::HeaderName::from_bytes(value.as_bytes())
+        .map(|_| ())
+        .map_err(|_| {
+            format!("mcp_gateway: '{field}' must be a valid HTTP header name, got {value:?}")
+        })
+}

@@ -1799,6 +1799,15 @@ pub(crate) async fn apply_request_body_plugins(
     headers: &HashMap<String, String>,
     body_bytes: Vec<u8>,
 ) -> Vec<u8> {
+    apply_request_body_plugins_with_context(plugins, None, headers, body_bytes).await
+}
+
+pub(crate) async fn apply_request_body_plugins_with_context(
+    plugins: &[Arc<dyn Plugin>],
+    mut ctx: Option<&mut RequestContext>,
+    headers: &HashMap<String, String>,
+    body_bytes: Vec<u8>,
+) -> Vec<u8> {
     if body_bytes.is_empty() || !plugins.iter().any(|plugin| plugin.modifies_request_body()) {
         return body_bytes;
     }
@@ -1807,9 +1816,15 @@ pub(crate) async fn apply_request_body_plugins(
     let mut current = body_bytes;
     for plugin in plugins {
         if plugin.modifies_request_body()
-            && let Some(transformed) = plugin
-                .transform_request_body(&current, content_type, headers)
-                .await
+            && let Some(transformed) = if let Some(ctx) = ctx.as_deref_mut() {
+                plugin
+                    .transform_request_body_with_context(ctx, &current, content_type, headers)
+                    .await
+            } else {
+                plugin
+                    .transform_request_body(&current, content_type, headers)
+                    .await
+            }
         {
             current = transformed;
         }
@@ -6573,6 +6588,14 @@ fn push_backend_path(url: &mut String, backend_path: &str, remaining_path: &str)
     url.push_str(remaining_path);
 }
 
+fn url_render_host(host: &str) -> std::borrow::Cow<'_, str> {
+    if host.contains(':') && !host.starts_with('[') {
+        std::borrow::Cow::Owned(format!("[{host}]"))
+    } else {
+        std::borrow::Cow::Borrowed(host)
+    }
+}
+
 /// Build a WebSocket backend URL using a specific target host/port,
 /// respecting strip_listen_path, backend_path, and query string.
 ///
@@ -6622,11 +6645,12 @@ pub(crate) fn build_websocket_backend_url_with_target(
     let backend_path = target_path.or(proxy.backend_path.as_deref()).unwrap_or("");
 
     let path_layout = backend_path_layout(backend_path, remaining_path);
+    let rendered_host = url_render_host(host);
 
     // Pre-calculate capacity and build in a single buffer.
     let capacity = scheme.len()
         + 3 // "://"
-        + host.len()
+        + rendered_host.len()
         + 6 // ":PORT" (max 5 digits + colon)
         + path_layout.len
         + if query_string.is_empty() {
@@ -6636,7 +6660,7 @@ pub(crate) fn build_websocket_backend_url_with_target(
         };
 
     let mut url = String::with_capacity(capacity);
-    let _ = write!(url, "{}://{}:{}", scheme, host, port);
+    let _ = write!(url, "{}://{}:{}", scheme, rendered_host, port);
     push_backend_path(&mut url, backend_path, remaining_path);
 
     if !query_string.is_empty() {
@@ -12282,12 +12306,13 @@ pub fn build_backend_url_with_target(
     let backend_path = target_path.or(proxy.backend_path.as_deref()).unwrap_or("");
 
     let path_layout = backend_path_layout(backend_path, remaining_path);
+    let rendered_host = url_render_host(host);
 
     // Build URL in a single buffer, writing the path segments directly to avoid
     // an intermediate `full_path` String allocation from format!().
     let capacity = scheme.len()
         + 3
-        + host.len()
+        + rendered_host.len()
         + 6
         + path_layout.len
         + if query_string.is_empty() {
@@ -12296,7 +12321,7 @@ pub fn build_backend_url_with_target(
             1 + query_string.len()
         };
     let mut url = String::with_capacity(capacity);
-    let _ = write!(url, "{}://{}:{}", scheme, host, port);
+    let _ = write!(url, "{}://{}:{}", scheme, rendered_host, port);
 
     push_backend_path(&mut url, backend_path, remaining_path);
 
@@ -12849,7 +12874,7 @@ async fn proxy_to_backend(
     client_request_body: ClientRequestBody,
     upstream_target: Option<&UpstreamTarget>,
     plugins: &[Arc<dyn crate::plugins::Plugin>],
-    ctx: Option<&mut RequestContext>,
+    mut ctx: Option<&mut RequestContext>,
     // Real, read-only request context for the response-side buffering decision.
     // Distinct from `ctx` above, which is the request-body-hook clone and is
     // `None` unless request-body buffering is active.
@@ -13339,7 +13364,13 @@ async fn proxy_to_backend(
                     body_bytes.len() as u64,
                     std::sync::atomic::Ordering::Release,
                 );
-                let body_bytes = apply_request_body_plugins(plugins, headers, body_bytes).await;
+                let body_bytes = apply_request_body_plugins_with_context(
+                    plugins,
+                    ctx.as_deref_mut(),
+                    headers,
+                    body_bytes,
+                )
+                .await;
                 match run_final_request_body_hooks(plugins, ctx, headers, &body_bytes).await {
                     PluginResult::Continue => {}
                     reject @ PluginResult::Reject { .. }
@@ -13456,7 +13487,13 @@ async fn proxy_to_backend(
                 );
 
                 // Transform request body via plugins (JSON field rename, add, remove, etc.)
-                let body_bytes = apply_request_body_plugins(plugins, headers, body_bytes).await;
+                let body_bytes = apply_request_body_plugins_with_context(
+                    plugins,
+                    ctx.as_deref_mut(),
+                    headers,
+                    body_bytes,
+                )
+                .await;
                 match run_final_request_body_hooks(plugins, ctx, headers, &body_bytes).await {
                     PluginResult::Continue => {}
                     reject @ PluginResult::Reject { .. }
@@ -15278,7 +15315,7 @@ async fn proxy_to_backend_http3(
     headers: &HashMap<String, String>,
     client_request_body: ClientRequestBody,
     plugins: &[Arc<dyn crate::plugins::Plugin>],
-    ctx: Option<&mut RequestContext>,
+    mut ctx: Option<&mut RequestContext>,
     upstream_target: Option<&UpstreamTarget>,
     client_ip: &str,
     is_tls: bool,
@@ -15680,7 +15717,9 @@ async fn proxy_to_backend_http3(
 
     ctx_bytes_sent_observed.fetch_max(request_body.len() as u64, Ordering::Release);
 
-    let request_body = apply_request_body_plugins(plugins, headers, request_body).await;
+    let request_body =
+        apply_request_body_plugins_with_context(plugins, ctx.as_deref_mut(), headers, request_body)
+            .await;
     match run_final_request_body_hooks(plugins, ctx, headers, &request_body).await {
         PluginResult::Continue => {}
         reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
@@ -17250,6 +17289,27 @@ mod tests {
             None,
         );
         assert_eq!(url, "ws://backend.local:8080/a/b");
+    }
+
+    #[test]
+    fn backend_url_brackets_ipv6_literal_host() {
+        let mut proxy = test_proxy(ResponseBodyMode::Stream);
+        proxy.dispatch_kind = DispatchKind::HttpPool;
+        proxy.backend_path = None;
+        proxy.strip_listen_path = false;
+
+        let url = build_backend_url_with_target(&proxy, "/mcp", "", "::1", 8080, 0, None);
+        assert_eq!(url, "http://[::1]:8080/mcp");
+    }
+
+    #[test]
+    fn websocket_backend_url_brackets_ipv6_literal_host() {
+        let mut proxy = test_proxy(ResponseBodyMode::Stream);
+        proxy.backend_scheme = Some(BackendScheme::Http);
+        proxy.strip_listen_path = false;
+
+        let url = build_websocket_backend_url_with_target(&proxy, "/mcp", "", "::1", 8080, 0, None);
+        assert_eq!(url, "ws://[::1]:8080/mcp");
     }
 
     #[test]

@@ -77,6 +77,7 @@ const PLUGIN_NAMES_UNDER_TEST: &[&str] = &[
     "ai_semantic_cache",
     "ai_semantic_firewall",
     "ai_federation",
+    "mcp_gateway",
     "ws_message_size_limiting",
     "ws_frame_logging",
     "ws_rate_limiting",
@@ -1535,6 +1536,16 @@ fn plugin_config_fixture(plugin_name: &str, dispatch_upstream_id: &str) -> Value
         "ai_federation" => {
             json!({"providers": [{"name": "test", "provider_type": "openai", "api_key": "sk-test"}]})
         }
+        "mcp_gateway" => json!({
+            "mode": "transparent_proxy",
+            "endpoint": {"path": "/mcp"},
+            "servers": {
+                "tools": {
+                    "upstream_url": "http://mcp-gateway.example/mcp",
+                    "namespace": "tools"
+                }
+            }
+        }),
         "ws_message_size_limiting" => json!({"max_frame_bytes": 65536}),
         "ws_rate_limiting" => json!({"frames_per_second": 100}),
         "udp_rate_limiting" => json!({"datagrams_per_second": 1000}),
