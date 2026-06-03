@@ -1118,3 +1118,342 @@ async fn functional_mesh_mode_production_binds_mtls_inbound_with_gateway_svid() 
         "production mesh did not bind an mTLS inbound listener from gateway SVID material after {RETRY_ATTEMPTS} attempts\n{last_failure}"
     );
 }
+
+/// Server + client SVIDs under a **shared** CA. `generate_gateway_svid` mints a
+/// fresh CA per call, so it can't drive a two-sided handshake; this signs both
+/// leaves from one root. The CA is returned both as the server's trust-bundle
+/// file (for `FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH`) and in PEM for the client
+/// probe's root store, and each leaf carries a `127.0.0.1` SAN so a standard
+/// rustls client can verify the server SVID by address.
+struct MeshPeerSvids {
+    /// The server leaf's SPIFFE ID, pinned client-side during the handshake.
+    server_spiffe: String,
+    server_cert_path: String,
+    server_key_path: String,
+    trust_bundle_path: String,
+    ca_pem: String,
+    client_cert_pem: String,
+    client_key_pem: String,
+    /// A client leaf signed by the **same CA** but bearing a SPIFFE ID in a trust
+    /// domain the server's bundle does not recognize. It chains to the CA, so a
+    /// chain-only verifier would admit it; the SPIFFE trust-domain verifier must
+    /// reject it. This isolates "requires a valid peer SVID" from chain validation.
+    untrusted_td_client_cert_pem: String,
+    untrusted_td_client_key_pem: String,
+}
+
+fn generate_mesh_peer_svids(
+    dir: &std::path::Path,
+    server_spiffe: &str,
+    client_spiffe: &str,
+) -> MeshPeerSvids {
+    use rcgen::{
+        BasicConstraints, CertificateParams, DistinguishedName, ExtendedKeyUsagePurpose, IsCa,
+        Issuer, KeyPair, KeyUsagePurpose, SanType,
+    };
+
+    let not_before = time::OffsetDateTime::now_utc() - time::Duration::days(1);
+    let not_after = time::OffsetDateTime::now_utc() + time::Duration::days(365);
+
+    // Shared root CA — also the trust bundle both peers verify against.
+    let ca_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("ca key");
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).expect("ca params");
+    ca_params.distinguished_name = DistinguishedName::new();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    ca_params.not_before = not_before;
+    ca_params.not_after = not_after;
+    let ca_cert = ca_params.self_signed(&ca_key).expect("ca cert");
+    let ca_pem = ca_cert.pem();
+    let issuer = Issuer::new(ca_params, ca_key);
+
+    let leaf = |spiffe: &str| -> (String, String) {
+        let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("leaf key");
+        let mut params = CertificateParams::default();
+        params.distinguished_name = DistinguishedName::new();
+        let id = SpiffeId::new(spiffe).expect("valid SPIFFE ID");
+        params
+            .subject_alt_names
+            .push(spiffe_id_to_san(&id).expect("spiffe SAN"));
+        // Loopback SAN so the test's rustls client can verify the server SVID by
+        // address (mesh peer verification is SPIFFE-SAN-based; the test client
+        // uses ordinary WebPKI name checking against 127.0.0.1).
+        params
+            .subject_alt_names
+            .push(SanType::IpAddress(std::net::IpAddr::V4(
+                std::net::Ipv4Addr::new(127, 0, 0, 1),
+            )));
+        params.is_ca = IsCa::ExplicitNoCa;
+        params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        params.extended_key_usages = vec![
+            ExtendedKeyUsagePurpose::ServerAuth,
+            ExtendedKeyUsagePurpose::ClientAuth,
+        ];
+        params.not_before = not_before;
+        params.not_after = not_after;
+        let cert = params.signed_by(&key, &issuer).expect("leaf cert");
+        (cert.pem(), key.serialize_pem())
+    };
+
+    let (server_cert_pem, server_key_pem) = leaf(server_spiffe);
+    let (client_cert_pem, client_key_pem) = leaf(client_spiffe);
+    // Same CA, but a trust domain the server bundle does not recognize — admitted
+    // by chain validation, must be rejected by the SPIFFE trust-domain verifier.
+    let (untrusted_td_client_cert_pem, untrusted_td_client_key_pem) =
+        leaf("spiffe://untrusted.example/ns/default/sa/client");
+
+    let server_cert_path = dir.join("server-svid.crt");
+    let server_key_path = dir.join("server-svid.key");
+    let trust_bundle_path = dir.join("mesh-ca.pem");
+    std::fs::write(&server_cert_path, &server_cert_pem).expect("write server cert");
+    std::fs::write(&server_key_path, &server_key_pem).expect("write server key");
+    std::fs::write(&trust_bundle_path, &ca_pem).expect("write trust bundle");
+
+    let to_str = |p: PathBuf| p.to_str().expect("svid path is UTF-8").to_string();
+    MeshPeerSvids {
+        server_spiffe: server_spiffe.to_string(),
+        server_cert_path: to_str(server_cert_path),
+        server_key_path: to_str(server_key_path),
+        trust_bundle_path: to_str(trust_bundle_path),
+        ca_pem,
+        client_cert_pem,
+        client_key_pem,
+        untrusted_td_client_cert_pem,
+        untrusted_td_client_key_pem,
+    }
+}
+
+/// A mesh slice whose mesh-wide PeerAuthentication resolves the inbound mTLS mode
+/// to STRICT, so the sidecar inbound listener requires + verifies a peer cert.
+fn strict_peer_auth_slice(node_id: &str) -> MeshSlice {
+    MeshSlice {
+        node_id: node_id.to_string(),
+        namespace: "ferrum".to_string(),
+        version: Utc::now().to_rfc3339(),
+        peer_authentications: vec![PeerAuthentication {
+            name: "mesh-strict".to_string(),
+            namespace: "ferrum".to_string(),
+            scope: None,
+            selector: None,
+            mtls_mode: MtlsMode::Strict,
+            port_overrides: HashMap::new(),
+        }],
+        ..MeshSlice::default()
+    }
+}
+
+/// Drive a real mTLS connection to the sidecar inbound listener at
+/// `127.0.0.1:port`, verifying the server SVID against `ca_pem` (the leaf carries
+/// a loopback SAN) **and** pinning the server's SPIFFE URI SAN to
+/// `expected_server_spiffe`. With `client_identity = Some((cert_pem, key_pem))`
+/// the client presents a client SVID; with `None` it presents none. Returns
+/// `Ok(())` only when the **two-sided handshake completes, the presented server
+/// leaf carries the expected SPIFFE identity, and the server accepts client-auth**.
+///
+/// Server-identity pin: WebPKI name checking only proves the leaf chains to
+/// `ca_pem` and is valid for `127.0.0.1`, so a same-CA cert with a wrong/missing
+/// SPIFFE URI SAN would still satisfy `connect()`. We therefore re-extract the
+/// peer leaf's SPIFFE ID post-handshake (the same extractor the inbound verifier
+/// uses) and require it to match.
+///
+/// TLS 1.3 subtlety: the client's `connect()` returns before the server validates
+/// the client certificate, so a STRICT server rejecting a missing/untrusted client
+/// cert is only observable *post*-handshake — it fires a `certificate required`
+/// fatal alert that surfaces on the next read. We therefore probe one read while
+/// sending nothing: an accepted peer leaves the server holding the connection open
+/// for the HTTP request (header-read timeout is 10s, so a 3s read blocks → times
+/// out → `Ok`), while a rejected peer's connection is torn down by the alert (read
+/// errors or hits immediate EOF → `Err`). This distinguishes a client-auth failure
+/// from any post-handshake HTTP behavior.
+async fn mesh_inbound_mtls_connect(
+    port: u16,
+    ca_pem: &str,
+    expected_server_spiffe: &str,
+    client_identity: Option<(&str, &str)>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use tokio::io::AsyncReadExt;
+
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in rustls_pemfile::certs(&mut ca_pem.as_bytes()).filter_map(|c| c.ok()) {
+        roots.add(cert)?;
+    }
+    let provider = rustls::crypto::ring::default_provider();
+    let builder = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+        .with_safe_default_protocol_versions()?
+        .with_root_certificates(roots);
+    let config = match client_identity {
+        Some((cert_pem, key_pem)) => {
+            let chain: Vec<_> = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+                .filter_map(|c| c.ok())
+                .collect();
+            let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())?
+                .ok_or("no client private key in PEM")?;
+            builder.with_client_auth_cert(chain, key)?
+        }
+        None => builder.with_no_client_auth(),
+    };
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+    let tcp = TcpStream::connect(("127.0.0.1", port)).await?;
+    let name = rustls::pki_types::ServerName::try_from("127.0.0.1".to_string())?;
+    // `connect()` resolving `Ok` proves the server SVID verified against `ca_pem`;
+    // under TLS 1.3 it does not yet prove the server accepted *our* client-auth.
+    let mut tls = tokio::time::timeout(Duration::from_secs(5), connector.connect(name, tcp))
+        .await
+        .map_err(|_| "tls handshake timed out")??;
+
+    // Pin the server SPIFFE identity from the presented leaf (chaining to the CA
+    // and a loopback SAN is not enough — see the doc comment). Reuses the inbound
+    // verifier's own URI-SAN extractor so this can't drift from production.
+    {
+        let (_io, conn) = tls.get_ref();
+        let server_leaf = conn
+            .peer_certificates()
+            .and_then(|chain| chain.first())
+            .ok_or("server presented no certificate")?;
+        let server_id =
+            ferrum_edge::identity::spiffe::extract_spiffe_id_from_cert(server_leaf.as_ref())
+                .map_err(|e| format!("server leaf lacks a valid SPIFFE URI SAN: {e}"))?;
+        let expected = SpiffeId::new(expected_server_spiffe)
+            .map_err(|e| format!("invalid expected server SPIFFE ID: {e}"))?;
+        if server_id != expected {
+            return Err(format!(
+                "server SPIFFE ID '{server_id}' does not match expected '{expected}'"
+            )
+            .into());
+        }
+    }
+
+    // Send nothing and read once to observe the post-handshake client-auth verdict
+    // (see the doc comment): block→timeout = accepted, alert/EOF = rejected.
+    let mut buf = [0u8; 1];
+    match tokio::time::timeout(Duration::from_secs(3), tls.read(&mut buf)).await {
+        Err(_) => Ok(()), // server holding the connection open for our request → accepted
+        Ok(Ok(0)) => {
+            Err("server closed the connection post-handshake (client-auth rejected)".into())
+        }
+        Ok(Ok(_)) => Ok(()), // server sent application/preface data → accepted
+        Ok(Err(e)) => Err(format!("post-handshake read failed (client-auth rejected): {e}").into()),
+    }
+}
+
+/// Live two-sided mTLS into the sidecar inbound listener (P1 keystone, Increment
+/// A — beyond #1525, which only asserts the listener *binds*). With a STRICT
+/// PeerAuthentication and the gateway SVID backing the inbound server identity,
+/// three real peers probe the listener, each also pinning the **server's** SPIFFE
+/// ID from the presented leaf:
+/// - a **shared-CA** client SVID completes the handshake and is **accepted**;
+/// - a client presenting **no** certificate is **rejected** by mTLS client-auth;
+/// - a client whose SVID chains to the same CA but lives in an **untrusted trust
+///   domain** is **rejected** — proving the SPIFFE trust-domain verifier enforces,
+///   not merely chain validation (the regression Codex flagged).
+/// The request→authz→backend leg (which needs real capture/routing) is covered by
+/// the kind `mesh-e2e-sidecar` workflow (Increment B). The spawn is retried with
+/// fresh ports per the `tests/**` bind-race rule; the mTLS assertions are not.
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_mode_strict_inbound_requires_peer_svid() {
+    ensure_gateway_built().expect("gateway binary built");
+
+    let mut last_failure = String::new();
+    for attempt in 1..=RETRY_ATTEMPTS {
+        let node_id = format!("functional-mesh-strict-mtls-{attempt}");
+        let temp = TempDir::new().expect("temp dir");
+        let peers = generate_mesh_peer_svids(
+            temp.path(),
+            "spiffe://cluster.local/ns/ferrum/sa/server",
+            "spiffe://cluster.local/ns/default/sa/client",
+        );
+        let cp = start_static_mesh_cp(strict_peer_auth_slice(&node_id)).await;
+        let ports = reserve_mesh_ports().await;
+        let inbound_port = ports.inbound;
+        let mut child = spawn_mesh_gateway(
+            &temp,
+            MeshGatewaySpawnOptions {
+                cp_addr: cp.addr,
+                ports,
+                node_id: &node_id,
+                config_protocol: "native",
+                topology: "sidecar",
+                waypoint_name: None,
+                env_overrides: vec![
+                    ("FERRUM_MESH_PRODUCTION_MODE", "true".to_string()),
+                    (
+                        "FERRUM_GATEWAY_SVID_CERT_PATH",
+                        peers.server_cert_path.clone(),
+                    ),
+                    (
+                        "FERRUM_GATEWAY_SVID_KEY_PATH",
+                        peers.server_key_path.clone(),
+                    ),
+                    (
+                        "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+                        peers.trust_bundle_path.clone(),
+                    ),
+                ],
+            },
+        );
+
+        if !wait_for_tcp_port(inbound_port, STARTUP_TIMEOUT).await {
+            // Startup / port-bind flake — retry with fresh ports.
+            last_failure = format!(
+                "attempt {attempt}: inbound listener never bound\n{}",
+                captured_output(&temp)
+            );
+            kill_child(&mut child);
+            cp.shutdown().await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
+
+        // Listener is up — run the real mTLS assertions (these are not retried).
+        // Every probe also pins the server SVID to `peers.server_spiffe`.
+        let with_cert = mesh_inbound_mtls_connect(
+            inbound_port,
+            &peers.ca_pem,
+            &peers.server_spiffe,
+            Some((&peers.client_cert_pem, &peers.client_key_pem)),
+        )
+        .await;
+        let no_cert =
+            mesh_inbound_mtls_connect(inbound_port, &peers.ca_pem, &peers.server_spiffe, None)
+                .await;
+        let untrusted_td = mesh_inbound_mtls_connect(
+            inbound_port,
+            &peers.ca_pem,
+            &peers.server_spiffe,
+            Some((
+                &peers.untrusted_td_client_cert_pem,
+                &peers.untrusted_td_client_key_pem,
+            )),
+        )
+        .await;
+
+        let output = captured_output(&temp);
+        kill_child(&mut child);
+        cp.shutdown().await;
+
+        assert!(
+            with_cert.is_ok(),
+            "a peer presenting a shared-CA SVID must complete the inbound mTLS handshake \
+             and be accepted by STRICT client-auth (server SVID pinned to '{}'): \
+             {with_cert:?}\n{output}",
+            peers.server_spiffe
+        );
+        assert!(
+            no_cert.is_err(),
+            "STRICT inbound must reject a peer presenting no client certificate: \
+             {no_cert:?}\n{output}"
+        );
+        assert!(
+            untrusted_td.is_err(),
+            "STRICT inbound must reject a client whose SVID chains to the CA but is in an \
+             untrusted trust domain — proves SPIFFE verification, not just chain validation: \
+             {untrusted_td:?}\n{output}"
+        );
+        return;
+    }
+
+    panic!(
+        "production sidecar never bound its mTLS inbound listener after {RETRY_ATTEMPTS} attempts\n{last_failure}"
+    );
+}
