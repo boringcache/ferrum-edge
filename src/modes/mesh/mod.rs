@@ -611,6 +611,23 @@ impl MeshRuntimeConfig {
         }
     }
 
+    /// Whether this topology runs an inbound **TLS-terminating** listener (mTLS
+    /// or HBONE). EastWestGateway does SNI passthrough — it forwards encrypted
+    /// bytes without terminating — so it has no plaintext-inbound posture and is
+    /// the single topology this returns `false` for. This is the one source of
+    /// truth for the runtime inbound fail-closed exemption (issue #1523): both
+    /// the startup gate (`enforce_mesh_inbound_fail_closed`) and the live-reload
+    /// apply task key their "is there anything to fail closed on?" check off it,
+    /// so the exempt set can never drift between the two.
+    fn has_inbound_tls_termination_listener(&self) -> bool {
+        self.listener_plan().iter().any(|listener| {
+            matches!(
+                listener.kind,
+                MeshListenerKind::MtlsTermination | MeshListenerKind::HboneTermination
+            )
+        })
+    }
+
     #[allow(dead_code)] // Used by tests and future xDS bootstrap wiring.
     pub fn mesh_slice_request(&self) -> MeshSliceRequest {
         MeshSliceRequest {
@@ -3798,6 +3815,23 @@ async fn serve_mesh_runtime(
             .and_then(|snapshot| snapshot.client_ca_bundle.as_ref()),
         mesh_inbound_spiffe_slot.as_ref(),
     )?;
+    // Runtime fail-closed enforcement (issue #1523): #1522's config-time gate
+    // only checks that identity material is *named*. Here the inbound listener's
+    // actual resolved posture is known, so a production mesh refuses to come up
+    // with a plaintext inbound termination listener or a configured-but-
+    // unloadable SPIFFE verifier, instead of silently falling open to the
+    // PERMISSIVE-plaintext posture (dev allows it with a loud warning). The
+    // production flag is read once here and threaded into the live-reload gate
+    // so it is fixed for the process lifetime.
+    let mesh_production_mode = crate::identity::production_mode();
+    enforce_mesh_inbound_fail_closed(
+        &runtime,
+        &env_config,
+        inbound_mtls_mode,
+        frontend_tls.as_ref(),
+        mesh_inbound_spiffe_slot.as_ref(),
+        mesh_production_mode,
+    )?;
     // Keep the slot populated with startup TLS even when live reload is
     // disabled. The flag controls which listener source is used; without live
     // reload the slot never updates again, so readers must not treat it as the
@@ -3934,6 +3968,7 @@ async fn serve_mesh_runtime(
             server_identity: mesh_frontend_identity,
             last_snapshot: initial_inbound_tls_snapshot,
             spiffe_bundle_slot: mesh_inbound_spiffe_slot,
+            production: mesh_production_mode,
         },
         shutdown_tx.subscribe(),
         dns_proxy_handle,
@@ -4387,15 +4422,26 @@ struct MeshInboundTlsReloadState {
     /// effect without a listener restart (per the lock-free SVID slot model
     /// in `.claude/rules/tls-security.md`).
     spiffe_bundle_slot: Option<tls::SharedBundleSlot>,
+    /// `FERRUM_MESH_PRODUCTION_MODE` captured once at startup. The live-reload
+    /// fail-closed gate (issue #1523) consults this instead of re-reading the
+    /// environment on every slice apply: the flag is fixed for the process
+    /// lifetime, and a per-apply env read would also be racy under the test
+    /// harness's env mutation. A production mesh refuses a PeerAuthentication
+    /// update that would downgrade the inbound listener to plaintext.
+    production: bool,
 }
 
 /// Build the optional SPIFFE inbound trust-bundle slot from the gateway SVID
 /// file material, merging in the slice's federated trust bundles so inbound
 /// peer SANs from federated trust domains validate too. Returns `None` when no
 /// gateway SVID material is configured (the inbound listener then keeps the
-/// operator client-CA chain verification it has always used). A load failure
-/// is logged and treated as `None` so a misconfigured SVID path does not take
-/// the whole listener down — it degrades to the pre-existing chain-only check.
+/// operator client-CA chain verification it has always used). It also returns
+/// `None` (logged) when SVID material *is* configured but fails to load — but
+/// the caller does NOT silently degrade to chain-only in that case (issue
+/// #1523): at startup a configured-but-unloadable SVID is fatal (see the F2
+/// note in the body, and `enforce_mesh_inbound_fail_closed`), and on live reload
+/// the previous trust bundle is retained. See `build_mesh_inbound_spiffe_slot`'s
+/// F2 comment for the precise per-caller disposition.
 fn build_mesh_inbound_spiffe_slot(
     env_config: &EnvConfig,
     slice: Option<&MeshSlice>,
@@ -4411,15 +4457,23 @@ fn build_mesh_inbound_spiffe_slot(
 
     // F2 (accepted coupling, documented): `load_svid_bundle_from_files`
     // validates the gateway SVID *leaf* (notBefore/notAfter, non-CA) as well as
-    // the trust-bundle CAs. An expired or mid-rotation gateway leaf therefore
-    // fails the whole load and we fall back to chain-only verification (no
-    // peer-SAN trust-domain check) with only a `warn!`, even though the trust
-    // *bundle* itself could still be valid. We intentionally do not load only
-    // the trust bundle here: the gateway leaf must also be currently valid for
-    // the listener to present a usable server identity, so an expired leaf is a
-    // real operational fault that the chain-only fallback degrades gracefully
-    // around rather than a reason to keep half-loading SVID material. Treating
-    // expired-leaf -> chain-only as the accepted current behavior.
+    // the trust-bundle CAs, so an expired/mid-rotation leaf OR a corrupt trust
+    // bundle fails the whole load and this returns `None`. The disposition is the
+    // CALLER's, and (issue #1523) it is NOT graceful chain-only at startup:
+    //   - Startup: a configured-but-unloadable gateway SVID is a hard fault. The
+    //     SAME material is loaded and validated by `load_gateway_svid_bundle` in
+    //     ProxyState construction (`new_with_bpf_metrics`), which refuses startup
+    //     *first*; `enforce_mesh_inbound_fail_closed` is the inbound-local guard
+    //     for the identical condition. So a configured SVID that fails to load —
+    //     including an expired/mid-rotation leaf — aborts startup; it does not
+    //     silently degrade to chain-only.
+    //   - Live reload: `stage_mesh_inbound_spiffe_bundle` keeps the PREVIOUS trust
+    //     bundle (the running verifier is retained, not dropped to chain-only), so
+    //     a transient mid-rotation failure does not drop inbound trust-domain
+    //     enforcement.
+    // We intentionally do not load only the trust bundle here: the gateway leaf
+    // must also be currently valid for the listener to present a usable server
+    // identity, so an expired leaf is a real fault, not a reason to half-load.
     let mut bundle = match crate::identity::file_loader::load_svid_bundle_from_files(
         std::path::Path::new(cert_path),
         std::path::Path::new(key_path),
@@ -4428,12 +4482,13 @@ fn build_mesh_inbound_spiffe_slot(
     ) {
         Ok(bundle) => bundle,
         Err(error) => {
+            // Neutral report — the caller decides the disposition: fatal at
+            // startup (also independently enforced by `load_gateway_svid_bundle`),
+            // previous-bundle-retained on live reload.
             error!(
                 %error,
-                "Failed to load gateway SVID material for mesh inbound SPIFFE peer \
-                 verification; trust-domain enforcement is now DISABLED until SVID \
-                 material reloads — inbound peers are accepted via chain validation \
-                 only (no peer trust-domain check)"
+                "Failed to load gateway SVID material for the mesh inbound SPIFFE peer \
+                 verifier (startup: fatal; live reload: previous trust bundle retained)"
             );
             return None;
         }
@@ -4592,17 +4647,61 @@ fn mesh_inbound_tls_reload_snapshot(
 fn load_mesh_frontend_server_identity(
     env_config: &EnvConfig,
 ) -> Result<Option<Arc<tls::MeshServerIdentity>>, anyhow::Error> {
-    match (
+    // The explicit frontend TLS cert/key is the operator override for the
+    // inbound listener's server identity.
+    if let (Some(cert_path), Some(key_path)) = (
         env_config.frontend_tls_cert_path.as_deref(),
         env_config.frontend_tls_key_path.as_deref(),
     ) {
-        (Some(cert_path), Some(key_path)) => Ok(Some(tls::load_mesh_server_identity(
+        return Ok(Some(tls::load_mesh_server_identity(
             cert_path,
             key_path,
             env_config.tls_cert_expiry_warning_days,
-        )?)),
-        _ => Ok(None),
+        )?));
     }
+    // Otherwise fall back to the gateway SVID material as the inbound server
+    // identity (issue #1523, gap #3 — "gateway SVID ≠ inbound server identity").
+    // Previously a mesh configured with ONLY FERRUM_GATEWAY_SVID_* had a SPIFFE
+    // peer *verifier* (built separately by `build_mesh_inbound_spiffe_slot`) but
+    // no server *cert*, so `load_mesh_frontend_tls` fell open to `Ok(None)`
+    // (plaintext) under the default PERMISSIVE mode. The gateway SVID IS the
+    // mesh's workload identity, so it should back the listener's server cert.
+    // The SVID's leaf cert + PKCS#8 key load via the same path as an explicit
+    // frontend cert; a load failure here is a hard error (fail closed) because
+    // configured-but-broken identity is a real fault, not a dev-plaintext
+    // posture ("no identity at all" is gated separately at config time by #1522).
+    if let (Some(cert_path), Some(key_path)) = (
+        env_config.gateway_svid_cert_path.as_deref(),
+        env_config.gateway_svid_key_path.as_deref(),
+    ) {
+        // Operability caveat (issue #1523): this server cert is loaded once here
+        // and pinned for the process lifetime. The gateway SVID file watcher
+        // (`run_gateway_svid_file_rotation_loop`) rotates only the BACKEND
+        // (outbound) identity, so after the file-based SVID rotates this inbound
+        // listener keeps presenting the startup leaf until restart — and once the
+        // pinned leaf expires (~one rotation period), inbound mTLS handshakes
+        // fail. Auto-rotating the SVID-backed inbound identity (a live
+        // `ResolvesServerCert`) is the deferred rotation work tracked alongside
+        // FERRUM_MESH_CA_BACKEND wiring; warn loudly so operators either supply
+        // explicit FERRUM_FRONTEND_TLS_* (with their own rotation) or
+        // restart/rolling-redeploy on SVID rotation.
+        warn!(
+            "Mesh inbound listener using gateway SVID material as its TLS server \
+             identity (no explicit FERRUM_FRONTEND_TLS_CERT_PATH / KEY_PATH set). \
+             This inbound server certificate is pinned at startup and is NOT \
+             auto-rotated (the gateway SVID file watcher rotates only the backend \
+             identity), so after the SVID rotates this listener keeps presenting \
+             the startup leaf until the gateway is restarted — inbound mTLS will \
+             fail once that leaf expires. Supply FERRUM_FRONTEND_TLS_CERT_PATH / \
+             KEY_PATH with your own rotation, or restart on SVID rotation."
+        );
+        return Ok(Some(tls::load_mesh_server_identity(
+            cert_path,
+            key_path,
+            env_config.tls_cert_expiry_warning_days,
+        )?));
+    }
+    Ok(None)
 }
 
 /// Outcome of resolving a PeerAuthentication mTLS mode into an inbound
@@ -4799,6 +4898,146 @@ fn load_mesh_frontend_tls(
     Ok(Some(tls_config))
 }
 
+/// Posture decision for a mesh inbound listener that would serve **plaintext**
+/// (issue #1523). Pure so the truth table can be unit-tested without touching the
+/// environment; the env reads + logging live in [`enforce_mesh_inbound_fail_closed`].
+///
+/// | trigger (plaintext) | production | result             |
+/// |---------------------|------------|--------------------|
+/// | false               | *          | `Ok`               |
+/// | true                | true       | `Refuse`           |
+/// | true                | false      | `AllowWithWarning` |
+///
+/// The **production** contract is absolute: a production mesh must serve mTLS on
+/// its inbound listener, so a plaintext posture is refused. **Dev** allows it
+/// with a loud warning — reaching plaintext in dev is always *intentional*: the
+/// no-identity *silent default* trap is separately fail-closed at config time by
+/// the `FERRUM_MESH_ALLOW_NO_CA` gate (`EnvConfig::validate`), so the only ways to
+/// get here in dev are (a) that opt-out already acknowledged, or (b) an explicit
+/// `PeerAuthentication` DISABLE. The runtime gate therefore does not re-consult
+/// the dev opt-out.
+///
+/// This governs ONLY the plaintext posture. A *configured-but-unloadable* SVID
+/// verifier (the listener serves TLS but its SPIFFE trust-domain verifier failed
+/// to load) is a genuine misconfiguration, not an intentional dev posture, so
+/// [`enforce_mesh_inbound_fail_closed`] hard-errors that case regardless of
+/// `production` — never routing it through this decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MeshInboundFailClosed {
+    /// Listener is mTLS-capable (or there is nothing to enforce); proceed.
+    Ok,
+    /// Insecure posture tolerated in dev/test; proceed after a loud warning.
+    AllowWithWarning,
+    /// Refuse — a production mesh must not serve a plaintext inbound listener.
+    Refuse,
+}
+
+fn decide_mesh_inbound_fail_closed(trigger: bool, production: bool) -> MeshInboundFailClosed {
+    if !trigger {
+        MeshInboundFailClosed::Ok
+    } else if production {
+        MeshInboundFailClosed::Refuse
+    } else {
+        MeshInboundFailClosed::AllowWithWarning
+    }
+}
+
+/// Fail closed when the *resolved* mesh inbound listener would not actually
+/// enforce mTLS (issue #1523 — the runtime complement to #1522's config-time
+/// presence check).
+///
+/// #1522 guarantees that a production mesh *names* file-based gateway SVID
+/// material, but that is only a presence check: it cannot see whether the
+/// material loads or whether the resolved PeerAuthentication mode would leave
+/// the inbound mTLS/HBONE termination listener serving plaintext. This runs at
+/// the startup TLS-setup path, where the listener's real posture is known, and
+/// closes two distinct escapes — with deliberately different severity:
+///
+///  - **configured-but-unloadable SVID verifier** (gap #2): the listener serves
+///    TLS but gateway SVID material is configured and failed to load, so the
+///    SPIFFE peer-trust-domain verifier is absent (an offered peer cert would not
+///    be trust-domain validated). The operator named all three
+///    `FERRUM_GATEWAY_SVID_*` paths intending verification, so this is a genuine
+///    misconfiguration — **fatal regardless of `production`**, mirroring how
+///    [`load_mesh_frontend_server_identity`] already hard-errors a broken SVID
+///    cert/key. (`ProxyState` construction's `load_gateway_svid_bundle` rejects
+///    the same broken material independently; this is the inbound-local guard.)
+///  - **would-serve-plaintext**: a termination listener exists but the resolved
+///    inbound `ServerConfig` is `None` (PeerAuthentication DISABLE, or no usable
+///    server identity), so the listener would accept unauthenticated plaintext.
+///    Refused under `production`; in dev allowed with a loud warning (intentional
+///    — see [`decide_mesh_inbound_fail_closed`]).
+///
+/// Topologies without a TLS-terminating inbound listener (EastWestGateway does
+/// SNI passthrough — encrypted bytes are forwarded, never terminated) have no
+/// plaintext-inbound posture to enforce against and are skipped.
+fn enforce_mesh_inbound_fail_closed(
+    runtime: &MeshRuntimeConfig,
+    env_config: &EnvConfig,
+    mtls_mode: config::MtlsMode,
+    frontend_tls: Option<&Arc<rustls::ServerConfig>>,
+    spiffe_bundle_slot: Option<&tls::SharedBundleSlot>,
+    production: bool,
+) -> Result<(), anyhow::Error> {
+    if !runtime.has_inbound_tls_termination_listener() {
+        return Ok(());
+    }
+
+    // A configured-but-unloadable SVID verifier on a TLS-serving listener is a
+    // genuine fault, not an intentional posture, so it is fatal regardless of
+    // `production` (consistent with the hard error a broken SVID cert/key already
+    // gets in `load_mesh_frontend_server_identity`). "Configured" is exact: blank
+    // FERRUM_GATEWAY_SVID_* values were normalized to `None` at parse (#1522), so
+    // all-three-`Some` means material was named; `build_mesh_inbound_spiffe_slot`
+    // returning `None` for named material then means the load failed (it logs the
+    // underlying error first). This is gated on `frontend_tls.is_some()` so a
+    // resolved-plaintext listener (DISABLE — the verifier is unused) falls to the
+    // plaintext branch below instead.
+    let gateway_svid_configured = env_config.gateway_svid_cert_path.is_some()
+        && env_config.gateway_svid_key_path.is_some()
+        && env_config.gateway_svid_trust_bundle_path.is_some();
+    if frontend_tls.is_some() && gateway_svid_configured && spiffe_bundle_slot.is_none() {
+        return Err(anyhow::anyhow!(
+            "gateway SVID material is configured (FERRUM_GATEWAY_SVID_*) but failed to load on \
+             {} topology, so the mesh inbound listener would serve TLS WITHOUT SPIFFE \
+             peer-trust-domain verification (an offered peer certificate would not be \
+             trust-domain validated). Fix the SVID cert/key/trust-bundle material, or unset it \
+             to fall back to operator client-CA verification.",
+            runtime.topology.as_str()
+        ));
+    }
+
+    // Otherwise the only remaining escape is a listener that would serve
+    // plaintext (PeerAuthentication DISABLE, or no usable server identity).
+    let reason: &str = if mtls_mode == config::MtlsMode::Disable {
+        "PeerAuthentication resolved to DISABLE, so the inbound mTLS/HBONE termination \
+         listener would accept unauthenticated plaintext"
+    } else {
+        "the inbound mTLS/HBONE termination listener resolved to no usable TLS server identity \
+         (set FERRUM_GATEWAY_SVID_CERT_PATH / KEY_PATH / TRUST_BUNDLE_PATH, or \
+         FERRUM_FRONTEND_TLS_CERT_PATH / KEY_PATH), so it would accept unauthenticated plaintext"
+    };
+    match decide_mesh_inbound_fail_closed(frontend_tls.is_none(), production) {
+        MeshInboundFailClosed::Ok => Ok(()),
+        MeshInboundFailClosed::AllowWithWarning => {
+            warn!(
+                topology = runtime.topology.as_str(),
+                ?mtls_mode,
+                "{reason}. The mesh inbound listener is coming up WITHOUT enforced mTLS and may \
+                 accept unauthenticated plaintext traffic. Dev/test only — configure gateway \
+                 SVID material and set FERRUM_MESH_PRODUCTION_MODE=true for production."
+            );
+            Ok(())
+        }
+        // Refuse only happens under production mode (see decide_*).
+        MeshInboundFailClosed::Refuse => Err(anyhow::anyhow!(
+            "FERRUM_MESH_PRODUCTION_MODE=true but {reason} on {} topology. Refusing to start: a \
+             production mesh must serve mTLS on its inbound listener.",
+            runtime.topology.as_str()
+        )),
+    }
+}
+
 fn validate_egress_gateway_mtls_config(
     runtime: &MeshRuntimeConfig,
     env_config: &EnvConfig,
@@ -4884,13 +5123,19 @@ struct StagedSpiffeBundle {
     bundle: Arc<Option<crate::identity::SvidBundle>>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn plan_mesh_inbound_tls_reload(
     proxy_state: &ProxyState,
+    runtime: &MeshRuntimeConfig,
     slice: &MeshSlice,
     mtls_mode: config::MtlsMode,
     server_identity: Option<&tls::MeshServerIdentity>,
     last_snapshot: Option<&MeshInboundTlsReloadSnapshot>,
     spiffe_bundle_slot: Option<&tls::SharedBundleSlot>,
+    production: bool,
+    // Precomputed once by the apply task (topology is process-fixed) so the reload
+    // path does not re-derive `runtime.listener_plan()` on every slice apply.
+    has_termination_listener: bool,
 ) -> Option<MeshInboundTlsReloadPlan> {
     let next_snapshot = match mesh_inbound_tls_reload_snapshot(&proxy_state.env_config, mtls_mode) {
         Ok(snapshot) => snapshot,
@@ -4936,11 +5181,57 @@ fn plan_mesh_inbound_tls_reload(
         next_snapshot.client_ca_bundle.as_ref(),
         spiffe_bundle_slot,
     ) {
-        Ok(tls_config) => Some(MeshInboundTlsReloadPlan::Swap {
-            snapshot: next_snapshot,
-            tls_config,
-            staged_spiffe,
-        }),
+        Ok(tls_config) => {
+            // Runtime fail-closed for PeerAuthentication LIVE RELOAD (issue
+            // #1523): the startup gate (`enforce_mesh_inbound_fail_closed`) only
+            // sees the initial slice. A later accepted update that resolves the
+            // inbound termination listener to plaintext — e.g. PeerAuthentication
+            // DISABLE makes `load_mesh_frontend_tls` return `None`, which
+            // `apply_mesh_inbound_tls_reload` would store, clearing the inbound +
+            // shared-stream TLS slots — would silently downgrade a running
+            // production sidecar to plaintext. Reject the slice instead (return
+            // `None` → the apply task keeps the last-good mTLS config in its
+            // entirety; fail-closed by retention, never crashing a live data
+            // plane). Same posture as startup: refused under production; dev allows
+            // it with a warning (an explicit DISABLE is an intentional choice).
+            // Topologies without a TLS-terminating inbound listener (EastWestGateway
+            // SNI passthrough) are exempt (`has_termination_listener` is false).
+            if has_termination_listener && tls_config.is_none() {
+                match decide_mesh_inbound_fail_closed(true, production) {
+                    MeshInboundFailClosed::Refuse => {
+                        warn!(
+                            mesh_slice_version = %slice.version,
+                            ?mtls_mode,
+                            topology = runtime.topology.as_str(),
+                            "Rejecting mesh slice: this PeerAuthentication update resolves the \
+                             inbound mTLS/HBONE termination listener to plaintext (no TLS server \
+                             config), which a production mesh must not serve. Keeping the last-good \
+                             mTLS config in its entirety (no authz/policy/ServiceEntry/endpoint \
+                             update from this slice is applied)."
+                        );
+                        // Drop the staged SPIFFE bundle: the slice is rejected, so
+                        // the live slot keeps its previous trust bundles.
+                        return None;
+                    }
+                    MeshInboundFailClosed::AllowWithWarning => {
+                        warn!(
+                            mesh_slice_version = %slice.version,
+                            ?mtls_mode,
+                            topology = runtime.topology.as_str(),
+                            "Applying a PeerAuthentication update that downgrades the inbound \
+                             listener to plaintext. The mesh inbound listener will accept \
+                             unauthenticated plaintext traffic. Dev/test only."
+                        );
+                    }
+                    MeshInboundFailClosed::Ok => {}
+                }
+            }
+            Some(MeshInboundTlsReloadPlan::Swap {
+                snapshot: next_snapshot,
+                tls_config,
+                staged_spiffe,
+            })
+        }
         Err(error) => {
             warn!(
                 mesh_slice_version = %slice.version,
@@ -5165,6 +5456,10 @@ fn start_mesh_slice_apply_task(
     dns_proxy: Option<Arc<MeshDnsProxy>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        // Topology is process-fixed, so whether this data plane has an inbound
+        // TLS-terminating listener never changes — compute it once here rather
+        // than re-deriving the listener plan on every slice apply.
+        let has_termination_listener = runtime.has_inbound_tls_termination_listener();
         let mut updates = mesh_state.subscribe();
         let mut federation_updates = mesh_state.federation_store().subscribe();
         let mut remote_endpoint_updates = mesh_state.remote_endpoint_store().subscribe();
@@ -5209,11 +5504,14 @@ fn start_mesh_slice_apply_task(
                         live_reload_inbound_mtls_mode(slice, &runtime).and_then(|mtls_mode| {
                             plan_mesh_inbound_tls_reload(
                                 &proxy_state,
+                                &runtime,
                                 slice,
                                 mtls_mode,
                                 inbound_tls_reload.server_identity.as_deref(),
                                 inbound_tls_reload.last_snapshot.as_ref(),
                                 inbound_tls_reload.spiffe_bundle_slot.as_ref(),
+                                inbound_tls_reload.production,
+                                has_termination_listener,
                             )
                             .map(|plan| (mtls_mode, plan))
                         })
@@ -6129,11 +6427,18 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn mesh_runtime_starts_listeners_and_shuts_down() {
+        ensure_crypto_provider();
+        // Provide a frontend TLS server identity so the inbound mTLS termination
+        // listener is mTLS-capable and the runtime inbound fail-closed gate
+        // (issue #1523) is satisfied without depending on process-env guardrail
+        // state — this async test cannot hold the sync ENV_LOCK across `.await`.
         let env = EnvConfig {
             mode: crate::config::OperatingMode::Mesh,
             pool_warmup_enabled: false,
             shutdown_drain_seconds: 0,
             accept_threads: 1,
+            frontend_tls_cert_path: Some("tests/certs/server.crt".to_string()),
+            frontend_tls_key_path: Some("tests/certs/server.key".to_string()),
             ..EnvConfig::default()
         };
         let runtime = MeshRuntimeConfig {
@@ -9810,6 +10115,7 @@ mod tests {
                 server_identity: None,
                 last_snapshot: None,
                 spiffe_bundle_slot: None,
+                production: false,
             },
             shutdown_rx,
             None,
@@ -9865,6 +10171,7 @@ mod tests {
                 server_identity: mesh_frontend_identity,
                 last_snapshot: Some(initial_snapshot),
                 spiffe_bundle_slot: None,
+                production: false,
             },
             shutdown_rx,
             None,
@@ -9945,6 +10252,7 @@ mod tests {
                 server_identity: mesh_frontend_identity,
                 last_snapshot: Some(initial_snapshot),
                 spiffe_bundle_slot: None,
+                production: false,
             },
             shutdown_rx,
             None,
@@ -10056,6 +10364,7 @@ mod tests {
                 server_identity: None,
                 last_snapshot: Some(initial_snapshot),
                 spiffe_bundle_slot: None,
+                production: false,
             },
             shutdown_rx,
             None,
@@ -10096,6 +10405,76 @@ mod tests {
             .await
             .expect("apply task should stop")
             .expect("apply task should join");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn plan_mesh_inbound_tls_reload_fails_closed_on_plaintext_downgrade() {
+        // Issue #1523 live-reload complement: a PeerAuthentication update that
+        // resolves the inbound termination listener to plaintext (DISABLE →
+        // `tls_config` None) must be rejected under production, so a running
+        // production sidecar is not silently downgraded mid-flight. The apply
+        // task treats a `None` plan as "keep the last-good config". `production`
+        // is passed explicitly (captured once at startup in the real runtime), so
+        // this test is deterministic and does not touch the environment.
+        ensure_crypto_provider();
+        let mut runtime = test_mesh_runtime_config(); // Sidecar → has MtlsTermination
+        runtime.inbound_listen_addr = "127.0.0.1:15006".parse().unwrap();
+        let env = EnvConfig {
+            mesh_peer_auth_live_reload_enabled: true,
+            frontend_tls_cert_path: Some("tests/certs/server.crt".to_string()),
+            frontend_tls_key_path: Some("tests/certs/server.key".to_string()),
+            pool_warmup_enabled: false,
+            shutdown_drain_seconds: 0,
+            ..EnvConfig::default()
+        };
+        let disable_slice = MeshSlice {
+            version: "disable-reload".to_string(),
+            ..MeshSlice::default()
+        };
+        let proxy_state = make_test_proxy_state_with_env(GatewayConfig::default(), env.clone());
+        let identity = load_mesh_frontend_server_identity(&env).expect("server identity");
+
+        // Production rejects the plaintext (DISABLE) downgrade: plan() is None,
+        // which the apply task treats as "keep the last-good mTLS config".
+        let plan = plan_mesh_inbound_tls_reload(
+            &proxy_state,
+            &runtime,
+            &disable_slice,
+            config::MtlsMode::Disable,
+            identity.as_deref(),
+            None,
+            None,
+            true, // production
+            true, // has a TLS-terminating inbound listener (Sidecar)
+        );
+        assert!(
+            plan.is_none(),
+            "production must reject a DISABLE (plaintext) inbound live reload"
+        );
+
+        // Dev (non-production) tolerates the downgrade (warns + swaps to None) —
+        // an explicit DISABLE reload is an intentional operator choice.
+        let plan = plan_mesh_inbound_tls_reload(
+            &proxy_state,
+            &runtime,
+            &disable_slice,
+            config::MtlsMode::Disable,
+            identity.as_deref(),
+            None,
+            None,
+            false, // dev
+            true,  // has a TLS-terminating inbound listener (Sidecar)
+        );
+        assert!(
+            matches!(
+                plan,
+                Some(MeshInboundTlsReloadPlan::Swap {
+                    tls_config: None,
+                    ..
+                })
+            ),
+            "dev (non-production) may apply a plaintext inbound reload"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -10917,6 +11296,191 @@ mod tests {
             tls_config.is_some(),
             "TLS config should be built (no client auth, but server TLS active)"
         );
+    }
+
+    #[test]
+    fn decide_mesh_inbound_fail_closed_matrix() {
+        // No trigger (listener is mTLS-capable) → always Ok.
+        assert_eq!(
+            decide_mesh_inbound_fail_closed(false, false),
+            MeshInboundFailClosed::Ok
+        );
+        assert_eq!(
+            decide_mesh_inbound_fail_closed(false, true),
+            MeshInboundFailClosed::Ok
+        );
+        // Triggered + production → Refuse (a production mesh must serve mTLS on
+        // its inbound listener).
+        assert_eq!(
+            decide_mesh_inbound_fail_closed(true, true),
+            MeshInboundFailClosed::Refuse
+        );
+        // Triggered + dev → allow with a warning. Reaching a plaintext posture in
+        // dev is intentional (explicit DISABLE, or an acknowledged no-identity
+        // posture that the config-time FERRUM_MESH_ALLOW_NO_CA gate already let
+        // through), so the runtime gate does not re-refuse it.
+        assert_eq!(
+            decide_mesh_inbound_fail_closed(true, false),
+            MeshInboundFailClosed::AllowWithWarning
+        );
+    }
+
+    #[test]
+    fn load_mesh_frontend_server_identity_falls_back_to_gateway_svid() {
+        ensure_crypto_provider();
+        // Only gateway SVID material set (no explicit frontend TLS): the SVID
+        // must back the inbound server identity so the listener is not plaintext
+        // (issue #1523, gap #3).
+        let env = EnvConfig {
+            gateway_svid_cert_path: Some("tests/certs/server.crt".to_string()),
+            gateway_svid_key_path: Some("tests/certs/server.key".to_string()),
+            ..EnvConfig::default()
+        };
+        let identity = load_mesh_frontend_server_identity(&env)
+            .expect("gateway SVID load should succeed")
+            .expect("gateway SVID must back the inbound server identity");
+        assert_eq!(identity.cert_path(), "tests/certs/server.crt");
+
+        // Explicit frontend TLS takes precedence over the SVID fallback (a
+        // broken SVID path here must be ignored because frontend TLS is set).
+        let env = EnvConfig {
+            frontend_tls_cert_path: Some("tests/certs/server.crt".to_string()),
+            frontend_tls_key_path: Some("tests/certs/server.key".to_string()),
+            gateway_svid_cert_path: Some("/nonexistent/svid.crt".to_string()),
+            gateway_svid_key_path: Some("/nonexistent/svid.key".to_string()),
+            ..EnvConfig::default()
+        };
+        let identity = load_mesh_frontend_server_identity(&env)
+            .expect("explicit frontend TLS load should succeed")
+            .expect("explicit frontend TLS identity");
+        assert_eq!(identity.cert_path(), "tests/certs/server.crt");
+
+        // Neither configured → no server identity (not an error here; the
+        // fail-closed gate decides what to do with a plaintext posture).
+        assert!(
+            load_mesh_frontend_server_identity(&EnvConfig::default())
+                .expect("no identity is not a load error")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn enforce_mesh_inbound_fail_closed_skips_passthrough_topology() {
+        // EastWestGateway has no TLS-terminating inbound listener (SNI
+        // passthrough forwards encrypted bytes), so there is no plaintext-inbound
+        // posture to enforce against — Ok even with DISABLE mode, no identity, and
+        // production=true (the no-termination-listener early return runs first).
+        let runtime = MeshRuntimeConfig {
+            topology: MeshTopology::EastWestGateway,
+            ..test_mesh_runtime_config()
+        };
+        enforce_mesh_inbound_fail_closed(
+            &runtime,
+            &EnvConfig::default(),
+            config::MtlsMode::Disable,
+            None,
+            None,
+            true,
+        )
+        .expect("east-west gateway has no termination listener to fail closed on");
+    }
+
+    #[test]
+    fn enforce_mesh_inbound_fail_closed_refuses_plaintext_under_production_only() {
+        // A termination-listener topology whose resolved inbound listener would
+        // serve plaintext (`frontend_tls` None — PeerAuthentication DISABLE, or no
+        // usable server identity) is refused under production and allowed with a
+        // warning in dev. This exercises the `enforce_` wrapper's plaintext branch
+        // directly: `decide_mesh_inbound_fail_closed_matrix` covers the pure
+        // decision, and the `#[ignore]` functional test covers the production
+        // refusal end-to-end, but the wrapper's own routing (no-SVID env →
+        // plaintext branch, reason selection, error vs Ok) is otherwise only hit
+        // in `--ignored` runs. No gateway SVID is configured, so the
+        // configured-but-unloadable SVID branch does not apply.
+        let runtime = test_mesh_runtime_config(); // Sidecar → has MtlsTermination
+
+        // Production refuses to bring up a plaintext inbound listener (DISABLE).
+        let err = enforce_mesh_inbound_fail_closed(
+            &runtime,
+            &EnvConfig::default(),
+            config::MtlsMode::Disable,
+            None, // frontend_tls: would serve plaintext
+            None, // spiffe_bundle_slot
+            true, // production
+        )
+        .expect_err("production must refuse a plaintext inbound termination listener");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("FERRUM_MESH_PRODUCTION_MODE=true") && msg.contains("DISABLE"),
+            "unexpected refusal message: {msg}"
+        );
+
+        // Dev tolerates plaintext with a warning — here via the "no usable server
+        // identity" reason path (PERMISSIVE, still no identity → `frontend_tls`
+        // None), the other way a termination listener resolves to plaintext.
+        enforce_mesh_inbound_fail_closed(
+            &runtime,
+            &EnvConfig::default(),
+            config::MtlsMode::Permissive,
+            None,
+            None,
+            false, // dev
+        )
+        .expect("dev tolerates a plaintext inbound listener with a warning");
+    }
+
+    #[test]
+    fn enforce_mesh_inbound_fail_closed_rejects_configured_but_unloadable_svid_verifier() {
+        ensure_crypto_provider();
+        // gap #2: a TLS-serving inbound listener whose configured gateway SVID
+        // verifier failed to load (slot None while all three FERRUM_GATEWAY_SVID_*
+        // are named) is a genuine misconfiguration — fatal regardless of
+        // FERRUM_MESH_PRODUCTION_MODE, mirroring the hard error a broken SVID
+        // cert/key already gets. It is NOT the intentional plaintext/DISABLE
+        // posture the dev relaxation is for.
+        let runtime = test_mesh_runtime_config(); // Sidecar → has MtlsTermination
+        let env = EnvConfig {
+            // A real frontend identity so the listener serves TLS (frontend_tls Some).
+            frontend_tls_cert_path: Some("tests/certs/server.crt".to_string()),
+            frontend_tls_key_path: Some("tests/certs/server.key".to_string()),
+            // Gateway SVID material is *configured* (all three paths named).
+            gateway_svid_cert_path: Some("tests/certs/server.crt".to_string()),
+            gateway_svid_key_path: Some("tests/certs/server.key".to_string()),
+            gateway_svid_trust_bundle_path: Some("/nonexistent/svid-bundle.pem".to_string()),
+            ..EnvConfig::default()
+        };
+        let tls_policy = TlsPolicy::from_env_config(&env).expect("tls policy");
+        let identity = load_mesh_frontend_server_identity(&env).expect("server identity");
+        let frontend_tls = load_mesh_frontend_tls(
+            &env,
+            &tls_policy,
+            &[],
+            config::MtlsMode::Permissive,
+            identity.as_deref(),
+            None,
+            None,
+        )
+        .expect("frontend tls builds")
+        .expect("frontend tls present");
+
+        // The SPIFFE verifier slot failed to load (None) → fatal in BOTH dev and
+        // production.
+        for production in [false, true] {
+            let err = enforce_mesh_inbound_fail_closed(
+                &runtime,
+                &env,
+                config::MtlsMode::Permissive,
+                Some(&frontend_tls),
+                None, // SPIFFE verifier slot failed to load
+                production,
+            )
+            .expect_err("a configured-but-unloadable SVID verifier must be fatal");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("SVID material is configured") && msg.contains("WITHOUT SPIFFE"),
+                "unexpected error (production={production}): {msg}"
+            );
+        }
     }
 
     #[test]
