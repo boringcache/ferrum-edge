@@ -16,7 +16,7 @@ use tokio::sync::OnceCell;
 use url::{Host, Url};
 
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
-use super::utils::sse::parse_sse_data_frames;
+use super::utils::sse::{SseReassembler, SseText, SseTextKind, parse_sse_data_frames_checked};
 use super::{HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext};
 
 const DEFAULT_REQUEST_JSON_PATHS: &[&str] = &[
@@ -45,6 +45,27 @@ const DEFAULT_RESPONSE_JSON_PATHS: &[&str] = &[
     "$.output[*].content[*].text",
     "$.output[*].arguments",
 ];
+
+/// Chat-completions streaming `delta.*` response paths. These are reassembled
+/// across frames by [`SseReassembler`]; per-frame extraction must skip them or
+/// it re-introduces the meaningless per-fragment segments reassembly exists to
+/// avoid. Non-delta paths (`message.*`, `output_text`, `output[*].*`) are not
+/// listed here because per-frame extraction handles them correctly — they never
+/// match a streaming `delta` frame, so there is no double counting.
+const SSE_DELTA_RESPONSE_PATHS: &[&str] = &[
+    "$.choices[*].delta.content",
+    "$.choices[*].delta.tool_calls[*].function.name",
+    "$.choices[*].delta.tool_calls[*].function.arguments",
+];
+
+/// Metadata key recording how a streamed response was handled. Set on the
+/// request path by `buffer` mode; read on the response path to pin only the
+/// matching event stream onto the buffered path.
+const RESPONSE_INSPECTION_KEY: &str = "ai_semantic_firewall.response_inspection";
+
+/// Value written to [`RESPONSE_INSPECTION_KEY`] when `buffer` mode detects a
+/// `stream: true` request and intends to buffer its SSE response.
+const STREAMING_BUFFERED_MARKER: &str = "streaming_buffered";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Direction {
@@ -152,8 +173,9 @@ impl EnforcementMode {
 }
 
 /// What to do with `stream: true` requests when response-side inspection is
-/// active. Streamed responses are not buffered, so the response-direction packs
-/// cannot run on them.
+/// active. A genuinely streamed response is not buffered, so the
+/// response-direction packs cannot run on it unless we change how the response
+/// body is handled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StreamingResponsePolicy {
     /// Allow the streamed response uninspected (fail-open). The skip is recorded
@@ -163,6 +185,13 @@ enum StreamingResponsePolicy {
     /// inspection by asking for a stream; clients must retry with
     /// `"stream": false` to receive a buffered, inspectable response.
     Reject,
+    /// Force the streamed response to **buffer**: the whole completion is
+    /// collected, its SSE deltas reassembled into coherent text, and the existing
+    /// response engine runs on the full body before anything reaches the client.
+    /// Most accurate (full context) but loses streaming UX and raises
+    /// time-to-first-byte; an oversized stream fails closed via
+    /// `max_response_body_size_bytes`.
+    Buffer,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -411,9 +440,10 @@ impl AiSemanticFirewall {
         {
             "skip" => StreamingResponsePolicy::Skip,
             "reject" => StreamingResponsePolicy::Reject,
+            "buffer" => StreamingResponsePolicy::Buffer,
             other => {
                 return Err(format!(
-                    "ai_semantic_firewall: 'streaming_response' must be one of 'skip' or 'reject', got {other:?}"
+                    "ai_semantic_firewall: 'streaming_response' must be one of 'skip', 'reject', or 'buffer', got {other:?}"
                 ));
             }
         };
@@ -1248,6 +1278,43 @@ impl AiSemanticFirewall {
             headers: json_headers(),
         }
     }
+
+    /// Disposition for a `buffer`-mode streamed response that yielded no
+    /// inspectable content (uninspectable `data:` events, or no extractable
+    /// content). Buffer mode exists to inspect the stream, so an uninspectable
+    /// body is treated as an inspection failure governed by `on_error`: `reject`
+    /// fails closed (502), `warn`/`allow` (and dry-run) record and deliver.
+    fn handle_uninspectable_buffered_stream(&self, ctx: &mut RequestContext) -> PluginResult {
+        let action = match self.on_error {
+            OnErrorAction::Allow => Action::Allow,
+            OnErrorAction::Warn => Action::Warn,
+            OnErrorAction::Reject => Action::Reject,
+        };
+        let decision = FirewallDecision {
+            action,
+            dry_run: self.mode == EnforcementMode::DryRun,
+            matches: Vec::new(),
+        };
+        self.write_decision_metadata(ctx, &decision, Direction::Response, None);
+        ctx.metadata.insert(
+            RESPONSE_INSPECTION_KEY.to_string(),
+            "streaming_uninspectable".to_string(),
+        );
+
+        if decision.dry_run || action != Action::Reject {
+            return PluginResult::Continue;
+        }
+
+        PluginResult::Reject {
+            status_code: 502,
+            body: rejection_body(
+                "ai_semantic_firewall_response_uninspectable",
+                "AI semantic firewall could not inspect the buffered streaming response.",
+                None,
+            ),
+            headers: json_headers(),
+        }
+    }
 }
 
 #[async_trait]
@@ -1267,10 +1334,11 @@ impl Plugin for AiSemanticFirewall {
     fn requires_request_body_before_before_proxy(&self) -> bool {
         self.enabled
             && ((self.inspect_request && self.has_request_rules)
-                // `streaming_response: reject` must read the request body to
-                // detect `stream: true` and fail closed, even for response-only
-                // policies (which otherwise do not buffer the request body).
-                || (self.streaming_response == StreamingResponsePolicy::Reject
+                // A non-`skip` streaming policy must read the request body to
+                // detect `stream: true` and act on it (reject, or force the
+                // response to buffer), even for response-only policies (which
+                // otherwise do not buffer the request body).
+                || (self.streaming_response != StreamingResponsePolicy::Skip
                     && self.inspect_response
                     && self.has_response_rules))
     }
@@ -1315,35 +1383,52 @@ impl Plugin for AiSemanticFirewall {
         };
 
         if json.get("stream").and_then(Value::as_bool) == Some(true) {
-            ctx.metadata
-                .insert("ai_request_streaming".to_string(), "true".to_string());
-            if self.inspect_response && self.has_response_rules {
-                if self.streaming_response == StreamingResponsePolicy::Reject
-                    && self.mode == EnforcementMode::Enforce
-                {
-                    // Fail closed: a client must not be able to disable response
-                    // inspection just by requesting a stream. Record the reject
-                    // for audit and require a non-streaming (bufferable) retry.
+            // `buffer` mode forces the streamed response onto the buffered path so
+            // its SSE deltas can be reassembled and inspected. It must NOT set
+            // `ai_request_streaming` — that shared flag suppresses response-body
+            // buffering (`should_buffer_response_body`), which is exactly what we
+            // want to keep enabled here.
+            let buffer_streamed_response = self.streaming_response
+                == StreamingResponsePolicy::Buffer
+                && self.inspect_response
+                && self.has_response_rules;
+
+            if buffer_streamed_response {
+                ctx.metadata.insert(
+                    RESPONSE_INSPECTION_KEY.to_string(),
+                    STREAMING_BUFFERED_MARKER.to_string(),
+                );
+            } else {
+                ctx.metadata
+                    .insert("ai_request_streaming".to_string(), "true".to_string());
+                if self.inspect_response && self.has_response_rules {
+                    if self.streaming_response == StreamingResponsePolicy::Reject
+                        && self.mode == EnforcementMode::Enforce
+                    {
+                        // Fail closed: a client must not be able to disable response
+                        // inspection just by requesting a stream. Record the reject
+                        // for audit and require a non-streaming (bufferable) retry.
+                        ctx.metadata.insert(
+                            "ai_semantic_firewall.response_inspection_skipped".to_string(),
+                            "streaming_rejected".to_string(),
+                        );
+                        return PluginResult::Reject {
+                            status_code: 400,
+                            body: rejection_body(
+                                "ai_semantic_firewall_streaming_rejected",
+                                "Streaming responses are not permitted while AI semantic firewall response inspection is enabled; retry with \"stream\": false.",
+                                None,
+                            ),
+                            headers: json_headers(),
+                        };
+                    }
+                    // Skip (or reject in dry-run): the streamed response is not
+                    // inspected; record the skip so operators can audit the gap.
                     ctx.metadata.insert(
                         "ai_semantic_firewall.response_inspection_skipped".to_string(),
-                        "streaming_rejected".to_string(),
+                        "streaming".to_string(),
                     );
-                    return PluginResult::Reject {
-                        status_code: 400,
-                        body: rejection_body(
-                            "ai_semantic_firewall_streaming_rejected",
-                            "Streaming responses are not permitted while AI semantic firewall response inspection is enabled; retry with \"stream\": false.",
-                            None,
-                        ),
-                        headers: json_headers(),
-                    };
                 }
-                // Skip (or reject in dry-run): the streamed response is not
-                // inspected; record the skip so operators can audit the gap.
-                ctx.metadata.insert(
-                    "ai_semantic_firewall.response_inspection_skipped".to_string(),
-                    "streaming".to_string(),
-                );
             }
         }
 
@@ -1383,9 +1468,20 @@ impl Plugin for AiSemanticFirewall {
     }
 
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
-        self.requires_response_body_buffering()
-            && ctx.metadata.get("ai_request_streaming").map(String::as_str) != Some("true")
-            && !is_native_grpc_request(ctx)
+        if !self.requires_response_body_buffering() || is_native_grpc_request(ctx) {
+            return false;
+        }
+        // `buffer` mode pins this response onto the buffered path even when an
+        // earlier request plugin (e.g. `ai_prompt_shield`, which runs first and
+        // writes `ai_request_streaming=true` on streamed requests) already set the
+        // shared flag that otherwise suppresses buffering. The buffer-mode marker
+        // — set on the request path only for a detected `stream: true` — takes
+        // precedence so the two plugins compose instead of silently disabling
+        // response inspection.
+        if buffer_streaming_marker_set(ctx) {
+            return true;
+        }
+        ctx.metadata.get("ai_request_streaming").map(String::as_str) != Some("true")
     }
 
     fn should_buffer_response_body_for_content_type(
@@ -1397,7 +1493,23 @@ impl Plugin for AiSemanticFirewall {
             return false;
         }
 
-        content_type.is_some_and(|ct| is_json_content_type(ct) && !is_event_stream_content_type(ct))
+        let Some(content_type) = content_type else {
+            return false;
+        };
+
+        if is_event_stream_content_type(content_type) {
+            // Pin an event stream onto the buffered path only when `buffer` mode
+            // actually flagged THIS request from a detected `stream: true` JSON
+            // POST (the request-path marker). Unrelated SSE — a `GET` EventSource
+            // endpoint, or a backend that unexpectedly returns an unbounded
+            // stream — must keep streaming; buffering it would collect until
+            // `max_response_body_size_bytes` and 502 instead. (Already-buffered
+            // bodies are still inspected in `on_response_body` regardless.)
+            return self.streaming_response == StreamingResponsePolicy::Buffer
+                && buffer_streaming_marker_set(ctx);
+        }
+
+        is_json_content_type(content_type)
     }
 
     async fn on_response_body(
@@ -1419,18 +1531,21 @@ impl Plugin for AiSemanticFirewall {
             .map(String::as_str)
             .unwrap_or("");
         let segments = if is_event_stream_content_type(content_type) {
-            // This only runs if the response was buffered by another response-body
-            // plugin or mode. Normal streaming SSE is intentionally skipped and
-            // signaled from the request path when `stream: true` is present.
-            let frames = parse_sse_data_frames(body);
-            let mut segments = Vec::new();
-            for (index, frame) in frames.iter().enumerate() {
-                extract_response_segments_from_json(
-                    frame,
-                    &self.extraction,
-                    Some(format!("sse[{index}]")),
-                    &mut segments,
-                );
+            // Reached when the response was buffered for inspection — either
+            // `streaming_response: buffer`, or another response-body plugin/mode
+            // pinned the stream. SSE deltas arrive as many tiny fragments, so they
+            // are reassembled into coherent per-choice / per-tool-call text before
+            // inspection rather than scored fragment-by-fragment.
+            let (segments, fully_parsed) = reassemble_sse_response_segments(body, &self.extraction);
+            // `buffer` mode forced this stream onto the buffered path specifically
+            // to inspect it. If nothing inspectable was recovered — the body had
+            // non-UTF-8 / non-JSON `data:` events, or no extractable content — then
+            // delivering it would be fail-open for an explicit inspection mode, so
+            // treat it as an inspection failure governed by `on_error`. (Other
+            // buffered SSE, e.g. pinned by a different plugin, keeps the lenient
+            // path: no marker means this branch is skipped.)
+            if buffer_streaming_marker_set(ctx) && (!fully_parsed || segments.is_empty()) {
+                return self.handle_uninspectable_buffered_stream(ctx);
             }
             segments
         } else if is_json_content_type(content_type) {
@@ -2057,6 +2172,139 @@ fn extract_response_segments_from_json(
             segments,
         );
     }
+}
+
+/// Reassemble a fully-buffered SSE chat-completion / Responses-API response into
+/// response-direction segments.
+///
+/// Two passes, merged and deduped, so the buffered path inspects everything in
+/// the body:
+///
+/// 1. **Delta reassembly.** Streaming bodies arrive as many tiny delta frames
+///    (`data: {"choices":[{"delta":{"content":"Hel"}}]}`); inspecting each frame
+///    in isolation is meaningless, so the deltas are concatenated per choice /
+///    tool call into coherent text first (see [`SseReassembler`]).
+/// 2. **Per-frame non-delta extraction.** A buffered stream can also carry
+///    non-delta JSON events — a final `choices[].message.content` / `output_text`
+///    summary, or a side-channel event — which could smuggle a violation past a
+///    clean delta stream. These are extracted per frame using only the non-delta
+///    paths; the chat-completions `delta.*` paths are excluded here because pass
+///    (1) already covers them and per-frame extraction would re-introduce the
+///    per-fragment segments reassembly exists to avoid.
+///
+/// Only fragments whose canonical JSON path is enabled in `response_json_paths`
+/// are kept, preserving operator extraction overrides.
+///
+/// Returns the segments plus whether the body was **fully inspectable** (valid
+/// UTF-8 and every `data:` payload parsed as JSON). A caller that forced this
+/// stream onto the buffered path (`buffer` mode) uses that flag to fail closed
+/// when part of the body could not be parsed and might hide content.
+fn reassemble_sse_response_segments(
+    body: &[u8],
+    extraction: &ExtractionConfig,
+) -> (Vec<TextSegment>, bool) {
+    let parsed = parse_sse_data_frames_checked(body);
+    let frames = parsed.frames;
+
+    let mut reassembler = SseReassembler::new();
+    for frame in &frames {
+        reassembler.push_frame(frame);
+    }
+    let mut segments: Vec<TextSegment> = reassembler
+        .into_texts()
+        .into_iter()
+        .filter_map(|text| sse_text_to_segment(text, extraction))
+        .collect();
+
+    let non_delta_paths: Vec<String> = extraction
+        .response_json_paths
+        .iter()
+        .filter(|path| !is_sse_delta_response_path(path))
+        .cloned()
+        .collect();
+    if !non_delta_paths.is_empty() {
+        let non_delta_extraction = ExtractionConfig {
+            request_json_paths: Vec::new(),
+            response_json_paths: non_delta_paths,
+        };
+        for (index, frame) in frames.iter().enumerate() {
+            extract_response_segments_from_json(
+                frame,
+                &non_delta_extraction,
+                Some(format!("sse[{index}]")),
+                &mut segments,
+            );
+        }
+    }
+
+    (dedupe_segments(segments), parsed.fully_parsed)
+}
+
+/// Whether a response JSON path is a chat-completions streaming `delta.*` path
+/// handled by [`SseReassembler`] (and therefore excluded from per-frame
+/// extraction in [`reassemble_sse_response_segments`]).
+fn is_sse_delta_response_path(path: &str) -> bool {
+    SSE_DELTA_RESPONSE_PATHS.contains(&path)
+}
+
+/// Map a reassembled SSE fragment onto a response-direction [`TextSegment`].
+///
+/// A reassembled streaming fragment corresponds to one or more canonical
+/// response paths — the streaming `delta.*` form plus its non-streaming
+/// equivalent(s) that catch the same content in a buffered response. The segment
+/// is kept when **any** of those equivalents is enabled in `response_json_paths`,
+/// so an extraction override that lists only the non-streaming path (e.g.
+/// `$.output_text`, or `$.choices[*].message.content`) still inspects the
+/// streamed equivalent instead of silently dropping it.
+fn sse_text_to_segment(text: SseText, extraction: &ExtractionConfig) -> Option<TextSegment> {
+    let (path_patterns, kind): (&[&str], SegmentKind) = match text.kind {
+        SseTextKind::ChatContent => (
+            &["$.choices[*].delta.content", "$.choices[*].message.content"],
+            SegmentKind::AssistantMessage,
+        ),
+        SseTextKind::ChatToolName => (
+            &[
+                "$.choices[*].delta.tool_calls[*].function.name",
+                "$.choices[*].message.tool_calls[*].function.name",
+            ],
+            SegmentKind::ToolCall,
+        ),
+        SseTextKind::ChatToolArguments => (
+            &[
+                "$.choices[*].delta.tool_calls[*].function.arguments",
+                "$.choices[*].message.tool_calls[*].function.arguments",
+            ],
+            SegmentKind::ToolArguments,
+        ),
+        SseTextKind::ResponsesText => (
+            &["$.output[*].content[*].text", "$.output_text"],
+            SegmentKind::AssistantMessage,
+        ),
+        SseTextKind::ResponsesArguments => (&["$.output[*].arguments"], SegmentKind::ToolArguments),
+    };
+
+    let enabled = path_patterns.iter().any(|pattern| {
+        extraction
+            .response_json_paths
+            .iter()
+            .any(|configured| configured == pattern)
+    });
+    if !enabled {
+        return None;
+    }
+
+    let trimmed = text.text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    Some(TextSegment {
+        direction: Direction::Response,
+        kind,
+        role: Some("assistant".to_string()),
+        json_path: Some(text.json_path),
+        text: trimmed.to_string(),
+    })
 }
 
 fn extract_known_path(
@@ -2874,6 +3122,17 @@ fn max_cosine(
         best = best.max(score);
     }
     Ok(best)
+}
+
+/// Whether `buffer` mode flagged this request's streamed response for buffering
+/// (set on the request path only for a detected `stream: true` JSON POST). Both
+/// response-buffering gates consult this so they agree, and it lets buffer mode
+/// override a shared `ai_request_streaming` flag set by another plugin.
+fn buffer_streaming_marker_set(ctx: &RequestContext) -> bool {
+    ctx.metadata
+        .get(RESPONSE_INSPECTION_KEY)
+        .map(String::as_str)
+        == Some(STREAMING_BUFFERED_MARKER)
 }
 
 fn is_native_grpc_request(ctx: &RequestContext) -> bool {
