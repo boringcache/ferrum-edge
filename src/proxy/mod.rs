@@ -6141,7 +6141,11 @@ async fn handle_websocket_request_authenticated(
     let ws_lb_guard =
         LoadBalancerConnectionGuard::new(current_target.clone(), upstream_balancer.clone());
     if let Some(permits) = backend_admission_permits.as_ref() {
-        permits.record_backend_outcome(BackendAdmissionOutcome {
+        // The permit is held for the full session below, so this records the
+        // backend-handshake latency without growing the limit — otherwise each
+        // concurrent session ratchets the limit up and defeats the in-flight
+        // WebSocket session cap.
+        permits.record_backend_outcome_holding(BackendAdmissionOutcome {
             response_status: if is_h2_websocket { 200 } else { 101 },
             connection_error: false,
             error_class: None,
@@ -10188,6 +10192,15 @@ async fn handle_proxy_request_inner(
             upstream_target.as_ref().and_then(|t| t.path.as_deref()),
         );
         let backend_start = Instant::now();
+        // Adaptive-concurrency admission latency must be measured from the
+        // backend dispatch point, not from here: `backend_start` precedes
+        // request-body collection and final-body hooks, so reusing it would
+        // bill slow client uploads / body-plugin time as backend latency and
+        // wrongly shrink a healthy upstream's limit. Reset this to the dispatch
+        // instant before each attempt, mirroring the HTTP path's
+        // `backend_admission_started_at`. `backend_start` itself stays the
+        // origin for full backend-latency metrics (`backend_total_ms`).
+        let mut grpc_backend_admission_started_at = backend_start;
 
         // Streaming-response safety:
         //   * Retries are triggered by CONNECTION errors (BackendUnavailable,
@@ -10360,6 +10373,7 @@ async fn handle_proxy_request_inner(
                     .await);
                 }
             };
+            grpc_backend_admission_started_at = Instant::now();
             let result = grpc_proxy::proxy_grpc_request_core(
                 grpc_method,
                 grpc_headers,
@@ -10468,6 +10482,7 @@ async fn handle_proxy_request_inner(
                         .await);
                     }
                 };
+                grpc_backend_admission_started_at = Instant::now();
                 let result = grpc_proxy::proxy_grpc_request_streaming(
                     request,
                     grpc_dispatch_proxy,
@@ -10517,6 +10532,7 @@ async fn handle_proxy_request_inner(
                                     .await);
                                 }
                             };
+                        grpc_backend_admission_started_at = Instant::now();
                         let result = grpc_proxy::proxy_grpc_request_core(
                             grpc_method,
                             grpc_headers,
@@ -10594,7 +10610,7 @@ async fn handle_proxy_request_inner(
                         response_status: 502,
                         connection_error: true,
                         error_class,
-                        backend_elapsed: backend_start.elapsed(),
+                        backend_elapsed: grpc_backend_admission_started_at.elapsed(),
                     });
                 }
 
@@ -10742,6 +10758,7 @@ async fn handle_proxy_request_inner(
                     &proxy,
                     grpc_current_target.as_deref(),
                 );
+                grpc_backend_admission_started_at = Instant::now();
                 grpc_result = grpc_proxy::proxy_grpc_request_from_bytes(
                     grpc_method.clone(),
                     grpc_req_headers.clone(),
@@ -10837,7 +10854,7 @@ async fn handle_proxy_request_inner(
 
         match grpc_result {
             Ok(GrpcResponseKind::Streaming(grpc_streaming)) => {
-                let grpc_backend_admission_elapsed = backend_start.elapsed();
+                let grpc_backend_admission_elapsed = grpc_backend_admission_started_at.elapsed();
                 // Frame-by-frame streaming path: headers arrived, body not buffered.
                 // Arm/defer circuit-breaker recording before after_proxy hooks
                 // so the post-header upload guard is measured from header
@@ -11159,7 +11176,7 @@ async fn handle_proxy_request_inner(
                         response_status,
                         connection_error: false,
                         error_class: None,
-                        backend_elapsed: backend_start.elapsed(),
+                        backend_elapsed: grpc_backend_admission_started_at.elapsed(),
                     });
                 }
 
@@ -11431,7 +11448,7 @@ async fn handle_proxy_request_inner(
                         response_status: 502,
                         connection_error,
                         error_class: Some(grpc_error_class),
-                        backend_elapsed: backend_start.elapsed(),
+                        backend_elapsed: grpc_backend_admission_started_at.elapsed(),
                     });
                 }
                 if grpc_error_class == retry::ErrorClass::PortExhaustion {

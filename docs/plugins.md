@@ -1951,13 +1951,13 @@ This makes plaintext TCP listeners IP-scoped, while TCP+TLS and UDP+DTLS listene
 
 ### `adaptive_concurrency`
 
-Protects upstreams by admitting backend dispatch only when the selected target is healthy enough to accept one more in-flight request. It shrinks a per-target concurrency limit when backend latency rises above the learned baseline, when backend responses are 5xx, or when connection errors occur; it cautiously increases the limit when the target is saturated and healthy.
+Protects upstreams by admitting backend dispatch only when the selected target is healthy enough to accept one more in-flight request. It shrinks a per-target concurrency limit when backend latency rises above the learned baseline, when backend responses are 5xx, when a backend response exceeds the configured maximum body size, or when connection errors occur; it cautiously increases the limit when the target is saturated and healthy. Client-side outcomes — a client disconnect, or an oversized client upload the gateway rejects with 413 — release the permit without feeding any latency, growth, or shrink signal, so aborted or abusive requests cannot train the limiter for an otherwise healthy backend.
 
 **Priority:** 2090
 **Phase:** `backend_admission`
 **Supported protocols:** HTTP, gRPC, WebSocket
 
-For HTTP and gRPC, admission runs after load balancing selects the backend target and after request-body buffering/final-body hooks complete, immediately before the gateway opens/sends each backend attempt. HTTP/3 frontends run the same target-aware admission for both native QUIC backend dispatch and the fallback H3-to-H1/H2 bridge. For WebSocket, admission runs once during the upgrade handshake and the permit is held for the full upgraded session, including HTTP/3 WebSocket.
+For HTTP and gRPC, admission runs after load balancing selects the backend target and after request-body buffering/final-body hooks complete, immediately before the gateway opens/sends each backend attempt; the latency sample is measured from that dispatch point so slow client uploads and body-plugin time are never attributed to the backend. HTTP/3 frontends run the same target-aware admission for both native QUIC backend dispatch and the fallback H3-to-H1/H2 bridge. For WebSocket, admission runs once during the upgrade handshake and the permit is held for the full upgraded session, including HTTP/3 WebSocket. Because that permit stays held for the session, a successful handshake records its backend-connect latency but does **not** grow the limit — otherwise every concurrent session would ratchet it upward and defeat the in-flight session cap; latency and failure signals can still shrink it.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|

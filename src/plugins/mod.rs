@@ -1851,6 +1851,19 @@ pub struct BackendAdmissionOutcome {
 
 pub trait BackendAdmissionPermit: Send + Sync {
     fn record_backend_outcome(&self, outcome: BackendAdmissionOutcome);
+
+    /// Record an outcome for an admission whose in-flight slot is still held
+    /// after this call returns — long-lived sessions such as WebSocket, where
+    /// the permit lives for the entire session rather than a single
+    /// request/response. Feeds the same latency/failure signals as
+    /// [`Self::record_backend_outcome`] but must never grow the limit: with the
+    /// slot still occupied, every concurrent handshake observes the limiter at
+    /// capacity, so growing here would ratchet the limit upward and defeat the
+    /// in-flight session cap. Defaults to `record_backend_outcome` for permits
+    /// that do not distinguish the two.
+    fn record_backend_outcome_holding(&self, outcome: BackendAdmissionOutcome) {
+        self.record_backend_outcome(outcome);
+    }
 }
 
 #[derive(Clone, Default)]
@@ -1866,6 +1879,15 @@ impl BackendAdmissionPermitSet {
     pub fn record_backend_outcome(&self, outcome: BackendAdmissionOutcome) {
         for permit in &self.permits {
             permit.record_backend_outcome(outcome);
+        }
+    }
+
+    /// Record an outcome while the in-flight slot stays held (long-lived
+    /// sessions such as WebSocket). See
+    /// [`BackendAdmissionPermit::record_backend_outcome_holding`].
+    pub fn record_backend_outcome_holding(&self, outcome: BackendAdmissionOutcome) {
+        for permit in &self.permits {
+            permit.record_backend_outcome_holding(outcome);
         }
     }
 }

@@ -792,7 +792,11 @@ pub(crate) async fn handle_h3_websocket(
         upstream_balancer.clone(),
     );
     if let Some(permits) = backend_admission_permits.as_ref() {
-        permits.record_backend_outcome(BackendAdmissionOutcome {
+        // The permit is held for the full session (moved into the task below),
+        // so record the handshake latency without growing the limit — matching
+        // the H1/H2 WebSocket path. Growing here would ratchet the limit up on
+        // every concurrent session and defeat the in-flight session cap.
+        permits.record_backend_outcome_holding(BackendAdmissionOutcome {
             response_status: 200,
             connection_error: false,
             error_class: None,

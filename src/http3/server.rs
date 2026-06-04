@@ -2375,11 +2375,17 @@ async fn handle_h3_request(
                 false,
                 backend_start.elapsed(),
             );
+            // Unlike the circuit-breaker/passive-health record above (which sees
+            // the real backend status), the adaptive-concurrency sample must
+            // treat an oversized backend response as a failure: the gateway
+            // sends a 502 and the low-latency 2xx/4xx status would otherwise be
+            // counted as a fast success and grow the limit. Mirrors the reqwest
+            // path, which tags the admission outcome `ResponseBodyTooLarge`.
             record_h3_backend_admission_outcome(
                 &mut backend_admission_permits,
                 response_status,
                 false,
-                None,
+                Some(crate::retry::ErrorClass::ResponseBodyTooLarge),
                 backend_admission_response_elapsed,
             );
             record_request(&state, 502);

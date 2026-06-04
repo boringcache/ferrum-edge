@@ -232,7 +232,7 @@ pub struct AdaptiveConcurrencyPermit {
 }
 
 impl AdaptiveConcurrencyPermit {
-    fn record_success_latency(&self, backend_elapsed: Duration) {
+    fn record_success_latency(&self, backend_elapsed: Duration, allow_increase: bool) {
         let latency_us = (backend_elapsed.as_micros() as u64).max(1);
         update_min(&self.state.baseline_latency_us, latency_us);
         let ewma = update_ewma(&self.state.latency_ewma_us, latency_us);
@@ -252,25 +252,53 @@ impl AdaptiveConcurrencyPermit {
         let current_in_flight = self.state.in_flight.load(Ordering::Acquire);
         if ewma > target_latency {
             decrease_limit(&self.state.limit, &self.config);
-        } else if current_in_flight >= current_limit {
+        } else if allow_increase && current_in_flight >= current_limit {
             increase_limit(&self.state.limit, &self.config);
         }
+    }
+
+    /// Shared outcome accounting. `allow_increase` is `false` for long-lived
+    /// admissions (WebSocket sessions) whose in-flight slot is still held when
+    /// the outcome is recorded: every concurrent handshake then observes
+    /// `in_flight >= limit`, so growing the limit there would ratchet it up to
+    /// `max_limit` and defeat the in-flight session cap.
+    fn record(&self, outcome: BackendAdmissionOutcome, allow_increase: bool) {
+        if self.recorded.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        // Client-/gateway-side outcomes do not reflect backend health: release
+        // the slot without feeding a latency, growth, or shrink signal. An
+        // oversized *client* upload surfaces as a gateway 413
+        // (`RequestBodyTooLarge`) and a client abort as `ClientDisconnect`;
+        // neither is the backend's fault, so they must not train the limiter.
+        if matches!(
+            outcome.error_class,
+            Some(ErrorClass::ClientDisconnect | ErrorClass::RequestBodyTooLarge)
+        ) {
+            return;
+        }
+        // Backend faults shrink the limit. An oversized *backend* response
+        // (`ResponseBodyTooLarge`) is a backend fault even when the status line
+        // looked healthy before the overflow was detected, so it must not be
+        // counted as a fast success.
+        if outcome.connection_error
+            || outcome.response_status >= 500
+            || outcome.error_class == Some(ErrorClass::ResponseBodyTooLarge)
+        {
+            decrease_limit(&self.state.limit, &self.config);
+            return;
+        }
+        self.record_success_latency(outcome.backend_elapsed, allow_increase);
     }
 }
 
 impl BackendAdmissionPermit for AdaptiveConcurrencyPermit {
     fn record_backend_outcome(&self, outcome: BackendAdmissionOutcome) {
-        if self.recorded.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        if outcome.error_class == Some(ErrorClass::ClientDisconnect) {
-            return;
-        }
-        if outcome.connection_error || outcome.response_status >= 500 {
-            decrease_limit(&self.state.limit, &self.config);
-            return;
-        }
-        self.record_success_latency(outcome.backend_elapsed);
+        self.record(outcome, true);
+    }
+
+    fn record_backend_outcome_holding(&self, outcome: BackendAdmissionOutcome) {
+        self.record(outcome, false);
     }
 }
 

@@ -39,6 +39,22 @@ fn limiter_config(initial_limit: u64) -> Arc<AdaptiveConcurrencyConfig> {
     })
 }
 
+fn growth_config(initial_limit: u64, max_limit: u64) -> Arc<AdaptiveConcurrencyConfig> {
+    Arc::new(AdaptiveConcurrencyConfig {
+        key_by: AdaptiveConcurrencyKeyBy::Proxy,
+        max_tracked_keys: 10_000,
+        min_limit: 1,
+        initial_limit,
+        max_limit,
+        min_samples: 1,
+        target_latency_multiplier: 1.5,
+        decrease_ratio: 0.5,
+        increase_step: 1,
+        shadow_mode: false,
+        expose_headers: false,
+    })
+}
+
 fn target(host: &str, port: u16) -> UpstreamTarget {
     UpstreamTarget {
         host: host.to_string(),
@@ -223,4 +239,128 @@ fn adaptive_concurrency_validates_bounds() {
         Err(err) => err,
     };
     assert!(err.contains("unsupported key_by"));
+}
+
+#[test]
+fn adaptive_concurrency_ignores_request_body_too_large_samples() {
+    let proxy = proxy();
+    let limiter = AdaptiveConcurrencyLimiter::new(16);
+    let config = limiter_config(4);
+    let permit = limiter
+        .try_acquire(&proxy, None, Arc::clone(&config))
+        .expect("request should be admitted");
+
+    // An oversized *client* upload surfaces as a gateway 413
+    // (`RequestBodyTooLarge`): it is the request's fault, not the backend's, so
+    // it must neither grow nor shrink the limit and must not record a sample.
+    permit.record_backend_outcome(BackendAdmissionOutcome {
+        response_status: 413,
+        connection_error: false,
+        error_class: Some(ErrorClass::RequestBodyTooLarge),
+        backend_elapsed: Duration::from_millis(50),
+    });
+
+    let snapshot = limiter
+        .snapshot(&proxy, None, AdaptiveConcurrencyKeyBy::Proxy)
+        .expect("state should exist after acquire");
+    assert_eq!(snapshot.limit, 4);
+    assert_eq!(snapshot.samples, 0);
+
+    drop(permit);
+}
+
+#[test]
+fn adaptive_concurrency_shrinks_on_oversized_backend_response() {
+    let proxy = proxy();
+    let limiter = AdaptiveConcurrencyLimiter::new(16);
+    let config = limiter_config(4);
+    let permit = limiter
+        .try_acquire(&proxy, None, Arc::clone(&config))
+        .expect("request should be admitted");
+
+    // A backend response that overflows the configured max body size is a
+    // backend fault even though the status line (200) looked healthy before the
+    // overflow was detected: it must shrink the limit, not be counted as a fast
+    // success. Mirrors the gateway sending a 502 to the client.
+    permit.record_backend_outcome(BackendAdmissionOutcome {
+        response_status: 200,
+        connection_error: false,
+        error_class: Some(ErrorClass::ResponseBodyTooLarge),
+        backend_elapsed: Duration::from_millis(5),
+    });
+
+    let snapshot = limiter
+        .snapshot(&proxy, None, AdaptiveConcurrencyKeyBy::Proxy)
+        .expect("state should exist after acquire");
+    assert_eq!(snapshot.limit, 2);
+    assert_eq!(snapshot.samples, 0);
+
+    drop(permit);
+}
+
+#[test]
+fn adaptive_concurrency_completed_success_grows_limit_at_capacity() {
+    let proxy = proxy();
+    let limiter = AdaptiveConcurrencyLimiter::new(16);
+    let config = growth_config(1, 4);
+    let permit = limiter
+        .try_acquire(&proxy, None, Arc::clone(&config))
+        .expect("request should be admitted");
+
+    // in_flight == limit == 1: a completed, fast success probes for more
+    // capacity and grows the limit (standard additive increase). This is the
+    // baseline that the WebSocket holding path below must NOT trigger.
+    permit.record_backend_outcome(BackendAdmissionOutcome {
+        response_status: 200,
+        connection_error: false,
+        error_class: None,
+        backend_elapsed: Duration::from_millis(1),
+    });
+
+    let snapshot = limiter
+        .snapshot(&proxy, None, AdaptiveConcurrencyKeyBy::Proxy)
+        .expect("state should exist after acquire");
+    assert_eq!(
+        snapshot.limit, 2,
+        "a completed success at capacity grows the limit"
+    );
+
+    drop(permit);
+}
+
+#[test]
+fn adaptive_concurrency_held_session_success_does_not_grow_limit() {
+    let proxy = proxy();
+    let limiter = AdaptiveConcurrencyLimiter::new(16);
+    let config = growth_config(1, 4);
+    let permit = limiter
+        .try_acquire(&proxy, None, Arc::clone(&config))
+        .expect("request should be admitted");
+
+    // A WebSocket handshake records its outcome while the session's permit is
+    // still held (in_flight stays 1 == limit). Growing here would ratchet the
+    // limit up on every concurrent session and defeat the in-flight session
+    // cap, so the holding variant records the latency sample but must NOT grow
+    // the limit. Contrast with `..._completed_success_grows_limit_at_capacity`,
+    // which uses the identical config and does grow.
+    permit.record_backend_outcome_holding(BackendAdmissionOutcome {
+        response_status: 200,
+        connection_error: false,
+        error_class: None,
+        backend_elapsed: Duration::from_millis(1),
+    });
+
+    let snapshot = limiter
+        .snapshot(&proxy, None, AdaptiveConcurrencyKeyBy::Proxy)
+        .expect("state should exist after acquire");
+    assert_eq!(
+        snapshot.limit, 1,
+        "a held (long-lived session) success must not grow the limit"
+    );
+    assert_eq!(
+        snapshot.samples, 1,
+        "the handshake latency sample is still recorded"
+    );
+
+    drop(permit);
 }
