@@ -13606,24 +13606,38 @@ async fn proxy_to_backend(
             );
         }
         if direct_h2_compatible && (direct_h2_supports || requires_direct_h2_for_sni) {
-            // Gate adaptive-concurrency admission BEFORE opening the H2 sender.
-            // `get_sender()` can dial the backend, so admitting afterward would
-            // let a request that should be rejected at capacity still create a
-            // connection, and a connect/handshake failure surfaced here would
-            // never train the limiter. On any fall-through to the reqwest path
-            // below, `h2_admission_permits` drops, releasing the in-flight slot
-            // so the reqwest path re-admits after its own body collection.
-            let mut h2_admission_permits = match backend_dispatch::run_backend_admission_plugins(
-                backend_admission_plugins,
-                request_ctx,
-                proxy,
-                upstream_target,
-                ProxyProtocol::Http,
-            ) {
-                Ok(permits) => permits,
-                Err(rejection) => return BackendDispatchResult::AdmissionRejected(rejection),
+            // Gate adaptive-concurrency admission BEFORE opening the H2 sender,
+            // but ONLY when this request can actually dispatch over direct H2 —
+            // i.e. body-size limits are disabled. `get_sender()` can dial the
+            // backend, so for the dispatching case admitting afterward would let
+            // a capacity-rejected request still create a connection and would
+            // hide get_sender connect failures from the limiter. When body-size
+            // limits are enabled this branch always falls through to the reqwest
+            // path, so admission must be deferred there (run after the reqwest
+            // request-size checks) — otherwise a capacity rejection here returns
+            // a 503 and an oversized upload that should be a local 413 is masked
+            // as upstream concurrency pressure. On any fall-through,
+            // `h2_admission_permits` drops, releasing the in-flight slot so the
+            // reqwest path re-admits.
+            let h2_can_dispatch = state.max_request_body_size_bytes == 0
+                && state.max_response_body_size_bytes == 0;
+            let mut h2_admission_permits = if h2_can_dispatch {
+                match backend_dispatch::run_backend_admission_plugins(
+                    backend_admission_plugins,
+                    request_ctx,
+                    proxy,
+                    upstream_target,
+                    ProxyProtocol::Http,
+                ) {
+                    Ok(permits) => permits,
+                    Err(rejection) => return BackendDispatchResult::AdmissionRejected(rejection),
+                }
+            } else {
+                None
             };
-            *backend_admission_started_at = Instant::now();
+            if h2_can_dispatch {
+                *backend_admission_started_at = Instant::now();
+            }
             let direct_h2_sender = match state.http2_pool.get_sender(direct_h2_proxy).await {
                 Ok(sender) => Some(sender),
                 Err(e) => {
@@ -13693,8 +13707,7 @@ async fn proxy_to_backend(
                 }
             };
             if let Some(sender) = direct_h2_sender {
-                if state.max_request_body_size_bytes == 0 && state.max_response_body_size_bytes == 0
-                {
+                if h2_can_dispatch {
                     let request = match client_request_body {
                         ClientRequestBody::Streaming(request) => *request,
                         ClientRequestBody::Buffered(_) => {
