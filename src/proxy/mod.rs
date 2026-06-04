@@ -11687,6 +11687,7 @@ async fn handle_proxy_request_inner(
             current_dispatch_h3,
             &bytes_sent_observed,
             inbound_version,
+            &mut backend_admission_started_at,
         )
         .await;
         if let Some(body_hook_ctx) = body_hook_ctx.take() {
@@ -11946,6 +11947,7 @@ async fn handle_proxy_request_inner(
             current_dispatch_h3,
             &bytes_sent_observed,
             inbound_version,
+            &mut backend_admission_started_at,
         )
         .await;
         if let Some(body_hook_ctx) = body_hook_ctx {
@@ -12042,7 +12044,13 @@ async fn handle_proxy_request_inner(
         });
     }
 
-    let backend_elapsed = backend_admission_elapsed.as_secs_f64() * 1000.0;
+    // Transaction backend latency must measure the FULL backend interaction
+    // from `backend_start`, spanning every retry attempt and backoff, so it
+    // stays consistent with `latency_total_ms`. It is deliberately NOT derived
+    // from `backend_admission_elapsed`: that timer is reset per attempt for the
+    // adaptive-concurrency sample, which would make retried requests report
+    // only the final attempt and understate backend time.
+    let backend_elapsed = backend_start.elapsed().as_secs_f64() * 1000.0;
     let backend_ttfb_ms = backend_elapsed;
     // For buffered responses, backend_elapsed includes full body download (accurate total).
     // For streaming responses, the body is still being sent to the client at log time,
@@ -13337,6 +13345,26 @@ fn backend_dispatch_response(
     }
 }
 
+/// Record a direct-H2 pool/connect failure against the admission permit acquired
+/// before `get_sender()`. Used when `get_sender()` fails on a path that does not
+/// fall back to reqwest (a real pool/connect failure, or an SNI-pinned backend
+/// that cannot downgrade), so the adaptive limiter learns the connect failure
+/// instead of seeing the slot silently released. Takes the permit, so its
+/// in-flight slot is released when the returned permit set drops.
+fn record_h2_pool_admission_failure(
+    permits: &mut Option<BackendAdmissionPermitSet>,
+    started_at: &Instant,
+) {
+    if let Some(permits) = permits.take() {
+        permits.record_backend_outcome(BackendAdmissionOutcome {
+            response_status: 502,
+            connection_error: true,
+            error_class: Some(retry::ErrorClass::ConnectionPoolError),
+            backend_elapsed: started_at.elapsed(),
+        });
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn proxy_to_backend(
     state: &ProxyState,
@@ -13369,6 +13397,13 @@ async fn proxy_to_backend(
     // has completed.
     ctx_bytes_sent_observed: &Arc<std::sync::atomic::AtomicU64>,
     inbound_version: hyper::Version,
+    // Out-parameter: set to the instant the backend admission permit is
+    // acquired (immediately before the backend dial / send), so the caller's
+    // adaptive-concurrency sample measures only the backend interaction and not
+    // the request-body collection / final-body-hook time that precedes it.
+    // Left at its incoming value (the caller's `backend_start`) on paths that
+    // never reach admission, so the fallback is the pre-fix behavior.
+    backend_admission_started_at: &mut Instant,
 ) -> BackendDispatchResult {
     // Honor DestinationRule per-port `connect_timeout_ms` overrides for this
     // dispatch. Borrowed when no override applies (zero-alloc hot path);
@@ -13436,6 +13471,7 @@ async fn proxy_to_backend(
             Ok(permits) => permits,
             Err(rejection) => return BackendDispatchResult::AdmissionRejected(rejection),
         };
+        *backend_admission_started_at = Instant::now();
         let (backend_resp, body_bytes) = proxy_to_backend_hbone(
             state,
             proxy,
@@ -13489,6 +13525,7 @@ async fn proxy_to_backend(
             Ok(permits) => permits,
             Err(rejection) => return BackendDispatchResult::AdmissionRejected(rejection),
         };
+        *backend_admission_started_at = Instant::now();
         let (mut backend_resp, body_bytes) = proxy_to_backend_http3(
             state,
             proxy,
@@ -13569,6 +13606,24 @@ async fn proxy_to_backend(
             );
         }
         if direct_h2_compatible && (direct_h2_supports || requires_direct_h2_for_sni) {
+            // Gate adaptive-concurrency admission BEFORE opening the H2 sender.
+            // `get_sender()` can dial the backend, so admitting afterward would
+            // let a request that should be rejected at capacity still create a
+            // connection, and a connect/handshake failure surfaced here would
+            // never train the limiter. On any fall-through to the reqwest path
+            // below, `h2_admission_permits` drops, releasing the in-flight slot
+            // so the reqwest path re-admits after its own body collection.
+            let mut h2_admission_permits = match backend_dispatch::run_backend_admission_plugins(
+                backend_admission_plugins,
+                request_ctx,
+                proxy,
+                upstream_target,
+                ProxyProtocol::Http,
+            ) {
+                Ok(permits) => permits,
+                Err(rejection) => return BackendDispatchResult::AdmissionRejected(rejection),
+            };
+            *backend_admission_started_at = Instant::now();
             let direct_h2_sender = match state.http2_pool.get_sender(direct_h2_proxy).await {
                 Ok(sender) => Some(sender),
                 Err(e) => {
@@ -13598,6 +13653,13 @@ async fn proxy_to_backend(
                                     "HTTP/2 pool negotiated HTTP/1.1 backend but backend TLS SNI override cannot fall back to reqwest"
                                 );
                             }
+                            // SNI override cannot fall back to reqwest, so this
+                            // request terminates at the H2 pool: record the pool
+                            // failure so the adaptive limiter learns it.
+                            record_h2_pool_admission_failure(
+                                &mut h2_admission_permits,
+                                backend_admission_started_at,
+                            );
                             return backend_dispatch_response(
                                 backend_tls_sni_requires_direct_h2_response(resolved_ip.clone()),
                                 None,
@@ -13609,9 +13671,19 @@ async fn proxy_to_backend(
                                 error = %e,
                                 "HTTP/2 pool negotiated HTTP/1.1 backend — downgrading cached capability and falling back to reqwest"
                             );
+                            // ALPN negotiated H1 — a capability mismatch, not a
+                            // backend failure. Leave `h2_admission_permits` to
+                            // drop on fall-through so the reqwest path re-admits
+                            // and records the real backend outcome there.
                             None
                         }
                     } else {
+                        // A real pool/connect failure: train the adaptive limiter
+                        // with the connect failure before returning the 502.
+                        record_h2_pool_admission_failure(
+                            &mut h2_admission_permits,
+                            backend_admission_started_at,
+                        );
                         return backend_dispatch_response(
                             http2_pool_sender_error_response(state, proxy, &e, resolved_ip.clone()),
                             None,
@@ -13648,19 +13720,6 @@ async fn proxy_to_backend(
                             );
                         }
                     };
-                    backend_admission_permits =
-                        match backend_dispatch::run_backend_admission_plugins(
-                            backend_admission_plugins,
-                            request_ctx,
-                            proxy,
-                            upstream_target,
-                            ProxyProtocol::Http,
-                        ) {
-                            Ok(permits) => permits,
-                            Err(rejection) => {
-                                return BackendDispatchResult::AdmissionRejected(rejection);
-                            }
-                        };
                     return backend_dispatch_response(
                         proxy_to_backend_http2(
                             state,
@@ -13680,7 +13739,7 @@ async fn proxy_to_backend(
                         )
                         .await,
                         None,
-                        backend_admission_permits,
+                        h2_admission_permits.take(),
                     );
                 }
                 debug!(
@@ -13690,6 +13749,9 @@ async fn proxy_to_backend(
                     "H2 pool bypassed because body-size limits are enabled — using reqwest path"
                 );
             }
+            // Fall through to the reqwest path: `h2_admission_permits` drops here,
+            // releasing the in-flight slot so the reqwest path below re-admits
+            // after its own request-body collection / final-body hooks.
         }
         if requires_direct_h2_for_sni {
             warn!(
@@ -14047,6 +14109,9 @@ async fn proxy_to_backend(
         Ok(permits) => permits,
         Err(rejection) => return BackendDispatchResult::AdmissionRejected(rejection),
     };
+    // Admission is acquired here, after request-body collection and final-body
+    // hooks, so the adaptive sample measures only the backend interaction.
+    *backend_admission_started_at = Instant::now();
 
     // Send
     let mut reqwest_backend_guard =
@@ -17448,6 +17513,7 @@ mod tests {
                 false, // dispatch_h3
                 &bytes_sent,
                 hyper::Version::HTTP_11,
+                &mut std::time::Instant::now(),
             )
             .await;
             let resp = match dispatch {
