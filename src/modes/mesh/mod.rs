@@ -1417,11 +1417,16 @@ fn materialize_sidecar_inbound_proxies(
         // port: Kubernetes container ports carry only the transport protocol
         // (e.g. TCP), while the application protocol (HTTP/gRPC) is declared on
         // the Service. The backend targets the workload's own app port.
-        for service in mesh_slice
-            .services
-            .iter()
-            .filter(|s| s.name == workload.service_name && s.namespace == workload.namespace)
-        {
+        for service in mesh_slice.services.iter().filter(|s| {
+            s.name == workload.service_name
+                && s.namespace == workload.namespace
+                // Require the Service to actually back the local workload. Other
+                // mesh resolution paths treat `MeshService.workloads[]` as the
+                // authoritative backing set, so a service whose refs omit this
+                // SPIFFE id (config typo, EndpointSlice lag) must not be routed
+                // to the local app merely because the names line up.
+                && s.workloads.iter().any(|w| w.spiffe_id.as_str() == local_spiffe)
+        }) {
             let http_ports: Vec<_> = service
                 .ports
                 .iter()
@@ -1454,22 +1459,51 @@ fn materialize_sidecar_inbound_proxies(
                      Materializing only the first HTTP port; the rest are not yet routable."
                 );
             }
-            // Backend = the workload's app port: map the service port to the
-            // workload port by name, then by number, else the workload's first
-            // port, else the service port itself.
-            let backend_port = workload
-                .ports
-                .iter()
-                .find(|wp| wp.name.is_some() && wp.name == service_port.name)
-                .or_else(|| {
-                    workload
-                        .ports
-                        .iter()
-                        .find(|wp| wp.port == service_port.port)
-                })
-                .or_else(|| workload.ports.first())
-                .map(|wp| wp.port)
-                .unwrap_or(service_port.port);
+            // Backend = the workload's app (container) port that this service
+            // port maps to. Kubernetes links the two via the Service's
+            // `targetPort`, which the mesh model does not yet carry end-to-end
+            // (it is dropped during K8s ingestion; see `ServicePort`). Resolve
+            // from the signals we do have, in declining order of confidence:
+            //   1. a shared port NAME — the canonical Service↔container linkage,
+            //   2. an equal port NUMBER — `targetPort` defaulting to the port,
+            //   3. the workload's sole container port — single-port pod.
+            // A workload that declares no ports defaults to the service port
+            // (Kubernetes' `targetPort`-defaults-to-`port` rule). Otherwise —
+            // multiple unnamed container ports whose numbers differ from the
+            // service port — the target is genuinely ambiguous: skip and warn
+            // rather than guess (the previous `first()` fallback silently
+            // misrouted to whichever container port happened to be listed first).
+            let backend_port = if workload.ports.is_empty() {
+                Some(service_port.port)
+            } else {
+                workload
+                    .ports
+                    .iter()
+                    .find(|wp| wp.name.is_some() && wp.name == service_port.name)
+                    .or_else(|| {
+                        workload
+                            .ports
+                            .iter()
+                            .find(|wp| wp.port == service_port.port)
+                    })
+                    .or(match workload.ports.as_slice() {
+                        [only] => Some(only),
+                        _ => None,
+                    })
+                    .map(|wp| wp.port)
+            };
+            let Some(backend_port) = backend_port else {
+                warn!(
+                    service = %service.name,
+                    namespace = %service.namespace,
+                    service_port = service_port.port,
+                    "Cannot resolve the local backend port for an inbound mesh route: \
+                     the service port shares neither a name nor a number with any \
+                     container port and the workload exposes multiple ports. Name the \
+                     ports consistently or define an explicit proxy. Skipping this route."
+                );
+                continue;
+            };
             let proxy = mesh_inbound_loopback_proxy(
                 &mesh_inbound_proxy_id(&service.namespace, &service.name, service_port.port),
                 mesh_service_host_variants(
@@ -1484,10 +1518,14 @@ fn materialize_sidecar_inbound_proxies(
             // Don't collide with an explicit proxy (e.g. an operator's file-mode
             // route — the documented pre-materialization workaround) already
             // routing this host + listen path; only replace our own prior route.
+            // Use the same host-overlap semantics as `validate_unique_listen_paths`
+            // (empty hosts = catch-all, wildcard patterns) so a catch-all/wildcard
+            // operator proxy is honored here rather than slipping past a literal
+            // match and being rejected later at validation.
             if config.proxies.iter().any(|p| {
                 p.id != proxy.id
                     && p.listen_path == proxy.listen_path
-                    && p.hosts.iter().any(|h| proxy.hosts.contains(h))
+                    && crate::config::types::hosts_overlap(&p.hosts, &proxy.hosts)
             }) {
                 debug!(
                     proxy_id = %proxy.id,
@@ -7236,6 +7274,125 @@ mod tests {
         assert!(
             config.proxies.iter().any(|p| p.id == "operator-reviews"),
             "the operator's proxy must be left intact"
+        );
+    }
+
+    #[test]
+    fn sidecar_inbound_proxies_yield_to_catch_all_operator_proxy() {
+        // A catch-all operator proxy (empty hosts) overlaps every host under
+        // `validate_unique_listen_paths`. A literal host match would miss it and
+        // materialize a colliding route that validation later rejects, failing
+        // startup/reload; host-overlap semantics must let the catch-all win.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(spiffe.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![workload("reviews", "reviews")],
+            services: vec![http_mesh_service("reviews", 8080, spiffe)],
+            ..MeshSlice::default()
+        };
+
+        // An operator catch-all proxy (empty hosts) already routes "/".
+        let mut config = GatewayConfig::default();
+        config.proxies.push(mesh_inbound_loopback_proxy(
+            "operator-catch-all",
+            Vec::new(),
+            "default",
+            7777,
+            chrono::Utc::now(),
+        ));
+
+        materialize_sidecar_inbound_proxies(&mut config, &runtime, &slice);
+        assert!(
+            !config
+                .proxies
+                .iter()
+                .any(|p| p.id.starts_with("__mesh-inbound-")),
+            "must not materialize a route overlapping a catch-all operator proxy"
+        );
+    }
+
+    #[test]
+    fn sidecar_inbound_proxies_require_service_to_reference_local_workload() {
+        // The local workload backs "reviews" by name, but the Service's workload
+        // refs omit this SPIFFE id (config typo, EndpointSlice lag). The service
+        // must not be routed to the local app on a name match alone.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(spiffe.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let mut service = http_mesh_service("reviews", 8080, spiffe);
+        service.workloads.clear();
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![workload("reviews", "reviews")],
+            services: vec![service],
+            ..MeshSlice::default()
+        };
+
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+        assert!(
+            !config
+                .proxies
+                .iter()
+                .any(|p| p.id.starts_with("__mesh-inbound-")),
+            "a service that does not reference the local workload must not be routed"
+        );
+    }
+
+    #[test]
+    fn sidecar_inbound_proxies_skip_when_backend_port_is_ambiguous() {
+        // The service port shares neither a name nor a number with any of the
+        // workload's *multiple unnamed* container ports, and the model does not
+        // carry the Service's targetPort. The backend is genuinely ambiguous, so
+        // the route is skipped — never silently routed to an arbitrary port.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(spiffe.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let mut local = workload("reviews", "reviews");
+        local.ports = vec![
+            WorkloadPort {
+                port: 8081,
+                protocol: AppProtocol::Tcp,
+                name: None,
+            },
+            WorkloadPort {
+                port: 8082,
+                protocol: AppProtocol::Tcp,
+                name: None,
+            },
+        ];
+        // Service port 80, unnamed: no name match, no number match (80 ∉ {8081,8082}).
+        let mut service = http_mesh_service("reviews", 80, spiffe);
+        service.ports[0].name = None;
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![local],
+            services: vec![service],
+            ..MeshSlice::default()
+        };
+
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+        assert!(
+            !config
+                .proxies
+                .iter()
+                .any(|p| p.id.starts_with("__mesh-inbound-")),
+            "an ambiguous backend port must not materialize a (mis)routed inbound proxy"
         );
     }
 
