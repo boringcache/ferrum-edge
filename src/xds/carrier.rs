@@ -327,10 +327,11 @@ pub fn build_slice_carriers(slice: &MeshSlice) -> Vec<MeshSliceCarrier> {
             slice.local_inbound_services.clone(),
         ));
     }
-    if !slice.local_inbound_workloads.is_empty() {
-        carriers.push(MeshSliceCarrier::LocalInboundWorkloads(
-            slice.local_inbound_workloads.clone(),
-        ));
+    // Emit on `Some` even when empty: the carrier's presence signals the
+    // authoritative "resolved local-inbound view" (an empty Some = ambiguous,
+    // materialize nothing); absence means no narrowing (fall back to workloads).
+    if let Some(local) = slice.local_inbound_workloads.as_ref() {
+        carriers.push(MeshSliceCarrier::LocalInboundWorkloads(local.clone()));
     }
     if !slice.workloads.is_empty() {
         carriers.push(MeshSliceCarrier::Workloads(slice.workloads.clone()));
@@ -398,7 +399,9 @@ pub fn apply_carrier(slice: &mut MeshSlice, carrier: MeshSliceCarrier) {
     match carrier {
         MeshSliceCarrier::Services(value) => slice.services = value,
         MeshSliceCarrier::LocalInboundServices(value) => slice.local_inbound_services = value,
-        MeshSliceCarrier::LocalInboundWorkloads(value) => slice.local_inbound_workloads = value,
+        MeshSliceCarrier::LocalInboundWorkloads(value) => {
+            slice.local_inbound_workloads = Some(value)
+        }
         MeshSliceCarrier::Workloads(value) => slice.workloads = value,
         MeshSliceCarrier::WorkloadLabels(value) => slice.labels = value,
         MeshSliceCarrier::MeshPolicies(value) => slice.mesh_policies = value,

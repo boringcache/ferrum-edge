@@ -1405,25 +1405,22 @@ fn materialize_sidecar_inbound_proxies(
         .multi_cluster
         .as_ref()
         .and_then(|mc| mc.local_cluster.as_deref());
-    // Inbound serving must not be gated by egress scope: prefer the un-narrowed
-    // local-inbound view when the slice carries one (populated when Sidecar
-    // egress narrowing is active), else fall back to `services` (already the
-    // full set when no narrowing applies). Reading `local_inbound_services`
-    // keeps the egress/outbound-registry `services` view untouched.
-    let inbound_services = if mesh_slice.local_inbound_services.is_empty() {
-        mesh_slice.services.as_slice()
-    } else {
-        mesh_slice.local_inbound_services.as_slice()
-    };
-    // Identify the local workload(s) from the preserved inbound view when the
-    // slice carries one — Sidecar identity narrowing can drop the local workload
-    // from `workloads` — else fall back to `workloads`. `resolve_local_workloads`
-    // applies the same precise match + shared-SPIFFE ambiguity guard the slice
-    // builder uses, so the two cannot drift.
-    let local_workload_src = if mesh_slice.local_inbound_workloads.is_empty() {
-        mesh_slice.workloads.as_slice()
-    } else {
-        mesh_slice.local_inbound_workloads.as_slice()
+    // `local_inbound_workloads` is `Some` exactly when the slice builder resolved
+    // the local-inbound view under Sidecar narrowing — it is then AUTHORITATIVE
+    // for BOTH the workload and service sources: an empty `Some` means the local
+    // identity was ambiguous, so materialize nothing and do NOT fall back to the
+    // narrowed `workloads`/`services` (that could collapse the ambiguity to one
+    // wrong service). `None` means no narrowing applied, so fall back to the full
+    // sets. Reading the separate views keeps the egress/outbound-registry
+    // `services`/`workloads` untouched. `resolve_local_workloads` re-applies the
+    // precise match + shared-SPIFFE ambiguity guard so CP and DP cannot drift.
+    let (inbound_services, local_workload_src) = match mesh_slice.local_inbound_workloads.as_deref()
+    {
+        Some(local) => (mesh_slice.local_inbound_services.as_slice(), local),
+        None => (
+            mesh_slice.services.as_slice(),
+            mesh_slice.workloads.as_slice(),
+        ),
     };
     let mut materialized = 0usize;
     for workload in crate::modes::mesh::slice::resolve_local_workloads(
@@ -1481,20 +1478,20 @@ fn materialize_sidecar_inbound_proxies(
                 );
             }
             // Backend = the workload's app (container) port this service port
-            // forwards to. Honor the Service's `targetPort` first — Kubernetes'
-            // authoritative service-port→container-port mapping: a numeric
-            // targetPort IS the container port; a named one resolves against the
-            // workload's container-port names. When no targetPort is declared (or
-            // a named one doesn't resolve), fall back to the heuristic over the
-            // signals we have, in declining order of confidence:
+            // forwards to. A declared `targetPort` is Kubernetes' AUTHORITATIVE
+            // service-port→container-port binding, so honor it exclusively — no
+            // heuristic fallback: a numeric targetPort IS the container port; a
+            // named one resolves against the workload's container-port names, and
+            // an unresolved name (typo / rollout skew) SKIPS rather than guessing
+            // a different port. Only when NO targetPort is declared do we fall
+            // back to the heuristic over the signals we have, in declining order
+            // of confidence:
             //   1. a shared port NAME — the canonical Service↔container linkage,
             //   2. an equal port NUMBER — `targetPort` defaulting to the port,
             //   3. the workload's sole container port — single-port pod.
             // A workload that declares no ports defaults to the service port
-            // (Kubernetes' `targetPort`-defaults-to-`port` rule). Otherwise —
-            // multiple unnamed container ports whose numbers differ from the
-            // service port and no targetPort — the target is genuinely ambiguous:
-            // skip and warn rather than guess (a blind fallback would misroute).
+            // (Kubernetes' `targetPort`-defaults-to-`port` rule). Otherwise the
+            // target is genuinely ambiguous: skip and warn rather than misroute.
             let backend_port = match service_port.target_port.as_ref() {
                 Some(ServiceTargetPort::Number(n)) => Some(*n),
                 Some(ServiceTargetPort::Name(name)) => workload
@@ -1502,38 +1499,35 @@ fn materialize_sidecar_inbound_proxies(
                     .iter()
                     .find(|wp| wp.name.as_deref() == Some(name.as_str()))
                     .map(|wp| wp.port),
-                None => None,
-            }
-            .or_else(|| {
-                if workload.ports.is_empty() {
-                    Some(service_port.port)
-                } else {
-                    workload
-                        .ports
-                        .iter()
-                        .find(|wp| wp.name.is_some() && wp.name == service_port.name)
-                        .or_else(|| {
-                            workload
-                                .ports
-                                .iter()
-                                .find(|wp| wp.port == service_port.port)
-                        })
-                        .or(match workload.ports.as_slice() {
-                            [only] => Some(only),
-                            _ => None,
-                        })
-                        .map(|wp| wp.port)
-                }
-            });
-            let Some(backend_port) = backend_port else {
+                None if workload.ports.is_empty() => Some(service_port.port),
+                None => workload
+                    .ports
+                    .iter()
+                    .find(|wp| wp.name.is_some() && wp.name == service_port.name)
+                    .or_else(|| {
+                        workload
+                            .ports
+                            .iter()
+                            .find(|wp| wp.port == service_port.port)
+                    })
+                    .or(match workload.ports.as_slice() {
+                        [only] => Some(only),
+                        _ => None,
+                    })
+                    .map(|wp| wp.port),
+            };
+            // Reject a 0 backend (invalid targetPort/port; config validation also
+            // rejects it for non-xDS slices) defensively rather than route to :0.
+            let Some(backend_port) = backend_port.filter(|&p| p != 0) else {
                 warn!(
                     service = %service.name,
                     namespace = %service.namespace,
                     service_port = service_port.port,
-                    "Cannot resolve the local backend port for an inbound mesh route: \
-                     the service port shares neither a name nor a number with any \
-                     container port and the workload exposes multiple ports. Name the \
-                     ports consistently or define an explicit proxy. Skipping this route."
+                    target_port = ?service_port.target_port,
+                    "Cannot resolve a usable local backend port for an inbound mesh route \
+                     (no resolvable Service targetPort, and no port name/number match among \
+                     multiple container ports). Set targetPort, name the ports consistently, \
+                     or define an explicit proxy. Skipping this route."
                 );
                 continue;
             };
@@ -7777,6 +7771,7 @@ mod tests {
             version: "test".to_string(),
             workloads: vec![workload("reviews", "reviews")],
             services: Vec::new(),
+            local_inbound_workloads: Some(vec![workload("reviews", "reviews")]),
             local_inbound_services: vec![http_mesh_service("reviews", 8080, spiffe)],
             ..MeshSlice::default()
         };
@@ -7790,6 +7785,41 @@ mod tests {
                 .any(|p| p.id == "__mesh-inbound-default-reviews-8080"),
             "must materialize from the un-narrowed local_inbound_services view \
              even when egress narrowing emptied `services`"
+        );
+    }
+
+    #[test]
+    fn sidecar_inbound_proxies_skip_when_resolved_view_is_ambiguous_empty() {
+        // The slice builder resolved the local-inbound view but found it
+        // ambiguous (shared SPIFFE, no labels) → Some(empty). The narrowed
+        // `workloads`/`services` here WOULD materialize a single service via the
+        // fallback path, but the authoritative empty view must win: skip, never
+        // fall back to the narrowed sets (which could collapse the ambiguity to
+        // one wrong service).
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(spiffe.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![workload("reviews", "reviews")],
+            services: vec![http_mesh_service("reviews", 8080, spiffe)],
+            local_inbound_workloads: Some(Vec::new()),
+            ..MeshSlice::default()
+        };
+
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+        assert!(
+            !config
+                .proxies
+                .iter()
+                .any(|p| p.id.starts_with("__mesh-inbound-")),
+            "an authoritative empty (ambiguous) inbound view must skip, not fall back to \
+             the narrowed workloads/services"
         );
     }
 
@@ -7810,7 +7840,7 @@ mod tests {
             version: "test".to_string(),
             workloads: Vec::new(),
             services: Vec::new(),
-            local_inbound_workloads: vec![workload("reviews", "reviews")],
+            local_inbound_workloads: Some(vec![workload("reviews", "reviews")]),
             local_inbound_services: vec![http_mesh_service("reviews", 8080, spiffe)],
             ..MeshSlice::default()
         };
@@ -9544,7 +9574,7 @@ mod tests {
             workloads: Vec::new(),
             services: Vec::new(),
             local_inbound_services: Vec::new(),
-            local_inbound_workloads: Vec::new(),
+            local_inbound_workloads: None,
             mesh_policies: Vec::new(),
             peer_authentications: Vec::new(),
             service_entries: Vec::new(),

@@ -1424,7 +1424,7 @@ struct RecoveredSliceCarriers {
     slice_carrier_seen: bool,
     services: Option<Vec<MeshService>>,
     local_inbound_services: Vec<MeshService>,
-    local_inbound_workloads: Vec<crate::modes::mesh::config::Workload>,
+    local_inbound_workloads: Option<Vec<crate::modes::mesh::config::Workload>>,
     labels: Option<BTreeMap<String, String>>,
     workloads: Vec<crate::modes::mesh::config::Workload>,
     mesh_policies: Vec<crate::modes::mesh::config::MeshPolicy>,
@@ -1646,7 +1646,9 @@ fn apply_recovered_carrier(
     match carrier {
         MeshSliceCarrier::Services(value) => recovered.services = Some(value),
         MeshSliceCarrier::LocalInboundServices(value) => recovered.local_inbound_services = value,
-        MeshSliceCarrier::LocalInboundWorkloads(value) => recovered.local_inbound_workloads = value,
+        MeshSliceCarrier::LocalInboundWorkloads(value) => {
+            recovered.local_inbound_workloads = Some(value)
+        }
         MeshSliceCarrier::Workloads(value) => recovered.workloads = value,
         MeshSliceCarrier::WorkloadLabels(value) => recovered.labels = Some(value),
         MeshSliceCarrier::MeshPolicies(value) => recovered.mesh_policies = value,
@@ -4026,7 +4028,7 @@ mod tests {
             // ECDS carriers independent of the egress-narrowed `services` /
             // identity-narrowed `workloads`.
             local_inbound_services: vec![service],
-            local_inbound_workloads: vec![workload],
+            local_inbound_workloads: Some(vec![workload]),
             mesh_policies: vec![MeshPolicy {
                 name: "allow-api".to_string(),
                 namespace: "default".to_string(),

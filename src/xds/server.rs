@@ -1172,28 +1172,42 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                             node_id = Some(current_node_id.clone());
                         };
 
-                        // Record the workload SPIFFE carried in `Node.metadata`
-                        // (initial requests only) before any snapshot is built
-                        // for this node, so Sidecar narrowing / the local-inbound
-                        // view are computed for the right workload. Absent
-                        // metadata (ACKs) leaves any prior identity intact.
-                        if let Some(node) = request.node.as_ref()
-                            && let Some(spiffe) =
-                                crate::xds::carrier::decode_node_metadata(&node.metadata)
-                                    .workload_spiffe_id
-                                    .filter(|s| !s.is_empty())
-                        {
-                            let previous = server
-                                .workload_identities
-                                .insert(current_node_id.clone(), spiffe.clone());
-                            // A snapshot is cached by (node id, config fingerprint)
-                            // only; if the identity is newly learned or changed
-                            // under this node id (e.g. a concurrent/make-before-
-                            // break stream built one before the metadata arrived),
-                            // a cached slice could carry the old/missing identity.
-                            // Drop it so the next build uses the current identity.
-                            if previous.as_deref() != Some(spiffe.as_str()) {
-                                server.invalidate_snapshot_for_config_update(&current_node_id);
+                        // Reconcile this node's workload identity from
+                        // `Node.metadata` before any snapshot is built, so Sidecar
+                        // narrowing / the local-inbound view are computed for the
+                        // right workload. A snapshot is cached by (node id, config
+                        // fingerprint) only, so any identity CHANGE must drop the
+                        // cached slice. ACKs carry `node: None` and don't reach
+                        // here, preserving the identity mid-stream.
+                        if let Some(node) = request.node.as_ref() {
+                            match crate::xds::carrier::decode_node_metadata(&node.metadata)
+                                .workload_spiffe_id
+                                .filter(|s| !s.is_empty())
+                            {
+                                Some(spiffe) => {
+                                    let previous = server
+                                        .workload_identities
+                                        .insert(current_node_id.clone(), spiffe.clone());
+                                    if previous.as_deref() != Some(spiffe.as_str()) {
+                                        server
+                                            .invalidate_snapshot_for_config_update(&current_node_id);
+                                    }
+                                }
+                                None => {
+                                    // Node present but carrying no workload identity
+                                    // (e.g. a reconnect under the same node id
+                                    // without metadata) clears any stale identity,
+                                    // so the new stream isn't narrowed with the
+                                    // previous workload.
+                                    if server
+                                        .workload_identities
+                                        .remove(&current_node_id)
+                                        .is_some()
+                                    {
+                                        server
+                                            .invalidate_snapshot_for_config_update(&current_node_id);
+                                    }
+                                }
                             }
                         }
 
@@ -1346,28 +1360,42 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                             node_id = Some(current_node_id.clone());
                         };
 
-                        // Record the workload SPIFFE carried in `Node.metadata`
-                        // (initial requests only) before any snapshot is built
-                        // for this node, so Sidecar narrowing / the local-inbound
-                        // view are computed for the right workload. Absent
-                        // metadata (ACKs) leaves any prior identity intact.
-                        if let Some(node) = request.node.as_ref()
-                            && let Some(spiffe) =
-                                crate::xds::carrier::decode_node_metadata(&node.metadata)
-                                    .workload_spiffe_id
-                                    .filter(|s| !s.is_empty())
-                        {
-                            let previous = server
-                                .workload_identities
-                                .insert(current_node_id.clone(), spiffe.clone());
-                            // A snapshot is cached by (node id, config fingerprint)
-                            // only; if the identity is newly learned or changed
-                            // under this node id (e.g. a concurrent/make-before-
-                            // break stream built one before the metadata arrived),
-                            // a cached slice could carry the old/missing identity.
-                            // Drop it so the next build uses the current identity.
-                            if previous.as_deref() != Some(spiffe.as_str()) {
-                                server.invalidate_snapshot_for_config_update(&current_node_id);
+                        // Reconcile this node's workload identity from
+                        // `Node.metadata` before any snapshot is built, so Sidecar
+                        // narrowing / the local-inbound view are computed for the
+                        // right workload. A snapshot is cached by (node id, config
+                        // fingerprint) only, so any identity CHANGE must drop the
+                        // cached slice. ACKs carry `node: None` and don't reach
+                        // here, preserving the identity mid-stream.
+                        if let Some(node) = request.node.as_ref() {
+                            match crate::xds::carrier::decode_node_metadata(&node.metadata)
+                                .workload_spiffe_id
+                                .filter(|s| !s.is_empty())
+                            {
+                                Some(spiffe) => {
+                                    let previous = server
+                                        .workload_identities
+                                        .insert(current_node_id.clone(), spiffe.clone());
+                                    if previous.as_deref() != Some(spiffe.as_str()) {
+                                        server
+                                            .invalidate_snapshot_for_config_update(&current_node_id);
+                                    }
+                                }
+                                None => {
+                                    // Node present but carrying no workload identity
+                                    // (e.g. a reconnect under the same node id
+                                    // without metadata) clears any stale identity,
+                                    // so the new stream isn't narrowed with the
+                                    // previous workload.
+                                    if server
+                                        .workload_identities
+                                        .remove(&current_node_id)
+                                        .is_some()
+                                    {
+                                        server
+                                            .invalidate_snapshot_for_config_update(&current_node_id);
+                                    }
+                                }
                             }
                         }
 

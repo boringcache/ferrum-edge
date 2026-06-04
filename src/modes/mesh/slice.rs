@@ -191,11 +191,18 @@ pub struct MeshSlice {
     /// back an egress-admitted service — including the local pod when its own
     /// service isn't admitted), which would leave the inbound materializer
     /// unable to find the local workload. This separate view preserves it (and
-    /// its container ports for backend resolution) without widening the
-    /// narrowed `workloads`/known-destinations view. Populated and consumed in
-    /// lockstep with `local_inbound_services`.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub local_inbound_workloads: Vec<Workload>,
+    /// its container ports for backend resolution) without widening the narrowed
+    /// `workloads`/known-destinations view.
+    ///
+    /// `Some` is the AUTHORITATIVE resolved local-inbound view (it gates whether
+    /// `local_inbound_services` is consulted); `Some(empty)` means the local
+    /// identity was resolved but **ambiguous** (a shared service-account SPIFFE
+    /// with no labels) and must materialize NO routes — the materializer must
+    /// NOT fall back to the narrowed `workloads`, which could collapse the
+    /// ambiguity to one (wrong) service. `None` means no narrowing applied, so
+    /// the materializer falls back to the full `workloads`/`services`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_inbound_workloads: Option<Vec<Workload>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mesh_policies: Vec<MeshPolicy>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -608,44 +615,46 @@ impl MeshSlice {
         // with a shared-SPIFFE ambiguity guard). Only needed when narrowing is
         // active; otherwise the full sets are intact and the materializer falls
         // back to them.
-        let (local_inbound_workloads, local_inbound_services): (Vec<Workload>, Vec<MeshService>) =
-            match request.workload_spiffe_id.as_deref() {
-                Some(spiffe) if applicable_sidecar.is_some() => {
-                    let local_cluster = mesh
-                        .multi_cluster
-                        .as_ref()
-                        .and_then(|mc| mc.local_cluster.as_deref());
-                    let local_workloads: Vec<Workload> = resolve_local_workloads(
-                        &workloads,
-                        spiffe,
-                        &effective_labels,
-                        local_cluster,
-                    )
-                    .into_iter()
-                    .cloned()
-                    .collect();
-                    let services = {
-                        let local_keys: BTreeSet<(&str, &str)> = local_workloads
-                            .iter()
-                            .map(|w| (w.service_name.as_str(), w.namespace.as_str()))
-                            .collect();
-                        mesh.services
-                            .iter()
-                            .filter(|s| {
-                                local_keys.contains(&(s.name.as_str(), s.namespace.as_str()))
-                                    && resource_namespace_visible(
-                                        &service_waypoint_namespaces,
-                                        &s.namespace,
-                                        &namespace,
-                                    )
-                            })
-                            .cloned()
-                            .collect::<Vec<_>>()
-                    };
-                    (local_workloads, services)
-                }
-                _ => (Vec::new(), Vec::new()),
-            };
+        // `local_inbound_workloads` is `Some` exactly when narrowing was active
+        // and we resolved (or ambiguously failed to resolve) the local identity;
+        // it then gates the materializer, which must NOT fall back to the
+        // narrowed `workloads`. `None` means no narrowing — full sets are intact.
+        let (local_inbound_workloads, local_inbound_services): (
+            Option<Vec<Workload>>,
+            Vec<MeshService>,
+        ) = match request.workload_spiffe_id.as_deref() {
+            Some(spiffe) if applicable_sidecar.is_some() => {
+                let local_cluster = mesh
+                    .multi_cluster
+                    .as_ref()
+                    .and_then(|mc| mc.local_cluster.as_deref());
+                let local_workloads: Vec<Workload> =
+                    resolve_local_workloads(&workloads, spiffe, &effective_labels, local_cluster)
+                        .into_iter()
+                        .cloned()
+                        .collect();
+                let services = {
+                    let local_keys: BTreeSet<(&str, &str)> = local_workloads
+                        .iter()
+                        .map(|w| (w.service_name.as_str(), w.namespace.as_str()))
+                        .collect();
+                    mesh.services
+                        .iter()
+                        .filter(|s| {
+                            local_keys.contains(&(s.name.as_str(), s.namespace.as_str()))
+                                && resource_namespace_visible(
+                                    &service_waypoint_namespaces,
+                                    &s.namespace,
+                                    &namespace,
+                                )
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>()
+                };
+                (Some(local_workloads), services)
+            }
+            _ => (None, Vec::new()),
+        };
         let mesh_policies: Vec<MeshPolicy> = mesh
             .mesh_policies
             .iter()
@@ -2488,7 +2497,7 @@ mod tests {
             workloads: vec![make_workload("ns", "web", HashMap::new())],
             services: vec![make_service("ns", "web")],
             local_inbound_services: Vec::new(),
-            local_inbound_workloads: Vec::new(),
+            local_inbound_workloads: None,
             mesh_policies: vec![make_policy("p1", "ns", PolicyScope::MeshWide)],
             peer_authentications: vec![make_peer_auth("pa1", "ns", None)],
             service_entries: vec![make_service_entry("se1", "ns", vec!["*".into()])],

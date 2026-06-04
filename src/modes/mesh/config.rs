@@ -2010,6 +2010,17 @@ fn validate_mesh_config_internal(
                 port.port,
                 &mut errors,
             );
+            match &port.target_port {
+                Some(ServiceTargetPort::Number(0)) => errors.push(format!(
+                    "MeshService '{}'.ports[{}].target_port: numeric targetPort must be greater than 0",
+                    svc.name, i
+                )),
+                Some(ServiceTargetPort::Name(name)) if name.trim().is_empty() => errors.push(format!(
+                    "MeshService '{}'.ports[{}].target_port: named targetPort must not be empty",
+                    svc.name, i
+                )),
+                _ => {}
+            }
         }
         for port in svc.protocol_overrides.keys() {
             validate_non_zero_port(
