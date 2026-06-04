@@ -6,6 +6,7 @@
 //! intent, indirect prompt injection, tool abuse, and business-topic policy.
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -16,8 +17,14 @@ use tokio::sync::OnceCell;
 use url::{Host, Url};
 
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
-use super::utils::sse::{SseReassembler, SseText, SseTextKind, parse_sse_data_frames_checked};
-use super::{HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext};
+use super::utils::sse::{
+    SseReassembler, SseText, SseTextKind, encode_sse_error_event, floor_char_boundary,
+    last_paragraph_boundary, last_sentence_boundary, parse_sse_data_frames_checked,
+};
+use super::{
+    HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext,
+    ResponseStreamAction, ResponseStreamInspector,
+};
 
 const DEFAULT_REQUEST_JSON_PATHS: &[&str] = &[
     "$.messages[*].content",
@@ -66,6 +73,19 @@ const RESPONSE_INSPECTION_KEY: &str = "ai_semantic_firewall.response_inspection"
 /// Value written to [`RESPONSE_INSPECTION_KEY`] when `buffer` mode detects a
 /// `stream: true` request and intends to buffer its SSE response.
 const STREAMING_BUFFERED_MARKER: &str = "streaming_buffered";
+
+/// Value written to [`RESPONSE_INSPECTION_KEY`] when `inspect` mode detects a
+/// `stream: true` request and intends to windowed-inspect its SSE response.
+const STREAMING_WINDOWED_MARKER: &str = "streaming_windowed";
+
+/// Dedicated boolean request markers (separate from the single-valued audit key
+/// [`RESPONSE_INSPECTION_KEY`]) so that two `ai_semantic_firewall` instances on
+/// one request — e.g. a `buffer` instance and an `inspect` instance — each
+/// record their own intent instead of overwriting a shared value, and neither
+/// instance's response handling is silently skipped. Set additively on the
+/// request path; read on the response path.
+const STREAM_BUFFER_REQUESTED_KEY: &str = "ai_semantic_firewall.stream_buffer_requested";
+const STREAM_INSPECT_REQUESTED_KEY: &str = "ai_semantic_firewall.stream_inspect_requested";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Direction {
@@ -192,6 +212,12 @@ enum StreamingResponsePolicy {
     /// time-to-first-byte; an oversized stream fails closed via
     /// `max_response_body_size_bytes`.
     Buffer,
+    /// Inspect the streamed response **progressively in windows**: reassemble to
+    /// a sentence/paragraph (or byte-cap) boundary, inspect that window, release
+    /// it if clean, and cut the stream mid-flight on a violation. Preserves
+    /// streaming UX (low time-to-first-byte) at the cost of windowed granularity
+    /// plus a per-window inspection. Configured by the `streaming` block.
+    Inspect,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -378,13 +404,17 @@ struct EvaluationOutcome {
     provider_error: Option<String>,
 }
 
-pub struct AiSemanticFirewall {
+/// Shared semantic-inspection engine: rules, provider, the lazily-built
+/// embedding index, and the evaluate / decide / decision-metadata machinery.
+///
+/// Held behind an `Arc` so the buffered request/response paths
+/// ([`AiSemanticFirewall`]) and the streaming `inspect` path (its windowed
+/// inspector) share **one** instance — same rules, one embedding index, one
+/// provider client — instead of duplicating the engine per stream.
+struct FirewallEngine {
     enabled: bool,
-    inspect_request: bool,
-    inspect_response: bool,
     mode: EnforcementMode,
     on_error: OnErrorAction,
-    streaming_response: StreamingResponsePolicy,
     provider: Option<ProviderConfig>,
     http_client: PluginHttpClient,
     rules: Vec<SemanticRule>,
@@ -392,8 +422,6 @@ pub struct AiSemanticFirewall {
     extraction: ExtractionConfig,
     privacy: PrivacyConfig,
     expose_rule_id_to_client: bool,
-    has_request_rules: bool,
-    has_response_rules: bool,
     /// True when both directions can produce decision metadata in the same
     /// transaction (request + response inspection both active with applicable
     /// rules). In that case decision metadata keys are scoped by direction
@@ -401,6 +429,19 @@ pub struct AiSemanticFirewall {
     /// so the response pass does not overwrite the request-side audit record.
     metadata_direction_scoped: bool,
     rule_embeddings: OnceCell<Arc<RuleEmbeddingIndex>>,
+}
+
+pub struct AiSemanticFirewall {
+    enabled: bool,
+    inspect_request: bool,
+    inspect_response: bool,
+    streaming_response: StreamingResponsePolicy,
+    has_request_rules: bool,
+    has_response_rules: bool,
+    /// Windowed-inspection config, `Some` only when `streaming_response: inspect`.
+    /// Drives the per-response [`StreamInspector`].
+    streaming_config: Option<StreamingInspectConfig>,
+    engine: Arc<FirewallEngine>,
 }
 
 impl AiSemanticFirewall {
@@ -441,11 +482,24 @@ impl AiSemanticFirewall {
             "skip" => StreamingResponsePolicy::Skip,
             "reject" => StreamingResponsePolicy::Reject,
             "buffer" => StreamingResponsePolicy::Buffer,
+            "inspect" => StreamingResponsePolicy::Inspect,
             other => {
                 return Err(format!(
-                    "ai_semantic_firewall: 'streaming_response' must be one of 'skip', 'reject', or 'buffer', got {other:?}"
+                    "ai_semantic_firewall: 'streaming_response' must be one of 'skip', 'reject', 'buffer', or 'inspect', got {other:?}"
                 ));
             }
+        };
+
+        let streaming_config = if streaming_response == StreamingResponsePolicy::Inspect {
+            Some(parse_streaming_inspect_config(config)?)
+        } else {
+            if config.get("streaming").is_some() {
+                return Err(
+                    "ai_semantic_firewall: 'streaming' block is only valid when 'streaming_response' is 'inspect'"
+                        .to_string(),
+                );
+            }
+            None
         };
 
         let default_action = match optional_string(config, "default_action")?.unwrap_or("reject") {
@@ -509,20 +563,24 @@ impl AiSemanticFirewall {
                 enabled,
                 inspect_request,
                 inspect_response,
-                mode,
-                on_error,
                 streaming_response,
-                provider: None,
-                http_client,
-                rules: Vec::new(),
-                allow_topics: Vec::new(),
-                extraction,
-                privacy,
-                expose_rule_id_to_client,
                 has_request_rules: false,
                 has_response_rules: false,
-                metadata_direction_scoped: false,
-                rule_embeddings: OnceCell::new(),
+                streaming_config,
+                engine: Arc::new(FirewallEngine {
+                    enabled,
+                    mode,
+                    on_error,
+                    provider: None,
+                    http_client,
+                    rules: Vec::new(),
+                    allow_topics: Vec::new(),
+                    extraction,
+                    privacy,
+                    expose_rule_id_to_client,
+                    metadata_direction_scoped: false,
+                    rule_embeddings: OnceCell::new(),
+                }),
             });
         }
 
@@ -587,23 +645,29 @@ impl AiSemanticFirewall {
             enabled,
             inspect_request,
             inspect_response,
-            mode,
-            on_error,
             streaming_response,
-            provider,
-            http_client,
-            rules,
-            allow_topics,
-            extraction,
-            privacy,
-            expose_rule_id_to_client,
             has_request_rules,
             has_response_rules,
-            metadata_direction_scoped: has_request_rules && has_response_rules,
-            rule_embeddings: OnceCell::new(),
+            streaming_config,
+            engine: Arc::new(FirewallEngine {
+                enabled,
+                mode,
+                on_error,
+                provider,
+                http_client,
+                rules,
+                allow_topics,
+                extraction,
+                privacy,
+                expose_rule_id_to_client,
+                metadata_direction_scoped: has_request_rules && has_response_rules,
+                rule_embeddings: OnceCell::new(),
+            }),
         })
     }
+}
 
+impl FirewallEngine {
     async fn evaluate(
         &self,
         direction: Direction,
@@ -1041,6 +1105,54 @@ impl AiSemanticFirewall {
                 || (self.on_error == OnErrorAction::Reject && decision.action != Action::Reject))
     }
 
+    /// Record a streamed `inspect` mode violation to the structured log — never
+    /// the client or `/metrics` (security detail belongs in logs). The detached
+    /// H1/H2 inspection task cannot write `RequestContext` metadata, so for both
+    /// `block` (cut) and `detect` (release-then-detect) this is the audit trail
+    /// for a streamed decision. No raw response text is logged (privacy); only
+    /// matched rule ids, peak severity, and snippet hashes. `cut` distinguishes a
+    /// `block`-mode cut from a `detect`-mode would-block.
+    fn log_stream_detection(&self, decision: &FirewallDecision, cut: bool) {
+        let rule_ids: Vec<&str> = decision
+            .matches
+            .iter()
+            .map(|m| m.rule_id.as_str())
+            .collect();
+        let peak_severity = decision
+            .matches
+            .iter()
+            .map(|m| m.severity)
+            .max_by_key(|s| s.rank())
+            .map(Severity::as_str)
+            .unwrap_or("none");
+        let snippet_hashes: Vec<&str> = decision
+            .matches
+            .iter()
+            .filter_map(|m| m.snippet_hash.as_deref())
+            .collect();
+        if cut {
+            tracing::warn!(
+                target: "ai_semantic_firewall",
+                direction = "response",
+                enforcement = "block",
+                peak_severity,
+                rule_ids = ?rule_ids,
+                snippet_hashes = ?snippet_hashes,
+                "streaming block: response window blocked by semantic firewall policy; stream cut"
+            );
+        } else {
+            tracing::warn!(
+                target: "ai_semantic_firewall",
+                direction = "response",
+                enforcement = "detect",
+                peak_severity,
+                rule_ids = ?rule_ids,
+                snippet_hashes = ?snippet_hashes,
+                "streaming detect: response window would be blocked by semantic firewall policy"
+            );
+        }
+    }
+
     fn write_decision_metadata(
         &self,
         ctx: &mut RequestContext,
@@ -1383,51 +1495,67 @@ impl Plugin for AiSemanticFirewall {
         };
 
         if json.get("stream").and_then(Value::as_bool) == Some(true) {
-            // `buffer` mode forces the streamed response onto the buffered path so
-            // its SSE deltas can be reassembled and inspected. It must NOT set
-            // `ai_request_streaming` — that shared flag suppresses response-body
-            // buffering (`should_buffer_response_body`), which is exactly what we
-            // want to keep enabled here.
-            let buffer_streamed_response = self.streaming_response
-                == StreamingResponsePolicy::Buffer
-                && self.inspect_response
-                && self.has_response_rules;
-
-            if buffer_streamed_response {
-                ctx.metadata.insert(
-                    RESPONSE_INSPECTION_KEY.to_string(),
-                    STREAMING_BUFFERED_MARKER.to_string(),
-                );
-            } else {
-                ctx.metadata
-                    .insert("ai_request_streaming".to_string(), "true".to_string());
-                if self.inspect_response && self.has_response_rules {
-                    if self.streaming_response == StreamingResponsePolicy::Reject
-                        && self.mode == EnforcementMode::Enforce
-                    {
-                        // Fail closed: a client must not be able to disable response
-                        // inspection just by requesting a stream. Record the reject
-                        // for audit and require a non-streaming (bufferable) retry.
-                        ctx.metadata.insert(
-                            "ai_semantic_firewall.response_inspection_skipped".to_string(),
-                            "streaming_rejected".to_string(),
-                        );
-                        return PluginResult::Reject {
-                            status_code: 400,
-                            body: rejection_body(
-                                "ai_semantic_firewall_streaming_rejected",
-                                "Streaming responses are not permitted while AI semantic firewall response inspection is enabled; retry with \"stream\": false.",
-                                None,
-                            ),
-                            headers: json_headers(),
-                        };
-                    }
-                    // Skip (or reject in dry-run): the streamed response is not
-                    // inspected; record the skip so operators can audit the gap.
+            let response_inspectable = self.inspect_response && self.has_response_rules;
+            match self.streaming_response {
+                // `buffer`: force the streamed response onto the buffered path so
+                // its deltas can be reassembled. Do NOT set `ai_request_streaming`
+                // — that shared flag suppresses response buffering, which buffer
+                // mode needs enabled.
+                StreamingResponsePolicy::Buffer if response_inspectable => {
+                    // Additive boolean marker (survives a second firewall instance)
+                    // plus the single-valued audit marker.
+                    ctx.metadata
+                        .insert(STREAM_BUFFER_REQUESTED_KEY.to_string(), "true".to_string());
+                    ctx.metadata.insert(
+                        RESPONSE_INSPECTION_KEY.to_string(),
+                        STREAMING_BUFFERED_MARKER.to_string(),
+                    );
+                }
+                // `inspect`: keep streaming (set `ai_request_streaming` so the
+                // response is NOT buffered) and let the per-chunk windowed
+                // inspector run on the response path.
+                StreamingResponsePolicy::Inspect if response_inspectable => {
+                    ctx.metadata
+                        .insert("ai_request_streaming".to_string(), "true".to_string());
+                    ctx.metadata
+                        .insert(STREAM_INSPECT_REQUESTED_KEY.to_string(), "true".to_string());
+                    ctx.metadata.insert(
+                        RESPONSE_INSPECTION_KEY.to_string(),
+                        STREAMING_WINDOWED_MARKER.to_string(),
+                    );
+                }
+                // `reject` (enforce): fail closed so a client cannot disable response
+                // inspection by requesting a stream; require a non-streaming retry.
+                StreamingResponsePolicy::Reject
+                    if response_inspectable && self.engine.mode == EnforcementMode::Enforce =>
+                {
+                    ctx.metadata
+                        .insert("ai_request_streaming".to_string(), "true".to_string());
                     ctx.metadata.insert(
                         "ai_semantic_firewall.response_inspection_skipped".to_string(),
-                        "streaming".to_string(),
+                        "streaming_rejected".to_string(),
                     );
+                    return PluginResult::Reject {
+                        status_code: 400,
+                        body: rejection_body(
+                            "ai_semantic_firewall_streaming_rejected",
+                            "Streaming responses are not permitted while AI semantic firewall response inspection is enabled; retry with \"stream\": false.",
+                            None,
+                        ),
+                        headers: json_headers(),
+                    };
+                }
+                // `skip` (default), `reject` in dry-run, or no response rules: the
+                // streamed response is not inspected. Record the skip for audit.
+                _ => {
+                    ctx.metadata
+                        .insert("ai_request_streaming".to_string(), "true".to_string());
+                    if response_inspectable {
+                        ctx.metadata.insert(
+                            "ai_semantic_firewall.response_inspection_skipped".to_string(),
+                            "streaming".to_string(),
+                        );
+                    }
                 }
             }
         }
@@ -1436,16 +1564,20 @@ impl Plugin for AiSemanticFirewall {
             return PluginResult::Continue;
         }
 
-        let segments = extract_request_segments(&json, &self.extraction);
-        if segments.is_empty() && self.allow_topics.is_empty() {
+        let segments = extract_request_segments(&json, &self.engine.extraction);
+        if segments.is_empty() && self.engine.allow_topics.is_empty() {
             return PluginResult::Continue;
         }
 
         let outcome = self
+            .engine
             .evaluate(Direction::Request, &segments, &ctx.plugin_http_call_ns)
             .await;
-        if self.should_handle_provider_error(&outcome.decision, outcome.provider_error.as_deref()) {
-            return self.handle_provider_error(
+        if self
+            .engine
+            .should_handle_provider_error(&outcome.decision, outcome.provider_error.as_deref())
+        {
+            return self.engine.handle_provider_error(
                 ctx,
                 Direction::Request,
                 outcome
@@ -1455,7 +1587,7 @@ impl Plugin for AiSemanticFirewall {
             );
         }
 
-        self.handle_decision(
+        self.engine.handle_decision(
             ctx,
             outcome.decision,
             Direction::Request,
@@ -1478,7 +1610,16 @@ impl Plugin for AiSemanticFirewall {
         // — set on the request path only for a detected `stream: true` — takes
         // precedence so the two plugins compose instead of silently disabling
         // response inspection.
-        if buffer_streaming_marker_set(ctx) {
+        //
+        // `inspect` mode also buffers by default (its windowed marker): the
+        // pre-header decision cannot see the content-type, so it must buffer so
+        // that `refine_stream_response_for_content_type` can later DOWNGRADE only an
+        // `text/event-stream` response to the windowed streaming path (see
+        // `should_buffer_response_body_for_content_type`). A non-SSE (JSON)
+        // response then stays buffered and is inspected by `on_response_body`
+        // instead of streaming past every check. (Setting `ai_request_streaming`
+        // alone is NOT enough — `refine` never upgrades stream→buffer.)
+        if buffer_streaming_marker_set(ctx) || windowed_streaming_marker_set(ctx) {
             return true;
         }
         ctx.metadata.get("ai_request_streaming").map(String::as_str) != Some("true")
@@ -1489,7 +1630,7 @@ impl Plugin for AiSemanticFirewall {
         ctx: &RequestContext,
         content_type: Option<&str>,
     ) -> bool {
-        if !self.should_buffer_response_body(ctx) {
+        if !self.requires_response_body_buffering() || is_native_grpc_request(ctx) {
             return false;
         }
 
@@ -1503,13 +1644,83 @@ impl Plugin for AiSemanticFirewall {
             // POST (the request-path marker). Unrelated SSE — a `GET` EventSource
             // endpoint, or a backend that unexpectedly returns an unbounded
             // stream — must keep streaming; buffering it would collect until
-            // `max_response_body_size_bytes` and 502 instead. (Already-buffered
-            // bodies are still inspected in `on_response_body` regardless.)
+            // `max_response_body_size_bytes` and 502 instead. An `inspect`-marked
+            // event stream stays streaming too (the windowed inspector handles it).
+            // (Already-buffered bodies are still inspected in `on_response_body`.)
             return self.streaming_response == StreamingResponsePolicy::Buffer
                 && buffer_streaming_marker_set(ctx);
         }
 
-        is_json_content_type(content_type)
+        if is_json_content_type(content_type) {
+            // A marked `inspect` request whose backend returned JSON (not the SSE
+            // its `stream: true` implied — e.g. the backend normalized the flag)
+            // MUST be buffered and inspected via `on_response_body`. Otherwise the
+            // `ai_request_streaming` flag keeps it on the streaming path with no
+            // windowed inspector (which only attaches for event streams), so
+            // response rules would be bypassed entirely.
+            if windowed_streaming_marker_set(ctx) {
+                return true;
+            }
+            return self.should_buffer_response_body(ctx);
+        }
+
+        false
+    }
+
+    fn requires_response_stream_hooks(&self) -> bool {
+        // Only `inspect` mode drives the per-chunk streaming hook; `streaming_config`
+        // is `Some` exactly for that mode. Honors `inspect.response` so disabling
+        // response inspection also disables the stream hook (matching
+        // `on_response_body`). Zero cost for every other config.
+        self.enabled
+            && self.inspect_response
+            && self.streaming_config.is_some()
+            && self.has_response_rules
+    }
+
+    fn forces_reqwest_dispatch(&self, ctx: &RequestContext) -> bool {
+        // Only when THIS request was marked for windowed inspection — so an
+        // inspect-mode proxy does not push its ordinary (non-streamed, never
+        // inspected) requests off the native-H3 backend path. The windowed
+        // inspector is wired only on the reqwest streaming response path, so a
+        // marked request must dispatch via reqwest to be inspectable.
+        self.enabled && self.streaming_config.is_some() && windowed_streaming_marker_set(ctx)
+    }
+
+    fn response_stream_inspector(
+        &self,
+        ctx: &RequestContext,
+        response_status: u16,
+        content_type: Option<&str>,
+    ) -> Option<Box<dyn ResponseStreamInspector>> {
+        if !self.enabled || !self.inspect_response || !self.has_response_rules {
+            return None;
+        }
+        // Gate to success responses, mirroring `on_response_body`: an upstream
+        // 4xx/5xx `text/event-stream` error body must not be inspected, truncated,
+        // or replaced with the firewall terminal event.
+        if !(200..300).contains(&response_status) {
+            return None;
+        }
+        // Only windowed-inspect a stream THIS request marked as a detected
+        // `stream: true` AI request (set on the request path). An unrelated SSE
+        // response — a `GET` EventSource route, or a backend that unexpectedly
+        // streams — must keep streaming untouched, never held or cut by AI rules,
+        // mirroring the `buffer`-mode marker gate.
+        if !windowed_streaming_marker_set(ctx) {
+            return None;
+        }
+        let config = self.streaming_config?;
+        // Only event streams are windowed; a non-stream (JSON) response under
+        // `inspect` mode is buffered and handled by `on_response_body`.
+        if !content_type.is_some_and(is_event_stream_content_type) {
+            return None;
+        }
+        Some(Box::new(StreamInspector::new(
+            Arc::clone(&self.engine),
+            config,
+            Arc::clone(&ctx.plugin_http_call_ns),
+        )))
     }
 
     async fn on_response_body(
@@ -1536,7 +1747,8 @@ impl Plugin for AiSemanticFirewall {
             // pinned the stream. SSE deltas arrive as many tiny fragments, so they
             // are reassembled into coherent per-choice / per-tool-call text before
             // inspection rather than scored fragment-by-fragment.
-            let (segments, fully_parsed) = reassemble_sse_response_segments(body, &self.extraction);
+            let (segments, fully_parsed) =
+                reassemble_sse_response_segments(body, &self.engine.extraction);
             // `buffer` mode forced this stream onto the buffered path specifically
             // to inspect it. If nothing inspectable was recovered — the body had
             // non-UTF-8 / non-JSON `data:` events, or no extractable content — then
@@ -1544,8 +1756,15 @@ impl Plugin for AiSemanticFirewall {
             // treat it as an inspection failure governed by `on_error`. (Other
             // buffered SSE, e.g. pinned by a different plugin, keeps the lenient
             // path: no marker means this branch is skipped.)
-            if buffer_streaming_marker_set(ctx) && (!fully_parsed || segments.is_empty()) {
-                return self.handle_uninspectable_buffered_stream(ctx);
+            // Fail closed for either marker: `buffer` mode pinned this stream, OR
+            // `inspect` mode marked it but the response was buffered anyway (e.g.
+            // another response-body plugin pinned it, so the windowed inspector
+            // never ran) — both promised inspection, so uninspectable SSE must
+            // honor on_error rather than be delivered.
+            if (buffer_streaming_marker_set(ctx) || windowed_streaming_marker_set(ctx))
+                && (!fully_parsed || segments.is_empty())
+            {
+                return self.engine.handle_uninspectable_buffered_stream(ctx);
             }
             segments
         } else if is_json_content_type(content_type) {
@@ -1554,7 +1773,12 @@ impl Plugin for AiSemanticFirewall {
                 Err(_) => return PluginResult::Continue,
             };
             let mut segments = Vec::new();
-            extract_response_segments_from_json(&json, &self.extraction, None, &mut segments);
+            extract_response_segments_from_json(
+                &json,
+                &self.engine.extraction,
+                None,
+                &mut segments,
+            );
             segments
         } else {
             return PluginResult::Continue;
@@ -1565,10 +1789,14 @@ impl Plugin for AiSemanticFirewall {
         }
 
         let outcome = self
+            .engine
             .evaluate(Direction::Response, &segments, &ctx.plugin_http_call_ns)
             .await;
-        if self.should_handle_provider_error(&outcome.decision, outcome.provider_error.as_deref()) {
-            return self.handle_provider_error(
+        if self
+            .engine
+            .should_handle_provider_error(&outcome.decision, outcome.provider_error.as_deref())
+        {
+            return self.engine.handle_provider_error(
                 ctx,
                 Direction::Response,
                 outcome
@@ -1578,7 +1806,7 @@ impl Plugin for AiSemanticFirewall {
             );
         }
 
-        self.handle_decision(
+        self.engine.handle_decision(
             ctx,
             outcome.decision,
             Direction::Response,
@@ -2245,6 +2473,705 @@ fn reassemble_sse_response_segments(
 /// extraction in [`reassemble_sse_response_segments`]).
 fn is_sse_delta_response_path(path: &str) -> bool {
     SSE_DELTA_RESPONSE_PATHS.contains(&path)
+}
+
+/// Where streamed `inspect` mode places window boundaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamWindowKind {
+    Sentence,
+    Paragraph,
+    Bytes,
+}
+
+/// How streamed `inspect` mode reacts to a mid-stream violation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamEnforcement {
+    /// Hold each window's raw bytes until that window is inspected-clean, then
+    /// release them; cut the stream on a violation. No un-inspected bytes ever
+    /// reach the client (block-mode contract). Adds windowing latency.
+    Block,
+    /// Forward bytes immediately (no holding, no added latency) and inspect
+    /// windows only to **detect** — a violation is logged, never cut, because
+    /// the bytes are already on the wire. Observability without enforcement;
+    /// the detection goes to the structured log, not to the client or metrics.
+    Detect,
+}
+
+/// Tunables for streamed `inspect` mode (the `streaming:` config block).
+#[derive(Debug, Clone, Copy)]
+struct StreamingInspectConfig {
+    window: StreamWindowKind,
+    /// `block` (hold + cut) or `detect` (release + log).
+    enforcement: StreamEnforcement,
+    /// Hard cap on held (un-released) raw bytes — forces a window even mid-sentence,
+    /// bounding both added latency and held memory. Also bounds the un-terminated
+    /// `carry`: a single SSE event larger than this is treated as uninspectable.
+    max_window_bytes: usize,
+    /// Bytes of already-cleared text re-inspected with the next window so a
+    /// violation phrase split across a boundary is still caught. Also the amount
+    /// of reassembled prose retained after a clean release (memory stays bounded
+    /// to roughly one window plus this overlap).
+    overlap_bytes: usize,
+    /// Safety cap on provider inspections per response.
+    max_inspections: u32,
+    /// Emit an OpenAI-compatible terminal error event on a cut (vs. a silent
+    /// end). `block` mode only — `detect` never cuts.
+    cut_with_error_event: bool,
+}
+
+/// A complete SSE event held pending release: its raw bytes (empty in `detect`
+/// mode, which forwards immediately and never holds), its raw byte length
+/// (tracked even when the bytes are not held, so the window cap still applies),
+/// the reassembled assistant-content length after it (so [`StreamWindowEngine`]
+/// releases frame-aligned raw bytes only up to an inspected-clean boundary), and
+/// whether the event was fully inspectable (valid UTF-8 with JSON `data:`
+/// payloads) so block mode can fail closed on content it could not parse.
+struct HeldEvent {
+    raw: Vec<u8>,
+    raw_len: usize,
+    content_len_after: usize,
+    inspectable: bool,
+    /// Parsed JSON `data:` frames, retained so the inspector can extract
+    /// per-frame NON-delta response paths (e.g. `choices[].message.content`,
+    /// `output_text`) before this event is released — matching the buffered
+    /// path. Dropped when the event is released. Bounded by `held`.
+    frames: Vec<Value>,
+}
+
+/// Pure state machine for windowed streamed inspection.
+///
+/// Accumulates raw SSE bytes and the reassembled assistant text in parallel.
+/// [`ingest`](Self::ingest) reassembles complete events and returns a window of
+/// text to inspect when a sentence/paragraph boundary (or the byte cap) is
+/// crossed — with a rolling overlap so a violation split across a boundary is
+/// caught. After a clean verdict the caller takes the released raw bytes via
+/// [`release`](Self::release); on a violation it calls [`discard_pending`](Self::discard_pending).
+///
+/// Block-mode contract: raw bytes are held until the text they produced has been
+/// inspected and cleared, so no un-inspected bytes reach the client. Async
+/// inspection lives in the caller; this type is sync and unit-testable.
+struct StreamWindowEngine {
+    config: StreamingInspectConfig,
+    /// Whether complete events' raw bytes are retained for release (`block`) or
+    /// dropped because they were already forwarded (`detect`).
+    hold_raw: bool,
+    /// Whether parsed JSON frames are retained on each held event for per-frame
+    /// non-delta extraction. `false` (the inspector sets it) when no non-delta
+    /// response paths are configured, so the delta-only case stores no `Value`s.
+    store_frames: bool,
+    reassembler: SseReassembler,
+    /// Raw bytes received but not yet split into a complete SSE event. Bounded
+    /// by `max_window_bytes` so an un-terminated event cannot grow unbounded.
+    carry: Vec<u8>,
+    /// Complete, reassembled events not yet released — oldest first.
+    held: Vec<HeldEvent>,
+    /// Assistant-content length already inspected-clean and released, in the
+    /// reassembler's CURRENT coordinates (which shrink as cleared prose is
+    /// drained, so this is rebased on every release).
+    cleared_len: usize,
+    /// Content offset the emitted-but-unverified window will clear to.
+    pending_clears_to: Option<usize>,
+}
+
+impl StreamWindowEngine {
+    fn new(config: StreamingInspectConfig) -> Self {
+        Self {
+            hold_raw: config.enforcement == StreamEnforcement::Block,
+            // Default to retaining frames; the inspector clears this when no
+            // non-delta extraction is configured.
+            store_frames: true,
+            config,
+            reassembler: SseReassembler::new(),
+            carry: Vec::new(),
+            held: Vec::new(),
+            cleared_len: 0,
+            pending_clears_to: None,
+        }
+    }
+
+    /// Reassemble one complete (or force-flushed) SSE event into a held entry,
+    /// recording whether it was fully inspectable.
+    fn absorb_event(&mut self, raw: Vec<u8>) {
+        let parsed = parse_sse_data_frames_checked(&raw);
+        for frame in &parsed.frames {
+            self.reassembler.push_frame(frame);
+        }
+        let content_len_after = self.reassembler.assistant_content_len();
+        let raw_len = raw.len();
+        self.held.push(HeldEvent {
+            raw: if self.hold_raw { raw } else { Vec::new() },
+            raw_len,
+            content_len_after,
+            inspectable: parsed.fully_parsed,
+            frames: if self.store_frames {
+                parsed.frames
+            } else {
+                Vec::new()
+            },
+        });
+    }
+
+    /// The parsed JSON frames of all currently-held (un-released) events, for
+    /// per-frame non-delta extraction. Bounded by `held`.
+    fn retained_frames(&self) -> impl Iterator<Item = &Value> {
+        self.held.iter().flat_map(|e| e.frames.iter())
+    }
+
+    /// Append a raw chunk, reassembling any complete SSE events. Returns `true`
+    /// when a window is ready to inspect (boundary, byte cap, or carry overflow),
+    /// setting the pending release point; `false` means hold.
+    fn ingest(&mut self, chunk: &[u8]) -> bool {
+        self.carry.extend_from_slice(chunk);
+        while let Some(end) = next_event_end(&self.carry) {
+            let raw: Vec<u8> = self.carry.drain(..end).collect();
+            self.absorb_event(raw);
+        }
+        // Bound carry: an event that never sends a blank-line terminator must not
+        // grow without limit. Once it passes the window cap, force it through as a
+        // (degenerate, almost certainly un-parseable) event so it is inspected or
+        // fails closed instead of buffering unbounded memory.
+        if self.carry.len() > self.config.max_window_bytes {
+            let raw = std::mem::take(&mut self.carry);
+            self.absorb_event(raw);
+        }
+        self.window_ready(false)
+    }
+
+    /// Flush at end of stream: parse any trailing partial event and signal a final
+    /// window covering all remaining content (boundary or not).
+    fn finish(&mut self) -> bool {
+        if !self.carry.is_empty() {
+            let raw = std::mem::take(&mut self.carry);
+            self.absorb_event(raw);
+        }
+        self.window_ready(true)
+    }
+
+    fn window_ready(&mut self, at_end: bool) -> bool {
+        let content_len = self.reassembler.assistant_content_len();
+        let held_bytes: usize = self.held.iter().map(|e| e.raw_len).sum();
+        let new_content = content_len > self.cleared_len;
+
+        let clears_to = if at_end {
+            if !new_content && self.held.is_empty() {
+                return false;
+            }
+            content_len
+        } else if new_content {
+            // Allocate the joined prose only when there is new content and a
+            // boundary search is actually needed (not per event).
+            let content = self.reassembler.assistant_content();
+            let new = &content[self.cleared_len..];
+            let boundary = match self.config.window {
+                StreamWindowKind::Sentence => last_sentence_boundary(new),
+                StreamWindowKind::Paragraph => last_paragraph_boundary(new),
+                StreamWindowKind::Bytes => None,
+            };
+            match boundary {
+                Some(b) => self.cleared_len + b,
+                None if held_bytes >= self.config.max_window_bytes => content_len,
+                None => return false,
+            }
+        } else if held_bytes >= self.config.max_window_bytes && !self.held.is_empty() {
+            // Non-prose events (role-only deltas, tool-call frames) piling past the
+            // cap: flush so their content/tool segments get inspected.
+            content_len
+        } else {
+            return false;
+        };
+
+        self.pending_clears_to = Some(clears_to);
+        true
+    }
+
+    /// The reassembled fragments to inspect for the pending window: the full
+    /// currently-retained reassembly (prose plus tool-call names/arguments).
+    /// Retained prose is bounded to roughly one window plus the overlap by
+    /// [`release`](Self::release), so this is not the whole completion.
+    fn snapshot_texts(&self) -> Vec<SseText> {
+        self.reassembler.texts()
+    }
+
+    /// Whether any held event that the pending window would release was not fully
+    /// inspectable (non-UTF-8 or a non-JSON `data:` payload). Block mode uses this
+    /// to fail closed on content it could not parse.
+    fn pending_uninspectable(&self) -> bool {
+        let Some(clears_to) = self.pending_clears_to else {
+            return false;
+        };
+        self.held
+            .iter()
+            .any(|e| !e.inspectable && e.content_len_after <= clears_to)
+    }
+
+    /// Commit the pending window: advance the cleared offset, take the raw bytes
+    /// of the now-cleared events (empty in `detect` mode), and drain inspected
+    /// prose down to the overlap so retained memory stays bounded.
+    fn release(&mut self) -> Vec<u8> {
+        let Some(clears_to) = self.pending_clears_to.take() else {
+            return Vec::new();
+        };
+        self.cleared_len = clears_to;
+        // `held` is ordered by arrival (content_len_after is monotonic), so the
+        // releasable events are a prefix — drain it once (O(n)) instead of
+        // repeated remove(0) (O(n^2) when a window releases many small events).
+        let release_count = self
+            .held
+            .iter()
+            .take_while(|e| e.content_len_after <= clears_to)
+            .count();
+        let mut out = Vec::new();
+        for ev in self.held.drain(..release_count) {
+            if !ev.raw.is_empty() {
+                out.extend_from_slice(&ev.raw);
+            }
+        }
+
+        // Bound retained prose: drop everything before the re-inspection overlap,
+        // rebasing the offsets that count from the front of the reassembly.
+        let keep_from = self.cleared_len.saturating_sub(self.config.overlap_bytes);
+        if keep_from > 0 {
+            let content = self.reassembler.assistant_content();
+            let drop = floor_char_boundary(&content, keep_from);
+            if drop > 0 {
+                self.reassembler.drain_assistant_prefix(drop);
+                self.cleared_len -= drop;
+                for e in &mut self.held {
+                    e.content_len_after = e.content_len_after.saturating_sub(drop);
+                }
+            }
+        }
+        // Bound retained tool-call arguments the same way: the window just
+        // inspected them clean, so drop all but the overlap tail. (These have no
+        // linear prose offset, so they are trimmed independently of `cleared_len`
+        // — the prose-based raw-frame release above is unaffected.)
+        self.reassembler
+            .truncate_streamed_tool_args(self.config.overlap_bytes);
+        out
+    }
+
+    /// Drop the pending window without releasing it (called on a policy cut).
+    fn discard_pending(&mut self) {
+        self.pending_clears_to = None;
+    }
+}
+
+/// Byte index just past the end of the first complete SSE event in `buf` (the
+/// first blank line), or `None` if no event has fully arrived yet.
+///
+/// SSE line terminators are `\n` or `\r\n` and may be mixed within one stream, so
+/// a blank line is any of `\n\n`, `\r\n\r\n`, `\n\r\n`, or `\r\n\n`. Scans for the
+/// earliest such boundary: a `\n` immediately followed by another line terminator
+/// (`\n` or `\r\n`).
+fn next_event_end(buf: &[u8]) -> Option<usize> {
+    for (i, &b) in buf.iter().enumerate() {
+        if b != b'\n' {
+            continue;
+        }
+        match buf.get(i + 1) {
+            Some(b'\n') => return Some(i + 2),
+            Some(b'\r') if buf.get(i + 2) == Some(&b'\n') => return Some(i + 3),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn streaming_str<'a>(
+    streaming: Option<&'a serde_json::Map<String, Value>>,
+    field: &str,
+) -> Result<Option<&'a str>, String> {
+    match streaming {
+        Some(obj) => optional_string_from_object(obj, field),
+        None => Ok(None),
+    }
+}
+
+fn streaming_u64(
+    streaming: Option<&serde_json::Map<String, Value>>,
+    field: &str,
+) -> Result<Option<u64>, String> {
+    let Some(obj) = streaming else {
+        return Ok(None);
+    };
+    let Some(value) = obj.get(field) else {
+        return Ok(None);
+    };
+    value.as_u64().map(Some).ok_or_else(|| {
+        format!("ai_semantic_firewall: streaming.{field} must be a non-negative integer")
+    })
+}
+
+/// Parse the `streaming:` block for `streaming_response: inspect`. Unsupported
+/// (planned-but-not-yet-implemented) values are rejected with a clear message
+/// rather than silently ignored, so operators are never misled.
+fn parse_streaming_inspect_config(config: &Value) -> Result<StreamingInspectConfig, String> {
+    let streaming = optional_object(config, "streaming")?;
+
+    let window = match streaming_str(streaming, "window")?.unwrap_or("sentence") {
+        "sentence" => StreamWindowKind::Sentence,
+        "paragraph" => StreamWindowKind::Paragraph,
+        "bytes" => StreamWindowKind::Bytes,
+        "tokens" => {
+            return Err(
+                "ai_semantic_firewall: streaming.window 'tokens' is not yet supported; use 'sentence', 'paragraph', or 'bytes'"
+                    .to_string(),
+            );
+        }
+        other => {
+            return Err(format!(
+                "ai_semantic_firewall: streaming.window must be one of 'sentence', 'paragraph', or 'bytes', got {other:?}"
+            ));
+        }
+    };
+
+    let enforcement = match streaming_str(streaming, "enforcement")?.unwrap_or("block") {
+        "block" => StreamEnforcement::Block,
+        "detect" => StreamEnforcement::Detect,
+        other => {
+            return Err(format!(
+                "ai_semantic_firewall: streaming.enforcement must be 'block' or 'detect', got {other:?}"
+            ));
+        }
+    };
+
+    let cut_with_error_event = match streaming_str(streaming, "on_violation")?
+        .unwrap_or("cut_with_error_event")
+    {
+        "cut_with_error_event" => true,
+        "cut_silent" => false,
+        other => {
+            return Err(format!(
+                "ai_semantic_firewall: streaming.on_violation must be 'cut_with_error_event' or 'cut_silent', got {other:?}"
+            ));
+        }
+    };
+
+    if streaming.is_some_and(|obj| obj.contains_key("max_hold_ms")) {
+        return Err(
+            "ai_semantic_firewall: streaming.max_hold_ms is not yet supported; windows are bounded by streaming.max_window_bytes"
+                .to_string(),
+        );
+    }
+
+    let max_window_bytes = streaming_u64(streaming, "max_window_bytes")?.unwrap_or(4096);
+    if max_window_bytes == 0 {
+        return Err(
+            "ai_semantic_firewall: streaming.max_window_bytes must be greater than 0".to_string(),
+        );
+    }
+    let overlap_bytes = streaming_u64(streaming, "overlap_bytes")?.unwrap_or(256);
+    let max_inspections = streaming_u64(streaming, "max_inspections")?.unwrap_or(64);
+    if max_inspections == 0 {
+        return Err(
+            "ai_semantic_firewall: streaming.max_inspections must be greater than 0".to_string(),
+        );
+    }
+
+    Ok(StreamingInspectConfig {
+        window,
+        enforcement,
+        max_window_bytes: max_window_bytes as usize,
+        overlap_bytes: overlap_bytes as usize,
+        max_inspections: u32::try_from(max_inspections).unwrap_or(u32::MAX),
+        cut_with_error_event,
+    })
+}
+
+/// Max concurrent `detect`-mode inspection round-trips per response. `detect`
+/// spawns each window's evaluation (so the stream is never blocked), so cap how
+/// many run at once — block mode serializes them via `await`, but an unbounded
+/// `detect` could otherwise fire up to `max_inspections` embedding calls at once
+/// on a fast stream.
+const DETECT_MAX_CONCURRENT_INSPECTIONS: usize = 4;
+
+/// Per-response windowed inspector for `streaming_response: inspect`. Owns its
+/// window state plus a shared [`FirewallEngine`], so it runs the same rules /
+/// embedding index as the buffered paths. Created by
+/// [`AiSemanticFirewall::response_stream_inspector`] and driven chunk-by-chunk
+/// by the proxy.
+struct StreamInspector {
+    engine: Arc<FirewallEngine>,
+    config: StreamingInspectConfig,
+    window: StreamWindowEngine,
+    /// Cloned from `ctx.plugin_http_call_ns` so embedding-call time is attributed
+    /// to the request even when driven from a detached H1/H2 task.
+    plugin_http_call_ns: Arc<AtomicU64>,
+    /// Non-delta response extraction paths (e.g. `$.choices[*].message.content`,
+    /// `$.output_text`), precomputed once. `Some` only when the config enables
+    /// such paths, so the common delta-only case pays nothing per window.
+    non_delta_extraction: Option<ExtractionConfig>,
+    inspections_used: u32,
+    terminated: bool,
+    /// Whether the one-time "forwarded uninspected" audit log has fired for this
+    /// response (so it is not repeated per window).
+    degraded_logged: bool,
+    /// Bounds concurrent `detect`-mode spawned inspections. `Some` only in detect
+    /// mode (block mode serializes via `await`, so it needs no limiter).
+    detect_concurrency: Option<Arc<tokio::sync::Semaphore>>,
+}
+
+impl StreamInspector {
+    fn new(
+        engine: Arc<FirewallEngine>,
+        config: StreamingInspectConfig,
+        plugin_http_call_ns: Arc<AtomicU64>,
+    ) -> Self {
+        // Pre-split the configured response paths: delta paths are covered by the
+        // reassembler; non-delta paths need per-frame extraction (matching the
+        // buffered path's `reassemble_sse_response_segments`).
+        let non_delta_paths: Vec<String> = engine
+            .extraction
+            .response_json_paths
+            .iter()
+            .filter(|path| !is_sse_delta_response_path(path))
+            .cloned()
+            .collect();
+        let non_delta_extraction = (!non_delta_paths.is_empty()).then(|| ExtractionConfig {
+            request_json_paths: Vec::new(),
+            response_json_paths: non_delta_paths,
+        });
+        // Only retain parsed frames when they will actually be consumed (non-delta
+        // extraction); the delta-only case stores no per-event `Value`s.
+        let mut window = StreamWindowEngine::new(config);
+        window.store_frames = non_delta_extraction.is_some();
+        Self {
+            engine,
+            config,
+            window,
+            plugin_http_call_ns,
+            non_delta_extraction,
+            inspections_used: 0,
+            terminated: false,
+            degraded_logged: false,
+            detect_concurrency: (config.enforcement == StreamEnforcement::Detect).then(|| {
+                Arc::new(tokio::sync::Semaphore::new(
+                    DETECT_MAX_CONCURRENT_INSPECTIONS,
+                ))
+            }),
+        }
+    }
+
+    /// Emit a one-time warning that block mode forwarded a window WITHOUT
+    /// inspecting it — the only place the "no un-inspected bytes reach the client"
+    /// contract degrades to pass-through (the per-response `max_inspections` cap is
+    /// hit, or a provider error under `on_error: warn`/`allow`). Logged once per
+    /// response so operators have an audit signal for the degraded window(s).
+    fn log_forward_uninspected_once(&mut self, reason: &str) {
+        if self.degraded_logged {
+            return;
+        }
+        self.degraded_logged = true;
+        tracing::warn!(
+            target: "ai_semantic_firewall",
+            direction = "response",
+            enforcement = "block",
+            reason,
+            "streaming inspect forwarded a response window UNINSPECTED; the block-mode no-un-inspected-bytes guarantee is degraded to pass-through for the remainder of this response"
+        );
+    }
+
+    /// Reassembled response segments for the pending window, mapped to the same
+    /// `TextSegment` kinds the buffered path uses (so chat-completion content,
+    /// Responses-API text, AND tool-call names/arguments are all evaluated against
+    /// the rules that apply to each kind — not just assistant prose). Restricted
+    /// to the enabled extraction paths via [`sse_text_to_segment`]. Also extracts
+    /// per-frame NON-delta response paths from the retained frames, so a backend
+    /// cannot bypass inspection by placing content in a `message.content` /
+    /// `output_text` field of a streamed event (the buffered path inspects these).
+    fn window_segments(&self) -> Vec<TextSegment> {
+        let mut segments: Vec<TextSegment> = self
+            .window
+            .snapshot_texts()
+            .into_iter()
+            .filter_map(|text| sse_text_to_segment(text, &self.engine.extraction))
+            .collect();
+        if let Some(non_delta_extraction) = &self.non_delta_extraction {
+            for (index, frame) in self.window.retained_frames().enumerate() {
+                extract_response_segments_from_json(
+                    frame,
+                    non_delta_extraction,
+                    Some(format!("sse[{index}]")),
+                    &mut segments,
+                );
+            }
+        }
+        segments
+    }
+
+    /// `block` mode: inspect the ready window and decide whether to release its
+    /// held raw bytes (clean) or cut the stream (violation). No un-inspected bytes
+    /// reach the client.
+    async fn act_on_window(&mut self) -> ResponseStreamAction {
+        // Fail closed: a held event about to be released carries a `data:` payload
+        // we could not parse (non-UTF-8 / non-JSON), which may hide content. Honor
+        // on_error — reject cuts; warn/allow forward best-effort — mirroring the
+        // buffered uninspectable path.
+        if self.window.pending_uninspectable() && self.engine.on_error == OnErrorAction::Reject {
+            return self.terminate();
+        }
+
+        let segments = self.window_segments();
+        // Nothing inspectable (role-only events flushed): release without a call.
+        if segments.is_empty() {
+            return ResponseStreamAction::Forward(Bytes::from(self.window.release()));
+        }
+        // Per-response inspection cap reached but content is still arriving: honor
+        // on_error instead of silently forwarding un-inspected windows — reject
+        // fails closed (cut), warn/allow forward best-effort. (Otherwise a
+        // violation placed after the cap would bypass the block-mode contract.)
+        if self.inspections_used >= self.config.max_inspections {
+            return if self.engine.on_error == OnErrorAction::Reject {
+                self.terminate()
+            } else {
+                self.log_forward_uninspected_once("max_inspections_reached");
+                ResponseStreamAction::Forward(Bytes::from(self.window.release()))
+            };
+        }
+        self.inspections_used += 1;
+
+        let outcome = self
+            .engine
+            .evaluate(Direction::Response, &segments, &self.plugin_http_call_ns)
+            .await;
+
+        // Provider error mid-stream honors on_error: reject fails closed, others
+        // forward best-effort.
+        if self
+            .engine
+            .should_handle_provider_error(&outcome.decision, outcome.provider_error.as_deref())
+        {
+            return if self.engine.on_error == OnErrorAction::Reject {
+                self.terminate()
+            } else {
+                self.log_forward_uninspected_once("provider_error");
+                ResponseStreamAction::Forward(Bytes::from(self.window.release()))
+            };
+        }
+
+        // A confirmed reject cuts the stream; dry-run never cuts. Log the decision
+        // so the cut stream still has an audit trail (rule ids / severity) — the
+        // detached task cannot write `RequestContext` metadata.
+        if outcome.decision.action == Action::Reject && !outcome.decision.dry_run {
+            self.engine.log_stream_detection(&outcome.decision, true);
+            self.terminate()
+        } else {
+            // A NON-cutting policy hit (a `warn` action, or a dry-run `would_reject`)
+            // is still forwarded — but log it, because the streaming path cannot
+            // write the `would_*`/`warn` transaction metadata the buffered path
+            // does, and logs are this path's only audit trail.
+            if matches!(outcome.decision.action, Action::Reject | Action::Warn)
+                && !outcome.decision.matches.is_empty()
+            {
+                self.engine.log_stream_detection(&outcome.decision, false);
+            }
+            ResponseStreamAction::Forward(Bytes::from(self.window.release()))
+        }
+    }
+
+    /// `detect` mode: the window's bytes were already forwarded, so this only
+    /// inspects to log a detection — it never cuts. Does ONLY cheap synchronous
+    /// bookkeeping (snapshot + advance/drain) and runs the actual evaluation in a
+    /// detached task, so a slow embedding call never stalls the stream — detect is
+    /// release-then-detect and must add no client-visible latency.
+    fn detect_window(&mut self) {
+        let segments = self.window_segments();
+        // Advance + drain; in detect mode `release()` returns no raw bytes (the
+        // chunk was already forwarded in `on_chunk`).
+        let _ = self.window.release();
+        if segments.is_empty() || self.inspections_used >= self.config.max_inspections {
+            return;
+        }
+        self.inspections_used += 1;
+        let engine = Arc::clone(&self.engine);
+        let plugin_http_call_ns = Arc::clone(&self.plugin_http_call_ns);
+        let concurrency = self.detect_concurrency.clone();
+        tokio::spawn(async move {
+            // Cap concurrent provider round-trips per response: the permit is held
+            // until the evaluation finishes, so excess windows queue rather than
+            // firing a burst of embedding calls. The stream itself is never blocked
+            // (the bytes were already forwarded in `on_chunk`).
+            let _permit = match concurrency {
+                Some(sem) => sem.acquire_owned().await.ok(),
+                None => None,
+            };
+            let outcome = engine
+                .evaluate(Direction::Response, &segments, &plugin_http_call_ns)
+                .await;
+            let provider_error = engine
+                .should_handle_provider_error(&outcome.decision, outcome.provider_error.as_deref());
+            // Log both `reject` and `warn` hits — same action gate as block mode.
+            // A streamed `warn` cannot write the buffered-path metadata, so the log
+            // is its only audit record.
+            if !provider_error
+                && matches!(outcome.decision.action, Action::Reject | Action::Warn)
+                && !outcome.decision.matches.is_empty()
+            {
+                engine.log_stream_detection(&outcome.decision, false);
+            }
+        });
+    }
+
+    fn terminate(&mut self) -> ResponseStreamAction {
+        self.terminated = true;
+        self.window.discard_pending();
+        let final_bytes = self.config.cut_with_error_event.then(|| {
+            encode_sse_error_event(
+                "ai_semantic_firewall_response_blocked",
+                "AI response was blocked by semantic firewall policy.",
+            )
+        });
+        ResponseStreamAction::Terminate(final_bytes)
+    }
+}
+
+#[async_trait]
+impl ResponseStreamInspector for StreamInspector {
+    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+        if self.terminated {
+            return ResponseStreamAction::Forward(Bytes::new());
+        }
+        match self.config.enforcement {
+            // Hold: emit only what the window engine clears (or cut).
+            StreamEnforcement::Block => {
+                if self.window.ingest(chunk) {
+                    self.act_on_window().await
+                } else {
+                    ResponseStreamAction::Forward(Bytes::new())
+                }
+            }
+            // Release immediately; inspect ready windows only to detect/log (the
+            // evaluation is spawned, so the forward is never stalled).
+            StreamEnforcement::Detect => {
+                let out = Bytes::copy_from_slice(chunk);
+                if self.window.ingest(chunk) {
+                    self.detect_window();
+                }
+                ResponseStreamAction::Forward(out)
+            }
+        }
+    }
+
+    async fn on_end(&mut self) -> ResponseStreamAction {
+        if self.terminated {
+            return ResponseStreamAction::Forward(Bytes::new());
+        }
+        match self.config.enforcement {
+            StreamEnforcement::Block => {
+                if self.window.finish() {
+                    self.act_on_window().await
+                } else {
+                    ResponseStreamAction::Forward(Bytes::new())
+                }
+            }
+            StreamEnforcement::Detect => {
+                if self.window.finish() {
+                    self.detect_window();
+                }
+                ResponseStreamAction::Forward(Bytes::new())
+            }
+        }
+    }
 }
 
 /// Map a reassembled SSE fragment onto a response-direction [`TextSegment`].
@@ -3130,9 +4057,18 @@ fn max_cosine(
 /// override a shared `ai_request_streaming` flag set by another plugin.
 fn buffer_streaming_marker_set(ctx: &RequestContext) -> bool {
     ctx.metadata
-        .get(RESPONSE_INSPECTION_KEY)
+        .get(STREAM_BUFFER_REQUESTED_KEY)
         .map(String::as_str)
-        == Some(STREAMING_BUFFERED_MARKER)
+        == Some("true")
+}
+
+/// Whether `inspect` mode flagged THIS request (a detected `stream: true` JSON
+/// POST) for windowed response inspection — see [`STREAM_INSPECT_REQUESTED_KEY`].
+fn windowed_streaming_marker_set(ctx: &RequestContext) -> bool {
+    ctx.metadata
+        .get(STREAM_INSPECT_REQUESTED_KEY)
+        .map(String::as_str)
+        == Some("true")
 }
 
 fn is_native_grpc_request(ctx: &RequestContext) -> bool {
@@ -3498,5 +4434,229 @@ fn optional_string_vec_in_object(
             .collect::<Result<Vec<_>, _>>()
             .map(Some),
         Some(_) => Err(format!("ai_semantic_firewall: '{field}' must be an array")),
+    }
+}
+
+#[cfg(test)]
+mod stream_window_tests {
+    //! Pure unit tests for the streamed `inspect` window state machine. The
+    //! engine is private and not externally testable without widening the API;
+    //! the async inspector + config are covered by the external plugin tests.
+    use super::*;
+
+    fn cfg(
+        window: StreamWindowKind,
+        max_window_bytes: usize,
+        overlap_bytes: usize,
+    ) -> StreamingInspectConfig {
+        cfg_with(
+            window,
+            max_window_bytes,
+            overlap_bytes,
+            StreamEnforcement::Block,
+        )
+    }
+
+    fn cfg_with(
+        window: StreamWindowKind,
+        max_window_bytes: usize,
+        overlap_bytes: usize,
+        enforcement: StreamEnforcement,
+    ) -> StreamingInspectConfig {
+        StreamingInspectConfig {
+            window,
+            enforcement,
+            max_window_bytes,
+            overlap_bytes,
+            max_inspections: 64,
+            cut_with_error_event: true,
+        }
+    }
+
+    /// Build one SSE chat-completion content-delta event (JSON-escaped).
+    fn content_event(text: &str) -> Vec<u8> {
+        let value = Value::String(text.to_string());
+        format!("data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":{value}}}}}]}}\n\n")
+            .into_bytes()
+    }
+
+    /// The reassembled assistant prose the engine would inspect for the pending
+    /// window (chat-completion content + Responses-API text from the snapshot).
+    fn window_prose(eng: &StreamWindowEngine) -> String {
+        eng.snapshot_texts()
+            .into_iter()
+            .filter(|t| {
+                matches!(
+                    t.kind,
+                    SseTextKind::ChatContent | SseTextKind::ResponsesText
+                )
+            })
+            .map(|t| t.text)
+            .collect()
+    }
+
+    #[test]
+    fn holds_partial_sentence_then_releases_on_boundary() {
+        let mut eng = StreamWindowEngine::new(cfg(StreamWindowKind::Sentence, 4096, 0));
+        let f1 = content_event("Hello ");
+        // No terminator/boundary yet → hold (not ready).
+        assert!(!eng.ingest(&f1));
+        let f2 = content_event("world.");
+        assert!(eng.ingest(&f2), "window ready at sentence boundary");
+        assert_eq!(window_prose(&eng), "Hello world.");
+        // A clean verdict releases the raw bytes of both held events.
+        assert_eq!(eng.release(), [f1, f2].concat());
+    }
+
+    #[test]
+    fn partial_event_without_blank_line_is_held() {
+        let mut eng = StreamWindowEngine::new(cfg(StreamWindowKind::Sentence, 4096, 0));
+        // No "\n\n" terminator and under the cap → nothing reassembled, hold.
+        assert!(!eng.ingest(b"data: {\"choices\":[{\"delta\":{\"content\":\"Hi.\"}}]}"));
+        assert!(eng.release().is_empty());
+    }
+
+    #[test]
+    fn byte_cap_forces_window_without_boundary() {
+        let mut eng = StreamWindowEngine::new(cfg(StreamWindowKind::Bytes, 8, 0));
+        let f = content_event("abcdefghij");
+        assert!(eng.ingest(&f), "forced window at byte cap");
+        assert_eq!(window_prose(&eng), "abcdefghij");
+        assert_eq!(eng.release(), f);
+    }
+
+    #[test]
+    fn overlap_reinspects_prior_cleared_text() {
+        let mut eng = StreamWindowEngine::new(cfg(StreamWindowKind::Sentence, 4096, 5));
+        let f1 = content_event("First one. ");
+        assert!(eng.ingest(&f1));
+        assert!(window_prose(&eng).starts_with("First one."));
+        eng.release();
+        let f2 = content_event("Second.");
+        assert!(eng.ingest(&f2), "second window");
+        let prose = window_prose(&eng);
+        assert!(prose.ends_with("Second."));
+        // Overlap re-introduced cleared text, so the window exceeds just the new text.
+        assert!(prose.len() > "Second.".len());
+    }
+
+    #[test]
+    fn clean_release_drains_retained_prose() {
+        let mut eng = StreamWindowEngine::new(cfg(StreamWindowKind::Sentence, 4096, 4));
+        let f1 = content_event("Aaaaa bbbbb. ");
+        assert!(eng.ingest(&f1));
+        eng.release();
+        // After a clean release the inspected prose is drained down to ~overlap, so
+        // memory does not grow with the whole completion (Codex P2).
+        let retained = window_prose(&eng);
+        assert!(
+            !retained.contains("Aaaaa"),
+            "drained prefix gone: {retained:?}"
+        );
+        assert!(retained.len() < "Aaaaa bbbbb. ".len());
+    }
+
+    #[test]
+    fn finish_flushes_trailing_partial_window() {
+        let mut eng = StreamWindowEngine::new(cfg(StreamWindowKind::Sentence, 4096, 0));
+        let f = content_event("no terminator");
+        assert!(!eng.ingest(&f)); // no sentence boundary yet → hold
+        assert!(eng.finish(), "end-of-stream flushes the held window");
+        assert_eq!(window_prose(&eng), "no terminator");
+        assert_eq!(eng.release(), f);
+    }
+
+    #[test]
+    fn role_only_events_release_with_the_next_content_window() {
+        let mut eng = StreamWindowEngine::new(cfg(StreamWindowKind::Sentence, 4096, 0));
+        let role =
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n".to_vec();
+        assert!(!eng.ingest(&role)); // no content yet
+        let f = content_event("Done.");
+        assert!(eng.ingest(&f));
+        assert_eq!(window_prose(&eng), "Done.");
+        // The role-only event is released alongside the content event it preceded.
+        assert_eq!(eng.release(), [role, f].concat());
+    }
+
+    #[test]
+    fn tool_call_only_stream_is_inspectable() {
+        // A stream with ONLY tool-call deltas (no assistant prose) still surfaces
+        // segments to inspect at end-of-stream, so tool_abuse rules are not
+        // bypassed (Codex P2).
+        let mut eng = StreamWindowEngine::new(cfg(StreamWindowKind::Sentence, 4096, 0));
+        let tool = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"shell\",\"arguments\":\"{\\\"cmd\\\":\\\"rm -rf /\\\"}\"}}]}}]}\n\n".to_vec();
+        assert!(!eng.ingest(&tool)); // no prose boundary, under cap → hold
+        assert!(eng.finish(), "end-of-stream flushes tool-only events");
+        let texts = eng.snapshot_texts();
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.kind == SseTextKind::ChatToolName && t.text == "shell"),
+            "tool-call name must be inspectable: {texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.kind == SseTextKind::ChatToolArguments && t.text.contains("rm -rf")),
+            "tool-call arguments must be inspectable: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn unterminated_nonjson_event_is_flagged_uninspectable() {
+        let mut eng = StreamWindowEngine::new(cfg(StreamWindowKind::Sentence, 4096, 0));
+        // A complete but non-JSON `data:` payload: parsed-but-uninspectable.
+        assert!(!eng.ingest(b"data: not-json\n\n"));
+        assert!(eng.finish());
+        assert!(
+            eng.pending_uninspectable(),
+            "a non-JSON data: event must fail closed in block mode"
+        );
+    }
+
+    #[test]
+    fn carry_overflow_forces_an_uninspectable_window() {
+        // A single event that never sends a blank-line terminator must not buffer
+        // unbounded memory: once `carry` passes the cap it is force-flushed as a
+        // degenerate (un-parseable) event (Codex P2).
+        let mut eng = StreamWindowEngine::new(cfg(StreamWindowKind::Bytes, 16, 0));
+        assert!(!eng.ingest(b"data: ")); // small, under cap
+        assert!(eng.ingest(&[b'a'; 32]), "carry overflow forces a window");
+        assert!(
+            eng.pending_uninspectable(),
+            "the oversized un-terminated event is uninspectable"
+        );
+        assert!(eng.carry.is_empty(), "carry was drained, not retained");
+    }
+
+    #[test]
+    fn detect_mode_does_not_hold_raw_bytes() {
+        // `detect` forwards bytes immediately, so the window engine retains no raw
+        // bytes to release — `release()` only advances offsets.
+        let mut eng = StreamWindowEngine::new(cfg_with(
+            StreamWindowKind::Sentence,
+            4096,
+            0,
+            StreamEnforcement::Detect,
+        ));
+        let f = content_event("Hi there.");
+        assert!(eng.ingest(&f));
+        assert!(
+            eng.release().is_empty(),
+            "detect mode holds no raw bytes for release"
+        );
+    }
+
+    #[test]
+    fn next_event_end_handles_lf_and_crlf() {
+        assert_eq!(next_event_end(b"data: x\n\nrest"), Some(9));
+        assert_eq!(next_event_end(b"data: x\r\n\r\nrest"), Some(11));
+        assert_eq!(next_event_end(b"data: x\n"), None);
+        // Mixed blank-line terminators (Codex round-8): \n\r\n and \r\n\n.
+        assert_eq!(next_event_end(b"data: x\n\r\nrest"), Some(10));
+        assert_eq!(next_event_end(b"data: x\r\n\nrest"), Some(10));
+        // A lone CR is not a blank-line terminator here; no false positive.
+        assert_eq!(next_event_end(b"data: x\ny\n"), None);
     }
 }

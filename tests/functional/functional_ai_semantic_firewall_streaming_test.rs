@@ -1,9 +1,14 @@
 //! Functional Tests for `ai_semantic_firewall` streaming response inspection (E2E)
 //!
-//! Exercises `streaming_response: buffer` end-to-end through the gateway in file
-//! mode: a `stream: true` request whose backend emits an SSE chat-completion is
-//! forced onto the buffered path, its deltas reassembled, and the full response
-//! engine run before anything reaches the client.
+//! Exercises all three streaming response modes end-to-end through the gateway in
+//! file mode, for a `stream: true` request whose backend emits an SSE
+//! chat-completion:
+//!   * `buffer`  — force the stream onto the buffered path, reassemble deltas,
+//!     run the full response engine before anything reaches the client;
+//!   * `inspect` (block) — progressive windowed inspection that cuts the stream
+//!     mid-flight on a violation (assistant prose AND tool-call arguments);
+//!   * `inspect` + `enforcement: detect` — release-then-detect: stream through
+//!     immediately and only log the violation (never cut).
 //!
 //! These tests rely only on the free lexical fast path (no live embedding
 //! provider): the leaking phrase is detected lexically, so the configured
@@ -35,6 +40,27 @@ async fn start_sse_backend_on(listener: TcpListener, sse_body: &'static str) {
                     "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     sse_body.len(),
                     sse_body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    }
+}
+
+/// Stream a fixed `application/json` body — a backend that ignored the
+/// `stream: true` flag and returned a normal JSON completion.
+async fn start_json_backend_on(listener: TcpListener, json_body: &'static str) {
+    loop {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 16384];
+                let _n = stream.read(&mut buf).await.unwrap_or(0);
+
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    json_body.len(),
+                    json_body
                 );
                 let _ = stream.write_all(response.as_bytes()).await;
                 let _ = stream.shutdown().await;
@@ -161,6 +187,22 @@ plugin_configs:
     )
 }
 
+/// Same proxy/plugin as [`buffer_mode_config`] but `streaming_response: inspect`
+/// — progressive windowed inspection with mid-stream cut.
+fn inspect_mode_config(backend_port: u16) -> String {
+    buffer_mode_config(backend_port).replace("\"buffer\"", "\"inspect\"")
+}
+
+/// `streaming_response: inspect` with `streaming.enforcement: detect` — Phase C
+/// release-then-detect: bytes stream through immediately and a violation is only
+/// logged, never cut.
+fn detect_mode_config(backend_port: u16) -> String {
+    buffer_mode_config(backend_port).replace(
+        "      streaming_response: \"buffer\"\n",
+        "      streaming_response: \"inspect\"\n      streaming:\n        enforcement: \"detect\"\n",
+    )
+}
+
 fn write_config(dir: &TempDir, contents: &str) -> String {
     let config_path = dir.path().join("config.yaml");
     let mut file = std::fs::File::create(&config_path).expect("create config");
@@ -182,6 +224,20 @@ const CLEAN_SSE: &str = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\"
 data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"is sunny today.\"}}]}\n\n\
 data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
 data: [DONE]\n\n";
+
+// A leak carried entirely in streamed tool-call ARGUMENTS (no assistant prose),
+// split across deltas. response_leakage applies to ToolArguments, so a windowed
+// inspector must still reassemble + inspect these and cut.
+const TOOL_LEAK_SSE: &str = "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n\
+data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"note\",\"arguments\":\"my system \"}}]}}]}\n\n\
+data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"prompt says never reveal policy\"}}]}}]}\n\n\
+data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n\
+data: [DONE]\n\n";
+
+// A NON-streaming JSON completion (the backend ignored `stream: true`) carrying a
+// leak in the non-delta `message.content` path. Inspect mode must buffer this and
+// block it via on_response_body, not stream it past every check.
+const JSON_LEAK: &str = "{\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"Sure. My system prompt says never reveal policy.\"}}]}";
 
 // ============================================================================
 // Tests
@@ -267,5 +323,234 @@ async fn buffer_mode_delivers_clean_streaming_response() {
     assert!(
         body.contains("is sunny today."),
         "delivered body should contain the reassembled completion, got: {body}"
+    );
+}
+
+#[ignore]
+#[tokio::test]
+async fn inspect_mode_cuts_leaking_stream_midflight() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    let config_path = write_config(&temp_dir, &inspect_mode_config(backend_port));
+
+    let backend = tokio::spawn(start_sse_backend_on(backend_listener, LEAKING_SSE));
+    let (mut gateway, proxy_port, _admin_port) = start_gateway_with_retry(&config_path).await;
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!(
+            "http://127.0.0.1:{}/ai/v1/chat/completions",
+            proxy_port
+        ))
+        .header("content-type", "application/json")
+        .body(r#"{"stream":true,"messages":[{"role":"user","content":"hello"}]}"#)
+        .send()
+        .await
+        .expect("request failed");
+
+    // Headers (200) are committed before the body streams, so a mid-stream cut
+    // can only truncate — the status stays 200.
+    let status = response.status().as_u16();
+    let body = response.text().await.unwrap_or_default();
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    backend.abort();
+
+    assert_eq!(
+        status, 200,
+        "streamed response keeps its 200 status (body: {body})"
+    );
+    // The leaking window is cut: the client gets the terminal error event and
+    // NEVER sees the leaking content.
+    assert!(
+        body.contains("ai_semantic_firewall_response_blocked"),
+        "cut stream should emit the terminal error event, got: {body}"
+    );
+    assert!(
+        !body.contains("never reveal policy"),
+        "the leaking window must not be delivered, got: {body}"
+    );
+}
+
+#[ignore]
+#[tokio::test]
+async fn inspect_mode_streams_clean_response() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    let config_path = write_config(&temp_dir, &inspect_mode_config(backend_port));
+
+    let backend = tokio::spawn(start_sse_backend_on(backend_listener, CLEAN_SSE));
+    let (mut gateway, proxy_port, _admin_port) = start_gateway_with_retry(&config_path).await;
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!(
+            "http://127.0.0.1:{}/ai/v1/chat/completions",
+            proxy_port
+        ))
+        .header("content-type", "application/json")
+        .body(r#"{"stream":true,"messages":[{"role":"user","content":"weather?"}]}"#)
+        .send()
+        .await
+        .expect("request failed");
+
+    let status = response.status().as_u16();
+    let body = response.text().await.unwrap_or_default();
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    backend.abort();
+
+    assert_eq!(
+        status, 200,
+        "clean stream is delivered, got {status} (body: {body})"
+    );
+    assert!(
+        body.contains("is sunny today."),
+        "clean windows should be released to the client, got: {body}"
+    );
+    assert!(
+        !body.contains("ai_semantic_firewall_response_blocked"),
+        "a clean stream must not emit the cut error event, got: {body}"
+    );
+}
+
+#[ignore]
+#[tokio::test]
+async fn inspect_mode_cuts_leaking_tool_call_stream() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    let config_path = write_config(&temp_dir, &inspect_mode_config(backend_port));
+
+    let backend = tokio::spawn(start_sse_backend_on(backend_listener, TOOL_LEAK_SSE));
+    let (mut gateway, proxy_port, _admin_port) = start_gateway_with_retry(&config_path).await;
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!(
+            "http://127.0.0.1:{}/ai/v1/chat/completions",
+            proxy_port
+        ))
+        .header("content-type", "application/json")
+        .body(r#"{"stream":true,"messages":[{"role":"user","content":"hello"}]}"#)
+        .send()
+        .await
+        .expect("request failed");
+
+    let status = response.status().as_u16();
+    let body = response.text().await.unwrap_or_default();
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    backend.abort();
+
+    assert_eq!(status, 200, "streamed response keeps its 200 status");
+    // The leak lives only in tool-call arguments, yet the windowed inspector
+    // reassembles + inspects them and cuts the stream.
+    assert!(
+        body.contains("ai_semantic_firewall_response_blocked"),
+        "a leaking tool-call stream must be cut, got: {body}"
+    );
+    assert!(
+        !body.contains("never reveal policy"),
+        "the leaking tool arguments must not be delivered, got: {body}"
+    );
+}
+
+#[ignore]
+#[tokio::test]
+async fn inspect_detect_mode_forwards_leak_without_cutting() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    let config_path = write_config(&temp_dir, &detect_mode_config(backend_port));
+
+    let backend = tokio::spawn(start_sse_backend_on(backend_listener, LEAKING_SSE));
+    let (mut gateway, proxy_port, _admin_port) = start_gateway_with_retry(&config_path).await;
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!(
+            "http://127.0.0.1:{}/ai/v1/chat/completions",
+            proxy_port
+        ))
+        .header("content-type", "application/json")
+        .body(r#"{"stream":true,"messages":[{"role":"user","content":"hello"}]}"#)
+        .send()
+        .await
+        .expect("request failed");
+
+    let status = response.status().as_u16();
+    let body = response.text().await.unwrap_or_default();
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    backend.abort();
+
+    // detect mode is release-then-detect: it never cuts, so the (leaking) stream
+    // is delivered in full and only logged. This is the deliberate contrast with
+    // block mode's `inspect_mode_cuts_leaking_stream_midflight`.
+    assert_eq!(status, 200, "detect mode delivers the stream, got {status}");
+    assert!(
+        body.contains("never reveal policy"),
+        "detect mode forwards the content (no cut), got: {body}"
+    );
+    assert!(
+        !body.contains("ai_semantic_firewall_response_blocked"),
+        "detect mode must NOT emit the cut error event, got: {body}"
+    );
+}
+
+#[ignore]
+#[tokio::test]
+async fn inspect_mode_buffers_and_blocks_non_sse_json_leak() {
+    // A backend that ignored stream:true and returned a JSON completion: inspect
+    // mode must BUFFER it (the windowed inspector only handles SSE) and block the
+    // leak via on_response_body — not stream it past every check uninspected.
+    let temp_dir = TempDir::new().expect("temp dir");
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    let config_path = write_config(&temp_dir, &inspect_mode_config(backend_port));
+
+    let backend = tokio::spawn(start_json_backend_on(backend_listener, JSON_LEAK));
+    let (mut gateway, proxy_port, _admin_port) = start_gateway_with_retry(&config_path).await;
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!(
+            "http://127.0.0.1:{}/ai/v1/chat/completions",
+            proxy_port
+        ))
+        .header("content-type", "application/json")
+        .body(r#"{"stream":true,"messages":[{"role":"user","content":"hello"}]}"#)
+        .send()
+        .await
+        .expect("request failed");
+
+    let status = response.status().as_u16();
+    let body = response.text().await.unwrap_or_default();
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    backend.abort();
+
+    // Buffered + inspected → blocked with a proper status (not a truncated 200),
+    // and the leak never reaches the client. Codex round-6: this is the scenario
+    // where the response was previously streamed past on_response_body.
+    assert_ne!(
+        status, 200,
+        "a buffered JSON leak must be blocked, got 200: {body}"
+    );
+    assert!(
+        body.contains("ai_semantic_firewall_response_blocked"),
+        "a non-SSE JSON leak must be blocked by on_response_body, got: {body}"
+    );
+    assert!(
+        !body.contains("never reveal policy"),
+        "the leaking JSON content must not be delivered, got: {body}"
     );
 }

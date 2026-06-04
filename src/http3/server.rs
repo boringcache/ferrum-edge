@@ -26,7 +26,9 @@ use super::config::Http3ServerConfig;
 use crate::config::types::{HttpFlavor, Proxy, UpstreamTarget};
 use crate::consumer_index::ConsumerIndex;
 use crate::load_balancer::LoadBalancerCache;
-use crate::plugins::{Plugin, PluginResult, ProxyProtocol, RequestContext, TransactionSummary};
+use crate::plugins::{
+    Plugin, PluginResult, ProxyProtocol, RequestContext, ResponseStreamAction, TransactionSummary,
+};
 use crate::proxy::headers::{
     apply_response_headers, is_backend_request_strip_header, is_backend_response_strip_header,
     parse_connection_listed_from_str_map,
@@ -1904,7 +1906,14 @@ async fn handle_h3_request(
         .await;
     }
 
+    // A request that will be response-stream-inspected (e.g. ai_semantic_firewall
+    // `inspect`, which pre-buffers the `stream: true` request to set its marker)
+    // must dispatch through the cross-protocol/reqwest path, where the inspector
+    // is wired — the native-H3 pool's several send loops are not. Mirrors the
+    // H1/H2 frontend's `forces_reqwest_dispatch` gate; unmarked requests keep
+    // native H3.
     let use_native_h3_pool = http_flavor == HttpFlavor::Plain
+        && !plugins.iter().any(|p| p.forces_reqwest_dispatch(&ctx))
         && crate::proxy::supports_native_http3_backend(&state, &proxy, upstream_target.as_deref());
     if !use_native_h3_pool {
         let prebuffered = if needs_request_buffering {
@@ -2431,6 +2440,36 @@ async fn handle_h3_request(
             &mut response_headers,
         );
 
+        // Streaming response inspection (e.g. ai_semantic_firewall `inspect` mode):
+        // if a plugin opts in for this event-stream response it returns a stateful
+        // inspector the loop drives chunk-by-chunk (Forward releases bytes,
+        // Terminate cuts). Computed BEFORE the headers are sent so Content-Length
+        // can be stripped — the inspector transforms the body, so the backend's
+        // length no longer applies and would make a cut look like a truncated body.
+        // Gated once per response; the common case (no opt-in) skips it entirely.
+        let mut response_inspector = if plugins.iter().any(|p| p.requires_response_stream_hooks()) {
+            let content_type = response_headers.get("content-type").map(String::as_str);
+            // Chain EVERY opted-in plugin (not just the first), gated to the
+            // response status so error bodies are not inspected.
+            let inspectors: Vec<_> = plugins
+                .iter()
+                .filter_map(|p| p.response_stream_inspector(&ctx, response_status, content_type))
+                .collect();
+            crate::plugins::chain_response_stream_inspectors(inspectors)
+        } else {
+            None
+        };
+        // Capture the backend's declared length BEFORE stripping it for the
+        // client — the graceful-close recovery below still needs it to tell a
+        // complete body from a truncated one (an inspected response strips
+        // Content-Length because the inspector transforms the body).
+        let declared_content_length: Option<u64> = response_headers
+            .get("content-length")
+            .and_then(|v| v.parse().ok());
+        if response_inspector.is_some() {
+            response_headers.remove("content-length");
+        }
+
         // Send response headers on the H3 stream
         let status_code = StatusCode::from_u16(response_status).unwrap_or(StatusCode::BAD_GATEWAY);
         let mut resp_builder =
@@ -2445,7 +2484,8 @@ async fn handle_h3_request(
 
         // Stream response body from backend h3 recv_stream to frontend h3 stream.
         // Uses a pinned Sleep that is reset in-place to avoid allocating a new
-        // timer wheel entry on every select! iteration.
+        // timer wheel entry on every select! iteration. `response_inspector` was
+        // resolved above (before the headers were sent).
         let coalesce_min_bytes = state.env_config.http3_coalesce_min_bytes;
         let coalesce_max_bytes = state.env_config.http3_coalesce_max_bytes;
         let flush_interval =
@@ -2482,6 +2522,55 @@ async fn handle_h3_request(
                                 body_error_class = Some(crate::retry::ErrorClass::ResponseBodyTooLarge);
                                 break 'outer;
                             }
+                            // Windowed inspection (bypasses coalescing): the
+                            // inspector holds raw bytes until a window is cleared,
+                            // then releases them verbatim, or cuts the stream.
+                            if let Some(inspector) = response_inspector.as_mut() {
+                                let chunk_bytes =
+                                    crate::http3::config::copy_remaining_response_chunk(&mut chunk);
+                                match inspector.on_chunk(&chunk_bytes).await {
+                                    ResponseStreamAction::Forward(out) => {
+                                        if !out.is_empty() {
+                                            let out_len = out.len() as u64;
+                                            if stream.send_data(out).await.is_err() {
+                                                client_disconnected = true;
+                                                body_error_class =
+                                                    Some(crate::retry::ErrorClass::ClientDisconnect);
+                                                break 'outer;
+                                            }
+                                            bytes_streamed += out_len;
+                                            flush_timer.as_mut().reset(
+                                                tokio::time::Instant::now() + flush_interval,
+                                            );
+                                        }
+                                    }
+                                    ResponseStreamAction::Terminate(final_bytes) => {
+                                        // Policy cut: emit the optional terminal event,
+                                        // end the stream. A clean cut is a NORMAL
+                                        // completion (no backend fault, no LB/capability
+                                        // penalty) — but only if the client is still
+                                        // there; a failed send/finish is a disconnect,
+                                        // not a clean completion.
+                                        if let Some(fb) = final_bytes
+                                            && !fb.is_empty()
+                                        {
+                                            let fb_len = fb.len() as u64;
+                                            if stream.send_data(fb).await.is_ok() {
+                                                bytes_streamed += fb_len;
+                                            }
+                                        }
+                                        if stream.finish().await.is_ok() {
+                                            body_completed = true;
+                                        } else {
+                                            client_disconnected = true;
+                                            body_error_class =
+                                                Some(crate::retry::ErrorClass::ClientDisconnect);
+                                        }
+                                        break 'outer;
+                                    }
+                                }
+                                continue;
+                            }
                             if crate::http3::config::should_direct_send_response_chunk(
                                 coalesce_buf.len(),
                                 chunk_len,
@@ -2516,9 +2605,7 @@ async fn handle_h3_request(
                         }
                         Ok(None) => { stream_done = true; }
                         Err(e) => {
-                            let cl: Option<u64> = response_headers
-                                .get("content-length")
-                                .and_then(|v| v.parse().ok());
+                            let cl: Option<u64> = declared_content_length;
                             let received = total_streamed as u64;
                             if crate::http3::client::is_h3_graceful_close(&e)
                                 && crate::http3::client::is_response_body_complete(
@@ -2559,7 +2646,29 @@ async fn handle_h3_request(
                 }
             }
             if stream_done {
-                if !coalesce_buf.is_empty() {
+                if let Some(inspector) = response_inspector.as_mut() {
+                    // Flush / inspect the trailing partial window at end of stream.
+                    match inspector.on_end().await {
+                        ResponseStreamAction::Forward(out) => {
+                            if !out.is_empty() {
+                                let out_len = out.len() as u64;
+                                if stream.send_data(out).await.is_ok() {
+                                    bytes_streamed += out_len;
+                                }
+                            }
+                        }
+                        ResponseStreamAction::Terminate(final_bytes) => {
+                            if let Some(fb) = final_bytes
+                                && !fb.is_empty()
+                            {
+                                let fb_len = fb.len() as u64;
+                                if stream.send_data(fb).await.is_ok() {
+                                    bytes_streamed += fb_len;
+                                }
+                            }
+                        }
+                    }
+                } else if !coalesce_buf.is_empty() {
                     let data = coalesce_buf.split().freeze();
                     let data_len = data.len() as u64;
                     if stream.send_data(data).await.is_err() {

@@ -135,6 +135,59 @@ pub fn parse_sse_data_frames_checked(body: &[u8]) -> SseParse {
     }
 }
 
+/// Encode an OpenAI-compatible terminal SSE error event for mid-stream
+/// termination: an `event: error` frame carrying `{"error":{"code","message"}}`
+/// followed by the `[DONE]` sentinel. A streaming client surfaces the trailing
+/// `error` data event and sees a clean end-of-stream rather than a silently
+/// truncated body.
+///
+/// `code` and `message` are JSON-escaped via `serde_json`, so embedded quotes or
+/// newlines cannot break out of the frame structure (control characters are
+/// escaped, keeping the payload on a single `data:` line).
+pub fn encode_sse_error_event(code: &str, message: &str) -> bytes::Bytes {
+    let payload = serde_json::json!({
+        "error": { "code": code, "message": message }
+    });
+    // serde_json's `Display` is compact and single-line, so the payload is a
+    // valid one-line SSE `data:` value.
+    bytes::Bytes::from(format!("event: error\ndata: {payload}\n\ndata: [DONE]\n\n"))
+}
+
+/// Floor `idx` down to the nearest UTF-8 char boundary at or below it in `s`.
+/// Window release/overlap offsets are computed from byte lengths, so callers
+/// snap them here before slicing to avoid panicking on multi-byte content.
+pub fn floor_char_boundary(s: &str, idx: usize) -> usize {
+    let mut i = idx.min(s.len());
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// Byte index just past the last sentence-terminating `.`/`!`/`?` that is
+/// followed by whitespace (or end of text) in `s`, or `None` when `s` holds no
+/// complete sentence. Lets streamed inspection release windows at sentence
+/// granularity. Terminators are ASCII, so the returned index is always a char
+/// boundary. Intentionally simple — an abbreviation or decimal just yields an
+/// earlier (still safe) window boundary.
+pub fn last_sentence_boundary(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut last = None;
+    for i in 0..bytes.len() {
+        if matches!(bytes[i], b'.' | b'!' | b'?')
+            && bytes.get(i + 1).is_none_or(u8::is_ascii_whitespace)
+        {
+            last = Some(i + 1);
+        }
+    }
+    last
+}
+
+/// Byte index just past the last paragraph break (blank line) in `s`, or `None`.
+pub fn last_paragraph_boundary(s: &str) -> Option<usize> {
+    s.rfind("\n\n").map(|i| i + 2)
+}
+
 /// Logical role of a reassembled streaming-SSE text fragment, so callers can map
 /// it onto their own segment taxonomy without re-deriving the JSON shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,7 +217,7 @@ pub struct SseText {
     pub text: String,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct ToolCallAccumulator {
     name: String,
     arguments: String,
@@ -184,7 +237,7 @@ struct ToolCallAccumulator {
 ///
 /// Insertion order is preserved across all accumulators so the output is
 /// deterministic.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct SseReassembler {
     /// `choice_index -> assistant content`.
     content: Vec<(usize, String)>,
@@ -199,6 +252,104 @@ pub struct SseReassembler {
 impl SseReassembler {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The assistant prose reassembled so far — chat-completion `delta.content`
+    /// across choices (in choice-index order) followed by Responses-API output
+    /// text. This is the stream that windowed inspection scans for sentence /
+    /// paragraph boundaries; tool-call arguments are inspected separately. With
+    /// parallel choices (`n > 1`) the texts are concatenated, which is an
+    /// approximation — `n = 1` is the dominant streaming case.
+    pub fn assistant_content(&self) -> String {
+        let mut combined = String::new();
+        for (_choice, text) in &self.content {
+            combined.push_str(text);
+        }
+        for (_key, text) in &self.responses_text {
+            combined.push_str(text);
+        }
+        combined
+    }
+
+    /// Byte length of [`assistant_content`](Self::assistant_content) without
+    /// allocating the joined string. Streamed `inspect` mode queries this per
+    /// event to track window/release offsets, so building the full string each
+    /// time would be O(n²) in the completion length.
+    pub fn assistant_content_len(&self) -> usize {
+        let content: usize = self.content.iter().map(|(_, t)| t.len()).sum();
+        let responses: usize = self.responses_text.iter().map(|(_, t)| t.len()).sum();
+        content + responses
+    }
+
+    /// Reassembled fragments as of now, **without** consuming the accumulator —
+    /// the streamed `inspect` path inspects the current window repeatedly as the
+    /// stream grows, so it cannot move the strings out the way
+    /// [`into_texts`](Self::into_texts) does for the one-shot buffered path.
+    pub fn texts(&self) -> Vec<SseText> {
+        self.clone().into_texts()
+    }
+
+    /// Trim each streamed tool-call argument accumulator (and Responses-API
+    /// function-call arguments) to its last `keep_tail` bytes, dropping the
+    /// already-inspected prefix.
+    ///
+    /// Counterpart to [`drain_assistant_prefix`](Self::drain_assistant_prefix)
+    /// for the non-prose accumulators: streamed `inspect` mode inspects tool-call
+    /// arguments alongside prose, so without trimming, a large `tool_calls[].
+    /// arguments` payload would be retained (and re-inspected) in full until EOF.
+    /// The caller trims only AFTER a window inspected those bytes clean, so the
+    /// dropped prefix was already evaluated; the kept tail preserves the
+    /// re-inspection overlap. Tool-call *names* are left intact (bounded by the
+    /// function name length). `keep_tail` is snapped up to a char boundary so the
+    /// retained tail never starts mid-character.
+    pub fn truncate_streamed_tool_args(&mut self, keep_tail: usize) {
+        fn trim(text: &mut String, keep_tail: usize) {
+            if text.len() > keep_tail {
+                let drop = floor_char_boundary(text, text.len() - keep_tail);
+                text.drain(..drop);
+            }
+        }
+        for (_key, accum) in &mut self.tool_calls {
+            trim(&mut accum.arguments, keep_tail);
+        }
+        for (_output, text) in &mut self.responses_args {
+            trim(text, keep_tail);
+        }
+    }
+
+    /// Drop the first `prefix_len` bytes of the logical
+    /// [`assistant_content`](Self::assistant_content) (chat-completion content
+    /// across choices, then Responses-API output text), keeping the tail.
+    ///
+    /// Streamed `inspect` mode calls this after releasing an inspected-clean
+    /// window so retained prose stays bounded to roughly one window plus the
+    /// re-inspection overlap, rather than growing with the whole completion.
+    /// Tool-call accumulators are intentionally left intact — they are bounded
+    /// by the size of the function-call payloads, not the prose length, and have
+    /// no linear release offset. `prefix_len` is snapped down to a char boundary
+    /// per entry, so a value landing mid-character simply retains a few extra
+    /// bytes (always safe — never drops un-inspected content).
+    pub fn drain_assistant_prefix(&mut self, prefix_len: usize) {
+        let mut remaining = prefix_len;
+        let drain_one = |text: &mut String, remaining: &mut usize| {
+            if *remaining == 0 {
+                return;
+            }
+            if *remaining >= text.len() {
+                *remaining -= text.len();
+                text.clear();
+            } else {
+                let cut = floor_char_boundary(text, *remaining);
+                text.drain(..cut);
+                *remaining = 0;
+            }
+        };
+        for (_choice, text) in &mut self.content {
+            drain_one(text, &mut remaining);
+        }
+        for (_key, text) in &mut self.responses_text {
+            drain_one(text, &mut remaining);
+        }
     }
 
     /// Accumulate one already-parsed SSE `data:` frame.
@@ -545,6 +696,139 @@ mod tests {
         let parsed = parse_sse_data_frames_checked(body);
         assert!(parsed.frames.is_empty());
         assert!(parsed.fully_parsed);
+    }
+
+    #[test]
+    fn encodes_terminal_sse_error_event() {
+        let bytes = encode_sse_error_event("ai_semantic_firewall_response_blocked", "blocked");
+        let text = std::str::from_utf8(&bytes).expect("utf8");
+        assert!(text.starts_with("event: error\ndata: {"));
+        assert!(text.ends_with("\n\ndata: [DONE]\n\n"));
+        // The data payload round-trips through the parser as one JSON frame.
+        let frames = parse_sse_data_frames(&bytes);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(
+            frames[0]["error"]["code"],
+            "ai_semantic_firewall_response_blocked"
+        );
+        assert_eq!(frames[0]["error"]["message"], "blocked");
+    }
+
+    #[test]
+    fn encode_sse_error_event_escapes_payload() {
+        // Embedded quotes / newlines must not break out of the single data line.
+        let bytes = encode_sse_error_event("c", "line1\nline2 \"q\"");
+        let frames = parse_sse_data_frames(&bytes);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0]["error"]["message"], "line1\nline2 \"q\"");
+    }
+
+    #[test]
+    fn assistant_content_concatenates_choice_and_responses_text() {
+        let mut r = SseReassembler::new();
+        for frame in parse_sse_data_frames(
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello \"}}]}\n\n\
+data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"world.\"}}]}\n\n",
+        ) {
+            r.push_frame(&frame);
+        }
+        assert_eq!(r.assistant_content(), "Hello world.");
+        // The no-alloc length tracks the joined string exactly.
+        assert_eq!(r.assistant_content_len(), "Hello world.".len());
+        // `texts()` is non-consuming and equals the consuming `into_texts()`.
+        assert_eq!(r.texts(), r.clone().into_texts());
+    }
+
+    #[test]
+    fn drain_assistant_prefix_keeps_tail_and_snaps_boundaries() {
+        let mut r = SseReassembler::new();
+        for frame in parse_sse_data_frames(
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello world.\"}}]}\n\n",
+        ) {
+            r.push_frame(&frame);
+        }
+        // Drop the first sentence, keep the tail.
+        r.drain_assistant_prefix("Hello ".len());
+        assert_eq!(r.assistant_content(), "world.");
+        assert_eq!(r.assistant_content_len(), "world.".len());
+
+        // A prefix landing mid-multibyte-char snaps down (retains a few extra
+        // bytes) rather than panicking or dropping a partial char.
+        let mut m = SseReassembler::new();
+        for frame in parse_sse_data_frames(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"aé\"}}]}\n\n".as_bytes(),
+        ) {
+            m.push_frame(&frame);
+        }
+        m.drain_assistant_prefix(2); // index 2 is mid-'é' → floors to 1
+        assert_eq!(m.assistant_content(), "é");
+
+        // Tool-call accumulators are NOT drained by a prose-prefix drain.
+        let mut t = SseReassembler::new();
+        for frame in parse_sse_data_frames(
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"exec\",\"arguments\":\"{}\"}}]}}]}\n\n",
+        ) {
+            t.push_frame(&frame);
+        }
+        t.drain_assistant_prefix(100);
+        assert!(t.texts().iter().any(|x| x.text == "exec"));
+    }
+
+    #[test]
+    fn truncate_streamed_tool_args_bounds_arguments_keeping_tail() {
+        let mut r = SseReassembler::new();
+        // A long tool-call argument stream (well past any small keep_tail).
+        let big = "X".repeat(500);
+        let frame = format!(
+            "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"index\":0,\"function\":{{\"name\":\"run\",\"arguments\":\"{big}\"}}}}]}}}}]}}\n\n"
+        );
+        for f in parse_sse_data_frames(frame.as_bytes()) {
+            r.push_frame(&f);
+        }
+        r.truncate_streamed_tool_args(64);
+        let args = r
+            .texts()
+            .into_iter()
+            .find(|t| t.kind == SseTextKind::ChatToolArguments)
+            .map(|t| t.text)
+            .unwrap_or_default();
+        assert!(
+            args.len() <= 64,
+            "args bounded to ~keep_tail, got {}",
+            args.len()
+        );
+        assert!(args.chars().all(|c| c == 'X'), "kept the argument tail");
+        // The tool NAME is never trimmed.
+        assert!(r.texts().iter().any(|t| t.text == "run"));
+    }
+
+    #[test]
+    fn last_sentence_boundary_finds_terminator_before_whitespace() {
+        assert_eq!(last_sentence_boundary("Hello world. More"), Some(12));
+        // Last terminator+whitespace wins: '!' at index 8 → boundary 9.
+        assert_eq!(last_sentence_boundary("One. Two! Three"), Some(9));
+        assert_eq!(
+            last_sentence_boundary("ends.").map(|i| &"ends."[..i]),
+            Some("ends.")
+        );
+        // No terminator-then-space (or end): no complete sentence.
+        assert_eq!(last_sentence_boundary("no boundary here"), None);
+        assert_eq!(last_sentence_boundary("mid.dle"), None);
+    }
+
+    #[test]
+    fn last_paragraph_boundary_finds_blank_line() {
+        assert_eq!(last_paragraph_boundary("para one\n\npara two"), Some(10));
+        assert_eq!(last_paragraph_boundary("single line"), None);
+    }
+
+    #[test]
+    fn floor_char_boundary_snaps_into_multibyte_content() {
+        let s = "aé"; // 'a' (1 byte) + 'é' (2 bytes) => len 3
+        assert_eq!(floor_char_boundary(s, 2), 1); // index 2 is mid-'é' → floor to 1
+        assert_eq!(floor_char_boundary(s, 1), 1);
+        assert_eq!(floor_char_boundary(s, 3), 3);
+        assert_eq!(floor_char_boundary(s, 99), 3); // clamps to len
     }
 
     fn reassemble(body: &[u8]) -> Vec<SseText> {

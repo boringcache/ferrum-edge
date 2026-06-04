@@ -12624,9 +12624,45 @@ components:
           description: Default action for built-in semantic rules.
         streaming_response:
           type: string
-          enum: [skip, reject, buffer]
+          enum: [skip, reject, buffer, inspect]
           default: skip
-          description: Behavior for stream:true requests when response-side inspection is active. skip allows the streamed response uninspected (fail-open, recorded in ai_semantic_firewall.response_inspection_skipped); reject fails closed and rejects the request so a client cannot disable response inspection by streaming — clients retry with stream:false to receive an inspectable buffered response; buffer forces the streamed response onto the buffered path, reassembles its SSE deltas into coherent text, and runs the full response engine before anything reaches the client (most accurate, highest time-to-first-byte; an oversized stream fails closed via FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES). buffer records ai_semantic_firewall.response_inspection=streaming_buffered.
+          description: Behavior for stream:true requests when response-side inspection is active. skip allows the streamed response uninspected (fail-open, recorded in ai_semantic_firewall.response_inspection_skipped); reject fails closed and rejects the request so a client cannot disable response inspection by streaming — clients retry with stream:false to receive an inspectable buffered response; buffer forces the streamed response onto the buffered path, reassembles its SSE deltas into coherent text, and runs the full response engine before anything reaches the client (most accurate, highest time-to-first-byte; an oversized stream fails closed via FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES); inspect inspects the stream progressively in windows (reassemble to a sentence/paragraph or byte-cap boundary, inspect, release if clean) and cuts the stream mid-flight on a violation with a terminal SSE error event — preserves streaming UX (low time-to-first-byte) at the cost of windowed granularity plus a per-window inspection. inspect records ai_semantic_firewall.response_inspection=streaming_windowed.
+        streaming:
+          type: object
+          description: Windowed-inspection tuning. Only valid when streaming_response is inspect.
+          properties:
+            window:
+              type: string
+              enum: [sentence, paragraph, bytes]
+              default: sentence
+              description: Window boundary detector (window=tokens is not yet supported).
+            max_window_bytes:
+              type: integer
+              format: uint
+              minimum: 1
+              default: 4096
+              description: Hard cap on held (un-released) raw bytes; forces a window even mid-sentence and bounds the un-terminated carry, bounding added latency and held memory. A single SSE event larger than this is treated as uninspectable (fails closed under on_error=reject, forwarded under warn/allow).
+            overlap_bytes:
+              type: integer
+              format: uint
+              default: 256
+              description: Bytes of already-cleared text re-inspected with the next window so a violation phrase split across a boundary is still caught. Also the amount of reassembled prose retained after a clean release, so memory stays bounded to roughly one window plus this overlap.
+            max_inspections:
+              type: integer
+              format: uint
+              minimum: 1
+              default: 64
+              description: Safety cap on provider inspections per response. Once reached, further inspectable windows honor on_error (reject cuts/fail-closed; warn/allow forward best-effort).
+            on_violation:
+              type: string
+              enum: [cut_with_error_event, cut_silent]
+              default: cut_with_error_event
+              description: Whether a cut emits an OpenAI-compatible terminal SSE error event or ends the stream silently. Applies to enforcement=block only (detect never cuts).
+            enforcement:
+              type: string
+              enum: [block, detect]
+              default: block
+              description: block holds each window until it passes inspection, then releases it (or cuts the stream on a violation) — no un-inspected bytes reach the client, at the cost of windowing latency. detect is release-then-detect — bytes stream through immediately and a violation is only logged (to the structured log, never the client or metrics), never cut; use it to observe what would be blocked without affecting traffic.
         provider:
           type: object
           required: [type, endpoint]
