@@ -144,7 +144,18 @@ impl ClientSubscriptionState {
         }
     }
 
-    fn build_initial_requests(&self, node_id: &str, cluster: &str) -> Vec<DiscoveryRequest> {
+    fn build_initial_requests(
+        &self,
+        node_id: &str,
+        cluster: &str,
+        workload_spiffe_id: Option<&str>,
+    ) -> Vec<DiscoveryRequest> {
+        // Carry the workload SPIFFE in `Node.metadata` so a Ferrum CP can
+        // identify this workload even when `node_id` is a hostname (the common
+        // default). The CP needs it to compute Sidecar-aware narrowing and the
+        // un-narrowed local-inbound-service view; without it a restrictive
+        // Sidecar would narrow the local service out of the ECDS carriers.
+        let node_metadata = crate::xds::carrier::encode_node_metadata(workload_spiffe_id);
         INITIAL_TYPE_URL_ORDER
             .iter()
             .map(|type_url| {
@@ -156,7 +167,7 @@ impl ClientSubscriptionState {
                     node: Some(Node {
                         id: node_id.to_string(),
                         cluster: cluster.to_string(),
-                        metadata: Vec::new(),
+                        metadata: node_metadata.clone(),
                     }),
                     // Phase B subscribes wildcard-style to each supported type URL.
                     // Ferrum CP and Istio wildcard modes accept empty resource_names;
@@ -742,10 +753,11 @@ async fn run_ads_stream_with_auth(
     // resumes from the last acknowledged state.
     stream_state.reset_for_new_stream();
 
-    for request in stream_state
-        .subscriptions
-        .build_initial_requests(&config.node_id, &config.cluster)
-    {
+    for request in stream_state.subscriptions.build_initial_requests(
+        &config.node_id,
+        &config.cluster,
+        config.workload_spiffe_id.as_deref(),
+    ) {
         tx.send(request)
             .await
             .map_err(|_| anyhow::anyhow!("xDS ADS request stream closed before initial request"))?;
@@ -1340,6 +1352,11 @@ fn reverse_translate(
         // CP) or the slice genuinely has no workloads.
         workloads: recovered.workloads,
         services,
+        // Inbound-only un-narrowed local services recovered from the dedicated
+        // carrier (kept separate from `services` so egress scope / the outbound
+        // registry is never widened). Empty when the CP applied no Sidecar
+        // narrowing; the materializer then falls back to `services`.
+        local_inbound_services: recovered.local_inbound_services,
         // GAP-1a: authorization policies recovered from the MeshPolicies
         // carrier. Without this the xDS mesh had NO authz (implicit allow-all).
         mesh_policies: recovered.mesh_policies,
@@ -1402,6 +1419,7 @@ fn reverse_translate(
 struct RecoveredSliceCarriers {
     slice_carrier_seen: bool,
     services: Option<Vec<MeshService>>,
+    local_inbound_services: Vec<MeshService>,
     labels: Option<BTreeMap<String, String>>,
     workloads: Vec<crate::modes::mesh::config::Workload>,
     mesh_policies: Vec<crate::modes::mesh::config::MeshPolicy>,
@@ -1622,6 +1640,7 @@ fn apply_recovered_carrier(
     recovered.slice_carrier_seen = true;
     match carrier {
         MeshSliceCarrier::Services(value) => recovered.services = Some(value),
+        MeshSliceCarrier::LocalInboundServices(value) => recovered.local_inbound_services = value,
         MeshSliceCarrier::Workloads(value) => recovered.workloads = value,
         MeshSliceCarrier::WorkloadLabels(value) => recovered.labels = Some(value),
         MeshSliceCarrier::MeshPolicies(value) => recovered.mesh_policies = value,
@@ -1912,7 +1931,8 @@ mod tests {
 
     #[test]
     fn initial_requests_are_ordered_cds_first() {
-        let requests = ClientSubscriptionState::new().build_initial_requests("node-a", "default");
+        let requests =
+            ClientSubscriptionState::new().build_initial_requests("node-a", "default", None);
         let type_urls: Vec<&str> = requests
             .iter()
             .map(|request| request.type_url.as_str())
@@ -1936,6 +1956,29 @@ mod tests {
                 .iter()
                 .all(|request| request.resource_names.is_empty())
         );
+    }
+
+    #[test]
+    fn initial_requests_carry_workload_spiffe_in_node_metadata() {
+        // The CP needs the workload SPIFFE to compute Sidecar narrowing / the
+        // local-inbound view; it travels in `Node.metadata` so a hostname
+        // `node_id` still works.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/api";
+        let requests = ClientSubscriptionState::new().build_initial_requests(
+            "host-1",
+            "default",
+            Some(spiffe),
+        );
+        let node = requests[0].node.as_ref().expect("node present");
+        assert_eq!(
+            crate::xds::carrier::decode_node_metadata(&node.metadata)
+                .workload_spiffe_id
+                .as_deref(),
+            Some(spiffe)
+        );
+        // Without a workload SPIFFE, metadata stays empty (prior wire shape).
+        let none = ClientSubscriptionState::new().build_initial_requests("host-1", "default", None);
+        assert!(none[0].node.as_ref().unwrap().metadata.is_empty());
     }
 
     #[test]
@@ -1991,7 +2034,7 @@ mod tests {
         state.record_response(CDS_TYPE_URL, "v1", "n1");
         state.mark_acked(CDS_TYPE_URL);
 
-        let requests = state.build_initial_requests("node-a", "default");
+        let requests = state.build_initial_requests("node-a", "default", None);
         let cds = requests
             .iter()
             .find(|request| request.type_url == CDS_TYPE_URL)
@@ -2032,7 +2075,7 @@ mod tests {
         assert!(
             state
                 .subscriptions
-                .build_initial_requests("node-a", "default")
+                .build_initial_requests("node-a", "default", None)
                 .iter()
                 .all(|request| request.version_info.is_empty())
         );
@@ -3004,7 +3047,7 @@ mod tests {
         state.reset_for_new_stream();
         let initial = state
             .subscriptions
-            .build_initial_requests("node-a", "default");
+            .build_initial_requests("node-a", "default", None);
         let cds = initial
             .iter()
             .find(|r| r.type_url == CDS_TYPE_URL)
@@ -3969,7 +4012,10 @@ mod tests {
             version: "v1".to_string(),
             labels: BTreeMap::from([("app".to_string(), "api".to_string())]),
             workloads: vec![workload],
-            services: vec![service],
+            services: vec![service.clone()],
+            // Inbound-only un-narrowed view must round-trip via its dedicated
+            // ECDS carrier independent of the egress-narrowed `services`.
+            local_inbound_services: vec![service],
             mesh_policies: vec![MeshPolicy {
                 name: "allow-api".to_string(),
                 namespace: "default".to_string(),
@@ -4116,6 +4162,11 @@ mod tests {
         // Services round-trip with full protocol + workload-ref shape via the
         // Services carrier (not the name-only CDS/EDS reconstruction).
         assert_eq!(recovered.services, native.services);
+        // The inbound-only un-narrowed view round-trips via its own carrier.
+        assert_eq!(
+            recovered.local_inbound_services,
+            native.local_inbound_services
+        );
 
         // Resolved-behavior parity spot-checks: the recovered slice answers
         // the same mTLS-posture and outbound-policy questions native would.

@@ -1404,32 +1404,23 @@ fn materialize_sidecar_inbound_proxies(
         .multi_cluster
         .as_ref()
         .and_then(|mc| mc.local_cluster.as_deref());
+    // Inbound serving must not be gated by egress scope: prefer the un-narrowed
+    // local-inbound view when the slice carries one (populated when Sidecar
+    // egress narrowing is active), else fall back to `services` (already the
+    // full set when no narrowing applies). Reading `local_inbound_services`
+    // keeps the egress/outbound-registry `services` view untouched.
+    let inbound_services = if mesh_slice.local_inbound_services.is_empty() {
+        mesh_slice.services.as_slice()
+    } else {
+        mesh_slice.local_inbound_services.as_slice()
+    };
     let mut materialized = 0usize;
+    // The local workload(s) are this sidecar's own pods, matched precisely by
+    // `workload_is_local` (SPIFFE id + non-vacuous label/cluster match) — the
+    // same predicate the slice builder uses to capture the inbound view, so the
+    // two cannot drift.
     for workload in mesh_slice.workloads.iter().filter(|w| {
-        if w.spiffe_id.as_str() != local_spiffe {
-            return false;
-        }
-        // Multi-cluster slices tag REMOTE endpoints with their origin cluster
-        // (`tag_remote_workloads`); local workloads are either untagged
-        // (`cluster: None`, the K8s path) or — for VM/WorkloadEntry workloads —
-        // tagged with the local cluster name. A workload is foreign only when
-        // its cluster is set AND differs from this slice's local cluster; such a
-        // workload must not be mistaken for the local pod (the route id is
-        // service/port-based, so it could otherwise replace the loopback route
-        // and point `backend_port` at a remote container port).
-        if let Some(wc) = w.cluster.as_deref()
-            && local_cluster != Some(wc)
-        {
-            return false;
-        }
-        if sidecar_labels.is_empty() {
-            return true;
-        }
-        !w.selector.labels.is_empty()
-            && w.selector
-                .labels
-                .iter()
-                .all(|(k, v)| sidecar_labels.get(k) == Some(v))
+        crate::modes::mesh::slice::workload_is_local(w, local_spiffe, sidecar_labels, local_cluster)
     }) {
         // Route inbound traffic for the service(s) this workload backs — its own
         // service (matched by name + namespace), never a service that merely
@@ -1437,7 +1428,7 @@ fn materialize_sidecar_inbound_proxies(
         // port: Kubernetes container ports carry only the transport protocol
         // (e.g. TCP), while the application protocol (HTTP/gRPC) is declared on
         // the Service. The backend targets the workload's own app port.
-        for service in mesh_slice.services.iter().filter(|s| {
+        for service in inbound_services.iter().filter(|s| {
             s.name == workload.service_name
                 && s.namespace == workload.namespace
                 // Require the Service to actually back the local workload. Other
@@ -7644,6 +7635,40 @@ mod tests {
     }
 
     #[test]
+    fn sidecar_inbound_proxies_use_local_inbound_services_view() {
+        // Sidecar egress narrowing can drop the local service from `services`.
+        // Inbound serving must not be gated by egress scope, so the materializer
+        // reads the un-narrowed `local_inbound_services` view. Here `services`
+        // is empty (as if fully egress-narrowed) yet the route still materializes
+        // from `local_inbound_services`.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(spiffe.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![workload("reviews", "reviews")],
+            services: Vec::new(),
+            local_inbound_services: vec![http_mesh_service("reviews", 8080, spiffe)],
+            ..MeshSlice::default()
+        };
+
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+        assert!(
+            config
+                .proxies
+                .iter()
+                .any(|p| p.id == "__mesh-inbound-default-reviews-8080"),
+            "must materialize from the un-narrowed local_inbound_services view \
+             even when egress narrowing emptied `services`"
+        );
+    }
+
+    #[test]
     fn waypoint_name_only_propagates_for_service_waypoint_topology() {
         let mut runtime = test_mesh_runtime_config();
         runtime.waypoint_name = Some("api-waypoint".to_string());
@@ -9321,6 +9346,7 @@ mod tests {
             version: "test".to_string(),
             workloads: Vec::new(),
             services: Vec::new(),
+            local_inbound_services: Vec::new(),
             mesh_policies: Vec::new(),
             peer_authentications: Vec::new(),
             service_entries: Vec::new(),

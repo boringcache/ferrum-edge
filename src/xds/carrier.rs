@@ -56,6 +56,12 @@ pub const FERRUM_CARRIER_TYPE_URL_PREFIX: &str = "type.googleapis.com/ferrum.con
 /// workload refs that the name-only CDS/EDS reconstruction cannot express).
 pub const FERRUM_ECDS_SERVICES_TYPE_URL: &str =
     "type.googleapis.com/ferrum.config.extension.v3.ServicesCarrier";
+/// Inner `type_url` for the inbound-only view of the local workload's own
+/// service(s), captured un-narrowed by Sidecar egress scope. Distinct from
+/// `ServicesCarrier` (the egress/outbound-narrowed view) so egress scope never
+/// gates inbound serving and the outbound registry is not widened.
+pub const FERRUM_ECDS_LOCAL_INBOUND_SERVICES_TYPE_URL: &str =
+    "type.googleapis.com/ferrum.config.extension.v3.LocalInboundServicesCarrier";
 /// Inner `type_url` for the per-pod workload / endpoint carrier.
 pub const FERRUM_ECDS_WORKLOADS_TYPE_URL: &str =
     "type.googleapis.com/ferrum.config.extension.v3.WorkloadsCarrier";
@@ -105,6 +111,7 @@ pub const FERRUM_CARRIER_RESOURCE_NAME_PREFIX: &str = "ferrum-mesh-carrier/";
 #[derive(Debug, Clone, PartialEq)]
 pub enum MeshSliceCarrier {
     Services(Vec<MeshService>),
+    LocalInboundServices(Vec<MeshService>),
     Workloads(Vec<Workload>),
     WorkloadLabels(BTreeMap<String, String>),
     MeshPolicies(Vec<MeshPolicy>),
@@ -124,6 +131,9 @@ impl MeshSliceCarrier {
     pub fn type_url(&self) -> &'static str {
         match self {
             MeshSliceCarrier::Services(_) => FERRUM_ECDS_SERVICES_TYPE_URL,
+            MeshSliceCarrier::LocalInboundServices(_) => {
+                FERRUM_ECDS_LOCAL_INBOUND_SERVICES_TYPE_URL
+            }
             MeshSliceCarrier::Workloads(_) => FERRUM_ECDS_WORKLOADS_TYPE_URL,
             MeshSliceCarrier::WorkloadLabels(_) => FERRUM_ECDS_LABELS_TYPE_URL,
             MeshSliceCarrier::MeshPolicies(_) => FERRUM_ECDS_MESH_POLICIES_TYPE_URL,
@@ -143,6 +153,7 @@ impl MeshSliceCarrier {
     pub fn resource_name(&self) -> String {
         let suffix = match self {
             MeshSliceCarrier::Services(_) => "services",
+            MeshSliceCarrier::LocalInboundServices(_) => "local-inbound-services",
             MeshSliceCarrier::Workloads(_) => "workloads",
             MeshSliceCarrier::WorkloadLabels(_) => "workload-labels",
             MeshSliceCarrier::MeshPolicies(_) => "mesh-policies",
@@ -163,6 +174,7 @@ impl MeshSliceCarrier {
     pub fn encode_value(&self) -> Result<Vec<u8>, serde_json::Error> {
         match self {
             MeshSliceCarrier::Services(value) => encode(value),
+            MeshSliceCarrier::LocalInboundServices(value) => encode(value),
             MeshSliceCarrier::Workloads(value) => encode(value),
             MeshSliceCarrier::WorkloadLabels(value) => encode(value),
             MeshSliceCarrier::MeshPolicies(value) => encode(value),
@@ -194,6 +206,9 @@ impl MeshSliceCarrier {
     pub fn decode(type_url: &str, value: &[u8]) -> Result<Option<Self>, serde_json::Error> {
         let carrier = match type_url {
             FERRUM_ECDS_SERVICES_TYPE_URL => MeshSliceCarrier::Services(decode_json(value)?),
+            FERRUM_ECDS_LOCAL_INBOUND_SERVICES_TYPE_URL => {
+                MeshSliceCarrier::LocalInboundServices(decode_json(value)?)
+            }
             FERRUM_ECDS_WORKLOADS_TYPE_URL => MeshSliceCarrier::Workloads(decode_json(value)?),
             FERRUM_ECDS_LABELS_TYPE_URL => MeshSliceCarrier::WorkloadLabels(decode_json(value)?),
             FERRUM_ECDS_MESH_POLICIES_TYPE_URL => {
@@ -237,6 +252,9 @@ impl MeshSliceCarrier {
 pub fn carrier_resource_name_for_type_url(type_url: &str) -> Option<&'static str> {
     match type_url {
         FERRUM_ECDS_SERVICES_TYPE_URL => Some("ferrum-mesh-carrier/services"),
+        FERRUM_ECDS_LOCAL_INBOUND_SERVICES_TYPE_URL => {
+            Some("ferrum-mesh-carrier/local-inbound-services")
+        }
         FERRUM_ECDS_WORKLOADS_TYPE_URL => Some("ferrum-mesh-carrier/workloads"),
         FERRUM_ECDS_LABELS_TYPE_URL => Some("ferrum-mesh-carrier/workload-labels"),
         FERRUM_ECDS_MESH_POLICIES_TYPE_URL => Some("ferrum-mesh-carrier/mesh-policies"),
@@ -285,6 +303,11 @@ pub fn build_slice_carriers(slice: &MeshSlice) -> Vec<MeshSliceCarrier> {
     let mut carriers = Vec::new();
     if !slice.services.is_empty() {
         carriers.push(MeshSliceCarrier::Services(slice.services.clone()));
+    }
+    if !slice.local_inbound_services.is_empty() {
+        carriers.push(MeshSliceCarrier::LocalInboundServices(
+            slice.local_inbound_services.clone(),
+        ));
     }
     if !slice.workloads.is_empty() {
         carriers.push(MeshSliceCarrier::Workloads(slice.workloads.clone()));
@@ -351,6 +374,7 @@ pub fn build_slice_carriers(slice: &MeshSlice) -> Vec<MeshSliceCarrier> {
 pub fn apply_carrier(slice: &mut MeshSlice, carrier: MeshSliceCarrier) {
     match carrier {
         MeshSliceCarrier::Services(value) => slice.services = value,
+        MeshSliceCarrier::LocalInboundServices(value) => slice.local_inbound_services = value,
         MeshSliceCarrier::Workloads(value) => slice.workloads = value,
         MeshSliceCarrier::WorkloadLabels(value) => slice.labels = value,
         MeshSliceCarrier::MeshPolicies(value) => slice.mesh_policies = value,
@@ -366,6 +390,42 @@ pub fn apply_carrier(slice: &mut MeshSlice, carrier: MeshSliceCarrier) {
         MeshSliceCarrier::MultiCluster(value) => slice.multi_cluster = Some(value),
         MeshSliceCarrier::SidecarEgressScope(value) => slice.sidecar_egress_scope = Some(value),
     }
+}
+
+/// Workload identity a Ferrum DP communicates to the CP via the xDS
+/// `Node.metadata` bytes shim (the minimal proto carries `bytes`, a placeholder
+/// for Envoy's `google.protobuf.Struct`). JSON-encoded so it stays
+/// forward-compatible if more node attributes are added later. The CP uses
+/// `workload_spiffe_id` to compute Sidecar-aware narrowing and the un-narrowed
+/// local-inbound-service view for that DP — without it, a hostname `Node.id`
+/// leaves the CP unable to identify the workload (`from_xds_node` only derives a
+/// SPIFFE from a `spiffe://` node id).
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct XdsNodeMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload_spiffe_id: Option<String>,
+}
+
+/// Encode `Node.metadata` bytes for an outgoing DP request. Returns empty when
+/// there is nothing to carry, matching the prior no-metadata wire shape.
+pub fn encode_node_metadata(workload_spiffe_id: Option<&str>) -> Vec<u8> {
+    match workload_spiffe_id {
+        Some(spiffe) if !spiffe.is_empty() => serde_json::to_vec(&XdsNodeMetadata {
+            workload_spiffe_id: Some(spiffe.to_string()),
+        })
+        .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+/// Decode `Node.metadata` bytes received from a DP request. Empty or malformed
+/// metadata decodes to the default (no identity) rather than erroring — node
+/// metadata is advisory and must never reject a stream.
+pub fn decode_node_metadata(bytes: &[u8]) -> XdsNodeMetadata {
+    if bytes.is_empty() {
+        return XdsNodeMetadata::default();
+    }
+    serde_json::from_slice(bytes).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -392,6 +452,7 @@ mod tests {
     fn slice_carrier_round_trip() {
         let carriers = vec![
             MeshSliceCarrier::Services(Vec::new()),
+            MeshSliceCarrier::LocalInboundServices(Vec::new()),
             MeshSliceCarrier::Workloads(Vec::new()),
             MeshSliceCarrier::WorkloadLabels(BTreeMap::from([(
                 "app".to_string(),
@@ -449,9 +510,29 @@ mod tests {
     }
 
     #[test]
+    fn node_metadata_round_trips_workload_spiffe() {
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let bytes = encode_node_metadata(Some(spiffe));
+        assert!(!bytes.is_empty());
+        assert_eq!(
+            decode_node_metadata(&bytes).workload_spiffe_id.as_deref(),
+            Some(spiffe)
+        );
+        // Absent / empty identity encodes to empty bytes (prior no-metadata
+        // wire shape) and decodes to no identity.
+        assert!(encode_node_metadata(None).is_empty());
+        assert!(encode_node_metadata(Some("")).is_empty());
+        assert_eq!(decode_node_metadata(&[]).workload_spiffe_id, None);
+        // Malformed metadata never errors/panics — it is advisory, so it
+        // decodes to no identity rather than rejecting the stream.
+        assert_eq!(decode_node_metadata(b"{garbage").workload_spiffe_id, None);
+    }
+
+    #[test]
     fn resource_names_are_unique_per_variant() {
         let carriers = [
             MeshSliceCarrier::Services(Vec::new()),
+            MeshSliceCarrier::LocalInboundServices(Vec::new()),
             MeshSliceCarrier::Workloads(Vec::new()),
             MeshSliceCarrier::WorkloadLabels(BTreeMap::from([(
                 "app".to_string(),
