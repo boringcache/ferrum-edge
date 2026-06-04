@@ -2045,10 +2045,12 @@ pub struct ProxyState {
     /// must carry a node-agent/eBPF cookie record or the connection is dropped
     /// fail-closed before TLS/HBONE processing.
     pub node_waypoint_identity_resolver: Option<Arc<NodeWaypointIdentityResolver>>,
-    /// Optional gateway SPIFFE identity used by gateway-to-mesh outbound TLS.
-    /// The slot shape matches mesh SVID rotation so later trust-bundle updates
-    /// can hot-swap without blocking proxy readers.
-    #[allow(dead_code)] // Consumed by gateway-to-mesh HBONE dispatch in the next bridge phase.
+    /// Gateway SPIFFE identity for gateway/sidecar-to-mesh outbound HBONE.
+    /// This is live, not staged: `supports_hbone_backend` gates HBONE dispatch
+    /// on this slot being loaded (see `current_dispatch_hbone` →
+    /// `proxy_to_backend_hbone`), and `build_spiffe_outbound_config` consumes it
+    /// to originate peer mTLS automatically. The slot shape matches mesh SVID
+    /// rotation so trust-bundle updates hot-swap without blocking proxy readers.
     pub gateway_svid_bundle: SharedSvidBundle,
     /// Latest SVID bundle loaded from files. CP-delivered trust bundles are an
     /// override; when a CP snapshot removes them, this restores file trust.
