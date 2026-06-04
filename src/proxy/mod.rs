@@ -13619,8 +13619,8 @@ async fn proxy_to_backend(
             // as upstream concurrency pressure. On any fall-through,
             // `h2_admission_permits` drops, releasing the in-flight slot so the
             // reqwest path re-admits.
-            let h2_can_dispatch = state.max_request_body_size_bytes == 0
-                && state.max_response_body_size_bytes == 0;
+            let h2_can_dispatch =
+                state.max_request_body_size_bytes == 0 && state.max_response_body_size_bytes == 0;
             let mut h2_admission_permits = if h2_can_dispatch {
                 match backend_dispatch::run_backend_admission_plugins(
                     backend_admission_plugins,

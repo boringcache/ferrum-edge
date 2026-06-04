@@ -231,7 +231,7 @@ Priority bands are spaced with gaps so future plugins can slot in without renumb
 |------|---------------|---------|---------|
 | **Early** | 0–949 | Tracing, IDs, preflight, and request short-circuiting before auth | `otel_tracing` (25), `correlation_id` (50), `cors` (100), `request_termination` (125), `mesh_outbound_registry` (130), `ip_restriction` (150), `geo_restriction` (175), `bot_detection` (200), `spec_expose` (210), `sse` (250), `grpc_web` (260), `grpc_method_router` (275), `spiffe_identity` (940) |
 | **AuthN** | 950–1999 | Authentication / identity verification | `mtls_auth` (950), `jwks_auth` (1000), `oauth2_introspection` (1050), `oidc_relying_party` (1075), `jwt_auth` (1100), `key_auth` (1200), `ldap_auth` (1250), `basic_auth` (1300), `hmac_auth` (1400), `soap_ws_security` (1500) |
-| **Admission** | 2000–2999 | Authorization, validation, and request admission control | `access_control` (2000), `tcp_connection_throttle` (2050), `mesh_authz` (2075), `opa` (2080), `adaptive_concurrency` (2090), `request_deduplication` (2750), `request_size_limiting` (2800), `ws_message_size_limiting` (2810), `graphql` (2850), `rate_limiting` (2900), `ws_rate_limiting` (2910), `udp_rate_limiting` (2915), `ai_prompt_shield` (2925), `waf` (2930), `fault_injection` (2940), `body_validator` (2950), `openapi_validator` (2960), `ai_semantic_firewall` (2968), `ai_request_guard` (2975), `ai_semantic_cache` (2980), `ai_federation` (2985), `mcp_gateway` (2992), `mesh_route_dispatch` (2995) |
+| **Admission** | 2000–2999 | Authorization, validation, and request admission control | `access_control` (2000), `tcp_connection_throttle` (2050), `mesh_authz` (2075), `opa` (2080), `adaptive_concurrency` (2090), `request_deduplication` (2750), `request_size_limiting` (2800), `ws_message_size_limiting` (2810), `graphql` (2850), `rate_limiting` (2900), `ws_rate_limiting` (2910), `udp_rate_limiting` (2915), `ai_prompt_shield` (2925), `waf` (2930), `fault_injection` (2940), `body_validator` (2950), `openapi_validator` (2960), `ai_semantic_firewall` (2968), `ai_request_guard` (2975), `ai_semantic_cache` (2980), `ai_federation` (2985), `mcp_gateway` (2992), `a2a_gateway` (2993), `mesh_route_dispatch` (2995) |
 | **Transform** | 3000–3999 | Request shaping and response buffering decisions | `request_transformer` (3000), `serverless_function` (3025), `response_mock` (3030), `grpc_deadline` (3050), `request_mirror` (3075), `load_testing` (3080), `response_size_limiting` (3490), `response_caching` (3500) |
 | **Response** | 4000–4999 | Response transformation, compression, security headers, and AI accounting | `response_transformer` (4000), `compression` (4050), `ai_response_guard` (4075), `security_headers` (4080), `ai_token_metrics` (4100), `ai_rate_limiter` (4200) |
 | **Custom** | 5000 | Default for unrecognized/custom plugins | _(future plugins)_ |
@@ -240,6 +240,8 @@ Priority bands are spaced with gaps so future plugins can slot in without renumb
 `soap_ws_security` keeps AuthN-band priority 1500 for ordering, but validates SOAP bodies in `before_proxy` after request-body buffering is available.
 
 `mcp_gateway` sits at priority 2992: generic admission/auth/body validation runs first, then MCP JSON-RPC metadata is extracted and aggregate-router calls can set `RequestContext.route_override_*` before final route-dispatch plugins and request transformers. It is HTTP-only and does not implement generic auth, rate limiting, retry, timeout, tracing, WAF, DLP, or semantic safety behavior; those remain separate Ferrum plugins that can consume emitted `mcp.*` metadata.
+
+`a2a_gateway` sits at priority 2993: it runs after MCP handling and before final mesh route dispatch. It observes HTTP JSON-RPC, HTTP+JSON/REST, and gRPC A2A methods, applies optional method policy, rewrites HTTP Agent Card responses, and emits `a2a.*` metadata. It preserves SSE/gRPC streaming and does not own A2A task state.
 
 `mesh_route_dispatch` intentionally sits at priority 2995: authentication, `mesh_authz`, and rate limiting evaluate the original public proxy identity, then route overrides apply before request transformers, mirror/serverless/caching plugins, and backend dispatch. It cannot select a different `mesh_authz` policy scope. When multiple instances are attached to the same proxy, each matching instance replaces the complete override destination and route-local timeout/retry policy from earlier instances; a non-matching later instance leaves any earlier match in place. Per-rule `backend_tls` is only valid for direct `backend_host`/`backend_port` destinations; `upstream_id` destinations use TLS from the referenced `Upstream`. For WebSockets, the override selects only the upgrade handshake backend; the upgraded connection is pinned to that backend and frame hooks do not re-route individual frames. HBONE CONNECT currently branches before `before_proxy`, so this plugin does not route HBONE streams today.
 
@@ -298,37 +300,38 @@ Given all built-in plugins enabled, the execution order is:
 | 43 | `ai_semantic_cache` | 2980 | before_proxy, after_proxy, on_final_response_body |
 | 44 | `ai_federation` | 2985 | before_proxy |
 | 45 | `mcp_gateway` | 2992 | before_proxy, transform_request_body |
-| 46 | `mesh_route_dispatch` | 2995 | before_proxy |
-| 47 | `request_transformer` | 3000 | before_proxy, transform_request_body |
-| 48 | `serverless_function` | 3025 | before_proxy |
-| 49 | `response_mock` | 3030 | before_proxy |
-| 50 | `grpc_deadline` | 3050 | before_proxy |
-| 51 | `request_mirror` | 3075 | before_proxy |
-| 52 | `load_testing` | 3080 | before_proxy |
-| 53 | `response_size_limiting` | 3490 | after_proxy, on_final_response_body |
-| 54 | `response_caching` | 3500 | before_proxy, after_proxy, on_final_response_body |
-| 55 | `response_transformer` | 4000 | after_proxy, transform_response_body |
-| 56 | `compression` | 4050 | before_proxy, after_proxy, transform_request_body, transform_response_body |
-| 57 | `ai_response_guard` | 4075 | on_response_body, transform_response_body |
-| 58 | `security_headers` | 4080 | after_proxy |
-| 59 | `ai_token_metrics` | 4100 | on_response_body |
-| 60 | `ai_rate_limiter` | 4200 | before_proxy, after_proxy, on_response_body |
-| 61 | `stdout_logging` | 9000 | log, on_stream_disconnect |
-| 62 | `ws_frame_logging` | 9050 | on_ws_frame |
-| 63 | `statsd_logging` | 9075 | log, on_stream_disconnect |
-| 64 | `http_logging` | 9100 | log, on_stream_disconnect |
-| 65 | `tcp_logging` | 9125 | log, on_stream_disconnect |
-| 66 | `kafka_logging` | 9150 | log, on_stream_disconnect |
-| 67 | `loki_logging` | 9155 | log, on_stream_disconnect |
-| 68 | `udp_logging` | 9160 | log, on_stream_disconnect |
-| 69 | `ws_logging` | 9175 | log, on_stream_disconnect |
-| 70 | `transaction_debugger` | 9200 | on_request_received, after_proxy, log, on_stream_disconnect |
-| 71 | `proxy_alerts` | 9250 | log, on_stream_disconnect, on_ws_disconnect |
-| 72 | `prometheus_metrics` | 9300 | log, on_stream_disconnect |
-| 73 | `api_chargeback` | 9350 | log, on_stream_disconnect, on_ws_disconnect |
-| 74 | `api_chargeback_sink` | 9351 | log, on_stream_disconnect, on_ws_disconnect |
-| 75 | `workload_metrics` | 9360 | before_proxy, after_proxy, log, on_stream_connect, on_stream_disconnect |
-| 76 | `__mesh_bpf_metrics` | 9365 | (no lifecycle hooks; passive Prometheus surface populated by the BPF SOCK_OPS event consumer) |
+| 46 | `a2a_gateway` | 2993 | before_proxy, after_proxy, on_response_body |
+| 47 | `mesh_route_dispatch` | 2995 | before_proxy |
+| 48 | `request_transformer` | 3000 | before_proxy, transform_request_body |
+| 49 | `serverless_function` | 3025 | before_proxy |
+| 50 | `response_mock` | 3030 | before_proxy |
+| 51 | `grpc_deadline` | 3050 | before_proxy |
+| 52 | `request_mirror` | 3075 | before_proxy |
+| 53 | `load_testing` | 3080 | before_proxy |
+| 54 | `response_size_limiting` | 3490 | after_proxy, on_final_response_body |
+| 55 | `response_caching` | 3500 | before_proxy, after_proxy, on_final_response_body |
+| 56 | `response_transformer` | 4000 | after_proxy, transform_response_body |
+| 57 | `compression` | 4050 | before_proxy, after_proxy, transform_request_body, transform_response_body |
+| 58 | `ai_response_guard` | 4075 | on_response_body, transform_response_body |
+| 59 | `security_headers` | 4080 | after_proxy |
+| 60 | `ai_token_metrics` | 4100 | on_response_body |
+| 61 | `ai_rate_limiter` | 4200 | before_proxy, after_proxy, on_response_body |
+| 62 | `stdout_logging` | 9000 | log, on_stream_disconnect |
+| 63 | `ws_frame_logging` | 9050 | on_ws_frame |
+| 64 | `statsd_logging` | 9075 | log, on_stream_disconnect |
+| 65 | `http_logging` | 9100 | log, on_stream_disconnect |
+| 66 | `tcp_logging` | 9125 | log, on_stream_disconnect |
+| 67 | `kafka_logging` | 9150 | log, on_stream_disconnect |
+| 68 | `loki_logging` | 9155 | log, on_stream_disconnect |
+| 69 | `udp_logging` | 9160 | log, on_stream_disconnect |
+| 70 | `ws_logging` | 9175 | log, on_stream_disconnect |
+| 71 | `transaction_debugger` | 9200 | on_request_received, after_proxy, log, on_stream_disconnect |
+| 72 | `proxy_alerts` | 9250 | log, on_stream_disconnect, on_ws_disconnect |
+| 73 | `prometheus_metrics` | 9300 | log, on_stream_disconnect |
+| 74 | `api_chargeback` | 9350 | log, on_stream_disconnect, on_ws_disconnect |
+| 75 | `api_chargeback_sink` | 9351 | log, on_stream_disconnect, on_ws_disconnect |
+| 76 | `workload_metrics` | 9360 | before_proxy, after_proxy, log, on_stream_connect, on_stream_disconnect |
+| 77 | `__mesh_bpf_metrics` | 9365 | (no lifecycle hooks; passive Prometheus surface populated by the BPF SOCK_OPS event consumer) |
 
 ## Why This Order Matters
 
@@ -551,6 +554,7 @@ TLS/DTLS are transport-layer concerns, not separate protocols. A plugin that sup
 | `ai_request_guard` | ✓ | ✓ | | | | Validates JSON request bodies |
 | `ai_federation` | ✓ | ✓ | | | | Routes to AI providers, normalizes responses |
 | `mcp_gateway` | ✓ | ✓ | | | | Parses MCP JSON-RPC, emits `mcp.*` metadata, and routes namespaced MCP tools/resources/prompts |
+| `a2a_gateway` | ✓ | ✓ | | | | Detects A2A HTTP/REST/gRPC methods, rewrites HTTP Agent Cards, applies method policy, and emits `a2a.*` metadata |
 | `mesh_route_dispatch` | ✓ | ✓ | ✓ | | | Rewrites the routing decision per request via `RequestContext.route_override_*`; for WebSocket, selects the upgrade backend only, not per-frame routing |
 | `ai_token_metrics` | ✓ | ✓ | | | | Parses JSON response bodies for token usage |
 | `ai_rate_limiter` | ✓ | ✓ | | | | Parses JSON response bodies for token counts |
