@@ -1402,6 +1402,16 @@ fn materialize_sidecar_inbound_proxies(
         if w.spiffe_id.as_str() != local_spiffe {
             return false;
         }
+        // Multi-cluster slices carry remote endpoints tagged with their origin
+        // cluster (`tag_remote_workloads`); the K8s translator builds local
+        // workloads with no cluster tag. A remote workload that happens to share
+        // this SPIFFE id + labels must NOT be mistaken for the local pod — the
+        // route id is service/port-based, so a remote workload could otherwise
+        // replace the loopback route and point `backend_port` at a remote
+        // container port, misrouting local inbound traffic.
+        if w.cluster.is_some() {
+            return false;
+        }
         if sidecar_labels.is_empty() {
             return true;
         }
@@ -1517,14 +1527,16 @@ fn materialize_sidecar_inbound_proxies(
             );
             // Don't collide with an explicit proxy (e.g. an operator's file-mode
             // route — the documented pre-materialization workaround) already
-            // routing this host + listen path; only replace our own prior route.
-            // Use the same host-overlap semantics as `validate_unique_listen_paths`
-            // (empty hosts = catch-all, wildcard patterns) so a catch-all/wildcard
-            // operator proxy is honored here rather than slipping past a literal
-            // match and being rejected later at validation.
+            // routing this host. Our route is a host `/` prefix, so it collides
+            // with an existing proxy on an overlapping host when that proxy
+            // shares the listen path OR is host-only (`listen_path: None` routes
+            // every path and sits in the router's host-only fallback tier, which
+            // our `/` prefix would otherwise silently shadow). Host overlap uses
+            // the same semantics as `validate_unique_listen_paths` (empty hosts =
+            // catch-all, wildcard patterns). Either way the operator's proxy wins.
             if config.proxies.iter().any(|p| {
                 p.id != proxy.id
-                    && p.listen_path == proxy.listen_path
+                    && (p.listen_path == proxy.listen_path || p.listen_path.is_none())
                     && crate::config::types::hosts_overlap(&p.hosts, &proxy.hosts)
             }) {
                 debug!(
@@ -7393,6 +7405,104 @@ mod tests {
                 .iter()
                 .any(|p| p.id.starts_with("__mesh-inbound-")),
             "an ambiguous backend port must not materialize a (mis)routed inbound proxy"
+        );
+    }
+
+    #[test]
+    fn sidecar_inbound_proxies_exclude_remote_cluster_workloads() {
+        // A multi-cluster slice carries a remote workload that shares this
+        // sidecar's SPIFFE id, service, and labels but originates in another
+        // cluster (cluster = Some(...)). It must not be treated as local — else
+        // it could replace the loopback route and point the backend at a remote
+        // container port. Only the local (untagged) workload's port is used.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(spiffe.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let local = workload("reviews", "reviews"); // cluster: None, port http=8080
+        let mut remote = workload("reviews", "reviews");
+        remote.cluster = Some("remote-west".to_string());
+        remote.ports = vec![WorkloadPort {
+            port: 9999,
+            protocol: AppProtocol::Http,
+            name: Some("http".to_string()),
+        }];
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![local, remote],
+            services: vec![http_mesh_service("reviews", 8080, spiffe)],
+            ..MeshSlice::default()
+        };
+
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+        let inbound: Vec<&str> = config
+            .proxies
+            .iter()
+            .filter(|p| p.id.starts_with("__mesh-inbound-"))
+            .map(|p| p.id.as_str())
+            .collect();
+        assert_eq!(
+            inbound,
+            vec!["__mesh-inbound-default-reviews-8080"],
+            "exactly one local inbound route"
+        );
+        let route = config
+            .proxies
+            .iter()
+            .find(|p| p.id == "__mesh-inbound-default-reviews-8080")
+            .expect("reviews route");
+        assert_eq!(
+            route.backend_port, 8080,
+            "must target the LOCAL workload's port, not the remote cluster's"
+        );
+    }
+
+    #[test]
+    fn sidecar_inbound_proxies_yield_to_host_only_operator_proxy() {
+        // An operator host-only proxy (listen_path: None) routes every path for
+        // the service host and sits in the router's host-only fallback tier. Our
+        // materialized "/" prefix route would shadow it, so we must yield.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(spiffe.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![workload("reviews", "reviews")],
+            services: vec![http_mesh_service("reviews", 8080, spiffe)],
+            ..MeshSlice::default()
+        };
+
+        // An operator host-only proxy (matches every path for the host).
+        let mut config = GatewayConfig::default();
+        let mut host_only = mesh_inbound_loopback_proxy(
+            "operator-host-only",
+            mesh_service_host_variants("reviews", "default", "cluster.local"),
+            "default",
+            7777,
+            chrono::Utc::now(),
+        );
+        host_only.listen_path = None;
+        config.proxies.push(host_only);
+
+        materialize_sidecar_inbound_proxies(&mut config, &runtime, &slice);
+        assert!(
+            !config
+                .proxies
+                .iter()
+                .any(|p| p.id.starts_with("__mesh-inbound-")),
+            "must yield to a same-host host-only operator proxy"
+        );
+        assert!(
+            config.proxies.iter().any(|p| p.id == "operator-host-only"),
+            "the operator's host-only proxy must be left intact"
         );
     }
 

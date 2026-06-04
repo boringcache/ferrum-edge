@@ -221,6 +221,47 @@ fn parse_client_ip(client_ip: &str) -> Option<std::net::IpAddr> {
     client_ip.trim().parse().ok()
 }
 
+/// Destination port for mesh authorization (`to.operation.ports` /
+/// `when: destination.port`).
+///
+/// For materialized sidecar **inbound** routes the request is delivered to the
+/// local app at the route's backend (workload/container) port, which is the
+/// port Istio inbound authz matches on — NOT the shared mTLS listener socket
+/// (e.g. 15006). A host-routed inbound `Proxy` carries `listen_port == None`,
+/// so without this the port would fall back to `frontend_listen_port` (the
+/// listener) and a port-scoped DENY on the app port would silently fail to
+/// match — a fail-open hole for DENY policies. Non-mesh and outbound traffic
+/// keep the existing listener/`listen_port` derivation.
+fn mesh_authz_destination_port(
+    mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
+    matched_proxy: Option<&crate::config::types::Proxy>,
+    frontend_listen_port: Option<u16>,
+) -> Option<u16> {
+    mesh_inbound_app_port(
+        mesh_direction,
+        matched_proxy.map(|proxy| (proxy.id.as_str(), proxy.backend_port)),
+    )
+    .or(frontend_listen_port)
+    .or_else(|| matched_proxy.and_then(|proxy| proxy.listen_port))
+}
+
+/// The app (workload/container) port a materialized sidecar inbound route
+/// forwards to, when the matched route is one — else `None` so the caller falls
+/// back to the listener-port derivation. Pure over `(proxy id, backend_port)`
+/// for testability.
+fn mesh_inbound_app_port(
+    mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
+    matched: Option<(&str, u16)>,
+) -> Option<u16> {
+    if mesh_direction == Some(crate::modes::mesh::MeshTrafficDirection::Inbound)
+        && let Some((id, backend_port)) = matched
+        && crate::modes::mesh::is_mesh_inbound_route_id(id)
+    {
+        return Some(backend_port);
+    }
+    None
+}
+
 fn jwt_attribute_to_mesh_attribute(value: &JwtAuthAttributeValue) -> MeshAuthzAttribute {
     match value {
         JwtAuthAttributeValue::Scalar(value) => MeshAuthzAttribute::Scalar(value.clone()),
@@ -721,11 +762,11 @@ impl Plugin for MeshAuthz {
             BTreeMap::new()
         };
         let request_principal = ctx.metadata.get("mesh.request_principal").cloned();
-        let port = ctx.frontend_listen_port.or_else(|| {
-            ctx.matched_proxy
-                .as_ref()
-                .and_then(|proxy| proxy.listen_port)
-        });
+        let port = mesh_authz_destination_port(
+            ctx.mesh_direction,
+            ctx.matched_proxy.as_deref(),
+            ctx.frontend_listen_port,
+        );
         // Istio source IP matchers. `source.ip` is the immediate downstream
         // socket peer captured before trusted-proxy rewriting; `remote.ip` is
         // the gateway-resolved client IP after XFF / real-IP resolution.
@@ -1176,4 +1217,55 @@ fn default_trusted_hbone_assertors() -> Vec<TrustedAssertor> {
         .iter()
         .map(|name| TrustedAssertor::ServiceAccount((*name).to_string()))
         .collect()
+}
+
+// Minimal inline module: `mesh_inbound_app_port` is private and cannot be
+// reached from `tests/` without widening the API (see testing rules). It is the
+// security-critical decision that surfaces a materialized inbound route's app
+// port to authz instead of the shared mTLS listener port, so a port-scoped DENY
+// no longer fails open.
+#[cfg(test)]
+mod tests {
+    use super::mesh_inbound_app_port;
+    use crate::modes::mesh::{MESH_INBOUND_PROXY_ID_PREFIX, MeshTrafficDirection};
+
+    #[test]
+    fn mesh_inbound_app_port_uses_backend_port_for_inbound_routes() {
+        let id = format!("{MESH_INBOUND_PROXY_ID_PREFIX}default-reviews-80");
+        assert_eq!(
+            mesh_inbound_app_port(
+                Some(MeshTrafficDirection::Inbound),
+                Some((id.as_str(), 8080))
+            ),
+            Some(8080),
+            "a materialized inbound route must authorize on the app/backend port, \
+             not the mTLS listener port"
+        );
+    }
+
+    #[test]
+    fn mesh_inbound_app_port_none_for_non_inbound_or_non_mesh() {
+        let id = format!("{MESH_INBOUND_PROXY_ID_PREFIX}default-reviews-80");
+        // Outbound direction, no direction, a non-mesh proxy id, and no matched
+        // proxy all fall back to the listener-port derivation (None here).
+        assert_eq!(
+            mesh_inbound_app_port(
+                Some(MeshTrafficDirection::Outbound),
+                Some((id.as_str(), 8080))
+            ),
+            None,
+        );
+        assert_eq!(mesh_inbound_app_port(None, Some((id.as_str(), 8080))), None);
+        assert_eq!(
+            mesh_inbound_app_port(
+                Some(MeshTrafficDirection::Inbound),
+                Some(("operator-route", 8080)),
+            ),
+            None,
+        );
+        assert_eq!(
+            mesh_inbound_app_port(Some(MeshTrafficDirection::Inbound), None),
+            None,
+        );
+    }
 }
