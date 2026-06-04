@@ -490,8 +490,10 @@ impl RouterCache {
             return result;
         }
 
-        // Slow path: search the host route table (cache miss)
-        let result = Self::search_route_table(table, host, path);
+        // Slow path: search the host route table (cache miss). The normal lookup
+        // never excludes inbound routes; direction scoping is handled by the
+        // request handlers via `resolve_route_excluding_mesh_inbound`.
+        let result = Self::search_route_table(table, host, path, false);
 
         // Allocate the cache key String only on the cold path (cache miss + insert).
         let cache_key = make_cache_key(host, path);
@@ -568,23 +570,35 @@ impl RouterCache {
         table: &HostRouteTable,
         host: Option<&str>,
         path: &str,
+        exclude_mesh_inbound: bool,
     ) -> Option<RouteMatch> {
+        // Admit a tier's match unless it is a materialized sidecar inbound route
+        // (`__mesh-inbound-*`) that this lookup is excluding. Dropping the match
+        // here lets the tiered search fall through to a lower-priority valid
+        // route instead of returning that inbound-only route. A no-op (and
+        // zero-cost via short-circuit) on the normal lookup path.
+        let admit = |rm: &RouteMatch| {
+            !(exclude_mesh_inbound && crate::modes::mesh::is_mesh_inbound_route_id(&rm.proxy.id))
+        };
         if let Some(host) = host {
             // 1. Exact host match — exact path, prefix, regex, then host-only
             if table.has_exact_path_routes
                 && let Some(routes) = table.exact_hosts_exact_paths.get(host)
-                && let Some(route_match) = find_exact_path_match_indexed(routes, path)
+                && let Some(route_match) =
+                    find_exact_path_match_indexed(routes, path).filter(|rm| admit(rm))
             {
                 return Some(route_match);
             }
             if let Some(routes) = table.exact_hosts.get(host)
-                && let Some(route_match) = find_prefix_match_indexed(routes, path)
+                && let Some(route_match) =
+                    find_prefix_match_indexed(routes, path).filter(|rm| admit(rm))
             {
                 return Some(route_match);
             }
             if table.has_regex_routes
                 && let Some(routes) = table.exact_hosts_regex.get(host)
-                && let Some(route_match) = find_regex_match_indexed(routes, path)
+                && let Some(route_match) =
+                    find_regex_match_indexed(routes, path).filter(|rm| admit(rm))
             {
                 return Some(route_match);
             }
@@ -602,7 +616,8 @@ impl RouterCache {
             if table.has_exact_path_routes {
                 for (pattern, routes) in &table.wildcard_hosts_exact_paths {
                     if wildcard_matches(pattern, host)
-                        && let Some(route_match) = find_exact_path_match_indexed(routes, path)
+                        && let Some(route_match) =
+                            find_exact_path_match_indexed(routes, path).filter(|rm| admit(rm))
                     {
                         return Some(route_match);
                     }
@@ -610,7 +625,8 @@ impl RouterCache {
             }
             for (pattern, routes) in &table.wildcard_hosts {
                 if wildcard_matches(pattern, host)
-                    && let Some(route_match) = find_prefix_match_indexed(routes, path)
+                    && let Some(route_match) =
+                        find_prefix_match_indexed(routes, path).filter(|rm| admit(rm))
                 {
                     return Some(route_match);
                 }
@@ -618,7 +634,8 @@ impl RouterCache {
             if table.has_regex_routes {
                 for (pattern, routes) in &table.wildcard_hosts_regex {
                     if wildcard_matches(pattern, host)
-                        && let Some(route_match) = find_regex_match_indexed(routes, path)
+                        && let Some(route_match) =
+                            find_regex_match_indexed(routes, path).filter(|rm| admit(rm))
                     {
                         return Some(route_match);
                     }
@@ -642,19 +659,38 @@ impl RouterCache {
         if table.has_exact_path_routes
             && let Some(route_match) =
                 find_exact_path_match_indexed(&table.catch_all_exact_paths, path)
+                    .filter(|rm| admit(rm))
         {
             return Some(route_match);
         }
-        if let Some(route_match) = find_prefix_match_indexed(&table.catch_all, path) {
+        if let Some(route_match) =
+            find_prefix_match_indexed(&table.catch_all, path).filter(|rm| admit(rm))
+        {
             return Some(route_match);
         }
         if table.has_regex_routes
-            && let Some(route_match) = find_regex_match_indexed(&table.catch_all_regex, path)
+            && let Some(route_match) =
+                find_regex_match_indexed(&table.catch_all_regex, path).filter(|rm| admit(rm))
         {
             return Some(route_match);
         }
 
         None
+    }
+
+    /// Resolve a route while **excluding** materialized sidecar inbound
+    /// (`__mesh-inbound-*`) routes. Uncached slow-path lookup used by the request
+    /// handlers only when a non-inbound (e.g. outbound capture) request happens
+    /// to match an inbound-only route — it re-resolves so a valid lower-priority
+    /// route is found instead of serving the inbound loopback route or 404ing.
+    pub(crate) fn resolve_route_excluding_mesh_inbound(
+        &self,
+        table: &HostRouteTable,
+        host: Option<&str>,
+        path: &str,
+    ) -> Option<RouteMatch> {
+        let normalized = normalize_encoded_slashes(path);
+        Self::search_route_table(table, host, &normalized, true)
     }
 
     /// Cache statistics for metrics: (prefix_entries, regex_entries, prefix_evictions, regex_evictions, max_entries).

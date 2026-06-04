@@ -1090,6 +1090,24 @@ async fn handle_h3_request(
         &path,
     );
 
+    // Materialized sidecar inbound routes (`__mesh-inbound-*`) are direction-
+    // scoped: the H3 frontend is never the mesh inbound mTLS listener, so if a
+    // request matched one, re-resolve excluding inbound routes (mirrors the
+    // H1/H2 handler) so it is not shortcut to the local loopback backend.
+    let route_match = match route_match {
+        Some(rm)
+            if ctx.mesh_direction != Some(crate::modes::mesh::MeshTrafficDirection::Inbound)
+                && crate::modes::mesh::is_mesh_inbound_route_id(&rm.proxy.id) =>
+        {
+            state.router_cache.resolve_route_excluding_mesh_inbound(
+                &epoch.route_table,
+                request_host.as_deref(),
+                &path,
+            )
+        }
+        other => other,
+    };
+
     let (proxy, strip_len) = match route_match {
         Some(rm) => {
             // Materialize headers now — path param injection writes to ctx.headers,

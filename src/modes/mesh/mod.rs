@@ -1390,47 +1390,62 @@ fn materialize_sidecar_inbound_proxies(
     };
 
     let now = chrono::Utc::now();
+    // The local workload(s) are this sidecar's own pods. A SPIFFE id alone is not
+    // a unique key — multiple workloads can share a service account / SPIFFE id —
+    // so when the sidecar's own labels are known (the slice carries them), also
+    // require the workload's selector labels to match this pod. Without labels we
+    // fall back to SPIFFE-only (the only key available).
+    let sidecar_labels = &mesh_slice.labels;
     let mut materialized = 0usize;
-    for workload in mesh_slice
-        .workloads
-        .iter()
-        .filter(|w| w.spiffe_id.as_str() == local_spiffe)
-    {
+    for workload in mesh_slice.workloads.iter().filter(|w| {
+        w.spiffe_id.as_str() == local_spiffe
+            && (sidecar_labels.is_empty()
+                || w.selector
+                    .labels
+                    .iter()
+                    .all(|(k, v)| sidecar_labels.get(k) == Some(v)))
+    }) {
         let http_ports: Vec<_> = workload
             .ports
             .iter()
             .filter(|p| is_http_family_mesh_protocol(p.protocol))
             .collect();
+        // Host-only routing can't disambiguate multiple ports of one workload: the
+        // router strips the request port, so same-host/same-path proxies collide
+        // (and fail `validate_unique_listen_paths` on reload). Until original-
+        // destination/port routing exists, materialize only the first HTTP-family
+        // port and warn that the rest are not yet routable.
+        let Some(port) = http_ports.first() else {
+            continue;
+        };
         if http_ports.len() > 1 {
             warn!(
                 service = %workload.service_name,
                 namespace = %workload.namespace,
                 http_ports = http_ports.len(),
-                "Local workload exposes multiple HTTP-family ports; inbound routes share a host \
-                 and cannot yet be disambiguated by port (original-destination routing lands in a \
-                 later stage). Materializing each; the host router resolves by host only."
+                routed_port = port.port,
+                "Local workload exposes multiple HTTP-family ports; host-only routing cannot \
+                 disambiguate them yet (original-destination routing lands in a later stage). \
+                 Materializing only the first HTTP port; the rest are not yet routable."
             );
         }
-
-        for port in http_ports {
-            let proxy = mesh_inbound_loopback_proxy(
-                &mesh_inbound_proxy_id(&workload.namespace, &workload.service_name, port.port),
-                mesh_service_host_variants(
-                    &workload.service_name,
-                    &workload.namespace,
-                    &runtime.cluster_domain,
-                ),
+        let proxy = mesh_inbound_loopback_proxy(
+            &mesh_inbound_proxy_id(&workload.namespace, &workload.service_name, port.port),
+            mesh_service_host_variants(
+                &workload.service_name,
                 &workload.namespace,
-                port.port,
-                now,
-            );
-            if let Some(existing) = config.proxies.iter_mut().find(|p| p.id == proxy.id) {
-                *existing = proxy;
-            } else {
-                config.proxies.push(proxy);
-            }
-            materialized += 1;
+                &runtime.cluster_domain,
+            ),
+            &workload.namespace,
+            port.port,
+            now,
+        );
+        if let Some(existing) = config.proxies.iter_mut().find(|p| p.id == proxy.id) {
+            *existing = proxy;
+        } else {
+            config.proxies.push(proxy);
         }
+        materialized += 1;
     }
 
     if materialized > 0 {
@@ -6959,6 +6974,94 @@ mod tests {
                 .hosts
                 .iter()
                 .any(|h| h == "reviews.default.svc.cluster.local")
+        );
+    }
+
+    #[test]
+    fn sidecar_inbound_proxies_disambiguate_shared_spiffe_by_labels() {
+        // Two workloads share the same service account / SPIFFE id but back
+        // different services and carry different labels. The sidecar's own labels
+        // (CP-provided on the slice) must select only the matching workload.
+        let shared = "spiffe://cluster.local/ns/default/sa/default";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(shared.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let shared_id = |service: &str, app: &str| {
+            let mut w = workload(service, app);
+            w.spiffe_id = SpiffeId::new(shared).unwrap();
+            w
+        };
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            labels: BTreeMap::from([("app".to_string(), "reviews".to_string())]),
+            workloads: vec![
+                shared_id("reviews", "reviews"),
+                shared_id("ratings", "ratings"),
+            ],
+            ..MeshSlice::default()
+        };
+
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+        let inbound: Vec<&str> = config
+            .proxies
+            .iter()
+            .filter(|p| p.id.starts_with("__mesh-inbound-"))
+            .map(|p| p.id.as_str())
+            .collect();
+        assert_eq!(
+            inbound,
+            vec!["__mesh-inbound-default-reviews-8080"],
+            "only the label-matched local workload's service may be materialized"
+        );
+    }
+
+    #[test]
+    fn sidecar_inbound_proxies_emit_one_route_for_multi_port_workload() {
+        // Host-only routing can't disambiguate ports yet, so a multi-HTTP-port
+        // workload must materialize exactly one (non-colliding) route, not several
+        // same-host routes that would fail unique-listen-path validation.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(spiffe.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let mut w = workload("reviews", "reviews");
+        w.ports = vec![
+            WorkloadPort {
+                port: 8080,
+                protocol: AppProtocol::Http,
+                name: Some("http".to_string()),
+            },
+            WorkloadPort {
+                port: 9090,
+                protocol: AppProtocol::Grpc,
+                name: Some("grpc".to_string()),
+            },
+        ];
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![w],
+            ..MeshSlice::default()
+        };
+
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+        let inbound: Vec<&str> = config
+            .proxies
+            .iter()
+            .filter(|p| p.id.starts_with("__mesh-inbound-"))
+            .map(|p| p.id.as_str())
+            .collect();
+        assert_eq!(
+            inbound,
+            vec!["__mesh-inbound-default-reviews-8080"],
+            "a multi-port workload must materialize exactly one (first HTTP) route"
         );
     }
 
