@@ -210,7 +210,7 @@ Per-pod sidecar proxy deployed alongside application containers. This is the def
 | Outbound capture | `127.0.0.1:15001` | Outbound | Plaintext capture |
 | Inbound mTLS | `0.0.0.0:15006` | Inbound | mTLS termination |
 
-The outbound listener intercepts application-originated traffic (redirected by iptables or eBPF) and routes it to the appropriate upstream. The inbound listener terminates mTLS from peer sidecars and forwards plaintext to the local application.
+The inbound listener terminates mTLS from peer sidecars and forwards plaintext to the co-located application: for the **local** workload (identified by its SPIFFE identity, `FERRUM_MESH_WORKLOAD_SPIFFE_ID`), Ferrum materializes an inbound route per HTTP-family service port the workload backs, targeting `127.0.0.1:<appPort>`, so an mTLS-terminated request reaches the app after `mesh_authz` admission. The outbound listener intercepts application-originated traffic (redirected by iptables or eBPF). **Outbound** L7 route materialization from the slice (per-service HBONE upstreams that originate peer mTLS) and original-destination routing for multi-port / TCP services are being added incrementally — until then, outbound routes and inbound routes for multi-port services require explicitly supplied proxies.
 
 ### Ambient
 
