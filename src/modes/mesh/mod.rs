@@ -7896,6 +7896,45 @@ mod tests {
     }
 
     #[test]
+    fn sidecar_inbound_proxies_skip_ambiguous_shared_spiffe_with_matching_labels() {
+        // Two workloads share the service-account SPIFFE AND the same labels but
+        // back different services. The sidecar's labels match BOTH, so labels do
+        // not disambiguate (they aren't pod-unique) — the identity is still
+        // ambiguous and must materialize NO routes.
+        let shared = "spiffe://cluster.local/ns/default/sa/shared";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(shared.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let mut reviews = workload("reviews", "shared-app");
+        reviews.spiffe_id = SpiffeId::new(shared).unwrap();
+        let mut ratings = workload("ratings", "shared-app");
+        ratings.spiffe_id = SpiffeId::new(shared).unwrap();
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            labels: BTreeMap::from([("app".to_string(), "shared-app".to_string())]),
+            workloads: vec![reviews, ratings],
+            services: vec![
+                http_mesh_service("reviews", 8080, shared),
+                http_mesh_service("ratings", 8080, shared),
+            ],
+            ..MeshSlice::default()
+        };
+
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+        assert!(
+            !config
+                .proxies
+                .iter()
+                .any(|p| p.id.starts_with("__mesh-inbound-")),
+            "labels matching multiple shared-SPIFFE services must not materialize routes"
+        );
+    }
+
+    #[test]
     fn waypoint_name_only_propagates_for_service_waypoint_topology() {
         let mut runtime = test_mesh_runtime_config();
         runtime.waypoint_name = Some("api-waypoint".to_string());

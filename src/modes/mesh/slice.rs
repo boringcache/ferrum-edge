@@ -1713,13 +1713,13 @@ pub(crate) fn workload_is_local(
 /// empty vec when the identity is **ambiguous**. Shared by the slice builder
 /// and the inbound route materializer so the two cannot diverge.
 ///
-/// A SPIFFE id is a service-account identity, not pod-unique. When the sidecar
-/// carries no labels (`sidecar_labels` empty — e.g. an unlabeled native sidecar,
-/// or an xDS request before labels are computed) `workload_is_local` matches
-/// every workload sharing that service account. If those workloads back **more
-/// than one distinct service**, we cannot tell which the local pod serves, so we
-/// return empty rather than materialize inbound routes to the wrong loopback
-/// app. With labels (or a single backed service) the match is unambiguous.
+/// A SPIFFE id is a service-account identity, not pod-unique, and labels aren't
+/// necessarily pod-unique either. So after matching by SPIFFE + labels + cluster
+/// (`workload_is_local`), if the matched set still backs **more than one distinct
+/// service** we cannot tell which one the local pod serves and return empty
+/// rather than materialize inbound routes to the wrong loopback app. A single
+/// backed service (including replicas that share one `service_name`) is
+/// unambiguous.
 pub(crate) fn resolve_local_workloads<'a>(
     workloads: &'a [Workload],
     local_spiffe: &str,
@@ -1730,21 +1730,26 @@ pub(crate) fn resolve_local_workloads<'a>(
         .iter()
         .filter(|w| workload_is_local(w, local_spiffe, sidecar_labels, local_cluster))
         .collect();
-    if sidecar_labels.is_empty() {
-        let distinct_services: BTreeSet<(&str, &str)> = matched
-            .iter()
-            .map(|w| (w.service_name.as_str(), w.namespace.as_str()))
-            .collect();
-        if distinct_services.len() > 1 {
-            warn!(
-                local_spiffe,
-                distinct_services = distinct_services.len(),
-                "Ambiguous local workload: a shared service-account SPIFFE backs multiple \
-                 services and no labels disambiguate it; skipping inbound materialization. \
-                 Set FERRUM_MESH_WORKLOAD_LABELS to identify the local pod's service."
-            );
-            return Vec::new();
-        }
+    // A single local pod backs exactly ONE service. If the matched set spans more
+    // than one distinct service the identity is ambiguous — a shared
+    // service-account SPIFFE that the labels (if any) don't disambiguate, since
+    // labels aren't necessarily pod-unique either — so fail closed rather than
+    // materialize inbound routes to the wrong loopback app. (Replicas of one
+    // service share its `service_name` and collapse to a single distinct entry.)
+    let distinct_services: BTreeSet<(&str, &str)> = matched
+        .iter()
+        .map(|w| (w.service_name.as_str(), w.namespace.as_str()))
+        .collect();
+    if distinct_services.len() > 1 {
+        warn!(
+            local_spiffe,
+            distinct_services = distinct_services.len(),
+            "Ambiguous local workload: a shared service-account SPIFFE backs multiple \
+             services that the sidecar's labels do not disambiguate; skipping inbound \
+             materialization. Set FERRUM_MESH_WORKLOAD_LABELS to uniquely identify the \
+             local pod's service."
+        );
+        return Vec::new();
     }
     matched
 }
