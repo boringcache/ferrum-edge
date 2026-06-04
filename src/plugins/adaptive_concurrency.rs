@@ -99,6 +99,7 @@ fn parse_config(object: &Map<String, Value>) -> Result<AdaptiveConcurrencyConfig
     let min_limit = optional_u64(object, "min_limit")?.unwrap_or(1);
     let initial_limit = optional_u64(object, "initial_limit")?.unwrap_or(32);
     let max_limit = optional_u64(object, "max_limit")?.unwrap_or(1024);
+    let max_tracked_keys = optional_u64(object, "max_tracked_keys")?.unwrap_or(10_000);
     let min_samples = optional_u64(object, "min_samples")?.unwrap_or(20);
     let increase_step = optional_u64(object, "increase_step")?.unwrap_or(1);
     let target_latency_multiplier =
@@ -126,6 +127,12 @@ fn parse_config(object: &Map<String, Value>) -> Result<AdaptiveConcurrencyConfig
                 .to_string(),
         );
     }
+    if max_tracked_keys == 0 {
+        return Err("adaptive_concurrency: 'max_tracked_keys' must be greater than 0".to_string());
+    }
+    let max_tracked_keys = usize::try_from(max_tracked_keys).map_err(|_| {
+        "adaptive_concurrency: 'max_tracked_keys' is too large for this platform".to_string()
+    })?;
     if min_samples == 0 {
         return Err("adaptive_concurrency: 'min_samples' must be greater than 0".to_string());
     }
@@ -147,6 +154,7 @@ fn parse_config(object: &Map<String, Value>) -> Result<AdaptiveConcurrencyConfig
 
     Ok(AdaptiveConcurrencyConfig {
         key_by,
+        max_tracked_keys,
         min_limit,
         initial_limit,
         max_limit,

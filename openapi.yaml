@@ -10699,9 +10699,10 @@ components:
       type: object
       description: >-
         Plugin: adaptive_concurrency — Target-aware backend admission for
-        upstream survival. Runs after load balancing for HTTP, gRPC, and native
-        HTTP/3 HTTP backend dispatch, and during WebSocket upgrade admission
-        with the permit held for the full session lifetime.
+        upstream survival. Runs after load balancing for HTTP, gRPC, native
+        HTTP/3 backend dispatch, HTTP/3 fallback bridge dispatch, and
+        WebSocket upgrade admission with the permit held for the full session
+        lifetime.
       properties:
         key_by:
           type: string
@@ -10713,6 +10714,12 @@ components:
             when the proxy uses an upstream, and falls back to proxy-target
             scoping for direct backends. `backend_target` shares one limit per
             backend endpoint across every proxy using this plugin instance.
+        max_tracked_keys:
+          type: integer
+          format: uint64
+          default: 10000
+          minimum: 1
+          description: Maximum number of distinct target keys this plugin instance will track. New keys beyond the cap are rejected to bound wildcard upstream memory use; existing keys continue to be admitted subject to their adaptive limit.
         min_limit:
           type: integer
           format: uint64

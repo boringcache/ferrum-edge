@@ -17,6 +17,9 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tracing::debug;
 
+use crate::plugins::BackendAdmissionOutcome;
+use crate::retry::ErrorClass;
+
 pub type ProxyBodyError = Box<dyn std::error::Error + Send + Sync>;
 
 pub(crate) type BoxError = ProxyBodyError;
@@ -52,6 +55,7 @@ pub struct ProxyBody {
     /// Dropped when the client-visible response body finishes, releasing
     /// backend-admission slots such as adaptive concurrency permits.
     _backend_admission_permits: Option<crate::plugins::BackendAdmissionPermitSet>,
+    backend_admission_outcome: Option<DeferredBackendAdmissionOutcome>,
     /// Deferred logger that fires after body completion, allowing
     /// `TransactionSummary.body_completed` / `body_error_class` /
     /// `client_disconnected` / `bytes_streamed` to reflect the
@@ -83,6 +87,12 @@ pub struct ProxyBody {
     /// will complete successfully on the next wake. Cheap — one atomic RMW
     /// on the first poll per body, zero cost thereafter.
     polled: AtomicBool,
+}
+
+#[derive(Clone, Copy)]
+struct DeferredBackendAdmissionOutcome {
+    response_status: u16,
+    backend_elapsed: Duration,
 }
 
 /// Inner body variant — buffered, streaming, or tracked-streaming.
@@ -221,6 +231,7 @@ impl ProxyBody {
             _per_ip_request_guard: None,
             _lb_connection_guard: None,
             _backend_admission_permits: None,
+            backend_admission_outcome: None,
             logger: None,
             bytes_streamed: AtomicU64::new(0),
             polled: AtomicBool::new(false),
@@ -241,6 +252,7 @@ impl ProxyBody {
             _per_ip_request_guard: None,
             _lb_connection_guard: None,
             _backend_admission_permits: None,
+            backend_admission_outcome: None,
             logger: None,
             bytes_streamed: AtomicU64::new(0),
             polled: AtomicBool::new(false),
@@ -275,11 +287,17 @@ impl ProxyBody {
         self
     }
 
-    pub(crate) fn with_backend_admission_permits(
+    pub(crate) fn with_deferred_backend_admission_outcome(
         mut self,
         permits: crate::plugins::BackendAdmissionPermitSet,
+        response_status: u16,
+        backend_elapsed: Duration,
     ) -> Self {
         self._backend_admission_permits = Some(permits);
+        self.backend_admission_outcome = Some(DeferredBackendAdmissionOutcome {
+            response_status,
+            backend_elapsed,
+        });
         self
     }
 
@@ -326,6 +344,7 @@ impl ProxyBody {
             _per_ip_request_guard: None,
             _lb_connection_guard: None,
             _backend_admission_permits: None,
+            backend_admission_outcome: None,
             logger: None,
             bytes_streamed: AtomicU64::new(0),
             polled: AtomicBool::new(false),
@@ -381,6 +400,32 @@ impl ProxyBody {
         };
         (self, metrics)
     }
+
+    fn record_deferred_backend_admission(
+        &mut self,
+        error_class: Option<ErrorClass>,
+        client_disconnected: bool,
+    ) {
+        let Some(permits) = self._backend_admission_permits.take() else {
+            return;
+        };
+        let Some(outcome) = self.backend_admission_outcome.take() else {
+            return;
+        };
+        let error_class = if client_disconnected {
+            Some(ErrorClass::ClientDisconnect)
+        } else {
+            error_class
+        };
+        let connection_error =
+            error_class.is_some_and(|class| class != ErrorClass::ClientDisconnect);
+        permits.record_backend_outcome(BackendAdmissionOutcome {
+            response_status: outcome.response_status,
+            connection_error,
+            error_class,
+            backend_elapsed: outcome.backend_elapsed,
+        });
+    }
 }
 
 impl http_body::Body for ProxyBody {
@@ -426,22 +471,24 @@ impl http_body::Body for ProxyBody {
                 }
             }
             Poll::Ready(Some(Err(e))) => {
+                let (class, disconnected) =
+                    crate::retry::classify_body_error(&**e as &dyn std::error::Error);
                 if let Some(logger) = this.logger.take() {
                     let bytes = this.bytes_streamed.load(Ordering::Relaxed);
-                    let (class, disconnected) =
-                        crate::retry::classify_body_error(&**e as &dyn std::error::Error);
                     logger.fire(crate::proxy::deferred_log::BodyOutcome::error(
                         class,
                         bytes,
                         disconnected,
                     ));
                 }
+                this.record_deferred_backend_admission(Some(class), disconnected);
             }
             Poll::Ready(None) => {
                 if let Some(logger) = this.logger.take() {
                     let bytes = this.bytes_streamed.load(Ordering::Relaxed);
                     logger.fire(crate::proxy::deferred_log::BodyOutcome::success(bytes));
                 }
+                this.record_deferred_backend_admission(None, false);
             }
             Poll::Pending => {}
         }
@@ -468,6 +515,8 @@ impl http_body::Body for ProxyBody {
 
 impl Drop for ProxyBody {
     fn drop(&mut self) {
+        let mut deferred_admission_error_class = None;
+        let mut deferred_admission_client_disconnected = false;
         if let Some(logger) = self.logger.take() {
             let bytes = self.bytes_streamed.load(Ordering::Relaxed);
 
@@ -525,8 +574,22 @@ impl Drop for ProxyBody {
                     }
                 }
             };
+            if !outcome.body_completed {
+                deferred_admission_error_class = outcome.body_error_class;
+                deferred_admission_client_disconnected = outcome.client_disconnected;
+            }
             logger.fire(outcome);
+        } else if self._backend_admission_permits.is_some()
+            && self.backend_admission_outcome.is_some()
+            && self.polled.load(Ordering::Relaxed)
+        {
+            deferred_admission_error_class = Some(ErrorClass::ClientDisconnect);
+            deferred_admission_client_disconnected = true;
         }
+        self.record_deferred_backend_admission(
+            deferred_admission_error_class,
+            deferred_admission_client_disconnected,
+        );
     }
 }
 

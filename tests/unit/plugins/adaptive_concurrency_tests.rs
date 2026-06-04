@@ -4,7 +4,7 @@ use std::time::Duration;
 use ferrum_edge::adaptive_concurrency::{
     AdaptiveConcurrencyConfig, AdaptiveConcurrencyKeyBy, AdaptiveConcurrencyLimiter,
 };
-use ferrum_edge::config::types::Proxy;
+use ferrum_edge::config::types::{Proxy, UpstreamTarget};
 use ferrum_edge::plugins::adaptive_concurrency::AdaptiveConcurrency;
 use ferrum_edge::plugins::{
     BackendAdmissionContext, BackendAdmissionDecision, BackendAdmissionOutcome,
@@ -26,6 +26,7 @@ fn proxy() -> Proxy {
 fn limiter_config(initial_limit: u64) -> Arc<AdaptiveConcurrencyConfig> {
     Arc::new(AdaptiveConcurrencyConfig {
         key_by: AdaptiveConcurrencyKeyBy::Proxy,
+        max_tracked_keys: 10_000,
         min_limit: 1,
         initial_limit,
         max_limit: initial_limit.max(1),
@@ -36,6 +37,17 @@ fn limiter_config(initial_limit: u64) -> Arc<AdaptiveConcurrencyConfig> {
         shadow_mode: false,
         expose_headers: false,
     })
+}
+
+fn target(host: &str, port: u16) -> UpstreamTarget {
+    UpstreamTarget {
+        host: host.to_string(),
+        port,
+        weight: 1,
+        tags: Default::default(),
+        locality: None,
+        path: None,
+    }
 }
 
 #[test]
@@ -130,6 +142,44 @@ fn adaptive_concurrency_ignores_client_disconnect_samples() {
         .expect("state should exist after acquire");
     assert_eq!(snapshot.limit, 4);
     assert_eq!(snapshot.samples, 0);
+}
+
+#[test]
+fn adaptive_concurrency_caps_tracked_target_keys() {
+    let proxy = proxy();
+    let limiter = AdaptiveConcurrencyLimiter::new(16);
+    let config = Arc::new(AdaptiveConcurrencyConfig {
+        key_by: AdaptiveConcurrencyKeyBy::Backend,
+        max_tracked_keys: 1,
+        min_limit: 1,
+        initial_limit: 2,
+        max_limit: 2,
+        min_samples: 1,
+        target_latency_multiplier: 1.5,
+        decrease_ratio: 0.5,
+        increase_step: 1,
+        shadow_mode: false,
+        expose_headers: false,
+    });
+    let first_target = target("a1.example.com", 8080);
+    let second_target = target("a2.example.com", 8080);
+
+    let first = limiter
+        .try_acquire(&proxy, Some(&first_target), Arc::clone(&config))
+        .expect("first distinct backend key should be admitted");
+    let same_key = limiter
+        .try_acquire(&proxy, Some(&first_target), Arc::clone(&config))
+        .expect("existing backend key should not consume another tracked-key slot");
+    let rejected = match limiter.try_acquire(&proxy, Some(&second_target), Arc::clone(&config)) {
+        Ok(_) => panic!("new backend key should be rejected when cap is exhausted"),
+        Err(rejected) => rejected,
+    };
+
+    assert_eq!(rejected.limit, 1);
+    assert_eq!(limiter.tracked_keys_count(), 1);
+
+    drop(first);
+    drop(same_key);
 }
 
 #[test]

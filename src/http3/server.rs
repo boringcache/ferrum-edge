@@ -1745,58 +1745,54 @@ async fn handle_h3_request(
     let upstream_balancer = selection.balancer;
     let use_native_h3_pool = http_flavor == HttpFlavor::Plain
         && crate::proxy::supports_native_http3_backend(&state, &proxy, upstream_target.as_deref());
+    let backend_admission_plugins = plugin_cache_view.backend_admission_plugins();
     let mut backend_admission_permits =
-        if http_flavor == HttpFlavor::WebSocket || use_native_h3_pool {
-            let backend_admission_plugins = plugin_cache_view.backend_admission_plugins();
-            match crate::proxy::backend_dispatch::run_backend_admission_plugins(
-                backend_admission_plugins.as_ref(),
-                &ctx,
-                &proxy,
-                upstream_target.as_deref(),
-                request_protocol,
-            ) {
-                Ok(permits) => permits,
-                Err(rejection) => {
-                    let mut headers = rejection.headers;
-                    apply_after_proxy_hooks_to_rejection(
-                        &plugins,
-                        &mut ctx,
-                        rejection.status_code,
-                        &mut headers,
-                    )
-                    .await;
-                    let http_status = StatusCode::from_u16(rejection.status_code)
-                        .unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
-                    let log_status_code = h3_reject_log_status_and_metadata(
-                        &mut ctx,
-                        http_flavor,
-                        http_status,
-                        &rejection.body,
-                        &headers,
-                    );
-                    record_request(&state, log_status_code);
-                    log_rejected_request(
-                        &plugins,
-                        &ctx,
-                        log_status_code,
-                        start_time,
-                        &rejection.plugin_name,
-                        plugin_execution_ns,
-                    )
-                    .await;
-                    send_h3_reject_flavor_aware(
-                        &mut stream,
-                        http_flavor,
-                        http_status,
-                        &rejection.body,
-                        &headers,
-                    )
-                    .await?;
-                    return Ok(());
-                }
+        match crate::proxy::backend_dispatch::run_backend_admission_plugins(
+            backend_admission_plugins.as_ref(),
+            &ctx,
+            &proxy,
+            upstream_target.as_deref(),
+            request_protocol,
+        ) {
+            Ok(permits) => permits,
+            Err(rejection) => {
+                let mut headers = rejection.headers;
+                apply_after_proxy_hooks_to_rejection(
+                    &plugins,
+                    &mut ctx,
+                    rejection.status_code,
+                    &mut headers,
+                )
+                .await;
+                let http_status = StatusCode::from_u16(rejection.status_code)
+                    .unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
+                let log_status_code = h3_reject_log_status_and_metadata(
+                    &mut ctx,
+                    http_flavor,
+                    http_status,
+                    &rejection.body,
+                    &headers,
+                );
+                record_request(&state, log_status_code);
+                log_rejected_request(
+                    &plugins,
+                    &ctx,
+                    log_status_code,
+                    start_time,
+                    &rejection.plugin_name,
+                    plugin_execution_ns,
+                )
+                .await;
+                send_h3_reject_flavor_aware(
+                    &mut stream,
+                    http_flavor,
+                    http_status,
+                    &rejection.body,
+                    &headers,
+                )
+                .await?;
+                return Ok(());
             }
-        } else {
-            None
         };
 
     let (cb_target_key, cb_is_half_open_probe) =
@@ -2064,6 +2060,13 @@ async fn handle_h3_request(
             })
             .await?;
 
+        record_h3_backend_admission_outcome(
+            &mut backend_admission_permits,
+            outcome.response_status,
+            outcome.connection_error,
+            outcome.body_error_class.or(outcome.error_class),
+            std::time::Duration::from_secs_f64(outcome.backend_total_ms / 1000.0),
+        );
         record_request(&state, outcome.response_status);
 
         // Build the same TransactionSummary shape the native H3 pool path

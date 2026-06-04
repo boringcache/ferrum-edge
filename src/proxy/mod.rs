@@ -8797,6 +8797,58 @@ async fn finalize_reject_response_with_after_proxy_hooks(
     normalize_reject_response(status, body, &headers, is_grpc_request)
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn handle_backend_admission_rejection(
+    rejection: backend_dispatch::BackendAdmissionRejection,
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    state: &ProxyState,
+    start_time: Instant,
+    plugin_execution_ns: u64,
+    original_request_path: Option<&str>,
+    is_grpc_request: bool,
+) -> Response<ProxyBody> {
+    let reject = finalize_reject_response_with_after_proxy_hooks(
+        plugins,
+        ctx,
+        StatusCode::from_u16(rejection.status_code).unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
+        &rejection.body,
+        rejection.headers,
+        is_grpc_request,
+    )
+    .await;
+    apply_grpc_reject_metadata(ctx, &reject);
+    log_rejected_request_with_path(
+        plugins,
+        ctx,
+        reject.http_status.as_u16(),
+        start_time,
+        &rejection.plugin_name,
+        plugin_execution_ns,
+        original_request_path,
+    )
+    .await;
+    record_request(state, reject.http_status.as_u16());
+    build_response_from_normalized_reject(reject)
+}
+
+fn release_circuit_breaker_probe_on_admission_reject(
+    state: &ProxyState,
+    proxy: &Proxy,
+    target_key: Option<&str>,
+    is_half_open_probe: bool,
+) {
+    if !is_half_open_probe {
+        return;
+    }
+    if let Some(cb_config) = &proxy.circuit_breaker {
+        let cb = state
+            .circuit_breaker_cache
+            .get_or_create(&proxy.id, target_key, cb_config);
+        cb.record_neutral(true);
+    }
+}
+
 pub fn request_is_authenticated(ctx: &RequestContext) -> bool {
     ctx.effective_identity().is_some()
 }
@@ -9933,40 +9985,7 @@ async fn handle_proxy_request_inner(
     let sticky_cookie_needed = selection.sticky_cookie_needed;
 
     let backend_admission_plugins = plugin_cache_view.backend_admission_plugins();
-    let mut backend_admission_permits = match backend_dispatch::run_backend_admission_plugins(
-        backend_admission_plugins.as_ref(),
-        &ctx,
-        &proxy,
-        upstream_target.as_deref(),
-        request_protocol,
-    ) {
-        Ok(permits) => permits,
-        Err(rejection) => {
-            let reject = finalize_reject_response_with_after_proxy_hooks(
-                &plugins,
-                &mut ctx,
-                StatusCode::from_u16(rejection.status_code)
-                    .unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
-                &rejection.body,
-                rejection.headers,
-                is_grpc_request,
-            )
-            .await;
-            apply_grpc_reject_metadata(&mut ctx, &reject);
-            log_rejected_request_with_path(
-                &plugins,
-                &ctx,
-                reject.http_status.as_u16(),
-                start_time,
-                &rejection.plugin_name,
-                plugin_execution_ns,
-                Some(&original_request_path),
-            )
-            .await;
-            record_request(&state, reject.http_status.as_u16());
-            return Ok(build_response_from_normalized_reject(reject));
-        }
-    };
+    let mut backend_admission_permits: Option<BackendAdmissionPermitSet> = None;
 
     // Circuit breaker check — per-target when upstream is configured, per-proxy otherwise
     let (cb_target_key, cb_is_half_open_probe) =
@@ -10027,6 +10046,34 @@ async fn handle_proxy_request_inner(
                 ));
             }
         }
+        backend_admission_permits = match backend_dispatch::run_backend_admission_plugins(
+            backend_admission_plugins.as_ref(),
+            &ctx,
+            &proxy,
+            upstream_target.as_deref(),
+            request_protocol,
+        ) {
+            Ok(permits) => permits,
+            Err(rejection) => {
+                release_circuit_breaker_probe_on_admission_reject(
+                    &state,
+                    &proxy,
+                    cb_target_key.as_deref(),
+                    cb_is_half_open_probe,
+                );
+                return Ok(handle_backend_admission_rejection(
+                    rejection,
+                    &plugins,
+                    &mut ctx,
+                    &state,
+                    start_time,
+                    plugin_execution_ns,
+                    Some(&original_request_path),
+                    is_grpc_request,
+                )
+                .await);
+            }
+        };
 
         let request = match client_request_body {
             ClientRequestBody::Streaming(request) => *request,
@@ -10286,6 +10333,28 @@ async fn handle_proxy_request_inner(
             // `retry_on_connect_failure` enabled. Mirrors the same
             // single-return contract documented in
             // `proxy_grpc_request`.
+            backend_admission_permits = match backend_dispatch::run_backend_admission_plugins(
+                backend_admission_plugins.as_ref(),
+                &ctx,
+                &proxy,
+                upstream_target.as_deref(),
+                ProxyProtocol::Grpc,
+            ) {
+                Ok(permits) => permits,
+                Err(rejection) => {
+                    return Ok(handle_backend_admission_rejection(
+                        rejection,
+                        &plugins,
+                        &mut ctx,
+                        &state,
+                        start_time,
+                        plugin_execution_ns,
+                        Some(&original_request_path),
+                        true,
+                    )
+                    .await);
+                }
+            };
             let result = grpc_proxy::proxy_grpc_request_core(
                 grpc_method,
                 grpc_headers,
@@ -10372,6 +10441,28 @@ async fn handle_proxy_request_inner(
                         // header time, no deferral.
                         _ => None,
                     };
+                backend_admission_permits = match backend_dispatch::run_backend_admission_plugins(
+                    backend_admission_plugins.as_ref(),
+                    &ctx,
+                    &proxy,
+                    upstream_target.as_deref(),
+                    ProxyProtocol::Grpc,
+                ) {
+                    Ok(permits) => permits,
+                    Err(rejection) => {
+                        return Ok(handle_backend_admission_rejection(
+                            rejection,
+                            &plugins,
+                            &mut ctx,
+                            &state,
+                            start_time,
+                            plugin_execution_ns,
+                            Some(&original_request_path),
+                            true,
+                        )
+                        .await);
+                    }
+                };
                 let result = grpc_proxy::proxy_grpc_request_streaming(
                     request,
                     grpc_dispatch_proxy,
@@ -10390,18 +10481,54 @@ async fn handle_proxy_request_inner(
                 // retry replay) but propagate the streaming decision to the
                 // response so trailers reach the client immediately when
                 // the response path is safe to stream.
-                grpc_proxy::proxy_grpc_request(
-                    request,
-                    grpc_dispatch_proxy,
-                    &grpc_backend_url,
-                    &state.grpc_pool,
-                    &state.dns_cache,
-                    proxy_headers,
-                    grpc_should_stream,
-                    state.max_grpc_recv_size_bytes,
-                    state.max_response_body_size_bytes,
-                )
-                .await
+                match grpc_proxy::collect_grpc_request_body(request, state.max_grpc_recv_size_bytes)
+                    .await
+                {
+                    Ok((grpc_method, grpc_headers, grpc_req_body)) => {
+                        ctx.bytes_sent_observed.fetch_max(
+                            grpc_req_body.len() as u64,
+                            std::sync::atomic::Ordering::Release,
+                        );
+                        backend_admission_permits =
+                            match backend_dispatch::run_backend_admission_plugins(
+                                backend_admission_plugins.as_ref(),
+                                &ctx,
+                                &proxy,
+                                upstream_target.as_deref(),
+                                ProxyProtocol::Grpc,
+                            ) {
+                                Ok(permits) => permits,
+                                Err(rejection) => {
+                                    return Ok(handle_backend_admission_rejection(
+                                        rejection,
+                                        &plugins,
+                                        &mut ctx,
+                                        &state,
+                                        start_time,
+                                        plugin_execution_ns,
+                                        Some(&original_request_path),
+                                        true,
+                                    )
+                                    .await);
+                                }
+                            };
+                        let result = grpc_proxy::proxy_grpc_request_core(
+                            grpc_method,
+                            grpc_headers,
+                            grpc_req_body.clone(),
+                            grpc_dispatch_proxy,
+                            &grpc_backend_url,
+                            &state.grpc_pool,
+                            &state.dns_cache,
+                            proxy_headers,
+                            grpc_should_stream,
+                            state.max_response_body_size_bytes,
+                        )
+                        .await;
+                        (result, grpc_req_body)
+                    }
+                    Err(error) => (Err(error), Bytes::new()),
+                }
             }
         };
 
@@ -10555,6 +10682,35 @@ async fn handle_proxy_request_inner(
                     }
                 }
 
+                backend_admission_permits = match backend_dispatch::run_backend_admission_plugins(
+                    backend_admission_plugins.as_ref(),
+                    &ctx,
+                    &proxy,
+                    grpc_current_target.as_deref(),
+                    ProxyProtocol::Grpc,
+                ) {
+                    Ok(permits) => permits,
+                    Err(rejection) => {
+                        release_circuit_breaker_probe_on_admission_reject(
+                            &state,
+                            &proxy,
+                            grpc_current_cb_key.as_deref(),
+                            grpc_cb_probe_slot,
+                        );
+                        return Ok(handle_backend_admission_rejection(
+                            rejection,
+                            &plugins,
+                            &mut ctx,
+                            &state,
+                            start_time,
+                            plugin_execution_ns,
+                            Some(&original_request_path),
+                            true,
+                        )
+                        .await);
+                    }
+                };
+
                 warn!(
                     proxy_id = %proxy.id,
                     attempt = grpc_attempt,
@@ -10676,6 +10832,7 @@ async fn handle_proxy_request_inner(
 
         match grpc_result {
             Ok(GrpcResponseKind::Streaming(grpc_streaming)) => {
+                let grpc_backend_admission_elapsed = backend_start.elapsed();
                 // Frame-by-frame streaming path: headers arrived, body not buffered.
                 // Arm/defer circuit-breaker recording before after_proxy hooks
                 // so the post-header upload guard is measured from header
@@ -10716,6 +10873,14 @@ async fn handle_proxy_request_inner(
                             true,
                         );
                         apply_grpc_reject_metadata(&mut ctx, &normalized);
+                        if let Some(permits) = backend_admission_permits.take() {
+                            permits.record_backend_outcome(BackendAdmissionOutcome {
+                                response_status: grpc_streaming.status,
+                                connection_error: false,
+                                error_class: None,
+                                backend_elapsed: grpc_backend_admission_elapsed,
+                            });
+                        }
                         // Use `original_request_path` so the log records the
                         // path the client actually requested, not the
                         // VirtualService-rewritten backend path in `ctx.path`.
@@ -10752,14 +10917,6 @@ async fn handle_proxy_request_inner(
                 } else {
                     None
                 };
-                if !body_exceeded && let Some(permits) = backend_admission_permits.as_ref() {
-                    permits.record_backend_outcome(BackendAdmissionOutcome {
-                        response_status: grpc_streaming.status,
-                        connection_error: false,
-                        error_class: None,
-                        backend_elapsed: backend_start.elapsed(),
-                    });
-                }
 
                 let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
                 let plugin_execution_ms = plugin_execution_ns as f64 / 1_000_000.0;
@@ -10944,7 +11101,11 @@ async fn handle_proxy_request_inner(
                     body = body.with_per_ip_request_guard(guard);
                 }
                 if let Some(permits) = backend_admission_permits.take() {
-                    body = body.with_backend_admission_permits(permits);
+                    body = body.with_deferred_backend_admission_outcome(
+                        permits,
+                        grpc_streaming.status,
+                        grpc_backend_admission_elapsed,
+                    );
                 }
 
                 // Detach the deferred logger before handing the body to
@@ -11481,7 +11642,7 @@ async fn handle_proxy_request_inner(
         } else {
             None
         };
-        let (mut result, retained_body) = proxy_to_backend(
+        let initial_dispatch = proxy_to_backend(
             &state,
             &proxy,
             &current_url,
@@ -11490,6 +11651,7 @@ async fn handle_proxy_request_inner(
             client_request_body,
             upstream_target.as_deref(),
             &plugins,
+            backend_admission_plugins.as_ref(),
             body_hook_ctx.as_mut(),
             &ctx,
             should_stream,
@@ -11504,6 +11666,41 @@ async fn handle_proxy_request_inner(
             inbound_version,
         )
         .await;
+        if let Some(body_hook_ctx) = body_hook_ctx.take() {
+            ctx.metadata = body_hook_ctx.metadata;
+            ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
+            ctx.waf_owned_metadata = body_hook_ctx.waf_owned_metadata;
+            ctx.waf_score = body_hook_ctx.waf_score;
+        }
+        let (mut result, retained_body) = match initial_dispatch {
+            BackendDispatchResult::Response {
+                response,
+                retained_body,
+                backend_admission_permits: permits,
+            } => {
+                backend_admission_permits = permits;
+                (response, retained_body)
+            }
+            BackendDispatchResult::AdmissionRejected(rejection) => {
+                release_circuit_breaker_probe_on_admission_reject(
+                    &state,
+                    &proxy,
+                    cb_target_key.as_deref(),
+                    cb_is_half_open_probe,
+                );
+                return Ok(handle_backend_admission_rejection(
+                    rejection,
+                    &plugins,
+                    &mut ctx,
+                    &state,
+                    start_time,
+                    plugin_execution_ns,
+                    Some(&original_request_path),
+                    false,
+                )
+                .await);
+            }
+        };
 
         while retry::should_retry(retry_config, &method, &result, attempt) {
             if let Some(permits) = backend_admission_permits.take() {
@@ -11609,6 +11806,35 @@ async fn handle_proxy_request_inner(
                 }
             }
 
+            backend_admission_permits = match backend_dispatch::run_backend_admission_plugins(
+                backend_admission_plugins.as_ref(),
+                &ctx,
+                &proxy,
+                current_target.as_deref(),
+                ProxyProtocol::Http,
+            ) {
+                Ok(permits) => permits,
+                Err(rejection) => {
+                    release_circuit_breaker_probe_on_admission_reject(
+                        &state,
+                        &proxy,
+                        current_cb_target_key.as_deref(),
+                        cb_retry_probe_slot_available,
+                    );
+                    return Ok(handle_backend_admission_rejection(
+                        rejection,
+                        &plugins,
+                        &mut ctx,
+                        &state,
+                        start_time,
+                        plugin_execution_ns,
+                        Some(&original_request_path),
+                        false,
+                    )
+                    .await);
+                }
+            };
+
             warn!(
                 proxy_id = %proxy.id,
                 attempt = attempt,
@@ -11667,12 +11893,6 @@ async fn handle_proxy_request_inner(
                     .mark_h3_unsupported(&proxy, current_target.as_deref());
             }
         }
-        if let Some(body_hook_ctx) = body_hook_ctx {
-            ctx.metadata = body_hook_ctx.metadata;
-            ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
-            ctx.waf_owned_metadata = body_hook_ctx.waf_owned_metadata;
-            ctx.waf_score = body_hook_ctx.waf_score;
-        }
         (result, current_cb_target_key)
     } else {
         let mut body_hook_ctx = if needs_final_request_body_context {
@@ -11680,7 +11900,7 @@ async fn handle_proxy_request_inner(
         } else {
             None
         };
-        let resp = proxy_to_backend(
+        let dispatch = proxy_to_backend(
             &state,
             &proxy,
             &backend_url,
@@ -11689,6 +11909,7 @@ async fn handle_proxy_request_inner(
             client_request_body,
             upstream_target.as_deref(),
             &plugins,
+            backend_admission_plugins.as_ref(),
             body_hook_ctx.as_mut(),
             &ctx,
             should_stream,
@@ -11702,14 +11923,42 @@ async fn handle_proxy_request_inner(
             &bytes_sent_observed,
             inbound_version,
         )
-        .await
-        .0;
+        .await;
         if let Some(body_hook_ctx) = body_hook_ctx {
             ctx.metadata = body_hook_ctx.metadata;
             ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
             ctx.waf_owned_metadata = body_hook_ctx.waf_owned_metadata;
             ctx.waf_score = body_hook_ctx.waf_score;
         }
+        let resp = match dispatch {
+            BackendDispatchResult::Response {
+                response,
+                backend_admission_permits: permits,
+                ..
+            } => {
+                backend_admission_permits = permits;
+                response
+            }
+            BackendDispatchResult::AdmissionRejected(rejection) => {
+                release_circuit_breaker_probe_on_admission_reject(
+                    &state,
+                    &proxy,
+                    cb_target_key.as_deref(),
+                    cb_is_half_open_probe,
+                );
+                return Ok(handle_backend_admission_rejection(
+                    rejection,
+                    &plugins,
+                    &mut ctx,
+                    &state,
+                    start_time,
+                    plugin_execution_ns,
+                    Some(&original_request_path),
+                    false,
+                )
+                .await);
+            }
+        };
         (resp, cb_target_key.clone())
     };
     let mut response_status = backend_resp.status_code;
@@ -11750,26 +11999,30 @@ async fn handle_proxy_request_inner(
         skip_final_cb_record,
         backend_start.elapsed(),
     );
-    if let Some(permits) = backend_admission_permits.as_ref() {
-        permits.record_backend_outcome(BackendAdmissionOutcome {
-            response_status,
-            connection_error: backend_resp.connection_error,
-            error_class: backend_error_class,
-            backend_elapsed: backend_start.elapsed(),
-        });
-    }
-
-    let backend_elapsed = backend_start.elapsed().as_secs_f64() * 1000.0;
-    let backend_ttfb_ms = backend_elapsed;
-    // For buffered responses, backend_elapsed includes full body download (accurate total).
-    // For streaming responses, the body is still being sent to the client at log time,
-    // so we mark total as unknown (-1.0) to avoid silently reporting TTFB as total.
+    let backend_admission_response_status = response_status;
+    let backend_admission_connection_error = backend_resp.connection_error;
+    let backend_admission_error_class = backend_error_class;
+    let backend_admission_elapsed = backend_start.elapsed();
     let is_streaming_response = matches!(
         &response_body,
         ResponseBody::Streaming { .. }
             | ResponseBody::StreamingH2(_)
             | ResponseBody::StreamingH3(_)
     );
+    if !is_streaming_response && let Some(permits) = backend_admission_permits.take() {
+        permits.record_backend_outcome(BackendAdmissionOutcome {
+            response_status: backend_admission_response_status,
+            connection_error: backend_admission_connection_error,
+            error_class: backend_admission_error_class,
+            backend_elapsed: backend_admission_elapsed,
+        });
+    }
+
+    let backend_elapsed = backend_admission_elapsed.as_secs_f64() * 1000.0;
+    let backend_ttfb_ms = backend_elapsed;
+    // For buffered responses, backend_elapsed includes full body download (accurate total).
+    // For streaming responses, the body is still being sent to the client at log time,
+    // so we mark total as unknown (-1.0) to avoid silently reporting TTFB as total.
     let backend_total_ms = if is_streaming_response {
         -1.0
     } else {
@@ -11794,6 +12047,21 @@ async fn handle_proxy_request_inner(
             after_proxy_rejected = true;
         }
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+    }
+
+    if !matches!(
+        &response_body,
+        ResponseBody::Streaming { .. }
+            | ResponseBody::StreamingH2(_)
+            | ResponseBody::StreamingH3(_)
+    ) && let Some(permits) = backend_admission_permits.take()
+    {
+        permits.record_backend_outcome(BackendAdmissionOutcome {
+            response_status: backend_admission_response_status,
+            connection_error: backend_admission_connection_error,
+            error_class: backend_admission_error_class,
+            backend_elapsed: backend_admission_elapsed,
+        });
     }
 
     // on_response_body hooks — only for buffered responses, only when plugins exist.
@@ -12173,7 +12441,11 @@ async fn handle_proxy_request_inner(
             };
             let mut base = base.with_lb_connection_guard(lb_connection_guard);
             if let Some(permits) = backend_admission_permits.take() {
-                base = base.with_backend_admission_permits(permits);
+                base = base.with_deferred_backend_admission_outcome(
+                    permits,
+                    backend_admission_response_status,
+                    backend_admission_elapsed,
+                );
             }
 
             if state.env_config.enable_streaming_latency_tracking {
@@ -12276,7 +12548,11 @@ async fn handle_proxy_request_inner(
             };
             let mut body = body.with_lb_connection_guard(lb_connection_guard);
             if let Some(permits) = backend_admission_permits.take() {
-                body = body.with_backend_admission_permits(permits);
+                body = body.with_deferred_backend_admission_outcome(
+                    permits,
+                    backend_admission_response_status,
+                    backend_admission_elapsed,
+                );
             }
             body
         }
@@ -12323,7 +12599,11 @@ async fn handle_proxy_request_inner(
             };
             let mut body = body.with_lb_connection_guard(lb_connection_guard);
             if let Some(permits) = backend_admission_permits.take() {
-                body = body.with_backend_admission_permits(permits);
+                body = body.with_deferred_backend_admission_outcome(
+                    permits,
+                    backend_admission_response_status,
+                    backend_admission_elapsed,
+                );
             }
             body
         }
@@ -13012,6 +13292,27 @@ pub(crate) async fn proxy_to_backend_retry(
 /// switching transports mid-attempt or across same-target retries; cross-
 /// target rotation runs against a different backend, so the new target's
 /// own capability classification is the right answer.
+enum BackendDispatchResult {
+    Response {
+        response: retry::BackendResponse,
+        retained_body: Option<Bytes>,
+        backend_admission_permits: Option<BackendAdmissionPermitSet>,
+    },
+    AdmissionRejected(backend_dispatch::BackendAdmissionRejection),
+}
+
+fn backend_dispatch_response(
+    response: retry::BackendResponse,
+    retained_body: Option<Bytes>,
+    backend_admission_permits: Option<BackendAdmissionPermitSet>,
+) -> BackendDispatchResult {
+    BackendDispatchResult::Response {
+        response,
+        retained_body,
+        backend_admission_permits,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn proxy_to_backend(
     state: &ProxyState,
@@ -13022,6 +13323,7 @@ async fn proxy_to_backend(
     client_request_body: ClientRequestBody,
     upstream_target: Option<&UpstreamTarget>,
     plugins: &[Arc<dyn crate::plugins::Plugin>],
+    backend_admission_plugins: &[Arc<dyn crate::plugins::Plugin>],
     mut ctx: Option<&mut RequestContext>,
     // Real, read-only request context for the response-side buffering decision.
     // Distinct from `ctx` above, which is the request-body-hook clone and is
@@ -13043,7 +13345,7 @@ async fn proxy_to_backend(
     // has completed.
     ctx_bytes_sent_observed: &Arc<std::sync::atomic::AtomicU64>,
     inbound_version: hyper::Version,
-) -> (retry::BackendResponse, Option<Bytes>) {
+) -> BackendDispatchResult {
     // Honor DestinationRule per-port `connect_timeout_ms` overrides for this
     // dispatch. Borrowed when no override applies (zero-alloc hot path);
     // cloned only when a port override differs from the proxy default.
@@ -13052,6 +13354,7 @@ async fn proxy_to_backend(
     // the effective timeout automatically.
     let effective_proxy = resolve_effective_proxy_for_target(proxy, upstream_target);
     let proxy: &Proxy = effective_proxy.as_ref();
+    let backend_admission_permits: Option<BackendAdmissionPermitSet>;
 
     // Context for the response-side buffer->stream downgrade. Use the real
     // request context (not the request-body-hook clone), but suppress the
@@ -13099,6 +13402,16 @@ async fn proxy_to_backend(
         .map(|ip| ip.to_string());
 
     if dispatch_hbone {
+        backend_admission_permits = match backend_dispatch::run_backend_admission_plugins(
+            backend_admission_plugins,
+            request_ctx,
+            proxy,
+            upstream_target,
+            ProxyProtocol::Http,
+        ) {
+            Ok(permits) => permits,
+            Err(rejection) => return BackendDispatchResult::AdmissionRejected(rejection),
+        };
         let (backend_resp, body_bytes) = proxy_to_backend_hbone(
             state,
             proxy,
@@ -13116,7 +13429,7 @@ async fn proxy_to_backend(
             ctx_bytes_sent_observed,
         )
         .await;
-        return (backend_resp, body_bytes);
+        return backend_dispatch_response(backend_resp, body_bytes, backend_admission_permits);
     }
 
     // Plain HTTPS requests attempt the native H3 pool only when startup
@@ -13142,6 +13455,16 @@ async fn proxy_to_backend(
     // H3 pool. Without retry, the 502 propagates to the client and the
     // NEXT request uses reqwest.
     if dispatch_h3 {
+        backend_admission_permits = match backend_dispatch::run_backend_admission_plugins(
+            backend_admission_plugins,
+            request_ctx,
+            proxy,
+            upstream_target,
+            ProxyProtocol::Http,
+        ) {
+            Ok(permits) => permits,
+            Err(rejection) => return BackendDispatchResult::AdmissionRejected(rejection),
+        };
         let (mut backend_resp, body_bytes) = proxy_to_backend_http3(
             state,
             proxy,
@@ -13183,7 +13506,7 @@ async fn proxy_to_backend(
                 .backend_capabilities
                 .mark_h3_unsupported(proxy, upstream_target);
         }
-        return (resp, body_bytes);
+        return backend_dispatch_response(resp, body_bytes, backend_admission_permits);
     }
 
     // Use the direct HTTP/2 pool only when the capability registry has already
@@ -13215,8 +13538,9 @@ async fn proxy_to_backend(
                 backend_tls_sni = ?direct_h2_proxy.resolved_tls.sni,
                 "H2 pool required for backend TLS SNI override but capability registry already marks this backend target H2/TLS unsupported"
             );
-            return (
+            return backend_dispatch_response(
                 backend_tls_sni_requires_direct_h2_response(resolved_ip.clone()),
+                None,
                 None,
             );
         }
@@ -13250,8 +13574,9 @@ async fn proxy_to_backend(
                                     "HTTP/2 pool negotiated HTTP/1.1 backend but backend TLS SNI override cannot fall back to reqwest"
                                 );
                             }
-                            return (
+                            return backend_dispatch_response(
                                 backend_tls_sni_requires_direct_h2_response(resolved_ip.clone()),
+                                None,
                                 None,
                             );
                         } else {
@@ -13263,8 +13588,9 @@ async fn proxy_to_backend(
                             None
                         }
                     } else {
-                        return (
+                        return backend_dispatch_response(
                             http2_pool_sender_error_response(state, proxy, &e, resolved_ip.clone()),
+                            None,
                             None,
                         );
                     }
@@ -13280,7 +13606,7 @@ async fn proxy_to_backend(
                                 false,
                                 "direct HTTP/2 pool should not be used when request body is pre-buffered"
                             );
-                            return (
+                            return backend_dispatch_response(
                                 retry::BackendResponse {
                                     status_code: 500,
                                     body: ResponseBody::Buffered(
@@ -13294,10 +13620,24 @@ async fn proxy_to_backend(
                                     error_class: None,
                                 },
                                 None,
+                                None,
                             );
                         }
                     };
-                    return (
+                    backend_admission_permits =
+                        match backend_dispatch::run_backend_admission_plugins(
+                            backend_admission_plugins,
+                            request_ctx,
+                            proxy,
+                            upstream_target,
+                            ProxyProtocol::Http,
+                        ) {
+                            Ok(permits) => permits,
+                            Err(rejection) => {
+                                return BackendDispatchResult::AdmissionRejected(rejection);
+                            }
+                        };
+                    return backend_dispatch_response(
                         proxy_to_backend_http2(
                             state,
                             direct_h2_proxy,
@@ -13316,6 +13656,7 @@ async fn proxy_to_backend(
                         )
                         .await,
                         None,
+                        backend_admission_permits,
                     );
                 }
                 debug!(
@@ -13335,8 +13676,9 @@ async fn proxy_to_backend(
                 enable_http2 = pool_config.enable_http2,
                 "H2 pool required for backend TLS SNI override but request is not compatible with direct H2 dispatch"
             );
-            return (
+            return backend_dispatch_response(
                 backend_tls_sni_requires_direct_h2_response(resolved_ip.clone()),
+                None,
                 None,
             );
         }
@@ -13363,7 +13705,7 @@ async fn proxy_to_backend(
                 "Connection pool client creation failed — refusing to proxy without proper TLS configuration: {}",
                 e
             );
-            return (
+            return backend_dispatch_response(
                 retry::BackendResponse {
                     status_code: 502,
                     body: ResponseBody::Buffered(r#"{"error":"Bad Gateway"}"#.as_bytes().to_vec()),
@@ -13373,6 +13715,7 @@ async fn proxy_to_backend(
                     error_class: Some(retry::ErrorClass::ConnectionPoolError),
                 },
                 None,
+                None,
             );
         }
     };
@@ -13381,7 +13724,7 @@ async fn proxy_to_backend(
         Ok(m) => m,
         Err(()) => {
             warn!("Invalid HTTP method: {}", method);
-            return (
+            return backend_dispatch_response(
                 retry::BackendResponse {
                     status_code: 405,
                     body: ResponseBody::Buffered(
@@ -13392,6 +13735,7 @@ async fn proxy_to_backend(
                     backend_resolved_ip: resolved_ip.clone(),
                     error_class: None,
                 },
+                None,
                 None,
             );
         }
@@ -13480,7 +13824,7 @@ async fn proxy_to_backend(
             && let Ok(len) = content_length.parse::<usize>()
             && len > state.max_request_body_size_bytes
         {
-            return (
+            return backend_dispatch_response(
                 retry::BackendResponse {
                     status_code: 413,
                     body: ResponseBody::Buffered(
@@ -13491,6 +13835,7 @@ async fn proxy_to_backend(
                     backend_resolved_ip: resolved_ip.clone(),
                     error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
                 },
+                None,
                 None,
             );
         }
@@ -13523,8 +13868,9 @@ async fn proxy_to_backend(
                     PluginResult::Continue => {}
                     reject @ PluginResult::Reject { .. }
                     | reject @ PluginResult::RejectBinary { .. } => {
-                        return (
+                        return backend_dispatch_response(
                             reject_result_to_backend_response(reject, resolved_ip.clone()),
+                            None,
                             None,
                         );
                     }
@@ -13580,7 +13926,7 @@ async fn proxy_to_backend(
                     match limited.collect().await {
                         Ok(collected) => collected.to_bytes().to_vec(),
                         Err(_) => {
-                            return (
+                            return backend_dispatch_response(
                                 retry::BackendResponse {
                                     status_code: 413,
                                     body:
@@ -13594,6 +13940,7 @@ async fn proxy_to_backend(
                                     backend_resolved_ip: resolved_ip.clone(),
                                     error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
                                 },
+                                None,
                                 None,
                             );
                         }
@@ -13609,7 +13956,7 @@ async fn proxy_to_backend(
                                 error = %e,
                                 "Client disconnected while sending request body"
                             );
-                            return (
+                            return backend_dispatch_response(
                                 retry::BackendResponse {
                                     status_code: 499,
                                     body: ResponseBody::Buffered(
@@ -13620,6 +13967,7 @@ async fn proxy_to_backend(
                                     backend_resolved_ip: resolved_ip.clone(),
                                     error_class: Some(retry::ErrorClass::ClientDisconnect),
                                 },
+                                None,
                                 None,
                             );
                         }
@@ -13646,8 +13994,9 @@ async fn proxy_to_backend(
                     PluginResult::Continue => {}
                     reject @ PluginResult::Reject { .. }
                     | reject @ PluginResult::RejectBinary { .. } => {
-                        return (
+                        return backend_dispatch_response(
                             reject_result_to_backend_response(reject, resolved_ip.clone()),
+                            None,
                             None,
                         );
                     }
@@ -13663,6 +14012,17 @@ async fn proxy_to_backend(
             }
         }
     }
+
+    backend_admission_permits = match backend_dispatch::run_backend_admission_plugins(
+        backend_admission_plugins,
+        request_ctx,
+        proxy,
+        upstream_target,
+        ProxyProtocol::Http,
+    ) {
+        Ok(permits) => permits,
+        Err(rejection) => return BackendDispatchResult::AdmissionRejected(rejection),
+    };
 
     // Send
     let mut reqwest_backend_guard =
@@ -13690,7 +14050,7 @@ async fn proxy_to_backend(
                     backend_status = response.status().as_u16(),
                     "Streaming request body exceeded maximum size (backend responded before body error surfaced)"
                 );
-                return (
+                return backend_dispatch_response(
                     retry::BackendResponse {
                         status_code: 413,
                         body: ResponseBody::Buffered(
@@ -13702,6 +14062,7 @@ async fn proxy_to_backend(
                         error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
                     },
                     retained_body,
+                    backend_admission_permits,
                 );
             }
 
@@ -13738,7 +14099,7 @@ async fn proxy_to_backend(
                         "Backend response body ({} bytes) exceeds limit ({} bytes)",
                         len, state.max_response_body_size_bytes
                     );
-                    return (
+                    return backend_dispatch_response(
                         retry::BackendResponse {
                             status_code: 502,
                             body: ResponseBody::Buffered(
@@ -13752,6 +14113,7 @@ async fn proxy_to_backend(
                             error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
                         },
                         retained_body,
+                        backend_admission_permits,
                     );
                 }
 
@@ -13771,7 +14133,7 @@ async fn proxy_to_backend(
                                 Vec::new()
                             }
                         };
-                        return (
+                        return backend_dispatch_response(
                             retry::BackendResponse {
                                 status_code: status,
                                 body: ResponseBody::Buffered(body),
@@ -13781,9 +14143,10 @@ async fn proxy_to_backend(
                                 error_class: None,
                             },
                             retained_body,
+                            backend_admission_permits,
                         );
                     }
-                    return (
+                    return backend_dispatch_response(
                         retry::BackendResponse {
                             status_code: status,
                             body: ResponseBody::Streaming {
@@ -13796,6 +14159,7 @@ async fn proxy_to_backend(
                             error_class: None,
                         },
                         retained_body,
+                        backend_admission_permits,
                     );
                 }
 
@@ -13803,7 +14167,7 @@ async fn proxy_to_backend(
                 // limit is still enforced via the `SizeLimitedStreamingResponse`
                 // adapter applied at the response body builder stage.
                 if stream_response {
-                    return (
+                    return backend_dispatch_response(
                         retry::BackendResponse {
                             status_code: status,
                             body: ResponseBody::Streaming {
@@ -13816,6 +14180,7 @@ async fn proxy_to_backend(
                             error_class: None,
                         },
                         retained_body,
+                        backend_admission_permits,
                     );
                 }
 
@@ -13919,7 +14284,7 @@ async fn proxy_to_backend(
                     max_body_size = state.max_request_body_size_bytes,
                     "Streaming request body exceeded maximum size"
                 );
-                return (
+                return backend_dispatch_response(
                     retry::BackendResponse {
                         status_code: 413,
                         body: ResponseBody::Buffered(
@@ -13931,6 +14296,7 @@ async fn proxy_to_backend(
                         error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
                     },
                     retained_body,
+                    backend_admission_permits,
                 );
             }
 
@@ -13967,7 +14333,7 @@ async fn proxy_to_backend(
         }
     };
 
-    (response, retained_body)
+    backend_dispatch_response(response, retained_body, backend_admission_permits)
 }
 
 /// Returns `true` for response content types that represent inherently unbounded
@@ -17036,7 +17402,7 @@ mod tests {
         ) -> ResponseBody {
             let ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
             let bytes_sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
-            let (resp, _) = proxy_to_backend(
+            let dispatch = proxy_to_backend(
                 state,
                 proxy,
                 backend_url,
@@ -17045,6 +17411,7 @@ mod tests {
                 ClientRequestBody::Buffered(Vec::new()),
                 None,
                 plugins,
+                &[],
                 None,  // body-hook ctx (absent for response-only configs)
                 &ctx,  // real read-only request context
                 false, // stream_response: WAF requested buffering pre-flight
@@ -17059,6 +17426,12 @@ mod tests {
                 hyper::Version::HTTP_11,
             )
             .await;
+            let resp = match dispatch {
+                BackendDispatchResult::Response { response, .. } => response,
+                BackendDispatchResult::AdmissionRejected(_) => {
+                    panic!("test does not configure backend admission plugins")
+                }
+            };
             resp.body
         }
 

@@ -7,11 +7,12 @@
 
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use crossbeam_utils::CachePadded;
 use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
 
 use crate::config::types::{Proxy, UpstreamTarget};
 use crate::plugins::{BackendAdmissionOutcome, BackendAdmissionPermit};
@@ -36,6 +37,7 @@ pub enum AdaptiveConcurrencyKeyBy {
 #[derive(Clone, Debug)]
 pub struct AdaptiveConcurrencyConfig {
     pub key_by: AdaptiveConcurrencyKeyBy,
+    pub max_tracked_keys: usize,
     pub min_limit: u64,
     pub initial_limit: u64,
     pub max_limit: u64,
@@ -92,12 +94,14 @@ impl AdaptiveConcurrencyState {
 
 pub struct AdaptiveConcurrencyLimiter {
     inner: DashMap<AdaptiveConcurrencyKey, Arc<AdaptiveConcurrencyState>>,
+    tracked_keys: AtomicUsize,
 }
 
 impl AdaptiveConcurrencyLimiter {
     pub fn new(shards: usize) -> Self {
         Self {
             inner: DashMap::with_shard_amount(shards),
+            tracked_keys: AtomicUsize::new(0),
         }
     }
 
@@ -112,11 +116,23 @@ impl AdaptiveConcurrencyLimiter {
         config: Arc<AdaptiveConcurrencyConfig>,
     ) -> Result<Arc<AdaptiveConcurrencyPermit>, AdaptiveConcurrencyLimitExceeded> {
         let key = build_key(proxy, target, config.key_by);
-        let state = self
-            .inner
-            .entry(key.clone())
-            .or_insert_with(|| Arc::new(AdaptiveConcurrencyState::new(config.initial_limit)))
-            .clone();
+        let state = match self.inner.get(&key) {
+            Some(entry) => Arc::clone(entry.value()),
+            None => {
+                self.reserve_key_slot(config.max_tracked_keys)?;
+                match self.inner.entry(key.clone()) {
+                    Entry::Occupied(entry) => {
+                        self.tracked_keys.fetch_sub(1, Ordering::AcqRel);
+                        Arc::clone(entry.get())
+                    }
+                    Entry::Vacant(entry) => {
+                        let state = Arc::new(AdaptiveConcurrencyState::new(config.initial_limit));
+                        entry.insert(Arc::clone(&state));
+                        state
+                    }
+                }
+            }
+        };
 
         loop {
             let current = state.in_flight.load(Ordering::Relaxed);
@@ -143,6 +159,30 @@ impl AdaptiveConcurrencyLimiter {
                     }));
                 }
                 Err(_) => continue,
+            }
+        }
+    }
+
+    fn reserve_key_slot(
+        &self,
+        max_tracked_keys: usize,
+    ) -> Result<(), AdaptiveConcurrencyLimitExceeded> {
+        let mut current = self.tracked_keys.load(Ordering::Acquire);
+        loop {
+            if current >= max_tracked_keys {
+                return Err(AdaptiveConcurrencyLimitExceeded {
+                    current_in_flight: current as u64,
+                    limit: max_tracked_keys as u64,
+                });
+            }
+            match self.tracked_keys.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(observed) => current = observed,
             }
         }
     }

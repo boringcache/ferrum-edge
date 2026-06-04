@@ -1957,11 +1957,12 @@ Protects upstreams by admitting backend dispatch only when the selected target i
 **Phase:** `backend_admission`
 **Supported protocols:** HTTP, gRPC, WebSocket
 
-For HTTP and gRPC, admission runs after load balancing selects the backend target and before the gateway opens/sends the backend request. Native HTTP/3 HTTP backends run the same target-aware admission before QUIC backend dispatch. For WebSocket, admission runs once during the upgrade handshake and the permit is held for the full upgraded session, including HTTP/3 WebSocket.
+For HTTP and gRPC, admission runs after load balancing selects the backend target and after request-body buffering/final-body hooks complete, immediately before the gateway opens/sends each backend attempt. HTTP/3 frontends run the same target-aware admission for both native QUIC backend dispatch and the fallback H3-to-H1/H2 bridge. For WebSocket, admission runs once during the upgrade handshake and the permit is held for the full upgraded session, including HTTP/3 WebSocket.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `key_by` | String | `proxy_target` | Limit scope: `proxy_target` keys by proxy plus selected backend, `upstream_target` keys by upstream plus selected backend when the proxy uses an upstream, and `backend_target` shares one limit per backend endpoint across every proxy using this plugin instance. |
+| `max_tracked_keys` | u64 | `10000` | Maximum number of distinct target keys this plugin instance will track. New keys beyond the cap are rejected to bound wildcard upstream memory use; existing keys continue to be admitted subject to their adaptive limit. |
 | `min_limit` | u64 | `1` | Lower bound for the adaptive in-flight request limit. Must be greater than zero. |
 | `initial_limit` | u64 | `32` | Starting in-flight request limit for a new target key. Must be between `min_limit` and `max_limit`. |
 | `max_limit` | u64 | `1024` | Upper bound for the adaptive in-flight request limit. Must be at least `min_limit`. |
@@ -1976,6 +1977,7 @@ For HTTP and gRPC, admission runs after load balancing selects the backend targe
 plugin_name: adaptive_concurrency
 config:
   key_by: upstream_target
+  max_tracked_keys: 10000
   initial_limit: 32
   min_limit: 2
   max_limit: 512

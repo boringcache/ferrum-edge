@@ -1267,6 +1267,7 @@ pub enum GrpcResponseKind {
 /// downstream client. This is only safe when retries are NOT configured (the
 /// body has already been consumed by the time we know if a retry is needed).
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub async fn proxy_grpc_request(
     req: Request<Incoming>,
     proxy: &Proxy,
