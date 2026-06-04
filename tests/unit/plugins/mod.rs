@@ -4,6 +4,7 @@ mod plugin_utils;
 mod mesh_route_dispatch_tests;
 
 mod access_control_tests;
+mod adaptive_concurrency_tests;
 mod ai_federation_tests;
 mod ai_prompt_shield_tests;
 mod ai_rate_limiter_tests;

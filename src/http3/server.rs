@@ -26,7 +26,10 @@ use super::config::Http3ServerConfig;
 use crate::config::types::{HttpFlavor, Proxy, UpstreamTarget};
 use crate::consumer_index::ConsumerIndex;
 use crate::load_balancer::LoadBalancerCache;
-use crate::plugins::{Plugin, PluginResult, ProxyProtocol, RequestContext, TransactionSummary};
+use crate::plugins::{
+    BackendAdmissionOutcome, BackendAdmissionPermitSet, Plugin, PluginResult, ProxyProtocol,
+    RequestContext, TransactionSummary,
+};
 use crate::proxy::headers::{
     apply_response_headers, is_backend_request_strip_header, is_backend_response_strip_header,
     parse_connection_listed_from_str_map,
@@ -1740,6 +1743,61 @@ async fn handle_h3_request(
         request_host.as_deref(),
     );
     let upstream_balancer = selection.balancer;
+    let use_native_h3_pool = http_flavor == HttpFlavor::Plain
+        && crate::proxy::supports_native_http3_backend(&state, &proxy, upstream_target.as_deref());
+    let mut backend_admission_permits =
+        if http_flavor == HttpFlavor::WebSocket || use_native_h3_pool {
+            let backend_admission_plugins = plugin_cache_view.backend_admission_plugins();
+            match crate::proxy::backend_dispatch::run_backend_admission_plugins(
+                backend_admission_plugins.as_ref(),
+                &ctx,
+                &proxy,
+                upstream_target.as_deref(),
+                request_protocol,
+            ) {
+                Ok(permits) => permits,
+                Err(rejection) => {
+                    let mut headers = rejection.headers;
+                    apply_after_proxy_hooks_to_rejection(
+                        &plugins,
+                        &mut ctx,
+                        rejection.status_code,
+                        &mut headers,
+                    )
+                    .await;
+                    let http_status = StatusCode::from_u16(rejection.status_code)
+                        .unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
+                    let log_status_code = h3_reject_log_status_and_metadata(
+                        &mut ctx,
+                        http_flavor,
+                        http_status,
+                        &rejection.body,
+                        &headers,
+                    );
+                    record_request(&state, log_status_code);
+                    log_rejected_request(
+                        &plugins,
+                        &ctx,
+                        log_status_code,
+                        start_time,
+                        &rejection.plugin_name,
+                        plugin_execution_ns,
+                    )
+                    .await;
+                    send_h3_reject_flavor_aware(
+                        &mut stream,
+                        http_flavor,
+                        http_status,
+                        &rejection.body,
+                        &headers,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            }
+        } else {
+            None
+        };
 
     let (cb_target_key, cb_is_half_open_probe) =
         match crate::proxy::backend_dispatch::check_circuit_breaker(
@@ -1893,6 +1951,7 @@ async fn handle_h3_request(
             start_time,
             cb_target_key,
             cb_is_half_open_probe,
+            backend_admission_permits.take(),
             backend_url,
             effective_query_string.to_string(),
             proxy_headers,
@@ -1904,8 +1963,6 @@ async fn handle_h3_request(
         .await;
     }
 
-    let use_native_h3_pool = http_flavor == HttpFlavor::Plain
-        && crate::proxy::supports_native_http3_backend(&state, &proxy, upstream_target.as_deref());
     if !use_native_h3_pool {
         let prebuffered = if needs_request_buffering {
             let body_was_prebuffered = prebuffered_body_data.is_some();
@@ -2176,6 +2233,13 @@ async fn handle_h3_request(
                         false,
                         backend_start.elapsed(),
                     );
+                    record_h3_backend_admission_outcome(
+                        &mut backend_admission_permits,
+                        413,
+                        false,
+                        Some(crate::retry::ErrorClass::ClientDisconnect),
+                        backend_start.elapsed(),
+                    );
                     return Ok(());
                 }
                 error!("Backend request failed (HTTP/3 streaming body): {}", e);
@@ -2229,6 +2293,13 @@ async fn handle_h3_request(
                     outcome_error_class,
                     cb_is_half_open_probe,
                     false,
+                    backend_start.elapsed(),
+                );
+                record_h3_backend_admission_outcome(
+                    &mut backend_admission_permits,
+                    502,
+                    outcome_connection_error,
+                    outcome_error_class,
                     backend_start.elapsed(),
                 );
 
@@ -2325,6 +2396,13 @@ async fn handle_h3_request(
                 false,
                 backend_start.elapsed(),
             );
+            record_h3_backend_admission_outcome(
+                &mut backend_admission_permits,
+                response_status,
+                false,
+                None,
+                backend_start.elapsed(),
+            );
             record_request(&state, 502);
             return Ok(());
         }
@@ -2367,6 +2445,13 @@ async fn handle_h3_request(
                 None,
                 cb_is_half_open_probe,
                 false,
+                backend_start.elapsed(),
+            );
+            record_h3_backend_admission_outcome(
+                &mut backend_admission_permits,
+                response_status,
+                false,
+                None,
                 backend_start.elapsed(),
             );
 
@@ -2593,6 +2678,18 @@ async fn handle_h3_request(
             None,
             cb_is_half_open_probe,
             false,
+            backend_start.elapsed(),
+        );
+        let backend_admission_connection_error = match body_error_class {
+            Some(crate::retry::ErrorClass::ClientDisconnect) => false,
+            Some(_) => true,
+            None => false,
+        };
+        record_h3_backend_admission_outcome(
+            &mut backend_admission_permits,
+            response_status,
+            backend_admission_connection_error,
+            body_error_class,
             backend_start.elapsed(),
         );
 
@@ -3063,6 +3160,13 @@ async fn handle_h3_request(
                 },
                 attempt,
             ) {
+                record_h3_backend_admission_outcome(
+                    &mut backend_admission_permits,
+                    result.status,
+                    !result.request_on_wire,
+                    result.error_class,
+                    backend_start.elapsed(),
+                );
                 // Record failure against current target's circuit breaker.
                 // Same typed signal as the retry decision: a graceful close
                 // (or any other post-`send_request` fault) does not count
@@ -3187,6 +3291,13 @@ async fn handle_h3_request(
             h3_error_class,
             cb_retry_probe_slot_available,
             false,
+            backend_start.elapsed(),
+        );
+        record_h3_backend_admission_outcome(
+            &mut backend_admission_permits,
+            response_status,
+            !h3_request_on_wire,
+            h3_error_class,
             backend_start.elapsed(),
         );
 
@@ -3411,6 +3522,23 @@ fn h3_plugin_protocol_for_flavor(flavor: HttpFlavor) -> ProxyProtocol {
         HttpFlavor::Plain => ProxyProtocol::Http,
         HttpFlavor::Grpc => ProxyProtocol::Grpc,
         HttpFlavor::WebSocket => ProxyProtocol::WebSocket,
+    }
+}
+
+fn record_h3_backend_admission_outcome(
+    permits: &mut Option<BackendAdmissionPermitSet>,
+    response_status: u16,
+    connection_error: bool,
+    error_class: Option<crate::retry::ErrorClass>,
+    backend_elapsed: Duration,
+) {
+    if let Some(permits) = permits.take() {
+        permits.record_backend_outcome(BackendAdmissionOutcome {
+            response_status,
+            connection_error,
+            error_class,
+            backend_elapsed,
+        });
     }
 }
 

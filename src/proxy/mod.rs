@@ -91,8 +91,9 @@ use crate::modes::mesh::node_waypoint::{
 };
 use crate::plugin_cache::{PluginCache, PluginCapabilities};
 use crate::plugins::{
-    Plugin, PluginResult, ProxyProtocol, RequestContext, TransactionSummary,
-    WebSocketFrameDirection, mesh_route_dispatch::MeshRouteDispatchConfig,
+    BackendAdmissionOutcome, BackendAdmissionPermitSet, Plugin, PluginResult, ProxyProtocol,
+    RequestContext, TransactionSummary, WebSocketFrameDirection,
+    mesh_route_dispatch::MeshRouteDispatchConfig,
 };
 use crate::proxy::headers as headers_mod;
 use crate::request_epoch::{RequestEpoch, RequestEpochStore, StagedRequestEpoch};
@@ -5715,6 +5716,7 @@ async fn handle_websocket_request_authenticated(
     is_tls: bool,
     cb_target_key: Option<String>,
     cb_is_half_open_probe: bool,
+    backend_admission_permits: Option<BackendAdmissionPermitSet>,
     requires_ws_frame_hooks: bool,
     query_string: String,
     strip_len: usize,
@@ -5826,6 +5828,8 @@ async fn handle_websocket_request_authenticated(
     let env_config = state.env_config.clone();
     let mut current_backend_url = backend_url;
     let mut current_target = upstream_target;
+    let mut backend_admission_permits = backend_admission_permits;
+    let backend_admission_start = Instant::now();
     let mut ws_attempt = 0u32;
 
     // The backend WebSocket connection acquired below is held for the full
@@ -5931,6 +5935,14 @@ async fn handle_websocket_request_authenticated(
                 };
 
                 if should_retry_ws {
+                    if let Some(permits) = backend_admission_permits.take() {
+                        permits.record_backend_outcome(BackendAdmissionOutcome {
+                            response_status: 502,
+                            connection_error: ws_is_pre_wire,
+                            error_class: Some(ws_error_class),
+                            backend_elapsed: backend_admission_start.elapsed(),
+                        });
+                    }
                     // Safety: should_retry_ws is only true when proxy.retry.is_some()
                     // (see condition above). Fall through to 502 if the invariant
                     // ever breaks due to a refactor, rather than panicking.
@@ -6020,6 +6032,14 @@ async fn handle_websocket_request_authenticated(
                     error = %e,
                     "WebSocket backend connection failed"
                 );
+                if let Some(permits) = backend_admission_permits.take() {
+                    permits.record_backend_outcome(BackendAdmissionOutcome {
+                        response_status: 502,
+                        connection_error: ws_is_pre_wire,
+                        error_class: Some(ws_error_class),
+                        backend_elapsed: backend_admission_start.elapsed(),
+                    });
+                }
                 state.request_count.fetch_add(1, Ordering::Relaxed);
                 record_status(&state, 502);
 
@@ -6086,6 +6106,14 @@ async fn handle_websocket_request_authenticated(
 
     let ws_lb_guard =
         LoadBalancerConnectionGuard::new(current_target.clone(), upstream_balancer.clone());
+    if let Some(permits) = backend_admission_permits.as_ref() {
+        permits.record_backend_outcome(BackendAdmissionOutcome {
+            response_status: if is_h2_websocket { 200 } else { 101 },
+            connection_error: false,
+            error_class: None,
+            backend_elapsed: backend_admission_start.elapsed(),
+        });
+    }
 
     // Backend verified — record status and log.
     // HTTP/2 Extended CONNECT returns 200 OK; HTTP/1.1 returns 101 Switching Protocols.
@@ -6287,6 +6315,7 @@ async fn handle_websocket_request_authenticated(
     };
     tokio::spawn(async move {
         let _ws_lb_guard = ws_lb_guard;
+        let _backend_admission_permits = backend_admission_permits;
         // Hold the connection guard for the full WS session lifetime. Drops on
         // every exit path (upgrade failure, run_websocket_proxy completion or
         // error), decrementing `active_connections` exactly once.
@@ -9903,6 +9932,42 @@ async fn handle_proxy_request_inner(
     let upstream_is_fallback = selection.is_fallback;
     let sticky_cookie_needed = selection.sticky_cookie_needed;
 
+    let backend_admission_plugins = plugin_cache_view.backend_admission_plugins();
+    let mut backend_admission_permits = match backend_dispatch::run_backend_admission_plugins(
+        backend_admission_plugins.as_ref(),
+        &ctx,
+        &proxy,
+        upstream_target.as_deref(),
+        request_protocol,
+    ) {
+        Ok(permits) => permits,
+        Err(rejection) => {
+            let reject = finalize_reject_response_with_after_proxy_hooks(
+                &plugins,
+                &mut ctx,
+                StatusCode::from_u16(rejection.status_code)
+                    .unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
+                &rejection.body,
+                rejection.headers,
+                is_grpc_request,
+            )
+            .await;
+            apply_grpc_reject_metadata(&mut ctx, &reject);
+            log_rejected_request_with_path(
+                &plugins,
+                &ctx,
+                reject.http_status.as_u16(),
+                start_time,
+                &rejection.plugin_name,
+                plugin_execution_ns,
+                Some(&original_request_path),
+            )
+            .await;
+            record_request(&state, reject.http_status.as_u16());
+            return Ok(build_response_from_normalized_reject(reject));
+        }
+    };
+
     // Circuit breaker check — per-target when upstream is configured, per-proxy otherwise
     let (cb_target_key, cb_is_half_open_probe) =
         match backend_dispatch::check_circuit_breaker(&proxy, &state, upstream_target.as_deref()) {
@@ -9998,6 +10063,7 @@ async fn handle_proxy_request_inner(
             is_tls,
             cb_target_key,
             cb_is_half_open_probe,
+            backend_admission_permits.take(),
             requires_ws_frame_hooks,
             effective_query_string.to_string(),
             strip_len,
@@ -10387,6 +10453,19 @@ async fn handle_proxy_request_inner(
                     break;
                 }
 
+                if let Some(permits) = backend_admission_permits.take() {
+                    let error_class = match &grpc_result {
+                        Err(error) => Some(retry::classify_grpc_proxy_error(error)),
+                        Ok(_) => None,
+                    };
+                    permits.record_backend_outcome(BackendAdmissionOutcome {
+                        response_status: 502,
+                        connection_error: true,
+                        error_class,
+                        backend_elapsed: backend_start.elapsed(),
+                    });
+                }
+
                 // Record circuit breaker failure for current target
                 if let Some(cb_config) = &proxy.circuit_breaker {
                     let cb = state.circuit_breaker_cache.get_or_create(
@@ -10673,6 +10752,14 @@ async fn handle_proxy_request_inner(
                 } else {
                     None
                 };
+                if !body_exceeded && let Some(permits) = backend_admission_permits.as_ref() {
+                    permits.record_backend_outcome(BackendAdmissionOutcome {
+                        response_status: grpc_streaming.status,
+                        connection_error: false,
+                        error_class: None,
+                        backend_elapsed: backend_start.elapsed(),
+                    });
+                }
 
                 let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
                 let plugin_execution_ms = plugin_execution_ns as f64 / 1_000_000.0;
@@ -10774,6 +10861,7 @@ async fn handle_proxy_request_inner(
                 };
 
                 if body_exceeded {
+                    drop(backend_admission_permits.take());
                     record_request(&state, 200);
                     return Ok(grpc_proxy::build_grpc_error_response(
                         grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
@@ -10855,6 +10943,9 @@ async fn handle_proxy_request_inner(
                 if let Some(guard) = per_ip_guard {
                     body = body.with_per_ip_request_guard(guard);
                 }
+                if let Some(permits) = backend_admission_permits.take() {
+                    body = body.with_backend_admission_permits(permits);
+                }
 
                 // Detach the deferred logger before handing the body to
                 // `resp_builder.body(...)`. If the build fails (e.g. plugin/
@@ -10897,6 +10988,14 @@ async fn handle_proxy_request_inner(
                 let mut response_status = grpc_resp.status;
                 let mut response_headers: HashMap<String, String> = grpc_resp.headers;
                 let mut response_body = grpc_resp.body;
+                if let Some(permits) = backend_admission_permits.take() {
+                    permits.record_backend_outcome(BackendAdmissionOutcome {
+                        response_status,
+                        connection_error: false,
+                        error_class: None,
+                        backend_elapsed: backend_start.elapsed(),
+                    });
+                }
 
                 // Forward trailers as response headers (gRPC Trailers-Only encoding).
                 // Drain instead of clone to avoid per-trailer String allocations.
@@ -11147,6 +11246,28 @@ async fn handle_proxy_request_inner(
             }
             Err(e) => {
                 let grpc_error_class = retry::classify_grpc_proxy_error(&e);
+                if !matches!(
+                    &e,
+                    GrpcProxyError::ResourceExhausted(_) | GrpcProxyError::Internal(_)
+                ) && let Some(permits) = backend_admission_permits.take()
+                {
+                    let connection_error = matches!(
+                        &e,
+                        GrpcProxyError::BackendUnavailable { kind, .. } if kind.is_connect_class()
+                    ) || matches!(
+                        &e,
+                        GrpcProxyError::BackendTimeout {
+                            kind: grpc_proxy::GrpcTimeoutKind::Connect,
+                            ..
+                        }
+                    );
+                    permits.record_backend_outcome(BackendAdmissionOutcome {
+                        response_status: 502,
+                        connection_error,
+                        error_class: Some(grpc_error_class),
+                        backend_elapsed: backend_start.elapsed(),
+                    });
+                }
                 if grpc_error_class == retry::ErrorClass::PortExhaustion {
                     state.overload.record_port_exhaustion();
                 }
@@ -11385,6 +11506,14 @@ async fn handle_proxy_request_inner(
         .await;
 
         while retry::should_retry(retry_config, &method, &result, attempt) {
+            if let Some(permits) = backend_admission_permits.take() {
+                permits.record_backend_outcome(BackendAdmissionOutcome {
+                    response_status: result.status_code,
+                    connection_error: result.connection_error,
+                    error_class: result.error_class,
+                    backend_elapsed: backend_start.elapsed(),
+                });
+            }
             // Record the failed attempt against the current target's circuit breaker
             // before potentially switching to a different target for the next retry.
             if let Some(cb_config) = &proxy.circuit_breaker {
@@ -11621,6 +11750,14 @@ async fn handle_proxy_request_inner(
         skip_final_cb_record,
         backend_start.elapsed(),
     );
+    if let Some(permits) = backend_admission_permits.as_ref() {
+        permits.record_backend_outcome(BackendAdmissionOutcome {
+            response_status,
+            connection_error: backend_resp.connection_error,
+            error_class: backend_error_class,
+            backend_elapsed: backend_start.elapsed(),
+        });
+    }
 
     let backend_elapsed = backend_start.elapsed().as_secs_f64() * 1000.0;
     let backend_ttfb_ms = backend_elapsed;
@@ -12034,7 +12171,10 @@ async fn handle_proxy_request_inner(
             } else {
                 base
             };
-            let base = base.with_lb_connection_guard(lb_connection_guard);
+            let mut base = base.with_lb_connection_guard(lb_connection_guard);
+            if let Some(permits) = backend_admission_permits.take() {
+                base = base.with_backend_admission_permits(permits);
+            }
 
             if state.env_config.enable_streaming_latency_tracking {
                 let (tracked_body, metrics) = base.into_tracked(backend_start);
@@ -12134,7 +12274,11 @@ async fn handle_proxy_request_inner(
                     state.h2_coalesce_target_bytes,
                 )
             };
-            body.with_lb_connection_guard(lb_connection_guard)
+            let mut body = body.with_lb_connection_guard(lb_connection_guard);
+            if let Some(permits) = backend_admission_permits.take() {
+                body = body.with_backend_admission_permits(permits);
+            }
+            body
         }
         ResponseBody::StreamingH3(h3_resp) => {
             let cl = response_headers
@@ -12177,7 +12321,11 @@ async fn handle_proxy_request_inner(
                     std::time::Duration::from_micros(state.env_config.http3_flush_interval_micros),
                 )
             };
-            body.with_lb_connection_guard(lb_connection_guard)
+            let mut body = body.with_lb_connection_guard(lb_connection_guard);
+            if let Some(permits) = backend_admission_permits.take() {
+                body = body.with_backend_admission_permits(permits);
+            }
+            body
         }
         ResponseBody::Buffered(data) => {
             // Buffered response: body is fully consumed, drop the guard

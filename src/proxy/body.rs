@@ -49,6 +49,9 @@ pub struct ProxyBody {
     /// (EOF, error, or client disconnect), ensuring least-connections
     /// accounting decrements when the backend stream actually ends.
     _lb_connection_guard: Option<super::LoadBalancerConnectionGuard>,
+    /// Dropped when the client-visible response body finishes, releasing
+    /// backend-admission slots such as adaptive concurrency permits.
+    _backend_admission_permits: Option<crate::plugins::BackendAdmissionPermitSet>,
     /// Deferred logger that fires after body completion, allowing
     /// `TransactionSummary.body_completed` / `body_error_class` /
     /// `client_disconnected` / `bytes_streamed` to reflect the
@@ -217,6 +220,7 @@ impl ProxyBody {
             _reqwest_backend_guard: None,
             _per_ip_request_guard: None,
             _lb_connection_guard: None,
+            _backend_admission_permits: None,
             logger: None,
             bytes_streamed: AtomicU64::new(0),
             polled: AtomicBool::new(false),
@@ -236,6 +240,7 @@ impl ProxyBody {
             _reqwest_backend_guard: None,
             _per_ip_request_guard: None,
             _lb_connection_guard: None,
+            _backend_admission_permits: None,
             logger: None,
             bytes_streamed: AtomicU64::new(0),
             polled: AtomicBool::new(false),
@@ -267,6 +272,14 @@ impl ProxyBody {
         guard: super::LoadBalancerConnectionGuard,
     ) -> Self {
         self._lb_connection_guard = Some(guard);
+        self
+    }
+
+    pub(crate) fn with_backend_admission_permits(
+        mut self,
+        permits: crate::plugins::BackendAdmissionPermitSet,
+    ) -> Self {
+        self._backend_admission_permits = Some(permits);
         self
     }
 
@@ -312,6 +325,7 @@ impl ProxyBody {
             _reqwest_backend_guard: None,
             _per_ip_request_guard: None,
             _lb_connection_guard: None,
+            _backend_admission_permits: None,
             logger: None,
             bytes_streamed: AtomicU64::new(0),
             polled: AtomicBool::new(false),

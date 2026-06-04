@@ -1,6 +1,6 @@
 # Plugin Reference
 
-Ferrum Edge includes 68 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
+Ferrum Edge includes 69 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
 
 For execution order, protocol support matrix, and design rationale, see [plugin_execution_order.md](plugin_execution_order.md).
 
@@ -10,12 +10,13 @@ For execution order, protocol support matrix, and design rationale, see [plugin_
 2. **`authenticate`** — Identifies the consumer (mTLS, JWKS, JWT, API Key, LDAP, Basic Auth, HMAC)
 3. **`authorize`** — Checks consumer permissions and policy decisions (Access Control, OPA, consumer-mode rate limiting)
 4. **`before_proxy`** — Modifies the request before forwarding (Request Transformer)
-5. **`after_proxy`** — Modifies response headers or can replace the backend response before downstream commit
-6. **`on_response_body`** — Processes the raw buffered backend body before transforms (AI token metrics, AI rate limiter)
-7. **`transform_response_body`** — Rewrites the buffered response body (Response Transformer body rules)
-8. **`on_final_response_body`** — Validates or stores the final client-visible buffered body (Body Validator, Response Size Limiting, Response Caching)
-9. **`log`** — Logs the transaction summary (Stdout/HTTP/Kafka Logging)
-10. **`on_ws_frame`** — Per-frame WebSocket hooks (Size Limiting, Rate Limiting, Frame Logging)
+5. **`backend_admission`** — Decides whether the selected backend target can accept one more in-flight request after load balancing
+6. **`after_proxy`** — Modifies response headers or can replace the backend response before downstream commit
+7. **`on_response_body`** — Processes the raw buffered backend body before transforms (AI token metrics, AI rate limiter)
+8. **`transform_response_body`** — Rewrites the buffered response body (Response Transformer body rules)
+9. **`on_final_response_body`** — Validates or stores the final client-visible buffered body (Body Validator, Response Size Limiting, Response Caching)
+10. **`log`** — Logs the transaction summary (Stdout/HTTP/Kafka Logging)
+11. **`on_ws_frame`** — Per-frame WebSocket hooks (Size Limiting, Rate Limiting, Frame Logging)
 
 ## Custom Plugins
 
@@ -1947,6 +1948,43 @@ Limits concurrent TCP connections per observed client identity on a per-proxy ba
 The proxy ID is included so the same identity can hold separate budgets across distinct proxies — useful for shared upstreams reached through differently-scoped listeners.
 
 This makes plaintext TCP listeners IP-scoped, while TCP+TLS and UDP+DTLS listeners can be scoped by the Consumer identified by [`mtls_auth`](#mtls_auth). Pair it with [`ip_restriction`](#ip_restriction) for IP authorization on plaintext TCP/UDP and [`access_control`](#access_control) for consumer allow/deny on TCP+TLS.
+
+### `adaptive_concurrency`
+
+Protects upstreams by admitting backend dispatch only when the selected target is healthy enough to accept one more in-flight request. It shrinks a per-target concurrency limit when backend latency rises above the learned baseline, when backend responses are 5xx, or when connection errors occur; it cautiously increases the limit when the target is saturated and healthy.
+
+**Priority:** 2090
+**Phase:** `backend_admission`
+**Supported protocols:** HTTP, gRPC, WebSocket
+
+For HTTP and gRPC, admission runs after load balancing selects the backend target and before the gateway opens/sends the backend request. Native HTTP/3 HTTP backends run the same target-aware admission before QUIC backend dispatch. For WebSocket, admission runs once during the upgrade handshake and the permit is held for the full upgraded session, including HTTP/3 WebSocket.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `key_by` | String | `proxy_target` | Limit scope: `proxy_target` keys by proxy plus selected backend, `upstream_target` keys by upstream plus selected backend when the proxy uses an upstream, and `backend_target` shares one limit per backend endpoint across every proxy using this plugin instance. |
+| `min_limit` | u64 | `1` | Lower bound for the adaptive in-flight request limit. Must be greater than zero. |
+| `initial_limit` | u64 | `32` | Starting in-flight request limit for a new target key. Must be between `min_limit` and `max_limit`. |
+| `max_limit` | u64 | `1024` | Upper bound for the adaptive in-flight request limit. Must be at least `min_limit`. |
+| `min_samples` | u64 | `20` | Successful backend samples required before latency-based growth/shrink decisions are applied. |
+| `target_latency_multiplier` | f64 | `1.5` | Target latency threshold as a multiple of the learned minimum observed backend latency. Must be finite and greater than `1.0`. |
+| `decrease_ratio` | f64 | `0.8` | Multiplicative decrease applied after a failure signal or high latency. Must be greater than `0` and less than `1`. |
+| `increase_step` | u64 | `1` | Additive increase applied when the target is saturated and latency remains within the target. |
+| `shadow_mode` | bool | `false` | Learn and expose state without rejecting requests when the current in-flight count is at or above the limit. |
+| `expose_headers` | bool | `false` | Include `x-adaptive-concurrency-limit` and `x-adaptive-concurrency-inflight` on rejection responses. |
+
+```yaml
+plugin_name: adaptive_concurrency
+config:
+  key_by: upstream_target
+  initial_limit: 32
+  min_limit: 2
+  max_limit: 512
+  min_samples: 20
+  target_latency_multiplier: 1.5
+  decrease_ratio: 0.8
+  increase_step: 1
+  shadow_mode: false
+```
 
 ### `ip_restriction`
 
