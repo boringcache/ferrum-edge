@@ -698,6 +698,7 @@ fn prepare_normalized_gateway_config_for_mesh(
     inject_mesh_global_plugins(&mut config, runtime, mesh_slice);
     materialize_east_west_gateway_proxies(&mut config, runtime, mesh_slice);
     materialize_egress_gateway_proxies(&mut config, runtime, mesh_slice);
+    materialize_sidecar_inbound_proxies(&mut config, runtime, mesh_slice);
     apply_destination_rules(&mut config, runtime, mesh_slice)?;
     project_mesh_source_locality(&mut config, mesh_slice);
     // Project slice-filtered ServiceEntries back into the prepared mesh
@@ -1311,6 +1312,199 @@ fn mesh_east_west_service_proxy_id(namespace: &str, name: &str) -> String {
 
 fn mesh_east_west_service_upstream_id(namespace: &str, name: &str) -> String {
     format!("__mesh-ew-upstream-{namespace}-{name}").replace(['/', '.'], "-")
+}
+
+// ── Sidecar inbound route materialization ─────────────────────────────────
+
+/// True for application protocols routed through the HTTP-family proxy chain.
+/// Stream protocols (raw TCP/TLS and the DB protocols) need an L4 stream proxy
+/// and are materialized by a later stage.
+fn is_http_family_mesh_protocol(protocol: AppProtocol) -> bool {
+    matches!(
+        protocol,
+        AppProtocol::Http | AppProtocol::Http2 | AppProtocol::Grpc | AppProtocol::Unknown
+    )
+}
+
+/// Host header variants a peer may use to reach a mesh service, in the form the
+/// router matches (the listener strips the port before routing): the bare
+/// service name (local-namespace short form) plus the `.ns`, `.ns.svc`, and
+/// `.ns.svc.<cluster_domain>` Kubernetes forms.
+fn mesh_service_host_variants(name: &str, namespace: &str, cluster_domain: &str) -> Vec<String> {
+    let domain = cluster_domain.trim_matches('.');
+    vec![
+        name.to_string(),
+        format!("{name}.{namespace}"),
+        format!("{name}.{namespace}.svc"),
+        format!("{name}.{namespace}.svc.{domain}"),
+    ]
+}
+
+fn mesh_inbound_proxy_id(namespace: &str, name: &str, port: u16) -> String {
+    format!("__mesh-inbound-{namespace}-{name}-{port}").replace(['/', '.'], "-")
+}
+
+/// Materialize inbound routes for the sidecar's **local** workload so that
+/// mTLS-terminated traffic on the inbound listener (`:15006`) reaches the
+/// co-located application on loopback. `docs/mesh.md` documents this ("the
+/// inbound listener … forwards plaintext to the local application"), but nothing
+/// implemented it: the slice's services/workloads were never turned into
+/// routable inbound proxies, so an inbound request found no proxy and returned
+/// 404. (The existing integration tests passed only because they hand-supplied a
+/// `Proxy`.) This closes that gap for the sidecar inbound direction.
+///
+/// The local workload is identified by the sidecar's own SPIFFE identity
+/// (`runtime.workload_spiffe_id`). For each HTTP-family service port the local
+/// workload backs, one proxy is emitted keyed by the service FQDN variants, with
+/// a plaintext loopback backend on that port. Stream (TCP) inbound and
+/// multi-port disambiguation by original destination land in later stages.
+fn materialize_sidecar_inbound_proxies(
+    config: &mut GatewayConfig,
+    runtime: &MeshRuntimeConfig,
+    mesh_slice: &MeshSlice,
+) {
+    if runtime.topology != MeshTopology::Sidecar {
+        return;
+    }
+    let Some(local_spiffe) = runtime.workload_spiffe_id.as_deref() else {
+        debug!("Sidecar inbound route materialization skipped: no workload SPIFFE identity");
+        return;
+    };
+
+    let now = chrono::Utc::now();
+    let mut materialized = 0usize;
+    for service in &mesh_slice.services {
+        // Only the local workload's own services back inbound routes to it.
+        if !service
+            .workloads
+            .iter()
+            .any(|wr| wr.spiffe_id.as_str() == local_spiffe)
+        {
+            continue;
+        }
+
+        let effective_protocol = |declared: AppProtocol, port: u16| {
+            service
+                .protocol_overrides
+                .get(&port)
+                .copied()
+                .unwrap_or(declared)
+        };
+
+        let http_port_count = service
+            .ports
+            .iter()
+            .filter(|p| is_http_family_mesh_protocol(effective_protocol(p.protocol, p.port)))
+            .count();
+        if http_port_count > 1 {
+            warn!(
+                service = %service.name,
+                namespace = %service.namespace,
+                http_ports = http_port_count,
+                "Local mesh service exposes multiple HTTP-family ports; inbound routes share a \
+                 host and cannot yet be disambiguated by port (original-destination routing lands \
+                 in a later stage). Materializing each; the host router resolves by host only."
+            );
+        }
+
+        for port in &service.ports {
+            if !is_http_family_mesh_protocol(effective_protocol(port.protocol, port.port)) {
+                continue;
+            }
+            let proxy = mesh_inbound_loopback_proxy(
+                &mesh_inbound_proxy_id(&service.namespace, &service.name, port.port),
+                mesh_service_host_variants(
+                    &service.name,
+                    &service.namespace,
+                    &runtime.cluster_domain,
+                ),
+                &service.namespace,
+                port.port,
+                now,
+            );
+            if let Some(existing) = config.proxies.iter_mut().find(|p| p.id == proxy.id) {
+                *existing = proxy;
+            } else {
+                config.proxies.push(proxy);
+            }
+            materialized += 1;
+        }
+    }
+
+    if materialized > 0 {
+        info!(
+            inbound_proxies = materialized,
+            local_spiffe, "Materialized sidecar inbound routes to the local application"
+        );
+    }
+}
+
+/// A loopback-backend HTTP proxy: inbound mesh traffic matching `hosts` is
+/// forwarded in plaintext to the co-located application at `127.0.0.1:<port>`.
+fn mesh_inbound_loopback_proxy(
+    id: &str,
+    hosts: Vec<String>,
+    namespace: &str,
+    port: u16,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Proxy {
+    Proxy {
+        id: id.to_string(),
+        name: Some(format!("mesh inbound {id}")),
+        namespace: namespace.to_string(),
+        hosts,
+        listen_path: Some("/".to_string()),
+        backend_scheme: Some(BackendScheme::Http),
+        dispatch_kind: Default::default(),
+        backend_host: "127.0.0.1".to_string(),
+        backend_port: port,
+        backend_path: None,
+        strip_listen_path: false,
+        // The local app expects its own service Host, not 127.0.0.1.
+        preserve_host_header: true,
+        backend_connect_timeout_ms: 5_000,
+        backend_read_timeout_ms: 30_000,
+        backend_write_timeout_ms: 30_000,
+        backend_tls_client_cert_path: None,
+        backend_tls_client_key_path: None,
+        backend_tls_verify_server_cert: false,
+        backend_tls_server_ca_cert_path: None,
+        resolved_tls: BackendTlsConfig::default(),
+        dispatch_port_overrides: None,
+        dns_override: None,
+        dns_cache_ttl_seconds: None,
+        auth_mode: Default::default(),
+        plugins: Vec::<PluginAssociation>::new(),
+        pool_idle_timeout_seconds: None,
+        pool_enable_http_keep_alive: None,
+        pool_enable_http2: None,
+        pool_tcp_keepalive_seconds: None,
+        pool_http2_keep_alive_interval_seconds: None,
+        pool_http2_keep_alive_timeout_seconds: None,
+        pool_http2_initial_stream_window_size: None,
+        pool_http2_initial_connection_window_size: None,
+        pool_http2_adaptive_window: None,
+        pool_http2_max_frame_size: None,
+        pool_http2_max_concurrent_streams: None,
+        pool_http3_connections_per_backend: None,
+        pool_max_requests_per_connection: None,
+        upstream_id: None,
+        upstream_subset: None,
+        api_spec_id: None,
+        circuit_breaker: None,
+        retry: None,
+        response_body_mode: ResponseBodyMode::Stream,
+        listen_port: None,
+        frontend_tls: false,
+        passthrough: false,
+        udp_idle_timeout_seconds: 60,
+        udp_max_response_amplification_factor: None,
+        tcp_idle_timeout_seconds: Some(300),
+        allowed_methods: None,
+        allowed_ws_origins: Vec::new(),
+        created_at: now,
+        updated_at: now,
+    }
 }
 
 // ── DestinationRule application ────────────────────────────────────────
@@ -6582,6 +6776,117 @@ mod tests {
             egress_stream_enabled: false,
             request_auth_require_exp: true,
         }
+    }
+
+    /// Build a single-HTTP-port service backed by the named workload's SPIFFE id.
+    fn reviews_service() -> MeshService {
+        MeshService {
+            name: "reviews".to_string(),
+            namespace: "default".to_string(),
+            ports: vec![ServicePort {
+                port: 8080,
+                protocol: AppProtocol::Http,
+                name: Some("http".to_string()),
+            }],
+            workloads: vec![crate::modes::mesh::config::WorkloadRef {
+                spiffe_id: SpiffeId::new("spiffe://cluster.local/ns/default/sa/reviews").unwrap(),
+            }],
+            protocol_overrides: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn sidecar_inbound_proxies_materialize_for_local_workload_services() {
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some("spiffe://cluster.local/ns/default/sa/reviews".to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![workload("reviews", "reviews")],
+            services: vec![reviews_service()],
+            ..MeshSlice::default()
+        };
+
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+
+        let inbound = config
+            .proxies
+            .iter()
+            .find(|p| p.id == "__mesh-inbound-default-reviews-8080")
+            .expect("inbound proxy materialized for the local workload's service");
+        assert_eq!(inbound.backend_host, "127.0.0.1");
+        assert_eq!(inbound.backend_port, 8080);
+        assert_eq!(inbound.backend_scheme, Some(BackendScheme::Http));
+        assert!(!inbound.passthrough);
+        assert!(
+            inbound
+                .hosts
+                .iter()
+                .any(|h| h == "reviews.default.svc.cluster.local"),
+            "inbound proxy must match the service FQDN: {:?}",
+            inbound.hosts
+        );
+        assert!(
+            inbound.hosts.iter().any(|h| h == "reviews"),
+            "inbound proxy must match the bare service name: {:?}",
+            inbound.hosts
+        );
+    }
+
+    #[test]
+    fn sidecar_inbound_proxies_skip_services_not_backed_by_local_workload() {
+        // The local workload is "client"; the only service is backed by "reviews".
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some("spiffe://cluster.local/ns/default/sa/client".to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![workload("reviews", "reviews")],
+            services: vec![reviews_service()],
+            ..MeshSlice::default()
+        };
+
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+        assert!(
+            !config
+                .proxies
+                .iter()
+                .any(|p| p.id.starts_with("__mesh-inbound-")),
+            "no inbound proxy should materialize for a service the local workload does not back"
+        );
+    }
+
+    #[test]
+    fn sidecar_inbound_proxies_absent_without_local_workload_identity() {
+        // No FERRUM_MESH_WORKLOAD_SPIFFE_ID → cannot identify the local workload.
+        let runtime = test_mesh_runtime_config();
+        assert!(runtime.workload_spiffe_id.is_none());
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![workload("reviews", "reviews")],
+            services: vec![reviews_service()],
+            ..MeshSlice::default()
+        };
+
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+        assert!(
+            !config
+                .proxies
+                .iter()
+                .any(|p| p.id.starts_with("__mesh-inbound-")),
+            "no inbound proxy should materialize without a local workload identity"
+        );
     }
 
     #[test]
