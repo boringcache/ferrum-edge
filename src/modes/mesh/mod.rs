@@ -1340,8 +1340,21 @@ fn mesh_service_host_variants(name: &str, namespace: &str, cluster_domain: &str)
     ]
 }
 
+/// Reserved id prefix for materialized sidecar inbound routes. These routes are
+/// **direction-scoped**: only the inbound listener may serve them. The inbound
+/// and outbound capture listeners share one route table, so the request path
+/// uses [`is_mesh_inbound_route_id`] to keep these loopback routes off the
+/// outbound listener (where they would shortcut an app's own-service traffic to
+/// loopback instead of the mesh).
+pub(crate) const MESH_INBOUND_PROXY_ID_PREFIX: &str = "__mesh-inbound-";
+
+/// Whether a proxy id names a materialized sidecar inbound route.
+pub(crate) fn is_mesh_inbound_route_id(id: &str) -> bool {
+    id.starts_with(MESH_INBOUND_PROXY_ID_PREFIX)
+}
+
 fn mesh_inbound_proxy_id(namespace: &str, name: &str, port: u16) -> String {
-    format!("__mesh-inbound-{namespace}-{name}-{port}").replace(['/', '.'], "-")
+    format!("{MESH_INBOUND_PROXY_ID_PREFIX}{namespace}-{name}-{port}").replace(['/', '.'], "-")
 }
 
 /// Materialize inbound routes for the sidecar's **local** workload so that
@@ -1353,11 +1366,16 @@ fn mesh_inbound_proxy_id(namespace: &str, name: &str, port: u16) -> String {
 /// 404. (The existing integration tests passed only because they hand-supplied a
 /// `Proxy`.) This closes that gap for the sidecar inbound direction.
 ///
-/// The local workload is identified by the sidecar's own SPIFFE identity
-/// (`runtime.workload_spiffe_id`). For each HTTP-family service port the local
-/// workload backs, one proxy is emitted keyed by the service FQDN variants, with
-/// a plaintext loopback backend on that port. Stream (TCP) inbound and
-/// multi-port disambiguation by original destination land in later stages.
+/// Driven by the **local workload(s)** — this sidecar's own pods, matched by the
+/// SPIFFE identity in `runtime.workload_spiffe_id`. Each route is keyed by the
+/// workload's own service FQDN (`service_name`/`namespace`) — never another
+/// service that merely shares the SPIFFE id — and targets the workload's own
+/// listening port (the app/target port, which may differ from the K8s service
+/// port). For each HTTP-family workload port, one loopback proxy is emitted.
+/// Stream (TCP) inbound and multi-port disambiguation by original destination
+/// land in later stages. The emitted proxies carry the
+/// [`MESH_INBOUND_PROXY_ID_PREFIX`] so the request path keeps them off the
+/// outbound listener.
 fn materialize_sidecar_inbound_proxies(
     config: &mut GatewayConfig,
     runtime: &MeshRuntimeConfig,
@@ -1373,52 +1391,36 @@ fn materialize_sidecar_inbound_proxies(
 
     let now = chrono::Utc::now();
     let mut materialized = 0usize;
-    for service in &mesh_slice.services {
-        // Only the local workload's own services back inbound routes to it.
-        if !service
-            .workloads
-            .iter()
-            .any(|wr| wr.spiffe_id.as_str() == local_spiffe)
-        {
-            continue;
-        }
-
-        let effective_protocol = |declared: AppProtocol, port: u16| {
-            service
-                .protocol_overrides
-                .get(&port)
-                .copied()
-                .unwrap_or(declared)
-        };
-
-        let http_port_count = service
+    for workload in mesh_slice
+        .workloads
+        .iter()
+        .filter(|w| w.spiffe_id.as_str() == local_spiffe)
+    {
+        let http_ports: Vec<_> = workload
             .ports
             .iter()
-            .filter(|p| is_http_family_mesh_protocol(effective_protocol(p.protocol, p.port)))
-            .count();
-        if http_port_count > 1 {
+            .filter(|p| is_http_family_mesh_protocol(p.protocol))
+            .collect();
+        if http_ports.len() > 1 {
             warn!(
-                service = %service.name,
-                namespace = %service.namespace,
-                http_ports = http_port_count,
-                "Local mesh service exposes multiple HTTP-family ports; inbound routes share a \
-                 host and cannot yet be disambiguated by port (original-destination routing lands \
-                 in a later stage). Materializing each; the host router resolves by host only."
+                service = %workload.service_name,
+                namespace = %workload.namespace,
+                http_ports = http_ports.len(),
+                "Local workload exposes multiple HTTP-family ports; inbound routes share a host \
+                 and cannot yet be disambiguated by port (original-destination routing lands in a \
+                 later stage). Materializing each; the host router resolves by host only."
             );
         }
 
-        for port in &service.ports {
-            if !is_http_family_mesh_protocol(effective_protocol(port.protocol, port.port)) {
-                continue;
-            }
+        for port in http_ports {
             let proxy = mesh_inbound_loopback_proxy(
-                &mesh_inbound_proxy_id(&service.namespace, &service.name, port.port),
+                &mesh_inbound_proxy_id(&workload.namespace, &workload.service_name, port.port),
                 mesh_service_host_variants(
-                    &service.name,
-                    &service.namespace,
+                    &workload.service_name,
+                    &workload.namespace,
                     &runtime.cluster_domain,
                 ),
-                &service.namespace,
+                &workload.namespace,
                 port.port,
                 now,
             );
@@ -6886,6 +6888,77 @@ mod tests {
                 .iter()
                 .any(|p| p.id.starts_with("__mesh-inbound-")),
             "no inbound proxy should materialize without a local workload identity"
+        );
+    }
+
+    #[test]
+    fn sidecar_inbound_proxies_use_workload_port_and_own_service_only() {
+        // The local workload backs service "reviews" on app/target port 9090.
+        // A different service "ratings" merely shares the same SPIFFE id (e.g. a
+        // second Service selecting the same service account) and advertises port
+        // 80. The inbound route must key on the workload's OWN service ("reviews")
+        // and target the workload's port (9090) — never "ratings", and never the
+        // service port 80.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(spiffe.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let mut local = workload("reviews", "reviews");
+        local.ports = vec![WorkloadPort {
+            port: 9090,
+            protocol: AppProtocol::Http,
+            name: Some("http".to_string()),
+        }];
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![local],
+            services: vec![MeshService {
+                name: "ratings".to_string(),
+                namespace: "default".to_string(),
+                ports: vec![ServicePort {
+                    port: 80,
+                    protocol: AppProtocol::Http,
+                    name: Some("http".to_string()),
+                }],
+                workloads: vec![crate::modes::mesh::config::WorkloadRef {
+                    spiffe_id: SpiffeId::new(spiffe).unwrap(),
+                }],
+                protocol_overrides: HashMap::new(),
+            }],
+            ..MeshSlice::default()
+        };
+
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+
+        let inbound: Vec<&str> = config
+            .proxies
+            .iter()
+            .filter(|p| p.id.starts_with("__mesh-inbound-"))
+            .map(|p| p.id.as_str())
+            .collect();
+        assert_eq!(
+            inbound,
+            vec!["__mesh-inbound-default-reviews-9090"],
+            "exactly one inbound route, for the local workload's OWN service on its OWN port"
+        );
+        let route = config
+            .proxies
+            .iter()
+            .find(|p| p.id == "__mesh-inbound-default-reviews-9090")
+            .expect("reviews route");
+        assert_eq!(
+            route.backend_port, 9090,
+            "inbound route must target the workload's app port, not a service port"
+        );
+        assert!(
+            route
+                .hosts
+                .iter()
+                .any(|h| h == "reviews.default.svc.cluster.local")
         );
     }
 

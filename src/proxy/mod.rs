@@ -9299,6 +9299,16 @@ async fn handle_proxy_request_inner(
         &path,
     );
 
+    // Materialized sidecar inbound routes (`__mesh-inbound-*`) live in the shared
+    // route table but are direction-scoped: only the inbound listener may serve
+    // them. On the outbound capture listener (or any non-inbound direction) drop
+    // the match so an application's own-service request is not shortcut to the
+    // local loopback instead of being routed out through the mesh.
+    let route_match = route_match.filter(|rm| {
+        !crate::modes::mesh::is_mesh_inbound_route_id(&rm.proxy.id)
+            || ctx.mesh_direction == Some(crate::modes::mesh::MeshTrafficDirection::Inbound)
+    });
+
     let (proxy, strip_len) = match route_match {
         Some(rm) => {
             // Materialize headers now — path param injection writes to ctx.headers,

@@ -1573,6 +1573,38 @@ async fn mesh_inbound_http_get(
     Ok((status, text))
 }
 
+/// A plaintext HTTP/1.1 GET (no TLS), returning the response status + full text.
+/// Used to probe the outbound capture listener, which must NOT serve the
+/// materialized inbound routes.
+async fn plaintext_http_get(
+    port: u16,
+    host: &str,
+    path: &str,
+) -> Result<(u16, String), Box<dyn std::error::Error + Send + Sync>> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut tcp = tokio::time::timeout(
+        Duration::from_secs(5),
+        TcpStream::connect(("127.0.0.1", port)),
+    )
+    .await
+    .map_err(|_| "connect timed out")??;
+    let request = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    tcp.write_all(request.as_bytes()).await?;
+    tcp.flush().await?;
+    let mut resp = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), tcp.read_to_end(&mut resp))
+        .await
+        .map_err(|_| "response read timed out")??;
+    let text = String::from_utf8_lossy(&resp).into_owned();
+    let status = text
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .ok_or_else(|| format!("could not parse HTTP status line from response: {text:?}"))?;
+    Ok((status, text))
+}
+
 /// A mesh slice that makes the local workload (`server_spiffe`) back a single
 /// HTTP service `echo` on `backend_port`, under STRICT PeerAuthentication, with
 /// a MeshWide authz policy that ALLOWs (or DENYs) the client principal. The
@@ -1671,7 +1703,7 @@ fn inbound_authz_slice(
 /// status + backend hit count. Spawn/bind flakes are retried with fresh ports;
 /// the request/assertions are not. `allow` selects an ALLOW vs DENY authz policy
 /// for the client principal.
-async fn drive_inbound_authz_request(allow: bool) -> Result<(u16, String), String> {
+async fn drive_inbound_authz_request(allow: bool) -> Result<(u16, String, bool), String> {
     ensure_gateway_built().map_err(|e| format!("gateway build: {e}"))?;
     let server_spiffe = "spiffe://cluster.local/ns/ferrum/sa/echo";
     let client_spiffe = "spiffe://cluster.local/ns/default/sa/client";
@@ -1694,6 +1726,7 @@ async fn drive_inbound_authz_request(allow: bool) -> Result<(u16, String), Strin
         .await;
         let ports = reserve_mesh_ports().await;
         let inbound_port = ports.inbound;
+        let outbound_port = ports.outbound;
         let mut child = spawn_mesh_gateway(
             &temp,
             MeshGatewaySpawnOptions {
@@ -1736,7 +1769,7 @@ async fn drive_inbound_authz_request(allow: bool) -> Result<(u16, String), Strin
             continue;
         }
 
-        let result = mesh_inbound_http_get(
+        let inbound = mesh_inbound_http_get(
             inbound_port,
             &peers.ca_pem,
             server_spiffe,
@@ -1746,12 +1779,25 @@ async fn drive_inbound_authz_request(allow: bool) -> Result<(u16, String), Strin
         )
         .await;
 
+        // The materialized inbound route must NOT be served on the outbound
+        // capture listener: a plaintext request there for the local service FQDN
+        // must not be shortcut to the loopback backend (outbound L7 routing isn't
+        // materialized yet, so it should 404). `outbound_serves_route` is true
+        // only if the outbound listener actually relayed the backend.
+        let _ = wait_for_tcp_port(outbound_port, STARTUP_TIMEOUT).await;
+        let outbound =
+            plaintext_http_get(outbound_port, "echo.ferrum.svc.cluster.local", "/").await;
+        let outbound_serves_route = match &outbound {
+            Ok((status, body)) => *status == 200 && body.contains("backend-ok"),
+            Err(_) => false,
+        };
+
         let output = captured_output(&temp);
         kill_child(&mut child);
         cp.shutdown().await;
 
-        return match result {
-            Ok((status, body)) => Ok((status, body)),
+        return match inbound {
+            Ok((status, body)) => Ok((status, body, outbound_serves_route)),
             Err(e) => Err(format!("inbound mTLS HTTP GET failed: {e}\n{output}")),
         };
     }
@@ -1769,7 +1815,7 @@ async fn drive_inbound_authz_request(allow: bool) -> Result<(u16, String), Strin
 #[ignore]
 #[tokio::test]
 async fn functional_mesh_sidecar_inbound_allows_authorized_peer_to_backend() {
-    let (status, body) = drive_inbound_authz_request(true)
+    let (status, body, outbound_serves_route) = drive_inbound_authz_request(true)
         .await
         .expect("authorized inbound case");
     assert_eq!(
@@ -1780,6 +1826,10 @@ async fn functional_mesh_sidecar_inbound_allows_authorized_peer_to_backend() {
         body.contains("backend-ok"),
         "the authorized response must carry the local backend's body: {body:?}"
     );
+    assert!(
+        !outbound_serves_route,
+        "the materialized inbound route must NOT be served on the outbound capture listener"
+    );
 }
 
 /// P1 keystone (Increment B): `mesh_authz` enforcement on the live inbound
@@ -1788,7 +1838,7 @@ async fn functional_mesh_sidecar_inbound_allows_authorized_peer_to_backend() {
 #[ignore]
 #[tokio::test]
 async fn functional_mesh_sidecar_inbound_denies_unauthorized_peer() {
-    let (status, body) = drive_inbound_authz_request(false)
+    let (status, body, _) = drive_inbound_authz_request(false)
         .await
         .expect("unauthorized inbound case");
     assert_eq!(
