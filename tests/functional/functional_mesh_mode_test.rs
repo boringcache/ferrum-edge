@@ -264,6 +264,7 @@ fn east_west_service_slice(node_id: &str) -> MeshSlice {
                 port: 18080,
                 protocol: AppProtocol::Http,
                 name: Some("http".to_string()),
+                target_port: None,
             }],
             workloads: vec![WorkloadRef { spiffe_id }],
             protocol_overrides: HashMap::new(),
@@ -1649,6 +1650,7 @@ fn inbound_authz_slice(
             port: backend_port,
             protocol: AppProtocol::Http,
             name: Some("http".to_string()),
+            target_port: None,
         }],
         workloads: vec![WorkloadRef {
             spiffe_id: server_id,

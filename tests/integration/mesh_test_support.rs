@@ -148,6 +148,7 @@ pub fn service_for(name: &str, namespace: &str, workloads: &[&Workload]) -> Mesh
             port: 8080,
             protocol: AppProtocol::Http,
             name: Some("http".to_string()),
+            target_port: None,
         }],
         workloads: workloads
             .iter()

@@ -48,7 +48,8 @@ use crate::modes::mesh::config::{
     AppProtocol, EastWestGateway, MeshConfig, MeshDestinationRule, MeshJwtRule, MeshLoadBalancer,
     MeshLocalityLbSetting, MeshOutlierDetection, MeshRequestAuthentication, MeshSimpleLb,
     MeshTelemetryConfig, MeshTrafficPolicy, MeshTrafficPolicyTls, MtlsMode, PolicyScope,
-    Resolution, ServiceEntry, ServiceEntryLocation, service_entry_exported_to_namespace,
+    Resolution, ServiceEntry, ServiceEntryLocation, ServiceTargetPort,
+    service_entry_exported_to_namespace,
 };
 use crate::modes::mesh::config_consumer::native_client::NativeMeshClientConfig;
 use crate::modes::mesh::config_consumer::xds_client::XdsClientConfig;
@@ -1479,39 +1480,51 @@ fn materialize_sidecar_inbound_proxies(
                      Materializing only the first HTTP port; the rest are not yet routable."
                 );
             }
-            // Backend = the workload's app (container) port that this service
-            // port maps to. Kubernetes links the two via the Service's
-            // `targetPort`, which the mesh model does not yet carry end-to-end
-            // (it is dropped during K8s ingestion; see `ServicePort`). Resolve
-            // from the signals we do have, in declining order of confidence:
+            // Backend = the workload's app (container) port this service port
+            // forwards to. Honor the Service's `targetPort` first — Kubernetes'
+            // authoritative service-port→container-port mapping: a numeric
+            // targetPort IS the container port; a named one resolves against the
+            // workload's container-port names. When no targetPort is declared (or
+            // a named one doesn't resolve), fall back to the heuristic over the
+            // signals we have, in declining order of confidence:
             //   1. a shared port NAME — the canonical Service↔container linkage,
             //   2. an equal port NUMBER — `targetPort` defaulting to the port,
             //   3. the workload's sole container port — single-port pod.
             // A workload that declares no ports defaults to the service port
             // (Kubernetes' `targetPort`-defaults-to-`port` rule). Otherwise —
             // multiple unnamed container ports whose numbers differ from the
-            // service port — the target is genuinely ambiguous: skip and warn
-            // rather than guess (the previous `first()` fallback silently
-            // misrouted to whichever container port happened to be listed first).
-            let backend_port = if workload.ports.is_empty() {
-                Some(service_port.port)
-            } else {
-                workload
+            // service port and no targetPort — the target is genuinely ambiguous:
+            // skip and warn rather than guess (a blind fallback would misroute).
+            let backend_port = match service_port.target_port.as_ref() {
+                Some(ServiceTargetPort::Number(n)) => Some(*n),
+                Some(ServiceTargetPort::Name(name)) => workload
                     .ports
                     .iter()
-                    .find(|wp| wp.name.is_some() && wp.name == service_port.name)
-                    .or_else(|| {
-                        workload
-                            .ports
-                            .iter()
-                            .find(|wp| wp.port == service_port.port)
-                    })
-                    .or(match workload.ports.as_slice() {
-                        [only] => Some(only),
-                        _ => None,
-                    })
-                    .map(|wp| wp.port)
-            };
+                    .find(|wp| wp.name.as_deref() == Some(name.as_str()))
+                    .map(|wp| wp.port),
+                None => None,
+            }
+            .or_else(|| {
+                if workload.ports.is_empty() {
+                    Some(service_port.port)
+                } else {
+                    workload
+                        .ports
+                        .iter()
+                        .find(|wp| wp.name.is_some() && wp.name == service_port.name)
+                        .or_else(|| {
+                            workload
+                                .ports
+                                .iter()
+                                .find(|wp| wp.port == service_port.port)
+                        })
+                        .or(match workload.ports.as_slice() {
+                            [only] => Some(only),
+                            _ => None,
+                        })
+                        .map(|wp| wp.port)
+                }
+            });
             let Some(backend_port) = backend_port else {
                 warn!(
                     service = %service.name,
@@ -6929,6 +6942,7 @@ mod tests {
                 port: 8080,
                 protocol: AppProtocol::Http,
                 name: Some("http".to_string()),
+                target_port: None,
             }],
             workloads: vec![crate::modes::mesh::config::WorkloadRef {
                 spiffe_id: SpiffeId::new("spiffe://cluster.local/ns/default/sa/reviews").unwrap(),
@@ -7058,6 +7072,7 @@ mod tests {
                 port: 80,
                 protocol: AppProtocol::Http,
                 name: Some("http".to_string()),
+                target_port: None,
             }],
             workloads: vec![crate::modes::mesh::config::WorkloadRef {
                 spiffe_id: SpiffeId::new(spiffe).unwrap(),
@@ -7113,6 +7128,7 @@ mod tests {
                 port,
                 protocol: AppProtocol::Http,
                 name: Some("http".to_string()),
+                target_port: None,
             }],
             workloads: vec![crate::modes::mesh::config::WorkloadRef {
                 spiffe_id: SpiffeId::new(spiffe).unwrap(),
@@ -7233,11 +7249,13 @@ mod tests {
                         port: 80,
                         protocol: AppProtocol::Http,
                         name: Some("http".to_string()),
+                        target_port: None,
                     },
                     ServicePort {
                         port: 90,
                         protocol: AppProtocol::Grpc,
                         name: Some("grpc".to_string()),
+                        target_port: None,
                     },
                 ],
                 workloads: vec![crate::modes::mesh::config::WorkloadRef {
@@ -7424,6 +7442,104 @@ mod tests {
                 .iter()
                 .any(|p| p.id.starts_with("__mesh-inbound-")),
             "an ambiguous backend port must not materialize a (mis)routed inbound proxy"
+        );
+    }
+
+    #[test]
+    fn sidecar_inbound_proxies_honor_numeric_target_port() {
+        // A Service with a numeric targetPort distinct from `port`, backed by a
+        // pod with multiple unnamed container ports — the shape that was
+        // ambiguous before targetPort was captured. The route must target the
+        // targetPort (the container port), not skip or guess.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(spiffe.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let mut local = workload("reviews", "reviews");
+        local.ports = vec![
+            WorkloadPort {
+                port: 8080,
+                protocol: AppProtocol::Tcp,
+                name: None,
+            },
+            WorkloadPort {
+                port: 9090,
+                protocol: AppProtocol::Tcp,
+                name: None,
+            },
+        ];
+        let mut service = http_mesh_service("reviews", 80, spiffe);
+        service.ports[0].name = None;
+        service.ports[0].target_port = Some(ServiceTargetPort::Number(9090));
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![local],
+            services: vec![service],
+            ..MeshSlice::default()
+        };
+
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+        let route = config
+            .proxies
+            .iter()
+            .find(|p| p.id == "__mesh-inbound-default-reviews-80")
+            .expect("route materialized via numeric targetPort");
+        assert_eq!(
+            route.backend_port, 9090,
+            "a numeric targetPort must select the container port directly"
+        );
+    }
+
+    #[test]
+    fn sidecar_inbound_proxies_honor_named_target_port() {
+        // A named targetPort resolves against the CONTAINER port name, which can
+        // differ from the Service port's own name — so name resolution must use
+        // targetPort, not the service port name.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(spiffe.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let mut local = workload("reviews", "reviews");
+        local.ports = vec![
+            WorkloadPort {
+                port: 8080,
+                protocol: AppProtocol::Http,
+                name: Some("web".to_string()),
+            },
+            WorkloadPort {
+                port: 9090,
+                protocol: AppProtocol::Http,
+                name: Some("admin".to_string()),
+            },
+        ];
+        // Service port named "http"; targetPort names the "admin" container port.
+        let mut service = http_mesh_service("reviews", 80, spiffe);
+        service.ports[0].target_port = Some(ServiceTargetPort::Name("admin".to_string()));
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![local],
+            services: vec![service],
+            ..MeshSlice::default()
+        };
+
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+        let route = config
+            .proxies
+            .iter()
+            .find(|p| p.id == "__mesh-inbound-default-reviews-80")
+            .expect("route materialized via named targetPort");
+        assert_eq!(
+            route.backend_port, 9090,
+            "a named targetPort must resolve to the matching container port, \
+             not the service port's own name"
         );
     }
 
@@ -9648,6 +9764,7 @@ mod tests {
                     port: 8080,
                     protocol: AppProtocol::Http,
                     name: Some("http".to_string()),
+                    target_port: None,
                 }],
                 workloads: Vec::new(),
                 protocol_overrides: HashMap::new(),
@@ -10028,6 +10145,7 @@ mod tests {
                     port: 9080,
                     protocol: AppProtocol::Http,
                     name: Some("http".to_string()),
+                    target_port: None,
                 }],
                 workloads: Vec::new(),
                 protocol_overrides: HashMap::new(),
@@ -10479,6 +10597,7 @@ mod tests {
                                 port: 9080,
                                 protocol: AppProtocol::Http,
                                 name: Some("http".to_string()),
+                                target_port: None,
                             }],
                             workloads: vec![crate::modes::mesh::config::WorkloadRef {
                                 spiffe_id: SpiffeId::new(
@@ -10558,6 +10677,7 @@ mod tests {
                                 port: 8080,
                                 protocol: AppProtocol::Http,
                                 name: None,
+                                target_port: None,
                             }],
                             workloads: vec![crate::modes::mesh::config::WorkloadRef {
                                 spiffe_id: SpiffeId::new(
@@ -10617,6 +10737,7 @@ mod tests {
                                     port: 9080,
                                     protocol: AppProtocol::Http,
                                     name: None,
+                                    target_port: None,
                                 }],
                                 workloads: vec![crate::modes::mesh::config::WorkloadRef {
                                     spiffe_id: SpiffeId::new(
@@ -10633,6 +10754,7 @@ mod tests {
                                     port: 3000,
                                     protocol: AppProtocol::Http,
                                     name: None,
+                                    target_port: None,
                                 }],
                                 workloads: vec![crate::modes::mesh::config::WorkloadRef {
                                     spiffe_id: SpiffeId::new(
@@ -10718,6 +10840,7 @@ mod tests {
                 port: 9080,
                 protocol: AppProtocol::Http,
                 name: None,
+                target_port: None,
             }],
             workloads: vec![
                 crate::modes::mesh::config::WorkloadRef {
@@ -10882,6 +11005,7 @@ mod tests {
                 port: 9080,
                 protocol: AppProtocol::Http,
                 name: None,
+                target_port: None,
             }],
             workloads: vec![crate::modes::mesh::config::WorkloadRef { spiffe_id: spiffe }],
             protocol_overrides: HashMap::new(),
@@ -10933,6 +11057,7 @@ mod tests {
                                 port: 9080,
                                 protocol: AppProtocol::Http,
                                 name: None,
+                                target_port: None,
                             }],
                             workloads: vec![
                                 crate::modes::mesh::config::WorkloadRef {
@@ -13168,6 +13293,7 @@ mod tests {
                 port,
                 protocol,
                 name: Some("http".to_string()),
+                target_port: None,
             }],
             export_to: Vec::new(),
             workload_selector: None,
@@ -13239,6 +13365,7 @@ mod tests {
                 port: 8080,
                 protocol: AppProtocol::Http,
                 name: None,
+                target_port: None,
             }],
             export_to: Vec::new(),
             workload_selector: None,
@@ -13273,6 +13400,7 @@ mod tests {
                 port: 8080,
                 protocol: AppProtocol::Http,
                 name: Some("http".to_string()),
+                target_port: None,
             }],
             export_to: Vec::new(),
             workload_selector: None,
@@ -13335,6 +13463,7 @@ mod tests {
                 port: 3306,
                 protocol: AppProtocol::Mysql,
                 name: Some("mysql".to_string()),
+                target_port: None,
             }],
             export_to: Vec::new(),
             workload_selector: None,
@@ -13421,11 +13550,13 @@ mod tests {
                     port: 80,
                     protocol: AppProtocol::Http,
                     name: Some("http".to_string()),
+                    target_port: None,
                 },
                 ServicePort {
                     port: 443,
                     protocol: AppProtocol::Tls,
                     name: Some("https".to_string()),
+                    target_port: None,
                 },
             ],
             export_to: Vec::new(),
@@ -13488,6 +13619,7 @@ mod tests {
                 port: 80,
                 protocol: AppProtocol::Http,
                 name: Some("http".to_string()),
+                target_port: None,
             }],
             export_to: Vec::new(),
             workload_selector: None,
@@ -13736,6 +13868,7 @@ mod tests {
                 port: 443,
                 protocol: AppProtocol::Tls,
                 name: Some("https".to_string()),
+                target_port: None,
             }],
             export_to: Vec::new(),
             workload_selector: None,
@@ -13781,6 +13914,7 @@ mod tests {
                 port: 8443,
                 protocol: AppProtocol::Tls,
                 name: None,
+                target_port: None,
             }],
             export_to: Vec::new(),
             workload_selector: None,
@@ -13818,6 +13952,7 @@ mod tests {
                 port: 443,
                 protocol: AppProtocol::Tls,
                 name: Some("https".to_string()),
+                target_port: None,
             }],
             export_to: Vec::new(),
             workload_selector: None,
@@ -13861,6 +13996,7 @@ mod tests {
                             port: 8080,
                             protocol: AppProtocol::Http,
                             name: None,
+                            target_port: None,
                         }],
                         export_to: Vec::new(),
                         workload_selector: None,
@@ -13937,6 +14073,7 @@ mod tests {
                 port,
                 protocol,
                 name: Some("stream".to_string()),
+                target_port: None,
             }],
             export_to: Vec::new(),
             workload_selector: None,
@@ -14040,6 +14177,7 @@ mod tests {
                 port: 3306,
                 protocol: AppProtocol::Mysql,
                 name: Some("mysql".to_string()),
+                target_port: None,
             }],
             export_to: Vec::new(),
             workload_selector: None,
@@ -14168,11 +14306,13 @@ mod tests {
                     port: 5432,
                     protocol: AppProtocol::Postgres,
                     name: Some("primary".to_string()),
+                    target_port: None,
                 },
                 ServicePort {
                     port: 5433,
                     protocol: AppProtocol::Postgres,
                     name: Some("replica".to_string()),
+                    target_port: None,
                 },
             ],
             export_to: Vec::new(),

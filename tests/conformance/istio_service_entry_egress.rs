@@ -309,6 +309,7 @@ fn outbound_traffic_policy_registry_only_injects_plugin() {
                     port: 443,
                     protocol: AppProtocol::Tls,
                     name: Some("https".to_string()),
+                    target_port: None,
                 }],
                 export_to: Vec::new(),
                 workload_selector: None,

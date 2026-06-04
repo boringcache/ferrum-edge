@@ -47,6 +47,7 @@ fn build_gateway_config(n_workloads: usize) -> GatewayConfig {
                 port: 8080,
                 protocol: Default::default(),
                 name: Some("http".to_string()),
+                target_port: None,
             }],
             workloads: vec![WorkloadRef { spiffe_id }],
             protocol_overrides: HashMap::new(),

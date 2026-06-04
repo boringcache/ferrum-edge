@@ -4,7 +4,8 @@ use serde_json::Value;
 
 use crate::identity::spiffe::SpiffeId;
 use crate::modes::mesh::config::{
-    AppProtocol, MeshService, ServicePort, Workload, WorkloadPort, WorkloadRef, WorkloadSelector,
+    AppProtocol, MeshService, ServicePort, ServiceTargetPort, Workload, WorkloadPort, WorkloadRef,
+    WorkloadSelector,
 };
 
 use super::{
@@ -192,10 +193,20 @@ fn collect_service(acc: &mut K8sAccumulator, object: &K8sObject) -> Result<(), K
         let port = port_from_u64(object, raw_port, "Service.spec.ports[].port")?;
         let name = string_field(port_entry, "name").map(ToOwned::to_owned);
         let protocol = service_app_protocol(port_entry, name.as_deref());
+        // `targetPort` is IntOrString: a numeric container port or a named one.
+        let target_port = match port_entry.get("targetPort") {
+            Some(Value::Number(n)) => n
+                .as_u64()
+                .and_then(|v| u16::try_from(v).ok())
+                .map(ServiceTargetPort::Number),
+            Some(Value::String(s)) if !s.is_empty() => Some(ServiceTargetPort::Name(s.clone())),
+            _ => None,
+        };
         service_ports.push(ServicePort {
             port,
             protocol,
             name,
+            target_port,
         });
     }
     acc.core.services.insert(
@@ -748,6 +759,11 @@ mod tests {
         assert_eq!(mesh.services.len(), 1);
         assert_eq!(mesh.services[0].name, "reviews");
         assert_eq!(mesh.services[0].ports[0].port, 9080);
+        // The Service `targetPort` is captured for inbound backend resolution.
+        assert_eq!(
+            mesh.services[0].ports[0].target_port,
+            Some(crate::modes::mesh::config::ServiceTargetPort::Number(9080))
+        );
         assert_eq!(mesh.services[0].workloads.len(), 1);
         assert_eq!(mesh.workloads.len(), 1);
         assert_eq!(mesh.workloads[0].addresses, vec!["10.1.0.10"]);

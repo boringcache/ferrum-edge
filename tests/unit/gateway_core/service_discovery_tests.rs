@@ -102,6 +102,7 @@ fn mesh_service(name: &str, spiffe_id: &str, port: u16) -> MeshService {
             port,
             protocol: AppProtocol::Http,
             name: Some("http".to_string()),
+            target_port: None,
         }],
         workloads: vec![WorkloadRef {
             spiffe_id: mesh_spiffe(spiffe_id),

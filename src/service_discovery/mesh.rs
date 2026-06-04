@@ -318,6 +318,7 @@ mod tests {
                     port,
                     protocol: AppProtocol::Http,
                     name: Some("http".to_string()),
+                    target_port: None,
                 })
                 .collect(),
             workloads: refs

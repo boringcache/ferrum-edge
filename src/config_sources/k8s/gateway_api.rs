@@ -872,6 +872,7 @@ fn mesh_services_from_gateway(object: &K8sObject) -> Result<Vec<MeshService>, K8
                     port,
                     protocol: app_protocol(string_field(listener, "protocol")),
                     name: Some(name.to_string()),
+                    target_port: None,
                 }],
                 workloads: Vec::new(),
                 protocol_overrides: HashMap::new(),

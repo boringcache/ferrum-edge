@@ -263,6 +263,7 @@ mod tests {
                 port: 27017,
                 protocol: AppProtocol::Tcp,
                 name: Some("mongo".to_string()),
+                target_port: None,
             }],
             workloads: Vec::new(),
             protocol_overrides: HashMap::new(),

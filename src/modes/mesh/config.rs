@@ -137,6 +137,21 @@ pub struct ServicePort {
     pub protocol: AppProtocol,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Kubernetes `Service.spec.ports[].targetPort` — the container port the
+    /// service forwards to, authoritative over the port name/number heuristic
+    /// when resolving the inbound backend. `IntOrString`: a numeric container
+    /// port or a named container port. Absent defaults to `port` (K8s rule).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_port: Option<ServiceTargetPort>,
+}
+
+/// Kubernetes `targetPort` is an `IntOrString`: either an explicit container
+/// port number, or the name of a container port resolved against the workload.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ServiceTargetPort {
+    Number(u16),
+    Name(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

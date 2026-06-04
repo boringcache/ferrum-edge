@@ -60,6 +60,7 @@ fn slice_with_one_service() -> MeshSlice {
             port: 8080,
             protocol: AppProtocol::Http,
             name: Some("http".to_string()),
+            target_port: None,
         }],
         workloads: vec![WorkloadRef {
             spiffe_id: workload.spiffe_id.clone(),
