@@ -186,16 +186,19 @@ fn adaptive_concurrency_caps_tracked_target_keys() {
     let same_key = limiter
         .try_acquire(&proxy, Some(&first_target), Arc::clone(&config))
         .expect("existing backend key should not consume another tracked-key slot");
-    let rejected = match limiter.try_acquire(&proxy, Some(&second_target), Arc::clone(&config)) {
-        Ok(_) => panic!("new backend key should be rejected when cap is exhausted"),
-        Err(rejected) => rejected,
-    };
+    assert_eq!(limiter.tracked_keys_count(), 1);
 
-    assert_eq!(rejected.limit, 1);
+    // A new target beyond the cap fails OPEN — admitted with an untracked permit
+    // rather than rejected — so the key cap can never black-hole a new target.
+    // The overflow key is not inserted, so tracked_keys stays at the cap.
+    let overflow = limiter
+        .try_acquire(&proxy, Some(&second_target), Arc::clone(&config))
+        .expect("a new target beyond the cap must fail open, not reject");
     assert_eq!(limiter.tracked_keys_count(), 1);
 
     drop(first);
     drop(same_key);
+    drop(overflow);
 }
 
 #[test]
@@ -363,4 +366,180 @@ fn adaptive_concurrency_held_session_success_does_not_grow_limit() {
     );
 
     drop(permit);
+}
+
+#[test]
+fn adaptive_concurrency_shrinks_on_high_latency_samples() {
+    let proxy = proxy();
+    let limiter = AdaptiveConcurrencyLimiter::new(16);
+    let config = Arc::new(AdaptiveConcurrencyConfig {
+        key_by: AdaptiveConcurrencyKeyBy::Proxy,
+        max_tracked_keys: 10_000,
+        min_limit: 1,
+        initial_limit: 4,
+        max_limit: 4,
+        min_samples: 2,
+        target_latency_multiplier: 1.5,
+        decrease_ratio: 0.5,
+        increase_step: 1,
+        shadow_mode: false,
+        expose_headers: false,
+    });
+
+    // Sample 1 establishes the baseline (1ms). Below min_samples, no decision.
+    let first = limiter
+        .try_acquire(&proxy, None, Arc::clone(&config))
+        .expect("first request admitted");
+    first.record_backend_outcome(BackendAdmissionOutcome {
+        response_status: 200,
+        connection_error: false,
+        error_class: None,
+        backend_elapsed: Duration::from_millis(1),
+    });
+    drop(first);
+
+    // Sample 2 is far above target (baseline * 1.5): the EWMA crosses the target
+    // and the limit shrinks. This exercises the latency control path directly,
+    // not a 5xx / oversized-body failure outcome.
+    let second = limiter
+        .try_acquire(&proxy, None, Arc::clone(&config))
+        .expect("second request admitted");
+    second.record_backend_outcome(BackendAdmissionOutcome {
+        response_status: 200,
+        connection_error: false,
+        error_class: None,
+        backend_elapsed: Duration::from_millis(100),
+    });
+    drop(second);
+
+    let snapshot = limiter
+        .snapshot(&proxy, None, AdaptiveConcurrencyKeyBy::Proxy)
+        .expect("state should exist after acquire");
+    assert_eq!(snapshot.samples, 2);
+    assert_eq!(
+        snapshot.limit, 2,
+        "a high-latency healthy sample must shrink the limit via the EWMA path"
+    );
+}
+
+#[test]
+fn adaptive_concurrency_shadow_mode_admits_past_limit() {
+    let proxy = proxy();
+    let limiter = AdaptiveConcurrencyLimiter::new(16);
+    let config = Arc::new(AdaptiveConcurrencyConfig {
+        key_by: AdaptiveConcurrencyKeyBy::Proxy,
+        max_tracked_keys: 10_000,
+        min_limit: 1,
+        initial_limit: 1,
+        max_limit: 1,
+        min_samples: 1,
+        target_latency_multiplier: 1.5,
+        decrease_ratio: 0.5,
+        increase_step: 1,
+        shadow_mode: true,
+        expose_headers: false,
+    });
+
+    let first = limiter
+        .try_acquire(&proxy, None, Arc::clone(&config))
+        .expect("first request admitted");
+    // in_flight (1) >= limit (1), but shadow mode must never reject.
+    let second = limiter
+        .try_acquire(&proxy, None, Arc::clone(&config))
+        .expect("shadow mode must admit past the limit");
+
+    let snapshot = limiter
+        .snapshot(&proxy, None, AdaptiveConcurrencyKeyBy::Proxy)
+        .expect("state should exist after acquire");
+    assert_eq!(
+        snapshot.in_flight, 2,
+        "both requests are counted in shadow mode"
+    );
+    assert_eq!(snapshot.rejections, 0, "shadow mode records no rejections");
+
+    drop(first);
+    drop(second);
+}
+
+#[test]
+fn adaptive_concurrency_shadow_mode_fails_open_at_key_cap() {
+    let proxy = proxy();
+    let limiter = AdaptiveConcurrencyLimiter::new(16);
+    let config = Arc::new(AdaptiveConcurrencyConfig {
+        key_by: AdaptiveConcurrencyKeyBy::Backend,
+        max_tracked_keys: 1,
+        min_limit: 1,
+        initial_limit: 1,
+        max_limit: 1,
+        min_samples: 1,
+        target_latency_multiplier: 1.5,
+        decrease_ratio: 0.5,
+        increase_step: 1,
+        shadow_mode: true,
+        expose_headers: false,
+    });
+    let first_target = target("a1.example.com", 8080);
+    let second_target = target("a2.example.com", 8080);
+
+    let _first = limiter
+        .try_acquire(&proxy, Some(&first_target), Arc::clone(&config))
+        .expect("first key tracked");
+    // The cap is exhausted; shadow mode must never reject, so the new target
+    // fails open rather than emitting a 503.
+    let _overflow = limiter
+        .try_acquire(&proxy, Some(&second_target), Arc::clone(&config))
+        .expect("shadow mode must never reject, even at the key cap");
+    assert_eq!(limiter.tracked_keys_count(), 1);
+}
+
+#[test]
+fn adaptive_concurrency_upstream_scope_shares_limit_across_proxies() {
+    // Two distinct proxies sharing one upstream share a single upstream-scoped
+    // limit for a given backend target.
+    let proxy_a: Proxy = serde_json::from_value(json!({
+        "id": "proxy-a",
+        "namespace": "default",
+        "upstream_id": "up-1",
+        "backend_host": "backend.local",
+        "backend_port": 8080
+    }))
+    .expect("proxy a should deserialize");
+    let proxy_b: Proxy = serde_json::from_value(json!({
+        "id": "proxy-b",
+        "namespace": "default",
+        "upstream_id": "up-1",
+        "backend_host": "backend.local",
+        "backend_port": 8080
+    }))
+    .expect("proxy b should deserialize");
+    let limiter = AdaptiveConcurrencyLimiter::new(16);
+    let config = Arc::new(AdaptiveConcurrencyConfig {
+        key_by: AdaptiveConcurrencyKeyBy::Upstream,
+        max_tracked_keys: 10_000,
+        min_limit: 1,
+        initial_limit: 1,
+        max_limit: 1,
+        min_samples: 1,
+        target_latency_multiplier: 1.5,
+        decrease_ratio: 0.5,
+        increase_step: 1,
+        shadow_mode: false,
+        expose_headers: false,
+    });
+    let tgt = target("backend.local", 8080);
+
+    let first = limiter
+        .try_acquire(&proxy_a, Some(&tgt), Arc::clone(&config))
+        .expect("first admitted under the shared upstream scope");
+    // Same upstream + same target via a different proxy resolves to the same key,
+    // so it hits the shared limit and is rejected.
+    let second = limiter.try_acquire(&proxy_b, Some(&tgt), Arc::clone(&config));
+    assert!(
+        second.is_err(),
+        "a second proxy sharing the upstream must hit the shared limit"
+    );
+    // Exactly one tracked key — shared across both proxies, not one per proxy.
+    assert_eq!(limiter.tracked_keys_count(), 1);
+
+    drop(first);
 }

@@ -287,6 +287,15 @@ impl ProxyBody {
         self
     }
 
+    /// Hold the backend-admission permit for the lifetime of a streamed response
+    /// body and record its outcome when the body reaches a terminal state.
+    ///
+    /// `backend_elapsed` is TTFB (captured at header arrival), so the adaptive
+    /// limiter's latency signal is TTFB even though the in-flight slot is held
+    /// for the full body. Unlike a WebSocket session this slot is still
+    /// transient (it frees at body completion), so this deliberately uses the
+    /// growth-allowing `record_backend_outcome`, not the holding variant — see
+    /// `AdaptiveConcurrencyPermit::record_success_latency`.
     pub(crate) fn with_deferred_backend_admission_outcome(
         mut self,
         permits: crate::plugins::BackendAdmissionPermitSet,

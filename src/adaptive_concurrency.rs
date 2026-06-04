@@ -51,7 +51,12 @@ pub struct AdaptiveConcurrencyConfig {
 
 #[derive(Clone, Debug, Eq)]
 pub struct AdaptiveConcurrencyKey {
-    scope: String,
+    // `Arc<str>` (not `String`): the scope is request-independent and resolved
+    // through a per-proxy cache, so building a key on the hot path is a refcount
+    // bump rather than a fresh allocation. `Hash`/`PartialEq` below stay
+    // content-based (`Arc<str>` hashes/compares the `str`), so distinct `Arc`
+    // instances carrying the same scope still collide/compare equal.
+    scope: Arc<str>,
     host: String,
     port: u16,
 }
@@ -94,6 +99,12 @@ impl AdaptiveConcurrencyState {
 
 pub struct AdaptiveConcurrencyLimiter {
     inner: DashMap<AdaptiveConcurrencyKey, Arc<AdaptiveConcurrencyState>>,
+    /// Per-proxy scope cache for `proxy`/`upstream` scoping, keyed by `proxy.id`
+    /// (unique per proxy). Bounded by the number of proxies using this plugin
+    /// instance and rebuilt with the plugin on reload, so it needs no eviction.
+    scope_cache: DashMap<Box<str>, Arc<str>>,
+    /// Shared scope for `key_by = backend_target` (a single constant string).
+    backend_scope: Arc<str>,
     tracked_keys: AtomicUsize,
 }
 
@@ -101,6 +112,8 @@ impl AdaptiveConcurrencyLimiter {
     pub fn new(shards: usize) -> Self {
         Self {
             inner: DashMap::with_shard_amount(shards),
+            scope_cache: DashMap::new(),
+            backend_scope: Arc::from("backend"),
             tracked_keys: AtomicUsize::new(0),
         }
     }
@@ -115,15 +128,30 @@ impl AdaptiveConcurrencyLimiter {
         target: Option<&UpstreamTarget>,
         config: Arc<AdaptiveConcurrencyConfig>,
     ) -> Result<Arc<AdaptiveConcurrencyPermit>, AdaptiveConcurrencyLimitExceeded> {
-        let key = build_key(proxy, target, config.key_by);
+        let key = build_key(self.resolve_scope(proxy, config.key_by), proxy, target);
         let state = match self.inner.entry(key) {
             Entry::Occupied(entry) => Arc::clone(entry.get()),
-            Entry::Vacant(entry) => {
-                self.reserve_key_slot(config.max_tracked_keys)?;
-                let state = Arc::new(AdaptiveConcurrencyState::new(config.initial_limit));
-                entry.insert(Arc::clone(&state));
-                state
-            }
+            Entry::Vacant(entry) => match self.reserve_key_slot(config.max_tracked_keys) {
+                Ok(()) => {
+                    let state = Arc::new(AdaptiveConcurrencyState::new(config.initial_limit));
+                    entry.insert(Arc::clone(&state));
+                    state
+                }
+                Err(_) => {
+                    // Key-cardinality cap reached. Fail OPEN with a per-request,
+                    // untracked state rather than rejecting: `max_tracked_keys`
+                    // only bounds the limiter's own memory, so a target beyond
+                    // the cap must still be admitted (never black-holed by a
+                    // blanket 503), and `shadow_mode` must never reject at all.
+                    // This state is NOT inserted into the map (memory stays
+                    // bounded) and dies with the permit, so overflow targets run
+                    // without adaptive limiting until churn frees a tracked slot
+                    // or a reload rebuilds the plugin. Starting at `in_flight = 0`
+                    // it always admits the request below.
+                    drop(entry);
+                    Arc::new(AdaptiveConcurrencyState::new(config.initial_limit))
+                }
+            },
         };
 
         loop {
@@ -186,10 +214,27 @@ impl AdaptiveConcurrencyLimiter {
         target: Option<&UpstreamTarget>,
         key_by: AdaptiveConcurrencyKeyBy,
     ) -> Option<AdaptiveConcurrencySnapshot> {
-        let key = build_key(proxy, target, key_by);
+        let key = build_key(self.resolve_scope(proxy, key_by), proxy, target);
         self.inner
             .get(&key)
             .map(|entry| AdaptiveConcurrencySnapshot::from_state(key, entry.value()))
+    }
+
+    /// Resolve the scope component of the key for `proxy` under `key_by`,
+    /// reusing a cached `Arc<str>` so the hot path never rebuilds it. `backend`
+    /// scoping returns one shared constant; `proxy`/`upstream` scoping caches per
+    /// `proxy.id` (which uniquely identifies the proxy, hence its scope).
+    fn resolve_scope(&self, proxy: &Proxy, key_by: AdaptiveConcurrencyKeyBy) -> Arc<str> {
+        if matches!(key_by, AdaptiveConcurrencyKeyBy::Backend) {
+            return Arc::clone(&self.backend_scope);
+        }
+        if let Some(cached) = self.scope_cache.get(proxy.id.as_str()) {
+            return Arc::clone(cached.value());
+        }
+        let scope: Arc<str> = Arc::from(compute_scope_string(proxy, key_by));
+        self.scope_cache
+            .insert(proxy.id.as_str().into(), Arc::clone(&scope));
+        scope
     }
 }
 
@@ -232,6 +277,22 @@ pub struct AdaptiveConcurrencyPermit {
 }
 
 impl AdaptiveConcurrencyPermit {
+    /// Feed one healthy backend sample into the limiter.
+    ///
+    /// `backend_elapsed` is the dispatch-relative backend latency. For buffered
+    /// responses it is the full backend round trip; for streamed responses it is
+    /// TTFB (headers), recorded at body completion — so for streaming backends
+    /// the latency signal is TTFB while the slot is held for the whole body.
+    /// That asymmetry is acceptable because a streamed slot is still transient
+    /// (it frees when the body completes), unlike a WebSocket session, which is
+    /// why streaming keeps `allow_increase = true` rather than using the holding
+    /// variant.
+    ///
+    /// Heuristic caveat: `baseline_latency_us` is a monotonically-decreasing
+    /// minimum that never decays back up, so a single unusually-fast response
+    /// (a tiny 200, a 304, a cache hit) permanently lowers `target_latency` and
+    /// can keep the limit pinned low. A windowed/decaying minimum would avoid
+    /// this; it is left as a documented sensitivity for now.
     fn record_success_latency(&self, backend_elapsed: Duration, allow_increase: bool) {
         let latency_us = (backend_elapsed.as_micros() as u64).max(1);
         update_min(&self.state.baseline_latency_us, latency_us);
@@ -309,15 +370,25 @@ impl Drop for AdaptiveConcurrencyPermit {
 }
 
 fn build_key(
+    scope: Arc<str>,
     proxy: &Proxy,
     target: Option<&UpstreamTarget>,
-    key_by: AdaptiveConcurrencyKeyBy,
 ) -> AdaptiveConcurrencyKey {
+    // Only host/port vary per request; `scope` is resolved (and cached) by the
+    // caller via `resolve_scope`.
     let (host, port) = target
         .map(|target| (target.host.as_str(), target.port))
         .unwrap_or((proxy.backend_host.as_str(), proxy.backend_port));
 
-    let scope = match key_by {
+    AdaptiveConcurrencyKey {
+        scope,
+        host: host.to_string(),
+        port,
+    }
+}
+
+fn compute_scope_string(proxy: &Proxy, key_by: AdaptiveConcurrencyKeyBy) -> String {
+    match key_by {
         AdaptiveConcurrencyKeyBy::Proxy => scoped_proxy(proxy),
         AdaptiveConcurrencyKeyBy::Upstream => proxy
             .upstream_id
@@ -333,13 +404,9 @@ fn build_key(
                 scope
             })
             .unwrap_or_else(|| scoped_proxy(proxy)),
+        // `backend` scope is served as a shared constant by `resolve_scope` and
+        // never reaches this function in practice.
         AdaptiveConcurrencyKeyBy::Backend => "backend".to_string(),
-    };
-
-    AdaptiveConcurrencyKey {
-        scope,
-        host: host.to_string(),
-        port,
     }
 }
 
