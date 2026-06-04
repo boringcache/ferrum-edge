@@ -547,18 +547,35 @@ impl MeshSlice {
             (BTreeSet::new(), BTreeSet::new())
         };
 
+        // A service the LOCAL workload backs is served *inbound*, not reached
+        // via egress, so it must not be gated by Sidecar egress scope: keep it
+        // un-narrowed even when the applicable Sidecar egress would drop or
+        // port-trim it. Without this, a restrictive `Sidecar` that omits the
+        // workload's own service would make its inbound mTLS traffic 404 (egress
+        // scope is for outbound). Gated on a local workload identity + a backing
+        // ref, so egress-only deployments and the existing narrowing are
+        // unchanged.
+        let local_spiffe = request.workload_spiffe_id.as_deref();
         let services: Vec<MeshService> = mesh
             .services
             .iter()
             .filter_map(|service| {
+                let namespace_visible = resource_namespace_visible(
+                    &service_waypoint_namespaces,
+                    &service.namespace,
+                    &namespace,
+                );
                 let Some(sidecar) = applicable_sidecar else {
-                    return resource_namespace_visible(
-                        &service_waypoint_namespaces,
-                        &service.namespace,
-                        &namespace,
-                    )
-                    .then(|| service.clone());
+                    return namespace_visible.then(|| service.clone());
                 };
+                if let Some(spiffe) = local_spiffe
+                    && service
+                        .workloads
+                        .iter()
+                        .any(|w| w.spiffe_id.as_str() == spiffe)
+                {
+                    return namespace_visible.then(|| service.clone());
+                }
                 narrow_service_ports(service, sidecar, &cluster_domain)
             })
             .collect();
@@ -4715,6 +4732,54 @@ mod tests {
         let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
         // Both entries with that host across alpha + beta should match.
         assert_eq!(slice.service_entries.len(), 2);
+    }
+
+    #[test]
+    fn sidecar_narrowing_keeps_local_service_despite_egress_scope() {
+        // Egress `./checkout` admits neither `reviews` nor `ratings`. `reviews`
+        // is the LOCAL workload's own service (inbound-served) and must survive
+        // narrowing — egress scope is for outbound, and dropping it would 404 the
+        // workload's own inbound mTLS traffic. `ratings` is a plain non-local
+        // service outside egress scope and is correctly narrowed away, proving
+        // the exemption is scoped to the workload's own service.
+        let local_spiffe = "spiffe://cluster.local/ns/alpha/sa/reviews";
+        let mut reviews = make_service("alpha", "reviews");
+        reviews.workloads = vec![crate::modes::mesh::config::WorkloadRef {
+            spiffe_id: crate::identity::SpiffeId::new(local_spiffe).unwrap(),
+        }];
+        let mesh = MeshConfig {
+            sidecars: vec![make_sidecar(
+                "default-sc",
+                "alpha",
+                None,
+                vec![vec!["./checkout"]],
+            )],
+            services: vec![
+                reviews,
+                make_service("alpha", "ratings"),
+                make_service("alpha", "checkout"),
+            ],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let request = MeshSliceRequest {
+            workload_spiffe_id: Some(local_spiffe.to_string()),
+            ..slice_request_enforced("alpha")
+        };
+        let slice = MeshSlice::from_gateway_config(&config, request);
+
+        assert!(
+            slice.services.iter().any(|s| s.name == "reviews"),
+            "the local workload's own service must survive egress narrowing"
+        );
+        assert!(
+            !slice.services.iter().any(|s| s.name == "ratings"),
+            "a non-local service outside egress scope must still be narrowed away"
+        );
+        assert!(
+            slice.services.iter().any(|s| s.name == "checkout"),
+            "an egress-admitted service stays"
+        );
     }
 
     #[test]
