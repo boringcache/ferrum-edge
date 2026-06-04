@@ -1481,7 +1481,7 @@ where
             upstream_balancer,
             current_target.as_deref(),
             current_cb_target_key.as_deref(),
-            reject.status_code,
+            status,
             false,
             None,
             cb_retry_probe_slot_available,
@@ -1490,7 +1490,7 @@ where
         );
         record_cross_protocol_backend_admission_outcome(
             &mut backend_admission_permits,
-            reject.status_code,
+            status,
             false,
             None,
             backend_admission_elapsed,

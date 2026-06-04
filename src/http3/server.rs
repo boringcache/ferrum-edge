@@ -2331,6 +2331,7 @@ async fn handle_h3_request(
             }
         };
 
+        let backend_admission_response_elapsed = backend_admission_start.elapsed();
         let response_status = h3_resp.status;
         let mut response_headers = h3_resp.headers;
 
@@ -2379,7 +2380,7 @@ async fn handle_h3_request(
                 response_status,
                 false,
                 None,
-                backend_admission_start.elapsed(),
+                backend_admission_response_elapsed,
             );
             record_request(&state, 502);
             return Ok(());
@@ -2430,7 +2431,7 @@ async fn handle_h3_request(
                 response_status,
                 false,
                 None,
-                backend_admission_start.elapsed(),
+                backend_admission_response_elapsed,
             );
 
             let backend_total_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
@@ -2668,7 +2669,7 @@ async fn handle_h3_request(
             response_status,
             backend_admission_connection_error,
             body_error_class,
-            backend_admission_start.elapsed(),
+            backend_admission_response_elapsed,
         );
 
         let backend_total_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
@@ -2912,6 +2913,7 @@ async fn handle_h3_request(
             &mut ctx,
             &mut plugin_execution_ns,
             is_early_data,
+            backend_admission_start,
         )
         .await?
         {
@@ -2955,6 +2957,7 @@ async fn handle_h3_request(
                 &plugins,
                 &mut ctx,
                 &mut plugin_execution_ns,
+                backend_admission_start,
             )
             .await;
 
@@ -3044,6 +3047,14 @@ async fn handle_h3_request(
             cb_is_half_open_probe,
             false,
             backend_start.elapsed(),
+        );
+        let backend_admission_error_class = h3_stream_result.body_error_class.or(h3_error_class);
+        record_h3_backend_admission_outcome(
+            &mut backend_admission_permits,
+            backend_status,
+            connection_error,
+            backend_admission_error_class,
+            h3_stream_result.backend_admission_elapsed,
         );
 
         let backend_total_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
@@ -3965,6 +3976,11 @@ struct H3StreamResult {
     /// reset can string-classify as `ConnectionReset` even though no
     /// request reached the backend).
     request_on_wire: bool,
+    /// Elapsed time from backend-admission acquisition until the backend
+    /// produced response headers or a pre-headers dispatch error. Streaming
+    /// callers reuse this after downstream body relay completes so adaptive
+    /// concurrency samples backend health rather than client backpressure.
+    backend_admission_elapsed: std::time::Duration,
 }
 
 enum H3RefinedResponse {
@@ -3987,6 +4003,7 @@ fn h3_backend_unavailable_stream_result(
     error_class: crate::retry::ErrorClass,
     request_on_wire: bool,
     reject_sent: bool,
+    backend_admission_elapsed: std::time::Duration,
 ) -> H3StreamResult {
     H3StreamResult {
         status: 502,
@@ -3997,6 +4014,7 @@ fn h3_backend_unavailable_stream_result(
         client_disconnected: !reject_sent,
         body_error_class: None,
         request_on_wire,
+        backend_admission_elapsed,
     }
 }
 
@@ -4030,6 +4048,7 @@ async fn proxy_to_backend_h3_refined_response(
     ctx: &mut RequestContext,
     plugin_execution_ns: &mut u64,
     is_early_data: bool,
+    backend_admission_start: std::time::Instant,
 ) -> Result<H3RefinedResponse, anyhow::Error> {
     let h3_headers = build_h3_backend_headers(
         proxy,
@@ -4091,11 +4110,17 @@ async fn proxy_to_backend_h3_refined_response(
             .await
             .is_ok();
             return Ok(H3RefinedResponse::Streamed(
-                h3_backend_unavailable_stream_result(h3_error_class, request_on_wire, reject_sent),
+                h3_backend_unavailable_stream_result(
+                    h3_error_class,
+                    request_on_wire,
+                    reject_sent,
+                    backend_admission_start.elapsed(),
+                ),
             ));
         }
     };
 
+    let backend_admission_elapsed = backend_admission_start.elapsed();
     let response_status = h3_resp.status;
     let mut response_headers = h3_resp.headers;
     response_headers.retain(|name, _| !is_backend_response_strip_header(name));
@@ -4121,6 +4146,7 @@ async fn proxy_to_backend_h3_refined_response(
             plugins,
             ctx,
             plugin_execution_ns,
+            backend_admission_elapsed,
         )
         .await?;
         return Ok(H3RefinedResponse::Streamed(result));
@@ -4242,6 +4268,7 @@ async fn stream_h3_open_response_to_client(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
     plugin_execution_ns: &mut u64,
+    backend_admission_elapsed: std::time::Duration,
 ) -> Result<H3StreamResult, anyhow::Error> {
     if state.max_response_body_size_bytes > 0
         && let Some(len) = response_headers
@@ -4265,6 +4292,7 @@ async fn stream_h3_open_response_to_client(
             client_disconnected: !size_reject_sent,
             body_error_class: None,
             request_on_wire: true,
+            backend_admission_elapsed,
         });
     }
 
@@ -4300,6 +4328,7 @@ async fn stream_h3_open_response_to_client(
                 Some(crate::retry::ErrorClass::ClientDisconnect)
             },
             request_on_wire: true,
+            backend_admission_elapsed,
         });
     }
 
@@ -4330,6 +4359,7 @@ async fn stream_h3_open_response_to_client(
             client_disconnected: true,
             body_error_class: Some(crate::retry::ErrorClass::ClientDisconnect),
             request_on_wire: true,
+            backend_admission_elapsed,
         });
     }
 
@@ -4471,6 +4501,7 @@ async fn stream_h3_open_response_to_client(
         client_disconnected,
         body_error_class,
         request_on_wire: true,
+        backend_admission_elapsed,
     })
 }
 
@@ -4498,6 +4529,7 @@ async fn proxy_to_backend_h3_streaming(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
     plugin_execution_ns: &mut u64,
+    backend_admission_start: std::time::Instant,
 ) -> Result<H3StreamResult, anyhow::Error> {
     let h3_headers = build_h3_backend_headers(
         proxy,
@@ -4572,10 +4604,12 @@ async fn proxy_to_backend_h3_streaming(
                 h3_error_class,
                 request_on_wire,
                 reject_sent,
+                backend_admission_start.elapsed(),
             ));
         }
     };
 
+    let backend_admission_elapsed = backend_admission_start.elapsed();
     let response_status = h3_resp.status;
     let mut response_headers = h3_resp.headers;
 
@@ -4622,6 +4656,7 @@ async fn proxy_to_backend_h3_streaming(
             // reached the wire. The 502 we synthesize is a gateway-side
             // policy rejection, not a transport failure.
             request_on_wire: true,
+            backend_admission_elapsed,
         });
     }
 
@@ -4669,6 +4704,7 @@ async fn proxy_to_backend_h3_streaming(
                 Some(crate::retry::ErrorClass::ClientDisconnect)
             },
             request_on_wire: true,
+            backend_admission_elapsed,
         });
     }
 
@@ -4705,6 +4741,7 @@ async fn proxy_to_backend_h3_streaming(
             // Headers came back from the backend; the request reached
             // the wire. The client gave up on us between then and now.
             request_on_wire: true,
+            backend_admission_elapsed,
         });
     }
 
@@ -4868,6 +4905,7 @@ async fn proxy_to_backend_h3_streaming(
         // produced response headers. Mid-stream aborts are post-wire
         // by construction — we already have headers from the backend.
         request_on_wire: true,
+        backend_admission_elapsed,
     })
 }
 
@@ -5825,6 +5863,7 @@ mod h3_streaming_outcome_tests {
             ErrorClass::ProtocolError,
             /* request_on_wire = */ true,
             /* reject_sent = */ false,
+            std::time::Duration::from_millis(7),
         );
         assert!(
             disconnected.client_disconnected,
@@ -5837,17 +5876,26 @@ mod h3_streaming_outcome_tests {
         );
         assert_eq!(disconnected.error_class, Some(ErrorClass::ProtocolError));
         assert!(disconnected.request_on_wire);
+        assert_eq!(
+            disconnected.backend_admission_elapsed,
+            std::time::Duration::from_millis(7)
+        );
 
         let delivered = super::h3_backend_unavailable_stream_result(
             ErrorClass::ProtocolError,
             /* request_on_wire = */ false,
             /* reject_sent = */ true,
+            std::time::Duration::from_millis(11),
         );
         assert!(
             !delivered.client_disconnected,
             "a delivered 502 reject write is not a client disconnect"
         );
         assert!(!delivered.request_on_wire);
+        assert_eq!(
+            delivered.backend_admission_elapsed,
+            std::time::Duration::from_millis(11)
+        );
     }
 }
 

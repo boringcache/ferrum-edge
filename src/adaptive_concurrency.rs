@@ -116,21 +116,13 @@ impl AdaptiveConcurrencyLimiter {
         config: Arc<AdaptiveConcurrencyConfig>,
     ) -> Result<Arc<AdaptiveConcurrencyPermit>, AdaptiveConcurrencyLimitExceeded> {
         let key = build_key(proxy, target, config.key_by);
-        let state = match self.inner.get(&key) {
-            Some(entry) => Arc::clone(entry.value()),
-            None => {
+        let state = match self.inner.entry(key) {
+            Entry::Occupied(entry) => Arc::clone(entry.get()),
+            Entry::Vacant(entry) => {
                 self.reserve_key_slot(config.max_tracked_keys)?;
-                match self.inner.entry(key.clone()) {
-                    Entry::Occupied(entry) => {
-                        self.tracked_keys.fetch_sub(1, Ordering::AcqRel);
-                        Arc::clone(entry.get())
-                    }
-                    Entry::Vacant(entry) => {
-                        let state = Arc::new(AdaptiveConcurrencyState::new(config.initial_limit));
-                        entry.insert(Arc::clone(&state));
-                        state
-                    }
-                }
+                let state = Arc::new(AdaptiveConcurrencyState::new(config.initial_limit));
+                entry.insert(Arc::clone(&state));
+                state
             }
         };
 
