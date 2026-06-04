@@ -1357,6 +1357,9 @@ fn reverse_translate(
         // registry is never widened). Empty when the CP applied no Sidecar
         // narrowing; the materializer then falls back to `services`.
         local_inbound_services: recovered.local_inbound_services,
+        // Local workload(s) preserved un-narrowed for inbound materialization
+        // (Sidecar identity narrowing can drop the local pod from `workloads`).
+        local_inbound_workloads: recovered.local_inbound_workloads,
         // GAP-1a: authorization policies recovered from the MeshPolicies
         // carrier. Without this the xDS mesh had NO authz (implicit allow-all).
         mesh_policies: recovered.mesh_policies,
@@ -1420,6 +1423,7 @@ struct RecoveredSliceCarriers {
     slice_carrier_seen: bool,
     services: Option<Vec<MeshService>>,
     local_inbound_services: Vec<MeshService>,
+    local_inbound_workloads: Vec<crate::modes::mesh::config::Workload>,
     labels: Option<BTreeMap<String, String>>,
     workloads: Vec<crate::modes::mesh::config::Workload>,
     mesh_policies: Vec<crate::modes::mesh::config::MeshPolicy>,
@@ -1641,6 +1645,7 @@ fn apply_recovered_carrier(
     match carrier {
         MeshSliceCarrier::Services(value) => recovered.services = Some(value),
         MeshSliceCarrier::LocalInboundServices(value) => recovered.local_inbound_services = value,
+        MeshSliceCarrier::LocalInboundWorkloads(value) => recovered.local_inbound_workloads = value,
         MeshSliceCarrier::Workloads(value) => recovered.workloads = value,
         MeshSliceCarrier::WorkloadLabels(value) => recovered.labels = Some(value),
         MeshSliceCarrier::MeshPolicies(value) => recovered.mesh_policies = value,
@@ -4011,11 +4016,13 @@ mod tests {
             namespace: "default".to_string(),
             version: "v1".to_string(),
             labels: BTreeMap::from([("app".to_string(), "api".to_string())]),
-            workloads: vec![workload],
+            workloads: vec![workload.clone()],
             services: vec![service.clone()],
-            // Inbound-only un-narrowed view must round-trip via its dedicated
-            // ECDS carrier independent of the egress-narrowed `services`.
+            // Inbound-only un-narrowed views must round-trip via their dedicated
+            // ECDS carriers independent of the egress-narrowed `services` /
+            // identity-narrowed `workloads`.
             local_inbound_services: vec![service],
+            local_inbound_workloads: vec![workload],
             mesh_policies: vec![MeshPolicy {
                 name: "allow-api".to_string(),
                 namespace: "default".to_string(),
@@ -4162,10 +4169,14 @@ mod tests {
         // Services round-trip with full protocol + workload-ref shape via the
         // Services carrier (not the name-only CDS/EDS reconstruction).
         assert_eq!(recovered.services, native.services);
-        // The inbound-only un-narrowed view round-trips via its own carrier.
+        // The inbound-only un-narrowed views round-trip via their own carriers.
         assert_eq!(
             recovered.local_inbound_services,
             native.local_inbound_services
+        );
+        assert_eq!(
+            recovered.local_inbound_workloads,
+            native.local_inbound_workloads
         );
 
         // Resolved-behavior parity spot-checks: the recovered slice answers

@@ -62,6 +62,12 @@ pub const FERRUM_ECDS_SERVICES_TYPE_URL: &str =
 /// gates inbound serving and the outbound registry is not widened.
 pub const FERRUM_ECDS_LOCAL_INBOUND_SERVICES_TYPE_URL: &str =
     "type.googleapis.com/ferrum.config.extension.v3.LocalInboundServicesCarrier";
+/// Inner `type_url` for the inbound-only view of the local workload(s), captured
+/// un-narrowed by Sidecar egress/identity narrowing so the inbound materializer
+/// can find the local pod (and its container ports for backend resolution) even
+/// when identity narrowing drops it from the `Workloads` carrier.
+pub const FERRUM_ECDS_LOCAL_INBOUND_WORKLOADS_TYPE_URL: &str =
+    "type.googleapis.com/ferrum.config.extension.v3.LocalInboundWorkloadsCarrier";
 /// Inner `type_url` for the per-pod workload / endpoint carrier.
 pub const FERRUM_ECDS_WORKLOADS_TYPE_URL: &str =
     "type.googleapis.com/ferrum.config.extension.v3.WorkloadsCarrier";
@@ -112,6 +118,7 @@ pub const FERRUM_CARRIER_RESOURCE_NAME_PREFIX: &str = "ferrum-mesh-carrier/";
 pub enum MeshSliceCarrier {
     Services(Vec<MeshService>),
     LocalInboundServices(Vec<MeshService>),
+    LocalInboundWorkloads(Vec<Workload>),
     Workloads(Vec<Workload>),
     WorkloadLabels(BTreeMap<String, String>),
     MeshPolicies(Vec<MeshPolicy>),
@@ -134,6 +141,9 @@ impl MeshSliceCarrier {
             MeshSliceCarrier::LocalInboundServices(_) => {
                 FERRUM_ECDS_LOCAL_INBOUND_SERVICES_TYPE_URL
             }
+            MeshSliceCarrier::LocalInboundWorkloads(_) => {
+                FERRUM_ECDS_LOCAL_INBOUND_WORKLOADS_TYPE_URL
+            }
             MeshSliceCarrier::Workloads(_) => FERRUM_ECDS_WORKLOADS_TYPE_URL,
             MeshSliceCarrier::WorkloadLabels(_) => FERRUM_ECDS_LABELS_TYPE_URL,
             MeshSliceCarrier::MeshPolicies(_) => FERRUM_ECDS_MESH_POLICIES_TYPE_URL,
@@ -154,6 +164,7 @@ impl MeshSliceCarrier {
         let suffix = match self {
             MeshSliceCarrier::Services(_) => "services",
             MeshSliceCarrier::LocalInboundServices(_) => "local-inbound-services",
+            MeshSliceCarrier::LocalInboundWorkloads(_) => "local-inbound-workloads",
             MeshSliceCarrier::Workloads(_) => "workloads",
             MeshSliceCarrier::WorkloadLabels(_) => "workload-labels",
             MeshSliceCarrier::MeshPolicies(_) => "mesh-policies",
@@ -175,6 +186,7 @@ impl MeshSliceCarrier {
         match self {
             MeshSliceCarrier::Services(value) => encode(value),
             MeshSliceCarrier::LocalInboundServices(value) => encode(value),
+            MeshSliceCarrier::LocalInboundWorkloads(value) => encode(value),
             MeshSliceCarrier::Workloads(value) => encode(value),
             MeshSliceCarrier::WorkloadLabels(value) => encode(value),
             MeshSliceCarrier::MeshPolicies(value) => encode(value),
@@ -208,6 +220,9 @@ impl MeshSliceCarrier {
             FERRUM_ECDS_SERVICES_TYPE_URL => MeshSliceCarrier::Services(decode_json(value)?),
             FERRUM_ECDS_LOCAL_INBOUND_SERVICES_TYPE_URL => {
                 MeshSliceCarrier::LocalInboundServices(decode_json(value)?)
+            }
+            FERRUM_ECDS_LOCAL_INBOUND_WORKLOADS_TYPE_URL => {
+                MeshSliceCarrier::LocalInboundWorkloads(decode_json(value)?)
             }
             FERRUM_ECDS_WORKLOADS_TYPE_URL => MeshSliceCarrier::Workloads(decode_json(value)?),
             FERRUM_ECDS_LABELS_TYPE_URL => MeshSliceCarrier::WorkloadLabels(decode_json(value)?),
@@ -254,6 +269,9 @@ pub fn carrier_resource_name_for_type_url(type_url: &str) -> Option<&'static str
         FERRUM_ECDS_SERVICES_TYPE_URL => Some("ferrum-mesh-carrier/services"),
         FERRUM_ECDS_LOCAL_INBOUND_SERVICES_TYPE_URL => {
             Some("ferrum-mesh-carrier/local-inbound-services")
+        }
+        FERRUM_ECDS_LOCAL_INBOUND_WORKLOADS_TYPE_URL => {
+            Some("ferrum-mesh-carrier/local-inbound-workloads")
         }
         FERRUM_ECDS_WORKLOADS_TYPE_URL => Some("ferrum-mesh-carrier/workloads"),
         FERRUM_ECDS_LABELS_TYPE_URL => Some("ferrum-mesh-carrier/workload-labels"),
@@ -307,6 +325,11 @@ pub fn build_slice_carriers(slice: &MeshSlice) -> Vec<MeshSliceCarrier> {
     if !slice.local_inbound_services.is_empty() {
         carriers.push(MeshSliceCarrier::LocalInboundServices(
             slice.local_inbound_services.clone(),
+        ));
+    }
+    if !slice.local_inbound_workloads.is_empty() {
+        carriers.push(MeshSliceCarrier::LocalInboundWorkloads(
+            slice.local_inbound_workloads.clone(),
         ));
     }
     if !slice.workloads.is_empty() {
@@ -375,6 +398,7 @@ pub fn apply_carrier(slice: &mut MeshSlice, carrier: MeshSliceCarrier) {
     match carrier {
         MeshSliceCarrier::Services(value) => slice.services = value,
         MeshSliceCarrier::LocalInboundServices(value) => slice.local_inbound_services = value,
+        MeshSliceCarrier::LocalInboundWorkloads(value) => slice.local_inbound_workloads = value,
         MeshSliceCarrier::Workloads(value) => slice.workloads = value,
         MeshSliceCarrier::WorkloadLabels(value) => slice.labels = value,
         MeshSliceCarrier::MeshPolicies(value) => slice.mesh_policies = value,
@@ -453,6 +477,7 @@ mod tests {
         let carriers = vec![
             MeshSliceCarrier::Services(Vec::new()),
             MeshSliceCarrier::LocalInboundServices(Vec::new()),
+            MeshSliceCarrier::LocalInboundWorkloads(Vec::new()),
             MeshSliceCarrier::Workloads(Vec::new()),
             MeshSliceCarrier::WorkloadLabels(BTreeMap::from([(
                 "app".to_string(),
@@ -533,6 +558,7 @@ mod tests {
         let carriers = [
             MeshSliceCarrier::Services(Vec::new()),
             MeshSliceCarrier::LocalInboundServices(Vec::new()),
+            MeshSliceCarrier::LocalInboundWorkloads(Vec::new()),
             MeshSliceCarrier::Workloads(Vec::new()),
             MeshSliceCarrier::WorkloadLabels(BTreeMap::from([(
                 "app".to_string(),

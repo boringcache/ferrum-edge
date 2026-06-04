@@ -1183,9 +1183,18 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                                     .workload_spiffe_id
                                     .filter(|s| !s.is_empty())
                         {
-                            server
+                            let previous = server
                                 .workload_identities
-                                .insert(current_node_id.clone(), spiffe);
+                                .insert(current_node_id.clone(), spiffe.clone());
+                            // A snapshot is cached by (node id, config fingerprint)
+                            // only; if the identity is newly learned or changed
+                            // under this node id (e.g. a concurrent/make-before-
+                            // break stream built one before the metadata arrived),
+                            // a cached slice could carry the old/missing identity.
+                            // Drop it so the next build uses the current identity.
+                            if previous.as_deref() != Some(spiffe.as_str()) {
+                                server.invalidate_snapshot_for_config_update(&current_node_id);
+                            }
                         }
 
                         if let Err(status) = ensure_supported_type_url(&request.type_url) {
@@ -1348,9 +1357,18 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                                     .workload_spiffe_id
                                     .filter(|s| !s.is_empty())
                         {
-                            server
+                            let previous = server
                                 .workload_identities
-                                .insert(current_node_id.clone(), spiffe);
+                                .insert(current_node_id.clone(), spiffe.clone());
+                            // A snapshot is cached by (node id, config fingerprint)
+                            // only; if the identity is newly learned or changed
+                            // under this node id (e.g. a concurrent/make-before-
+                            // break stream built one before the metadata arrived),
+                            // a cached slice could carry the old/missing identity.
+                            // Drop it so the next build uses the current identity.
+                            if previous.as_deref() != Some(spiffe.as_str()) {
+                                server.invalidate_snapshot_for_config_update(&current_node_id);
+                            }
                         }
 
                         if let Err(status) = ensure_supported_type_url(&request.type_url) {

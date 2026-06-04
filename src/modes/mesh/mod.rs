@@ -1414,14 +1414,23 @@ fn materialize_sidecar_inbound_proxies(
     } else {
         mesh_slice.local_inbound_services.as_slice()
     };
+    // Identify the local workload(s) from the preserved inbound view when the
+    // slice carries one — Sidecar identity narrowing can drop the local workload
+    // from `workloads` — else fall back to `workloads`. `resolve_local_workloads`
+    // applies the same precise match + shared-SPIFFE ambiguity guard the slice
+    // builder uses, so the two cannot drift.
+    let local_workload_src = if mesh_slice.local_inbound_workloads.is_empty() {
+        mesh_slice.workloads.as_slice()
+    } else {
+        mesh_slice.local_inbound_workloads.as_slice()
+    };
     let mut materialized = 0usize;
-    // The local workload(s) are this sidecar's own pods, matched precisely by
-    // `workload_is_local` (SPIFFE id + non-vacuous label/cluster match) — the
-    // same predicate the slice builder uses to capture the inbound view, so the
-    // two cannot drift.
-    for workload in mesh_slice.workloads.iter().filter(|w| {
-        crate::modes::mesh::slice::workload_is_local(w, local_spiffe, sidecar_labels, local_cluster)
-    }) {
+    for workload in crate::modes::mesh::slice::resolve_local_workloads(
+        local_workload_src,
+        local_spiffe,
+        sidecar_labels,
+        local_cluster,
+    ) {
         // Route inbound traffic for the service(s) this workload backs — its own
         // service (matched by name + namespace), never a service that merely
         // shares its SPIFFE id. HTTP-family routability is read from the SERVICE
@@ -7669,6 +7678,78 @@ mod tests {
     }
 
     #[test]
+    fn sidecar_inbound_proxies_use_preserved_local_workload_when_narrowed() {
+        // Sidecar identity narrowing can drop the local workload from
+        // `workloads`. The preserved `local_inbound_workloads` view must let the
+        // materializer still find it (and its container port). Here `workloads`
+        // is empty (as if identity-narrowed) yet the route materializes.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(spiffe.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: Vec::new(),
+            services: Vec::new(),
+            local_inbound_workloads: vec![workload("reviews", "reviews")],
+            local_inbound_services: vec![http_mesh_service("reviews", 8080, spiffe)],
+            ..MeshSlice::default()
+        };
+
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+        assert!(
+            config
+                .proxies
+                .iter()
+                .any(|p| p.id == "__mesh-inbound-default-reviews-8080"),
+            "must materialize from the preserved local_inbound_workloads view when \
+             identity narrowing emptied `workloads`"
+        );
+    }
+
+    #[test]
+    fn sidecar_inbound_proxies_skip_ambiguous_shared_spiffe_without_labels() {
+        // Two workloads share the service-account SPIFFE but back different
+        // services, and the sidecar carries no labels to disambiguate. The local
+        // identity is ambiguous, so NO inbound route is materialized (rather than
+        // routing to the wrong loopback app).
+        let shared = "spiffe://cluster.local/ns/default/sa/shared";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(shared.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let mut reviews = workload("reviews", "reviews");
+        reviews.spiffe_id = SpiffeId::new(shared).unwrap();
+        let mut ratings = workload("ratings", "ratings");
+        ratings.spiffe_id = SpiffeId::new(shared).unwrap();
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![reviews, ratings],
+            services: vec![
+                http_mesh_service("reviews", 8080, shared),
+                http_mesh_service("ratings", 8080, shared),
+            ],
+            ..MeshSlice::default()
+        };
+
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+        assert!(
+            !config
+                .proxies
+                .iter()
+                .any(|p| p.id.starts_with("__mesh-inbound-")),
+            "ambiguous shared-SPIFFE local identity without labels must not materialize routes"
+        );
+    }
+
+    #[test]
     fn waypoint_name_only_propagates_for_service_waypoint_topology() {
         let mut runtime = test_mesh_runtime_config();
         runtime.waypoint_name = Some("api-waypoint".to_string());
@@ -9347,6 +9428,7 @@ mod tests {
             workloads: Vec::new(),
             services: Vec::new(),
             local_inbound_services: Vec::new(),
+            local_inbound_workloads: Vec::new(),
             mesh_policies: Vec::new(),
             peer_authentications: Vec::new(),
             service_entries: Vec::new(),
