@@ -5705,6 +5705,7 @@ async fn handle_websocket_request_authenticated(
     ctx: RequestContext,
     proxy_headers: HashMap<String, String>,
     plugins: Arc<Vec<Arc<dyn Plugin>>>,
+    backend_admission_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     plugin_execution_ns: u64,
     epoch: Arc<RequestEpoch>,
     upstream_target: Option<Arc<UpstreamTarget>>,
@@ -5716,7 +5717,6 @@ async fn handle_websocket_request_authenticated(
     is_tls: bool,
     cb_target_key: Option<String>,
     cb_is_half_open_probe: bool,
-    backend_admission_permits: Option<BackendAdmissionPermitSet>,
     requires_ws_frame_hooks: bool,
     query_string: String,
     strip_len: usize,
@@ -5731,6 +5731,7 @@ async fn handle_websocket_request_authenticated(
         proxy.id,
         remote_addr.ip()
     );
+    let mut ctx = ctx;
 
     // Build backend URL using upstream target if available
     let (effective_host, effective_port) = if let Some(ref target) = upstream_target {
@@ -5828,8 +5829,9 @@ async fn handle_websocket_request_authenticated(
     let env_config = state.env_config.clone();
     let mut current_backend_url = backend_url;
     let mut current_target = upstream_target;
-    let mut backend_admission_permits = backend_admission_permits;
-    let backend_admission_start = Instant::now();
+    let mut backend_admission_permits: Option<BackendAdmissionPermitSet>;
+    let mut backend_admission_start: Instant;
+    let mut ws_cb_probe_slot_available = cb_is_half_open_probe;
     let mut ws_attempt = 0u32;
 
     // The backend WebSocket connection acquired below is held for the full
@@ -5879,6 +5881,37 @@ async fn handle_websocket_request_authenticated(
                     StatusCode::SERVICE_UNAVAILABLE,
                     r#"{"error":"Backend connection limit exceeded"}"#,
                 ));
+            }
+        };
+
+        backend_admission_start = Instant::now();
+        backend_admission_permits = match backend_dispatch::run_backend_admission_plugins(
+            backend_admission_plugins.as_ref(),
+            &ctx,
+            &proxy,
+            current_target.as_deref(),
+            ProxyProtocol::WebSocket,
+        ) {
+            Ok(permits) => permits,
+            Err(rejection) => {
+                drop(conn_slot);
+                release_circuit_breaker_probe_on_admission_reject(
+                    &state,
+                    &proxy,
+                    cb_target_key.as_deref(),
+                    ws_cb_probe_slot_available,
+                );
+                return Ok(handle_backend_admission_rejection(
+                    rejection,
+                    &plugins,
+                    &mut ctx,
+                    &state,
+                    start_time,
+                    plugin_execution_ns,
+                    Some(&original_request_path),
+                    false,
+                )
+                .await);
             }
         };
 
@@ -5974,7 +6007,8 @@ async fn handle_websocket_request_authenticated(
                             current_cb_key.as_deref(),
                             cb_config,
                         );
-                        cb.record_failure(502, ws_is_pre_wire, cb_is_half_open_probe);
+                        cb.record_failure(502, ws_is_pre_wire, ws_cb_probe_slot_available);
+                        ws_cb_probe_slot_available = false;
                     }
 
                     let delay = retry::retry_delay(retry_config, ws_attempt);
@@ -10046,35 +10080,6 @@ async fn handle_proxy_request_inner(
                 ));
             }
         }
-        backend_admission_permits = match backend_dispatch::run_backend_admission_plugins(
-            backend_admission_plugins.as_ref(),
-            &ctx,
-            &proxy,
-            upstream_target.as_deref(),
-            request_protocol,
-        ) {
-            Ok(permits) => permits,
-            Err(rejection) => {
-                release_circuit_breaker_probe_on_admission_reject(
-                    &state,
-                    &proxy,
-                    cb_target_key.as_deref(),
-                    cb_is_half_open_probe,
-                );
-                return Ok(handle_backend_admission_rejection(
-                    rejection,
-                    &plugins,
-                    &mut ctx,
-                    &state,
-                    start_time,
-                    plugin_execution_ns,
-                    Some(&original_request_path),
-                    is_grpc_request,
-                )
-                .await);
-            }
-        };
-
         let request = match client_request_body {
             ClientRequestBody::Streaming(request) => *request,
             ClientRequestBody::Buffered(_) => {
@@ -10099,6 +10104,7 @@ async fn handle_proxy_request_inner(
             ctx,
             websocket_proxy_headers,
             plugins,
+            backend_admission_plugins,
             plugin_execution_ns,
             Arc::clone(&epoch),
             upstream_target,
@@ -10110,7 +10116,6 @@ async fn handle_proxy_request_inner(
             is_tls,
             cb_target_key,
             cb_is_half_open_probe,
-            backend_admission_permits.take(),
             requires_ws_frame_hooks,
             effective_query_string.to_string(),
             strip_len,
@@ -11632,6 +11637,7 @@ async fn handle_proxy_request_inner(
     let bytes_sent_observed = Arc::clone(&ctx.bytes_sent_observed);
     let mut cb_retry_probe_slot_available = cb_is_half_open_probe;
     let mut skip_final_cb_record = false;
+    let mut backend_admission_started_at = backend_start;
     let (backend_resp, final_cb_target_key) = if let Some(retry_config) = retry_config {
         let mut attempt = 0u32;
         let mut current_target = upstream_target.clone();
@@ -11708,7 +11714,7 @@ async fn handle_proxy_request_inner(
                     response_status: result.status_code,
                     connection_error: result.connection_error,
                     error_class: result.error_class,
-                    backend_elapsed: backend_start.elapsed(),
+                    backend_elapsed: backend_admission_started_at.elapsed(),
                 });
             }
             // Record the failed attempt against the current target's circuit breaker
@@ -11806,6 +11812,7 @@ async fn handle_proxy_request_inner(
                 }
             }
 
+            backend_admission_started_at = Instant::now();
             backend_admission_permits = match backend_dispatch::run_backend_admission_plugins(
                 backend_admission_plugins.as_ref(),
                 &ctx,
@@ -12002,7 +12009,7 @@ async fn handle_proxy_request_inner(
     let backend_admission_response_status = response_status;
     let backend_admission_connection_error = backend_resp.connection_error;
     let backend_admission_error_class = backend_error_class;
-    let backend_admission_elapsed = backend_start.elapsed();
+    let backend_admission_elapsed = backend_admission_started_at.elapsed();
     let is_streaming_response = matches!(
         &response_body,
         ResponseBody::Streaming { .. }

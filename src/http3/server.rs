@@ -1746,54 +1746,8 @@ async fn handle_h3_request(
     let use_native_h3_pool = http_flavor == HttpFlavor::Plain
         && crate::proxy::supports_native_http3_backend(&state, &proxy, upstream_target.as_deref());
     let backend_admission_plugins = plugin_cache_view.backend_admission_plugins();
-    let mut backend_admission_permits =
-        match crate::proxy::backend_dispatch::run_backend_admission_plugins(
-            backend_admission_plugins.as_ref(),
-            &ctx,
-            &proxy,
-            upstream_target.as_deref(),
-            request_protocol,
-        ) {
-            Ok(permits) => permits,
-            Err(rejection) => {
-                let mut headers = rejection.headers;
-                apply_after_proxy_hooks_to_rejection(
-                    &plugins,
-                    &mut ctx,
-                    rejection.status_code,
-                    &mut headers,
-                )
-                .await;
-                let http_status = StatusCode::from_u16(rejection.status_code)
-                    .unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
-                let log_status_code = h3_reject_log_status_and_metadata(
-                    &mut ctx,
-                    http_flavor,
-                    http_status,
-                    &rejection.body,
-                    &headers,
-                );
-                record_request(&state, log_status_code);
-                log_rejected_request(
-                    &plugins,
-                    &ctx,
-                    log_status_code,
-                    start_time,
-                    &rejection.plugin_name,
-                    plugin_execution_ns,
-                )
-                .await;
-                send_h3_reject_flavor_aware(
-                    &mut stream,
-                    http_flavor,
-                    http_status,
-                    &rejection.body,
-                    &headers,
-                )
-                .await?;
-                return Ok(());
-            }
-        };
+    let mut backend_admission_permits: Option<BackendAdmissionPermitSet>;
+    let mut backend_admission_start: std::time::Instant;
 
     let (cb_target_key, cb_is_half_open_probe) =
         match crate::proxy::backend_dispatch::check_circuit_breaker(
@@ -1939,6 +1893,7 @@ async fn handle_h3_request(
             proxy,
             ctx,
             plugins,
+            backend_admission_plugins,
             plugin_execution_ns,
             upstream_target,
             upstream_balancer,
@@ -1947,7 +1902,6 @@ async fn handle_h3_request(
             start_time,
             cb_target_key,
             cb_is_half_open_probe,
-            backend_admission_permits.take(),
             backend_url,
             effective_query_string.to_string(),
             proxy_headers,
@@ -2055,18 +2009,12 @@ async fn handle_h3_request(
                 client_ip: &client_ip_owned,
                 ctx: &mut ctx,
                 plugins: &plugins,
+                backend_admission_plugins: backend_admission_plugins.as_ref(),
                 requires_response_body_buffering: maybe_requires_response_body_buffering,
                 sticky_cookie_needed,
             })
             .await?;
 
-        record_h3_backend_admission_outcome(
-            &mut backend_admission_permits,
-            outcome.response_status,
-            outcome.connection_error,
-            outcome.body_error_class.or(outcome.error_class),
-            std::time::Duration::from_secs_f64(outcome.backend_total_ms / 1000.0),
-        );
         record_request(&state, outcome.response_status);
 
         // Build the same TransactionSummary shape the native H3 pool path
@@ -2127,6 +2075,33 @@ async fn handle_h3_request(
         // ===== STREAMING REQUEST + RESPONSE PATH =====
         // Stream both the request body (frontend → backend) and response body
         // (backend → frontend) without buffering either into memory.
+
+        backend_admission_start = std::time::Instant::now();
+        backend_admission_permits = match run_h3_backend_admission_or_send_reject(
+            backend_admission_plugins.as_ref(),
+            &plugins,
+            &mut ctx,
+            &proxy,
+            upstream_target.as_deref(),
+            http_flavor,
+            &mut stream,
+            &state,
+            start_time,
+            plugin_execution_ns,
+        )
+        .await?
+        {
+            Ok(permits) => permits,
+            Err(()) => {
+                release_h3_circuit_breaker_probe_on_admission_reject(
+                    &state,
+                    &proxy,
+                    cb_target_key.as_deref(),
+                    cb_is_half_open_probe,
+                );
+                return Ok(());
+            }
+        };
 
         // Track connection for least-connections LB (after all pre-dispatch rejects)
         if let (Some(_upstream_id), Some(target), Some(balancer)) = (
@@ -2241,7 +2216,7 @@ async fn handle_h3_request(
                         413,
                         false,
                         Some(crate::retry::ErrorClass::ClientDisconnect),
-                        backend_start.elapsed(),
+                        backend_admission_start.elapsed(),
                     );
                     return Ok(());
                 }
@@ -2303,7 +2278,7 @@ async fn handle_h3_request(
                     502,
                     outcome_connection_error,
                     outcome_error_class,
-                    backend_start.elapsed(),
+                    backend_admission_start.elapsed(),
                 );
 
                 let backend_total_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
@@ -2404,7 +2379,7 @@ async fn handle_h3_request(
                 response_status,
                 false,
                 None,
-                backend_start.elapsed(),
+                backend_admission_start.elapsed(),
             );
             record_request(&state, 502);
             return Ok(());
@@ -2455,7 +2430,7 @@ async fn handle_h3_request(
                 response_status,
                 false,
                 None,
-                backend_start.elapsed(),
+                backend_admission_start.elapsed(),
             );
 
             let backend_total_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
@@ -2693,7 +2668,7 @@ async fn handle_h3_request(
             response_status,
             backend_admission_connection_error,
             body_error_class,
-            backend_start.elapsed(),
+            backend_admission_start.elapsed(),
         );
 
         let backend_total_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
@@ -2871,6 +2846,33 @@ async fn handle_h3_request(
             return Ok(());
         }
     }
+
+    backend_admission_start = std::time::Instant::now();
+    backend_admission_permits = match run_h3_backend_admission_or_send_reject(
+        backend_admission_plugins.as_ref(),
+        &plugins,
+        &mut ctx,
+        &proxy,
+        upstream_target.as_deref(),
+        http_flavor,
+        &mut stream,
+        &state,
+        start_time,
+        plugin_execution_ns,
+    )
+    .await?
+    {
+        Ok(permits) => permits,
+        Err(()) => {
+            release_h3_circuit_breaker_probe_on_admission_reject(
+                &state,
+                &proxy,
+                cb_target_key.as_deref(),
+                cb_is_half_open_probe,
+            );
+            return Ok(());
+        }
+    };
 
     // Track connection for least-connections LB (after all pre-dispatch rejects).
     // Placed here so the streaming-request path above handles its own tracking,
@@ -3168,7 +3170,7 @@ async fn handle_h3_request(
                     result.status,
                     !result.request_on_wire,
                     result.error_class,
-                    backend_start.elapsed(),
+                    backend_admission_start.elapsed(),
                 );
                 // Record failure against current target's circuit breaker.
                 // Same typed signal as the retry decision: a graceful close
@@ -3219,6 +3221,33 @@ async fn handle_h3_request(
                         Some(crate::circuit_breaker::target_key(&next.host, next.port));
                     current_target = Some(next);
                 }
+
+                backend_admission_start = std::time::Instant::now();
+                backend_admission_permits = match run_h3_backend_admission_or_send_reject(
+                    backend_admission_plugins.as_ref(),
+                    &plugins,
+                    &mut ctx,
+                    &proxy,
+                    current_target.as_deref(),
+                    http_flavor,
+                    &mut stream,
+                    &state,
+                    start_time,
+                    plugin_execution_ns,
+                )
+                .await?
+                {
+                    Ok(permits) => permits,
+                    Err(()) => {
+                        release_h3_circuit_breaker_probe_on_admission_reject(
+                            &state,
+                            &proxy,
+                            current_cb_target_key.as_deref(),
+                            cb_retry_probe_slot_available,
+                        );
+                        return Ok(());
+                    }
+                };
 
                 warn!(
                     proxy_id = %proxy.id,
@@ -3301,7 +3330,7 @@ async fn handle_h3_request(
             response_status,
             !h3_request_on_wire,
             h3_error_class,
-            backend_start.elapsed(),
+            backend_admission_start.elapsed(),
         );
 
         let backend_ttfb_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
@@ -3525,6 +3554,74 @@ fn h3_plugin_protocol_for_flavor(flavor: HttpFlavor) -> ProxyProtocol {
         HttpFlavor::Plain => ProxyProtocol::Http,
         HttpFlavor::Grpc => ProxyProtocol::Grpc,
         HttpFlavor::WebSocket => ProxyProtocol::WebSocket,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_h3_backend_admission_or_send_reject(
+    backend_admission_plugins: &[Arc<dyn Plugin>],
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    proxy: &Proxy,
+    upstream_target: Option<&UpstreamTarget>,
+    flavor: HttpFlavor,
+    stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    state: &ProxyState,
+    start_time: std::time::Instant,
+    plugin_execution_ns: u64,
+) -> Result<Result<Option<BackendAdmissionPermitSet>, ()>, anyhow::Error> {
+    match crate::proxy::backend_dispatch::run_backend_admission_plugins(
+        backend_admission_plugins,
+        ctx,
+        proxy,
+        upstream_target,
+        h3_plugin_protocol_for_flavor(flavor),
+    ) {
+        Ok(permits) => Ok(Ok(permits)),
+        Err(rejection) => {
+            let mut headers = rejection.headers;
+            apply_after_proxy_hooks_to_rejection(plugins, ctx, rejection.status_code, &mut headers)
+                .await;
+            let http_status = StatusCode::from_u16(rejection.status_code)
+                .unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
+            let log_status_code = h3_reject_log_status_and_metadata(
+                ctx,
+                flavor,
+                http_status,
+                &rejection.body,
+                &headers,
+            );
+            record_request(state, log_status_code);
+            log_rejected_request(
+                plugins,
+                ctx,
+                log_status_code,
+                start_time,
+                &rejection.plugin_name,
+                plugin_execution_ns,
+            )
+            .await;
+            send_h3_reject_flavor_aware(stream, flavor, http_status, &rejection.body, &headers)
+                .await?;
+            Ok(Err(()))
+        }
+    }
+}
+
+fn release_h3_circuit_breaker_probe_on_admission_reject(
+    state: &ProxyState,
+    proxy: &Proxy,
+    target_key: Option<&str>,
+    is_half_open_probe: bool,
+) {
+    if !is_half_open_probe {
+        return;
+    }
+    if let Some(cb_config) = &proxy.circuit_breaker {
+        let cb = state
+            .circuit_breaker_cache
+            .get_or_create(&proxy.id, target_key, cb_config);
+        cb.record_neutral(true);
     }
 }
 
