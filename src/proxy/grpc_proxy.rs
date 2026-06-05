@@ -1216,6 +1216,25 @@ pub(crate) fn grpc_status_to_http_status(grpc_status: u32) -> u16 {
     }
 }
 
+/// Derive the HTTP status the adaptive-concurrency limiter should see for a
+/// gRPC response whose outcome rides in the `grpc-status` trailer (normal
+/// responses) or header (trailers-only) under HTTP 200. Returns the mapped HTTP
+/// status for a non-OK gRPC status, else `http_status`. Shared by the buffered
+/// H1/H2 and H3 gRPC admission paths so they cannot drift.
+pub(crate) fn grpc_admission_status_from_maps(
+    trailers: &HashMap<String, String>,
+    headers: &HashMap<String, String>,
+    http_status: u16,
+) -> u16 {
+    trailers
+        .get("grpc-status")
+        .or_else(|| headers.get("grpc-status"))
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .filter(|&code| code != 0)
+        .map(grpc_status_to_http_status)
+        .unwrap_or(http_status)
+}
+
 /// HTTP/3 admission rejects use `425 Too Early` for 0-RTT policy failures.
 /// gRPC clients should see that transport retry signal as UNAVAILABLE.
 pub(crate) fn h3_http_reject_status_to_grpc_status(status: StatusCode) -> u32 {

@@ -11180,6 +11180,10 @@ async fn handle_proxy_request_inner(
                             grpc_streaming.status,
                             grpc_backend_admission_elapsed,
                         )
+                        // The response finishes HTTP 200 with the gRPC outcome in a
+                        // grpc-status trailer; classify it at EOF so a backend gRPC
+                        // failure (e.g. 14 -> 503) shrinks the limit.
+                        .with_grpc_trailer_admission_classification()
                         // A late client-upload overflow (> max_grpc_recv_size_bytes)
                         // RSTs the response stream; tag the outcome so the limiter
                         // treats it as a client-side RequestBodyTooLarge (ignored)
@@ -11240,14 +11244,11 @@ async fn handle_proxy_request_inner(
                     // while client-side statuses stay <500 (healthy). `grpc_resp`
                     // trailers are still intact here — drained into `response_headers`
                     // below.
-                    let admission_status = grpc_resp
-                        .trailers
-                        .get("grpc-status")
-                        .or_else(|| response_headers.get("grpc-status"))
-                        .and_then(|s| s.trim().parse::<u32>().ok())
-                        .filter(|&code| code != 0)
-                        .map(grpc_proxy::grpc_status_to_http_status)
-                        .unwrap_or(response_status);
+                    let admission_status = grpc_proxy::grpc_admission_status_from_maps(
+                        &grpc_resp.trailers,
+                        &response_headers,
+                        response_status,
+                    );
                     permits.record_backend_outcome(BackendAdmissionOutcome {
                         response_status: admission_status,
                         connection_error: false,
@@ -13345,31 +13346,12 @@ pub(crate) async fn proxy_to_backend_retry(
                     // Content-Length is within cutoff (and within max_response
                     // _body_size_bytes if set, checked above), so eager
                     // collection is bounded.
-                    match response.bytes().await {
-                        Ok(b) => retry::BackendResponse {
-                            status_code: status,
-                            body: ResponseBody::Buffered(b.to_vec()),
-                            headers: resp_headers,
-                            connection_error: false,
-                            backend_resolved_ip: resolved_ip.clone(),
-                            error_class: None,
-                        },
-                        Err(e) => {
-                            warn!("Failed to read backend response body: {}", e);
-                            retry::BackendResponse {
-                                status_code: 502,
-                                body: ResponseBody::Buffered(
-                                    r#"{"error":"Backend response body read failed"}"#
-                                        .as_bytes()
-                                        .to_vec(),
-                                ),
-                                headers: HashMap::new(),
-                                connection_error: true,
-                                backend_resolved_ip: resolved_ip.clone(),
-                                error_class: Some(retry::ErrorClass::ConnectionReset),
-                            }
-                        }
-                    }
+                    buffered_backend_response_from_body_read(
+                        response.bytes().await,
+                        status,
+                        resp_headers,
+                        resolved_ip.clone(),
+                    )
                 } else {
                     // Streaming path — the downstream body builder applies
                     // `SizeLimitedStreamingResponse` when CL is absent and a
@@ -13411,21 +13393,12 @@ pub(crate) async fn proxy_to_backend_retry(
                         },
                     }
                 } else {
-                    let body = match response.bytes().await {
-                        Ok(b) => b.to_vec(),
-                        Err(e) => {
-                            warn!("Failed to read backend response body: {}", e);
-                            Vec::new()
-                        }
-                    };
-                    retry::BackendResponse {
-                        status_code: status,
-                        body: ResponseBody::Buffered(body),
-                        headers: resp_headers,
-                        connection_error: false,
-                        backend_resolved_ip: resolved_ip.clone(),
-                        error_class: None,
-                    }
+                    buffered_backend_response_from_body_read(
+                        response.bytes().await,
+                        status,
+                        resp_headers,
+                        resolved_ip.clone(),
+                    )
                 }
             }
         }
@@ -13515,6 +13488,45 @@ fn record_h2_pool_admission_failure(
             error_class: Some(retry::ErrorClass::ConnectionPoolError),
             backend_elapsed: started_at.elapsed(),
         });
+    }
+}
+
+/// Build a buffered `BackendResponse` from a reqwest body-read result. A read
+/// failure AFTER the response headers arrived (backend reset/closed/timed out
+/// mid-body) is a backend fault, so it must surface as a 502 with
+/// `connection_error` and an error class — NOT the backend's original status with
+/// a silently-emptied body. Otherwise the non-streaming adaptive-concurrency
+/// admission (and passive health) record a mid-body backend failure as a healthy
+/// success and can grow the limit. Mirrors the size-limited buffered read paths
+/// that already classify this.
+fn buffered_backend_response_from_body_read(
+    result: Result<bytes::Bytes, reqwest::Error>,
+    status: u16,
+    resp_headers: HashMap<String, String>,
+    resolved_ip: Option<String>,
+) -> retry::BackendResponse {
+    match result {
+        Ok(b) => retry::BackendResponse {
+            status_code: status,
+            body: ResponseBody::Buffered(b.to_vec()),
+            headers: resp_headers,
+            connection_error: false,
+            backend_resolved_ip: resolved_ip,
+            error_class: None,
+        },
+        Err(e) => {
+            warn!("Failed to read backend response body: {}", e);
+            retry::BackendResponse {
+                status_code: 502,
+                body: ResponseBody::Buffered(
+                    r#"{"error":"Backend response body read failed"}"#.as_bytes().to_vec(),
+                ),
+                headers: HashMap::new(),
+                connection_error: true,
+                backend_resolved_ip: resolved_ip,
+                error_class: Some(retry::ErrorClass::ConnectionReset),
+            }
+        }
     }
 }
 
@@ -14435,22 +14447,13 @@ async fn proxy_to_backend(
                         && content_length.is_some_and(|cl| cl <= cutoff)
                         && !is_streaming_content_type(&resp_headers)
                     {
-                        let body = match response.bytes().await {
-                            Ok(b) => b.to_vec(),
-                            Err(e) => {
-                                warn!("Failed to read backend response body: {}", e);
-                                Vec::new()
-                            }
-                        };
                         return backend_dispatch_response(
-                            retry::BackendResponse {
-                                status_code: status,
-                                body: ResponseBody::Buffered(body),
-                                headers: resp_headers,
-                                connection_error: false,
-                                backend_resolved_ip: resolved_ip.clone(),
-                                error_class: None,
-                            },
+                            buffered_backend_response_from_body_read(
+                                response.bytes().await,
+                                status,
+                                resp_headers,
+                                resolved_ip.clone(),
+                            ),
                             retained_body,
                             backend_admission_permits,
                         );
@@ -14527,31 +14530,12 @@ async fn proxy_to_backend(
                     && content_length.is_some_and(|cl| cl <= cutoff)
                     && !is_streaming_content_type(&resp_headers)
                 {
-                    match response.bytes().await {
-                        Ok(b) => retry::BackendResponse {
-                            status_code: status,
-                            body: ResponseBody::Buffered(b.to_vec()),
-                            headers: resp_headers,
-                            connection_error: false,
-                            backend_resolved_ip: resolved_ip.clone(),
-                            error_class: None,
-                        },
-                        Err(e) => {
-                            warn!("Failed to read backend response body: {}", e);
-                            retry::BackendResponse {
-                                status_code: 502,
-                                body: ResponseBody::Buffered(
-                                    r#"{"error":"Backend response body read failed"}"#
-                                        .as_bytes()
-                                        .to_vec(),
-                                ),
-                                headers: HashMap::new(),
-                                connection_error: true,
-                                backend_resolved_ip: resolved_ip.clone(),
-                                error_class: Some(retry::ErrorClass::ConnectionReset),
-                            }
-                        }
-                    }
+                    buffered_backend_response_from_body_read(
+                        response.bytes().await,
+                        status,
+                        resp_headers,
+                        resolved_ip.clone(),
+                    )
                 } else {
                     retry::BackendResponse {
                         status_code: status,
@@ -14566,21 +14550,12 @@ async fn proxy_to_backend(
                     }
                 }
             } else {
-                let body = match response.bytes().await {
-                    Ok(b) => b.to_vec(),
-                    Err(e) => {
-                        warn!("Failed to read backend response body: {}", e);
-                        Vec::new()
-                    }
-                };
-                retry::BackendResponse {
-                    status_code: status,
-                    body: ResponseBody::Buffered(body),
-                    headers: resp_headers,
-                    connection_error: false,
-                    backend_resolved_ip: resolved_ip.clone(),
-                    error_class: None,
-                }
+                buffered_backend_response_from_body_read(
+                    response.bytes().await,
+                    status,
+                    resp_headers,
+                    resolved_ip.clone(),
+                )
             }
         }
         Err(e) => {

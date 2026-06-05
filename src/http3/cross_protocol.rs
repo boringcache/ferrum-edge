@@ -2230,9 +2230,15 @@ where
                     false,
                     backend_start.elapsed(),
                 );
+                // Feed the limiter the BACKEND status, not the gateway policy reject
+                // in `outcome.response_status`: the backend responded fine and an
+                // after_proxy hook rejected it locally, so training on the policy
+                // status would wrongly shrink a healthy backend limit. gRPC errors
+                // ride on HTTP 200, and a rejected response is never forwarded, so use
+                // the backend `resp.status` directly (matching the plain buffered path).
                 record_cross_protocol_backend_admission_outcome(
                     &mut backend_admission_permits,
-                    outcome.response_status,
+                    resp.status,
                     false,
                     None,
                     backend_admission_start.elapsed(),
@@ -2385,9 +2391,22 @@ where
                 false,
                 backend_start.elapsed(),
             );
+            // A completed buffered gRPC response carries its backend outcome in the
+            // grpc-status trailer (HTTP 200), so map it for the admission sample —
+            // an UNAVAILABLE/INTERNAL backend must shrink, not look healthy. An
+            // incomplete stream stays a client disconnect (ignored), matching H1/H2.
+            let admission_status = if body_completed {
+                crate::proxy::grpc_proxy::grpc_admission_status_from_maps(
+                    &response_trailers,
+                    &response_headers,
+                    response_status,
+                )
+            } else {
+                response_status
+            };
             record_cross_protocol_backend_admission_outcome(
                 &mut backend_admission_permits,
-                response_status,
+                admission_status,
                 false,
                 if body_completed {
                     None
@@ -2458,9 +2477,12 @@ where
                     false,
                     backend_start.elapsed(),
                 );
+                // Backend status, not the gateway policy reject (see the buffered
+                // reject path above): a locally-rejected response must not train the
+                // limiter as a backend failure.
                 record_cross_protocol_backend_admission_outcome(
                     &mut backend_admission_permits,
-                    outcome.response_status,
+                    streaming.status,
                     false,
                     None,
                     backend_admission_start.elapsed(),
@@ -2485,7 +2507,15 @@ where
 
             let mut final_body_completed = body_completed;
             let mut final_client_disconnected = client_disconnected;
+            // Capture the backend gRPC outcome from the trailers before they are
+            // stripped/forwarded, so the admission sample below reflects a backend
+            // gRPC failure (e.g. 14 -> 503) instead of the HTTP 200 status line.
+            let mut grpc_trailer_status: Option<u32> = None;
             if body_completed && let Some(mut trailers) = trailers {
+                grpc_trailer_status = trailers
+                    .get("grpc-status")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.trim().parse::<u32>().ok());
                 // Strip RFC 9110 §7.6.1 response-direction hop-by-hop names from
                 // the backend gRPC trailers before forwarding to the H3 client,
                 // via the shared helper so this site, the buffered path
@@ -2538,9 +2568,18 @@ where
                 Some(_) => true,
                 None => false,
             };
+            // On a clean completion the backend health rides in the grpc-status
+            // trailer (HTTP 200) — map a non-OK status to 5xx so the limiter shrinks;
+            // a mid-stream body error already drives `connection_error`/error_class.
+            let admission_status = match grpc_trailer_status {
+                Some(code) if code != 0 => {
+                    crate::proxy::grpc_proxy::grpc_status_to_http_status(code)
+                }
+                _ => streaming.status,
+            };
             record_cross_protocol_backend_admission_outcome(
                 &mut backend_admission_permits,
-                streaming.status,
+                admission_status,
                 backend_admission_connection_error,
                 body_error_class,
                 backend_admission_start.elapsed(),

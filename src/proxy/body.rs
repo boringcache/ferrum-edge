@@ -100,6 +100,13 @@ struct DeferredBackendAdmissionOutcome {
     /// outcome is forced to `RequestBodyTooLarge` (which the limiter ignores)
     /// rather than letting the body error shrink the limit.
     request_body_exceeded: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// gRPC streaming responses finish HTTP 200 and carry the real outcome in a
+    /// `grpc-status` trailer. When set, `poll_frame` inspects forwarded trailer
+    /// frames and records the HTTP-mapped status of a non-OK gRPC status into
+    /// `grpc_trailer_http_status`, so a backend gRPC failure (e.g. 14 -> 503)
+    /// shrinks the limit instead of recording a healthy success at EOF.
+    classify_grpc_trailer: bool,
+    grpc_trailer_http_status: Option<u16>,
 }
 
 /// Inner body variant — buffered, streaming, or tracked-streaming.
@@ -314,7 +321,21 @@ impl ProxyBody {
             response_status,
             backend_elapsed,
             request_body_exceeded: None,
+            classify_grpc_trailer: false,
+            grpc_trailer_http_status: None,
         });
+        self
+    }
+
+    /// Enable gRPC trailer classification for the deferred admission outcome:
+    /// `poll_frame` will read the `grpc-status` from forwarded trailer frames and
+    /// (for a non-OK status) record the HTTP-mapped status so a backend gRPC
+    /// failure on a streaming response shrinks the limit instead of recording a
+    /// healthy success at EOF. No-op when no deferred admission outcome is set.
+    pub(crate) fn with_grpc_trailer_admission_classification(mut self) -> Self {
+        if let Some(outcome) = self.backend_admission_outcome.as_mut() {
+            outcome.classify_grpc_trailer = true;
+        }
         self
     }
 
@@ -462,8 +483,14 @@ impl ProxyBody {
         };
         let connection_error =
             error_class.is_some_and(|class| class != ErrorClass::ClientDisconnect);
+        // Prefer the gRPC trailer's mapped status (a non-OK grpc-status finishes
+        // HTTP 200) so a backend gRPC failure shrinks the limit; falls back to the
+        // header status for non-gRPC streams or an OK/absent trailer.
+        let response_status = outcome
+            .grpc_trailer_http_status
+            .unwrap_or(outcome.response_status);
         permits.record_backend_outcome(BackendAdmissionOutcome {
-            response_status: outcome.response_status,
+            response_status,
             connection_error,
             error_class,
             backend_elapsed: outcome.backend_elapsed,
@@ -511,6 +538,22 @@ impl http_body::Body for ProxyBody {
                 {
                     this.bytes_streamed
                         .fetch_add(data.len() as u64, Ordering::Relaxed);
+                }
+                // gRPC streaming admission: the response finished HTTP 200 and the
+                // real outcome rides in the grpc-status trailer, so capture a non-OK
+                // status here (it arrives just before EOF) and map it to HTTP, so the
+                // deferred admission below records a backend gRPC failure as a fault.
+                if let Some(outcome) = this.backend_admission_outcome.as_mut()
+                    && outcome.classify_grpc_trailer
+                    && let Some(trailers) = frame.trailers_ref()
+                    && let Some(code) = trailers
+                        .get("grpc-status")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|s| s.trim().parse::<u32>().ok())
+                    && code != 0
+                {
+                    outcome.grpc_trailer_http_status =
+                        Some(crate::proxy::grpc_proxy::grpc_status_to_http_status(code));
                 }
             }
             Poll::Ready(Some(Err(e))) => {
