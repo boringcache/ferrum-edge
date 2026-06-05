@@ -1216,14 +1216,23 @@ fn build_east_west_service_targets(
             continue;
         }
 
-        // Backend (container) port for this workload address: honor the Service
-        // `targetPort` of the first service port (Kubernetes' authoritative
-        // service-port→container-port binding), else the service port itself,
-        // else the workload's first port.
+        // Backend (container) port for this workload address: honor the first
+        // service port's `targetPort` (Kubernetes' authoritative
+        // service-port→container-port binding). A DECLARED targetPort is
+        // authoritative — resolve it, or SKIP this target (fail closed) rather
+        // than fall back to the Service port, so an unresolved named targetPort
+        // (rollout skew / typo like `targetPort: "http"` with no matching
+        // container port) doesn't silently publish a target on the wrong port.
+        // Only an ABSENT targetPort falls back to the service port; a service
+        // with no ports at all uses the workload's first port.
         let target_port = match service.ports.first() {
-            Some(sp) => {
-                resolve_target_port(sp.target_port.as_ref(), &workload.ports).unwrap_or(sp.port)
-            }
+            Some(sp) => match sp.target_port.as_ref() {
+                Some(_) => match resolve_target_port(sp.target_port.as_ref(), &workload.ports) {
+                    Some(p) if p != 0 => p,
+                    _ => continue,
+                },
+                None => sp.port,
+            },
             None => workload.ports.first().map(|p| p.port).unwrap_or(80),
         };
 
@@ -14726,6 +14735,28 @@ mod tests {
         assert!(
             !upstream.port_overrides.contains_key(&80),
             "policy must not stay under the service port 80"
+        );
+    }
+
+    #[test]
+    fn east_west_drops_target_when_named_target_port_unresolved() {
+        // build_east_west_service_targets: a named targetPort that does not
+        // resolve against the workload ports must drop the target (fail closed),
+        // not fall back to the Service port.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let mut svc = http_mesh_service("reviews", 80, spiffe);
+        svc.ports[0].target_port = Some(ServiceTargetPort::Name("http".to_string()));
+        let mut wl = workload("reviews", "reviews");
+        wl.addresses = vec!["10.0.0.1".to_string()];
+        wl.ports = vec![WorkloadPort {
+            port: 9999,
+            protocol: AppProtocol::Http,
+            name: Some("grpc".to_string()),
+        }];
+        let targets = build_east_west_service_targets(&svc, &[wl], None);
+        assert!(
+            targets.is_empty(),
+            "an unresolved named targetPort must drop the east-west target, not dial the Service port"
         );
     }
 

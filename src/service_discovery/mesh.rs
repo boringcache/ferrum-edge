@@ -110,22 +110,26 @@ impl MeshServiceDiscoverer {
         workload: &Workload,
     ) -> Option<SelectedPort> {
         if let Some(selected) = selected_service_port {
-            // Honor the Service `targetPort` first — Kubernetes' authoritative
-            // service-port→container-port binding — so the workload-address
-            // target dials the container port it declares, not the Service port.
-            // A NUMERIC targetPort does not require the Pod to declare a matching
-            // `containerPort`, so resolve it BEFORE the no-ports fast path below;
-            // otherwise a `port: 80, targetPort: 8080` upstream would dial 80
-            // whenever the workload advertises addresses but no `ports[]`.
-            if let Some(backend) =
-                resolve_target_port(selected.target_port.as_ref(), &workload.ports)
-            {
-                return Some(SelectedPort {
-                    port: backend,
-                    name: selected.name.clone(),
-                    protocol: selected.protocol,
-                    target_port: None,
-                });
+            // A DECLARED Service `targetPort` is Kubernetes' authoritative
+            // service-port→container-port binding, so honor it exclusively: a
+            // numeric targetPort needs no matching `containerPort` (so this also
+            // covers a workload that declares no `ports[]`), and a named one
+            // resolves against the workload's container-port names. FAIL CLOSED —
+            // return `None` to drop the target — when a NAMED targetPort does not
+            // resolve, rather than fall back to the Service port (a rollout skew
+            // or typo like `port: 80, targetPort: "http"` with no matching
+            // container port would otherwise silently dial 80). Only an ABSENT
+            // targetPort uses the heuristics below.
+            if selected.target_port.is_some() {
+                return match resolve_target_port(selected.target_port.as_ref(), &workload.ports) {
+                    Some(backend) if backend != 0 => Some(SelectedPort {
+                        port: backend,
+                        name: selected.name.clone(),
+                        protocol: selected.protocol,
+                        target_port: None,
+                    }),
+                    _ => None,
+                };
             }
 
             if workload.ports.is_empty() {
@@ -403,6 +407,35 @@ mod tests {
         assert_eq!(
             targets[0].port, 8080,
             "dials the numeric targetPort even though the workload declares no ports"
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_drops_target_when_named_target_port_unresolved() {
+        // A NAMED targetPort the workload does not expose must fail closed (drop
+        // the target) rather than fall back to the Service port.
+        let api_id = "spiffe://cluster.local/ns/ferrum/sa/api";
+        let mut svc = service("api", vec![api_id], vec![80]);
+        svc.ports[0].target_port = Some(ServiceTargetPort::Name("http".to_string()));
+        let mut wl = workload(api_id, "api", vec!["10.0.0.1"], vec![9999]);
+        wl.ports[0].name = Some("grpc".to_string()); // no "http" container port
+        let mesh = MeshConfig {
+            services: vec![svc],
+            workloads: vec![wl],
+            ..MeshConfig::default()
+        };
+        let discoverer = MeshServiceDiscoverer::new(
+            epoch_store(Some(mesh)),
+            "api".to_string(),
+            default_namespace(),
+            None,
+            1,
+        );
+
+        let targets = discoverer.discover().await.expect("discover succeeds");
+        assert!(
+            targets.is_empty(),
+            "an unresolved named targetPort must drop the target, not dial the Service port"
         );
     }
 
