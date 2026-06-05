@@ -2343,6 +2343,7 @@ mod tests {
                 port: 443,
                 protocol: AppProtocol::Http,
                 name: Some("https".to_string()),
+                target_port: None,
             }],
             export_to: Vec::new(),
             workload_selector: None,
@@ -2393,6 +2394,7 @@ mod tests {
                 port: 8080,
                 protocol: AppProtocol::Http,
                 name: Some("http".to_string()),
+                target_port: None,
             }],
             workloads: workload_refs
                 .into_iter()

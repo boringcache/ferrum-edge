@@ -49,6 +49,7 @@ fn build_slice(n_workloads: usize) -> MeshSlice {
                 port: 8080,
                 protocol: Default::default(),
                 name: Some("http".to_string()),
+                target_port: None,
             }],
             workloads: vec![WorkloadRef { spiffe_id }],
             protocol_overrides: HashMap::new(),

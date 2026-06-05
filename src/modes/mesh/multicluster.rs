@@ -1314,6 +1314,7 @@ mod tests {
                 port: 8080,
                 protocol: Default::default(),
                 name: Some("http".to_string()),
+                target_port: None,
             }],
             workloads: refs
                 .iter()

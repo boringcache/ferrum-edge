@@ -3658,10 +3658,17 @@ fn service_ports(object: &K8sObject) -> Result<Vec<ServicePort>, K8sTranslateErr
             let Some(raw_port) = port.get("number").and_then(Value::as_u64) else {
                 return Ok(());
             };
+            // Istio ServiceEntry `targetPort` is a numeric container port.
+            let target_port = port
+                .get("targetPort")
+                .and_then(Value::as_u64)
+                .and_then(|v| u16::try_from(v).ok())
+                .map(crate::modes::mesh::config::ServiceTargetPort::Number);
             ports.push(ServicePort {
                 port: port_from_u64(object, raw_port, "ports[].number")?,
                 protocol: app_protocol(string_field(port, "protocol")),
                 name: string_field(port, "name").map(ToOwned::to_owned),
+                target_port,
             });
             Ok::<(), K8sTranslateError>(())
         })?;

@@ -69,6 +69,7 @@ fn mesh_service(name: &str) -> MeshService {
             port: 8080,
             protocol: AppProtocol::Http,
             name: None,
+            target_port: None,
         }],
         workloads: Vec::new(),
         protocol_overrides: std::collections::HashMap::new(),

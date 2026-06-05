@@ -36,8 +36,9 @@ use ferrum_edge::grpc::proto::mesh_config_sync_server::{MeshConfigSync, MeshConf
 use ferrum_edge::grpc::proto::{ConfigUpdate, MeshConfigUpdate, MeshSubscribeRequest};
 use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain, spiffe_id_to_san};
 use ferrum_edge::modes::mesh::config::{
-    AppProtocol, MeshService, MtlsMode, PeerAuthentication, ServicePort, Workload, WorkloadPort,
-    WorkloadRef, WorkloadSelector,
+    AppProtocol, MeshPolicy, MeshRule, MeshService, MtlsMode, PeerAuthentication, PolicyAction,
+    PolicyScope, PrincipalMatch, ServicePort, Workload, WorkloadPort, WorkloadRef,
+    WorkloadSelector,
 };
 use ferrum_edge::modes::mesh::slice::MeshSlice;
 use ferrum_edge::xds::XdsAdsServer;
@@ -263,6 +264,7 @@ fn east_west_service_slice(node_id: &str) -> MeshSlice {
                 port: 18080,
                 protocol: AppProtocol::Http,
                 name: Some("http".to_string()),
+                target_port: None,
             }],
             workloads: vec![WorkloadRef { spiffe_id }],
             protocol_overrides: HashMap::new(),
@@ -1455,5 +1457,398 @@ async fn functional_mesh_mode_strict_inbound_requires_peer_svid() {
 
     panic!(
         "production sidecar never bound its mTLS inbound listener after {RETRY_ATTEMPTS} attempts\n{last_failure}"
+    );
+}
+
+/// A minimal HTTP/1.1 backend standing in for the sidecar's co-located
+/// application. Binds an ephemeral loopback port (held by the accept loop, never
+/// dropped/rebound) and replies `200` with a distinctive `backend-ok` body to any
+/// request. The body is the reliable "request reached the backend" signal: an
+/// allowed request relays this body to the client, while a denied request gets a
+/// sidecar-generated 403 without it. (Connection counts are unreliable here — the
+/// capability-registry refresh probes the backend regardless of authz/warmup.)
+async fn start_echo_backend() -> u16 {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind echo backend");
+    let port = listener.local_addr().expect("echo backend addr").port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                let body = b"backend-ok\n";
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(body).await;
+                let _ = sock.flush().await;
+            });
+        }
+    });
+    port
+}
+
+/// Drive a real HTTP request over mTLS into the sidecar inbound listener and
+/// return the HTTP status. Mirrors `mesh_inbound_mtls_connect`'s TLS setup
+/// (root = `ca_pem`, client SVID, server SPIFFE pin) but then sends a `GET` and
+/// parses the response status line — so the caller can assert the materialized
+/// inbound route + `mesh_authz` verdict (200 reached-backend vs 403 denied).
+async fn mesh_inbound_http_get(
+    port: u16,
+    ca_pem: &str,
+    expected_server_spiffe: &str,
+    client_identity: Option<(&str, &str)>,
+    host: &str,
+    path: &str,
+) -> Result<(u16, String), Box<dyn std::error::Error + Send + Sync>> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in rustls_pemfile::certs(&mut ca_pem.as_bytes()).filter_map(|c| c.ok()) {
+        roots.add(cert)?;
+    }
+    let provider = rustls::crypto::ring::default_provider();
+    let builder = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+        .with_safe_default_protocol_versions()?
+        .with_root_certificates(roots);
+    let config = match client_identity {
+        Some((cert_pem, key_pem)) => {
+            let chain: Vec<_> = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+                .filter_map(|c| c.ok())
+                .collect();
+            let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())?
+                .ok_or("no client private key in PEM")?;
+            builder.with_client_auth_cert(chain, key)?
+        }
+        None => builder.with_no_client_auth(),
+    };
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+    let tcp = TcpStream::connect(("127.0.0.1", port)).await?;
+    let name = rustls::pki_types::ServerName::try_from("127.0.0.1".to_string())?;
+    let mut tls = tokio::time::timeout(Duration::from_secs(5), connector.connect(name, tcp))
+        .await
+        .map_err(|_| "tls handshake timed out")??;
+
+    // Pin the server SPIFFE identity from the presented leaf (same rigor as
+    // mesh_inbound_mtls_connect — a same-CA loopback cert is not enough).
+    {
+        let (_io, conn) = tls.get_ref();
+        let server_leaf = conn
+            .peer_certificates()
+            .and_then(|chain| chain.first())
+            .ok_or("server presented no certificate")?;
+        let server_id =
+            ferrum_edge::identity::spiffe::extract_spiffe_id_from_cert(server_leaf.as_ref())
+                .map_err(|e| format!("server leaf lacks a valid SPIFFE URI SAN: {e}"))?;
+        let expected = SpiffeId::new(expected_server_spiffe)
+            .map_err(|e| format!("invalid expected server SPIFFE ID: {e}"))?;
+        if server_id != expected {
+            return Err(format!(
+                "server SPIFFE ID '{server_id}' does not match expected '{expected}'"
+            )
+            .into());
+        }
+    }
+
+    let request = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    tls.write_all(request.as_bytes()).await?;
+    tls.flush().await?;
+    let mut resp = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), tls.read_to_end(&mut resp))
+        .await
+        .map_err(|_| "response read timed out")??;
+    let text = String::from_utf8_lossy(&resp).into_owned();
+    let status = text
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .ok_or_else(|| format!("could not parse HTTP status line from response: {text:?}"))?;
+    Ok((status, text))
+}
+
+/// A plaintext HTTP/1.1 GET (no TLS), returning the response status + full text.
+/// Used to probe the outbound capture listener, which must NOT serve the
+/// materialized inbound routes.
+async fn plaintext_http_get(
+    port: u16,
+    host: &str,
+    path: &str,
+) -> Result<(u16, String), Box<dyn std::error::Error + Send + Sync>> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut tcp = tokio::time::timeout(
+        Duration::from_secs(5),
+        TcpStream::connect(("127.0.0.1", port)),
+    )
+    .await
+    .map_err(|_| "connect timed out")??;
+    let request = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    tcp.write_all(request.as_bytes()).await?;
+    tcp.flush().await?;
+    let mut resp = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), tcp.read_to_end(&mut resp))
+        .await
+        .map_err(|_| "response read timed out")??;
+    let text = String::from_utf8_lossy(&resp).into_owned();
+    let status = text
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .ok_or_else(|| format!("could not parse HTTP status line from response: {text:?}"))?;
+    Ok((status, text))
+}
+
+/// A mesh slice that makes the local workload (`server_spiffe`) back a single
+/// HTTP service `echo` on `backend_port`, under STRICT PeerAuthentication, with
+/// a MeshWide authz policy that ALLOWs (or DENYs) the client principal. The
+/// inbound materializer turns the service into a loopback route to the echo
+/// backend; `mesh_authz` then decides whether the request reaches it.
+fn inbound_authz_slice(
+    node_id: &str,
+    server_spiffe: &str,
+    client_spiffe: &str,
+    backend_port: u16,
+    allow: bool,
+) -> MeshSlice {
+    let server_id = SpiffeId::new(server_spiffe).expect("server SPIFFE id");
+    let trust_domain = TrustDomain::new("cluster.local").expect("trust domain");
+    let http_port = WorkloadPort {
+        port: backend_port,
+        protocol: AppProtocol::Http,
+        name: Some("http".to_string()),
+    };
+    let server_workload = Workload {
+        spiffe_id: server_id.clone(),
+        selector: WorkloadSelector {
+            labels: HashMap::from([("app".to_string(), "echo".to_string())]),
+            namespace: Some("ferrum".to_string()),
+        },
+        service_name: "echo".to_string(),
+        addresses: vec!["127.0.0.1".to_string()],
+        ports: vec![http_port],
+        trust_domain: trust_domain.clone(),
+        namespace: "ferrum".to_string(),
+        network: None,
+        cluster: None,
+        weight: None,
+        locality: None,
+        service_account: Some("echo".to_string()),
+        pod_uid: None,
+    };
+    let echo_service = MeshService {
+        name: "echo".to_string(),
+        namespace: "ferrum".to_string(),
+        ports: vec![ServicePort {
+            port: backend_port,
+            protocol: AppProtocol::Http,
+            name: Some("http".to_string()),
+            target_port: None,
+        }],
+        workloads: vec![WorkloadRef {
+            spiffe_id: server_id,
+        }],
+        protocol_overrides: HashMap::new(),
+    };
+    let policy = MeshPolicy {
+        name: if allow { "allow-client" } else { "deny-client" }.to_string(),
+        namespace: "ferrum".to_string(),
+        scope: PolicyScope::MeshWide,
+        rules: vec![MeshRule {
+            from: vec![PrincipalMatch {
+                spiffe_id_pattern: Some(client_spiffe.to_string()),
+                namespace_pattern: None,
+                trust_domain: Some(trust_domain),
+                trust_domain_pattern: None,
+            }],
+            to: Vec::new(),
+            when: Vec::new(),
+            request_principals: Vec::new(),
+            not_request_principals: Vec::new(),
+            source_negation: Default::default(),
+            never_matches: false,
+            action: if allow {
+                PolicyAction::Allow
+            } else {
+                PolicyAction::Deny
+            },
+        }],
+    };
+    MeshSlice {
+        node_id: node_id.to_string(),
+        namespace: "ferrum".to_string(),
+        version: Utc::now().to_rfc3339(),
+        workloads: vec![server_workload],
+        services: vec![echo_service],
+        peer_authentications: vec![PeerAuthentication {
+            name: "mesh-strict".to_string(),
+            namespace: "ferrum".to_string(),
+            scope: None,
+            selector: None,
+            mtls_mode: MtlsMode::Strict,
+            port_overrides: HashMap::new(),
+        }],
+        mesh_policies: vec![policy],
+        ..MeshSlice::default()
+    }
+}
+
+/// Spawn a production sidecar fed a routing+authz slice, stand up a loopback echo
+/// backend, and drive one authorized client request over mTLS. Returns the HTTP
+/// status + backend hit count. Spawn/bind flakes are retried with fresh ports;
+/// the request/assertions are not. `allow` selects an ALLOW vs DENY authz policy
+/// for the client principal.
+async fn drive_inbound_authz_request(allow: bool) -> Result<(u16, String, bool), String> {
+    ensure_gateway_built().map_err(|e| format!("gateway build: {e}"))?;
+    let server_spiffe = "spiffe://cluster.local/ns/ferrum/sa/echo";
+    let client_spiffe = "spiffe://cluster.local/ns/default/sa/client";
+    let label = if allow { "allow" } else { "deny" };
+
+    let mut last_failure = String::new();
+    for attempt in 1..=RETRY_ATTEMPTS {
+        let node_id = format!("functional-mesh-inbound-authz-{label}-{attempt}");
+        let temp = TempDir::new().map_err(|e| format!("temp dir: {e}"))?;
+        let peers = generate_mesh_peer_svids(temp.path(), server_spiffe, client_spiffe);
+        let backend_port = start_echo_backend().await;
+
+        let cp = start_static_mesh_cp(inbound_authz_slice(
+            &node_id,
+            server_spiffe,
+            client_spiffe,
+            backend_port,
+            allow,
+        ))
+        .await;
+        let ports = reserve_mesh_ports().await;
+        let inbound_port = ports.inbound;
+        let outbound_port = ports.outbound;
+        let mut child = spawn_mesh_gateway(
+            &temp,
+            MeshGatewaySpawnOptions {
+                cp_addr: cp.addr,
+                ports,
+                node_id: &node_id,
+                config_protocol: "native",
+                topology: "sidecar",
+                waypoint_name: None,
+                env_overrides: vec![
+                    ("FERRUM_MESH_PRODUCTION_MODE", "true".to_string()),
+                    // No startup warmup probes to the materialized backend; the
+                    // assertion keys on the relayed response body, not hit counts.
+                    ("FERRUM_POOL_WARMUP_ENABLED", "false".to_string()),
+                    ("FERRUM_MESH_WORKLOAD_SPIFFE_ID", server_spiffe.to_string()),
+                    (
+                        "FERRUM_GATEWAY_SVID_CERT_PATH",
+                        peers.server_cert_path.clone(),
+                    ),
+                    (
+                        "FERRUM_GATEWAY_SVID_KEY_PATH",
+                        peers.server_key_path.clone(),
+                    ),
+                    (
+                        "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+                        peers.trust_bundle_path.clone(),
+                    ),
+                ],
+            },
+        );
+
+        if !wait_for_tcp_port(inbound_port, STARTUP_TIMEOUT).await {
+            last_failure = format!(
+                "attempt {attempt}: inbound listener never bound\n{}",
+                captured_output(&temp)
+            );
+            kill_child(&mut child);
+            cp.shutdown().await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
+
+        let inbound = mesh_inbound_http_get(
+            inbound_port,
+            &peers.ca_pem,
+            server_spiffe,
+            Some((&peers.client_cert_pem, &peers.client_key_pem)),
+            "echo.ferrum.svc.cluster.local",
+            "/",
+        )
+        .await;
+
+        // The materialized inbound route must NOT be served on the outbound
+        // capture listener: a plaintext request there for the local service FQDN
+        // must not be shortcut to the loopback backend (outbound L7 routing isn't
+        // materialized yet, so it should 404). `outbound_serves_route` is true
+        // only if the outbound listener actually relayed the backend.
+        let _ = wait_for_tcp_port(outbound_port, STARTUP_TIMEOUT).await;
+        let outbound =
+            plaintext_http_get(outbound_port, "echo.ferrum.svc.cluster.local", "/").await;
+        let outbound_serves_route = match &outbound {
+            Ok((status, body)) => *status == 200 && body.contains("backend-ok"),
+            Err(_) => false,
+        };
+
+        let output = captured_output(&temp);
+        kill_child(&mut child);
+        cp.shutdown().await;
+
+        return match inbound {
+            Ok((status, body)) => Ok((status, body, outbound_serves_route)),
+            Err(e) => Err(format!("inbound mTLS HTTP GET failed: {e}\n{output}")),
+        };
+    }
+
+    Err(format!(
+        "production sidecar never bound its inbound listener after {RETRY_ATTEMPTS} attempts\n{last_failure}"
+    ))
+}
+
+/// P1 keystone (Increment B): the **live inbound datapath**. An authorized peer's
+/// real HTTP request flows over mTLS into the sidecar, through the materialized
+/// inbound route, past `mesh_authz`, and reaches the co-located backend (200).
+/// This is what the inbound route materializer makes possible — before it, the
+/// request 404'd with no proxy to route to.
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_sidecar_inbound_allows_authorized_peer_to_backend() {
+    let (status, body, outbound_serves_route) = drive_inbound_authz_request(true)
+        .await
+        .expect("authorized inbound case");
+    assert_eq!(
+        status, 200,
+        "an authorized peer's request must traverse the materialized inbound route to the local backend (200); body: {body:?}"
+    );
+    assert!(
+        body.contains("backend-ok"),
+        "the authorized response must carry the local backend's body: {body:?}"
+    );
+    assert!(
+        !outbound_serves_route,
+        "the materialized inbound route must NOT be served on the outbound capture listener"
+    );
+}
+
+/// P1 keystone (Increment B): `mesh_authz` enforcement on the live inbound
+/// datapath. A peer the policy DENYs completes mTLS but is rejected with 403
+/// **before** the request reaches the local backend.
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_sidecar_inbound_denies_unauthorized_peer() {
+    let (status, body, _) = drive_inbound_authz_request(false)
+        .await
+        .expect("unauthorized inbound case");
+    assert_eq!(
+        status, 403,
+        "a denied peer's request must be rejected by mesh_authz (403); body: {body:?}"
+    );
+    assert!(
+        !body.contains("backend-ok"),
+        "a denied request must NOT reach the local backend (no backend body): {body:?}"
     );
 }

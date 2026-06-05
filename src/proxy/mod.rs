@@ -2045,10 +2045,12 @@ pub struct ProxyState {
     /// must carry a node-agent/eBPF cookie record or the connection is dropped
     /// fail-closed before TLS/HBONE processing.
     pub node_waypoint_identity_resolver: Option<Arc<NodeWaypointIdentityResolver>>,
-    /// Optional gateway SPIFFE identity used by gateway-to-mesh outbound TLS.
-    /// The slot shape matches mesh SVID rotation so later trust-bundle updates
-    /// can hot-swap without blocking proxy readers.
-    #[allow(dead_code)] // Consumed by gateway-to-mesh HBONE dispatch in the next bridge phase.
+    /// Gateway SPIFFE identity for gateway/sidecar-to-mesh outbound HBONE.
+    /// This is live, not staged: `supports_hbone_backend` gates HBONE dispatch
+    /// on this slot being loaded (see `current_dispatch_hbone` →
+    /// `proxy_to_backend_hbone`), and `build_spiffe_outbound_config` consumes it
+    /// to originate peer mTLS automatically. The slot shape matches mesh SVID
+    /// rotation so trust-bundle updates hot-swap without blocking proxy readers.
     pub gateway_svid_bundle: SharedSvidBundle,
     /// Latest SVID bundle loaded from files. CP-delivered trust bundles are an
     /// override; when a CP snapshot removes them, this restores file trust.
@@ -9298,6 +9300,25 @@ async fn handle_proxy_request_inner(
         request_host.as_deref(),
         &path,
     );
+
+    // Materialized sidecar inbound routes (`__mesh-inbound-*`) are direction-
+    // scoped: only the inbound listener may serve them. If a non-inbound request
+    // matched one, re-resolve excluding inbound routes so a valid lower-priority
+    // route is found instead of shortcutting the app's own-service traffic to
+    // loopback (or 404ing past a real outbound route).
+    let route_match = match route_match {
+        Some(rm)
+            if ctx.mesh_direction != Some(crate::modes::mesh::MeshTrafficDirection::Inbound)
+                && crate::modes::mesh::is_mesh_inbound_route_id(&rm.proxy.id) =>
+        {
+            state.router_cache.resolve_route_excluding_mesh_inbound(
+                &epoch.route_table,
+                request_host.as_deref(),
+                &path,
+            )
+        }
+        other => other,
+    };
 
     let (proxy, strip_len) = match route_match {
         Some(rm) => {

@@ -296,6 +296,7 @@ fn service_entry_external(name: &str, hosts: Vec<&str>, ports: Vec<u16>) -> Serv
                 port: p,
                 protocol: AppProtocol::Http,
                 name: Some("http".to_string()),
+                target_port: None,
             })
             .collect(),
         export_to: Vec::new(),

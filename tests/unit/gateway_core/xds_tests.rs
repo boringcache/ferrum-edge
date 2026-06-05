@@ -58,6 +58,7 @@ fn mesh_config() -> MeshConfig {
                 port: 8080,
                 protocol: AppProtocol::Http,
                 name: Some("http".to_string()),
+                target_port: None,
             }],
             workloads: Vec::new(),
             protocol_overrides: HashMap::new(),
@@ -205,6 +206,7 @@ fn translators_deduplicate_colliding_cluster_resources() {
             port: 8080,
             protocol: AppProtocol::Http,
             name: Some("http".to_string()),
+            target_port: None,
         }],
         export_to: Vec::new(),
         workload_selector: None,
@@ -241,6 +243,7 @@ fn service_entry_workload_selector_does_not_hide_visible_entry() {
             port: 8080,
             protocol: AppProtocol::Http,
             name: Some("http".to_string()),
+            target_port: None,
         }],
         export_to: Vec::new(),
         workload_selector: Some(WorkloadSelector {

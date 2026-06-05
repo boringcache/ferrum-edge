@@ -137,6 +137,42 @@ pub struct ServicePort {
     pub protocol: AppProtocol,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Kubernetes `Service.spec.ports[].targetPort` — the container port the
+    /// service forwards to, authoritative over the port name/number heuristic
+    /// when resolving the inbound backend. `IntOrString`: a numeric container
+    /// port or a named container port. Absent defaults to `port` (K8s rule).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_port: Option<ServiceTargetPort>,
+}
+
+/// Kubernetes `targetPort` is an `IntOrString`: either an explicit container
+/// port number, or the name of a container port resolved against the workload.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ServiceTargetPort {
+    Number(u16),
+    Name(String),
+}
+
+/// Resolve a Service port's `targetPort` to a backend (container) port when it
+/// yields a usable one: a non-zero numeric targetPort, or a named targetPort
+/// that matches one of `workload_ports`. Returns `None` when no targetPort is
+/// declared, a numeric one is zero, or a named one doesn't resolve — leaving the
+/// caller to apply its own fallback (each dialing path differs: skip, the
+/// service port, the workload's first port, ...). Shared so every path that
+/// dials a workload/endpoint address honors `targetPort` consistently.
+pub(crate) fn resolve_target_port(
+    target_port: Option<&ServiceTargetPort>,
+    workload_ports: &[WorkloadPort],
+) -> Option<u16> {
+    match target_port {
+        Some(ServiceTargetPort::Number(n)) if *n != 0 => Some(*n),
+        Some(ServiceTargetPort::Name(name)) => workload_ports
+            .iter()
+            .find(|wp| wp.name.as_deref() == Some(name.as_str()))
+            .map(|wp| wp.port),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1995,6 +2031,17 @@ fn validate_mesh_config_internal(
                 port.port,
                 &mut errors,
             );
+            match &port.target_port {
+                Some(ServiceTargetPort::Number(0)) => errors.push(format!(
+                    "MeshService '{}'.ports[{}].target_port: numeric targetPort must be greater than 0",
+                    svc.name, i
+                )),
+                Some(ServiceTargetPort::Name(name)) if name.trim().is_empty() => errors.push(format!(
+                    "MeshService '{}'.ports[{}].target_port: named targetPort must not be empty",
+                    svc.name, i
+                )),
+                _ => {}
+            }
         }
         for port in svc.protocol_overrides.keys() {
             validate_non_zero_port(

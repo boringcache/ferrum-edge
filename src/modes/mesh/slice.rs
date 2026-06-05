@@ -141,6 +141,17 @@ impl MeshSliceRequest {
         self.cluster_domain = cluster_domain;
         self
     }
+
+    /// Override the workload SPIFFE id when provided. Used by the xDS CP to
+    /// apply the identity carried in `Node.metadata` (which takes precedence
+    /// over any `node_id`-derived value); `None` leaves the existing value so a
+    /// `spiffe://` node id still resolves via `from_xds_node`.
+    pub fn with_workload_spiffe_id(mut self, workload_spiffe_id: Option<String>) -> Self {
+        if workload_spiffe_id.is_some() {
+            self.workload_spiffe_id = workload_spiffe_id;
+        }
+        self
+    }
 }
 
 /// Canonical per-node mesh view. This is the common source for both xDS
@@ -163,6 +174,35 @@ pub struct MeshSlice {
     pub workloads: Vec<Workload>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub services: Vec<MeshService>,
+    /// Inbound-only view: the LOCAL workload's own service(s), captured
+    /// **un-narrowed** by Sidecar egress scope. `services` is the egress/
+    /// outbound view (narrowed, and feeds `build_known_destinations`); egress
+    /// scope must not gate *inbound* serving, so sidecar inbound route
+    /// materialization reads this separate view instead. Populated only when
+    /// Sidecar egress narrowing is active and a local workload identity is
+    /// known; empty otherwise (then `services` is the full set and the
+    /// materializer falls back to it). Kept out of `services` so the outbound
+    /// registry / egress scope is never widened by it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub local_inbound_services: Vec<MeshService>,
+    /// The local workload(s) backing this sidecar, captured **un-narrowed** by
+    /// Sidecar egress/identity narrowing. `workloads` is narrowed under
+    /// `FERRUM_MESH_SIDECAR_IDENTITY_NARROWING` (it drops workloads that don't
+    /// back an egress-admitted service — including the local pod when its own
+    /// service isn't admitted), which would leave the inbound materializer
+    /// unable to find the local workload. This separate view preserves it (and
+    /// its container ports for backend resolution) without widening the narrowed
+    /// `workloads`/known-destinations view.
+    ///
+    /// `Some` is the AUTHORITATIVE resolved local-inbound view (it gates whether
+    /// `local_inbound_services` is consulted); `Some(empty)` means the local
+    /// identity was resolved but **ambiguous** (a shared service-account SPIFFE
+    /// with no labels) and must materialize NO routes — the materializer must
+    /// NOT fall back to the narrowed `workloads`, which could collapse the
+    /// ambiguity to one (wrong) service. `None` means no narrowing applied, so
+    /// the materializer falls back to the full `workloads`/`services`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_inbound_workloads: Option<Vec<Workload>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mesh_policies: Vec<MeshPolicy>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -330,6 +370,8 @@ impl MeshSlice {
             && self.labels == other.labels
             && self.workloads == other.workloads
             && self.services == other.services
+            && self.local_inbound_services == other.local_inbound_services
+            && self.local_inbound_workloads == other.local_inbound_workloads
             && self.mesh_policies == other.mesh_policies
             && self.peer_authentications == other.peer_authentications
             && self.service_entries == other.service_entries
@@ -562,6 +604,57 @@ impl MeshSlice {
                 narrow_service_ports(service, sidecar, &cluster_domain)
             })
             .collect();
+        // Inbound serving must not be gated by egress scope. When a Sidecar
+        // narrows `services`/`workloads` (egress narrowing can drop or port-trim
+        // the workload's own service; identity narrowing can drop the local
+        // workload itself), capture the LOCAL workload(s) and their own
+        // service(s) **un-narrowed** in separate inbound-only views — never
+        // folded into `services`/`workloads`, so the egress/outbound-registry
+        // view is unchanged. The local workload is identified by
+        // `resolve_local_workloads` (SPIFFE + non-vacuous label/cluster match,
+        // with a shared-SPIFFE ambiguity guard). Only needed when narrowing is
+        // active; otherwise the full sets are intact and the materializer falls
+        // back to them.
+        // `local_inbound_workloads` is `Some` exactly when narrowing was active
+        // and we resolved (or ambiguously failed to resolve) the local identity;
+        // it then gates the materializer, which must NOT fall back to the
+        // narrowed `workloads`. `None` means no narrowing — full sets are intact.
+        let (local_inbound_workloads, local_inbound_services): (
+            Option<Vec<Workload>>,
+            Vec<MeshService>,
+        ) = match request.workload_spiffe_id.as_deref() {
+            Some(spiffe) if applicable_sidecar.is_some() => {
+                let local_cluster = mesh
+                    .multi_cluster
+                    .as_ref()
+                    .and_then(|mc| mc.local_cluster.as_deref());
+                let local_workloads: Vec<Workload> =
+                    resolve_local_workloads(&workloads, spiffe, &effective_labels, local_cluster)
+                        .into_iter()
+                        .cloned()
+                        .collect();
+                let services = {
+                    let local_keys: BTreeSet<(&str, &str)> = local_workloads
+                        .iter()
+                        .map(|w| (w.service_name.as_str(), w.namespace.as_str()))
+                        .collect();
+                    mesh.services
+                        .iter()
+                        .filter(|s| {
+                            local_keys.contains(&(s.name.as_str(), s.namespace.as_str()))
+                                && resource_namespace_visible(
+                                    &service_waypoint_namespaces,
+                                    &s.namespace,
+                                    &namespace,
+                                )
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>()
+                };
+                (Some(local_workloads), services)
+            }
+            _ => (None, Vec::new()),
+        };
         let mesh_policies: Vec<MeshPolicy> = mesh
             .mesh_policies
             .iter()
@@ -740,6 +833,8 @@ impl MeshSlice {
             version,
             workloads,
             services,
+            local_inbound_services,
+            local_inbound_workloads,
             mesh_policies,
             peer_authentications,
             service_entries,
@@ -1582,6 +1677,83 @@ enum SidecarPortAdmission {
     Ports(BTreeSet<u16>),
 }
 
+/// Whether `workload` is one of this sidecar's own local pods. Shared by the
+/// slice builder (to capture un-narrowed local inbound services) and the inbound
+/// route materializer so the two cannot diverge. A SPIFFE id alone is a
+/// service-account identity, not pod-unique, so when the sidecar's labels are
+/// known also require a **non-vacuous** selector-label match (an empty selector
+/// matches "any" and would reintroduce a shared-service-account leak). Remote
+/// multi-cluster endpoints (tagged with a foreign `cluster`) are never local.
+pub(crate) fn workload_is_local(
+    workload: &Workload,
+    local_spiffe: &str,
+    sidecar_labels: &BTreeMap<String, String>,
+    local_cluster: Option<&str>,
+) -> bool {
+    if workload.spiffe_id.as_str() != local_spiffe {
+        return false;
+    }
+    if let Some(wc) = workload.cluster.as_deref()
+        && local_cluster != Some(wc)
+    {
+        return false;
+    }
+    if sidecar_labels.is_empty() {
+        return true;
+    }
+    !workload.selector.labels.is_empty()
+        && workload
+            .selector
+            .labels
+            .iter()
+            .all(|(k, v)| sidecar_labels.get(k) == Some(v))
+}
+
+/// The local workload(s) backing this sidecar, identified precisely — or an
+/// empty vec when the identity is **ambiguous**. Shared by the slice builder
+/// and the inbound route materializer so the two cannot diverge.
+///
+/// A SPIFFE id is a service-account identity, not pod-unique, and labels aren't
+/// necessarily pod-unique either. So after matching by SPIFFE + labels + cluster
+/// (`workload_is_local`), if the matched set still backs **more than one distinct
+/// service** we cannot tell which one the local pod serves and return empty
+/// rather than materialize inbound routes to the wrong loopback app. A single
+/// backed service (including replicas that share one `service_name`) is
+/// unambiguous.
+pub(crate) fn resolve_local_workloads<'a>(
+    workloads: &'a [Workload],
+    local_spiffe: &str,
+    sidecar_labels: &BTreeMap<String, String>,
+    local_cluster: Option<&str>,
+) -> Vec<&'a Workload> {
+    let matched: Vec<&Workload> = workloads
+        .iter()
+        .filter(|w| workload_is_local(w, local_spiffe, sidecar_labels, local_cluster))
+        .collect();
+    // A single local pod backs exactly ONE service. If the matched set spans more
+    // than one distinct service the identity is ambiguous — a shared
+    // service-account SPIFFE that the labels (if any) don't disambiguate, since
+    // labels aren't necessarily pod-unique either — so fail closed rather than
+    // materialize inbound routes to the wrong loopback app. (Replicas of one
+    // service share its `service_name` and collapse to a single distinct entry.)
+    let distinct_services: BTreeSet<(&str, &str)> = matched
+        .iter()
+        .map(|w| (w.service_name.as_str(), w.namespace.as_str()))
+        .collect();
+    if distinct_services.len() > 1 {
+        warn!(
+            local_spiffe,
+            distinct_services = distinct_services.len(),
+            "Ambiguous local workload: a shared service-account SPIFFE backs multiple \
+             services that the sidecar's labels do not disambiguate; skipping inbound \
+             materialization. Set FERRUM_MESH_WORKLOAD_LABELS to uniquely identify the \
+             local pod's service."
+        );
+        return Vec::new();
+    }
+    matched
+}
+
 fn narrow_service_ports(
     service: &MeshService,
     sidecar: ResolvedSidecarEgress<'_>,
@@ -2090,6 +2262,7 @@ mod tests {
                     port: *port,
                     protocol: AppProtocol::Http,
                     name: None,
+                    target_port: None,
                 })
                 .collect(),
             workloads: Vec::new(),
@@ -2215,6 +2388,7 @@ mod tests {
                 port: 443,
                 protocol: AppProtocol::Http2,
                 name: None,
+                target_port: None,
             }],
             export_to,
             workload_selector: None,
@@ -2327,6 +2501,8 @@ mod tests {
             version: "v1".into(),
             workloads: vec![make_workload("ns", "web", HashMap::new())],
             services: vec![make_service("ns", "web")],
+            local_inbound_services: Vec::new(),
+            local_inbound_workloads: None,
             mesh_policies: vec![make_policy("p1", "ns", PolicyScope::MeshWide)],
             peer_authentications: vec![make_peer_auth("pa1", "ns", None)],
             service_entries: vec![make_service_entry("se1", "ns", vec!["*".into()])],
@@ -4058,6 +4234,7 @@ mod tests {
                     port: 8080,
                     protocol: AppProtocol::Http,
                     name: Some("http".into()),
+                    target_port: None,
                 }],
                 workloads: Vec::new(),
                 protocol_overrides: HashMap::new(),
@@ -4105,6 +4282,7 @@ mod tests {
             port: 8080,
             protocol: AppProtocol::Http,
             name: Some("http".into()),
+            target_port: None,
         };
         let slice = MeshSlice {
             namespace: "default".into(),
@@ -4147,6 +4325,7 @@ mod tests {
                     port: 8080,
                     protocol: AppProtocol::Http,
                     name: None,
+                    target_port: None,
                 }],
                 workloads: Vec::new(),
                 protocol_overrides: HashMap::new(),
@@ -4182,6 +4361,7 @@ mod tests {
                     port: 443,
                     protocol: AppProtocol::Tls,
                     name: Some("https".into()),
+                    target_port: None,
                 }],
                 export_to: Vec::new(),
                 workload_selector: None,
@@ -4275,6 +4455,7 @@ mod tests {
                         port: 8080,
                         protocol: AppProtocol::Http,
                         name: None,
+                        target_port: None,
                     }],
                     workloads: Vec::new(),
                     protocol_overrides: HashMap::new(),
@@ -4286,6 +4467,7 @@ mod tests {
                         port: 8080,
                         protocol: AppProtocol::Http,
                         name: None,
+                        target_port: None,
                     }],
                     workloads: Vec::new(),
                     protocol_overrides: HashMap::new(),
@@ -4388,6 +4570,7 @@ mod tests {
                     port: *port,
                     protocol: AppProtocol::Http2,
                     name: None,
+                    target_port: None,
                 })
                 .collect(),
             export_to,
@@ -4715,6 +4898,84 @@ mod tests {
         let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
         // Both entries with that host across alpha + beta should match.
         assert_eq!(slice.service_entries.len(), 2);
+    }
+
+    #[test]
+    fn sidecar_narrowing_captures_local_inbound_services_without_widening_egress() {
+        // Two pods share the service account SPIFFE `sa/shared` but back
+        // different services (`reviews` vs `ratings`) and carry different labels.
+        // Egress `./checkout` admits only `checkout`. The local workload is the
+        // `reviews` pod (label app=reviews). Expectations:
+        //  - `services` (egress/outbound view) is narrowed to `checkout` only —
+        //    `reviews` is NOT folded back in, so the outbound registry / egress
+        //    scope is not widened (L577).
+        //  - `local_inbound_services` (inbound-only view) carries `reviews`
+        //    un-narrowed so its inbound mTLS traffic doesn't 404.
+        //  - `ratings` shares the SPIFFE but its labels don't match the local
+        //    workload, so it is NOT treated as local (L575).
+        let shared_spiffe = "spiffe://cluster.local/ns/alpha/sa/shared";
+        let mut reviews_wl = make_workload(
+            "alpha",
+            "reviews",
+            HashMap::from([("app".to_string(), "reviews".to_string())]),
+        );
+        reviews_wl.spiffe_id = SpiffeId::new(shared_spiffe).unwrap();
+        let mut ratings_wl = make_workload(
+            "alpha",
+            "ratings",
+            HashMap::from([("app".to_string(), "ratings".to_string())]),
+        );
+        ratings_wl.spiffe_id = SpiffeId::new(shared_spiffe).unwrap();
+        let mesh = MeshConfig {
+            sidecars: vec![make_sidecar(
+                "default-sc",
+                "alpha",
+                None,
+                vec![vec!["./checkout"]],
+            )],
+            workloads: vec![reviews_wl, ratings_wl],
+            services: vec![
+                make_service("alpha", "reviews"),
+                make_service("alpha", "ratings"),
+                make_service("alpha", "checkout"),
+            ],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let request = MeshSliceRequest {
+            workload_spiffe_id: Some(shared_spiffe.to_string()),
+            ..slice_request_enforced_with_labels(
+                "alpha",
+                BTreeMap::from([("app".to_string(), "reviews".to_string())]),
+            )
+        };
+        let slice = MeshSlice::from_gateway_config(&config, request);
+
+        // L577: egress-narrowed `services` is NOT widened by the inbound view.
+        assert!(
+            !slice.services.iter().any(|s| s.name == "reviews"),
+            "the local service must not be folded back into the egress `services` view"
+        );
+        assert!(
+            slice.services.iter().any(|s| s.name == "checkout"),
+            "an egress-admitted service stays in `services`"
+        );
+        // Inbound view carries the local service un-narrowed.
+        assert!(
+            slice
+                .local_inbound_services
+                .iter()
+                .any(|s| s.name == "reviews"),
+            "the local workload's own service must be captured for inbound serving"
+        );
+        // L575: a SPIFFE-sharing but label-mismatched service is not local.
+        assert!(
+            !slice
+                .local_inbound_services
+                .iter()
+                .any(|s| s.name == "ratings"),
+            "a service sharing the service-account SPIFFE but not the local pod's labels is not local"
+        );
     }
 
     #[test]
@@ -5093,11 +5354,13 @@ mod tests {
                         port: 443,
                         protocol: AppProtocol::Http2,
                         name: None,
+                        target_port: None,
                     },
                     ServicePort {
                         port: 5432,
                         protocol: AppProtocol::Tcp,
                         name: None,
+                        target_port: None,
                     },
                 ],
                 export_to: vec!["*".into()],
@@ -6426,6 +6689,7 @@ mod tests {
                     port: 443,
                     protocol: AppProtocol::Http2,
                     name: None,
+                    target_port: None,
                 }],
                 export_to: vec!["*".into()],
                 workload_selector: None,

@@ -85,6 +85,13 @@ pub struct XdsAdsServer {
     snapshot_cache: Arc<XdsSnapshotCache>,
     nonce_tracker: Arc<XdsNonceTracker>,
     active_streams: Arc<XdsStreamRegistry>,
+    /// Per-node workload SPIFFE identities learned from the DP's `Node.metadata`
+    /// on the ADS stream. The CP keys snapshots by `node_id` (a per-pod
+    /// hostname by default), so the workload SPIFFE — needed to compute
+    /// Sidecar-aware narrowing and the un-narrowed local-inbound-service view —
+    /// is recorded here when first seen and read at snapshot-build time.
+    /// Cleared when the node's last stream ends.
+    workload_identities: Arc<DashMap<String, String>>,
     /// Mirror of `EnvConfig.mesh_sidecar_enforced`. When `true`, the slice
     /// builder applies Istio `Sidecar` egress scope narrowing. Default
     /// `false` preserves existing CP behavior.
@@ -166,6 +173,7 @@ struct XdsStreamGuard {
     snapshot_cache: Arc<XdsSnapshotCache>,
     nonce_tracker: Arc<XdsNonceTracker>,
     active_streams: Arc<XdsStreamRegistry>,
+    workload_identities: Arc<DashMap<String, String>>,
 }
 
 impl XdsStreamGuard {
@@ -173,12 +181,14 @@ impl XdsStreamGuard {
         snapshot_cache: Arc<XdsSnapshotCache>,
         nonce_tracker: Arc<XdsNonceTracker>,
         active_streams: Arc<XdsStreamRegistry>,
+        workload_identities: Arc<DashMap<String, String>>,
     ) -> Self {
         Self {
             node_id: None,
             snapshot_cache,
             nonce_tracker,
             active_streams,
+            workload_identities,
         }
     }
 
@@ -200,6 +210,7 @@ impl XdsStreamGuard {
         if self.active_streams.unregister(&node_id) {
             self.snapshot_cache.remove(&node_id);
             self.nonce_tracker.remove_node(&node_id);
+            self.workload_identities.remove(&node_id);
         }
     }
 }
@@ -249,6 +260,7 @@ impl XdsAdsServer {
             snapshot_cache: Arc::new(XdsSnapshotCache::new()),
             nonce_tracker: Arc::new(XdsNonceTracker::new()),
             active_streams: Arc::new(XdsStreamRegistry::new(DEFAULT_XDS_MAX_STREAMS_PER_NODE)),
+            workload_identities: Arc::new(DashMap::new()),
             sidecar_enforced,
             sidecar_enforced_dry_run: false,
             sidecar_identity_narrowing: false,
@@ -303,6 +315,14 @@ impl XdsAdsServer {
 
     fn rebuild_snapshot_from_config(&self, node_id: &str, config: &GatewayConfig) -> XdsSnapshot {
         let request = MeshSliceRequest::from_xds_node(node_id.to_string(), self.namespace.clone())
+            // The workload SPIFFE (from `Node.metadata`) takes precedence over
+            // the `node_id`-derived one so Sidecar narrowing / the local-inbound
+            // view are computed for the right workload even with a hostname node.
+            .with_workload_spiffe_id(
+                self.workload_identities
+                    .get(node_id)
+                    .map(|entry| entry.value().clone()),
+            )
             .with_cluster_domain(self.cluster_domain.clone())
             .with_enforce_sidecar_egress(self.sidecar_enforced)
             .with_sidecar_egress_dry_run(self.sidecar_enforced_dry_run)
@@ -357,6 +377,7 @@ impl XdsAdsServer {
             self.snapshot_cache.clone(),
             self.nonce_tracker.clone(),
             self.active_streams.clone(),
+            self.workload_identities.clone(),
         )
     }
 
@@ -1151,6 +1172,45 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                             node_id = Some(current_node_id.clone());
                         };
 
+                        // Reconcile this node's workload identity from
+                        // `Node.metadata` before any snapshot is built, so Sidecar
+                        // narrowing / the local-inbound view are computed for the
+                        // right workload. A snapshot is cached by (node id, config
+                        // fingerprint) only, so any identity CHANGE must drop the
+                        // cached slice. ACKs carry `node: None` and don't reach
+                        // here, preserving the identity mid-stream.
+                        if let Some(node) = request.node.as_ref() {
+                            match crate::xds::carrier::decode_node_metadata(&node.metadata)
+                                .workload_spiffe_id
+                                .filter(|s| !s.is_empty())
+                            {
+                                Some(spiffe) => {
+                                    let previous = server
+                                        .workload_identities
+                                        .insert(current_node_id.clone(), spiffe.clone());
+                                    if previous.as_deref() != Some(spiffe.as_str()) {
+                                        server
+                                            .invalidate_snapshot_for_config_update(&current_node_id);
+                                    }
+                                }
+                                None => {
+                                    // Node present but carrying no workload identity
+                                    // (e.g. a reconnect under the same node id
+                                    // without metadata) clears any stale identity,
+                                    // so the new stream isn't narrowed with the
+                                    // previous workload.
+                                    if server
+                                        .workload_identities
+                                        .remove(&current_node_id)
+                                        .is_some()
+                                    {
+                                        server
+                                            .invalidate_snapshot_for_config_update(&current_node_id);
+                                    }
+                                }
+                            }
+                        }
+
                         if let Err(status) = ensure_supported_type_url(&request.type_url) {
                             let _ = tx.send(Err(status)).await;
                             return;
@@ -1299,6 +1359,45 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                             }
                             node_id = Some(current_node_id.clone());
                         };
+
+                        // Reconcile this node's workload identity from
+                        // `Node.metadata` before any snapshot is built, so Sidecar
+                        // narrowing / the local-inbound view are computed for the
+                        // right workload. A snapshot is cached by (node id, config
+                        // fingerprint) only, so any identity CHANGE must drop the
+                        // cached slice. ACKs carry `node: None` and don't reach
+                        // here, preserving the identity mid-stream.
+                        if let Some(node) = request.node.as_ref() {
+                            match crate::xds::carrier::decode_node_metadata(&node.metadata)
+                                .workload_spiffe_id
+                                .filter(|s| !s.is_empty())
+                            {
+                                Some(spiffe) => {
+                                    let previous = server
+                                        .workload_identities
+                                        .insert(current_node_id.clone(), spiffe.clone());
+                                    if previous.as_deref() != Some(spiffe.as_str()) {
+                                        server
+                                            .invalidate_snapshot_for_config_update(&current_node_id);
+                                    }
+                                }
+                                None => {
+                                    // Node present but carrying no workload identity
+                                    // (e.g. a reconnect under the same node id
+                                    // without metadata) clears any stale identity,
+                                    // so the new stream isn't narrowed with the
+                                    // previous workload.
+                                    if server
+                                        .workload_identities
+                                        .remove(&current_node_id)
+                                        .is_some()
+                                    {
+                                        server
+                                            .invalidate_snapshot_for_config_update(&current_node_id);
+                                    }
+                                }
+                            }
+                        }
 
                         if let Err(status) = ensure_supported_type_url(&request.type_url) {
                             let _ = tx.send(Err(status)).await;
@@ -1712,6 +1811,7 @@ mod tests {
                 port: 8080,
                 protocol: AppProtocol::Http,
                 name: Some("http".to_string()),
+                target_port: None,
             }],
             workloads: Vec::new(),
             protocol_overrides: HashMap::new(),
@@ -1948,6 +2048,7 @@ mod tests {
             snapshot_cache.clone(),
             nonce_tracker.clone(),
             active_streams.clone(),
+            Arc::new(DashMap::new()),
         );
         first
             .set_node_id("node-a")
@@ -1957,6 +2058,7 @@ mod tests {
             snapshot_cache.clone(),
             nonce_tracker.clone(),
             active_streams.clone(),
+            Arc::new(DashMap::new()),
         );
         let err = second
             .set_node_id("node-a")
@@ -1974,7 +2076,12 @@ mod tests {
 
         // Releasing the first (registered) guard frees the only slot.
         drop(first);
-        let mut third = XdsStreamGuard::new(snapshot_cache, nonce_tracker, active_streams.clone());
+        let mut third = XdsStreamGuard::new(
+            snapshot_cache,
+            nonce_tracker,
+            active_streams.clone(),
+            Arc::new(DashMap::new()),
+        );
         assert!(
             third.set_node_id("node-a").is_ok(),
             "after the registered stream drops, the slot is available"

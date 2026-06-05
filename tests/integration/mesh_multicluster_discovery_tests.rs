@@ -73,6 +73,7 @@ fn service(name: &str, refs: &[&str]) -> MeshService {
             port: 8080,
             protocol: AppProtocol::Http,
             name: Some("http".to_string()),
+            target_port: None,
         }],
         workloads: refs
             .iter()

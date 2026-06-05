@@ -359,6 +359,7 @@ fn service_entry_in_namespace(
             port: 8080,
             protocol: Default::default(),
             name: Some("http".to_string()),
+            target_port: None,
         }],
         export_to: export_to.into_iter().map(ToString::to_string).collect(),
         workload_selector: None,
@@ -402,6 +403,7 @@ fn service_in_namespace(
             port,
             protocol: Default::default(),
             name: Some("http".to_string()),
+            target_port: None,
         }],
         workloads: workloads
             .into_iter()

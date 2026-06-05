@@ -48,7 +48,8 @@ use crate::modes::mesh::config::{
     AppProtocol, EastWestGateway, MeshConfig, MeshDestinationRule, MeshJwtRule, MeshLoadBalancer,
     MeshLocalityLbSetting, MeshOutlierDetection, MeshRequestAuthentication, MeshSimpleLb,
     MeshTelemetryConfig, MeshTrafficPolicy, MeshTrafficPolicyTls, MtlsMode, PolicyScope,
-    Resolution, ServiceEntry, ServiceEntryLocation, service_entry_exported_to_namespace,
+    Resolution, ServiceEntry, ServiceEntryLocation, ServiceTargetPort, resolve_target_port,
+    service_entry_exported_to_namespace,
 };
 use crate::modes::mesh::config_consumer::native_client::NativeMeshClientConfig;
 use crate::modes::mesh::config_consumer::xds_client::XdsClientConfig;
@@ -698,6 +699,7 @@ fn prepare_normalized_gateway_config_for_mesh(
     inject_mesh_global_plugins(&mut config, runtime, mesh_slice);
     materialize_east_west_gateway_proxies(&mut config, runtime, mesh_slice);
     materialize_egress_gateway_proxies(&mut config, runtime, mesh_slice);
+    materialize_sidecar_inbound_proxies(&mut config, runtime, mesh_slice);
     apply_destination_rules(&mut config, runtime, mesh_slice)?;
     project_mesh_source_locality(&mut config, mesh_slice);
     // Project slice-filtered ServiceEntries back into the prepared mesh
@@ -1214,14 +1216,25 @@ fn build_east_west_service_targets(
             continue;
         }
 
-        // Use the first service port as the target port. If the service has no
-        // ports, fall back to the workload's first port.
-        let target_port = service
-            .ports
-            .first()
-            .map(|p| p.port)
-            .or_else(|| workload.ports.first().map(|p| p.port))
-            .unwrap_or(80);
+        // Backend (container) port for this workload address: honor the first
+        // service port's `targetPort` (Kubernetes' authoritative
+        // service-port→container-port binding). A DECLARED targetPort is
+        // authoritative — resolve it, or SKIP this target (fail closed) rather
+        // than fall back to the Service port, so an unresolved named targetPort
+        // (rollout skew / typo like `targetPort: "http"` with no matching
+        // container port) doesn't silently publish a target on the wrong port.
+        // Only an ABSENT targetPort falls back to the service port; a service
+        // with no ports at all uses the workload's first port.
+        let target_port = match service.ports.first() {
+            Some(sp) => match sp.target_port.as_ref() {
+                Some(_) => match resolve_target_port(sp.target_port.as_ref(), &workload.ports) {
+                    Some(p) if p != 0 => p,
+                    _ => continue,
+                },
+                None => sp.port,
+            },
+            None => workload.ports.first().map(|p| p.port).unwrap_or(80),
+        };
 
         for address in &workload.addresses {
             targets.push(UpstreamTarget {
@@ -1313,6 +1326,357 @@ fn mesh_east_west_service_upstream_id(namespace: &str, name: &str) -> String {
     format!("__mesh-ew-upstream-{namespace}-{name}").replace(['/', '.'], "-")
 }
 
+// ── Sidecar inbound route materialization ─────────────────────────────────
+
+/// True for application protocols routed through the HTTP-family proxy chain.
+/// Stream protocols (raw TCP/TLS and the DB protocols) need an L4 stream proxy
+/// and are materialized by a later stage.
+fn is_http_family_mesh_protocol(protocol: AppProtocol) -> bool {
+    matches!(
+        protocol,
+        AppProtocol::Http | AppProtocol::Http2 | AppProtocol::Grpc | AppProtocol::Unknown
+    )
+}
+
+/// Host header variants a peer may use to reach a mesh service, in the form the
+/// router matches (the listener strips the port before routing): the bare
+/// service name (local-namespace short form) plus the `.ns`, `.ns.svc`, and
+/// `.ns.svc.<cluster_domain>` Kubernetes forms.
+fn mesh_service_host_variants(name: &str, namespace: &str, cluster_domain: &str) -> Vec<String> {
+    let domain = cluster_domain.trim_matches('.');
+    vec![
+        name.to_string(),
+        format!("{name}.{namespace}"),
+        format!("{name}.{namespace}.svc"),
+        format!("{name}.{namespace}.svc.{domain}"),
+    ]
+}
+
+/// Reserved id prefix for materialized sidecar inbound routes. These routes are
+/// **direction-scoped**: only the inbound listener may serve them. The inbound
+/// and outbound capture listeners share one route table, so the request path
+/// uses [`is_mesh_inbound_route_id`] to keep these loopback routes off the
+/// outbound listener (where they would shortcut an app's own-service traffic to
+/// loopback instead of the mesh).
+pub(crate) const MESH_INBOUND_PROXY_ID_PREFIX: &str = "__mesh-inbound-";
+
+/// Whether a proxy id names a materialized sidecar inbound route.
+pub(crate) fn is_mesh_inbound_route_id(id: &str) -> bool {
+    id.starts_with(MESH_INBOUND_PROXY_ID_PREFIX)
+}
+
+fn mesh_inbound_proxy_id(namespace: &str, name: &str, port: u16) -> String {
+    format!("{MESH_INBOUND_PROXY_ID_PREFIX}{namespace}-{name}-{port}").replace(['/', '.'], "-")
+}
+
+/// Materialize inbound routes for the sidecar's **local** workload so that
+/// mTLS-terminated traffic on the inbound listener (`:15006`) reaches the
+/// co-located application on loopback. `docs/mesh.md` documents this ("the
+/// inbound listener … forwards plaintext to the local application"), but nothing
+/// implemented it: the slice's services/workloads were never turned into
+/// routable inbound proxies, so an inbound request found no proxy and returned
+/// 404. (The existing integration tests passed only because they hand-supplied a
+/// `Proxy`.) This closes that gap for the sidecar inbound direction.
+///
+/// Driven by the **local workload(s)** — this sidecar's own pods, matched by the
+/// SPIFFE identity in `runtime.workload_spiffe_id`. Each route is keyed by the
+/// workload's own service FQDN (`service_name`/`namespace`) — never another
+/// service that merely shares the SPIFFE id — and targets the workload's own
+/// listening port (the app/target port, which may differ from the K8s service
+/// port). For each HTTP-family workload port, one loopback proxy is emitted.
+/// Stream (TCP) inbound and multi-port disambiguation by original destination
+/// land in later stages. The emitted proxies carry the
+/// [`MESH_INBOUND_PROXY_ID_PREFIX`] so the request path keeps them off the
+/// outbound listener.
+fn materialize_sidecar_inbound_proxies(
+    config: &mut GatewayConfig,
+    runtime: &MeshRuntimeConfig,
+    mesh_slice: &MeshSlice,
+) {
+    if runtime.topology != MeshTopology::Sidecar {
+        return;
+    }
+    let Some(local_spiffe) = runtime.workload_spiffe_id.as_deref() else {
+        debug!("Sidecar inbound route materialization skipped: no workload SPIFFE identity");
+        return;
+    };
+
+    let now = chrono::Utc::now();
+    // The local workload(s) are this sidecar's own pods. A SPIFFE id alone is not
+    // a unique key — multiple workloads can share a service account / SPIFFE id —
+    // so when the sidecar's own labels are known (the slice carries them), also
+    // require the workload's selector labels to **non-vacuously** match this pod
+    // (an empty selector matches "any" and would reintroduce the shared-SPIFFE
+    // leak). Without labels at all, fall back to SPIFFE-only.
+    let sidecar_labels = &mesh_slice.labels;
+    // Name of this sidecar's own cluster, when the slice declares one. Used to
+    // tell a remote endpoint apart from a legitimately cluster-tagged local
+    // workload (see the cluster check below).
+    let local_cluster = mesh_slice
+        .multi_cluster
+        .as_ref()
+        .and_then(|mc| mc.local_cluster.as_deref());
+    // `local_inbound_workloads` is `Some` exactly when the slice builder resolved
+    // the local-inbound view under Sidecar narrowing — it is then AUTHORITATIVE
+    // for BOTH the workload and service sources: an empty `Some` means the local
+    // identity was ambiguous, so materialize nothing and do NOT fall back to the
+    // narrowed `workloads`/`services` (that could collapse the ambiguity to one
+    // wrong service). `None` means no narrowing applied, so fall back to the full
+    // sets. Reading the separate views keeps the egress/outbound-registry
+    // `services`/`workloads` untouched. `resolve_local_workloads` re-applies the
+    // precise match + shared-SPIFFE ambiguity guard so CP and DP cannot drift.
+    let (inbound_services, local_workload_src) = match mesh_slice.local_inbound_workloads.as_deref()
+    {
+        Some(local) => (mesh_slice.local_inbound_services.as_slice(), local),
+        None => (
+            mesh_slice.services.as_slice(),
+            mesh_slice.workloads.as_slice(),
+        ),
+    };
+    let mut materialized = 0usize;
+    for workload in crate::modes::mesh::slice::resolve_local_workloads(
+        local_workload_src,
+        local_spiffe,
+        sidecar_labels,
+        local_cluster,
+    ) {
+        // Route inbound traffic for the service(s) this workload backs — its own
+        // service (matched by name + namespace), never a service that merely
+        // shares its SPIFFE id. HTTP-family routability is read from the SERVICE
+        // port: Kubernetes container ports carry only the transport protocol
+        // (e.g. TCP), while the application protocol (HTTP/gRPC) is declared on
+        // the Service. The backend targets the workload's own app port.
+        for service in inbound_services.iter().filter(|s| {
+            s.name == workload.service_name
+                && s.namespace == workload.namespace
+                // Require the Service to actually back the local workload. Other
+                // mesh resolution paths treat `MeshService.workloads[]` as the
+                // authoritative backing set, so a service whose refs omit this
+                // SPIFFE id (config typo, EndpointSlice lag) must not be routed
+                // to the local app merely because the names line up.
+                && s.workloads.iter().any(|w| w.spiffe_id.as_str() == local_spiffe)
+        }) {
+            let http_ports: Vec<_> = service
+                .ports
+                .iter()
+                .filter(|sp| {
+                    is_http_family_mesh_protocol(
+                        service
+                            .protocol_overrides
+                            .get(&sp.port)
+                            .copied()
+                            .unwrap_or(sp.protocol),
+                    )
+                })
+                .collect();
+            // Host-only routing can't disambiguate multiple service ports: the
+            // router strips the request port from `Host`/`:authority`, so a
+            // single `/` route on the shared service host matches traffic to
+            // EVERY service port and would silently forward it to the FIRST
+            // port's backend (e.g. `Host: reviews:90` -> the port-80 backend).
+            // That is a cross-port misroute, not the clean "unsupported"
+            // rejection callers expect. Until original-destination routing
+            // (Stage 1) can disambiguate by the captured port, fail closed:
+            // materialize NOTHING for a service exposing more than one
+            // HTTP-family port, and warn. Operators who need a specific port
+            // routed sooner can define an explicit proxy (which this
+            // materializer yields to). Single-HTTP-port services — the common
+            // case — are unaffected.
+            if http_ports.len() > 1 {
+                warn!(
+                    service = %service.name,
+                    namespace = %service.namespace,
+                    http_ports = http_ports.len(),
+                    "Local service exposes multiple HTTP-family ports; host-only routing cannot \
+                     disambiguate them yet (original-destination routing lands in a later stage). \
+                     Skipping inbound materialization for this service to avoid forwarding one \
+                     port's traffic to another port's backend; define an explicit proxy to route \
+                     a specific port."
+                );
+                continue;
+            }
+            let Some(service_port) = http_ports.first() else {
+                continue;
+            };
+            // Backend = the workload's app (container) port this service port
+            // forwards to. A declared `targetPort` is Kubernetes' AUTHORITATIVE
+            // service-port→container-port binding, so honor it exclusively — no
+            // heuristic fallback: a numeric targetPort IS the container port; a
+            // named one resolves against the workload's container-port names, and
+            // an unresolved name (typo / rollout skew) SKIPS rather than guessing
+            // a different port. Only when NO targetPort is declared do we fall
+            // back to the heuristic over the signals we have, in declining order
+            // of confidence:
+            //   1. a shared port NAME — the canonical Service↔container linkage,
+            //   2. an equal port NUMBER — `targetPort` defaulting to the port,
+            //   3. the workload's sole container port — single-port pod.
+            // A workload that declares no ports defaults to the service port
+            // (Kubernetes' `targetPort`-defaults-to-`port` rule). Otherwise the
+            // target is genuinely ambiguous: skip and warn rather than misroute.
+            let backend_port = match service_port.target_port.as_ref() {
+                Some(ServiceTargetPort::Number(n)) => Some(*n),
+                Some(ServiceTargetPort::Name(name)) => workload
+                    .ports
+                    .iter()
+                    .find(|wp| wp.name.as_deref() == Some(name.as_str()))
+                    .map(|wp| wp.port),
+                None if workload.ports.is_empty() => Some(service_port.port),
+                None => workload
+                    .ports
+                    .iter()
+                    .find(|wp| wp.name.is_some() && wp.name == service_port.name)
+                    .or_else(|| {
+                        workload
+                            .ports
+                            .iter()
+                            .find(|wp| wp.port == service_port.port)
+                    })
+                    .or(match workload.ports.as_slice() {
+                        [only] => Some(only),
+                        _ => None,
+                    })
+                    .map(|wp| wp.port),
+            };
+            // Reject a 0 backend (invalid targetPort/port; config validation also
+            // rejects it for non-xDS slices) defensively rather than route to :0.
+            let Some(backend_port) = backend_port.filter(|&p| p != 0) else {
+                warn!(
+                    service = %service.name,
+                    namespace = %service.namespace,
+                    service_port = service_port.port,
+                    target_port = ?service_port.target_port,
+                    "Cannot resolve a usable local backend port for an inbound mesh route \
+                     (no resolvable Service targetPort, and no port name/number match among \
+                     multiple container ports). Set targetPort, name the ports consistently, \
+                     or define an explicit proxy. Skipping this route."
+                );
+                continue;
+            };
+            let proxy = mesh_inbound_loopback_proxy(
+                &mesh_inbound_proxy_id(&service.namespace, &service.name, service_port.port),
+                mesh_service_host_variants(
+                    &service.name,
+                    &service.namespace,
+                    &runtime.cluster_domain,
+                ),
+                &service.namespace,
+                backend_port,
+                now,
+            );
+            // Don't collide with or shadow an explicit operator proxy (e.g. the
+            // documented file-mode pre-materialization workaround) already
+            // routing this host. Our route is the greediest HTTP match for the
+            // host — a `/` prefix — and the router searches exact → prefix →
+            // regex → host-only, so it shadows any same-host regex (`~...`) or
+            // host-only (`listen_path: None`) route and collides with an equal
+            // `/` prefix. (Exact and longer-prefix operator routes still win for
+            // their own paths, so they coexist.) Only HTTP-family proxies share
+            // this routing space: stream proxies route by `listen_port` and carry
+            // empty hosts + null `listen_path` that would otherwise read as a
+            // host-only catch-all here, so skip them exactly as
+            // `validate_unique_listen_paths` does. Either way the operator wins.
+            if config.proxies.iter().any(|p| {
+                if p.id == proxy.id || p.dispatch_kind.is_stream() {
+                    return false;
+                }
+                let shadows_or_collides = p.listen_path == proxy.listen_path
+                    || p.listen_path.is_none()
+                    || p.listen_path
+                        .as_deref()
+                        .is_some_and(|lp| lp.starts_with('~'));
+                shadows_or_collides && crate::config::types::hosts_overlap(&p.hosts, &proxy.hosts)
+            }) {
+                debug!(
+                    proxy_id = %proxy.id,
+                    "Skipping inbound route materialization; an existing proxy already routes this host/path"
+                );
+                continue;
+            }
+            if let Some(existing) = config.proxies.iter_mut().find(|p| p.id == proxy.id) {
+                *existing = proxy;
+            } else {
+                config.proxies.push(proxy);
+            }
+            materialized += 1;
+        }
+    }
+
+    if materialized > 0 {
+        info!(
+            inbound_proxies = materialized,
+            local_spiffe, "Materialized sidecar inbound routes to the local application"
+        );
+    }
+}
+
+/// A loopback-backend HTTP proxy: inbound mesh traffic matching `hosts` is
+/// forwarded in plaintext to the co-located application at `127.0.0.1:<port>`.
+fn mesh_inbound_loopback_proxy(
+    id: &str,
+    hosts: Vec<String>,
+    namespace: &str,
+    port: u16,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Proxy {
+    Proxy {
+        id: id.to_string(),
+        name: Some(format!("mesh inbound {id}")),
+        namespace: namespace.to_string(),
+        hosts,
+        listen_path: Some("/".to_string()),
+        backend_scheme: Some(BackendScheme::Http),
+        dispatch_kind: Default::default(),
+        backend_host: "127.0.0.1".to_string(),
+        backend_port: port,
+        backend_path: None,
+        strip_listen_path: false,
+        // The local app expects its own service Host, not 127.0.0.1.
+        preserve_host_header: true,
+        backend_connect_timeout_ms: 5_000,
+        backend_read_timeout_ms: 30_000,
+        backend_write_timeout_ms: 30_000,
+        backend_tls_client_cert_path: None,
+        backend_tls_client_key_path: None,
+        backend_tls_verify_server_cert: false,
+        backend_tls_server_ca_cert_path: None,
+        resolved_tls: BackendTlsConfig::default(),
+        dispatch_port_overrides: None,
+        dns_override: None,
+        dns_cache_ttl_seconds: None,
+        auth_mode: Default::default(),
+        plugins: Vec::<PluginAssociation>::new(),
+        pool_idle_timeout_seconds: None,
+        pool_enable_http_keep_alive: None,
+        pool_enable_http2: None,
+        pool_tcp_keepalive_seconds: None,
+        pool_http2_keep_alive_interval_seconds: None,
+        pool_http2_keep_alive_timeout_seconds: None,
+        pool_http2_initial_stream_window_size: None,
+        pool_http2_initial_connection_window_size: None,
+        pool_http2_adaptive_window: None,
+        pool_http2_max_frame_size: None,
+        pool_http2_max_concurrent_streams: None,
+        pool_http3_connections_per_backend: None,
+        pool_max_requests_per_connection: None,
+        upstream_id: None,
+        upstream_subset: None,
+        api_spec_id: None,
+        circuit_breaker: None,
+        retry: None,
+        response_body_mode: ResponseBodyMode::Stream,
+        listen_port: None,
+        frontend_tls: false,
+        passthrough: false,
+        udp_idle_timeout_seconds: 60,
+        udp_max_response_amplification_factor: None,
+        tcp_idle_timeout_seconds: Some(300),
+        allowed_methods: None,
+        allowed_ws_origins: Vec::new(),
+        created_at: now,
+        updated_at: now,
+    }
+}
+
 // ── DestinationRule application ────────────────────────────────────────
 
 /// Apply DestinationRule traffic policies onto matching upstreams.
@@ -1327,6 +1691,25 @@ fn mesh_east_west_service_upstream_id(namespace: &str, name: &str) -> String {
 /// Multiple DRs targeting the same upstream are applied in a deterministic
 /// order — sorted by `(namespace, name)` — so the last-writer-wins outcome
 /// is reproducible across CP restarts and DP subscribers.
+/// Resolve the in-mesh `MeshService` a service-discovery upstream routes to, for
+/// re-keying targetPort-remapped port-level policy (round-12 F2). A mesh-provider
+/// service-discovery upstream names the service in its config; the discoverer
+/// resolves its workload-address targets to the Service `targetPort` at runtime
+/// (`service_discovery::mesh`), so a DestinationRule `portLevelSettings` entry
+/// keyed on the Service port must be re-keyed to that dial port. Returns `None`
+/// for non-mesh-discovery upstreams.
+fn mesh_upstream_service<'a>(
+    upstream: &Upstream,
+    mesh_slice: &'a MeshSlice,
+) -> Option<&'a crate::modes::mesh::config::MeshService> {
+    let mesh_sd = upstream.service_discovery.as_ref()?.mesh.as_ref()?;
+    let namespace = mesh_sd.namespace.as_deref().unwrap_or(&upstream.namespace);
+    mesh_slice
+        .services
+        .iter()
+        .find(|s| s.name == mesh_sd.service_name && s.namespace == namespace)
+}
+
 fn apply_destination_rules(
     config: &mut GatewayConfig,
     runtime: &MeshRuntimeConfig,
@@ -1376,6 +1759,33 @@ fn apply_destination_rules(
             let upstream_target_ports: std::collections::HashSet<u16> =
                 upstream.targets.iter().map(|t| t.port).collect();
             let has_service_discovery = upstream.service_discovery.is_some();
+
+            // Round-12 F2: a mesh service-discovery upstream whose Service
+            // declares a numeric `targetPort` dials the container port (T) at
+            // runtime, not the Service port (P); dispatch keys port overrides by
+            // the dial port, so a DR `portLevelSettings` entry keyed on P must be
+            // re-keyed to T or it never matches the resolved target. Map P→T for
+            // numeric targetPorts. (Targets resolve at runtime, so a static
+            // target-port check isn't possible — and isn't needed, since a numeric
+            // targetPort is authoritative. A named targetPort resolves per-workload
+            // and is left under the Service port: a documented residual.)
+            let mesh_port_remap: std::collections::HashMap<u16, u16> = if has_service_discovery {
+                mesh_upstream_service(upstream, mesh_slice)
+                    .map(|svc| {
+                        svc.ports
+                            .iter()
+                            .filter_map(|sp| match sp.target_port {
+                                Some(ServiceTargetPort::Number(t)) if t != 0 && t != sp.port => {
+                                    Some((sp.port, t))
+                                }
+                                _ => None,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            } else {
+                std::collections::HashMap::new()
+            };
 
             // Top-level `connectionPool.tcp.{maxConnections,tcpKeepalive}` fan
             // out to every port served by this upstream. Per-port
@@ -1431,7 +1841,20 @@ fn apply_destination_rules(
             let upstream_base_tls = BackendTlsConfig::from_upstream(upstream);
             let upstream_id_for_tls = upstream.id.clone();
             for (port, port_policy) in &dr.port_level_settings {
-                if !has_service_discovery && !upstream_target_ports.contains(port) {
+                // The `port_overrides` key this Service-port-scoped entry must
+                // land on. A mesh service-discovery upstream whose Service remaps
+                // the port via a numeric `targetPort` is re-keyed P→T (round-12
+                // F2); a direct target-port match needs no remap; a service-
+                // discovery upstream with no remap keeps the entry under the
+                // declared port (targets resolve at runtime); anything else is a
+                // phantom DR port.
+                let store_port = if upstream_target_ports.contains(port) {
+                    *port
+                } else if let Some(dial) = mesh_port_remap.get(port) {
+                    *dial
+                } else if has_service_discovery {
+                    *port
+                } else {
                     warn!(
                         rule = %dr.name,
                         upstream = %upstream.id,
@@ -1439,7 +1862,7 @@ fn apply_destination_rules(
                         "DestinationRule portLevelSettings entry references a port not used by any target; skipping"
                     );
                     continue;
-                }
+                };
                 // Resolve per-port backend TLS over the upstream base, mirroring
                 // the per-subset TLS overlay. Computed before the `override_slot`
                 // mutable borrow. Fail-closed: an unresolvable per-port TLS
@@ -1463,7 +1886,7 @@ fn apply_destination_rules(
                     None
                 };
 
-                let override_slot = upstream.port_overrides.entry(*port).or_default();
+                let override_slot = upstream.port_overrides.entry(store_port).or_default();
                 apply_traffic_policy_to_port_override(override_slot, port_policy);
                 if let Some(slot) = resolved_port_tls {
                     override_slot.tls = Some(slot);
@@ -2272,8 +2695,19 @@ fn build_http_egress_for_entry(
         return;
     }
 
+    // Honor a numeric ServiceEntry `targetPort` for the backend (the proxy/
+    // upstream IDs below stay keyed on the service `port`). A numeric targetPort
+    // also overrides the per-endpoint named port map for STATIC endpoints, so
+    // pass NO port name in that case — otherwise the static path requires each
+    // endpoint to carry a matching `ports[name]` entry and ignores the resolved
+    // targetPort. A named/absent targetPort keeps the endpoint port map.
+    let (backend_port, backend_port_name) =
+        match resolve_target_port(port_spec.target_port.as_ref(), &[]) {
+            Some(resolved) => (resolved, None),
+            None => (port_spec.port, port_spec.name.clone()),
+        };
     for host in proxy_hosts {
-        let targets = build_egress_upstream_targets(entry, host, port_spec.port, &port_spec.name);
+        let targets = build_egress_upstream_targets(entry, host, backend_port, &backend_port_name);
 
         if targets.is_empty() {
             debug!(
@@ -2373,8 +2807,21 @@ fn build_stream_egress_for_entry(
         }
     };
 
+    // Honor a numeric ServiceEntry `targetPort` for the backend dial port while
+    // the listener, proxy/upstream IDs, and port-dedup stay keyed on the service
+    // `port`. Mirrors the HTTP egress branch; without it a TCP ServiceEntry like
+    // `number: 5432, targetPort: 15432` would bind 5432 but dial 5432. A numeric
+    // targetPort also overrides the per-endpoint named port map for STATIC
+    // endpoints, so pass NO port name in that case — otherwise
+    // `build_egress_upstream_targets` requires each endpoint to carry a matching
+    // `ports[name]` entry and ignores the resolved targetPort.
+    let (backend_port, backend_port_name) =
+        match resolve_target_port(port_spec.target_port.as_ref(), &[]) {
+            Some(resolved) => (resolved, None),
+            None => (port_spec.port, port_spec.name.clone()),
+        };
     let targets =
-        build_egress_upstream_targets(entry, representative_host, port_spec.port, &port_spec.name);
+        build_egress_upstream_targets(entry, representative_host, backend_port, &backend_port_name);
 
     if targets.is_empty() {
         debug!(
@@ -6584,6 +7031,1016 @@ mod tests {
         }
     }
 
+    /// Build a single-HTTP-port service backed by the named workload's SPIFFE id.
+    fn reviews_service() -> MeshService {
+        MeshService {
+            name: "reviews".to_string(),
+            namespace: "default".to_string(),
+            ports: vec![ServicePort {
+                port: 8080,
+                protocol: AppProtocol::Http,
+                name: Some("http".to_string()),
+                target_port: None,
+            }],
+            workloads: vec![crate::modes::mesh::config::WorkloadRef {
+                spiffe_id: SpiffeId::new("spiffe://cluster.local/ns/default/sa/reviews").unwrap(),
+            }],
+            protocol_overrides: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn sidecar_inbound_proxies_materialize_for_local_workload_services() {
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some("spiffe://cluster.local/ns/default/sa/reviews".to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![workload("reviews", "reviews")],
+            services: vec![reviews_service()],
+            ..MeshSlice::default()
+        };
+
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+
+        let inbound = config
+            .proxies
+            .iter()
+            .find(|p| p.id == "__mesh-inbound-default-reviews-8080")
+            .expect("inbound proxy materialized for the local workload's service");
+        assert_eq!(inbound.backend_host, "127.0.0.1");
+        assert_eq!(inbound.backend_port, 8080);
+        assert_eq!(inbound.backend_scheme, Some(BackendScheme::Http));
+        assert!(!inbound.passthrough);
+        assert!(
+            inbound
+                .hosts
+                .iter()
+                .any(|h| h == "reviews.default.svc.cluster.local"),
+            "inbound proxy must match the service FQDN: {:?}",
+            inbound.hosts
+        );
+        assert!(
+            inbound.hosts.iter().any(|h| h == "reviews"),
+            "inbound proxy must match the bare service name: {:?}",
+            inbound.hosts
+        );
+    }
+
+    #[test]
+    fn sidecar_inbound_proxies_skip_services_not_backed_by_local_workload() {
+        // The local workload is "client"; the only service is backed by "reviews".
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some("spiffe://cluster.local/ns/default/sa/client".to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![workload("reviews", "reviews")],
+            services: vec![reviews_service()],
+            ..MeshSlice::default()
+        };
+
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+        assert!(
+            !config
+                .proxies
+                .iter()
+                .any(|p| p.id.starts_with("__mesh-inbound-")),
+            "no inbound proxy should materialize for a service the local workload does not back"
+        );
+    }
+
+    #[test]
+    fn sidecar_inbound_proxies_absent_without_local_workload_identity() {
+        // No FERRUM_MESH_WORKLOAD_SPIFFE_ID → cannot identify the local workload.
+        let runtime = test_mesh_runtime_config();
+        assert!(runtime.workload_spiffe_id.is_none());
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![workload("reviews", "reviews")],
+            services: vec![reviews_service()],
+            ..MeshSlice::default()
+        };
+
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+        assert!(
+            !config
+                .proxies
+                .iter()
+                .any(|p| p.id.starts_with("__mesh-inbound-")),
+            "no inbound proxy should materialize without a local workload identity"
+        );
+    }
+
+    #[test]
+    fn sidecar_inbound_proxies_use_workload_port_and_own_service_only() {
+        // The local workload backs service "reviews" with a TCP *container* port
+        // 9090 (the app/target port); the Service declares the port as HTTP on 80.
+        // A different service "ratings" merely shares the SPIFFE id. The inbound
+        // route must (a) key on the workload's OWN service ("reviews", not
+        // "ratings"), (b) be routable from the SERVICE port's HTTP protocol
+        // despite the workload port being TCP, and (c) target the workload's app
+        // port 9090 (not the service port 80).
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(spiffe.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let mut local = workload("reviews", "reviews");
+        local.ports = vec![WorkloadPort {
+            port: 9090,
+            protocol: AppProtocol::Tcp,
+            name: Some("http".to_string()),
+        }];
+        let http_service = |name: &str| MeshService {
+            name: name.to_string(),
+            namespace: "default".to_string(),
+            ports: vec![ServicePort {
+                port: 80,
+                protocol: AppProtocol::Http,
+                name: Some("http".to_string()),
+                target_port: None,
+            }],
+            workloads: vec![crate::modes::mesh::config::WorkloadRef {
+                spiffe_id: SpiffeId::new(spiffe).unwrap(),
+            }],
+            protocol_overrides: HashMap::new(),
+        };
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![local],
+            services: vec![http_service("reviews"), http_service("ratings")],
+            ..MeshSlice::default()
+        };
+
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+
+        let inbound: Vec<&str> = config
+            .proxies
+            .iter()
+            .filter(|p| p.id.starts_with("__mesh-inbound-"))
+            .map(|p| p.id.as_str())
+            .collect();
+        assert_eq!(
+            inbound,
+            vec!["__mesh-inbound-default-reviews-80"],
+            "exactly one inbound route, for the local workload's OWN service (not 'ratings')"
+        );
+        let route = config
+            .proxies
+            .iter()
+            .find(|p| p.id == "__mesh-inbound-default-reviews-80")
+            .expect("reviews route");
+        assert_eq!(
+            route.backend_port, 9090,
+            "inbound route must target the workload's app port, not the service port"
+        );
+        assert!(
+            route
+                .hosts
+                .iter()
+                .any(|h| h == "reviews.default.svc.cluster.local")
+        );
+    }
+
+    /// Build an HTTP `MeshService` named `name` on `port`, backed by `spiffe`.
+    fn http_mesh_service(name: &str, port: u16, spiffe: &str) -> MeshService {
+        MeshService {
+            name: name.to_string(),
+            namespace: "default".to_string(),
+            ports: vec![ServicePort {
+                port,
+                protocol: AppProtocol::Http,
+                name: Some("http".to_string()),
+                target_port: None,
+            }],
+            workloads: vec![crate::modes::mesh::config::WorkloadRef {
+                spiffe_id: SpiffeId::new(spiffe).unwrap(),
+            }],
+            protocol_overrides: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn sidecar_inbound_proxies_disambiguate_shared_spiffe_by_labels() {
+        // Two workloads share the SPIFFE id but back different services and carry
+        // different labels. The sidecar's own labels (CP-provided) select only the
+        // matching workload, so only its service's route materializes.
+        let shared = "spiffe://cluster.local/ns/default/sa/default";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(shared.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let shared_id = |service: &str, app: &str| {
+            let mut w = workload(service, app);
+            w.spiffe_id = SpiffeId::new(shared).unwrap();
+            w
+        };
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            labels: BTreeMap::from([("app".to_string(), "reviews".to_string())]),
+            workloads: vec![
+                shared_id("reviews", "reviews"),
+                shared_id("ratings", "ratings"),
+            ],
+            services: vec![
+                http_mesh_service("reviews", 8080, shared),
+                http_mesh_service("ratings", 8080, shared),
+            ],
+            ..MeshSlice::default()
+        };
+
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+        let inbound: Vec<&str> = config
+            .proxies
+            .iter()
+            .filter(|p| p.id.starts_with("__mesh-inbound-"))
+            .map(|p| p.id.as_str())
+            .collect();
+        assert_eq!(
+            inbound,
+            vec!["__mesh-inbound-default-reviews-8080"],
+            "only the label-matched local workload's service may be materialized"
+        );
+    }
+
+    #[test]
+    fn sidecar_inbound_proxies_reject_empty_selector_when_sidecar_labeled() {
+        // A workload sharing the SPIFFE id but with an EMPTY selector must NOT be
+        // treated as local when the sidecar's labels are known — an empty selector
+        // matches "any" and would reintroduce the cross-service leak.
+        let shared = "spiffe://cluster.local/ns/default/sa/default";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(shared.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let mut reviews = workload("reviews", "reviews");
+        reviews.spiffe_id = SpiffeId::new(shared).unwrap();
+        let mut legacy = workload("legacy", "legacy");
+        legacy.spiffe_id = SpiffeId::new(shared).unwrap();
+        legacy.selector.labels.clear();
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            labels: BTreeMap::from([("app".to_string(), "reviews".to_string())]),
+            workloads: vec![reviews, legacy],
+            services: vec![
+                http_mesh_service("reviews", 8080, shared),
+                http_mesh_service("legacy", 8080, shared),
+            ],
+            ..MeshSlice::default()
+        };
+
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+        let inbound: Vec<&str> = config
+            .proxies
+            .iter()
+            .filter(|p| p.id.starts_with("__mesh-inbound-"))
+            .map(|p| p.id.as_str())
+            .collect();
+        assert_eq!(
+            inbound,
+            vec!["__mesh-inbound-default-reviews-8080"],
+            "an empty-selector workload must not be treated as local when the sidecar has labels"
+        );
+    }
+
+    #[test]
+    fn sidecar_inbound_proxies_skip_multi_http_port_service() {
+        // Host-only routing can't disambiguate ports yet (the router strips the
+        // request port), so a single `/` route on the shared host would forward
+        // EVERY port's traffic to the first port's backend — a cross-port
+        // misroute. Fail closed: a service exposing more than one HTTP-family
+        // port materializes NO inbound route until original-destination routing
+        // lands. Operators can define an explicit proxy for a specific port.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(spiffe.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![workload("reviews", "reviews")],
+            services: vec![MeshService {
+                name: "reviews".to_string(),
+                namespace: "default".to_string(),
+                ports: vec![
+                    ServicePort {
+                        port: 80,
+                        protocol: AppProtocol::Http,
+                        name: Some("http".to_string()),
+                        target_port: None,
+                    },
+                    ServicePort {
+                        port: 90,
+                        protocol: AppProtocol::Grpc,
+                        name: Some("grpc".to_string()),
+                        target_port: None,
+                    },
+                ],
+                workloads: vec![crate::modes::mesh::config::WorkloadRef {
+                    spiffe_id: SpiffeId::new(spiffe).unwrap(),
+                }],
+                protocol_overrides: HashMap::new(),
+            }],
+            ..MeshSlice::default()
+        };
+
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+        let inbound: Vec<&str> = config
+            .proxies
+            .iter()
+            .filter(|p| p.id.starts_with("__mesh-inbound-"))
+            .map(|p| p.id.as_str())
+            .collect();
+        assert!(
+            inbound.is_empty(),
+            "a service with >1 HTTP-family port must materialize no inbound route \
+             (fail closed against cross-port misrouting), got {inbound:?}"
+        );
+    }
+
+    #[test]
+    fn sidecar_inbound_proxies_skip_route_overlapping_explicit_proxy() {
+        // In file/config mode the prepared config starts from operator proxies. If
+        // one already routes the service host at "/", materialization must NOT add
+        // a colliding `__mesh-inbound-*` route (which would fail unique-listen-path
+        // validation); the operator's proxy wins.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(spiffe.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![workload("reviews", "reviews")],
+            services: vec![http_mesh_service("reviews", 8080, spiffe)],
+            ..MeshSlice::default()
+        };
+
+        // An operator proxy already routes the reviews FQDN at "/".
+        let mut config = GatewayConfig::default();
+        config.proxies.push(mesh_inbound_loopback_proxy(
+            "operator-reviews",
+            mesh_service_host_variants("reviews", "default", "cluster.local"),
+            "default",
+            7777,
+            chrono::Utc::now(),
+        ));
+
+        materialize_sidecar_inbound_proxies(&mut config, &runtime, &slice);
+
+        assert!(
+            !config
+                .proxies
+                .iter()
+                .any(|p| p.id.starts_with("__mesh-inbound-")),
+            "must not materialize a route that collides with an existing explicit proxy"
+        );
+        assert!(
+            config.proxies.iter().any(|p| p.id == "operator-reviews"),
+            "the operator's proxy must be left intact"
+        );
+    }
+
+    #[test]
+    fn sidecar_inbound_proxies_yield_to_catch_all_operator_proxy() {
+        // A catch-all operator proxy (empty hosts) overlaps every host under
+        // `validate_unique_listen_paths`. A literal host match would miss it and
+        // materialize a colliding route that validation later rejects, failing
+        // startup/reload; host-overlap semantics must let the catch-all win.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(spiffe.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![workload("reviews", "reviews")],
+            services: vec![http_mesh_service("reviews", 8080, spiffe)],
+            ..MeshSlice::default()
+        };
+
+        // An operator catch-all proxy (empty hosts) already routes "/".
+        let mut config = GatewayConfig::default();
+        config.proxies.push(mesh_inbound_loopback_proxy(
+            "operator-catch-all",
+            Vec::new(),
+            "default",
+            7777,
+            chrono::Utc::now(),
+        ));
+
+        materialize_sidecar_inbound_proxies(&mut config, &runtime, &slice);
+        assert!(
+            !config
+                .proxies
+                .iter()
+                .any(|p| p.id.starts_with("__mesh-inbound-")),
+            "must not materialize a route overlapping a catch-all operator proxy"
+        );
+    }
+
+    #[test]
+    fn sidecar_inbound_proxies_require_service_to_reference_local_workload() {
+        // The local workload backs "reviews" by name, but the Service's workload
+        // refs omit this SPIFFE id (config typo, EndpointSlice lag). The service
+        // must not be routed to the local app on a name match alone.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(spiffe.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let mut service = http_mesh_service("reviews", 8080, spiffe);
+        service.workloads.clear();
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![workload("reviews", "reviews")],
+            services: vec![service],
+            ..MeshSlice::default()
+        };
+
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+        assert!(
+            !config
+                .proxies
+                .iter()
+                .any(|p| p.id.starts_with("__mesh-inbound-")),
+            "a service that does not reference the local workload must not be routed"
+        );
+    }
+
+    #[test]
+    fn sidecar_inbound_proxies_skip_when_backend_port_is_ambiguous() {
+        // The service port shares neither a name nor a number with any of the
+        // workload's *multiple unnamed* container ports, and the model does not
+        // carry the Service's targetPort. The backend is genuinely ambiguous, so
+        // the route is skipped — never silently routed to an arbitrary port.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(spiffe.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let mut local = workload("reviews", "reviews");
+        local.ports = vec![
+            WorkloadPort {
+                port: 8081,
+                protocol: AppProtocol::Tcp,
+                name: None,
+            },
+            WorkloadPort {
+                port: 8082,
+                protocol: AppProtocol::Tcp,
+                name: None,
+            },
+        ];
+        // Service port 80, unnamed: no name match, no number match (80 ∉ {8081,8082}).
+        let mut service = http_mesh_service("reviews", 80, spiffe);
+        service.ports[0].name = None;
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![local],
+            services: vec![service],
+            ..MeshSlice::default()
+        };
+
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+        assert!(
+            !config
+                .proxies
+                .iter()
+                .any(|p| p.id.starts_with("__mesh-inbound-")),
+            "an ambiguous backend port must not materialize a (mis)routed inbound proxy"
+        );
+    }
+
+    #[test]
+    fn sidecar_inbound_proxies_honor_numeric_target_port() {
+        // A Service with a numeric targetPort distinct from `port`, backed by a
+        // pod with multiple unnamed container ports — the shape that was
+        // ambiguous before targetPort was captured. The route must target the
+        // targetPort (the container port), not skip or guess.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(spiffe.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let mut local = workload("reviews", "reviews");
+        local.ports = vec![
+            WorkloadPort {
+                port: 8080,
+                protocol: AppProtocol::Tcp,
+                name: None,
+            },
+            WorkloadPort {
+                port: 9090,
+                protocol: AppProtocol::Tcp,
+                name: None,
+            },
+        ];
+        let mut service = http_mesh_service("reviews", 80, spiffe);
+        service.ports[0].name = None;
+        service.ports[0].target_port = Some(ServiceTargetPort::Number(9090));
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![local],
+            services: vec![service],
+            ..MeshSlice::default()
+        };
+
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+        let route = config
+            .proxies
+            .iter()
+            .find(|p| p.id == "__mesh-inbound-default-reviews-80")
+            .expect("route materialized via numeric targetPort");
+        assert_eq!(
+            route.backend_port, 9090,
+            "a numeric targetPort must select the container port directly"
+        );
+    }
+
+    #[test]
+    fn sidecar_inbound_proxies_honor_named_target_port() {
+        // A named targetPort resolves against the CONTAINER port name, which can
+        // differ from the Service port's own name — so name resolution must use
+        // targetPort, not the service port name.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(spiffe.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let mut local = workload("reviews", "reviews");
+        local.ports = vec![
+            WorkloadPort {
+                port: 8080,
+                protocol: AppProtocol::Http,
+                name: Some("web".to_string()),
+            },
+            WorkloadPort {
+                port: 9090,
+                protocol: AppProtocol::Http,
+                name: Some("admin".to_string()),
+            },
+        ];
+        // Service port named "http"; targetPort names the "admin" container port.
+        let mut service = http_mesh_service("reviews", 80, spiffe);
+        service.ports[0].target_port = Some(ServiceTargetPort::Name("admin".to_string()));
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![local],
+            services: vec![service],
+            ..MeshSlice::default()
+        };
+
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+        let route = config
+            .proxies
+            .iter()
+            .find(|p| p.id == "__mesh-inbound-default-reviews-80")
+            .expect("route materialized via named targetPort");
+        assert_eq!(
+            route.backend_port, 9090,
+            "a named targetPort must resolve to the matching container port, \
+             not the service port's own name"
+        );
+    }
+
+    #[test]
+    fn sidecar_inbound_proxies_exclude_remote_cluster_workloads() {
+        // A multi-cluster slice carries a remote workload that shares this
+        // sidecar's SPIFFE id, service, and labels but originates in another
+        // cluster (cluster = Some(...)). It must not be treated as local — else
+        // it could replace the loopback route and point the backend at a remote
+        // container port. Only the local (untagged) workload's port is used.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(spiffe.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let local = workload("reviews", "reviews"); // cluster: None, port http=8080
+        let mut remote = workload("reviews", "reviews");
+        remote.cluster = Some("remote-west".to_string());
+        remote.ports = vec![WorkloadPort {
+            port: 9999,
+            protocol: AppProtocol::Http,
+            name: Some("http".to_string()),
+        }];
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![local, remote],
+            services: vec![http_mesh_service("reviews", 8080, spiffe)],
+            ..MeshSlice::default()
+        };
+
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+        let inbound: Vec<&str> = config
+            .proxies
+            .iter()
+            .filter(|p| p.id.starts_with("__mesh-inbound-"))
+            .map(|p| p.id.as_str())
+            .collect();
+        assert_eq!(
+            inbound,
+            vec!["__mesh-inbound-default-reviews-8080"],
+            "exactly one local inbound route"
+        );
+        let route = config
+            .proxies
+            .iter()
+            .find(|p| p.id == "__mesh-inbound-default-reviews-8080")
+            .expect("reviews route");
+        assert_eq!(
+            route.backend_port, 8080,
+            "must target the LOCAL workload's port, not the remote cluster's"
+        );
+    }
+
+    #[test]
+    fn sidecar_inbound_proxies_yield_to_host_only_operator_proxy() {
+        // An operator host-only proxy (listen_path: None) routes every path for
+        // the service host and sits in the router's host-only fallback tier. Our
+        // materialized "/" prefix route would shadow it, so we must yield.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(spiffe.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![workload("reviews", "reviews")],
+            services: vec![http_mesh_service("reviews", 8080, spiffe)],
+            ..MeshSlice::default()
+        };
+
+        // An operator host-only proxy (matches every path for the host).
+        let mut config = GatewayConfig::default();
+        let mut host_only = mesh_inbound_loopback_proxy(
+            "operator-host-only",
+            mesh_service_host_variants("reviews", "default", "cluster.local"),
+            "default",
+            7777,
+            chrono::Utc::now(),
+        );
+        host_only.listen_path = None;
+        config.proxies.push(host_only);
+
+        materialize_sidecar_inbound_proxies(&mut config, &runtime, &slice);
+        assert!(
+            !config
+                .proxies
+                .iter()
+                .any(|p| p.id.starts_with("__mesh-inbound-")),
+            "must yield to a same-host host-only operator proxy"
+        );
+        assert!(
+            config.proxies.iter().any(|p| p.id == "operator-host-only"),
+            "the operator's host-only proxy must be left intact"
+        );
+    }
+
+    #[test]
+    fn sidecar_inbound_proxies_allow_local_cluster_tagged_workload() {
+        // A VM/WorkloadEntry local workload carries the local cluster name. With
+        // the slice's `multi_cluster.local_cluster` matching, it must be treated
+        // as local and materialize a route — not dropped as if it were remote.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(spiffe.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let mut local = workload("reviews", "reviews");
+        local.cluster = Some("cluster-a".to_string());
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![local],
+            services: vec![http_mesh_service("reviews", 8080, spiffe)],
+            multi_cluster: Some(MultiClusterConfig {
+                local_cluster: Some("cluster-a".to_string()),
+                ..MultiClusterConfig::default()
+            }),
+            ..MeshSlice::default()
+        };
+
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+        assert!(
+            config
+                .proxies
+                .iter()
+                .any(|p| p.id == "__mesh-inbound-default-reviews-8080"),
+            "a workload tagged with the local cluster name must materialize a route"
+        );
+    }
+
+    #[test]
+    fn sidecar_inbound_proxies_yield_to_regex_operator_route() {
+        // An operator regex route (`~...`) on the service host is searched after
+        // the prefix tier, so our materialized `/` prefix would shadow it. Yield.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(spiffe.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![workload("reviews", "reviews")],
+            services: vec![http_mesh_service("reviews", 8080, spiffe)],
+            ..MeshSlice::default()
+        };
+
+        let mut config = GatewayConfig::default();
+        let mut regex_route = mesh_inbound_loopback_proxy(
+            "operator-regex",
+            mesh_service_host_variants("reviews", "default", "cluster.local"),
+            "default",
+            7777,
+            chrono::Utc::now(),
+        );
+        regex_route.listen_path = Some("~^/api/.*".to_string());
+        config.proxies.push(regex_route);
+
+        materialize_sidecar_inbound_proxies(&mut config, &runtime, &slice);
+        assert!(
+            !config
+                .proxies
+                .iter()
+                .any(|p| p.id.starts_with("__mesh-inbound-")),
+            "must yield to a same-host regex operator route"
+        );
+        assert!(config.proxies.iter().any(|p| p.id == "operator-regex"));
+    }
+
+    #[test]
+    fn sidecar_inbound_proxies_ignore_stream_proxies_in_overlap() {
+        // A TCP stream proxy carries empty hosts + null listen_path (it routes by
+        // listen_port). It must NOT read as a host-only catch-all that suppresses
+        // HTTP inbound materialization, matching `validate_unique_listen_paths`.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(spiffe.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![workload("reviews", "reviews")],
+            services: vec![http_mesh_service("reviews", 8080, spiffe)],
+            ..MeshSlice::default()
+        };
+
+        let mut config = GatewayConfig::default();
+        let mut tcp_proxy = mesh_inbound_loopback_proxy(
+            "operator-tcp",
+            Vec::new(),
+            "default",
+            9000,
+            chrono::Utc::now(),
+        );
+        tcp_proxy.listen_path = None;
+        tcp_proxy.hosts = Vec::new();
+        tcp_proxy.dispatch_kind = crate::config::types::DispatchKind::TcpRaw;
+        config.proxies.push(tcp_proxy);
+
+        materialize_sidecar_inbound_proxies(&mut config, &runtime, &slice);
+        assert!(
+            config
+                .proxies
+                .iter()
+                .any(|p| p.id == "__mesh-inbound-default-reviews-8080"),
+            "a stream proxy must not suppress HTTP inbound materialization"
+        );
+    }
+
+    #[test]
+    fn sidecar_inbound_proxies_use_local_inbound_services_view() {
+        // Sidecar egress narrowing can drop the local service from `services`.
+        // Inbound serving must not be gated by egress scope, so the materializer
+        // reads the un-narrowed `local_inbound_services` view. Here `services`
+        // is empty (as if fully egress-narrowed) yet the route still materializes
+        // from `local_inbound_services`.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(spiffe.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![workload("reviews", "reviews")],
+            services: Vec::new(),
+            local_inbound_workloads: Some(vec![workload("reviews", "reviews")]),
+            local_inbound_services: vec![http_mesh_service("reviews", 8080, spiffe)],
+            ..MeshSlice::default()
+        };
+
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+        assert!(
+            config
+                .proxies
+                .iter()
+                .any(|p| p.id == "__mesh-inbound-default-reviews-8080"),
+            "must materialize from the un-narrowed local_inbound_services view \
+             even when egress narrowing emptied `services`"
+        );
+    }
+
+    #[test]
+    fn sidecar_inbound_proxies_skip_when_resolved_view_is_ambiguous_empty() {
+        // The slice builder resolved the local-inbound view but found it
+        // ambiguous (shared SPIFFE, no labels) → Some(empty). The narrowed
+        // `workloads`/`services` here WOULD materialize a single service via the
+        // fallback path, but the authoritative empty view must win: skip, never
+        // fall back to the narrowed sets (which could collapse the ambiguity to
+        // one wrong service).
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(spiffe.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![workload("reviews", "reviews")],
+            services: vec![http_mesh_service("reviews", 8080, spiffe)],
+            local_inbound_workloads: Some(Vec::new()),
+            ..MeshSlice::default()
+        };
+
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+        assert!(
+            !config
+                .proxies
+                .iter()
+                .any(|p| p.id.starts_with("__mesh-inbound-")),
+            "an authoritative empty (ambiguous) inbound view must skip, not fall back to \
+             the narrowed workloads/services"
+        );
+    }
+
+    #[test]
+    fn sidecar_inbound_proxies_use_preserved_local_workload_when_narrowed() {
+        // Sidecar identity narrowing can drop the local workload from
+        // `workloads`. The preserved `local_inbound_workloads` view must let the
+        // materializer still find it (and its container port). Here `workloads`
+        // is empty (as if identity-narrowed) yet the route materializes.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(spiffe.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: Vec::new(),
+            services: Vec::new(),
+            local_inbound_workloads: Some(vec![workload("reviews", "reviews")]),
+            local_inbound_services: vec![http_mesh_service("reviews", 8080, spiffe)],
+            ..MeshSlice::default()
+        };
+
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+        assert!(
+            config
+                .proxies
+                .iter()
+                .any(|p| p.id == "__mesh-inbound-default-reviews-8080"),
+            "must materialize from the preserved local_inbound_workloads view when \
+             identity narrowing emptied `workloads`"
+        );
+    }
+
+    #[test]
+    fn sidecar_inbound_proxies_skip_ambiguous_shared_spiffe_without_labels() {
+        // Two workloads share the service-account SPIFFE but back different
+        // services, and the sidecar carries no labels to disambiguate. The local
+        // identity is ambiguous, so NO inbound route is materialized (rather than
+        // routing to the wrong loopback app).
+        let shared = "spiffe://cluster.local/ns/default/sa/shared";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(shared.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let mut reviews = workload("reviews", "reviews");
+        reviews.spiffe_id = SpiffeId::new(shared).unwrap();
+        let mut ratings = workload("ratings", "ratings");
+        ratings.spiffe_id = SpiffeId::new(shared).unwrap();
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![reviews, ratings],
+            services: vec![
+                http_mesh_service("reviews", 8080, shared),
+                http_mesh_service("ratings", 8080, shared),
+            ],
+            ..MeshSlice::default()
+        };
+
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+        assert!(
+            !config
+                .proxies
+                .iter()
+                .any(|p| p.id.starts_with("__mesh-inbound-")),
+            "ambiguous shared-SPIFFE local identity without labels must not materialize routes"
+        );
+    }
+
+    #[test]
+    fn sidecar_inbound_proxies_skip_ambiguous_shared_spiffe_with_matching_labels() {
+        // Two workloads share the service-account SPIFFE AND the same labels but
+        // back different services. The sidecar's labels match BOTH, so labels do
+        // not disambiguate (they aren't pod-unique) — the identity is still
+        // ambiguous and must materialize NO routes.
+        let shared = "spiffe://cluster.local/ns/default/sa/shared";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(shared.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let mut reviews = workload("reviews", "shared-app");
+        reviews.spiffe_id = SpiffeId::new(shared).unwrap();
+        let mut ratings = workload("ratings", "shared-app");
+        ratings.spiffe_id = SpiffeId::new(shared).unwrap();
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            labels: BTreeMap::from([("app".to_string(), "shared-app".to_string())]),
+            workloads: vec![reviews, ratings],
+            services: vec![
+                http_mesh_service("reviews", 8080, shared),
+                http_mesh_service("ratings", 8080, shared),
+            ],
+            ..MeshSlice::default()
+        };
+
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+        assert!(
+            !config
+                .proxies
+                .iter()
+                .any(|p| p.id.starts_with("__mesh-inbound-")),
+            "labels matching multiple shared-SPIFFE services must not materialize routes"
+        );
+    }
+
     #[test]
     fn waypoint_name_only_propagates_for_service_waypoint_topology() {
         let mut runtime = test_mesh_runtime_config();
@@ -8262,6 +9719,8 @@ mod tests {
             version: "test".to_string(),
             workloads: Vec::new(),
             services: Vec::new(),
+            local_inbound_services: Vec::new(),
+            local_inbound_workloads: None,
             mesh_policies: Vec::new(),
             peer_authentications: Vec::new(),
             service_entries: Vec::new(),
@@ -8481,6 +9940,7 @@ mod tests {
                     port: 8080,
                     protocol: AppProtocol::Http,
                     name: Some("http".to_string()),
+                    target_port: None,
                 }],
                 workloads: Vec::new(),
                 protocol_overrides: HashMap::new(),
@@ -8861,6 +10321,7 @@ mod tests {
                     port: 9080,
                     protocol: AppProtocol::Http,
                     name: Some("http".to_string()),
+                    target_port: None,
                 }],
                 workloads: Vec::new(),
                 protocol_overrides: HashMap::new(),
@@ -9312,6 +10773,7 @@ mod tests {
                                 port: 9080,
                                 protocol: AppProtocol::Http,
                                 name: Some("http".to_string()),
+                                target_port: None,
                             }],
                             workloads: vec![crate::modes::mesh::config::WorkloadRef {
                                 spiffe_id: SpiffeId::new(
@@ -9391,6 +10853,7 @@ mod tests {
                                 port: 8080,
                                 protocol: AppProtocol::Http,
                                 name: None,
+                                target_port: None,
                             }],
                             workloads: vec![crate::modes::mesh::config::WorkloadRef {
                                 spiffe_id: SpiffeId::new(
@@ -9450,6 +10913,7 @@ mod tests {
                                     port: 9080,
                                     protocol: AppProtocol::Http,
                                     name: None,
+                                    target_port: None,
                                 }],
                                 workloads: vec![crate::modes::mesh::config::WorkloadRef {
                                     spiffe_id: SpiffeId::new(
@@ -9466,6 +10930,7 @@ mod tests {
                                     port: 3000,
                                     protocol: AppProtocol::Http,
                                     name: None,
+                                    target_port: None,
                                 }],
                                 workloads: vec![crate::modes::mesh::config::WorkloadRef {
                                     spiffe_id: SpiffeId::new(
@@ -9551,6 +11016,7 @@ mod tests {
                 port: 9080,
                 protocol: AppProtocol::Http,
                 name: None,
+                target_port: None,
             }],
             workloads: vec![
                 crate::modes::mesh::config::WorkloadRef {
@@ -9703,6 +11169,36 @@ mod tests {
     }
 
     #[test]
+    fn east_west_service_targets_honor_target_port() {
+        // Service port 80 with targetPort 8080; the pod listens on container port
+        // 8080. East-west targets dial workload addresses, so they must use 8080.
+        let spiffe = SpiffeId::new("spiffe://cluster.local/ns/default/sa/reviews").unwrap();
+        let mut wl = workload("reviews", "reviews");
+        wl.spiffe_id = spiffe.clone();
+        wl.addresses = vec!["10.0.0.5".to_string()];
+        let service = MeshService {
+            name: "reviews".to_string(),
+            namespace: "default".to_string(),
+            ports: vec![ServicePort {
+                port: 80,
+                protocol: AppProtocol::Http,
+                name: Some("http".to_string()),
+                target_port: Some(ServiceTargetPort::Number(8080)),
+            }],
+            workloads: vec![crate::modes::mesh::config::WorkloadRef { spiffe_id: spiffe }],
+            protocol_overrides: HashMap::new(),
+        };
+
+        let targets = build_east_west_service_targets(&service, &[wl], None);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].host, "10.0.0.5");
+        assert_eq!(
+            targets[0].port, 8080,
+            "east-west must dial the container port (targetPort), not the service port"
+        );
+    }
+
+    #[test]
     fn east_west_service_targets_preserve_explicit_refs_with_stale_service_metadata() {
         let spiffe = SpiffeId::new("spiffe://cluster.local/ns/default/sa/reviews").unwrap();
         let mut legacy = workload("legacy-reviews", "legacy-reviews");
@@ -9715,6 +11211,7 @@ mod tests {
                 port: 9080,
                 protocol: AppProtocol::Http,
                 name: None,
+                target_port: None,
             }],
             workloads: vec![crate::modes::mesh::config::WorkloadRef { spiffe_id: spiffe }],
             protocol_overrides: HashMap::new(),
@@ -9766,6 +11263,7 @@ mod tests {
                                 port: 9080,
                                 protocol: AppProtocol::Http,
                                 name: None,
+                                target_port: None,
                             }],
                             workloads: vec![
                                 crate::modes::mesh::config::WorkloadRef {
@@ -12001,6 +13499,7 @@ mod tests {
                 port,
                 protocol,
                 name: Some("http".to_string()),
+                target_port: None,
             }],
             export_to: Vec::new(),
             workload_selector: None,
@@ -12072,6 +13571,7 @@ mod tests {
                 port: 8080,
                 protocol: AppProtocol::Http,
                 name: None,
+                target_port: None,
             }],
             export_to: Vec::new(),
             workload_selector: None,
@@ -12106,6 +13606,7 @@ mod tests {
                 port: 8080,
                 protocol: AppProtocol::Http,
                 name: Some("http".to_string()),
+                target_port: None,
             }],
             export_to: Vec::new(),
             workload_selector: None,
@@ -12168,6 +13669,7 @@ mod tests {
                 port: 3306,
                 protocol: AppProtocol::Mysql,
                 name: Some("mysql".to_string()),
+                target_port: None,
             }],
             export_to: Vec::new(),
             workload_selector: None,
@@ -12254,11 +13756,13 @@ mod tests {
                     port: 80,
                     protocol: AppProtocol::Http,
                     name: Some("http".to_string()),
+                    target_port: None,
                 },
                 ServicePort {
                     port: 443,
                     protocol: AppProtocol::Tls,
                     name: Some("https".to_string()),
+                    target_port: None,
                 },
             ],
             export_to: Vec::new(),
@@ -12321,6 +13825,7 @@ mod tests {
                 port: 80,
                 protocol: AppProtocol::Http,
                 name: Some("http".to_string()),
+                target_port: None,
             }],
             export_to: Vec::new(),
             workload_selector: None,
@@ -12382,6 +13887,34 @@ mod tests {
         assert_eq!(secondary.targets.len(), 1);
         assert_eq!(secondary.targets[0].host, "secondary.external.com");
         assert_eq!(secondary.targets[0].port, 443);
+    }
+
+    #[test]
+    fn egress_dns_resolution_honors_service_entry_target_port() {
+        // ServiceEntry port 443 with targetPort 8443 (DNS resolution): the egress
+        // upstream target must dial the backend port 8443, not the service port.
+        let mut entry = test_external_service_entry(
+            "dns-svc",
+            vec!["primary.external.com".to_string()],
+            443,
+            AppProtocol::Tls,
+        );
+        entry.ports[0].target_port = Some(ServiceTargetPort::Number(8443));
+
+        let (_, upstreams) = build_egress_proxies_and_upstreams(
+            &[entry],
+            "default",
+            &std::collections::HashSet::new(),
+            true,
+        );
+
+        assert_eq!(upstreams.len(), 1);
+        assert_eq!(upstreams[0].targets.len(), 1);
+        assert_eq!(upstreams[0].targets[0].host, "primary.external.com");
+        assert_eq!(
+            upstreams[0].targets[0].port, 8443,
+            "egress must dial the ServiceEntry targetPort, not the service port"
+        );
     }
 
     #[test]
@@ -12569,6 +14102,7 @@ mod tests {
                 port: 443,
                 protocol: AppProtocol::Tls,
                 name: Some("https".to_string()),
+                target_port: None,
             }],
             export_to: Vec::new(),
             workload_selector: None,
@@ -12614,6 +14148,7 @@ mod tests {
                 port: 8443,
                 protocol: AppProtocol::Tls,
                 name: None,
+                target_port: None,
             }],
             export_to: Vec::new(),
             workload_selector: None,
@@ -12651,6 +14186,7 @@ mod tests {
                 port: 443,
                 protocol: AppProtocol::Tls,
                 name: Some("https".to_string()),
+                target_port: None,
             }],
             export_to: Vec::new(),
             workload_selector: None,
@@ -12694,6 +14230,7 @@ mod tests {
                             port: 8080,
                             protocol: AppProtocol::Http,
                             name: None,
+                            target_port: None,
                         }],
                         export_to: Vec::new(),
                         workload_selector: None,
@@ -12770,6 +14307,7 @@ mod tests {
                 port,
                 protocol,
                 name: Some("stream".to_string()),
+                target_port: None,
             }],
             export_to: Vec::new(),
             workload_selector: None,
@@ -12873,6 +14411,7 @@ mod tests {
                 port: 3306,
                 protocol: AppProtocol::Mysql,
                 name: Some("mysql".to_string()),
+                target_port: None,
             }],
             export_to: Vec::new(),
             workload_selector: None,
@@ -13001,11 +14540,13 @@ mod tests {
                     port: 5432,
                     protocol: AppProtocol::Postgres,
                     name: Some("primary".to_string()),
+                    target_port: None,
                 },
                 ServicePort {
                     port: 5433,
                     protocol: AppProtocol::Postgres,
                     name: Some("replica".to_string()),
+                    target_port: None,
                 },
             ],
             export_to: Vec::new(),
@@ -13023,6 +14564,200 @@ mod tests {
         assert_eq!(upstreams.len(), 2);
         assert!(proxies.iter().any(|p| p.listen_port == Some(5432)));
         assert!(proxies.iter().any(|p| p.listen_port == Some(5433)));
+    }
+
+    #[test]
+    fn egress_stream_service_entry_honors_target_port_for_backend_dial() {
+        // A stream (TCP-family) ServiceEntry with `targetPort` must listen on the
+        // service `port` (where captured outbound traffic arrives) but dial the
+        // backend on the resolved `targetPort` — mirroring the HTTP egress path.
+        // Without this the listener and dial port stay pinned together and a
+        // `number: 5432, targetPort: 15432` entry would dial 5432, not 15432.
+        let service_entries = vec![ServiceEntry {
+            name: "db-with-target-port".to_string(),
+            namespace: "default".to_string(),
+            hosts: vec!["db.vendor.com".to_string()],
+            endpoints: Vec::new(),
+            resolution: Resolution::Dns,
+            location: ServiceEntryLocation::MeshExternal,
+            ports: vec![ServicePort {
+                port: 5432,
+                protocol: AppProtocol::Postgres,
+                name: Some("primary".to_string()),
+                target_port: Some(ServiceTargetPort::Number(15432)),
+            }],
+            export_to: Vec::new(),
+            workload_selector: None,
+        }];
+
+        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+            &service_entries,
+            "default",
+            &std::collections::HashSet::new(),
+            true,
+        );
+
+        let stream_proxy = proxies
+            .iter()
+            .find(|p| p.listen_port == Some(5432))
+            .expect("stream proxy listens on the service port, not the targetPort");
+        assert_eq!(
+            stream_proxy.backend_scheme,
+            Some(BackendScheme::Tcp),
+            "postgres is a stream-family protocol"
+        );
+
+        assert_eq!(
+            upstreams.len(),
+            1,
+            "one upstream for the single stream port"
+        );
+        let target_ports: Vec<u16> = upstreams[0].targets.iter().map(|t| t.port).collect();
+        assert_eq!(
+            target_ports,
+            vec![15432],
+            "the upstream must dial the resolved targetPort, not the service port"
+        );
+    }
+
+    #[test]
+    fn egress_static_service_entry_honors_numeric_target_port_for_named_port() {
+        // A STATIC ServiceEntry with a NAMED port + numeric targetPort whose
+        // endpoints carry no per-endpoint port map for that name must still dial
+        // the numeric targetPort: the targetPort overrides the endpoint named-port
+        // map (without the fix the endpoint is dropped for lack of `ports[name]`).
+        let service_entries = vec![ServiceEntry {
+            name: "ext-db".to_string(),
+            namespace: "default".to_string(),
+            hosts: vec!["db.vendor.com".to_string()],
+            endpoints: vec![MeshEndpoint {
+                address: "10.9.9.9".to_string(),
+                ports: HashMap::new(),
+                labels: HashMap::new(),
+                network: None,
+            }],
+            resolution: Resolution::Static,
+            location: ServiceEntryLocation::MeshExternal,
+            ports: vec![ServicePort {
+                port: 5432,
+                protocol: AppProtocol::Postgres,
+                name: Some("tcp".to_string()),
+                target_port: Some(ServiceTargetPort::Number(15432)),
+            }],
+            export_to: Vec::new(),
+            workload_selector: None,
+        }];
+
+        let (_proxies, upstreams) = build_egress_proxies_and_upstreams(
+            &service_entries,
+            "default",
+            &std::collections::HashSet::new(),
+            true,
+        );
+
+        assert_eq!(
+            upstreams.len(),
+            1,
+            "one upstream for the static stream port"
+        );
+        let target_ports: Vec<u16> = upstreams[0].targets.iter().map(|t| t.port).collect();
+        assert_eq!(
+            target_ports,
+            vec![15432],
+            "numeric targetPort overrides the (absent) endpoint named-port map for static endpoints"
+        );
+    }
+
+    #[test]
+    fn service_discovery_upstream_rekeys_port_policy_to_numeric_target_port() {
+        // A mesh service-discovery upstream for a Service with port 80 ->
+        // targetPort 8080 resolves its targets to 8080 at runtime; a DR
+        // portLevelSettings keyed on 80 must be re-keyed to 8080 so dispatch
+        // (which keys overrides by the dial port) applies it (round-12 F2).
+        let mut upstream = destination_rule_test_upstream(
+            "reviews.default.svc.cluster.local",
+            "reviews.default.svc.cluster.local",
+        );
+        upstream.targets.clear(); // service-discovery resolves targets at runtime
+        upstream.service_discovery = Some(crate::config::types::ServiceDiscoveryConfig {
+            provider: crate::config::types::SdProvider::Mesh,
+            dns_sd: None,
+            kubernetes: None,
+            consul: None,
+            mesh: Some(crate::config::types::MeshSdConfig {
+                service_name: "reviews".to_string(),
+                namespace: Some("default".to_string()),
+                port: None,
+                poll_interval_seconds: 30,
+            }),
+            default_weight: 1,
+        });
+        let mut config = GatewayConfig {
+            upstreams: vec![upstream],
+            ..GatewayConfig::default()
+        };
+
+        let mut svc = http_mesh_service(
+            "reviews",
+            80,
+            "spiffe://cluster.local/ns/default/sa/reviews",
+        );
+        svc.ports[0].target_port = Some(ServiceTargetPort::Number(8080));
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            services: vec![svc],
+            destination_rules: vec![MeshDestinationRule {
+                name: "reviews".to_string(),
+                namespace: "default".to_string(),
+                host: "reviews.default.svc.cluster.local".to_string(),
+                traffic_policy: None,
+                port_level_settings: HashMap::from([(
+                    80u16,
+                    MeshTrafficPolicy {
+                        max_connections: Some(7),
+                        ..MeshTrafficPolicy::default()
+                    },
+                )]),
+                subsets: Vec::new(),
+            }],
+            ..MeshSlice::default()
+        };
+
+        apply_destination_rules(&mut config, &test_mesh_runtime_config(), &slice)
+            .expect("destination rules apply");
+
+        let upstream = &config.upstreams[0];
+        assert!(
+            upstream.port_overrides.contains_key(&8080),
+            "port-level policy must be re-keyed onto the dial port 8080, got {:?}",
+            upstream.port_overrides.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !upstream.port_overrides.contains_key(&80),
+            "policy must not stay under the service port 80"
+        );
+    }
+
+    #[test]
+    fn east_west_drops_target_when_named_target_port_unresolved() {
+        // build_east_west_service_targets: a named targetPort that does not
+        // resolve against the workload ports must drop the target (fail closed),
+        // not fall back to the Service port.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let mut svc = http_mesh_service("reviews", 80, spiffe);
+        svc.ports[0].target_port = Some(ServiceTargetPort::Name("http".to_string()));
+        let mut wl = workload("reviews", "reviews");
+        wl.addresses = vec!["10.0.0.1".to_string()];
+        wl.ports = vec![WorkloadPort {
+            port: 9999,
+            protocol: AppProtocol::Http,
+            name: Some("grpc".to_string()),
+        }];
+        let targets = build_east_west_service_targets(&svc, &[wl], None);
+        assert!(
+            targets.is_empty(),
+            "an unresolved named targetPort must drop the east-west target, not dial the Service port"
+        );
     }
 
     #[test]
