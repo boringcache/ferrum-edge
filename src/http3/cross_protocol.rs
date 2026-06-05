@@ -1674,9 +1674,16 @@ where
             false,
             backend_start.elapsed(),
         );
+        // Feed the limiter the ORIGINAL backend `status`, not `response_status`:
+        // response-body/final-body plugin rejects above may have rewritten
+        // `response_status` to a gateway policy code (e.g. a 503/4xx reject of a
+        // healthy backend 200). Recording the policy status would make the
+        // adaptive limiter shrink/grow on a signal that does not reflect backend
+        // health. Matches the streaming path below and the H1/H2 path, which
+        // capture the backend status before response-body hooks run.
         record_cross_protocol_backend_admission_outcome(
             &mut backend_admission_permits,
-            response_status,
+            status,
             false,
             if body_completed {
                 None

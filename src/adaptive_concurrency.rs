@@ -112,7 +112,11 @@ impl AdaptiveConcurrencyLimiter {
     pub fn new(shards: usize) -> Self {
         Self {
             inner: DashMap::with_shard_amount(shards),
-            scope_cache: DashMap::new(),
+            // `scope_cache.get()` runs on the backend-dispatch hot path for
+            // proxy/upstream scoping, so honor the operator's configured shard
+            // count (pool_shard_amount) like `inner` rather than DashMap's
+            // default, keeping per-shard lock contention bounded under load.
+            scope_cache: DashMap::with_shard_amount(shards),
             backend_scope: Arc::from("backend"),
             tracked_keys: AtomicUsize::new(0),
         }

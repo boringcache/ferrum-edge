@@ -2,9 +2,14 @@
 //!
 //! Plugins execute in priority order (lower number = runs first) through
 //! lifecycle phases: `on_request_received` → `authenticate` → `authorize` →
-//! `before_proxy` → `backend_admission` → `transform_request_body` →
-//! `on_final_request_body` → `after_proxy` → `on_response_body` → `transform_response_body` →
+//! `before_proxy` → `transform_request_body` → `on_final_request_body` →
+//! `backend_admission` → `after_proxy` → `on_response_body` → `transform_response_body` →
 //! `on_final_response_body` → `log` → `on_ws_frame`.
+//!
+//! `backend_admission` runs last on the request side — after request-body
+//! transforms and `on_final_request_body`, immediately before the backend
+//! dispatch — so a rejected admission still skips the actual upstream call but
+//! not the body hooks that precede it.
 //!
 //! Each plugin declares which protocols it supports via `supported_protocols()`.
 //! The `PluginCache` pre-filters plugins per protocol at config reload time
