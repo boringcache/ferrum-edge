@@ -10411,6 +10411,31 @@ async fn handle_proxy_request_inner(
                 }
             };
             if grpc_can_use_streaming_fast_path {
+                // Reject an oversized declared Content-Length BEFORE admission, so
+                // a capacity rejection cannot mask the size violation as a
+                // concurrency reject instead of the deterministic RESOURCE_EXHAUSTED
+                // the streaming size limiter produces. The split/mixed gRPC paths
+                // enforce the limit during body collection (before admission); this
+                // fully-streaming path never collects, so the check is hoisted here
+                // (mirrors the reqwest/direct-H2/H3/HBONE ordering). gRPC errors ride
+                // on HTTP 200, matching the streaming overflow's logged status.
+                if state.max_grpc_recv_size_bytes > 0
+                    && let Some(content_length) = request.headers().get("content-length")
+                    && let Some(len) = content_length
+                        .to_str()
+                        .ok()
+                        .and_then(|s| s.parse::<usize>().ok())
+                    && len > state.max_grpc_recv_size_bytes
+                {
+                    record_request(&state, 200);
+                    return Ok(grpc_proxy::build_grpc_error_response(
+                        grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
+                        &format!(
+                            "gRPC request payload size exceeds maximum of {} bytes",
+                            state.max_grpc_recv_size_bytes
+                        ),
+                    ));
+                }
                 // Fully streaming fast path: forward request body frame-by-
                 // frame without collecting. No retries possible (request
                 // body consumed on wire) and no body plugins.
@@ -11149,11 +11174,20 @@ async fn handle_proxy_request_inner(
                     body = body.with_per_ip_request_guard(guard);
                 }
                 if let Some(permits) = backend_admission_permits.take() {
-                    body = body.with_deferred_backend_admission_outcome(
-                        permits,
-                        grpc_streaming.status,
-                        grpc_backend_admission_elapsed,
-                    );
+                    body = body
+                        .with_deferred_backend_admission_outcome(
+                            permits,
+                            grpc_streaming.status,
+                            grpc_backend_admission_elapsed,
+                        )
+                        // A late client-upload overflow (> max_grpc_recv_size_bytes)
+                        // RSTs the response stream; tag the outcome so the limiter
+                        // treats it as a client-side RequestBodyTooLarge (ignored)
+                        // instead of a backend fault, matching the circuit breaker's
+                        // NEUTRAL handling of the same flag on this path.
+                        .with_deferred_admission_request_body_exceeded_flag(
+                            grpc_streaming.request_body_exceeded.clone(),
+                        );
                 }
 
                 // Detach the deferred logger before handing the body to

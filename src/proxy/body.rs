@@ -89,10 +89,17 @@ pub struct ProxyBody {
     polled: AtomicBool,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct DeferredBackendAdmissionOutcome {
     response_status: u16,
     backend_elapsed: Duration,
+    /// Set on the gRPC fully-streaming path: a late client-upload overflow
+    /// (`> max_grpc_recv_size_bytes`) RSTs the backend response stream after
+    /// headers, surfacing as a body error. That is a client/gateway-side size
+    /// violation, not a backend fault, so when this flag has tripped the limiter
+    /// outcome is forced to `RequestBodyTooLarge` (which the limiter ignores)
+    /// rather than letting the body error shrink the limit.
+    request_body_exceeded: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 /// Inner body variant — buffered, streaming, or tracked-streaming.
@@ -306,7 +313,24 @@ impl ProxyBody {
         self.backend_admission_outcome = Some(DeferredBackendAdmissionOutcome {
             response_status,
             backend_elapsed,
+            request_body_exceeded: None,
         });
+        self
+    }
+
+    /// Attach the gRPC streaming request-body-overflow flag to an already-set
+    /// deferred backend-admission outcome. When the flag has tripped by the time
+    /// the body terminates, the recorded outcome is forced to `RequestBodyTooLarge`
+    /// so a client-upload overflow that RSTs the response stream is ignored by the
+    /// adaptive limiter instead of being counted as a backend fault. No-op when no
+    /// deferred admission outcome is attached or the flag is `None`.
+    pub(crate) fn with_deferred_admission_request_body_exceeded_flag(
+        mut self,
+        flag: Option<Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Self {
+        if let Some(outcome) = self.backend_admission_outcome.as_mut() {
+            outcome.request_body_exceeded = flag;
+        }
         self
     }
 
@@ -421,7 +445,17 @@ impl ProxyBody {
         let Some(outcome) = self.backend_admission_outcome.take() else {
             return;
         };
-        let error_class = if client_disconnected {
+        let error_class = if outcome
+            .request_body_exceeded
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+        {
+            // Late gRPC client-upload overflow RST the backend response stream:
+            // a client/gateway-side size violation, not a backend fault. Force
+            // RequestBodyTooLarge so the limiter ignores it (no shrink), matching
+            // how the circuit breaker neutralizes the same overflow.
+            Some(ErrorClass::RequestBodyTooLarge)
+        } else if client_disconnected {
             Some(ErrorClass::ClientDisconnect)
         } else {
             error_class
