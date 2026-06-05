@@ -30,8 +30,9 @@ use crate::plugins::{Plugin, PluginHttpClient, ProxyProtocol, create_plugin_with
 // ---------------------------------------------------------------------------
 
 use crate::plugins::{
-    PluginResult, RequestContext, StreamConnectionContext, StreamTransactionSummary,
-    TransactionSummary, UdpDatagramContext, UdpDatagramVerdict, WebSocketFrameDirection,
+    PluginResult, RequestContext, ResponseStreamInspector, StreamConnectionContext,
+    StreamTransactionSummary, TransactionSummary, UdpDatagramContext, UdpDatagramVerdict,
+    WebSocketFrameDirection,
 };
 use async_trait::async_trait;
 
@@ -122,6 +123,17 @@ impl Plugin for PriorityOverridePlugin {
     }
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
         self.inner.should_buffer_response_body(ctx)
+    }
+    fn should_buffer_response_body_for_content_type(
+        &self,
+        ctx: &RequestContext,
+        content_type: Option<&str>,
+    ) -> bool {
+        // Must forward, not fall back to the trait default (which ignores
+        // content-type): a priority-overridden inspect-mode policy needs the
+        // buffer->stream downgrade for SSE, else it buffers an unbounded stream.
+        self.inner
+            .should_buffer_response_body_for_content_type(ctx, content_type)
     }
     async fn on_response_body(
         &self,
@@ -219,6 +231,21 @@ impl Plugin for PriorityOverridePlugin {
         self.inner
             .on_ws_frame(proxy_id, connection_id, direction, message)
             .await
+    }
+    fn requires_response_stream_hooks(&self) -> bool {
+        self.inner.requires_response_stream_hooks()
+    }
+    fn forces_reqwest_dispatch(&self, ctx: &RequestContext) -> bool {
+        self.inner.forces_reqwest_dispatch(ctx)
+    }
+    fn response_stream_inspector(
+        &self,
+        ctx: &RequestContext,
+        response_status: u16,
+        content_type: Option<&str>,
+    ) -> Option<Box<dyn ResponseStreamInspector>> {
+        self.inner
+            .response_stream_inspector(ctx, response_status, content_type)
     }
     fn requires_udp_datagram_hooks(&self) -> bool {
         self.inner.requires_udp_datagram_hooks()

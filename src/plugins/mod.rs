@@ -1286,6 +1286,205 @@ pub enum PluginResult {
     },
 }
 
+/// Action returned by a plugin's per-chunk streaming-response hooks
+/// ([`Plugin::on_response_stream_chunk`] / [`Plugin::on_response_stream_end`]),
+/// generalizing the WebSocket [`Plugin::on_ws_frame`] model to streaming HTTP
+/// response bodies (e.g. SSE) that are never buffered.
+///
+/// Headers are already committed by the time a body streams, so enforcement on
+/// a streamed response can only **truncate** — it cannot change the status or
+/// retract bytes already sent downstream.
+#[derive(Debug, Clone)]
+pub enum ResponseStreamAction {
+    /// Release these bytes downstream now. An empty `Bytes` means "hold /
+    /// accumulate": emit nothing for this chunk because the plugin is buffering
+    /// a window it has not yet cleared for release.
+    Forward(bytes::Bytes),
+    /// Stop the response stream: emit the optional final bytes (e.g. an SSE
+    /// terminal error event) and then end the body. Already-sent bytes are
+    /// unrecoverable, so this truncates the response in flight.
+    Terminate(Option<bytes::Bytes>),
+}
+
+/// A stateful, per-response inspector for a streaming (non-buffered) response
+/// body, created by [`Plugin::response_stream_inspector`]. It **owns** its
+/// window / accumulator state, so the same type works both inside the async H3
+/// streaming loop and inside the detached task that drives the poll-based H1/H2
+/// channel body (which cannot borrow the request `ctx`). The proxy drives it
+/// chunk-by-chunk and relays the returned [`ResponseStreamAction`] bytes.
+#[async_trait]
+pub trait ResponseStreamInspector: Send {
+    /// Inspect the next decoded chunk of the response body.
+    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction;
+
+    /// Flush / inspect the trailing partial window at end of stream. The default
+    /// forwards nothing.
+    async fn on_end(&mut self) -> ResponseStreamAction {
+        ResponseStreamAction::Forward(bytes::Bytes::new())
+    }
+}
+
+/// Compose the stream inspectors of several plugins into one, so a response with
+/// more than one opted-in plugin (e.g. a global and a proxy-scoped
+/// `ai_semantic_firewall` with different rules) runs them ALL, not just the
+/// first — matching how every other response hook runs for every plugin.
+///
+/// `None` if the list is empty; the single inspector unchanged if there is one;
+/// otherwise a [`ChainedResponseStreamInspector`].
+pub fn chain_response_stream_inspectors(
+    mut inspectors: Vec<Box<dyn ResponseStreamInspector>>,
+) -> Option<Box<dyn ResponseStreamInspector>> {
+    match inspectors.len() {
+        0 => None,
+        1 => inspectors.pop(),
+        _ => Some(Box::new(ChainedResponseStreamInspector { inspectors })),
+    }
+}
+
+/// Pipes each chunk through a chain of [`ResponseStreamInspector`]s: inspector
+/// *i*'s `Forward` output is the input to inspector *i+1*, so each plugin sees
+/// the (frame-aligned) bytes its predecessors released. The first `Terminate`
+/// short-circuits and cuts the stream. Same-call clean releases from an
+/// upstream inspector are dropped on a downstream cut — the stream is ending
+/// anyway, and that preserves the single-`ResponseStreamAction` contract.
+struct ChainedResponseStreamInspector {
+    inspectors: Vec<Box<dyn ResponseStreamInspector>>,
+}
+
+#[async_trait]
+impl ResponseStreamInspector for ChainedResponseStreamInspector {
+    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+        let mut buf = bytes::Bytes::copy_from_slice(chunk);
+        for inspector in &mut self.inspectors {
+            if buf.is_empty() {
+                // An upstream inspector is holding this window; nothing yet for
+                // the rest of the chain to see.
+                return ResponseStreamAction::Forward(bytes::Bytes::new());
+            }
+            match inspector.on_chunk(&buf).await {
+                ResponseStreamAction::Forward(out) => buf = out,
+                terminate @ ResponseStreamAction::Terminate(_) => return terminate,
+            }
+        }
+        ResponseStreamAction::Forward(buf)
+    }
+
+    async fn on_end(&mut self) -> ResponseStreamAction {
+        // Flush each inspector in order; bytes flushed by inspector *i* are fed to
+        // inspector *i+1* as a final chunk before *i+1* is itself flushed.
+        let mut carry = bytes::Bytes::new();
+        for inspector in &mut self.inspectors {
+            let mut released = bytes::BytesMut::new();
+            if !carry.is_empty() {
+                match inspector.on_chunk(&carry).await {
+                    ResponseStreamAction::Forward(out) => released.extend_from_slice(&out),
+                    terminate @ ResponseStreamAction::Terminate(_) => return terminate,
+                }
+            }
+            match inspector.on_end().await {
+                ResponseStreamAction::Forward(out) => released.extend_from_slice(&out),
+                terminate @ ResponseStreamAction::Terminate(_) => return terminate,
+            }
+            carry = released.freeze();
+        }
+        ResponseStreamAction::Forward(carry)
+    }
+}
+
+#[cfg(test)]
+mod chained_inspector_tests {
+    //! Focused tests for [`ChainedResponseStreamInspector`]'s threading — the
+    //! struct is private, so these stay inline. The non-trivial part is `on_end`,
+    //! where one inspector's flushed bytes must pass through the next inspector's
+    //! `on_chunk` AND `on_end` before being released.
+    use super::*;
+
+    /// Passes chunks through unchanged; emits `tag` once at end-of-stream.
+    struct TagAtEnd {
+        tag: &'static str,
+    }
+    #[async_trait]
+    impl ResponseStreamInspector for TagAtEnd {
+        async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+            ResponseStreamAction::Forward(bytes::Bytes::copy_from_slice(chunk))
+        }
+        async fn on_end(&mut self) -> ResponseStreamAction {
+            ResponseStreamAction::Forward(bytes::Bytes::copy_from_slice(self.tag.as_bytes()))
+        }
+    }
+
+    /// Cuts immediately on the first chunk.
+    struct CutNow;
+    #[async_trait]
+    impl ResponseStreamInspector for CutNow {
+        async fn on_chunk(&mut self, _chunk: &[u8]) -> ResponseStreamAction {
+            ResponseStreamAction::Terminate(Some(bytes::Bytes::from_static(b"CUT")))
+        }
+    }
+
+    /// Holds everything (never releases) — Forward(empty).
+    struct HoldAll;
+    #[async_trait]
+    impl ResponseStreamInspector for HoldAll {
+        async fn on_chunk(&mut self, _chunk: &[u8]) -> ResponseStreamAction {
+            ResponseStreamAction::Forward(bytes::Bytes::new())
+        }
+    }
+
+    fn forwarded(action: ResponseStreamAction) -> bytes::Bytes {
+        match action {
+            ResponseStreamAction::Forward(b) => b,
+            ResponseStreamAction::Terminate(_) => panic!("expected Forward, got Terminate"),
+        }
+    }
+
+    #[tokio::test]
+    async fn single_inspector_is_returned_unwrapped() {
+        let chain = chain_response_stream_inspectors(vec![Box::new(TagAtEnd { tag: "A" })]);
+        assert!(chain.is_some());
+        // len 0 -> None
+        assert!(chain_response_stream_inspectors(vec![]).is_none());
+    }
+
+    #[tokio::test]
+    async fn on_chunk_threads_through_all_and_on_end_carries() {
+        let mut chain = chain_response_stream_inspectors(vec![
+            Box::new(TagAtEnd { tag: "A" }),
+            Box::new(TagAtEnd { tag: "B" }),
+        ])
+        .expect("two inspectors chain");
+        // A chunk passes through both unchanged.
+        assert_eq!(&forwarded(chain.on_chunk(b"hi").await)[..], b"hi");
+        // on_end: A flushes "A" -> fed through B.on_chunk ("A") -> then B flushes
+        // "B"; result is "A" ++ "B".
+        assert_eq!(&forwarded(chain.on_end().await)[..], b"AB");
+    }
+
+    #[tokio::test]
+    async fn first_terminate_short_circuits() {
+        let mut chain = chain_response_stream_inspectors(vec![
+            Box::new(CutNow),
+            Box::new(TagAtEnd { tag: "B" }),
+        ])
+        .expect("chain");
+        assert!(matches!(
+            chain.on_chunk(b"x").await,
+            ResponseStreamAction::Terminate(Some(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn upstream_hold_stops_the_chain() {
+        let mut chain = chain_response_stream_inspectors(vec![
+            Box::new(HoldAll),
+            Box::new(TagAtEnd { tag: "B" }),
+        ])
+        .expect("chain");
+        // First inspector holds → nothing reaches the second this chunk.
+        assert!(forwarded(chain.on_chunk(b"x").await).is_empty());
+    }
+}
+
 /// Mirror response metadata from the `request_mirror` plugin's spawned task.
 ///
 /// Communicated via `tokio::sync::watch` channel from the spawned mirror task
@@ -2378,6 +2577,51 @@ pub trait Plugin: Send + Sync {
         _message: &tokio_tungstenite::tungstenite::Message,
     ) -> Option<tokio_tungstenite::tungstenite::Message> {
         None
+    }
+
+    /// Returns `true` if this plugin needs per-chunk inspection of *streaming*
+    /// (non-buffered) HTTP response bodies — e.g. windowed inspection of an SSE
+    /// LLM completion. Zero overhead when `false` (default): the proxy's
+    /// streaming pipeline skips the hook path entirely, and `PluginCache`
+    /// precomputes an O(1) per-proxy flag from this so unrelated proxies never
+    /// pay. Distinct from response-body buffering — a plugin that inspects a
+    /// stream window-by-window does **not** buffer the whole body.
+    fn requires_response_stream_hooks(&self) -> bool {
+        false
+    }
+
+    /// Create a stateful [`ResponseStreamInspector`] for a streaming (non-buffered)
+    /// response body, or `None` to stream it through unchanged. Called once per
+    /// eligible response for **every** plugin that opts in via
+    /// [`Self::requires_response_stream_hooks`] (the proxy chains the returned
+    /// inspectors, so multiple stream-inspecting plugins compose); the plugin
+    /// decides applicability from `ctx`, the response `response_status`, and the
+    /// `content_type` (e.g. only inspect a 2xx `text/event-stream`, matching how
+    /// [`Self::on_response_body`] only inspects success responses).
+    ///
+    /// Returning an inspector is how a plugin generalizes the [`Self::on_ws_frame`]
+    /// model to HTTP response streams: the proxy then drives the inspector
+    /// chunk-by-chunk. The inspector **owns** its window/accumulator state, so it
+    /// works both inside the async H3 loop and inside the detached task that
+    /// drives the poll-based H1/H2 channel body (which cannot borrow `ctx`).
+    fn response_stream_inspector(
+        &self,
+        _ctx: &RequestContext,
+        _response_status: u16,
+        _content_type: Option<&str>,
+    ) -> Option<Box<dyn ResponseStreamInspector>> {
+        None
+    }
+
+    /// Returns `true` if THIS request's response must come back on the reqwest
+    /// streaming path rather than a native-H3 (or other advanced) backend
+    /// transport — e.g. because a response-stream inspector will run and is only
+    /// wired on the reqwest path. Evaluated per request just before backend
+    /// dispatch (after `before_proxy`), so a plugin can scope it to the requests
+    /// it actually inspects (via `ctx` markers) instead of forcing every request
+    /// on the proxy off the fast path. Zero overhead when `false` (default).
+    fn forces_reqwest_dispatch(&self, _ctx: &RequestContext) -> bool {
+        false
     }
 
     /// Returns `true` if this plugin needs per-datagram UDP inspection.
