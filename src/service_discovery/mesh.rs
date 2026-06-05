@@ -110,13 +110,13 @@ impl MeshServiceDiscoverer {
         workload: &Workload,
     ) -> Option<SelectedPort> {
         if let Some(selected) = selected_service_port {
-            if workload.ports.is_empty() {
-                return Some(selected.clone());
-            }
-
             // Honor the Service `targetPort` first — Kubernetes' authoritative
             // service-port→container-port binding — so the workload-address
             // target dials the container port it declares, not the Service port.
+            // A NUMERIC targetPort does not require the Pod to declare a matching
+            // `containerPort`, so resolve it BEFORE the no-ports fast path below;
+            // otherwise a `port: 80, targetPort: 8080` upstream would dial 80
+            // whenever the workload advertises addresses but no `ports[]`.
             if let Some(backend) =
                 resolve_target_port(selected.target_port.as_ref(), &workload.ports)
             {
@@ -126,6 +126,10 @@ impl MeshServiceDiscoverer {
                     protocol: selected.protocol,
                     target_port: None,
                 });
+            }
+
+            if workload.ports.is_empty() {
+                return Some(selected.clone());
             }
 
             if let Some(workload_port) = workload
@@ -370,6 +374,36 @@ mod tests {
             &consumer_index,
             &load_balancer_cache,
         ))
+    }
+
+    #[tokio::test]
+    async fn discovers_numeric_target_port_when_workload_omits_ports() {
+        // A Kubernetes numeric `targetPort` needs no matching `containerPort`, so
+        // a workload with addresses but no `ports[]` must still dial the
+        // targetPort (8080), not the Service port (80). Regression: the no-ports
+        // fast path used to return the Service port before the targetPort resolve.
+        let api_id = "spiffe://cluster.local/ns/ferrum/sa/api";
+        let mut svc = service("api", vec![api_id], vec![80]);
+        svc.ports[0].target_port = Some(ServiceTargetPort::Number(8080));
+        let mesh = MeshConfig {
+            services: vec![svc],
+            workloads: vec![workload(api_id, "api", vec!["10.0.0.1"], vec![])],
+            ..MeshConfig::default()
+        };
+        let discoverer = MeshServiceDiscoverer::new(
+            epoch_store(Some(mesh)),
+            "api".to_string(),
+            default_namespace(),
+            None,
+            1,
+        );
+
+        let targets = discoverer.discover().await.expect("discover succeeds");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(
+            targets[0].port, 8080,
+            "dials the numeric targetPort even though the workload declares no ports"
+        );
     }
 
     #[tokio::test]

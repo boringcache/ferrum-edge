@@ -1682,6 +1682,25 @@ fn mesh_inbound_loopback_proxy(
 /// Multiple DRs targeting the same upstream are applied in a deterministic
 /// order — sorted by `(namespace, name)` — so the last-writer-wins outcome
 /// is reproducible across CP restarts and DP subscribers.
+/// Resolve the in-mesh `MeshService` a service-discovery upstream routes to, for
+/// re-keying targetPort-remapped port-level policy (round-12 F2). A mesh-provider
+/// service-discovery upstream names the service in its config; the discoverer
+/// resolves its workload-address targets to the Service `targetPort` at runtime
+/// (`service_discovery::mesh`), so a DestinationRule `portLevelSettings` entry
+/// keyed on the Service port must be re-keyed to that dial port. Returns `None`
+/// for non-mesh-discovery upstreams.
+fn mesh_upstream_service<'a>(
+    upstream: &Upstream,
+    mesh_slice: &'a MeshSlice,
+) -> Option<&'a crate::modes::mesh::config::MeshService> {
+    let mesh_sd = upstream.service_discovery.as_ref()?.mesh.as_ref()?;
+    let namespace = mesh_sd.namespace.as_deref().unwrap_or(&upstream.namespace);
+    mesh_slice
+        .services
+        .iter()
+        .find(|s| s.name == mesh_sd.service_name && s.namespace == namespace)
+}
+
 fn apply_destination_rules(
     config: &mut GatewayConfig,
     runtime: &MeshRuntimeConfig,
@@ -1731,6 +1750,33 @@ fn apply_destination_rules(
             let upstream_target_ports: std::collections::HashSet<u16> =
                 upstream.targets.iter().map(|t| t.port).collect();
             let has_service_discovery = upstream.service_discovery.is_some();
+
+            // Round-12 F2: a mesh service-discovery upstream whose Service
+            // declares a numeric `targetPort` dials the container port (T) at
+            // runtime, not the Service port (P); dispatch keys port overrides by
+            // the dial port, so a DR `portLevelSettings` entry keyed on P must be
+            // re-keyed to T or it never matches the resolved target. Map P→T for
+            // numeric targetPorts. (Targets resolve at runtime, so a static
+            // target-port check isn't possible — and isn't needed, since a numeric
+            // targetPort is authoritative. A named targetPort resolves per-workload
+            // and is left under the Service port: a documented residual.)
+            let mesh_port_remap: std::collections::HashMap<u16, u16> = if has_service_discovery {
+                mesh_upstream_service(upstream, mesh_slice)
+                    .map(|svc| {
+                        svc.ports
+                            .iter()
+                            .filter_map(|sp| match sp.target_port {
+                                Some(ServiceTargetPort::Number(t)) if t != 0 && t != sp.port => {
+                                    Some((sp.port, t))
+                                }
+                                _ => None,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            } else {
+                std::collections::HashMap::new()
+            };
 
             // Top-level `connectionPool.tcp.{maxConnections,tcpKeepalive}` fan
             // out to every port served by this upstream. Per-port
@@ -1786,7 +1832,20 @@ fn apply_destination_rules(
             let upstream_base_tls = BackendTlsConfig::from_upstream(upstream);
             let upstream_id_for_tls = upstream.id.clone();
             for (port, port_policy) in &dr.port_level_settings {
-                if !has_service_discovery && !upstream_target_ports.contains(port) {
+                // The `port_overrides` key this Service-port-scoped entry must
+                // land on. A mesh service-discovery upstream whose Service remaps
+                // the port via a numeric `targetPort` is re-keyed P→T (round-12
+                // F2); a direct target-port match needs no remap; a service-
+                // discovery upstream with no remap keeps the entry under the
+                // declared port (targets resolve at runtime); anything else is a
+                // phantom DR port.
+                let store_port = if upstream_target_ports.contains(port) {
+                    *port
+                } else if let Some(dial) = mesh_port_remap.get(port) {
+                    *dial
+                } else if has_service_discovery {
+                    *port
+                } else {
                     warn!(
                         rule = %dr.name,
                         upstream = %upstream.id,
@@ -1794,7 +1853,7 @@ fn apply_destination_rules(
                         "DestinationRule portLevelSettings entry references a port not used by any target; skipping"
                     );
                     continue;
-                }
+                };
                 // Resolve per-port backend TLS over the upstream base, mirroring
                 // the per-subset TLS overlay. Computed before the `override_slot`
                 // mutable borrow. Fail-closed: an unresolvable per-port TLS
@@ -1818,7 +1877,7 @@ fn apply_destination_rules(
                     None
                 };
 
-                let override_slot = upstream.port_overrides.entry(*port).or_default();
+                let override_slot = upstream.port_overrides.entry(store_port).or_default();
                 apply_traffic_policy_to_port_override(override_slot, port_policy);
                 if let Some(slot) = resolved_port_tls {
                     override_slot.tls = Some(slot);
@@ -2628,12 +2687,18 @@ fn build_http_egress_for_entry(
     }
 
     // Honor a numeric ServiceEntry `targetPort` for the backend (the proxy/
-    // upstream IDs below stay keyed on the service `port`). The named-endpoint
-    // path inside still uses each endpoint's own port map.
-    let backend_port =
-        resolve_target_port(port_spec.target_port.as_ref(), &[]).unwrap_or(port_spec.port);
+    // upstream IDs below stay keyed on the service `port`). A numeric targetPort
+    // also overrides the per-endpoint named port map for STATIC endpoints, so
+    // pass NO port name in that case — otherwise the static path requires each
+    // endpoint to carry a matching `ports[name]` entry and ignores the resolved
+    // targetPort. A named/absent targetPort keeps the endpoint port map.
+    let (backend_port, backend_port_name) =
+        match resolve_target_port(port_spec.target_port.as_ref(), &[]) {
+            Some(resolved) => (resolved, None),
+            None => (port_spec.port, port_spec.name.clone()),
+        };
     for host in proxy_hosts {
-        let targets = build_egress_upstream_targets(entry, host, backend_port, &port_spec.name);
+        let targets = build_egress_upstream_targets(entry, host, backend_port, &backend_port_name);
 
         if targets.is_empty() {
             debug!(
@@ -2734,17 +2799,20 @@ fn build_stream_egress_for_entry(
     };
 
     // Honor a numeric ServiceEntry `targetPort` for the backend dial port while
-    // the listener, proxy/upstream IDs, and port-dedup stay keyed on the
-    // service `port` — captured outbound traffic arrives on the service port and
-    // the upstream forwards to the backend port. Mirrors the HTTP egress branch
-    // (`build_http_egress_for_entry`); without it a TCP ServiceEntry like
-    // `number: 5432, targetPort: 15432` would bind 5432 but dial 5432 instead of
-    // 15432. The static-endpoint path inside `build_egress_upstream_targets`
-    // still uses each endpoint's own (named) port map.
-    let backend_port =
-        resolve_target_port(port_spec.target_port.as_ref(), &[]).unwrap_or(port_spec.port);
+    // the listener, proxy/upstream IDs, and port-dedup stay keyed on the service
+    // `port`. Mirrors the HTTP egress branch; without it a TCP ServiceEntry like
+    // `number: 5432, targetPort: 15432` would bind 5432 but dial 5432. A numeric
+    // targetPort also overrides the per-endpoint named port map for STATIC
+    // endpoints, so pass NO port name in that case — otherwise
+    // `build_egress_upstream_targets` requires each endpoint to carry a matching
+    // `ports[name]` entry and ignores the resolved targetPort.
+    let (backend_port, backend_port_name) =
+        match resolve_target_port(port_spec.target_port.as_ref(), &[]) {
+            Some(resolved) => (resolved, None),
+            None => (port_spec.port, port_spec.name.clone()),
+        };
     let targets =
-        build_egress_upstream_targets(entry, representative_host, backend_port, &port_spec.name);
+        build_egress_upstream_targets(entry, representative_host, backend_port, &backend_port_name);
 
     if targets.is_empty() {
         debug!(
@@ -14540,6 +14608,124 @@ mod tests {
             target_ports,
             vec![15432],
             "the upstream must dial the resolved targetPort, not the service port"
+        );
+    }
+
+    #[test]
+    fn egress_static_service_entry_honors_numeric_target_port_for_named_port() {
+        // A STATIC ServiceEntry with a NAMED port + numeric targetPort whose
+        // endpoints carry no per-endpoint port map for that name must still dial
+        // the numeric targetPort: the targetPort overrides the endpoint named-port
+        // map (without the fix the endpoint is dropped for lack of `ports[name]`).
+        let service_entries = vec![ServiceEntry {
+            name: "ext-db".to_string(),
+            namespace: "default".to_string(),
+            hosts: vec!["db.vendor.com".to_string()],
+            endpoints: vec![MeshEndpoint {
+                address: "10.9.9.9".to_string(),
+                ports: HashMap::new(),
+                labels: HashMap::new(),
+                network: None,
+            }],
+            resolution: Resolution::Static,
+            location: ServiceEntryLocation::MeshExternal,
+            ports: vec![ServicePort {
+                port: 5432,
+                protocol: AppProtocol::Postgres,
+                name: Some("tcp".to_string()),
+                target_port: Some(ServiceTargetPort::Number(15432)),
+            }],
+            export_to: Vec::new(),
+            workload_selector: None,
+        }];
+
+        let (_proxies, upstreams) = build_egress_proxies_and_upstreams(
+            &service_entries,
+            "default",
+            &std::collections::HashSet::new(),
+            true,
+        );
+
+        assert_eq!(
+            upstreams.len(),
+            1,
+            "one upstream for the static stream port"
+        );
+        let target_ports: Vec<u16> = upstreams[0].targets.iter().map(|t| t.port).collect();
+        assert_eq!(
+            target_ports,
+            vec![15432],
+            "numeric targetPort overrides the (absent) endpoint named-port map for static endpoints"
+        );
+    }
+
+    #[test]
+    fn service_discovery_upstream_rekeys_port_policy_to_numeric_target_port() {
+        // A mesh service-discovery upstream for a Service with port 80 ->
+        // targetPort 8080 resolves its targets to 8080 at runtime; a DR
+        // portLevelSettings keyed on 80 must be re-keyed to 8080 so dispatch
+        // (which keys overrides by the dial port) applies it (round-12 F2).
+        let mut upstream = destination_rule_test_upstream(
+            "reviews.default.svc.cluster.local",
+            "reviews.default.svc.cluster.local",
+        );
+        upstream.targets.clear(); // service-discovery resolves targets at runtime
+        upstream.service_discovery = Some(crate::config::types::ServiceDiscoveryConfig {
+            provider: crate::config::types::SdProvider::Mesh,
+            dns_sd: None,
+            kubernetes: None,
+            consul: None,
+            mesh: Some(crate::config::types::MeshSdConfig {
+                service_name: "reviews".to_string(),
+                namespace: Some("default".to_string()),
+                port: None,
+                poll_interval_seconds: 30,
+            }),
+            default_weight: 1,
+        });
+        let mut config = GatewayConfig {
+            upstreams: vec![upstream],
+            ..GatewayConfig::default()
+        };
+
+        let mut svc = http_mesh_service(
+            "reviews",
+            80,
+            "spiffe://cluster.local/ns/default/sa/reviews",
+        );
+        svc.ports[0].target_port = Some(ServiceTargetPort::Number(8080));
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            services: vec![svc],
+            destination_rules: vec![MeshDestinationRule {
+                name: "reviews".to_string(),
+                namespace: "default".to_string(),
+                host: "reviews.default.svc.cluster.local".to_string(),
+                traffic_policy: None,
+                port_level_settings: HashMap::from([(
+                    80u16,
+                    MeshTrafficPolicy {
+                        max_connections: Some(7),
+                        ..MeshTrafficPolicy::default()
+                    },
+                )]),
+                subsets: Vec::new(),
+            }],
+            ..MeshSlice::default()
+        };
+
+        apply_destination_rules(&mut config, &test_mesh_runtime_config(), &slice)
+            .expect("destination rules apply");
+
+        let upstream = &config.upstreams[0];
+        assert!(
+            upstream.port_overrides.contains_key(&8080),
+            "port-level policy must be re-keyed onto the dial port 8080, got {:?}",
+            upstream.port_overrides.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !upstream.port_overrides.contains_key(&80),
+            "policy must not stay under the service port 80"
         );
     }
 
