@@ -13468,6 +13468,45 @@ fn record_h2_pool_admission_failure(
     }
 }
 
+/// Content-Length 413 fast path, hoisted BEFORE backend admission on the HBONE
+/// and native-H3 dispatch branches. Those branches always dispatch (no reqwest
+/// fall-through), and their request-size check lives inside the backend dispatch
+/// function — i.e. after admission. With the adaptive limiter at capacity, an
+/// oversized upload would then be rejected as a concurrency 503 instead of the
+/// deterministic gateway 413, masking a client/gateway policy violation as
+/// upstream pressure. The reqwest/direct-H2 paths already run their size checks
+/// before admitting; this restores the same ordering. Returns the 413 dispatch
+/// result when the declared Content-Length exceeds the limit, else `None`.
+fn oversized_request_body_dispatch_reject(
+    state: &ProxyState,
+    method: &str,
+    headers: &HashMap<String, String>,
+    resolved_ip: Option<String>,
+) -> Option<BackendDispatchResult> {
+    if state.max_request_body_size_bytes > 0
+        && request_may_have_body(method, headers)
+        && let Some(content_length) = headers.get("content-length")
+        && let Ok(len) = content_length.parse::<usize>()
+        && len > state.max_request_body_size_bytes
+    {
+        return Some(backend_dispatch_response(
+            retry::BackendResponse {
+                status_code: 413,
+                body: ResponseBody::Buffered(
+                    r#"{"error":"Request body exceeds maximum size"}"#.as_bytes().to_vec(),
+                ),
+                headers: HashMap::new(),
+                connection_error: false,
+                backend_resolved_ip: resolved_ip,
+                error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
+            },
+            None,
+            None,
+        ));
+    }
+    None
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn proxy_to_backend(
     state: &ProxyState,
@@ -13564,6 +13603,13 @@ async fn proxy_to_backend(
         .map(|ip| ip.to_string());
 
     if dispatch_hbone {
+        // 413 on an oversized declared Content-Length BEFORE admission, so a
+        // capacity rejection cannot mask the size violation as a 503.
+        if let Some(reject) =
+            oversized_request_body_dispatch_reject(state, method, headers, resolved_ip.clone())
+        {
+            return reject;
+        }
         backend_admission_permits = match backend_dispatch::run_backend_admission_plugins(
             backend_admission_plugins,
             request_ctx,
@@ -13618,6 +13664,14 @@ async fn proxy_to_backend(
     // H3 pool. Without retry, the 502 propagates to the client and the
     // NEXT request uses reqwest.
     if dispatch_h3 {
+        // 413 on an oversized declared Content-Length BEFORE admission (same
+        // ordering as the reqwest/direct-H2 paths), so a capacity rejection
+        // cannot mask the size violation as a 503.
+        if let Some(reject) =
+            oversized_request_body_dispatch_reject(state, method, headers, resolved_ip.clone())
+        {
+            return reject;
+        }
         backend_admission_permits = match backend_dispatch::run_backend_admission_plugins(
             backend_admission_plugins,
             request_ctx,

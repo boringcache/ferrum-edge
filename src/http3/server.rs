@@ -2096,19 +2096,14 @@ async fn handle_h3_request(
             &state,
             start_time,
             plugin_execution_ns,
+            cb_target_key.as_deref(),
+            cb_is_half_open_probe,
         )
         .await?
         {
             Ok(permits) => permits,
-            Err(()) => {
-                release_h3_circuit_breaker_probe_on_admission_reject(
-                    &state,
-                    &proxy,
-                    cb_target_key.as_deref(),
-                    cb_is_half_open_probe,
-                );
-                return Ok(());
-            }
+            // Probe release happens inside the helper, before the reject write.
+            Err(()) => return Ok(()),
         };
 
         // Track connection for least-connections LB (after all pre-dispatch rejects)
@@ -2974,19 +2969,14 @@ async fn handle_h3_request(
         &state,
         start_time,
         plugin_execution_ns,
+        cb_target_key.as_deref(),
+        cb_is_half_open_probe,
     )
     .await?
     {
         Ok(permits) => permits,
-        Err(()) => {
-            release_h3_circuit_breaker_probe_on_admission_reject(
-                &state,
-                &proxy,
-                cb_target_key.as_deref(),
-                cb_is_half_open_probe,
-            );
-            return Ok(());
-        }
+        // Probe release happens inside the helper, before the reject write.
+        Err(()) => return Ok(()),
     };
 
     // Track connection for least-connections LB (after all pre-dispatch rejects).
@@ -3359,19 +3349,14 @@ async fn handle_h3_request(
                     &state,
                     start_time,
                     plugin_execution_ns,
+                    current_cb_target_key.as_deref(),
+                    cb_retry_probe_slot_available,
                 )
                 .await?
                 {
                     Ok(permits) => permits,
-                    Err(()) => {
-                        release_h3_circuit_breaker_probe_on_admission_reject(
-                            &state,
-                            &proxy,
-                            current_cb_target_key.as_deref(),
-                            cb_retry_probe_slot_available,
-                        );
-                        return Ok(());
-                    }
+                    // Probe release happens inside the helper, before the reject write.
+                    Err(()) => return Ok(()),
                 };
 
                 warn!(
@@ -3694,6 +3679,8 @@ async fn run_h3_backend_admission_or_send_reject(
     state: &ProxyState,
     start_time: std::time::Instant,
     plugin_execution_ns: u64,
+    cb_target_key: Option<&str>,
+    cb_is_half_open_probe: bool,
 ) -> Result<Result<Option<BackendAdmissionPermitSet>, ()>, anyhow::Error> {
     match crate::proxy::backend_dispatch::run_backend_admission_plugins(
         backend_admission_plugins,
@@ -3704,6 +3691,17 @@ async fn run_h3_backend_admission_or_send_reject(
     ) {
         Ok(permits) => Ok(Ok(permits)),
         Err(rejection) => {
+            // Release any reserved circuit-breaker HALF_OPEN probe BEFORE writing
+            // the reject body: the write below propagates errors with `?`, so if
+            // the H3 client resets mid-write this returns early. The caller frees
+            // the probe only on the `Ok(Err(()))` arm, so releasing here guarantees
+            // the slot is freed even when the reject write fails.
+            release_h3_circuit_breaker_probe_on_admission_reject(
+                state,
+                proxy,
+                cb_target_key,
+                cb_is_half_open_probe,
+            );
             let mut headers = rejection.headers;
             apply_after_proxy_hooks_to_rejection(plugins, ctx, rejection.status_code, &mut headers)
                 .await;

@@ -249,6 +249,9 @@ async fn run_cross_protocol_backend_admission_or_reject<S>(
     stream: &mut RequestStream<S, Bytes>,
     backend_start: Instant,
     bytes_sent: u64,
+    state: &ProxyState,
+    cb_target_key: Option<&str>,
+    cb_is_half_open_probe: bool,
 ) -> Result<Result<Option<BackendAdmissionPermitSet>, CrossProtocolOutcome>, anyhow::Error>
 where
     S: RecvStream + SendStream<Bytes>,
@@ -262,6 +265,16 @@ where
     ) {
         Ok(permits) => Ok(Ok(permits)),
         Err(rejection) => {
+            // Release any reserved CB HALF_OPEN probe BEFORE writing the reject:
+            // the writes below use `await?`, so an H3 client closing mid-write
+            // returns early. The callers release only on the `Err(outcome)` arm,
+            // so releasing here guarantees the slot is freed even on write error.
+            release_cross_protocol_circuit_breaker_probe_on_admission_reject(
+                state,
+                proxy,
+                cb_target_key,
+                cb_is_half_open_probe,
+            );
             let mut headers = rejection.headers;
             crate::proxy::apply_after_proxy_hooks_to_rejection(
                 plugins,
@@ -848,19 +861,15 @@ where
                             stream,
                             backend_start,
                             bytes_sent,
+                            state,
+                            current_cb_target_key.as_deref(),
+                            cb_retry_probe_slot_available,
                         )
                         .await?
                         {
                             Ok(permits) => permits,
-                            Err(outcome) => {
-                                release_cross_protocol_circuit_breaker_probe_on_admission_reject(
-                                    state,
-                                    proxy,
-                                    current_cb_target_key.as_deref(),
-                                    cb_retry_probe_slot_available,
-                                );
-                                return Ok(outcome);
-                            }
+                            // Probe release happens inside the helper, before the reject write.
+                            Err(outcome) => return Ok(outcome),
                         };
                     record_cross_protocol_connection_start(
                         upstream_balancer,
@@ -1084,19 +1093,15 @@ where
                         stream,
                         backend_start,
                         0,
+                        state,
+                        current_cb_target_key.as_deref(),
+                        cb_retry_probe_slot_available,
                     )
                     .await?
                     {
                         Ok(permits) => permits,
-                        Err(outcome) => {
-                            release_cross_protocol_circuit_breaker_probe_on_admission_reject(
-                                state,
-                                proxy,
-                                current_cb_target_key.as_deref(),
-                                cb_retry_probe_slot_available,
-                            );
-                            return Ok(outcome);
-                        }
+                        // Probe release happens inside the helper, before the reject write.
+                        Err(outcome) => return Ok(outcome),
                     };
                 record_cross_protocol_connection_start(
                     upstream_balancer,
@@ -1982,19 +1987,15 @@ where
         stream,
         backend_start,
         bytes_sent,
+        state,
+        current_cb_target_key.as_deref(),
+        cb_retry_probe_slot_available,
     )
     .await?
     {
         Ok(permits) => permits,
-        Err(outcome) => {
-            release_cross_protocol_circuit_breaker_probe_on_admission_reject(
-                state,
-                proxy,
-                current_cb_target_key.as_deref(),
-                cb_retry_probe_slot_available,
-            );
-            return Ok(outcome);
-        }
+        // Probe release happens inside the helper, before the reject write.
+        Err(outcome) => return Ok(outcome),
     };
     record_cross_protocol_connection_start(upstream_balancer, current_target.as_deref());
     // `hmap` already contains the complete backend-bound header set
@@ -2117,19 +2118,15 @@ where
                 stream,
                 backend_start,
                 bytes_sent,
+                state,
+                current_cb_target_key.as_deref(),
+                cb_retry_probe_slot_available,
             )
             .await?
             {
                 Ok(permits) => permits,
-                Err(outcome) => {
-                    release_cross_protocol_circuit_breaker_probe_on_admission_reject(
-                        state,
-                        proxy,
-                        current_cb_target_key.as_deref(),
-                        cb_retry_probe_slot_available,
-                    );
-                    return Ok(outcome);
-                }
+                // Probe release happens inside the helper, before the reject write.
+                Err(outcome) => return Ok(outcome),
             };
             record_cross_protocol_connection_start(upstream_balancer, current_target.as_deref());
 
