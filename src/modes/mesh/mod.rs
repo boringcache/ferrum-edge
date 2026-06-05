@@ -1460,25 +1460,35 @@ fn materialize_sidecar_inbound_proxies(
                     )
                 })
                 .collect();
-            // Host-only routing can't disambiguate multiple service ports (the
-            // router strips the request port, so same-host/same-path proxies
-            // collide and fail `validate_unique_listen_paths`). Until original-
-            // destination routing exists, materialize only the first HTTP-family
-            // service port and warn the rest are not yet routable.
-            let Some(service_port) = http_ports.first() else {
-                continue;
-            };
+            // Host-only routing can't disambiguate multiple service ports: the
+            // router strips the request port from `Host`/`:authority`, so a
+            // single `/` route on the shared service host matches traffic to
+            // EVERY service port and would silently forward it to the FIRST
+            // port's backend (e.g. `Host: reviews:90` -> the port-80 backend).
+            // That is a cross-port misroute, not the clean "unsupported"
+            // rejection callers expect. Until original-destination routing
+            // (Stage 1) can disambiguate by the captured port, fail closed:
+            // materialize NOTHING for a service exposing more than one
+            // HTTP-family port, and warn. Operators who need a specific port
+            // routed sooner can define an explicit proxy (which this
+            // materializer yields to). Single-HTTP-port services — the common
+            // case — are unaffected.
             if http_ports.len() > 1 {
                 warn!(
                     service = %service.name,
                     namespace = %service.namespace,
                     http_ports = http_ports.len(),
-                    routed_port = service_port.port,
                     "Local service exposes multiple HTTP-family ports; host-only routing cannot \
                      disambiguate them yet (original-destination routing lands in a later stage). \
-                     Materializing only the first HTTP port; the rest are not yet routable."
+                     Skipping inbound materialization for this service to avoid forwarding one \
+                     port's traffic to another port's backend; define an explicit proxy to route \
+                     a specific port."
                 );
+                continue;
             }
+            let Some(service_port) = http_ports.first() else {
+                continue;
+            };
             // Backend = the workload's app (container) port this service port
             // forwards to. A declared `targetPort` is Kubernetes' AUTHORITATIVE
             // service-port→container-port binding, so honor it exclusively — no
@@ -2723,8 +2733,18 @@ fn build_stream_egress_for_entry(
         }
     };
 
+    // Honor a numeric ServiceEntry `targetPort` for the backend dial port while
+    // the listener, proxy/upstream IDs, and port-dedup stay keyed on the
+    // service `port` — captured outbound traffic arrives on the service port and
+    // the upstream forwards to the backend port. Mirrors the HTTP egress branch
+    // (`build_http_egress_for_entry`); without it a TCP ServiceEntry like
+    // `number: 5432, targetPort: 15432` would bind 5432 but dial 5432 instead of
+    // 15432. The static-endpoint path inside `build_egress_upstream_targets`
+    // still uses each endpoint's own (named) port map.
+    let backend_port =
+        resolve_target_port(port_spec.target_port.as_ref(), &[]).unwrap_or(port_spec.port);
     let targets =
-        build_egress_upstream_targets(entry, representative_host, port_spec.port, &port_spec.name);
+        build_egress_upstream_targets(entry, representative_host, backend_port, &port_spec.name);
 
     if targets.is_empty() {
         debug!(
@@ -7228,10 +7248,13 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_inbound_proxies_emit_one_route_for_multi_port_service() {
-        // Host-only routing can't disambiguate ports yet, so a service exposing
-        // multiple HTTP ports must materialize exactly one (non-colliding) route,
-        // not several same-host routes that would fail unique-listen-path checks.
+    fn sidecar_inbound_proxies_skip_multi_http_port_service() {
+        // Host-only routing can't disambiguate ports yet (the router strips the
+        // request port), so a single `/` route on the shared host would forward
+        // EVERY port's traffic to the first port's backend — a cross-port
+        // misroute. Fail closed: a service exposing more than one HTTP-family
+        // port materializes NO inbound route until original-destination routing
+        // lands. Operators can define an explicit proxy for a specific port.
         let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
         let runtime = MeshRuntimeConfig {
             workload_spiffe_id: Some(spiffe.to_string()),
@@ -7275,10 +7298,10 @@ mod tests {
             .filter(|p| p.id.starts_with("__mesh-inbound-"))
             .map(|p| p.id.as_str())
             .collect();
-        assert_eq!(
-            inbound,
-            vec!["__mesh-inbound-default-reviews-80"],
-            "a multi-port service must materialize exactly one (first HTTP) route"
+        assert!(
+            inbound.is_empty(),
+            "a service with >1 HTTP-family port must materialize no inbound route \
+             (fail closed against cross-port misrouting), got {inbound:?}"
         );
     }
 
@@ -14464,6 +14487,60 @@ mod tests {
         assert_eq!(upstreams.len(), 2);
         assert!(proxies.iter().any(|p| p.listen_port == Some(5432)));
         assert!(proxies.iter().any(|p| p.listen_port == Some(5433)));
+    }
+
+    #[test]
+    fn egress_stream_service_entry_honors_target_port_for_backend_dial() {
+        // A stream (TCP-family) ServiceEntry with `targetPort` must listen on the
+        // service `port` (where captured outbound traffic arrives) but dial the
+        // backend on the resolved `targetPort` — mirroring the HTTP egress path.
+        // Without this the listener and dial port stay pinned together and a
+        // `number: 5432, targetPort: 15432` entry would dial 5432, not 15432.
+        let service_entries = vec![ServiceEntry {
+            name: "db-with-target-port".to_string(),
+            namespace: "default".to_string(),
+            hosts: vec!["db.vendor.com".to_string()],
+            endpoints: Vec::new(),
+            resolution: Resolution::Dns,
+            location: ServiceEntryLocation::MeshExternal,
+            ports: vec![ServicePort {
+                port: 5432,
+                protocol: AppProtocol::Postgres,
+                name: Some("primary".to_string()),
+                target_port: Some(ServiceTargetPort::Number(15432)),
+            }],
+            export_to: Vec::new(),
+            workload_selector: None,
+        }];
+
+        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+            &service_entries,
+            "default",
+            &std::collections::HashSet::new(),
+            true,
+        );
+
+        let stream_proxy = proxies
+            .iter()
+            .find(|p| p.listen_port == Some(5432))
+            .expect("stream proxy listens on the service port, not the targetPort");
+        assert_eq!(
+            stream_proxy.backend_scheme,
+            Some(BackendScheme::Tcp),
+            "postgres is a stream-family protocol"
+        );
+
+        assert_eq!(
+            upstreams.len(),
+            1,
+            "one upstream for the single stream port"
+        );
+        let target_ports: Vec<u16> = upstreams[0].targets.iter().map(|t| t.port).collect();
+        assert_eq!(
+            target_ports,
+            vec![15432],
+            "the upstream must dial the resolved targetPort, not the service port"
+        );
     }
 
     #[test]
