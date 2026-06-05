@@ -154,6 +154,27 @@ pub enum ServiceTargetPort {
     Name(String),
 }
 
+/// Resolve a Service port's `targetPort` to a backend (container) port when it
+/// yields a usable one: a non-zero numeric targetPort, or a named targetPort
+/// that matches one of `workload_ports`. Returns `None` when no targetPort is
+/// declared, a numeric one is zero, or a named one doesn't resolve — leaving the
+/// caller to apply its own fallback (each dialing path differs: skip, the
+/// service port, the workload's first port, ...). Shared so every path that
+/// dials a workload/endpoint address honors `targetPort` consistently.
+pub(crate) fn resolve_target_port(
+    target_port: Option<&ServiceTargetPort>,
+    workload_ports: &[WorkloadPort],
+) -> Option<u16> {
+    match target_port {
+        Some(ServiceTargetPort::Number(n)) if *n != 0 => Some(*n),
+        Some(ServiceTargetPort::Name(name)) => workload_ports
+            .iter()
+            .find(|wp| wp.name.as_deref() == Some(name.as_str()))
+            .map(|wp| wp.port),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct WorkloadRef {
     pub spiffe_id: SpiffeId,

@@ -48,7 +48,7 @@ use crate::modes::mesh::config::{
     AppProtocol, EastWestGateway, MeshConfig, MeshDestinationRule, MeshJwtRule, MeshLoadBalancer,
     MeshLocalityLbSetting, MeshOutlierDetection, MeshRequestAuthentication, MeshSimpleLb,
     MeshTelemetryConfig, MeshTrafficPolicy, MeshTrafficPolicyTls, MtlsMode, PolicyScope,
-    Resolution, ServiceEntry, ServiceEntryLocation, ServiceTargetPort,
+    Resolution, ServiceEntry, ServiceEntryLocation, ServiceTargetPort, resolve_target_port,
     service_entry_exported_to_namespace,
 };
 use crate::modes::mesh::config_consumer::native_client::NativeMeshClientConfig;
@@ -1216,14 +1216,16 @@ fn build_east_west_service_targets(
             continue;
         }
 
-        // Use the first service port as the target port. If the service has no
-        // ports, fall back to the workload's first port.
-        let target_port = service
-            .ports
-            .first()
-            .map(|p| p.port)
-            .or_else(|| workload.ports.first().map(|p| p.port))
-            .unwrap_or(80);
+        // Backend (container) port for this workload address: honor the Service
+        // `targetPort` of the first service port (Kubernetes' authoritative
+        // service-port→container-port binding), else the service port itself,
+        // else the workload's first port.
+        let target_port = match service.ports.first() {
+            Some(sp) => {
+                resolve_target_port(sp.target_port.as_ref(), &workload.ports).unwrap_or(sp.port)
+            }
+            None => workload.ports.first().map(|p| p.port).unwrap_or(80),
+        };
 
         for address in &workload.addresses {
             targets.push(UpstreamTarget {
@@ -2615,8 +2617,13 @@ fn build_http_egress_for_entry(
         return;
     }
 
+    // Honor a numeric ServiceEntry `targetPort` for the backend (the proxy/
+    // upstream IDs below stay keyed on the service `port`). The named-endpoint
+    // path inside still uses each endpoint's own port map.
+    let backend_port =
+        resolve_target_port(port_spec.target_port.as_ref(), &[]).unwrap_or(port_spec.port);
     for host in proxy_hosts {
-        let targets = build_egress_upstream_targets(entry, host, port_spec.port, &port_spec.name);
+        let targets = build_egress_upstream_targets(entry, host, backend_port, &port_spec.name);
 
         if targets.is_empty() {
             debug!(
@@ -11062,6 +11069,36 @@ mod tests {
     }
 
     #[test]
+    fn east_west_service_targets_honor_target_port() {
+        // Service port 80 with targetPort 8080; the pod listens on container port
+        // 8080. East-west targets dial workload addresses, so they must use 8080.
+        let spiffe = SpiffeId::new("spiffe://cluster.local/ns/default/sa/reviews").unwrap();
+        let mut wl = workload("reviews", "reviews");
+        wl.spiffe_id = spiffe.clone();
+        wl.addresses = vec!["10.0.0.5".to_string()];
+        let service = MeshService {
+            name: "reviews".to_string(),
+            namespace: "default".to_string(),
+            ports: vec![ServicePort {
+                port: 80,
+                protocol: AppProtocol::Http,
+                name: Some("http".to_string()),
+                target_port: Some(ServiceTargetPort::Number(8080)),
+            }],
+            workloads: vec![crate::modes::mesh::config::WorkloadRef { spiffe_id: spiffe }],
+            protocol_overrides: HashMap::new(),
+        };
+
+        let targets = build_east_west_service_targets(&service, &[wl], None);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].host, "10.0.0.5");
+        assert_eq!(
+            targets[0].port, 8080,
+            "east-west must dial the container port (targetPort), not the service port"
+        );
+    }
+
+    #[test]
     fn east_west_service_targets_preserve_explicit_refs_with_stale_service_metadata() {
         let spiffe = SpiffeId::new("spiffe://cluster.local/ns/default/sa/reviews").unwrap();
         let mut legacy = workload("legacy-reviews", "legacy-reviews");
@@ -13750,6 +13787,34 @@ mod tests {
         assert_eq!(secondary.targets.len(), 1);
         assert_eq!(secondary.targets[0].host, "secondary.external.com");
         assert_eq!(secondary.targets[0].port, 443);
+    }
+
+    #[test]
+    fn egress_dns_resolution_honors_service_entry_target_port() {
+        // ServiceEntry port 443 with targetPort 8443 (DNS resolution): the egress
+        // upstream target must dial the backend port 8443, not the service port.
+        let mut entry = test_external_service_entry(
+            "dns-svc",
+            vec!["primary.external.com".to_string()],
+            443,
+            AppProtocol::Tls,
+        );
+        entry.ports[0].target_port = Some(ServiceTargetPort::Number(8443));
+
+        let (_, upstreams) = build_egress_proxies_and_upstreams(
+            &[entry],
+            "default",
+            &std::collections::HashSet::new(),
+            true,
+        );
+
+        assert_eq!(upstreams.len(), 1);
+        assert_eq!(upstreams[0].targets.len(), 1);
+        assert_eq!(upstreams[0].targets[0].host, "primary.external.com");
+        assert_eq!(
+            upstreams[0].targets[0].port, 8443,
+            "egress must dial the ServiceEntry targetPort, not the service port"
+        );
     }
 
     #[test]

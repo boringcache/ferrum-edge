@@ -6,7 +6,9 @@
 //! the request hot path on the existing load-balancer snapshot.
 
 use crate::config::types::UpstreamTarget;
-use crate::modes::mesh::config::{AppProtocol, MeshService, Workload};
+use crate::modes::mesh::config::{
+    AppProtocol, MeshService, ServiceTargetPort, Workload, resolve_target_port,
+};
 use crate::request_epoch::RequestEpochStore;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -46,6 +48,7 @@ impl MeshServiceDiscoverer {
                     port: requested,
                     name: None,
                     protocol: AppProtocol::Unknown,
+                    target_port: None,
                 })
             } else {
                 service
@@ -56,6 +59,7 @@ impl MeshServiceDiscoverer {
                         port: port.port,
                         name: port.name.clone(),
                         protocol: port.protocol,
+                        target_port: port.target_port.clone(),
                     })
             };
         }
@@ -64,6 +68,7 @@ impl MeshServiceDiscoverer {
             port: port.port,
             name: port.name.clone(),
             protocol: port.protocol,
+            target_port: port.target_port.clone(),
         })
     }
 
@@ -109,6 +114,20 @@ impl MeshServiceDiscoverer {
                 return Some(selected.clone());
             }
 
+            // Honor the Service `targetPort` first — Kubernetes' authoritative
+            // service-port→container-port binding — so the workload-address
+            // target dials the container port it declares, not the Service port.
+            if let Some(backend) =
+                resolve_target_port(selected.target_port.as_ref(), &workload.ports)
+            {
+                return Some(SelectedPort {
+                    port: backend,
+                    name: selected.name.clone(),
+                    protocol: selected.protocol,
+                    target_port: None,
+                });
+            }
+
             if let Some(workload_port) = workload
                 .ports
                 .iter()
@@ -119,6 +138,7 @@ impl MeshServiceDiscoverer {
                         port: workload_port.port,
                         name: workload_port.name.clone(),
                         protocol: workload_port.protocol,
+                        target_port: None,
                     });
                 }
                 return Some(selected.clone());
@@ -130,6 +150,7 @@ impl MeshServiceDiscoverer {
             port: port.port,
             name: port.name.clone(),
             protocol: port.protocol,
+            target_port: None,
         })
     }
 
@@ -248,6 +269,9 @@ struct SelectedPort {
     port: u16,
     name: Option<String>,
     protocol: AppProtocol,
+    /// The Service port's `targetPort`, carried so workload-address targets dial
+    /// the container port it declares rather than the Service port.
+    target_port: Option<ServiceTargetPort>,
 }
 
 fn protocol_tag(protocol: AppProtocol) -> &'static str {
@@ -389,6 +413,36 @@ mod tests {
         assert_eq!(
             targets[0].tags.get("mesh.namespace").map(String::as_str),
             Some("ferrum")
+        );
+    }
+
+    #[tokio::test]
+    async fn honors_service_target_port_for_workload_address() {
+        // Service port 80 with targetPort 8080; the pod listens on container
+        // port 8080. The discovered target must dial 8080 (the container port),
+        // not 80 (the service port).
+        let api_id = "spiffe://cluster.local/ns/ferrum/sa/api";
+        let mut svc = service("api", vec![api_id], vec![80]);
+        svc.ports[0].target_port = Some(ServiceTargetPort::Number(8080));
+        let mesh = MeshConfig {
+            services: vec![svc],
+            workloads: vec![workload(api_id, "api", vec!["10.0.0.1"], vec![8080])],
+            ..MeshConfig::default()
+        };
+        let discoverer = MeshServiceDiscoverer::new(
+            epoch_store(Some(mesh)),
+            "api".to_string(),
+            default_namespace(),
+            None,
+            1,
+        );
+
+        let targets = discoverer.discover().await.expect("discover succeeds");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].host, "10.0.0.1");
+        assert_eq!(
+            targets[0].port, 8080,
+            "must dial the container port (targetPort), not the service port"
         );
     }
 
