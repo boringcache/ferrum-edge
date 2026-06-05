@@ -10360,6 +10360,16 @@ async fn handle_proxy_request_inner(
             ) {
                 Ok(permits) => permits,
                 Err(rejection) => {
+                    // The initial CB check may have admitted this request as a
+                    // HALF_OPEN probe; an adaptive-concurrency reject here must
+                    // release that probe slot so the breaker can admit the next
+                    // probe (the retry path and HTTP/WS/H3 paths do the same).
+                    release_circuit_breaker_probe_on_admission_reject(
+                        &state,
+                        &proxy,
+                        cb_target_key.as_deref(),
+                        grpc_cb_probe_slot,
+                    );
                     return Ok(handle_backend_admission_rejection(
                         rejection,
                         &plugins,
@@ -10469,6 +10479,14 @@ async fn handle_proxy_request_inner(
                 ) {
                     Ok(permits) => permits,
                     Err(rejection) => {
+                        // Release the CB HALF_OPEN probe slot before rejecting, as on
+                        // the other admission paths (see the split-path branch above).
+                        release_circuit_breaker_probe_on_admission_reject(
+                            &state,
+                            &proxy,
+                            cb_target_key.as_deref(),
+                            grpc_cb_probe_slot,
+                        );
                         return Ok(handle_backend_admission_rejection(
                             rejection,
                             &plugins,
@@ -10519,6 +10537,14 @@ async fn handle_proxy_request_inner(
                             ) {
                                 Ok(permits) => permits,
                                 Err(rejection) => {
+                                    // Release the CB HALF_OPEN probe slot before
+                                    // rejecting, as on the other admission paths.
+                                    release_circuit_breaker_probe_on_admission_reject(
+                                        &state,
+                                        &proxy,
+                                        cb_target_key.as_deref(),
+                                        grpc_cb_probe_slot,
+                                    );
                                     return Ok(handle_backend_admission_rejection(
                                         rejection,
                                         &plugins,
@@ -12492,7 +12518,22 @@ async fn handle_proxy_request_inner(
                     reqwest_backend_guard,
                     lb_connection_guard,
                 ));
-                crate::proxy::body::inspected_streaming_body(rx)
+                // Carry the adaptive-concurrency permits on the inspected body, just
+                // like the non-inspect streaming path below: the in-flight slot then
+                // stays counted for the full inspected stream and the backend outcome
+                // is recorded when the body completes (EOF / policy cut / error /
+                // client disconnect) via the same deferred machinery, rather than
+                // being released early at header time.
+                let inspected = crate::proxy::body::inspected_streaming_body(rx);
+                if let Some(permits) = backend_admission_permits.take() {
+                    inspected.with_deferred_backend_admission_outcome(
+                        permits,
+                        backend_admission_response_status,
+                        backend_admission_elapsed,
+                    )
+                } else {
+                    inspected
+                }
             } else {
                 let cl = response_headers
                     .get("content-length")
@@ -12531,11 +12572,8 @@ async fn handle_proxy_request_inner(
                 // Deferred backend-admission outcome (adaptive_concurrency): thread the
                 // permits into the streaming body so the limiter's latency/health
                 // signal fires and the in-flight slot is released at body completion.
-                // The inspect branch above does NOT thread permits into its detached
-                // inspection task, so there the slot is released when this function
-                // returns (via the permit's Drop — fail-safe, never leaks) and the
-                // adaptive sample is skipped. Acceptable on that rare
-                // inspect∩adaptive-concurrency overlap; the limit can never wedge.
+                // The inspect branch above attaches the same permits to its inspected
+                // body, so both streaming paths count the slot for the full stream.
                 if let Some(permits) = backend_admission_permits.take() {
                     base = base.with_deferred_backend_admission_outcome(
                         permits,

@@ -99,9 +99,10 @@ impl AdaptiveConcurrencyState {
 
 pub struct AdaptiveConcurrencyLimiter {
     inner: DashMap<AdaptiveConcurrencyKey, Arc<AdaptiveConcurrencyState>>,
-    /// Per-proxy scope cache for `proxy`/`upstream` scoping, keyed by `proxy.id`
-    /// (unique per proxy). Bounded by the number of proxies using this plugin
+    /// Per-proxy scope cache for `proxy` scoping, keyed by `proxy.id` (unique and
+    /// stable per proxy). Bounded by the number of proxies using this plugin
     /// instance and rebuilt with the plugin on reload, so it needs no eviction.
+    /// `upstream` scoping is intentionally not cached here — see `resolve_scope`.
     scope_cache: DashMap<Box<str>, Arc<str>>,
     /// Shared scope for `key_by = backend_target` (a single constant string).
     backend_scope: Arc<str>,
@@ -113,9 +114,9 @@ impl AdaptiveConcurrencyLimiter {
         Self {
             inner: DashMap::with_shard_amount(shards),
             // `scope_cache.get()` runs on the backend-dispatch hot path for
-            // proxy/upstream scoping, so honor the operator's configured shard
-            // count (pool_shard_amount) like `inner` rather than DashMap's
-            // default, keeping per-shard lock contention bounded under load.
+            // proxy scoping, so honor the operator's configured shard count
+            // (pool_shard_amount) like `inner` rather than DashMap's default,
+            // keeping per-shard lock contention bounded under load.
             scope_cache: DashMap::with_shard_amount(shards),
             backend_scope: Arc::from("backend"),
             tracked_keys: AtomicUsize::new(0),
@@ -224,21 +225,31 @@ impl AdaptiveConcurrencyLimiter {
             .map(|entry| AdaptiveConcurrencySnapshot::from_state(key, entry.value()))
     }
 
-    /// Resolve the scope component of the key for `proxy` under `key_by`,
-    /// reusing a cached `Arc<str>` so the hot path never rebuilds it. `backend`
-    /// scoping returns one shared constant; `proxy`/`upstream` scoping caches per
-    /// `proxy.id` (which uniquely identifies the proxy, hence its scope).
+    /// Resolve the scope component of the key for `proxy` under `key_by`.
+    /// `backend` scoping returns one shared constant. `proxy` scoping caches a
+    /// reused `Arc<str>` per `proxy.id` — which uniquely and stably identifies
+    /// the proxy, so the cached `proxy:{ns}:{id}` scope never goes stale.
+    /// `upstream` scoping is computed per call: its `upstream:{ns}:{upstream_id}`
+    /// depends on the proxy's upstream, which can change across a reload while a
+    /// shared (global/proxy_group) limiter instance — and this cache — is
+    /// preserved, so caching it by `proxy.id` would serve a stale upstream scope
+    /// (and keying by `upstream_id` alone could collide across namespaces). The
+    /// string is short, and the admission path already allocates the full key in
+    /// `build_key`.
     fn resolve_scope(&self, proxy: &Proxy, key_by: AdaptiveConcurrencyKeyBy) -> Arc<str> {
-        if matches!(key_by, AdaptiveConcurrencyKeyBy::Backend) {
-            return Arc::clone(&self.backend_scope);
+        match key_by {
+            AdaptiveConcurrencyKeyBy::Backend => Arc::clone(&self.backend_scope),
+            AdaptiveConcurrencyKeyBy::Upstream => Arc::from(compute_scope_string(proxy, key_by)),
+            AdaptiveConcurrencyKeyBy::Proxy => {
+                if let Some(cached) = self.scope_cache.get(proxy.id.as_str()) {
+                    return Arc::clone(cached.value());
+                }
+                let scope: Arc<str> = Arc::from(compute_scope_string(proxy, key_by));
+                self.scope_cache
+                    .insert(proxy.id.as_str().into(), Arc::clone(&scope));
+                scope
+            }
         }
-        if let Some(cached) = self.scope_cache.get(proxy.id.as_str()) {
-            return Arc::clone(cached.value());
-        }
-        let scope: Arc<str> = Arc::from(compute_scope_string(proxy, key_by));
-        self.scope_cache
-            .insert(proxy.id.as_str().into(), Arc::clone(&scope));
-        scope
     }
 }
 
