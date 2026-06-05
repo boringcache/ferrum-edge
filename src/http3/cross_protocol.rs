@@ -1081,6 +1081,27 @@ where
                 )
             }
             None => {
+                // 413 on an oversized declared Content-Length BEFORE admission, so a
+                // saturated limiter cannot mask the size violation as a 503. The
+                // streaming reader below enforces the limit mid-body (recording the
+                // admission outcome as a client-side overflow there), but admission
+                // runs before the first read — mirror the reqwest/direct-H2/H3/HBONE
+                // ordering so an oversized H3 upload still gets the local 413. No
+                // permits exist yet and no backend was dialed, so nothing to record.
+                if state.max_request_body_size_bytes > 0
+                    && let Some(content_length) = proxy_headers.get("content-length")
+                    && let Ok(len) = content_length.parse::<usize>()
+                    && len > state.max_request_body_size_bytes
+                {
+                    return write_error(
+                        stream,
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        r#"{"error":"Request body exceeds maximum size"}"#,
+                        backend_start,
+                        0,
+                    )
+                    .await;
+                }
                 let backend_admission_start = Instant::now();
                 let mut backend_admission_permits =
                     match run_cross_protocol_backend_admission_or_reject(
