@@ -629,6 +629,25 @@ impl Drop for ProxyBody {
             deferred_admission_error_class = Some(ErrorClass::ClientDisconnect);
             deferred_admission_client_disconnected = true;
         }
+        // A never-polled *streaming* body is ambiguous between a legitimate empty
+        // response (HEAD / 204 / zero-length, which the logger above optimistically
+        // counts as success) and a client that dropped immediately after headers
+        // before hyper polled a single frame. The adaptive limiter must not train
+        // on that ambiguity as healthy backend latency — and so grow the limit —
+        // so when the outcome would otherwise be recorded as success, ignore it
+        // like a client disconnect. A `Full` body that already holds the complete
+        // response is a real success and is intentionally left untouched.
+        if deferred_admission_error_class.is_none()
+            && !deferred_admission_client_disconnected
+            && !self.polled.load(Ordering::Relaxed)
+            && matches!(
+                self.kind,
+                ProxyBodyKind::Stream(_) | ProxyBodyKind::Tracked(_)
+            )
+        {
+            deferred_admission_error_class = Some(ErrorClass::ClientDisconnect);
+            deferred_admission_client_disconnected = true;
+        }
         self.record_deferred_backend_admission(
             deferred_admission_error_class,
             deferred_admission_client_disconnected,

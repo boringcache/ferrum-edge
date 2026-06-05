@@ -1186,6 +1186,36 @@ pub(crate) fn http_reject_status_to_grpc_status(status: StatusCode) -> u32 {
     }
 }
 
+/// Map a gRPC status code to the closest HTTP status — the reverse of
+/// [`http_reject_status_to_grpc_status`]. Used to feed the adaptive-concurrency
+/// limiter a backend-health signal for gRPC responses whose failure rides in the
+/// `grpc-status` trailer under HTTP 200: server-side failures (UNAVAILABLE,
+/// INTERNAL, DEADLINE_EXCEEDED, UNKNOWN, DATA_LOSS) map to 5xx so the limiter
+/// shrinks, while client-side statuses map to 4xx and stay healthy. Consistent
+/// with how the limiter already treats any HTTP 5xx as a backend fault.
+pub(crate) fn grpc_status_to_http_status(grpc_status: u32) -> u16 {
+    match grpc_status {
+        0 => 200,  // OK
+        1 => 499,  // CANCELLED (client closed request)
+        2 => 500,  // UNKNOWN
+        3 => 400,  // INVALID_ARGUMENT
+        4 => 504,  // DEADLINE_EXCEEDED
+        5 => 404,  // NOT_FOUND
+        6 => 409,  // ALREADY_EXISTS
+        7 => 403,  // PERMISSION_DENIED
+        8 => 429,  // RESOURCE_EXHAUSTED
+        9 => 400,  // FAILED_PRECONDITION
+        10 => 409, // ABORTED
+        11 => 400, // OUT_OF_RANGE
+        12 => 501, // UNIMPLEMENTED
+        13 => 500, // INTERNAL
+        14 => 503, // UNAVAILABLE
+        15 => 500, // DATA_LOSS
+        16 => 401, // UNAUTHENTICATED
+        _ => 500,  // unknown code — treat as a server error
+    }
+}
+
 /// HTTP/3 admission rejects use `425 Too Early` for 0-RTT policy failures.
 /// gRPC clients should see that transport retry signal as UNAVAILABLE.
 pub(crate) fn h3_http_reject_status_to_grpc_status(status: StatusCode) -> u32 {

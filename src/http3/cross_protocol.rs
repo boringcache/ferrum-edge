@@ -1087,12 +1087,21 @@ where
                 // admission outcome as a client-side overflow there), but admission
                 // runs before the first read — mirror the reqwest/direct-H2/H3/HBONE
                 // ordering so an oversized H3 upload still gets the local 413. No
-                // permits exist yet and no backend was dialed, so nothing to record.
+                // admission permits exist yet, but the initial circuit-breaker check
+                // may have reserved a HALF_OPEN probe, so neutralize it here (the
+                // reader-loop 413 below does the same) or one oversized body wedges
+                // the breaker's half-open slot.
                 if state.max_request_body_size_bytes > 0
                     && let Some(content_length) = proxy_headers.get("content-length")
                     && let Ok(len) = content_length.parse::<usize>()
                     && len > state.max_request_body_size_bytes
                 {
+                    release_cross_protocol_circuit_breaker_probe_on_admission_reject(
+                        state,
+                        proxy,
+                        current_cb_target_key.as_deref(),
+                        cb_retry_probe_slot_available,
+                    );
                     return write_error(
                         stream,
                         StatusCode::PAYLOAD_TOO_LARGE,

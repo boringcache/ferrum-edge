@@ -11232,8 +11232,24 @@ async fn handle_proxy_request_inner(
                 let mut response_headers: HashMap<String, String> = grpc_resp.headers;
                 let mut response_body = grpc_resp.body;
                 if let Some(permits) = backend_admission_permits.take() {
+                    // gRPC application failures ride in the `grpc-status` trailer
+                    // (or header, for trailers-only) under HTTP 200, so the HTTP
+                    // status alone mislabels an UNAVAILABLE/INTERNAL backend as a
+                    // healthy success. Map the effective non-OK gRPC status to HTTP
+                    // so a server-side failure surfaces as 5xx and shrinks the limit,
+                    // while client-side statuses stay <500 (healthy). `grpc_resp`
+                    // trailers are still intact here — drained into `response_headers`
+                    // below.
+                    let admission_status = grpc_resp
+                        .trailers
+                        .get("grpc-status")
+                        .or_else(|| response_headers.get("grpc-status"))
+                        .and_then(|s| s.trim().parse::<u32>().ok())
+                        .filter(|&code| code != 0)
+                        .map(grpc_proxy::grpc_status_to_http_status)
+                        .unwrap_or(response_status);
                     permits.record_backend_outcome(BackendAdmissionOutcome {
-                        response_status,
+                        response_status: admission_status,
                         connection_error: false,
                         error_class: None,
                         backend_elapsed: grpc_backend_admission_started_at.elapsed(),
