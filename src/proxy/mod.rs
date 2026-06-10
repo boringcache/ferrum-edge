@@ -40,6 +40,7 @@ pub mod hbone_pool;
 mod hbone_proxy;
 pub mod headers;
 pub mod http2_pool;
+pub mod mesh_mtls_pool;
 pub mod netns_capture;
 pub mod sni;
 pub mod stream_error;
@@ -255,6 +256,8 @@ struct HboneProbeTarget<'a> {
     host: &'a str,
     port: u16,
     hbone_port: u16,
+    /// Pinned destination identity for the probe handshake (mirrors dispatch).
+    expected_peer: Option<&'a crate::identity::SpiffeId>,
     previous_hbone: Option<ProtocolSupport>,
 }
 
@@ -376,10 +379,10 @@ fn config_empty_ignoring_gateway_managed_plugins(config: &GatewayConfig) -> bool
 }
 
 fn gateway_hbone_mtls_observed(
-    dispatch_hbone: bool,
+    dispatch_mesh_transport: bool,
     error_class: Option<retry::ErrorClass>,
 ) -> bool {
-    dispatch_hbone
+    dispatch_mesh_transport
         && !matches!(
             error_class,
             Some(
@@ -399,13 +402,19 @@ fn gateway_hbone_mtls_observed(
         )
 }
 
-fn annotate_gateway_hbone_metadata(
+/// Stamp mesh transport metadata for an outbound mesh-mTLS-secured dispatch.
+/// `transport` is `Some("hbone")` for Ambient HBONE and `Some("mtls")` for
+/// Sidecar SVID-mTLS; `None` (non-mesh dispatch) stamps nothing.
+fn annotate_gateway_mesh_metadata(
     ctx: &mut RequestContext,
     target: Option<&UpstreamTarget>,
-    dispatch_hbone: bool,
+    transport: Option<&'static str>,
     error_class: Option<retry::ErrorClass>,
 ) {
-    if !gateway_hbone_mtls_observed(dispatch_hbone, error_class) {
+    let Some(transport) = transport else {
+        return;
+    };
+    if !gateway_hbone_mtls_observed(true, error_class) {
         return;
     }
 
@@ -414,7 +423,7 @@ fn annotate_gateway_hbone_metadata(
         "mutual_tls".to_string(),
     );
     ctx.metadata
-        .insert("mesh.gateway.transport".to_string(), "hbone".to_string());
+        .insert("mesh.gateway.transport".to_string(), transport.to_string());
 
     let Some(target) = target else {
         return;
@@ -664,10 +673,25 @@ fn collect_reqwest_warmup_candidates_for_proxy(
         && let Some(upstream) = upstream_map.get(upstream_id.as_str())
     {
         for target in &upstream.targets {
+            // Mesh-transport-tagged targets are NOT plaintext reqwest backends.
+            // HBONE targets warm via their own capability probe; SVID-mTLS
+            // targets dial a peer's mTLS listener — a plaintext reqwest HEAD to
+            // the app port would fail (or, worse, dial the app outside the mesh
+            // transport). Leave both to their transport-specific paths.
+            if hbone_pool::target_hbone_enabled(target)
+                || mesh_mtls_pool::target_mesh_mtls_enabled(target)
+            {
+                continue;
+            }
             targets.push((target.host.clone(), target.port));
         }
     }
-    if targets.is_empty() {
+    // Fall back to the proxy's own backend only when it has one. A mesh egress
+    // proxy carries `upstream_id` + an empty `backend_host`, so once its
+    // mesh-tagged targets are filtered out above, `targets` is empty and there
+    // is nothing to warm — do NOT synthesize a `:0` candidate from the empty
+    // backend.
+    if targets.is_empty() && !proxy.backend_host.is_empty() {
         targets.push((proxy.backend_host.clone(), proxy.backend_port));
     }
 
@@ -995,6 +1019,61 @@ pub fn is_hbone_connect_request<B>(req: &Request<B>, env_config: &EnvConfig) -> 
     hbone_proxy::is_connect_request(req, env_config)
 }
 
+/// Whether an authenticated inbound HBONE CONNECT to `host:port` may be
+/// transparently relayed. SAFE local targets only: a loopback address (the
+/// co-located app — Ferrum's per-workload Ambient/Sidecar model puts the app on
+/// loopback) or an in-mesh workload address+port the slice already declares.
+/// This bounds the terminator to mesh-known destinations, so an authenticated
+/// peer can never use the HBONE listener as an open proxy to arbitrary internal
+/// hosts. (`handle_hbone_request` separately requires the peer to be an
+/// authenticated, trust-domain-verified mesh identity before dialing.)
+fn inbound_hbone_relay_destination_allowed(
+    host: &str,
+    port: u16,
+    mesh: Option<&crate::modes::mesh::config::MeshConfig>,
+) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>()
+        && ip.is_loopback()
+    {
+        return true;
+    }
+    // Otherwise the destination must be an in-mesh workload address+port the
+    // slice declares — never an arbitrary host. A workload that declares no
+    // ports admits any port for its address (the slice does not constrain it).
+    mesh.is_some_and(|mesh| {
+        mesh.workloads.iter().any(|workload| {
+            workload.addresses.iter().any(|addr| addr == host)
+                && (workload.ports.is_empty() || workload.ports.iter().any(|wp| wp.port == port))
+        })
+    })
+}
+
+/// Build a transparent inbound HBONE relay proxy that dials the CONNECT
+/// `:authority` of an authenticated mesh peer, for an Ambient/Waypoint
+/// terminator where no inbound route is materialized. Returns `None` (caller
+/// 404s) when the authority is missing/portless or is not a safe local relay
+/// target per [`inbound_hbone_relay_destination_allowed`].
+fn build_inbound_hbone_relay_proxy(
+    authority: Option<&http::uri::Authority>,
+    mesh: Option<&crate::modes::mesh::config::MeshConfig>,
+) -> Option<Arc<Proxy>> {
+    let authority = authority?;
+    let host = authority.host();
+    let port = authority.port_u16()?;
+    if host.is_empty() || port == 0 {
+        return None;
+    }
+    if !inbound_hbone_relay_destination_allowed(host, port, mesh) {
+        return None;
+    }
+    Some(Arc::new(
+        crate::modes::mesh::mesh_inbound_hbone_relay_proxy(host, port),
+    ))
+}
+
 #[allow(dead_code)]
 fn is_websocket_upgrade(req: &Request<Incoming>) -> bool {
     let headers = req.headers();
@@ -1168,6 +1247,27 @@ fn supports_hbone_backend(
             .backend_capabilities
             .get(proxy, Some(target))
             .is_some_and(|record| record.hbone.is_supported())
+}
+
+/// Whether a target dispatches over the Sidecar egress SVID-mTLS HTTP/2 pool
+/// (`mesh.mtls=true` tag). Unlike HBONE there is no capability-registry gate:
+/// `mesh.mtls` targets are produced only by the mesh outbound materializer for
+/// slice-declared sidecar peers, so the peer's transport is known by
+/// construction — a failed dial is a connection error, not a capability
+/// classification signal.
+fn supports_mesh_mtls_backend(
+    state: &ProxyState,
+    proxy: &Proxy,
+    upstream_target: Option<&UpstreamTarget>,
+) -> bool {
+    let Some(target) = upstream_target else {
+        return false;
+    };
+    // Same dispatch-kind gate as HBONE: only plaintext HttpPool proxies carry
+    // mesh egress routes.
+    proxy_can_dispatch_hbone(proxy)
+        && mesh_mtls_pool::target_mesh_mtls_enabled(target)
+        && state.gateway_svid_bundle.load().is_some()
 }
 
 fn should_fallback_to_reqwest_after_http2_pool_error(err: &http2_pool::Http2PoolError) -> bool {
@@ -1953,6 +2053,8 @@ pub struct ProxyState {
     pub http2_pool: Arc<Http2ConnectionPool>,
     /// HBONE connection pool for gateway-to-mesh outbound tunnels.
     pub hbone_pool: Arc<HboneConnectionPool>,
+    /// Sidecar egress SVID-mTLS HTTP/2 pool (`mesh.mtls` targets).
+    pub mesh_mtls_pool: Arc<mesh_mtls_pool::MeshMtlsConnectionPool>,
     /// HTTP/3 connection pool for QUIC backends (reuses QUIC connections)
     pub h3_pool: Arc<Http3ConnectionPool>,
     /// Startup-classified backend protocol capabilities keyed by real backend target identity.
@@ -3214,6 +3316,12 @@ impl ProxyState {
             gateway_svid_bundle.clone(),
             pool_shard_amount,
         ));
+        let mesh_mtls_pool = Arc::new(mesh_mtls_pool::MeshMtlsConnectionPool::new(
+            global_pool_config.clone(),
+            dns_cache.clone(),
+            gateway_svid_bundle.clone(),
+            pool_shard_amount,
+        ));
         let h3_pool = Arc::new(Http3ConnectionPool::new_with_svid_generation(
             env_config_arc.clone(),
             dns_cache.clone(),
@@ -3523,6 +3631,7 @@ impl ProxyState {
             grpc_pool,
             http2_pool,
             hbone_pool,
+            mesh_mtls_pool,
             h3_pool,
             backend_capabilities,
             backend_capabilities_refresh,
@@ -3861,6 +3970,7 @@ impl ProxyState {
                     host,
                     port,
                     hbone_port: target.hbone_port,
+                    expected_peer: target.hbone_expected_peer.as_ref(),
                     previous_hbone,
                 },
                 &mut record,
@@ -3984,8 +4094,13 @@ impl ProxyState {
 
         match tokio::time::timeout(
             probe_timeout,
-            self.hbone_pool
-                .warmup_connection(probe_proxy, host, port, hbone_port),
+            self.hbone_pool.warmup_connection(
+                probe_proxy,
+                host,
+                port,
+                hbone_port,
+                target.expected_peer,
+            ),
         )
         .await
         {
@@ -9424,20 +9539,24 @@ async fn handle_proxy_request_inner(
         &path,
     );
 
-    // Materialized sidecar inbound routes (`__mesh-inbound-*`) are direction-
-    // scoped: only the inbound listener may serve them. If a non-inbound request
-    // matched one, re-resolve excluding inbound routes so a valid lower-priority
-    // route is found instead of shortcutting the app's own-service traffic to
-    // loopback (or 404ing past a real outbound route).
+    // Materialized mesh routes (`__mesh-inbound-*` / `__mesh-outbound-*`) are
+    // direction-scoped: the inbound and outbound capture listeners share one
+    // route table, so each may serve only its own direction's routes. If the
+    // cached winner is a mesh route whose direction does not match this request's
+    // listener direction, re-resolve keeping only matching-direction routes — so
+    // a peer's inbound request is not re-tunnelled out an outbound HBONE route,
+    // and an app's outbound request is not shortcut to the local inbound loopback
+    // (and neither 404s past a valid lower-priority route).
     let route_match = match route_match {
         Some(rm)
-            if ctx.mesh_direction != Some(crate::modes::mesh::MeshTrafficDirection::Inbound)
-                && crate::modes::mesh::is_mesh_inbound_route_id(&rm.proxy.id) =>
+            if crate::modes::mesh::mesh_route_direction(&rm.proxy.id)
+                .is_some_and(|route_dir| Some(route_dir) != ctx.mesh_direction) =>
         {
-            state.router_cache.resolve_route_excluding_mesh_inbound(
+            state.router_cache.resolve_route_excluding_wrong_direction(
                 &epoch.route_table,
                 request_host.as_deref(),
                 &path,
+                ctx.mesh_direction,
             )
         }
         other => other,
@@ -9492,16 +9611,42 @@ async fn handle_proxy_request_inner(
             (rm.proxy, rm.matched_prefix_len)
         }
         None => {
-            debug!(path = %path, client_ip = %ctx.client_ip, "No route matched for request path");
-            state.request_count.fetch_add(1, Ordering::Relaxed);
-            let reject = normalize_reject_response(
-                StatusCode::NOT_FOUND,
-                br#"{"error":"Not Found"}"#,
-                &EMPTY_HEADERS,
-                request_uses_grpc_content_type,
-            );
-            record_status(&state, reject.http_status.as_u16());
-            return Ok(build_response_from_normalized_reject(reject));
+            // Ambient / Waypoint inbound HBONE terminators materialize NO
+            // inbound routes — the relay is transparent: it dials the CONNECT
+            // `:authority`, the original destination the mesh peer asked for.
+            // An authenticated CONNECT to a safe local target therefore relays
+            // through a synthesized proxy instead of 404ing. The synthesized
+            // proxy is built only on the inbound listener (`mesh_direction ==
+            // Inbound`) and only for a loopback / slice-known workload
+            // destination; `handle_hbone_request` re-checks the
+            // authenticated-peer gate before dialing.
+            let hbone_relay = if is_hbone_connect
+                && ctx.mesh_direction == Some(crate::modes::mesh::MeshTrafficDirection::Inbound)
+            {
+                build_inbound_hbone_relay_proxy(req.uri().authority(), epoch.config.mesh.as_deref())
+            } else {
+                None
+            };
+            match hbone_relay {
+                Some(relay_proxy) => {
+                    // Plugins (incl. the mesh global chain / `mesh_authz`) read
+                    // `ctx.headers`, so materialize them before the chain runs.
+                    ctx.materialize_headers();
+                    (relay_proxy, 0)
+                }
+                None => {
+                    debug!(path = %path, client_ip = %ctx.client_ip, "No route matched for request path");
+                    state.request_count.fetch_add(1, Ordering::Relaxed);
+                    let reject = normalize_reject_response(
+                        StatusCode::NOT_FOUND,
+                        br#"{"error":"Not Found"}"#,
+                        &EMPTY_HEADERS,
+                        request_uses_grpc_content_type,
+                    );
+                    record_status(&state, reject.http_status.as_u16());
+                    return Ok(build_response_from_normalized_reject(reject));
+                }
+            }
         }
     };
 
@@ -11763,6 +11908,33 @@ async fn handle_proxy_request_inner(
             r#"{"error":"Bad Gateway","message":"HBONE dispatch required for this backend target"}"#,
         ));
     }
+    // Sidecar egress mirrors the HBONE fail-closed contract: a `mesh.mtls=true`
+    // target that cannot dispatch over the SVID-mTLS pool must never fall back
+    // to a plaintext direct-backend dial.
+    let mesh_mtls_required = upstream_target
+        .as_deref()
+        .is_some_and(mesh_mtls_pool::target_mesh_mtls_enabled);
+    let current_dispatch_mesh_mtls = !has_retry
+        && can_use_hbone_pool(
+            has_retry,
+            requires_request_body_buffering,
+            stream_request_body,
+        )
+        && supports_mesh_mtls_backend(&state, &proxy, upstream_target.as_deref());
+    if mesh_mtls_required && !current_dispatch_mesh_mtls {
+        warn!(
+            proxy_id = %proxy.id,
+            upstream_target = ?upstream_target,
+            has_retry,
+            requires_request_body_buffering,
+            stream_request_body,
+            "mesh.mtls=true target requires sidecar SVID-mTLS dispatch; refusing direct-backend fallback"
+        );
+        return Ok(build_response(
+            StatusCode::BAD_GATEWAY,
+            r#"{"error":"Bad Gateway","message":"Sidecar mTLS dispatch required for this backend target"}"#,
+        ));
+    }
     let mut current_dispatch_h3 = !requires_response_stream_inspection
         && supports_native_http3_backend(&state, &proxy, upstream_target.as_deref());
     let bytes_sent_observed = Arc::clone(&ctx.bytes_sent_observed);
@@ -11797,6 +11969,7 @@ async fn handle_proxy_request_inner(
             has_retry,
             &request_client_ip,
             is_tls,
+            false,
             false,
             current_dispatch_h3,
             &bytes_sent_observed,
@@ -12058,6 +12231,7 @@ async fn handle_proxy_request_inner(
             &request_client_ip,
             is_tls,
             current_dispatch_hbone,
+            current_dispatch_mesh_mtls,
             current_dispatch_h3,
             &bytes_sent_observed,
             inbound_version,
@@ -12106,10 +12280,16 @@ async fn handle_proxy_request_inner(
     let mut response_headers = backend_resp.headers;
     let backend_resolved_ip = backend_resp.backend_resolved_ip;
     let backend_error_class = backend_resp.error_class;
-    annotate_gateway_hbone_metadata(
+    annotate_gateway_mesh_metadata(
         &mut ctx,
         upstream_target.as_deref(),
-        current_dispatch_hbone,
+        if current_dispatch_hbone {
+            Some("hbone")
+        } else if current_dispatch_mesh_mtls {
+            Some("mtls")
+        } else {
+            None
+        },
         backend_error_class,
     );
 
@@ -13617,6 +13797,7 @@ async fn proxy_to_backend(
     client_ip: &str,
     is_tls: bool,
     dispatch_hbone: bool,
+    dispatch_mesh_mtls: bool,
     dispatch_h3: bool,
     // Shared counter for request body bytes observed on the wire. Populated
     // by the body handling block below via either `fetch_max` (buffered paths)
@@ -13709,6 +13890,45 @@ async fn proxy_to_backend(
         };
         *backend_admission_started_at = Instant::now();
         let (backend_resp, body_bytes) = proxy_to_backend_hbone(
+            state,
+            proxy,
+            backend_url,
+            method,
+            headers,
+            client_request_body,
+            upstream_target,
+            plugins,
+            response_decision_ctx,
+            stream_response,
+            client_ip,
+            is_tls,
+            resolved_ip.clone(),
+            ctx_bytes_sent_observed,
+        )
+        .await;
+        return backend_dispatch_response(backend_resp, body_bytes, backend_admission_permits);
+    }
+
+    // Sidecar egress: plain HTTP/2 over SVID-mTLS to the peer sidecar's
+    // inbound listener. Same admission ordering as the HBONE path.
+    if dispatch_mesh_mtls {
+        if let Some(reject) =
+            oversized_request_body_dispatch_reject(state, method, headers, resolved_ip.clone())
+        {
+            return reject;
+        }
+        backend_admission_permits = match backend_dispatch::run_backend_admission_plugins(
+            backend_admission_plugins,
+            request_ctx,
+            proxy,
+            upstream_target,
+            ProxyProtocol::Http,
+        ) {
+            Ok(permits) => permits,
+            Err(rejection) => return BackendDispatchResult::AdmissionRejected(rejection),
+        };
+        *backend_admission_started_at = Instant::now();
+        let (backend_resp, body_bytes) = proxy_to_backend_mesh_mtls(
             state,
             proxy,
             backend_url,
@@ -15453,9 +15673,33 @@ async fn proxy_to_backend_hbone(
     }
 
     let hbone_port = hbone_pool::target_hbone_port(target);
+    // Pin the destination workload identity declared on the target. A present
+    // but corrupt `mesh.spiffe_id` tag fails CLOSED here — never silently
+    // downgrade a pinned dial to trust-domain-only verification.
+    let expected_peer = match hbone_pool::target_expected_peer_spiffe(target) {
+        Ok(peer) => peer,
+        Err(err) => {
+            error!(
+                proxy_id = %proxy.id,
+                target_host = %target.host,
+                error = %err,
+                "Refusing HBONE dispatch: invalid pinned peer identity tag"
+            );
+            return (
+                hbone_pool_error_response(state, proxy, &err, resolved_ip),
+                None,
+            );
+        }
+    };
     let tunnel = match state
         .hbone_pool
-        .get_tunnel(proxy, &target.host, target.port, hbone_port)
+        .get_tunnel(
+            proxy,
+            &target.host,
+            target.port,
+            hbone_port,
+            expected_peer.as_ref(),
+        )
         .await
     {
         Ok(tunnel) => tunnel,
@@ -15652,6 +15896,473 @@ async fn proxy_to_backend_hbone(
                 warn!(
                     proxy_id = %proxy.id,
                     "HBONE tunneled HTTP read timeout ({}ms) waiting for backend response",
+                    proxy.backend_read_timeout_ms
+                );
+                return (
+                    retry::BackendResponse {
+                        status_code: 504,
+                        body: ResponseBody::Buffered(
+                            r#"{"error":"Backend timeout"}"#.as_bytes().to_vec(),
+                        ),
+                        headers: HashMap::new(),
+                        connection_error: false,
+                        backend_resolved_ip: resolved_ip,
+                        error_class: Some(retry::ErrorClass::ReadWriteTimeout),
+                    },
+                    None,
+                );
+            }
+        }
+    } else {
+        match send_fut.await {
+            Ok(response) => response,
+            Err(err) => {
+                if body_size_exceeded.load(Ordering::Acquire) {
+                    return (
+                        hbone_request_body_too_large_response(
+                            proxy,
+                            resolved_ip,
+                            None,
+                            state.max_request_body_size_bytes,
+                        ),
+                        None,
+                    );
+                }
+                return (hbone_hyper_error_response(proxy, err, resolved_ip), None);
+            }
+        }
+    };
+
+    let status = response.status().as_u16();
+    let content_length = response
+        .headers()
+        .get("content-length")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok());
+    if state.max_response_body_size_bytes > 0
+        && let Some(len) = content_length
+        && len > state.max_response_body_size_bytes
+    {
+        return (
+            hbone_response_body_too_large_response(
+                proxy,
+                resolved_ip,
+                Some(len),
+                state.max_response_body_size_bytes,
+            ),
+            None,
+        );
+    }
+    let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
+    collect_hyper_response_headers(response.headers(), &mut resp_headers);
+
+    // Content-type-aware buffer -> stream downgrade (see `proxy_to_backend`).
+    let stream_response = refine_stream_response_for_content_type(
+        stream_response,
+        proxy,
+        plugins,
+        ctx,
+        &resp_headers,
+    );
+
+    if stream_response {
+        (
+            retry::BackendResponse {
+                status_code: status,
+                body: ResponseBody::StreamingH2(response),
+                headers: resp_headers,
+                connection_error: false,
+                backend_resolved_ip: resolved_ip,
+                error_class: None,
+            },
+            None,
+        )
+    } else {
+        let body_bytes = match collect_hyper_body_with_limit(
+            response.into_body(),
+            state.max_response_body_size_bytes,
+        )
+        .await
+        {
+            Ok(body_bytes) => body_bytes,
+            Err(HyperBodyCollectError::TooLarge) => {
+                return (
+                    hbone_response_body_too_large_response(
+                        proxy,
+                        resolved_ip,
+                        None,
+                        state.max_response_body_size_bytes,
+                    ),
+                    None,
+                );
+            }
+            Err(HyperBodyCollectError::Read(err)) => {
+                return (hbone_hyper_error_response(proxy, err, resolved_ip), None);
+            }
+        };
+        (
+            retry::BackendResponse {
+                status_code: status,
+                body: ResponseBody::Buffered(body_bytes),
+                headers: resp_headers,
+                connection_error: false,
+                backend_resolved_ip: resolved_ip,
+                error_class: None,
+            },
+            None,
+        )
+    }
+}
+
+/// Sidecar egress dispatch: send the request as HTTP/2 over a pooled SVID-mTLS
+/// session to the destination sidecar's inbound listener (`mesh.mtls` targets).
+///
+/// Mirrors [`proxy_to_backend_hbone`]'s contract — streaming-only request body
+/// wrapped in `SizeLimitedIncoming`, baggage-stripped inner headers, the same
+/// size-limit and timeout handling, fail-closed on a missing/corrupt pinned
+/// peer identity — but speaks h2 directly to the peer (no CONNECT tunnel):
+/// the request `:authority` carries the service host the peer's inbound route
+/// matches on, and the Host header is left to hyper's `:authority` mapping.
+#[allow(clippy::too_many_arguments)]
+async fn proxy_to_backend_mesh_mtls(
+    state: &ProxyState,
+    proxy: &Proxy,
+    backend_url: &str,
+    method: &str,
+    headers: &HashMap<String, String>,
+    client_request_body: ClientRequestBody,
+    upstream_target: Option<&UpstreamTarget>,
+    plugins: &[Arc<dyn crate::plugins::Plugin>],
+    ctx: Option<&RequestContext>,
+    stream_response: bool,
+    client_ip: &str,
+    is_tls: bool,
+    resolved_ip: Option<String>,
+    ctx_bytes_sent_observed: &Arc<std::sync::atomic::AtomicU64>,
+) -> (retry::BackendResponse, Option<Bytes>) {
+    let Some(target) = upstream_target else {
+        return (
+            retry::BackendResponse {
+                status_code: 502,
+                body: ResponseBody::Buffered(
+                    r#"{"error":"Sidecar mTLS target missing"}"#.as_bytes().to_vec(),
+                ),
+                headers: HashMap::new(),
+                connection_error: true,
+                backend_resolved_ip: resolved_ip,
+                error_class: Some(retry::ErrorClass::ConnectionPoolError),
+            },
+            None,
+        );
+    };
+
+    // The pinned destination identity is mandatory for mesh.mtls targets —
+    // missing or corrupt fails closed before any dial.
+    let expected_peer = match mesh_mtls_pool::target_mesh_mtls_expected_peer(target) {
+        Ok(peer) => peer,
+        Err(err) => {
+            error!(
+                proxy_id = %proxy.id,
+                target_host = %target.host,
+                error = %err,
+                "Refusing sidecar mTLS dispatch: unusable pinned peer identity"
+            );
+            return (
+                hbone_pool_error_response(state, proxy, &err, resolved_ip),
+                None,
+            );
+        }
+    };
+
+    debug!(
+        proxy_id = %proxy.id,
+        target_host = %target.host,
+        target_port = target.port,
+        expected_peer = %expected_peer.as_str(),
+        "Proxying request via sidecar SVID-mTLS HTTP/2"
+    );
+
+    let original_req = match client_request_body {
+        ClientRequestBody::Streaming(request) => *request,
+        ClientRequestBody::Buffered(_) => {
+            debug_assert!(
+                false,
+                "mesh mTLS pool should not be used when request body is pre-buffered"
+            );
+            return (
+                retry::BackendResponse {
+                    status_code: 500,
+                    body: ResponseBody::Buffered(
+                        r#"{"error":"mesh mTLS request buffering invariant violated"}"#
+                            .as_bytes()
+                            .to_vec(),
+                    ),
+                    headers: HashMap::new(),
+                    connection_error: false,
+                    backend_resolved_ip: resolved_ip,
+                    error_class: None,
+                },
+                None,
+            );
+        }
+    };
+
+    if request_may_have_body(method, headers)
+        && state.max_request_body_size_bytes > 0
+        && let Some(content_length) = headers.get("content-length")
+        && let Ok(len) = content_length.parse::<usize>()
+        && len > state.max_request_body_size_bytes
+    {
+        return (
+            hbone_request_body_too_large_response(
+                proxy,
+                resolved_ip,
+                Some(len),
+                state.max_request_body_size_bytes,
+            ),
+            None,
+        );
+    }
+
+    let mtls_port = mesh_mtls_pool::target_mesh_mtls_port(target);
+    let mut sender = match state
+        .mesh_mtls_pool
+        .get_sender(proxy, &target.host, mtls_port, &expected_peer)
+        .await
+    {
+        Ok(sender) => sender,
+        Err(err) => {
+            return (
+                hbone_pool_error_response(state, proxy, &err, resolved_ip),
+                None,
+            );
+        }
+    };
+    // Bound readiness by the connect budget: a pooled-but-saturated connection
+    // (stream-cap reached) must not stall the request indefinitely.
+    match tokio::time::timeout(
+        Duration::from_millis(proxy.backend_connect_timeout_ms),
+        sender.ready(),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => return (hbone_hyper_error_response(proxy, err, resolved_ip), None),
+        Err(_) => {
+            warn!(
+                proxy_id = %proxy.id,
+                "sidecar mTLS HTTP/2 sender readiness timed out ({}ms)",
+                proxy.backend_connect_timeout_ms
+            );
+            return (
+                retry::BackendResponse {
+                    status_code: 504,
+                    body: ResponseBody::Buffered(
+                        r#"{"error":"Backend timeout"}"#.as_bytes().to_vec(),
+                    ),
+                    headers: HashMap::new(),
+                    connection_error: true,
+                    backend_resolved_ip: resolved_ip,
+                    error_class: Some(retry::ErrorClass::ConnectionTimeout),
+                },
+                None,
+            );
+        }
+    }
+
+    let uri: hyper::Uri = match backend_url.parse() {
+        Ok(uri) => uri,
+        Err(e) => {
+            error!(proxy_id = %proxy.id, error = %e, "Invalid sidecar mTLS backend URL");
+            return (
+                retry::BackendResponse {
+                    status_code: 502,
+                    body: ResponseBody::Buffered(
+                        r#"{"error":"Invalid backend URL"}"#.as_bytes().to_vec(),
+                    ),
+                    headers: HashMap::new(),
+                    connection_error: false,
+                    backend_resolved_ip: resolved_ip,
+                    error_class: None,
+                },
+                None,
+            );
+        }
+    };
+    let path_and_query = uri
+        .path_and_query()
+        .cloned()
+        .unwrap_or_else(|| http::uri::PathAndQuery::from_static("/"));
+    // `:authority` is the routing key on the peer: its materialized inbound
+    // route matches the SERVICE host, so a preserved client Host wins; without
+    // preservation fall back to the dial authority (peer pod + app port),
+    // matching the HBONE inner request's Host fallback.
+    let authority_owned;
+    let authority = if proxy.preserve_host_header
+        && let Some(host) = headers.get("host")
+        && !host.is_empty()
+    {
+        host.as_str()
+    } else {
+        authority_owned = hbone_pool::authority_for_host_port(&target.host, target.port);
+        authority_owned.as_str()
+    };
+    let tunneled_uri = match hyper::Uri::builder()
+        .scheme("https")
+        .authority(authority)
+        .path_and_query(path_and_query)
+        .build()
+    {
+        Ok(uri) => uri,
+        Err(e) => {
+            error!(
+                proxy_id = %proxy.id,
+                authority,
+                error = %e,
+                "Invalid sidecar mTLS request authority"
+            );
+            return (
+                retry::BackendResponse {
+                    status_code: 502,
+                    body: ResponseBody::Buffered(
+                        r#"{"error":"Invalid backend authority"}"#.as_bytes().to_vec(),
+                    ),
+                    headers: HashMap::new(),
+                    connection_error: false,
+                    backend_resolved_ip: resolved_ip,
+                    error_class: None,
+                },
+                None,
+            );
+        }
+    };
+
+    let (mut parts, body) = original_req.into_parts();
+    let body_size_exceeded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let max_request_body_size = if state.max_request_body_size_bytes > 0 {
+        state.max_request_body_size_bytes
+    } else {
+        usize::MAX
+    };
+    let body = body::SizeLimitedIncoming::new_with_counter(
+        body,
+        max_request_body_size,
+        Arc::clone(&body_size_exceeded),
+        Arc::clone(ctx_bytes_sent_observed),
+    );
+    parts.uri = tunneled_uri;
+    parts.version = hyper::Version::HTTP_2;
+    parts.method = match parse_hyper_method(method) {
+        Ok(method) => method,
+        Err(()) => {
+            return (
+                retry::BackendResponse {
+                    status_code: 405,
+                    body: ResponseBody::Buffered(
+                        r#"{"error":"Method Not Allowed"}"#.as_bytes().to_vec(),
+                    ),
+                    headers: HashMap::new(),
+                    connection_error: false,
+                    backend_resolved_ip: resolved_ip,
+                    error_class: None,
+                },
+                None,
+            );
+        }
+    };
+    parts.headers.clear();
+    // Same inner-header hygiene as HBONE: client-supplied identity baggage is
+    // stripped so a captured app cannot assert a forged source principal.
+    let owned_mesh_headers =
+        hbone_inner_headers_with_stripped_baggage(headers, &state.mesh_egress_strip_baggage_keys);
+    let headers = owned_mesh_headers.as_ref().unwrap_or(headers);
+    let connection_listed_strip = headers_mod::parse_connection_listed_from_str_map(headers);
+    for (k, v) in headers {
+        match k.as_str() {
+            // H2 carries the request host in `:authority` (set above); a
+            // duplicate `host` header would trip the peer's host/authority
+            // consistency check.
+            "host" => continue,
+            n if headers_mod::is_backend_request_strip_header(n) => continue,
+            n if connection_listed_strip.iter().any(|s| s == n) => continue,
+            _ => {
+                if let (Ok(name), Ok(val)) = (
+                    hyper::header::HeaderName::from_bytes(k.as_bytes()),
+                    hyper::header::HeaderValue::from_str(v),
+                ) {
+                    parts.headers.insert(name, val);
+                }
+            }
+        }
+    }
+
+    let xff_val = build_xff_value(
+        headers.get("x-forwarded-for").map(|s| s.as_str()),
+        client_ip,
+    );
+    if let Ok(val) = hyper::header::HeaderValue::from_str(&xff_val) {
+        parts.headers.insert("x-forwarded-for", val);
+    }
+    if let Ok(val) = hyper::header::HeaderValue::from_str(if is_tls { "https" } else { "http" }) {
+        parts.headers.insert("x-forwarded-proto", val);
+    }
+    if let Some(host) = headers.get("host")
+        && let Ok(val) = hyper::header::HeaderValue::from_str(host)
+    {
+        parts.headers.insert("x-forwarded-host", val);
+    }
+    if let Some(ref via) = state.via_header_http2
+        && let Ok(val) = hyper::header::HeaderValue::from_str(via)
+    {
+        parts.headers.insert("via", val);
+    }
+    if state.add_forwarded_header {
+        let proto_str = if is_tls { "https" } else { "http" };
+        let fwd = build_forwarded_value(
+            client_ip,
+            proto_str,
+            headers.get("host").map(|s| s.as_str()),
+        );
+        if let Ok(val) = hyper::header::HeaderValue::from_str(&fwd) {
+            parts.headers.insert("forwarded", val);
+        }
+    }
+
+    let backend_req = Request::from_parts(parts, body);
+    let send_fut = sender.send_request(backend_req);
+    let response = if proxy.backend_read_timeout_ms > 0 {
+        let timeout = Duration::from_millis(proxy.backend_read_timeout_ms);
+        match tokio::time::timeout(timeout, send_fut).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(err)) => {
+                if body_size_exceeded.load(Ordering::Acquire) {
+                    return (
+                        hbone_request_body_too_large_response(
+                            proxy,
+                            resolved_ip,
+                            None,
+                            state.max_request_body_size_bytes,
+                        ),
+                        None,
+                    );
+                }
+                return (hbone_hyper_error_response(proxy, err, resolved_ip), None);
+            }
+            Err(_) => {
+                if body_size_exceeded.load(Ordering::Acquire) {
+                    return (
+                        hbone_request_body_too_large_response(
+                            proxy,
+                            resolved_ip,
+                            None,
+                            state.max_request_body_size_bytes,
+                        ),
+                        None,
+                    );
+                }
+                warn!(
+                    proxy_id = %proxy.id,
+                    "sidecar mTLS HTTP read timeout ({}ms) waiting for backend response",
                     proxy.backend_read_timeout_ms
                 );
                 return (
@@ -17730,6 +18441,7 @@ mod tests {
                 "127.0.0.1",
                 false, // is_tls
                 false, // dispatch_hbone
+                false, // dispatch_mesh_mtls
                 false, // dispatch_h3
                 &bytes_sent,
                 hyper::Version::HTTP_11,
@@ -20339,7 +21051,7 @@ mod tests {
             "edge-proxy-default".to_string(),
         );
 
-        annotate_gateway_hbone_metadata(&mut ctx, Some(&target), true, None);
+        annotate_gateway_mesh_metadata(&mut ctx, Some(&target), Some("hbone"), None);
 
         assert_eq!(
             ctx.metadata
@@ -20372,7 +21084,12 @@ mod tests {
         let mut ctx =
             RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
 
-        annotate_gateway_hbone_metadata(&mut ctx, None, true, Some(retry::ErrorClass::TlsError));
+        annotate_gateway_mesh_metadata(
+            &mut ctx,
+            None,
+            Some("hbone"),
+            Some(retry::ErrorClass::TlsError),
+        );
 
         assert!(!ctx.metadata.contains_key("mesh.connection_security_policy"));
         assert!(!ctx.metadata.contains_key("mesh.gateway.transport"));
@@ -20383,10 +21100,10 @@ mod tests {
         let mut ctx =
             RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
 
-        annotate_gateway_hbone_metadata(
+        annotate_gateway_mesh_metadata(
             &mut ctx,
             None,
-            true,
+            Some("hbone"),
             Some(retry::ErrorClass::RequestError),
         );
 
@@ -20399,10 +21116,10 @@ mod tests {
         let mut ctx =
             RequestContext::new("127.0.0.1".to_string(), "POST".to_string(), "/".to_string());
 
-        annotate_gateway_hbone_metadata(
+        annotate_gateway_mesh_metadata(
             &mut ctx,
             None,
-            true,
+            Some("hbone"),
             Some(retry::ErrorClass::RequestBodyTooLarge),
         );
 
@@ -20415,15 +21132,80 @@ mod tests {
         let mut ctx =
             RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
 
-        annotate_gateway_hbone_metadata(
+        annotate_gateway_mesh_metadata(
             &mut ctx,
             None,
-            true,
+            Some("hbone"),
             Some(retry::ErrorClass::ProtocolError),
         );
 
         assert!(!ctx.metadata.contains_key("mesh.connection_security_policy"));
         assert!(!ctx.metadata.contains_key("mesh.gateway.transport"));
+    }
+
+    #[test]
+    fn inbound_hbone_relay_guard_allows_only_local_destinations() {
+        use crate::identity::spiffe::{SpiffeId, TrustDomain};
+        use crate::modes::mesh::config::{MeshConfig, Workload, WorkloadPort, WorkloadSelector};
+
+        // Loopback is always a safe relay target (the co-located app), even
+        // with no slice context.
+        assert!(inbound_hbone_relay_destination_allowed(
+            "127.0.0.1",
+            8080,
+            None
+        ));
+        assert!(inbound_hbone_relay_destination_allowed("::1", 8080, None));
+        assert!(inbound_hbone_relay_destination_allowed(
+            "localhost",
+            8080,
+            None
+        ));
+
+        // A non-loopback host is REFUSED when it is not a slice-known workload —
+        // an authenticated peer must not be able to relay to arbitrary hosts.
+        assert!(!inbound_hbone_relay_destination_allowed(
+            "10.1.2.3", 8080, None
+        ));
+
+        let mut mesh = MeshConfig::default();
+        mesh.workloads.push(Workload {
+            spiffe_id: SpiffeId::new("spiffe://cluster.local/ns/default/sa/app").unwrap(),
+            selector: WorkloadSelector::default(),
+            service_name: "app".to_string(),
+            addresses: vec!["10.1.2.3".to_string()],
+            ports: vec![WorkloadPort {
+                port: 8080,
+                protocol: crate::modes::mesh::config::AppProtocol::Http,
+                name: None,
+            }],
+            trust_domain: TrustDomain::new("cluster.local").unwrap(),
+            namespace: "default".to_string(),
+            network: None,
+            cluster: None,
+            weight: None,
+            locality: None,
+            service_account: None,
+            pod_uid: None,
+        });
+        // Now the workload's exact address+port is allowed...
+        assert!(inbound_hbone_relay_destination_allowed(
+            "10.1.2.3",
+            8080,
+            Some(&mesh)
+        ));
+        // ...but a port the workload does not expose is refused...
+        assert!(!inbound_hbone_relay_destination_allowed(
+            "10.1.2.3",
+            9999,
+            Some(&mesh)
+        ));
+        // ...and an address the slice does not declare is refused.
+        assert!(!inbound_hbone_relay_destination_allowed(
+            "10.9.9.9",
+            8080,
+            Some(&mesh)
+        ));
     }
 
     #[test]
