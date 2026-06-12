@@ -13377,7 +13377,7 @@ async fn handle_proxy_request_inner(
                     response_status,
                     cl,
                 )
-            } else if state.max_response_body_size_bytes > 0 && cl.is_none() {
+            } else if state.max_response_body_size_bytes > 0 {
                 crate::proxy::body::size_limited_streaming_h3_body(
                     h3_resp.recv_stream,
                     state.max_response_body_size_bytes,
@@ -15981,6 +15981,52 @@ fn hbone_response_body_too_large_response(
     }
 }
 
+fn h3_response_body_too_large_response(
+    proxy: &Proxy,
+    resolved_ip: Option<String>,
+    observed_size: Option<usize>,
+    max_size: usize,
+) -> retry::BackendResponse {
+    match observed_size {
+        Some(size) => warn!(
+            proxy_id = %proxy.id,
+            response_body_bytes = size,
+            max_response_body_size_bytes = max_size,
+            "HTTP/3 backend response body exceeds configured size limit"
+        ),
+        None => warn!(
+            proxy_id = %proxy.id,
+            max_response_body_size_bytes = max_size,
+            "HTTP/3 backend response body exceeded configured size limit while streaming"
+        ),
+    }
+    retry::BackendResponse {
+        status_code: 502,
+        body: ResponseBody::Buffered(
+            r#"{"error":"Backend response body exceeds maximum size"}"#
+                .as_bytes()
+                .to_vec(),
+        ),
+        headers: HashMap::new(),
+        connection_error: false,
+        backend_resolved_ip: resolved_ip,
+        error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
+    }
+}
+
+fn declared_response_length_exceeds_limit(
+    headers: &HashMap<String, String>,
+    max_response_body_size_bytes: usize,
+) -> Option<usize> {
+    if max_response_body_size_bytes == 0 {
+        return None;
+    }
+    let len = headers
+        .get("content-length")
+        .and_then(|value| value.parse::<usize>().ok())?;
+    (len > max_response_body_size_bytes).then_some(len)
+}
+
 fn hbone_request_body_too_large_response(
     proxy: &Proxy,
     resolved_ip: Option<String>,
@@ -17467,6 +17513,20 @@ async fn proxy_to_backend_http3(
                 return match h3_result {
                     Ok(response) => {
                         if stream_response {
+                            if let Some(len) = declared_response_length_exceeds_limit(
+                                &response.headers,
+                                state.max_response_body_size_bytes,
+                            ) {
+                                return (
+                                    h3_response_body_too_large_response(
+                                        proxy,
+                                        resolved_ip,
+                                        Some(len),
+                                        state.max_response_body_size_bytes,
+                                    ),
+                                    None,
+                                );
+                            }
                             debug!(
                                 proxy_id = %proxy.id,
                                 status = response.status,
@@ -17476,6 +17536,10 @@ async fn proxy_to_backend_http3(
                                 retry::BackendResponse {
                                     status_code: response.status,
                                     body: ResponseBody::StreamingH3(Box::new(response)),
+                                    // The sole caller moves the headers out of the
+                                    // `StreamingH3` payload via
+                                    // `std::mem::take(&mut h3_resp.headers)` — leave
+                                    // this empty instead of cloning the map per request.
                                     headers: HashMap::new(),
                                     connection_error: false,
                                     backend_resolved_ip: resolved_ip,
@@ -17853,6 +17917,20 @@ async fn proxy_to_backend_http3(
 
         match h3_result {
             Ok(response) => {
+                if let Some(len) = declared_response_length_exceeds_limit(
+                    &response.headers,
+                    state.max_response_body_size_bytes,
+                ) {
+                    return (
+                        h3_response_body_too_large_response(
+                            proxy,
+                            resolved_ip,
+                            Some(len),
+                            state.max_response_body_size_bytes,
+                        ),
+                        retained_body,
+                    );
+                }
                 debug!(
                     proxy_id = %proxy.id,
                     status = response.status,
@@ -17862,6 +17940,10 @@ async fn proxy_to_backend_http3(
                     retry::BackendResponse {
                         status_code: response.status,
                         body: ResponseBody::StreamingH3(Box::new(response)),
+                        // The sole caller moves the headers out of the
+                        // `StreamingH3` payload via
+                        // `std::mem::take(&mut h3_resp.headers)` — leave
+                        // this empty instead of cloning the map per request.
                         headers: HashMap::new(),
                         connection_error: false,
                         backend_resolved_ip: resolved_ip,
@@ -18305,6 +18387,23 @@ mod tests {
     use async_trait::async_trait;
     use http::header::HeaderValue;
     use serde_json::json;
+
+    #[test]
+    fn declared_response_length_exceeds_limit_only_when_header_is_over_cap() {
+        let mut headers = HashMap::new();
+        assert_eq!(declared_response_length_exceeds_limit(&headers, 10), None);
+
+        headers.insert("content-length".to_string(), "11".to_string());
+        assert_eq!(declared_response_length_exceeds_limit(&headers, 0), None);
+        assert_eq!(declared_response_length_exceeds_limit(&headers, 11), None);
+        assert_eq!(
+            declared_response_length_exceeds_limit(&headers, 10),
+            Some(11)
+        );
+
+        headers.insert("content-length".to_string(), "not-a-number".to_string());
+        assert_eq!(declared_response_length_exceeds_limit(&headers, 10), None);
+    }
 
     /// Directly exercises the gRPC streaming circuit-breaker classification:
     /// a late client-upload overflow is gateway-side and must be NEUTRAL, while
