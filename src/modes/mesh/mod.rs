@@ -2140,7 +2140,7 @@ fn materialize_mesh_outbound_proxies(
             // NAME / id, and the targets are pod IPs) — otherwise no DR traffic policy
             // would apply to outbound HBONE routes (top-level connectTimeout / LB /
             // outlier, plus per-port `portLevelSettings`, which `apply_destination_rules`
-            // re-keys onto the dial port via `mesh_outbound_upstream_port_remap`).
+            // fans out from the owning Service port onto the targets' dial ports).
             let service_fqdn = format!(
                 "{}.{}.svc.{}",
                 service.name,
@@ -2350,12 +2350,15 @@ fn mesh_outbound_route_proxy(
 /// The upstream backing a materialized outbound egress proxy: the service's
 /// transport-tagged workload targets with passive health and round-robin LB.
 /// Mirrors the east-west service upstream. Top-level DR traffic policy applies
-/// (the upstream is FQDN-named so DestinationRules match it), and per-port
-/// `portLevelSettings` authored on the service port are re-keyed onto the dial
-/// port by [`mesh_outbound_upstream_port_remap`] in `apply_destination_rules`, so
-/// a numeric `targetPort != port` service keeps its per-port settings. A *named*
-/// `targetPort` stays under the service port — a residual matching the
-/// service-discovery / egress-ServiceEntry paths.
+/// (the upstream is FQDN-named so DestinationRules match it), and the
+/// `portLevelSettings` entry authored on this upstream's owning Service port
+/// is fanned out by `apply_destination_rules` onto every distinct target dial
+/// port — the targets dial the per-workload resolved `targetPort` (numeric or
+/// **named**, which can resolve differently across workloads), all owned by
+/// the one Service port this per-port upstream serves. Named `targetPort`
+/// per-port DR is therefore fully applied here (unlike the service-discovery /
+/// egress-ServiceEntry paths, where named ports resolve at runtime and their
+/// entries stay under the declared port).
 fn mesh_outbound_route_upstream(
     upstream_id: &str,
     namespace: &str,
@@ -2425,48 +2428,6 @@ fn mesh_upstream_service<'a>(
         .services
         .iter()
         .find(|s| s.name == mesh_sd.service_name && s.namespace == namespace)
-}
-
-/// Resolve in-mesh Service service-port→dial-port remaps for a materialized
-/// Ambient outbound HBONE upstream (`__mesh-out-upstream-*`).
-///
-/// Like an egress ServiceEntry upstream, this upstream is static-target: its
-/// targets dial the resolved numeric `targetPort` while a DestinationRule
-/// `portLevelSettings` entry is authored on the Service port. Dispatch keys port
-/// overrides by the dial port, so a P entry must be re-keyed to T or per-port
-/// policy (connect timeout / LB / outlier / per-port TLS / maxConnections) is
-/// dropped as a phantom port. Only ports whose numeric `targetPort` is an actual
-/// dialed target are remapped, so `portLevelSettings` on a non-materialized (e.g.
-/// non-HTTP) service port still fails closed as a phantom rather than bloating
-/// `port_overrides`. Named `targetPort`s stay under the Service port (a residual
-/// matching the service-discovery / egress paths). Empty for any other upstream.
-fn mesh_outbound_upstream_port_remap(
-    upstream: &Upstream,
-    mesh_slice: &MeshSlice,
-) -> std::collections::HashMap<u16, u16> {
-    let target_ports: std::collections::HashSet<u16> =
-        upstream.targets.iter().map(|t| t.port).collect();
-    mesh_slice
-        .services
-        .iter()
-        .flat_map(|svc| {
-            // Upstreams are per service port; remap only the owning port's
-            // DR entry onto its resolved numeric targetPort.
-            svc.ports.iter().filter_map(|sp| {
-                if upstream.id != mesh_outbound_upstream_id(&svc.namespace, &svc.name, sp.port) {
-                    return None;
-                }
-                match sp.target_port {
-                    Some(ServiceTargetPort::Number(t))
-                        if t != 0 && t != sp.port && target_ports.contains(&t) =>
-                    {
-                        Some((sp.port, t))
-                    }
-                    _ => None,
-                }
-            })
-        })
-        .collect()
 }
 
 /// Resolve ServiceEntry service-port→dial-port remaps for an egress upstream.
@@ -2607,14 +2568,11 @@ fn apply_destination_rules(
             } else {
                 egress_service_entry_port_remap(upstream, mesh_slice)
             };
-            // Materialized Ambient outbound HBONE upstreams (`__mesh-out-upstream-*`)
-            // are static-target: their targets dial the resolved numeric
-            // `targetPort` while a DR `portLevelSettings` entry is keyed on the
-            // Service port, so re-key P→T here too or the per-port policy is dropped
-            // as a phantom port. Rebound (not folded into the if/else above) so it
-            // composes with any service-port→dial-port remap derived there.
-            let mut mesh_port_remap = mesh_port_remap;
-            mesh_port_remap.extend(mesh_outbound_upstream_port_remap(upstream, mesh_slice));
+            // (Materialized per-port outbound upstreams — `__mesh-out-upstream-*` —
+            // need no remap here: the owner-gated branch in the per-port loop
+            // below fans their owning Service port's entry out to every
+            // distinct target dial port, which subsumes the former numeric
+            // P→T remap and additionally covers NAMED `targetPort`s.)
 
             // Top-level `connectionPool.tcp.{maxConnections,tcpKeepalive}` fan
             // out to every port served by this upstream. Per-port
@@ -2670,19 +2628,26 @@ fn apply_destination_rules(
             let upstream_base_tls = BackendTlsConfig::from_upstream(upstream);
             let upstream_id_for_tls = upstream.id.clone();
             for (port, port_policy) in &dr.port_level_settings {
-                // The `port_overrides` key this Service-port-scoped entry must
-                // land on. A materialized per-port outbound upstream accepts
-                // ONLY its owning Service port's entry (re-keyed to the dial
-                // port when a numeric targetPort remap exists) — an entry for
+                // The `port_overrides` key(s) this Service-port-scoped entry
+                // must land on. A materialized per-port outbound upstream
+                // accepts ONLY its owning Service port's entry — an entry for
                 // any other service port belongs to that port's own sibling
                 // upstream, even when it numerically equals this upstream's
-                // dial port. Otherwise: a mesh service-discovery upstream
+                // dial port — and FANS IT OUT to every distinct target dial
+                // port: dispatch keys `port_overrides` by the LB-selected
+                // target's port, and the targets dial the per-workload
+                // resolved `targetPort` (numeric OR named — a named port can
+                // legitimately resolve to different container ports across
+                // workloads), all of which are owned by this one Service port
+                // by construction. This is what closes the former named-
+                // `targetPort` residual: one Service-port entry, one-to-many
+                // dial ports. Otherwise: a mesh service-discovery upstream
                 // whose Service remaps the port via a numeric `targetPort` is
                 // re-keyed P→T (round-12 F2); a direct target-port match
                 // needs no remap; a service-discovery upstream with no remap
                 // keeps the entry under the declared port (targets resolve at
                 // runtime); anything else is a phantom DR port.
-                let store_port = if let Some(owning_port) =
+                let store_ports: Vec<u16> = if let Some(owning_port) =
                     outbound_upstream_owner_port.get(&upstream.id)
                 {
                     if port != owning_port {
@@ -2695,13 +2660,23 @@ fn apply_destination_rules(
                         );
                         continue;
                     }
-                    *mesh_port_remap.get(port).unwrap_or(port)
+                    if upstream_target_ports.is_empty() {
+                        // Defensive: an owner-gated upstream always has the
+                        // targets it was materialized with; keep the entry
+                        // under the Service port rather than dropping policy.
+                        vec![*port]
+                    } else {
+                        let mut dial_ports: Vec<u16> =
+                            upstream_target_ports.iter().copied().collect();
+                        dial_ports.sort_unstable();
+                        dial_ports
+                    }
                 } else if upstream_target_ports.contains(port) {
-                    *port
+                    vec![*port]
                 } else if let Some(dial) = mesh_port_remap.get(port) {
-                    *dial
+                    vec![*dial]
                 } else if has_service_discovery {
-                    *port
+                    vec![*port]
                 } else {
                     warn!(
                         rule = %dr.name,
@@ -2734,10 +2709,81 @@ fn apply_destination_rules(
                     None
                 };
 
-                let override_slot = upstream.port_overrides.entry(store_port).or_default();
-                apply_traffic_policy_to_port_override(override_slot, port_policy);
-                if let Some(slot) = resolved_port_tls {
-                    override_slot.tls = Some(slot);
+                let is_owner_entry = outbound_upstream_owner_port.get(&upstream.id) == Some(port);
+                // Seed a FRESH fanned slot's passive health from the upstream
+                // level — which carries this DR's top-level outlierDetection,
+                // applied above — so a PARTIAL per-port outlier override
+                // layers over the top-level window/recovery fields instead of
+                // over defaults (`passive_health_for_target` prefers a
+                // per-port slot outright). Owner-gated entries only, and only
+                // when the entry actually carries outlierDetection; a slot an
+                // earlier rule already populated keeps its accumulated
+                // layering.
+                let upstream_passive_seed =
+                    if is_owner_entry && port_policy.outlier_detection.is_some() {
+                        upstream
+                            .health_checks
+                            .as_ref()
+                            .and_then(|h| h.passive.clone())
+                    } else {
+                        None
+                    };
+                for store_port in store_ports {
+                    let override_slot = upstream.port_overrides.entry(store_port).or_default();
+                    if override_slot.passive_health_check.is_none()
+                        && let Some(ref seed) = upstream_passive_seed
+                    {
+                        override_slot.passive_health_check = Some(seed.clone());
+                    }
+                    apply_traffic_policy_to_port_override(override_slot, port_policy);
+                    if let Some(ref slot) = resolved_port_tls {
+                        override_slot.tls = Some(slot.clone());
+                    }
+                }
+
+                // SELECTION-TIME fields of an owner-gated per-port upstream's
+                // owning entry additionally land at the UPSTREAM level: the
+                // LB engages a per-port lane only when one dial port covers
+                // every target (`initial_dispatch_port_override`), so a named
+                // `targetPort` resolving heterogeneously across replicas
+                // leaves no full-coverage lane and selection falls back to
+                // upstream-level LB/hash/locality (and upstream-level passive
+                // thresholds back the per-target slots). This upstream serves
+                // exactly one Service port, so its port policy IS the
+                // whole-upstream policy. Field semantics mirror the per-port
+                // slot helper: LB/outlier layer additively, hash keys are
+                // owned by the LB choice (cleared when the entry switches to
+                // a non-hash algorithm), and locality is owned by the entry
+                // with a fallback to this DR's top-level locality — exactly
+                // the per-port LANE's `.or(upstream-level)` fallback at LB
+                // build — assigned unconditionally so a later rule's owning
+                // entry that omits locality clears a stale earlier projection
+                // instead of pinning it.
+                if is_owner_entry {
+                    if let Some(algorithm) = mesh_lb_to_ferrum(&port_policy.load_balancer) {
+                        upstream.algorithm = algorithm;
+                        // Unconditional: clears stale hash keys when this
+                        // port switches to a non-hash algorithm (mirrors
+                        // `apply_traffic_policy_to_port_override`).
+                        upstream.hash_on = mesh_hash_on_to_ferrum(&port_policy.load_balancer);
+                    }
+                    if let Some(ref od) = port_policy.outlier_detection {
+                        let passive = upstream
+                            .health_checks
+                            .get_or_insert_with(HealthCheckConfig::default)
+                            .passive
+                            .get_or_insert_with(PassiveHealthCheck::default);
+                        apply_outlier_detection_to_passive(passive, od);
+                    }
+                    upstream.locality_lb_setting = port_policy
+                        .locality_lb_setting
+                        .as_ref()
+                        .or_else(|| {
+                            dr.traffic_policy
+                                .as_ref()
+                                .and_then(|tp| tp.locality_lb_setting.as_ref())
+                        })
+                        .map(into_upstream_locality);
                 }
             }
 
@@ -8531,6 +8577,318 @@ mod tests {
     }
 
     #[test]
+    fn mesh_outbound_applies_port_policy_for_named_target_port() {
+        // The former residual: a NAMED targetPort resolves per workload at
+        // materialization, so the DR entry authored on Service port 80 must
+        // land on the resolved container port's override slot — previously it
+        // stayed under 80 and never matched the dialing target.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let mut svc = http_mesh_service("reviews", 80, spiffe);
+        svc.ports[0].target_port = Some(ServiceTargetPort::Name("http".to_string()));
+        let mut wl = workload_with_address("reviews", "reviews", "10.0.0.1");
+        wl.ports = vec![WorkloadPort {
+            port: 8080,
+            protocol: AppProtocol::Http,
+            name: Some("http".to_string()),
+        }];
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            workloads: vec![wl],
+            services: vec![svc],
+            destination_rules: vec![MeshDestinationRule {
+                name: "reviews".to_string(),
+                namespace: "default".to_string(),
+                host: "reviews.default.svc.cluster.local".to_string(),
+                traffic_policy: None,
+                port_level_settings: HashMap::from([(
+                    80u16,
+                    MeshTrafficPolicy {
+                        connect_timeout_ms: Some(1234),
+                        ..MeshTrafficPolicy::default()
+                    },
+                )]),
+                subsets: Vec::new(),
+            }],
+            ..MeshSlice::default()
+        };
+        let mut config = GatewayConfig::default();
+        materialize_mesh_outbound_proxies(&mut config, &ambient_runtime(), &slice);
+        apply_destination_rules(&mut config, &ambient_runtime(), &slice)
+            .expect("destination rules apply");
+
+        let upstream = config
+            .upstreams
+            .iter()
+            .find(|u| u.id == "__mesh-out-upstream-default-reviews-80")
+            .expect("outbound upstream materialized");
+        assert_eq!(
+            upstream.targets[0].port, 8080,
+            "the target dials the name-resolved container port"
+        );
+        assert_eq!(
+            upstream
+                .port_overrides
+                .get(&8080)
+                .and_then(|slot| slot.connect_timeout_ms),
+            Some(1234),
+            "the Service-port entry must land on the name-resolved dial port"
+        );
+        assert!(
+            !upstream.port_overrides.contains_key(&80),
+            "the entry must not be stranded under the service port"
+        );
+    }
+
+    #[test]
+    fn mesh_outbound_fans_port_policy_to_heterogeneous_named_resolutions() {
+        // Replica workloads may resolve the same NAMED targetPort to different
+        // container ports. The one Service-port DR entry fans out to every
+        // distinct dial port — dispatch keys overrides by the LB-selected
+        // target's port, and every target is owned by this Service port.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let mut svc = http_mesh_service("reviews", 80, spiffe);
+        svc.ports[0].target_port = Some(ServiceTargetPort::Name("http".to_string()));
+        // Two replicas sharing the service-account SPIFFE: the service must
+        // reference each by index for one-to-one target matching.
+        svc.workloads.push(crate::modes::mesh::config::WorkloadRef {
+            spiffe_id: SpiffeId::new(spiffe).unwrap(),
+        });
+        let mut wl_a = workload_with_address("reviews", "reviews", "10.0.0.1");
+        wl_a.ports = vec![WorkloadPort {
+            port: 8080,
+            protocol: AppProtocol::Http,
+            name: Some("http".to_string()),
+        }];
+        let mut wl_b = workload_with_address("reviews", "reviews", "10.0.0.2");
+        wl_b.ports = vec![WorkloadPort {
+            port: 8081,
+            protocol: AppProtocol::Http,
+            name: Some("http".to_string()),
+        }];
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            workloads: vec![wl_a, wl_b],
+            services: vec![svc],
+            destination_rules: vec![MeshDestinationRule {
+                name: "reviews".to_string(),
+                namespace: "default".to_string(),
+                host: "reviews.default.svc.cluster.local".to_string(),
+                // Top-level consistentHash: the owning port entry's switch to
+                // a non-hash algorithm must clear the stale hash policy at
+                // the upstream level (the hash strategy is read independently
+                // of the selected algorithm).
+                traffic_policy: Some(MeshTrafficPolicy {
+                    load_balancer: Some(MeshLoadBalancer::ConsistentHash(
+                        crate::modes::mesh::config::MeshConsistentHash {
+                            http_header_name: Some("x-session".to_string()),
+                            http_cookie_name: None,
+                            use_source_ip: false,
+                        },
+                    )),
+                    ..MeshTrafficPolicy::default()
+                }),
+                port_level_settings: HashMap::from([(
+                    80u16,
+                    MeshTrafficPolicy {
+                        connect_timeout_ms: Some(1234),
+                        load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::Random)),
+                        ..MeshTrafficPolicy::default()
+                    },
+                )]),
+                subsets: Vec::new(),
+            }],
+            ..MeshSlice::default()
+        };
+        let mut config = GatewayConfig::default();
+        materialize_mesh_outbound_proxies(&mut config, &ambient_runtime(), &slice);
+        apply_destination_rules(&mut config, &ambient_runtime(), &slice)
+            .expect("destination rules apply");
+
+        let upstream = config
+            .upstreams
+            .iter()
+            .find(|u| u.id == "__mesh-out-upstream-default-reviews-80")
+            .expect("outbound upstream materialized");
+        let mut dial_ports: Vec<u16> = upstream.targets.iter().map(|t| t.port).collect();
+        dial_ports.sort_unstable();
+        assert_eq!(
+            dial_ports,
+            vec![8080, 8081],
+            "each replica dials its own name-resolved container port"
+        );
+        for dial_port in [8080u16, 8081] {
+            assert_eq!(
+                upstream
+                    .port_overrides
+                    .get(&dial_port)
+                    .and_then(|slot| slot.connect_timeout_ms),
+                Some(1234),
+                "the Service-port entry must fan out to dial port {dial_port}"
+            );
+        }
+        assert!(
+            !upstream.port_overrides.contains_key(&80),
+            "the entry must not be stranded under the service port"
+        );
+        // SELECTION-TIME policy must also land at the UPSTREAM level: with
+        // heterogeneous dial ports no per-port LB lane covers every target
+        // (`initial_dispatch_port_override` stays 0), so selection falls back
+        // to upstream-level LB — which must therefore carry the owning
+        // Service port's policy.
+        assert_eq!(
+            upstream.algorithm,
+            LoadBalancerAlgorithm::Random,
+            "the owning port's loadBalancer must apply at the upstream level \
+             so heterogeneous-dial-port selection honors it"
+        );
+        assert_eq!(
+            upstream.hash_on, None,
+            "switching the owning port to a non-hash algorithm must clear the \
+             top-level consistentHash key — the hash strategy is read \
+             independently of the selected algorithm"
+        );
+    }
+
+    #[test]
+    fn mesh_outbound_fanned_slots_layer_partial_outlier_over_top_level() {
+        // A top-level outlierDetection sets the detection window / recovery
+        // fields; the owning port entry overrides only consecutiveErrors. The
+        // fresh fanned dial-port slot must be SEEDED from the upstream-level
+        // passive config so `passive_health_for_target` (which prefers a
+        // per-port slot outright) still sees the top-level window/recovery
+        // fields layered under the per-port override.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let mut svc = http_mesh_service("reviews", 80, spiffe);
+        svc.ports[0].target_port = Some(ServiceTargetPort::Name("http".to_string()));
+        let mut wl = workload_with_address("reviews", "reviews", "10.0.0.1");
+        wl.ports = vec![WorkloadPort {
+            port: 8080,
+            protocol: AppProtocol::Http,
+            name: Some("http".to_string()),
+        }];
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            workloads: vec![wl],
+            services: vec![svc],
+            destination_rules: vec![MeshDestinationRule {
+                name: "reviews".to_string(),
+                namespace: "default".to_string(),
+                host: "reviews.default.svc.cluster.local".to_string(),
+                traffic_policy: Some(MeshTrafficPolicy {
+                    outlier_detection: Some(MeshOutlierDetection {
+                        consecutive_errors: None,
+                        interval_seconds: Some(33),
+                        base_ejection_seconds: Some(44),
+                        max_ejection_percent: None,
+                    }),
+                    ..MeshTrafficPolicy::default()
+                }),
+                port_level_settings: HashMap::from([(
+                    80u16,
+                    MeshTrafficPolicy {
+                        outlier_detection: Some(MeshOutlierDetection {
+                            consecutive_errors: Some(7),
+                            interval_seconds: None,
+                            base_ejection_seconds: None,
+                            max_ejection_percent: None,
+                        }),
+                        ..MeshTrafficPolicy::default()
+                    },
+                )]),
+                subsets: Vec::new(),
+            }],
+            ..MeshSlice::default()
+        };
+        let mut config = GatewayConfig::default();
+        materialize_mesh_outbound_proxies(&mut config, &ambient_runtime(), &slice);
+        apply_destination_rules(&mut config, &ambient_runtime(), &slice)
+            .expect("destination rules apply");
+
+        let upstream = config
+            .upstreams
+            .iter()
+            .find(|u| u.id == "__mesh-out-upstream-default-reviews-80")
+            .expect("outbound upstream materialized");
+        let slot_passive = upstream
+            .port_overrides
+            .get(&8080)
+            .and_then(|slot| slot.passive_health_check.as_ref())
+            .expect("fanned slot carries passive health");
+        assert_eq!(
+            slot_passive.unhealthy_threshold, 7,
+            "the per-port consecutiveErrors override applies"
+        );
+        assert_eq!(
+            slot_passive.unhealthy_window_seconds, 33,
+            "the top-level detection interval must survive in the fanned slot"
+        );
+        assert_eq!(
+            slot_passive.healthy_after_seconds, 44,
+            "the top-level base ejection time must survive in the fanned slot"
+        );
+    }
+
+    #[test]
+    fn mesh_outbound_owner_locality_overlay_clears_stale_projection() {
+        // Rule "a" projects a locality policy via the owning port entry; a
+        // LATER rule "b" for the same host carries an owning-port entry that
+        // omits locality (and no top-level locality). The upstream-level
+        // overlay must CLEAR the earlier projection — heterogeneous-dial-port
+        // selection reads the upstream-level locality state, which must not
+        // pin a policy the latest rule no longer declares.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let mut svc = http_mesh_service("reviews", 80, spiffe);
+        svc.ports[0].target_port = Some(ServiceTargetPort::Name("http".to_string()));
+        let mut wl = workload_with_address("reviews", "reviews", "10.0.0.1");
+        wl.ports = vec![WorkloadPort {
+            port: 8080,
+            protocol: AppProtocol::Http,
+            name: Some("http".to_string()),
+        }];
+        let locality = MeshLocalityLbSetting {
+            enabled: true,
+            ..MeshLocalityLbSetting::default()
+        };
+        let dr = |name: &str, with_locality: bool| MeshDestinationRule {
+            name: name.to_string(),
+            namespace: "default".to_string(),
+            host: "reviews.default.svc.cluster.local".to_string(),
+            traffic_policy: None,
+            port_level_settings: HashMap::from([(
+                80u16,
+                MeshTrafficPolicy {
+                    locality_lb_setting: with_locality.then(|| locality.clone()),
+                    ..MeshTrafficPolicy::default()
+                },
+            )]),
+            subsets: Vec::new(),
+        };
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            workloads: vec![wl],
+            services: vec![svc],
+            // Sorted application order: "a" (sets locality) then "b" (omits).
+            destination_rules: vec![dr("a", true), dr("b", false)],
+            ..MeshSlice::default()
+        };
+        let mut config = GatewayConfig::default();
+        materialize_mesh_outbound_proxies(&mut config, &ambient_runtime(), &slice);
+        apply_destination_rules(&mut config, &ambient_runtime(), &slice)
+            .expect("destination rules apply");
+
+        let upstream = config
+            .upstreams
+            .iter()
+            .find(|u| u.id == "__mesh-out-upstream-default-reviews-80")
+            .expect("outbound upstream materialized");
+        assert!(
+            upstream.locality_lb_setting.is_none(),
+            "the later owning entry omitting locality must clear the earlier \
+             rule's upstream-level projection"
+        );
+    }
+
+    #[test]
     fn mesh_outbound_port_policy_does_not_leak_across_sibling_upstreams() {
         // Service declares ports 80 (targetPort 8080) and 8080. Port 80's
         // upstream DIALS 8080, so the generic "entry port is a target port"
@@ -8567,6 +8925,7 @@ mod tests {
                         8080u16,
                         MeshTrafficPolicy {
                             connect_timeout_ms: Some(2222),
+                            load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::Random)),
                             ..MeshTrafficPolicy::default()
                         },
                     ),
@@ -8594,6 +8953,12 @@ mod tests {
             "port 80's upstream carries ITS OWN service port's policy, \
              re-keyed onto its dial port 8080"
         );
+        assert_eq!(
+            upstream_80.algorithm,
+            LoadBalancerAlgorithm::RoundRobin,
+            "service port 8080's SELECTION-TIME policy must not bleed onto \
+             port 80's upstream-level LB"
+        );
 
         let upstream_8080 = config
             .upstreams
@@ -8607,6 +8972,12 @@ mod tests {
                 .and_then(|slot| slot.connect_timeout_ms),
             Some(2222),
             "service port 8080's policy lands only on its own sibling upstream"
+        );
+        assert_eq!(
+            upstream_8080.algorithm,
+            LoadBalancerAlgorithm::Random,
+            "the owning port's SELECTION-TIME policy lands on its own \
+             upstream's LB"
         );
     }
 
