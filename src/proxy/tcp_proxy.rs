@@ -1964,6 +1964,7 @@ async fn handle_tcp_connection_inner(
 
     // ----- Passthrough mode: forward encrypted bytes without TLS termination -----
     if params.passthrough {
+        let mut cb_info = cb_info;
         // Peek at the ClientHello to extract SNI for logging/routing.
         // Skip if already extracted during SNI-based proxy resolution above.
         if stream_ctx.sni_hostname.is_none() {
@@ -2002,6 +2003,35 @@ async fn handle_tcp_connection_inner(
             }
         }
 
+        // Circuit breaker check — reject before DNS resolution or backend
+        // connect if the passthrough target is open. This mirrors the
+        // terminating TCP path; passthrough still records backend outcomes
+        // below, so it must also honor breaker admission and preserve the
+        // half-open probe flag for the matching record_success/failure call.
+        if let Some(ref cb_config) = cb_info.cb_config {
+            match circuit_breaker_cache.can_execute(
+                proxy_id,
+                cb_info.cb_target_key.as_deref(),
+                cb_config,
+            ) {
+                Ok((_cb, is_half_open_probe)) => {
+                    cb_info.is_half_open_probe = is_half_open_probe;
+                }
+                Err(_) => {
+                    warn!(
+                        proxy_id = %proxy_id,
+                        client = %remote_addr,
+                        "TCP passthrough connection rejected: circuit breaker open"
+                    );
+                    return Err(StreamSetupError::new(
+                        StreamSetupKind::CircuitBreakerOpen,
+                        format!("for {}:{}", params.backend_host, params.backend_port),
+                    )
+                    .into());
+                }
+            }
+        }
+
         let connect_timeout = Duration::from_millis(params.backend_connect_timeout_ms);
         let idle_timeout = if params.tcp_idle_timeout_seconds > 0 {
             Some(Duration::from_secs(params.tcp_idle_timeout_seconds))
@@ -2032,17 +2062,37 @@ async fn handle_tcp_connection_inner(
         #[cfg(not(target_os = "linux"))]
         let splice_used = false;
 
-        // Resolve backend IP via DNS
-        let resolved_ip = dns_cache
+        // Resolve backend IP via DNS. A resolution failure is a backend
+        // reachability failure: record it against the breaker (mirrors the
+        // non-passthrough path) so the failure counts toward opening AND any
+        // half-open probe slot claimed by can_execute above is released —
+        // otherwise an unresolvable passthrough hostname wedges HALF_OPEN
+        // until reload.
+        let resolved_ip = match dns_cache
             .resolve(
                 &params.backend_host,
                 params.dns_override.as_deref(),
                 params.dns_cache_ttl_seconds,
             )
             .await
-            .map_err(|e| {
-                anyhow::anyhow!("DNS resolution failed for {}: {}", params.backend_host, e)
-            })?;
+        {
+            Ok(ip) => ip,
+            Err(e) => {
+                if let Some(ref cb_config) = cb_info.cb_config {
+                    let cb = circuit_breaker_cache.get_or_create(
+                        proxy_id,
+                        cb_info.cb_target_key.as_deref(),
+                        cb_config,
+                    );
+                    cb.record_failure(502, true, cb_info.is_half_open_probe);
+                }
+                return Err(anyhow::anyhow!(
+                    "DNS resolution failed for {}: {}",
+                    params.backend_host,
+                    e
+                ));
+            }
+        };
         let addr = SocketAddr::new(resolved_ip, params.backend_port);
         backend_info.backend_resolved_ip = Some(resolved_ip.to_string());
 
@@ -2065,6 +2115,18 @@ async fn handle_tcp_connection_inner(
                     reason = %reason,
                     "TCP passthrough rejected: backend maxConnections reached"
                 );
+                // This is a gateway-local policy rejection, not a backend
+                // outcome. If the breaker admission above claimed a
+                // half-open probe slot, release it neutrally so passthrough
+                // traffic cannot wedge HALF_OPEN.
+                if let Some(ref cb_config) = cb_info.cb_config {
+                    let cb = circuit_breaker_cache.get_or_create(
+                        proxy_id,
+                        cb_info.cb_target_key.as_deref(),
+                        cb_config,
+                    );
+                    cb.record_neutral(cb_info.is_half_open_probe);
+                }
                 return Err(StreamSetupError::with_source(
                     StreamSetupKind::BackendMaxConnectionsExceeded,
                     format!(
@@ -2102,6 +2164,7 @@ async fn handle_tcp_connection_inner(
             passthrough_port_override.and_then(|o| o.tcp_keepalive.as_ref()),
         );
 
+        let _backend_session_guard = TcpBackendSessionGuard::new(metrics);
         let buf_size = adaptive_buffer.get_buffer_size(proxy_id);
 
         // On Linux, use splice(2) for zero-copy relay between raw TCP sockets.
