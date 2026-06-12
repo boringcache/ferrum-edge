@@ -119,7 +119,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::{Buf, Bytes};
 use chrono::Utc;
@@ -147,6 +147,7 @@ const H3_WS_DUPLEX_BUFFER_BYTES: usize = 64 * 1024;
 /// an h3 DATA `Bytes`; keeping it at 16 KiB caps per-session bridge memory
 /// while still batching small frames.
 const H3_WS_SEND_PUMP_READ_BUFFER_BYTES: usize = 16 * 1024;
+const H3_WS_PUMP_DRAIN_GRACE: Duration = Duration::from_secs(30);
 
 struct AbortOnDropJoinHandle {
     handle: Option<tokio::task::JoinHandle<()>>,
@@ -171,11 +172,27 @@ impl AbortOnDropJoinHandle {
             let _ = handle.await;
         }
     }
+}
 
-    async fn wait(mut self) {
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.await;
-        }
+async fn wait_for_h3_ws_send_pump(
+    proxy_id: &str,
+    mut send_pump: AbortOnDropJoinHandle,
+    drain_grace: Duration,
+) {
+    let Some(mut handle) = send_pump.handle.take() else {
+        return;
+    };
+    if tokio::time::timeout(drain_grace, &mut handle)
+        .await
+        .is_err()
+    {
+        warn!(
+            proxy_id = %proxy_id,
+            drain_grace_seconds = drain_grace.as_secs(),
+            "H3 WS send pump drain grace expired; aborting pump"
+        );
+        handle.abort();
+        let _ = handle.await;
     }
 }
 
@@ -547,6 +564,14 @@ pub(crate) async fn handle_h3_websocket(
     let mut ws_cb_probe_slot_available = cb_is_half_open_probe;
     let mut ws_attempt = 0u32;
 
+    // Connection-wide idle tracker created BEFORE the backend dial so the
+    // byte-level activity adapter can be installed under the backend framer
+    // inside `connect_websocket_backend`; the same tracker is later wired
+    // under the client framer by `run_websocket_proxy`. `None` disables the
+    // idle bound entirely.
+    let ws_idle_tracker = crate::proxy::WsIdleTracker::from_timeout_seconds(
+        state.env_config.websocket_idle_timeout_seconds,
+    );
     // The backend WebSocket connection acquired below is held for the full
     // session lifetime (the inline relay below, until this function returns),
     // so this guard's slot releases exactly when the dedicated backend
@@ -652,6 +677,7 @@ pub(crate) async fn handle_h3_websocket(
             &state.crls,
             state.max_websocket_frame_size_bytes,
             state.websocket_write_buffer_size,
+            ws_idle_tracker.clone(),
         )
         .await
         {
@@ -816,6 +842,10 @@ pub(crate) async fn handle_h3_websocket(
                         plugin_execution_ns,
                         start_time,
                         &current_backend_url,
+                        crate::proxy::websocket_dns_resolution_host(
+                            &proxy,
+                            current_target.as_deref(),
+                        ),
                         ws_error_class,
                         &original_request_path,
                     )
@@ -959,6 +989,7 @@ pub(crate) async fn handle_h3_websocket(
         plugin_execution_ns,
         start_time,
         &current_backend_url,
+        crate::proxy::websocket_dns_resolution_host(&proxy, current_target.as_deref()),
         &original_request_path,
     )
     .await;
@@ -1103,6 +1134,7 @@ pub(crate) async fn handle_h3_websocket(
         // gap because tungstenite only exposes a permissive
         // accept-unmasked mode. See docs/http3.md#frame-masking--rfc-9220-5-vs-rfc-6455.
         true,
+        ws_idle_tracker,
         &adaptive_buf,
     )
     .await;
@@ -1138,7 +1170,7 @@ pub(crate) async fn handle_h3_websocket(
     // dropped cleanly.
     recv_pump.abort();
     recv_pump.abort_and_wait().await;
-    send_pump.wait().await;
+    wait_for_h3_ws_send_pump(&proxy.id, send_pump, H3_WS_PUMP_DRAIN_GRACE).await;
 
     // Drop guards explicitly so their `Drop` impl runs before the
     // info!() below — keeps the "session ended" log adjacent to the
@@ -1180,6 +1212,7 @@ async fn emit_successful_upgrade_summary(
     plugin_execution_ns: u64,
     start_time: Instant,
     backend_url: &str,
+    resolve_host: &str,
     // The client-requested path before any VirtualService `rewrite.uri` was
     // applied. Logged as `request_path` so access logs record what the client
     // sent, not the backend-rewritten path in `ctx.path`.
@@ -1197,7 +1230,7 @@ async fn emit_successful_upgrade_summary(
     let resolved_ip = state
         .dns_cache
         .resolve(
-            &proxy.backend_host,
+            resolve_host,
             proxy.dns_override.as_deref(),
             proxy.dns_cache_ttl_seconds,
         )
@@ -1255,6 +1288,7 @@ async fn emit_failed_upgrade_summary(
     plugin_execution_ns: u64,
     start_time: Instant,
     backend_url: &str,
+    resolve_host: &str,
     error_class: retry::ErrorClass,
     // The client-requested path before any VirtualService `rewrite.uri` was
     // applied. Logged as `request_path` so access logs record what the client
@@ -1273,7 +1307,7 @@ async fn emit_failed_upgrade_summary(
     let resolved_ip = state
         .dns_cache
         .resolve(
-            &proxy.backend_host,
+            resolve_host,
             proxy.dns_override.as_deref(),
             proxy.dns_cache_ttl_seconds,
         )
@@ -1538,5 +1572,38 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         panic!("dropping AbortOnDropJoinHandle should abort and drop the task future");
+    }
+
+    #[tokio::test]
+    async fn h3_ws_send_pump_wait_timeout_aborts_pending_task() {
+        struct DropMarker(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+        impl Drop for DropMarker {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dropped_in_task = dropped.clone();
+        let handle = tokio::spawn(async move {
+            let _marker = DropMarker(dropped_in_task);
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        let guard = AbortOnDropJoinHandle::new(handle);
+        started_rx.await.expect("task started");
+
+        wait_for_h3_ws_send_pump("test-proxy", guard, Duration::from_millis(5)).await;
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+        while std::time::Instant::now() < deadline {
+            if dropped.load(Ordering::SeqCst) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("send pump wait timeout should abort and drop the task future");
     }
 }
