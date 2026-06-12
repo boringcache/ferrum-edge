@@ -2691,8 +2691,8 @@ async fn run_gateway_svid_file_rotation_loop(
 /// and `grpc_pool` get a `drain_backend_tls_config_cache_svid_generation()`
 /// call on rotation — the H3 pool's TLS config cache is co-located on
 /// `connection_pool.backend_h3_tls_configs`, so it is drained transitively,
-/// and the mesh mTLS pool builds its SPIFFE client config per connect (no
-/// cache to drain). All pools get a `force_drain_svid_generation()` call when
+/// and the HBONE and mesh mTLS pools build their SPIFFE client config per
+/// connect (no cache to drain). All pools get a `force_drain_svid_generation()` call when
 /// the operator-configured drain window elapses, because each pool keeps its
 /// own `DashMap` of live connections.
 #[derive(Clone)]
@@ -2701,6 +2701,7 @@ struct BackendPoolFamily {
     http2_pool: Arc<Http2ConnectionPool>,
     grpc_pool: Arc<GrpcConnectionPool>,
     h3_pool: Arc<Http3ConnectionPool>,
+    hbone_pool: Arc<HboneConnectionPool>,
     mesh_mtls_pool: Arc<mesh_mtls_pool::MeshMtlsConnectionPool>,
 }
 
@@ -2725,6 +2726,7 @@ impl BackendPoolFamily {
         self.http2_pool.force_drain_svid_generation(generation);
         self.grpc_pool.force_drain_svid_generation(generation);
         self.h3_pool.force_drain_svid_generation(generation);
+        self.hbone_pool.force_drain_svid_generation(generation);
         self.mesh_mtls_pool.force_drain_svid_generation(generation);
     }
 
@@ -2733,6 +2735,7 @@ impl BackendPoolFamily {
         self.http2_pool.force_drain_all();
         self.grpc_pool.force_drain_all();
         self.h3_pool.force_drain_all();
+        self.hbone_pool.force_drain_all();
         self.mesh_mtls_pool.force_drain_all();
     }
 }
@@ -3061,10 +3064,15 @@ impl ProxyState {
             http2_pool: self.http2_pool.clone(),
             grpc_pool: self.grpc_pool.clone(),
             h3_pool: self.h3_pool.clone(),
+            hbone_pool: self.hbone_pool.clone(),
             mesh_mtls_pool: self.mesh_mtls_pool.clone(),
         };
         pools.clear_tls_config_caches();
         pools.force_drain_all();
+        // UDP/DTLS listeners keep listener-local backend DTLS config caches
+        // keyed by paths/options; bump the shared epoch so new sessions
+        // rebuild from the rotated bytes instead of serving stale params.
+        self.stream_listener_manager.bump_backend_tls_reload_epoch();
 
         let config = self.config.load_full();
         self.health_checker
@@ -3072,7 +3080,7 @@ impl ProxyState {
 
         info!(
             validated_backend_tls_configs = validated,
-            "Backend TLS material reloaded; backend client pools were drained"
+            "Backend TLS material reloaded; backend client pools and DTLS config caches were drained"
         );
         Ok(())
     }
@@ -3351,11 +3359,12 @@ impl ProxyState {
         let gateway_trust_bundles = empty_gateway_trust_bundle_slot();
         let mesh_inbound_tls = empty_mesh_inbound_tls_slot();
         let mesh_outbound_enforcement = crate::modes::mesh::outbound_enforcement::empty_slot();
-        let hbone_pool = Arc::new(HboneConnectionPool::new(
+        let hbone_pool = Arc::new(HboneConnectionPool::new_with_svid_generation(
             global_pool_config.clone(),
             dns_cache.clone(),
             gateway_svid_bundle.clone(),
             pool_shard_amount,
+            backend_svid_generation.clone(),
         ));
         let mesh_mtls_pool = Arc::new(
             mesh_mtls_pool::MeshMtlsConnectionPool::new_with_svid_generation(
@@ -3490,6 +3499,7 @@ impl ProxyState {
                     http2_pool: http2_pool.clone(),
                     grpc_pool: grpc_pool.clone(),
                     h3_pool: h3_pool.clone(),
+                    hbone_pool: hbone_pool.clone(),
                     mesh_mtls_pool: mesh_mtls_pool.clone(),
                 },
                 health_checker: health_checker.clone(),
