@@ -100,6 +100,9 @@ struct UdpSession {
     /// Plugins and proxy metadata resolved from the RequestEpoch used to create this session.
     plugins: Arc<Vec<Arc<dyn Plugin>>>,
     datagram_plugins: Arc<[Arc<dyn Plugin>]>,
+    datagram_client_ip: Arc<str>,
+    datagram_proxy_id: Arc<str>,
+    datagram_proxy_name: Option<Arc<str>>,
     /// Nature of the per-datagram payloads this (plain-UDP-frontend) session
     /// hands to `on_udp_datagram`: `PlaintextWire` for plain UDP, or
     /// `EncryptedWire` for passthrough proxies that forward ciphertext. The
@@ -404,6 +407,10 @@ fn reserve_udp_session_slot(
     })
 }
 
+fn udp_session_shard_amount(override_value: usize) -> usize {
+    crate::util::sharding::pool_shard_amount(override_value)
+}
+
 struct UdpSessionEpochView {
     proxy: Proxy,
     plugins: Arc<Vec<Arc<dyn Plugin>>>,
@@ -420,10 +427,7 @@ fn resolve_udp_session_epoch_view(
     listen_port: u16,
 ) -> Result<UdpSessionEpochView, anyhow::Error> {
     let base_proxy = epoch
-        .config
-        .proxies
-        .iter()
-        .find(|p| p.id == listener_proxy_id)
+        .proxy_by_id(listener_proxy_id)
         .ok_or_else(|| anyhow::anyhow!("Proxy {} not found", listener_proxy_id))?;
 
     let sni_hostname = if base_proxy.passthrough {
@@ -433,7 +437,7 @@ fn resolve_udp_session_epoch_view(
     };
 
     let resolved_proxy_id = if let Some(sni_ids) = sni_proxy_ids {
-        super::sni::resolve_proxy_by_sni(sni_hostname.as_deref(), sni_ids, &epoch.config)
+        super::sni::resolve_proxy_by_sni_in_epoch(sni_hostname.as_deref(), sni_ids, epoch)
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "No matching passthrough proxy for SNI {:?} on port {}",
@@ -446,10 +450,7 @@ fn resolve_udp_session_epoch_view(
     };
 
     let proxy = epoch
-        .config
-        .proxies
-        .iter()
-        .find(|p| p.id == resolved_proxy_id)
+        .proxy_by_id(resolved_proxy_id)
         .ok_or_else(|| anyhow::anyhow!("Proxy {} not found", resolved_proxy_id))?
         .clone();
     let plugins = epoch
@@ -474,9 +475,9 @@ fn resolve_udp_session_epoch_view(
 #[allow(clippy::too_many_arguments)]
 async fn udp_datagram_allowed(
     datagram_plugins: &[Arc<dyn Plugin>],
-    client_addr: SocketAddr,
-    proxy_id: &str,
-    proxy_name: Option<&str>,
+    client_ip: Arc<str>,
+    proxy_id: Arc<str>,
+    proxy_name: Option<Arc<str>>,
     listen_port: u16,
     payload: &[u8],
     payload_kind: StreamBytesKind,
@@ -488,9 +489,9 @@ async fn udp_datagram_allowed(
     }
 
     let ctx = UdpDatagramContext {
-        client_ip: Arc::from(client_addr.ip().to_string()),
-        proxy_id: Arc::from(proxy_id),
-        proxy_name: proxy_name.map(Arc::from),
+        client_ip,
+        proxy_id,
+        proxy_name,
         listen_port,
         datagram_size: payload.len(),
         direction,
@@ -851,6 +852,8 @@ pub struct UdpListenerConfig {
     /// Number of datagrams per `recvmmsg` syscall on Linux (default: 64).
     /// Ignored on non-Linux platforms.
     pub recvmmsg_batch_size: usize,
+    /// DashMap shard count for the per-client UDP session map.
+    pub session_shard_amount: usize,
     /// Shared overload state for session accounting and load shedding.
     pub overload: Arc<crate::overload::OverloadState>,
     /// SO_BUSY_POLL duration in microseconds for low-latency receive.
@@ -905,6 +908,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
         sni_proxy_ids,
         adaptive_buffer,
         recvmmsg_batch_size,
+        session_shard_amount,
         overload,
         so_busy_poll_us,
         udp_gro_enabled,
@@ -912,6 +916,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
         udp_pktinfo_enabled,
         mesh_outbound_enforcement,
     } = cfg;
+    let session_shard_amount = udp_session_shard_amount(session_shard_amount);
     // so_busy_poll_us and udp_gro_enabled are used in #[cfg(target_os = "linux")] blocks below.
     #[cfg(not(target_os = "linux"))]
     let _ = (so_busy_poll_us, udp_gro_enabled, udp_pktinfo_enabled);
@@ -1020,18 +1025,14 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
         Arc::new(BackendDtlsConfigCacheState::new(backend_tls_reload_epoch));
     // Both maps are consulted on every received datagram, so shard sizing
     // goes through the shared hot-path contract instead of DashMap's
-    // `4 * num_cpus` default. `0` is the auto sentinel
-    // (`next_power_of_two(max(64, num_cpus * 16))`) — the operator
-    // `FERRUM_POOL_SHARD_AMOUNT` override is not plumbed into stream
-    // listeners, matching `BackendConnectionLimiter::new()`.
-    let shard_amount = crate::util::sharding::pool_shard_amount(0);
+    // `4 * num_cpus` default.
     let sessions: SessionMap = Arc::new(DashMap::with_hasher_and_shard_amount(
         ahash::RandomState::default(),
-        shard_amount,
+        session_shard_amount,
     ));
     let pending_sessions: PendingSessionMap = Arc::new(DashMap::with_hasher_and_shard_amount(
         ahash::RandomState::default(),
-        shard_amount,
+        session_shard_amount,
     ));
 
     // Spawn session cleanup task
@@ -1600,9 +1601,9 @@ async fn process_datagram(
 
     if !udp_datagram_allowed(
         &session.datagram_plugins,
-        client_addr,
-        &session.proxy_id,
-        session.proxy_name.as_deref(),
+        Arc::clone(&session.datagram_client_ip),
+        Arc::clone(&session.datagram_proxy_id),
+        session.datagram_proxy_name.clone(),
         session.listen_port,
         data,
         session.datagram_payload_kind,
@@ -1741,9 +1742,9 @@ async fn process_new_session_datagram(
         std::sync::Mutex::new(std::collections::HashMap::<String, String>::new());
     if !udp_datagram_allowed(
         &view.datagram_plugins,
-        client_addr,
-        &view.proxy.id,
-        view.proxy.name.as_deref(),
+        Arc::from(client_addr.ip().to_string()),
+        Arc::from(view.proxy.id.as_str()),
+        view.proxy.name.as_deref().map(Arc::from),
         listen_port,
         &data,
         if view.proxy.passthrough {
@@ -1846,9 +1847,9 @@ async fn process_new_session_datagram(
         for dgram in batch {
             if !udp_datagram_allowed(
                 &session.datagram_plugins,
-                client_addr,
-                &session.proxy_id,
-                session.proxy_name.as_deref(),
+                Arc::clone(&session.datagram_client_ip),
+                Arc::clone(&session.datagram_proxy_id),
+                session.datagram_proxy_name.clone(),
                 session.listen_port,
                 &dgram,
                 session.datagram_payload_kind,
@@ -2099,8 +2100,7 @@ async fn start_dtls_frontend_listener(
                 }
 
                 let epoch = request_epoch.load();
-                let Some(proxy) = epoch.config.proxies.iter().find(|p| p.id == proxy_id).cloned()
-                else {
+                let Some(proxy) = epoch.proxy_by_id(&proxy_id).cloned() else {
                     metrics.active_sessions.fetch_sub(1, Ordering::Relaxed);
                     client_conn.close().await;
                     warn!(proxy_id = %proxy_id, "DTLS listener proxy no longer exists in request epoch");
@@ -2567,10 +2567,7 @@ async fn handle_dtls_client_inner(
 ) -> Result<(), anyhow::Error> {
     // Look up proxy config
     let proxy = epoch
-        .config
-        .proxies
-        .iter()
-        .find(|p| p.id == proxy_id)
+        .proxy_by_id(proxy_id)
         .ok_or_else(|| anyhow::anyhow!("Proxy {} not found", proxy_id))?
         .clone();
     let idle_timeout = Duration::from_secs(proxy.udp_idle_timeout_seconds.max(1));
@@ -3239,6 +3236,9 @@ async fn create_session(
     let now = coarse_epoch_millis();
     let consumer_username = stream_ctx.effective_identity().map(str::to_owned);
     let auth_method = stream_ctx.auth_method;
+    let datagram_client_ip: Arc<str> = Arc::from(client_addr.ip().to_string());
+    let datagram_proxy_id: Arc<str> = Arc::from(proxy_id);
+    let datagram_proxy_name: Option<Arc<str>> = proxy_name.as_deref().map(Arc::from);
     let session = Arc::new(UdpSession {
         backend_socket: backend_socket.clone(),
         dtls_conn: dtls_conn.clone(),
@@ -3257,6 +3257,9 @@ async fn create_session(
         local_addr: std::sync::OnceLock::new(),
         plugins: Arc::clone(&plugins),
         datagram_plugins: Arc::clone(&datagram_plugins),
+        datagram_client_ip: Arc::clone(&datagram_client_ip),
+        datagram_proxy_id: Arc::clone(&datagram_proxy_id),
+        datagram_proxy_name: datagram_proxy_name.clone(),
         datagram_payload_kind: if is_passthrough {
             StreamBytesKind::EncryptedWire
         } else {
@@ -3303,9 +3306,9 @@ async fn create_session(
     let reply_amplification_factor = proxy.udp_max_response_amplification_factor;
     let reply_adaptive_buffer = adaptive_buffer.clone();
     let reply_datagram_plugins = Arc::clone(&datagram_plugins);
-    let reply_dgram_client_ip: Arc<str> = Arc::from(client_addr.ip().to_string());
-    let reply_dgram_proxy_id: Arc<str> = Arc::from(proxy_id);
-    let reply_dgram_proxy_name2: Option<Arc<str>> = proxy_name.as_deref().map(Arc::from);
+    let reply_dgram_client_ip = Arc::clone(&datagram_client_ip);
+    let reply_dgram_proxy_id = Arc::clone(&datagram_proxy_id);
+    let reply_dgram_proxy_name = datagram_proxy_name;
     let reply_listen_port = listen_port;
     let reply_stop_notify = Arc::clone(&session.stop_notify);
     let mut reply_listener_shutdown = listener_shutdown.clone();
@@ -3470,7 +3473,7 @@ async fn create_session(
                 let ctx = UdpDatagramContext {
                     client_ip: reply_dgram_client_ip.clone(),
                     proxy_id: reply_dgram_proxy_id.clone(),
-                    proxy_name: reply_dgram_proxy_name2.clone(),
+                    proxy_name: reply_dgram_proxy_name.clone(),
                     listen_port: reply_listen_port,
                     datagram_size: len,
                     direction: UdpDatagramDirection::BackendToClient,
@@ -3577,7 +3580,7 @@ async fn create_session(
                                 let ctx = UdpDatagramContext {
                                     client_ip: reply_dgram_client_ip.clone(),
                                     proxy_id: reply_dgram_proxy_id.clone(),
-                                    proxy_name: reply_dgram_proxy_name2.clone(),
+                                    proxy_name: reply_dgram_proxy_name.clone(),
                                     listen_port: reply_listen_port,
                                     datagram_size: len2,
                                     direction: UdpDatagramDirection::BackendToClient,
@@ -3933,7 +3936,7 @@ mod tests {
         STREAM_ERR_BACKEND_DTLS_HANDSHAKE_FAILED, UdpDisconnectContext, UdpSession,
         build_dtls_stream_summary, build_udp_stream_summary, cached_backend_dtls_config,
         dtls_disconnect_cause, dtls_disconnect_direction, emit_udp_stream_disconnect,
-        reserve_udp_session_slot,
+        reserve_udp_session_slot, udp_session_shard_amount,
     };
     use crate::config::types::{BackendScheme, BackendTlsConfig, Proxy};
     use crate::plugins::{Plugin, StreamTransactionSummary};
@@ -3966,6 +3969,9 @@ mod tests {
             local_addr: std::sync::OnceLock::new(),
             plugins: Arc::new(Vec::new()),
             datagram_plugins: Arc::from([]),
+            datagram_client_ip: Arc::from("127.0.0.1"),
+            datagram_proxy_id: Arc::from("udp-proxy"),
+            datagram_proxy_name: Some(Arc::from("UDP Proxy")),
             datagram_payload_kind: crate::plugins::StreamBytesKind::PlaintextWire,
             proxy_id: "udp-proxy".to_string(),
             proxy_name: Some("UDP Proxy".to_string()),
@@ -4486,6 +4492,9 @@ backend_tls_verify_server_cert: false
             local_addr: std::sync::OnceLock::new(),
             plugins: Arc::new(Vec::new()),
             datagram_plugins: Arc::from([]),
+            datagram_client_ip: Arc::from("127.0.0.1"),
+            datagram_proxy_id: Arc::from("udp-proxy"),
+            datagram_proxy_name: Some(Arc::from("UDP Proxy")),
             datagram_payload_kind: crate::plugins::StreamBytesKind::PlaintextWire,
             proxy_id: "udp-proxy".to_string(),
             proxy_name: Some("UDP Proxy".to_string()),
@@ -4516,6 +4525,30 @@ backend_tls_verify_server_cert: false
             state.active_connections.load(Ordering::Relaxed),
             0,
             "dropping the UDP session must release the global connection slot"
+        );
+    }
+
+    #[test]
+    fn udp_session_caches_datagram_plugin_context_strings() {
+        let session = make_udp_session();
+
+        assert_eq!(session.datagram_client_ip.as_ref(), "127.0.0.1");
+        assert_eq!(session.datagram_proxy_id.as_ref(), "udp-proxy");
+        assert_eq!(
+            session
+                .datagram_proxy_name
+                .as_ref()
+                .map(|name| name.as_ref()),
+            Some("UDP Proxy")
+        );
+    }
+
+    #[test]
+    fn udp_session_shard_amount_uses_pool_sharding_helper() {
+        assert_eq!(udp_session_shard_amount(3), 4);
+        assert_eq!(
+            udp_session_shard_amount(0),
+            crate::util::sharding::pool_shard_amount(0)
         );
     }
 

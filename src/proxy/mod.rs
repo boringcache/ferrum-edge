@@ -3441,6 +3441,7 @@ impl ProxyState {
         let load_balancer_cache = Arc::new(LoadBalancerCache::new(&config));
         let request_epoch = Arc::new(RequestEpochStore::new(RequestEpoch {
             config: Arc::new(config.clone()),
+            proxy_index_by_id: crate::request_epoch::build_proxy_index_by_id(&config),
             route_table: RouterCache::build_route_table_snapshot(&config),
             plugin_cache: plugin_cache.load_inner(),
             consumer_index: consumer_index.load_inner(),
@@ -3585,22 +3586,24 @@ impl ProxyState {
                         tracing::info!(
                             "io_uring splice auto-detection: enabled (IORING_OP_SPLICE probe passed)"
                         );
-                        // Warn if the tokio blocking-thread pool is too small for the
-                        // per-stream pattern: io_uring splice spawns 2 `spawn_blocking`
-                        // tasks per TCP connection (one per direction). With the default
-                        // cap of 512, thousands of concurrent streams will saturate the
-                        // pool and new splices will queue, causing latency spikes. 1024
-                        // is the rule-of-thumb floor; operators with very high connection
-                        // counts should set FERRUM_BLOCKING_THREADS much higher or
-                        // disable io_uring splice entirely.
+                        // io_uring splice spawns 2 `spawn_blocking` tasks per relayed
+                        // TCP connection (one per direction), but concurrent io_uring
+                        // relays are semaphore-capped at IO_URING_SPLICE_MAX_CONCURRENT
+                        // (128) in tcp_proxy.rs — beyond the cap, additional relays
+                        // transparently fall back to the async splice path instead of
+                        // queueing on the blocking pool. Worst-case io_uring usage is
+                        // therefore 256 blocking threads. Warn only when the configured
+                        // pool is smaller than the default 512: 256 io_uring threads
+                        // would then crowd out other `spawn_blocking` users.
                         let effective_blocking_threads =
                             env_config_arc.blocking_threads.unwrap_or(512);
-                        if effective_blocking_threads < 1024 {
+                        if effective_blocking_threads < 512 {
                             tracing::warn!(
                                 blocking_threads = effective_blocking_threads,
-                                "FERRUM_IO_URING_SPLICE_ENABLED=true but FERRUM_BLOCKING_THREADS={} is low; \
-                             each TCP stream consumes 2 blocking threads. \
-                             Recommended: FERRUM_BLOCKING_THREADS >= 1024 for io_uring splice.",
+                                "FERRUM_IO_URING_SPLICE_ENABLED=true with FERRUM_BLOCKING_THREADS={} below the 512 default; \
+                             io_uring splice can occupy up to 256 blocking threads (128 concurrent relays x 2 directions; \
+                             further relays fall back to async splice). \
+                             Recommended: FERRUM_BLOCKING_THREADS >= 512 so other spawn_blocking work keeps headroom.",
                                 effective_blocking_threads
                             );
                         }
@@ -3651,6 +3654,7 @@ impl ProxyState {
                     }
                     v
                 },
+                env_config_arc.pool_shard_amount,
                 mesh_outbound_enforcement.clone(),
             ),
         );
@@ -5721,7 +5725,7 @@ async fn run_per_ip_cleanup_loop(
 async fn handle_connection(
     stream: tokio::net::TcpStream,
     remote_addr: SocketAddr,
-    state: ProxyState,
+    state: Arc<ProxyState>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     frontend_listen_port: Option<u16>,
     node_waypoint_identity: Option<Arc<NodeWaypointIdentity>>,
@@ -5772,7 +5776,7 @@ async fn handle_connection(
     // WebSocket requests flow through handle_proxy_request so that authentication
     // and authorization plugins execute before the upgrade handshake.
     let svc = service_fn(move |req: Request<Incoming>| {
-        let state = state.clone();
+        let state = Arc::clone(&state);
         let addr = remote_addr;
         let connection_metadata = RequestConnectionMetadata {
             frontend_listen_port,
@@ -5875,7 +5879,7 @@ pub fn try_acquire_websocket_connection_permit(
 #[allow(clippy::too_many_arguments)]
 async fn handle_websocket_request_authenticated(
     req: Request<Incoming>,
-    state: ProxyState,
+    state: Arc<ProxyState>,
     remote_addr: SocketAddr,
     proxy: Arc<Proxy>,
     ctx: RequestContext,
@@ -7897,6 +7901,7 @@ pub async fn start_proxy_listener_with_bound_listener(
     shutdown: tokio::sync::watch::Receiver<bool>,
     tls_config: Option<Arc<rustls::ServerConfig>>,
 ) -> Result<(), anyhow::Error> {
+    let state = Arc::new(state);
     // Optional connection limit, mirroring the bound-port path. The semaphore
     // is sized from `max_connections` and shared with the connection guard.
     let conn_semaphore: Option<Arc<tokio::sync::Semaphore>> =
@@ -8256,6 +8261,7 @@ async fn start_proxy_listener_with_tls_source_and_signal(
         } else {
             None
         };
+    let state = Arc::new(state);
 
     if accept_threads > 1 {
         // Multi-listener mode: spawn N-1 additional accept loops, each with its
@@ -8266,7 +8272,7 @@ async fn start_proxy_listener_with_tls_source_and_signal(
         // Spawn additional listeners (threads 1..N-1)
         for i in 1..accept_threads {
             let listener = create_proxy_socket(addr, backlog, tfo_queue, reuse_port)?;
-            let state = state.clone();
+            let state = Arc::clone(&state);
             let tls_source = tls_source.clone();
             let semaphore = conn_semaphore.clone();
             let shutdown_rx = shutdown.clone();
@@ -8357,7 +8363,7 @@ impl SourceIpOverride {
 #[allow(clippy::too_many_arguments)]
 async fn run_accept_loop(
     listener: TcpListener,
-    state: ProxyState,
+    state: Arc<ProxyState>,
     tls_source: ListenerTlsSource,
     conn_semaphore: Option<Arc<tokio::sync::Semaphore>>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
@@ -8419,7 +8425,7 @@ async fn run_accept_loop(
                             None
                         };
 
-                        let state = state.clone();
+                        let state = Arc::clone(&state);
                         let node_waypoint_identity =
                             if let Some(resolver) = state.node_waypoint_identity_resolver.as_ref() {
                                 match resolver.resolve_stream(&stream) {
@@ -8552,7 +8558,7 @@ async fn run_accept_loop(
 async fn handle_tls_connection(
     stream: tokio::net::TcpStream,
     remote_addr: SocketAddr,
-    state: ProxyState,
+    state: Arc<ProxyState>,
     tls_config: Arc<rustls::ServerConfig>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     tls_connection_metadata: TlsConnectionMetadata,
@@ -8633,7 +8639,7 @@ async fn handle_tls_connection(
     // WebSocket requests flow through handle_proxy_request so that authentication
     // and authorization plugins execute before the upgrade handshake.
     let svc = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
-        let state = state.clone();
+        let state = Arc::clone(&state);
         let addr = remote_addr;
         let cert = client_cert_der.clone();
         let chain = client_cert_chain_der.clone();
@@ -9256,7 +9262,7 @@ pub async fn handle_proxy_request(
 ) -> Result<Response<ProxyBody>, hyper::Error> {
     handle_proxy_request_on_frontend_port(
         req,
-        state,
+        Arc::new(state),
         remote_addr,
         is_tls,
         tls_client_cert_der,
@@ -9268,7 +9274,7 @@ pub async fn handle_proxy_request(
 
 async fn handle_proxy_request_on_frontend_port(
     req: Request<Incoming>,
-    state: ProxyState,
+    state: Arc<ProxyState>,
     remote_addr: SocketAddr,
     is_tls: bool,
     tls_client_cert_der: Option<Arc<Vec<u8>>>,
@@ -9341,7 +9347,7 @@ async fn handle_proxy_request_on_frontend_port(
 /// function can attach the [`RequestGuard`] to the response body.
 async fn handle_proxy_request_inner(
     req: Request<Incoming>,
-    state: ProxyState,
+    state: Arc<ProxyState>,
     remote_addr: SocketAddr,
     is_tls: bool,
     tls_client_cert_der: Option<Arc<Vec<u8>>>,
@@ -11569,7 +11575,7 @@ async fn handle_proxy_request_inner(
                 }
                 body = body
                     .with_deferred_backend_dispatch_outcome(
-                        Arc::new(state.clone()),
+                        Arc::clone(&state),
                         Arc::clone(&proxy),
                         Arc::clone(&epoch.load_balancer),
                         upstream_balancer.clone(),
