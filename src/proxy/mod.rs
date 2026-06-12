@@ -3074,14 +3074,46 @@ impl ProxyState {
         // keyed by paths/options; bump the shared epoch so new sessions
         // rebuild from the rotated bytes instead of serving stale params.
         self.stream_listener_manager.bump_backend_tls_reload_epoch();
+        // Publish the reloaded CRLs to the stream listener manager BEFORE the
+        // reconcile below: TCP+TLS reload keys fold in the CRL content
+        // fingerprint, so this swap is what makes a CRL-only rotation restart
+        // those listeners with the new revocation list (and what makes any
+        // restarted listener rebuild against the rotated CRLs rather than the
+        // startup snapshot).
+        self.stream_listener_manager
+            .set_crls(self.shared_crls.load_full());
 
         let config = self.config.load_full();
         self.health_checker
             .restart_with_shutdown(&config, self.health_check_shutdown_rx.clone());
 
+        // TCP+TLS stream listeners cache their backend `ClientConfig` at
+        // spawn and only recompute the content fingerprints in their reload
+        // keys inside `StreamListenerManager::reconcile()`. The live-reload
+        // watcher observes the same stream-proxy TLS sources (see
+        // `collect_backend_tls_watched_sources`), so a same-path CA / client
+        // cert rotation must also drive a stream reconcile here — otherwise
+        // stream listeners keep the stale cached config until an unrelated
+        // config delta or a restart. Spawned so this synchronous rebuild
+        // callback (invoked from the watcher task) never blocks on the
+        // listeners mutex; reconcile itself never crashes and reports
+        // per-listener failures, which we surface as warnings.
+        let stream_listener_manager = self.stream_listener_manager.clone();
+        tokio::spawn(async move {
+            let failures = stream_listener_manager.reconcile().await;
+            for (proxy_id, port, err) in &failures {
+                warn!(
+                    proxy_id = %proxy_id,
+                    port = port,
+                    "Stream listener reconcile after backend TLS material reload reported a failure: {}",
+                    err
+                );
+            }
+        });
+
         info!(
             validated_backend_tls_configs = validated,
-            "Backend TLS material reloaded; backend client pools and DTLS config caches were drained"
+            "Backend TLS material reloaded; backend client pools and DTLS config caches were drained and stream listeners reconciled"
         );
         Ok(())
     }
@@ -5233,13 +5265,30 @@ impl ProxyState {
         warn_if_h3_backend_tls_policy_incompatible(&new_config, self.tls_policy.as_deref());
         self.spawn_backend_capability_refresh();
 
-        // Reconcile stream proxy listeners if any proxies changed
+        // Reconcile stream proxy listeners if any proxies changed.
+        //
+        // Upstream changes must also trigger reconcile: a TCP+TLS stream
+        // proxy's backend TLS (CA / client cert / verify / SAN list) can be
+        // supplied by its referenced upstream via `resolved_tls`, and an
+        // upstream-only update never marks the proxy itself as modified
+        // (delta diffing is `updated_at`-based). Conservative trigger — any
+        // upstream change while stream proxies exist — is fine: reconcile is
+        // idempotent and only restarts listeners whose reload key actually
+        // changed.
+        let upstreams_changed = !delta.added_upstreams.is_empty()
+            || !delta.removed_upstream_ids.is_empty()
+            || !delta.modified_upstreams.is_empty();
         let stream_proxies_changed = delta
             .added_proxies
             .iter()
             .chain(delta.modified_proxies.iter())
             .any(|p| p.dispatch_kind.is_stream())
-            || !delta.removed_proxy_ids.is_empty();
+            || !delta.removed_proxy_ids.is_empty()
+            || (upstreams_changed
+                && new_config
+                    .proxies
+                    .iter()
+                    .any(|p| p.dispatch_kind.is_stream()));
         if stream_proxies_changed {
             let slm = self.stream_listener_manager.clone();
             tokio::spawn(async move {
@@ -5603,7 +5652,16 @@ impl ProxyState {
         // one in-flight probe + one queued re-run.
         self.spawn_backend_capability_refresh();
 
-        // Reconcile stream proxy listeners if any stream proxies changed
+        // Reconcile stream proxy listeners if any stream proxies changed.
+        //
+        // Upstream changes must also trigger reconcile: a TCP+TLS stream
+        // proxy's backend TLS (CA / client cert / verify / SAN list) can be
+        // supplied by its referenced upstream via `resolved_tls`, and an
+        // upstream-only update never marks the proxy itself as modified
+        // (delta diffing is `updated_at`-based). Conservative trigger — any
+        // upstream change while stream proxies exist — is fine: reconcile is
+        // idempotent and only restarts listeners whose reload key actually
+        // changed.
         let removed_had_stream = if !delta.removed_proxy_ids.is_empty() {
             let removed_set: std::collections::HashSet<&str> =
                 delta.removed_proxy_ids.iter().map(|s| s.as_str()).collect();
@@ -5614,12 +5672,20 @@ impl ProxyState {
         } else {
             false
         };
+        let upstreams_changed = !delta.added_upstreams.is_empty()
+            || !delta.removed_upstream_ids.is_empty()
+            || !delta.modified_upstreams.is_empty();
         let stream_proxies_changed = delta
             .added_proxies
             .iter()
             .chain(delta.modified_proxies.iter())
             .any(|p| p.dispatch_kind.is_stream())
-            || removed_had_stream;
+            || removed_had_stream
+            || (upstreams_changed
+                && new_config
+                    .proxies
+                    .iter()
+                    .any(|p| p.dispatch_kind.is_stream()));
         if stream_proxies_changed {
             let failures = self.stream_listener_manager.reconcile().await;
             for (proxy_id, port, err) in &failures {
