@@ -42,8 +42,9 @@ use crate::tls::backend::BackendSvidGeneration;
 use crate::tls::spiffe::build_spiffe_outbound_config;
 
 use super::hbone_pool::{
-    HbonePoolError, MESH_SPIFFE_ID_TAG, entry_idle_expired, matches_boolish_true, svid_fingerprint,
-    target_expected_peer_spiffe, unix_secs, write_pool_config_key,
+    H2ConnectTunnel, HbonePoolError, MESH_SPIFFE_ID_TAG, authority_for_host_port,
+    dial_h2_connect_sender, entry_idle_expired, matches_boolish_true, open_h2_connect_stream,
+    svid_fingerprint, target_expected_peer_spiffe, unix_secs, write_pool_config_key,
 };
 
 /// Tag marking a target for Sidecar SVID-mTLS dispatch (the peer is a mesh
@@ -432,6 +433,64 @@ impl MeshMtlsConnectionPool {
             &pool_config,
         )
         .await
+    }
+
+    /// Open a raw-TCP egress CONNECT tunnel to a peer sidecar's inbound mTLS
+    /// listener (`:15006`, or the `mesh.mtls_port`-tagged override) over a
+    /// FRESH SVID-mTLS H2 connection. `target_host:target_port` is the
+    /// destination workload's address and app (container) port — the CONNECT
+    /// `:authority` the peer's transport-agnostic inbound relay dials locally.
+    ///
+    /// Unlike HTTP-family Sidecar egress (which multiplexes over the pooled
+    /// [`MeshMtlsSender`] connections) and Ambient raw-TCP egress (which
+    /// multiplexes over the shared HBONE pool), each captured raw-TCP stream
+    /// gets its OWN mesh-mTLS H2 connection carrying exactly ONE CONNECT
+    /// stream (1:1, dropped when the stream closes). Raw-TCP streams are
+    /// long-lived, so the handshake amortizes over the connection's lifetime,
+    /// and SVID rotation is automatic because every new stream dials with the
+    /// current SVID. Pooling these tunnels is a documented follow-up.
+    ///
+    /// The CONNECT is BARE — no `x-ferrum-mesh-protocol` marker and no W3C
+    /// baggage: the peer authenticates this gateway by its mTLS client
+    /// certificate (one sidecar SVID == one workload identity), and the
+    /// destination's inbound relay (`build_inbound_hbone_relay_proxy`, gated by
+    /// `is_hbone_connect` + `mesh_direction == Inbound`, which a bare H2 CONNECT
+    /// satisfies) dials the authority. Fail-closed: a missing gateway SVID
+    /// errors before the dial, and the dial PINS `expected_peer`.
+    pub async fn open_connect_tunnel(
+        &self,
+        proxy: &Proxy,
+        target_host: &str,
+        target_port: u16,
+        mtls_port: u16,
+        expected_peer: &SpiffeId,
+    ) -> Result<H2ConnectTunnel, HbonePoolError> {
+        // Fail closed when no gateway SVID is loaded — never dial a mesh peer
+        // identity-less (parity with `get_sender` and the HBONE raw-TCP path).
+        let _ = self.current_svid_fingerprint_cached()?;
+        let pool_config = self.pool_config.for_proxy(proxy);
+        let sender = dial_h2_connect_sender(
+            &self.dns_cache,
+            &self.gateway_svid,
+            proxy,
+            target_host,
+            mtls_port,
+            Some(expected_peer),
+            &pool_config,
+        )
+        .await?;
+        tokio::time::timeout(
+            Duration::from_millis(proxy.backend_connect_timeout_ms),
+            open_h2_connect_stream(sender, target_host, target_port, None, None),
+        )
+        .await
+        .map_err(|_| HbonePoolError::ConnectStream {
+            authority: authority_for_host_port(target_host, target_port),
+            message: format!(
+                "timed out after {}ms waiting for sidecar mesh-mTLS CONNECT response",
+                proxy.backend_connect_timeout_ms
+            ),
+        })?
     }
 
     async fn get_or_create_sender(

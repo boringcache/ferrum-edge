@@ -463,7 +463,7 @@ impl HboneConnectionPool {
         target_port: u16,
         hbone_port: u16,
         expected_peer: Option<&crate::identity::SpiffeId>,
-    ) -> Result<HboneTunnel, HbonePoolError> {
+    ) -> Result<H2ConnectTunnel, HbonePoolError> {
         let (source_identity, fingerprint) = self.current_svid_identity_cached()?;
         let pool_config = self.pool_config.for_proxy(proxy);
 
@@ -832,131 +832,19 @@ impl HboneConnectionPool {
         expected_peer: Option<&crate::identity::SpiffeId>,
         pool_config: &PoolConfig,
     ) -> Result<SendRequest<Bytes>, HbonePoolError> {
-        let resolved_ip = self
-            .dns_cache
-            .resolve(
-                target_host,
-                proxy.dns_override.as_deref(),
-                proxy.dns_cache_ttl_seconds,
-            )
-            .await
-            .map_err(|e| HbonePoolError::DnsLookup {
-                host: target_host.to_string(),
-                message: e.to_string(),
-            })?;
-        let sock_addr = std::net::SocketAddr::new(resolved_ip, hbone_port);
-        let addr = sock_addr.to_string();
-        let connect_timeout = Duration::from_millis(proxy.backend_connect_timeout_ms);
-        let connect_started = Instant::now();
-
-        let tcp = tokio::time::timeout(
-            connect_timeout,
-            crate::socket_opts::connect_with_socket_opts(sock_addr),
+        // The raw-`h2` dial over SVID-mTLS is the transport primitive shared
+        // with the Sidecar mesh-mTLS raw-TCP egress path; only the dial port
+        // (`:15008` here) and the CONNECT request differ.
+        dial_h2_connect_sender(
+            &self.dns_cache,
+            &self.gateway_svid,
+            proxy,
+            target_host,
+            hbone_port,
+            expected_peer,
+            pool_config,
         )
         .await
-        .map_err(|_| HbonePoolError::ConnectTimeout {
-            addr: addr.clone(),
-            timeout_ms: proxy.backend_connect_timeout_ms,
-        })?
-        .map_err(|source| HbonePoolError::Connect {
-            addr: addr.clone(),
-            source,
-        })?;
-        let _ = tcp.set_nodelay(true);
-        if pool_config.enable_http_keep_alive {
-            set_tcp_keepalive(&tcp, pool_config.tcp_keepalive_seconds);
-        }
-
-        // HBONE is HTTP/2 CONNECT over mTLS — advertise h2 only so a sidecar can
-        // reject non-HBONE clients at ALPN. When the target declared its
-        // workload identity (`mesh.spiffe_id` tag), PIN it: the peer must
-        // present exactly that SVID, not merely one from an allowed trust
-        // domain — a same-trust-domain workload at a reused pod IP must not be
-        // able to impersonate the destination.
-        let tls_config = build_spiffe_outbound_config(
-            self.gateway_svid.clone(),
-            expected_peer.cloned(),
-            vec![b"h2".to_vec()],
-        )?;
-        let connector = TlsConnector::from(tls_config);
-        let server_name = rustls::pki_types::ServerName::try_from(target_host.to_string())
-            .map_err(|e| HbonePoolError::InvalidServerName {
-                host: target_host.to_string(),
-                message: e.to_string(),
-            })?;
-
-        let Some(remaining) =
-            crate::pool::remaining_connect_timeout(connect_started, connect_timeout)
-        else {
-            return Err(HbonePoolError::ConnectTimeout {
-                addr,
-                timeout_ms: proxy.backend_connect_timeout_ms,
-            });
-        };
-        let tls_stream = tokio::time::timeout(remaining, connector.connect(server_name, tcp))
-            .await
-            .map_err(|_| HbonePoolError::ConnectTimeout {
-                addr: addr.clone(),
-                timeout_ms: proxy.backend_connect_timeout_ms,
-            })?
-            .map_err(|e| HbonePoolError::TlsHandshake {
-                host: target_host.to_string(),
-                message: e.to_string(),
-            })?;
-
-        let (stream_window_size, connection_window_size) = h2_window_sizes(pool_config);
-        let mut builder = h2::client::Builder::new();
-        // The lower-level h2 builder does not expose hyper's adaptive-window
-        // toggle. When adaptive sizing is requested, h2_window_sizes() raises
-        // the initial windows to the same high-throughput starting point used
-        // by the direct HTTP/2 pool.
-        builder
-            .initial_window_size(stream_window_size)
-            .initial_connection_window_size(connection_window_size)
-            .max_frame_size(pool_config.http2_max_frame_size)
-            .max_concurrent_reset_streams(4096);
-        if let Some(max_streams) = pool_config.http2_max_concurrent_streams {
-            builder.max_concurrent_streams(max_streams);
-        }
-
-        let Some(remaining) =
-            crate::pool::remaining_connect_timeout(connect_started, connect_timeout)
-        else {
-            return Err(HbonePoolError::ConnectTimeout {
-                addr,
-                timeout_ms: proxy.backend_connect_timeout_ms,
-            });
-        };
-        let (sender, mut connection) =
-            tokio::time::timeout(remaining, builder.handshake(tls_stream))
-                .await
-                .map_err(|_| HbonePoolError::ConnectTimeout {
-                    addr,
-                    timeout_ms: proxy.backend_connect_timeout_ms,
-                })?
-                .map_err(|e| HbonePoolError::H2Handshake {
-                    host: target_host.to_string(),
-                    message: e.to_string(),
-                })?;
-        if pool_config.enable_http2
-            && let Some(ping_pong) = connection.ping_pong()
-        {
-            spawn_h2_keepalive(
-                ping_pong,
-                pool_config.http2_keep_alive_interval_seconds,
-                pool_config.http2_keep_alive_timeout_seconds,
-            );
-        }
-
-        // Connection driver exits when all SendRequest handles are dropped.
-        // In-flight tunnels are covered by RequestGuard on the dispatch path.
-        tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                debug!("hbone_pool: HTTP/2 connection closed: {}", e);
-            }
-        });
-
-        Ok(sender)
     }
 
     async fn open_connect_stream(
@@ -965,70 +853,31 @@ impl HboneConnectionPool {
         target_host: &str,
         target_port: u16,
         source_identity: &crate::identity::SpiffeId,
-    ) -> Result<HboneTunnel, HbonePoolError> {
-        let authority = authority_for_host_port(target_host, target_port);
-
-        let mut request = Request::builder()
-            .method(Method::CONNECT)
-            .version(Version::HTTP_2)
-            .uri(authority.as_str())
-            .body(())
-            .map_err(|e| HbonePoolError::InvalidConnectRequest {
-                authority: authority.clone(),
-                message: e.to_string(),
-            })?;
+    ) -> Result<H2ConnectTunnel, HbonePoolError> {
+        // HBONE stamps the `hbone` protocol marker and a W3C baggage header
+        // carrying the source workload identity; the shared opener handles the
+        // rest of the CONNECT exchange.
         let baggage = baggage_header_for_source(source_identity);
-        request.headers_mut().insert(
-            BAGGAGE_HEADER,
-            http::HeaderValue::from_str(&baggage).map_err(|e| {
-                HbonePoolError::InvalidConnectRequest {
-                    authority: authority.clone(),
-                    message: e.to_string(),
-                }
-            })?,
-        );
-        request.headers_mut().insert(
-            "x-ferrum-mesh-protocol",
-            http::HeaderValue::from_static("hbone"),
-        );
-
-        let mut sender = sender
-            .ready()
-            .await
-            .map_err(|e| HbonePoolError::ConnectStream {
-                authority: authority.clone(),
-                message: e.to_string(),
-            })?;
-        let (response_fut, send_stream) =
-            sender
-                .send_request(request, false)
-                .map_err(|e| HbonePoolError::ConnectStream {
-                    authority: authority.clone(),
-                    message: e.to_string(),
-                })?;
-        let response = response_fut
-            .await
-            .map_err(|e| HbonePoolError::ConnectStream {
-                authority: authority.clone(),
-                message: e.to_string(),
-            })?;
-        if response.status() != StatusCode::OK {
-            return Err(HbonePoolError::ConnectRejected {
-                authority,
-                status: response.status().as_u16(),
-            });
-        }
-        Ok(HboneTunnel {
-            recv_stream: response.into_body(),
-            send_stream,
-            read_buf: Bytes::new(),
-            write_closed: false,
-            write_reservation: 0,
-        })
+        open_h2_connect_stream(
+            sender,
+            target_host,
+            target_port,
+            Some(&baggage),
+            Some("hbone"),
+        )
+        .await
     }
 }
 
-pub struct HboneTunnel {
+/// A bidirectional byte tunnel over one HTTP/2 CONNECT stream.
+///
+/// This is the transport primitive shared by every mesh CONNECT tunnel,
+/// regardless of topology: HBONE (Ambient/Waypoint, `:15008`, with the
+/// `x-ferrum-mesh-protocol: hbone` marker) and Sidecar SVID-mTLS raw-TCP
+/// egress (`:15006`, a bare CONNECT). Both ride raw `h2` streams; the only
+/// wire difference is the dial port and the optional marker/baggage on the
+/// CONNECT request (see [`open_h2_connect_stream`]).
+pub struct H2ConnectTunnel {
     recv_stream: RecvStream,
     send_stream: SendStream<Bytes>,
     read_buf: Bytes,
@@ -1036,7 +885,7 @@ pub struct HboneTunnel {
     write_reservation: usize,
 }
 
-impl AsyncRead for HboneTunnel {
+impl AsyncRead for H2ConnectTunnel {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -1080,7 +929,7 @@ impl AsyncRead for HboneTunnel {
     }
 }
 
-impl AsyncWrite for HboneTunnel {
+impl AsyncWrite for H2ConnectTunnel {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -1141,7 +990,219 @@ impl AsyncWrite for HboneTunnel {
     }
 }
 
-impl Unpin for HboneTunnel {}
+impl Unpin for H2ConnectTunnel {}
+
+/// Dial a fresh raw-`h2` client connection to `target_host:dial_port` over an
+/// SVID-mTLS session (ALPN `h2`), pinned to `expected_peer` when present, and
+/// complete the HTTP/2 handshake. Shared by the HBONE pool (dialing the peer's
+/// `:15008`) and the Sidecar mesh-mTLS raw-TCP egress path (dialing the peer's
+/// `:15006`) — the transport is identical at this layer; only the dial port and
+/// the CONNECT request itself differ (see [`open_h2_connect_stream`]). The whole
+/// dial (DNS + TCP + TLS + H2 handshake) is bounded by
+/// `proxy.backend_connect_timeout_ms`. Advertising `h2` only lets a peer reject
+/// non-mesh clients at ALPN; pinning the peer identity means a same-trust-domain
+/// workload at a reused pod IP cannot impersonate the destination.
+pub(crate) async fn dial_h2_connect_sender(
+    dns_cache: &DnsCache,
+    gateway_svid: &SharedSvidBundle,
+    proxy: &Proxy,
+    target_host: &str,
+    dial_port: u16,
+    expected_peer: Option<&crate::identity::SpiffeId>,
+    pool_config: &PoolConfig,
+) -> Result<SendRequest<Bytes>, HbonePoolError> {
+    let resolved_ip = dns_cache
+        .resolve(
+            target_host,
+            proxy.dns_override.as_deref(),
+            proxy.dns_cache_ttl_seconds,
+        )
+        .await
+        .map_err(|e| HbonePoolError::DnsLookup {
+            host: target_host.to_string(),
+            message: e.to_string(),
+        })?;
+    let sock_addr = std::net::SocketAddr::new(resolved_ip, dial_port);
+    let addr = sock_addr.to_string();
+    let connect_timeout = Duration::from_millis(proxy.backend_connect_timeout_ms);
+    let connect_started = Instant::now();
+
+    let tcp = tokio::time::timeout(
+        connect_timeout,
+        crate::socket_opts::connect_with_socket_opts(sock_addr),
+    )
+    .await
+    .map_err(|_| HbonePoolError::ConnectTimeout {
+        addr: addr.clone(),
+        timeout_ms: proxy.backend_connect_timeout_ms,
+    })?
+    .map_err(|source| HbonePoolError::Connect {
+        addr: addr.clone(),
+        source,
+    })?;
+    let _ = tcp.set_nodelay(true);
+    if pool_config.enable_http_keep_alive {
+        set_tcp_keepalive(&tcp, pool_config.tcp_keepalive_seconds);
+    }
+
+    let tls_config = build_spiffe_outbound_config(
+        gateway_svid.clone(),
+        expected_peer.cloned(),
+        vec![b"h2".to_vec()],
+    )?;
+    let connector = TlsConnector::from(tls_config);
+    let server_name =
+        rustls::pki_types::ServerName::try_from(target_host.to_string()).map_err(|e| {
+            HbonePoolError::InvalidServerName {
+                host: target_host.to_string(),
+                message: e.to_string(),
+            }
+        })?;
+
+    let Some(remaining) = crate::pool::remaining_connect_timeout(connect_started, connect_timeout)
+    else {
+        return Err(HbonePoolError::ConnectTimeout {
+            addr,
+            timeout_ms: proxy.backend_connect_timeout_ms,
+        });
+    };
+    let tls_stream = tokio::time::timeout(remaining, connector.connect(server_name, tcp))
+        .await
+        .map_err(|_| HbonePoolError::ConnectTimeout {
+            addr: addr.clone(),
+            timeout_ms: proxy.backend_connect_timeout_ms,
+        })?
+        .map_err(|e| HbonePoolError::TlsHandshake {
+            host: target_host.to_string(),
+            message: e.to_string(),
+        })?;
+
+    let (stream_window_size, connection_window_size) = h2_window_sizes(pool_config);
+    let mut builder = h2::client::Builder::new();
+    builder
+        .initial_window_size(stream_window_size)
+        .initial_connection_window_size(connection_window_size)
+        .max_frame_size(pool_config.http2_max_frame_size)
+        .max_concurrent_reset_streams(4096);
+    if let Some(max_streams) = pool_config.http2_max_concurrent_streams {
+        builder.max_concurrent_streams(max_streams);
+    }
+
+    let Some(remaining) = crate::pool::remaining_connect_timeout(connect_started, connect_timeout)
+    else {
+        return Err(HbonePoolError::ConnectTimeout {
+            addr,
+            timeout_ms: proxy.backend_connect_timeout_ms,
+        });
+    };
+    let (sender, mut connection) = tokio::time::timeout(remaining, builder.handshake(tls_stream))
+        .await
+        .map_err(|_| HbonePoolError::ConnectTimeout {
+            addr,
+            timeout_ms: proxy.backend_connect_timeout_ms,
+        })?
+        .map_err(|e| HbonePoolError::H2Handshake {
+            host: target_host.to_string(),
+            message: e.to_string(),
+        })?;
+    if pool_config.enable_http2
+        && let Some(ping_pong) = connection.ping_pong()
+    {
+        spawn_h2_keepalive(
+            ping_pong,
+            pool_config.http2_keep_alive_interval_seconds,
+            pool_config.http2_keep_alive_timeout_seconds,
+        );
+    }
+
+    // Connection driver exits when all SendRequest handles are dropped.
+    // In-flight tunnels are covered by RequestGuard on the dispatch path.
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            debug!("mesh h2 connect pool: HTTP/2 connection closed: {}", e);
+        }
+    });
+
+    Ok(sender)
+}
+
+/// Open one HTTP/2 CONNECT stream to `target_host:target_port` over `sender`,
+/// returning the bidirectional byte tunnel. `marker` stamps the optional
+/// `x-ferrum-mesh-protocol` header (`Some("hbone")` for HBONE; `None` for a bare
+/// Sidecar mesh-mTLS CONNECT), and `baggage` carries the optional W3C baggage
+/// source identity (HBONE only — Sidecar mTLS authenticates the peer via its
+/// client certificate and needs no baggage). A non-200 CONNECT response fails
+/// closed.
+pub(crate) async fn open_h2_connect_stream(
+    sender: SendRequest<Bytes>,
+    target_host: &str,
+    target_port: u16,
+    baggage: Option<&str>,
+    marker: Option<&'static str>,
+) -> Result<H2ConnectTunnel, HbonePoolError> {
+    let authority = authority_for_host_port(target_host, target_port);
+
+    let mut request = Request::builder()
+        .method(Method::CONNECT)
+        .version(Version::HTTP_2)
+        .uri(authority.as_str())
+        .body(())
+        .map_err(|e| HbonePoolError::InvalidConnectRequest {
+            authority: authority.clone(),
+            message: e.to_string(),
+        })?;
+    if let Some(baggage) = baggage {
+        request.headers_mut().insert(
+            BAGGAGE_HEADER,
+            http::HeaderValue::from_str(baggage).map_err(|e| {
+                HbonePoolError::InvalidConnectRequest {
+                    authority: authority.clone(),
+                    message: e.to_string(),
+                }
+            })?,
+        );
+    }
+    if let Some(marker) = marker {
+        request.headers_mut().insert(
+            "x-ferrum-mesh-protocol",
+            http::HeaderValue::from_static(marker),
+        );
+    }
+
+    let mut sender = sender
+        .ready()
+        .await
+        .map_err(|e| HbonePoolError::ConnectStream {
+            authority: authority.clone(),
+            message: e.to_string(),
+        })?;
+    let (response_fut, send_stream) =
+        sender
+            .send_request(request, false)
+            .map_err(|e| HbonePoolError::ConnectStream {
+                authority: authority.clone(),
+                message: e.to_string(),
+            })?;
+    let response = response_fut
+        .await
+        .map_err(|e| HbonePoolError::ConnectStream {
+            authority: authority.clone(),
+            message: e.to_string(),
+        })?;
+    if response.status() != StatusCode::OK {
+        return Err(HbonePoolError::ConnectRejected {
+            authority,
+            status: response.status().as_u16(),
+        });
+    }
+    Ok(H2ConnectTunnel {
+        recv_stream: response.into_body(),
+        send_stream,
+        read_buf: Bytes::new(),
+        write_closed: false,
+        write_reservation: 0,
+    })
+}
 
 pub fn target_hbone_enabled(target: &UpstreamTarget) -> bool {
     target
