@@ -5324,7 +5324,41 @@ impl ProxyState {
             |current| {
                 let delta = ConfigDelta::compute(&current.config, &new_config);
                 if delta.is_empty() {
-                    return Ok(None);
+                    // No proxy / upstream / consumer / plugin delta. The mesh
+                    // block (`config.mesh`) is NOT diffed by `ConfigDelta`
+                    // (it carries no `id`/`updated_at`), and mesh endpoints
+                    // (`mesh.workloads`/`mesh.services`) are resolved at REQUEST
+                    // time from the live request-epoch's `config.mesh` (e.g. the
+                    // inbound HBONE relay destination guard, and the mesh
+                    // service discoverer) — NOT from any materialized
+                    // `Upstream.targets`. So a mesh-only change (a federation
+                    // bundle refresh, or a cross-cluster remote-cluster
+                    // scale-up/down merged in by
+                    // `merge_remote_endpoints_into_mesh`) leaves the delta empty
+                    // yet genuinely changes routable state. Republish the epoch
+                    // with the fresh config so the request path observes the new
+                    // `config.mesh`; the pre-computed caches (routes, plugins,
+                    // consumers, LB) are unchanged and reused as-is
+                    // (`route_changed = false`, `lb_changed = false`).
+                    //
+                    // Without this, the `Ok(None)` no-delta path below updates
+                    // only `ProxyState.config` (the ArcSwap the request path
+                    // does NOT read for mesh), leaving `request_epoch.config`
+                    // stale — so a remote scale-up / trust-bundle overlay never
+                    // reaches the live proxy until an unrelated proxy/upstream
+                    // delta forces a republish (codex F7.2 round-5, finding 3).
+                    if current.config.mesh == new_config.mesh {
+                        return Ok(None);
+                    }
+                    return Ok(Some(StagedRequestEpoch {
+                        config: Arc::clone(&staged_config),
+                        route_table: Arc::clone(&current.route_table),
+                        plugin_cache: Arc::clone(&current.plugin_cache),
+                        consumer_index: Arc::clone(&current.consumer_index),
+                        load_balancer: Arc::clone(&current.load_balancer),
+                        route_changed: false,
+                        lb_changed: false,
+                    }));
                 }
                 let staged = self.stage_incremental_request_epoch(
                     current,
@@ -5358,7 +5392,18 @@ impl ProxyState {
         };
         PluginCache::retain_active_uris_for_inner(&published.plugin_cache);
 
-        let delta = applied_delta.expect("delta captured when publish_result is Some");
+        // Mesh-only republish (no proxy/upstream/consumer/plugin delta — only
+        // `config.mesh` changed): the pre-computed caches were reused unchanged,
+        // so there is nothing to prune, warm, reconcile, or restart. The fresh
+        // epoch (and the mirrored `ProxyState.config`) already carry the new
+        // `config.mesh` for the request path. `mirror_request_epoch_wrappers`
+        // published the new config above. Return without running the
+        // delta-keyed maintenance below (it would all be a no-op anyway, and
+        // `applied_delta` is `None` here).
+        let Some(delta) = applied_delta else {
+            debug!("Config update: mesh-only change republished (caches reused)");
+            return true;
+        };
         let proxy_plugin_rebuild_count = delta.proxy_ids_needing_plugin_rebuild(&new_config).len();
 
         // --- CircuitBreakerCache: prune breakers for deleted proxies ---
@@ -24277,6 +24322,109 @@ mod tests {
             "valid config must be swapped into hot state"
         );
         assert_eq!(post.proxies[0].id, "p1");
+    }
+
+    /// Codex F7.2 round-5, finding 3: a config update whose ONLY change is the
+    /// `mesh` block (no proxy / upstream / consumer / plugin delta) must still
+    /// republish the request epoch, so request-time readers of
+    /// `request_epoch.config.mesh` (e.g. the inbound HBONE relay destination
+    /// guard, the mesh service discoverer) observe the new endpoints. Before the
+    /// fix, the empty-`ConfigDelta` path updated only `ProxyState.config` (the
+    /// ArcSwap the request path does NOT read for mesh) and left
+    /// `request_epoch.config` stale.
+    #[tokio::test]
+    async fn update_config_mesh_only_change_republishes_request_epoch() {
+        use crate::identity::spiffe::{SpiffeId, TrustDomain};
+        use crate::modes::mesh::config::{MeshConfig, Workload, WorkloadSelector};
+
+        fn remote_workload(addr: &str) -> Workload {
+            Workload {
+                spiffe_id: SpiffeId::new("spiffe://remote.local/ns/default/sa/reviews".to_string())
+                    .unwrap(),
+                selector: WorkloadSelector::default(),
+                service_name: "reviews".to_string(),
+                addresses: vec![addr.to_string()],
+                ports: vec![],
+                trust_domain: TrustDomain::new("remote.local").unwrap(),
+                namespace: "default".to_string(),
+                network: None,
+                cluster: Some("remote".to_string()),
+                weight: None,
+                locality: None,
+                service_account: None,
+                pod_uid: None,
+            }
+        }
+
+        // The SAME proxy instance backs both configs, so its `id`/`updated_at`
+        // are identical and `ConfigDelta` reports no proxy change — isolating the
+        // mesh-only delta path.
+        let proxy = make_validation_proxy("p1", "/api");
+        let mut config_v1 = make_validation_config(vec![proxy.clone()]);
+        let mut mesh_v1 = MeshConfig::default();
+        mesh_v1.workloads.push(remote_workload("10.2.0.1"));
+        config_v1.mesh = Some(Box::new(mesh_v1));
+
+        let state = make_test_proxy_state(GatewayConfig::default());
+        assert!(state.update_config(config_v1), "initial apply succeeds");
+        let epoch_v1 = state.request_epoch.load();
+        assert_eq!(
+            epoch_v1
+                .config
+                .mesh
+                .as_ref()
+                .map(|m| m.workloads.len())
+                .unwrap_or(0),
+            1,
+            "initial mesh workload is in the request epoch"
+        );
+
+        // v2: identical proxy (same instance → same `updated_at`, so no proxy
+        // delta), mesh block gains a second remote workload. `Proxy::updated_at`
+        // defaults to `Utc::now()` on deserialize, so the proxy MUST be cloned
+        // rather than rebuilt to keep `ConfigDelta` from seeing a proxy change.
+        let mut mesh_v2 = MeshConfig::default();
+        mesh_v2.workloads.push(remote_workload("10.2.0.1"));
+        mesh_v2.workloads.push(remote_workload("10.2.0.2"));
+        let mut config_v2 = make_validation_config(vec![proxy.clone()]);
+        config_v2.mesh = Some(Box::new(mesh_v2));
+
+        assert!(
+            state.update_config(config_v2),
+            "a mesh-only change must report applied=true (epoch republished)"
+        );
+        let epoch_v2 = state.request_epoch.load();
+        assert_eq!(
+            epoch_v2
+                .config
+                .mesh
+                .as_ref()
+                .map(|m| m.workloads.len())
+                .unwrap_or(0),
+            2,
+            "the request epoch's config.mesh must carry the new endpoint set, not the stale one"
+        );
+        assert!(
+            !Arc::ptr_eq(&epoch_v1, &epoch_v2),
+            "a real mesh change must publish a NEW request epoch"
+        );
+
+        // Re-applying an equivalent config (same cloned proxy, same mesh) must
+        // NOT republish: the epoch pointer is unchanged and update_config
+        // returns false.
+        let mut mesh_again = MeshConfig::default();
+        mesh_again.workloads.push(remote_workload("10.2.0.1"));
+        mesh_again.workloads.push(remote_workload("10.2.0.2"));
+        let mut config_v2_again = make_validation_config(vec![proxy]);
+        config_v2_again.mesh = Some(Box::new(mesh_again));
+        assert!(
+            !state.update_config(config_v2_again),
+            "an identical mesh + proxy config is a genuine no-op"
+        );
+        assert!(
+            Arc::ptr_eq(&epoch_v2, &state.request_epoch.load()),
+            "a no-op apply must not republish the request epoch"
+        );
     }
 
     // ── DestinationRule per-port connect-timeout dispatch wiring ──────────

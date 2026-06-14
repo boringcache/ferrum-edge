@@ -951,11 +951,20 @@ fn gateway_config_from_mesh_slice(
     // into the local registry. Remote workloads carry a distinct (remote)
     // locality so the locality-aware priority-tier load balancer fails over
     // local → remote at the endpoint level. Empty snapshots are a no-op.
+    //
+    // The merge is filtered against THIS slice's `multi_cluster` (the candidate
+    // about to be applied): a remote cluster absent from — or with a divergent
+    // identity vs — the candidate contributes no endpoints, so cluster removal /
+    // control-plane identity changes fail closed within the same generation
+    // instead of leaking one generation until the discovery reconciler (sourced
+    // from the accepted slice) evicts the store entry. Fail-closed: a slice with
+    // no `multi_cluster` admits no remote endpoints (codex F7.2 round-4).
     let (workloads, services) = match remote_endpoints {
         Some(snapshot) if !snapshot.is_empty() => multicluster::merge_remote_endpoints_into_mesh(
             &slice.workloads,
             &slice.services,
             snapshot,
+            slice.multi_cluster.as_ref(),
         ),
         _ => (slice.workloads.clone(), slice.services.clone()),
     };
@@ -7880,13 +7889,26 @@ fn start_federation_poller_reconcile_task(
     })
 }
 
+/// Reconcile remote-cluster endpoint-discovery pollers against the latest
+/// **accepted** mesh slice. Like the federation poller reconciler above, the
+/// multicluster config and trust bundles are read from the *applied* slice
+/// (`applied_snapshot` / `subscribe_applied`), never the merely *received* one:
+/// the apply task may REJECT a received slice and keep serving the previous
+/// accepted proxy config, so a rejected slice that diverges (e.g. a changed
+/// `network` or `control_plane_url` for the same cluster name + trust domain)
+/// must never start a poller or populate the `RemoteEndpointStore`. Sourcing
+/// discovery from the accepted slice keeps `GET /mesh/remote-clusters`'s
+/// `discovered` view free of any cluster the proxy did not accept (the
+/// admin-side name+trust-domain filter is then belt-and-suspenders) and means
+/// the store only ever holds endpoints from the proxy-applied multicluster
+/// config.
 fn start_remote_cluster_discovery_reconcile_task(
     mesh_state: MeshRuntimeState,
     mut manager: multicluster::RemoteDiscoveryManager,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut updates = mesh_state.subscribe();
+        let mut updates = mesh_state.subscribe_applied();
         let mut federation_updates = mesh_state.federation_store().subscribe();
         loop {
             if *shutdown_rx.borrow() {
@@ -7894,7 +7916,7 @@ fn start_remote_cluster_discovery_reconcile_task(
                 return;
             }
 
-            let snapshot = mesh_state.snapshot();
+            let snapshot = mesh_state.applied_snapshot();
             let slice = snapshot.as_ref().as_ref();
             let federation_snapshot = mesh_state.federation_store().snapshot();
             let trust_domains = multicluster::trust_domains_from_bundles(
@@ -7955,6 +7977,184 @@ fn publish_staged_spiffe_bundle(proxy_state: &ProxyState, staged: Option<StagedS
     }
 }
 
+/// Build a proxy [`GatewayConfig`] from `base_slice` overlaid with the current
+/// federation + remote-endpoint snapshots and apply it to the live proxy
+/// runtime, running the same TLS / node-waypoint / DNS / outbound-enforcement
+/// side-effects the apply loop performs. Factored out of
+/// [`start_mesh_slice_apply_task`] so the loop can apply a generation against
+/// EITHER the freshly-received slice OR the last-accepted slice.
+///
+/// The last-accepted re-apply is the fix for the codex F7.2 round-4 finding that
+/// an accepted remote-cluster (or federation) update was consumed but never
+/// reflected while the *received* slice was invalid: the discovery poller is
+/// keyed to the accepted slice, so it can legitimately publish endpoint changes
+/// for the last-accepted generation while the CP's newest received slice is one
+/// the proxy rejects. Re-applying the overlay against `base_slice =
+/// last_applied_slice` lets that scale-up/down reach the live proxy without
+/// waiting for a fresh valid slice — fail-closed by retention if even the
+/// last-accepted base no longer builds.
+///
+/// `base_slice` is also the candidate for the remote-endpoint membership filter
+/// in [`gateway_config_from_mesh_slice`]: a remote cluster absent from (or with
+/// a diverged identity vs) `base_slice.multi_cluster` contributes no endpoints
+/// to this generation, so cluster removal / control-plane identity changes are
+/// fail-closed within the SAME generation rather than leaking one generation
+/// until the discovery reconciler evicts the store entry.
+#[allow(clippy::too_many_arguments)]
+async fn apply_mesh_slice_generation(
+    mesh_state: &MeshRuntimeState,
+    proxy_state: &ProxyState,
+    runtime: &MeshRuntimeConfig,
+    base_slice: &MeshSlice,
+    federation_snapshot: &federation::FederationSnapshot,
+    remote_snapshot: &multicluster::RemoteEndpointSnapshot,
+    live_reload_enabled: bool,
+    inbound_tls_reload: &mut MeshInboundTlsReloadState,
+    has_termination_listener: bool,
+    last_applied_slice: &mut Option<Arc<MeshSlice>>,
+    dns_proxy: &Option<Arc<MeshDnsProxy>>,
+) -> bool {
+    let live_reload = if live_reload_enabled {
+        live_reload_inbound_mtls_mode(base_slice, runtime).and_then(|mtls_mode| {
+            plan_mesh_inbound_tls_reload(
+                proxy_state,
+                runtime,
+                base_slice,
+                mtls_mode,
+                inbound_tls_reload.server_identity.as_deref(),
+                inbound_tls_reload.last_snapshot.as_ref(),
+                inbound_tls_reload.spiffe_bundle_slot.as_ref(),
+                inbound_tls_reload.runtime_trust_overlay_slot.as_ref(),
+                inbound_tls_reload.production,
+                has_termination_listener,
+            )
+            .map(|plan| (mtls_mode, plan))
+        })
+    } else {
+        None
+    };
+    if live_reload_enabled && live_reload.is_none() {
+        warn!(
+            mesh_slice_version = %base_slice.version,
+            "Rejected mesh slice before proxy config apply because inbound mTLS live reload preparation failed"
+        );
+        return false;
+    }
+    match gateway_config_from_mesh_slice(
+        base_slice,
+        runtime,
+        Some(federation_snapshot),
+        Some(remote_snapshot),
+    ) {
+        Ok(config) => {
+            let previous_loaded_at = proxy_state.config.load_full().loaded_at;
+            let candidate_loaded_at = config.loaded_at;
+            // GAP-2M.4: build node-waypoint per-pod policy scopes before
+            // config apply, but publish them only after update_config accepts
+            // the candidate. Pre-swapping scopes can pair old policies with a
+            // rejected slice's workload metadata indefinitely; staging keeps
+            // rejection side-effect free while making the post-accept swap a
+            // cheap ArcSwap publish.
+            let staged_policy_scopes = if runtime.topology == MeshTopology::NodeWaypoint {
+                proxy_state
+                    .node_waypoint_identity_resolver
+                    .as_ref()
+                    .map(|resolver| {
+                        (
+                            Arc::clone(resolver),
+                            resolver
+                                .build_policy_scope_snapshot_from_workloads(&base_slice.workloads),
+                        )
+                    })
+            } else {
+                None
+            };
+            // The TLS reload plan (listener config + staged SPIFFE inbound
+            // trust-bundle) is built before config apply, but both are
+            // published only after proxy config acceptance inside
+            // `apply_mesh_inbound_tls_reload`. This avoids pre-swapping TLS or
+            // mutating inbound trust domains for a proxy config the runtime
+            // rejects, at the cost of a tiny accept window where listeners may
+            // still see the previous TLS config and the previous trust bundle.
+            // On a Permissive-to-Strict escalation, an accepted connection in
+            // that window can enter the new plugin chain without a peer
+            // principal; mesh authz still fails closed for identity-required
+            // policy until the slot swaps.
+            let applied = proxy_state.update_config(config);
+            let current_loaded_at = proxy_state.config.load_full().loaded_at;
+            let accepted = mesh_proxy_update_was_accepted(
+                applied,
+                previous_loaded_at,
+                current_loaded_at,
+                candidate_loaded_at,
+            );
+            // Publish the node-waypoint resolver snapshot the instant the proxy
+            // config is accepted — before recording the apply result or
+            // reloading TLS — so the window where the new config is live but the
+            // resolver still holds the previous generation is the minimum
+            // possible. Config and resolver are independent ArcSwaps that cannot
+            // swap atomically, and staging-until-accept keeps a rejected slice
+            // side-effect-free, which precludes pre-swapping the resolver before
+            // update_config. So config swaps first and the resolver swaps here,
+            // one statement later: within that bounded window the OLD generation
+            // still answers, so a workload the new slice removed keeps resolving
+            // its old scope (served briefly — NOT failed closed in-window), and
+            // a newly added one is not yet enrolled. This is the accepted,
+            // self-correcting apply-gap residual: it closes the instant the
+            // store below runs, and because the HTTP/HBONE path re-queries the
+            // scope per request it picks up the new generation on the next
+            // request (the stream path captures at accept). The fail-closed
+            // authz gate is enforced against whichever generation is live — it
+            // is not an in-window guarantee.
+            if accepted && let Some((resolver, snapshot)) = staged_policy_scopes {
+                resolver.install_policy_scope_snapshot(snapshot);
+            }
+            record_mesh_slice_apply_result(mesh_state, last_applied_slice, base_slice, accepted);
+            if accepted && let Some((mtls_mode, plan)) = live_reload {
+                apply_mesh_inbound_tls_reload(
+                    proxy_state,
+                    base_slice,
+                    mtls_mode,
+                    plan,
+                    &mut inbound_tls_reload.last_snapshot,
+                )
+                .await;
+            }
+            if accepted && let Some(dns_proxy) = dns_proxy {
+                dns_proxy.update_from_slice(base_slice);
+            }
+            if accepted {
+                refresh_mesh_outbound_enforcement(proxy_state, runtime, base_slice);
+            }
+            if applied {
+                info!(
+                    mesh_slice_version = %base_slice.version,
+                    "Applied mesh slice to proxy runtime"
+                );
+            } else if accepted {
+                debug!(
+                    mesh_slice_version = %base_slice.version,
+                    "Accepted mesh slice with no proxy runtime delta"
+                );
+            } else {
+                warn!(
+                    mesh_slice_version = %base_slice.version,
+                    "Rejected mesh slice proxy config; leaving last applied slice and DNS table unchanged"
+                );
+            }
+            accepted
+        }
+        Err(e) => {
+            warn!(
+                mesh_slice_version = %base_slice.version,
+                error = %e,
+                "Ignoring invalid mesh slice update"
+            );
+            false
+        }
+    }
+}
+
 fn start_mesh_slice_apply_task(
     mesh_state: MeshRuntimeState,
     proxy_state: ProxyState,
@@ -8009,168 +8209,77 @@ fn start_mesh_slice_apply_task(
                 } else {
                     let live_reload_enabled =
                         proxy_state.env_config.mesh_peer_auth_live_reload_enabled;
-                    let live_reload = if live_reload_enabled {
-                        live_reload_inbound_mtls_mode(slice, &runtime).and_then(|mtls_mode| {
-                            plan_mesh_inbound_tls_reload(
-                                &proxy_state,
-                                &runtime,
-                                slice,
-                                mtls_mode,
-                                inbound_tls_reload.server_identity.as_deref(),
-                                inbound_tls_reload.last_snapshot.as_ref(),
-                                inbound_tls_reload.spiffe_bundle_slot.as_ref(),
-                                inbound_tls_reload.runtime_trust_overlay_slot.as_ref(),
-                                inbound_tls_reload.production,
-                                has_termination_listener,
-                            )
-                            .map(|plan| (mtls_mode, plan))
-                        })
-                    } else {
-                        None
-                    };
-                    if live_reload_enabled && live_reload.is_none() {
-                        warn!(
-                            mesh_slice_version = %slice.version,
-                            "Rejected mesh slice before proxy config apply because inbound mTLS live reload preparation failed"
+                    let federation_snapshot = mesh_state.federation_store().snapshot();
+                    let remote_snapshot = mesh_state.remote_endpoint_store().snapshot();
+                    // Snapshot the last-accepted slice BEFORE the primary attempt
+                    // mutates `last_applied_slice`, so a rejected received slice
+                    // can fall back to re-applying the overlay against the slice
+                    // the proxy is actually serving (codex F7.2 round-4).
+                    let last_accepted_base = last_applied_slice.clone();
+                    let received_accepted = apply_mesh_slice_generation(
+                        &mesh_state,
+                        &proxy_state,
+                        &runtime,
+                        slice,
+                        &federation_snapshot,
+                        &remote_snapshot,
+                        live_reload_enabled,
+                        &mut inbound_tls_reload,
+                        has_termination_listener,
+                        &mut last_applied_slice,
+                        &dns_proxy,
+                    )
+                    .await;
+                    // Finding 3 (accepted-remote/federation update vs rejected
+                    // received slice): the discovery + federation pollers are
+                    // keyed to the ACCEPTED slice, so they can publish overlay
+                    // changes (a remote-cluster scale-up/down, a fresh trust
+                    // bundle) for the last-accepted generation while the CP's
+                    // newest RECEIVED slice is one the proxy rejects. The primary
+                    // attempt above rebuilt from that rejected received slice, so
+                    // without this the overlay change is consumed (its revision
+                    // marker advances below) but never reaches the live proxy
+                    // until another valid slice arrives. When the received slice
+                    // did not apply AND an overlay revision changed, re-apply the
+                    // overlay against the last-accepted slice so the change is
+                    // reflected. Fail-closed by retention: if even the
+                    // last-accepted base no longer builds, the previous live
+                    // config is kept. Skipped when the received slice IS the
+                    // last-accepted one (no distinct base to fall back to) — that
+                    // case is already covered by the primary attempt.
+                    if !received_accepted
+                        && (federation_changed || remote_changed)
+                        && let Some(base) = last_accepted_base
+                        && !mesh_slice_matches_last_applied(Some(base.as_ref()), slice)
+                    {
+                        debug!(
+                            rejected_slice_version = %slice.version,
+                            last_accepted_slice_version = %base.version,
+                            "Received mesh slice rejected; re-applying federation/remote overlay against last-accepted slice"
                         );
-                    } else {
-                        let federation_snapshot = mesh_state.federation_store().snapshot();
-                        let remote_snapshot = mesh_state.remote_endpoint_store().snapshot();
-                        match gateway_config_from_mesh_slice(
-                            slice,
+                        apply_mesh_slice_generation(
+                            &mesh_state,
+                            &proxy_state,
                             &runtime,
-                            Some(&federation_snapshot),
-                            Some(&remote_snapshot),
-                        ) {
-                            Ok(config) => {
-                                let previous_loaded_at = proxy_state.config.load_full().loaded_at;
-                                let candidate_loaded_at = config.loaded_at;
-                                // GAP-2M.4: build node-waypoint per-pod policy scopes before
-                                // config apply, but publish them only after update_config accepts
-                                // the candidate. Pre-swapping scopes can pair old policies with a
-                                // rejected slice's workload metadata indefinitely; staging keeps
-                                // rejection side-effect free while making the post-accept swap a
-                                // cheap ArcSwap publish.
-                                let staged_policy_scopes =
-                                    if runtime.topology == MeshTopology::NodeWaypoint {
-                                        proxy_state.node_waypoint_identity_resolver.as_ref().map(
-                                            |resolver| {
-                                                (
-                                                    Arc::clone(resolver),
-                                                    resolver
-                                                        .build_policy_scope_snapshot_from_workloads(
-                                                            &slice.workloads,
-                                                        ),
-                                                )
-                                            },
-                                        )
-                                    } else {
-                                        None
-                                    };
-                                // The TLS reload plan (listener config + staged SPIFFE inbound
-                                // trust-bundle) is built before config apply, but both are
-                                // published only after proxy config acceptance inside
-                                // `apply_mesh_inbound_tls_reload`. This avoids pre-swapping TLS or
-                                // mutating inbound trust domains for a proxy config the runtime
-                                // rejects, at the cost of a tiny accept window where listeners may
-                                // still see the previous TLS config and the previous trust bundle.
-                                // On a Permissive-to-Strict escalation, an accepted connection in
-                                // that window can enter the new plugin chain without a peer
-                                // principal; mesh authz still fails closed for identity-required
-                                // policy until the slot swaps.
-                                let applied = proxy_state.update_config(config);
-                                let current_loaded_at = proxy_state.config.load_full().loaded_at;
-                                let accepted = mesh_proxy_update_was_accepted(
-                                    applied,
-                                    previous_loaded_at,
-                                    current_loaded_at,
-                                    candidate_loaded_at,
-                                );
-                                // Publish the node-waypoint resolver snapshot the
-                                // instant the proxy config is accepted — before
-                                // recording the apply result or reloading TLS — so
-                                // the window where the new config is live but the
-                                // resolver still holds the previous generation is
-                                // the minimum possible. Config and resolver are
-                                // independent ArcSwaps that cannot swap atomically,
-                                // and staging-until-accept keeps a rejected slice
-                                // side-effect-free, which precludes pre-swapping the
-                                // resolver before update_config. So config swaps
-                                // first and the resolver swaps here, one statement
-                                // later: within that bounded window the OLD
-                                // generation still answers, so a workload the new
-                                // slice removed keeps resolving its old scope
-                                // (served briefly — NOT failed closed in-window),
-                                // and a newly added one is not yet enrolled. This is
-                                // the accepted, self-correcting apply-gap residual:
-                                // it closes the instant the store below runs, and
-                                // because the HTTP/HBONE path re-queries the scope
-                                // per request it picks up the new generation on the
-                                // next request (the stream path captures at accept).
-                                // The fail-closed authz gate is enforced against
-                                // whichever generation is live — it is not an
-                                // in-window guarantee.
-                                if accepted && let Some((resolver, snapshot)) = staged_policy_scopes
-                                {
-                                    resolver.install_policy_scope_snapshot(snapshot);
-                                }
-                                record_mesh_slice_apply_result(
-                                    &mesh_state,
-                                    &mut last_applied_slice,
-                                    slice,
-                                    accepted,
-                                );
-                                if accepted && let Some((mtls_mode, plan)) = live_reload {
-                                    apply_mesh_inbound_tls_reload(
-                                        &proxy_state,
-                                        slice,
-                                        mtls_mode,
-                                        plan,
-                                        &mut inbound_tls_reload.last_snapshot,
-                                    )
-                                    .await;
-                                }
-                                if accepted && let Some(ref dns_proxy) = dns_proxy {
-                                    dns_proxy.update_from_slice(slice);
-                                }
-                                if accepted {
-                                    refresh_mesh_outbound_enforcement(
-                                        &proxy_state,
-                                        &runtime,
-                                        slice,
-                                    );
-                                }
-                                if applied {
-                                    info!(
-                                        mesh_slice_version = %slice.version,
-                                        "Applied mesh slice to proxy runtime"
-                                    );
-                                } else if accepted {
-                                    debug!(
-                                        mesh_slice_version = %slice.version,
-                                        "Accepted mesh slice with no proxy runtime delta"
-                                    );
-                                } else {
-                                    warn!(
-                                        mesh_slice_version = %slice.version,
-                                        "Rejected mesh slice proxy config; leaving last applied slice and DNS table unchanged"
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                warn!(
-                                    mesh_slice_version = %slice.version,
-                                    error = %e,
-                                    "Ignoring invalid mesh slice update"
-                                );
-                            }
-                        }
+                            base.as_ref(),
+                            &federation_snapshot,
+                            &remote_snapshot,
+                            live_reload_enabled,
+                            &mut inbound_tls_reload,
+                            has_termination_listener,
+                            &mut last_applied_slice,
+                            &dns_proxy,
+                        )
+                        .await;
                     }
                 }
                 // Federation / remote-endpoint revisions are consumed after
                 // every apply attempt, whether successful or not. A rejected
                 // apply still advances the markers so a transient invalid slice
                 // doesn't pin the apply loop in a re-apply spin on every poll.
+                // (Finding 3's re-apply against the last-accepted slice has
+                // already reflected any accepted overlay change before we
+                // advance, so the change is not lost by this consume.)
                 last_applied_federation_revision = current_federation_revision;
                 last_applied_remote_revision = current_remote_revision;
             }
@@ -8406,8 +8515,9 @@ mod tests {
         AccessLogFilter, AppProtocol, EastWestGateway, JwtHeader, MeshAccessLoggingConfig,
         MeshConfig, MeshEndpoint, MeshJwtRule, MeshPolicy, MeshRequestAuthentication, MeshRule,
         MeshService, MeshSubset, MeshTelemetryResource, MeshTracingConfig, MultiClusterConfig,
-        PolicyAction, PolicyScope, PrincipalMatch, Resolution, ServiceEntry, ServiceEntryLocation,
-        ServicePort, TracingProvider, Workload, WorkloadPort, WorkloadSelector,
+        PolicyAction, PolicyScope, PrincipalMatch, RemoteCluster, Resolution, ServiceEntry,
+        ServiceEntryLocation, ServicePort, TracingProvider, Workload, WorkloadPort, WorkloadRef,
+        WorkloadSelector,
     };
     use std::collections::{BTreeMap, HashMap};
     use std::sync::Mutex;
@@ -14350,6 +14460,31 @@ mod tests {
         .unwrap_or_else(|_| panic!("mesh_authz label {key} did not become {expected}"));
     }
 
+    /// Wait until the live proxy config's mesh `workloads` include a workload
+    /// carrying `address` (used to observe remote-cluster endpoints merged by the
+    /// slice-apply path).
+    async fn wait_for_mesh_workload_address(proxy_state: &ProxyState, address: &str) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let present = proxy_state
+                    .current_config()
+                    .mesh
+                    .as_ref()
+                    .is_some_and(|mesh| {
+                        mesh.workloads
+                            .iter()
+                            .any(|w| w.addresses.iter().any(|a| a == address))
+                    });
+                if present {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("mesh workload with address {address} did not become live"));
+    }
+
     fn mesh_authz_label(proxy_state: &ProxyState, key: &str) -> Option<String> {
         proxy_state
             .current_config()
@@ -15423,6 +15558,159 @@ mod tests {
             ..MeshSlice::default()
         });
         wait_for_mesh_authz_label(&proxy_state, "app", "worker").await;
+
+        let _ = shutdown_tx.send(true);
+        tokio::time::timeout(Duration::from_secs(2), apply_task)
+            .await
+            .expect("apply task should stop")
+            .expect("apply task should join");
+    }
+
+    /// Codex F7.2 round-4 / Finding 3: an accepted remote-cluster scale-up must
+    /// reach the live proxy even while the CP's most-recent *received* slice is
+    /// one the proxy REJECTS. The discovery poller is keyed to the ACCEPTED
+    /// slice, so it legitimately publishes endpoint changes for the last-accepted
+    /// generation while a newer received slice is invalid; the apply loop must
+    /// re-apply the remote overlay against the last-accepted slice instead of
+    /// rebuilding from (and advancing past) the rejected received snapshot.
+    #[tokio::test(flavor = "current_thread")]
+    async fn mesh_runtime_apply_task_applies_remote_scaleup_while_received_slice_rejected() {
+        let runtime = test_mesh_runtime_config();
+        let mesh_state = MeshRuntimeState::new();
+        let proxy_state = make_test_proxy_state(GatewayConfig::default());
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let apply_task = start_mesh_slice_apply_task(
+            mesh_state.clone(),
+            proxy_state.clone(),
+            runtime,
+            None,
+            MeshInboundTlsReloadState {
+                server_identity: None,
+                last_snapshot: None,
+                spiffe_bundle_slot: None,
+                runtime_trust_overlay_slot: None,
+                production: false,
+            },
+            shutdown_rx,
+            None,
+        );
+
+        let multi_cluster = MultiClusterConfig {
+            remote_clusters: vec![RemoteCluster {
+                name: "west".to_string(),
+                trust_domain: TrustDomain::new("remote.local").unwrap(),
+                network: Some("net2".to_string()),
+                control_plane_url: Some("https://cp.remote.example:15010".to_string()),
+                federation_endpoint: None,
+            }],
+            ..MultiClusterConfig::default()
+        };
+        // A valid, ACCEPTED slice declaring the remote cluster + a local
+        // workload/service. The label lets us wait for acceptance.
+        let good_slice = MeshSlice {
+            version: "good-v1".to_string(),
+            labels: [("app".to_string(), "reviews".to_string())].into(),
+            workloads: vec![workload_with_address("local", "reviews", "10.1.0.1")],
+            services: vec![MeshService {
+                cluster_ips: Vec::new(),
+                name: "reviews".to_string(),
+                namespace: "default".to_string(),
+                ports: vec![ServicePort {
+                    port: 8080,
+                    protocol: AppProtocol::Http,
+                    name: Some("http".to_string()),
+                    target_port: None,
+                }],
+                workloads: vec![WorkloadRef {
+                    spiffe_id: SpiffeId::new(
+                        "spiffe://cluster.local/ns/default/sa/local".to_string(),
+                    )
+                    .unwrap(),
+                }],
+                protocol_overrides: HashMap::new(),
+            }],
+            multi_cluster: Some(multi_cluster),
+            ..MeshSlice::default()
+        };
+        mesh_state.install_slice(good_slice);
+        wait_for_mesh_authz_label(&proxy_state, "app", "reviews").await;
+
+        // Helper: build a remote endpoint entry for `west` with the given remote
+        // workload addresses.
+        let remote_entry = |addrs: &[&str]| {
+            let workloads = addrs
+                .iter()
+                .enumerate()
+                .map(|(i, addr)| {
+                    let mut w = workload_with_address(&format!("remote{i}"), "reviews", addr);
+                    w.spiffe_id =
+                        SpiffeId::new(format!("spiffe://remote.local/ns/default/sa/remote{i}"))
+                            .unwrap();
+                    w.trust_domain = TrustDomain::new("remote.local").unwrap();
+                    w
+                })
+                .collect();
+            multicluster::RemoteClusterEntry::new(
+                "west".to_string(),
+                TrustDomain::new("remote.local").unwrap(),
+                Some("net2".to_string()),
+                // Must match the accepted slice's declared (normalized)
+                // control_plane_url so the full-poll-identity merge filter
+                // admits these endpoints.
+                Some("https://cp.remote.example:15010".to_string()),
+                multicluster::RemoteClusterEndpoints {
+                    workloads,
+                    services: Vec::new(),
+                },
+                1,
+            )
+        };
+
+        // First successful poll: the remote cluster contributes one endpoint.
+        // The apply loop re-applies the (still-accepted) good slice with the
+        // remote overlay, so the live config gains 10.2.0.1.
+        mesh_state
+            .remote_endpoint_store()
+            .install_for_test(remote_entry(&["10.2.0.1"]));
+        wait_for_mesh_workload_address(&proxy_state, "10.2.0.1").await;
+
+        // Now the CP pushes an INVALID slice (a MeshPolicy with an empty
+        // principal matcher fails `MeshConfig::validate`, so
+        // `gateway_config_from_mesh_slice` returns Err → the slice is rejected).
+        let bad_slice = MeshSlice {
+            version: "bad-v2".to_string(),
+            labels: [("app".to_string(), "rejected".to_string())].into(),
+            mesh_policies: vec![MeshPolicy {
+                name: "broken".to_string(),
+                namespace: "default".to_string(),
+                scope: PolicyScope::MeshWide,
+                rules: vec![MeshRule {
+                    from: vec![PrincipalMatch::default()],
+                    action: PolicyAction::Allow,
+                    ..MeshRule::default()
+                }],
+            }],
+            ..MeshSlice::default()
+        };
+        mesh_state.install_slice(bad_slice);
+
+        // While the rejected slice is the current received slice, the remote
+        // cluster scales UP to two endpoints. The poller is keyed to the
+        // last-accepted slice, so this is legitimate. The apply loop must
+        // re-apply the overlay against the last-accepted (good) slice, so the
+        // live config gains 10.2.0.2 even though the received slice is invalid.
+        mesh_state
+            .remote_endpoint_store()
+            .install_for_test(remote_entry(&["10.2.0.1", "10.2.0.2"]));
+        wait_for_mesh_workload_address(&proxy_state, "10.2.0.2").await;
+
+        // The live config still carries the ACCEPTED slice's label, not the
+        // rejected slice's — the rejected slice never became live.
+        assert_eq!(
+            mesh_authz_label(&proxy_state, "app").as_deref(),
+            Some("reviews"),
+            "rejected slice must not become the live config; only its remote overlay re-applies onto the accepted slice"
+        );
 
         let _ = shutdown_tx.send(true);
         tokio::time::timeout(Duration::from_secs(2), apply_task)
