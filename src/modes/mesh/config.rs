@@ -1306,12 +1306,18 @@ pub struct MeshSidecarIngress {
     pub port: u16,
     /// Application-layer protocol of the listener. Only recognized HTTP-family
     /// listeners (`http`/`http2`/`grpc`/`https`) materialize an HTTP route;
-    /// stream (`tcp`/`tls`/db) listeners — and, on the K8s path, a MISSING or
-    /// UNRECOGNIZED protocol string (the translator's `sidecar_ingress_app_protocol`
-    /// maps both to a non-HTTP `AppProtocol`, fail-closed) — are not modeled here
-    /// (raw-TCP inbound has no Host/route and is captured separately) and are
-    /// reported as deferred. The native path admits no unknown `AppProtocol`
-    /// value (serde rejects it), so a native typo fails deserialization instead.
+    /// stream (`tcp`/`tls`/db) listeners — and a MISSING or UNRECOGNIZED protocol
+    /// — are not modeled here (raw-TCP inbound has no Host/route and is captured
+    /// separately) and are reported as deferred.
+    ///
+    /// Fail-closed across sources: on the K8s path the translator's
+    /// `sidecar_ingress_app_protocol` maps a missing/typo'd protocol to a non-HTTP
+    /// `AppProtocol` (never `Unknown`). On the native/file/xDS path this field
+    /// deserializes directly, so an OMITTED `protocol` falls back to
+    /// `AppProtocol::default()` (`Unknown`) and an explicit `"unknown"` parses to
+    /// `Unknown`; `resolve()` REJECTS `Unknown` (via `is_http_family_app_protocol`)
+    /// so a listener whose protocol the source omitted or garbled defers rather
+    /// than being guessed onto the HTTP request path — matching the K8s behavior.
     #[serde(default)]
     pub protocol: AppProtocol,
     /// Istio `port.name` — informational; preserved for observability.
@@ -1448,25 +1454,32 @@ impl MeshSidecarIngress {
     }
 }
 
-/// HTTP-family classification shared by ingress-listener resolution and the
-/// inbound materializer. Mirrors `is_http_family_mesh_protocol` in
-/// [`crate::modes::mesh`]; kept here so the config model can resolve ingress
-/// entries without importing the mode module. `pub(crate)` so the K8s Istio
-/// status writer classifies Sidecar `ingress[]` protocols through the SAME
-/// predicate `MeshSidecarIngress::resolve` uses — keeping the translator/
-/// resolution predicate and the deferred-field report in lock-step.
+/// HTTP-family classification for Sidecar `ingress[]` listeners, shared by
+/// ingress-listener resolution ([`MeshSidecarIngress::resolve`]) and the K8s
+/// status writer's deferred-field report (via
+/// [`sidecar_ingress_protocol_is_http_family`](crate::config_sources::k8s::sidecar_ingress_protocol_is_http_family)),
+/// kept here so the config model can resolve ingress entries without importing
+/// the mode module and so the two callers can never disagree on whether a
+/// listener is modeled.
 ///
-/// Note: for a Sidecar `ingress[]` listener the raw `port.protocol` string is
-/// pre-classified by the K8s translator's `sidecar_ingress_app_protocol` (and
-/// rejected at deserialization on the native path, where serde admits no unknown
-/// `AppProtocol` value), so an ingress entry never carries `AppProtocol::Unknown`:
-/// `https` is mapped to `Http2` (routed) while a missing or mistyped protocol is
-/// mapped to `Tcp` (deferred). `Unknown` is still HTTP-family here only for the
-/// service-port default path's `unknown → HTTP` convention.
+/// **Fail-closed on `Unknown`** (unlike the service-port default path's separate
+/// `is_http_family_mesh_protocol`, which keeps the `unknown → HTTP` convention).
+/// On the K8s path the raw `port.protocol` string is pre-classified by
+/// `sidecar_ingress_app_protocol`, which maps `https` → `Http2` (routed) and a
+/// missing/mistyped protocol → `Tcp` (deferred) and NEVER yields `Unknown`. But
+/// the native/file/xDS source stores `MeshSidecarIngress.protocol` directly via
+/// serde, where an OMITTED `protocol` falls back to `AppProtocol::default()`
+/// (`Unknown`) and an explicit `"unknown"` deserializes to `Unknown`. Treating
+/// `Unknown` as HTTP-family there would materialize a custom inbound listener
+/// the K8s translator (and the documented fail-closed rule) would have deferred.
+/// Excluding `Unknown` here defers it on every source — matching the K8s path's
+/// missing/garbled-protocol behavior — without affecting the status-writer
+/// lock-step (that caller only ever passes the routable values
+/// `sidecar_ingress_app_protocol` emits, never `Unknown`).
 pub(crate) fn is_http_family_app_protocol(protocol: AppProtocol) -> bool {
     matches!(
         protocol,
-        AppProtocol::Http | AppProtocol::Http2 | AppProtocol::Grpc | AppProtocol::Unknown
+        AppProtocol::Http | AppProtocol::Http2 | AppProtocol::Grpc
     )
 }
 

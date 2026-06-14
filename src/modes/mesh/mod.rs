@@ -803,33 +803,45 @@ fn prepare_normalized_gateway_config_for_mesh(
         // emitted (F6 §6.2). Forward-derived from the slice, never parsed from
         // ids.
         //
-        // Re-validate each carried listener's backend endpoint at this single
-        // chokepoint (consumed by BOTH the router grouping and the materializer)
-        // before it is trusted. A `ResolvedIngressListener` can arrive already
-        // resolved over the xDS/native slice carrier, where
-        // `endpoint_host`/`endpoint_port` are decoded straight from untrusted
-        // wire JSON; a malformed or hostile carrier could otherwise point a
-        // listener at an off-box host or a `:0` backend that the raw Sidecar
-        // resolution path would have deferred fail-closed. Dropping the invalid
-        // entries here (the same loopback/instance-IP + nonzero-port allowlist
-        // `MeshSidecarIngress::resolve` enforces) keeps the router's
-        // `declared_http_ports` count and the materialized routes in lock-step
-        // and fails closed instead of dialing somewhere resolution would refuse.
+        // Re-validate each carried listener at this single chokepoint (consumed by
+        // BOTH the router grouping and the materializer) before it is trusted. A
+        // `ResolvedIngressListener` can arrive already resolved over the xDS/native
+        // slice carrier, where every field — backend `endpoint_host`/`endpoint_port`
+        // AND the stamped `owner_namespace`/`owner_service` — is decoded straight
+        // from untrusted wire JSON. Drop a listener that fails EITHER guard:
+        //   - an invalid backend (off-box host / `:0` port) the raw Sidecar
+        //     resolution path would have deferred fail-closed, and
+        //   - an owner-less entry that has no host identity of its own (in a mixed
+        //     malformed carrier it would otherwise be grouped/materialized under
+        //     another listener's service host).
+        // Applying the IDENTICAL pair of guards the materializer applies keeps the
+        // router's `declared_http_ports` count and the materialized routes in
+        // lock-step and fails closed instead of routing somewhere resolution would
+        // refuse.
         mesh.local_ingress_listeners = mesh_slice
             .local_ingress_listeners
             .iter()
             .filter(|listener| {
-                if listener.endpoint_is_valid() {
-                    return true;
+                if !listener.endpoint_is_valid() {
+                    warn!(
+                        listener_port = listener.port,
+                        endpoint_host = %listener.endpoint_host,
+                        endpoint_port = listener.endpoint_port,
+                        "Dropping carried Sidecar ingress[] listener with an invalid backend endpoint \
+                         (not a loopback host:port); failing closed rather than routing it"
+                    );
+                    return false;
                 }
-                warn!(
-                    listener_port = listener.port,
-                    endpoint_host = %listener.endpoint_host,
-                    endpoint_port = listener.endpoint_port,
-                    "Dropping carried Sidecar ingress[] listener with an invalid backend endpoint \
-                     (not a loopback host:port); failing closed rather than routing it"
-                );
-                false
+                if listener.owner_namespace.is_empty() || listener.owner_service.is_empty() {
+                    warn!(
+                        listener_port = listener.port,
+                        "Dropping carried Sidecar ingress[] listener with no stamped owner identity \
+                         (no local service anchor); failing closed rather than grouping it under \
+                         another listener's service host"
+                    );
+                    return false;
+                }
+                true
             })
             .cloned()
             .collect();
@@ -2091,44 +2103,68 @@ fn materialize_sidecar_ingress_listener_proxies(
     local_spiffe: &str,
     now: chrono::DateTime<chrono::Utc>,
 ) {
-    // Re-validate every carried listener's backend endpoint before using it. A
+    // Re-validate every carried listener before using it. A
     // `ResolvedIngressListener` can arrive already resolved over the xDS/native
-    // slice carrier, where `endpoint_host`/`endpoint_port` are decoded straight
-    // from untrusted wire JSON; a malformed or hostile carrier could otherwise
-    // point a listener at an off-box host or a `:0` backend that the raw Sidecar
-    // resolution path would have deferred fail-closed. Drop any listener that
-    // fails the same loopback/instance-IP + nonzero-port allowlist
-    // `MeshSidecarIngress::resolve` enforces, so the carrier path can never
-    // dial somewhere resolution would have refused.
+    // slice carrier, where every field — `endpoint_host`/`endpoint_port` AND the
+    // stamped `owner_namespace`/`owner_service` — is decoded straight from
+    // untrusted wire JSON. Drop a listener that fails EITHER guard, fail-closed:
+    //
+    //   1. Backend endpoint: must pass the same loopback/instance-IP +
+    //      nonzero-port allowlist `MeshSidecarIngress::resolve` enforces, so the
+    //      carrier path can never dial somewhere resolution would have refused.
+    //   2. Owner anchor: must carry a non-empty `owner_namespace`/`owner_service`
+    //      (the slice builder stamps these from the resolved local service; it
+    //      clears ALL listeners when no local service anchors them). An owner-less
+    //      entry has NO host identity of its own. In a MIXED malformed carrier
+    //      (one stamped listener + one owner-less one) the `hosts` set below would
+    //      be non-empty from the stamped entry, so without this guard the
+    //      owner-less listener would be materialized with another service's hosts
+    //      and an `__mesh-ingress--PORT` id — routing the service host to a
+    //      listener that failed the local-service anchor check. Drop it instead.
+    //
+    // Filtering at this single point keeps `hosts`, the sibling-id set, and the
+    // materialization loop all operating on the same stamped-and-valid set (the
+    // back-projection that feeds the router's `mesh_ingress_listener_groups`
+    // applies the identical pair of guards, so router grouping and materialized
+    // routes stay in lock-step).
     let listeners: Vec<&crate::modes::mesh::config::ResolvedIngressListener> = mesh_slice
         .local_ingress_listeners
         .iter()
         .filter(|listener| {
-            if listener.endpoint_is_valid() {
-                return true;
+            if !listener.endpoint_is_valid() {
+                warn!(
+                    local_spiffe,
+                    listener_port = listener.port,
+                    endpoint_host = %listener.endpoint_host,
+                    endpoint_port = listener.endpoint_port,
+                    "Dropping carried Sidecar ingress[] listener with an invalid backend endpoint \
+                     (not a loopback host:port); failing closed rather than dialing it"
+                );
+                return false;
             }
-            warn!(
-                local_spiffe,
-                listener_port = listener.port,
-                endpoint_host = %listener.endpoint_host,
-                endpoint_port = listener.endpoint_port,
-                "Dropping carried Sidecar ingress[] listener with an invalid backend endpoint \
-                 (not a loopback host:port); failing closed rather than dialing it"
-            );
-            false
+            if listener.owner_namespace.is_empty() || listener.owner_service.is_empty() {
+                warn!(
+                    local_spiffe,
+                    listener_port = listener.port,
+                    "Dropping carried Sidecar ingress[] listener with no stamped owner identity \
+                     (no local service anchor); failing closed rather than routing it under \
+                     another listener's service host"
+                );
+                return false;
+            }
+            true
         })
         .collect();
 
     // Host identity for the ingress routes: the union of each listener's owning
     // local service FQDN variants (the owner the slice builder stamped from the
-    // resolved local-inbound view). A peer-sidecar dial addressed to the service
-    // host matches here; an orig-dst-captured plain inbound dial is
-    // disambiguated by the listener port post-match.
+    // resolved local-inbound view). Every surviving listener carries a non-empty
+    // owner (owner-less entries were dropped fail-closed above), so this is the
+    // union of all stamped owners. A peer-sidecar dial addressed to the service
+    // host matches here; an orig-dst-captured plain inbound dial is disambiguated
+    // by the listener port post-match.
     let mut hosts: Vec<String> = Vec::new();
     for listener in &listeners {
-        if listener.owner_namespace.is_empty() || listener.owner_service.is_empty() {
-            continue;
-        }
         for host in mesh_service_host_variants(
             &listener.owner_service,
             &listener.owner_namespace,
@@ -2140,14 +2176,14 @@ fn materialize_sidecar_ingress_listener_proxies(
         }
     }
     if hosts.is_empty() {
-        // No resolved local service to anchor the listener's host identity. Fail
-        // closed: a host-less `/` route would read as a catch-all and could
+        // Every listener was dropped (no valid, owner-stamped entry survived the
+        // filter above) so there is no local service to anchor a host identity.
+        // Fail closed: a host-less `/` route would read as a catch-all and could
         // shadow unrelated traffic. Istio also only configures ingress when the
         // workload is associated with a service. (The slice builder normally
         // drops listeners in this case; this is a defensive backstop.)
         warn!(
             local_spiffe,
-            ingress_listeners = listeners.len(),
             "Sidecar ingress[] declared but no local service resolved to anchor the listener host \
              identity; skipping ingress materialization (no routes emitted)"
         );
@@ -19491,6 +19527,77 @@ mod tests {
                 .iter()
                 .any(|p| p.id.starts_with("__mesh-ingress-")),
             "an unstamped (owner-less) ingress listener materializes no route"
+        );
+    }
+
+    #[test]
+    fn sidecar_ingress_mixed_carrier_drops_owner_less_listener() {
+        // Codex round-3 P2: a MIXED malformed carrier carries one stamped listener
+        // AND a separate valid-but-owner-less listener. The host set is non-empty
+        // from the stamped entry, so without the per-listener owner guard the
+        // owner-less entry would be materialized with the stamped listener's
+        // service hosts and an `__mesh-ingress--PORT` id — routing the service
+        // host to a listener that failed the local-service anchor check. The
+        // owner-less entry must be dropped fail-closed; only the stamped listener
+        // materializes.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(spiffe.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let stamped = ingress_listener(8443, "127.0.0.1", 8080);
+        let owner_less = crate::modes::mesh::config::ResolvedIngressListener {
+            port: 9443,
+            endpoint_host: "127.0.0.1".to_string(),
+            endpoint_port: 9090,
+            owner_namespace: String::new(),
+            owner_service: String::new(),
+        };
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![workload("reviews", "reviews")],
+            services: vec![http_mesh_service("reviews", 80, spiffe)],
+            local_inbound_services: vec![http_mesh_service("reviews", 80, spiffe)],
+            local_inbound_workloads: Some(vec![workload("reviews", "reviews")]),
+            local_ingress_listeners: vec![stamped, owner_less],
+            sidecar_ingress_declared: true,
+            ..MeshSlice::default()
+        };
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+        let ingress: Vec<&str> = config
+            .proxies
+            .iter()
+            .filter(|p| p.id.starts_with("__mesh-ingress-"))
+            .map(|p| p.id.as_str())
+            .collect();
+        assert_eq!(
+            ingress,
+            vec!["__mesh-ingress-default-reviews-8443"],
+            "only the stamped listener materializes; the owner-less entry is dropped"
+        );
+        assert!(
+            !config
+                .proxies
+                .iter()
+                .any(|p| p.id.contains("__mesh-ingress--")),
+            "no owner-less `__mesh-ingress--PORT` route may be materialized"
+        );
+        // The owner-less port must also NOT appear in the router's ingress sibling
+        // grouping (back-projection applies the same guard), so the materialized
+        // route and the group stay in lock-step.
+        let groups =
+            mesh_ingress_listener_groups(config.mesh.as_ref().expect("mesh config back-projected"));
+        let grouped_ports: Vec<u16> = groups
+            .iter()
+            .flat_map(|g| g.siblings.iter().map(|(port, _)| *port))
+            .collect();
+        assert_eq!(
+            grouped_ports,
+            vec![8443],
+            "only the stamped listener port is grouped by the router"
         );
     }
 

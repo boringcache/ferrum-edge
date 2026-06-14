@@ -1124,18 +1124,59 @@ fn ingress_resolve_preserves_v6_address_family() {
 }
 
 #[test]
-fn ingress_resolve_unknown_protocol_is_http_family() {
-    // `resolve()` treats the `AppProtocol::Unknown` value itself as HTTP-family
-    // (the service-port `unknown → HTTP` convention). NOTE: the K8s ingress
-    // translator no longer PRODUCES `Unknown` for a Sidecar `ingress[]` entry —
-    // `sidecar_ingress_app_protocol` maps `https` → routable and a missing/typo'd
-    // protocol → a non-HTTP value (deferred) — so this exercises the resolve()
-    // contract directly, not the K8s translation path (see istio.rs tests for the
-    // typo/missing-deferral behavior).
-    assert!(
-        ingress_entry(8443, AppProtocol::Unknown, "127.0.0.1:8080")
-            .resolve()
-            .is_ok()
+fn ingress_resolve_rejects_unknown_protocol() {
+    // Codex round-3 P2: a Sidecar `ingress[]` listener whose protocol is
+    // `AppProtocol::Unknown` must FAIL CLOSED (defer), not be routed as HTTP. On
+    // the native/file/xDS path `MeshSidecarIngress.protocol` deserializes
+    // directly: an OMITTED `protocol` falls back to `AppProtocol::default()`
+    // (`Unknown`) and an explicit `"unknown"` parses to `Unknown`. Either way the
+    // source did not declare a routable HTTP-family listener, so `resolve()`
+    // defers it as a non-HTTP listener — matching the K8s translator (which maps
+    // a missing/garbled protocol to a non-HTTP `AppProtocol`) and the documented
+    // fail-closed rule. This is independent of the service-port default path's
+    // `unknown → HTTP` convention (a separate predicate).
+    assert_eq!(
+        ingress_entry(8443, AppProtocol::Unknown, "127.0.0.1:8080").resolve(),
+        Err(IngressListenerUnsupported::NonHttpProtocol),
+        "an Unknown-protocol ingress listener must defer, never route as HTTP"
+    );
+}
+
+#[test]
+fn ingress_omitted_protocol_deserializes_to_unknown_then_defers() {
+    // Native/file/xDS parity with the K8s path: a Sidecar `ingress[]` entry that
+    // OMITS `protocol` must deserialize (the field is `#[serde(default)]`), land
+    // on `AppProtocol::Unknown`, and DEFER at `resolve()` — never be guessed onto
+    // the HTTP request path. Mirrors `sidecar_ingress_missing_protocol_is_deferred`
+    // on the K8s translator side.
+    let entry: MeshSidecarIngress = serde_json::from_value(serde_json::json!({
+        "port": 8443,
+        "default_endpoint": "127.0.0.1:8080"
+        // protocol intentionally omitted
+    }))
+    .expect("an omitted protocol must still deserialize (defaulted field)");
+    assert_eq!(
+        entry.protocol,
+        AppProtocol::Unknown,
+        "an omitted ingress protocol defaults to Unknown"
+    );
+    assert_eq!(
+        entry.resolve(),
+        Err(IngressListenerUnsupported::NonHttpProtocol),
+        "an omitted (Unknown) protocol defers fail-closed, it does not route"
+    );
+
+    // An explicit `"unknown"` string parses to `Unknown` and defers identically.
+    let explicit: MeshSidecarIngress = serde_json::from_value(serde_json::json!({
+        "port": 8443,
+        "protocol": "unknown",
+        "default_endpoint": "127.0.0.1:8080"
+    }))
+    .expect("an explicit unknown protocol deserializes");
+    assert_eq!(explicit.protocol, AppProtocol::Unknown);
+    assert_eq!(
+        explicit.resolve(),
+        Err(IngressListenerUnsupported::NonHttpProtocol)
     );
 }
 

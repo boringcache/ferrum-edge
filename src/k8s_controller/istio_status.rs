@@ -1062,19 +1062,32 @@ fn sidecar_status(
 /// Classify a Sidecar's `spec.ingress[]` entries into (modeled_count,
 /// deferred_reasons) so the status writer reports which listeners Ferrum
 /// materialized and which it left deferred. Mirrors
-/// `MeshSidecarIngress::resolve` fail-closed semantics on the raw spec so the
-/// translator predicate and the status writer stay in lock-step: an entry is
-/// modeled iff its protocol is HTTP-family AND its `defaultEndpoint` is a
-/// loopback / instance-IP `host:port`. Unix-socket and non-loopback endpoints,
-/// non-HTTP-family protocols, and unparseable shapes are deferred (the
-/// translator still accepts the resource; only the unmodeled entries surface
-/// here).
+/// `MeshSidecarIngress::resolve` and the slice resolver's fail-closed semantics
+/// on the raw spec so the translator predicate and the status writer stay in
+/// lock-step: an entry is modeled iff its protocol is HTTP-family AND its
+/// `defaultEndpoint` is a loopback / instance-IP `host:port` AND its listener
+/// port has not already been claimed by an earlier modeled entry. Unix-socket
+/// and non-loopback endpoints, non-HTTP-family protocols, unparseable shapes,
+/// and DUPLICATE listener ports are deferred (the translator still accepts the
+/// resource; only the unmodeled entries surface here).
+///
+/// The duplicate-port dedup mirrors `resolve_applicable_sidecar_ingress` in
+/// `src/modes/mesh/slice.rs`, which reserves a listener port only for the FIRST
+/// successfully resolved entry on that port and warns + drops later entries with
+/// the same port. Counting each supported entry would over-report `ingress_modeled`
+/// (more listeners than Ferrum actually materializes) and mislead `kubectl`
+/// rollout verification, so a supported entry on an already-claimed port is
+/// reported as a deferred duplicate instead of inflating the modeled count.
 fn classify_sidecar_ingress_entries(spec: &Value) -> (usize, Vec<&'static str>) {
     let Some(entries) = spec.get("ingress").and_then(Value::as_array) else {
         return (0, Vec::new());
     };
     let mut modeled = 0usize;
     let mut deferred: Vec<&'static str> = Vec::new();
+    // Listener ports already claimed by a modeled entry. Mirrors the slice
+    // resolver's `seen_ports` (reserved only on a SUCCESSFUL resolve, so a
+    // deferred entry never consumes a port a later valid entry could use).
+    let mut seen_modeled_ports: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
     let push_unique = |deferred: &mut Vec<&'static str>, reason: &'static str| {
         if !deferred.contains(&reason) {
             deferred.push(reason);
@@ -1114,18 +1127,35 @@ fn classify_sidecar_ingress_entries(spec: &Value) -> (usize, Vec<&'static str>) 
             );
             continue;
         }
-        match endpoint.parse::<std::net::SocketAddr>() {
-            Ok(addr)
-                if addr.port() != 0 && (addr.ip().is_loopback() || addr.ip().is_unspecified()) =>
-            {
-                modeled += 1;
-            }
-            _ => {
+        let endpoint_ok = matches!(
+            endpoint.parse::<std::net::SocketAddr>(),
+            Ok(addr) if addr.port() != 0 && (addr.ip().is_loopback() || addr.ip().is_unspecified())
+        );
+        if !endpoint_ok {
+            push_unique(
+                &mut deferred,
+                "defaultEndpoint must be a loopback/instance-IP host:port",
+            );
+            continue;
+        }
+        // The entry would resolve. Reserve its listener port; a later supported
+        // entry on the same port is dropped by the slice resolver, so report it
+        // as a deferred duplicate rather than counting a listener Ferrum does not
+        // materialize. `port.number` is present and valid here — the translator
+        // rejects a missing/out-of-range `port.number` before this classifier
+        // runs (it only runs on an accepted resource).
+        let listener_port = entry
+            .get("port")
+            .and_then(|p| p.get("number"))
+            .and_then(Value::as_u64);
+        match listener_port {
+            Some(port) if !seen_modeled_ports.insert(port) => {
                 push_unique(
                     &mut deferred,
-                    "defaultEndpoint must be a loopback/instance-IP host:port",
+                    "duplicate listener port (only the first entry is modeled)",
                 );
             }
+            _ => modeled += 1,
         }
     }
     (modeled, deferred)
@@ -2607,6 +2637,87 @@ mod tests {
         assert!(
             deferred.iter().any(|f| f.contains("non-HTTP-family")),
             "a mistyped protocol must be reported as a deferred non-HTTP listener, got {deferred:?}"
+        );
+    }
+
+    #[test]
+    fn sidecar_duplicate_ingress_port_counts_one_modeled() {
+        // Codex round-3 P3: two supported `ingress[]` entries on the SAME listener
+        // port. The slice resolver keeps only the first (reserves the port, warns
+        // + drops the second), so the status writer must report ONE modeled
+        // listener (not two) and surface the duplicate as a deferred field —
+        // otherwise `kubectl` reports more modeled listeners than Ferrum
+        // materializes, misleading rollout verification.
+        let obj = object(
+            "networking.istio.io/v1",
+            "Sidecar",
+            "dup-port-sidecar",
+            json!({
+                "ingress": [
+                    { "port": { "number": 8443, "protocol": "HTTP" }, "defaultEndpoint": "127.0.0.1:8080" },
+                    { "port": { "number": 8443, "protocol": "HTTP2" }, "defaultEndpoint": "127.0.0.1:9090" }
+                ]
+            }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options());
+        let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        assert_eq!(
+            detail["translation"]["ingress_modeled"].as_u64(),
+            Some(1),
+            "two entries on the same listener port model only one listener"
+        );
+        let deferred: Vec<&str> = detail["translation"]["deferred_fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            deferred
+                .iter()
+                .any(|f| f.contains("duplicate listener port")),
+            "the duplicate listener port must be reported as deferred, got {deferred:?}"
+        );
+    }
+
+    #[test]
+    fn sidecar_deferred_entry_does_not_reserve_port_for_later_valid_entry() {
+        // A DEFERRED entry (non-HTTP) on a port must NOT reserve that port: a
+        // later VALID entry on the same port number is still modeled — mirroring
+        // the slice resolver, which reserves a port only on a SUCCESSFUL resolve.
+        let obj = object(
+            "networking.istio.io/v1",
+            "Sidecar",
+            "deferred-then-valid-sidecar",
+            json!({
+                "ingress": [
+                    { "port": { "number": 8443, "protocol": "TCP" }, "defaultEndpoint": "127.0.0.1:8080" },
+                    { "port": { "number": 8443, "protocol": "HTTP" }, "defaultEndpoint": "127.0.0.1:9090" }
+                ]
+            }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options());
+        let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        assert_eq!(
+            detail["translation"]["ingress_modeled"].as_u64(),
+            Some(1),
+            "the valid entry is modeled even though a deferred entry shares its port"
+        );
+        let deferred: Vec<&str> = detail["translation"]["deferred_fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            deferred.iter().any(|f| f.contains("non-HTTP-family")),
+            "the TCP entry is deferred as non-HTTP, got {deferred:?}"
+        );
+        assert!(
+            !deferred
+                .iter()
+                .any(|f| f.contains("duplicate listener port")),
+            "a deferred entry must not make a later valid entry a duplicate, got {deferred:?}"
         );
     }
 
