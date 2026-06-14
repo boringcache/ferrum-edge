@@ -249,8 +249,10 @@ pub struct SubsetTrafficPolicy {
     /// (consecutive errors, interval, base-ejection time, min-health) are
     /// consulted per-subset by `passive_health_for_target` for proxies bound to
     /// this subset, overriding the upstream-level passive health. The
-    /// `maxEjectionPercent` *cap* is resolved through the LoadBalancerCache at
-    /// the upstream level and is not yet per-subset (see docs/mesh.md).
+    /// `maxEjectionPercent` *cap* is also resolved per-subset, by
+    /// `LoadBalancerCache::max_ejection_percent_resolved_from` with the SAME
+    /// per-port > per-subset > upstream precedence as the thresholds, so the cap
+    /// and the thresholds always come from the same tier.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub passive_health_check: Option<PassiveHealthCheck>,
 }
@@ -485,12 +487,14 @@ pub struct ResolvedSubsetTrafficPolicy {
     /// so the hot path can swap one `BackendTlsConfig` for another without
     /// re-running the overlay).
     pub tls: Option<BackendTlsConfig>,
-    /// Subset-resolved passive health (ejection thresholds), from the subset's
-    /// `outlierDetection`. `Some` when the subset configured outlier detection;
-    /// consulted by `passive_health_for_target` ahead of the upstream-level
-    /// passive health for proxies bound to this subset. The `maxEjectionPercent`
-    /// cap is resolved at the upstream level (LoadBalancerCache) and is not yet
-    /// per-subset.
+    /// Subset-resolved passive health (ejection thresholds AND the
+    /// `maxEjectionPercent` cap), from the subset's `outlierDetection`. `Some`
+    /// when the subset configured outlier detection; consulted by
+    /// `passive_health_for_target` ahead of the upstream-level passive health for
+    /// proxies bound to this subset. The `maxEjectionPercent` cap is resolved
+    /// per-subset by `LoadBalancerCache::max_ejection_percent_resolved_from`
+    /// (reading this overlay), with the SAME per-port > per-subset > upstream
+    /// precedence as the thresholds.
     pub passive_health_check: Option<PassiveHealthCheck>,
 }
 

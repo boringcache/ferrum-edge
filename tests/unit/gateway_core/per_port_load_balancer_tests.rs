@@ -4,7 +4,7 @@ use chrono::Utc;
 use dashmap::DashMap;
 use ferrum_edge::config::types::{
     GatewayConfig, HealthCheckConfig, LoadBalancerAlgorithm, PassiveHealthCheck, Proxy,
-    SubsetDefinition, Upstream, UpstreamPortOverride, UpstreamTarget,
+    ResolvedSubsetTrafficPolicy, SubsetDefinition, Upstream, UpstreamPortOverride, UpstreamTarget,
 };
 use ferrum_edge::health_check::HealthChecker;
 use ferrum_edge::load_balancer::{
@@ -398,6 +398,27 @@ fn proxy_for_upstream() -> Proxy {
         "upstream_id": "u1",
     }))
     .expect("test proxy should deserialize")
+}
+
+/// A proxy bound to a DestinationRule subset (sets `upstream_subset`).
+fn proxy_for_upstream_subset(subset: &str) -> Proxy {
+    let mut proxy = proxy_for_upstream();
+    proxy.upstream_subset = Some(subset.to_string());
+    proxy
+}
+
+/// Build a resolved subset overlay carrying only an `outlierDetection` passive
+/// overlay with the given ejection cap (mirrors what
+/// `apply_outlier_detection_to_passive` stores per-subset on the upstream).
+fn subset_passive_with_cap(max_ejection_percent: Option<u8>) -> ResolvedSubsetTrafficPolicy {
+    ResolvedSubsetTrafficPolicy {
+        tls: None,
+        passive_health_check: Some(PassiveHealthCheck {
+            unhealthy_threshold: 3,
+            max_ejection_percent,
+            ..PassiveHealthCheck::default()
+        }),
+    }
 }
 
 #[test]
@@ -811,5 +832,199 @@ fn port_passive_override_without_max_ejection_does_not_inherit_upstream_cap() {
         ),
         Some(25),
         "ports without a passive override should still inherit the upstream cap"
+    );
+}
+
+// ── F5.2: per-subset maxEjectionPercent cap resolution ──────────────────────
+
+#[test]
+fn subset_bound_proxy_uses_subset_max_ejection_cap_not_upstream() {
+    // Upstream cap = 100%, subset 'v1' cap = 20%. A proxy bound to subset 'v1'
+    // must resolve the SUBSET cap, mirroring how the thresholds are already
+    // resolved per-subset by `passive_health_for_target`.
+    let mut upstream = upstream_with_overrides(
+        LoadBalancerAlgorithm::RoundRobin,
+        vec![target("a", 8080), target("b", 8080)],
+        HashMap::new(),
+    );
+    upstream.health_checks = Some(HealthCheckConfig {
+        active: None,
+        passive: Some(PassiveHealthCheck {
+            max_ejection_percent: Some(100),
+            ..PassiveHealthCheck::default()
+        }),
+    });
+    upstream
+        .resolved_subset_tls
+        .insert("v1".to_string(), subset_passive_with_cap(Some(20)));
+
+    let config = GatewayConfig {
+        proxies: vec![proxy_for_upstream_subset("v1")],
+        upstreams: vec![upstream],
+        ..GatewayConfig::default()
+    };
+    let cache = LoadBalancerCache::new(&config);
+    let snapshot = cache.load();
+
+    assert_eq!(
+        LoadBalancerCache::max_ejection_percent_resolved_from(
+            &snapshot,
+            "u1",
+            &config.proxies[0],
+            None,
+        ),
+        Some(20),
+        "a subset-bound proxy must use the subset's ejection cap, not the upstream cap"
+    );
+}
+
+#[test]
+fn unsubsetted_proxy_uses_upstream_max_ejection_cap_even_when_subset_overlay_exists() {
+    // The same upstream carries a subset overlay, but a proxy with no
+    // `upstream_subset` must still resolve the upstream-level cap.
+    let mut upstream = upstream_with_overrides(
+        LoadBalancerAlgorithm::RoundRobin,
+        vec![target("a", 8080), target("b", 8080)],
+        HashMap::new(),
+    );
+    upstream.health_checks = Some(HealthCheckConfig {
+        active: None,
+        passive: Some(PassiveHealthCheck {
+            max_ejection_percent: Some(100),
+            ..PassiveHealthCheck::default()
+        }),
+    });
+    upstream
+        .resolved_subset_tls
+        .insert("v1".to_string(), subset_passive_with_cap(Some(20)));
+
+    let config = GatewayConfig {
+        proxies: vec![proxy_for_upstream()],
+        upstreams: vec![upstream],
+        ..GatewayConfig::default()
+    };
+    let cache = LoadBalancerCache::new(&config);
+    let snapshot = cache.load();
+
+    assert_eq!(
+        LoadBalancerCache::max_ejection_percent_resolved_from(
+            &snapshot,
+            "u1",
+            &config.proxies[0],
+            None,
+        ),
+        Some(100),
+        "an unsubsetted proxy must use the upstream cap even if a subset overlay exists"
+    );
+}
+
+#[test]
+fn subset_overlay_without_max_ejection_does_not_inherit_upstream_cap() {
+    // Wholesale-tier invariant: a present subset overlay replaces the
+    // upstream tier even when its own cap is `None` (so the cap and the
+    // subset's thresholds always come from the SAME tier — never mixed).
+    let mut upstream = upstream_with_overrides(
+        LoadBalancerAlgorithm::RoundRobin,
+        vec![target("a", 8080), target("b", 8080)],
+        HashMap::new(),
+    );
+    upstream.health_checks = Some(HealthCheckConfig {
+        active: None,
+        passive: Some(PassiveHealthCheck {
+            max_ejection_percent: Some(100),
+            ..PassiveHealthCheck::default()
+        }),
+    });
+    upstream
+        .resolved_subset_tls
+        .insert("v1".to_string(), subset_passive_with_cap(None));
+
+    let config = GatewayConfig {
+        proxies: vec![proxy_for_upstream_subset("v1")],
+        upstreams: vec![upstream],
+        ..GatewayConfig::default()
+    };
+    let cache = LoadBalancerCache::new(&config);
+    let snapshot = cache.load();
+
+    assert_eq!(
+        LoadBalancerCache::max_ejection_percent_resolved_from(
+            &snapshot,
+            "u1",
+            &config.proxies[0],
+            None,
+        ),
+        None,
+        "a subset outlierDetection overlay that omits maxEjectionPercent owns the \
+         cap wholesale and must not fall back to the upstream cap"
+    );
+}
+
+#[test]
+fn per_port_override_wins_over_subset_max_ejection_cap() {
+    // Precedence: per-port (40%) > per-subset (20%) > upstream (100%).
+    // A subset-bound proxy whose dispatch lands on a port with its own
+    // outlierDetection override must use the PORT cap.
+    let mut port_overrides = HashMap::new();
+    port_overrides.insert(
+        8080,
+        UpstreamPortOverride {
+            passive_health_check: Some(PassiveHealthCheck {
+                unhealthy_threshold: 1,
+                max_ejection_percent: Some(40),
+                ..PassiveHealthCheck::default()
+            }),
+            ..Default::default()
+        },
+    );
+    let mut upstream = upstream_with_overrides(
+        LoadBalancerAlgorithm::RoundRobin,
+        vec![target("a", 8080), target("b", 8080)],
+        port_overrides,
+    );
+    upstream.health_checks = Some(HealthCheckConfig {
+        active: None,
+        passive: Some(PassiveHealthCheck {
+            max_ejection_percent: Some(100),
+            ..PassiveHealthCheck::default()
+        }),
+    });
+    upstream
+        .resolved_subset_tls
+        .insert("v1".to_string(), subset_passive_with_cap(Some(20)));
+
+    let mut config = GatewayConfig {
+        proxies: vec![proxy_for_upstream_subset("v1")],
+        upstreams: vec![upstream],
+        ..GatewayConfig::default()
+    };
+    config.resolve_dispatch_port_overrides();
+    let cache = LoadBalancerCache::new(&config);
+    let snapshot = cache.load();
+
+    // With a live per-port override for port 8080, the caller passes
+    // `Some(8080)` — the port cap (40) wins over the subset cap (20).
+    assert_eq!(
+        LoadBalancerCache::max_ejection_percent_resolved_from(
+            &snapshot,
+            "u1",
+            &config.proxies[0],
+            Some(8080),
+        ),
+        Some(40),
+        "a per-port outlierDetection override must win over the subset cap"
+    );
+
+    // Without a port signal (`None`), the same subset-bound proxy falls to the
+    // subset cap (20), proving the subset tier is between port and upstream.
+    assert_eq!(
+        LoadBalancerCache::max_ejection_percent_resolved_from(
+            &snapshot,
+            "u1",
+            &config.proxies[0],
+            None,
+        ),
+        Some(20),
+        "with no per-port signal the subset cap (not the upstream cap) is used"
     );
 }

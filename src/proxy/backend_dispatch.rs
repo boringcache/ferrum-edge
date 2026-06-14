@@ -215,23 +215,21 @@ pub(crate) fn select_upstream_target(
 
     let balancers = &epoch.load_balancer;
 
-    // Resolve the ejection cap from the upstream's passive health config.
+    // Resolve the ejection cap with the SAME precedence the passive-health
+    // thresholds use in `passive_health_for_target` (per-port > per-subset >
+    // upstream) so the cap and the thresholds are always drawn from one tier.
     let dispatch_port = initial_dispatch_port(
         proxy,
         LoadBalancerCache::initial_dispatch_port_override_from(balancers, upstream_id),
     );
     let has_port_override =
         has_effective_port_override(proxy, balancers, upstream_id, dispatch_port);
-    let max_ejection_percent = if has_port_override {
-        LoadBalancerCache::max_ejection_percent_for_port_from(
-            balancers,
-            upstream_id,
-            proxy,
-            dispatch_port,
-        )
-    } else {
-        LoadBalancerCache::max_ejection_percent_from(balancers, upstream_id)
-    };
+    let max_ejection_percent = LoadBalancerCache::max_ejection_percent_resolved_from(
+        balancers,
+        upstream_id,
+        proxy,
+        has_port_override.then_some(dispatch_port),
+    );
 
     let health_ctx = HealthContext {
         active_unhealthy: &state.health_checker.active_unhealthy_targets,
@@ -692,8 +690,10 @@ pub(crate) fn passive_health_for_target<'a>(
         .and_then(|override_config| override_config.passive_health_check.as_ref())
         .or_else(|| {
             // Subset-bound proxy: prefer the subset's resolved passive-health
-            // thresholds over the upstream-level ones. (The maxEjectionPercent
-            // cap is still resolved at upstream scope via the LoadBalancerCache.)
+            // overlay over the upstream-level one. The maxEjectionPercent cap is
+            // resolved with this SAME precedence by
+            // `LoadBalancerCache::max_ejection_percent_resolved_from`, so the cap
+            // and these thresholds always come from the same tier.
             proxy
                 .upstream_subset
                 .as_deref()
@@ -819,16 +819,15 @@ pub(crate) fn select_next_retry_target(
             .passive_health
             .get(&proxy.id)
             .map(|r| r.value().clone()),
-        max_ejection_percent: if let Some(port) = retry_override_port {
-            LoadBalancerCache::max_ejection_percent_for_port_from(
-                &epoch.load_balancer,
-                upstream_id,
-                proxy,
-                port,
-            )
-        } else {
-            LoadBalancerCache::max_ejection_percent_from(&epoch.load_balancer, upstream_id)
-        },
+        // Same precedence as the steady-state path and `passive_health_for_target`
+        // (per-port > per-subset > upstream). `retry_override_port` is already
+        // `Some` only when a live per-port override covers the retried target.
+        max_ejection_percent: LoadBalancerCache::max_ejection_percent_resolved_from(
+            &epoch.load_balancer,
+            upstream_id,
+            proxy,
+            retry_override_port,
+        ),
     };
 
     if let Some(subset_name) = proxy.upstream_subset.as_deref() {

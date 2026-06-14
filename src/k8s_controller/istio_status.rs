@@ -567,24 +567,20 @@ fn destination_rule_status(
 
     let (accepted, reason, message, detail) = match result {
         Ok(_translation) => {
-            // T1-C deferred fields: the per-subset outlierDetection
-            // maxEjectionPercent cap, and the parsed-but-dropped connectionPool.http
+            // T1-C deferred fields: the parsed-but-dropped connectionPool.http
             // knobs the translator only warns on (http1MaxPendingRequests /
             // maxRetries / h2UpgradePolicy).
             // Now APPLIED (no longer deferred): per-subset
             // connectionPool.tcp.connectTimeout (overrides backend_connect_timeout_ms
             // for subset-bound proxies), portLevelSettings[].tls (per-port backend
-            // TLS projected onto the effective proxy's resolved_tls), and per-subset
-            // outlierDetection *thresholds* (consecutive errors / interval /
-            // base-ejection / min-health) — only the maxEjectionPercent cap remains
-            // upstream-level.
+            // TLS projected onto the effective proxy's resolved_tls), and the full
+            // per-subset outlierDetection — both the *thresholds* (consecutive
+            // errors / interval / base-ejection / min-health) and the
+            // *maxEjectionPercent cap*, the latter resolved by
+            // `LoadBalancerCache::max_ejection_percent_resolved_from` with the
+            // same per-port > per-subset > upstream precedence as the thresholds.
             // Surface the rest so operators see the gap in `kubectl describe`.
             let mut deferred: Vec<&'static str> = Vec::new();
-            if has_subset_outlier_max_ejection_percent(&object.spec) {
-                deferred.push(
-                    "subsets[].trafficPolicy.outlierDetection.maxEjectionPercent (thresholds applied per-subset; ejection cap uses upstream-level)",
-                );
-            }
             deferred.extend(deferred_connection_pool_http_fields(&object.spec));
             let message = if deferred.is_empty() {
                 format!("Ferrum accepted this DestinationRule (host: {host})")
@@ -622,25 +618,6 @@ fn destination_rule_status(
     };
 
     accepted_status(object, accepted, reason, &message, detail)
-}
-
-/// True only when some subset's `outlierDetection` sets `maxEjectionPercent`.
-/// The thresholds (consecutive errors / interval / base-ejection / min-health)
-/// are applied per-subset, so they are NOT deferred; only the ejection *cap*
-/// still resolves at the upstream level, so a threshold-only subset policy must
-/// not surface a misleading deferred-field warning.
-fn has_subset_outlier_max_ejection_percent(spec: &Value) -> bool {
-    spec.get("subsets")
-        .and_then(Value::as_array)
-        .is_some_and(|subsets| {
-            subsets.iter().any(|subset| {
-                subset
-                    .get("trafficPolicy")
-                    .and_then(|tp| tp.get("outlierDetection"))
-                    .and_then(|od| od.get("maxEjectionPercent"))
-                    .is_some()
-            })
-        })
 }
 
 /// `connectionPool.http` knobs the translator parses but drops with an
@@ -1794,9 +1771,11 @@ mod tests {
     }
 
     #[test]
-    fn destination_rule_subset_outlier_max_ejection_percent_is_deferred() {
-        // Only the maxEjectionPercent *cap* remains upstream-level, so a subset
-        // that sets it surfaces the residual deferred field.
+    fn destination_rule_subset_outlier_max_ejection_percent_not_deferred() {
+        // The maxEjectionPercent *cap* is now applied per-subset (resolved with
+        // the same per-port > per-subset > upstream precedence as the
+        // thresholds), so a subset that sets it must NOT surface any deferred
+        // field — neither the cap nor the thresholds are deferred.
         let obj = object(
             "networking.istio.io/v1",
             "DestinationRule",
@@ -1821,8 +1800,8 @@ mod tests {
             .filter_map(Value::as_str)
             .collect();
         assert!(
-            deferred.iter().any(|f| f.contains("maxEjectionPercent")),
-            "subset with maxEjectionPercent must surface the deferred cap field, got {deferred:?}"
+            !deferred.iter().any(|f| f.contains("maxEjectionPercent")),
+            "subset maxEjectionPercent is applied per-subset now and must not be deferred, got {deferred:?}"
         );
     }
 

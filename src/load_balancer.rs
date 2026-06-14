@@ -815,6 +815,67 @@ impl LoadBalancerCache {
         Self::max_ejection_percent_from(snapshot, upstream_id)
     }
 
+    /// Resolve the passive-health `maxEjectionPercent` cap for a dispatch using
+    /// the SAME precedence the *thresholds* use in
+    /// `backend_dispatch::passive_health_for_target`:
+    ///
+    /// per-port override (`portLevelSettings[].outlierDetection`) > per-subset
+    /// (`subsets[].trafficPolicy.outlierDetection`) > upstream-level.
+    ///
+    /// `port` is `Some` only when a per-port override is actually in effect for
+    /// this dispatch (the caller has already confirmed via
+    /// `has_effective_port_override` / `retry_port_override_dispatch_port` +
+    /// `has_port_override_state_from`); pass `None` otherwise so a phantom
+    /// `dispatch_port_overrides` entry without a live balancer lane is ignored.
+    ///
+    /// INVARIANT — the tiers are **wholesale**: a present overlay replaces all
+    /// lower tiers *even when its own `max_ejection_percent` is `None`*. This
+    /// MUST match `passive_health_for_target`'s wholesale `.or_else()` chain so
+    /// the cap and the thresholds are always drawn from the SAME tier — a subset
+    /// (or per-port) `outlierDetection` that omits `maxEjectionPercent` must not
+    /// silently fall back to the upstream-level cap while its thresholds come
+    /// from the subset, which would mix policy from two tiers.
+    ///
+    /// Hot-path safe: snapshot map lookups only; `snapshot.upstreams` already
+    /// holds the `Arc<Upstream>`, so the subset tier borrows it without cloning.
+    #[inline]
+    pub fn max_ejection_percent_resolved_from(
+        snapshot: &LoadBalancerCacheInner,
+        upstream_id: &str,
+        proxy: &Proxy,
+        port: Option<u16>,
+    ) -> Option<u8> {
+        // Per-port tier: a live override lane whose `passive_health_check` is
+        // present wins wholesale (its cap may be `None`).
+        if let Some(port) = port
+            && Self::has_port_override_state_from(snapshot, upstream_id, port)
+            && let Some(port_passive) = proxy
+                .dispatch_port_overrides
+                .as_ref()
+                .and_then(|overrides| overrides.get(&port))
+                .and_then(|override_config| override_config.passive_health_check.as_ref())
+        {
+            return port_passive.max_ejection_percent;
+        }
+
+        // Per-subset tier: a subset-bound proxy whose subset resolved an
+        // `outlierDetection` overlay wins wholesale over the upstream level
+        // (mirrors how `passive_health_for_target` reaches the subset overlay
+        // via `resolved_subset_tls`).
+        if let Some(subset) = proxy.upstream_subset.as_deref()
+            && let Some(subset_passive) = snapshot
+                .upstreams
+                .get(upstream_id)
+                .and_then(|u| u.resolved_subset_tls.get(subset))
+                .and_then(|resolved| resolved.passive_health_check.as_ref())
+        {
+            return subset_passive.max_ejection_percent;
+        }
+
+        // Upstream tier.
+        Self::max_ejection_percent_from(snapshot, upstream_id)
+    }
+
     /// Snapshot of active connection counts per upstream for metrics.
     pub fn active_connections_snapshot(&self) -> Vec<(String, Vec<(String, i64)>)> {
         let inner = self.inner.load();
