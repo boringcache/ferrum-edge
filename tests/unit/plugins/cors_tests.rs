@@ -1079,3 +1079,241 @@ async fn test_after_proxy_rejection_with_cors_origin_strips_stale_headers() {
     assert!(!response_headers.contains_key("access-control-allow-credentials"));
     assert!(!response_headers.contains_key("access-control-expose-headers"));
 }
+
+// ── Istio StringMatch object origin matchers (exact / prefix / regex) ────────
+//
+// These back the VirtualService `corsPolicy` `prefix`/`regex` origin
+// projection: a `corsPolicy.allowOrigins[]` StringMatch entry is emitted into
+// `allowed_origins` as `{exact|prefix|regex}`, and the plugin reflects a
+// matching Origin into `Access-Control-Allow-Origin` and 403s a non-match.
+
+#[tokio::test]
+async fn test_object_exact_origin_matches_and_reflects() {
+    let plugin = CorsPlugin::new(&json!({
+        "allowed_origins": [{"exact": "https://app.example.com"}]
+    }))
+    .unwrap();
+
+    let mut ctx = make_cors_ctx("GET", "https://app.example.com");
+    let result = plugin.on_request_received(&mut ctx).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "{{exact}} matcher should match the same origin string"
+    );
+
+    let mut response_headers: HashMap<String, String> = HashMap::new();
+    let _ = plugin
+        .after_proxy(&mut ctx, 200, &mut response_headers)
+        .await;
+    assert_eq!(
+        response_headers.get("access-control-allow-origin").unwrap(),
+        "https://app.example.com",
+        "a matched origin is reflected verbatim"
+    );
+}
+
+#[tokio::test]
+async fn test_prefix_origin_matches_and_reflects() {
+    let plugin = CorsPlugin::new(&json!({
+        "allowed_origins": [{"prefix": "https://app."}]
+    }))
+    .unwrap();
+
+    // Matching origin: starts with the literal prefix → reflected.
+    let mut ctx = make_cors_ctx("GET", "https://app.example.com");
+    let result = plugin.on_request_received(&mut ctx).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "prefix matcher should admit an origin that starts with the prefix"
+    );
+    let mut response_headers: HashMap<String, String> = HashMap::new();
+    let _ = plugin
+        .after_proxy(&mut ctx, 200, &mut response_headers)
+        .await;
+    assert_eq!(
+        response_headers.get("access-control-allow-origin").unwrap(),
+        "https://app.example.com",
+    );
+}
+
+#[tokio::test]
+async fn test_prefix_origin_rejects_non_match() {
+    let plugin = CorsPlugin::new(&json!({
+        "allowed_origins": [{"prefix": "https://app."}]
+    }))
+    .unwrap();
+
+    let mut ctx = make_cors_ctx("GET", "https://evil.example.com");
+    let result = plugin.on_request_received(&mut ctx).await;
+    match result {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 403);
+            assert_eq!(body, "CORS origin not allowed");
+        }
+        _ => panic!("Expected 403 Reject — origin without the prefix must not match"),
+    }
+    assert!(!ctx.metadata.contains_key("cors_origin"));
+}
+
+#[tokio::test]
+async fn test_regex_origin_full_match_reflects() {
+    let plugin = CorsPlugin::new(&json!({
+        "allowed_origins": [{"regex": "https://.*\\.example\\.com"}]
+    }))
+    .unwrap();
+
+    let mut ctx = make_cors_ctx("GET", "https://sub.example.com");
+    let result = plugin.on_request_received(&mut ctx).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "regex matcher should admit a fully-matching origin"
+    );
+    let mut response_headers: HashMap<String, String> = HashMap::new();
+    let _ = plugin
+        .after_proxy(&mut ctx, 200, &mut response_headers)
+        .await;
+    assert_eq!(
+        response_headers.get("access-control-allow-origin").unwrap(),
+        "https://sub.example.com",
+    );
+}
+
+#[tokio::test]
+async fn test_regex_origin_rejects_non_match() {
+    let plugin = CorsPlugin::new(&json!({
+        "allowed_origins": [{"regex": "https://.*\\.example\\.com"}]
+    }))
+    .unwrap();
+
+    let mut ctx = make_cors_ctx("GET", "https://sub.evil.com");
+    let result = plugin.on_request_received(&mut ctx).await;
+    match result {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 403),
+        _ => panic!("Expected 403 Reject — origin not matching the regex"),
+    }
+}
+
+#[tokio::test]
+async fn test_regex_origin_requires_full_match_not_substring() {
+    // Istio `StringMatch.regex` is a FULL match. A pattern that matches only a
+    // substring of the Origin must NOT admit it (no implicit `.*` on the ends),
+    // so a trailing-garbage origin is rejected even though the prefix matches.
+    let plugin = CorsPlugin::new(&json!({
+        "allowed_origins": [{"regex": "https://app\\.example\\.com"}]
+    }))
+    .unwrap();
+
+    let mut ctx = make_cors_ctx("GET", "https://app.example.com.evil.com");
+    let result = plugin.on_request_received(&mut ctx).await;
+    match result {
+        PluginResult::Reject { status_code, .. } => assert_eq!(
+            status_code, 403,
+            "regex must full-match; a suffix-extended origin must be rejected"
+        ),
+        _ => panic!("Expected 403 Reject — regex is a full match, not a substring search"),
+    }
+}
+
+#[tokio::test]
+async fn test_mixed_string_and_object_origin_matchers() {
+    // Plain-string and object matchers can be mixed in one `allowed_origins`.
+    let plugin = CorsPlugin::new(&json!({
+        "allowed_origins": [
+            "https://exact.example.com",
+            {"prefix": "https://app."},
+            {"regex": "https://.*\\.api\\.example\\.com"}
+        ]
+    }))
+    .unwrap();
+
+    for origin in [
+        "https://exact.example.com",
+        "https://app.anything.com",
+        "https://v2.api.example.com",
+    ] {
+        let mut ctx = make_cors_ctx("GET", origin);
+        let result = plugin.on_request_received(&mut ctx).await;
+        assert!(
+            matches!(result, PluginResult::Continue),
+            "origin {origin} should match one of the mixed matchers"
+        );
+    }
+
+    let mut ctx = make_cors_ctx("GET", "https://nope.com");
+    match plugin.on_request_received(&mut ctx).await {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 403),
+        _ => panic!("Expected 403 Reject for an origin matching none of the matchers"),
+    }
+}
+
+#[tokio::test]
+async fn test_preflight_with_prefix_origin_emits_cors_headers() {
+    let plugin = CorsPlugin::new(&json!({
+        "allowed_origins": [{"prefix": "https://app."}],
+        "allowed_methods": ["GET", "POST"]
+    }))
+    .unwrap();
+
+    let mut ctx = make_preflight_ctx("https://app.example.com", "POST");
+    match plugin.on_request_received(&mut ctx).await {
+        PluginResult::Reject {
+            status_code,
+            headers,
+            ..
+        } => {
+            assert_eq!(status_code, 204);
+            assert_eq!(
+                headers.get("access-control-allow-origin").unwrap(),
+                "https://app.example.com",
+            );
+        }
+        _ => panic!("Expected 204 preflight approval for a prefix-matched origin"),
+    }
+}
+
+#[test]
+fn test_constructor_rejects_uncompilable_regex_origin() {
+    let err = CorsPlugin::new(&json!({
+        "allowed_origins": [{"regex": "https://(example"}]
+    }))
+    .err()
+    .expect("an un-compilable regex origin must be rejected at config time");
+    assert!(err.contains("regex matcher"), "got: {err}");
+}
+
+#[test]
+fn test_constructor_rejects_empty_prefix_origin() {
+    // An empty prefix would match every origin — reject it rather than create
+    // an accidental allow-all policy.
+    let err = CorsPlugin::new(&json!({
+        "allowed_origins": [{"prefix": ""}]
+    }))
+    .err()
+    .expect("an empty prefix origin must be rejected");
+    assert!(err.contains("prefix matcher"), "got: {err}");
+}
+
+#[test]
+fn test_constructor_rejects_multi_key_origin_matcher() {
+    let err = CorsPlugin::new(&json!({
+        "allowed_origins": [{"prefix": "https://app.", "regex": "https://.*"}]
+    }))
+    .err()
+    .expect("an object matcher with two keys must be rejected");
+    assert!(err.contains("exactly one"), "got: {err}");
+}
+
+#[test]
+fn test_constructor_rejects_empty_object_origin_matcher() {
+    let err = CorsPlugin::new(&json!({
+        "allowed_origins": [{}]
+    }))
+    .err()
+    .expect("an object matcher with no exact/prefix/regex must be rejected");
+    assert!(
+        err.contains("exact") && err.contains("prefix") && err.contains("regex"),
+        "got: {err}"
+    );
+}

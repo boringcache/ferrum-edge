@@ -86,10 +86,11 @@ fn cors_plugin_for(translation_input: &[K8sObject]) -> Option<PluginConfig> {
 }
 
 /// VS field: `http[].corsPolicy`. Translated to a proxy-scoped `cors` plugin
-/// when its origins are representable (`allowOrigins[].exact` / legacy
-/// `allowOrigin`). GA: this is the common-case CORS surface Istio operators set
-/// on a route. `prefix`/`regex` origin matchers have no `cors` plugin
-/// equivalent and are left unprojected (deferred), not silently approximated.
+/// when its origins are representable (`allowOrigins[]` `exact`/`prefix`/`regex`
+/// `StringMatch` / legacy `allowOrigin`). GA: this is the common-case CORS
+/// surface Istio operators set on a route. Only a malformed/unknown origin
+/// matcher or an un-compilable `regex` is left unprojected (deferred), not
+/// silently approximated.
 #[test]
 fn vs_cors_policy_translated() {
     register_feature!(
@@ -97,7 +98,7 @@ fn vs_cors_policy_translated() {
         feature = "http[].corsPolicy",
         status = Status::Supported,
         maturity = Maturity::Ga,
-        notes = "Translated to a proxy-scoped `cors` plugin (allowOrigins[].exact / legacy allowOrigin, allowMethods/allowHeaders/exposeHeaders/maxAge/allowCredentials). prefix/regex origins are left unprojected and reported as a deferred field.",
+        notes = "Translated to a proxy-scoped `cors` plugin (allowOrigins[] exact/prefix/regex StringMatch / legacy allowOrigin, allowMethods/allowHeaders/exposeHeaders/maxAge/allowCredentials). Only a malformed matcher or un-compilable regex is left unprojected (deferred).",
     );
     let cors = cors_plugin_for(&[virtual_service(json!({
         "hosts": ["api.example.com"],
@@ -138,27 +139,67 @@ fn vs_cors_policy_translated() {
         .expect("emitted cors config is valid");
 }
 
-/// A `corsPolicy` whose origins use a `regex`/`prefix` matcher cannot be mapped
-/// to the `cors` plugin's origin model, so the translator leaves it unprojected
-/// (no cors plugin emitted) rather than approximating — routing still applies.
+/// A `corsPolicy` whose origins use `regex` / `prefix` `StringMatch` matchers is
+/// projected onto the extended `cors` plugin (the Istio matcher shapes map to
+/// the plugin's `{prefix}` / `{regex}` `allowed_origins` entries, matched as a
+/// literal prefix / RE2 full match respectively).
 #[test]
-fn vs_cors_policy_regex_origin_not_projected() {
+fn vs_cors_policy_regex_and_prefix_origins_projected() {
     register_feature!(
         category = CATEGORY,
         feature = "http[].corsPolicy regex/prefix origins",
+        status = Status::Supported,
+        notes = "regex/prefix origin matchers project onto the cors plugin's {prefix}/{regex} allowed_origins entries (literal prefix / RE2 full match). Only an un-compilable regex stays deferred.",
+    );
+    let cors = cors_plugin_for(&[virtual_service(json!({
+        "hosts": ["api.example.com"],
+        "http": [{
+            "route": [{"destination": {"host": "echo.default.svc.cluster.local", "port": {"number": 8080}}}],
+            "corsPolicy": {"allowOrigins": [
+                {"regex": "https://.*\\.example\\.com"},
+                {"prefix": "https://app."}
+            ]}
+        }]
+    }))])
+    .expect("regex/prefix-origin corsPolicy must emit a cors plugin");
+
+    assert_eq!(
+        cors.config["allowed_origins"],
+        json!([
+            {"regex": "https://.*\\.example\\.com"},
+            {"prefix": "https://app."}
+        ]),
+        "Istio StringMatch origins map to the cors plugin's object matcher form"
+    );
+
+    // The emitted config must construct a valid cors plugin (regex compiles,
+    // matchers are accepted).
+    ferrum_edge::plugins::validate_plugin_config("cors", &cors.config)
+        .expect("emitted cors config with prefix/regex origins is valid");
+}
+
+/// A `corsPolicy` `regex` origin matcher that does not compile cannot be
+/// projected into a valid `cors` plugin, so the translator leaves it
+/// unprojected (no cors plugin emitted, surfaced as a deferred field) rather
+/// than emitting a config that would fail validation — routing still applies.
+#[test]
+fn vs_cors_policy_uncompilable_regex_origin_not_projected() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "http[].corsPolicy uncompilable regex origin",
         status = Status::Deferred,
-        notes = "regex/prefix origin matchers have no cors plugin equivalent; left unprojected (deferred) and reported in status.deferred_fields. Use the cors plugin directly.",
+        notes = "An un-compilable regex origin matcher is fail-closed: left unprojected (deferred) and reported in status.deferred_fields, never emitted as an invalid plugin config.",
     );
     assert!(
         cors_plugin_for(&[virtual_service(json!({
             "hosts": ["api.example.com"],
             "http": [{
                 "route": [{"destination": {"host": "echo.default.svc.cluster.local", "port": {"number": 8080}}}],
-                "corsPolicy": {"allowOrigins": [{"regex": "https://.*\\.example\\.com"}]}
+                "corsPolicy": {"allowOrigins": [{"regex": "https://(example"}]}
             }]
         }))])
         .is_none(),
-        "regex-origin corsPolicy must not emit a cors plugin"
+        "uncompilable-regex-origin corsPolicy must not emit a cors plugin"
     );
 }
 
