@@ -3678,6 +3678,12 @@ async fn handle_h3_request(
                     response_headers
                         .insert("content-length".to_string(), transformed.len().to_string());
                     response_body = transformed;
+                    // A plugin (response_transformer, compression, grpc_web, …)
+                    // replaced the bytes sent to the client. The backend's
+                    // trailers (digest/checksum/app-status) described the
+                    // ORIGINAL body, so they no longer apply — drop them, the
+                    // same way the reject paths above do (issue #1630).
+                    response_trailers = None;
                 }
             }
             plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
@@ -3809,8 +3815,20 @@ async fn handle_h3_request(
         match response_trailers {
             Some(mut trailers) => {
                 strip_response_hop_by_hop_trailers(&mut trailers);
-                if !trailers.is_empty() {
-                    stream.send_trailers(trailers).await?;
+                if !trailers.is_empty()
+                    && let Err(err) = stream.send_trailers(trailers).await
+                {
+                    // The trailers are valid for the backend but the H3 client
+                    // could not accept them (e.g. they exceed its advertised
+                    // field-section size → HeaderTooBig). The body has already
+                    // been sent successfully, so DROP the trailers and still
+                    // emit a clean FIN rather than `?`-propagating and turning
+                    // an otherwise-complete buffered response into a downstream
+                    // stream error (issue #1630).
+                    debug!(
+                        error = %err,
+                        "H3 send_trailers failed on buffered response; dropping trailers and finishing cleanly"
+                    );
                 }
                 stream.finish().await?;
             }
