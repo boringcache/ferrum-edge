@@ -42,9 +42,10 @@ use crate::tls::backend::BackendSvidGeneration;
 use crate::tls::spiffe::build_spiffe_outbound_config;
 
 use super::hbone_pool::{
-    H2ConnectTunnel, HbonePoolError, MESH_SPIFFE_ID_TAG, authority_for_host_port,
-    dial_h2_connect_sender, entry_idle_expired, matches_boolish_true, open_h2_connect_stream,
-    svid_fingerprint, target_expected_peer_spiffe, unix_secs, write_pool_config_key,
+    H2ConnectTunnel, H2WsConnectTunnel, HbonePoolError, MESH_SPIFFE_ID_TAG,
+    authority_for_host_port, dial_h2_connect_sender, entry_idle_expired, matches_boolish_true,
+    open_h2_connect_stream, open_h2_ws_connect_stream, svid_fingerprint,
+    target_expected_peer_spiffe, unix_secs, write_pool_config_key,
 };
 
 /// Tag marking a target for Sidecar SVID-mTLS dispatch (the peer is a mesh
@@ -488,6 +489,73 @@ impl MeshMtlsConnectionPool {
             authority: authority_for_host_port(target_host, target_port),
             message: format!(
                 "timed out after {}ms waiting for sidecar mesh-mTLS CONNECT response",
+                proxy.backend_connect_timeout_ms
+            ),
+        })?
+    }
+
+    /// Open a WebSocket Extended CONNECT (RFC 8441) byte tunnel to a peer
+    /// sidecar's inbound mTLS listener over a FRESH SVID-mTLS H2 connection. The
+    /// connection is DIALED to `dial_host:mtls_port` (the peer's pod address +
+    /// `:15006`/`mesh.mtls_port`); the Extended CONNECT `:authority` is the
+    /// pre-built `authority` — the SERVICE routing key the peer's inbound
+    /// WebSocket route matches on, computed by the caller with the same
+    /// preserve-host / multi-port logic as the HTTP-family egress path so parity
+    /// holds byte-for-byte. Separating them mirrors `proxy_to_backend_mesh_mtls`,
+    /// where the dial target and the inner request authority are distinct.
+    ///
+    /// Like [`Self::open_connect_tunnel`] (raw-TCP egress) this is **1:1**: each
+    /// WebSocket session gets its OWN mesh-mTLS H2 connection carrying exactly
+    /// ONE Extended CONNECT stream (dropped when the session closes), NOT
+    /// multiplexed over the pooled [`MeshMtlsSender`] connections. A proxied
+    /// WebSocket already opens one dedicated backend connection bounded by
+    /// `DestinationRule.maxConnections`, so a per-session H2 connection keeps
+    /// long-lived sessions off the multiplexed HTTP pool; SVID rotation is
+    /// automatic (every session dials with the current SVID).
+    ///
+    /// Unlike the bare raw-TCP CONNECT, this is an **Extended** CONNECT carrying
+    /// `:protocol=websocket` and the forwardable WebSocket handshake headers
+    /// (`Sec-WebSocket-Protocol`, etc.) — the destination sidecar's `:15006`
+    /// listener (`auto`, advertises `SETTINGS_ENABLE_CONNECT_PROTOCOL`) treats it
+    /// as a client-originated WebSocket upgrade and bridges it to the local app.
+    /// The mTLS client certificate authenticates this gateway (no baggage,
+    /// `marker = None`). Fail-closed: a missing gateway SVID errors before the
+    /// dial, the dial PINS `expected_peer`, and a peer that never negotiated
+    /// Extended CONNECT errors before any stream is opened.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn open_ws_connect_tunnel(
+        &self,
+        proxy: &Proxy,
+        dial_host: &str,
+        mtls_port: u16,
+        authority: &str,
+        expected_peer: &SpiffeId,
+        ws_handshake_headers: &[(String, String)],
+    ) -> Result<H2WsConnectTunnel, HbonePoolError> {
+        // Fail closed when no gateway SVID is loaded — never dial a mesh peer
+        // identity-less (parity with `open_connect_tunnel` and `get_sender`).
+        let _ = self.current_svid_fingerprint_cached()?;
+        let pool_config = self.pool_config.for_proxy(proxy);
+        let sender = dial_h2_connect_sender(
+            &self.dns_cache,
+            &self.gateway_svid,
+            proxy,
+            dial_host,
+            mtls_port,
+            Some(expected_peer),
+            &pool_config,
+        )
+        .await?;
+        tokio::time::timeout(
+            Duration::from_millis(proxy.backend_connect_timeout_ms),
+            open_h2_ws_connect_stream(sender, authority, ws_handshake_headers, None, None),
+        )
+        .await
+        .map_err(|_| HbonePoolError::ConnectStream {
+            authority: authority.to_string(),
+            message: format!(
+                "timed out after {}ms waiting for sidecar mesh-mTLS WebSocket Extended CONNECT \
+                 response",
                 proxy.backend_connect_timeout_ms
             ),
         })?

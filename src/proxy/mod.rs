@@ -6273,6 +6273,12 @@ async fn handle_websocket_request_authenticated(
     // If the backend is unreachable, we return 502 instead of a premature 101.
     // Supports retry with upstream target rotation for connection failures.
     let env_config = state.env_config.clone();
+    // The client-sent Host: the mesh egress Extended CONNECT `:authority` is
+    // derived from it (the egress route is `preserve_host_header`) so the peer's
+    // inbound route matches on the SERVICE host, exactly like HTTP egress. Read
+    // from `ctx.headers` (the WS framing headers, incl. Host, are stripped from
+    // `client_headers`). Stable across retry attempts.
+    let ws_client_host = ctx.headers.get("host").cloned();
     let mut current_backend_url = backend_url;
     let mut current_target = upstream_target;
     let mut backend_admission_permits: Option<BackendAdmissionPermitSet>;
@@ -6376,19 +6382,45 @@ async fn handle_websocket_request_authenticated(
             }
         };
 
-        match connect_websocket_backend(
-            &current_backend_url,
-            &proxy,
-            &env_config,
-            &client_headers,
-            state.tls_policy.as_deref(),
-            &state.crls,
-            state.max_websocket_frame_size_bytes,
-            state.websocket_write_buffer_size,
-            ws_idle_tracker.clone(),
-        )
-        .await
-        {
+        // Mesh egress (Sidecar `mesh.mtls` / Ambient `mesh.hbone`): route the WS
+        // upgrade through an RFC 8441 Extended CONNECT over the SVID-mTLS / HBONE
+        // tunnel instead of a direct plaintext/TLS dial. Fail-closed — a
+        // mesh-tagged target that cannot dispatch over its secured transport
+        // (missing SVID, unpinned peer, peer without Extended CONNECT) errors and
+        // is NEVER dialed in plaintext (`connect_mesh_websocket_backend` never
+        // calls `connect_websocket_backend`). Recomputed per attempt because the
+        // retry loop may rotate `current_target`.
+        let ws_mesh_egress = current_target.as_deref().and_then(websocket_mesh_egress);
+        let ws_dial_result: Result<WsBackendHandshake, Box<dyn std::error::Error + Send + Sync>> =
+            match (&ws_mesh_egress, current_target.as_deref()) {
+                (Some(egress), Some(target)) => connect_mesh_websocket_backend(
+                    &state,
+                    &proxy,
+                    target,
+                    egress,
+                    ws_client_host.as_deref(),
+                    &client_headers,
+                    state.max_websocket_frame_size_bytes,
+                    state.websocket_write_buffer_size,
+                    ws_idle_tracker.clone(),
+                )
+                .await
+                .map(|handshake| WsBackendHandshake::Mesh(Box::new(handshake))),
+                _ => connect_websocket_backend(
+                    &current_backend_url,
+                    &proxy,
+                    &env_config,
+                    &client_headers,
+                    state.tls_policy.as_deref(),
+                    &state.crls,
+                    state.max_websocket_frame_size_bytes,
+                    state.websocket_write_buffer_size,
+                    ws_idle_tracker.clone(),
+                )
+                .await
+                .map(|handshake| WsBackendHandshake::Direct(Box::new(handshake))),
+            };
+        match ws_dial_result {
             Ok(handshake) => {
                 backend_conn_guard = conn_slot;
                 break handshake;
@@ -6766,10 +6798,9 @@ async fn handle_websocket_request_authenticated(
     // 8441 §5.2). Clients that send `Sec-WebSocket-Protocol` expect the
     // server to confirm the selected value; dropping it breaks
     // subprotocol-based dispatch in application code.
-    if let Some(proto) = backend_handshake.negotiated_subprotocol.clone() {
+    if let Some(proto) = backend_handshake.negotiated_subprotocol().cloned() {
         ws_resp_builder = ws_resp_builder.header("sec-websocket-protocol", proto);
     }
-    let backend_ws_stream = backend_handshake.stream;
 
     // Inject sticky session cookie on WebSocket upgrade responses
     if sticky_cookie_needed
@@ -6902,28 +6933,60 @@ async fn handle_websocket_request_authenticated(
                 // this wrap and passes its own duplex adapter directly
                 // to `run_websocket_proxy`, which is now generic over
                 // the client transport type.
-                if let Err(e) = run_websocket_proxy(
-                    TokioIo::new(upgraded),
-                    backend_ws_stream,
-                    &proxy_id,
-                    ws_conn_id,
-                    ws_frame_plugins,
-                    ws_disconnect_plugins,
-                    session_meta,
-                    ws_connection_permit,
-                    max_ws_frame,
-                    ws_write_buf,
-                    ws_tunnel,
-                    // H1/H2: RFC 6455 / RFC 8441 mandate masked
-                    // client-to-server frames. The H3 caller in
-                    // `src/http3/websocket.rs` passes `true` for
-                    // RFC 9220 §5 compliance.
-                    false,
-                    ws_idle_tracker,
-                    &adaptive_buf,
-                )
-                .await
-                {
+                //
+                // `run_websocket_proxy` is also generic over the backend
+                // transport, so dispatch on the handshake variant: a direct
+                // TCP/TLS backend stream, or a mesh egress
+                // `WebSocketStream<H2ConnectTunnel>` over an Extended CONNECT
+                // tunnel. Both share the same frame relay and plugin pipeline.
+                let client_io = TokioIo::new(upgraded);
+                let relay_result = match backend_handshake {
+                    WsBackendHandshake::Direct(handshake) => {
+                        let handshake = *handshake;
+                        run_websocket_proxy(
+                            client_io,
+                            handshake.stream,
+                            &proxy_id,
+                            ws_conn_id,
+                            ws_frame_plugins,
+                            ws_disconnect_plugins,
+                            session_meta,
+                            ws_connection_permit,
+                            max_ws_frame,
+                            ws_write_buf,
+                            ws_tunnel,
+                            // H1/H2: RFC 6455 / RFC 8441 mandate masked
+                            // client-to-server frames. The H3 caller in
+                            // `src/http3/websocket.rs` passes `true` for
+                            // RFC 9220 §5 compliance.
+                            false,
+                            ws_idle_tracker,
+                            &adaptive_buf,
+                        )
+                        .await
+                    }
+                    WsBackendHandshake::Mesh(handshake) => {
+                        let handshake = *handshake;
+                        run_websocket_proxy(
+                            client_io,
+                            handshake.stream,
+                            &proxy_id,
+                            ws_conn_id,
+                            ws_frame_plugins,
+                            ws_disconnect_plugins,
+                            session_meta,
+                            ws_connection_permit,
+                            max_ws_frame,
+                            ws_write_buf,
+                            ws_tunnel,
+                            false,
+                            ws_idle_tracker,
+                            &adaptive_buf,
+                        )
+                        .await
+                    }
+                };
+                if let Err(e) = relay_result {
                     error!("WebSocket proxying error for {}: {}", proxy_id, e);
                 }
             }
@@ -7352,6 +7415,41 @@ pub(crate) struct BackendWsHandshake {
     pub negotiated_subprotocol: Option<hyper::header::HeaderValue>,
 }
 
+/// Backend WebSocket transport for a mesh egress session: the raw WebSocket
+/// frame stream carried over an HTTP/2 Extended CONNECT (RFC 8441) byte tunnel
+/// (`H2ConnectTunnel`), wrapped in the byte-level idle adapter beneath the
+/// framer exactly like the TCP/TLS backend path. The tunnel already rides
+/// SVID-mTLS (Sidecar `:15006`) or HBONE (Ambient `:15008`); there is no second
+/// TLS layer.
+type MeshBackendWsStream = WebSocketStream<WsActivityIo<crate::proxy::hbone_pool::H2ConnectTunnel>>;
+
+pub(crate) struct MeshBackendWsHandshake {
+    pub stream: MeshBackendWsStream,
+    pub negotiated_subprotocol: Option<hyper::header::HeaderValue>,
+}
+
+/// Unified backend WebSocket handshake: either a direct TCP/TLS upgrade (the
+/// pre-mesh / non-mesh path) or a mesh egress Extended CONNECT tunnel (Sidecar
+/// mesh-mTLS or Ambient HBONE). Both feed the SAME generic `run_websocket_proxy`
+/// frame relay — only the backend transport type differs, so the session spawn
+/// dispatches on the variant.
+pub(crate) enum WsBackendHandshake {
+    // Both variants are boxed: the direct TCP/TLS handshake is ~1.4 KB and the
+    // mesh tunnel ~0.4 KB, so boxing keeps the enum (and every WS dispatch that
+    // names it) pointer-sized.
+    Direct(Box<BackendWsHandshake>),
+    Mesh(Box<MeshBackendWsHandshake>),
+}
+
+impl WsBackendHandshake {
+    fn negotiated_subprotocol(&self) -> Option<&hyper::header::HeaderValue> {
+        match self {
+            Self::Direct(handshake) => handshake.negotiated_subprotocol.as_ref(),
+            Self::Mesh(handshake) => handshake.negotiated_subprotocol.as_ref(),
+        }
+    }
+}
+
 /// Connect to backend WebSocket server before sending 101 to client.
 /// Returns the connected backend stream + negotiated handshake metadata,
 /// or an error if the backend is unreachable.
@@ -7451,6 +7549,145 @@ pub(crate) async fn connect_websocket_backend(
     Ok(BackendWsHandshake {
         stream: backend_ws_stream,
         negotiated_subprotocol,
+    })
+}
+
+/// The mesh egress transport a WebSocket upgrade should ride, derived from the
+/// LB-selected upstream target's tags. `None` means the target is not mesh-egress
+/// tagged, so the ordinary direct TCP/TLS WebSocket path is used.
+enum MeshWsEgress {
+    /// Sidecar SVID-mTLS (`mesh.mtls`): dial the peer sidecar's inbound mTLS
+    /// listener over a fresh mesh-mTLS H2 connection and Extended CONNECT.
+    SidecarMtls,
+    /// Ambient HBONE (`mesh.hbone`): dial the peer's `:15008` HBONE listener
+    /// over a fresh SVID-mTLS H2 connection and Extended CONNECT.
+    AmbientHbone,
+}
+
+/// Decide whether a WebSocket upgrade to `target` must ride a mesh egress
+/// transport, keyed purely on the target's transport tag. Returns `None` only
+/// for non-mesh targets (the direct TCP/TLS path applies). A mesh-tagged target
+/// is ALWAYS reported as mesh egress — even when the gateway SVID is missing —
+/// so the upgrade fails closed in `connect_mesh_websocket_backend` (where the
+/// pool errors `NoSvid` before any dial) rather than silently falling back to a
+/// plaintext dial of a `mesh.mtls`/`mesh.hbone` destination. This is the
+/// WebSocket analogue of the `supports_mesh_mtls_backend` / `supports_hbone_backend`
+/// fail-closed contract, but the SVID/capability check is deferred to the dial
+/// because returning `None` here would route to the plaintext path.
+fn websocket_mesh_egress(target: &UpstreamTarget) -> Option<MeshWsEgress> {
+    if mesh_mtls_pool::target_mesh_mtls_enabled(target) {
+        Some(MeshWsEgress::SidecarMtls)
+    } else if hbone_pool::target_hbone_enabled(target) {
+        Some(MeshWsEgress::AmbientHbone)
+    } else {
+        None
+    }
+}
+
+/// Open a backend WebSocket transport over a mesh egress Extended CONNECT
+/// (RFC 8441) tunnel for a `mesh.mtls`-tagged (Sidecar) or `mesh.hbone`-tagged
+/// (Ambient) destination. The returned stream carries raw WebSocket frames over
+/// the SVID-mTLS / HBONE byte tunnel; the peer's mesh inbound listener bridges
+/// the Extended CONNECT to the local app's WebSocket (transport-agnostic on the
+/// destination side — no peer change needed).
+///
+/// The connection is dialed to the peer's pod address + transport port, but the
+/// Extended CONNECT `:authority` is the SERVICE routing key the peer's inbound
+/// route matches on — computed exactly like `proxy_to_backend_mesh_mtls`'s inner
+/// `:authority`: the preserved client `Host` (the egress route sets
+/// `preserve_host_header`), rewritten to `<host>:<service_port>` for a
+/// multi-port Sidecar destination (`mesh.mtls_authority_port`), or the dial
+/// authority (`<target.host>:<target.port>`) when no client Host is available.
+///
+/// Identity is PINNED via `mesh.spiffe_id` (mandatory for `mesh.mtls`; carried
+/// when present for `mesh.hbone`). Fails closed: a missing gateway SVID, an
+/// absent/invalid pinned identity, or a peer that never negotiated Extended
+/// CONNECT errors instead of falling back to a plaintext dial.
+#[allow(clippy::too_many_arguments)]
+async fn connect_mesh_websocket_backend(
+    state: &ProxyState,
+    proxy: &Proxy,
+    target: &UpstreamTarget,
+    egress: &MeshWsEgress,
+    client_host: Option<&str>,
+    client_headers: &[(String, String)],
+    max_websocket_frame_size_bytes: usize,
+    websocket_write_buffer_size: usize,
+    idle_tracker: Option<Arc<WsIdleTracker>>,
+) -> Result<MeshBackendWsHandshake, Box<dyn std::error::Error + Send + Sync>> {
+    // Compute the Extended CONNECT `:authority` the destination routes on,
+    // mirroring `proxy_to_backend_mesh_mtls`'s inner `:authority` BYTE-FOR-BYTE
+    // so the WS path and HTTP path are interchangeable on the peer:
+    //   * preserve-host + multi-port Sidecar → `<client_host>:<service_port>`
+    //     (`mesh_mtls_request_authority`, the rewrite tag the peer's per-port
+    //     inbound siblings disambiguate by — `:15006` dials are direct/never
+    //     NATed; HBONE relays the authority transparently);
+    //   * preserve-host + single-port → the client Host VERBATIM (incl. any
+    //     explicit port, and NO port when the client sent none — matching the
+    //     HTTP single-port path exactly);
+    //   * otherwise → the dial authority (`<target.host>:<target.port>`).
+    let authority = match client_host {
+        Some(host) if proxy.preserve_host_header && !host.is_empty() => {
+            match mesh_mtls_pool::target_mesh_mtls_authority_port(target) {
+                Some(service_port) => mesh_mtls_request_authority(host, service_port),
+                None => host.to_string(),
+            }
+        }
+        _ => hbone_pool::authority_for_host_port(&target.host, target.port),
+    };
+
+    let ws_tunnel = match egress {
+        MeshWsEgress::SidecarMtls => {
+            let expected_peer = mesh_mtls_pool::target_mesh_mtls_expected_peer(target)?;
+            let mtls_port = mesh_mtls_pool::target_mesh_mtls_port(target);
+            state
+                .mesh_mtls_pool
+                .open_ws_connect_tunnel(
+                    proxy,
+                    &target.host,
+                    mtls_port,
+                    &authority,
+                    &expected_peer,
+                    client_headers,
+                )
+                .await?
+        }
+        MeshWsEgress::AmbientHbone => {
+            let expected_peer = hbone_pool::target_expected_peer_spiffe(target)?;
+            let hbone_port = hbone_pool::target_hbone_port(target);
+            state
+                .hbone_pool
+                .get_ws_tunnel(
+                    proxy,
+                    &target.host,
+                    hbone_port,
+                    &authority,
+                    expected_peer.as_ref(),
+                    client_headers,
+                )
+                .await?
+        }
+    };
+
+    let mut ws_config = WebSocketConfig::default();
+    ws_config.max_frame_size = Some(max_websocket_frame_size_bytes);
+    ws_config.max_message_size = Some(max_websocket_frame_size_bytes.saturating_mul(4));
+    ws_config.write_buffer_size = websocket_write_buffer_size;
+
+    // The Extended CONNECT response (200) already confirmed the upgrade, so the
+    // tunnel IS the raw WebSocket frame transport — wrap it as a CLIENT-role
+    // framer directly (no inner H1 handshake). The byte-level idle adapter sits
+    // under the framer, matching the TCP/TLS backend path.
+    let stream = WebSocketStream::from_raw_socket(
+        WsActivityIo::new(ws_tunnel.tunnel, idle_tracker),
+        tokio_tungstenite::tungstenite::protocol::Role::Client,
+        Some(ws_config),
+    )
+    .await;
+
+    Ok(MeshBackendWsHandshake {
+        stream,
+        negotiated_subprotocol: ws_tunnel.negotiated_subprotocol,
     })
 }
 
@@ -7792,9 +8029,9 @@ where
 /// on the H3 path; strict RFC 9220 §5 enforcement (close 1002 on a
 /// masked H3 frame) is a future-work follow-up.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn run_websocket_proxy<C>(
+pub(crate) async fn run_websocket_proxy<C, B>(
     client_io: C,
-    backend_ws_stream: BackendWsStream,
+    backend_ws_stream: WebSocketStream<B>,
     proxy_id: &str,
     connection_id: u64,
     ws_frame_plugins: Vec<Arc<dyn Plugin>>,
@@ -7810,6 +8047,13 @@ pub(crate) async fn run_websocket_proxy<C>(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    // Generic over the backend transport so the H1/H2/H3 paths (a TCP/TLS
+    // backend stream via `connect_websocket_backend`) and the Sidecar/Ambient
+    // mesh egress paths (a `WebSocketStream<H2ConnectTunnel>` over an Extended
+    // CONNECT byte tunnel) share one frame relay. The tunnel-mode raw-copy
+    // fast path is H1-only; both transports satisfy the bound, so the early
+    // return below stays generic.
+    B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     // Invariant: the tunnel-mode raw-copy fast path is only reachable from H1
     // frontends. RFC 6455 (H1.1) and RFC 8441 (H2 Extended CONNECT) mandate

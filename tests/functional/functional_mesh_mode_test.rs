@@ -3371,3 +3371,334 @@ async fn functional_mesh_sidecar_outbound_multi_port_without_orig_dst_fails_clos
          attempts\n{last_failure}"
     );
 }
+
+/// Start a WebSocket echo server on a fresh TCP port. The destination gateway
+/// B's inbound loopback route targets this as the local application: B's
+/// inbound listener terminates the source's WebSocket-over-mesh Extended
+/// CONNECT and bridges it to this server over a plain HTTP/1.1 upgrade. The
+/// server echoes every text/binary frame back with a `backend-ws:` prefix so
+/// the test can prove frames traversed the full A→B→app→B→A datapath, then
+/// honors a Close.
+async fn start_websocket_echo_backend() -> u16 {
+    use futures_util::{SinkExt, StreamExt};
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind websocket echo backend");
+    let port = listener
+        .local_addr()
+        .expect("websocket echo backend addr")
+        .port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((sock, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let Ok(mut ws) = tokio_tungstenite::accept_async(sock).await else {
+                    return;
+                };
+                use tokio_tungstenite::tungstenite::Message;
+                // A recv error ends the session (the `while let Some(Ok(..))`
+                // simply stops looping), which is all an echo server needs.
+                while let Some(Ok(msg)) = ws.next().await {
+                    let send_result = match msg {
+                        Message::Text(text) => {
+                            ws.send(Message::Text(format!("backend-ws:{text}").into()))
+                                .await
+                        }
+                        Message::Binary(bytes) => ws.send(Message::Binary(bytes)).await,
+                        Message::Ping(payload) => ws.send(Message::Pong(payload)).await,
+                        Message::Close(_) => {
+                            let _ = ws.send(Message::Close(None)).await;
+                            break;
+                        }
+                        _ => Ok(()),
+                    };
+                    if send_result.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    port
+}
+
+/// Open a plaintext HTTP/1.1 WebSocket upgrade to gateway A's outbound capture
+/// listener (the same channel `plaintext_http_get` uses), send one text frame,
+/// and return the echoed reply. The `Host` selects A's `mesh.mtls` egress route
+/// to svc-b; the WebSocket upgrade then rides A's Sidecar mesh-mTLS Extended
+/// CONNECT to B. Errors (handshake refused, no echo) are returned so the driver
+/// can retry / assert fail-closed.
+async fn mesh_websocket_echo_roundtrip(
+    port: u16,
+    host: &str,
+    payload: &str,
+) -> Result<String, String> {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let tcp = tokio::time::timeout(
+        Duration::from_secs(5),
+        TcpStream::connect(("127.0.0.1", port)),
+    )
+    .await
+    .map_err(|_| "websocket connect timed out".to_string())?
+    .map_err(|e| format!("websocket connect failed: {e}"))?;
+
+    // Build the upgrade request with the egress-route Host (tungstenite would
+    // otherwise key the Host off the raw 127.0.0.1 address and miss the route).
+    let mut request = format!("ws://{host}/")
+        .into_client_request()
+        .map_err(|e| format!("build ws request: {e}"))?;
+    request.headers_mut().insert(
+        "host",
+        host.parse().map_err(|e| format!("host header: {e}"))?,
+    );
+
+    let (mut ws, _resp) = tokio::time::timeout(
+        Duration::from_secs(8),
+        tokio_tungstenite::client_async(request, tcp),
+    )
+    .await
+    .map_err(|_| "websocket handshake timed out".to_string())?
+    .map_err(|e| format!("websocket handshake failed: {e}"))?;
+
+    ws.send(Message::Text(payload.to_string().into()))
+        .await
+        .map_err(|e| format!("websocket send failed: {e}"))?;
+
+    let reply = loop {
+        let msg = tokio::time::timeout(Duration::from_secs(8), ws.next())
+            .await
+            .map_err(|_| "websocket reply timed out".to_string())?
+            .ok_or_else(|| "websocket closed before reply".to_string())?
+            .map_err(|e| format!("websocket recv failed: {e}"))?;
+        match msg {
+            Message::Text(text) => break text.to_string(),
+            // Ignore control frames while waiting for the echoed data frame.
+            Message::Ping(_) | Message::Pong(_) => continue,
+            Message::Close(frame) => {
+                return Err(format!("websocket closed before echo: {frame:?}"));
+            }
+            other => return Err(format!("unexpected websocket frame: {other:?}")),
+        }
+    };
+    let _ = ws.send(Message::Close(None)).await;
+    Ok(reply)
+}
+
+/// Two-gateway WebSocket egress driver, mirroring [`drive_egress_a_to_b`] but
+/// proxying a WebSocket upgrade instead of a plain GET. Reuses the same SVID,
+/// slice, port, and gateway-spawn machinery; only the backend (a WS echo
+/// server) and the client (a WS handshake + frame round-trip) differ.
+/// Returns `Ok(echoed_payload)` on success, `Err(diagnostic)` otherwise.
+async fn drive_websocket_egress_a_to_b(
+    topology: &str,
+    client_trusted: bool,
+) -> Result<(String, String), String> {
+    ensure_gateway_built().map_err(|e| format!("gateway build: {e}"))?;
+    let a_spiffe = "spiffe://cluster.local/ns/ferrum/sa/client-app";
+    let b_spiffe = "spiffe://cluster.local/ns/ferrum/sa/svc-b";
+    let trust_label = if client_trusted {
+        "trusted"
+    } else {
+        "untrusted"
+    };
+
+    let mut last_failure = String::new();
+    for attempt in 1..=RETRY_ATTEMPTS {
+        let node_a = format!("functional-mesh-ws-egress-{topology}-{trust_label}-a-{attempt}");
+        let node_b = format!("functional-mesh-ws-egress-{topology}-{trust_label}-b-{attempt}");
+        let temp_a = TempDir::new().map_err(|e| format!("temp dir a: {e}"))?;
+        let temp_b = TempDir::new().map_err(|e| format!("temp dir b: {e}"))?;
+        let svids = generate_two_gateway_svids(temp_b.path(), a_spiffe, b_spiffe);
+        let a_svid = if client_trusted {
+            svids.a
+        } else {
+            generate_gateway_svid(temp_a.path(), a_spiffe)
+        };
+        let backend_port = start_websocket_echo_backend().await;
+
+        let cp_b =
+            start_static_mesh_cp(egress_service_slice(&node_b, b_spiffe, backend_port)).await;
+        let cp_a =
+            start_static_mesh_cp(egress_service_slice(&node_a, b_spiffe, backend_port)).await;
+        let ports_a = reserve_mesh_ports().await;
+        let ports_b = reserve_mesh_ports().await;
+        let a_outbound_port = ports_a.outbound;
+        let b_transport_port = match topology {
+            "sidecar" => ports_b.inbound,
+            "ambient" => ports_b.hbone,
+            other => return Err(format!("unsupported ws egress topology {other}")),
+        };
+
+        let mut child_b = spawn_mesh_gateway(
+            &temp_b,
+            MeshGatewaySpawnOptions {
+                cp_addr: cp_b.addr,
+                ports: ports_b,
+                node_id: &node_b,
+                config_protocol: "native",
+                topology,
+                waypoint_name: None,
+                env_overrides: vec![
+                    ("FERRUM_MESH_PRODUCTION_MODE", "true".to_string()),
+                    ("FERRUM_POOL_WARMUP_ENABLED", "false".to_string()),
+                    ("FERRUM_MESH_WORKLOAD_SPIFFE_ID", b_spiffe.to_string()),
+                    ("FERRUM_GATEWAY_SVID_CERT_PATH", svids.b.cert_path.clone()),
+                    ("FERRUM_GATEWAY_SVID_KEY_PATH", svids.b.key_path.clone()),
+                    (
+                        "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+                        svids.b.trust_bundle_path.clone(),
+                    ),
+                ],
+            },
+        );
+        if !wait_for_tcp_port(b_transport_port, STARTUP_TIMEOUT).await {
+            last_failure = format!(
+                "attempt {attempt}: gateway B transport listener never bound\n{}",
+                captured_output(&temp_b)
+            );
+            kill_child(&mut child_b);
+            cp_b.shutdown().await;
+            cp_a.shutdown().await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
+
+        let mut a_env = vec![
+            ("FERRUM_MESH_PRODUCTION_MODE", "true".to_string()),
+            ("FERRUM_LOG_LEVEL", "debug".to_string()),
+            ("FERRUM_MESH_WORKLOAD_SPIFFE_ID", a_spiffe.to_string()),
+            ("FERRUM_GATEWAY_SVID_CERT_PATH", a_svid.cert_path.clone()),
+            ("FERRUM_GATEWAY_SVID_KEY_PATH", a_svid.key_path.clone()),
+            (
+                "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+                a_svid.trust_bundle_path.clone(),
+            ),
+        ];
+        match topology {
+            "sidecar" => {
+                a_env.push(("FERRUM_POOL_WARMUP_ENABLED", "false".to_string()));
+                a_env.push(("FERRUM_MESH_EGRESS_MTLS_PORT", b_transport_port.to_string()));
+            }
+            _ => {
+                a_env.push(("FERRUM_POOL_WARMUP_ENABLED", "true".to_string()));
+                a_env.push((
+                    "FERRUM_MESH_EGRESS_HBONE_PORT",
+                    b_transport_port.to_string(),
+                ));
+            }
+        }
+        let mut child_a = spawn_mesh_gateway(
+            &temp_a,
+            MeshGatewaySpawnOptions {
+                cp_addr: cp_a.addr,
+                ports: ports_a,
+                node_id: &node_a,
+                config_protocol: "native",
+                topology,
+                waypoint_name: None,
+                env_overrides: a_env,
+            },
+        );
+        if !wait_for_tcp_port(a_outbound_port, STARTUP_TIMEOUT).await {
+            last_failure = format!(
+                "attempt {attempt}: gateway A outbound listener never bound\n{}",
+                captured_output(&temp_a)
+            );
+            kill_child(&mut child_a);
+            kill_child(&mut child_b);
+            cp_a.shutdown().await;
+            cp_b.shutdown().await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
+
+        // Open the WebSocket through A's outbound listener. Retried briefly for
+        // the same warmup/probe convergence reason as the HTTP egress driver;
+        // the untrusted negative asserts the FINAL state (never a success).
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let last: Result<String, String> = loop {
+            let attempt = mesh_websocket_echo_roundtrip(
+                a_outbound_port,
+                "svc-b.ferrum.svc.cluster.local",
+                "mesh-ws-hello",
+            )
+            .await;
+            if let Ok(ref reply) = attempt
+                && reply.contains("backend-ws:mesh-ws-hello")
+            {
+                break attempt;
+            }
+            if Instant::now() >= deadline {
+                break attempt;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        };
+
+        let output_a = captured_output(&temp_a);
+        let output_b = captured_output(&temp_b);
+        kill_child(&mut child_a);
+        kill_child(&mut child_b);
+        cp_a.shutdown().await;
+        cp_b.shutdown().await;
+
+        let logs = format!("--- gateway A ---\n{output_a}\n--- gateway B ---\n{output_b}");
+        return match last {
+            Ok(reply) => Ok((reply, logs)),
+            Err(e) => Err(format!("{e}\n{logs}")),
+        };
+    }
+
+    Err(format!(
+        "ws egress gateways never bound their listeners after {RETRY_ATTEMPTS} attempts\n{last_failure}"
+    ))
+}
+
+/// WebSocket egress keystone (Sidecar, F2 §3.2): a WebSocket upgrade captured at
+/// gateway A reaches the WS echo backend behind gateway B over an **RFC 8441
+/// Extended CONNECT carried on plain SVID-mTLS HTTP/2** to B's inbound listener
+/// — outbound capture → materialized `mesh.mtls` egress route → WS handler
+/// opens an Extended CONNECT over mesh-mTLS (peer pinned to B's workload
+/// identity) → B's STRICT inbound termination recognizes the Extended CONNECT
+/// WebSocket → bridges to the local WS app → frames echo back to A. Proves the
+/// WS upgrade rides the SAME secured transport as Sidecar HTTP egress instead of
+/// the pre-mesh plaintext dial.
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_sidecar_ws_egress_routes_a_to_b_over_mtls() {
+    let (reply, logs) = drive_websocket_egress_a_to_b("sidecar", true)
+        .await
+        .expect("sidecar websocket egress drive");
+    assert!(
+        reply.contains("backend-ws:mesh-ws-hello"),
+        "the WebSocket frame must traverse A's SVID-mTLS Extended CONNECT egress to B's WS \
+         backend and echo back; reply: {reply:?}\n{logs}"
+    );
+}
+
+/// WebSocket egress mTLS negative (Sidecar): a source gateway whose SVID does
+/// NOT chain to the mesh CA must not reach B's WS backend. The mesh-mTLS dial
+/// underpinning the Extended CONNECT fails SVID verification (A rejects B's
+/// server SVID; B's STRICT inbound rejects A's client cert), so the WebSocket
+/// upgrade fails closed — it must never echo a backend frame. Proves the WS
+/// egress path really verifies SVIDs rather than blindly tunneling.
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_sidecar_ws_egress_rejects_untrusted_client_gateway() {
+    // The driver returns `Err` when the WebSocket upgrade never completes (the
+    // expected fail-closed outcome for an untrusted gateway: the mesh-mTLS dial
+    // underpinning the Extended CONNECT fails SVID verification before a 101).
+    // It returns `Ok(reply)` only if a handshake somehow succeeded — in which
+    // case the reply must NOT carry a backend frame.
+    if let Ok((reply, logs)) = drive_websocket_egress_a_to_b("sidecar", false).await {
+        assert!(
+            !reply.contains("backend-ws:"),
+            "an untrusted gateway's WebSocket egress must fail closed, not echo a backend \
+             frame: {reply:?}\n{logs}"
+        );
+    }
+}
