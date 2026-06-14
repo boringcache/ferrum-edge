@@ -2012,7 +2012,31 @@ async fn handle_h3_request(
             let body_was_prebuffered = prebuffered_body_data.is_some();
             let mut body_data = prebuffered_body_data.take().unwrap_or_default();
             if !body_was_prebuffered {
-                while let Some(chunk) = stream.recv_data().await? {
+                while let Some(chunk) = stream.recv_data().await.map_err(|e| {
+                    // Client read error during cross-protocol prebuffering,
+                    // before cross_protocol::run (which would release a
+                    // reserved HALF_OPEN probe). Release it here so an aborted
+                    // upload during HALF_OPEN can't permanently wedge the
+                    // breaker — same leak class as the oversized-body 413 path
+                    // below. ClientDisconnect drives a neutral breaker release
+                    // and suppresses the health/latency samples; status is
+                    // irrelevant (no response was produced).
+                    crate::proxy::backend_dispatch::record_backend_outcome_no_conn_end(
+                        &state,
+                        &proxy,
+                        &epoch.load_balancer,
+                        upstream_balancer.as_ref(),
+                        upstream_target.as_deref(),
+                        cb_target_key.as_deref(),
+                        0,
+                        false,
+                        Some(crate::retry::ErrorClass::ClientDisconnect),
+                        cb_is_half_open_probe,
+                        false,
+                        backend_start.elapsed(),
+                    );
+                    e
+                })? {
                     let bytes = chunk.chunk();
                     if content_length_limit > 0
                         && body_data.len() + bytes.len() > content_length_limit
@@ -2963,11 +2987,32 @@ async fn handle_h3_request(
     let body_was_prebuffered = prebuffered_body_data.is_some();
     let mut body_data = prebuffered_body_data.take().unwrap_or_default();
     if !body_was_prebuffered {
-        while let Some(chunk) = stream.recv_data().await? {
+        while let Some(chunk) = stream.recv_data().await.map_err(|e| {
+            // Client read error while buffering the request body, before
+            // backend dispatch. The CB check above may have reserved a
+            // HALF_OPEN probe; release it so the breaker isn't wedged,
+            // matching run_h3_backend_admission_or_send_reject.
+            release_h3_circuit_breaker_probe_on_admission_reject(
+                &state,
+                &proxy,
+                cb_target_key.as_deref(),
+                cb_is_half_open_probe,
+            );
+            e
+        })? {
             let bytes = chunk.chunk();
             if state.max_request_body_size_bytes > 0
                 && body_data.len() + bytes.len() > state.max_request_body_size_bytes
             {
+                // Oversized body — gateway-side 413 before backend dispatch.
+                // Release the reserved HALF_OPEN probe before the reject write
+                // (which uses `?` and could exit early on client reset).
+                release_h3_circuit_breaker_probe_on_admission_reject(
+                    &state,
+                    &proxy,
+                    cb_target_key.as_deref(),
+                    cb_is_half_open_probe,
+                );
                 record_request(&state, 413);
                 send_h3_response(
                     &mut stream,
@@ -3029,6 +3074,18 @@ async fn handle_h3_request(
         crate::plugins::PluginResult::Continue => {}
         reject @ crate::plugins::PluginResult::Reject { .. }
         | reject @ crate::plugins::PluginResult::RejectBinary { .. } => {
+            // Gateway-side reject before backend dispatch. The CB check above may
+            // have reserved a HALF_OPEN probe; release it before any client-facing
+            // reject write (the sends below use `?` and can exit early on client
+            // reset), matching run_h3_backend_admission_or_send_reject. Placed
+            // before the destructure so it also covers the 500 conversion-failure
+            // fallback below.
+            release_h3_circuit_breaker_probe_on_admission_reject(
+                &state,
+                &proxy,
+                cb_target_key.as_deref(),
+                cb_is_half_open_probe,
+            );
             let Some(reject) = plugin_result_into_reject_parts(reject) else {
                 tracing::error!("Plugin result could not be converted to rejection parts");
                 record_request(&state, 500);
