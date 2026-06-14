@@ -251,8 +251,14 @@ pub struct SubsetTrafficPolicy {
     /// this subset, overriding the upstream-level passive health. The
     /// `maxEjectionPercent` *cap* is also resolved per-subset, by
     /// `LoadBalancerCache::max_ejection_percent_resolved_from` with the SAME
-    /// per-port > per-subset > upstream precedence as the thresholds, so the cap
-    /// and the thresholds always come from the same tier.
+    /// per-port > per-subset > upstream tier precedence as the thresholds, so
+    /// the cap and the thresholds come from the same tier. The cap is also
+    /// scoped to the subset's candidate pool (the denominator is the subset
+    /// target count, not the whole upstream). The per-port cap tier applies
+    /// only when a single dispatch port is resolvable pre-selection (non-subset
+    /// dispatch, single-port upstreams, or port-pinned retries); for a
+    /// subset-routed dispatch on a multi-port upstream the subset cap governs
+    /// (see `max_ejection_percent_resolved_from`'s pre-selection-asymmetry note).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub passive_health_check: Option<PassiveHealthCheck>,
 }
@@ -494,7 +500,10 @@ pub struct ResolvedSubsetTrafficPolicy {
     /// proxies bound to this subset. The `maxEjectionPercent` cap is resolved
     /// per-subset by `LoadBalancerCache::max_ejection_percent_resolved_from`
     /// (reading this overlay), with the SAME per-port > per-subset > upstream
-    /// precedence as the thresholds.
+    /// tier precedence as the thresholds, and is scoped to the subset's
+    /// candidate pool (denominator = subset target count). The per-port tier
+    /// applies only when a single dispatch port is resolvable pre-selection;
+    /// for subset dispatch on a multi-port upstream the subset cap governs.
     pub passive_health_check: Option<PassiveHealthCheck>,
 }
 
