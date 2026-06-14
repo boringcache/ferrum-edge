@@ -18761,7 +18761,12 @@ async fn proxy_to_backend_http3(
                             )
                             .await
                             {
-                                Ok(body) => body,
+                                // Trailers (issue #1630) are not forwarded on this
+                                // H1/H2-frontend → H3-backend path: emitting them to
+                                // an H1/H2 client needs chunked-trailer / trailers-
+                                // frame machinery that is out of scope. Discard the
+                                // trailer slot the drain helper now returns.
+                                Ok((body, _trailers)) => body,
                                 Err(crate::http3::client::H3BodyDrainError::ResponseTooLarge {
                                     ..
                                 }) => {
@@ -19227,12 +19232,18 @@ async fn proxy_to_backend_http3(
 
         match h3_result {
             Ok(response) => {
-                debug!(proxy_id = %proxy.id, status = response.0, "HTTP/3 backend request successful");
+                debug!(proxy_id = %proxy.id, status = response.status, "HTTP/3 backend request successful");
+                // Backend trailers (`response.trailers`) are intentionally
+                // dropped on this H1/H2-frontend → H3-backend path: forwarding
+                // them would require H1 chunked-trailer / H2 trailers-frame
+                // emission on the client side, which is out of scope for issue
+                // #1630 (limited to the plain H3-frontend → H3-backend buffered
+                // path). The H3-frontend buffered path forwards them.
                 (
                     retry::BackendResponse {
-                        status_code: response.0,
-                        body: ResponseBody::Buffered(response.1),
-                        headers: response.2,
+                        status_code: response.status,
+                        body: ResponseBody::Buffered(response.body),
+                        headers: response.headers,
                         connection_error: false,
                         backend_resolved_ip: resolved_ip,
                         error_class: None,
@@ -19657,7 +19668,7 @@ async fn proxy_to_backend_http3_retry(
         Ok(response) => {
             debug!(
                 proxy_id = %proxy.id,
-                status = response.0,
+                status = response.status,
                 "HTTP/3 backend retry request successful"
             );
             // Belt-and-suspenders size guard. The H3 pool enforces this while
@@ -19665,11 +19676,11 @@ async fn proxy_to_backend_http3_retry(
             // full buffering; keep this post-return check to protect future
             // alternate H3 collection paths.
             if state.max_response_body_size_bytes > 0
-                && response.1.len() > state.max_response_body_size_bytes
+                && response.body.len() > state.max_response_body_size_bytes
             {
                 warn!(
                     "Backend response body ({} bytes) exceeds limit ({} bytes)",
-                    response.1.len(),
+                    response.body.len(),
                     state.max_response_body_size_bytes
                 );
                 return retry::BackendResponse {
@@ -19685,10 +19696,14 @@ async fn proxy_to_backend_http3_retry(
                     error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
                 };
             }
+            // Backend trailers (`response.trailers`) are dropped here for the
+            // same reason as the non-retry H1/H2-frontend → H3-backend path:
+            // emitting them to an H1/H2 client needs chunked-trailer / trailers-
+            // frame machinery that is out of scope for issue #1630.
             retry::BackendResponse {
-                status_code: response.0,
-                body: ResponseBody::Buffered(response.1),
-                headers: response.2,
+                status_code: response.status,
+                body: ResponseBody::Buffered(response.body),
+                headers: response.headers,
                 connection_error: false,
                 backend_resolved_ip: resolved_ip,
                 error_class: None,
