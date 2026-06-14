@@ -2281,7 +2281,8 @@ fn materialize_mesh_outbound_proxies(
 }
 
 /// Materialize raw-TCP egress UPSTREAMS for the stream-family
-/// (TCP/TLS/DB-protocol) service ports of in-mesh services — Ambient only.
+/// (TCP/TLS/DB-protocol) service ports of in-mesh services — both captured
+/// topologies.
 ///
 /// Unlike HTTP-family egress, NO route proxy enters the config: a raw stream
 /// has no Host header to route by, so the request path can't use the host
@@ -2300,23 +2301,27 @@ fn materialize_mesh_outbound_proxies(
 /// captured dial to a non-mesh destination must never be tunnelled into the
 /// mesh on a port coincidence.
 ///
-/// Per-topology scope: **Ambient only.** Sidecar's transport is plain
-/// mTLS-HTTP/2 to the peer's `:15006` — there is no raw-byte tunnel to ride
-/// and the destination sidecar has no stream inbound — so Sidecar
-/// stream-family ports materialize nothing (warned once per apply) and their
-/// captured dials keep failing as before. Headless / VIP-less services
-/// likewise materialize nothing routable and warn.
+/// Per-topology scope: **Ambient and Sidecar.** The transport differs — Ambient
+/// emits `mesh.hbone` targets (relay over HBONE `:15008`), Sidecar emits
+/// `mesh.mtls` targets (relay over a fresh mesh-mTLS H2 CONNECT tunnel to the
+/// peer's `:15006`; the destination sidecar's inbound listener recognizes a bare
+/// H2 CONNECT and relays it like HBONE does) — but the materialization is
+/// identical: per-port upstreams keyed to the service VIP. Headless / VIP-less
+/// services materialize nothing routable and warn (raw streams carry no Host, so
+/// captured dials are matched strictly by `(VIP, port)`).
 fn materialize_mesh_outbound_tcp_upstreams(
     config: &mut GatewayConfig,
     runtime: &MeshRuntimeConfig,
     mesh_slice: &MeshSlice,
 ) {
-    let supported = matches!(runtime.topology, MeshTopology::Ambient);
-    if !supported && runtime.topology != MeshTopology::Sidecar {
-        // Gateway topologies have their own materializers and no plaintext
-        // outbound capture listener.
-        return;
-    }
+    // Raw-TCP egress now rides BOTH captured topologies. Gateway topologies
+    // (east-west / egress / waypoints) have their own materializers and no
+    // plaintext outbound capture listener.
+    let transport = match runtime.topology {
+        MeshTopology::Ambient => MeshEgressTransport::Hbone,
+        MeshTopology::Sidecar => MeshEgressTransport::SidecarMtls,
+        _ => return,
+    };
     let local_cluster = mesh_slice
         .multi_cluster
         .as_ref()
@@ -2326,18 +2331,6 @@ fn materialize_mesh_outbound_tcp_upstreams(
     for service in &mesh_slice.services {
         let tcp_ports = service_tcp_stream_ports(service);
         if tcp_ports.is_empty() {
-            continue;
-        }
-        if !supported {
-            warn!(
-                service = %service.name,
-                namespace = %service.namespace,
-                tcp_ports = tcp_ports.len(),
-                "In-mesh service declares stream-family (TCP) ports, but raw-TCP egress is \
-                 Ambient-only (Sidecar's mTLS-HTTP transport carries no raw byte stream and \
-                 its peer inbound has no stream listener). Captured raw-TCP dials to this \
-                 service will fail; route it through an explicit stream proxy if needed."
-            );
             continue;
         }
         if service.cluster_ips.is_empty() {
@@ -2360,7 +2353,7 @@ fn materialize_mesh_outbound_tcp_upstreams(
                 .copied()
                 .unwrap_or(service_port.protocol);
             let targets = build_outbound_mesh_targets(
-                MeshEgressTransport::Hbone,
+                transport,
                 runtime,
                 service,
                 service_port,
@@ -2408,8 +2401,10 @@ fn materialize_mesh_outbound_tcp_upstreams(
     if materialized > 0 {
         info!(
             tcp_upstreams = materialized,
-            "Materialized mesh raw-TCP egress upstreams for in-mesh services (HBONE relay, \
-             selected by captured original destination against service VIPs)"
+            topology = ?runtime.topology,
+            "Materialized mesh raw-TCP egress upstreams for in-mesh services (relayed over the \
+             topology's CONNECT transport, selected by captured original destination against \
+             service VIPs)"
         );
     }
 }
@@ -9673,10 +9668,17 @@ mod tests {
     }
 
     #[test]
-    fn mesh_outbound_tcp_upstreams_skip_sidecar_and_vipless() {
+    fn mesh_outbound_tcp_upstreams_materialize_for_sidecar() {
+        // Sidecar raw-TCP egress: one per-port upstream with `mesh.mtls`-tagged,
+        // identity-pinned targets dialing the resolved targetPort — the same
+        // materialization as Ambient, but stamped for the mesh-mTLS CONNECT
+        // transport (dial the peer's `:15006`) rather than HBONE. NO route proxy
+        // (raw streams have no Host; the accept loop matches the captured
+        // original destination against the VIP table).
         let spiffe = "spiffe://cluster.local/ns/default/sa/redis";
         let mut svc = http_mesh_service("redis", 6379, spiffe);
         svc.ports[0].protocol = AppProtocol::Redis;
+        svc.ports[0].target_port = Some(ServiceTargetPort::Number(6380));
         svc.cluster_ips = vec!["10.96.0.1".to_string()];
         let slice = MeshSlice {
             namespace: "default".to_string(),
@@ -9684,33 +9686,61 @@ mod tests {
             services: vec![svc],
             ..MeshSlice::default()
         };
-        // Sidecar topology: no raw-byte transport to the peer — nothing
-        // materializes (warned once per apply).
         let runtime = test_mesh_runtime_config();
         assert_eq!(runtime.topology, MeshTopology::Sidecar);
         let mut config = GatewayConfig::default();
         materialize_mesh_outbound_tcp_upstreams(&mut config, &runtime, &slice);
         assert!(
-            config.upstreams.is_empty(),
-            "Sidecar raw-TCP egress stays fail-closed"
+            config.proxies.is_empty(),
+            "raw-TCP egress materializes upstreams only, never route proxies"
         );
-
-        // VIP-less (headless) service: original destinations cannot be mapped
-        // to it — nothing materializes.
-        let mut headless = http_mesh_service("redis", 6379, spiffe);
-        headless.ports[0].protocol = AppProtocol::Redis;
-        let slice = MeshSlice {
-            namespace: "default".to_string(),
-            workloads: vec![workload_with_address("redis", "redis", "10.0.0.7")],
-            services: vec![headless],
-            ..MeshSlice::default()
-        };
-        let mut config = GatewayConfig::default();
-        materialize_mesh_outbound_tcp_upstreams(&mut config, &ambient_runtime(), &slice);
+        let upstream = config
+            .upstreams
+            .iter()
+            .find(|u| u.id == "__mesh-out-tcp-upstream-default-redis-6379")
+            .expect("per-port raw-TCP upstream for Sidecar");
+        let target = &upstream.targets[0];
+        assert_eq!(target.host, "10.0.0.7");
+        assert_eq!(target.port, 6380, "targets dial the resolved targetPort");
+        assert_eq!(
+            target.tags.get("mesh.mtls").map(String::as_str),
+            Some("true"),
+            "Sidecar raw-TCP egress rides the mesh-mTLS CONNECT transport"
+        );
         assert!(
-            config.upstreams.is_empty(),
-            "a VIP-less service cannot be raw-TCP egress-routed"
+            !target.tags.contains_key("mesh.hbone"),
+            "Sidecar targets must NEVER carry the HBONE (`:15008`) transport tag"
         );
+        assert_eq!(
+            target.tags.get("mesh.spiffe_id").map(String::as_str),
+            Some(spiffe),
+            "destination identity stays pinned"
+        );
+    }
+
+    #[test]
+    fn mesh_outbound_tcp_upstreams_skip_vipless() {
+        // VIP-less (headless) service: a raw stream carries no Host and a bare
+        // port number is ambiguous, so original destinations cannot be mapped
+        // to it — nothing materializes on either captured topology.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/redis";
+        for runtime in [ambient_runtime(), test_mesh_runtime_config()] {
+            let mut headless = http_mesh_service("redis", 6379, spiffe);
+            headless.ports[0].protocol = AppProtocol::Redis;
+            let slice = MeshSlice {
+                namespace: "default".to_string(),
+                workloads: vec![workload_with_address("redis", "redis", "10.0.0.7")],
+                services: vec![headless],
+                ..MeshSlice::default()
+            };
+            let mut config = GatewayConfig::default();
+            materialize_mesh_outbound_tcp_upstreams(&mut config, &runtime, &slice);
+            assert!(
+                config.upstreams.is_empty(),
+                "a VIP-less service cannot be raw-TCP egress-routed ({:?})",
+                runtime.topology
+            );
+        }
     }
 
     #[test]

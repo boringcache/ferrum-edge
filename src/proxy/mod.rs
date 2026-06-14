@@ -4061,6 +4061,15 @@ impl ProxyState {
                     &upstream_id,
                 );
                 for target in &upstream.targets {
+                    // Only Ambient `mesh.hbone` targets use the HBONE capability
+                    // registry. Sidecar `mesh.mtls` raw-TCP targets dispatch over
+                    // a mesh-mTLS CONNECT tunnel with NO capability probe
+                    // (slice-declared sidecars speak mesh-mTLS by construction),
+                    // so enrolling them would dial a non-existent `:15008` HBONE
+                    // listener and record a spurious unsupported verdict.
+                    if !crate::proxy::hbone_pool::target_hbone_enabled(target) {
+                        continue;
+                    }
                     let probe_target =
                         BackendCapabilityProbeTarget::from_proxy(&relay_proxy, Some(target));
                     if seen.insert(probe_target.key.clone()) {
