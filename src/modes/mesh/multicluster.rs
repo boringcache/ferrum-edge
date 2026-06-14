@@ -108,6 +108,18 @@ pub struct RemoteClusterEntry {
     /// Network label of the remote cluster, used to default workload locality
     /// when the remote workload carries none.
     pub network: Option<String>,
+    /// **Normalized** control-plane URL these endpoints were polled from (the
+    /// value the poll task dialed, i.e. [`normalize_control_plane_url`] applied
+    /// to the trimmed operator URL). Stored so the FULL poll identity — not just
+    /// (name, trust_domain, network) — can be matched against an about-to-be-
+    /// applied / accepted slice (codex F7.2 round-5): a slice that changes ONLY
+    /// `control_plane_url` for the same name keeps a stale store entry until the
+    /// discovery reconciler stops the old poller, and without the URL here the
+    /// same-generation admission filter and the admin `discovered` filter cannot
+    /// tell the old endpoints (fetched from the previous CP) apart from the
+    /// newly-declared identity. `None` only for entries staged without a poll
+    /// URL (test seeders); production entries always carry the polled URL.
+    pub control_plane_url: Option<String>,
     pub endpoints: RemoteClusterEndpoints,
     /// Unix-seconds timestamp of the last successful poll for this cluster.
     /// Shared (`Arc<AtomicU64>`) so a no-op poll refreshes it without a clone;
@@ -121,6 +133,7 @@ impl RemoteClusterEntry {
         cluster_name: String,
         trust_domain: TrustDomain,
         network: Option<String>,
+        control_plane_url: Option<String>,
         endpoints: RemoteClusterEndpoints,
         fetched_at_unix_seconds: u64,
     ) -> Self {
@@ -128,6 +141,7 @@ impl RemoteClusterEntry {
             cluster_name,
             trust_domain,
             network,
+            control_plane_url,
             endpoints,
             fetched_at: Arc::new(AtomicU64::new(fetched_at_unix_seconds)),
         }
@@ -138,6 +152,40 @@ impl RemoteClusterEntry {
     /// one poll task and read for human-facing age reporting).
     pub fn fetched_at_unix_seconds(&self) -> u64 {
         self.fetched_at.load(Ordering::Relaxed)
+    }
+
+    /// Whether this stored entry's FULL poll identity matches a `RemoteCluster`
+    /// declared in a candidate / accepted slice. The poll identity is
+    /// (name, trust_domain, network, **normalized control_plane_url**): two
+    /// clusters that share a name but differ on any of those resolve / dial
+    /// differently and must not be conflated.
+    ///
+    /// The declared URL is normalized + trimmed the SAME way the poll target is
+    /// ([`poll_targets_for_multi_cluster`] → [`normalize_control_plane_url`])
+    /// before comparison, so an operator-written `grpcs://` declaration matches a
+    /// stored `https://` poll URL and trailing whitespace never causes a false
+    /// mismatch. A declaration with no usable `control_plane_url` is never a
+    /// match for a stored (polled) entry — such a cluster is federation-only and
+    /// is never polled, so it cannot legitimately own discovered endpoints.
+    ///
+    /// Centralizing this here keeps the same-generation merge filter
+    /// ([`cluster_admitted_by_candidate`]) and the admin `discovered` filter
+    /// (`admin::mesh_remote_clusters::build_response`) from drifting: both ask
+    /// the SAME "is this stored entry the one this slice declares?" question.
+    pub fn matches_declared(&self, declared: &crate::modes::mesh::config::RemoteCluster) -> bool {
+        if declared.name != self.cluster_name
+            || declared.trust_domain != self.trust_domain
+            || declared.network != self.network
+        {
+            return false;
+        }
+        match declared.control_plane_url.as_deref().map(str::trim) {
+            Some(url) if !url.is_empty() => {
+                self.control_plane_url.as_deref() == Some(normalize_control_plane_url(url).as_str())
+            }
+            // Federation-only (or empty) declaration: never owns polled endpoints.
+            _ => false,
+        }
     }
 }
 
@@ -494,17 +542,20 @@ struct WorkloadEndpointKey {
 /// before the discovery reconciler can react to a just-accepted slice that
 /// removed (or re-identified) a cluster. Filtering the merge against the
 /// candidate slice closes that one-generation window: a cluster the candidate
-/// does NOT declare (removal), or declares under a divergent identity
-/// (`trust_domain` / `network` change — the poll-identity fields the snapshot
-/// entry carries), contributes NO endpoints to this generation. Fail-closed: a
-/// candidate slice with no `MultiClusterConfig` admits nothing, so a stale store
-/// can never leak endpoints into a slice that dropped multi-cluster entirely.
+/// does NOT declare (removal), or declares under a divergent identity,
+/// contributes NO endpoints to this generation. Fail-closed: a candidate slice
+/// with no `MultiClusterConfig` admits nothing, so a stale store can never leak
+/// endpoints into a slice that dropped multi-cluster entirely.
 ///
-/// `control_plane_url` is not stored on the entry, so a URL-only divergence is
-/// not caught here; it is caught one generation later by the discovery
-/// reconciler (which keys on the full identity incl. the URL and evicts the
-/// store entry). Matching `trust_domain` + `network` is the fail-closed
-/// same-generation guard for the identity fields the snapshot exposes.
+/// The match is the FULL poll identity — name, trust_domain, network, AND the
+/// normalized `control_plane_url` — via [`RemoteClusterEntry::matches_declared`].
+/// Storing the polled URL on the entry (codex F7.2 round-5) closes the former
+/// URL-only-divergence gap: when an accepted slice changes ONLY
+/// `control_plane_url` for an existing cluster name, the stored entry (still
+/// holding the OLD CP's endpoints) no longer matches the candidate, so the
+/// generation that accepts the new config serves NO endpoints from the previous
+/// control plane while the discovery reconciler spins up the new poller. It is
+/// no longer the case that a URL-only change leaks for a generation.
 fn cluster_admitted_by_candidate(
     entry: &RemoteClusterEntry,
     candidate: Option<&MultiClusterConfig>,
@@ -512,11 +563,10 @@ fn cluster_admitted_by_candidate(
     let Some(candidate) = candidate else {
         return false;
     };
-    candidate.remote_clusters.iter().any(|declared| {
-        declared.name == entry.cluster_name
-            && declared.trust_domain == entry.trust_domain
-            && declared.network == entry.network
-    })
+    candidate
+        .remote_clusters
+        .iter()
+        .any(|declared| entry.matches_declared(declared))
 }
 
 /// Merge the remote-endpoint snapshot into a slice's local `workloads` /
@@ -1034,6 +1084,10 @@ async fn remote_discovery_loop(
                     ctx.cluster_name.clone(),
                     ctx.trust_domain.clone(),
                     ctx.network.clone(),
+                    // `ctx.control_plane_url` is already normalized by
+                    // `poll_targets_for_multi_cluster`; store it so a later
+                    // URL-only slice change fails the membership filter closed.
+                    Some(ctx.control_plane_url.clone()),
                     endpoints,
                     now,
                 );
@@ -1467,6 +1521,9 @@ mod tests {
                 cluster.to_string(),
                 td("remote.local"),
                 Some("net2".to_string()),
+                // Matches the URL `candidate_admitting` declares (already
+                // normalized form), so the full-poll-identity filter admits it.
+                Some("https://cp.remote.example:15010".to_string()),
                 endpoints,
                 1,
             ),
@@ -1923,6 +1980,142 @@ mod tests {
         );
     }
 
+    /// Codex F7.2 round-5, finding 1: a candidate slice that changes ONLY the
+    /// `control_plane_url` (same name + trust domain + network) must NOT admit
+    /// the stored entry — those endpoints were fetched from the PREVIOUS control
+    /// plane, so the generation that accepts the new URL must serve none of them
+    /// until the discovery reconciler starts the new poller. The stored entry
+    /// carries the normalized polled URL, so the filter can tell them apart.
+    #[test]
+    fn merge_drops_cluster_with_url_only_divergence() {
+        let local = vec![workload(
+            "spiffe://cluster.local/ns/default/sa/local",
+            "reviews",
+            "10.1.0.1",
+            None,
+        )];
+        let remote = RemoteClusterEndpoints {
+            workloads: vec![workload(
+                "spiffe://remote.local/ns/default/sa/remote",
+                "reviews",
+                "10.2.0.1",
+                None,
+            )],
+            services: vec![],
+        };
+        // `snapshot_with` stores URL `https://cp.remote.example:15010`.
+        let snapshot = snapshot_with("west", remote);
+
+        // Candidate keeps name + trust domain + network but moves the CP to v2.
+        let url_only_change = MultiClusterConfig {
+            remote_clusters: vec![RemoteCluster {
+                name: "west".to_string(),
+                trust_domain: td("remote.local"),
+                network: Some("net2".to_string()),
+                control_plane_url: Some("https://cp-v2.remote.example:15010".to_string()),
+                federation_endpoint: None,
+            }],
+            ..MultiClusterConfig::default()
+        };
+        let (workloads, _) =
+            merge_remote_endpoints_into_mesh(&local, &[], &snapshot, Some(&url_only_change));
+        assert_eq!(
+            workloads.len(),
+            1,
+            "a URL-only change must not serve endpoints fetched from the previous control plane"
+        );
+
+        // The operator-written `grpcs://` form of the SAME URL still admits it
+        // (normalization matches it to the stored `https://` poll URL).
+        let grpcs_same = MultiClusterConfig {
+            remote_clusters: vec![RemoteCluster {
+                name: "west".to_string(),
+                trust_domain: td("remote.local"),
+                network: Some("net2".to_string()),
+                control_plane_url: Some("grpcs://cp.remote.example:15010".to_string()),
+                federation_endpoint: None,
+            }],
+            ..MultiClusterConfig::default()
+        };
+        let (workloads, _) =
+            merge_remote_endpoints_into_mesh(&local, &[], &snapshot, Some(&grpcs_same));
+        assert_eq!(
+            workloads.len(),
+            2,
+            "a grpcs:// declaration of the same URL normalizes to the stored https:// and admits"
+        );
+    }
+
+    /// `matches_declared` is the single source of truth shared by the merge
+    /// filter and the admin `discovered` filter; pin its identity rules.
+    #[test]
+    fn matches_declared_compares_full_poll_identity() {
+        let entry = RemoteClusterEntry::new(
+            "west".to_string(),
+            td("remote.local"),
+            Some("net2".to_string()),
+            Some("https://cp.remote.example:15010".to_string()),
+            RemoteClusterEndpoints::default(),
+            1,
+        );
+        let base = RemoteCluster {
+            name: "west".to_string(),
+            trust_domain: td("remote.local"),
+            network: Some("net2".to_string()),
+            control_plane_url: Some("https://cp.remote.example:15010".to_string()),
+            federation_endpoint: None,
+        };
+        assert!(entry.matches_declared(&base), "exact identity matches");
+        // grpcs:// normalizes to the stored https:// → matches.
+        assert!(entry.matches_declared(&RemoteCluster {
+            control_plane_url: Some("grpcs://cp.remote.example:15010".to_string()),
+            ..base.clone()
+        }));
+        // Surrounding whitespace is trimmed before normalization.
+        assert!(entry.matches_declared(&RemoteCluster {
+            control_plane_url: Some("  https://cp.remote.example:15010  ".to_string()),
+            ..base.clone()
+        }));
+        // Each identity field, diverged in isolation, fails the match.
+        assert!(!entry.matches_declared(&RemoteCluster {
+            name: "east".to_string(),
+            ..base.clone()
+        }));
+        assert!(!entry.matches_declared(&RemoteCluster {
+            trust_domain: td("other.local"),
+            ..base.clone()
+        }));
+        assert!(!entry.matches_declared(&RemoteCluster {
+            network: Some("net-other".to_string()),
+            ..base.clone()
+        }));
+        assert!(!entry.matches_declared(&RemoteCluster {
+            control_plane_url: Some("https://cp-v2.remote.example:15010".to_string()),
+            ..base.clone()
+        }));
+        // A federation-only (no URL) or blank-URL declaration never owns polled
+        // endpoints, even with otherwise-matching identity.
+        assert!(!entry.matches_declared(&RemoteCluster {
+            control_plane_url: None,
+            ..base.clone()
+        }));
+        assert!(!entry.matches_declared(&RemoteCluster {
+            control_plane_url: Some("   ".to_string()),
+            ..base.clone()
+        }));
+        // An entry with no stored URL (test seeder shape) never matches a
+        // URL-bearing declaration.
+        let urlless = RemoteClusterEntry::new(
+            "west".to_string(),
+            td("remote.local"),
+            Some("net2".to_string()),
+            None,
+            RemoteClusterEndpoints::default(),
+            1,
+        );
+        assert!(!urlless.matches_declared(&base));
+    }
+
     #[test]
     fn store_install_and_snapshot_round_trip() {
         let store = RemoteEndpointStore::new();
@@ -1933,6 +2126,7 @@ mod tests {
             cluster_name: "west".to_string(),
             trust_domain: td("remote.local"),
             network: None,
+            control_plane_url: None,
             endpoints: RemoteClusterEndpoints {
                 workloads: vec![workload(
                     "spiffe://remote.local/ns/default/sa/a",
@@ -2019,6 +2213,7 @@ mod tests {
             cluster_name: "west".to_string(),
             trust_domain: td("remote.local"),
             network: None,
+            control_plane_url: None,
             endpoints: RemoteClusterEndpoints {
                 workloads: vec![workload(
                     "spiffe://remote.local/ns/default/sa/a",
@@ -2089,6 +2284,7 @@ mod tests {
             cluster_name: "west".to_string(),
             trust_domain: td("remote.local"),
             network: Some("net-a".to_string()),
+            control_plane_url: Some("https://cp-v1.remote.example:15010".to_string()),
             endpoints: RemoteClusterEndpoints {
                 workloads: vec![workload(
                     "spiffe://remote.local/ns/default/sa/a",
@@ -2340,6 +2536,7 @@ mod tests {
             cluster_name: "west".to_string(),
             trust_domain: td("remote.local"),
             network: None,
+            control_plane_url: None,
             endpoints: RemoteClusterEndpoints {
                 workloads: vec![workload(
                     "spiffe://remote.local/ns/default/sa/stale",
@@ -2382,6 +2579,7 @@ mod tests {
             cluster_name: "west".to_string(),
             trust_domain: td("remote.local"),
             network: None,
+            control_plane_url: None,
             endpoints: endpoints.clone(),
             fetched_at: Arc::new(AtomicU64::new(1)),
         };
@@ -2424,6 +2622,7 @@ mod tests {
             cluster_name: "west".to_string(),
             trust_domain: td("remote.local"),
             network: None,
+            control_plane_url: None,
             endpoints: endpoints.clone(),
             fetched_at: Arc::new(AtomicU64::new(fetched_at)),
         };
@@ -2494,6 +2693,7 @@ mod tests {
                 "west".to_string(),
                 td("remote.local"),
                 None,
+                None,
                 endpoints.clone(),
                 fetched_at,
             )
@@ -2545,6 +2745,7 @@ mod tests {
             cluster_name: "west".to_string(),
             trust_domain: td("remote.local"),
             network: None,
+            control_plane_url: None,
             endpoints: endpoints.clone(),
             fetched_at: Arc::new(AtomicU64::new(fetched_at)),
         };

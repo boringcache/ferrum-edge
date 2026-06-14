@@ -94,6 +94,9 @@ fn remote_snapshot(endpoints: RemoteClusterEndpoints) -> RemoteEndpointSnapshot 
             "west".to_string(),
             td("remote.local"),
             Some("net2".to_string()),
+            // Matches `admitting_candidate`'s declared (normalized) URL so the
+            // full-poll-identity merge filter admits these endpoints.
+            Some("https://cp.remote.example:15010".to_string()),
             endpoints,
             1,
         ),

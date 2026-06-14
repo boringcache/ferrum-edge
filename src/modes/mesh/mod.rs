@@ -15500,6 +15500,10 @@ mod tests {
                 "west".to_string(),
                 TrustDomain::new("remote.local").unwrap(),
                 Some("net2".to_string()),
+                // Must match the accepted slice's declared (normalized)
+                // control_plane_url so the full-poll-identity merge filter
+                // admits these endpoints.
+                Some("https://cp.remote.example:15010".to_string()),
                 multicluster::RemoteClusterEndpoints {
                     workloads,
                     services: Vec::new(),

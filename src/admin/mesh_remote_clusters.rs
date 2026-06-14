@@ -38,12 +38,11 @@
 //! See `docs/mesh.md` "Cross-Cluster Endpoint Discovery" for the operator
 //! playbook.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::identity::TrustDomain;
-use crate::modes::mesh::config::MultiClusterConfig;
+use crate::modes::mesh::config::{MultiClusterConfig, RemoteCluster};
 use crate::modes::mesh::multicluster::RemoteEndpointSnapshot;
 
 /// One remote cluster this DP has successfully fetched endpoints from. Counts
@@ -156,42 +155,45 @@ pub struct MeshRemoteClustersInputs<'a> {
 /// so it can no longer be populated from a slice the proxy REJECTED — a
 /// rejected slice that changes any poll-identity field (`network`,
 /// `control_plane_url`, trust domain, …) for the same cluster name never starts
-/// a poller. This accepted-scope filter is therefore belt-and-suspenders: a
-/// discovered cluster is still scoped to the accepted config — matched by
-/// **cluster name and declared trust domain** — so a cluster absent from the
-/// accepted config (or present under a different trust domain) is **omitted**
-/// from `discovered`, and the store-side and filter-side guards must both pass.
-/// Fail closed: when no slice is accepted (or it carries no
-/// `MultiClusterConfig`), the accepted set is empty and `discovered` is empty
-/// regardless of what the store holds.
+/// a poller. This accepted-scope filter is a second guard: a discovered cluster
+/// is surfaced only when an accepted `RemoteCluster` matches the stored entry's
+/// **full poll identity** — name, trust domain, network, AND normalized
+/// `control_plane_url` — via
+/// [`crate::modes::mesh::multicluster::RemoteClusterEntry::matches_declared`]. So a
+/// cluster absent from the accepted config, or present under a different trust
+/// domain / network / control-plane URL, is **omitted** from `discovered`, and
+/// the store-side and filter-side guards must both pass. Matching the URL too
+/// (codex F7.2 round-5) means even a same-name + same-trust-domain entry whose
+/// network or CP URL diverges from the accepted slice (e.g. a still-running
+/// poller's last-good entry during a URL change) is never reported as
+/// `discovered` with its stale network. Fail closed: when no slice is accepted
+/// (or it carries no `MultiClusterConfig`), `discovered` is empty regardless of
+/// what the store holds.
 pub fn build_response(inputs: MeshRemoteClustersInputs<'_>) -> MeshRemoteClustersResponse {
-    // Accepted remote-cluster set: name → declared trust domain. Discovery
-    // entries are only surfaced when they match an accepted (name, trust
-    // domain) pair, so a rejected slice's clusters never appear as live
-    // discovery. Empty when no slice / no multicluster config is accepted.
-    let accepted: HashMap<&str, &TrustDomain> = inputs
+    // Accepted remote-cluster declarations. A discovery entry is surfaced only
+    // when one of these matches its full poll identity (name + trust domain +
+    // network + normalized control_plane_url), so a rejected slice's clusters —
+    // or a stale entry whose identity diverges from the accepted slice — never
+    // appear as live discovery. Empty slice when no multicluster config is
+    // accepted.
+    let accepted: &[RemoteCluster] = inputs
         .multi_cluster
-        .map(|mc| {
-            mc.remote_clusters
-                .iter()
-                .map(|remote| (remote.name.as_str(), &remote.trust_domain))
-                .collect()
-        })
+        .map(|mc| mc.remote_clusters.as_slice())
         .unwrap_or_default();
 
     // Discovered view: one entry per fetched cluster, counts only — filtered to
-    // the accepted slice's clusters (by name AND trust domain). The store is
+    // the accepted slice's clusters by full poll identity. The store is
     // reconciled from the accepted slice, so this is a second guard: any cluster
-    // not in the accepted config is omitted regardless of how it got into the
-    // store.
+    // whose identity is not declared by the accepted config is omitted
+    // regardless of how it got into the store.
     let mut discovered: Vec<DiscoveredRemoteCluster> = inputs
         .snapshot
         .clusters
         .values()
         .filter(|entry| {
             accepted
-                .get(entry.cluster_name.as_str())
-                .is_some_and(|accepted_td| **accepted_td == entry.trust_domain)
+                .iter()
+                .any(|declared| entry.matches_declared(declared))
         })
         .map(|entry| {
             // Read the shared poll-timestamp atomic ONCE so the reported

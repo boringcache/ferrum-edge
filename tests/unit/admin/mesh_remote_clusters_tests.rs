@@ -68,10 +68,16 @@ fn service(name: &str) -> MeshService {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn entry(
     cluster: &str,
     trust_domain: &str,
     network: Option<&str>,
+    // NORMALIZED control-plane URL the entry was "polled" from. `build_response`
+    // matches the FULL poll identity (name + trust domain + network + URL), so
+    // tests pass the normalized form of the accepted config's `control_plane_url`
+    // (e.g. `grpcs://cp:1` → `https://cp:1`) to be surfaced as `discovered`.
+    control_plane_url: Option<&str>,
     workloads: Vec<Workload>,
     services: Vec<MeshService>,
     fetched_at: u64,
@@ -80,6 +86,7 @@ fn entry(
         cluster.to_string(),
         td(trust_domain),
         network.map(str::to_string),
+        control_plane_url.map(str::to_string),
         RemoteClusterEndpoints {
             workloads,
             services,
@@ -150,6 +157,7 @@ fn discovered_surfaces_counts_and_age() {
         "remote-east",
         "remote.local",
         Some("net2"),
+        Some("https://cp.remote.local:50051"),
         vec![
             workload(
                 "spiffe://remote.local/ns/default/sa/reviews",
@@ -200,6 +208,7 @@ fn discovered_payload_carries_no_raw_addresses_or_identities() {
         "remote-east",
         "remote.local",
         None,
+        Some("https://cp.remote.local:50051"),
         vec![workload(
             "spiffe://remote.local/ns/default/sa/reviews",
             "reviews",
@@ -234,9 +243,33 @@ fn discovered_is_sorted_by_cluster_name() {
         remote_cluster("mike", "m.local", None, Some("grpcs://m:1"), None),
     ]);
     let snapshot = snapshot_with(vec![
-        entry("zulu", "z.local", None, vec![], vec![], 10),
-        entry("alpha", "a.local", None, vec![], vec![], 10),
-        entry("mike", "m.local", None, vec![], vec![], 10),
+        entry(
+            "zulu",
+            "z.local",
+            None,
+            Some("https://z:1"),
+            vec![],
+            vec![],
+            10,
+        ),
+        entry(
+            "alpha",
+            "a.local",
+            None,
+            Some("https://a:1"),
+            vec![],
+            vec![],
+            10,
+        ),
+        entry(
+            "mike",
+            "m.local",
+            None,
+            Some("https://m:1"),
+            vec![],
+            vec![],
+            10,
+        ),
     ]);
     let resp = build_response(MeshRemoteClustersInputs {
         snapshot: &snapshot,
@@ -266,6 +299,7 @@ fn future_fetch_timestamp_clamps_age_to_zero() {
         "remote-east",
         "remote.local",
         None,
+        Some("https://cp:1"),
         vec![],
         vec![],
         2_000,
@@ -303,6 +337,7 @@ fn configured_reflects_declared_remotes_with_url_booleans() {
         "remote-east",
         "remote.local",
         Some("net2"),
+        Some("https://cp.remote.local:50051"),
         vec![workload(
             "spiffe://remote.local/ns/default/sa/reviews",
             "reviews",
@@ -379,6 +414,7 @@ fn response_round_trips_and_omits_absent_network() {
         "remote-east",
         "remote.local",
         None,
+        Some("https://cp:1"),
         vec![],
         vec![],
         500,
@@ -413,6 +449,7 @@ fn discovered_is_scoped_to_accepted_slice_clusters() {
             "remote-east",
             "remote.local",
             Some("net2"),
+            Some("https://cp.remote.local:50051"),
             vec![workload(
                 "spiffe://remote.local/ns/default/sa/reviews",
                 "reviews",
@@ -424,6 +461,8 @@ fn discovered_is_scoped_to_accepted_slice_clusters() {
         entry(
             "remote-rejected",
             "rejected.local",
+            None,
+            // Absent from the accepted config entirely; URL is irrelevant.
             None,
             vec![workload(
                 "spiffe://rejected.local/ns/default/sa/evil",
@@ -475,6 +514,9 @@ fn discovered_scoping_matches_trust_domain_not_just_name() {
         "remote-east",
         "evil.local",
         None,
+        // Same URL the accepted config declares: prove the trust-domain
+        // mismatch alone causes omission, not a URL divergence.
+        Some("https://cp.remote.local:50051"),
         vec![workload(
             "spiffe://evil.local/ns/default/sa/evil",
             "evil",
@@ -512,24 +554,22 @@ fn discovered_scoping_matches_trust_domain_not_just_name() {
 }
 
 #[test]
-fn discovered_filter_alone_cannot_catch_diverged_poll_identity() {
-    // Codex F7.2 round-3: the admin-side filter matches only (name, trust
-    // domain). A store entry that keeps the accepted name + trust domain but
-    // diverges on its poll identity (`network` here, and `control_plane_url`
-    // which this response shape does not even carry) therefore PASSES the
-    // filter — and is reported with the STORE's network, not the accepted
-    // config's. This test pins that gap to document WHY the real fix lives in
-    // the discovery reconciler: it now reconciles from the *accepted* slice
-    // (`start_remote_cluster_discovery_reconcile_task` →
-    // `RemoteEndpointStore`), so a rejected slice that only changed
-    // network/control_plane_url never starts a poller and the store can never
-    // hold such an entry in the first place. The filter is belt-and-suspenders;
-    // it is not, on its own, sufficient.
+fn discovered_filter_omits_entry_with_diverged_network() {
+    // Codex F7.2 round-5: the admin-side filter now matches the FULL poll
+    // identity (name + trust domain + network + normalized control_plane_url),
+    // not just (name, trust domain). A store entry that keeps the accepted name
+    // + trust domain but diverges on `network` (e.g. a still-running poller's
+    // last-good entry while a slice changed the network for the same name) is
+    // OMITTED — it is never reported as `discovered` with its stale network.
+    // (The reconcile-from-accepted store fix means such an entry should not
+    // arise in production; this filter is the belt-and-suspenders second guard
+    // that also catches it if it somehow does.)
     let snapshot = snapshot_with(vec![entry(
         "remote-east",
         "remote.local",
         // Diverged network: the accepted config below declares `net-accepted`.
         Some("net-rejected"),
+        Some("https://cp.remote.local:50051"),
         vec![workload(
             "spiffe://remote.local/ns/default/sa/reviews",
             "reviews",
@@ -542,10 +582,7 @@ fn discovered_filter_alone_cannot_catch_diverged_poll_identity() {
         "remote-east",
         "remote.local",
         Some("net-accepted"),
-        // Accepted control_plane_url v1; a rejected slice could carry v2 with
-        // the same name + trust domain, and the response shape carries no URL
-        // to filter on at all.
-        Some("grpcs://cp-v1.remote.local:50051"),
+        Some("grpcs://cp.remote.local:50051"),
         None,
     )]);
 
@@ -556,17 +593,105 @@ fn discovered_filter_alone_cannot_catch_diverged_poll_identity() {
         now_unix_seconds: 1_000,
     });
 
-    // The name+trust-domain filter passes, so the diverged entry is surfaced —
-    // and with the STORE's (rejected) network, not the accepted one. This is
-    // the leak the reconcile-from-accepted fix prevents upstream of this filter.
+    assert!(
+        resp.discovered.is_empty(),
+        "an entry whose network diverges from the accepted slice must be omitted, \
+         not surfaced with its stale network"
+    );
+    // remote-east IS configured, but discovered is false: the only same-name
+    // store entry has a diverged network.
+    assert_eq!(resp.configured.len(), 1);
+    assert!(
+        !resp.configured[0].discovered,
+        "the discovered flag follows the same full-poll-identity scoping"
+    );
+}
+
+#[test]
+fn discovered_filter_omits_entry_with_url_only_divergence() {
+    // Codex F7.2 round-5: a URL-only change (same name + trust domain + network)
+    // is the case the entry now stores `control_plane_url` to catch. The accepted
+    // config moved the control plane to v2; the store still holds the v1 entry
+    // (fetched from the OLD CP) until the reconciler restarts the poller. Because
+    // the admin filter matches the normalized URL, the stale v1 entry is OMITTED
+    // rather than reported as `discovered` against the v2 declaration.
+    let snapshot = snapshot_with(vec![entry(
+        "remote-east",
+        "remote.local",
+        Some("net2"),
+        // v1 URL (normalized form); the accepted config declares v2 below.
+        Some("https://cp-v1.remote.local:50051"),
+        vec![workload(
+            "spiffe://remote.local/ns/default/sa/reviews",
+            "reviews",
+            "10.9.0.1",
+        )],
+        vec![],
+        900,
+    )]);
+    let mc = multi_cluster_with(vec![remote_cluster(
+        "remote-east",
+        "remote.local",
+        Some("net2"),
+        // v2 control plane (grpcs → https on normalize).
+        Some("grpcs://cp-v2.remote.local:50051"),
+        None,
+    )]);
+
+    let resp = build_response(MeshRemoteClustersInputs {
+        snapshot: &snapshot,
+        multi_cluster: Some(&mc),
+        discovery_enabled: true,
+        now_unix_seconds: 1_000,
+    });
+
+    assert!(
+        resp.discovered.is_empty(),
+        "a stale entry from the previous control plane must not be reported as \
+         discovered against the newly-declared control_plane_url"
+    );
+    assert_eq!(resp.configured.len(), 1);
+    assert!(!resp.configured[0].discovered);
+}
+
+#[test]
+fn discovered_filter_matches_grpcs_declaration_against_normalized_entry() {
+    // The accepted config carries the operator-written `grpcs://` scheme; the
+    // stored entry carries the NORMALIZED `https://` poll URL. The filter
+    // normalizes the declaration before comparing, so they match and the cluster
+    // is surfaced as discovered. (Guards against a regression where the filter
+    // compared the raw operator scheme against the normalized stored scheme.)
+    let snapshot = snapshot_with(vec![entry(
+        "remote-east",
+        "remote.local",
+        Some("net2"),
+        Some("https://cp.remote.local:50051"),
+        vec![workload(
+            "spiffe://remote.local/ns/default/sa/reviews",
+            "reviews",
+            "10.9.0.1",
+        )],
+        vec![],
+        900,
+    )]);
+    let mc = multi_cluster_with(vec![remote_cluster(
+        "remote-east",
+        "remote.local",
+        Some("net2"),
+        Some("grpcs://cp.remote.local:50051"),
+        None,
+    )]);
+
+    let resp = build_response(MeshRemoteClustersInputs {
+        snapshot: &snapshot,
+        multi_cluster: Some(&mc),
+        discovery_enabled: true,
+        now_unix_seconds: 1_000,
+    });
+
     assert_eq!(resp.discovered.len(), 1);
     assert_eq!(resp.discovered[0].cluster_name, "remote-east");
-    assert_eq!(
-        resp.discovered[0].network.as_deref(),
-        Some("net-rejected"),
-        "the filter cannot tell an accepted poll identity from a diverged one; \
-         the store must therefore never be fed a rejected target"
-    );
+    assert!(resp.configured[0].discovered);
 }
 
 #[test]
@@ -577,6 +702,8 @@ fn no_accepted_slice_means_no_discovered_clusters() {
     let snapshot = snapshot_with(vec![entry(
         "remote-east",
         "remote.local",
+        None,
+        // No accepted slice at all; URL is irrelevant to this fail-closed case.
         None,
         vec![workload(
             "spiffe://remote.local/ns/default/sa/reviews",
