@@ -853,6 +853,14 @@ fn prepare_normalized_gateway_config_for_mesh(
             })
             .cloned()
             .collect();
+        // Back-project the DECLARED HTTP-family ingress port count untouched by
+        // the re-validation drops above (F6 §6.2). The drops reduce the
+        // materialized `local_ingress_listeners` (siblings), but the declared
+        // count must reflect what the operator declared so a partially
+        // materialized group stays ambiguous: `mesh_ingress_listener_groups`
+        // floors it at the surviving sibling count, so a hostile carrier can
+        // never push it BELOW what materialized.
+        mesh.declared_ingress_http_ports = mesh_slice.declared_ingress_http_ports;
     }
     config.normalize_fields();
     config.resolve_upstream_tls();
@@ -1783,8 +1791,18 @@ pub(crate) fn mesh_ingress_listener_groups(
             )
         })
         .collect();
+    // `declared_http_ports` is the count of DISTINCT HTTP-family listener ports
+    // the operator DECLARED (`MeshConfig.declared_ingress_http_ports`), NOT the
+    // materialized sibling count — so an HTTP-family entry whose `defaultEndpoint`
+    // was unroutable (or a listener dropped at carrier re-validation) still keeps
+    // the group ambiguous: an orig-dst-less request fails closed in the router
+    // (`PortSignalUnavailable`) instead of the surviving sibling absorbing the
+    // skipped port's traffic. Floored at the materialized sibling count so a
+    // hostile/stale carrier count below what materialized can never collapse a
+    // multi-listener group back to the single-listener no-signal pass-through.
+    let declared_http_ports = mesh.declared_ingress_http_ports.max(siblings.len());
     vec![MeshOutboundServiceGroup {
-        declared_http_ports: siblings.len(),
+        declared_http_ports,
         siblings,
     }]
 }
@@ -13958,6 +13976,7 @@ mod tests {
             local_inbound_workloads: None,
             local_ingress_listeners: Vec::new(),
             sidecar_ingress_declared: false,
+            declared_ingress_http_ports: 0,
             mesh_policies: Vec::new(),
             peer_authentications: Vec::new(),
             service_entries: Vec::new(),

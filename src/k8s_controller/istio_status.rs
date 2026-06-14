@@ -240,7 +240,12 @@ pub fn plan_istio_status_updates(
                     &options.istio_root_namespace,
                 ),
                 "WorkloadEntry" => workload_entry_status(object, result.as_ref()),
-                "Sidecar" => sidecar_status(object, result.as_ref(), &options.istio_root_namespace),
+                "Sidecar" => sidecar_status(
+                    object,
+                    result.as_ref(),
+                    &options.istio_root_namespace,
+                    options.mesh_sidecar_ingress_enforced,
+                ),
                 "Telemetry" => telemetry_status(object, result.as_ref()),
                 _ => return None,
             };
@@ -991,10 +996,20 @@ fn workload_entry_status(
 /// Ingress entries that Ferrum cannot represent (Unix-socket / non-loopback
 /// `defaultEndpoint`, non-HTTP-family protocol) stay in `deferred_fields`;
 /// resolvable listeners are materialized and reported via `ingress_modeled`.
+///
+/// `ingress_enforced` is the EFFECTIVE ingress materialization gate
+/// (`FERRUM_MESH_SIDECAR_ENFORCED && !FERRUM_MESH_SIDECAR_ENFORCED_DRY_RUN`),
+/// mirroring the slice builder's `sidecar_enforced && !sidecar_dry_run` ingress
+/// predicate. Ingress is materialized ONLY when it is true, so `ingress_modeled`
+/// is reported as `0` otherwise — the `FerrumAccepted` status must never claim a
+/// listener is modeled while the data plane is still serving the default inbound
+/// behavior in the default dry-run / disabled posture (keeps the translator and
+/// the status writer in lock-step on what is actually applied).
 fn sidecar_status(
     object: &K8sObject,
     result: Result<&K8sTranslation, &K8sTranslateError>,
     istio_root_namespace: &str,
+    ingress_enforced: bool,
 ) -> (Value, Option<Value>) {
     let egress_entry_count = object
         .spec
@@ -1018,22 +1033,44 @@ fn sidecar_status(
 
     match result {
         Ok(_translation) => {
-            let (ingress_modeled, ingress_deferred) =
+            let (ingress_modelable, ingress_deferred) =
                 classify_sidecar_ingress_entries(&object.spec);
+            // Ingress is MATERIALIZED only under the enforcement gate
+            // (`FERRUM_MESH_SIDECAR_ENFORCED && !dry_run`), exactly like the slice
+            // builder. Report the shape-modelable count as `ingress_modeled` only
+            // when the gate is on; otherwise report `0` so an operator using the
+            // `FerrumAccepted` status to verify rollout never sees a false positive
+            // while the data plane is still serving the default inbound behavior.
+            let ingress_modeled = if ingress_enforced {
+                ingress_modelable
+            } else {
+                0
+            };
             let mut deferred: Vec<String> = Vec::new();
             for reason in &ingress_deferred {
                 deferred.push(format!("ingress[] {reason}"));
             }
+            // When ingress modeling is gated off, surface the modelable-but-not-
+            // applied count so operators still see the shapes Ferrum WOULD model
+            // once they enable enforcement (the gate, not the resource, is why
+            // `ingress_modeled` is 0).
+            let ingress_clause = if ingress_enforced {
+                format!("{ingress_modeled} ingress listener(s) modeled")
+            } else {
+                format!(
+                    "ingress listeners not materialized (FERRUM_MESH_SIDECAR_ENFORCED off / dry-run; \
+                     {ingress_modelable} modelable when enabled)"
+                )
+            };
             let message = if deferred.is_empty() {
                 format!(
                     "Ferrum accepted this Sidecar (scope: {scope}; {egress_entry_count} egress entry/entries; \
-                     {ingress_modeled} ingress listener(s) modeled; egress narrowing gated by \
-                     FERRUM_MESH_SIDECAR_ENFORCED)"
+                     {ingress_clause}; egress narrowing gated by FERRUM_MESH_SIDECAR_ENFORCED)"
                 )
             } else {
                 format!(
                     "Ferrum accepted this Sidecar (scope: {scope}; {egress_entry_count} egress entry/entries; \
-                     {ingress_modeled} ingress listener(s) modeled); deferred fields: {}",
+                     {ingress_clause}); deferred fields: {}",
                     deferred.join(", ")
                 )
             };
@@ -1332,6 +1369,15 @@ mod tests {
             "default".to_string(),
             TrustDomain::new("cluster.local").expect("test trust domain"),
         )
+    }
+
+    /// Options with the Sidecar ingress materialization gate ON, mirroring
+    /// `FERRUM_MESH_SIDECAR_ENFORCED=true` (not dry-run). The status writer
+    /// reports `ingress_modeled` as materialized only under this gate, so the
+    /// ingress-modeling tests use it; the default `options()` leaves the gate
+    /// off (the default dry-run/disabled posture, where modeling is not applied).
+    fn options_ingress_enforced() -> K8sTranslationOptions {
+        options().with_mesh_sidecar_ingress_enforced(true)
     }
 
     fn object(api_version: &str, kind: &str, name: &str, spec: Value) -> K8sObject {
@@ -2558,7 +2604,7 @@ mod tests {
                 "egress": [ { "hosts": ["./*"] } ]
             }),
         );
-        let updates = plan_istio_status_updates(&[obj], options());
+        let updates = plan_istio_status_updates(&[obj], options_ingress_enforced());
         let detail = updates[0].ferrum_detail.as_ref().unwrap();
         assert_eq!(
             detail["translation"]["ingress_modeled"].as_u64(),
@@ -2594,7 +2640,7 @@ mod tests {
                 ]
             }),
         );
-        let updates = plan_istio_status_updates(&[obj], options());
+        let updates = plan_istio_status_updates(&[obj], options_ingress_enforced());
         let detail = updates[0].ferrum_detail.as_ref().unwrap();
         assert_eq!(
             detail["translation"]["ingress_modeled"].as_u64(),
@@ -2633,7 +2679,7 @@ mod tests {
                 "ingress": [ { "port": { "number": 8443, "protocol": "HTTPS", "name": "https" }, "defaultEndpoint": "127.0.0.1:8080" } ]
             }),
         );
-        let updates = plan_istio_status_updates(&[obj], options());
+        let updates = plan_istio_status_updates(&[obj], options_ingress_enforced());
         let detail = updates[0].ferrum_detail.as_ref().unwrap();
         assert_eq!(
             detail["translation"]["ingress_modeled"].as_u64(),
@@ -2666,12 +2712,12 @@ mod tests {
                 "ingress": [ { "port": { "number": 8443, "protocol": "HTPS" }, "defaultEndpoint": "127.0.0.1:8080" } ]
             }),
         );
-        let updates = plan_istio_status_updates(&[obj], options());
+        let updates = plan_istio_status_updates(&[obj], options_ingress_enforced());
         let detail = updates[0].ferrum_detail.as_ref().unwrap();
         assert_eq!(
             detail["translation"]["ingress_modeled"].as_u64(),
             Some(0),
-            "a mistyped protocol must not be counted as a modeled listener"
+            "a mistyped protocol must not be counted as a modeled listener (even when enforced)"
         );
         let deferred: Vec<&str> = detail["translation"]["deferred_fields"]
             .as_array()
@@ -2704,7 +2750,7 @@ mod tests {
                 ]
             }),
         );
-        let updates = plan_istio_status_updates(&[obj], options());
+        let updates = plan_istio_status_updates(&[obj], options_ingress_enforced());
         let detail = updates[0].ferrum_detail.as_ref().unwrap();
         assert_eq!(
             detail["translation"]["ingress_modeled"].as_u64(),
@@ -2741,7 +2787,7 @@ mod tests {
                 ]
             }),
         );
-        let updates = plan_istio_status_updates(&[obj], options());
+        let updates = plan_istio_status_updates(&[obj], options_ingress_enforced());
         let detail = updates[0].ferrum_detail.as_ref().unwrap();
         assert_eq!(
             detail["translation"]["ingress_modeled"].as_u64(),
@@ -2763,6 +2809,63 @@ mod tests {
                 .iter()
                 .any(|f| f.contains("duplicate listener port")),
             "a deferred entry must not make a later valid entry a duplicate, got {deferred:?}"
+        );
+    }
+
+    /// Codex round-4 P2: in the DEFAULT posture (`FERRUM_MESH_SIDECAR_ENFORCED`
+    /// off / dry-run) the slice builder materializes NO ingress listeners, so the
+    /// status writer must report `ingress_modeled == 0` even for a shape-modelable
+    /// loopback HTTP listener — never a false positive while the data plane is
+    /// still serving the default inbound behavior. The message makes the gated-off
+    /// state explicit (and surfaces the modelable-when-enabled count).
+    #[test]
+    fn sidecar_ingress_not_modeled_when_enforcement_gate_off() {
+        let obj = object(
+            "networking.istio.io/v1",
+            "Sidecar",
+            "ingress-sidecar-dry-run",
+            json!({
+                "ingress": [ { "port": { "number": 9080, "protocol": "HTTP", "name": "http" }, "defaultEndpoint": "127.0.0.1:8080" } ],
+                "egress": [ { "hosts": ["./*"] } ]
+            }),
+        );
+        // Default options() leaves mesh_sidecar_ingress_enforced = false.
+        let updates = plan_istio_status_updates(&[obj], options());
+        let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        assert_eq!(
+            detail["translation"]["ingress_modeled"].as_u64(),
+            Some(0),
+            "with the enforcement gate off the data plane materializes no ingress, so \
+             ingress_modeled must be 0 even for a shape-modelable listener"
+        );
+        let c = find_condition(
+            updates[0].status["conditions"].as_array().unwrap(),
+            "FerrumAccepted",
+        );
+        // Still accepted (the resource is valid); only materialization is gated.
+        assert_eq!(c["status"].as_str(), Some("True"));
+        let message = c["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("not materialized") && message.contains("1 modelable when enabled"),
+            "the message must surface that ingress is gated off and the modelable count, got: {message}"
+        );
+
+        // Flipping the gate on materializes the same listener and reports it.
+        let obj_enforced = object(
+            "networking.istio.io/v1",
+            "Sidecar",
+            "ingress-sidecar-dry-run",
+            json!({
+                "ingress": [ { "port": { "number": 9080, "protocol": "HTTP", "name": "http" }, "defaultEndpoint": "127.0.0.1:8080" } ],
+                "egress": [ { "hosts": ["./*"] } ]
+            }),
+        );
+        let enforced = plan_istio_status_updates(&[obj_enforced], options_ingress_enforced());
+        let enforced_detail = enforced[0].ferrum_detail.as_ref().unwrap();
+        assert_eq!(
+            enforced_detail["translation"]["ingress_modeled"].as_u64(),
+            Some(1),
+            "the same listener is reported modeled once the enforcement gate is on"
         );
     }
 

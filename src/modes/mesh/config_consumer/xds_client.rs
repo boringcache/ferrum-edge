@@ -1374,6 +1374,12 @@ fn reverse_translate(
         // even when `local_ingress_listeners` is empty), so an all-unsupported
         // `ingress[]` still suppresses the default inbound routes on the DP.
         sidecar_ingress_declared: recovered.sidecar_ingress_declared,
+        // F6 §6.2: count of DISTINCT HTTP-family ingress[] listener ports the
+        // workload declared, recovered from the dedicated carrier (emitted even
+        // when it exceeds the resolved listener count). The DP router uses it to
+        // keep a partially materialized ingress group ambiguous to an
+        // orig-dst-less request rather than passing through to the survivor.
+        declared_ingress_http_ports: recovered.declared_ingress_http_ports,
         // GAP-1a: authorization policies recovered from the MeshPolicies
         // carrier. Without this the xDS mesh had NO authz (implicit allow-all).
         mesh_policies: recovered.mesh_policies,
@@ -1440,6 +1446,7 @@ struct RecoveredSliceCarriers {
     local_inbound_workloads: Option<Vec<crate::modes::mesh::config::Workload>>,
     local_ingress_listeners: Vec<crate::modes::mesh::config::ResolvedIngressListener>,
     sidecar_ingress_declared: bool,
+    declared_ingress_http_ports: usize,
     labels: Option<BTreeMap<String, String>>,
     workloads: Vec<crate::modes::mesh::config::Workload>,
     mesh_policies: Vec<crate::modes::mesh::config::MeshPolicy>,
@@ -1667,6 +1674,9 @@ fn apply_recovered_carrier(
         MeshSliceCarrier::LocalIngressListeners(value) => recovered.local_ingress_listeners = value,
         MeshSliceCarrier::SidecarIngressDeclared(value) => {
             recovered.sidecar_ingress_declared = value
+        }
+        MeshSliceCarrier::SidecarIngressDeclaredPorts(value) => {
+            recovered.declared_ingress_http_ports = value
         }
         MeshSliceCarrier::Workloads(value) => recovered.workloads = value,
         MeshSliceCarrier::WorkloadLabels(value) => recovered.labels = Some(value),
@@ -4060,6 +4070,10 @@ mod tests {
                 owner_service: "api".to_string(),
             }],
             sidecar_ingress_declared: true,
+            // F6 §6.2 (codex round-4 P2): the DECLARED HTTP-family ingress port
+            // count (here 2 > the 1 resolved listener) must round-trip via its
+            // dedicated ECDS carrier so the DP router keeps the group ambiguous.
+            declared_ingress_http_ports: 2,
             mesh_policies: vec![MeshPolicy {
                 name: "allow-api".to_string(),
                 namespace: "default".to_string(),
@@ -4225,6 +4239,15 @@ mod tests {
         assert!(
             recovered.sidecar_ingress_declared,
             "the sidecar-ingress-declared marker must survive the xDS round trip"
+        );
+        assert_eq!(
+            recovered.declared_ingress_http_ports, native.declared_ingress_http_ports,
+            "the declared HTTP-family ingress port count must survive the xDS round trip"
+        );
+        assert_eq!(
+            recovered.declared_ingress_http_ports, 2,
+            "the declared count (2) exceeds the 1 resolved listener and must be preserved \
+             so the DP router keeps the partially materialized group ambiguous"
         );
 
         // Resolved-behavior parity spot-checks: the recovered slice answers

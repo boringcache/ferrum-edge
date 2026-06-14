@@ -259,6 +259,10 @@ pub(crate) fn is_false(value: &bool) -> bool {
     !*value
 }
 
+pub(crate) fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PolicyAction {
@@ -1452,6 +1456,24 @@ impl MeshSidecarIngress {
             owner_service: String::new(),
         })
     }
+
+    /// Whether this entry counts toward the workload's DECLARED HTTP-family
+    /// ingress listener port set — i.e. it names an HTTP-family protocol on a
+    /// usable (nonzero) listener port, so it WOULD materialize an inbound route
+    /// were its `defaultEndpoint` routable. This is the port-ambiguity predicate
+    /// (a superset of [`resolve`](Self::resolve) success): it deliberately
+    /// returns `true` for an HTTP-family entry whose endpoint is omitted /
+    /// `unix://` / off-box (a `resolve()` failure), because such an entry STILL
+    /// declared a distinct inbound listener port — so a partially materialized
+    /// group must stay ambiguous to an orig-dst-less request rather than letting
+    /// a surviving sibling absorb the skipped port's traffic (F6 §6.2). It
+    /// excludes only listeners that are not HTTP-family at all (deferred raw-TCP,
+    /// never an HTTP route) and zero-port entries (no port to disambiguate on).
+    /// The slice resolver dedups by port, so the DECLARED COUNT is over distinct
+    /// HTTP-family ports, mirroring the resolved-set dedup.
+    pub(crate) fn is_declared_http_family_listener(&self) -> bool {
+        self.port != 0 && is_http_family_app_protocol(self.protocol)
+    }
 }
 
 /// HTTP-family classification for Sidecar `ingress[]` listeners, shared by
@@ -2063,6 +2085,17 @@ pub struct MeshConfig {
     /// operator-settable, never serialized.
     #[serde(skip)]
     pub local_ingress_listeners: Vec<ResolvedIngressListener>,
+    /// Runtime-only back-projection of `MeshSlice.declared_ingress_http_ports`
+    /// (F6 §6.2), set by mesh preparation. The count of DISTINCT HTTP-family
+    /// `ingress[]` listener ports the workload DECLARED — which can EXCEED
+    /// `local_ingress_listeners.len()` when an HTTP-family entry's
+    /// `defaultEndpoint` is unroutable. `mesh_ingress_listener_groups` uses it as
+    /// the ingress group's `declared_http_ports` so a partially materialized
+    /// group stays AMBIGUOUS to an orig-dst-less request (fail closed) instead of
+    /// the surviving sibling absorbing the skipped port's traffic. `serde(skip)`:
+    /// never operator-settable, never serialized.
+    #[serde(skip)]
+    pub declared_ingress_http_ports: usize,
 }
 
 pub fn default_istio_root_namespace() -> String {
@@ -2094,6 +2127,7 @@ impl Default for MeshConfig {
             extension_configs: Vec::new(),
             local_inbound_services: None,
             local_ingress_listeners: Vec::new(),
+            declared_ingress_http_ports: 0,
         }
     }
 }

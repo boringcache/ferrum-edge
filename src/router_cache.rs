@@ -3104,6 +3104,75 @@ mod tests {
         );
     }
 
+    /// Codex round-4 P2: a Sidecar that DECLARES two HTTP-family ingress[]
+    /// listeners but where only ONE resolved (the other had an omitted / `unix://`
+    /// / off-box `defaultEndpoint`) must NOT collapse to the single-listener
+    /// no-signal pass-through. `MeshConfig.declared_ingress_http_ports` (2) carries
+    /// the DECLARED count past the resolved set (1), so `mesh_ingress_listener_groups`
+    /// reports `declared_http_ports == 2`, keeping the group AMBIGUOUS: an
+    /// orig-dst-less request fails closed (`PortSignalUnavailable`) instead of being
+    /// routed to the surviving sibling and absorbing the skipped listener's traffic.
+    #[test]
+    fn mesh_ingress_partial_materialization_fails_closed_without_signal() {
+        use crate::modes::mesh::config::{MeshConfig, ResolvedIngressListener};
+        // Only listener 8080 resolved; listener 8443 was declared HTTP-family but
+        // its endpoint was unroutable, so it is absent from local_ingress_listeners
+        // yet counted in declared_ingress_http_ports.
+        let mut p = minimal_proxy_for_routing("__mesh-ingress-default-reviews-8080", "/");
+        p.hosts = vec!["reviews".to_string()];
+        p.backend_port = 5000;
+        let config = GatewayConfig {
+            proxies: vec![p],
+            mesh: Some(Box::new(MeshConfig {
+                local_ingress_listeners: vec![ResolvedIngressListener {
+                    port: 8080,
+                    endpoint_host: "127.0.0.1".to_string(),
+                    endpoint_port: 5000,
+                    owner_namespace: "default".to_string(),
+                    owner_service: "reviews".to_string(),
+                }],
+                // Operator declared TWO HTTP-family ingress ports; only one
+                // resolved. The declared count must drive the router.
+                declared_ingress_http_ports: 2,
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+        let cache = RouterCache::new(&config, 100);
+        let table = cache.route_table.load();
+
+        // No port signal: with two DECLARED listeners and one resolved, the group
+        // is ambiguous → fail closed (NOT a fall-through to the survivor).
+        let rm = cache.find_proxy(Some("reviews"), "/").expect("route");
+        assert!(
+            matches!(
+                table.select_mesh_inbound_port_route(rm, None, None),
+                Err(MeshInboundPortSelectError::PortSignalUnavailable)
+            ),
+            "a partially materialized ingress group must fail closed without a port signal, \
+             not route the skipped port's traffic to the surviving listener"
+        );
+
+        // A signal for the RESOLVED listener port still routes correctly.
+        let rm = cache.find_proxy(Some("reviews"), "/").expect("route");
+        let (kept, authz_port) = table
+            .select_mesh_inbound_port_route(rm, Some(8080), None)
+            .expect("orig-dst = the resolved listener port selects its sibling");
+        assert_eq!(kept.proxy.backend_port, 5000);
+        assert_eq!(authz_port, Some(8080));
+
+        // A signal for the SKIPPED (declared-but-unresolved) listener port has no
+        // materialized sibling → fail closed, never absorbed by the survivor.
+        let rm = cache.find_proxy(Some("reviews"), "/").expect("route");
+        assert!(
+            matches!(
+                table.select_mesh_inbound_port_route(rm, Some(8443), None),
+                Err(MeshInboundPortSelectError::PortNotMaterialized)
+            ),
+            "a signal to the skipped declared listener port must fail closed"
+        );
+    }
+
     /// Counterpart to the ingress fail-closed check: a SINGLE-port SERVICE-default
     /// inbound group (`is_ingress == false`) keeps the back-compat passthrough —
     /// it accepts any explicit port and a bare-Host dial onto the sole sibling, so
