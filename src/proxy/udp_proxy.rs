@@ -470,7 +470,20 @@ fn resolve_udp_session_epoch_view(
         .ok_or_else(|| anyhow::anyhow!("Proxy {} not found", listener_proxy_id))?;
 
     let sni_hostname = if base_proxy.passthrough {
-        super::sni::extract_sni_from_dtls_client_hello(initial_data)
+        match super::sni::extract_sni_from_dtls_client_hello(initial_data) {
+            super::sni::DtlsSniResult::Hostname(host) => Some(host),
+            super::sni::DtlsSniResult::NoSni => None,
+            super::sni::DtlsSniResult::InvalidFragment => {
+                // A DTLS continuation fragment (fragment_offset != 0) as the first
+                // datagram for this client tuple carries no parseable ClientHello
+                // start. Drop it instead of letting `None` (no-SNI) bind it to the
+                // empty-host catch-all proxy and create a bogus session.
+                return Err(anyhow::anyhow!(
+                    "Dropping DTLS continuation fragment (no ClientHello start) on port {}",
+                    listen_port
+                ));
+            }
+        }
     } else {
         None
     };

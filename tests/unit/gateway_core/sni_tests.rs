@@ -1,6 +1,6 @@
 use ferrum_edge::proxy::sni::{
-    extract_sni_from_client_hello, extract_sni_from_dtls_client_hello, extract_sni_from_tcp_stream,
-    resolve_proxy_by_sni,
+    DtlsSniResult, extract_sni_from_client_hello, extract_sni_from_dtls_client_hello,
+    extract_sni_from_tcp_stream, resolve_proxy_by_sni,
 };
 
 fn build_tls_client_hello(hostname: &str) -> Vec<u8> {
@@ -326,9 +326,10 @@ fn extract_dtls_sni_fails_closed_on_continuation_fragment() {
     let frag = build_dtls_continuation_fragment("frag.example.com");
     assert_eq!(
         extract_sni_from_dtls_client_hello(&frag),
-        None,
-        "a DTLS continuation fragment (fragment_offset > 0) must fail closed \
-         rather than misparse mid-message bytes as a fresh ClientHello body"
+        DtlsSniResult::InvalidFragment,
+        "a DTLS continuation fragment (fragment_offset > 0) must signal \
+         InvalidFragment so the caller DROPS it — returning NoSni would let it \
+         bind to the empty-host catch-all instead of being dropped"
     );
 }
 
@@ -337,7 +338,7 @@ fn extract_dtls_sni_unfragmented_still_parses() {
     let data = build_dtls_client_hello("whole.example.com");
     assert_eq!(
         extract_sni_from_dtls_client_hello(&data),
-        Some("whole.example.com".to_string()),
+        DtlsSniResult::Hostname("whole.example.com".to_string()),
         "an unfragmented DTLS ClientHello (offset 0, full length) must still parse"
     );
 }
@@ -367,7 +368,7 @@ fn test_extract_sni_from_dtls_client_hello() {
     let data = build_dtls_client_hello("dtls.example.com");
     assert_eq!(
         extract_sni_from_dtls_client_hello(&data),
-        Some("dtls.example.com".to_string())
+        DtlsSniResult::Hostname("dtls.example.com".to_string())
     );
 }
 
@@ -376,21 +377,32 @@ fn test_extract_sni_from_dtls_case_normalized() {
     let data = build_dtls_client_hello("DTLS.Example.COM");
     assert_eq!(
         extract_sni_from_dtls_client_hello(&data),
-        Some("dtls.example.com".to_string())
+        DtlsSniResult::Hostname("dtls.example.com".to_string())
     );
 }
 
 #[test]
 fn test_extract_sni_from_dtls_truncated() {
-    assert_eq!(extract_sni_from_dtls_client_hello(&[]), None);
-    assert_eq!(extract_sni_from_dtls_client_hello(&[0x16; 10]), None);
+    // Too short to be a DTLS handshake — not a continuation fragment, so it stays
+    // catch-all eligible (NoSni), preserving the historical no-SNI routing.
+    assert_eq!(
+        extract_sni_from_dtls_client_hello(&[]),
+        DtlsSniResult::NoSni
+    );
+    assert_eq!(
+        extract_sni_from_dtls_client_hello(&[0x16; 10]),
+        DtlsSniResult::NoSni
+    );
 }
 
 #[test]
 fn test_extract_sni_from_dtls_wrong_content_type() {
     let mut data = build_dtls_client_hello("example.com");
     data[0] = 0x17;
-    assert_eq!(extract_sni_from_dtls_client_hello(&data), None);
+    assert_eq!(
+        extract_sni_from_dtls_client_hello(&data),
+        DtlsSniResult::NoSni
+    );
 }
 
 // ── Malformed ClientHello edge cases ────────────────────────────────────────
@@ -478,16 +490,26 @@ fn test_extract_sni_random_garbage_bytes() {
 
 #[test]
 fn test_extract_sni_dtls_oversized_cookie() {
+    // Malformed body (offset 0, so not a continuation fragment) → catch-all
+    // eligible NoSni, not InvalidFragment.
     let mut data = build_dtls_client_hello("example.com");
     data[60] = 0xFF;
-    assert_eq!(extract_sni_from_dtls_client_hello(&data), None);
+    assert_eq!(
+        extract_sni_from_dtls_client_hello(&data),
+        DtlsSniResult::NoSni
+    );
 }
 
 #[test]
 fn test_extract_sni_dtls_wrong_handshake_type() {
+    // Non-ClientHello handshake type → NoSni (catch-all eligible), matching the
+    // historical no-SNI routing; only a continuation fragment is InvalidFragment.
     let mut data = build_dtls_client_hello("example.com");
     data[13] = 0x02;
-    assert_eq!(extract_sni_from_dtls_client_hello(&data), None);
+    assert_eq!(
+        extract_sni_from_dtls_client_hello(&data),
+        DtlsSniResult::NoSni
+    );
 }
 
 // ── resolve_proxy_by_sni ─────────────────────────────────────────────────────
@@ -736,6 +758,59 @@ async fn test_extract_sni_from_tcp_stream_handles_split_clienthello() {
 
     let result = accept_task.await.expect("accept_task");
     assert_eq!(result, Some("split.example.com".to_string()));
+}
+
+/// Record fragmentation can split the handshake message *inside* its own 4-byte
+/// header — here after only the 1-byte msg_type, so the u24 length lives in the
+/// SECOND TLS record. The wire-span computation must reassemble those 4 header
+/// bytes across records before reading the length; reading a fixed `buf[6..9]`
+/// would capture the next record's header, compute a bogus span, and stall the
+/// peek until the handshake timeout. Each record is delivered in its own TCP
+/// segment so the peek loop genuinely observes the partial header first.
+#[tokio::test]
+async fn test_extract_sni_from_tcp_stream_header_split_across_records() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+
+    let single = build_tls_client_hello("hdrsplit.example.com");
+    // Split at handshake byte 1: record 1 carries ONLY the msg_type (0x01); the
+    // 3-byte handshake length (and everything after) lands in record 2.
+    let two_records = split_tls_client_hello_into_records(&single, 1);
+    // record 1 = 5-byte TLS header + 1 handshake byte = 6 bytes.
+    let (first, rest) = two_records.split_at(6);
+    let (first, rest) = (first.to_vec(), rest.to_vec());
+
+    let accept_task = tokio::spawn(async move {
+        let (server_stream, _) = listener.accept().await.expect("accept");
+        let started = std::time::Instant::now();
+        let result =
+            extract_sni_from_tcp_stream(&server_stream, Some(std::time::Duration::from_secs(5)))
+                .await;
+        (result, started.elapsed())
+    });
+
+    let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    use tokio::io::AsyncWriteExt;
+    client.write_all(&first).await.expect("write first");
+    client.flush().await.expect("flush first");
+    // Let the server's first peek observe only the first record (partial header).
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    client.write_all(&rest).await.expect("write rest");
+    client.flush().await.expect("flush rest");
+
+    let (result, elapsed) = accept_task.await.expect("accept_task");
+    assert_eq!(
+        result,
+        Some("hdrsplit.example.com".to_string()),
+        "SNI must be found when the handshake header is split across TLS records"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "header-split ClientHello stalled until the handshake timeout instead of \
+         reassembling the handshake header across records: {elapsed:?}"
+    );
 }
 
 /// Exact host matches must beat wildcard matches regardless of the order the

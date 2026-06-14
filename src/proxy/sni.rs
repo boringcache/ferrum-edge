@@ -81,8 +81,9 @@ pub async fn extract_sni_from_tcp_stream(
         // Determine how many wire bytes cover the full ClientHello handshake
         // message — which MAY span multiple TLS records (record fragmentation) —
         // and keep peeking until they are all buffered. The span is known once
-        // the first record header (5) + handshake header (msg_type + 3-byte
-        // length) = 9 bytes have arrived; before that, keep peeking.
+        // the handshake header (msg_type + 3-byte length) has been reassembled
+        // across records — which may take more than the first record when a
+        // fragment splits inside that 4-byte header; before that, keep peeking.
         if let Some(want) = tls_clienthello_wire_span(&buf[..have], MAX_CLIENT_HELLO_LEN)
             && have >= want
         {
@@ -175,16 +176,28 @@ fn reassemble_tls_handshake_records(data: &[u8]) -> Option<Vec<u8>> {
 /// across records. Returns `None` while more bytes are needed to compute the
 /// span. Capped at `cap` so a hostile length field cannot request unbounded
 /// buffering.
+///
+/// The 4-byte handshake header (msg_type + u24 length) is itself reassembled
+/// across records before the length is read: record fragmentation can split the
+/// handshake message after only the 1-byte msg_type, so the length bytes may
+/// live in the NEXT TLS record. Reading them from a fixed `buf[6..9]` offset
+/// would then capture the next record's header instead. We therefore walk the
+/// handshake-record payloads, accumulating bytes until at least 4 handshake-layer
+/// bytes are available, and only then compute the span.
 fn tls_clienthello_wire_span(buf: &[u8], cap: usize) -> Option<usize> {
-    // Need the first record header (5) + handshake msg_type (1) + length (3).
-    if buf.len() < 9 || buf[0] != 0x16 {
+    if buf.is_empty() || buf[0] != 0x16 {
         return None;
     }
-    // Handshake length lives at the first record payload offset 1..4 == buf[6..9].
-    let handshake_total = 4usize.saturating_add(u24_to_usize(&buf[6..9]));
 
     let mut pos = 0usize;
+    // Handshake-layer bytes seen so far (payload only, record headers excluded).
     let mut handshake_seen = 0usize;
+    // First four reassembled handshake-layer bytes: msg_type (1) + u24 length (3).
+    let mut header = [0u8; 4];
+    let mut header_filled = 0usize;
+    // `handshake_total` becomes known once the 4-byte header is reassembled.
+    let mut handshake_total: Option<usize> = None;
+
     loop {
         if pos + 5 > buf.len() {
             // Need the next record header before the span can be extended.
@@ -196,61 +209,130 @@ fn tls_clienthello_wire_span(buf: &[u8], cap: usize) -> Option<usize> {
             return Some(pos.clamp(1, cap));
         }
         let record_len = u16::from_be_bytes([buf[pos + 3], buf[pos + 4]]) as usize;
-        let record_end = pos + 5 + record_len;
+        let payload_start = pos + 5;
+        let record_end = payload_start + record_len;
+
+        // Reassemble the handshake header (msg_type + u24 length) across records
+        // before trusting the length. Only consume the bytes actually buffered in
+        // this record's payload — a record may be truncated in `buf`.
+        if header_filled < 4 {
+            let avail = buf.len().min(record_end).saturating_sub(payload_start);
+            let take = avail.min(4 - header_filled);
+            header[header_filled..header_filled + take]
+                .copy_from_slice(&buf[payload_start..payload_start + take]);
+            header_filled += take;
+            if header_filled == 4 {
+                // msg_type 0x01 = ClientHello; anything else is not a span we route.
+                if header[0] != 0x01 {
+                    return None;
+                }
+                handshake_total = Some(4usize.saturating_add(u24_to_usize(&header[1..4])));
+            }
+        }
+
         handshake_seen = handshake_seen.saturating_add(record_len);
-        if handshake_seen >= handshake_total || record_end >= cap {
+
+        if let Some(total) = handshake_total {
+            if handshake_seen >= total || record_end >= cap {
+                return Some(record_end.min(cap));
+            }
+        } else if record_end >= cap {
+            // Header still unknown but we've hit the cap — buffer no further.
             return Some(record_end.min(cap));
         }
+
         pos = record_end;
     }
+}
+
+/// Outcome of parsing a DTLS ClientHello datagram for its SNI hostname.
+///
+/// The distinction between [`NoSni`](DtlsSniResult::NoSni) and
+/// [`InvalidFragment`](DtlsSniResult::InvalidFragment) is load-bearing for
+/// passthrough routing: `NoSni` is eligible for the empty-host catch-all proxy
+/// (matching plain no-SNI behavior), whereas `InvalidFragment` must be DROPPED.
+/// A DTLS continuation fragment (`fragment_offset != 0`) carries no parseable
+/// handshake start, so creating a catch-all session for it would bind a
+/// mid-message datagram with no real SNI to the catch-all. Collapsing both to a
+/// bare `None` (the old return type) hid that case as no-SNI and routed it.
+///
+/// Only the continuation-fragment case yields `InvalidFragment`; every other
+/// "can't extract an SNI" path (too short, wrong content type, non-ClientHello,
+/// malformed body) stays `NoSni` so existing catch-all routing is preserved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DtlsSniResult {
+    /// A ClientHello with a parsed SNI hostname (already ASCII-lowercased).
+    Hostname(String),
+    /// No SNI could be extracted, but the datagram may legitimately begin a
+    /// session — routes to the catch-all, matching plain (no-SNI) behavior.
+    NoSni,
+    /// A DTLS continuation fragment (`fragment_offset != 0`): mid-message bytes
+    /// that cannot start a session. The passthrough caller DROPS this rather
+    /// than binding it to the empty-host catch-all.
+    InvalidFragment,
 }
 
 /// Extract the SNI hostname from a DTLS ClientHello datagram.
 ///
 /// DTLS uses a 13-byte record header (vs 5 for TLS) and a 12-byte handshake
 /// header (vs 4 for TLS) with epoch, sequence number, and fragment offsets.
-pub fn extract_sni_from_dtls_client_hello(data: &[u8]) -> Option<String> {
+///
+/// Returns a [`DtlsSniResult`] so the passthrough caller can tell a genuine
+/// no-SNI ClientHello (catch-all eligible) apart from a continuation fragment
+/// that must be dropped rather than routed.
+pub fn extract_sni_from_dtls_client_hello(data: &[u8]) -> DtlsSniResult {
     // DTLS record header: content_type (1) + version (2) + epoch (2) +
     //                     sequence_number (6) + length (2) = 13 bytes
     if data.len() < 13 {
-        return None;
+        return DtlsSniResult::NoSni;
     }
 
     // Content type 0x16 = Handshake
     if data[0] != 0x16 {
-        return None;
+        return DtlsSniResult::NoSni;
     }
 
     let record_len = u16::from_be_bytes([data[11], data[12]]) as usize;
-    let handshake_data = data.get(13..13 + record_len.min(data.len() - 13))?;
+    let Some(handshake_data) = data.get(13..13 + record_len.min(data.len() - 13)) else {
+        return DtlsSniResult::NoSni;
+    };
 
     // DTLS handshake header: msg_type (1) + length (3) + message_seq (2) +
     //                        fragment_offset (3) + fragment_length (3) = 12 bytes
     if handshake_data.len() < 12 {
-        return None;
+        return DtlsSniResult::NoSni;
     }
 
     // msg_type 0x01 = ClientHello
     if handshake_data[0] != 0x01 {
-        return None;
+        return DtlsSniResult::NoSni;
     }
 
     // DTLS handshake header: total length (1..4), message_seq (4..6),
     // fragment_offset (6..9), fragment_length (9..12). A ClientHello MAY be
     // fragmented across datagrams. Passthrough mode does not reassemble fragments
-    // across datagrams, so fail closed on a continuation fragment rather than
-    // misparse mid-message bytes as a fresh ClientHello body (which would yield a
-    // bogus SNI). A first fragment (offset 0) is still parsed best-effort — SNI
-    // may sit within its prefix; a None result then genuinely means "SNI not in
-    // this fragment".
+    // across datagrams, so signal `InvalidFragment` on a continuation fragment
+    // rather than misparse mid-message bytes as a fresh ClientHello body (which
+    // would yield a bogus SNI). Returning `InvalidFragment` (not `NoSni`) keeps
+    // the caller from binding the continuation to the empty-host catch-all. A
+    // first fragment (offset 0) is still parsed best-effort — SNI may sit within
+    // its prefix; a `NoSni` result then genuinely means "SNI not in this
+    // fragment" and stays catch-all eligible.
     let fragment_offset = u24_to_usize(&handshake_data[6..9]);
     if fragment_offset != 0 {
-        return None;
+        return DtlsSniResult::InvalidFragment;
     }
     let fragment_len = u24_to_usize(&handshake_data[9..12]);
-    let client_hello = handshake_data.get(12..12 + fragment_len.min(handshake_data.len() - 12))?;
+    let Some(client_hello) =
+        handshake_data.get(12..12 + fragment_len.min(handshake_data.len() - 12))
+    else {
+        return DtlsSniResult::NoSni;
+    };
 
-    parse_dtls_client_hello_body(client_hello)
+    match parse_dtls_client_hello_body(client_hello) {
+        Some(hostname) => DtlsSniResult::Hostname(hostname),
+        None => DtlsSniResult::NoSni,
+    }
 }
 
 /// Parse the SNI from a TLS handshake payload (after the 5-byte TLS record header).
