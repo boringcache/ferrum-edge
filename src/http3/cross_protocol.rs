@@ -2447,18 +2447,14 @@ where
                 outcome.backend_resolved_ip = final_backend_resolved_ip.clone();
                 return Ok(outcome);
             }
-            crate::http3::server::inject_sticky_cookie(
-                epoch,
-                proxy,
-                current_target.as_deref(),
-                sticky_cookie_needed,
-                &mut plugin_response_headers,
-            );
-            // Run the buffered response-body hook pipeline in the same
-            // order as the main gRPC proxy path so reject/transform
-            // semantics stay transport-independent. Hooks operate on the
-            // merged view; the wire `response_headers` is assembled from it
-            // after trailer reconciliation below.
+            // Run the buffered response-body hook pipeline in the same order as
+            // the main gRPC proxy path so reject/transform semantics stay
+            // transport-independent. Hooks operate on the merged view; the wire
+            // `response_headers` is assembled from it after trailer
+            // reconciliation below, and the sticky-affinity cookie is injected
+            // onto those final initial headers (matching the main path) so a
+            // trailer-only backend `set-cookie` cannot divert it into the wire
+            // trailers.
             let mut response_status = resp.status;
             let mut response_body = resp.body;
             let mut response_trailers = resp.trailers;
@@ -2568,6 +2564,29 @@ where
                     response_headers.remove(k);
                 }
             }
+            // Inject the sticky-affinity cookie onto the final initial headers,
+            // matching the main gRPC path's ordering. Doing it here rather than on
+            // the merged view ensures it lands in the wire HEADERS frame even when
+            // the backend sent a trailer-only `set-cookie` (a non-shadowed trailer
+            // key that the strip loop above just removed from the headers).
+            crate::http3::server::inject_sticky_cookie(
+                epoch,
+                proxy,
+                current_target.as_deref(),
+                sticky_cookie_needed,
+                &mut response_headers,
+            );
+            // Capture the backend's true gRPC terminal status for the admission
+            // sample BEFORE the trailers may be cleared just below: when a
+            // transform (grpc_web) converts the response away from native gRPC we
+            // drop the native TRAILERS frame, but adaptive concurrency must still
+            // see a failing backend (grpc-status 14/INTERNAL, etc.) shrink rather
+            // than be recorded as a healthy HTTP 200.
+            let grpc_admission_status = crate::proxy::grpc_proxy::grpc_admission_status_from_maps(
+                &response_trailers,
+                &response_headers,
+                response_status,
+            );
             // A transform that converted away from native gRPC (grpc_web appends
             // a gRPC-Web trailer frame to the body and relabels the content-type)
             // must not ALSO emit native H3 trailers, or terminal status would be
@@ -2647,11 +2666,7 @@ where
             // an UNAVAILABLE/INTERNAL backend must shrink, not look healthy. An
             // incomplete stream stays a client disconnect (ignored), matching H1/H2.
             let admission_status = if body_completed {
-                crate::proxy::grpc_proxy::grpc_admission_status_from_maps(
-                    &response_trailers,
-                    &response_headers,
-                    response_status,
-                )
+                grpc_admission_status
             } else {
                 response_status
             };
