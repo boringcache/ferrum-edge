@@ -11153,6 +11153,19 @@ async fn handle_proxy_request_inner(
                     "WebSocket upgrade rejected: Origin '{}' not in allowed_ws_origins for proxy {}",
                     origin, proxy.id
                 );
+                // The circuit-breaker check above may have admitted this request
+                // as a HALF_OPEN probe. This origin reject happens before any
+                // backend dispatch, so release the claimed probe slot — otherwise
+                // repeated rejected origin probes leak `half_open_in_flight` slots
+                // and wedge the breaker. Mirrors the H3 origin reject in
+                // `src/http3/server.rs` and the other H1/H2 WebSocket gateway-side
+                // rejects (missing OnUpgrade, connection limits, backend admission).
+                release_circuit_breaker_probe_on_admission_reject(
+                    &state,
+                    &proxy,
+                    cb_target_key.as_deref(),
+                    cb_is_half_open_probe,
+                );
                 record_request(&state, 403);
                 return Ok(build_response(
                     StatusCode::FORBIDDEN,
