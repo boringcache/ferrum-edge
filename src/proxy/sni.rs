@@ -78,14 +78,16 @@ pub async fn extract_sni_from_tcp_stream(
             return None;
         }
 
-        // Need the 5-byte record header to know the full record length.
-        if have >= 5 {
-            let record_len = u16::from_be_bytes([buf[3], buf[4]]) as usize;
-            let want = (5 + record_len).min(MAX_CLIENT_HELLO_LEN);
-            if have >= want {
-                // Full first record buffered.
-                return extract_sni_from_client_hello(&buf[..have]);
-            }
+        // Determine how many wire bytes cover the full ClientHello handshake
+        // message — which MAY span multiple TLS records (record fragmentation) —
+        // and keep peeking until they are all buffered. The span is known once
+        // the first record header (5) + handshake header (msg_type + 3-byte
+        // length) = 9 bytes have arrived; before that, keep peeking.
+        if let Some(want) = tls_clienthello_wire_span(&buf[..have], MAX_CLIENT_HELLO_LEN)
+            && have >= want
+        {
+            // Full ClientHello handshake (across all its records) buffered.
+            return extract_sni_from_client_hello(&buf[..have]);
         }
         let now = tokio::time::Instant::now();
         if now >= deadline {
@@ -114,9 +116,93 @@ pub fn extract_sni_from_client_hello(data: &[u8]) -> Option<String> {
     }
 
     let record_len = u16::from_be_bytes([data[3], data[4]]) as usize;
-    let handshake_data = data.get(5..5 + record_len.min(data.len() - 5))?;
+    let first_payload = data.get(5..5 + record_len.min(data.len() - 5))?;
 
-    parse_client_hello_sni(handshake_data)
+    // Fast path (the overwhelmingly common case): the whole ClientHello handshake
+    // message fits inside the first TLS record, so parse it in place with no
+    // allocation. The handshake header is msg_type (1) + length (3).
+    if first_payload.len() >= 4 {
+        let msg_len = u24_to_usize(&first_payload[1..4]);
+        if first_payload.len() >= 4 + msg_len {
+            return parse_client_hello_sni(first_payload);
+        }
+    }
+
+    // The ClientHello handshake message spans multiple TLS records (record
+    // fragmentation — protocol-valid: a single handshake message MAY be split
+    // across records, and SNI can land in a later record). Reassemble the
+    // handshake-layer bytes from consecutive handshake records and parse the
+    // joined message. Without this, SNI in a non-first record is missed and the
+    // connection silently misroutes to the catch-all proxy.
+    let handshake = reassemble_tls_handshake_records(data)?;
+    parse_client_hello_sni(&handshake)
+}
+
+/// Concatenate the handshake-layer payloads of consecutive TLS handshake records
+/// in `data` so a ClientHello fragmented across records can be parsed as one
+/// message. Stops at the first non-handshake record, a record truncated in the
+/// buffer, or the end of the buffer. Bounded by the caller's buffer length
+/// (`MAX_CLIENT_HELLO_LEN` on the peek path).
+fn reassemble_tls_handshake_records(data: &[u8]) -> Option<Vec<u8>> {
+    let mut handshake = Vec::new();
+    let mut pos = 0usize;
+    while pos + 5 <= data.len() {
+        // Only handshake (0x16) records carry ClientHello fragments.
+        if data[pos] != 0x16 {
+            break;
+        }
+        let record_len = u16::from_be_bytes([data[pos + 3], data[pos + 4]]) as usize;
+        let payload_start = pos + 5;
+        let avail = (data.len() - payload_start).min(record_len);
+        handshake.extend_from_slice(&data[payload_start..payload_start + avail]);
+        if avail < record_len {
+            // Record payload truncated in the buffer — can't continue past it.
+            break;
+        }
+        pos = payload_start + record_len;
+    }
+    if handshake.is_empty() {
+        None
+    } else {
+        Some(handshake)
+    }
+}
+
+/// Total wire bytes (TLS record headers + payloads) that span the complete
+/// ClientHello handshake message, given a buffer that begins with a handshake
+/// record. The handshake message length (its 3-byte header field) determines how
+/// many record payloads must be summed; a single message MAY be fragmented
+/// across records. Returns `None` while more bytes are needed to compute the
+/// span. Capped at `cap` so a hostile length field cannot request unbounded
+/// buffering.
+fn tls_clienthello_wire_span(buf: &[u8], cap: usize) -> Option<usize> {
+    // Need the first record header (5) + handshake msg_type (1) + length (3).
+    if buf.len() < 9 || buf[0] != 0x16 {
+        return None;
+    }
+    // Handshake length lives at the first record payload offset 1..4 == buf[6..9].
+    let handshake_total = 4usize.saturating_add(u24_to_usize(&buf[6..9]));
+
+    let mut pos = 0usize;
+    let mut handshake_seen = 0usize;
+    loop {
+        if pos + 5 > buf.len() {
+            // Need the next record header before the span can be extended.
+            return None;
+        }
+        if buf[pos] != 0x16 {
+            // Interleaved non-handshake record: stop at the previous boundary so
+            // the handshake records gathered so far are parsed.
+            return Some(pos.clamp(1, cap));
+        }
+        let record_len = u16::from_be_bytes([buf[pos + 3], buf[pos + 4]]) as usize;
+        let record_end = pos + 5 + record_len;
+        handshake_seen = handshake_seen.saturating_add(record_len);
+        if handshake_seen >= handshake_total || record_end >= cap {
+            return Some(record_end.min(cap));
+        }
+        pos = record_end;
+    }
 }
 
 /// Extract the SNI hostname from a DTLS ClientHello datagram.
@@ -149,6 +235,18 @@ pub fn extract_sni_from_dtls_client_hello(data: &[u8]) -> Option<String> {
         return None;
     }
 
+    // DTLS handshake header: total length (1..4), message_seq (4..6),
+    // fragment_offset (6..9), fragment_length (9..12). A ClientHello MAY be
+    // fragmented across datagrams. Passthrough mode does not reassemble fragments
+    // across datagrams, so fail closed on a continuation fragment rather than
+    // misparse mid-message bytes as a fresh ClientHello body (which would yield a
+    // bogus SNI). A first fragment (offset 0) is still parsed best-effort — SNI
+    // may sit within its prefix; a None result then genuinely means "SNI not in
+    // this fragment".
+    let fragment_offset = u24_to_usize(&handshake_data[6..9]);
+    if fragment_offset != 0 {
+        return None;
+    }
     let fragment_len = u24_to_usize(&handshake_data[9..12]);
     let client_hello = handshake_data.get(12..12 + fragment_len.min(handshake_data.len() - 12))?;
 

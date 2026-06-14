@@ -269,6 +269,79 @@ fn test_extract_sni_wrong_handshake_type() {
     assert_eq!(extract_sni_from_client_hello(&data), None);
 }
 
+/// Re-frame a single-record TLS ClientHello into two TLS records that carry the
+/// same handshake message, split at `split_at` handshake bytes — exercises
+/// record-fragmentation reassembly.
+fn split_tls_client_hello_into_records(single: &[u8], split_at: usize) -> Vec<u8> {
+    // single = [0x16, version(2), record_len(2), handshake...]
+    let handshake = &single[5..];
+    let split = split_at.min(handshake.len());
+    let (h1, h2) = handshake.split_at(split);
+    let mut out = Vec::new();
+    for part in [h1, h2] {
+        out.push(0x16);
+        out.extend_from_slice(&[0x03, 0x01]);
+        out.extend_from_slice(&(part.len() as u16).to_be_bytes());
+        out.extend_from_slice(part);
+    }
+    out
+}
+
+#[test]
+fn extract_sni_reassembles_clienthello_across_tls_records() {
+    let single = build_tls_client_hello("split.example.com");
+    // Split mid-handshake so the SNI (in the trailing extensions) lands in the
+    // SECOND record — the old single-record parser silently missed it.
+    let two_records = split_tls_client_hello_into_records(&single, 10);
+    assert_eq!(
+        extract_sni_from_client_hello(&two_records),
+        Some("split.example.com".to_string()),
+        "SNI in a later TLS record must be reassembled across records and found"
+    );
+}
+
+#[test]
+fn extract_sni_single_record_fast_path_unchanged() {
+    // The common single-record case must still parse (fast path, no reassembly).
+    let data = build_tls_client_hello("whole.example.com");
+    assert_eq!(
+        extract_sni_from_client_hello(&data),
+        Some("whole.example.com".to_string())
+    );
+}
+
+/// Build a DTLS ClientHello record marked as a continuation fragment
+/// (`fragment_offset` > 0). The handshake header starts at record offset 13;
+/// `fragment_offset` is handshake bytes 6..9 → record bytes 19..22.
+fn build_dtls_continuation_fragment(hostname: &str) -> Vec<u8> {
+    let mut record = build_dtls_client_hello(hostname);
+    record[19] = 0x00;
+    record[20] = 0x00;
+    record[21] = 0x10; // fragment_offset = 16 (mid-message)
+    record
+}
+
+#[test]
+fn extract_dtls_sni_fails_closed_on_continuation_fragment() {
+    let frag = build_dtls_continuation_fragment("frag.example.com");
+    assert_eq!(
+        extract_sni_from_dtls_client_hello(&frag),
+        None,
+        "a DTLS continuation fragment (fragment_offset > 0) must fail closed \
+         rather than misparse mid-message bytes as a fresh ClientHello body"
+    );
+}
+
+#[test]
+fn extract_dtls_sni_unfragmented_still_parses() {
+    let data = build_dtls_client_hello("whole.example.com");
+    assert_eq!(
+        extract_sni_from_dtls_client_hello(&data),
+        Some("whole.example.com".to_string()),
+        "an unfragmented DTLS ClientHello (offset 0, full length) must still parse"
+    );
+}
+
 #[test]
 fn test_extract_sni_rejects_short_server_name_list_length() {
     let hostname = "example.com";
