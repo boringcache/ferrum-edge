@@ -84,11 +84,21 @@ pub async fn extract_sni_from_tcp_stream(
         // the handshake header (msg_type + 3-byte length) has been reassembled
         // across records — which may take more than the first record when a
         // fragment splits inside that 4-byte header; before that, keep peeking.
-        if let Some(want) = tls_clienthello_wire_span(&buf[..have], MAX_CLIENT_HELLO_LEN)
-            && have >= want
-        {
-            // Full ClientHello handshake (across all its records) buffered.
-            return extract_sni_from_client_hello(&buf[..have]);
+        match tls_clienthello_wire_span(&buf[..have], MAX_CLIENT_HELLO_LEN) {
+            WireSpan::Span(want) if have >= want => {
+                // Full ClientHello handshake (across all its records) buffered.
+                return extract_sni_from_client_hello(&buf[..have]);
+            }
+            WireSpan::NotClientHello => {
+                // The first handshake byte proved this is not a ClientHello (e.g.
+                // a complete handshake record whose msg_type != 0x01). Reject now
+                // rather than re-peek the same bytes until the handshake timeout —
+                // a no-SNI `None` routes the connection to the catch-all per the
+                // existing non-ClientHello semantics.
+                return None;
+            }
+            // `Span` with more bytes still to buffer, or `NeedMore`: keep peeking.
+            WireSpan::Span(_) | WireSpan::NeedMore => {}
         }
         let now = tokio::time::Instant::now();
         if now >= deadline {
@@ -169,13 +179,35 @@ fn reassemble_tls_handshake_records(data: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
+/// Outcome of computing how many wire bytes span a ClientHello handshake.
+///
+/// The peek loop must distinguish "keep peeking" from "this can never be a
+/// ClientHello", so it can reject a non-ClientHello first record immediately
+/// instead of re-peeking the same bytes until the handshake timeout fires. A
+/// bare `Option<usize>` conflated those two: `None` was returned both when more
+/// bytes were needed AND when the first handshake byte proved the message was
+/// not a ClientHello, so the loop treated a definitive rejection as need-more.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WireSpan {
+    /// The full extent (in wire bytes from the buffer start) of the ClientHello
+    /// handshake message is known and equals this many bytes.
+    Span(usize),
+    /// More bytes must be buffered before the span can be computed — keep peeking.
+    NeedMore,
+    /// The first handshake `msg_type` is present and is not ClientHello (`0x01`):
+    /// this stream is definitively not a ClientHello. The peek loop must stop and
+    /// reject promptly rather than wait for more bytes.
+    NotClientHello,
+}
+
 /// Total wire bytes (TLS record headers + payloads) that span the complete
 /// ClientHello handshake message, given a buffer that begins with a handshake
 /// record. The handshake message length (its 3-byte header field) determines how
 /// many record payloads must be summed; a single message MAY be fragmented
-/// across records. Returns `None` while more bytes are needed to compute the
-/// span. Capped at `cap` so a hostile length field cannot request unbounded
-/// buffering.
+/// across records. Returns [`WireSpan::NeedMore`] while more bytes are needed to
+/// compute the span and [`WireSpan::NotClientHello`] as soon as the first
+/// handshake byte proves the message is not a ClientHello. Capped at `cap` so a
+/// hostile length field cannot request unbounded buffering.
 ///
 /// The 4-byte handshake header (msg_type + u24 length) is itself reassembled
 /// across records before the length is read: record fragmentation can split the
@@ -183,10 +215,17 @@ fn reassemble_tls_handshake_records(data: &[u8]) -> Option<Vec<u8>> {
 /// live in the NEXT TLS record. Reading them from a fixed `buf[6..9]` offset
 /// would then capture the next record's header instead. We therefore walk the
 /// handshake-record payloads, accumulating bytes until at least 4 handshake-layer
-/// bytes are available, and only then compute the span.
-fn tls_clienthello_wire_span(buf: &[u8], cap: usize) -> Option<usize> {
-    if buf.is_empty() || buf[0] != 0x16 {
-        return None;
+/// bytes are available, and only then compute the span. The `msg_type` check
+/// happens as soon as the first handshake byte lands (it may arrive before the
+/// remaining 3 length bytes), so a non-ClientHello is rejected at the earliest
+/// possible point.
+fn tls_clienthello_wire_span(buf: &[u8], cap: usize) -> WireSpan {
+    if buf.is_empty() {
+        return WireSpan::NeedMore;
+    }
+    if buf[0] != 0x16 {
+        // Not even a TLS handshake record — definitively not a ClientHello.
+        return WireSpan::NotClientHello;
     }
 
     let mut pos = 0usize;
@@ -201,12 +240,12 @@ fn tls_clienthello_wire_span(buf: &[u8], cap: usize) -> Option<usize> {
     loop {
         if pos + 5 > buf.len() {
             // Need the next record header before the span can be extended.
-            return None;
+            return WireSpan::NeedMore;
         }
         if buf[pos] != 0x16 {
             // Interleaved non-handshake record: stop at the previous boundary so
             // the handshake records gathered so far are parsed.
-            return Some(pos.clamp(1, cap));
+            return WireSpan::Span(pos.clamp(1, cap));
         }
         let record_len = u16::from_be_bytes([buf[pos + 3], buf[pos + 4]]) as usize;
         let payload_start = pos + 5;
@@ -221,11 +260,15 @@ fn tls_clienthello_wire_span(buf: &[u8], cap: usize) -> Option<usize> {
             header[header_filled..header_filled + take]
                 .copy_from_slice(&buf[payload_start..payload_start + take]);
             header_filled += take;
+            // Reject as soon as the 1-byte msg_type is known — it may land before
+            // the remaining 3 length bytes when a fragment splits inside the
+            // handshake header. msg_type 0x01 = ClientHello; anything else is not
+            // a ClientHello and must be rejected promptly so the peek loop stops
+            // re-peeking instead of stalling until the handshake timeout.
+            if header_filled >= 1 && header[0] != 0x01 {
+                return WireSpan::NotClientHello;
+            }
             if header_filled == 4 {
-                // msg_type 0x01 = ClientHello; anything else is not a span we route.
-                if header[0] != 0x01 {
-                    return None;
-                }
                 handshake_total = Some(4usize.saturating_add(u24_to_usize(&header[1..4])));
             }
         }
@@ -234,11 +277,11 @@ fn tls_clienthello_wire_span(buf: &[u8], cap: usize) -> Option<usize> {
 
         if let Some(total) = handshake_total {
             if handshake_seen >= total || record_end >= cap {
-                return Some(record_end.min(cap));
+                return WireSpan::Span(record_end.min(cap));
             }
         } else if record_end >= cap {
             // Header still unknown but we've hit the cap — buffer no further.
-            return Some(record_end.min(cap));
+            return WireSpan::Span(record_end.min(cap));
         }
 
         pos = record_end;
@@ -251,14 +294,20 @@ fn tls_clienthello_wire_span(buf: &[u8], cap: usize) -> Option<usize> {
 /// [`InvalidFragment`](DtlsSniResult::InvalidFragment) is load-bearing for
 /// passthrough routing: `NoSni` is eligible for the empty-host catch-all proxy
 /// (matching plain no-SNI behavior), whereas `InvalidFragment` must be DROPPED.
-/// A DTLS continuation fragment (`fragment_offset != 0`) carries no parseable
-/// handshake start, so creating a catch-all session for it would bind a
-/// mid-message datagram with no real SNI to the catch-all. Collapsing both to a
-/// bare `None` (the old return type) hid that case as no-SNI and routed it.
+/// A fragmented DTLS ClientHello (a continuation fragment, or an initial fragment
+/// whose SNI lives in a later, unseen fragment) carries no usable SNI start, so
+/// creating a catch-all session for it would bind a partial-message datagram with
+/// no real SNI to the catch-all. Collapsing both to a bare `None` (the old return
+/// type) hid that case as no-SNI and routed it.
 ///
-/// Only the continuation-fragment case yields `InvalidFragment`; every other
-/// "can't extract an SNI" path (too short, wrong content type, non-ClientHello,
-/// malformed body) stays `NoSni` so existing catch-all routing is preserved.
+/// `InvalidFragment` is returned for any DTLS ClientHello fragment that cannot be
+/// fully parsed in this single datagram: a continuation fragment
+/// (`fragment_offset != 0`) or an initial fragment of a fragmented message
+/// (`fragment_offset == 0 && fragment_length < length`) from which no SNI was
+/// extracted. Every other "can't extract an SNI" path (too short, wrong content
+/// type, non-ClientHello, malformed body, or a complete single-fragment
+/// ClientHello with no SNI) stays `NoSni` so existing catch-all routing is
+/// preserved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DtlsSniResult {
     /// A ClientHello with a parsed SNI hostname (already ASCII-lowercased).
@@ -266,9 +315,11 @@ pub enum DtlsSniResult {
     /// No SNI could be extracted, but the datagram may legitimately begin a
     /// session — routes to the catch-all, matching plain (no-SNI) behavior.
     NoSni,
-    /// A DTLS continuation fragment (`fragment_offset != 0`): mid-message bytes
-    /// that cannot start a session. The passthrough caller DROPS this rather
-    /// than binding it to the empty-host catch-all.
+    /// A DTLS ClientHello fragment that cannot be fully parsed from this single
+    /// datagram: a continuation fragment (`fragment_offset != 0`), or an initial
+    /// fragment of a fragmented message (`fragment_length < length`) whose SNI is
+    /// not present in this fragment. The passthrough caller DROPS this rather than
+    /// binding it to the empty-host catch-all.
     InvalidFragment,
 }
 
@@ -278,8 +329,9 @@ pub enum DtlsSniResult {
 /// header (vs 4 for TLS) with epoch, sequence number, and fragment offsets.
 ///
 /// Returns a [`DtlsSniResult`] so the passthrough caller can tell a genuine
-/// no-SNI ClientHello (catch-all eligible) apart from a continuation fragment
-/// that must be dropped rather than routed.
+/// no-SNI ClientHello (catch-all eligible) apart from a fragment that must be
+/// dropped rather than routed (a continuation fragment, or an initial fragment of
+/// a fragmented ClientHello whose SNI is not in this datagram).
 pub fn extract_sni_from_dtls_client_hello(data: &[u8]) -> DtlsSniResult {
     // DTLS record header: content_type (1) + version (2) + epoch (2) +
     //                     sequence_number (6) + length (2) = 13 bytes
@@ -311,17 +363,16 @@ pub fn extract_sni_from_dtls_client_hello(data: &[u8]) -> DtlsSniResult {
     // DTLS handshake header: total length (1..4), message_seq (4..6),
     // fragment_offset (6..9), fragment_length (9..12). A ClientHello MAY be
     // fragmented across datagrams. Passthrough mode does not reassemble fragments
-    // across datagrams, so signal `InvalidFragment` on a continuation fragment
-    // rather than misparse mid-message bytes as a fresh ClientHello body (which
-    // would yield a bogus SNI). Returning `InvalidFragment` (not `NoSni`) keeps
-    // the caller from binding the continuation to the empty-host catch-all. A
-    // first fragment (offset 0) is still parsed best-effort — SNI may sit within
-    // its prefix; a `NoSni` result then genuinely means "SNI not in this
-    // fragment" and stays catch-all eligible.
+    // across datagrams, so signal `InvalidFragment` on a fragment that does not
+    // carry a complete, parseable ClientHello rather than misparse partial bytes
+    // and bind a bogus session. Returning `InvalidFragment` (not `NoSni`) keeps
+    // the caller from binding the fragment to the empty-host catch-all.
     let fragment_offset = u24_to_usize(&handshake_data[6..9]);
     if fragment_offset != 0 {
+        // A continuation fragment carries no parseable handshake start.
         return DtlsSniResult::InvalidFragment;
     }
+    let handshake_total_len = u24_to_usize(&handshake_data[1..4]);
     let fragment_len = u24_to_usize(&handshake_data[9..12]);
     let Some(client_hello) =
         handshake_data.get(12..12 + fragment_len.min(handshake_data.len() - 12))
@@ -330,7 +381,18 @@ pub fn extract_sni_from_dtls_client_hello(data: &[u8]) -> DtlsSniResult {
     };
 
     match parse_dtls_client_hello_body(client_hello) {
+        // SNI was found within this fragment — route on it regardless of whether
+        // the full message spans more datagrams.
         Some(hostname) => DtlsSniResult::Hostname(hostname),
+        // No SNI parsed from this fragment. An INITIAL fragment (offset 0) of a
+        // FRAGMENTED ClientHello (`fragment_length < length`) does not contain the
+        // whole message: the SNI extension may live in a later, unseen fragment.
+        // Passthrough does not reassemble, so fail closed (`InvalidFragment`)
+        // rather than treat it as genuinely no-SNI and bind the empty-host
+        // catch-all — exactly the bogus session this guard exists to prevent. A
+        // complete single-fragment ClientHello (`fragment_length == length`) with
+        // no SNI is genuinely no-SNI and stays catch-all eligible (`NoSni`).
+        None if fragment_len < handshake_total_len => DtlsSniResult::InvalidFragment,
         None => DtlsSniResult::NoSni,
     }
 }

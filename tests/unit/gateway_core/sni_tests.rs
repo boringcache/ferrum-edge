@@ -101,6 +101,11 @@ fn build_dtls_client_hello(hostname: &str) -> Vec<u8> {
     record
 }
 
+/// Read a 3-byte big-endian unsigned integer (mirrors `u24_to_usize` in `sni.rs`).
+fn u24(bytes: &[u8]) -> usize {
+    ((bytes[0] as usize) << 16) | ((bytes[1] as usize) << 8) | (bytes[2] as usize)
+}
+
 fn set_sni_list_len(data: &mut [u8], hostname: &str, list_len: u16) {
     let hostname_offset = data
         .windows(hostname.len())
@@ -330,6 +335,59 @@ fn extract_dtls_sni_fails_closed_on_continuation_fragment() {
         "a DTLS continuation fragment (fragment_offset > 0) must signal \
          InvalidFragment so the caller DROPS it — returning NoSni would let it \
          bind to the empty-host catch-all instead of being dropped"
+    );
+}
+
+/// Build the INITIAL fragment (`fragment_offset == 0`) of a DTLS ClientHello that
+/// is fragmented across datagrams: the handshake `length` stays the full message
+/// length while `fragment_length` (and the buffered body) is truncated to
+/// `frag_body_len` bytes, so the SNI extension (in the trailing extensions) is
+/// NOT present in this datagram. Layout (record-relative): handshake starts at
+/// offset 13; `length` = handshake bytes 1..4 (record 14..17), `fragment_offset`
+/// = handshake bytes 6..9 (record 19..22), `fragment_length` = handshake bytes
+/// 9..12 (record 22..25), body starts at record offset 25.
+fn build_dtls_first_fragment(hostname: &str, frag_body_len: usize) -> Vec<u8> {
+    let full = build_dtls_client_hello(hostname);
+    // Total handshake message length (handshake bytes 1..4 → record 14..16).
+    let total_len = u24(&full[14..17]);
+    assert!(
+        frag_body_len < total_len,
+        "first fragment must carry fewer body bytes than the full message"
+    );
+
+    // Rebuild a record that keeps the full `length` but a truncated body and a
+    // matching `fragment_length`, so offset 0 + fragment_length < length.
+    let mut record = Vec::new();
+    record.extend_from_slice(&full[..13]); // DTLS record header (rewrite len below)
+    record.extend_from_slice(&full[13..14]); // msg_type (0x01)
+    record.extend_from_slice(&full[14..17]); // length: full message length (unchanged)
+    record.extend_from_slice(&full[17..19]); // message_seq
+    record.extend_from_slice(&[0x00, 0x00, 0x00]); // fragment_offset: 0 (initial)
+    record.push((frag_body_len >> 16) as u8); // fragment_length: truncated
+    record.push((frag_body_len >> 8) as u8);
+    record.push(frag_body_len as u8);
+    // Only the first `frag_body_len` body bytes (body starts at record offset 25).
+    record.extend_from_slice(&full[25..25 + frag_body_len]);
+
+    // Fix the DTLS record length (bytes 11..13) = 12-byte handshake header + body.
+    let record_payload_len = (12 + frag_body_len) as u16;
+    record[11..13].copy_from_slice(&record_payload_len.to_be_bytes());
+    record
+}
+
+#[test]
+fn extract_dtls_sni_fails_closed_on_initial_fragment_without_sni() {
+    // Initial fragment (offset 0) carrying only 16 body bytes — version (2) +
+    // part of random (14): well before the SNI extension. Because the full
+    // message is longer, `fragment_length < length`, so the parser cannot find
+    // SNI in this datagram and must fail closed rather than route to catch-all.
+    let frag = build_dtls_first_fragment("frag.example.com", 16);
+    assert_eq!(
+        extract_sni_from_dtls_client_hello(&frag),
+        DtlsSniResult::InvalidFragment,
+        "an initial DTLS fragment (offset 0, fragment_length < length) whose SNI \
+         lives in a later fragment must signal InvalidFragment — returning NoSni \
+         would bind the partial ClientHello to the empty-host catch-all"
     );
 }
 
@@ -721,6 +779,52 @@ async fn test_extract_sni_from_tcp_stream_rejects_non_tls_prefix_immediately() {
     assert!(
         elapsed < std::time::Duration::from_millis(300),
         "non-TLS prefix waited for the handshake timeout: {elapsed:?}"
+    );
+}
+
+/// A peer that writes a COMPLETE handshake record whose `msg_type` is not
+/// ClientHello (`0x01`) — here a ServerHello (`0x02`) — and then stalls must be
+/// rejected as soon as that record is buffered, not re-peeked until the full
+/// handshake timeout. The msg_type alone is enough to decide this is not a
+/// ClientHello, so the peek loop must stop promptly.
+#[tokio::test]
+async fn test_extract_sni_from_tcp_stream_rejects_complete_non_clienthello_record_immediately() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+
+    // A valid TLS handshake record, but with msg_type flipped to ServerHello.
+    // Record layout: [0x16, version(2), record_len(2), msg_type, ...]; the
+    // handshake msg_type is at record offset 5.
+    let mut not_hello = build_tls_client_hello("example.com");
+    not_hello[5] = 0x02; // ServerHello, a complete-but-not-ClientHello handshake.
+
+    let accept_task = tokio::spawn(async move {
+        let (server_stream, _) = listener.accept().await.expect("accept");
+        let started = std::time::Instant::now();
+        let result =
+            extract_sni_from_tcp_stream(&server_stream, Some(std::time::Duration::from_secs(1)))
+                .await;
+        (result, started.elapsed())
+    });
+
+    let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    use tokio::io::AsyncWriteExt;
+    client.write_all(&not_hello).await.expect("write record");
+    client.flush().await.expect("flush record");
+    // Keep the socket open and silent — a non-prompt loop would re-peek the same
+    // bytes until the 1s handshake timeout.
+
+    let (result, elapsed) = accept_task.await.expect("accept_task");
+    assert_eq!(
+        result, None,
+        "a complete non-ClientHello record must not produce SNI"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_millis(300),
+        "complete non-ClientHello record re-peeked until the handshake timeout \
+         instead of rejecting promptly: {elapsed:?}"
     );
 }
 
