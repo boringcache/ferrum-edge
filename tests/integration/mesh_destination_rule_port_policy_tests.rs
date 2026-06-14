@@ -423,6 +423,11 @@ fn destination_rule_top_level_connection_pool_http_fans_out_to_target_ports() {
                         max_requests_per_connection: Some(75),
                         idle_timeout_ms: Some(45_000),
                         http2_max_requests: Some(250),
+                        // F5.1: the two newly-projected knobs also fan out.
+                        h2_upgrade_policy: Some(
+                            ferrum_edge::config::types::H2UpgradePolicy::DoNotUpgrade,
+                        ),
+                        max_retries: Some(2),
                     }),
                     ..MeshTrafficPolicy::default()
                 }),
@@ -443,6 +448,11 @@ fn destination_rule_top_level_connection_pool_http_fans_out_to_target_ports() {
     assert_eq!(port_override.http_max_requests_per_connection, Some(75));
     assert_eq!(port_override.http_idle_timeout_ms, Some(45_000));
     assert_eq!(port_override.h2_max_concurrent_streams, Some(250));
+    assert_eq!(
+        port_override.h2_upgrade_policy,
+        Some(ferrum_edge::config::types::H2UpgradePolicy::DoNotUpgrade)
+    );
+    assert_eq!(port_override.max_retries, Some(2));
 
     // Dispatch projection: the per-port overlay reaches every referencing
     // proxy via `resolve_dispatch_port_overrides`.
@@ -454,6 +464,11 @@ fn destination_rule_top_level_connection_pool_http_fans_out_to_target_ports() {
     assert_eq!(dispatch_override.http_max_requests_per_connection, Some(75));
     assert_eq!(dispatch_override.http_idle_timeout_ms, Some(45_000));
     assert_eq!(dispatch_override.h2_max_concurrent_streams, Some(250));
+    assert_eq!(
+        dispatch_override.h2_upgrade_policy,
+        Some(ferrum_edge::config::types::H2UpgradePolicy::DoNotUpgrade)
+    );
+    assert_eq!(dispatch_override.max_retries, Some(2));
 }
 
 #[test]
@@ -490,6 +505,8 @@ fn destination_rule_port_level_connection_pool_http_overrides_top_level_fan_out(
                         max_requests_per_connection: Some(75),
                         idle_timeout_ms: Some(45_000),
                         http2_max_requests: Some(250),
+                        h2_upgrade_policy: None,
+                        max_retries: None,
                     }),
                     ..MeshTrafficPolicy::default()
                 }),
@@ -529,6 +546,8 @@ fn destination_rule_connection_pool_http_only_per_port_no_fan_out() {
                 max_requests_per_connection: Some(10),
                 idle_timeout_ms: Some(30_000),
                 http2_max_requests: Some(20),
+                h2_upgrade_policy: None,
+                max_retries: None,
             }),
             ..MeshTrafficPolicy::default()
         },

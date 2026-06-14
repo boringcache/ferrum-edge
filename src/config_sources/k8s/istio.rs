@@ -1267,16 +1267,24 @@ fn parse_keepalive_duration_seconds(
 
 /// Translate Istio `connectionPool.http` into Ferrum's typed HTTP overlay.
 ///
-/// Supported fields (T1-C scope): `maxRequestsPerConnection`, `idleTimeout`,
-/// `http2MaxRequests`. Deferred fields (`http1MaxPendingRequests`,
-/// `maxRetries`, `h2UpgradePolicy`) are detected and pushed onto
-/// `acc.warnings` so operators see the gateway acknowledging the field but
-/// otherwise dropping it — the Istio status writer
-/// (`src/k8s_controller/istio_status.rs`) promotes the same fields into the
+/// Supported fields: `maxRequestsPerConnection`, `idleTimeout`,
+/// `http2MaxRequests`, `h2UpgradePolicy`, and `maxRetries`. The only
+/// remaining deferred field, `http1MaxPendingRequests`, is detected and
+/// pushed onto `acc.warnings` so operators see the gateway acknowledging the
+/// field but otherwise dropping it — the Istio status writer
+/// (`src/k8s_controller/istio_status.rs`) promotes the same field into the
 /// DestinationRule `status.ferrum.translation.deferred_fields` list so the
-/// gap is visible from `kubectl describe`. Returning `Ok(None)` from this
+/// gap is visible from `kubectl describe` (it needs a Ferrum-side
+/// pending-request gauge to enforce). Returning `Ok(None)` from this
 /// function signals "block was present but no supported field was set" so
 /// the caller can skip emitting an empty overlay on the slice.
+///
+/// `maxRetries` semantics differ honestly from Envoy: Envoy's
+/// `connectionPool.http.maxRetries` is a cluster-wide outstanding-retry
+/// concurrency budget; Ferrum's retry model is per-request, so the field is
+/// projected as a per-request retry-count CAP (see `docs/mesh.md` and
+/// `cap_proxy_retry_for_target`). It is still validated as a positive
+/// integer here (zero/negative rejected) like the other uint32 knobs.
 fn translate_connection_pool_http(
     acc: &mut K8sAccumulator,
     object: &K8sObject,
@@ -1300,8 +1308,21 @@ fn translate_connection_pool_http(
         Some(v) => Some(translate_http_uint32(object, "http2MaxRequests", v)?),
         None => None,
     };
+    let h2_upgrade_policy = match http.get("h2UpgradePolicy") {
+        Some(v) => translate_h2_upgrade_policy(object, v)?,
+        None => None,
+    };
+    // Reject zero/negative `maxRetries` (mirrors `http2MaxRequests`). A
+    // configured cap of 0 would be ambiguous against our per-request-cap
+    // interpretation (it would zero out an existing retry policy, which is
+    // not what an operator setting an Envoy outstanding-retry budget means);
+    // fail closed at translate time rather than silently disabling retries.
+    let max_retries = match http.get("maxRetries") {
+        Some(v) => Some(translate_http_uint32(object, "maxRetries", v)?),
+        None => None,
+    };
 
-    // Deferred fields: surface an operator-visible warning so the gateway
+    // Deferred field: surface an operator-visible warning so the gateway
     // acknowledges the field but signals it is not yet enforced. The Istio
     // status writer mirrors the same field list into the DestinationRule
     // `status.ferrum.translation.deferred_fields` block so the gap is also
@@ -1309,10 +1330,10 @@ fn translate_connection_pool_http(
     // `DEFERRED_CONNECTION_POOL_HTTP_FIELDS` in
     // `src/k8s_controller/istio_status.rs` and docs/mesh.md's
     // `connectionPool.http.*` status table.
-    for field in ["http1MaxPendingRequests", "maxRetries", "h2UpgradePolicy"] {
+    for field in ["http1MaxPendingRequests"] {
         if http.get(field).is_some() {
             acc.warnings.push(format!(
-                "DestinationRule {}/{}: connectionPool.http.{field} is parsed but not yet projected; tracked as a follow-on (T1-C deferred set)",
+                "DestinationRule {}/{}: connectionPool.http.{field} is parsed but not yet projected; tracked as a follow-on (needs a Ferrum-side pending-request gauge)",
                 object.metadata.namespace, object.metadata.name
             ));
         }
@@ -1322,11 +1343,41 @@ fn translate_connection_pool_http(
         max_requests_per_connection,
         idle_timeout_ms,
         http2_max_requests,
+        h2_upgrade_policy,
+        max_retries,
     };
     if overlay == MeshConnectionPoolHttp::default() {
         Ok(None)
     } else {
         Ok(Some(overlay))
+    }
+}
+
+/// Parse `connectionPool.http.h2UpgradePolicy`. Istio's enum is `DEFAULT`,
+/// `DO_NOT_UPGRADE`, `UPGRADE`. `DEFAULT` maps to `None` (probe-driven
+/// behavior unchanged). Unknown values fail closed at translate time rather
+/// than silently defaulting — a typo should surface, not be guessed.
+fn translate_h2_upgrade_policy(
+    object: &K8sObject,
+    value: &Value,
+) -> Result<Option<crate::config::types::H2UpgradePolicy>, K8sTranslateError> {
+    use crate::config::types::H2UpgradePolicy;
+    let raw = value.as_str().ok_or_else(|| {
+        invalid_resource(
+            object,
+            "trafficPolicy.connectionPool.http.h2UpgradePolicy must be a string",
+        )
+    })?;
+    match raw {
+        "DEFAULT" => Ok(None),
+        "UPGRADE" => Ok(Some(H2UpgradePolicy::Upgrade)),
+        "DO_NOT_UPGRADE" => Ok(Some(H2UpgradePolicy::DoNotUpgrade)),
+        other => Err(invalid_resource(
+            object,
+            format!(
+                "trafficPolicy.connectionPool.http.h2UpgradePolicy '{other}' is not a valid value (expected DEFAULT, UPGRADE, or DO_NOT_UPGRADE)"
+            ),
+        )),
     }
 }
 
@@ -15038,13 +15089,12 @@ extensionProviders:
     }
 
     #[test]
-    fn destination_rule_accepts_deferred_http_fields_with_warning() {
-        // `http1MaxPendingRequests`, `maxRetries`, and `h2UpgradePolicy` are
-        // tracked T1-C follow-ons. The translator should not fail when
-        // operators set them (they would never be able to upgrade off Istio
-        // otherwise); the gateway emits an operator-visible warning per
-        // deferred field and drops them. The Istio status writer mirrors
-        // these into `status.ferrum.translation.deferred_fields`.
+    fn destination_rule_defers_only_http1_max_pending_requests_with_warning() {
+        // After F5.1, `maxRetries` and `h2UpgradePolicy` are projected and must
+        // NOT warn. Only `http1MaxPendingRequests` remains deferred (it needs a
+        // Ferrum-side pending-request gauge); the gateway emits an
+        // operator-visible warning and drops just that one. The Istio status
+        // writer mirrors only it into `status.ferrum.translation.deferred_fields`.
         let result = translate_k8s_objects(
             &[object(
                 "DestinationRule",
@@ -15064,14 +15114,20 @@ extensionProviders:
             )],
             options(),
         )
-        .expect("translation succeeds despite deferred fields");
-        for field in ["http1MaxPendingRequests", "maxRetries", "h2UpgradePolicy"] {
+        .expect("translation succeeds despite the deferred field");
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("http1MaxPendingRequests") && w.contains("not yet projected")),
+            "expected a deferred-field warning for http1MaxPendingRequests; warnings = {:?}",
+            result.warnings
+        );
+        // The now-projected fields must NOT warn.
+        for field in ["maxRetries", "h2UpgradePolicy"] {
             assert!(
-                result
-                    .warnings
-                    .iter()
-                    .any(|w| w.contains(field) && w.contains("not yet projected")),
-                "expected a deferred-field warning mentioning {field}; warnings = {:?}",
+                !result.warnings.iter().any(|w| w.contains(field)),
+                "{field} is projected now and must not warn; warnings = {:?}",
                 result.warnings
             );
         }
@@ -15083,10 +15139,153 @@ extensionProviders:
             .connection_pool_http
             .as_ref()
             .unwrap();
-        // Only the supported field landed on the overlay.
+        // The supported + newly-projected fields landed on the overlay.
         assert_eq!(http.http2_max_requests, Some(250));
+        assert_eq!(http.max_retries, Some(5));
+        assert_eq!(
+            http.h2_upgrade_policy,
+            Some(crate::config::types::H2UpgradePolicy::Upgrade)
+        );
+        // `http1MaxPendingRequests` is still dropped (no overlay slot).
         assert!(http.max_requests_per_connection.is_none());
         assert!(http.idle_timeout_ms.is_none());
+    }
+
+    #[test]
+    fn destination_rule_translates_h2_upgrade_policy_and_max_retries() {
+        use crate::config::types::H2UpgradePolicy;
+        // DO_NOT_UPGRADE + maxRetries on the top-level connectionPool.http.
+        let result = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "connectionPool": {
+                            "http": {
+                                "h2UpgradePolicy": "DO_NOT_UPGRADE",
+                                "maxRetries": 2
+                            }
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+        let dr = &result.config.mesh.unwrap().destination_rules[0];
+        let http = dr
+            .traffic_policy
+            .as_ref()
+            .unwrap()
+            .connection_pool_http
+            .as_ref()
+            .unwrap();
+        assert_eq!(http.h2_upgrade_policy, Some(H2UpgradePolicy::DoNotUpgrade));
+        assert_eq!(http.max_retries, Some(2));
+        // No warning for the now-projected fields.
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|w| w.contains("h2UpgradePolicy") || w.contains("maxRetries")),
+            "projected fields must not warn; warnings = {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn destination_rule_h2_upgrade_policy_default_maps_to_none() {
+        // Istio's `DEFAULT` means "probe-driven" — it must map to `None` on the
+        // overlay, not to a Ferrum enum variant, so it leaves dispatch
+        // unchanged. With only `DEFAULT` set the overlay is effectively empty.
+        let result = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "connectionPool": {"http": {"h2UpgradePolicy": "DEFAULT"}}
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+        let dr = &result.config.mesh.unwrap().destination_rules[0];
+        // DEFAULT-only block synthesizes no overlay (matches the deferred-only
+        // "block present but nothing to project" contract).
+        assert!(
+            dr.traffic_policy
+                .as_ref()
+                .and_then(|p| p.connection_pool_http.as_ref())
+                .is_none(),
+            "DEFAULT-only http block must not synthesize an overlay"
+        );
+    }
+
+    #[test]
+    fn destination_rule_rejects_invalid_h2_upgrade_policy() {
+        let err = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "connectionPool": {"http": {"h2UpgradePolicy": "MAYBE"}}
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("unknown h2UpgradePolicy must fail closed");
+        assert!(
+            err.to_string().contains("h2UpgradePolicy")
+                && err.to_string().contains("not a valid value"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn destination_rule_rejects_zero_max_retries() {
+        let err = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "connectionPool": {"http": {"maxRetries": 0}}
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("zero maxRetries must fail");
+        assert!(
+            err.to_string().contains("maxRetries must be positive"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn destination_rule_rejects_negative_max_retries() {
+        let err = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "connectionPool": {"http": {"maxRetries": -1}}
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("negative maxRetries must fail");
+        assert!(
+            err.to_string().contains("maxRetries must be positive"),
+            "unexpected: {err}"
+        );
     }
 
     // ── Sidecar translator ──────────────────────────────────────────────

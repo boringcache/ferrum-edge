@@ -272,30 +272,83 @@ fn dr_connection_pool_http_http2_max_requests() {
     assert_eq!(http.http2_max_requests, Some(100));
 }
 
-/// Deferred T1-C set: `http1MaxPendingRequests` / `maxRetries` / `h2UpgradePolicy`.
-/// Translator parses them and emits an operator-visible warning, but does not
-/// project. The conformance assertion is the translation does not fail when the
-/// field is set, and no overlay slot is populated. The Istio controller also
-/// surfaces these in the DestinationRule `status.ferrum.translation.deferred_fields`.
+/// `trafficPolicy.connectionPool.http.h2UpgradePolicy` — F5.1.
+/// Projects onto `Proxy.h2_upgrade_policy` per port and drives the plain-HTTPS
+/// H2-vs-H1 dispatch fork (`DO_NOT_UPGRADE` forces reqwest/H1; `UPGRADE` prefers
+/// direct-H2 incl. for `Unknown` targets, fail-safe against proven-Unsupported).
 #[test]
-fn dr_connection_pool_http_deferred_fields_warned() {
+fn dr_connection_pool_http_h2_upgrade_policy() {
     register_feature!(
         category = CATEGORY,
-        feature = "trafficPolicy.connectionPool.http.{http1MaxPendingRequests,maxRetries,h2UpgradePolicy}",
-        status = Status::Deferred,
-        notes = "T1-C deferred set: translator warns + surfaces in status deferred_fields; no projection slot today.",
+        feature = "trafficPolicy.connectionPool.http.h2UpgradePolicy",
+        status = Status::Supported,
+        notes = "F5.1: projects onto Proxy.h2_upgrade_policy; consulted at the plain-HTTPS h1-vs-h2 dispatch fork. DEFAULT maps to None; unknown values rejected.",
     );
     let dr = translated(json!({
         "host": "echo.default.svc.cluster.local",
         "trafficPolicy": {
-            "connectionPool": {"http": {
-                "http1MaxPendingRequests": 50,
-                "maxRetries": 3,
-                "h2UpgradePolicy": "UPGRADE"
-            }}
+            "connectionPool": {"http": {"h2UpgradePolicy": "DO_NOT_UPGRADE"}}
         }
     }));
-    // Translation must succeed and none of the deferred fields produce an overlay.
+    let http = dr
+        .traffic_policy
+        .expect("traffic policy")
+        .connection_pool_http
+        .expect("http overlay");
+    assert_eq!(
+        http.h2_upgrade_policy,
+        Some(ferrum_edge::config::types::H2UpgradePolicy::DoNotUpgrade)
+    );
+}
+
+/// `trafficPolicy.connectionPool.http.maxRetries` — F5.1.
+/// Interpreted as a per-request retry-count CAP (an upper bound on
+/// `Proxy.retry.max_retries`), NOT Envoy's cluster-wide outstanding-retry
+/// budget. Never increases retries and never enables retries when the proxy has
+/// no retry policy. Zero/negative rejected at translate time.
+#[test]
+fn dr_connection_pool_http_max_retries() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "trafficPolicy.connectionPool.http.maxRetries",
+        status = Status::Supported,
+        notes = "F5.1: per-request retry-count CAP (min(existing, dr); no-enable when no policy) — honest reinterpretation of Envoy's cluster-wide outstanding-retry budget.",
+    );
+    let dr = translated(json!({
+        "host": "echo.default.svc.cluster.local",
+        "trafficPolicy": {
+            "connectionPool": {"http": {"maxRetries": 2}}
+        }
+    }));
+    let http = dr
+        .traffic_policy
+        .expect("traffic policy")
+        .connection_pool_http
+        .expect("http overlay");
+    assert_eq!(http.max_retries, Some(2));
+}
+
+/// Deferred set after F5.1: only `http1MaxPendingRequests` remains.
+/// Translator parses it and emits an operator-visible warning, but does not
+/// project (it needs a Ferrum-side pending-request gauge). The conformance
+/// assertion is that translation does not fail and no overlay slot is populated.
+/// The Istio controller also surfaces it in
+/// `status.ferrum.translation.deferred_fields`.
+#[test]
+fn dr_connection_pool_http_http1_max_pending_requests_deferred() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "trafficPolicy.connectionPool.http.http1MaxPendingRequests",
+        status = Status::Deferred,
+        notes = "Only remaining deferred HTTP knob: translator warns + surfaces in status deferred_fields; needs a Ferrum-side pending-request gauge.",
+    );
+    let dr = translated(json!({
+        "host": "echo.default.svc.cluster.local",
+        "trafficPolicy": {
+            "connectionPool": {"http": {"http1MaxPendingRequests": 50}}
+        }
+    }));
+    // Translation must succeed and the deferred-only block produces no overlay.
     assert!(
         dr.traffic_policy
             .as_ref()

@@ -1288,6 +1288,47 @@ pub(crate) fn can_dispatch_direct_http2_pool(
         && max_response_body_size_bytes == 0
 }
 
+/// Resolve whether plain-HTTPS dispatch should take the direct HTTP/2 pool,
+/// folding in the DestinationRule `connectionPool.http.h2UpgradePolicy`
+/// override on top of the capability-registry verdict.
+///
+/// `can_dispatch` is the body/limit/`enable_http2` gate
+/// ([`can_dispatch_direct_http2_pool`]). `supports` is the registry's
+/// `h2_tls == Supported`; `known_unsupported` is `h2_tls == Unsupported`
+/// (absence / `Unknown` is neither). `requires_sni` forces direct-H2 because
+/// reqwest cannot apply a per-request backend SNI.
+///
+/// Policy interaction (scope is strictly plain-HTTPS h1-vs-h2; gRPC and
+/// HBONE/mesh-mTLS never reach this):
+/// * `DoNotUpgrade` → never take direct-H2 (force reqwest/H1), UNLESS a
+///   backend-TLS SNI override mandates it (`requires_sni` wins).
+/// * `Upgrade` → also take direct-H2 when the registry verdict is `Unknown`
+///   (no record yet / `h2_tls == Unknown`), as a hint to try H2 instead of
+///   defaulting to reqwest — but stays fail-safe: a target proven
+///   `Unsupported` is never forced onto H2.
+/// * `DEFAULT`/absent (`None`) → unchanged probe-driven behavior (take H2
+///   only when `supports` or `requires_sni`).
+pub(crate) fn should_dispatch_direct_h2(
+    can_dispatch: bool,
+    supports: bool,
+    known_unsupported: bool,
+    requires_sni: bool,
+    policy: Option<crate::config::types::H2UpgradePolicy>,
+) -> bool {
+    use crate::config::types::H2UpgradePolicy;
+    if !can_dispatch {
+        return false;
+    }
+    // DO_NOT_UPGRADE forces reqwest/H1 unless a per-request SNI mandates H2.
+    if matches!(policy, Some(H2UpgradePolicy::DoNotUpgrade)) && !requires_sni {
+        return false;
+    }
+    // UPGRADE treats an unclassified target as a hint to try H2, but never
+    // overrides a proven-Unsupported verdict.
+    let prefer_upgrade = matches!(policy, Some(H2UpgradePolicy::Upgrade)) && !known_unsupported;
+    supports || requires_sni || prefer_upgrade
+}
+
 pub(crate) fn supports_native_http3_backend(
     state: &ProxyState,
     proxy: &Proxy,
@@ -11720,6 +11761,14 @@ async fn handle_proxy_request_inner(
     let upstream_is_fallback = selection.is_fallback;
     let sticky_cookie_needed = selection.sticky_cookie_needed;
 
+    // Apply the DestinationRule `connectionPool.http.maxRetries` per-request
+    // retry-count CAP now that the dispatch target's port is known, before any
+    // retry loop (HTTP / gRPC / WebSocket) reads `proxy.retry`. This caps an
+    // existing retry policy to `min(existing, dr_max)`; it never enables retries
+    // when the proxy has none. No-op (no Arc clone) in the common case.
+    let proxy = cap_proxy_retry_for_target(proxy, upstream_target.as_deref());
+    ctx.matched_proxy = Some(Arc::clone(&proxy));
+
     let backend_admission_plugins = plugin_cache_view.backend_admission_plugins();
     let mut backend_admission_permits: Option<BackendAdmissionPermitSet> = None;
 
@@ -15066,11 +15115,20 @@ pub(crate) fn resolve_effective_proxy_for_target<'a>(
         .as_ref()
         .filter(|t| **t != proxy.resolved_tls);
 
+    // Per-port `h2UpgradePolicy` (DestinationRule `connectionPool.http`). Drives
+    // the plain-HTTPS H2-vs-H1 dispatch fork in `proxy_to_backend` via the
+    // effective proxy's `h2_upgrade_policy`. Project it when the per-port value
+    // differs from what the proxy already carries.
+    let h2_upgrade_override = override_config
+        .h2_upgrade_policy
+        .filter(|new| Some(*new) != proxy.h2_upgrade_policy);
+
     if connect_override.is_none()
         && h2_streams_override.is_none()
         && idle_seconds_override.is_none()
         && max_reqs_override.is_none()
         && tls_override.is_none()
+        && h2_upgrade_override.is_none()
     {
         return std::borrow::Cow::Borrowed(proxy);
     }
@@ -15091,7 +15149,59 @@ pub(crate) fn resolve_effective_proxy_for_target<'a>(
     if let Some(tls) = tls_override {
         owned.resolved_tls = tls.clone();
     }
+    if let Some(policy) = h2_upgrade_override {
+        owned.h2_upgrade_policy = Some(policy);
+    }
     std::borrow::Cow::Owned(owned)
+}
+
+/// Cap a proxy's per-request retry count from the DestinationRule
+/// `connectionPool.http.maxRetries` override for the dispatch target's port.
+///
+/// **Honest semantics (read this):** Envoy's `connectionPool.http.maxRetries`
+/// is a *cluster-wide outstanding-retry concurrency budget*. Ferrum's retry
+/// model (`Proxy.retry`) is *per-request*, so we interpret DR `maxRetries` as
+/// an upper bound on the per-request retry count, NOT Envoy's gauge. See
+/// `docs/mesh.md` "DestinationRule maxRetries semantics".
+///
+/// Precedence / no-double-retry:
+/// * If the proxy already has a retry policy, the effective `max_retries`
+///   becomes `min(existing, dr_max_retries)` — never *increases* retries.
+/// * If the proxy has NO retry policy, DR `maxRetries` alone does NOT enable
+///   retries (an Istio `maxRetries` is a budget, not a retry-policy enabler),
+///   so we leave `retry == None`.
+///
+/// Applied once, in `handle_proxy_request_inner`, right after the dispatch
+/// target (hence its port) is resolved and BEFORE `proxy.retry` is consumed
+/// by the HTTP / gRPC / WebSocket retry loops. Returns the same `Arc` (no
+/// clone) in the common case: no port override, no `maxRetries`, no retry
+/// policy, or the cap is already >= the configured count.
+pub(crate) fn cap_proxy_retry_for_target(
+    proxy: Arc<Proxy>,
+    upstream_target: Option<&UpstreamTarget>,
+) -> Arc<Proxy> {
+    // No retry policy → DR maxRetries does not synthesize one.
+    let Some(existing) = proxy.retry.as_ref() else {
+        return proxy;
+    };
+    let Some(overrides) = proxy.dispatch_port_overrides.as_ref() else {
+        return proxy;
+    };
+    let Some(target) = upstream_target else {
+        return proxy;
+    };
+    let Some(cap) = overrides.get(&target.port).and_then(|o| o.max_retries) else {
+        return proxy;
+    };
+    if existing.max_retries <= cap {
+        // Cap does not reduce the configured count — nothing to do.
+        return proxy;
+    }
+    let mut owned = (*proxy).clone();
+    if let Some(retry) = owned.retry.as_mut() {
+        retry.max_retries = cap;
+    }
+    Arc::new(owned)
 }
 
 /// Resolve the DestinationRule `connectionPool.tcp.maxConnections` cap for the
@@ -15902,6 +16012,18 @@ async fn proxy_to_backend(
             state.max_request_body_size_bytes,
             state.max_response_body_size_bytes,
         );
+        // Fold the DestinationRule `connectionPool.http.h2UpgradePolicy` override
+        // (projected onto the effective proxy) into the registry verdict. Scope
+        // is strictly this plain-HTTPS h1-vs-h2 fork — gRPC (always H2) and
+        // HBONE/mesh-mTLS transports never reach here. See
+        // `should_dispatch_direct_h2` for the exact policy interaction.
+        let direct_h2_dispatch = should_dispatch_direct_h2(
+            direct_h2_can_dispatch,
+            direct_h2_supports,
+            direct_h2_known_unsupported,
+            requires_direct_h2_for_sni,
+            direct_h2_proxy.h2_upgrade_policy,
+        );
         if requires_direct_h2_for_sni && direct_h2_known_unsupported {
             debug!(
                 proxy_id = %proxy.id,
@@ -15914,7 +16036,7 @@ async fn proxy_to_backend(
                 None,
             );
         }
-        if direct_h2_can_dispatch && (direct_h2_supports || requires_direct_h2_for_sni) {
+        if direct_h2_dispatch {
             // Gate adaptive-concurrency admission BEFORE opening the H2 sender.
             // `get_sender()` can dial the backend, so admitting afterward would
             // let a capacity-rejected request still create a connection and
@@ -25056,6 +25178,213 @@ mod tests {
         // Unchanged fields preserved from proxy:
         assert_eq!(owned.pool_idle_timeout_seconds, Some(120));
         assert_eq!(owned.pool_max_requests_per_connection, Some(40));
+    }
+
+    // ── F5.1: h2UpgradePolicy projection + dispatch decision ─────────────
+
+    /// Build a test proxy carrying a per-port `h2_upgrade_policy` override.
+    fn proxy_with_h2_upgrade_override(policy: crate::config::types::H2UpgradePolicy) -> Proxy {
+        let mut proxy = proxy_with_port_overrides_for_test(5000, &[]);
+        proxy.dispatch_port_overrides = Some(HashMap::from([(
+            8080u16,
+            crate::config::types::ResolvedPortOverride {
+                h2_upgrade_policy: Some(policy),
+                ..Default::default()
+            },
+        )]));
+        proxy
+    }
+
+    #[test]
+    fn resolve_effective_proxy_projects_h2_upgrade_policy_per_port() {
+        use crate::config::types::H2UpgradePolicy;
+        let proxy = proxy_with_h2_upgrade_override(H2UpgradePolicy::DoNotUpgrade);
+        let target = target_for_test(8080);
+        let effective = resolve_effective_proxy_for_target(&proxy, Some(&target));
+        assert!(
+            matches!(effective, std::borrow::Cow::Owned(_)),
+            "differing h2_upgrade_policy must take the owned-clone branch"
+        );
+        assert_eq!(
+            effective.h2_upgrade_policy,
+            Some(H2UpgradePolicy::DoNotUpgrade)
+        );
+        assert!(
+            proxy.h2_upgrade_policy.is_none(),
+            "original proxy is untouched"
+        );
+    }
+
+    #[test]
+    fn resolve_effective_proxy_borrows_when_h2_upgrade_policy_matches() {
+        use crate::config::types::H2UpgradePolicy;
+        let mut proxy = proxy_with_h2_upgrade_override(H2UpgradePolicy::Upgrade);
+        proxy.h2_upgrade_policy = Some(H2UpgradePolicy::Upgrade);
+        let target = target_for_test(8080);
+        let effective = resolve_effective_proxy_for_target(&proxy, Some(&target));
+        assert!(
+            matches!(effective, std::borrow::Cow::Borrowed(_)),
+            "matching h2_upgrade_policy must avoid the owned clone"
+        );
+    }
+
+    #[test]
+    fn should_dispatch_direct_h2_default_policy_follows_capability() {
+        // DEFAULT/absent: probe-driven. H2 only when Supported (or SNI-forced).
+        assert!(
+            should_dispatch_direct_h2(true, true, false, false, None),
+            "Supported + can_dispatch must take direct-H2"
+        );
+        assert!(
+            !should_dispatch_direct_h2(true, false, false, false, None),
+            "Unknown (not Supported) + no SNI must NOT take direct-H2"
+        );
+        assert!(
+            !should_dispatch_direct_h2(false, true, false, false, None),
+            "can_dispatch=false always blocks direct-H2"
+        );
+    }
+
+    #[test]
+    fn should_dispatch_direct_h2_do_not_upgrade_forces_h1_even_when_supported() {
+        use crate::config::types::H2UpgradePolicy;
+        // The key behavior: DO_NOT_UPGRADE must NOT take direct-H2 even when the
+        // capability registry proves h2_tls Supported.
+        assert!(
+            !should_dispatch_direct_h2(
+                true,
+                true, // supports = Supported
+                false,
+                false, // no SNI
+                Some(H2UpgradePolicy::DoNotUpgrade),
+            ),
+            "DO_NOT_UPGRADE must force reqwest/H1 even when h2_tls is Supported"
+        );
+        // ...unless a backend-TLS SNI override mandates direct-H2 (reqwest can't
+        // do per-request SNI). SNI wins; documented.
+        assert!(
+            should_dispatch_direct_h2(
+                true,
+                false,
+                false,
+                true, // requires_sni
+                Some(H2UpgradePolicy::DoNotUpgrade),
+            ),
+            "a backend-TLS SNI override still requires direct-H2 under DO_NOT_UPGRADE"
+        );
+    }
+
+    #[test]
+    fn should_dispatch_direct_h2_upgrade_tries_unknown_but_not_unsupported() {
+        use crate::config::types::H2UpgradePolicy;
+        // UPGRADE: try H2 even when capability is Unknown (no record yet).
+        assert!(
+            should_dispatch_direct_h2(
+                true,
+                false, // not Supported...
+                false, // ...and not known-Unsupported → Unknown
+                false,
+                Some(H2UpgradePolicy::Upgrade),
+            ),
+            "UPGRADE must try direct-H2 for an Unknown target"
+        );
+        // Fail-safe: never force H2 against a proven-Unsupported target.
+        assert!(
+            !should_dispatch_direct_h2(
+                true,
+                false,
+                true, // known_unsupported
+                false,
+                Some(H2UpgradePolicy::Upgrade),
+            ),
+            "UPGRADE must NOT force direct-H2 against a proven-Unsupported target"
+        );
+    }
+
+    // ── F5.1: maxRetries per-request cap ─────────────────────────────────
+
+    fn proxy_with_max_retries_override(max_retries: Option<u32>) -> Arc<Proxy> {
+        let mut proxy = proxy_with_port_overrides_for_test(5000, &[]);
+        proxy.dispatch_port_overrides = Some(HashMap::from([(
+            8080u16,
+            crate::config::types::ResolvedPortOverride {
+                max_retries,
+                ..Default::default()
+            },
+        )]));
+        Arc::new(proxy)
+    }
+
+    #[test]
+    fn cap_proxy_retry_caps_existing_larger_policy() {
+        // Existing retry policy max_retries=5; DR cap=2 → effective 2.
+        let mut inner = (*proxy_with_max_retries_override(Some(2))).clone();
+        inner.retry = Some(crate::config::types::RetryConfig {
+            max_retries: 5,
+            ..Default::default()
+        });
+        let proxy = Arc::new(inner);
+        let target = target_for_test(8080);
+        let capped = cap_proxy_retry_for_target(proxy, Some(&target));
+        assert_eq!(
+            capped.retry.as_ref().unwrap().max_retries,
+            2,
+            "DR maxRetries must cap an existing larger policy to the DR value"
+        );
+    }
+
+    #[test]
+    fn cap_proxy_retry_never_increases_retries() {
+        // Existing max_retries=1; DR cap=4 → stays 1 (min, never increase).
+        let mut inner = (*proxy_with_max_retries_override(Some(4))).clone();
+        inner.retry = Some(crate::config::types::RetryConfig {
+            max_retries: 1,
+            ..Default::default()
+        });
+        let proxy = Arc::new(inner);
+        let target = target_for_test(8080);
+        let capped = cap_proxy_retry_for_target(proxy.clone(), Some(&target));
+        assert_eq!(
+            capped.retry.as_ref().unwrap().max_retries,
+            1,
+            "DR maxRetries must never increase an existing smaller retry count"
+        );
+        assert!(
+            Arc::ptr_eq(&proxy, &capped),
+            "no-op cap must return the same Arc (no clone)"
+        );
+    }
+
+    #[test]
+    fn cap_proxy_retry_does_not_enable_retries_without_policy() {
+        // No retry policy + DR maxRetries → still no retry policy (a budget is
+        // not a retry-policy enabler).
+        let proxy = proxy_with_max_retries_override(Some(3));
+        assert!(proxy.retry.is_none());
+        let target = target_for_test(8080);
+        let capped = cap_proxy_retry_for_target(proxy.clone(), Some(&target));
+        assert!(
+            capped.retry.is_none(),
+            "DR maxRetries must NOT synthesize a retry policy when none exists"
+        );
+        assert!(
+            Arc::ptr_eq(&proxy, &capped),
+            "no-policy path must return the same Arc (no clone)"
+        );
+    }
+
+    #[test]
+    fn cap_proxy_retry_noop_without_target_or_override() {
+        // No upstream target → cannot resolve a port → no cap.
+        let mut inner = (*proxy_with_max_retries_override(Some(1))).clone();
+        inner.retry = Some(crate::config::types::RetryConfig {
+            max_retries: 5,
+            ..Default::default()
+        });
+        let proxy = Arc::new(inner);
+        let capped = cap_proxy_retry_for_target(proxy.clone(), None);
+        assert_eq!(capped.retry.as_ref().unwrap().max_retries, 5);
+        assert!(Arc::ptr_eq(&proxy, &capped));
     }
 
     #[test]

@@ -263,6 +263,32 @@ pub struct SubsetTrafficPolicy {
     pub passive_health_check: Option<PassiveHealthCheck>,
 }
 
+/// Whether plain-HTTP backend dispatch may upgrade to HTTP/2.
+///
+/// Mapped from Istio DestinationRule
+/// `connectionPool.http.h2UpgradePolicy`. Only the plain-HTTPS h1-vs-h2
+/// dispatch fork in `proxy_to_backend` consults this — it does NOT touch
+/// gRPC (always H2), HBONE, or mesh-mTLS transport selection. Projected
+/// onto `Proxy.h2_upgrade_policy` per target port.
+///
+/// Istio's `DEFAULT` maps to "field absent" (`Option::None` on the proxy),
+/// so this enum only carries the two operator-overriding modes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum H2UpgradePolicy {
+    /// Istio `UPGRADE`: prefer HTTP/2 to the backend. Used as a hint when
+    /// the capability registry has not yet classified the target
+    /// (`Unknown` → try direct-H2 instead of defaulting to reqwest/H1).
+    /// Stays fail-safe: a target proven `Unsupported` (e.g. ALPN
+    /// negotiated H1) is NOT forced onto H2.
+    Upgrade,
+    /// Istio `DO_NOT_UPGRADE`: force the HTTP/1.1 path (reqwest). Skips the
+    /// direct-H2 pool even when the capability registry marks the target
+    /// `h2_tls` Supported. (A backend-TLS SNI override still requires
+    /// direct-H2 because reqwest cannot apply a per-request SNI — that case
+    /// wins and is documented.)
+    DoNotUpgrade,
+}
+
 /// Per-destination-port traffic policy overrides on an upstream.
 ///
 /// Populated from an Istio DestinationRule's `trafficPolicy.portLevelSettings[]`
@@ -364,6 +390,22 @@ pub struct UpstreamPortOverride {
     /// its own pool rather than sharing a connection with another port.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<BackendTlsConfig>,
+    /// Per-port HTTP/2 upgrade policy, mapped from DestinationRule
+    /// `connectionPool.http.h2UpgradePolicy`. Projected onto the per-target
+    /// effective proxy's `h2_upgrade_policy` and consulted at the
+    /// plain-HTTPS H2-vs-H1 dispatch fork. `DEFAULT`/absent leaves probe-driven
+    /// behavior unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub h2_upgrade_policy: Option<H2UpgradePolicy>,
+    /// Per-port retry-count cap, mapped from DestinationRule
+    /// `connectionPool.http.maxRetries`. Interpreted as an upper bound on the
+    /// per-request `Proxy.retry.max_retries` (NOT Envoy's cluster-wide
+    /// outstanding-retry budget — see `docs/mesh.md`). Applied via
+    /// `cap_proxy_retry_for_target` once the dispatch target port is known:
+    /// effective `max_retries = min(existing, this)`; never increases retries
+    /// and never synthesizes a retry policy when the proxy has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_retries: Option<u32>,
 }
 
 /// Per-target TCP keepalive override. Mirrors Istio's
@@ -419,6 +461,8 @@ pub struct ResolvedPortOverride {
     pub http_idle_timeout_ms: Option<u64>,
     pub h2_max_concurrent_streams: Option<u32>,
     pub tls: Option<BackendTlsConfig>,
+    pub h2_upgrade_policy: Option<H2UpgradePolicy>,
+    pub max_retries: Option<u32>,
 }
 
 impl ResolvedPortOverride {
@@ -439,6 +483,8 @@ impl ResolvedPortOverride {
             http_idle_timeout_ms: value.http_idle_timeout_ms,
             h2_max_concurrent_streams: value.h2_max_concurrent_streams,
             tls,
+            h2_upgrade_policy: value.h2_upgrade_policy,
+            max_retries: value.max_retries,
         };
         (!resolved.is_empty()).then_some(resolved)
     }
@@ -455,6 +501,8 @@ impl ResolvedPortOverride {
             && self.http_idle_timeout_ms.is_none()
             && self.h2_max_concurrent_streams.is_none()
             && self.tls.is_none()
+            && self.h2_upgrade_policy.is_none()
+            && self.max_retries.is_none()
     }
 }
 
@@ -1661,6 +1709,18 @@ pub struct Proxy {
     /// When set, overrides the global `FERRUM_HTTP3_CONNECTIONS_PER_BACKEND` default.
     #[serde(default)]
     pub pool_http3_connections_per_backend: Option<usize>,
+    /// Istio DestinationRule `connectionPool.http.h2UpgradePolicy`. Controls
+    /// the plain-HTTPS backend HTTP/1.1-vs-HTTP/2 dispatch fork in
+    /// `proxy_to_backend`: `DoNotUpgrade` forces the reqwest/H1 path even when
+    /// the capability registry marks the target H2-capable; `Upgrade` prefers
+    /// direct-H2 (and treats an `Unknown` capability as a hint to try H2
+    /// instead of defaulting to reqwest). `None` (`DEFAULT`/absent) leaves the
+    /// probe-driven behavior unchanged. Populated at dispatch time by
+    /// `resolve_effective_proxy_for_target` from
+    /// `Upstream.port_overrides[port].h2_upgrade_policy`. Does NOT affect gRPC
+    /// (always H2) or HBONE/mesh-mTLS transport selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub h2_upgrade_policy: Option<H2UpgradePolicy>,
     /// Istio DestinationRule `connectionPool.http.maxRequestsPerConnection`
     /// (wire-projected). Populated at admit time directly, and at dispatch
     /// time by `resolve_effective_proxy_for_target` from

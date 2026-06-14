@@ -1218,6 +1218,7 @@ fn east_west_gateway_proxy(gateway: &EastWestGateway, listen_port: u16) -> Proxy
         pool_http2_max_frame_size: None,
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
+        h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
         upstream_id: None,
         upstream_subset: None,
@@ -1471,6 +1472,7 @@ fn east_west_service_proxy(
         pool_http2_max_frame_size: None,
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
+        h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
         upstream_id: Some(upstream_id.to_string()),
         upstream_subset: None,
@@ -2356,6 +2358,7 @@ fn mesh_inbound_loopback_proxy_to(
         pool_http2_max_frame_size: None,
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
+        h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
         upstream_id: None,
         upstream_subset: None,
@@ -2433,6 +2436,7 @@ pub(crate) fn mesh_inbound_hbone_relay_proxy(host: &str, port: u16) -> Proxy {
         pool_http2_max_frame_size: None,
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
+        h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
         upstream_id: None,
         upstream_subset: None,
@@ -2853,6 +2857,7 @@ pub(crate) fn mesh_outbound_tcp_relay_proxy(
         pool_http2_max_frame_size: None,
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
+        h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
         upstream_id: Some(upstream_id.to_string()),
         upstream_subset: None,
@@ -3040,6 +3045,7 @@ fn mesh_outbound_route_proxy(
         pool_http2_max_frame_size: None,
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
+        h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
         upstream_id: Some(upstream_id.to_string()),
         upstream_subset: None,
@@ -3763,6 +3769,12 @@ fn apply_connection_pool_http_to_port_override(
     }
     if let Some(max_streams) = http.http2_max_requests {
         slot.h2_max_concurrent_streams = Some(max_streams);
+    }
+    if let Some(policy) = http.h2_upgrade_policy {
+        slot.h2_upgrade_policy = Some(policy);
+    }
+    if let Some(max_retries) = http.max_retries {
+        slot.max_retries = Some(max_retries);
     }
 }
 
@@ -4785,6 +4797,7 @@ fn egress_gateway_proxy(
         pool_http2_max_frame_size: None,
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
+        h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
         upstream_id: Some(upstream_id.to_string()),
         upstream_subset: None,
@@ -4873,6 +4886,7 @@ fn stream_egress_gateway_proxy(
         pool_http2_max_frame_size: None,
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
+        h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
         upstream_id: Some(upstream_id.to_string()),
         upstream_subset: None,

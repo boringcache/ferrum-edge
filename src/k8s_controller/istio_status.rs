@@ -567,9 +567,10 @@ fn destination_rule_status(
 
     let (accepted, reason, message, detail) = match result {
         Ok(_translation) => {
-            // T1-C deferred fields: the parsed-but-dropped connectionPool.http
-            // knobs the translator only warns on (http1MaxPendingRequests /
-            // maxRetries / h2UpgradePolicy).
+            // Deferred field: the parsed-but-dropped connectionPool.http knob
+            // the translator only warns on (http1MaxPendingRequests — the only
+            // one remaining; maxRetries + h2UpgradePolicy became APPLIED in
+            // F5.1).
             // Now APPLIED (no longer deferred): per-subset
             // connectionPool.tcp.connectTimeout (overrides backend_connect_timeout_ms
             // for subset-bound proxies), portLevelSettings[].tls (per-port backend
@@ -623,21 +624,13 @@ fn destination_rule_status(
 /// `connectionPool.http` knobs the translator parses but drops with an
 /// operator-visible warning (see `translate_connection_pool_http` in
 /// `src/config_sources/k8s/istio.rs`). Keep this list in sync with the
-/// translator's deferred-field loop.
-const DEFERRED_CONNECTION_POOL_HTTP_FIELDS: &[(&str, &str)] = &[
-    (
-        "http1MaxPendingRequests",
-        "trafficPolicy.connectionPool.http.http1MaxPendingRequests (parsed but not enforced)",
-    ),
-    (
-        "maxRetries",
-        "trafficPolicy.connectionPool.http.maxRetries (parsed but not enforced)",
-    ),
-    (
-        "h2UpgradePolicy",
-        "trafficPolicy.connectionPool.http.h2UpgradePolicy (parsed but not enforced)",
-    ),
-];
+/// translator's deferred-field loop. `maxRetries` and `h2UpgradePolicy` are
+/// now projected and enforced, so only `http1MaxPendingRequests` remains
+/// deferred (it needs a Ferrum-side pending-request gauge).
+const DEFERRED_CONNECTION_POOL_HTTP_FIELDS: &[(&str, &str)] = &[(
+    "http1MaxPendingRequests",
+    "trafficPolicy.connectionPool.http.http1MaxPendingRequests (parsed but not enforced)",
+)];
 
 /// Collect the deferred `connectionPool.http.*` field labels present under
 /// the top-level `trafficPolicy`, `trafficPolicy.portLevelSettings[]`, or any
@@ -1807,6 +1800,9 @@ mod tests {
 
     #[test]
     fn destination_rule_with_port_level_http_deferred_field_surfaces_deferred_field() {
+        // `http1MaxPendingRequests` is the only remaining deferred HTTP knob
+        // (maxRetries / h2UpgradePolicy became applied in F5.1). It must still
+        // surface in `deferred_fields` when set at the port level.
         let obj = object(
             "networking.istio.io/v1",
             "DestinationRule",
@@ -1818,7 +1814,7 @@ mod tests {
                         {
                             "port": { "number": 8080 },
                             "connectionPool": {
-                                "http": { "maxRetries": 3 }
+                                "http": { "http1MaxPendingRequests": 64 }
                             }
                         }
                     ]
@@ -1834,8 +1830,10 @@ mod tests {
             .filter_map(Value::as_str)
             .collect();
         assert!(
-            deferred.iter().any(|f| f.contains("maxRetries")),
-            "deferred_fields should mention port-level maxRetries, got {deferred:?}"
+            deferred
+                .iter()
+                .any(|f| f.contains("http1MaxPendingRequests")),
+            "deferred_fields should mention port-level http1MaxPendingRequests, got {deferred:?}"
         );
     }
 
