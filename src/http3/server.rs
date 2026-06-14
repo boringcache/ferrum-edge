@@ -2012,7 +2012,7 @@ async fn handle_h3_request(
             let body_was_prebuffered = prebuffered_body_data.is_some();
             let mut body_data = prebuffered_body_data.take().unwrap_or_default();
             if !body_was_prebuffered {
-                while let Some(chunk) = stream.recv_data().await.map_err(|e| {
+                while let Some(chunk) = stream.recv_data().await.inspect_err(|_e| {
                     // Client read error during cross-protocol prebuffering,
                     // before cross_protocol::run (which would release a
                     // reserved HALF_OPEN probe). Release it here so an aborted
@@ -2035,7 +2035,6 @@ async fn handle_h3_request(
                         false,
                         backend_start.elapsed(),
                     );
-                    e
                 })? {
                     let bytes = chunk.chunk();
                     if content_length_limit > 0
@@ -2987,7 +2986,7 @@ async fn handle_h3_request(
     let body_was_prebuffered = prebuffered_body_data.is_some();
     let mut body_data = prebuffered_body_data.take().unwrap_or_default();
     if !body_was_prebuffered {
-        while let Some(chunk) = stream.recv_data().await.map_err(|e| {
+        while let Some(chunk) = stream.recv_data().await.inspect_err(|_e| {
             // Client read error while buffering the request body, before
             // backend dispatch. The CB check above may have reserved a
             // HALF_OPEN probe; release it so the breaker isn't wedged,
@@ -2998,7 +2997,6 @@ async fn handle_h3_request(
                 cb_target_key.as_deref(),
                 cb_is_half_open_probe,
             );
-            e
         })? {
             let bytes = chunk.chunk();
             if state.max_request_body_size_bytes > 0
