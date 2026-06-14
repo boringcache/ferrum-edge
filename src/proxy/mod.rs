@@ -12458,17 +12458,11 @@ async fn handle_proxy_request_inner(
                 // not feed plugins (or the wire) the bogus header copy, so
                 // the trailing value wins in the view and the header copy is
                 // stripped on the non-empty wire path below.
-                let mut plugin_response_headers = response_headers.clone();
-                let mut header_shadowed_trailer_keys: HashSet<String> = HashSet::new();
-                for (k, v) in &response_trailers {
-                    if response_headers.contains_key(k)
-                        && !grpc_proxy::is_reserved_grpc_terminal_metadata(k)
-                    {
-                        header_shadowed_trailer_keys.insert(k.clone());
-                    } else {
-                        plugin_response_headers.insert(k.clone(), v.clone());
-                    }
-                }
+                let (mut plugin_response_headers, header_shadowed_trailer_keys) =
+                    grpc_proxy::build_grpc_plugin_header_view(
+                        &response_headers,
+                        &response_trailers,
+                    );
 
                 // after_proxy hooks
                 let mut after_proxy_rejected = false;
@@ -12681,19 +12675,12 @@ async fn handle_proxy_request_inner(
                     // hook left it untouched, keep the backend's true trailer
                     // value (faithful split wire shape). Removal of a shadowed
                     // key still suppresses the hidden trailer.
-                    response_trailers.retain(|k, v| match plugin_response_headers.get(k) {
-                        Some(plugin_value) => {
-                            if header_shadowed_trailer_keys.contains(k) {
-                                if response_headers.get(k) != Some(plugin_value) {
-                                    *v = plugin_value.clone();
-                                }
-                            } else if plugin_value != v {
-                                *v = plugin_value.clone();
-                            }
-                            true
-                        }
-                        None => false,
-                    });
+                    grpc_proxy::reconcile_grpc_trailers_from_view(
+                        &mut response_trailers,
+                        &plugin_response_headers,
+                        &response_headers,
+                        &header_shadowed_trailer_keys,
+                    );
                     response_headers = plugin_response_headers;
                 }
                 if response_body.is_empty() {

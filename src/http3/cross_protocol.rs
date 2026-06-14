@@ -2349,18 +2349,26 @@ where
         resolve_cross_protocol_backend_ip(state, proxy, current_target.as_deref()).await;
 
     match result {
-        Ok(GrpcResponseKind::Buffered(mut resp)) => {
-            // Buffered variant: pool extracted trailers up front. Run the
-            // full response-hook pipeline (after_proxy, sticky cookie,
-            // on_response_body, on_final_response_body) on the buffered
-            // body — the main gRPC path does the same, so H3 gRPC buffered
-            // responses now behave identically.
+        Ok(GrpcResponseKind::Buffered(resp)) => {
+            // Buffered variant: pool extracted trailers up front. Run the full
+            // response-hook pipeline (after_proxy, sticky cookie,
+            // on_response_body, transform, on_final_response_body) on a merged
+            // header+trailer VIEW, exactly like the main gRPC buffered path, so
+            // a response hook that edits or removes a (header-shadowed or
+            // trailer-only) gRPC trailer is reconciled onto the wire identically
+            // on H1/H2 and H3 (#1614). `resp.headers` is left untouched as the
+            // pristine backend initial-header reference for that reconciliation.
+            let (mut plugin_response_headers, header_shadowed_trailer_keys) =
+                crate::proxy::grpc_proxy::build_grpc_plugin_header_view(
+                    &resp.headers,
+                    &resp.trailers,
+                );
             if !plugins.is_empty()
                 && let Some(reject) = crate::proxy::run_after_proxy_hooks(
                     plugins,
                     ctx,
                     resp.status,
-                    &mut resp.headers,
+                    &mut plugin_response_headers,
                 )
                 .await
             {
@@ -2444,18 +2452,24 @@ where
                 proxy,
                 current_target.as_deref(),
                 sticky_cookie_needed,
-                &mut resp.headers,
+                &mut plugin_response_headers,
             );
             // Run the buffered response-body hook pipeline in the same
             // order as the main gRPC proxy path so reject/transform
-            // semantics stay transport-independent.
+            // semantics stay transport-independent. Hooks operate on the
+            // merged view; the wire `response_headers` is assembled from it
+            // after trailer reconciliation below.
             let mut response_status = resp.status;
-            let mut response_headers = resp.headers;
             let mut response_body = resp.body;
             let mut response_trailers = resp.trailers;
             for plugin in plugins.iter() {
                 let result = plugin
-                    .on_response_body(ctx, response_status, &response_headers, &response_body)
+                    .on_response_body(
+                        ctx,
+                        response_status,
+                        &plugin_response_headers,
+                        &response_body,
+                    )
                     .await;
                 match result {
                     PluginResult::Continue => {}
@@ -2470,7 +2484,7 @@ where
                             ctx,
                             reject,
                             &mut response_status,
-                            &mut response_headers,
+                            &mut plugin_response_headers,
                             &mut response_body,
                             &mut response_trailers,
                         )
@@ -2480,48 +2494,35 @@ where
                 }
             }
             // A response-body transform like grpc_web reads the gRPC status from
-            // the headers map it is handed (the H2 buffered path merges trailers
-            // into headers as Trailers-Only before this hook). On this H3 path
-            // the gRPC trailers (grpc-status / grpc-message) are kept separate in
-            // `response_trailers` so plain gRPC-over-H3 can send real H3 trailers
-            // — but that hides grpc-status from grpc_web, which then synthesizes
-            // UNKNOWN(2) for an otherwise-successful response. Hand the transform
-            // a merged headers+trailers VIEW (built only when trailers exist; a
-            // trailer never overrides a real header) so the true status is
-            // embedded, while leaving the wire `response_headers` /
-            // `response_trailers` untouched — plain gRPC must keep real trailers,
-            // not Trailers-Only.
-            let transform_headers_with_trailers = (!response_trailers.is_empty()).then(|| {
-                let mut merged = response_headers.clone();
-                for (key, value) in &response_trailers {
-                    merged.entry(key.clone()).or_insert_with(|| value.clone());
-                }
-                merged
-            });
+            // the headers map it is handed. The merged view already carries the
+            // gRPC trailers (grpc-status / grpc-message and any trailer-only
+            // keys; a trailer never overrides a real header), so the transform
+            // sees the true terminal status instead of synthesizing UNKNOWN(2),
+            // while the wire trailers stay separate for the split H3 wire shape.
+            // content-length updates land on the view and flow into the wire
+            // headers after reconciliation below.
             for plugin in plugins.iter() {
-                // Re-borrow per iteration so the immutable view ends before the
-                // `response_headers` mutation below (content-length is the only
-                // field mutated here; trailers — and thus grpc-status — are
-                // immutable, so the merged view stays correct across iterations).
-                let transform_headers = transform_headers_with_trailers
-                    .as_ref()
-                    .unwrap_or(&response_headers);
                 if let Some(transformed) = plugin
                     .transform_response_body(
                         &response_body,
-                        content_type_of(&response_headers),
-                        transform_headers,
+                        content_type_of(&plugin_response_headers),
+                        &plugin_response_headers,
                     )
                     .await
                 {
-                    response_headers
+                    plugin_response_headers
                         .insert("content-length".to_string(), transformed.len().to_string());
                     response_body = transformed;
                 }
             }
             for plugin in plugins.iter() {
                 let result = plugin
-                    .on_final_response_body(ctx, response_status, &response_headers, &response_body)
+                    .on_final_response_body(
+                        ctx,
+                        response_status,
+                        &plugin_response_headers,
+                        &response_body,
+                    )
                     .await;
                 match result {
                     PluginResult::Continue => {}
@@ -2536,7 +2537,7 @@ where
                             ctx,
                             reject,
                             &mut response_status,
-                            &mut response_headers,
+                            &mut plugin_response_headers,
                             &mut response_body,
                             &mut response_trailers,
                         )
@@ -2544,6 +2545,39 @@ where
                         break;
                     }
                 }
+            }
+
+            // Reconcile hook edits/removals from the merged view back into the
+            // wire trailers, then assemble the initial HEADERS frame from the
+            // view. H3 always uses the split wire shape — real initial headers
+            // plus a real TRAILERS frame, never a Trailers-Only collapse — so
+            // plain gRPC-over-H3 keeps real trailers. `resp.headers` still holds
+            // the pristine backend initial headers for the shadowed-key edit
+            // detection. Strip the merged trailer copies (and any trailer-only
+            // keys) out of the initial headers; header-shadowed keys stay real
+            // headers whose true trailing value rides the wire trailer.
+            crate::proxy::grpc_proxy::reconcile_grpc_trailers_from_view(
+                &mut response_trailers,
+                &plugin_response_headers,
+                &resp.headers,
+                &header_shadowed_trailer_keys,
+            );
+            let mut response_headers = plugin_response_headers;
+            for k in response_trailers.keys() {
+                if !header_shadowed_trailer_keys.contains(k) {
+                    response_headers.remove(k);
+                }
+            }
+            // A transform that converted away from native gRPC (grpc_web appends
+            // a gRPC-Web trailer frame to the body and relabels the content-type)
+            // must not ALSO emit native H3 trailers, or terminal status would be
+            // double-signalled — mirror the main gRPC path's guard.
+            if !response_trailers.is_empty()
+                && response_headers.get("content-type").is_some_and(|ct| {
+                    !crate::proxy::backend_dispatch::is_native_grpc_content_type(ct.as_bytes())
+                })
+            {
+                response_trailers.clear();
             }
 
             if let Err(error) =
