@@ -45,6 +45,15 @@ pub const MESH_SPIFFE_ID_TAG: &str = "mesh.spiffe_id";
 const MAX_HBONE_WRITE_CHUNK: usize = 16 * 1024;
 const ADAPTIVE_STREAM_WINDOW_SIZE: u32 = 16 * 1024 * 1024;
 const ADAPTIVE_CONNECTION_WINDOW_SIZE: u32 = 64 * 1024 * 1024;
+/// Bounded poll for the peer's `SETTINGS_ENABLE_CONNECT_PROTOCOL` acknowledgement
+/// when opening a WebSocket Extended CONNECT over a freshly handshaked H2
+/// connection (see [`open_h2_ws_connect_stream`]). The setting rides the peer's
+/// initial SETTINGS frame, processed asynchronously by the connection driver, so
+/// one yield + a few short sleeps let a capable peer's frame land before the dial
+/// fails closed. The interval is tiny and the count small: SETTINGS is the first
+/// frame, so this resolves in well under a millisecond on a healthy connection.
+const EXTENDED_CONNECT_SETTINGS_POLL_ATTEMPTS: u32 = 10;
+const EXTENDED_CONNECT_SETTINGS_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 thread_local! {
     static HBONE_POOL_KEY_BUF: RefCell<String> = RefCell::new(String::with_capacity(160));
@@ -98,6 +107,11 @@ pub enum HbonePoolError {
     ConnectStream { authority: String, message: String },
     #[error("HBONE CONNECT rejected for {authority} with status {status}")]
     ConnectRejected { authority: String, status: u16 },
+    #[error(
+        "peer at {authority} did not negotiate SETTINGS_ENABLE_CONNECT_PROTOCOL; \
+         cannot open a WebSocket Extended CONNECT (RFC 8441) stream"
+    )]
+    ExtendedConnectUnsupported { authority: String },
 }
 
 impl HbonePoolError {
@@ -126,7 +140,8 @@ impl HbonePoolError {
             Self::H2Handshake { .. }
             | Self::InvalidConnectRequest { .. }
             | Self::ConnectStream { .. }
-            | Self::ConnectRejected { .. } => ErrorClass::ProtocolError,
+            | Self::ConnectRejected { .. }
+            | Self::ExtendedConnectUnsupported { .. } => ErrorClass::ProtocolError,
         }
     }
 
@@ -511,6 +526,72 @@ impl HboneConnectionPool {
             authority: authority_for_host_port(target_host, target_port),
             message: format!(
                 "timed out after {}ms waiting for HBONE CONNECT response",
+                proxy.backend_connect_timeout_ms
+            ),
+        })?
+    }
+
+    /// Open a **bare** HBONE CONNECT byte tunnel to a peer's HBONE listener over
+    /// a FRESH SVID-mTLS H2 connection for a WebSocket egress session, carrying
+    /// the HBONE protocol marker and the W3C source-identity baggage just like
+    /// [`Self::get_tunnel`]. The connection is DIALED to `dial_host:hbone_port`
+    /// (the peer's pod address + `:15008`/`mesh.hbone_port`); the bare CONNECT
+    /// `:authority` is `app_host:app_port` — the destination workload's app
+    /// address+port the peer's transparent HBONE relay byte-copies to locally.
+    ///
+    /// This is the WebSocket analogue of [`Self::get_tunnel`] / the raw-TCP HBONE
+    /// egress path, NOT an Extended CONNECT. Ambient/Waypoint materialize NO
+    /// inbound routes, and the route-miss transparent-relay fallback
+    /// (`build_inbound_hbone_relay_proxy`) is gated on a BARE CONNECT
+    /// (`is_connect_request` requires `:protocol` to be ABSENT) — so an Extended
+    /// CONNECT carrying `:protocol=websocket` to `:15008` would 404 before any WS
+    /// handler runs. Instead the caller dials this bare byte tunnel to the app
+    /// addr:port and speaks the WebSocket (inner H1 upgrade) THROUGH it: the
+    /// relay byte-copies the upgrade to the loopback app, which performs the WS
+    /// handshake — no destination-side change.
+    ///
+    /// Unlike HTTP-family Ambient egress (which multiplexes over the pooled HBONE
+    /// connections) this dials its OWN H2 connection carrying exactly ONE CONNECT
+    /// stream (1:1, dropped when the WebSocket session closes) — the same model
+    /// the Sidecar raw-TCP / Sidecar WebSocket egress paths use. A proxied
+    /// WebSocket already opens one dedicated backend connection (its lifetime is
+    /// bounded by `DestinationRule.maxConnections` via `BackendConnectionGuard`),
+    /// so a per-session H2 connection keeps long-lived WebSocket sessions off the
+    /// multiplexed HTTP pool and amortizes the handshake over the session.
+    /// SVID rotation is automatic because every new session dials with the
+    /// current SVID. The dial PINS `expected_peer`; a missing gateway SVID fails
+    /// closed before the dial.
+    pub async fn get_ws_byte_tunnel(
+        &self,
+        proxy: &Proxy,
+        dial_host: &str,
+        hbone_port: u16,
+        app_host: &str,
+        app_port: u16,
+        expected_peer: Option<&crate::identity::SpiffeId>,
+    ) -> Result<H2ConnectTunnel, HbonePoolError> {
+        let (source_identity, _fingerprint) = self.current_svid_identity_cached()?;
+        let pool_config = self.pool_config.for_proxy(proxy);
+        let sender = dial_h2_connect_sender(
+            &self.dns_cache,
+            &self.gateway_svid,
+            proxy,
+            dial_host,
+            hbone_port,
+            expected_peer,
+            &pool_config,
+        )
+        .await?;
+        let baggage = baggage_header_for_source(&source_identity);
+        tokio::time::timeout(
+            Duration::from_millis(proxy.backend_connect_timeout_ms),
+            open_h2_connect_stream(sender, app_host, app_port, Some(&baggage), Some("hbone")),
+        )
+        .await
+        .map_err(|_| HbonePoolError::ConnectStream {
+            authority: authority_for_host_port(app_host, app_port),
+            message: format!(
+                "timed out after {}ms waiting for HBONE WebSocket byte-tunnel CONNECT response",
                 proxy.backend_connect_timeout_ms
             ),
         })?
@@ -1201,6 +1282,179 @@ pub(crate) async fn open_h2_connect_stream(
         read_buf: Bytes::new(),
         write_closed: false,
         write_reservation: 0,
+    })
+}
+
+/// Outcome of a successful WebSocket Extended CONNECT (RFC 8441) over an H2
+/// session: the byte tunnel carrying the raw WebSocket frame stream, plus the
+/// subprotocol the peer negotiated (forwarded to the originating client per RFC
+/// 6455 §11.3.4 / RFC 8441 §5.2). The tunnel is the wire transport directly —
+/// there is NO inner HTTP/1.1 upgrade handshake and NO `Sec-WebSocket-Key`
+/// exchange (those are HTTP/1.1-only); the caller wraps the tunnel as a
+/// `Role::Client` WebSocket framer.
+pub struct H2WsConnectTunnel {
+    pub tunnel: H2ConnectTunnel,
+    pub negotiated_subprotocol: Option<http::HeaderValue>,
+}
+
+/// Open one HTTP/2 **Extended** CONNECT stream (RFC 8441 — `:method=CONNECT`
+/// plus the `:protocol=websocket` pseudo-header) carrying the `:authority`
+/// routing key over `sender`, returning the byte tunnel that carries the
+/// WebSocket frame stream. This is the WebSocket analogue of
+/// [`open_h2_connect_stream`]: the destination's mesh inbound listener (Sidecar
+/// `:15006` / Ambient `:15008`, both advertise
+/// `SETTINGS_ENABLE_CONNECT_PROTOCOL`) treats the Extended CONNECT exactly as a
+/// client-originated WebSocket upgrade and bridges it to the local app — so the
+/// source must speak Extended CONNECT, NOT a bare CONNECT carrying an inner H1
+/// handshake.
+///
+/// `authority` is the pre-built `:authority` the peer routes on — the caller
+/// computes it with the same preserve-host / multi-port logic as the HTTP-family
+/// mesh egress path so parity holds byte-for-byte (e.g. a port-less service
+/// Host). It is independent of the connection's dial target (the connection is
+/// already established on `sender`). `path_and_query` is the client's request
+/// target (`:path`), preserved byte-for-byte so `ws://svc-b/ws?room=1` reaches
+/// the destination as `/ws?room=1` (not `/`) — the caller derives it from the
+/// computed backend URL and guarantees a leading `/`.
+///
+/// `ws_handshake_headers` are the forwardable WebSocket request headers (e.g.
+/// `Sec-WebSocket-Protocol`, `Sec-WebSocket-Extensions`, identity headers) that
+/// ride the Extended CONNECT request; the RFC 6455 framing headers
+/// (`Upgrade`/`Connection`/`Sec-WebSocket-Key`/`Sec-WebSocket-Version`) are NOT
+/// sent — they are HTTP/1.1-only and the caller's frontend already stripped
+/// them. `marker` stamps the optional `x-ferrum-mesh-protocol` header
+/// (`Some("hbone")` for Ambient HBONE; `None` for a Sidecar mesh-mTLS dial), and
+/// `baggage` carries the optional W3C baggage source identity (HBONE only).
+///
+/// Fails closed: if the peer never acknowledged
+/// `SETTINGS_ENABLE_CONNECT_PROTOCOL`, sending an Extended CONNECT would be a
+/// protocol violation, so we return [`HbonePoolError::ExtendedConnectUnsupported`]
+/// before sending anything. A non-200 response also fails closed.
+pub(crate) async fn open_h2_ws_connect_stream(
+    sender: SendRequest<Bytes>,
+    authority: &str,
+    path_and_query: &str,
+    ws_handshake_headers: &[(String, String)],
+    baggage: Option<&str>,
+    marker: Option<&'static str>,
+) -> Result<H2WsConnectTunnel, HbonePoolError> {
+    // Owned copy for the error variants (which carry a `String`).
+    let authority = authority.to_string();
+    // RFC 8441 Extended CONNECT keeps `:scheme` and `:path` (unlike a bare
+    // CONNECT, which drops them). h2 derives them from the request URI, so build
+    // a full `https://<authority><path_and_query>` URI rather than a bare
+    // authority. `path_and_query` is the CLIENT's request target (e.g.
+    // `/ws?room=1`), preserved byte-for-byte so the destination routes + builds
+    // the local backend WebSocket URL on the same path the client requested
+    // (parity with direct WS forwarding and the HTTP mesh paths). Callers
+    // normalize it to start with `/`; an empty/relative value would make
+    // `https://authority` parse as an opaque URI with no path, so the caller
+    // guarantees a leading `/`.
+    let uri = format!("https://{authority}{path_and_query}");
+    let mut request = Request::builder()
+        .method(Method::CONNECT)
+        .version(Version::HTTP_2)
+        .uri(uri.as_str())
+        .body(())
+        .map_err(|e| HbonePoolError::InvalidConnectRequest {
+            authority: authority.to_string(),
+            message: e.to_string(),
+        })?;
+    // The `:protocol` pseudo-header is carried as an h2 extension; the h2 client
+    // removes it from the request extensions and serializes it on the wire.
+    request
+        .extensions_mut()
+        .insert(h2::ext::Protocol::from_static("websocket"));
+    if let Some(baggage) = baggage {
+        request.headers_mut().insert(
+            BAGGAGE_HEADER,
+            http::HeaderValue::from_str(baggage).map_err(|e| {
+                HbonePoolError::InvalidConnectRequest {
+                    authority: authority.clone(),
+                    message: e.to_string(),
+                }
+            })?,
+        );
+    }
+    if let Some(marker) = marker {
+        request.headers_mut().insert(
+            "x-ferrum-mesh-protocol",
+            http::HeaderValue::from_static(marker),
+        );
+    }
+    for (name, value) in ws_handshake_headers {
+        if let (Ok(header_name), Ok(header_value)) = (
+            http::HeaderName::from_bytes(name.as_bytes()),
+            http::HeaderValue::from_str(value),
+        ) {
+            request.headers_mut().append(header_name, header_value);
+        }
+    }
+
+    let mut sender = sender
+        .ready()
+        .await
+        .map_err(|e| HbonePoolError::ConnectStream {
+            authority: authority.clone(),
+            message: e.to_string(),
+        })?;
+    // Fail closed before sending: a peer that never acknowledged
+    // `SETTINGS_ENABLE_CONNECT_PROTOCOL` would reset an Extended CONNECT stream.
+    // The setting is learned from the peer's initial SETTINGS frame, which the
+    // connection driver processes asynchronously — on a freshly handshaked
+    // connection it may not be observed at the instant `ready()` first resolves.
+    // Poll it with a short bounded wait (yielding so the driver can read the
+    // frame) before declaring the peer incapable, so a healthy peer that simply
+    // hasn't had its SETTINGS processed yet is not falsely rejected.
+    if !sender.is_extended_connect_protocol_enabled() {
+        let mut negotiated = false;
+        for attempt in 0..EXTENDED_CONNECT_SETTINGS_POLL_ATTEMPTS {
+            if attempt == 0 {
+                tokio::task::yield_now().await;
+            } else {
+                tokio::time::sleep(EXTENDED_CONNECT_SETTINGS_POLL_INTERVAL).await;
+            }
+            if sender.is_extended_connect_protocol_enabled() {
+                negotiated = true;
+                break;
+            }
+        }
+        if !negotiated {
+            return Err(HbonePoolError::ExtendedConnectUnsupported { authority });
+        }
+    }
+    let (response_fut, send_stream) =
+        sender
+            .send_request(request, false)
+            .map_err(|e| HbonePoolError::ConnectStream {
+                authority: authority.clone(),
+                message: e.to_string(),
+            })?;
+    let response = response_fut
+        .await
+        .map_err(|e| HbonePoolError::ConnectStream {
+            authority: authority.clone(),
+            message: e.to_string(),
+        })?;
+    if response.status() != StatusCode::OK {
+        return Err(HbonePoolError::ConnectRejected {
+            authority,
+            status: response.status().as_u16(),
+        });
+    }
+    let negotiated_subprotocol = response
+        .headers()
+        .get(http::header::SEC_WEBSOCKET_PROTOCOL)
+        .cloned();
+    Ok(H2WsConnectTunnel {
+        tunnel: H2ConnectTunnel {
+            recv_stream: response.into_body(),
+            send_stream,
+            read_buf: Bytes::new(),
+            write_closed: false,
+            write_reservation: 0,
+        },
+        negotiated_subprotocol,
     })
 }
 
@@ -2348,5 +2602,183 @@ mod tests {
             source: std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out"),
         };
         assert_eq!(timed_out.error_class(), ErrorClass::ConnectionTimeout);
+    }
+
+    // Establish a raw (plaintext) h2 client connection to an in-process h2
+    // server listening on loopback, returning the client `SendRequest`. No TLS:
+    // these tests exercise the Extended CONNECT request shape + fail-closed
+    // gate, which are independent of the SVID-mTLS transport the production dial
+    // wraps it in.
+    async fn h2_client_to(addr: std::net::SocketAddr) -> SendRequest<Bytes> {
+        let tcp = TcpStream::connect(addr).await.expect("client tcp connect");
+        let (sender, connection) = h2::client::handshake(tcp)
+            .await
+            .expect("client h2 handshake");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        sender.ready().await.expect("client sender ready")
+    }
+
+    #[tokio::test]
+    async fn ws_extended_connect_fails_closed_when_peer_lacks_connect_protocol() {
+        // Server does NOT call `enable_connect_protocol`, so an Extended CONNECT
+        // would be a protocol violation. The opener must fail closed BEFORE
+        // sending a request rather than dialing the peer regardless.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind h2 server");
+        let addr = listener.local_addr().expect("server addr");
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.expect("server accept");
+            // Default builder: SETTINGS_ENABLE_CONNECT_PROTOCOL is NOT advertised.
+            let mut conn = h2::server::handshake(tcp).await.expect("server handshake");
+            // Drive the connection so SETTINGS are exchanged; the client should
+            // reject before sending any request, so no stream is expected.
+            let _ = conn.accept().await;
+        });
+
+        let sender = h2_client_to(addr).await;
+        let result = open_h2_ws_connect_stream(
+            sender,
+            "orders.default.svc.cluster.local:8080",
+            "/",
+            &[],
+            None,
+            None,
+        )
+        .await;
+        match result {
+            Err(HbonePoolError::ExtendedConnectUnsupported { authority }) => {
+                assert_eq!(authority, "orders.default.svc.cluster.local:8080");
+            }
+            Err(other) => panic!("expected ExtendedConnectUnsupported, got error {other:?}"),
+            Ok(_) => panic!("expected ExtendedConnectUnsupported, got an open tunnel"),
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ws_extended_connect_opens_tunnel_and_relays_bytes() {
+        // Server advertises SETTINGS_ENABLE_CONNECT_PROTOCOL, accepts the
+        // Extended CONNECT (200) echoing a negotiated subprotocol, then echoes
+        // payload bytes back over the stream body — proving the opener produces
+        // a working bidirectional tunnel and surfaces the subprotocol.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind h2 server");
+        let addr = listener.local_addr().expect("server addr");
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.expect("server accept");
+            let mut builder = h2::server::Builder::new();
+            builder.enable_connect_protocol();
+            let mut conn = builder
+                .handshake::<_, Bytes>(tcp)
+                .await
+                .expect("server handshake");
+            let (request, mut respond) = conn
+                .accept()
+                .await
+                .expect("server has a stream")
+                .expect("accepted request");
+            // The request must be an Extended CONNECT carrying :protocol=websocket.
+            assert_eq!(request.method(), &Method::CONNECT);
+            assert_eq!(
+                request
+                    .extensions()
+                    .get::<h2::ext::Protocol>()
+                    .map(|p| p.as_str().to_string()),
+                Some("websocket".to_string())
+            );
+            // The client's non-root `:path` must be preserved byte-for-byte
+            // (codex finding #2): a hard-coded `/` would drop `?room=1` and the
+            // destination would route + build the local WS backend URL wrong.
+            assert_eq!(
+                request
+                    .uri()
+                    .path_and_query()
+                    .map(|pq| pq.as_str().to_string()),
+                Some("/ws?room=1".to_string()),
+                "the WebSocket :path+query must survive the Extended CONNECT"
+            );
+            assert_eq!(
+                request
+                    .headers()
+                    .get("sec-websocket-protocol")
+                    .and_then(|v| v.to_str().ok()),
+                Some("chat")
+            );
+            // Echo the stream body in its OWN task and keep polling the
+            // connection below: `SendStream::send_data` only QUEUES frames; the
+            // h2 connection future is what flushes them to the socket. If the
+            // echo ran inline here, the task would park on the next
+            // `body.data().await` (Pending) after echoing the first frame and
+            // never drive the connection, so the echoed bytes would sit unflushed
+            // and the client's read would hang. This mirrors the working
+            // server pattern in `tests/integration/gateway_hbone_pool_tests.rs`.
+            tokio::spawn(async move {
+                let mut body = request.into_body();
+                let response = http::Response::builder()
+                    .status(StatusCode::OK)
+                    .header("sec-websocket-protocol", "chat")
+                    .body(())
+                    .expect("build response");
+                let mut send = respond
+                    .send_response(response, false)
+                    .expect("send response");
+                // Echo each inbound data chunk back over the response body.
+                while let Some(chunk) = body.data().await {
+                    let chunk = chunk.expect("server recv chunk");
+                    let _ = body.flow_control().release_capacity(chunk.len());
+                    if chunk.is_empty() {
+                        continue;
+                    }
+                    if send.send_data(chunk, false).is_err() {
+                        return;
+                    }
+                }
+                let _ = send.send_data(Bytes::new(), true);
+            });
+            // Drive the connection so queued response frames flush and the client
+            // can read the echo; this returns once the connection closes.
+            while let Some(next) = conn.accept().await {
+                if next.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let sender = h2_client_to(addr).await;
+        let ws = open_h2_ws_connect_stream(
+            sender,
+            "orders.default.svc.cluster.local:8080",
+            "/ws?room=1",
+            &[("Sec-WebSocket-Protocol".to_string(), "chat".to_string())],
+            None,
+            None,
+        )
+        .await
+        .expect("extended connect tunnel opens");
+
+        assert_eq!(
+            ws.negotiated_subprotocol
+                .as_ref()
+                .and_then(|v| v.to_str().ok()),
+            Some("chat"),
+            "the negotiated subprotocol must be surfaced to the caller"
+        );
+
+        // Round-trip bytes over the raw tunnel (the WebSocket frame transport).
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut tunnel = ws.tunnel;
+        tunnel
+            .write_all(b"frame-bytes")
+            .await
+            .expect("tunnel write");
+        tunnel.flush().await.expect("tunnel flush");
+        let mut buf = [0u8; 11];
+        tunnel.read_exact(&mut buf).await.expect("tunnel read echo");
+        assert_eq!(&buf, b"frame-bytes");
+        server.abort();
     }
 }
