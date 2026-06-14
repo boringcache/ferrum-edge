@@ -76,16 +76,16 @@ fn entry(
     services: Vec<MeshService>,
     fetched_at: u64,
 ) -> RemoteClusterEntry {
-    RemoteClusterEntry {
-        cluster_name: cluster.to_string(),
-        trust_domain: td(trust_domain),
-        network: network.map(str::to_string),
-        endpoints: RemoteClusterEndpoints {
+    RemoteClusterEntry::new(
+        cluster.to_string(),
+        td(trust_domain),
+        network.map(str::to_string),
+        RemoteClusterEndpoints {
             workloads,
             services,
         },
-        fetched_at_unix_seconds: fetched_at,
-    }
+        fetched_at,
+    )
 }
 
 fn snapshot_with(entries: Vec<RemoteClusterEntry>) -> RemoteEndpointSnapshot {

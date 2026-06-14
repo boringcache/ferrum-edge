@@ -193,18 +193,23 @@ pub fn build_response(inputs: MeshRemoteClustersInputs<'_>) -> MeshRemoteCluster
                 .get(entry.cluster_name.as_str())
                 .is_some_and(|accepted_td| **accepted_td == entry.trust_domain)
         })
-        .map(|entry| DiscoveredRemoteCluster {
-            cluster_name: entry.cluster_name.clone(),
-            trust_domain: entry.trust_domain.as_str().to_string(),
-            network: entry.network.clone(),
-            workload_count: entry.endpoints.workloads.len(),
-            service_count: entry.endpoints.services.len(),
-            fetched_at_unix_seconds: entry.fetched_at_unix_seconds,
-            // Saturating sub: a fetch timestamp ahead of `now` (clock skew on
-            // the remote CP's clock vs ours) maps to `0` rather than wrapping.
-            age_seconds: inputs
-                .now_unix_seconds
-                .saturating_sub(entry.fetched_at_unix_seconds),
+        .map(|entry| {
+            // Read the shared poll-timestamp atomic ONCE so the reported
+            // `fetched_at_unix_seconds` and the derived `age_seconds` are
+            // computed from the same value (a concurrent poll could refresh the
+            // atomic between two reads, otherwise yielding an inconsistent pair).
+            let fetched_at = entry.fetched_at_unix_seconds();
+            DiscoveredRemoteCluster {
+                cluster_name: entry.cluster_name.clone(),
+                trust_domain: entry.trust_domain.as_str().to_string(),
+                network: entry.network.clone(),
+                workload_count: entry.endpoints.workloads.len(),
+                service_count: entry.endpoints.services.len(),
+                fetched_at_unix_seconds: fetched_at,
+                // Saturating sub: a fetch timestamp ahead of `now` (clock skew on
+                // the remote CP's clock vs ours) maps to `0` rather than wrapping.
+                age_seconds: inputs.now_unix_seconds.saturating_sub(fetched_at),
+            }
         })
         .collect();
     discovered.sort_by(|a, b| a.cluster_name.cmp(&b.cluster_name));
