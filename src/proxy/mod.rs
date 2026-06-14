@@ -1019,6 +1019,30 @@ fn warn_if_h3_backend_tls_policy_incompatible(
 /// that `run_websocket_proxy` uses to populate `ws_frame_plugins`
 /// (`requires_ws_frame_hooks(proxy_id)`) is the source of truth here so the
 /// reported count and the actual fast-path condition cannot drift.
+/// Count the HTTP-family proxies exposed to the tunnel-mode first-frame-loss
+/// risk: those that would take the raw-copy fast path in `run_websocket_proxy`.
+///
+/// Only HTTP-family proxies (http/https + ws/wss/grpc runtime flavors) can serve
+/// a WebSocket upgrade; stream-family proxies (tcp/udp/dtls) never reach the
+/// tunnel-mode raw-copy branch. `DispatchKind::is_http_family()` is exactly
+/// `HttpPool | HttpsPool`. Of those, exclude proxies whose plugin set requires
+/// per-frame WS hooks — they parse frames instead of taking the raw-copy fast
+/// path, so they carry no first-frame-loss exposure. Shared by the warning
+/// emitter and the one-time latch so the count and the actual fast-path
+/// condition (`requires_ws_frame_hooks`) cannot drift.
+pub(crate) fn websocket_tunnel_mode_frame_loss_affected_count(
+    config: &GatewayConfig,
+    plugin_cache: &PluginCache,
+) -> usize {
+    config
+        .proxies
+        .iter()
+        .filter(|proxy| {
+            proxy.dispatch_kind.is_http_family() && !plugin_cache.requires_ws_frame_hooks(&proxy.id)
+        })
+        .count()
+}
+
 pub(crate) fn warn_if_websocket_tunnel_mode_frame_loss_risk(
     config: &GatewayConfig,
     plugin_cache: &PluginCache,
@@ -1028,19 +1052,8 @@ pub(crate) fn warn_if_websocket_tunnel_mode_frame_loss_risk(
         return 0;
     }
 
-    // Only HTTP-family proxies (http/https + ws/wss/grpc runtime flavors) can
-    // serve a WebSocket upgrade; stream-family proxies (tcp/udp/dtls) never
-    // reach the tunnel-mode raw-copy branch. `DispatchKind::is_http_family()`
-    // is exactly `HttpPool | HttpsPool`. Of those, exclude proxies whose plugin
-    // set requires per-frame WS hooks — they parse frames instead of taking the
-    // raw-copy fast path, so they carry no first-frame-loss exposure.
-    let affected_proxy_count = config
-        .proxies
-        .iter()
-        .filter(|proxy| {
-            proxy.dispatch_kind.is_http_family() && !plugin_cache.requires_ws_frame_hooks(&proxy.id)
-        })
-        .count();
+    let affected_proxy_count =
+        websocket_tunnel_mode_frame_loss_affected_count(config, plugin_cache);
     if affected_proxy_count == 0 {
         return 0;
     }
@@ -3668,18 +3681,25 @@ impl ProxyState {
         // The `compare_exchange` in `warn_websocket_tunnel_mode_frame_loss_once`
         // keeps the two paths idempotent (at most one warning per instance).
         let config_has_proxies = !config.proxies.is_empty();
-        if websocket_tunnel_mode && config_has_proxies {
-            warn_if_websocket_tunnel_mode_frame_loss_risk(
+        // Emit the one-time warning here for modes that hand the constructor the
+        // real config (db/file). `warn_if_...` returns the affected-proxy count
+        // (0 when tunnel mode is off OR no exposed proxy), and we latch the
+        // one-time warning as "already emitted" ONLY when it actually warned.
+        // If the constructor config has proxies but none are affected (all
+        // stream-family, or every HTTP proxy carries a frame-level plugin), the
+        // latch stays open so a later reload that introduces a pluginless HTTP
+        // proxy still warns exactly once. The empty-config DP path also leaves
+        // it unset, emitting on the first non-empty apply instead. The
+        // `compare_exchange` in `warn_websocket_tunnel_mode_frame_loss_once`
+        // keeps the two paths idempotent (at most one warning per instance).
+        let constructor_warned = websocket_tunnel_mode
+            && config_has_proxies
+            && warn_if_websocket_tunnel_mode_frame_loss_risk(
                 &config,
                 &plugin_cache,
                 websocket_tunnel_mode,
-            );
-        }
-        // Latch the one-time warning as "already evaluated" only when the
-        // constructor saw a non-empty config (db/file). Leaving it unset for an
-        // empty startup config lets the first real config-apply (DP first CP
-        // snapshot) run the evaluation exactly once.
-        let tunnel_mode_frame_loss_warned = Arc::new(AtomicBool::new(config_has_proxies));
+            ) > 0;
+        let tunnel_mode_frame_loss_warned = Arc::new(AtomicBool::new(constructor_warned));
         let plugin_http_client_for_state = plugin_http_client.clone();
         // Build credential-indexed consumer lookup for O(1) auth
         let consumer_index = Arc::new(ConsumerIndex::new(&config.consumers));
@@ -5286,8 +5306,20 @@ impl ProxyState {
         if !self.websocket_tunnel_mode {
             return;
         }
-        // Latch first so concurrent appliers (or constructor + first apply)
-        // can never double-warn; only the winner of the swap evaluates.
+        // Fast path: already warned once.
+        if self.tunnel_mode_frame_loss_warned.load(Ordering::Acquire) {
+            return;
+        }
+        // Count affected proxies WITHOUT emitting, and latch only when there is
+        // at least one. Otherwise the first config that happens to expose no
+        // affected proxy (a DP whose first CP delta carried only stream proxies,
+        // or whose HTTP proxies all had frame-level plugins) would flip the latch
+        // and a later reload that introduces a pluginless HTTP proxy would skip
+        // the warning entirely.
+        if websocket_tunnel_mode_frame_loss_affected_count(config, plugin_cache) == 0 {
+            return;
+        }
+        // Latch now (winner emits) so concurrent appliers can never double-warn.
         if self
             .tunnel_mode_frame_loss_warned
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)

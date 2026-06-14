@@ -31,7 +31,9 @@ use ferrum_edge::_test_support::{
     StreamIoSide, fire_ws_tunnel_disconnect_hooks, make_ws_session_meta,
     warn_if_websocket_tunnel_mode_frame_loss_risk_for_test,
 };
-use ferrum_edge::config::types::{BackendScheme, DispatchKind, GatewayConfig, PluginConfig, Proxy};
+use ferrum_edge::config::types::{
+    BackendScheme, DispatchKind, GatewayConfig, PluginAssociation, PluginConfig, Proxy,
+};
 use ferrum_edge::plugins::{Direction, Plugin, WsDisconnectContext};
 use ferrum_edge::retry::ErrorClass;
 
@@ -240,8 +242,11 @@ fn proxy_with_dispatch_kind(id: &str, scheme: BackendScheme, kind: DispatchKind)
 /// Build a proxy-scoped `ws_frame_logging` plugin config bound to `proxy_id`.
 /// `ws_frame_logging` returns `requires_ws_frame_hooks() == true`, so any proxy
 /// carrying it parses every frame and never takes the lossy raw-tunnel path —
-/// the warning must therefore exclude it. A proxy-scoped plugin config resolves
-/// purely by `proxy_id`; no `PluginAssociation` entry is needed.
+/// the warning must therefore exclude it. `PluginCache` only instantiates a
+/// proxy-scoped config when the proxy's `plugins` list also references the
+/// config id, so callers MUST push a matching `PluginAssociation` onto the proxy
+/// (see [`ws_frame_plugin_association`]); the `proxy_id` on the config alone is
+/// not enough.
 fn ws_frame_logging_for(proxy_id: &str) -> PluginConfig {
     let json = format!(
         r#"{{
@@ -253,6 +258,16 @@ fn ws_frame_logging_for(proxy_id: &str) -> PluginConfig {
         }}"#
     );
     serde_json::from_str(&json).expect("ws_frame_logging plugin config deserializes")
+}
+
+/// The `PluginAssociation` a proxy must carry so `PluginCache` instantiates the
+/// proxy-scoped `ws_frame_logging` config built by [`ws_frame_logging_for`] for
+/// that proxy. Without it, `requires_ws_frame_hooks(proxy_id)` stays false and
+/// the proxy is wrongly treated as taking the lossy raw-tunnel path.
+fn ws_frame_plugin_association(proxy_id: &str) -> PluginAssociation {
+    PluginAssociation {
+        plugin_config_id: format!("wsfl-{proxy_id}"),
+    }
 }
 
 #[test]
@@ -332,7 +347,9 @@ fn test_tunnel_warning_excludes_proxy_with_ws_frame_plugin() {
     // (`ws_frame_logging`), so `run_websocket_proxy` parses frames instead of
     // taking the raw-copy fast path — there is no first-frame-loss exposure.
     // The warning must report 0 even with tunnel mode enabled.
-    let proxy = proxy_with_dispatch_kind("p-https", BackendScheme::Https, DispatchKind::HttpsPool);
+    let mut proxy =
+        proxy_with_dispatch_kind("p-https", BackendScheme::Https, DispatchKind::HttpsPool);
+    proxy.plugins.push(ws_frame_plugin_association(&proxy.id));
     let config = GatewayConfig {
         plugin_configs: vec![ws_frame_logging_for(&proxy.id)],
         proxies: vec![proxy],
@@ -352,8 +369,11 @@ fn test_tunnel_warning_counts_only_frame_pluginless_http_proxies() {
     // safe) and one without (takes the raw-copy fast path, lossy). The warning
     // must count only the second — the count and the actual fast-path condition
     // share `requires_ws_frame_hooks(proxy_id)` as their single source of truth.
-    let p_framed =
+    let mut p_framed =
         proxy_with_dispatch_kind("p-framed", BackendScheme::Https, DispatchKind::HttpsPool);
+    p_framed
+        .plugins
+        .push(ws_frame_plugin_association(&p_framed.id));
     let p_raw = proxy_with_dispatch_kind("p-raw", BackendScheme::Http, DispatchKind::HttpPool);
     let config = GatewayConfig {
         plugin_configs: vec![ws_frame_logging_for(&p_framed.id)],
