@@ -11168,6 +11168,12 @@ components:
               - type: string
               - type: object
                 additionalProperties: false
+                minProperties: 1
+                maxProperties: 1
+                description: >-
+                  Istio StringMatch-shaped origin matcher: EXACTLY ONE of
+                  exact / prefix / regex (no extra or unknown keys). Empty or
+                  multi-key objects are rejected at config time.
                 properties:
                   exact:
                     type: string

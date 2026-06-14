@@ -3315,6 +3315,17 @@ fn cors_allowed_origins(cors: &Value) -> Option<Vec<Value>> {
 /// pattern is never reflected into a header.
 fn cors_origin_matcher_value(entry: &Value) -> Option<Value> {
     let obj = entry.as_object()?;
+    // Istio `StringMatch` contract: EXACTLY ONE recognized key with a string
+    // value, nothing else. A malformed matcher (extra/unknown key, a non-string
+    // value, or multiple keys — e.g. `{"prefix":"x","regex":123}`) is NOT
+    // representable, so return None and leave the policy DEFERRED (fail-closed)
+    // rather than silently dropping the bad key and approximating it. Mirrors
+    // `CorsPlugin::parse_origin_matcher` via the shared StringMatch validator, so
+    // the translator, the plugin, and the deferred-field status writer agree.
+    if !super::string_match_has_exactly_one_supported_operator(entry, &["exact", "prefix", "regex"])
+    {
+        return None;
+    }
     let exact = obj.get("exact").and_then(Value::as_str);
     let prefix = obj.get("prefix").and_then(Value::as_str);
     let regex = obj.get("regex").and_then(Value::as_str);

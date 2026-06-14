@@ -203,6 +203,33 @@ fn vs_cors_policy_uncompilable_regex_origin_not_projected() {
     );
 }
 
+/// A `corsPolicy` `allowOrigins[]` entry that is not a single-key
+/// `exact`/`prefix`/`regex` `StringMatch` — here a valid `prefix` plus an extra
+/// non-string `regex` key — is a malformed matcher. It must be fail-closed
+/// (left unprojected / deferred), not silently approximated by dropping the bad
+/// key, so the translator, the `cors` plugin, and the deferred-field status
+/// writer all agree it is unrepresentable.
+#[test]
+fn vs_cors_policy_malformed_origin_matcher_not_projected() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "http[].corsPolicy malformed origin matcher",
+        status = Status::Deferred,
+        notes = "A StringMatch origin matcher with extra/unknown or non-string keys is fail-closed: left unprojected (deferred), never approximated by dropping the bad key.",
+    );
+    assert!(
+        cors_plugin_for(&[virtual_service(json!({
+            "hosts": ["api.example.com"],
+            "http": [{
+                "route": [{"destination": {"host": "echo.default.svc.cluster.local", "port": {"number": 8080}}}],
+                "corsPolicy": {"allowOrigins": [{"prefix": "https://app.", "regex": 123}]}
+            }]
+        }))])
+        .is_none(),
+        "a malformed (multi/extra-key) origin matcher must not emit a cors plugin"
+    );
+}
+
 /// VS `spec.tls[]` L4 routing → passthrough TCP stream proxy keyed by SNI
 /// (encrypted bytes forwarded, no TLS termination), reusing the gateway /
 /// east-west stream + SNI machinery.
