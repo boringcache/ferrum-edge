@@ -12291,19 +12291,23 @@ async fn handle_proxy_request_inner(
                 let cl = response_headers
                     .get("content-length")
                     .and_then(|v| v.parse::<u64>().ok());
+                // gRPC streaming body deadline: the post-plugin `grpc-timeout`
+                // (uncapped), with `backend_read_timeout_ms` as the fallback only
+                // when the client set no deadline (see
+                // `grpc_proxy::streaming_effective_timeout_ms`). The gRPC deadline
+                // otherwise bounds only the response-header wait, so without this
+                // a backend that streams headers then stalls would pin the
+                // streaming guards until the client disconnects. `0` (no client
+                // deadline and no operator fallback) leaves long-lived server/bidi
+                // streams that legitimately idle between messages unbounded.
+                let grpc_stream_read_timeout_ms = grpc_streaming.response_read_timeout_ms;
                 let body = if state.response_buffer_cutoff_bytes == 0
                     && state.max_response_body_size_bytes == 0
                 {
                     crate::proxy::body::direct_streaming_h2_body_strip_hop_by_hop_trailers(
                         grpc_streaming.body,
                         cl,
-                        // gRPC streaming responses are bounded by the gRPC deadline
-                        // (`grpc-timeout`), not `backend_read_timeout_ms`. Applying a
-                        // per-frame idle read timeout here would truncate long-lived
-                        // server/bidi streams that legitimately idle between messages
-                        // (e.g. server-push subscriptions). Pass 0 to disable it on the
-                        // gRPC path; the plain H2/HBONE path below keeps the bound.
-                        0,
+                        grpc_stream_read_timeout_ms,
                     )
                 } else if state.max_response_body_size_bytes > 0 {
                     crate::proxy::body::size_limited_coalescing_h2_body_strip_hop_by_hop_trailers(
@@ -12311,16 +12315,14 @@ async fn handle_proxy_request_inner(
                         state.max_response_body_size_bytes,
                         cl,
                         state.h2_coalesce_target_bytes,
-                        // gRPC streaming honors `grpc-timeout`, not `backend_read_timeout_ms`.
-                        0,
+                        grpc_stream_read_timeout_ms,
                     )
                 } else {
                     crate::proxy::body::coalescing_h2_body_strip_hop_by_hop_trailers(
                         grpc_streaming.body,
                         cl,
                         state.h2_coalesce_target_bytes,
-                        // gRPC streaming honors `grpc-timeout`, not `backend_read_timeout_ms`.
-                        0,
+                        grpc_stream_read_timeout_ms,
                     )
                 };
                 let mut body = if let Some(logger) = deferred_grpc_logger {

@@ -1379,6 +1379,14 @@ pub struct GrpcStreamingResponse {
     /// this flag and abort the response if set — the backend received a
     /// truncated request so the response is likely invalid.
     pub request_body_exceeded: Option<Arc<AtomicBool>>,
+    /// Per-frame idle read timeout (ms) the response-body consumer must apply to
+    /// the streaming `body`, derived from [`streaming_effective_timeout_ms`]: the
+    /// post-plugin client `grpc-timeout` (uncapped), falling back to
+    /// `backend_read_timeout_ms` only when the client set no deadline. `0` =
+    /// unbounded. The gRPC deadline otherwise only bounds the response-header
+    /// wait, so without this a backend that sends headers then stalls would pin
+    /// the streaming guards until the client disconnects.
+    pub response_read_timeout_ms: u64,
 }
 
 /// Either a fully-buffered or streaming gRPC response.
@@ -1713,6 +1721,7 @@ pub async fn proxy_grpc_request_streaming(
         } else {
             None
         },
+        response_read_timeout_ms: effective_timeout_ms.unwrap_or(0),
     }))
 }
 
@@ -1826,6 +1835,15 @@ pub(crate) async fn proxy_grpc_request_core(
         None => (None, None),
     };
 
+    // Effective per-frame idle read timeout for the STREAMING response body,
+    // computed before `headers` is moved into the backend request below. Same
+    // post-plugin grpc-timeout (uncapped) / backend_read_timeout_ms-fallback
+    // rule as the streaming dispatch's header-wait deadline, so a backend that
+    // streams headers then stalls cannot pin the streaming guards until the
+    // client disconnects. Unused on the buffered path. 0 = unbounded.
+    let streaming_response_read_timeout_ms =
+        streaming_effective_timeout_ms(&headers, proxy).unwrap_or(0);
+
     let mut backend_req = Request::new(GrpcBody::Buffered(Full::new(body_bytes)));
     *backend_req.method_mut() = method;
     *backend_req.uri_mut() = uri;
@@ -1919,6 +1937,7 @@ pub(crate) async fn proxy_grpc_request_core(
             headers: resp_headers,
             body: response.into_body(),
             request_body_exceeded: None, // buffered request body — already fully sent
+            response_read_timeout_ms: streaming_response_read_timeout_ms,
         }));
     }
 
