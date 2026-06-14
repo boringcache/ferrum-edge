@@ -986,6 +986,65 @@ fn warn_if_h3_backend_tls_policy_incompatible(
     }
 }
 
+/// Emit a one-time startup warning when `FERRUM_WEBSOCKET_TUNNEL_MODE` is
+/// enabled and the loaded config has HTTP-family proxies that could carry
+/// WebSocket traffic.
+///
+/// Tunnel mode (raw `copy_bidirectional` after the upgrade, taken only when a
+/// proxy has no frame-level WebSocket plugins) cannot recover backend frame
+/// bytes that tokio-tungstenite coalesced into its internal read buffer while
+/// parsing the backend `101 Switching Protocols` response: `into_inner()`
+/// returns only the underlying socket and discards the codec's buffered tail.
+/// tokio-tungstenite/tungstenite expose no accessor for that residual (verified
+/// against the pinned 0.29 release and upstream `master`), so the first
+/// backend→client push frame can be silently dropped for backends that send
+/// immediately after upgrade (stock tickers, Socket.IO server broadcasts,
+/// MQTT-over-WS). The caveat is documented in code comments and `ferrum.conf`;
+/// surfacing it as a structured startup `warn!` makes the risk visible in
+/// operational logs without reading source.
+///
+/// Returns the number of HTTP-family proxies the caveat applies to (the proxies
+/// that can actually carry WebSocket traffic) so the decision is unit-testable;
+/// returns `0` (and logs nothing) when tunnel mode is disabled or no HTTP-family
+/// proxy is configured. The warning is intentionally per-instance, not
+/// per-session: tunnel mode is a global flag and per-session residual cannot be
+/// detected (no buffer accessor), so this is a coarse, once-at-startup signal.
+pub(crate) fn warn_if_websocket_tunnel_mode_frame_loss_risk(
+    config: &GatewayConfig,
+    websocket_tunnel_mode: bool,
+) -> usize {
+    if !websocket_tunnel_mode {
+        return 0;
+    }
+
+    // Only HTTP-family proxies (http/https + ws/wss/grpc runtime flavors) can
+    // serve a WebSocket upgrade; stream-family proxies (tcp/udp/dtls) never
+    // reach the tunnel-mode raw-copy branch. `DispatchKind::is_http_family()`
+    // is exactly `HttpPool | HttpsPool`.
+    let affected_proxy_count = config
+        .proxies
+        .iter()
+        .filter(|proxy| proxy.dispatch_kind.is_http_family())
+        .count();
+    if affected_proxy_count == 0 {
+        return 0;
+    }
+
+    warn!(
+        affected_proxy_count,
+        "FERRUM_WEBSOCKET_TUNNEL_MODE is enabled: WebSocket sessions on \
+         HTTP-family proxies without a frame-level plugin use raw TCP copy and \
+         can drop the first backend push frame if the backend coalesces it into \
+         the same TCP segment as the 101 Switching Protocols response (residual \
+         bytes buffered by tokio-tungstenite during the backend handshake are \
+         not recoverable). Disable FERRUM_WEBSOCKET_TUNNEL_MODE or attach a \
+         frame-level WebSocket plugin for any backend that pushes immediately \
+         after upgrade; request/response protocols are unaffected."
+    );
+
+    affected_proxy_count
+}
+
 /// Check if the request is a WebSocket upgrade request.
 ///
 /// Uses ASCII case-insensitive comparisons to avoid per-request `to_lowercase()`
@@ -3465,6 +3524,7 @@ impl ProxyState {
         let global_pool_config = PoolConfig::from_env();
         let tls_policy_arc = tls_policy.map(Arc::new);
         warn_if_h3_backend_tls_policy_incompatible(&config, tls_policy_arc.as_deref());
+        warn_if_websocket_tunnel_mode_frame_loss_risk(&config, websocket_tunnel_mode);
         let crls = crate::tls::load_crls(env_config.tls_crl_file_path.as_deref())?;
         let shared_crls = crate::tls::shared_crl_list(crls.clone());
         let backend_svid_generation = Arc::new(AtomicU64::new(0));
@@ -7852,9 +7912,20 @@ where
         // carried WebSocket frame bytes in the same TCP segment as the 101
         // Switching Protocols response, tungstenite may have already pulled
         // those bytes into its internal read buffer during handshake parsing,
-        // and `into_inner()` will drop them. Deployments where the backend
-        // sends immediately after upgrade should use frame-parsing mode (set
-        // a frame-level plugin or disable `FERRUM_WEBSOCKET_TUNNEL_MODE`).
+        // and `into_inner()` will drop them. This residual is NOT recoverable
+        // through tokio-tungstenite's public API: `WebSocketStream::into_inner`
+        // / `get_ref` only expose the underlying socket, and the codec's
+        // `in_buffer` (`tungstenite::protocol::frame::FrameCodec`) is reachable
+        // only through the private `WebSocket.context` field — verified against
+        // the pinned 0.29 release and upstream `master`. Fully recovering it
+        // would require hand-rolling the backend HTTP/1.1 Upgrade (so the
+        // gateway owns the read buffer) or vendoring a tungstenite patch that
+        // exposes the tail; both are out of scope for this fast path. The risk
+        // is surfaced operationally by `warn_if_websocket_tunnel_mode_frame_loss_risk`,
+        // which logs a one-time startup `warn!` when tunnel mode is enabled.
+        // Deployments where the backend sends immediately after upgrade should
+        // use frame-parsing mode (set a frame-level plugin or disable
+        // `FERRUM_WEBSOCKET_TUNNEL_MODE`).
         let backend = backend_ws_stream.into_inner();
         let buf_size = adaptive_buffer.get_buffer_size(proxy_id);
         let copy_result = tcp_proxy::bidirectional_copy_for_relay(

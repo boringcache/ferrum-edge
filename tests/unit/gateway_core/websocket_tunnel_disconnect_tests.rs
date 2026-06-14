@@ -17,6 +17,9 @@
 //!    `.io_side`, and `.error_class`.
 //! 4. Empty plugin slices skip the hook entirely (zero overhead when no
 //!    plugin opts in).
+//!
+//! The final section (issue #1619) pins the decision behind the
+//! `FERRUM_WEBSOCKET_TUNNEL_MODE` startup frame-loss-risk warning.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -26,7 +29,9 @@ use async_trait::async_trait;
 
 use ferrum_edge::_test_support::{
     StreamIoSide, fire_ws_tunnel_disconnect_hooks, make_ws_session_meta,
+    warn_if_websocket_tunnel_mode_frame_loss_risk_for_test,
 };
+use ferrum_edge::config::types::{BackendScheme, DispatchKind, GatewayConfig, Proxy};
 use ferrum_edge::plugins::{Direction, Plugin, WsDisconnectContext};
 use ferrum_edge::retry::ErrorClass;
 
@@ -193,4 +198,108 @@ async fn test_tunnel_disconnect_skips_when_no_plugins_opted_in() {
         Some((Direction::Unknown, ErrorClass::RequestError, None)),
     )
     .await;
+}
+
+// ── Startup frame-loss-risk warning decision (issue #1619) ───────────────────
+//
+// `FERRUM_WEBSOCKET_TUNNEL_MODE` cannot recover backend WebSocket frame bytes
+// that tokio-tungstenite buffered while parsing the backend 101 response
+// (`into_inner()` discards the codec's read buffer and the dependency exposes
+// no accessor for it), so the first backend push frame can be dropped. The
+// gateway surfaces that caveat as a one-time startup `warn!`. These tests pin
+// the decision behind that warning: it fires only when tunnel mode is enabled
+// AND at least one HTTP-family proxy (the only kind that can carry a WebSocket
+// upgrade) is configured. The helper returns the count of affected proxies so
+// the decision is assertable without capturing logs.
+
+/// Build a minimal `Proxy` with the requested dispatch kind. `dispatch_kind`
+/// is `#[serde(skip)]` (resolved post-deserialize), so it is set explicitly
+/// here rather than via JSON.
+fn proxy_with_dispatch_kind(id: &str, scheme: BackendScheme, kind: DispatchKind) -> Proxy {
+    let json = format!(
+        r#"{{
+            "id": "{id}",
+            "backend_scheme": "{}",
+            "backend_host": "backend.example.com",
+            "backend_port": 9000
+        }}"#,
+        match scheme {
+            BackendScheme::Http => "http",
+            BackendScheme::Https => "https",
+            BackendScheme::Tcp => "tcp",
+            BackendScheme::Tcps => "tcps",
+            BackendScheme::Udp => "udp",
+            BackendScheme::Dtls => "dtls",
+        }
+    );
+    let mut proxy: Proxy = serde_json::from_str(&json).expect("proxy json deserializes");
+    proxy.dispatch_kind = kind;
+    proxy
+}
+
+#[test]
+fn test_tunnel_warning_skipped_when_tunnel_mode_disabled() {
+    let config = GatewayConfig {
+        proxies: vec![proxy_with_dispatch_kind(
+            "p-https",
+            BackendScheme::Https,
+            DispatchKind::HttpsPool,
+        )],
+        ..GatewayConfig::default()
+    };
+
+    // Tunnel mode off → no warning regardless of proxy mix.
+    assert_eq!(
+        warn_if_websocket_tunnel_mode_frame_loss_risk_for_test(&config, false),
+        0,
+    );
+}
+
+#[test]
+fn test_tunnel_warning_skipped_when_only_stream_proxies() {
+    let config = GatewayConfig {
+        proxies: vec![
+            proxy_with_dispatch_kind("p-tcp", BackendScheme::Tcp, DispatchKind::TcpRaw),
+            proxy_with_dispatch_kind("p-udp", BackendScheme::Udp, DispatchKind::UdpRaw),
+            proxy_with_dispatch_kind("p-dtls", BackendScheme::Dtls, DispatchKind::UdpDtls),
+        ],
+        ..GatewayConfig::default()
+    };
+
+    // Stream-family proxies never reach the tunnel-mode raw-copy branch, so
+    // even with tunnel mode enabled there is no WebSocket frame-loss exposure.
+    assert_eq!(
+        warn_if_websocket_tunnel_mode_frame_loss_risk_for_test(&config, true),
+        0,
+    );
+}
+
+#[test]
+fn test_tunnel_warning_counts_only_http_family_proxies() {
+    let config = GatewayConfig {
+        proxies: vec![
+            proxy_with_dispatch_kind("p-http", BackendScheme::Http, DispatchKind::HttpPool),
+            proxy_with_dispatch_kind("p-https", BackendScheme::Https, DispatchKind::HttpsPool),
+            proxy_with_dispatch_kind("p-tcp", BackendScheme::Tcp, DispatchKind::TcpRaw),
+            proxy_with_dispatch_kind("p-tcptls", BackendScheme::Tcps, DispatchKind::TcpTls),
+        ],
+        ..GatewayConfig::default()
+    };
+
+    // Tunnel mode on + 2 HTTP-family proxies (http + https) → warning fires and
+    // reports exactly the 2 affected proxies; the TCP / TCP+TLS proxies are
+    // excluded.
+    assert_eq!(
+        warn_if_websocket_tunnel_mode_frame_loss_risk_for_test(&config, true),
+        2,
+    );
+}
+
+#[test]
+fn test_tunnel_warning_skipped_when_no_proxies() {
+    let config = GatewayConfig::default();
+    assert_eq!(
+        warn_if_websocket_tunnel_mode_frame_loss_risk_for_test(&config, true),
+        0,
+    );
 }
