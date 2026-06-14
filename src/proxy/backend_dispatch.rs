@@ -580,23 +580,27 @@ fn client_side_no_backend_signal(error_class: Option<ErrorClass>) -> bool {
 }
 
 /// A post-wire backend failure: the request reached the backend's application
-/// layer (response headers already arrived) and then the response stalled or the
-/// transport broke before the body/trailers completed.
+/// layer (response headers already arrived) and then the response stalled, the
+/// transport broke, or the backend over-sent before the body/trailers completed.
 ///
 /// These classes are NOT connection errors — the request went on the wire, so
 /// `connection_error` stays false and connect-failure retry replay must respect
 /// method idempotency — but they ARE backend-health failures that the circuit
-/// breaker / passive health / least-latency accounting must count. Without this,
-/// a backend that returns `200` headers and then times out or RSTs mid-stream is
-/// recorded as healthy because neither `connection_error` nor a 5xx status is
-/// set (see the streaming `IdleReadTimeoutBody` / native-H3 read-timeout paths).
+/// breaker / passive health / least-latency accounting AND the adaptive
+/// concurrency limiter (`AdaptiveConcurrencyPermit::record`) must count. Without
+/// this, a backend that returns `200` headers and then times out / RSTs
+/// mid-stream (or floods past the response-size cap) is recorded as healthy
+/// because neither `connection_error` nor a 5xx status is set (see the streaming
+/// `IdleReadTimeoutBody` / native-H3 read-timeout paths and
+/// `record_deferred_backend_admission`).
 ///
-/// `ClientDisconnect` / `RequestBodyTooLarge` are deliberately excluded — they
-/// are client/gateway-side and already neutralized by
-/// `client_side_no_backend_signal`; `ResponseBodyTooLarge` is a gateway-imposed
-/// cap, not a backend fault; `GracefulRemoteClose` is a clean close.
+/// `ResponseBodyTooLarge` IS included: an oversized backend response is a backend
+/// fault (the existing limiter contract), even though the gateway is the one that
+/// cuts it. `ClientDisconnect` / `RequestBodyTooLarge` are excluded — they are
+/// client/gateway-side and already neutralized by `client_side_no_backend_signal`;
+/// `GracefulRemoteClose` is a clean close.
 #[inline]
-fn error_class_is_post_wire_backend_failure(error_class: Option<ErrorClass>) -> bool {
+pub(crate) fn error_class_is_post_wire_backend_failure(error_class: Option<ErrorClass>) -> bool {
     matches!(
         error_class,
         Some(
@@ -604,6 +608,7 @@ fn error_class_is_post_wire_backend_failure(error_class: Option<ErrorClass>) -> 
                 | ErrorClass::ConnectionReset
                 | ErrorClass::ConnectionClosed
                 | ErrorClass::ProtocolError
+                | ErrorClass::ResponseBodyTooLarge
         )
     )
 }
@@ -677,16 +682,24 @@ fn record_backend_outcome_inner(
                 .get_or_create(&proxy.id, final_cb_target_key, cb_config);
         if client_side_no_backend_signal {
             cb.record_neutral(is_half_open_probe);
-        } else if backend_failure {
-            // Route both connection errors and post-wire backend failures (a
-            // backend that returned headers then stalled / RST mid-response)
-            // through record_failure() as connection-level so they can trip the
-            // breaker even when the response status is a healthy 2xx. When
-            // trip_on_connection_errors=false, record_failure() treats them as
-            // neutral while still releasing half-open probe slots.
+        } else if connection_error {
+            // Pre-wire connection error → routed as connection-level, gated by
+            // trip_on_connection_errors. When that is false, record_failure()
+            // treats it as neutral while still releasing half-open probe slots.
             cb.record_failure(response_status, true, is_half_open_probe);
         } else if cb.config().failure_status_codes.contains(&response_status) {
+            // A configured failure status (5xx etc.) trips the breaker
+            // regardless of connection-error gating. Checked BEFORE the
+            // post-wire arm so a backend that returns a failure status AND then
+            // stalls / RSTs mid-body still records the (ungated) status-code
+            // failure rather than a trip_on_connection_errors-gated one.
             cb.record_failure(response_status, false, is_half_open_probe);
+        } else if error_class_is_post_wire_backend_failure(error_class) {
+            // Post-wire backend failure with a non-failure status (a 2xx stream
+            // that then timed out / reset mid-body): route through the
+            // connection-level path so it can trip even though the status looked
+            // healthy, gated by trip_on_connection_errors like a transport fault.
+            cb.record_failure(response_status, true, is_half_open_probe);
         } else {
             cb.record_success(is_half_open_probe);
         }

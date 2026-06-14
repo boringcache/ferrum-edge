@@ -353,13 +353,19 @@ impl AdaptiveConcurrencyPermit {
         ) {
             return;
         }
-        // Backend faults shrink the limit. An oversized *backend* response
-        // (`ResponseBodyTooLarge`) is a backend fault even when the status line
-        // looked healthy before the overflow was detected, so it must not be
-        // counted as a fast success.
+        // Backend faults shrink the limit. Besides connection errors and 5xx,
+        // this covers post-wire backend failures — a stream that returned healthy
+        // 2xx headers and then timed out / reset mid-body (`ReadWriteTimeout` /
+        // `ConnectionReset` / `ConnectionClosed` / `ProtocolError`) or over-sent
+        // past the response-size cap (`ResponseBodyTooLarge`). Without them the
+        // limiter would treat a post-header backend stall as a fast success and
+        // grow the limit. Shares the predicate with the circuit-breaker /
+        // passive-health accounting so the two cannot drift.
         if outcome.connection_error
             || outcome.response_status >= 500
-            || outcome.error_class == Some(ErrorClass::ResponseBodyTooLarge)
+            || crate::proxy::backend_dispatch::error_class_is_post_wire_backend_failure(
+                outcome.error_class,
+            )
         {
             decrease_limit(&self.state.limit, &self.config);
             return;
