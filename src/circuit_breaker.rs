@@ -311,6 +311,16 @@ impl CircuitBreaker {
             .store(now_epoch_ms(), Ordering::Relaxed);
 
         match packed_state(packed) {
+            // A half-open probe failure that finds the breaker already CLOSED lost
+            // the race to a sibling probe reaching the success threshold and
+            // closing it. Reopen unconditionally — any admitted probe failure
+            // reopens — rather than fall through to the closed-state
+            // failure-threshold arm below, where a concurrent CLOSED-state success
+            // resetting failure_count could drop the failure and leave the breaker
+            // CLOSED despite a failed probe (only reachable with
+            // half_open_max_requests > 1, where sibling probes can close while
+            // this one fails).
+            STATE_CLOSED if is_half_open_probe => self.reopen_after_probe_failure(),
             STATE_CLOSED => {
                 let failures = self.failure_count.fetch_add(1, Ordering::Relaxed) + 1;
                 if failures >= self.config.failure_threshold {
@@ -353,52 +363,7 @@ impl CircuitBreaker {
                     }
                 }
             }
-            STATE_HALF_OPEN => {
-                // Reopen: publish OPEN and clear the in-flight count in ONE CAS,
-                // so HALF_OPEN admissions stop at the SAME instant the count is
-                // zeroed. With separate atomics, clearing the count before
-                // publishing OPEN let a concurrent can_execute() that still
-                // observed HALF_OPEN acquire fresh slots against the just-zeroed
-                // counter and over-admit during the reopen; publishing OPEN first
-                // instead could strand the cleared count. Fusing them removes
-                // both windows. The failing probe's own slot is subsumed by the
-                // count reset, and any straggler from this cycle releases as a
-                // no-op at 0.
-                self.success_count.store(0, Ordering::Relaxed);
-                loop {
-                    let p = self.packed.load(Ordering::Acquire);
-                    match packed_state(p) {
-                        // A sibling probe failure already reopened — done.
-                        STATE_OPEN => break,
-                        // HALF_OPEN (the normal case) OR CLOSED — a sibling probe
-                        // reached the success threshold and closed the breaker
-                        // before we got here. Either way an admitted half-open
-                        // probe FAILED, and the half-open policy is that ANY probe
-                        // failure reopens, so reopen even from the freshly-closed
-                        // state (matching the prior code, which published OPEN
-                        // unconditionally after observing HALF_OPEN). Dropping the
-                        // failure on a lost close race would otherwise leave the
-                        // breaker CLOSED despite a failed probe when
-                        // half_open_max_requests > 1. Clears the in-flight count
-                        // in the same CAS.
-                        _ => {
-                            if self
-                                .packed
-                                .compare_exchange_weak(
-                                    p,
-                                    pack(STATE_OPEN, 0),
-                                    Ordering::AcqRel,
-                                    Ordering::Relaxed,
-                                )
-                                .is_ok()
-                            {
-                                warn!("Circuit breaker reopening (probe failed)");
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
+            STATE_HALF_OPEN => self.reopen_after_probe_failure(),
             STATE_OPEN if is_half_open_probe => {
                 // A concurrent record_failure already reopened the circuit between
                 // our can_execute() (when it was HALF_OPEN) and now. Release our
@@ -406,6 +371,42 @@ impl CircuitBreaker {
                 self.release_half_open_slot();
             }
             _ => {}
+        }
+    }
+
+    /// Reopen the breaker after a half-open probe failure (or a non-probe failure
+    /// observed while HALF_OPEN). Publishes OPEN and clears the in-flight count in
+    /// ONE CAS — so HALF_OPEN admissions stop at the same instant the count is
+    /// zeroed (no over-admission window during the reopen) — reopening from
+    /// HALF_OPEN OR a freshly-raced CLOSED (a sibling probe reached the success
+    /// threshold and closed the breaker first). Any admitted probe failure
+    /// reopens; only an already-published OPEN is left alone. The failing probe's
+    /// slot is subsumed by the count reset, and a straggler from this cycle
+    /// releases as a no-op at 0.
+    fn reopen_after_probe_failure(&self) {
+        self.success_count.store(0, Ordering::Relaxed);
+        loop {
+            let p = self.packed.load(Ordering::Acquire);
+            match packed_state(p) {
+                // A sibling probe failure already reopened — done.
+                STATE_OPEN => break,
+                // HALF_OPEN or CLOSED → reopen, clearing the count in the same CAS.
+                _ => {
+                    if self
+                        .packed
+                        .compare_exchange_weak(
+                            p,
+                            pack(STATE_OPEN, 0),
+                            Ordering::AcqRel,
+                            Ordering::Relaxed,
+                        )
+                        .is_ok()
+                    {
+                        warn!("Circuit breaker reopening (probe failed)");
+                        break;
+                    }
+                }
+            }
         }
     }
 
