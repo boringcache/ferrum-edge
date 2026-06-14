@@ -1601,11 +1601,18 @@ fn test_half_open_bound_and_no_wedge_under_admit_reopen_race_stress() {
         let cb = cb.clone();
         handles.push(thread::spawn(move || {
             for i in 0..20_000u32 {
-                if cb.can_execute().is_ok() {
+                // Preserve the probe flag `can_execute()` returns: only a request
+                // admitted AS a half-open probe (`Ok(true)`) may complete as one.
+                // A CLOSED-state admission (`Ok(false)`) must record as a
+                // non-probe — passing `true` there would release a half-open slot
+                // the request never held (corrupting the in-flight count) and run
+                // a closed-state failure through the probe-reopen path, masking
+                // the admission bound this test validates.
+                if let Ok(is_probe) = cb.can_execute() {
                     if t.wrapping_add(i) % 3 == 0 {
-                        cb.record_failure(500, false, true); // reopen
+                        cb.record_failure(500, false, is_probe); // reopen iff a probe
                     } else {
-                        cb.record_success(true);
+                        cb.record_success(is_probe);
                     }
                 }
             }
