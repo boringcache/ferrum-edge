@@ -1217,6 +1217,29 @@ async fn test_regex_origin_requires_full_match_not_substring() {
 }
 
 #[tokio::test]
+async fn test_regex_origin_alternation_full_match_accepts_later_branch() {
+    // Regression for the anchored-vs-first-find bug: with a top-level
+    // alternation whose FIRST branch is a strict prefix of the Origin, an
+    // unanchored `find` returns the shorter leading match and the full-length
+    // check rejects the Origin — even though a LATER branch matches the whole
+    // string. Anchoring the compiled pattern (`^(?:...)$`) makes `is_match`
+    // try every branch, so the Origin is correctly admitted.
+    let plugin = CorsPlugin::new(&json!({
+        "allowed_origins": [{"regex": "https://app|https://app\\.example\\.com"}]
+    }))
+    .unwrap();
+
+    let mut ctx = make_cors_ctx("GET", "https://app.example.com");
+    assert!(
+        matches!(
+            plugin.on_request_received(&mut ctx).await,
+            PluginResult::Continue
+        ),
+        "a later alternation branch fully matching the Origin must admit it"
+    );
+}
+
+#[tokio::test]
 async fn test_mixed_string_and_object_origin_matchers() {
     // Plain-string and object matchers can be mixed in one `allowed_origins`.
     let plugin = CorsPlugin::new(&json!({
@@ -1302,6 +1325,31 @@ fn test_constructor_rejects_multi_key_origin_matcher() {
     }))
     .err()
     .expect("an object matcher with two keys must be rejected");
+    assert!(err.contains("exactly one"), "got: {err}");
+}
+
+#[test]
+fn test_constructor_rejects_object_matcher_with_non_string_extra_key() {
+    // Regression: a recognized key with a NON-string value (here `regex`)
+    // alongside a valid string key must NOT be silently dropped, leaving a bare
+    // prefix matcher — the StringMatch contract is exactly one well-typed key.
+    let err = CorsPlugin::new(&json!({
+        "allowed_origins": [{"prefix": "https://app.", "regex": 123}]
+    }))
+    .err()
+    .expect("an object matcher with an extra (non-string) key must be rejected");
+    assert!(err.contains("exactly one"), "got: {err}");
+}
+
+#[test]
+fn test_constructor_rejects_object_matcher_with_unknown_key() {
+    // An unknown key must be rejected rather than ignored while a sibling valid
+    // key is honored.
+    let err = CorsPlugin::new(&json!({
+        "allowed_origins": [{"prefix": "https://app.", "bogus": "x"}]
+    }))
+    .err()
+    .expect("an object matcher with an unknown key must be rejected");
     assert!(err.contains("exactly one"), "got: {err}");
 }
 

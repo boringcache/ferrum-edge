@@ -226,6 +226,26 @@ impl CorsPlugin {
     /// pattern is compiled here (config time) so an invalid pattern is a config
     /// error, never a request-path panic.
     fn parse_origin_matcher(value: &Value) -> Result<OriginPattern, String> {
+        // Istio `StringMatch` contract: EXACTLY ONE recognized key, and nothing
+        // else. Reject unknown keys, extra keys, or a non-string value rather
+        // than silently coercing — mirrors
+        // `config_sources::k8s::string_match_has_exactly_one_supported_operator`
+        // used for Istio request matchers. Without this, a malformed config like
+        // `{"prefix":"x","regex":123}` would slip through as a bare prefix
+        // matcher, dropping the invalid second key.
+        const MATCHER_KEYS: [&str; 3] = ["exact", "prefix", "regex"];
+        let obj = value.as_object().ok_or_else(|| {
+            "cors: 'allowed_origins' object matcher must be a JSON object with one of \
+             'exact', 'prefix', or 'regex'"
+                .to_string()
+        })?;
+        if obj.len() != 1 || !obj.keys().all(|key| MATCHER_KEYS.contains(&key.as_str())) {
+            return Err(
+                "cors: 'allowed_origins' object matcher must specify exactly one of \
+                 'exact', 'prefix', or 'regex' (no extra or unknown keys)"
+                    .to_string(),
+            );
+        }
         let exact = value.get("exact").and_then(Value::as_str);
         let prefix = value.get("prefix").and_then(Value::as_str);
         let regex = value.get("regex").and_then(Value::as_str);
@@ -264,11 +284,19 @@ impl CorsPlugin {
                             .to_string(),
                     );
                 }
-                // Compile with the regex crate's default size limit; the engine
-                // is finite-automaton based, so a hostile pattern cannot trigger
-                // catastrophic backtracking. A pattern that fails to compile (or
-                // exceeds the size limit) is rejected here, not at request time.
-                let compiled = Regex::new(regex).map_err(|e| {
+                // Istio `StringMatch.regex` is a FULL match. Anchor at compile
+                // time (the shared Ferrum convention for Istio-style regex, also
+                // strips a redundant leading `^`/trailing `$`) so matching can
+                // use `is_match`: checking only the first unanchored `find`
+                // would reject an Origin that a LATER alternation branch fully
+                // matches (e.g. `https://app|https://app\.example\.com` vs
+                // `https://app.example.com`, where `find` returns the shorter
+                // `https://app`). Compile with the regex crate's default size
+                // limit; the engine is finite-automaton based, so a hostile
+                // pattern cannot trigger catastrophic backtracking. A pattern
+                // that fails to compile is rejected here, not at request time.
+                let anchored = crate::config::types::anchor_regex_pattern(regex);
+                let compiled = Regex::new(&anchored).map_err(|e| {
                     format!("cors: 'allowed_origins' regex matcher '{regex}' is invalid: {e}")
                 })?;
                 Ok(OriginPattern::Regex(compiled))
@@ -343,9 +371,11 @@ impl CorsPlugin {
                 OriginPattern::WildcardSubdomain(suffix) => origin_host(origin)
                     .is_some_and(|host| ascii_ends_with_ignore_case(host, suffix.as_str())),
                 OriginPattern::Prefix(prefix) => origin.starts_with(prefix.as_str()),
-                OriginPattern::Regex(re) => re
-                    .find(origin)
-                    .is_some_and(|m| m.start() == 0 && m.end() == origin.len()),
+                // The compiled pattern is anchored at parse time
+                // (`anchor_regex_pattern`), so a full-string match is exactly
+                // `is_match` — and it tries every alternation branch, unlike the
+                // first unanchored `find`.
+                OriginPattern::Regex(re) => re.is_match(origin),
             }),
         }
     }
