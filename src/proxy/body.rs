@@ -628,8 +628,17 @@ impl ProxyBody {
         } else {
             error_class
         };
+        // `connection_error` means exactly "the request body never reached the
+        // backend's application layer" (see the Connection-Error Classification
+        // Boundary). By the time a streaming body is producing deferred
+        // outcomes the response headers have already arrived, so a terminal
+        // body error — including the `ReadWriteTimeout` raised by
+        // `IdleReadTimeoutBody` — is post-wire and must NOT be flagged as a
+        // connection error. Derive it from the canonical `request_reached_wire`
+        // predicate instead of "anything that isn't a client disconnect", which
+        // wrongly painted mid-stream read timeouts / resets as connect failures.
         let connection_error =
-            error_class.is_some_and(|class| class != ErrorClass::ClientDisconnect);
+            error_class.is_some_and(|class| !crate::retry::request_reached_wire(class));
         // Prefer the gRPC trailer's mapped status (a non-OK grpc-status finishes
         // HTTP 200) so a backend gRPC failure shrinks the limit; falls back to the
         // header status for non-gRPC streams or an OK/absent trailer.
@@ -665,8 +674,15 @@ impl ProxyBody {
         } else {
             error_class.or(outcome.error_class)
         };
+        // Post-wire body errors (mid-stream read timeout, reset, close) are not
+        // connection errors — the request already reached the backend's
+        // application layer. Preserve any dispatch-phase connection error
+        // recorded at construction, but derive the body-error contribution from
+        // the canonical `request_reached_wire` predicate rather than treating
+        // every non-disconnect class as a connect failure. See the matching
+        // note in `record_deferred_backend_admission`.
         let connection_error = outcome.connection_error
-            || error_class.is_some_and(|class| class != ErrorClass::ClientDisconnect);
+            || error_class.is_some_and(|class| !crate::retry::request_reached_wire(class));
         let response_status = outcome
             .grpc_trailer_http_status
             .unwrap_or(outcome.response_status);
@@ -1852,6 +1868,130 @@ impl http_body::Body for DirectH2Body {
     }
 }
 
+/// Wraps a streaming HTTP/2 response body with a per-frame idle read deadline.
+///
+/// After the response headers have arrived, a backend can stop producing body
+/// frames while keeping the H2 connection alive. Without a deadline the
+/// streaming relay stays parked on the next `poll_frame`, pinning the request's
+/// lifetime guards (overload `RequestGuard`, per-IP request accounting, the
+/// least-connections LB guard, backend-admission permits) until the client
+/// disconnects or the backend eventually resumes.
+///
+/// This wrapper arms a pinned `Sleep` only while it is actually waiting on the
+/// backend (a `Pending` inner poll); if no frame arrives within
+/// `backend_read_timeout_ms` of beginning that wait, `poll_frame` yields a
+/// `std::io::Error` of kind `TimedOut`. That kind is mapped to
+/// `ErrorClass::ReadWriteTimeout` (post-wire) by `retry::classify_typed_chain`,
+/// so deferred backend/admission accounting records a read timeout (and, being
+/// post-wire, NOT a connection error) rather than an indefinite in-flight
+/// stream — matching the buffered H2 body collection
+/// (`collect_hyper_body_with_limit`) and the native-H3 streaming read timeout.
+///
+/// The deadline is (re)armed only on the transition from "have a frame" to
+/// "waiting on the backend" — NOT on every received frame. A slow downstream
+/// client can keep the relay from polling this body for an arbitrary interval
+/// (H2 flow-control backpressure), and that interval is the client's latency,
+/// not the backend's. Arming on the false→true `waiting` edge measures
+/// contiguous backend-read latency and avoids charging downstream stalls to the
+/// backend, which would spuriously time out a healthy-but-flow-controlled
+/// stream.
+///
+/// `backend_read_timeout_ms == 0` keeps the unbounded opt-out: the call sites
+/// skip this wrapper entirely in that case.
+struct IdleReadTimeoutBody<B> {
+    inner: B,
+    timeout: std::time::Duration,
+    deadline: Pin<Box<tokio::time::Sleep>>,
+    /// `true` once an inner `Pending` poll has begun a backend-read wait, reset
+    /// to `false` whenever a frame is delivered. The deadline is re-armed only
+    /// on the `false -> true` edge so it never counts downstream-drain time.
+    waiting: bool,
+}
+
+impl<B> IdleReadTimeoutBody<B> {
+    fn new(inner: B, timeout_ms: u64) -> Self {
+        let timeout = std::time::Duration::from_millis(timeout_ms);
+        Self {
+            inner,
+            timeout,
+            deadline: Box::pin(tokio::time::sleep(timeout)),
+            waiting: false,
+        }
+    }
+}
+
+impl<B> http_body::Body for IdleReadTimeoutBody<B>
+where
+    B: http_body::Body<Data = Bytes> + Unpin,
+    B::Error: Into<BoxError>,
+{
+    type Data = Bytes;
+    // `BoxError` (not a concrete enum) because this wrapper is now placed
+    // OUTERMOST — directly around the `Coalescing` adapter (whose `Error` is
+    // already `BoxError`) — rather than inside it. Wrapping the coalescer is
+    // exactly what makes the deadline measure only genuine backend-read waits:
+    // the coalescer reports `Pending` only when it has NO buffered frame to
+    // flush AND the backend itself is pending, so the `waiting`-edge re-arm can
+    // no longer fire while a sub-target frame is sitting buffered waiting on a
+    // slow downstream client. A boxed `dyn Error` does not implement `Error`,
+    // but that no longer matters: the wrapper is no longer a `FrameSource`
+    // inner, so it needs no concrete error type. The timeout is emitted as a
+    // boxed `io::Error` of kind `TimedOut`, which `retry::classify_typed_chain`
+    // still maps to `ErrorClass::ReadWriteTimeout`.
+    type Error = BoxError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                // A backend frame arrived — we are no longer waiting on the
+                // backend. Do NOT arm the deadline here: the interval until the
+                // next `poll_frame` can be dominated by a slow client draining
+                // this frame (H2 flow-control backpressure), which is downstream
+                // latency, not backend latency. The deadline is armed on the
+                // next `Pending` instead, so it only ever measures contiguous
+                // backend-read wait time.
+                this.waiting = false;
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e.into()))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => {
+                if !this.waiting {
+                    // First `Pending` since the last delivered frame: begin the
+                    // backend-read wait now so any downstream-drain interval that
+                    // just elapsed is excluded from the timeout budget.
+                    this.waiting = true;
+                    this.deadline
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + this.timeout);
+                }
+                match std::future::Future::poll(this.deadline.as_mut(), cx) {
+                    Poll::Ready(()) => Poll::Ready(Some(Err(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "backend response body read timeout after {}ms",
+                            this.timeout.as_millis()
+                        ),
+                    )) as BoxError))),
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
 struct DirectH3Body<S = crate::http3::client::H3RequestStream> {
     source: H3FrameSource<S>,
     content_length: Option<u64>,
@@ -2043,10 +2183,25 @@ pub(crate) fn coalescing_h2_body_strip_hop_by_hop_trailers(
     body: Incoming,
     content_length: Option<u64>,
     coalesce_target: usize,
+    read_timeout_ms: u64,
 ) -> ProxyBody {
-    let stripped = StripHopByHopTrailers::new(body);
-    let coalescing = Coalescing::new(stripped, coalesce_target, content_length);
-    ProxyBody::streaming(Box::pin(coalescing))
+    // Bound the backend read by `backend_read_timeout_ms` (>0) so a backend that
+    // sends headers then stalls cannot pin the streaming relay indefinitely. The
+    // deadline wraps the coalescer OUTERMOST (not the raw body inside it): the
+    // coalescer only reports `Pending` once it has no buffered frame left to
+    // flush AND the backend is pending, so the deadline measures genuine
+    // backend-read waits and never fires while a sub-target frame is buffered
+    // waiting on a slow downstream client. See `IdleReadTimeoutBody`.
+    if read_timeout_ms > 0 {
+        let stripped = StripHopByHopTrailers::new(body);
+        let coalescing = Coalescing::new(stripped, coalesce_target, content_length);
+        let timed = IdleReadTimeoutBody::new(coalescing, read_timeout_ms);
+        ProxyBody::streaming(Box::pin(timed))
+    } else {
+        let stripped = StripHopByHopTrailers::new(body);
+        let coalescing = Coalescing::new(stripped, coalesce_target, content_length);
+        ProxyBody::streaming(Box::pin(coalescing))
+    }
 }
 
 /// Size-limited coalescing HTTP/2 streaming body with hop-by-hop trailer
@@ -2058,11 +2213,23 @@ pub(crate) fn size_limited_coalescing_h2_body_strip_hop_by_hop_trailers(
     max_bytes: usize,
     content_length: Option<u64>,
     coalesce_target: usize,
+    read_timeout_ms: u64,
 ) -> ProxyBody {
-    let stripped = StripHopByHopTrailers::new(body);
-    let limited = SizeLimitedFrameSource::new(stripped, max_bytes);
-    let coalescing = Coalescing::new(limited, coalesce_target, content_length);
-    ProxyBody::streaming(Box::pin(coalescing))
+    if read_timeout_ms > 0 {
+        // See `coalescing_h2_body_strip_hop_by_hop_trailers`: the deadline wraps
+        // the coalescer OUTERMOST so it never fires while a buffered sub-target
+        // frame is waiting on a slow downstream client.
+        let stripped = StripHopByHopTrailers::new(body);
+        let limited = SizeLimitedFrameSource::new(stripped, max_bytes);
+        let coalescing = Coalescing::new(limited, coalesce_target, content_length);
+        let timed = IdleReadTimeoutBody::new(coalescing, read_timeout_ms);
+        ProxyBody::streaming(Box::pin(timed))
+    } else {
+        let stripped = StripHopByHopTrailers::new(body);
+        let limited = SizeLimitedFrameSource::new(stripped, max_bytes);
+        let coalescing = Coalescing::new(limited, coalesce_target, content_length);
+        ProxyBody::streaming(Box::pin(coalescing))
+    }
 }
 
 /// Direct (non-coalesced) HTTP/2 streaming body wrapped in
@@ -2073,6 +2240,7 @@ pub(crate) fn size_limited_coalescing_h2_body_strip_hop_by_hop_trailers(
 pub(crate) fn direct_streaming_h2_body_strip_hop_by_hop_trailers(
     body: Incoming,
     content_length: Option<u64>,
+    read_timeout_ms: u64,
 ) -> ProxyBody {
     use http_body_util::BodyExt;
 
@@ -2080,8 +2248,18 @@ pub(crate) fn direct_streaming_h2_body_strip_hop_by_hop_trailers(
         inner: body,
         content_length,
     };
-    let stripped = StripHopByHopTrailers::new(direct);
-    ProxyBody::streaming(Box::pin(stripped.map_err(|e| Box::new(e) as BoxError)))
+    if read_timeout_ms > 0 {
+        // The direct path has no coalescing buffer, so the deadline can wrap the
+        // direct body directly — `Strip` forwards frames without buffering, so
+        // the `waiting`-edge re-arm already excludes downstream-drain time.
+        // `IdleReadTimeoutBody` already yields `BoxError`, so no `map_err`.
+        let timed = IdleReadTimeoutBody::new(direct, read_timeout_ms);
+        let stripped = StripHopByHopTrailers::new(timed);
+        ProxyBody::streaming(Box::pin(stripped))
+    } else {
+        let stripped = StripHopByHopTrailers::new(direct);
+        ProxyBody::streaming(Box::pin(stripped.map_err(|e| Box::new(e) as BoxError)))
+    }
 }
 
 /// A body wrapper that filters hop-by-hop response headers out of any

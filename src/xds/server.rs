@@ -2147,6 +2147,8 @@ mod tests {
                         hosts: vec!["./api".to_string()],
                         port: None,
                     }],
+                    ingress_declared: false,
+                    ingress: Vec::new(),
                 }],
                 ..MeshConfig::default()
             })),

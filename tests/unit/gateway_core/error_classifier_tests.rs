@@ -9,10 +9,11 @@
 //! but the fallback keeps classification meaningful for hand-rolled tests and
 //! rare future wrappers that can't surface a typed cause.
 
+use ferrum_edge::proxy::hbone_pool::HbonePoolError;
 use ferrum_edge::proxy::http2_pool::{
     BackendUnavailableSource, Http2PoolError, InternalSource, classify_http2_pool_error,
 };
-use ferrum_edge::retry::ErrorClass;
+use ferrum_edge::retry::{ErrorClass, classify_boxed_setup_error, request_reached_wire};
 use std::io;
 
 // ── HTTP/2 pool classifier — typed source chain ─────────────────────────
@@ -438,4 +439,85 @@ fn test_h3_fallback_stream_protocol_markers_still_match() {
             "expected ProtocolError for {msg:?}"
         );
     }
+}
+
+// ── Mesh-transport (HBONE / mesh-mTLS) boxed setup-error classification ──
+//
+// The WebSocket-over-mesh egress dial returns `HbonePoolError` BOXED to the
+// shared WebSocket failure handler, which classifies via
+// `retry::classify_boxed_setup_error`. That handler must keep the pre-wire
+// connect-failure semantics `HbonePoolError::error_class()` already encodes —
+// otherwise pre-wire mesh setup failures (missing gateway SVID, invalid
+// `mesh.spiffe_id`, DNS failure, peer without Extended CONNECT) would be
+// misclassified as post-wire and corrupt `retry_on_connect_failure`,
+// backend-admission `connection_error`, and circuit-breaker passive health.
+// These assert the boxed-error downcast added to `classify_typed_chain`.
+
+#[test]
+fn test_boxed_hbone_no_svid_is_pre_wire_connection_pool_error() {
+    // A missing gateway SVID fails before any dial — pre-wire by construction.
+    let err: Box<dyn std::error::Error + Send + Sync> = Box::new(HbonePoolError::NoSvid);
+    let class = classify_boxed_setup_error(err.as_ref());
+    assert_eq!(class, ErrorClass::ConnectionPoolError);
+    assert!(
+        !request_reached_wire(class),
+        "missing-SVID must be treated as pre-wire (the request never crossed the wire)"
+    );
+}
+
+#[test]
+fn test_boxed_hbone_invalid_peer_spiffe_tag_is_pre_wire() {
+    // A corrupt pinned `mesh.spiffe_id` fails the dial closed — pre-wire.
+    let err: Box<dyn std::error::Error + Send + Sync> =
+        Box::new(HbonePoolError::InvalidPeerSpiffeTag {
+            value: "not-a-spiffe-id".to_string(),
+            message: "missing scheme".to_string(),
+        });
+    let class = classify_boxed_setup_error(err.as_ref());
+    assert_eq!(class, ErrorClass::ConnectionPoolError);
+    assert!(!request_reached_wire(class));
+}
+
+#[test]
+fn test_boxed_hbone_dns_lookup_is_pre_wire_dns_error() {
+    let err: Box<dyn std::error::Error + Send + Sync> = Box::new(HbonePoolError::DnsLookup {
+        host: "svc-b.ferrum.svc.cluster.local".to_string(),
+        message: "no addresses".to_string(),
+    });
+    let class = classify_boxed_setup_error(err.as_ref());
+    assert_eq!(class, ErrorClass::DnsLookupError);
+    assert!(!request_reached_wire(class));
+}
+
+#[test]
+fn test_boxed_hbone_extended_connect_unsupported_is_protocol_error() {
+    // A peer that never negotiated RFC 8441 (Sidecar WS Extended CONNECT) is a
+    // ProtocolError — post-wire by class (the connection established), so it is
+    // NOT replayed under `retry_on_connect_failure`. The key assertion is that
+    // the downcast routes through `error_class()` rather than the substring
+    // fallback (which has no token for this message).
+    let err: Box<dyn std::error::Error + Send + Sync> =
+        Box::new(HbonePoolError::ExtendedConnectUnsupported {
+            authority: "svc-b.ferrum.svc.cluster.local:8080".to_string(),
+        });
+    assert_eq!(
+        classify_boxed_setup_error(err.as_ref()),
+        ErrorClass::ProtocolError
+    );
+}
+
+#[test]
+fn test_boxed_hbone_connect_refused_is_pre_wire_connection_refused() {
+    // The TCP connect to the peer's transport port was refused — the
+    // variant-level `error_class()` maps the inner io kind to a pre-wire
+    // class. Asserting via the BOXED path proves the downcast wins over the
+    // generic io-error chain arm (which would also need the connect-phase
+    // override to land here).
+    let err: Box<dyn std::error::Error + Send + Sync> = Box::new(HbonePoolError::Connect {
+        addr: "127.0.0.1:15008".to_string(),
+        source: io::Error::new(io::ErrorKind::ConnectionRefused, "connection refused"),
+    });
+    let class = classify_boxed_setup_error(err.as_ref());
+    assert_eq!(class, ErrorClass::ConnectionRefused);
+    assert!(!request_reached_wire(class));
 }

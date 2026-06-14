@@ -25,8 +25,10 @@
 //!   and host/endpoint/port counts.
 //! - `RequestAuthentication` — status reports the resolved scope and the
 //!   number of JWT rules (permissive-by-default semantics).
-//! - `Sidecar` — status reports the egress scope and flags `ingress`
-//!   listener config as deferred (Ferrum models egress scoping only).
+//! - `Sidecar` — status reports the egress scope and the modeled `ingress[]`
+//!   listener count. Only ingress entries Ferrum cannot model (Unix-socket /
+//!   non-loopback `defaultEndpoint`, non-HTTP-family protocol) remain in
+//!   `deferred_fields`; resolvable listeners are materialized.
 //! - `Telemetry` — status reports which sections (tracing / metrics /
 //!   accessLogging) are present.
 //! - `WorkloadEntry` — status reports the derived SPIFFE service account
@@ -238,7 +240,12 @@ pub fn plan_istio_status_updates(
                     &options.istio_root_namespace,
                 ),
                 "WorkloadEntry" => workload_entry_status(object, result.as_ref()),
-                "Sidecar" => sidecar_status(object, result.as_ref(), &options.istio_root_namespace),
+                "Sidecar" => sidecar_status(
+                    object,
+                    result.as_ref(),
+                    &options.istio_root_namespace,
+                    options.mesh_sidecar_ingress_enforced,
+                ),
                 "Telemetry" => telemetry_status(object, result.as_ref()),
                 _ => return None,
             };
@@ -560,24 +567,20 @@ fn destination_rule_status(
 
     let (accepted, reason, message, detail) = match result {
         Ok(_translation) => {
-            // T1-C deferred fields: the per-subset outlierDetection
-            // maxEjectionPercent cap, and the parsed-but-dropped connectionPool.http
+            // T1-C deferred fields: the parsed-but-dropped connectionPool.http
             // knobs the translator only warns on (http1MaxPendingRequests /
             // maxRetries / h2UpgradePolicy).
             // Now APPLIED (no longer deferred): per-subset
             // connectionPool.tcp.connectTimeout (overrides backend_connect_timeout_ms
             // for subset-bound proxies), portLevelSettings[].tls (per-port backend
-            // TLS projected onto the effective proxy's resolved_tls), and per-subset
-            // outlierDetection *thresholds* (consecutive errors / interval /
-            // base-ejection / min-health) — only the maxEjectionPercent cap remains
-            // upstream-level.
+            // TLS projected onto the effective proxy's resolved_tls), and the full
+            // per-subset outlierDetection — both the *thresholds* (consecutive
+            // errors / interval / base-ejection / min-health) and the
+            // *maxEjectionPercent cap*, the latter resolved by
+            // `LoadBalancerCache::max_ejection_percent_resolved_from` with the
+            // same per-port > per-subset > upstream precedence as the thresholds.
             // Surface the rest so operators see the gap in `kubectl describe`.
             let mut deferred: Vec<&'static str> = Vec::new();
-            if has_subset_outlier_max_ejection_percent(&object.spec) {
-                deferred.push(
-                    "subsets[].trafficPolicy.outlierDetection.maxEjectionPercent (thresholds applied per-subset; ejection cap uses upstream-level)",
-                );
-            }
             deferred.extend(deferred_connection_pool_http_fields(&object.spec));
             let message = if deferred.is_empty() {
                 format!("Ferrum accepted this DestinationRule (host: {host})")
@@ -615,25 +618,6 @@ fn destination_rule_status(
     };
 
     accepted_status(object, accepted, reason, &message, detail)
-}
-
-/// True only when some subset's `outlierDetection` sets `maxEjectionPercent`.
-/// The thresholds (consecutive errors / interval / base-ejection / min-health)
-/// are applied per-subset, so they are NOT deferred; only the ejection *cap*
-/// still resolves at the upstream level, so a threshold-only subset policy must
-/// not surface a misleading deferred-field warning.
-fn has_subset_outlier_max_ejection_percent(spec: &Value) -> bool {
-    spec.get("subsets")
-        .and_then(Value::as_array)
-        .is_some_and(|subsets| {
-            subsets.iter().any(|subset| {
-                subset
-                    .get("trafficPolicy")
-                    .and_then(|tp| tp.get("outlierDetection"))
-                    .and_then(|od| od.get("maxEjectionPercent"))
-                    .is_some()
-            })
-        })
 }
 
 /// `connectionPool.http` knobs the translator parses but drops with an
@@ -983,14 +967,26 @@ fn workload_entry_status(
     }
 }
 
-/// Status for `Sidecar`. Ferrum models only the egress scope of a Sidecar;
-/// `ingress` listener configuration is intentionally not modeled and is
-/// surfaced as a deferred field. The egress narrowing itself is gated by
+/// Status for `Sidecar`. Ferrum models the egress scope AND (F6 §6.2) the
+/// `ingress[]` custom inbound listeners. Egress narrowing is gated by
 /// `FERRUM_MESH_SIDECAR_ENFORCED` (Sidecars are always parsed/persisted).
+/// Ingress entries that Ferrum cannot represent (Unix-socket / non-loopback
+/// `defaultEndpoint`, non-HTTP-family protocol) stay in `deferred_fields`;
+/// resolvable listeners are materialized and reported via `ingress_modeled`.
+///
+/// `ingress_enforced` is the EFFECTIVE ingress materialization gate
+/// (`FERRUM_MESH_SIDECAR_ENFORCED && !FERRUM_MESH_SIDECAR_ENFORCED_DRY_RUN`),
+/// mirroring the slice builder's `sidecar_enforced && !sidecar_dry_run` ingress
+/// predicate. Ingress is materialized ONLY when it is true, so `ingress_modeled`
+/// is reported as `0` otherwise — the `FerrumAccepted` status must never claim a
+/// listener is modeled while the data plane is still serving the default inbound
+/// behavior in the default dry-run / disabled posture (keeps the translator and
+/// the status writer in lock-step on what is actually applied).
 fn sidecar_status(
     object: &K8sObject,
     result: Result<&K8sTranslation, &K8sTranslateError>,
     istio_root_namespace: &str,
+    ingress_enforced: bool,
 ) -> (Value, Option<Value>) {
     let egress_entry_count = object
         .spec
@@ -1014,19 +1010,44 @@ fn sidecar_status(
 
     match result {
         Ok(_translation) => {
-            let mut deferred: Vec<&'static str> = Vec::new();
-            if object.spec.get("ingress").is_some() {
-                deferred.push("ingress[] (listener config not modeled; egress scope only)");
+            let (ingress_modelable, ingress_deferred) =
+                classify_sidecar_ingress_entries(&object.spec);
+            // Ingress is MATERIALIZED only under the enforcement gate
+            // (`FERRUM_MESH_SIDECAR_ENFORCED && !dry_run`), exactly like the slice
+            // builder. Report the shape-modelable count as `ingress_modeled` only
+            // when the gate is on; otherwise report `0` so an operator using the
+            // `FerrumAccepted` status to verify rollout never sees a false positive
+            // while the data plane is still serving the default inbound behavior.
+            let ingress_modeled = if ingress_enforced {
+                ingress_modelable
+            } else {
+                0
+            };
+            let mut deferred: Vec<String> = Vec::new();
+            for reason in &ingress_deferred {
+                deferred.push(format!("ingress[] {reason}"));
             }
+            // When ingress modeling is gated off, surface the modelable-but-not-
+            // applied count so operators still see the shapes Ferrum WOULD model
+            // once they enable enforcement (the gate, not the resource, is why
+            // `ingress_modeled` is 0).
+            let ingress_clause = if ingress_enforced {
+                format!("{ingress_modeled} ingress listener(s) modeled")
+            } else {
+                format!(
+                    "ingress listeners not materialized (FERRUM_MESH_SIDECAR_ENFORCED off / dry-run; \
+                     {ingress_modelable} modelable when enabled)"
+                )
+            };
             let message = if deferred.is_empty() {
                 format!(
                     "Ferrum accepted this Sidecar (scope: {scope}; {egress_entry_count} egress entry/entries; \
-                     egress narrowing gated by FERRUM_MESH_SIDECAR_ENFORCED)"
+                     {ingress_clause}; egress narrowing gated by FERRUM_MESH_SIDECAR_ENFORCED)"
                 )
             } else {
                 format!(
-                    "Ferrum accepted this Sidecar (scope: {scope}; {egress_entry_count} egress entry/entries); \
-                     deferred fields: {}",
+                    "Ferrum accepted this Sidecar (scope: {scope}; {egress_entry_count} egress entry/entries; \
+                     {ingress_clause}); deferred fields: {}",
                     deferred.join(", ")
                 )
             };
@@ -1034,6 +1055,7 @@ fn sidecar_status(
                 "translation": {
                     "scope": scope,
                     "egress_entries": egress_entry_count,
+                    "ingress_modeled": ingress_modeled,
                     "deferred_fields": deferred,
                 }
             });
@@ -1051,6 +1073,108 @@ fn sidecar_status(
             accepted_status(object, false, "Invalid", &message, Some(detail))
         }
     }
+}
+
+/// Classify a Sidecar's `spec.ingress[]` entries into (modeled_count,
+/// deferred_reasons) so the status writer reports which listeners Ferrum
+/// materialized and which it left deferred. Mirrors
+/// `MeshSidecarIngress::resolve` and the slice resolver's fail-closed semantics
+/// on the raw spec so the translator predicate and the status writer stay in
+/// lock-step: an entry is modeled iff its protocol is HTTP-family AND its
+/// `defaultEndpoint` is a loopback / instance-IP `host:port` AND its listener
+/// port has not already been claimed by an earlier modeled entry. Unix-socket
+/// and non-loopback endpoints, non-HTTP-family protocols, unparseable shapes,
+/// and DUPLICATE listener ports are deferred (the translator still accepts the
+/// resource; only the unmodeled entries surface here).
+///
+/// The duplicate-port dedup mirrors `resolve_applicable_sidecar_ingress` in
+/// `src/modes/mesh/slice.rs`, which reserves a listener port only for the FIRST
+/// successfully resolved entry on that port and warns + drops later entries with
+/// the same port. Counting each supported entry would over-report `ingress_modeled`
+/// (more listeners than Ferrum actually materializes) and mislead `kubectl`
+/// rollout verification, so a supported entry on an already-claimed port is
+/// reported as a deferred duplicate instead of inflating the modeled count.
+fn classify_sidecar_ingress_entries(spec: &Value) -> (usize, Vec<&'static str>) {
+    let Some(entries) = spec.get("ingress").and_then(Value::as_array) else {
+        return (0, Vec::new());
+    };
+    let mut modeled = 0usize;
+    let mut deferred: Vec<&'static str> = Vec::new();
+    // Listener ports already claimed by a modeled entry. Mirrors the slice
+    // resolver's `seen_ports` (reserved only on a SUCCESSFUL resolve, so a
+    // deferred entry never consumes a port a later valid entry could use).
+    let mut seen_modeled_ports: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+    let push_unique = |deferred: &mut Vec<&'static str>, reason: &'static str| {
+        if !deferred.contains(&reason) {
+            deferred.push(reason);
+        }
+    };
+    for entry in entries {
+        let protocol = entry
+            .get("port")
+            .and_then(|p| p.get("protocol"))
+            .and_then(Value::as_str);
+        // Classify through the SAME shared predicate `MeshSidecarIngress::resolve`
+        // uses (raw string → `sidecar_ingress_app_protocol` →
+        // `is_http_family_app_protocol`), so resolution and this deferred-field
+        // report never disagree. `https` is recognized HTTP-family and IS
+        // materialized — counted as modeled below — while a MISSING or
+        // UNRECOGNIZED protocol (e.g. a `HTPS` typo) maps to a non-HTTP
+        // `AppProtocol` and is reported as a deferred non-HTTP listener (it is
+        // NOT routed onto the HTTP request path), matching resolution.
+        let http_family =
+            crate::config_sources::k8s::sidecar_ingress_protocol_is_http_family(protocol);
+        let endpoint = entry
+            .get("defaultEndpoint")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        if !http_family {
+            push_unique(
+                &mut deferred,
+                "non-HTTP-family listener (raw-TCP inbound not modeled)",
+            );
+            continue;
+        }
+        if endpoint.starts_with("unix://") {
+            push_unique(
+                &mut deferred,
+                "unix:// defaultEndpoint not representable (host:port backends only)",
+            );
+            continue;
+        }
+        let endpoint_ok = matches!(
+            endpoint.parse::<std::net::SocketAddr>(),
+            Ok(addr) if addr.port() != 0 && (addr.ip().is_loopback() || addr.ip().is_unspecified())
+        );
+        if !endpoint_ok {
+            push_unique(
+                &mut deferred,
+                "defaultEndpoint must be a loopback/instance-IP host:port",
+            );
+            continue;
+        }
+        // The entry would resolve. Reserve its listener port; a later supported
+        // entry on the same port is dropped by the slice resolver, so report it
+        // as a deferred duplicate rather than counting a listener Ferrum does not
+        // materialize. `port.number` is present and valid here — the translator
+        // rejects a missing/out-of-range `port.number` before this classifier
+        // runs (it only runs on an accepted resource).
+        let listener_port = entry
+            .get("port")
+            .and_then(|p| p.get("number"))
+            .and_then(Value::as_u64);
+        match listener_port {
+            Some(port) if !seen_modeled_ports.insert(port) => {
+                push_unique(
+                    &mut deferred,
+                    "duplicate listener port (only the first entry is modeled)",
+                );
+            }
+            _ => modeled += 1,
+        }
+    }
+    (modeled, deferred)
 }
 
 /// Status for `Telemetry`. Reports which top-level sections (tracing /
@@ -1222,6 +1346,15 @@ mod tests {
             "default".to_string(),
             TrustDomain::new("cluster.local").expect("test trust domain"),
         )
+    }
+
+    /// Options with the Sidecar ingress materialization gate ON, mirroring
+    /// `FERRUM_MESH_SIDECAR_ENFORCED=true` (not dry-run). The status writer
+    /// reports `ingress_modeled` as materialized only under this gate, so the
+    /// ingress-modeling tests use it; the default `options()` leaves the gate
+    /// off (the default dry-run/disabled posture, where modeling is not applied).
+    fn options_ingress_enforced() -> K8sTranslationOptions {
+        options().with_mesh_sidecar_ingress_enforced(true)
     }
 
     fn object(api_version: &str, kind: &str, name: &str, spec: Value) -> K8sObject {
@@ -1638,9 +1771,11 @@ mod tests {
     }
 
     #[test]
-    fn destination_rule_subset_outlier_max_ejection_percent_is_deferred() {
-        // Only the maxEjectionPercent *cap* remains upstream-level, so a subset
-        // that sets it surfaces the residual deferred field.
+    fn destination_rule_subset_outlier_max_ejection_percent_not_deferred() {
+        // The maxEjectionPercent *cap* is now applied per-subset (resolved with
+        // the same per-port > per-subset > upstream precedence as the
+        // thresholds), so a subset that sets it must NOT surface any deferred
+        // field — neither the cap nor the thresholds are deferred.
         let obj = object(
             "networking.istio.io/v1",
             "DestinationRule",
@@ -1665,8 +1800,8 @@ mod tests {
             .filter_map(Value::as_str)
             .collect();
         assert!(
-            deferred.iter().any(|f| f.contains("maxEjectionPercent")),
-            "subset with maxEjectionPercent must surface the deferred cap field, got {deferred:?}"
+            !deferred.iter().any(|f| f.contains("maxEjectionPercent")),
+            "subset maxEjectionPercent is applied per-subset now and must not be deferred, got {deferred:?}"
         );
     }
 
@@ -2436,7 +2571,9 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_ingress_surfaces_deferred_field() {
+    fn sidecar_supported_ingress_is_modeled_not_deferred() {
+        // A loopback HTTP listener is modeled (F6 §6.2): reported via
+        // `ingress_modeled`, NOT flagged deferred.
         let obj = object(
             "networking.istio.io/v1",
             "Sidecar",
@@ -2446,8 +2583,13 @@ mod tests {
                 "egress": [ { "hosts": ["./*"] } ]
             }),
         );
-        let updates = plan_istio_status_updates(&[obj], options());
+        let updates = plan_istio_status_updates(&[obj], options_ingress_enforced());
         let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        assert_eq!(
+            detail["translation"]["ingress_modeled"].as_u64(),
+            Some(1),
+            "a loopback HTTP listener is modeled"
+        );
         let deferred: Vec<&str> = detail["translation"]["deferred_fields"]
             .as_array()
             .unwrap()
@@ -2455,8 +2597,254 @@ mod tests {
             .filter_map(Value::as_str)
             .collect();
         assert!(
-            deferred.iter().any(|f| f.contains("ingress")),
-            "Sidecar ingress should be flagged as deferred, got {deferred:?}"
+            deferred.is_empty(),
+            "a fully supported ingress listener is not deferred, got {deferred:?}"
+        );
+    }
+
+    #[test]
+    fn sidecar_unsupported_ingress_surfaces_deferred_field() {
+        // Unix-socket and non-HTTP-family listeners stay deferred even though
+        // the resource is accepted; a supported sibling is still counted as
+        // modeled.
+        let obj = object(
+            "networking.istio.io/v1",
+            "Sidecar",
+            "ingress-sidecar",
+            json!({
+                "ingress": [
+                    { "port": { "number": 9080, "protocol": "HTTP" }, "defaultEndpoint": "127.0.0.1:8080" },
+                    { "port": { "number": 7000, "protocol": "GRPC" }, "defaultEndpoint": "unix:///var/run/grpc.sock" },
+                    { "port": { "number": 6000, "protocol": "TCP" }, "defaultEndpoint": "127.0.0.1:6000" }
+                ]
+            }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options_ingress_enforced());
+        let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        assert_eq!(
+            detail["translation"]["ingress_modeled"].as_u64(),
+            Some(1),
+            "only the loopback HTTP listener is modeled"
+        );
+        let deferred: Vec<&str> = detail["translation"]["deferred_fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            deferred.iter().any(|f| f.contains("unix://")),
+            "unix-socket listener must be deferred, got {deferred:?}"
+        );
+        assert!(
+            deferred.iter().any(|f| f.contains("non-HTTP-family")),
+            "TCP listener must be deferred, got {deferred:?}"
+        );
+    }
+
+    #[test]
+    fn sidecar_https_ingress_is_modeled_not_deferred() {
+        // F6 §6.2 (round-1 Finding 5, preserved by round-2): an HTTPS ingress
+        // listener is a recognized HTTP-family protocol (mapped to a routable
+        // `AppProtocol` by `sidecar_ingress_app_protocol`), which resolution
+        // MATERIALIZES. The status classifier must agree (it routes the protocol
+        // through the same shared predicate), so the live listener is reported as
+        // modeled — NOT falsely reported as a deferred non-HTTP-family listener.
+        let obj = object(
+            "networking.istio.io/v1",
+            "Sidecar",
+            "ingress-sidecar",
+            json!({
+                "ingress": [ { "port": { "number": 8443, "protocol": "HTTPS", "name": "https" }, "defaultEndpoint": "127.0.0.1:8080" } ]
+            }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options_ingress_enforced());
+        let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        assert_eq!(
+            detail["translation"]["ingress_modeled"].as_u64(),
+            Some(1),
+            "an HTTPS listener (recognized HTTP-family) is modeled"
+        );
+        let deferred: Vec<&str> = detail["translation"]["deferred_fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            !deferred.iter().any(|f| f.contains("non-HTTP-family")),
+            "an HTTPS listener must NOT be reported as a deferred non-HTTP listener, got {deferred:?}"
+        );
+    }
+
+    #[test]
+    fn sidecar_mistyped_ingress_protocol_is_deferred_not_modeled() {
+        // Codex round-2 P2: a mistyped protocol (`HTPS`) must NOT be reported as
+        // modeled — the status writer must keep it in deferred_fields (matching
+        // resolution, which now defers it as a non-HTTP listener) rather than
+        // counting a non-HTTP listener as a live HTTP route.
+        let obj = object(
+            "networking.istio.io/v1",
+            "Sidecar",
+            "typo-sidecar",
+            json!({
+                "ingress": [ { "port": { "number": 8443, "protocol": "HTPS" }, "defaultEndpoint": "127.0.0.1:8080" } ]
+            }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options_ingress_enforced());
+        let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        assert_eq!(
+            detail["translation"]["ingress_modeled"].as_u64(),
+            Some(0),
+            "a mistyped protocol must not be counted as a modeled listener (even when enforced)"
+        );
+        let deferred: Vec<&str> = detail["translation"]["deferred_fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            deferred.iter().any(|f| f.contains("non-HTTP-family")),
+            "a mistyped protocol must be reported as a deferred non-HTTP listener, got {deferred:?}"
+        );
+    }
+
+    #[test]
+    fn sidecar_duplicate_ingress_port_counts_one_modeled() {
+        // Codex round-3 P3: two supported `ingress[]` entries on the SAME listener
+        // port. The slice resolver keeps only the first (reserves the port, warns
+        // + drops the second), so the status writer must report ONE modeled
+        // listener (not two) and surface the duplicate as a deferred field —
+        // otherwise `kubectl` reports more modeled listeners than Ferrum
+        // materializes, misleading rollout verification.
+        let obj = object(
+            "networking.istio.io/v1",
+            "Sidecar",
+            "dup-port-sidecar",
+            json!({
+                "ingress": [
+                    { "port": { "number": 8443, "protocol": "HTTP" }, "defaultEndpoint": "127.0.0.1:8080" },
+                    { "port": { "number": 8443, "protocol": "HTTP2" }, "defaultEndpoint": "127.0.0.1:9090" }
+                ]
+            }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options_ingress_enforced());
+        let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        assert_eq!(
+            detail["translation"]["ingress_modeled"].as_u64(),
+            Some(1),
+            "two entries on the same listener port model only one listener"
+        );
+        let deferred: Vec<&str> = detail["translation"]["deferred_fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            deferred
+                .iter()
+                .any(|f| f.contains("duplicate listener port")),
+            "the duplicate listener port must be reported as deferred, got {deferred:?}"
+        );
+    }
+
+    #[test]
+    fn sidecar_deferred_entry_does_not_reserve_port_for_later_valid_entry() {
+        // A DEFERRED entry (non-HTTP) on a port must NOT reserve that port: a
+        // later VALID entry on the same port number is still modeled — mirroring
+        // the slice resolver, which reserves a port only on a SUCCESSFUL resolve.
+        let obj = object(
+            "networking.istio.io/v1",
+            "Sidecar",
+            "deferred-then-valid-sidecar",
+            json!({
+                "ingress": [
+                    { "port": { "number": 8443, "protocol": "TCP" }, "defaultEndpoint": "127.0.0.1:8080" },
+                    { "port": { "number": 8443, "protocol": "HTTP" }, "defaultEndpoint": "127.0.0.1:9090" }
+                ]
+            }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options_ingress_enforced());
+        let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        assert_eq!(
+            detail["translation"]["ingress_modeled"].as_u64(),
+            Some(1),
+            "the valid entry is modeled even though a deferred entry shares its port"
+        );
+        let deferred: Vec<&str> = detail["translation"]["deferred_fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            deferred.iter().any(|f| f.contains("non-HTTP-family")),
+            "the TCP entry is deferred as non-HTTP, got {deferred:?}"
+        );
+        assert!(
+            !deferred
+                .iter()
+                .any(|f| f.contains("duplicate listener port")),
+            "a deferred entry must not make a later valid entry a duplicate, got {deferred:?}"
+        );
+    }
+
+    /// Codex round-4 P2: in the DEFAULT posture (`FERRUM_MESH_SIDECAR_ENFORCED`
+    /// off / dry-run) the slice builder materializes NO ingress listeners, so the
+    /// status writer must report `ingress_modeled == 0` even for a shape-modelable
+    /// loopback HTTP listener — never a false positive while the data plane is
+    /// still serving the default inbound behavior. The message makes the gated-off
+    /// state explicit (and surfaces the modelable-when-enabled count).
+    #[test]
+    fn sidecar_ingress_not_modeled_when_enforcement_gate_off() {
+        let obj = object(
+            "networking.istio.io/v1",
+            "Sidecar",
+            "ingress-sidecar-dry-run",
+            json!({
+                "ingress": [ { "port": { "number": 9080, "protocol": "HTTP", "name": "http" }, "defaultEndpoint": "127.0.0.1:8080" } ],
+                "egress": [ { "hosts": ["./*"] } ]
+            }),
+        );
+        // Default options() leaves mesh_sidecar_ingress_enforced = false.
+        let updates = plan_istio_status_updates(&[obj], options());
+        let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        assert_eq!(
+            detail["translation"]["ingress_modeled"].as_u64(),
+            Some(0),
+            "with the enforcement gate off the data plane materializes no ingress, so \
+             ingress_modeled must be 0 even for a shape-modelable listener"
+        );
+        let c = find_condition(
+            updates[0].status["conditions"].as_array().unwrap(),
+            "FerrumAccepted",
+        );
+        // Still accepted (the resource is valid); only materialization is gated.
+        assert_eq!(c["status"].as_str(), Some("True"));
+        let message = c["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("not materialized") && message.contains("1 modelable when enabled"),
+            "the message must surface that ingress is gated off and the modelable count, got: {message}"
+        );
+
+        // Flipping the gate on materializes the same listener and reports it.
+        let obj_enforced = object(
+            "networking.istio.io/v1",
+            "Sidecar",
+            "ingress-sidecar-dry-run",
+            json!({
+                "ingress": [ { "port": { "number": 9080, "protocol": "HTTP", "name": "http" }, "defaultEndpoint": "127.0.0.1:8080" } ],
+                "egress": [ { "hosts": ["./*"] } ]
+            }),
+        );
+        let enforced = plan_istio_status_updates(&[obj_enforced], options_ingress_enforced());
+        let enforced_detail = enforced[0].ferrum_detail.as_ref().unwrap();
+        assert_eq!(
+            enforced_detail["translation"]["ingress_modeled"].as_u64(),
+            Some(1),
+            "the same listener is reported modeled once the enforcement gate is on"
         );
     }
 

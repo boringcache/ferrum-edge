@@ -257,9 +257,38 @@ pub(crate) struct MeshInboundPortGroup {
     /// partially materialized group: without a port signal, traffic meant for
     /// a skipped port is indistinguishable from the surviving one.
     declared_http_ports: usize,
-    /// `(service_port, route)` pairs sorted by service port ascending; entry 0
+    /// Per-sibling selection keys, sorted by `authority_port` ascending; entry 0
     /// is the representative present in the route tiers.
-    ports: Vec<(u16, Arc<Proxy>)>,
+    ports: Vec<MeshInboundSibling>,
+    /// `true` for a Sidecar `ingress[]` group (`__mesh-ingress-*`), `false` for
+    /// a service-port default inbound group (`__mesh-inbound-*`). Drives the
+    /// authorization destination port: an ingress listener authorizes on the
+    /// declared LISTENER port (`authority_port`, e.g. `8443`), NOT the
+    /// `defaultEndpoint` backend port — so an `AuthorizationPolicy` ALLOW/DENY
+    /// scoped to the listener port matches (a DENY on the listener port must be
+    /// enforced; routing it through the backend port would fail a DENY OPEN). A
+    /// service-port default inbound group authorizes on the container/backend
+    /// port, matching Istio's inbound authz, so this stays `false` there.
+    is_ingress: bool,
+}
+
+/// One inbound per-port sibling's selection keys. The authority port and the
+/// captured-original-destination match port are stored separately because they
+/// DIFFER for Sidecar `ingress[]` listeners: a service-port default inbound
+/// sibling matches orig-dst against the resolved CONTAINER (target) port
+/// (`backend_port`) and the request authority against the SERVICE port, while
+/// an `ingress[]` listener matches BOTH signals against the declared LISTENER
+/// port (the dialed port) and forwards to a separate `defaultEndpoint` backend.
+pub(crate) struct MeshInboundSibling {
+    /// Port the request's pre-strip `Host`/`:authority` must carry to select
+    /// this sibling — the SERVICE port (default inbound) or the LISTENER port
+    /// (`ingress[]`).
+    authority_port: u16,
+    /// Port the connection's captured original destination must equal to select
+    /// this sibling — the CONTAINER port (default inbound) or the LISTENER port
+    /// (`ingress[]`).
+    orig_dst_match_port: u16,
+    route: Arc<Proxy>,
 }
 
 /// Why [`HostRouteTable::select_mesh_inbound_port_route`] refused to pick a
@@ -361,42 +390,88 @@ impl HostRouteTable {
     ///
     /// Behavior matrix (see [`MeshInboundPortGroup`]):
     /// - route not grouped → keep `current`;
-    /// - the service DECLARES exactly one HTTP-family port → keep `current`
-    ///   unconditionally (back-compat: single-port services accept bare-Host
-    ///   clients, older peers, and any explicit port today — selection adds
-    ///   no new requirement to them);
+    /// - a single-port SERVICE-default group (`is_ingress == false`) → keep
+    ///   `current` unconditionally (back-compat: single-port services accept
+    ///   bare-Host clients, older peers, and any explicit port today — selection
+    ///   adds no new requirement to them);
+    /// - a single-listener INGRESS group (`is_ingress == true`) → a present port
+    ///   signal MUST equal the declared listener port (else
+    ///   [`MeshInboundPortSelectError::PortNotMaterialized`]); a request with no
+    ///   port signal falls through to the sole listener. An ingress listener
+    ///   binds a specific port and must not absorb traffic to an undeclared one;
     /// - multi-port with no signal at all →
     ///   [`MeshInboundPortSelectError::PortSignalUnavailable`];
     /// - multi-port with a present-but-unmatched signal →
     ///   [`MeshInboundPortSelectError::PortNotMaterialized`].
+    ///
+    /// Returns the selected `RouteMatch` plus the **authorization listener
+    /// port** for a Sidecar `ingress[]` route: `Some(listener_port)` when the
+    /// matched group is an ingress group, else `None`. The request handler
+    /// stamps this onto `RequestContext` so `mesh_authz` authorizes an ingress
+    /// listener on its DECLARED port (e.g. `8443`), not the `defaultEndpoint`
+    /// backend port — see [`MeshInboundPortGroup::is_ingress`]. The port is the
+    /// selected sibling's `authority_port` (which equals its `orig_dst_match_port`
+    /// for ingress), so it is correct for both the multi-listener and the
+    /// single-listener (no-signal fall-through) paths.
     pub(crate) fn select_mesh_inbound_port_route(
         &self,
         current: RouteMatch,
         orig_dst_port: Option<u16>,
         authority_port: Option<u16>,
-    ) -> Result<RouteMatch, MeshInboundPortSelectError> {
+    ) -> Result<(RouteMatch, Option<u16>), MeshInboundPortSelectError> {
         let Some(group) = self.mesh_inbound_ports.get(&current.proxy.id) else {
-            return Ok(current);
+            return Ok((current, None));
         };
         if group.declared_http_ports == 1 {
-            return Ok(current);
+            if group.is_ingress {
+                // A Sidecar `ingress[]` group binds a SPECIFIC declared listener
+                // port (e.g. `8443`); unlike a single-port service it must NOT
+                // absorb traffic to any other port. A request that names a port
+                // (captured orig-dst or explicit authority) is accepted only when
+                // that port matches the sole listener; a present-but-unmatched
+                // signal fails closed (a single-port service-default group keeps
+                // the back-compat passthrough below). With NO port signal the
+                // request falls through to the sole listener — there is no other
+                // inbound destination to confuse it with.
+                let listener_port = group.ports.first().map(|s| s.authority_port);
+                let signal = orig_dst_port.or(authority_port);
+                if let Some(port) = signal
+                    && listener_port != Some(port)
+                {
+                    return Err(MeshInboundPortSelectError::PortNotMaterialized);
+                }
+                return Ok((current, listener_port));
+            }
+            // Single declared SERVICE port (non-ingress): keep the representative
+            // unconditionally (back-compat — single-port services accept bare-Host
+            // clients and any explicit port). Not an ingress group, so no authz
+            // listener port to stamp.
+            return Ok((current, None));
         }
         let selected = if let Some(container_port) = orig_dst_port {
             group
                 .ports
                 .iter()
-                .find(|(_, proxy)| proxy.backend_port == container_port)
+                .find(|sibling| sibling.orig_dst_match_port == container_port)
         } else if let Some(service_port) = authority_port {
-            group.ports.iter().find(|(p, _)| *p == service_port)
+            group
+                .ports
+                .iter()
+                .find(|sibling| sibling.authority_port == service_port)
         } else {
             return Err(MeshInboundPortSelectError::PortSignalUnavailable);
         };
         match selected {
-            Some((_, proxy)) => Ok(RouteMatch {
-                proxy: Arc::clone(proxy),
-                path_params: current.path_params,
-                matched_prefix_len: current.matched_prefix_len,
-            }),
+            Some(sibling) => Ok((
+                RouteMatch {
+                    proxy: Arc::clone(&sibling.route),
+                    path_params: current.path_params,
+                    matched_prefix_len: current.matched_prefix_len,
+                },
+                // The authz listener port for an ingress group is the SELECTED
+                // sibling's listener port (its `authority_port`).
+                group.is_ingress.then_some(sibling.authority_port),
+            )),
             None => Err(MeshInboundPortSelectError::PortNotMaterialized),
         }
     }
@@ -1166,6 +1241,10 @@ impl RouterCache {
             // local-inbound service view (`mesh_inbound_service_groups`). The
             // synthesized HBONE relay proxy never appears in `config.proxies`,
             // so it can never be grouped here despite sharing the id prefix.
+            // A service-port default inbound sibling matches the captured
+            // original destination against its resolved CONTAINER port
+            // (`backend_port`) and the request authority against its SERVICE
+            // port (the group key).
             let inbound_proxies: HashMap<&str, &Proxy> = config
                 .proxies
                 .iter()
@@ -1176,19 +1255,89 @@ impl RouterCache {
                 .map(|p| (p.id.as_str(), p))
                 .collect();
             for group in crate::modes::mesh::mesh_inbound_service_groups(mesh) {
-                let members = group_members(&group.siblings, &inbound_proxies);
+                let mut members: Vec<MeshInboundSibling> = group
+                    .siblings
+                    .iter()
+                    .filter_map(|(service_port, id)| {
+                        inbound_proxies.get(id.as_str()).map(|p| {
+                            let route = Arc::new((*p).clone());
+                            MeshInboundSibling {
+                                authority_port: *service_port,
+                                orig_dst_match_port: route.backend_port,
+                                route,
+                            }
+                        })
+                    })
+                    .collect();
+                members.sort_by_key(|sibling| sibling.authority_port);
                 if members.is_empty() {
                     continue;
                 }
-                let representative_id = members[0].1.id.clone();
-                for (_, sibling) in members.iter().skip(1) {
-                    mesh_sibling_skip_ids.insert(sibling.id.clone());
+                let representative_id = members[0].route.id.clone();
+                for sibling in members.iter().skip(1) {
+                    mesh_sibling_skip_ids.insert(sibling.route.id.clone());
                 }
                 mesh_inbound_ports.insert(
                     representative_id,
                     Arc::new(MeshInboundPortGroup {
                         declared_http_ports: group.declared_http_ports,
                         ports: members,
+                        // Service-port default inbound: authorize on the
+                        // container/backend port (Istio inbound authz).
+                        is_ingress: false,
+                    }),
+                );
+            }
+            // F6 §6.2: Sidecar ingress[] custom-listener siblings. Forward-derived
+            // from the resolved listeners (`mesh_ingress_listener_groups`), keyed
+            // by the declared LISTENER port for BOTH the captured original
+            // destination AND the request authority (the dialed port is the
+            // listener port on the shared :15006 inbound listener), forwarding to
+            // a separate `defaultEndpoint` backend. Folded into the same
+            // `mesh_inbound_ports` map so the request path's existing inbound
+            // arm (`select_mesh_inbound_port_route`) disambiguates them with no
+            // fork. Ingress and service-port defaults never coexist for one
+            // workload (ingress replaces defaults at materialization).
+            let ingress_proxies: HashMap<&str, &Proxy> = config
+                .proxies
+                .iter()
+                .filter(|p| {
+                    !p.dispatch_kind.is_stream()
+                        && crate::modes::mesh::is_mesh_ingress_route_id(&p.id)
+                })
+                .map(|p| (p.id.as_str(), p))
+                .collect();
+            for group in crate::modes::mesh::mesh_ingress_listener_groups(mesh) {
+                let mut members: Vec<MeshInboundSibling> = group
+                    .siblings
+                    .iter()
+                    .filter_map(|(listener_port, id)| {
+                        ingress_proxies
+                            .get(id.as_str())
+                            .map(|p| MeshInboundSibling {
+                                authority_port: *listener_port,
+                                orig_dst_match_port: *listener_port,
+                                route: Arc::new((*p).clone()),
+                            })
+                    })
+                    .collect();
+                members.sort_by_key(|sibling| sibling.authority_port);
+                if members.is_empty() {
+                    continue;
+                }
+                let representative_id = members[0].route.id.clone();
+                for sibling in members.iter().skip(1) {
+                    mesh_sibling_skip_ids.insert(sibling.route.id.clone());
+                }
+                mesh_inbound_ports.insert(
+                    representative_id,
+                    Arc::new(MeshInboundPortGroup {
+                        declared_http_ports: group.declared_http_ports,
+                        ports: members,
+                        // Sidecar ingress[]: authorize on the declared LISTENER
+                        // port (`authority_port`), not the `defaultEndpoint`
+                        // backend port — see `MeshInboundPortGroup::is_ingress`.
+                        is_ingress: true,
                     }),
                 );
             }
@@ -2701,29 +2850,33 @@ mod tests {
             .expect("representative route matches by host");
         assert_eq!(rm.proxy.id, "__mesh-inbound-default-reviews-80");
 
-        // Inbound orig-dst (container port) picks each sibling.
+        // Inbound orig-dst (container port) picks each sibling. A service-port
+        // default inbound group is NOT ingress, so the authz listener port is
+        // `None` (authz uses the backend port).
         for (service_port, container_port) in [(80u16, 8080u16), (90, 9090)] {
             let rm = cache.find_proxy(Some("reviews"), "/").expect("route");
-            let selected = table
+            let (selected, ingress_authz_port) = table
                 .select_mesh_inbound_port_route(rm, Some(container_port), None)
                 .expect("captured container port selects its sibling");
             assert_eq!(
                 selected.proxy.id,
                 format!("__mesh-inbound-default-reviews-{service_port}")
             );
+            assert_eq!(ingress_authz_port, None);
         }
 
         // Authority port (service port) picks each sibling when orig-dst is
         // absent (the peer-sidecar direct-dial case).
         for service_port in [80u16, 90] {
             let rm = cache.find_proxy(Some("reviews"), "/").expect("route");
-            let selected = table
+            let (selected, ingress_authz_port) = table
                 .select_mesh_inbound_port_route(rm, None, Some(service_port))
                 .expect("authority service port selects its sibling");
             assert_eq!(
                 selected.proxy.id,
                 format!("__mesh-inbound-default-reviews-{service_port}")
             );
+            assert_eq!(ingress_authz_port, None);
         }
 
         // A present-but-unmatched orig-dst fails closed even when the
@@ -2768,11 +2921,294 @@ mod tests {
 
         for (orig_dst, authority) in [(None, None), (None, Some(9999u16)), (Some(9999u16), None)] {
             let rm = cache.find_proxy(Some("ratings"), "/").expect("route");
-            let kept = table
+            let (kept, ingress_authz_port) = table
                 .select_mesh_inbound_port_route(rm, orig_dst, authority)
                 .expect("single-port group never demands a signal");
             assert_eq!(kept.proxy.id, "__mesh-inbound-default-ratings-8080");
+            assert_eq!(
+                ingress_authz_port, None,
+                "service-port group is not ingress"
+            );
         }
+    }
+
+    /// Sidecar `ingress[]` custom-listener siblings (F6 §6.2) disambiguate by
+    /// the declared LISTENER port for BOTH the captured original destination
+    /// AND the request authority — NOT by the backend (`defaultEndpoint`) port,
+    /// which is distinct. Folded into the same `mesh_inbound_ports` map, so the
+    /// shared `select_mesh_inbound_port_route` resolves them with no fork.
+    #[test]
+    fn mesh_ingress_port_group_selects_sibling_by_listener_port() {
+        use crate::modes::mesh::config::{MeshConfig, ResolvedIngressListener};
+        // Two ingress listeners: listener 8080 → backend 5000, listener 8443 →
+        // backend 6000. The backend ports deliberately do NOT equal the listener
+        // ports, proving orig-dst matches the LISTENER port.
+        let mut proxies = Vec::new();
+        for (listener_port, backend_port) in [(8080u16, 5000u16), (8443, 6000)] {
+            let mut p = minimal_proxy_for_routing(
+                &format!("__mesh-ingress-default-reviews-{listener_port}"),
+                "/",
+            );
+            p.hosts = vec!["reviews".to_string()];
+            p.backend_port = backend_port;
+            proxies.push(p);
+        }
+        let config = GatewayConfig {
+            proxies,
+            mesh: Some(Box::new(MeshConfig {
+                local_ingress_listeners: vec![
+                    ResolvedIngressListener {
+                        port: 8080,
+                        endpoint_host: "127.0.0.1".to_string(),
+                        endpoint_port: 5000,
+                        owner_namespace: "default".to_string(),
+                        owner_service: "reviews".to_string(),
+                    },
+                    ResolvedIngressListener {
+                        port: 8443,
+                        endpoint_host: "127.0.0.1".to_string(),
+                        endpoint_port: 6000,
+                        owner_namespace: "default".to_string(),
+                        owner_service: "reviews".to_string(),
+                    },
+                ],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+        let cache = RouterCache::new(&config, 100);
+        let table = cache.route_table.load();
+
+        // Lowest listener port is the tier representative.
+        let rm = cache.find_proxy(Some("reviews"), "/").expect("route");
+        assert_eq!(rm.proxy.id, "__mesh-ingress-default-reviews-8080");
+
+        // orig-dst = LISTENER port selects the matching sibling (by listener
+        // port, NOT backend port — 6000 as orig-dst must NOT match). The authz
+        // listener port returned is the DECLARED listener port (8443), NOT the
+        // backend port (6000) — this is what `mesh_authz` enforces on (F6 §6.2).
+        let rm = cache.find_proxy(Some("reviews"), "/").expect("route");
+        let (by_orig, authz_port) = table
+            .select_mesh_inbound_port_route(rm, Some(8443), None)
+            .expect("orig-dst = listener port 8443 selects its sibling");
+        assert_eq!(by_orig.proxy.backend_port, 6000);
+        assert_eq!(
+            authz_port,
+            Some(8443),
+            "ingress authz must use the declared listener port, not the backend port"
+        );
+
+        // authority = LISTENER port also selects, and stamps the listener port.
+        let rm = cache.find_proxy(Some("reviews"), "/").expect("route");
+        let (by_auth, authz_port) = table
+            .select_mesh_inbound_port_route(rm, None, Some(8080))
+            .expect("authority = listener port 8080 selects its sibling");
+        assert_eq!(by_auth.proxy.backend_port, 5000);
+        assert_eq!(authz_port, Some(8080));
+
+        // A backend port presented as orig-dst must NOT match a listener — fail
+        // closed (5000/6000 are backends, not dialed listener ports).
+        let rm = cache.find_proxy(Some("reviews"), "/").expect("route");
+        assert!(matches!(
+            table.select_mesh_inbound_port_route(rm, Some(6000), None),
+            Err(MeshInboundPortSelectError::PortNotMaterialized)
+        ));
+    }
+
+    /// A SINGLE ingress listener still surfaces its declared listener port for
+    /// authz — so a peer dial with no orig-dst / authority port authorizes on the
+    /// listener port, never the backend port (F6 §6.2 security, single-listener
+    /// path). A PRESENT port signal must MATCH the declared listener port; an
+    /// undeclared port fails closed (codex round-2 P1: a single ingress listener
+    /// must not absorb traffic addressed to a different port).
+    #[test]
+    fn mesh_ingress_single_listener_surfaces_listener_authz_port() {
+        use crate::modes::mesh::config::{MeshConfig, ResolvedIngressListener};
+        let mut p = minimal_proxy_for_routing("__mesh-ingress-default-reviews-8443", "/");
+        p.hosts = vec!["reviews".to_string()];
+        p.backend_port = 8080; // backend != listener
+        let config = GatewayConfig {
+            proxies: vec![p],
+            mesh: Some(Box::new(MeshConfig {
+                local_ingress_listeners: vec![ResolvedIngressListener {
+                    port: 8443,
+                    endpoint_host: "127.0.0.1".to_string(),
+                    endpoint_port: 8080,
+                    owner_namespace: "default".to_string(),
+                    owner_service: "reviews".to_string(),
+                }],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+        let cache = RouterCache::new(&config, 100);
+        let table = cache.route_table.load();
+
+        // No port signal at all: falls through to the sole listener AND stamps
+        // the declared listener port for authz.
+        let rm = cache.find_proxy(Some("reviews"), "/").expect("route");
+        let (kept, authz_port) = table
+            .select_mesh_inbound_port_route(rm, None, None)
+            .expect("single ingress listener keeps the route when no port signal is present");
+        assert_eq!(kept.proxy.backend_port, 8080);
+        assert_eq!(
+            authz_port,
+            Some(8443),
+            "single ingress listener must authorize on its declared listener port"
+        );
+
+        // A MATCHING orig-dst (the dialed listener port) is accepted and stamps
+        // the listener port.
+        let rm = cache.find_proxy(Some("reviews"), "/").expect("route");
+        let (kept, authz_port) = table
+            .select_mesh_inbound_port_route(rm, Some(8443), None)
+            .expect("orig-dst = the declared listener port selects the sole listener");
+        assert_eq!(kept.proxy.backend_port, 8080);
+        assert_eq!(authz_port, Some(8443));
+
+        // A MATCHING authority port (a peer dial carrying the listener port) is
+        // accepted.
+        let rm = cache.find_proxy(Some("reviews"), "/").expect("route");
+        assert!(
+            table
+                .select_mesh_inbound_port_route(rm, None, Some(8443))
+                .is_ok(),
+            "authority = the declared listener port selects the sole listener"
+        );
+
+        // A MISMATCHED orig-dst (a port the listener did not declare — e.g. the
+        // backend port 8080, or any other port) must FAIL CLOSED, not be absorbed
+        // onto the sole listener (codex round-2 P1).
+        let rm = cache.find_proxy(Some("reviews"), "/").expect("route");
+        assert!(
+            matches!(
+                table.select_mesh_inbound_port_route(rm, Some(8080), None),
+                Err(MeshInboundPortSelectError::PortNotMaterialized)
+            ),
+            "an orig-dst to an undeclared port must not be accepted onto the single ingress listener"
+        );
+        let rm = cache.find_proxy(Some("reviews"), "/").expect("route");
+        assert!(matches!(
+            table.select_mesh_inbound_port_route(rm, Some(9999), None),
+            Err(MeshInboundPortSelectError::PortNotMaterialized)
+        ));
+
+        // A MISMATCHED authority port likewise fails closed (orig-dst absent).
+        let rm = cache.find_proxy(Some("reviews"), "/").expect("route");
+        assert!(
+            matches!(
+                table.select_mesh_inbound_port_route(rm, None, Some(9999)),
+                Err(MeshInboundPortSelectError::PortNotMaterialized)
+            ),
+            "an authority to an undeclared port must not be accepted onto the single ingress listener"
+        );
+    }
+
+    /// Codex round-4 P2: a Sidecar that DECLARES two HTTP-family ingress[]
+    /// listeners but where only ONE resolved (the other had an omitted / `unix://`
+    /// / off-box `defaultEndpoint`) must NOT collapse to the single-listener
+    /// no-signal pass-through. `MeshConfig.declared_ingress_http_ports` (2) carries
+    /// the DECLARED count past the resolved set (1), so `mesh_ingress_listener_groups`
+    /// reports `declared_http_ports == 2`, keeping the group AMBIGUOUS: an
+    /// orig-dst-less request fails closed (`PortSignalUnavailable`) instead of being
+    /// routed to the surviving sibling and absorbing the skipped listener's traffic.
+    #[test]
+    fn mesh_ingress_partial_materialization_fails_closed_without_signal() {
+        use crate::modes::mesh::config::{MeshConfig, ResolvedIngressListener};
+        // Only listener 8080 resolved; listener 8443 was declared HTTP-family but
+        // its endpoint was unroutable, so it is absent from local_ingress_listeners
+        // yet counted in declared_ingress_http_ports.
+        let mut p = minimal_proxy_for_routing("__mesh-ingress-default-reviews-8080", "/");
+        p.hosts = vec!["reviews".to_string()];
+        p.backend_port = 5000;
+        let config = GatewayConfig {
+            proxies: vec![p],
+            mesh: Some(Box::new(MeshConfig {
+                local_ingress_listeners: vec![ResolvedIngressListener {
+                    port: 8080,
+                    endpoint_host: "127.0.0.1".to_string(),
+                    endpoint_port: 5000,
+                    owner_namespace: "default".to_string(),
+                    owner_service: "reviews".to_string(),
+                }],
+                // Operator declared TWO HTTP-family ingress ports; only one
+                // resolved. The declared count must drive the router.
+                declared_ingress_http_ports: 2,
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+        let cache = RouterCache::new(&config, 100);
+        let table = cache.route_table.load();
+
+        // No port signal: with two DECLARED listeners and one resolved, the group
+        // is ambiguous → fail closed (NOT a fall-through to the survivor).
+        let rm = cache.find_proxy(Some("reviews"), "/").expect("route");
+        assert!(
+            matches!(
+                table.select_mesh_inbound_port_route(rm, None, None),
+                Err(MeshInboundPortSelectError::PortSignalUnavailable)
+            ),
+            "a partially materialized ingress group must fail closed without a port signal, \
+             not route the skipped port's traffic to the surviving listener"
+        );
+
+        // A signal for the RESOLVED listener port still routes correctly.
+        let rm = cache.find_proxy(Some("reviews"), "/").expect("route");
+        let (kept, authz_port) = table
+            .select_mesh_inbound_port_route(rm, Some(8080), None)
+            .expect("orig-dst = the resolved listener port selects its sibling");
+        assert_eq!(kept.proxy.backend_port, 5000);
+        assert_eq!(authz_port, Some(8080));
+
+        // A signal for the SKIPPED (declared-but-unresolved) listener port has no
+        // materialized sibling → fail closed, never absorbed by the survivor.
+        let rm = cache.find_proxy(Some("reviews"), "/").expect("route");
+        assert!(
+            matches!(
+                table.select_mesh_inbound_port_route(rm, Some(8443), None),
+                Err(MeshInboundPortSelectError::PortNotMaterialized)
+            ),
+            "a signal to the skipped declared listener port must fail closed"
+        );
+    }
+
+    /// Counterpart to the ingress fail-closed check: a SINGLE-port SERVICE-default
+    /// inbound group (`is_ingress == false`) keeps the back-compat passthrough —
+    /// it accepts any explicit port and a bare-Host dial onto the sole sibling, so
+    /// the round-2 ingress tightening does NOT regress single-port services.
+    #[test]
+    fn mesh_inbound_single_service_port_keeps_backcompat_passthrough() {
+        let mut p = minimal_proxy_for_routing("__mesh-inbound-default-reviews-80", "/");
+        p.hosts = vec!["reviews".to_string()];
+        p.backend_port = 8080;
+        let config = GatewayConfig {
+            proxies: vec![p],
+            // The service declares exactly one HTTP port.
+            mesh: mesh_block(&[("default", "reviews", &[80])]),
+            ..GatewayConfig::default()
+        };
+        let cache = RouterCache::new(&config, 100);
+        let table = cache.route_table.load();
+
+        // No signal → keep (back-compat), and NO ingress authz port (service
+        // default authorizes on the backend port).
+        let rm = cache.find_proxy(Some("reviews"), "/").expect("route");
+        let (kept, authz_port) = table
+            .select_mesh_inbound_port_route(rm, None, None)
+            .expect("single service port keeps the route unconditionally");
+        assert_eq!(kept.proxy.backend_port, 8080);
+        assert_eq!(authz_port, None);
+
+        // An explicit (even unrelated) authority/orig-dst port is still accepted
+        // for a single-port service — unchanged from round-1.
+        let rm = cache.find_proxy(Some("reviews"), "/").expect("route");
+        assert!(
+            table
+                .select_mesh_inbound_port_route(rm, Some(12345), None)
+                .is_ok(),
+            "a single-port service must keep accepting any explicit port (back-compat)"
+        );
     }
 
     /// A partially materialized multi-port group (one sibling skipped) still

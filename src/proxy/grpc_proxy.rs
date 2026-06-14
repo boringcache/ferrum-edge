@@ -717,11 +717,26 @@ impl GrpcPoolManager {
         // Disable Nagle for lower latency
         let _ = tcp.set_nodelay(true);
 
-        // Apply TCP keepalive using per-proxy pool config
+        // Apply TCP keepalive: honor the DestinationRule
+        // `connectionPool.tcp.tcpKeepalive` per-port override (keyed by the
+        // dial target's port, `proxy.backend_port`), falling back to the
+        // global pool keepalive. NOTE: keepalive is NOT in the pool key
+        // (forbidden by `.claude/rules/proxy-protocols.md`), and this
+        // connection is pooled+shared, so the first dispatcher to materialize
+        // the connection wins — same first-materializer tradeoff documented
+        // for `idleTimeout` / `maxRequestsPerConnection`.
         let pool_config = self.global_pool_config.for_proxy(proxy);
-        if pool_config.enable_http_keep_alive {
-            Self::set_tcp_keepalive(&tcp, pool_config.tcp_keepalive_seconds);
-        }
+        crate::socket_opts::apply_pooled_tcp_keepalive(
+            "grpc_proxy",
+            &tcp,
+            proxy
+                .dispatch_port_overrides
+                .as_ref()
+                .and_then(|m| m.get(&port))
+                .and_then(|o| o.tcp_keepalive.as_ref()),
+            pool_config.enable_http_keep_alive,
+            pool_config.tcp_keepalive_seconds,
+        );
 
         let use_tls = matches!(proxy.backend_scheme, Some(BackendScheme::Https));
 
@@ -788,25 +803,6 @@ impl GrpcPoolManager {
         }
 
         builder
-    }
-
-    /// Set TCP keepalive on a stream to detect dead backend connections.
-    fn set_tcp_keepalive(stream: &TcpStream, keepalive_seconds: u64) {
-        #[cfg(unix)]
-        use std::os::fd::AsFd;
-        #[cfg(windows)]
-        use std::os::windows::io::AsSocket;
-
-        #[cfg(unix)]
-        let borrowed = stream.as_fd();
-        #[cfg(windows)]
-        let borrowed = stream.as_socket();
-        let socket = socket2::SockRef::from(&borrowed);
-        let keepalive =
-            socket2::TcpKeepalive::new().with_time(Duration::from_secs(keepalive_seconds));
-        if let Err(e) = socket.set_tcp_keepalive(&keepalive) {
-            debug!("gRPC: failed to set TCP keepalive: {}", e);
-        }
     }
 
     /// Create an h2c (cleartext HTTP/2) connection using prior knowledge.
@@ -1379,6 +1375,14 @@ pub struct GrpcStreamingResponse {
     /// this flag and abort the response if set — the backend received a
     /// truncated request so the response is likely invalid.
     pub request_body_exceeded: Option<Arc<AtomicBool>>,
+    /// Per-frame idle read timeout (ms) the response-body consumer must apply to
+    /// the streaming `body`, derived from [`streaming_effective_timeout_ms`]: the
+    /// post-plugin client `grpc-timeout` (uncapped), falling back to
+    /// `backend_read_timeout_ms` only when the client set no deadline. `0` =
+    /// unbounded. The gRPC deadline otherwise only bounds the response-header
+    /// wait, so without this a backend that sends headers then stalls would pin
+    /// the streaming guards until the client disconnects.
+    pub response_read_timeout_ms: u64,
 }
 
 /// Either a fully-buffered or streaming gRPC response.
@@ -1687,23 +1691,27 @@ pub async fn proxy_grpc_request_streaming(
     // the proxy boundary. Mirrors `proxy_grpc_request_core` so the two
     // gRPC response paths cannot drift.
     let status = response.status().as_u16();
-    let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
-    // Snapshot any Connection-listed names before the canonical strip so
-    // we can also remove them per RFC 9110 §7.6.1. Hyper rejects
-    // `Connection` on H2 frames (RFC 9113 §8.2.2), so this is typically
-    // a no-op for valid gRPC backends — present for defence in depth.
+    // Collect backend response headers through the shared collector that the
+    // plain-HTTP path uses, instead of a bespoke `insert` loop that overwrote
+    // duplicate names. Repeated `Set-Cookie` values are newline-joined (RFC 6265
+    // — they MUST be emitted as separate header lines, never comma-folded), other
+    // repeated headers are comma-folded, and both the canonical hop-by-hop set
+    // (RFC 9110 §7.6.1) and any `Connection`-listed names are stripped.
+    // `apply_response_headers()` in the consuming path later splits the
+    // newline-joined `Set-Cookie` back into individual header lines. Reusing the
+    // shared collector keeps the gRPC and generic paths from drifting and stops
+    // duplicate response headers (e.g. multiple `Set-Cookie`) from collapsing to
+    // a single value. Hyper rejects `Connection` on H2 frames (RFC 9113 §8.2.2),
+    // so the Connection-listed strip is typically a no-op for valid gRPC backends
+    // — present for defence in depth.
+    let mut resp_headers = HashMap::new();
     let connection_listed = parse_connection_listed_headers(response.headers());
-    for (k, v) in response.headers() {
-        if is_backend_response_strip_header(k.as_str()) {
-            continue;
-        }
-        if connection_listed.iter().any(|n| n == k) {
-            continue;
-        }
-        if let Ok(vs) = v.to_str() {
-            resp_headers.insert(k.as_str().to_string(), vs.to_string());
-        }
-    }
+    super::collect_response_headers_generic(
+        response.headers().keys_len(),
+        response.headers().iter(),
+        &mut resp_headers,
+        &connection_listed,
+    );
     Ok(GrpcResponseKind::Streaming(GrpcStreamingResponse {
         status,
         headers: resp_headers,
@@ -1713,6 +1721,7 @@ pub async fn proxy_grpc_request_streaming(
         } else {
             None
         },
+        response_read_timeout_ms: effective_timeout_ms.unwrap_or(0),
     }))
 }
 
@@ -1826,6 +1835,15 @@ pub(crate) async fn proxy_grpc_request_core(
         None => (None, None),
     };
 
+    // Effective per-frame idle read timeout for the STREAMING response body,
+    // computed before `headers` is moved into the backend request below. Same
+    // post-plugin grpc-timeout (uncapped) / backend_read_timeout_ms-fallback
+    // rule as the streaming dispatch's header-wait deadline, so a backend that
+    // streams headers then stalls cannot pin the streaming guards until the
+    // client disconnects. Unused on the buffered path. 0 = unbounded.
+    let streaming_response_read_timeout_ms =
+        streaming_effective_timeout_ms(&headers, proxy).unwrap_or(0);
+
     let mut backend_req = Request::new(GrpcBody::Buffered(Full::new(body_bytes)));
     *backend_req.method_mut() = method;
     *backend_req.uri_mut() = uri;
@@ -1892,23 +1910,25 @@ pub(crate) async fn proxy_grpc_request_core(
         send_fut.await.map_err(map_send_err)?
     };
 
-    // Extract response status and headers, stripping hop-by-hop headers
-    // per RFC 9110 §7.6.1 (canonical predicate in `proxy::headers`),
-    // including any header NAMED in the response's `Connection` field.
+    // Extract response status and headers through the shared collector the
+    // plain-HTTP path uses, instead of a bespoke `insert` loop that overwrote
+    // duplicate names. Repeated `Set-Cookie` values are newline-joined (RFC 6265
+    // — emitted as separate header lines, never comma-folded), other repeated
+    // headers are comma-folded, and both the canonical hop-by-hop set (RFC 9110
+    // §7.6.1) and any `Connection`-listed names are stripped.
+    // `apply_response_headers()` later splits the newline-joined `Set-Cookie`
+    // back into individual lines. Reusing the shared collector keeps the two
+    // gRPC paths and the generic path from drifting and stops duplicate response
+    // headers from collapsing to a single value.
     let status = response.status().as_u16();
-    let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
+    let mut resp_headers = HashMap::new();
     let connection_listed = parse_connection_listed_headers(response.headers());
-    for (k, v) in response.headers() {
-        if is_backend_response_strip_header(k.as_str()) {
-            continue;
-        }
-        if connection_listed.iter().any(|n| n == k) {
-            continue;
-        }
-        if let Ok(vs) = v.to_str() {
-            resp_headers.insert(k.as_str().to_string(), vs.to_string());
-        }
-    }
+    super::collect_response_headers_generic(
+        response.headers().keys_len(),
+        response.headers().iter(),
+        &mut resp_headers,
+        &connection_listed,
+    );
 
     // Streaming mode: return the live Incoming body without buffering.
     // The caller (mod.rs) wraps it in CoalescingH2Body so hyper
@@ -1919,6 +1939,7 @@ pub(crate) async fn proxy_grpc_request_core(
             headers: resp_headers,
             body: response.into_body(),
             request_body_exceeded: None, // buffered request body — already fully sent
+            response_read_timeout_ms: streaming_response_read_timeout_ms,
         }));
     }
 
@@ -2873,5 +2894,49 @@ mod tests {
         collect_buffered_grpc_trailers(&trailer_map, &mut out);
         assert_eq!(out.len(), 1);
         assert_eq!(out.get("grpc-status").map(String::as_str), Some("0"));
+    }
+
+    #[test]
+    fn grpc_response_header_collection_preserves_duplicate_set_cookie() {
+        // Regression for the bug where the gRPC response-header copy used a
+        // HashMap `insert` loop and collapsed duplicate header values — notably
+        // multiple `Set-Cookie` — to the last value, breaking session
+        // stickiness / auth flows. Both the streaming and buffered gRPC paths
+        // now delegate to `collect_response_headers_generic`, matching the
+        // plain-HTTP path: `Set-Cookie` is newline-joined (so the consuming
+        // `apply_response_headers` re-emits separate header lines), other
+        // duplicates are comma-folded, and hop-by-hop names are stripped. This
+        // test exercises the collector exactly as the two gRPC paths now call it.
+        let mut source = http::HeaderMap::new();
+        source.append("set-cookie", http::HeaderValue::from_static("session=a"));
+        source.append("set-cookie", http::HeaderValue::from_static("theme=dark"));
+        source.append("x-multi", http::HeaderValue::from_static("1"));
+        source.append("x-multi", http::HeaderValue::from_static("2"));
+        // Response-direction hop-by-hop header — must be stripped.
+        source.insert("keep-alive", http::HeaderValue::from_static("timeout=5"));
+
+        let mut out: HashMap<String, String> = HashMap::new();
+        let connection_listed = crate::proxy::headers::parse_connection_listed_headers(&source);
+        crate::proxy::collect_response_headers_generic(
+            source.keys_len(),
+            source.iter(),
+            &mut out,
+            &connection_listed,
+        );
+
+        assert_eq!(
+            out.get("set-cookie").map(String::as_str),
+            Some("session=a\ntheme=dark"),
+            "duplicate Set-Cookie must be newline-joined, not collapsed to the last value"
+        );
+        assert_eq!(
+            out.get("x-multi").map(String::as_str),
+            Some("1, 2"),
+            "other duplicate response headers are comma-folded"
+        );
+        assert!(
+            !out.contains_key("keep-alive"),
+            "hop-by-hop response headers must be stripped"
+        );
     }
 }

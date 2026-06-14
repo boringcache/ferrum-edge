@@ -91,6 +91,16 @@ pub struct RemoteClusterEndpoints {
 }
 
 /// One installed remote cluster's endpoints plus provenance.
+///
+/// `fetched_at` is a shared [`AtomicU64`] (not a plain `u64`) so a no-op poll —
+/// identical endpoints, only a newer poll timestamp — can refresh the age in
+/// place via a single relaxed store, WITHOUT cloning the snapshot or this
+/// entry's [`RemoteClusterEndpoints`] payload (which can hold tens of thousands
+/// of workloads/services near the per-cluster caps). The atomic is published
+/// inside the live `ArcSwap` snapshot, so the lock-free admin/apply readers
+/// observe the refreshed value without a swap. A *changed* endpoint set still
+/// goes through the full `inner.rcu` install, which mints a fresh `fetched_at`
+/// for the new entry. See [`RemoteEndpointStore::install`].
 #[derive(Debug, Clone)]
 pub struct RemoteClusterEntry {
     pub cluster_name: String,
@@ -98,8 +108,85 @@ pub struct RemoteClusterEntry {
     /// Network label of the remote cluster, used to default workload locality
     /// when the remote workload carries none.
     pub network: Option<String>,
+    /// **Normalized** control-plane URL these endpoints were polled from (the
+    /// value the poll task dialed, i.e. [`normalize_control_plane_url`] applied
+    /// to the trimmed operator URL). Stored so the FULL poll identity — not just
+    /// (name, trust_domain, network) — can be matched against an about-to-be-
+    /// applied / accepted slice (codex F7.2 round-5): a slice that changes ONLY
+    /// `control_plane_url` for the same name keeps a stale store entry until the
+    /// discovery reconciler stops the old poller, and without the URL here the
+    /// same-generation admission filter and the admin `discovered` filter cannot
+    /// tell the old endpoints (fetched from the previous CP) apart from the
+    /// newly-declared identity. `None` only for entries staged without a poll
+    /// URL (test seeders); production entries always carry the polled URL.
+    pub control_plane_url: Option<String>,
     pub endpoints: RemoteClusterEndpoints,
-    pub fetched_at_unix_seconds: u64,
+    /// Unix-seconds timestamp of the last successful poll for this cluster.
+    /// Shared (`Arc<AtomicU64>`) so a no-op poll refreshes it without a clone;
+    /// read through [`RemoteClusterEntry::fetched_at_unix_seconds`].
+    pub fetched_at: Arc<AtomicU64>,
+}
+
+impl RemoteClusterEntry {
+    /// Construct an entry, wrapping the poll timestamp in a fresh shared atomic.
+    pub fn new(
+        cluster_name: String,
+        trust_domain: TrustDomain,
+        network: Option<String>,
+        control_plane_url: Option<String>,
+        endpoints: RemoteClusterEndpoints,
+        fetched_at_unix_seconds: u64,
+    ) -> Self {
+        Self {
+            cluster_name,
+            trust_domain,
+            network,
+            control_plane_url,
+            endpoints,
+            fetched_at: Arc::new(AtomicU64::new(fetched_at_unix_seconds)),
+        }
+    }
+
+    /// Last-successful-poll timestamp (Unix seconds). Lock-free relaxed read of
+    /// the shared atomic; ordering does not matter (a single scalar refreshed by
+    /// one poll task and read for human-facing age reporting).
+    pub fn fetched_at_unix_seconds(&self) -> u64 {
+        self.fetched_at.load(Ordering::Relaxed)
+    }
+
+    /// Whether this stored entry's FULL poll identity matches a `RemoteCluster`
+    /// declared in a candidate / accepted slice. The poll identity is
+    /// (name, trust_domain, network, **normalized control_plane_url**): two
+    /// clusters that share a name but differ on any of those resolve / dial
+    /// differently and must not be conflated.
+    ///
+    /// The declared URL is normalized + trimmed the SAME way the poll target is
+    /// ([`poll_targets_for_multi_cluster`] → [`normalize_control_plane_url`])
+    /// before comparison, so an operator-written `grpcs://` declaration matches a
+    /// stored `https://` poll URL and trailing whitespace never causes a false
+    /// mismatch. A declaration with no usable `control_plane_url` is never a
+    /// match for a stored (polled) entry — such a cluster is federation-only and
+    /// is never polled, so it cannot legitimately own discovered endpoints.
+    ///
+    /// Centralizing this here keeps the same-generation merge filter
+    /// ([`cluster_admitted_by_candidate`]) and the admin `discovered` filter
+    /// (`admin::mesh_remote_clusters::build_response`) from drifting: both ask
+    /// the SAME "is this stored entry the one this slice declares?" question.
+    pub fn matches_declared(&self, declared: &crate::modes::mesh::config::RemoteCluster) -> bool {
+        if declared.name != self.cluster_name
+            || declared.trust_domain != self.trust_domain
+            || declared.network != self.network
+        {
+            return false;
+        }
+        match declared.control_plane_url.as_deref().map(str::trim) {
+            Some(url) if !url.is_empty() => {
+                self.control_plane_url.as_deref() == Some(normalize_control_plane_url(url).as_str())
+            }
+            // Federation-only (or empty) declaration: never owns polled endpoints.
+            _ => false,
+        }
+    }
 }
 
 /// Snapshot the store hands out to slice apply and the admin API. Keyed by
@@ -174,8 +261,16 @@ impl RemoteEndpointStore {
     /// Test helper: register a cluster and immediately install its entry in one
     /// step. Production code must use `register_cluster` + `install` so the
     /// generation token is passed through the poll task.
+    ///
+    /// `#[cfg(test)]` so this seeder is NEVER compiled into production builds and
+    /// can never be reached through the public `MeshRuntimeState` API — staging
+    /// a discovered snapshot is exclusively an in-crate test concern. It is
+    /// `pub(crate)` (not module-private) so the mesh apply-loop tests in
+    /// `super::mod` can seed the store to exercise the rejected-received-slice
+    /// re-apply path (codex F7.2 round-4); it remains test-only and unreachable
+    /// from production code.
     #[cfg(test)]
-    pub fn install_for_test(&self, entry: RemoteClusterEntry) {
+    pub(crate) fn install_for_test(&self, entry: RemoteClusterEntry) {
         let new_gen = self.register_cluster(&entry.cluster_name);
         self.install(entry, new_gen);
     }
@@ -202,48 +297,87 @@ impl RemoteEndpointStore {
     /// is discarded — closing the abort→install race (F6).
     ///
     /// When the endpoints are byte-identical to what is already stored, the
-    /// revision is NOT bumped and the apply task is not woken (F2).
+    /// apply task is NOT woken and the revision is NOT bumped (F2) — but the
+    /// stored `fetched_at` IS refreshed to this poll's timestamp. That keeps the
+    /// admin endpoint's `age_seconds` measuring time-since-last-successful-POLL
+    /// rather than time-since-last-endpoint-CHANGE, so a healthy but stable
+    /// remote cluster does not look stale to operator alerting. The refresh is a
+    /// single relaxed store into the entry's **shared** `fetched_at` atomic — it
+    /// does NOT clone the snapshot or the (potentially huge) endpoint payload,
+    /// and it does NOT touch `revision_tx`/`first_ready`, preserving the
+    /// "no reconcile on unchanged endpoints" optimization without the
+    /// steady-state per-poll deep-clone the previous in-`rcu` refresh incurred.
     ///
-    /// Returns `true` only when this call actually mutated the snapshot (a real
-    /// install), so callers can avoid logging "installed" on a deduped or
-    /// retired-cluster no-op.
+    /// Returns `true` only when this call actually changed the endpoint set (a
+    /// real install), so callers can avoid logging "installed" on a deduped
+    /// (timestamp-only refresh) or retired-cluster no-op.
     fn install(&self, entry: RemoteClusterEntry, task_generation: u64) -> bool {
         let name = entry.cluster_name.clone();
         // Fast-path generation check: bail out early if the task's cluster slot
-        // was already retired, avoiding the dedup load + clone for stale tasks.
-        // This is re-validated atomically inside the rcu below — it is only an
-        // optimization, not the authoritative check.
+        // was already retired, avoiding the swap for stale tasks. This is
+        // re-validated below — it is only an optimization, not the authoritative
+        // check.
         if !self.cluster_generation_matches(&name, task_generation) {
             return false;
         }
-        // No-op dedup: skip the revision bump when the endpoints are unchanged.
+        // No-op dedup: endpoints identical to what is stored. Refresh only the
+        // poll timestamp (so `age_seconds` tracks polls) via the entry's shared
+        // atomic — NO snapshot/endpoint clone — and do NOT wake the apply task.
+        //
+        // Concurrency: the atomic lives inside the currently-published snapshot
+        // (`current`), so the store is visible to lock-free readers without an
+        // `ArcSwap` swap. The generation is RE-CHECKED immediately before the
+        // store so a stale task (whose cluster was removed, or removed and
+        // re-registered at a newer generation) cannot refresh a live entry's
+        // age: `remove()` retires the generation BEFORE clearing `inner`, so
+        // either the recheck fails (skip) or `remove` has not yet cleared the
+        // entry and a harmless store lands on an entry about to be dropped from
+        // the snapshot (the next published snapshot — without this cluster, or
+        // with the re-registered cluster's own fresh atomic — is what readers
+        // see). It can therefore never resurrect a removed cluster (the entry is
+        // already present; we add nothing) nor mis-age a re-registered one.
         {
             let current = self.inner.load();
-            if current
-                .clusters
-                .get(&name)
-                .is_some_and(|existing| existing.endpoints == entry.endpoints)
+            if let Some(existing) = current.clusters.get(&name)
+                && existing.endpoints == entry.endpoints
             {
-                // Endpoints are identical — do not wake the apply task.
+                if self.cluster_generation_matches(&name, task_generation) {
+                    existing
+                        .fetched_at
+                        .store(entry.fetched_at_unix_seconds(), Ordering::Relaxed);
+                }
                 return false;
             }
         }
-        // CAS loop so two concurrent successful polls (different clusters)
-        // cannot stomp each other's snapshot clone. The generation is re-checked
-        // INSIDE the closure so the check-and-insert is atomic with respect to
-        // `remove()`: `remove` retires the generation (in `cluster_generation`)
-        // BEFORE clearing endpoints (in `inner`). So if a `remove` races this
+        // First sight or CHANGED endpoints: full install via a CAS loop so two
+        // concurrent successful polls (different clusters) cannot stomp each
+        // other's snapshot clone. The generation is re-checked INSIDE the
+        // closure so the check-and-insert is atomic with respect to `remove()`:
+        // `remove` retires the generation (in `cluster_generation`) BEFORE
+        // clearing endpoints (in `inner`). So if a `remove` races this
         // mid-flight install, either (a) this rcu commits first and `remove`'s
         // subsequent `inner` clear drops the endpoints, or (b) `remove`'s `inner`
         // clear wins the CAS, this closure retries, re-reads the now-retired
         // generation, and skips — never reintroducing endpoints for a removed
         // cluster. Without the in-closure recheck, a stale task could insert
         // after `remove` had already cleared the cluster (the F6 race, widened
-        // to the trust-withdrawal case).
+        // to the trust-withdrawal case). `installed` is computed fresh on every
+        // closure iteration so a CAS retry never carries a stale verdict.
         let mut installed = false;
         self.inner.rcu(|current| {
+            installed = false;
             if !self.cluster_generation_matches(&name, task_generation) {
-                installed = false;
+                return Arc::clone(current);
+            }
+            // Re-confirm the endpoints still differ: a concurrent poll for the
+            // same cluster may have installed identical endpoints between our
+            // pre-check above and this CAS attempt. If so, this is a no-op (the
+            // timestamp refresh raced ahead) — do not wake the apply task.
+            if current
+                .clusters
+                .get(&name)
+                .is_some_and(|existing| existing.endpoints == entry.endpoints)
+            {
                 return Arc::clone(current);
             }
             let mut next = (**current).clone();
@@ -402,12 +536,52 @@ struct WorkloadEndpointKey {
     ports: Vec<(u16, AppProtocol, Option<String>)>,
 }
 
+/// Whether a stored remote-cluster entry is admitted by the candidate (about-to-
+/// be-applied) slice's [`MultiClusterConfig`]. The store is reconciled from the
+/// ACCEPTED slice, but the apply loop reads the store snapshot a generation
+/// before the discovery reconciler can react to a just-accepted slice that
+/// removed (or re-identified) a cluster. Filtering the merge against the
+/// candidate slice closes that one-generation window: a cluster the candidate
+/// does NOT declare (removal), or declares under a divergent identity,
+/// contributes NO endpoints to this generation. Fail-closed: a candidate slice
+/// with no `MultiClusterConfig` admits nothing, so a stale store can never leak
+/// endpoints into a slice that dropped multi-cluster entirely.
+///
+/// The match is the FULL poll identity — name, trust_domain, network, AND the
+/// normalized `control_plane_url` — via [`RemoteClusterEntry::matches_declared`].
+/// Storing the polled URL on the entry (codex F7.2 round-5) closes the former
+/// URL-only-divergence gap: when an accepted slice changes ONLY
+/// `control_plane_url` for an existing cluster name, the stored entry (still
+/// holding the OLD CP's endpoints) no longer matches the candidate, so the
+/// generation that accepts the new config serves NO endpoints from the previous
+/// control plane while the discovery reconciler spins up the new poller. It is
+/// no longer the case that a URL-only change leaks for a generation.
+fn cluster_admitted_by_candidate(
+    entry: &RemoteClusterEntry,
+    candidate: Option<&MultiClusterConfig>,
+) -> bool {
+    let Some(candidate) = candidate else {
+        return false;
+    };
+    candidate
+        .remote_clusters
+        .iter()
+        .any(|declared| entry.matches_declared(declared))
+}
+
 /// Merge the remote-endpoint snapshot into a slice's local `workloads` /
 /// `services`. Returns the merged vectors; the slice-apply path uses these to
 /// build `GatewayConfig.mesh` so [`MeshServiceDiscoverer`] resolves both local
 /// and remote endpoints for a service.
 ///
-/// Merge rules:
+/// Only remote clusters admitted by `candidate_multi_cluster` (the about-to-be-
+/// applied slice's [`MultiClusterConfig`]) contribute endpoints — see
+/// [`cluster_admitted_by_candidate`]. This makes cluster removal / control-plane
+/// identity changes fail-closed within the SAME generation rather than leaking
+/// stale endpoints for one generation until the discovery reconciler evicts the
+/// store entry.
+///
+/// Merge rules (for admitted clusters):
 /// - Remote workloads are appended after local ones. Exact endpoint duplicates
 ///   are skipped, but workloads with the same SPIFFE ID and different addresses
 ///   are retained; multi-cluster services can legitimately expose replicas with
@@ -424,6 +598,7 @@ pub fn merge_remote_endpoints_into_mesh(
     local_workloads: &[Workload],
     local_services: &[MeshService],
     snapshot: &RemoteEndpointSnapshot,
+    candidate_multi_cluster: Option<&MultiClusterConfig>,
 ) -> (Vec<Workload>, Vec<MeshService>) {
     if snapshot.is_empty() {
         return (local_workloads.to_vec(), local_services.to_vec());
@@ -450,6 +625,13 @@ pub fn merge_remote_endpoints_into_mesh(
         let Some(entry) = snapshot.clusters.get(cluster_name) else {
             continue;
         };
+        // Fail-closed same-generation filter: drop endpoints for any cluster the
+        // candidate slice does not declare (or declares under a divergent
+        // identity). The store may still hold them for one generation until the
+        // discovery reconciler (sourced from the accepted slice) evicts them.
+        if !cluster_admitted_by_candidate(entry, candidate_multi_cluster) {
+            continue;
+        }
         for workload in &entry.endpoints.workloads {
             if seen_workloads.insert(workload_endpoint_key(workload)) {
                 workloads.push(workload.clone());
@@ -898,18 +1080,22 @@ async fn remote_discovery_loop(
             Ok(endpoints) => {
                 let now = chrono::Utc::now().timestamp().max(0) as u64;
                 let workload_count = endpoints.workloads.len();
-                let entry = RemoteClusterEntry {
-                    cluster_name: ctx.cluster_name.clone(),
-                    trust_domain: ctx.trust_domain.clone(),
-                    network: ctx.network.clone(),
+                let entry = RemoteClusterEntry::new(
+                    ctx.cluster_name.clone(),
+                    ctx.trust_domain.clone(),
+                    ctx.network.clone(),
+                    // `ctx.control_plane_url` is already normalized by
+                    // `poll_targets_for_multi_cluster`; store it so a later
+                    // URL-only slice change fails the membership filter closed.
+                    Some(ctx.control_plane_url.clone()),
                     endpoints,
-                    fetched_at_unix_seconds: now,
-                };
+                    now,
+                );
                 // Capture the summary fields before moving `entry` into
                 // `install`, so the log can fire on the actual install result.
                 let log_trust_domain = entry.trust_domain.clone();
                 let log_network = entry.network.clone();
-                let log_fetched_at = entry.fetched_at_unix_seconds;
+                let log_fetched_at = entry.fetched_at_unix_seconds();
                 let installed = store.install(entry, task_generation);
                 if installed {
                     info!(
@@ -1331,15 +1517,35 @@ mod tests {
         let mut clusters = HashMap::new();
         clusters.insert(
             cluster.to_string(),
-            RemoteClusterEntry {
-                cluster_name: cluster.to_string(),
-                trust_domain: td("remote.local"),
-                network: Some("net2".to_string()),
+            RemoteClusterEntry::new(
+                cluster.to_string(),
+                td("remote.local"),
+                Some("net2".to_string()),
+                // Matches the URL `candidate_admitting` declares (already
+                // normalized form), so the full-poll-identity filter admits it.
+                Some("https://cp.remote.example:15010".to_string()),
                 endpoints,
-                fetched_at_unix_seconds: 1,
-            },
+                1,
+            ),
         );
         RemoteEndpointSnapshot { clusters }
+    }
+
+    /// A candidate `MultiClusterConfig` that admits the `snapshot_with` cluster
+    /// identity (`name` / `remote.local` / `net2`) so the merge tests below see
+    /// the same-generation candidate filter pass. Tests asserting the filter
+    /// REJECTS a divergent/absent cluster build their own candidate.
+    fn candidate_admitting(cluster: &str) -> MultiClusterConfig {
+        MultiClusterConfig {
+            remote_clusters: vec![RemoteCluster {
+                name: cluster.to_string(),
+                trust_domain: td("remote.local"),
+                network: Some("net2".to_string()),
+                control_plane_url: Some("https://cp.remote.example:15010".to_string()),
+                federation_endpoint: None,
+            }],
+            ..MultiClusterConfig::default()
+        }
     }
 
     #[test]
@@ -1556,8 +1762,12 @@ mod tests {
         };
         let snapshot = snapshot_with("west", remote);
 
-        let (workloads, services) =
-            merge_remote_endpoints_into_mesh(&local_workloads, &local_services, &snapshot);
+        let (workloads, services) = merge_remote_endpoints_into_mesh(
+            &local_workloads,
+            &local_services,
+            &snapshot,
+            Some(&candidate_admitting("west")),
+        );
 
         assert_eq!(workloads.len(), 2, "remote workload appended");
         // Single merged `reviews` service with BOTH refs so the discoverer
@@ -1586,7 +1796,12 @@ mod tests {
             services: vec![],
         };
         let snapshot = snapshot_with("west", remote);
-        let (workloads, _) = merge_remote_endpoints_into_mesh(&local, &[], &snapshot);
+        let (workloads, _) = merge_remote_endpoints_into_mesh(
+            &local,
+            &[],
+            &snapshot,
+            Some(&candidate_admitting("west")),
+        );
         assert_eq!(workloads.len(), 2);
         assert_eq!(workloads[0].addresses, vec!["10.1.0.1".to_string()]);
         assert_eq!(workloads[1].addresses, vec!["10.9.9.9".to_string()]);
@@ -1610,7 +1825,12 @@ mod tests {
             services: vec![],
         };
         let snapshot = snapshot_with("west", remote);
-        let (workloads, _) = merge_remote_endpoints_into_mesh(&local, &[], &snapshot);
+        let (workloads, _) = merge_remote_endpoints_into_mesh(
+            &local,
+            &[],
+            &snapshot,
+            Some(&candidate_admitting("west")),
+        );
         assert_eq!(workloads.len(), 1);
     }
 
@@ -1629,9 +1849,271 @@ mod tests {
                 &["spiffe://cluster.local/ns/default/sa/a"],
             )],
             &RemoteEndpointSnapshot::default(),
+            None,
         );
         assert_eq!(workloads.len(), 1);
         assert_eq!(services.len(), 1);
+    }
+
+    /// Finding 1 (same-generation fail-closed): a stored remote cluster that the
+    /// CANDIDATE slice does not declare contributes NO endpoints, even though the
+    /// store still holds it (the discovery reconciler, sourced from the accepted
+    /// slice, evicts it only on the next generation). Cluster removal must be
+    /// fail-closed within the generation that removed it.
+    #[test]
+    fn merge_drops_cluster_absent_from_candidate_slice() {
+        let local = vec![workload(
+            "spiffe://cluster.local/ns/default/sa/local",
+            "reviews",
+            "10.1.0.1",
+            None,
+        )];
+        let remote = RemoteClusterEndpoints {
+            workloads: vec![workload(
+                "spiffe://remote.local/ns/default/sa/remote",
+                "reviews",
+                "10.2.0.1",
+                None,
+            )],
+            services: vec![service(
+                "reviews",
+                &["spiffe://remote.local/ns/default/sa/remote"],
+            )],
+        };
+        let snapshot = snapshot_with("west", remote);
+
+        // Candidate declares NO multi-cluster at all → fail closed, no remote
+        // endpoints contributed.
+        let (workloads, services) = merge_remote_endpoints_into_mesh(&local, &[], &snapshot, None);
+        assert_eq!(
+            workloads.len(),
+            1,
+            "no remote workload when candidate is None"
+        );
+        assert!(services.is_empty());
+
+        // Candidate declares a DIFFERENT cluster name → the stored `west` is not
+        // admitted.
+        let other = MultiClusterConfig {
+            remote_clusters: vec![RemoteCluster {
+                name: "east".to_string(),
+                trust_domain: td("remote.local"),
+                network: Some("net2".to_string()),
+                control_plane_url: Some("https://cp.east.example:15010".to_string()),
+                federation_endpoint: None,
+            }],
+            ..MultiClusterConfig::default()
+        };
+        let (workloads, _) = merge_remote_endpoints_into_mesh(&local, &[], &snapshot, Some(&other));
+        assert_eq!(
+            workloads.len(),
+            1,
+            "a cluster absent from the candidate contributes nothing"
+        );
+    }
+
+    /// Finding 1 (identity divergence): a candidate that keeps the cluster NAME
+    /// but diverges on a poll-identity field the entry carries (`network` here,
+    /// `trust_domain` likewise) does NOT admit the stored entry — the
+    /// same-generation guard for the fields the snapshot exposes.
+    #[test]
+    fn merge_drops_cluster_with_diverged_identity_in_candidate() {
+        let local = vec![workload(
+            "spiffe://cluster.local/ns/default/sa/local",
+            "reviews",
+            "10.1.0.1",
+            None,
+        )];
+        let remote = RemoteClusterEndpoints {
+            workloads: vec![workload(
+                "spiffe://remote.local/ns/default/sa/remote",
+                "reviews",
+                "10.2.0.1",
+                None,
+            )],
+            services: vec![],
+        };
+        // Stored entry carries network `net2` (from `snapshot_with`).
+        let snapshot = snapshot_with("west", remote);
+
+        // Candidate declares `west` but on a DIFFERENT network.
+        let diverged_network = MultiClusterConfig {
+            remote_clusters: vec![RemoteCluster {
+                name: "west".to_string(),
+                trust_domain: td("remote.local"),
+                network: Some("net-other".to_string()),
+                control_plane_url: Some("https://cp.remote.example:15010".to_string()),
+                federation_endpoint: None,
+            }],
+            ..MultiClusterConfig::default()
+        };
+        let (workloads, _) =
+            merge_remote_endpoints_into_mesh(&local, &[], &snapshot, Some(&diverged_network));
+        assert_eq!(workloads.len(), 1, "diverged network is not admitted");
+
+        // Candidate declares `west`/`net2` but a DIFFERENT trust domain.
+        let diverged_td = MultiClusterConfig {
+            remote_clusters: vec![RemoteCluster {
+                name: "west".to_string(),
+                trust_domain: td("other.local"),
+                network: Some("net2".to_string()),
+                control_plane_url: Some("https://cp.remote.example:15010".to_string()),
+                federation_endpoint: None,
+            }],
+            ..MultiClusterConfig::default()
+        };
+        let (workloads, _) =
+            merge_remote_endpoints_into_mesh(&local, &[], &snapshot, Some(&diverged_td));
+        assert_eq!(workloads.len(), 1, "diverged trust domain is not admitted");
+
+        // Matching identity admits it.
+        let (workloads, _) = merge_remote_endpoints_into_mesh(
+            &local,
+            &[],
+            &snapshot,
+            Some(&candidate_admitting("west")),
+        );
+        assert_eq!(
+            workloads.len(),
+            2,
+            "matching identity admits the remote workload"
+        );
+    }
+
+    /// Codex F7.2 round-5, finding 1: a candidate slice that changes ONLY the
+    /// `control_plane_url` (same name + trust domain + network) must NOT admit
+    /// the stored entry — those endpoints were fetched from the PREVIOUS control
+    /// plane, so the generation that accepts the new URL must serve none of them
+    /// until the discovery reconciler starts the new poller. The stored entry
+    /// carries the normalized polled URL, so the filter can tell them apart.
+    #[test]
+    fn merge_drops_cluster_with_url_only_divergence() {
+        let local = vec![workload(
+            "spiffe://cluster.local/ns/default/sa/local",
+            "reviews",
+            "10.1.0.1",
+            None,
+        )];
+        let remote = RemoteClusterEndpoints {
+            workloads: vec![workload(
+                "spiffe://remote.local/ns/default/sa/remote",
+                "reviews",
+                "10.2.0.1",
+                None,
+            )],
+            services: vec![],
+        };
+        // `snapshot_with` stores URL `https://cp.remote.example:15010`.
+        let snapshot = snapshot_with("west", remote);
+
+        // Candidate keeps name + trust domain + network but moves the CP to v2.
+        let url_only_change = MultiClusterConfig {
+            remote_clusters: vec![RemoteCluster {
+                name: "west".to_string(),
+                trust_domain: td("remote.local"),
+                network: Some("net2".to_string()),
+                control_plane_url: Some("https://cp-v2.remote.example:15010".to_string()),
+                federation_endpoint: None,
+            }],
+            ..MultiClusterConfig::default()
+        };
+        let (workloads, _) =
+            merge_remote_endpoints_into_mesh(&local, &[], &snapshot, Some(&url_only_change));
+        assert_eq!(
+            workloads.len(),
+            1,
+            "a URL-only change must not serve endpoints fetched from the previous control plane"
+        );
+
+        // The operator-written `grpcs://` form of the SAME URL still admits it
+        // (normalization matches it to the stored `https://` poll URL).
+        let grpcs_same = MultiClusterConfig {
+            remote_clusters: vec![RemoteCluster {
+                name: "west".to_string(),
+                trust_domain: td("remote.local"),
+                network: Some("net2".to_string()),
+                control_plane_url: Some("grpcs://cp.remote.example:15010".to_string()),
+                federation_endpoint: None,
+            }],
+            ..MultiClusterConfig::default()
+        };
+        let (workloads, _) =
+            merge_remote_endpoints_into_mesh(&local, &[], &snapshot, Some(&grpcs_same));
+        assert_eq!(
+            workloads.len(),
+            2,
+            "a grpcs:// declaration of the same URL normalizes to the stored https:// and admits"
+        );
+    }
+
+    /// `matches_declared` is the single source of truth shared by the merge
+    /// filter and the admin `discovered` filter; pin its identity rules.
+    #[test]
+    fn matches_declared_compares_full_poll_identity() {
+        let entry = RemoteClusterEntry::new(
+            "west".to_string(),
+            td("remote.local"),
+            Some("net2".to_string()),
+            Some("https://cp.remote.example:15010".to_string()),
+            RemoteClusterEndpoints::default(),
+            1,
+        );
+        let base = RemoteCluster {
+            name: "west".to_string(),
+            trust_domain: td("remote.local"),
+            network: Some("net2".to_string()),
+            control_plane_url: Some("https://cp.remote.example:15010".to_string()),
+            federation_endpoint: None,
+        };
+        assert!(entry.matches_declared(&base), "exact identity matches");
+        // grpcs:// normalizes to the stored https:// → matches.
+        assert!(entry.matches_declared(&RemoteCluster {
+            control_plane_url: Some("grpcs://cp.remote.example:15010".to_string()),
+            ..base.clone()
+        }));
+        // Surrounding whitespace is trimmed before normalization.
+        assert!(entry.matches_declared(&RemoteCluster {
+            control_plane_url: Some("  https://cp.remote.example:15010  ".to_string()),
+            ..base.clone()
+        }));
+        // Each identity field, diverged in isolation, fails the match.
+        assert!(!entry.matches_declared(&RemoteCluster {
+            name: "east".to_string(),
+            ..base.clone()
+        }));
+        assert!(!entry.matches_declared(&RemoteCluster {
+            trust_domain: td("other.local"),
+            ..base.clone()
+        }));
+        assert!(!entry.matches_declared(&RemoteCluster {
+            network: Some("net-other".to_string()),
+            ..base.clone()
+        }));
+        assert!(!entry.matches_declared(&RemoteCluster {
+            control_plane_url: Some("https://cp-v2.remote.example:15010".to_string()),
+            ..base.clone()
+        }));
+        // A federation-only (no URL) or blank-URL declaration never owns polled
+        // endpoints, even with otherwise-matching identity.
+        assert!(!entry.matches_declared(&RemoteCluster {
+            control_plane_url: None,
+            ..base.clone()
+        }));
+        assert!(!entry.matches_declared(&RemoteCluster {
+            control_plane_url: Some("   ".to_string()),
+            ..base.clone()
+        }));
+        // An entry with no stored URL (test seeder shape) never matches a
+        // URL-bearing declaration.
+        let urlless = RemoteClusterEntry::new(
+            "west".to_string(),
+            td("remote.local"),
+            Some("net2".to_string()),
+            None,
+            RemoteClusterEndpoints::default(),
+            1,
+        );
+        assert!(!urlless.matches_declared(&base));
     }
 
     #[test]
@@ -1644,6 +2126,7 @@ mod tests {
             cluster_name: "west".to_string(),
             trust_domain: td("remote.local"),
             network: None,
+            control_plane_url: None,
             endpoints: RemoteClusterEndpoints {
                 workloads: vec![workload(
                     "spiffe://remote.local/ns/default/sa/a",
@@ -1653,14 +2136,14 @@ mod tests {
                 )],
                 services: vec![],
             },
-            fetched_at_unix_seconds: 1,
+            fetched_at: Arc::new(AtomicU64::new(1)),
         });
         assert!(store.has_first_success());
         let snapshot = store.snapshot();
         let entry = snapshot.clusters.get("west").expect("installed entry");
         assert_eq!(entry.trust_domain.as_str(), "remote.local");
         assert_eq!(entry.endpoints.workloads.len(), 1);
-        assert_eq!(entry.fetched_at_unix_seconds, 1);
+        assert_eq!(entry.fetched_at_unix_seconds(), 1);
 
         store.remove("west");
         assert!(store.snapshot().is_empty());
@@ -1730,6 +2213,7 @@ mod tests {
             cluster_name: "west".to_string(),
             trust_domain: td("remote.local"),
             network: None,
+            control_plane_url: None,
             endpoints: RemoteClusterEndpoints {
                 workloads: vec![workload(
                     "spiffe://remote.local/ns/default/sa/a",
@@ -1739,7 +2223,7 @@ mod tests {
                 )],
                 services: vec![],
             },
-            fetched_at_unix_seconds: 1,
+            fetched_at: Arc::new(AtomicU64::new(1)),
         });
         assert!(!store.snapshot().is_empty());
 
@@ -1749,6 +2233,93 @@ mod tests {
             store.snapshot().is_empty(),
             "trust withdrawal removes stale remote endpoints"
         );
+        manager.shutdown();
+    }
+
+    /// Codex F7.2 round-3: a target that keeps the same cluster name + trust
+    /// domain but changes its poll identity (`network` AND `control_plane_url`)
+    /// is a DIFFERENT poll target. `reconcile` must stop the old poller and
+    /// evict its endpoints rather than keep serving them — otherwise a rejected
+    /// slice that only diverged on those fields could leave stale endpoints in
+    /// the store (and thus under `/mesh/remote-clusters`'s `discovered`, which
+    /// the name+trust-domain admin filter would NOT catch). Combined with
+    /// sourcing the reconcile from the *accepted* slice, this guarantees the
+    /// store only ever holds endpoints from the proxy-applied multicluster
+    /// config. Trust eligibility is held constant here to isolate the
+    /// poll-identity-change path from the trust-withdrawal path above.
+    #[tokio::test]
+    async fn manager_evicts_endpoints_when_poll_identity_diverges() {
+        let store = RemoteEndpointStore::new();
+        let config = RemoteDiscoveryConfig {
+            poll_interval: Duration::from_secs(60),
+            request_timeout: Duration::from_secs(1),
+            jwt_secret: None,
+            node_id: "dp-1".to_string(),
+            namespace: "default".to_string(),
+            tls_config: RemoteDiscoveryTlsConfig::default(),
+        };
+        let mut manager = RemoteDiscoveryManager::new(Some(config), store.clone(), |ctx| {
+            Arc::new(MissingSecretSource {
+                cluster_name: ctx.cluster_name.clone(),
+            })
+        });
+
+        // Accepted slice declares `west` with network `net-a` reachable at v1.
+        let accepted = MultiClusterConfig {
+            remote_clusters: vec![RemoteCluster {
+                name: "west".to_string(),
+                trust_domain: td("remote.local"),
+                network: Some("net-a".to_string()),
+                control_plane_url: Some("https://cp-v1.remote.example:15010".to_string()),
+                federation_endpoint: None,
+            }],
+            ..MultiClusterConfig::default()
+        };
+        let mut trusted = std::collections::HashSet::new();
+        trusted.insert(td("remote.local"));
+
+        manager.reconcile(Some(&accepted), trusted.clone());
+        assert_eq!(manager.running_cluster_names(), vec!["west"]);
+        store.install_for_test(RemoteClusterEntry {
+            cluster_name: "west".to_string(),
+            trust_domain: td("remote.local"),
+            network: Some("net-a".to_string()),
+            control_plane_url: Some("https://cp-v1.remote.example:15010".to_string()),
+            endpoints: RemoteClusterEndpoints {
+                workloads: vec![workload(
+                    "spiffe://remote.local/ns/default/sa/a",
+                    "reviews",
+                    "10.2.0.1",
+                    None,
+                )],
+                services: vec![],
+            },
+            fetched_at: Arc::new(AtomicU64::new(1)),
+        });
+        assert!(!store.snapshot().is_empty());
+
+        // A divergent target: SAME cluster name + trust domain, but a changed
+        // network AND control_plane_url (the exact shape a rejected slice could
+        // carry past a name+trust-domain-only filter). The old poller must be
+        // stopped and its endpoints evicted before the new poller starts.
+        let divergent = MultiClusterConfig {
+            remote_clusters: vec![RemoteCluster {
+                name: "west".to_string(),
+                trust_domain: td("remote.local"),
+                network: Some("net-b".to_string()),
+                control_plane_url: Some("https://cp-v2.remote.example:15010".to_string()),
+                federation_endpoint: None,
+            }],
+            ..MultiClusterConfig::default()
+        };
+        manager.reconcile(Some(&divergent), trusted);
+        assert!(
+            store.snapshot().is_empty(),
+            "a changed network/control_plane_url evicts the prior cluster's endpoints"
+        );
+        // The cluster is still eligible, so a fresh poller for the new identity
+        // is started (it just hasn't fetched anything yet via the stub source).
+        assert_eq!(manager.running_cluster_names(), vec!["west"]);
         manager.shutdown();
     }
 
@@ -1965,6 +2536,7 @@ mod tests {
             cluster_name: "west".to_string(),
             trust_domain: td("remote.local"),
             network: None,
+            control_plane_url: None,
             endpoints: RemoteClusterEndpoints {
                 workloads: vec![workload(
                     "spiffe://remote.local/ns/default/sa/stale",
@@ -1974,7 +2546,7 @@ mod tests {
                 )],
                 services: vec![],
             },
-            fetched_at_unix_seconds: 1,
+            fetched_at: Arc::new(AtomicU64::new(1)),
         };
         // The install must be silently dropped — the generation slot is gone.
         store.install(entry, stale_gen);
@@ -2007,8 +2579,9 @@ mod tests {
             cluster_name: "west".to_string(),
             trust_domain: td("remote.local"),
             network: None,
+            control_plane_url: None,
             endpoints: endpoints.clone(),
-            fetched_at_unix_seconds: 1,
+            fetched_at: Arc::new(AtomicU64::new(1)),
         };
         // First install: should bump the revision.
         store.install_for_test(entry());
@@ -2024,6 +2597,169 @@ mod tests {
         assert!(
             !rx.has_changed().unwrap(),
             "no-op poll with identical endpoints must not bump revision"
+        );
+    }
+
+    /// Finding 1: a no-op poll (identical endpoints) with a NEWER fetch
+    /// timestamp must refresh the stored `fetched_at_unix_seconds` so the admin
+    /// endpoint's `age_seconds` tracks the last successful POLL — not the last
+    /// endpoint CHANGE — WITHOUT waking the apply task. A healthy-but-stable
+    /// remote cluster otherwise looks stale to operator alerting.
+    #[test]
+    fn no_op_poll_refreshes_fetch_timestamp_without_bumping_revision() {
+        let store = RemoteEndpointStore::new();
+        let mut rx = store.subscribe();
+        let endpoints = RemoteClusterEndpoints {
+            workloads: vec![workload(
+                "spiffe://remote.local/ns/default/sa/a",
+                "reviews",
+                "10.2.0.1",
+                Some("remote-west"),
+            )],
+            services: vec![],
+        };
+        let entry_at = |fetched_at: u64| RemoteClusterEntry {
+            cluster_name: "west".to_string(),
+            trust_domain: td("remote.local"),
+            network: None,
+            control_plane_url: None,
+            endpoints: endpoints.clone(),
+            fetched_at: Arc::new(AtomicU64::new(fetched_at)),
+        };
+
+        // First poll at t=100 installs and bumps the revision.
+        let gen1 = store.register_cluster("west");
+        assert!(
+            store.install(entry_at(100), gen1),
+            "first install changes endpoints → returns true"
+        );
+        assert!(rx.has_changed().unwrap(), "first install bumps revision");
+        rx.mark_unchanged();
+        assert_eq!(
+            store
+                .snapshot()
+                .clusters
+                .get("west")
+                .map(|e| e.fetched_at_unix_seconds()),
+            Some(100)
+        );
+
+        // Second poll at t=160: SAME endpoints, NEWER timestamp. Must refresh
+        // the stored timestamp but NOT wake the apply task and NOT report a
+        // change.
+        let gen2 = store.register_cluster("west");
+        assert!(
+            !store.install(entry_at(160), gen2),
+            "no-op poll (same endpoints) returns false even though it refreshed the timestamp"
+        );
+        assert!(
+            !rx.has_changed().unwrap(),
+            "timestamp-only refresh must not bump revision / wake apply"
+        );
+        assert_eq!(
+            store
+                .snapshot()
+                .clusters
+                .get("west")
+                .map(|e| e.fetched_at_unix_seconds()),
+            Some(160),
+            "age must track the latest successful poll, not the last endpoint change"
+        );
+    }
+
+    /// Finding 2 (perf): a no-op poll must refresh the fetch timestamp WITHOUT
+    /// deep-cloning the snapshot or the endpoint payload. We prove it two ways:
+    /// (1) the published `inner` snapshot `Arc` is byte-for-byte the SAME pointer
+    /// before and after the no-op refresh (a deep clone would `ArcSwap::store` a
+    /// new snapshot, changing the pointer); (2) an `Arc` handle to the entry's
+    /// shared `fetched_at` atomic captured BEFORE the poll observes the NEW value
+    /// after it (the in-place store targets the live entry, not a clone). With
+    /// the previous in-`rcu` refresh both would fail (new snapshot pointer; the
+    /// old atomic handle, copied into the clone, would be stale).
+    #[test]
+    fn no_op_poll_refreshes_timestamp_in_place_without_cloning_snapshot() {
+        let store = RemoteEndpointStore::new();
+        let endpoints = RemoteClusterEndpoints {
+            workloads: vec![workload(
+                "spiffe://remote.local/ns/default/sa/a",
+                "reviews",
+                "10.2.0.1",
+                Some("remote-west"),
+            )],
+            services: vec![],
+        };
+        let entry_at = |fetched_at: u64| {
+            RemoteClusterEntry::new(
+                "west".to_string(),
+                td("remote.local"),
+                None,
+                None,
+                endpoints.clone(),
+                fetched_at,
+            )
+        };
+
+        let gen1 = store.register_cluster("west");
+        assert!(store.install(entry_at(100), gen1));
+
+        // Capture the live snapshot Arc and a handle to the shared atomic.
+        let snapshot_before = store.snapshot();
+        let shared_atomic = Arc::clone(&snapshot_before.clusters.get("west").unwrap().fetched_at);
+        assert_eq!(shared_atomic.load(Ordering::Relaxed), 100);
+
+        // No-op poll: identical endpoints, newer timestamp.
+        let gen2 = store.register_cluster("west");
+        assert!(!store.install(entry_at(160), gen2));
+
+        // (1) The published snapshot Arc is unchanged → no clone+swap happened.
+        let snapshot_after = store.snapshot();
+        assert!(
+            Arc::ptr_eq(&snapshot_before, &snapshot_after),
+            "a no-op timestamp refresh must NOT swap a freshly-cloned snapshot"
+        );
+        // (2) The pre-captured shared atomic observes the new value in place.
+        assert_eq!(
+            shared_atomic.load(Ordering::Relaxed),
+            160,
+            "the shared fetched_at atomic is refreshed in place (no payload clone)"
+        );
+    }
+
+    /// Finding 1 (fail-closed): the timestamp refresh on a no-op poll must
+    /// respect the generation guard. A retired cluster (removed / trust
+    /// withdrawn) whose in-flight task lands a no-op poll must NOT have its age
+    /// refreshed or its endpoints reinstated — the cluster is gone.
+    #[test]
+    fn no_op_refresh_is_blocked_for_retired_cluster() {
+        let store = RemoteEndpointStore::new();
+        let endpoints = RemoteClusterEndpoints {
+            workloads: vec![workload(
+                "spiffe://remote.local/ns/default/sa/a",
+                "reviews",
+                "10.2.0.1",
+                None,
+            )],
+            services: vec![],
+        };
+        let entry_at = |fetched_at: u64| RemoteClusterEntry {
+            cluster_name: "west".to_string(),
+            trust_domain: td("remote.local"),
+            network: None,
+            control_plane_url: None,
+            endpoints: endpoints.clone(),
+            fetched_at: Arc::new(AtomicU64::new(fetched_at)),
+        };
+        // Install once, then retire the cluster.
+        let stale_gen = store.register_cluster("west");
+        assert!(store.install(entry_at(100), stale_gen));
+        store.remove("west");
+        assert!(store.snapshot().is_empty(), "remove clears the cluster");
+        // The stale task's next (no-op) poll must be dropped, not refresh a
+        // resurrected entry.
+        assert!(!store.install(entry_at(160), stale_gen));
+        assert!(
+            store.snapshot().is_empty(),
+            "retired cluster must not be reinstated by a no-op timestamp refresh"
         );
     }
 

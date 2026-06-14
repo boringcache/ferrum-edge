@@ -35,6 +35,11 @@ pub struct ReconcilerConfig {
     pub debounce_ms: u64,
     pub full_sync_interval_secs: u64,
     pub pod_discovery_enabled: bool,
+    /// Effective Sidecar `ingress[]` materialization gate
+    /// (`FERRUM_MESH_SIDECAR_ENFORCED && !FERRUM_MESH_SIDECAR_ENFORCED_DRY_RUN`),
+    /// passed to the Istio status writer so it reports `ingress_modeled` only
+    /// when the data plane actually materializes the listeners (F6 §6.2).
+    pub mesh_sidecar_ingress_enforced: bool,
 }
 
 pub struct ReconcileBroadcasters {
@@ -132,6 +137,7 @@ async fn run_reconcile_loop(
             watch_namespaces: reconciler_config.watch_namespaces.clone(),
             trust_domain: trust_domain.clone(),
             pod_discovery_enabled: reconciler_config.pod_discovery_enabled,
+            mesh_sidecar_ingress_enforced: reconciler_config.mesh_sidecar_ingress_enforced,
             gateway_status_writer: gateway_status_writer.clone(),
             istio_status_writer: istio_status_writer.clone(),
             metrics: Arc::clone(&metrics),
@@ -165,6 +171,8 @@ async fn run_reconcile_loop(
                         watch_namespaces: reconciler_config.watch_namespaces.clone(),
                         trust_domain: trust_domain.clone(),
                         pod_discovery_enabled: reconciler_config.pod_discovery_enabled,
+                        mesh_sidecar_ingress_enforced: reconciler_config
+                            .mesh_sidecar_ingress_enforced,
                         gateway_status_writer: gateway_status_writer.clone(),
                         istio_status_writer: istio_status_writer.clone(),
                         metrics: Arc::clone(&metrics),
@@ -192,6 +200,8 @@ async fn run_reconcile_loop(
                         watch_namespaces: reconciler_config.watch_namespaces.clone(),
                         trust_domain: trust_domain.clone(),
                         pod_discovery_enabled: reconciler_config.pod_discovery_enabled,
+                        mesh_sidecar_ingress_enforced: reconciler_config
+                            .mesh_sidecar_ingress_enforced,
                         gateway_status_writer: gateway_status_writer.clone(),
                         istio_status_writer: istio_status_writer.clone(),
                         metrics: Arc::clone(&metrics),
@@ -367,6 +377,7 @@ struct ReconcileContext {
     watch_namespaces: Vec<String>,
     trust_domain: TrustDomain,
     pod_discovery_enabled: bool,
+    mesh_sidecar_ingress_enforced: bool,
     gateway_status_writer: Option<GatewayApiStatusWriter>,
     /// T2-B: Istio CRD status sub-resource patcher. `None` when the
     /// controller couldn't be built (no Istio CRD watching, or the
@@ -399,7 +410,8 @@ async fn do_reconcile(store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>, ctx:
         .with_cluster_domain(ctx.cluster_domain.clone())
         .with_istio_root_namespace(ctx.istio_root_namespace.clone())
         .with_source_namespaces(source_namespaces)
-        .with_pod_discovery_enabled(ctx.pod_discovery_enabled);
+        .with_pod_discovery_enabled(ctx.pod_discovery_enabled)
+        .with_mesh_sidecar_ingress_enforced(ctx.mesh_sidecar_ingress_enforced);
     let Some(translation) = translate_with_skip_retries(&objects, options.clone(), &ctx.metrics)
     else {
         return;

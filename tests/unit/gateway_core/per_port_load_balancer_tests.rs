@@ -4,7 +4,7 @@ use chrono::Utc;
 use dashmap::DashMap;
 use ferrum_edge::config::types::{
     GatewayConfig, HealthCheckConfig, LoadBalancerAlgorithm, PassiveHealthCheck, Proxy,
-    SubsetDefinition, Upstream, UpstreamPortOverride, UpstreamTarget,
+    ResolvedSubsetTrafficPolicy, SubsetDefinition, Upstream, UpstreamPortOverride, UpstreamTarget,
 };
 use ferrum_edge::health_check::HealthChecker;
 use ferrum_edge::load_balancer::{
@@ -398,6 +398,27 @@ fn proxy_for_upstream() -> Proxy {
         "upstream_id": "u1",
     }))
     .expect("test proxy should deserialize")
+}
+
+/// A proxy bound to a DestinationRule subset (sets `upstream_subset`).
+fn proxy_for_upstream_subset(subset: &str) -> Proxy {
+    let mut proxy = proxy_for_upstream();
+    proxy.upstream_subset = Some(subset.to_string());
+    proxy
+}
+
+/// Build a resolved subset overlay carrying only an `outlierDetection` passive
+/// overlay with the given ejection cap (mirrors what
+/// `apply_outlier_detection_to_passive` stores per-subset on the upstream).
+fn subset_passive_with_cap(max_ejection_percent: Option<u8>) -> ResolvedSubsetTrafficPolicy {
+    ResolvedSubsetTrafficPolicy {
+        tls: None,
+        passive_health_check: Some(PassiveHealthCheck {
+            unhealthy_threshold: 3,
+            max_ejection_percent,
+            ..PassiveHealthCheck::default()
+        }),
+    }
 }
 
 #[test]
@@ -812,4 +833,651 @@ fn port_passive_override_without_max_ejection_does_not_inherit_upstream_cap() {
         Some(25),
         "ports without a passive override should still inherit the upstream cap"
     );
+}
+
+// ── F5.2: per-subset maxEjectionPercent cap resolution ──────────────────────
+
+#[test]
+fn subset_bound_proxy_uses_subset_max_ejection_cap_not_upstream() {
+    // Upstream cap = 100%, subset 'v1' cap = 20%. A proxy bound to subset 'v1'
+    // must resolve the SUBSET cap, mirroring how the thresholds are already
+    // resolved per-subset by `passive_health_for_target`.
+    let mut upstream = upstream_with_overrides(
+        LoadBalancerAlgorithm::RoundRobin,
+        vec![target("a", 8080), target("b", 8080)],
+        HashMap::new(),
+    );
+    upstream.health_checks = Some(HealthCheckConfig {
+        active: None,
+        passive: Some(PassiveHealthCheck {
+            max_ejection_percent: Some(100),
+            ..PassiveHealthCheck::default()
+        }),
+    });
+    upstream
+        .resolved_subset_tls
+        .insert("v1".to_string(), subset_passive_with_cap(Some(20)));
+
+    let config = GatewayConfig {
+        proxies: vec![proxy_for_upstream_subset("v1")],
+        upstreams: vec![upstream],
+        ..GatewayConfig::default()
+    };
+    let cache = LoadBalancerCache::new(&config);
+    let snapshot = cache.load();
+
+    assert_eq!(
+        LoadBalancerCache::max_ejection_percent_resolved_from(
+            &snapshot,
+            "u1",
+            &config.proxies[0],
+            None,
+        ),
+        Some(20),
+        "a subset-bound proxy must use the subset's ejection cap, not the upstream cap"
+    );
+}
+
+#[test]
+fn unsubsetted_proxy_uses_upstream_max_ejection_cap_even_when_subset_overlay_exists() {
+    // The same upstream carries a subset overlay, but a proxy with no
+    // `upstream_subset` must still resolve the upstream-level cap.
+    let mut upstream = upstream_with_overrides(
+        LoadBalancerAlgorithm::RoundRobin,
+        vec![target("a", 8080), target("b", 8080)],
+        HashMap::new(),
+    );
+    upstream.health_checks = Some(HealthCheckConfig {
+        active: None,
+        passive: Some(PassiveHealthCheck {
+            max_ejection_percent: Some(100),
+            ..PassiveHealthCheck::default()
+        }),
+    });
+    upstream
+        .resolved_subset_tls
+        .insert("v1".to_string(), subset_passive_with_cap(Some(20)));
+
+    let config = GatewayConfig {
+        proxies: vec![proxy_for_upstream()],
+        upstreams: vec![upstream],
+        ..GatewayConfig::default()
+    };
+    let cache = LoadBalancerCache::new(&config);
+    let snapshot = cache.load();
+
+    assert_eq!(
+        LoadBalancerCache::max_ejection_percent_resolved_from(
+            &snapshot,
+            "u1",
+            &config.proxies[0],
+            None,
+        ),
+        Some(100),
+        "an unsubsetted proxy must use the upstream cap even if a subset overlay exists"
+    );
+}
+
+#[test]
+fn subset_overlay_without_max_ejection_does_not_inherit_upstream_cap() {
+    // Wholesale-tier invariant: a present subset overlay replaces the
+    // upstream tier even when its own cap is `None` (so the cap and the
+    // subset's thresholds always come from the SAME tier — never mixed).
+    let mut upstream = upstream_with_overrides(
+        LoadBalancerAlgorithm::RoundRobin,
+        vec![target("a", 8080), target("b", 8080)],
+        HashMap::new(),
+    );
+    upstream.health_checks = Some(HealthCheckConfig {
+        active: None,
+        passive: Some(PassiveHealthCheck {
+            max_ejection_percent: Some(100),
+            ..PassiveHealthCheck::default()
+        }),
+    });
+    upstream
+        .resolved_subset_tls
+        .insert("v1".to_string(), subset_passive_with_cap(None));
+
+    let config = GatewayConfig {
+        proxies: vec![proxy_for_upstream_subset("v1")],
+        upstreams: vec![upstream],
+        ..GatewayConfig::default()
+    };
+    let cache = LoadBalancerCache::new(&config);
+    let snapshot = cache.load();
+
+    assert_eq!(
+        LoadBalancerCache::max_ejection_percent_resolved_from(
+            &snapshot,
+            "u1",
+            &config.proxies[0],
+            None,
+        ),
+        None,
+        "a subset outlierDetection overlay that omits maxEjectionPercent owns the \
+         cap wholesale and must not fall back to the upstream cap"
+    );
+}
+
+#[test]
+fn per_port_override_wins_over_subset_max_ejection_cap() {
+    // Precedence: per-port (40%) > per-subset (20%) > upstream (100%).
+    // A subset-bound proxy whose dispatch lands on a port with its own
+    // outlierDetection override must use the PORT cap.
+    let mut port_overrides = HashMap::new();
+    port_overrides.insert(
+        8080,
+        UpstreamPortOverride {
+            passive_health_check: Some(PassiveHealthCheck {
+                unhealthy_threshold: 1,
+                max_ejection_percent: Some(40),
+                ..PassiveHealthCheck::default()
+            }),
+            ..Default::default()
+        },
+    );
+    let mut upstream = upstream_with_overrides(
+        LoadBalancerAlgorithm::RoundRobin,
+        vec![target("a", 8080), target("b", 8080)],
+        port_overrides,
+    );
+    upstream.health_checks = Some(HealthCheckConfig {
+        active: None,
+        passive: Some(PassiveHealthCheck {
+            max_ejection_percent: Some(100),
+            ..PassiveHealthCheck::default()
+        }),
+    });
+    upstream
+        .resolved_subset_tls
+        .insert("v1".to_string(), subset_passive_with_cap(Some(20)));
+
+    let mut config = GatewayConfig {
+        proxies: vec![proxy_for_upstream_subset("v1")],
+        upstreams: vec![upstream],
+        ..GatewayConfig::default()
+    };
+    config.resolve_dispatch_port_overrides();
+    let cache = LoadBalancerCache::new(&config);
+    let snapshot = cache.load();
+
+    // With a live per-port override for port 8080, the caller passes
+    // `Some(8080)` — the port cap (40) wins over the subset cap (20).
+    assert_eq!(
+        LoadBalancerCache::max_ejection_percent_resolved_from(
+            &snapshot,
+            "u1",
+            &config.proxies[0],
+            Some(8080),
+        ),
+        Some(40),
+        "a per-port outlierDetection override must win over the subset cap"
+    );
+
+    // Without a port signal (`None`), the same subset-bound proxy falls to the
+    // subset cap (20), proving the subset tier is between port and upstream.
+    assert_eq!(
+        LoadBalancerCache::max_ejection_percent_resolved_from(
+            &snapshot,
+            "u1",
+            &config.proxies[0],
+            None,
+        ),
+        Some(20),
+        "with no per-port signal the subset cap (not the upstream cap) is used"
+    );
+}
+
+// ── F5.2 round 1: ejection cap denominator must be the SUBSET candidate pool ─
+
+/// A subset `subset_name` whose membership is every target carrying
+/// `(label_key, label_value)` in its tags, with an `outlierDetection` overlay
+/// carrying `cap` — wired into BOTH `subsets` (so the LB computes subset
+/// membership) and `resolved_subset_tls` (so the cap resolver reaches it).
+fn upstream_with_subset_cap(
+    targets: Vec<UpstreamTarget>,
+    subset_name: &str,
+    label_key: &str,
+    label_value: &str,
+    upstream_cap: Option<u8>,
+    subset_cap: Option<u8>,
+    port_overrides: HashMap<u16, UpstreamPortOverride>,
+) -> Upstream {
+    use ferrum_edge::config::types::SubsetDefinition;
+    let mut upstream =
+        upstream_with_overrides(LoadBalancerAlgorithm::RoundRobin, targets, port_overrides);
+    upstream.health_checks = Some(HealthCheckConfig {
+        active: None,
+        passive: Some(PassiveHealthCheck {
+            unhealthy_threshold: 1,
+            max_ejection_percent: upstream_cap,
+            ..PassiveHealthCheck::default()
+        }),
+    });
+    upstream.subsets = Some(vec![SubsetDefinition {
+        name: subset_name.to_string(),
+        labels: HashMap::from([(label_key.to_string(), label_value.to_string())]),
+        traffic_policy: None,
+    }]);
+    upstream
+        .resolved_subset_tls
+        .insert(subset_name.to_string(), subset_passive_with_cap(subset_cap));
+    upstream
+}
+
+/// Build a passive-health context that has the given targets passive-ejected
+/// (oldest-first by ascending timestamp) for proxy `p1`, under `cap`.
+fn passive_ctx_ejecting<'a>(
+    active_unhealthy: &'a DashMap<String, u64>,
+    ejected: &[&UpstreamTarget],
+    cap: Option<u8>,
+) -> HealthContext<'a> {
+    let checker = HealthChecker::new();
+    let pasv = PassiveHealthCheck {
+        unhealthy_threshold: 1,
+        max_ejection_percent: cap,
+        ..PassiveHealthCheck::default()
+    };
+    for t in ejected {
+        checker.report_response("p1", t, 500, false, Some(&pasv));
+    }
+    let proxy_state = checker
+        .passive_health
+        .get("p1")
+        .expect("passive health state created")
+        .clone();
+    for (i, t) in ejected.iter().enumerate() {
+        // Deterministic ascending eject timestamps so re-admission (oldest
+        // first) is predictable.
+        proxy_state
+            .unhealthy
+            .insert(target_host_port_key(t), 100 + i as u64);
+    }
+    HealthContext {
+        active_unhealthy,
+        proxy_passive: Some(proxy_state),
+        max_ejection_percent: cap,
+    }
+}
+
+#[test]
+fn subset_ejection_cap_denominator_is_subset_pool_not_full_upstream() {
+    // 10-target upstream; subset 'v1' = the 2 tagged targets. Both subset
+    // targets are passive-ejected with subset cap = 50%.
+    //   - BUGGY (full-upstream denominator): ceil(10*0.5)=5, 2<=5 ⇒ neither
+    //     re-admitted ⇒ subset goes EMPTY (select returns None).
+    //   - FIXED (subset denominator): ceil(2*0.5)=1, 2>1 ⇒ exactly 1 re-admitted
+    //     ⇒ subset stays available and selectable.
+    let mut targets = vec![
+        tagged_target("v1-a", 8080, &[("version", "v1")]),
+        tagged_target("v1-b", 8080, &[("version", "v1")]),
+    ];
+    targets.extend((0..8).map(|i| tagged_target(&format!("v2-{i}"), 8080, &[("version", "v2")])));
+
+    let upstream = upstream_with_subset_cap(
+        targets.clone(),
+        "v1",
+        "version",
+        "v1",
+        Some(100), // upstream cap (would not eject anyone if it were used)
+        Some(50),  // subset cap — the one under test
+        HashMap::new(),
+    );
+    let config = GatewayConfig {
+        proxies: vec![proxy_for_upstream_subset("v1")],
+        upstreams: vec![upstream],
+        ..GatewayConfig::default()
+    };
+    let cache = LoadBalancerCache::new(&config);
+    let snapshot = cache.load();
+
+    let active_unhealthy: DashMap<String, u64> = DashMap::new();
+    // Eject BOTH subset targets; v1-a has the oldest timestamp so it is the one
+    // re-admitted under the subset cap.
+    let health = passive_ctx_ejecting(&active_unhealthy, &[&targets[0], &targets[1]], Some(50));
+
+    let selection =
+        LoadBalancerCache::select_target_subset_from(&snapshot, "u1", "key", "v1", Some(&health))
+            .expect("subset must stay available: the 50% subset cap re-admits 1 of 2 ejected");
+    assert!(
+        !selection.is_fallback,
+        "re-admission under the subset cap is a healthy selection, not a degraded fallback"
+    );
+    assert_eq!(
+        selection.target.host, "v1-a",
+        "the earliest-ejected subset target (v1-a) is re-admitted first"
+    );
+
+    // Sanity: the cap resolver itself returns the subset cap for this proxy.
+    assert_eq!(
+        LoadBalancerCache::max_ejection_percent_resolved_from(
+            &snapshot,
+            "u1",
+            &config.proxies[0],
+            None,
+        ),
+        Some(50),
+    );
+}
+
+#[test]
+fn subset_ejection_cap_denominator_is_subset_pool_vec_fallback() {
+    // Same property on the >128-target Vec fallback path: a 2-target subset
+    // inside a 140-target upstream, both subset targets ejected, subset cap 50%.
+    // Full-upstream denominator would be ceil(140*0.5)=70 (eject both); subset
+    // denominator is ceil(2*0.5)=1 (re-admit exactly one).
+    let mut targets = vec![
+        tagged_target("v1-a", 8080, &[("version", "v1")]),
+        tagged_target("v1-b", 8080, &[("version", "v1")]),
+    ];
+    targets.extend((0..140).map(|i| tagged_target(&format!("v2-{i}"), 8080, &[("version", "v2")])));
+
+    let upstream = upstream_with_subset_cap(
+        targets.clone(),
+        "v1",
+        "version",
+        "v1",
+        Some(100),
+        Some(50),
+        HashMap::new(),
+    );
+    let config = GatewayConfig {
+        proxies: vec![proxy_for_upstream_subset("v1")],
+        upstreams: vec![upstream],
+        ..GatewayConfig::default()
+    };
+    let cache = LoadBalancerCache::new(&config);
+    let snapshot = cache.load();
+
+    let active_unhealthy: DashMap<String, u64> = DashMap::new();
+    let health = passive_ctx_ejecting(&active_unhealthy, &[&targets[0], &targets[1]], Some(50));
+
+    let selection =
+        LoadBalancerCache::select_target_subset_from(&snapshot, "u1", "key", "v1", Some(&health))
+            .expect("Vec fallback must scope the subset cap to the subset pool too");
+    assert!(!selection.is_fallback);
+    assert_eq!(selection.target.host, "v1-a");
+}
+
+#[test]
+fn port_subset_ejection_cap_denominator_is_subset_intersect_port() {
+    // Port+subset: subset 'v1' has 4 tagged targets, but only 2 sit on port
+    // 8080 (the dispatch port has its own outlierDetection cap = 50%). The
+    // candidate pool for a port+subset dispatch is subset∩port = 2 targets.
+    //   - PRE-FIX (port denominator): port 8080 carries 6 targets, so
+    //     ceil(6*0.5)=3, 2<=3 ⇒ both subset∩port targets stay ejected ⇒ None.
+    //   - FIXED (subset∩port denominator): ceil(2*0.5)=1 ⇒ exactly 1 re-admitted.
+    let mut port_overrides = HashMap::new();
+    port_overrides.insert(
+        8080,
+        UpstreamPortOverride {
+            passive_health_check: Some(PassiveHealthCheck {
+                unhealthy_threshold: 1,
+                max_ejection_percent: Some(50),
+                ..PassiveHealthCheck::default()
+            }),
+            ..Default::default()
+        },
+    );
+
+    // subset∩port (2): v1 on 8080. subset-not-port (2): v1 on 9090.
+    // port-not-subset (4): v2 on 8080 — make port 8080 carry 6 total.
+    let mut targets = vec![
+        tagged_target("v1p-a", 8080, &[("version", "v1")]),
+        tagged_target("v1p-b", 8080, &[("version", "v1")]),
+        tagged_target("v1q-a", 9090, &[("version", "v1")]),
+        tagged_target("v1q-b", 9090, &[("version", "v1")]),
+    ];
+    targets.extend((0..4).map(|i| tagged_target(&format!("v2p-{i}"), 8080, &[("version", "v2")])));
+
+    let upstream = upstream_with_subset_cap(
+        targets.clone(),
+        "v1",
+        "version",
+        "v1",
+        Some(100),
+        Some(100), // subset cap loose; the PORT cap (50%) is the live tier here
+        port_overrides,
+    );
+    let mut config = GatewayConfig {
+        proxies: vec![proxy_for_upstream_subset("v1")],
+        upstreams: vec![upstream],
+        ..GatewayConfig::default()
+    };
+    config.resolve_dispatch_port_overrides();
+    let cache = LoadBalancerCache::new(&config);
+    let snapshot = cache.load();
+
+    let active_unhealthy: DashMap<String, u64> = DashMap::new();
+    // Eject the two subset∩port targets (v1p-a oldest).
+    let health = passive_ctx_ejecting(&active_unhealthy, &[&targets[0], &targets[1]], Some(50));
+
+    let selection = LoadBalancerCache::select_target_for_port_subset_from(
+        &snapshot,
+        "u1",
+        "key",
+        8080,
+        "v1",
+        Some(&health),
+    )
+    .expect("port+subset dispatch must size its cap against subset∩port, not the whole port");
+    assert!(!selection.is_fallback);
+    assert_eq!(
+        selection.target.host, "v1p-a",
+        "earliest-ejected subset∩port target is re-admitted under the 50% cap over a 2-target pool"
+    );
+}
+
+// ── F5.2 round 2: subset-retry must exclude the previous target BEFORE the cap ─
+//
+// The retry-exclusion selectors must drop the excluded (previously tried) target
+// from the candidate pool *before* sizing the passive ejection cap. If the cap
+// is computed over the full subset first and the excluded target is then cleared,
+// a readmission budget spent on the excluded target leaves the actual retry
+// candidate ejected — wrongly returning `None`.
+
+#[test]
+fn subset_retry_excludes_previous_target_before_ejection_cap() {
+    // Subset 'v1' = 3 tagged targets [a, b, c], ALL passive-ejected (a oldest,
+    // then b, then c), subset cap = 34%. The retry excludes 'v1-a' — the
+    // earliest-ejected one, which the cap would re-admit first.
+    //   - BUGGY (cap over full subset, THEN clear excluded): ceil(3*0.34)=2 ⇒
+    //     re-admit 1 ⇒ that one is v1-a (oldest) ⇒ clearing v1-a afterwards
+    //     empties the candidate set ⇒ returns None even though v1-b/v1-c remain.
+    //   - FIXED (exclude v1-a FIRST, then cap over {v1-b, v1-c}): ceil(2*0.34)=1
+    //     ⇒ re-admit 1 ⇒ v1-b (oldest remaining) is returned.
+    let targets = vec![
+        tagged_target("v1-a", 8080, &[("version", "v1")]),
+        tagged_target("v1-b", 8080, &[("version", "v1")]),
+        tagged_target("v1-c", 8080, &[("version", "v1")]),
+    ];
+
+    let upstream = upstream_with_subset_cap(
+        targets.clone(),
+        "v1",
+        "version",
+        "v1",
+        Some(100), // upstream cap (loose; not the live tier)
+        Some(34),  // subset cap under test
+        HashMap::new(),
+    );
+    let config = GatewayConfig {
+        proxies: vec![proxy_for_upstream_subset("v1")],
+        upstreams: vec![upstream],
+        ..GatewayConfig::default()
+    };
+    let cache = LoadBalancerCache::new(&config);
+    let snapshot = cache.load();
+
+    let active_unhealthy: DashMap<String, u64> = DashMap::new();
+    // Eject all three (v1-a oldest, v1-c newest).
+    let health = passive_ctx_ejecting(
+        &active_unhealthy,
+        &[&targets[0], &targets[1], &targets[2]],
+        Some(34),
+    );
+
+    let retry = LoadBalancerCache::select_next_target_subset_from(
+        &snapshot,
+        "u1",
+        "retry",
+        "v1",
+        &targets[0], // exclude v1-a, the earliest-ejected candidate
+        Some(&health),
+    )
+    .expect(
+        "subset retry must re-admit a REMAINING candidate after excluding the previous target; \
+         excluding before the cap prevents the budget being spent on the excluded target",
+    );
+    assert_eq!(
+        retry.host, "v1-b",
+        "the earliest-ejected REMAINING target (v1-b) is re-admitted for the retry"
+    );
+    assert_ne!(
+        retry.host, "v1-a",
+        "the excluded previous target must never be returned by the retry"
+    );
+}
+
+#[test]
+fn port_subset_retry_excludes_previous_target_before_ejection_cap() {
+    // Same property on the port+subset retry path. subset∩port (3 on 8080) all
+    // ejected, subset cap = 34%, retry excludes the earliest-ejected one.
+    let mut port_overrides = HashMap::new();
+    port_overrides.insert(
+        8080,
+        UpstreamPortOverride {
+            passive_health_check: Some(PassiveHealthCheck {
+                unhealthy_threshold: 1,
+                max_ejection_percent: Some(34),
+                ..PassiveHealthCheck::default()
+            }),
+            ..Default::default()
+        },
+    );
+
+    // subset∩port (3): v1 on 8080. Add v2 on 8080 + v1 on 9090 so neither the
+    // port pool nor the bare subset pool equals the intersection.
+    let mut targets = vec![
+        tagged_target("v1p-a", 8080, &[("version", "v1")]),
+        tagged_target("v1p-b", 8080, &[("version", "v1")]),
+        tagged_target("v1p-c", 8080, &[("version", "v1")]),
+        tagged_target("v1q-a", 9090, &[("version", "v1")]),
+    ];
+    targets.extend((0..3).map(|i| tagged_target(&format!("v2p-{i}"), 8080, &[("version", "v2")])));
+
+    let upstream = upstream_with_subset_cap(
+        targets.clone(),
+        "v1",
+        "version",
+        "v1",
+        Some(100),
+        Some(100), // subset cap loose; the PORT cap (34%) is the live tier
+        port_overrides,
+    );
+    let mut config = GatewayConfig {
+        proxies: vec![proxy_for_upstream_subset("v1")],
+        upstreams: vec![upstream],
+        ..GatewayConfig::default()
+    };
+    config.resolve_dispatch_port_overrides();
+    let cache = LoadBalancerCache::new(&config);
+    let snapshot = cache.load();
+
+    let active_unhealthy: DashMap<String, u64> = DashMap::new();
+    // Eject the three subset∩port targets (v1p-a oldest, v1p-c newest).
+    let health = passive_ctx_ejecting(
+        &active_unhealthy,
+        &[&targets[0], &targets[1], &targets[2]],
+        Some(34),
+    );
+
+    let retry = LoadBalancerCache::select_next_target_for_port_subset_from(
+        &snapshot,
+        "u1",
+        "retry",
+        8080,
+        "v1",
+        &targets[0], // exclude v1p-a, the earliest-ejected subset∩port candidate
+        Some(&health),
+    )
+    .expect(
+        "port+subset retry must re-admit a REMAINING subset∩port candidate after excluding the \
+         previous target, sizing the cap over the post-exclusion candidate pool",
+    );
+    assert_eq!(
+        retry.host, "v1p-b",
+        "earliest-ejected REMAINING subset∩port target (v1p-b) is re-admitted for the retry"
+    );
+    assert_eq!(
+        retry.port, 8080,
+        "retry must stay within the dispatch port's subset∩port pool"
+    );
+}
+
+#[test]
+fn port_subset_selection_unchanged_after_alloc_free_mask_refactor() {
+    // Guard: the ≤128-target port+subset selection (now built from an alloc-free
+    // subset∩port stack-`u128` mask instead of a heap index `Vec`) still selects
+    // only targets inside subset∩port, with healthy targets preferred over an
+    // ejected one. v1 on 8080 = {a (ejected), b (healthy)}; v1 on 9090 and v2 on
+    // 8080 must never be selected for a port-8080 + subset-v1 dispatch.
+    let mut port_overrides = HashMap::new();
+    port_overrides.insert(
+        8080,
+        UpstreamPortOverride {
+            passive_health_check: Some(PassiveHealthCheck {
+                unhealthy_threshold: 1,
+                max_ejection_percent: Some(100), // loose: keep the ejected one out
+                ..PassiveHealthCheck::default()
+            }),
+            ..Default::default()
+        },
+    );
+    let mut targets = vec![
+        tagged_target("v1p-a", 8080, &[("version", "v1")]),
+        tagged_target("v1p-b", 8080, &[("version", "v1")]),
+        tagged_target("v1q-a", 9090, &[("version", "v1")]),
+    ];
+    targets.extend((0..3).map(|i| tagged_target(&format!("v2p-{i}"), 8080, &[("version", "v2")])));
+
+    let upstream = upstream_with_subset_cap(
+        targets.clone(),
+        "v1",
+        "version",
+        "v1",
+        Some(100),
+        Some(100),
+        port_overrides,
+    );
+    let mut config = GatewayConfig {
+        proxies: vec![proxy_for_upstream_subset("v1")],
+        upstreams: vec![upstream],
+        ..GatewayConfig::default()
+    };
+    config.resolve_dispatch_port_overrides();
+    let cache = LoadBalancerCache::new(&config);
+    let snapshot = cache.load();
+
+    let active_unhealthy: DashMap<String, u64> = DashMap::new();
+    // v1p-a ejected under a 100% cap ⇒ stays out; only v1p-b is healthy.
+    let health = passive_ctx_ejecting(&active_unhealthy, &[&targets[0]], Some(100));
+
+    for i in 0..10 {
+        let selection = LoadBalancerCache::select_target_for_port_subset_from(
+            &snapshot,
+            "u1",
+            &format!("key-{i}"),
+            8080,
+            "v1",
+            Some(&health),
+        )
+        .expect("a healthy subset∩port target is always available");
+        assert_eq!(
+            selection.target.host, "v1p-b",
+            "only the healthy subset∩port target may be selected"
+        );
+        assert!(!selection.is_fallback);
+    }
 }

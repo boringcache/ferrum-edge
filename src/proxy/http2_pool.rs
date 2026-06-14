@@ -199,9 +199,24 @@ impl Http2PoolManager {
         let _ = tcp.set_nodelay(true);
 
         let pool_config = self.global_pool_config.for_proxy(proxy);
-        if pool_config.enable_http_keep_alive {
-            Self::set_tcp_keepalive(&tcp, pool_config.tcp_keepalive_seconds);
-        }
+        // Honor the DestinationRule `connectionPool.tcp.tcpKeepalive` per-port
+        // override (keyed by the dial target's port, `proxy.backend_port`),
+        // falling back to the global pool keepalive. NOTE: keepalive is NOT in
+        // the pool key (forbidden by `.claude/rules/proxy-protocols.md`), and
+        // this connection is pooled+shared, so the first dispatcher to
+        // materialize the connection wins — same first-materializer tradeoff
+        // documented for `idleTimeout` / `maxRequestsPerConnection`.
+        crate::socket_opts::apply_pooled_tcp_keepalive(
+            "http2_pool",
+            &tcp,
+            proxy
+                .dispatch_port_overrides
+                .as_ref()
+                .and_then(|m| m.get(&port))
+                .and_then(|o| o.tcp_keepalive.as_ref()),
+            pool_config.enable_http_keep_alive,
+            pool_config.tcp_keepalive_seconds,
+        );
 
         self.create_tls_connection(
             tcp,
@@ -259,24 +274,6 @@ impl Http2PoolManager {
         }
 
         builder
-    }
-
-    fn set_tcp_keepalive(stream: &TcpStream, keepalive_seconds: u64) {
-        #[cfg(unix)]
-        use std::os::fd::AsFd;
-        #[cfg(windows)]
-        use std::os::windows::io::AsSocket;
-
-        #[cfg(unix)]
-        let borrowed = stream.as_fd();
-        #[cfg(windows)]
-        let borrowed = stream.as_socket();
-        let socket = socket2::SockRef::from(&borrowed);
-        let keepalive =
-            socket2::TcpKeepalive::new().with_time(Duration::from_secs(keepalive_seconds));
-        if let Err(e) = socket.set_tcp_keepalive(&keepalive) {
-            debug!("http2_pool: failed to set TCP keepalive: {}", e);
-        }
     }
 
     fn get_tls_config(
