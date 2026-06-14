@@ -1824,12 +1824,31 @@ fn materialize_sidecar_inbound_proxies(
     // F6 §6.2: when the local workload's applicable Sidecar declares
     // `ingress[]` listeners, Istio configures the workload's inbound listeners
     // explicitly and they REPLACE the default per-service-port inbound
-    // materialization. Mirror that: materialize one loopback route per resolved
-    // ingress listener (declared port → its `defaultEndpoint`) and return,
-    // skipping the service-port defaults below. The listeners were resolved
-    // (and unsupported shapes dropped) at slice build; an empty list means no
-    // ingress was declared (or none resolved) and we fall through to defaults.
-    if !mesh_slice.local_ingress_listeners.is_empty() {
+    // materialization. Mirror that, FAIL CLOSED on the "declared" signal — NOT
+    // on whether any listener resolved:
+    //   * `sidecar_ingress_declared` is the authoritative marker that the
+    //     operator declared a non-empty `ingress[]` (the slice builder sets it
+    //     independent of how many entries resolved; it rides its own ECDS
+    //     carrier so it survives an empty resolved list on the xDS path).
+    //   * `local_ingress_listeners` is the subset that resolved into routable
+    //     loopback HTTP routes.
+    // When ingress is DECLARED we materialize the resolved listeners (possibly
+    // none) and RETURN, skipping the service-port defaults. An all-unsupported
+    // `ingress[]` (declared, but empty resolved list) therefore yields NO
+    // inbound routes rather than silently exposing the default `:15006`
+    // loopback routes the operator explicitly replaced — exposing those would
+    // be a fail-open regression. (`local_ingress_listeners` non-empty implies
+    // declared, so the OR also covers a pre-marker slice that somehow carries
+    // listeners without the flag.)
+    if mesh_slice.sidecar_ingress_declared || !mesh_slice.local_ingress_listeners.is_empty() {
+        if mesh_slice.local_ingress_listeners.is_empty() {
+            warn!(
+                local_spiffe,
+                "Sidecar ingress[] declared but no listener resolved into a routable inbound \
+                 route (all entries unsupported, or no local service anchored them); failing \
+                 closed — emitting NO default service-port inbound routes for this workload"
+            );
+        }
         materialize_sidecar_ingress_listener_proxies(
             config,
             runtime,
@@ -13611,6 +13630,7 @@ mod tests {
             local_inbound_services: Vec::new(),
             local_inbound_workloads: None,
             local_ingress_listeners: Vec::new(),
+            sidecar_ingress_declared: false,
             mesh_policies: Vec::new(),
             peer_authentications: Vec::new(),
             service_entries: Vec::new(),
@@ -19414,6 +19434,86 @@ mod tests {
                 .iter()
                 .any(|p| p.id.starts_with("__mesh-ingress-")),
             "an unstamped (owner-less) ingress listener materializes no route"
+        );
+    }
+
+    #[test]
+    fn sidecar_ingress_declared_all_unsupported_fails_closed_no_default_routes() {
+        // F6 §6.2 (Finding 1, fail closed): the applicable Sidecar DECLARED
+        // `ingress[]` but every entry was unsupported, so the resolved listener
+        // list is EMPTY (`sidecar_ingress_declared == true`,
+        // `local_ingress_listeners == []`). The operator opted out of the
+        // default per-service-port inbound listeners (Istio's `ingress[]`
+        // replaces them), so the materializer must emit NEITHER ingress routes
+        // NOR the default `__mesh-inbound-*` routes — exposing the defaults would
+        // be a fail-open regression.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(spiffe.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![workload("reviews", "reviews")],
+            services: vec![http_mesh_service("reviews", 80, spiffe)],
+            local_inbound_services: vec![http_mesh_service("reviews", 80, spiffe)],
+            local_inbound_workloads: Some(vec![workload("reviews", "reviews")]),
+            // Declared, but NOTHING resolved (all entries unsupported).
+            local_ingress_listeners: Vec::new(),
+            sidecar_ingress_declared: true,
+            ..MeshSlice::default()
+        };
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+        assert!(
+            !config
+                .proxies
+                .iter()
+                .any(|p| p.id.starts_with("__mesh-ingress-")),
+            "all-unsupported ingress materializes no ingress routes"
+        );
+        assert!(
+            !config
+                .proxies
+                .iter()
+                .any(|p| p.id.starts_with("__mesh-inbound-")),
+            "declared-but-unresolved ingress must FAIL CLOSED: no default \
+             service-port inbound routes (operator replaced them)"
+        );
+    }
+
+    #[test]
+    fn sidecar_no_ingress_declared_keeps_default_inbound_routes() {
+        // Control for the fail-closed test: when NO ingress was declared
+        // (`sidecar_ingress_declared == false`, no listeners), the default
+        // service-port inbound materialization runs as before.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(spiffe.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![workload("reviews", "reviews")],
+            services: vec![http_mesh_service("reviews", 80, spiffe)],
+            local_inbound_services: vec![http_mesh_service("reviews", 80, spiffe)],
+            local_inbound_workloads: Some(vec![workload("reviews", "reviews")]),
+            local_ingress_listeners: Vec::new(),
+            sidecar_ingress_declared: false,
+            ..MeshSlice::default()
+        };
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+        assert!(
+            config
+                .proxies
+                .iter()
+                .any(|p| p.id.starts_with("__mesh-inbound-")),
+            "no ingress declared → default service-port inbound routes materialize"
         );
     }
 }

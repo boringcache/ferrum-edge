@@ -74,6 +74,14 @@ pub const FERRUM_ECDS_LOCAL_INBOUND_WORKLOADS_TYPE_URL: &str =
 /// when present, replace the default per-service-port inbound materialization.
 pub const FERRUM_ECDS_LOCAL_INGRESS_LISTENERS_TYPE_URL: &str =
     "type.googleapis.com/ferrum.config.extension.v3.LocalIngressListenersCarrier";
+/// Inner `type_url` for the fail-closed "Sidecar declared `ingress[]`" marker
+/// (F6 §6.2). Carried SEPARATELY from `LocalIngressListenersCarrier` because the
+/// marker is meaningful precisely when the resolved listener list is EMPTY (all
+/// entries unsupported, or no local service anchored them): it tells the DP that
+/// the operator declared custom ingress, so the inbound materializer fails
+/// closed (no default per-service-port routes) rather than exposing them.
+pub const FERRUM_ECDS_SIDECAR_INGRESS_DECLARED_TYPE_URL: &str =
+    "type.googleapis.com/ferrum.config.extension.v3.SidecarIngressDeclaredCarrier";
 /// Inner `type_url` for the per-pod workload / endpoint carrier.
 pub const FERRUM_ECDS_WORKLOADS_TYPE_URL: &str =
     "type.googleapis.com/ferrum.config.extension.v3.WorkloadsCarrier";
@@ -126,6 +134,10 @@ pub enum MeshSliceCarrier {
     LocalInboundServices(Vec<MeshService>),
     LocalInboundWorkloads(Vec<Workload>),
     LocalIngressListeners(Vec<ResolvedIngressListener>),
+    /// Fail-closed marker: the applicable Sidecar declared a non-empty
+    /// `ingress[]`. Always `true` when emitted (the CP only emits it when set);
+    /// see [`FERRUM_ECDS_SIDECAR_INGRESS_DECLARED_TYPE_URL`].
+    SidecarIngressDeclared(bool),
     Workloads(Vec<Workload>),
     WorkloadLabels(BTreeMap<String, String>),
     MeshPolicies(Vec<MeshPolicy>),
@@ -154,6 +166,9 @@ impl MeshSliceCarrier {
             MeshSliceCarrier::LocalIngressListeners(_) => {
                 FERRUM_ECDS_LOCAL_INGRESS_LISTENERS_TYPE_URL
             }
+            MeshSliceCarrier::SidecarIngressDeclared(_) => {
+                FERRUM_ECDS_SIDECAR_INGRESS_DECLARED_TYPE_URL
+            }
             MeshSliceCarrier::Workloads(_) => FERRUM_ECDS_WORKLOADS_TYPE_URL,
             MeshSliceCarrier::WorkloadLabels(_) => FERRUM_ECDS_LABELS_TYPE_URL,
             MeshSliceCarrier::MeshPolicies(_) => FERRUM_ECDS_MESH_POLICIES_TYPE_URL,
@@ -176,6 +191,7 @@ impl MeshSliceCarrier {
             MeshSliceCarrier::LocalInboundServices(_) => "local-inbound-services",
             MeshSliceCarrier::LocalInboundWorkloads(_) => "local-inbound-workloads",
             MeshSliceCarrier::LocalIngressListeners(_) => "local-ingress-listeners",
+            MeshSliceCarrier::SidecarIngressDeclared(_) => "sidecar-ingress-declared",
             MeshSliceCarrier::Workloads(_) => "workloads",
             MeshSliceCarrier::WorkloadLabels(_) => "workload-labels",
             MeshSliceCarrier::MeshPolicies(_) => "mesh-policies",
@@ -199,6 +215,7 @@ impl MeshSliceCarrier {
             MeshSliceCarrier::LocalInboundServices(value) => encode(value),
             MeshSliceCarrier::LocalInboundWorkloads(value) => encode(value),
             MeshSliceCarrier::LocalIngressListeners(value) => encode(value),
+            MeshSliceCarrier::SidecarIngressDeclared(value) => encode(value),
             MeshSliceCarrier::Workloads(value) => encode(value),
             MeshSliceCarrier::WorkloadLabels(value) => encode(value),
             MeshSliceCarrier::MeshPolicies(value) => encode(value),
@@ -238,6 +255,9 @@ impl MeshSliceCarrier {
             }
             FERRUM_ECDS_LOCAL_INGRESS_LISTENERS_TYPE_URL => {
                 MeshSliceCarrier::LocalIngressListeners(decode_json(value)?)
+            }
+            FERRUM_ECDS_SIDECAR_INGRESS_DECLARED_TYPE_URL => {
+                MeshSliceCarrier::SidecarIngressDeclared(decode_json(value)?)
             }
             FERRUM_ECDS_WORKLOADS_TYPE_URL => MeshSliceCarrier::Workloads(decode_json(value)?),
             FERRUM_ECDS_LABELS_TYPE_URL => MeshSliceCarrier::WorkloadLabels(decode_json(value)?),
@@ -290,6 +310,9 @@ pub fn carrier_resource_name_for_type_url(type_url: &str) -> Option<&'static str
         }
         FERRUM_ECDS_LOCAL_INGRESS_LISTENERS_TYPE_URL => {
             Some("ferrum-mesh-carrier/local-ingress-listeners")
+        }
+        FERRUM_ECDS_SIDECAR_INGRESS_DECLARED_TYPE_URL => {
+            Some("ferrum-mesh-carrier/sidecar-ingress-declared")
         }
         FERRUM_ECDS_WORKLOADS_TYPE_URL => Some("ferrum-mesh-carrier/workloads"),
         FERRUM_ECDS_LABELS_TYPE_URL => Some("ferrum-mesh-carrier/workload-labels"),
@@ -355,6 +378,14 @@ pub fn build_slice_carriers(slice: &MeshSlice) -> Vec<MeshSliceCarrier> {
         carriers.push(MeshSliceCarrier::LocalIngressListeners(
             slice.local_ingress_listeners.clone(),
         ));
+    }
+    // Fail-closed ingress-declared marker (F6 §6.2): emitted only when set. It
+    // matters precisely when `local_ingress_listeners` is EMPTY (so the listener
+    // carrier above is absent), telling the DP the operator declared custom
+    // ingress so the inbound materializer suppresses the default service-port
+    // routes. `false` is the implicit default on the DP, so it is never emitted.
+    if slice.sidecar_ingress_declared {
+        carriers.push(MeshSliceCarrier::SidecarIngressDeclared(true));
     }
     if !slice.workloads.is_empty() {
         carriers.push(MeshSliceCarrier::Workloads(slice.workloads.clone()));
@@ -426,6 +457,7 @@ pub fn apply_carrier(slice: &mut MeshSlice, carrier: MeshSliceCarrier) {
             slice.local_inbound_workloads = Some(value)
         }
         MeshSliceCarrier::LocalIngressListeners(value) => slice.local_ingress_listeners = value,
+        MeshSliceCarrier::SidecarIngressDeclared(value) => slice.sidecar_ingress_declared = value,
         MeshSliceCarrier::Workloads(value) => slice.workloads = value,
         MeshSliceCarrier::WorkloadLabels(value) => slice.labels = value,
         MeshSliceCarrier::MeshPolicies(value) => slice.mesh_policies = value,
@@ -512,6 +544,7 @@ mod tests {
                 owner_namespace: "default".to_string(),
                 owner_service: "reviews".to_string(),
             }]),
+            MeshSliceCarrier::SidecarIngressDeclared(true),
             MeshSliceCarrier::Workloads(Vec::new()),
             MeshSliceCarrier::WorkloadLabels(BTreeMap::from([(
                 "app".to_string(),
@@ -594,6 +627,7 @@ mod tests {
             MeshSliceCarrier::LocalInboundServices(Vec::new()),
             MeshSliceCarrier::LocalInboundWorkloads(Vec::new()),
             MeshSliceCarrier::LocalIngressListeners(Vec::new()),
+            MeshSliceCarrier::SidecarIngressDeclared(true),
             MeshSliceCarrier::Workloads(Vec::new()),
             MeshSliceCarrier::WorkloadLabels(BTreeMap::from([(
                 "app".to_string(),

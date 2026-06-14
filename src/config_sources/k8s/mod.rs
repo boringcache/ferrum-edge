@@ -13,6 +13,11 @@ mod mesh_config;
 // the translator's "emit cors plugin vs. leave unprojected" decision and the
 // status writer's deferred-field reporting use one predicate and never diverge.
 pub(crate) use istio::cors_policy_translatable;
+// Shared with the Istio status writer the same way: the Sidecar `ingress[]`
+// HTTP-family classification used by resolution and by deferred-field reporting
+// is one predicate, so an HTTPS (→ Unknown → HTTP-family) listener is never
+// modeled by resolution yet reported as a deferred non-HTTP listener.
+pub(crate) use istio::sidecar_ingress_protocol_is_http_family;
 
 use std::collections::{HashMap, HashSet};
 

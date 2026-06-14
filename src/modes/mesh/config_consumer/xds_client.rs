@@ -1369,6 +1369,11 @@ fn reverse_translate(
         // LocalIngressListeners carrier. Empty when the CP modeled no custom
         // inbound listeners.
         local_ingress_listeners: recovered.local_ingress_listeners,
+        // F6 §6.2 fail-closed marker: the applicable Sidecar declared a
+        // non-empty `ingress[]`. Recovered from the dedicated carrier (emitted
+        // even when `local_ingress_listeners` is empty), so an all-unsupported
+        // `ingress[]` still suppresses the default inbound routes on the DP.
+        sidecar_ingress_declared: recovered.sidecar_ingress_declared,
         // GAP-1a: authorization policies recovered from the MeshPolicies
         // carrier. Without this the xDS mesh had NO authz (implicit allow-all).
         mesh_policies: recovered.mesh_policies,
@@ -1434,6 +1439,7 @@ struct RecoveredSliceCarriers {
     local_inbound_services: Vec<MeshService>,
     local_inbound_workloads: Option<Vec<crate::modes::mesh::config::Workload>>,
     local_ingress_listeners: Vec<crate::modes::mesh::config::ResolvedIngressListener>,
+    sidecar_ingress_declared: bool,
     labels: Option<BTreeMap<String, String>>,
     workloads: Vec<crate::modes::mesh::config::Workload>,
     mesh_policies: Vec<crate::modes::mesh::config::MeshPolicy>,
@@ -1659,6 +1665,9 @@ fn apply_recovered_carrier(
             recovered.local_inbound_workloads = Some(value)
         }
         MeshSliceCarrier::LocalIngressListeners(value) => recovered.local_ingress_listeners = value,
+        MeshSliceCarrier::SidecarIngressDeclared(value) => {
+            recovered.sidecar_ingress_declared = value
+        }
         MeshSliceCarrier::Workloads(value) => recovered.workloads = value,
         MeshSliceCarrier::WorkloadLabels(value) => recovered.labels = Some(value),
         MeshSliceCarrier::MeshPolicies(value) => recovered.mesh_policies = value,
@@ -4041,6 +4050,16 @@ mod tests {
             // identity-narrowed `workloads`.
             local_inbound_services: vec![service],
             local_inbound_workloads: Some(vec![workload]),
+            // F6 §6.2: a resolved ingress listener AND the fail-closed declared
+            // marker must round-trip via their dedicated ECDS carriers.
+            local_ingress_listeners: vec![crate::modes::mesh::config::ResolvedIngressListener {
+                port: 8443,
+                endpoint_host: "127.0.0.1".to_string(),
+                endpoint_port: 8080,
+                owner_namespace: "default".to_string(),
+                owner_service: "api".to_string(),
+            }],
+            sidecar_ingress_declared: true,
             mesh_policies: vec![MeshPolicy {
                 name: "allow-api".to_string(),
                 namespace: "default".to_string(),
@@ -4196,6 +4215,16 @@ mod tests {
         assert_eq!(
             recovered.local_inbound_workloads,
             native.local_inbound_workloads
+        );
+        // F6 §6.2: resolved ingress listeners + the fail-closed declared marker
+        // round-trip via their own carriers.
+        assert_eq!(
+            recovered.local_ingress_listeners,
+            native.local_ingress_listeners
+        );
+        assert!(
+            recovered.sidecar_ingress_declared,
+            "the sidecar-ingress-declared marker must survive the xDS round trip"
         );
 
         // Resolved-behavior parity spot-checks: the recovered slice answers

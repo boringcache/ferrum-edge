@@ -255,7 +255,7 @@ pub struct MeshRule {
     pub action: PolicyAction,
 }
 
-fn is_false(value: &bool) -> bool {
+pub(crate) fn is_false(value: &bool) -> bool {
     !*value
 }
 
@@ -1313,6 +1313,16 @@ pub struct MeshSidecarIngress {
     /// endpoints are **not** representable by Ferrum's host:port backend model
     /// and fail closed (the entry is skipped at materialization and kept in the
     /// `deferred_fields` report) rather than being mis-modeled.
+    ///
+    /// **Optional** in Istio (an entry may omit it — Istio then defers the
+    /// listener). The native/file/xDS mesh model must mirror that: an omitted
+    /// `defaultEndpoint` deserializes to the empty string and is deferred at
+    /// `resolve()` (the empty value fails the `host:port` parse →
+    /// `UnparseableEndpoint`), exactly like the K8s translation path which fills
+    /// an empty string for an omitted field. Without `#[serde(default)]` an
+    /// omitted field would fail DESERIALIZATION before validation could defer
+    /// the listener — a native-path-only break the K8s path never hit.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub default_endpoint: String,
 }
 
@@ -1393,8 +1403,13 @@ impl MeshSidecarIngress {
 /// HTTP-family classification shared by ingress-listener resolution and the
 /// inbound materializer. Mirrors `is_http_family_mesh_protocol` in
 /// [`crate::modes::mesh`]; kept here so the config model can resolve ingress
-/// entries without importing the mode module.
-fn is_http_family_app_protocol(protocol: AppProtocol) -> bool {
+/// entries without importing the mode module. `pub(crate)` so the K8s Istio
+/// status writer classifies Sidecar `ingress[]` protocols through the SAME
+/// predicate `MeshSidecarIngress::resolve` uses — keeping the translator/
+/// resolution predicate and the deferred-field report in lock-step (e.g.
+/// `https` → `AppProtocol::Unknown` → HTTP-family, so an HTTPS ingress listener
+/// is reported as modeled, not deferred).
+pub(crate) fn is_http_family_app_protocol(protocol: AppProtocol) -> bool {
     matches!(
         protocol,
         AppProtocol::Http | AppProtocol::Http2 | AppProtocol::Grpc | AppProtocol::Unknown

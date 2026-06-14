@@ -3775,6 +3775,20 @@ fn app_protocol(value: Option<&str>) -> AppProtocol {
     }
 }
 
+/// Whether a Sidecar `ingress[].port.protocol` string names an HTTP-family
+/// listener Ferrum materializes (vs. a stream/raw-TCP listener it defers).
+/// Routes the raw string through the SAME `app_protocol` mapping the translator
+/// uses and the SAME `is_http_family_app_protocol` predicate
+/// `MeshSidecarIngress::resolve` uses, so the translator/resolution side and the
+/// Istio status writer's deferred-field report can never disagree on whether a
+/// listener is modeled. In particular `https` (and any other unrecognized
+/// protocol) maps to `AppProtocol::Unknown`, which IS HTTP-family — so an HTTPS
+/// ingress listener is reported as modeled, matching what resolution does.
+/// Shared (like [`cors_policy_translatable`]) to keep the predicate in one place.
+pub(crate) fn sidecar_ingress_protocol_is_http_family(protocol: Option<&str>) -> bool {
+    crate::modes::mesh::config::is_http_family_app_protocol(app_protocol(protocol))
+}
+
 fn telemetry(
     acc: &mut K8sAccumulator,
     object: &K8sObject,

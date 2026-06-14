@@ -1179,9 +1179,11 @@ Each modeled ingress entry becomes one inbound loopback route:
 - **listen path** — `/` (the route is selected by host, then disambiguated by port).
 - **port disambiguation** — on Ferrum's shared `:15006` inbound listener, the captured original destination (the port the client dialed) **and** a peer sidecar's request authority are matched against the **declared listener port** (not the `defaultEndpoint` port, which is the separate forward target). This reuses `select_mesh_inbound_port_route`: multiple ingress listeners on one workload are siblings disambiguated by listener port, and a request that addresses no declared listener port fails closed with `502` rather than being routed to an arbitrary backend.
 
-### Precedence vs. the default inbound listeners
+- **authorization port** — `mesh_authz` authorizes an ingress listener on its **declared listener port** (e.g. `8443`), not the `defaultEndpoint` backend port (e.g. `8080`). An `AuthorizationPolicy` `to.operation.ports` / `when: destination.port` rule scoped to the listener port therefore matches; authorizing on the backend port would let an ALLOW miss and — worse — a port-scoped **DENY fail open**. (Service-port default inbound routes keep authorizing on the container/backend port, matching Istio inbound authz.) The listener port is stamped onto the request at port selection and read by authz; if it is somehow unavailable for an ingress route, authz fails closed (it never falls back to the backend port).
 
-Per Istio, when `ingress[]` is present it **replaces** the workload's default per-service-port inbound listeners. Ferrum mirrors this: if the applicable `Sidecar` resolves any ingress listener, the inbound materializer emits routes **only** from the `ingress[]` block and skips the service-port default `:15006` → `127.0.0.1:targetPort` materialization for that workload. A workload with no (resolvable) ingress keeps the default service-port inbound behavior unchanged. This avoids any silent host+path conflict — the two never coexist for one workload.
+### Precedence vs. the default inbound listeners (fail-closed)
+
+Per Istio, when `ingress[]` is present it **replaces** the workload's default per-service-port inbound listeners. Ferrum mirrors this and **fails closed on the declared signal, not on what resolved**: if the applicable `Sidecar` declares a non-empty `ingress[]`, the inbound materializer emits routes **only** from the resolved `ingress[]` listeners and skips the service-port default `:15006` → `127.0.0.1:targetPort` materialization for that workload — **even if every entry was unsupported and nothing resolved**. An all-unsupported `ingress[]` therefore yields **no inbound routes** for the workload rather than silently exposing the default service-port routes the operator explicitly replaced (exposing them would be a fail-open regression). Only a workload whose applicable `Sidecar` declares **no** `ingress[]` keeps the default service-port inbound behavior. This avoids any silent host+path conflict — the two never coexist for one workload. The "ingress was declared" marker is tracked separately from the resolved-listener list and rides its own ECDS carrier so it survives an empty resolved list on the xDS path.
 
 ### Supported and deferred `defaultEndpoint` forms
 
@@ -1191,12 +1193,13 @@ Per Istio, when `ingress[]` is present it **replaces** the workload's default pe
 |---|---|
 | `127.0.0.1:PORT`, `[::1]:PORT` (loopback) | Modeled; dials that loopback address + port (address family preserved). |
 | `0.0.0.0:PORT`, `[::]:PORT` (instance IP) | Modeled; mapped to loopback (`127.0.0.1` / `::1`) — the sidecar app shares the pod network namespace. |
+| HTTP-family `port.protocol` (`http`/`http2`/`grpc`/`https`/unset) | Modeled — `https` (and any unrecognized protocol) maps to `AppProtocol::Unknown`, which Ferrum treats as HTTP-family. |
 | `unix:///path/to/socket` | **Deferred** — Ferrum's backend model is `host:port` only; not representable. |
 | Arbitrary off-box IP (`10.0.0.5:PORT`) | **Deferred** — Istio forbids arbitrary IPs; Ferrum's loopback-only model will not dial off-box. |
 | Non-HTTP-family `port.protocol` (`tcp`/`tls`/`mongo`/…) | **Deferred** — raw-TCP inbound has no Host/route and is not modeled here. |
-| Omitted / empty `defaultEndpoint` | **Deferred** — Istio allows omitting it; with no forward target there is nothing to route. |
+| Omitted / empty `defaultEndpoint` | **Deferred** — Istio allows omitting it (the native model also accepts an omitted field, defaulting to empty); with no forward target there is nothing to route. |
 
-The status writer reports the count of modeled listeners as `status.ferrum.translation.ingress_modeled` and lists deferral reasons in `deferred_fields`. A listener `port` of `0` is a hard validation error (rejected), not a deferral.
+The status writer reports the count of modeled listeners as `status.ferrum.translation.ingress_modeled` and lists deferral reasons in `deferred_fields`. The HTTP-family classification is shared by translation/resolution and the status writer (one predicate), so a modeled listener is never falsely reported as a deferred non-HTTP listener (and vice-versa). A listener `port` of `0` is a hard validation error (rejected), not a deferral.
 
 ### `bind` and `captureMode` limitations
 
@@ -1205,7 +1208,9 @@ The status writer reports the count of modeled listeners as `status.ferrum.trans
 
 ### xDS / file / native parity
 
-The resolved listeners ride the slice as `local_ingress_listeners` (computed CP-side, since raw `MeshSidecar` records do not ride the slice — only the resolved view does, mirroring `local_inbound_services`). On xDS they ride a dedicated ECDS carrier (`LocalIngressListenersCarrier`); on the native and `FERRUM_MESH_CONFIG_PROTOCOL=file` sources the same `MeshSlice::from_gateway_config` builder resolves them, so an xDS-built slice stays functionally equivalent to a native-built one.
+The resolved listeners ride the slice as `local_ingress_listeners` (computed CP-side, since raw `MeshSidecar` records do not ride the slice — only the resolved view does, mirroring `local_inbound_services`). On xDS they ride a dedicated ECDS carrier (`LocalIngressListenersCarrier`); the fail-closed "ingress was declared" marker rides its own carrier (`SidecarIngressDeclaredCarrier`) so an all-unsupported `ingress[]` still suppresses the default routes on the DP even with an empty listener list. On the native and `FERRUM_MESH_CONFIG_PROTOCOL=file` sources the same `MeshSlice::from_gateway_config` builder resolves them, so an xDS-built slice stays functionally equivalent to a native-built one.
+
+Ingress resolution is **decoupled from egress-scope inheritance**: a Sidecar that declares only `ingress[]` usually omits `spec.egress` (so it inherits the egress default), and when no namespace/root default exists no egress scope applies — but the ingress listeners still resolve, and the local-inbound service view that anchors their host identity is resolved independently of whether an egress scope was applied. An ingress-only workload Sidecar therefore models its listeners correctly instead of falling back to default inbound routing.
 
 ## Config Drift Introspection
 

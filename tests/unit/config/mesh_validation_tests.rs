@@ -1187,6 +1187,30 @@ fn ingress_resolve_rejects_zero_listener_port() {
 }
 
 #[test]
+fn ingress_omitted_default_endpoint_deserializes_then_defers() {
+    // F6 §6.2 (Finding 3): Istio treats `defaultEndpoint` as OPTIONAL. The
+    // native model must DESERIALIZE an entry that omits it (it must not be a
+    // required serde field), defaulting to the empty string, which then defers
+    // at `resolve()` — matching the K8s translation path (which fills an empty
+    // string for an omitted field).
+    let entry: MeshSidecarIngress = serde_json::from_value(serde_json::json!({
+        "port": 8443,
+        "protocol": "http"
+        // defaultEndpoint intentionally omitted
+    }))
+    .expect("an omitted defaultEndpoint must still deserialize (optional field)");
+    assert_eq!(
+        entry.default_endpoint, "",
+        "omitted endpoint defaults to empty"
+    );
+    assert_eq!(
+        entry.resolve(),
+        Err(IngressListenerUnsupported::UnparseableEndpoint),
+        "an empty defaultEndpoint defers (fail-closed), it is not a hard error"
+    );
+}
+
+#[test]
 fn validate_rejects_zero_ingress_port() {
     // A zero listener port is structurally invalid. An empty/absent
     // defaultEndpoint is NOT a hard error (Istio allows omitting it) — it is

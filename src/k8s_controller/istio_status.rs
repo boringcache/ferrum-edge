@@ -1084,13 +1084,15 @@ fn classify_sidecar_ingress_entries(spec: &Value) -> (usize, Vec<&'static str>) 
         let protocol = entry
             .get("port")
             .and_then(|p| p.get("protocol"))
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        let http_family = matches!(
-            protocol.as_str(),
-            "http" | "http2" | "grpc" | "" | "unknown"
-        );
+            .and_then(Value::as_str);
+        // Classify through the SAME shared predicate `MeshSidecarIngress::resolve`
+        // uses (raw string → `app_protocol` → `is_http_family_app_protocol`), so
+        // resolution and this deferred-field report never disagree. Notably
+        // `https` maps to `AppProtocol::Unknown`, which IS HTTP-family and IS
+        // materialized — so an HTTPS listener is counted as modeled below, not
+        // falsely reported as a deferred non-HTTP listener.
+        let http_family =
+            crate::config_sources::k8s::sidecar_ingress_protocol_is_http_family(protocol);
         let endpoint = entry
             .get("defaultEndpoint")
             .and_then(Value::as_str)
@@ -2535,6 +2537,40 @@ mod tests {
         assert!(
             deferred.iter().any(|f| f.contains("non-HTTP-family")),
             "TCP listener must be deferred, got {deferred:?}"
+        );
+    }
+
+    #[test]
+    fn sidecar_https_ingress_is_modeled_not_deferred() {
+        // F6 §6.2 (Finding 5): an HTTPS ingress listener maps to
+        // `AppProtocol::Unknown`, which resolution treats as HTTP-family and
+        // MATERIALIZES. The status classifier must agree (it routes the protocol
+        // through the same shared predicate), so the live listener is reported as
+        // modeled — NOT falsely reported as a deferred non-HTTP-family listener.
+        let obj = object(
+            "networking.istio.io/v1",
+            "Sidecar",
+            "ingress-sidecar",
+            json!({
+                "ingress": [ { "port": { "number": 8443, "protocol": "HTTPS", "name": "https" }, "defaultEndpoint": "127.0.0.1:8080" } ]
+            }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options());
+        let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        assert_eq!(
+            detail["translation"]["ingress_modeled"].as_u64(),
+            Some(1),
+            "an HTTPS listener (→ Unknown → HTTP-family) is modeled"
+        );
+        let deferred: Vec<&str> = detail["translation"]["deferred_fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            !deferred.iter().any(|f| f.contains("non-HTTP-family")),
+            "an HTTPS listener must NOT be reported as a deferred non-HTTP listener, got {deferred:?}"
         );
     }
 

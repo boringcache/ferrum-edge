@@ -10,7 +10,7 @@ use crate::modes::mesh::config::{
     MeshRuntimeOverlay, MeshService, MeshSidecar, MeshSidecarEgress, MeshTelemetryResource,
     MtlsMode, MultiClusterConfig, OutboundTrafficPolicy, PeerAuthentication, PolicyScope,
     ResolvedIngressListener, ServiceEntry, SidecarHostPattern, TrustBundleSet, Workload,
-    WorkloadLabels, policy_scope_applies_to_workload, proxy_config_applies_to_workload,
+    WorkloadLabels, is_false, policy_scope_applies_to_workload, proxy_config_applies_to_workload,
     scope_applies_to_workload, service_entry_applies_to_workload, workload_selector_matches,
 };
 use crate::modes::mesh::dns_proxy::DEFAULT_CLUSTER_DOMAIN;
@@ -217,6 +217,18 @@ pub struct MeshSlice {
     /// Sidecar declares no ingress, or no entry resolved.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub local_ingress_listeners: Vec<ResolvedIngressListener>,
+    /// Fail-closed marker: the local workload's applicable `Sidecar` declared a
+    /// NON-EMPTY `spec.ingress[]`, independent of whether any entry RESOLVED
+    /// into `local_ingress_listeners`. Per Istio, declaring `ingress[]` REPLACES
+    /// the default per-service-port inbound listeners; so when this is `true`
+    /// the inbound materializer SKIPS the default routes even if
+    /// `local_ingress_listeners` is empty (every entry unsupported, or no local
+    /// service anchored them) — exposing the default `:15006` loopback routes
+    /// for a workload whose operator declared (failed-closed) custom ingress
+    /// would be a fail-open regression. `local_ingress_listeners` non-empty
+    /// implies this is `true`; this can be `true` with an empty listener list.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub sidecar_ingress_declared: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mesh_policies: Vec<MeshPolicy>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -600,17 +612,19 @@ impl MeshSlice {
         // writer. Carried on the slice so the DP materializer never re-resolves
         // raw `MeshSidecar` records (they do not ride the slice), mirroring the
         // `local_inbound_services` pattern.
-        let mut local_ingress_listeners: Vec<ResolvedIngressListener> =
-            if sidecar_enforced && !sidecar_dry_run {
-                resolve_applicable_sidecar_ingress(
-                    &mesh.sidecars,
-                    effective_namespace,
-                    &effective_labels,
-                    mesh.istio_root_namespace.as_str(),
-                )
-            } else {
-                Vec::new()
-            };
+        let (mut local_ingress_listeners, sidecar_ingress_declared): (
+            Vec<ResolvedIngressListener>,
+            bool,
+        ) = if sidecar_enforced && !sidecar_dry_run {
+            resolve_applicable_sidecar_ingress(
+                &mesh.sidecars,
+                effective_namespace,
+                &effective_labels,
+                mesh.istio_root_namespace.as_str(),
+            )
+        } else {
+            (Vec::new(), false)
+        };
 
         // Sidecar-only indexes: skip the full scan over `mesh.services` and
         // `mesh.service_entries` when no Sidecar applies (default-off feature,
@@ -649,49 +663,85 @@ impl MeshSlice {
         // folded into `services`/`workloads`, so the egress/outbound-registry
         // view is unchanged. The local workload is identified by
         // `resolve_local_workloads` (SPIFFE + non-vacuous label/cluster match,
-        // with a shared-SPIFFE ambiguity guard). Only needed when narrowing is
-        // active; otherwise the full sets are intact and the materializer falls
-        // back to them.
+        // with a shared-SPIFFE ambiguity guard).
+        //
+        // Resolution is factored into one closure so the ingress path can reuse
+        // it INDEPENDENTLY of egress-scope inheritance (a Sidecar that declares
+        // only `ingress[]` usually omits `spec.egress` → `egress_inherits_defaults`,
+        // which can resolve no egress scope and leave `applicable_sidecar` `None`,
+        // yet its ingress listeners were still resolved and need a local-service
+        // anchor). The closure borrows the workload sets immutably and is pure.
+        let resolve_local_inbound = |spiffe: &str| -> (Vec<Workload>, Vec<MeshService>) {
+            let local_cluster = mesh
+                .multi_cluster
+                .as_ref()
+                .and_then(|mc| mc.local_cluster.as_deref());
+            let local_workloads: Vec<Workload> =
+                resolve_local_workloads(&workloads, spiffe, &effective_labels, local_cluster)
+                    .into_iter()
+                    .cloned()
+                    .collect();
+            let local_keys: BTreeSet<(&str, &str)> = local_workloads
+                .iter()
+                .map(|w| (w.service_name.as_str(), w.namespace.as_str()))
+                .collect();
+            let services = mesh
+                .services
+                .iter()
+                .filter(|s| {
+                    local_keys.contains(&(s.name.as_str(), s.namespace.as_str()))
+                        && resource_namespace_visible(
+                            &service_waypoint_namespaces,
+                            &s.namespace,
+                            &namespace,
+                        )
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            (local_workloads, services)
+        };
+
+        // Egress-narrowing inbound view: only needed when egress narrowing is
+        // active; otherwise the full `services`/`workloads` are intact and the
+        // materializer falls back to them.
         // `local_inbound_workloads` is `Some` exactly when narrowing was active
         // and we resolved (or ambiguously failed to resolve) the local identity;
         // it then gates the materializer, which must NOT fall back to the
         // narrowed `workloads`. `None` means no narrowing — full sets are intact.
-        let (local_inbound_workloads, local_inbound_services): (
+        let (mut local_inbound_workloads, mut local_inbound_services): (
             Option<Vec<Workload>>,
             Vec<MeshService>,
         ) = match request.workload_spiffe_id.as_deref() {
             Some(spiffe) if applicable_sidecar.is_some() => {
-                let local_cluster = mesh
-                    .multi_cluster
-                    .as_ref()
-                    .and_then(|mc| mc.local_cluster.as_deref());
-                let local_workloads: Vec<Workload> =
-                    resolve_local_workloads(&workloads, spiffe, &effective_labels, local_cluster)
-                        .into_iter()
-                        .cloned()
-                        .collect();
-                let services = {
-                    let local_keys: BTreeSet<(&str, &str)> = local_workloads
-                        .iter()
-                        .map(|w| (w.service_name.as_str(), w.namespace.as_str()))
-                        .collect();
-                    mesh.services
-                        .iter()
-                        .filter(|s| {
-                            local_keys.contains(&(s.name.as_str(), s.namespace.as_str()))
-                                && resource_namespace_visible(
-                                    &service_waypoint_namespaces,
-                                    &s.namespace,
-                                    &namespace,
-                                )
-                        })
-                        .cloned()
-                        .collect::<Vec<_>>()
-                };
+                let (local_workloads, services) = resolve_local_inbound(spiffe);
                 (Some(local_workloads), services)
             }
             _ => (None, Vec::new()),
         };
+
+        // F6 §6.2 (decouple ingress from egress scope): an ingress-only Sidecar
+        // may have resolved listeners (or declared ingress) while egress scope
+        // resolved to none (`applicable_sidecar` `None`) — so the block above
+        // left `local_inbound_services` empty. Resolve the local-inbound view
+        // here from the workload SPIFFE id INDEPENDENTLY, so the listeners get a
+        // host anchor (and the materializer/router see the local service) without
+        // an egress scope having been applied. Never folds into the egress
+        // `services`/`workloads` view. Skipped when egress already resolved it
+        // (re-resolving would be redundant) or there is no ingress to anchor.
+        if (sidecar_ingress_declared || !local_ingress_listeners.is_empty())
+            && local_inbound_services.is_empty()
+            && let Some(spiffe) = request.workload_spiffe_id.as_deref()
+        {
+            let (local_workloads, services) = resolve_local_inbound(spiffe);
+            // `Some` marks the local-inbound view as AUTHORITATIVE (the
+            // materializer must not fall back to the narrowed `workloads`),
+            // mirroring the egress-narrowed branch above. Set only when we
+            // actually resolved a view here (a `None` from the egress branch
+            // means "no narrowing"; promoting it to `Some(empty)` would wrongly
+            // suppress the default fallback for a workload with no ingress).
+            local_inbound_workloads = Some(local_workloads);
+            local_inbound_services = services;
+        }
 
         // Stamp the ingress listeners with the owning local service identity
         // (the first resolved local-inbound service). Both the inbound
@@ -700,7 +750,9 @@ impl MeshSlice {
         // lock-step without re-running local-workload resolution. When no local
         // service resolved (e.g. EndpointSlice lag), drop the listeners — they
         // have no host identity to anchor and the materializer would skip them
-        // fail-closed anyway.
+        // fail-closed anyway. (The `sidecar_ingress_declared` marker still rides
+        // the slice, so the materializer fails closed — no default routes — even
+        // when the anchor is missing and the listener list is empty.)
         if !local_ingress_listeners.is_empty() {
             match local_inbound_services.first() {
                 Some(service) => {
@@ -900,6 +952,7 @@ impl MeshSlice {
             local_inbound_services,
             local_inbound_workloads,
             local_ingress_listeners,
+            sidecar_ingress_declared,
             mesh_policies,
             peer_authentications,
             service_entries,
@@ -1781,25 +1834,36 @@ fn select_applicable_sidecar<'a, L: WorkloadLabels + ?Sized>(
 }
 
 /// Resolve the routable custom inbound listeners from a workload's applicable
-/// `Sidecar.ingress[]`. Unsupported entries (Unix-socket / non-loopback
-/// `defaultEndpoint`, non-HTTP-family protocol, zero port) are dropped
-/// fail-closed and warned; only the entries that resolve to a loopback
-/// host:port HTTP route are returned. Empty when no Sidecar applies or the
-/// selected Sidecar declares no resolvable ingress.
+/// `Sidecar.ingress[]`, returning `(resolved_listeners, ingress_declared)`.
+///
+/// Unsupported entries (Unix-socket / non-loopback `defaultEndpoint`,
+/// non-HTTP-family protocol, zero port) are dropped fail-closed and warned; only
+/// the entries that resolve to a loopback host:port HTTP route are returned.
+///
+/// `ingress_declared` is `true` when the applicable Sidecar declares a NON-EMPTY
+/// `ingress[]` — independent of whether any entry resolved. This is the
+/// fail-closed marker the inbound materializer needs: an operator that declares
+/// ingress (even one whose entries are ALL unsupported) has explicitly opted out
+/// of the default per-service-port inbound listeners (Istio's `ingress[]`
+/// REPLACES them), so the materializer must SKIP the default routes rather than
+/// silently exposing them when the resolved list is empty. (Resolved listeners
+/// can be empty while declared is true; declared can never be false while
+/// resolved is non-empty.)
 fn resolve_applicable_sidecar_ingress<L: WorkloadLabels + ?Sized>(
     sidecars: &[MeshSidecar],
     workload_namespace: &str,
     workload_labels: &L,
     istio_root_namespace: &str,
-) -> Vec<ResolvedIngressListener> {
+) -> (Vec<ResolvedIngressListener>, bool) {
     let Some(sidecar) = select_applicable_sidecar(
         sidecars,
         workload_namespace,
         workload_labels,
         istio_root_namespace,
     ) else {
-        return Vec::new();
+        return (Vec::new(), false);
     };
+    let ingress_declared = !sidecar.ingress.is_empty();
     let mut resolved: Vec<ResolvedIngressListener> = Vec::new();
     let mut seen_ports: BTreeSet<u16> = BTreeSet::new();
     for entry in &sidecar.ingress {
@@ -1831,7 +1895,7 @@ fn resolve_applicable_sidecar_ingress<L: WorkloadLabels + ?Sized>(
             }
         }
     }
-    resolved
+    (resolved, ingress_declared)
 }
 
 fn sidecar_host_match_namespace<'a>(
@@ -2691,6 +2755,7 @@ mod tests {
             local_inbound_services: Vec::new(),
             local_inbound_workloads: None,
             local_ingress_listeners: Vec::new(),
+            sidecar_ingress_declared: false,
             mesh_policies: vec![make_policy("p1", "ns", PolicyScope::MeshWide)],
             peer_authentications: vec![make_peer_auth("pa1", "ns", None)],
             service_entries: vec![make_service_entry("se1", "ns", vec!["*".into()])],
@@ -5244,6 +5309,86 @@ mod tests {
             "owner stamped from the resolved local service"
         );
         assert_eq!(listener.owner_service, "reviews");
+        assert!(
+            slice.sidecar_ingress_declared,
+            "the applicable Sidecar declared a non-empty ingress[]"
+        );
+    }
+
+    #[test]
+    fn sidecar_ingress_only_resolves_independent_of_egress_scope() {
+        // F6 §6.2 (Finding 4): a Sidecar that declares ONLY `ingress[]` and
+        // omits `spec.egress` (egress_inherits_defaults = true) with NO
+        // namespace/root default to inherit resolves NO egress scope —
+        // `applicable_sidecar` is None. The ingress listeners must STILL resolve
+        // and the local-inbound service view must STILL be stamped (decoupled
+        // from egress-scope inheritance), so the listeners get a host anchor
+        // instead of being cleared.
+        let spiffe = "spiffe://cluster.local/ns/alpha/sa/reviews";
+        let mut reviews_wl = make_workload(
+            "alpha",
+            "reviews",
+            HashMap::from([("app".to_string(), "reviews".to_string())]),
+        );
+        reviews_wl.spiffe_id = SpiffeId::new(spiffe).unwrap();
+        // Ingress-only Sidecar: egress omitted → inherits defaults, but there is
+        // no namespace/root default Sidecar, so egress resolves to None.
+        let mut sidecar = MeshSidecar {
+            name: "reviews-sc".into(),
+            namespace: "alpha".into(),
+            workload_selector: Some(WorkloadSelector {
+                labels: HashMap::from([("app".to_string(), "reviews".to_string())]),
+                namespace: Some("alpha".to_string()),
+            }),
+            egress_inherits_defaults: true,
+            egress: Vec::new(),
+            ingress: Vec::new(),
+        };
+        sidecar.ingress = vec![MeshSidecarIngress {
+            port: 8443,
+            protocol: AppProtocol::Http,
+            name: None,
+            bind: None,
+            default_endpoint: "127.0.0.1:8080".to_string(),
+        }];
+        let mesh = MeshConfig {
+            sidecars: vec![sidecar],
+            workloads: vec![reviews_wl],
+            services: vec![make_service("alpha", "reviews")],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let request = MeshSliceRequest {
+            workload_spiffe_id: Some(spiffe.to_string()),
+            ..slice_request_enforced_with_labels(
+                "alpha",
+                BTreeMap::from([("app".to_string(), "reviews".to_string())]),
+            )
+        };
+        let slice = MeshSlice::from_gateway_config(&config, request);
+
+        assert!(
+            slice.sidecar_ingress_declared,
+            "ingress-only Sidecar still records the declared marker"
+        );
+        assert_eq!(
+            slice.local_ingress_listeners.len(),
+            1,
+            "ingress listener resolves even though no egress scope applied"
+        );
+        let listener = &slice.local_ingress_listeners[0];
+        assert_eq!(
+            listener.owner_service, "reviews",
+            "listener owner stamped from the independently-resolved local service"
+        );
+        assert_eq!(listener.owner_namespace, "alpha");
+        assert!(
+            slice
+                .local_inbound_services
+                .iter()
+                .any(|s| s.name == "reviews" && s.namespace == "alpha"),
+            "local-inbound service view is populated independent of egress scope"
+        );
     }
 
     #[test]
