@@ -2681,27 +2681,44 @@ mod tests {
                     .and_then(|v| v.to_str().ok()),
                 Some("chat")
             );
-            let mut body = request.into_body();
-            let response = http::Response::builder()
-                .status(StatusCode::OK)
-                .header("sec-websocket-protocol", "chat")
-                .body(())
-                .expect("build response");
-            let mut send = respond
-                .send_response(response, false)
-                .expect("send response");
-            // Echo each inbound data chunk back over the response body.
-            while let Some(chunk) = body.data().await {
-                let chunk = chunk.expect("server recv chunk");
-                let _ = body.flow_control().release_capacity(chunk.len());
-                if chunk.is_empty() {
-                    continue;
+            // Echo the stream body in its OWN task and keep polling the
+            // connection below: `SendStream::send_data` only QUEUES frames; the
+            // h2 connection future is what flushes them to the socket. If the
+            // echo ran inline here, the task would park on the next
+            // `body.data().await` (Pending) after echoing the first frame and
+            // never drive the connection, so the echoed bytes would sit unflushed
+            // and the client's read would hang. This mirrors the working
+            // server pattern in `tests/integration/gateway_hbone_pool_tests.rs`.
+            tokio::spawn(async move {
+                let mut body = request.into_body();
+                let response = http::Response::builder()
+                    .status(StatusCode::OK)
+                    .header("sec-websocket-protocol", "chat")
+                    .body(())
+                    .expect("build response");
+                let mut send = respond
+                    .send_response(response, false)
+                    .expect("send response");
+                // Echo each inbound data chunk back over the response body.
+                while let Some(chunk) = body.data().await {
+                    let chunk = chunk.expect("server recv chunk");
+                    let _ = body.flow_control().release_capacity(chunk.len());
+                    if chunk.is_empty() {
+                        continue;
+                    }
+                    if send.send_data(chunk, false).is_err() {
+                        return;
+                    }
                 }
-                send.send_data(chunk, false).expect("server echo data");
+                let _ = send.send_data(Bytes::new(), true);
+            });
+            // Drive the connection so queued response frames flush and the client
+            // can read the echo; this returns once the connection closes.
+            while let Some(next) = conn.accept().await {
+                if next.is_err() {
+                    break;
+                }
             }
-            let _ = send.send_data(Bytes::new(), true);
-            // Keep the connection alive long enough for the client to read.
-            let _ = conn.accept().await;
         });
 
         let sender = h2_client_to(addr).await;
