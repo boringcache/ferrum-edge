@@ -30,7 +30,7 @@ use hyper::body::Incoming;
 use hyper::client::conn::http2;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -1249,6 +1249,74 @@ pub(crate) fn is_reserved_grpc_terminal_metadata(key: &str) -> bool {
         key,
         "grpc-status" | "grpc-message" | "grpc-status-details-bin"
     )
+}
+
+/// Build the merged header+trailer view buffered gRPC response-hook plugins run
+/// on, plus the set of trailer keys the backend ALSO sent as real initial
+/// headers ("header-shadowed" keys).
+///
+/// Plugins historically saw a single merged map because trailers were inserted
+/// into the response headers before hooks ran. This reproduces that view: a
+/// trailer-only key is merged in so hooks can see and sanitize it; a key the
+/// backend also sent as a real header is recorded in the returned set instead
+/// of overriding the header value (a trailer never overrides a real header in
+/// the view), so post-hook writeback can tell a genuine hook edit from the
+/// backend's distinct trailer value. The reserved gRPC terminal-status keys
+/// (`grpc-status` / `grpc-message` / `grpc-status-details-bin`) are
+/// trailer-authoritative and never treated as shadowed.
+///
+/// Shared by the main buffered gRPC path (`proxy::handle_proxy_request`) and the
+/// HTTP/3 cross-protocol bridge (`http3::cross_protocol`) so a response-hook
+/// sanitizer reaches the wire trailers identically on both — see
+/// [`reconcile_grpc_trailers_from_view`] for the writeback half.
+pub fn build_grpc_plugin_header_view(
+    response_headers: &HashMap<String, String>,
+    response_trailers: &HashMap<String, String>,
+) -> (HashMap<String, String>, HashSet<String>) {
+    let mut plugin_response_headers = response_headers.clone();
+    let mut header_shadowed_trailer_keys: HashSet<String> = HashSet::new();
+    for (k, v) in response_trailers {
+        if response_headers.contains_key(k) && !is_reserved_grpc_terminal_metadata(k) {
+            header_shadowed_trailer_keys.insert(k.clone());
+        } else {
+            plugin_response_headers.insert(k.clone(), v.clone());
+        }
+    }
+    (plugin_response_headers, header_shadowed_trailer_keys)
+}
+
+/// Reconcile response-hook mutations made on the merged plugin view (built by
+/// [`build_grpc_plugin_header_view`]) back into the wire `response_trailers`.
+///
+/// `original_response_headers` must be the backend's initial headers as they
+/// were before hooks ran. A trailer key now absent from the view was removed by
+/// a hook (drop it). A header-shadowed key was merged into the view at the
+/// *header* value, so its view value is not comparable to the trailer's own
+/// value — detect a genuine hook edit by comparing the view value against the
+/// original header value and only then copy the sanitized value into the hidden
+/// wire trailer (a sanitizer must scrub every client-visible copy); an
+/// untouched shadowed trailer keeps the backend's true trailing value. A
+/// non-shadowed (trailer-only) key whose view value changed was edited by a
+/// hook; copy it.
+pub fn reconcile_grpc_trailers_from_view(
+    response_trailers: &mut HashMap<String, String>,
+    plugin_response_headers: &HashMap<String, String>,
+    original_response_headers: &HashMap<String, String>,
+    header_shadowed_trailer_keys: &HashSet<String>,
+) {
+    response_trailers.retain(|k, v| match plugin_response_headers.get(k) {
+        Some(plugin_value) => {
+            if header_shadowed_trailer_keys.contains(k) {
+                if original_response_headers.get(k) != Some(plugin_value) {
+                    *v = plugin_value.clone();
+                }
+            } else if plugin_value != v {
+                *v = plugin_value.clone();
+            }
+            true
+        }
+        None => false,
+    });
 }
 
 /// HTTP/3 admission rejects use `425 Too Early` for 0-RTT policy failures.
