@@ -205,6 +205,26 @@ impl From<h3::error::StreamError> for H3BodyDrainError {
     }
 }
 
+/// A fully buffered HTTP/3 backend response returned by the pool's buffered
+/// request APIs ([`Http3ConnectionPool::request`] /
+/// [`Http3ConnectionPool::request_with_target`]).
+///
+/// `headers` carries the response headers (hop-by-hop names already stripped
+/// during collection). `trailers` carries any backend response trailers read
+/// after the body (issue #1630), still unsanitized — the buffered native-H3
+/// server send path strips response-direction hop-by-hop trailer names and
+/// forwards them to the client before FIN, mirroring the streaming path's
+/// `finish_h3_response_with_backend_trailers`. `trailers` is `None` when the
+/// backend sent none, the trailer read timed out, or it ended with a graceful
+/// close.
+#[derive(Debug)]
+pub(crate) struct H3BufferedResponse {
+    pub status: u16,
+    pub body: Vec<u8>,
+    pub headers: HashMap<String, String>,
+    pub trailers: Option<http::HeaderMap>,
+}
+
 /// Drain an H3 response stream into a `Vec<u8>`, tolerating a post-body
 /// graceful close signal. Two variants are recovered:
 ///
@@ -219,13 +239,18 @@ impl From<h3::error::StreamError> for H3BodyDrainError {
 /// particular stream, whereas the connection-level signals above don't
 /// invalidate already-sent data.
 ///
-/// Known residual (issue #1565 finding 3): buffered native-H3 paths drop
-/// backend trailers. This helper drains only DATA frames; any trailers the
-/// backend sends after the body are never read or forwarded. The streaming
-/// native-H3 paths forward trailers (`finish_h3_response_with_backend_trailers`
-/// in `http3/server.rs`), but plumbing trailers through the buffered paths
-/// requires a `ResponseBody::Buffered`-level trailer slot (and H1/H2 frontend
-/// chunked-trailer emission), which is deferred to a follow-up.
+/// Trailers (issue #1630): after the DATA-frame drain completes (FIN or a
+/// recoverable graceful close), this helper reads backend response trailers
+/// via `recv_trailers()`, bounded by the same `backend_read_timeout_ms`
+/// deadline used for `recv_data`. The trailers are returned (unsanitized) as
+/// the second tuple element so the buffered native-H3 server path can strip
+/// response-direction hop-by-hop names and forward them to the client before
+/// FIN — matching the streaming-path
+/// `finish_h3_response_with_backend_trailers` in `http3/server.rs`. A trailer
+/// read timeout, a graceful close at the trailer phase, or simply no trailers
+/// yields `None` (not an error), mirroring the body-phase graceful-close
+/// handling: trailers are optional and their absence must not fail a complete
+/// response.
 pub(crate) async fn drain_h3_response_body(
     stream: &mut H3RequestStream,
     method: &str,
@@ -233,7 +258,7 @@ pub(crate) async fn drain_h3_response_body(
     content_length: Option<u64>,
     max_response_body_size_bytes: usize,
     backend_read_timeout_ms: u64,
-) -> Result<Vec<u8>, H3BodyDrainError> {
+) -> Result<(Vec<u8>, Option<http::HeaderMap>), H3BodyDrainError> {
     if max_response_body_size_bytes > 0
         && content_length.is_some_and(|len| len > max_response_body_size_bytes as u64)
     {
@@ -291,7 +316,56 @@ pub(crate) async fn drain_h3_response_body(
             }
         }
     }
-    Ok(body)
+
+    // Body fully drained (FIN or a recoverable graceful close). Read any
+    // backend trailers so the buffered native-H3 server path can forward them
+    // — the streaming path already does this via
+    // `finish_h3_response_with_backend_trailers`. Bound by the same
+    // `backend_read_timeout_ms` deadline as `recv_data`. Trailers are optional:
+    // a read timeout, a graceful close at the trailer phase, or no trailers at
+    // all each yield `None` rather than failing an otherwise-complete response.
+    let trailers = match read_h3_trailers_with_timeout(stream, backend_read_timeout_ms).await {
+        Ok(trailers) => trailers,
+        Err(e) if is_h3_graceful_close(&e) => None,
+        Err(e) => {
+            debug!(
+                error = %e,
+                "H3 recv_trailers failed after complete body; forwarding response without trailers"
+            );
+            None
+        }
+    };
+    Ok((body, trailers))
+}
+
+/// Read backend response trailers, bounded by `backend_read_timeout_ms`.
+///
+/// A timeout collapses into `Ok(None)` (treated identically to "no trailers")
+/// rather than a `StreamError`, so the buffered drain path can forward an
+/// otherwise-complete response without trailers instead of failing it.
+async fn read_h3_trailers_with_timeout(
+    stream: &mut H3RequestStream,
+    backend_read_timeout_ms: u64,
+) -> Result<Option<http::HeaderMap>, h3::error::StreamError> {
+    if backend_read_timeout_ms > 0 {
+        match tokio::time::timeout(
+            Duration::from_millis(backend_read_timeout_ms),
+            stream.recv_trailers(),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                debug!(
+                    timeout_ms = backend_read_timeout_ms,
+                    "H3 recv_trailers timed out after complete body; forwarding response without trailers"
+                );
+                Ok(None)
+            }
+        }
+    } else {
+        stream.recv_trailers().await
+    }
 }
 
 async fn recv_h3_response_with_timeout(
@@ -1243,7 +1317,7 @@ impl Http3ConnectionPool {
         headers: &[(http::header::HeaderName, http::header::HeaderValue)],
         body: bytes::Bytes,
         tls_config_fn: impl FnOnce() -> Result<Arc<rustls::ClientConfig>, anyhow::Error>,
-    ) -> H3PoolResult<(u16, Vec<u8>, HashMap<String, String>)> {
+    ) -> H3PoolResult<H3BufferedResponse> {
         // Per-proxy override takes priority over global default
         let conns_per_backend = proxy
             .pool_http3_connections_per_backend
@@ -1397,7 +1471,7 @@ impl Http3ConnectionPool {
         headers: &[(http::header::HeaderName, http::header::HeaderValue)],
         body: bytes::Bytes,
         tls_config_fn: impl FnOnce() -> Result<Arc<rustls::ClientConfig>, anyhow::Error>,
-    ) -> H3PoolResult<(u16, Vec<u8>, HashMap<String, String>)> {
+    ) -> H3PoolResult<H3BufferedResponse> {
         let conns_per_backend = proxy
             .pool_http3_connections_per_backend
             .unwrap_or(self.connections_per_backend)
@@ -1704,7 +1778,7 @@ impl Http3ConnectionPool {
         headers: &[(http::header::HeaderName, http::header::HeaderValue)],
         body: bytes::Bytes,
         max_response_body_size_bytes: usize,
-    ) -> H3PoolResult<(u16, Vec<u8>, HashMap<String, String>)> {
+    ) -> H3PoolResult<H3BufferedResponse> {
         let uri: http::Uri = backend_url
             .parse()
             .map_err(|e| H3PoolError::pre_wire(anyhow::anyhow!("Invalid backend URL: {}", e)))?;
@@ -1783,8 +1857,10 @@ impl Http3ConnectionPool {
         // Body-on-wire semantics: `send_request` already returned Ok by this
         // point, so any recv_data error is post_wire. Recovery for graceful
         // CONNECTION_CLOSE(H3_NO_ERROR) / GOAWAY after a complete body lives
-        // inside `drain_h3_response_body`.
-        let response_body = drain_h3_response_body(
+        // inside `drain_h3_response_body`, which also reads any backend
+        // trailers (returned here so the buffered server path can forward
+        // them — see issue #1630).
+        let (response_body, response_trailers) = drain_h3_response_body(
             &mut stream,
             method,
             status,
@@ -1803,7 +1879,12 @@ impl Http3ConnectionPool {
             other => H3PoolError::post_wire(anyhow::anyhow!("recv_data failed: {}", other)),
         })?;
 
-        Ok((status, response_body, response_headers))
+        Ok(H3BufferedResponse {
+            status,
+            body: response_body,
+            headers: response_headers,
+            trailers: response_trailers,
+        })
     }
 
     /// Execute an HTTP/3 request, returning headers and a stream handle for the
@@ -2876,7 +2957,9 @@ impl Http3Client {
             .get("content-length")
             .and_then(|v| v.parse().ok());
 
-        let response_body =
+        // This integration/test client does not surface trailers; discard the
+        // trailer slot the shared drain helper now returns (issue #1630).
+        let (response_body, _trailers) =
             drain_h3_response_body(&mut stream, method, status, content_length, 0, 0).await?;
 
         Ok((status, response_body, response_headers))
