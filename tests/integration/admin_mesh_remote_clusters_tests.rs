@@ -4,11 +4,11 @@
 //! JWT gating, the not-in-mesh-mode `404`, the empty-before-discovery shape, and
 //! the accepted-slice → `configured` view contract (including that an accepted
 //! `MultiClusterConfig` with no successfully-polled cluster yields an empty
-//! `discovered` list — the discovery store is fed from the *received* slice and
-//! is intentionally NOT mutable through any production API). The pure
+//! `discovered` list — the discovery store is reconciled from the *accepted*
+//! slice and is intentionally NOT mutable through any production API). The pure
 //! response-builder logic — discovered counts/age, sorting, counts-only payload,
-//! and the accepted-slice scoping that filters a received-but-rejected slice's
-//! clusters out of `discovered` — is covered by the unit suite in
+//! and the accepted-slice scoping that filters any cluster absent from the
+//! accepted config out of `discovered` — is covered by the unit suite in
 //! `tests/unit/admin/mesh_remote_clusters_tests.rs`, which can stage a
 //! `RemoteEndpointSnapshot` directly without a runtime store seeder.
 

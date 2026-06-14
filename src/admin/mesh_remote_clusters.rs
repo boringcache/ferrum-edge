@@ -151,14 +151,17 @@ pub struct MeshRemoteClustersInputs<'a> {
 /// reads. Unit-tested directly to lock down the shape.
 ///
 /// Both views are derived from the **accepted** slice's `MultiClusterConfig`.
-/// The discovery store is fed from the *received* slice, which can transiently
-/// diverge from the accepted one during a rejected-slice window: the store
-/// could hold clusters declared by a slice the proxy REJECTED. Surfacing those
-/// would make an invalid slice look like live cross-cluster discovery, so a
-/// discovered cluster is scoped to the accepted config — matched by **cluster
-/// name and declared trust domain** — and a cluster absent from the accepted
-/// config (or present under a different trust domain) is **omitted** from
-/// `discovered`. Fail closed: when no slice is accepted (or it carries no
+/// The discovery store itself is now reconciled from the *accepted* slice too
+/// (`start_remote_cluster_discovery_reconcile_task` reads `applied_snapshot`),
+/// so it can no longer be populated from a slice the proxy REJECTED — a
+/// rejected slice that changes any poll-identity field (`network`,
+/// `control_plane_url`, trust domain, …) for the same cluster name never starts
+/// a poller. This accepted-scope filter is therefore belt-and-suspenders: a
+/// discovered cluster is still scoped to the accepted config — matched by
+/// **cluster name and declared trust domain** — so a cluster absent from the
+/// accepted config (or present under a different trust domain) is **omitted**
+/// from `discovered`, and the store-side and filter-side guards must both pass.
+/// Fail closed: when no slice is accepted (or it carries no
 /// `MultiClusterConfig`), the accepted set is empty and `discovered` is empty
 /// regardless of what the store holds.
 pub fn build_response(inputs: MeshRemoteClustersInputs<'_>) -> MeshRemoteClustersResponse {
@@ -177,8 +180,10 @@ pub fn build_response(inputs: MeshRemoteClustersInputs<'_>) -> MeshRemoteCluster
         .unwrap_or_default();
 
     // Discovered view: one entry per fetched cluster, counts only — filtered to
-    // the accepted slice's clusters (by name AND trust domain), so a
-    // received-but-rejected slice's clusters are not reported as discovered.
+    // the accepted slice's clusters (by name AND trust domain). The store is
+    // reconciled from the accepted slice, so this is a second guard: any cluster
+    // not in the accepted config is omitted regardless of how it got into the
+    // store.
     let mut discovered: Vec<DiscoveredRemoteCluster> = inputs
         .snapshot
         .clusters

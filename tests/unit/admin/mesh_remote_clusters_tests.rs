@@ -403,9 +403,11 @@ fn response_round_trips_and_omits_absent_network() {
 
 #[test]
 fn discovered_is_scoped_to_accepted_slice_clusters() {
-    // The discovery store (fed by the RECEIVED slice) holds two clusters, but
-    // the ACCEPTED slice declares only `remote-east`. `remote-rejected` came
-    // from a slice the proxy rejected and MUST NOT appear as live discovery.
+    // The discovery store holds two clusters, but the ACCEPTED slice declares
+    // only `remote-east`. `remote-rejected` is not in the accepted config and
+    // MUST NOT appear as live discovery. (The store is now reconciled from the
+    // accepted slice, so such an entry should not arise in production; this
+    // belt-and-suspenders filter keeps it out even if it somehow does.)
     let snapshot = snapshot_with(vec![
         entry(
             "remote-east",
@@ -506,6 +508,64 @@ fn discovered_scoping_matches_trust_domain_not_just_name() {
     assert!(
         !resp.configured[0].discovered,
         "the discovered flag must follow the same (name, trust domain) scoping"
+    );
+}
+
+#[test]
+fn discovered_filter_alone_cannot_catch_diverged_poll_identity() {
+    // Codex F7.2 round-3: the admin-side filter matches only (name, trust
+    // domain). A store entry that keeps the accepted name + trust domain but
+    // diverges on its poll identity (`network` here, and `control_plane_url`
+    // which this response shape does not even carry) therefore PASSES the
+    // filter — and is reported with the STORE's network, not the accepted
+    // config's. This test pins that gap to document WHY the real fix lives in
+    // the discovery reconciler: it now reconciles from the *accepted* slice
+    // (`start_remote_cluster_discovery_reconcile_task` →
+    // `RemoteEndpointStore`), so a rejected slice that only changed
+    // network/control_plane_url never starts a poller and the store can never
+    // hold such an entry in the first place. The filter is belt-and-suspenders;
+    // it is not, on its own, sufficient.
+    let snapshot = snapshot_with(vec![entry(
+        "remote-east",
+        "remote.local",
+        // Diverged network: the accepted config below declares `net-accepted`.
+        Some("net-rejected"),
+        vec![workload(
+            "spiffe://remote.local/ns/default/sa/reviews",
+            "reviews",
+            "10.9.0.1",
+        )],
+        vec![],
+        900,
+    )]);
+    let mc = multi_cluster_with(vec![remote_cluster(
+        "remote-east",
+        "remote.local",
+        Some("net-accepted"),
+        // Accepted control_plane_url v1; a rejected slice could carry v2 with
+        // the same name + trust domain, and the response shape carries no URL
+        // to filter on at all.
+        Some("grpcs://cp-v1.remote.local:50051"),
+        None,
+    )]);
+
+    let resp = build_response(MeshRemoteClustersInputs {
+        snapshot: &snapshot,
+        multi_cluster: Some(&mc),
+        discovery_enabled: true,
+        now_unix_seconds: 1_000,
+    });
+
+    // The name+trust-domain filter passes, so the diverged entry is surfaced —
+    // and with the STORE's (rejected) network, not the accepted one. This is
+    // the leak the reconcile-from-accepted fix prevents upstream of this filter.
+    assert_eq!(resp.discovered.len(), 1);
+    assert_eq!(resp.discovered[0].cluster_name, "remote-east");
+    assert_eq!(
+        resp.discovered[0].network.as_deref(),
+        Some("net-rejected"),
+        "the filter cannot tell an accepted poll identity from a diverged one; \
+         the store must therefore never be fed a rejected target"
     );
 }
 

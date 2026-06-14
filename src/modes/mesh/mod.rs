@@ -7763,13 +7763,26 @@ fn start_federation_poller_reconcile_task(
     })
 }
 
+/// Reconcile remote-cluster endpoint-discovery pollers against the latest
+/// **accepted** mesh slice. Like the federation poller reconciler above, the
+/// multicluster config and trust bundles are read from the *applied* slice
+/// (`applied_snapshot` / `subscribe_applied`), never the merely *received* one:
+/// the apply task may REJECT a received slice and keep serving the previous
+/// accepted proxy config, so a rejected slice that diverges (e.g. a changed
+/// `network` or `control_plane_url` for the same cluster name + trust domain)
+/// must never start a poller or populate the `RemoteEndpointStore`. Sourcing
+/// discovery from the accepted slice keeps `GET /mesh/remote-clusters`'s
+/// `discovered` view free of any cluster the proxy did not accept (the
+/// admin-side name+trust-domain filter is then belt-and-suspenders) and means
+/// the store only ever holds endpoints from the proxy-applied multicluster
+/// config.
 fn start_remote_cluster_discovery_reconcile_task(
     mesh_state: MeshRuntimeState,
     mut manager: multicluster::RemoteDiscoveryManager,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut updates = mesh_state.subscribe();
+        let mut updates = mesh_state.subscribe_applied();
         let mut federation_updates = mesh_state.federation_store().subscribe();
         loop {
             if *shutdown_rx.borrow() {
@@ -7777,7 +7790,7 @@ fn start_remote_cluster_discovery_reconcile_task(
                 return;
             }
 
-            let snapshot = mesh_state.snapshot();
+            let snapshot = mesh_state.applied_snapshot();
             let slice = snapshot.as_ref().as_ref();
             let federation_snapshot = mesh_state.federation_store().snapshot();
             let trust_domains = multicluster::trust_domains_from_bundles(

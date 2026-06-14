@@ -1780,6 +1780,92 @@ mod tests {
         manager.shutdown();
     }
 
+    /// Codex F7.2 round-3: a target that keeps the same cluster name + trust
+    /// domain but changes its poll identity (`network` AND `control_plane_url`)
+    /// is a DIFFERENT poll target. `reconcile` must stop the old poller and
+    /// evict its endpoints rather than keep serving them — otherwise a rejected
+    /// slice that only diverged on those fields could leave stale endpoints in
+    /// the store (and thus under `/mesh/remote-clusters`'s `discovered`, which
+    /// the name+trust-domain admin filter would NOT catch). Combined with
+    /// sourcing the reconcile from the *accepted* slice, this guarantees the
+    /// store only ever holds endpoints from the proxy-applied multicluster
+    /// config. Trust eligibility is held constant here to isolate the
+    /// poll-identity-change path from the trust-withdrawal path above.
+    #[tokio::test]
+    async fn manager_evicts_endpoints_when_poll_identity_diverges() {
+        let store = RemoteEndpointStore::new();
+        let config = RemoteDiscoveryConfig {
+            poll_interval: Duration::from_secs(60),
+            request_timeout: Duration::from_secs(1),
+            jwt_secret: None,
+            node_id: "dp-1".to_string(),
+            namespace: "default".to_string(),
+            tls_config: RemoteDiscoveryTlsConfig::default(),
+        };
+        let mut manager = RemoteDiscoveryManager::new(Some(config), store.clone(), |ctx| {
+            Arc::new(MissingSecretSource {
+                cluster_name: ctx.cluster_name.clone(),
+            })
+        });
+
+        // Accepted slice declares `west` with network `net-a` reachable at v1.
+        let accepted = MultiClusterConfig {
+            remote_clusters: vec![RemoteCluster {
+                name: "west".to_string(),
+                trust_domain: td("remote.local"),
+                network: Some("net-a".to_string()),
+                control_plane_url: Some("https://cp-v1.remote.example:15010".to_string()),
+                federation_endpoint: None,
+            }],
+            ..MultiClusterConfig::default()
+        };
+        let mut trusted = std::collections::HashSet::new();
+        trusted.insert(td("remote.local"));
+
+        manager.reconcile(Some(&accepted), trusted.clone());
+        assert_eq!(manager.running_cluster_names(), vec!["west"]);
+        store.install_for_test(RemoteClusterEntry {
+            cluster_name: "west".to_string(),
+            trust_domain: td("remote.local"),
+            network: Some("net-a".to_string()),
+            endpoints: RemoteClusterEndpoints {
+                workloads: vec![workload(
+                    "spiffe://remote.local/ns/default/sa/a",
+                    "reviews",
+                    "10.2.0.1",
+                    None,
+                )],
+                services: vec![],
+            },
+            fetched_at_unix_seconds: 1,
+        });
+        assert!(!store.snapshot().is_empty());
+
+        // A divergent target: SAME cluster name + trust domain, but a changed
+        // network AND control_plane_url (the exact shape a rejected slice could
+        // carry past a name+trust-domain-only filter). The old poller must be
+        // stopped and its endpoints evicted before the new poller starts.
+        let divergent = MultiClusterConfig {
+            remote_clusters: vec![RemoteCluster {
+                name: "west".to_string(),
+                trust_domain: td("remote.local"),
+                network: Some("net-b".to_string()),
+                control_plane_url: Some("https://cp-v2.remote.example:15010".to_string()),
+                federation_endpoint: None,
+            }],
+            ..MultiClusterConfig::default()
+        };
+        manager.reconcile(Some(&divergent), trusted);
+        assert!(
+            store.snapshot().is_empty(),
+            "a changed network/control_plane_url evicts the prior cluster's endpoints"
+        );
+        // The cluster is still eligible, so a fresh poller for the new identity
+        // is started (it just hasn't fetched anything yet via the stub source).
+        assert_eq!(manager.running_cluster_names(), vec!["west"]);
+        manager.shutdown();
+    }
+
     #[test]
     fn validate_control_plane_url_rejects_metadata_and_bad_scheme() {
         assert!(validate_control_plane_url("https://cp.example:15010").is_ok());
