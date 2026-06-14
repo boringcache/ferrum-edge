@@ -1026,3 +1026,63 @@ Returns `503` when proxy state is unavailable, `404` when no active mesh egress 
 
 - `FERRUM_MESH_SIDECAR_ENFORCED` — gates the slice-narrowing pass (default `false`).
 - `FERRUM_MESH_SIDECAR_ENFORCED_DRY_RUN` — computes the scope and exposes it through these endpoints while leaving the slice unenforced.
+
+## Mesh Remote Clusters (mesh mode)
+
+### `GET /mesh/remote-clusters`
+
+JWT-authenticated, mesh-only introspection of the data plane's view of multicluster east-west discovery. Operators previously inferred remote-cluster state only indirectly from `GET /mesh/config-drift` workload/service `resources` counts; this endpoint names the remote clusters directly and distinguishes "configured but never polled" from "not configured".
+
+Two views are returned:
+
+- `discovered` — remote clusters this DP has successfully polled over the native `MeshSubscribe` stream (cross-cluster endpoint discovery), keyed and sorted by `cluster_name`, each with per-cluster `workload_count` / `service_count`, the `fetched_at_unix_seconds` of the last successful poll, and the derived `age_seconds`. Empty when discovery is disabled (`FERRUM_MESH_REMOTE_DISCOVERY_POLL_INTERVAL_SECONDS` is `0`), no remote cluster is trust-eligible, or no poll has succeeded yet.
+- `configured` — remote clusters declared in the **accepted** slice's multicluster config: name, trust domain, network, and whether a control plane (`control_plane_configured`) / federation endpoint (`federation_endpoint_configured`) is set. Each carries a `discovered` flag cross-referencing the live snapshot, so a configured-but-unreachable cluster is visible.
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/mesh/remote-clusters
+```
+
+Response:
+
+```json
+{
+  "discovery_enabled": true,
+  "discovered": [
+    {
+      "cluster_name": "remote-east",
+      "trust_domain": "east.example.com",
+      "network": "net2",
+      "workload_count": 12,
+      "service_count": 3,
+      "fetched_at_unix_seconds": 1747595531,
+      "age_seconds": 8
+    }
+  ],
+  "configured": [
+    {
+      "cluster_name": "remote-east",
+      "trust_domain": "east.example.com",
+      "network": "net2",
+      "control_plane_configured": true,
+      "federation_endpoint_configured": true,
+      "discovered": true
+    },
+    {
+      "cluster_name": "remote-west",
+      "trust_domain": "west.example.com",
+      "control_plane_configured": false,
+      "federation_endpoint_configured": true,
+      "discovered": false
+    }
+  ]
+}
+```
+
+**Disclosure surface**: the payload reveals the cross-cluster topology shape the DP participates in — remote cluster names, trust domains, networks, and per-cluster endpoint counts. It deliberately omits raw workload addresses, SPIFFE IDs, and the control-plane / federation URLs themselves (those are reported only as booleans), keeping the same sensitive detail that `/mesh/config-drift` keeps off `/metrics` behind the JWT.
+
+Returns `404 Not Found` outside mesh mode (when the mesh runtime state is not wired into the admin API). In mesh mode with nothing configured or discovered yet, both lists are empty (a `200`, not a `404`) so dashboards can poll continuously across boot.
+
+### Related environment variables
+
+- `FERRUM_MESH_REMOTE_DISCOVERY_POLL_INTERVAL_SECONDS` — poll interval for cross-cluster endpoint discovery; `0` (default) disables it and forces `discovered` empty.
+- `FERRUM_MESH_REMOTE_DISCOVERY_POLL_TIMEOUT_SECONDS` — per-poll request timeout (default `30`).

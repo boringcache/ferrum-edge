@@ -174,7 +174,18 @@ impl RemoteEndpointStore {
     /// Test helper: register a cluster and immediately install its entry in one
     /// step. Production code must use `register_cluster` + `install` so the
     /// generation token is passed through the poll task.
-    #[cfg(test)]
+    ///
+    /// `#[doc(hidden)]` rather than `#[cfg(test)]` so the integration-test crate
+    /// (which compiles against this crate as an external dependency, where
+    /// `cfg(test)` is inactive) can stage a discovered-remote-cluster snapshot
+    /// for the `GET /mesh/remote-clusters` admin handler — mirroring the
+    /// `runtime_overlay_consumers::test_lock` test-support convention. It is not
+    /// part of the supported API and performs the same register+install the
+    /// discovery loop does, so it is harmless if ever reached in a non-test
+    /// build. The runtime crate / binary never call it (only the inline unit
+    /// tests and the integration-test crate do), hence `#[allow(dead_code)]`.
+    #[doc(hidden)]
+    #[allow(dead_code)]
     pub fn install_for_test(&self, entry: RemoteClusterEntry) {
         let new_gen = self.register_cluster(&entry.cluster_name);
         self.install(entry, new_gen);
