@@ -2709,20 +2709,33 @@ async fn handle_h3_request(
         let mut bytes_streamed: u64 = 0;
         let mut body_completed = false;
 
+        // Set when the recv_data arm consumed a backend frame; the loop head
+        // re-arms `read_deadline` on the NEXT iteration so the deadline only
+        // ever measures the wait for the next backend frame and never charges
+        // the time spent sending the previous frame downstream (slow-client H2
+        // backpressure) to the backend. Mirrors `IdleReadTimeoutBody`'s
+        // `waiting` flag on the H2 path.
+        let mut just_received_backend_frame = false;
         // Skipped entirely when send_response already failed above — the
         // relay loop would only rediscover the dead stream on its first
         // send_data and there is no backend data worth pulling for it.
         'outer: while !client_disconnected {
+            // Re-arm the read deadline only after the previous frame has been
+            // sent downstream, so the send interval is excluded from the budget.
+            if read_timeout_active && just_received_backend_frame {
+                read_deadline.as_mut().reset(
+                    tokio::time::Instant::now()
+                        + std::time::Duration::from_millis(backend_read_timeout_ms),
+                );
+                just_received_backend_frame = false;
+            }
             tokio::select! {
                 chunk_result = h3_resp.recv_stream.recv_data(), if !stream_done => {
                     match chunk_result {
                         Ok(Some(mut chunk)) => {
-                            if read_timeout_active {
-                                read_deadline.as_mut().reset(
-                                    tokio::time::Instant::now()
-                                        + std::time::Duration::from_millis(backend_read_timeout_ms),
-                                );
-                            }
+                            // Defer the deadline re-arm to the loop head so the
+                            // downstream send below is excluded from the budget.
+                            just_received_backend_frame = true;
                             let chunk_len = chunk.remaining();
                             // Always count received bytes — the graceful-close
                             // recovery below uses this to decide if the body is
@@ -2940,7 +2953,28 @@ async fn handle_h3_request(
             }
         }
 
-        // Record outcome
+        // Record outcome.
+        //
+        // A streaming body that reached this point already delivered its
+        // response headers, so any terminal `body_error_class` is post-wire.
+        // Mirror the refined/cross-protocol streaming consumer's predicate (see
+        // the `(h3_error_class, body_error_class)` match further below) so the
+        // native and refined H3 streaming paths classify identically:
+        //   * `ReadWriteTimeout` — post-wire read timeout, NOT a connect failure
+        //     (matches the H2 `IdleReadTimeoutBody` path and the buffered H3
+        //     path); previously hard-coded `(false, None)` hid it from passive
+        //     health entirely.
+        //   * `ClientDisconnect` — a client-side signal; feeding the class
+        //     through instead of `None` lets the circuit breaker / passive
+        //     health treat it as neutral rather than a phantom backend success.
+        //   * any other body fault (mid-stream reset/close, `ResponseBodyTooLarge`)
+        //     — a backend fault, consistent with the refined-streaming consumer.
+        let body_outcome_connection_error = match body_error_class {
+            None
+            | Some(crate::retry::ErrorClass::ReadWriteTimeout)
+            | Some(crate::retry::ErrorClass::ClientDisconnect) => false,
+            Some(_) => true,
+        };
         crate::proxy::backend_dispatch::record_backend_outcome(
             &state,
             &proxy,
@@ -2949,21 +2983,16 @@ async fn handle_h3_request(
             upstream_target.as_deref(),
             cb_target_key.as_deref(),
             response_status,
-            false,
-            None,
+            body_outcome_connection_error,
+            body_error_class,
             cb_is_half_open_probe,
             false,
             backend_start.elapsed(),
         );
-        let backend_admission_connection_error = match body_error_class {
-            Some(crate::retry::ErrorClass::ClientDisconnect) => false,
-            Some(_) => true,
-            None => false,
-        };
         record_h3_backend_admission_outcome(
             &mut backend_admission_permits,
             response_status,
-            backend_admission_connection_error,
+            body_outcome_connection_error,
             body_error_class,
             backend_admission_response_elapsed,
         );
@@ -3302,9 +3331,15 @@ async fn handle_h3_request(
         //      see only the 503 status and skipping passive-health
         //      transport-failure accounting.
         //
-        // Current 5-arm predicate driven by `(error_class, body_error_class)`:
+        // Current predicate driven by `(error_class, body_error_class)`:
         //
         //   * `(None, None)` — clean response. Not a connection error.
+        //   * `(_, Some(ReadWriteTimeout))` — streaming read timeout. Post-wire
+        //     (headers already delivered), so NOT a connection error — matches
+        //     the H2 `IdleReadTimeoutBody` path, the buffered H3 path, and the
+        //     native-H3 streaming loop. The read-deadline arm records
+        //     ReadWriteTimeout on BOTH the terminal and body class, so intercept
+        //     it here before the generic backend-fault arms below.
         //   * `(None, Some(ClientDisconnect))` — client gave up between
         //     headers and end-of-body. Not a backend fault.
         //   * `(None, Some(_))` — body-phase issue with no terminal
@@ -3322,11 +3357,17 @@ async fn handle_h3_request(
         //     achieving the PR's primary goal.
         let connection_error = match (h3_error_class, h3_stream_result.body_error_class) {
             (None, None) => false,
+            (_, Some(crate::retry::ErrorClass::ReadWriteTimeout)) => false,
             (None, Some(crate::retry::ErrorClass::ClientDisconnect)) => false,
             (None, Some(_)) => true,
             (Some(_), Some(_)) => true,
             (Some(_), None) => !h3_stream_result.request_on_wire,
         };
+        // Prefer the body class so a body-only ClientDisconnect is recognized as
+        // a client-side (non-backend) signal by passive health / the breaker
+        // instead of a phantom success (the terminal `h3_error_class` is None for
+        // a mid-body client disconnect). Shared with the admission outcome below.
+        let backend_outcome_error_class = h3_stream_result.body_error_class.or(h3_error_class);
         crate::proxy::backend_dispatch::record_backend_outcome(
             &state,
             &proxy,
@@ -3336,17 +3377,16 @@ async fn handle_h3_request(
             cb_target_key.as_deref(),
             backend_status,
             connection_error,
-            h3_error_class,
+            backend_outcome_error_class,
             cb_is_half_open_probe,
             false,
             backend_start.elapsed(),
         );
-        let backend_admission_error_class = h3_stream_result.body_error_class.or(h3_error_class);
         record_h3_backend_admission_outcome(
             &mut backend_admission_permits,
             backend_status,
             connection_error,
-            backend_admission_error_class,
+            backend_outcome_error_class,
             h3_stream_result.backend_admission_elapsed,
         );
 
@@ -4773,18 +4813,25 @@ async fn stream_h3_open_response_to_client(
     let mut body_completed = false;
     let mut body_error_class: Option<crate::retry::ErrorClass> = None;
     let mut terminal_error_class: Option<crate::retry::ErrorClass> = None;
+    // See `just_received_backend_frame` in the native H3 streaming loop: the
+    // deadline is re-armed at the loop head AFTER the prior frame's downstream
+    // send, so slow-client backpressure is never charged to the backend.
+    let mut just_received_backend_frame = false;
 
     'outer: loop {
+        if read_timeout_active && just_received_backend_frame {
+            read_deadline.as_mut().reset(
+                tokio::time::Instant::now()
+                    + std::time::Duration::from_millis(backend_read_timeout_ms),
+            );
+            just_received_backend_frame = false;
+        }
         tokio::select! {
             chunk_result = recv_stream.recv_data(), if !stream_done => {
                 match chunk_result {
                     Ok(Some(mut chunk)) => {
-                        if read_timeout_active {
-                            read_deadline.as_mut().reset(
-                                tokio::time::Instant::now()
-                                    + std::time::Duration::from_millis(backend_read_timeout_ms),
-                            );
-                        }
+                        // Defer the deadline re-arm to the loop head.
+                        just_received_backend_frame = true;
                         let chunk_len = chunk.remaining();
                         total_streamed += chunk_len;
                         if state.max_response_body_size_bytes > 0
@@ -5208,18 +5255,25 @@ async fn proxy_to_backend_h3_streaming(
     let mut body_completed = false;
     let mut body_error_class: Option<crate::retry::ErrorClass> = None;
     let mut terminal_error_class: Option<crate::retry::ErrorClass> = None;
+    // See `just_received_backend_frame` in the native H3 streaming loop: the
+    // deadline is re-armed at the loop head AFTER the prior frame's downstream
+    // send, so slow-client backpressure is never charged to the backend.
+    let mut just_received_backend_frame = false;
 
     'outer: loop {
+        if read_timeout_active && just_received_backend_frame {
+            read_deadline.as_mut().reset(
+                tokio::time::Instant::now()
+                    + std::time::Duration::from_millis(backend_read_timeout_ms),
+            );
+            just_received_backend_frame = false;
+        }
         tokio::select! {
             chunk_result = h3_resp.recv_stream.recv_data(), if !stream_done => {
                 match chunk_result {
                     Ok(Some(mut chunk)) => {
-                        if read_timeout_active {
-                            read_deadline.as_mut().reset(
-                                tokio::time::Instant::now()
-                                    + std::time::Duration::from_millis(backend_read_timeout_ms),
-                            );
-                        }
+                        // Defer the deadline re-arm to the loop head.
+                        just_received_backend_frame = true;
                         let chunk_len = chunk.remaining();
                         // Always count received bytes — the graceful-close
                         // recovery below uses this to decide if the body is
