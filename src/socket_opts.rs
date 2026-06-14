@@ -412,6 +412,96 @@ fn apply_tcp_keepalive_inner(
     socket.set_tcp_keepalive(&params)
 }
 
+/// Apply TCP keepalive on a freshly connected, socket-owning H2-family pool
+/// connection, honoring a DestinationRule `connectionPool.tcp.tcpKeepalive`
+/// per-port override when present and otherwise falling back to the global
+/// pool keepalive (whole-seconds `time` only, the pre-existing behavior).
+///
+/// This is the pooled-connection analogue of `tcp_proxy::apply_backend_tcp_keepalive`
+/// (stream-family). The H2-family pools (direct-H2, gRPC, HBONE, mesh-mTLS)
+/// previously applied only the global `pool_config.tcp_keepalive_seconds` here;
+/// this resolves the per-port DR override the SAME way the stream path does
+/// (`proxy.dispatch_port_overrides[port].tcp_keepalive`, keyed by the dial
+/// target's app/service port) and applies its full time/interval/probes when
+/// set. The DR override is additive and takes precedence; the global value
+/// remains the fallback so existing (non-mesh / no-DR) behavior is unchanged.
+///
+/// IMPORTANT: keepalive is NOT part of the pool key (forbidden by the
+/// proxy-protocol rules — see `.claude/rules/proxy-protocols.md` "Never add
+/// policy fields ... keepalives to pool keys"). Because the setting is applied
+/// once at connection creation on a pooled+shared multiplexed connection, the
+/// "first proxy to materialize the pooled connection wins" tradeoff applies
+/// (same as documented for `idleTimeout` / `maxRequestsPerConnection`): later
+/// dispatchers that differ only in keepalive reuse the existing connection and
+/// inherit the keepalive of whoever created it.
+///
+/// Best-effort: a `setsockopt` failure logs at `warn!` and continues rather
+/// than dropping the backend connection — keepalive is an operational hint,
+/// not a correctness requirement (matches the stream path).
+pub fn apply_pooled_tcp_keepalive(
+    pool: &str,
+    stream: &tokio::net::TcpStream,
+    port_override: Option<&crate::config::types::TcpKeepaliveCfg>,
+    global_enabled: bool,
+    global_seconds: u64,
+) {
+    // Per-port DR override takes precedence (full time/interval/probes).
+    if let Some(cfg) = port_override.filter(|c| !c.is_empty()) {
+        apply_pooled_tcp_keepalive_cfg(pool, stream, cfg);
+        return;
+    }
+    // Fallback: global pool keepalive (whole-seconds idle time only).
+    if global_enabled {
+        apply_pooled_tcp_keepalive_cfg(
+            pool,
+            stream,
+            &crate::config::types::TcpKeepaliveCfg {
+                time_seconds: Some(global_seconds as u32),
+                interval_seconds: None,
+                probes: None,
+            },
+        );
+    }
+}
+
+/// Shared apply that maps a [`crate::config::types::TcpKeepaliveCfg`] onto a
+/// connected `tokio::net::TcpStream`, logging at `warn!` (best-effort) on a
+/// `setsockopt` failure. Used by [`apply_pooled_tcp_keepalive`] for both the
+/// DR-override and global-fallback branches so the two share one fd-lifecycle
+/// and error contract.
+fn apply_pooled_tcp_keepalive_cfg(
+    pool: &str,
+    stream: &tokio::net::TcpStream,
+    cfg: &crate::config::types::TcpKeepaliveCfg,
+) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        if let Err(e) = apply_tcp_keepalive(stream.as_raw_fd(), cfg) {
+            tracing::warn!(
+                pool = %pool,
+                error = %e,
+                "Failed to apply TCP keepalive on pooled backend socket; continuing"
+            );
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawSocket;
+        if let Err(e) = apply_tcp_keepalive(stream.as_raw_socket(), cfg) {
+            tracing::warn!(
+                pool = %pool,
+                error = %e,
+                "Failed to apply TCP keepalive on pooled backend socket; continuing"
+            );
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (pool, stream, cfg);
+    }
+}
+
 // ── TCP_INFO (BDP-optimal buffer sizing) ───────────────────────────────
 
 /// Kernel-level TCP connection metrics from `getsockopt(TCP_INFO)`.
@@ -2612,6 +2702,104 @@ mod keepalive_tests {
         // Any further getsockopt would EBADF if the helper accidentally
         // dropped the borrowed fd.
         let _ = getsockopt_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE);
+    }
+
+    // ── apply_pooled_tcp_keepalive (H2-family pool resolution + fallback) ──
+    //
+    // These exercise the helper the socket-owning H2-family pools (direct-H2,
+    // gRPC, HBONE, mesh-mTLS) call at connection creation: a DR per-port
+    // `tcpKeepalive` override takes precedence (full time/interval/probes),
+    // and otherwise the global pool keepalive (whole-seconds idle time only)
+    // is the fallback — preserving the pre-existing behavior. They use a real
+    // `tokio::net::TcpStream` loopback pair so the fd path matches production.
+
+    async fn tokio_loopback_client() -> tokio::net::TcpStream {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        // Keep the accepted server side alive for the connection's lifetime.
+        let (server, _) = listener.accept().await.unwrap();
+        std::mem::forget(server);
+        client
+    }
+
+    #[tokio::test]
+    async fn pooled_keepalive_override_takes_precedence_over_global() {
+        let client = tokio_loopback_client().await;
+        let fd = client.as_raw_fd();
+        let cfg = TcpKeepaliveCfg {
+            time_seconds: Some(150),
+            interval_seconds: Some(25),
+            probes: Some(7),
+        };
+        // Override present AND a (different) global value set — the override
+        // must win and apply its full time/interval/probes.
+        super::apply_pooled_tcp_keepalive("test_pool", &client, Some(&cfg), true, 999);
+
+        let so_keepalive = getsockopt_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE);
+        assert_ne!(so_keepalive, 0, "override must enable SO_KEEPALIVE");
+
+        #[cfg(target_os = "linux")]
+        let time_name = libc::TCP_KEEPIDLE;
+        #[cfg(target_os = "macos")]
+        let time_name = libc::TCP_KEEPALIVE;
+        let time = getsockopt_int(fd, libc::IPPROTO_TCP, time_name);
+        assert_eq!(time, 150, "override time_seconds must win over global 999");
+        let interval = getsockopt_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL);
+        assert_eq!(interval, 25, "override interval_seconds must apply");
+        let probes = getsockopt_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT);
+        assert_eq!(probes, 7, "override probes must apply");
+    }
+
+    #[tokio::test]
+    async fn pooled_keepalive_falls_back_to_global_seconds_when_no_override() {
+        let client = tokio_loopback_client().await;
+        let fd = client.as_raw_fd();
+        // No DR override → fall back to the global pool keepalive (seconds-only
+        // idle time), preserving the pre-existing pool behavior.
+        super::apply_pooled_tcp_keepalive("test_pool", &client, None, true, 222);
+
+        let so_keepalive = getsockopt_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE);
+        assert_ne!(so_keepalive, 0, "global fallback must enable SO_KEEPALIVE");
+
+        #[cfg(target_os = "linux")]
+        let time_name = libc::TCP_KEEPIDLE;
+        #[cfg(target_os = "macos")]
+        let time_name = libc::TCP_KEEPALIVE;
+        let time = getsockopt_int(fd, libc::IPPROTO_TCP, time_name);
+        assert_eq!(time, 222, "global keepalive seconds must apply as idle time");
+    }
+
+    #[tokio::test]
+    async fn pooled_keepalive_global_disabled_is_noop() {
+        let client = tokio_loopback_client().await;
+        let fd = client.as_raw_fd();
+        // No override AND global disabled → nothing applied, SO_KEEPALIVE off.
+        super::apply_pooled_tcp_keepalive("test_pool", &client, None, false, 222);
+        let so_keepalive = getsockopt_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE);
+        assert_eq!(
+            so_keepalive, 0,
+            "no override + global disabled must not enable keepalive"
+        );
+    }
+
+    #[tokio::test]
+    async fn pooled_keepalive_empty_override_falls_back_to_global() {
+        let client = tokio_loopback_client().await;
+        let fd = client.as_raw_fd();
+        // An empty (all-None) override must NOT be treated as "configured" —
+        // it falls through to the global fallback so an upstream that carried
+        // an empty `tcpKeepalive` does not suppress the global keepalive.
+        let empty = TcpKeepaliveCfg::default();
+        super::apply_pooled_tcp_keepalive("test_pool", &client, Some(&empty), true, 333);
+        let so_keepalive = getsockopt_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE);
+        assert_ne!(so_keepalive, 0, "empty override should fall back to global");
+        #[cfg(target_os = "linux")]
+        let time_name = libc::TCP_KEEPIDLE;
+        #[cfg(target_os = "macos")]
+        let time_name = libc::TCP_KEEPALIVE;
+        let time = getsockopt_int(fd, libc::IPPROTO_TCP, time_name);
+        assert_eq!(time, 333, "empty override falls back to global seconds");
     }
 }
 

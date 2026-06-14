@@ -717,11 +717,26 @@ impl GrpcPoolManager {
         // Disable Nagle for lower latency
         let _ = tcp.set_nodelay(true);
 
-        // Apply TCP keepalive using per-proxy pool config
+        // Apply TCP keepalive: honor the DestinationRule
+        // `connectionPool.tcp.tcpKeepalive` per-port override (keyed by the
+        // dial target's port, `proxy.backend_port`), falling back to the
+        // global pool keepalive. NOTE: keepalive is NOT in the pool key
+        // (forbidden by `.claude/rules/proxy-protocols.md`), and this
+        // connection is pooled+shared, so the first dispatcher to materialize
+        // the connection wins — same first-materializer tradeoff documented
+        // for `idleTimeout` / `maxRequestsPerConnection`.
         let pool_config = self.global_pool_config.for_proxy(proxy);
-        if pool_config.enable_http_keep_alive {
-            Self::set_tcp_keepalive(&tcp, pool_config.tcp_keepalive_seconds);
-        }
+        crate::socket_opts::apply_pooled_tcp_keepalive(
+            "grpc_proxy",
+            &tcp,
+            proxy
+                .dispatch_port_overrides
+                .as_ref()
+                .and_then(|m| m.get(&port))
+                .and_then(|o| o.tcp_keepalive.as_ref()),
+            pool_config.enable_http_keep_alive,
+            pool_config.tcp_keepalive_seconds,
+        );
 
         let use_tls = matches!(proxy.backend_scheme, Some(BackendScheme::Https));
 
@@ -788,25 +803,6 @@ impl GrpcPoolManager {
         }
 
         builder
-    }
-
-    /// Set TCP keepalive on a stream to detect dead backend connections.
-    fn set_tcp_keepalive(stream: &TcpStream, keepalive_seconds: u64) {
-        #[cfg(unix)]
-        use std::os::fd::AsFd;
-        #[cfg(windows)]
-        use std::os::windows::io::AsSocket;
-
-        #[cfg(unix)]
-        let borrowed = stream.as_fd();
-        #[cfg(windows)]
-        let borrowed = stream.as_socket();
-        let socket = socket2::SockRef::from(&borrowed);
-        let keepalive =
-            socket2::TcpKeepalive::new().with_time(Duration::from_secs(keepalive_seconds));
-        if let Err(e) = socket.set_tcp_keepalive(&keepalive) {
-            debug!("gRPC: failed to set TCP keepalive: {}", e);
-        }
     }
 
     /// Create an h2c (cleartext HTTP/2) connection using prior knowledge.

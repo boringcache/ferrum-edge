@@ -7929,6 +7929,7 @@ async fn connect_mesh_websocket_backend(
                 .open_ws_connect_tunnel(
                     proxy,
                     &target.host,
+                    target.port,
                     mtls_port,
                     &authority,
                     path_and_query,
