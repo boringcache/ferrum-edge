@@ -1365,6 +1365,10 @@ fn reverse_translate(
         // Local workload(s) preserved un-narrowed for inbound materialization
         // (Sidecar identity narrowing can drop the local pod from `workloads`).
         local_inbound_workloads: recovered.local_inbound_workloads,
+        // F6 §6.2: resolved Sidecar ingress[] listeners recovered from the
+        // LocalIngressListeners carrier. Empty when the CP modeled no custom
+        // inbound listeners.
+        local_ingress_listeners: recovered.local_ingress_listeners,
         // GAP-1a: authorization policies recovered from the MeshPolicies
         // carrier. Without this the xDS mesh had NO authz (implicit allow-all).
         mesh_policies: recovered.mesh_policies,
@@ -1429,6 +1433,7 @@ struct RecoveredSliceCarriers {
     services: Option<Vec<MeshService>>,
     local_inbound_services: Vec<MeshService>,
     local_inbound_workloads: Option<Vec<crate::modes::mesh::config::Workload>>,
+    local_ingress_listeners: Vec<crate::modes::mesh::config::ResolvedIngressListener>,
     labels: Option<BTreeMap<String, String>>,
     workloads: Vec<crate::modes::mesh::config::Workload>,
     mesh_policies: Vec<crate::modes::mesh::config::MeshPolicy>,
@@ -1653,6 +1658,7 @@ fn apply_recovered_carrier(
         MeshSliceCarrier::LocalInboundWorkloads(value) => {
             recovered.local_inbound_workloads = Some(value)
         }
+        MeshSliceCarrier::LocalIngressListeners(value) => recovered.local_ingress_listeners = value,
         MeshSliceCarrier::Workloads(value) => recovered.workloads = value,
         MeshSliceCarrier::WorkloadLabels(value) => recovered.labels = Some(value),
         MeshSliceCarrier::MeshPolicies(value) => recovered.mesh_policies = value,

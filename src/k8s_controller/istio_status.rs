@@ -25,8 +25,10 @@
 //!   and host/endpoint/port counts.
 //! - `RequestAuthentication` — status reports the resolved scope and the
 //!   number of JWT rules (permissive-by-default semantics).
-//! - `Sidecar` — status reports the egress scope and flags `ingress`
-//!   listener config as deferred (Ferrum models egress scoping only).
+//! - `Sidecar` — status reports the egress scope and the modeled `ingress[]`
+//!   listener count. Only ingress entries Ferrum cannot model (Unix-socket /
+//!   non-loopback `defaultEndpoint`, non-HTTP-family protocol) remain in
+//!   `deferred_fields`; resolvable listeners are materialized.
 //! - `Telemetry` — status reports which sections (tracing / metrics /
 //!   accessLogging) are present.
 //! - `WorkloadEntry` — status reports the derived SPIFFE service account
@@ -981,10 +983,12 @@ fn workload_entry_status(
     }
 }
 
-/// Status for `Sidecar`. Ferrum models only the egress scope of a Sidecar;
-/// `ingress` listener configuration is intentionally not modeled and is
-/// surfaced as a deferred field. The egress narrowing itself is gated by
+/// Status for `Sidecar`. Ferrum models the egress scope AND (F6 §6.2) the
+/// `ingress[]` custom inbound listeners. Egress narrowing is gated by
 /// `FERRUM_MESH_SIDECAR_ENFORCED` (Sidecars are always parsed/persisted).
+/// Ingress entries that Ferrum cannot represent (Unix-socket / non-loopback
+/// `defaultEndpoint`, non-HTTP-family protocol) stay in `deferred_fields`;
+/// resolvable listeners are materialized and reported via `ingress_modeled`.
 fn sidecar_status(
     object: &K8sObject,
     result: Result<&K8sTranslation, &K8sTranslateError>,
@@ -1012,19 +1016,22 @@ fn sidecar_status(
 
     match result {
         Ok(_translation) => {
-            let mut deferred: Vec<&'static str> = Vec::new();
-            if object.spec.get("ingress").is_some() {
-                deferred.push("ingress[] (listener config not modeled; egress scope only)");
+            let (ingress_modeled, ingress_deferred) =
+                classify_sidecar_ingress_entries(&object.spec);
+            let mut deferred: Vec<String> = Vec::new();
+            for reason in &ingress_deferred {
+                deferred.push(format!("ingress[] {reason}"));
             }
             let message = if deferred.is_empty() {
                 format!(
                     "Ferrum accepted this Sidecar (scope: {scope}; {egress_entry_count} egress entry/entries; \
-                     egress narrowing gated by FERRUM_MESH_SIDECAR_ENFORCED)"
+                     {ingress_modeled} ingress listener(s) modeled; egress narrowing gated by \
+                     FERRUM_MESH_SIDECAR_ENFORCED)"
                 )
             } else {
                 format!(
-                    "Ferrum accepted this Sidecar (scope: {scope}; {egress_entry_count} egress entry/entries); \
-                     deferred fields: {}",
+                    "Ferrum accepted this Sidecar (scope: {scope}; {egress_entry_count} egress entry/entries; \
+                     {ingress_modeled} ingress listener(s) modeled); deferred fields: {}",
                     deferred.join(", ")
                 )
             };
@@ -1032,6 +1039,7 @@ fn sidecar_status(
                 "translation": {
                     "scope": scope,
                     "egress_entries": egress_entry_count,
+                    "ingress_modeled": ingress_modeled,
                     "deferred_fields": deferred,
                 }
             });
@@ -1049,6 +1057,74 @@ fn sidecar_status(
             accepted_status(object, false, "Invalid", &message, Some(detail))
         }
     }
+}
+
+/// Classify a Sidecar's `spec.ingress[]` entries into (modeled_count,
+/// deferred_reasons) so the status writer reports which listeners Ferrum
+/// materialized and which it left deferred. Mirrors
+/// `MeshSidecarIngress::resolve` fail-closed semantics on the raw spec so the
+/// translator predicate and the status writer stay in lock-step: an entry is
+/// modeled iff its protocol is HTTP-family AND its `defaultEndpoint` is a
+/// loopback / instance-IP `host:port`. Unix-socket and non-loopback endpoints,
+/// non-HTTP-family protocols, and unparseable shapes are deferred (the
+/// translator still accepts the resource; only the unmodeled entries surface
+/// here).
+fn classify_sidecar_ingress_entries(spec: &Value) -> (usize, Vec<&'static str>) {
+    let Some(entries) = spec.get("ingress").and_then(Value::as_array) else {
+        return (0, Vec::new());
+    };
+    let mut modeled = 0usize;
+    let mut deferred: Vec<&'static str> = Vec::new();
+    let push_unique = |deferred: &mut Vec<&'static str>, reason: &'static str| {
+        if !deferred.contains(&reason) {
+            deferred.push(reason);
+        }
+    };
+    for entry in entries {
+        let protocol = entry
+            .get("port")
+            .and_then(|p| p.get("protocol"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let http_family = matches!(
+            protocol.as_str(),
+            "http" | "http2" | "grpc" | "" | "unknown"
+        );
+        let endpoint = entry
+            .get("defaultEndpoint")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        if !http_family {
+            push_unique(
+                &mut deferred,
+                "non-HTTP-family listener (raw-TCP inbound not modeled)",
+            );
+            continue;
+        }
+        if endpoint.starts_with("unix://") {
+            push_unique(
+                &mut deferred,
+                "unix:// defaultEndpoint not representable (host:port backends only)",
+            );
+            continue;
+        }
+        match endpoint.parse::<std::net::SocketAddr>() {
+            Ok(addr)
+                if addr.port() != 0 && (addr.ip().is_loopback() || addr.ip().is_unspecified()) =>
+            {
+                modeled += 1;
+            }
+            _ => {
+                push_unique(
+                    &mut deferred,
+                    "defaultEndpoint must be a loopback/instance-IP host:port",
+                );
+            }
+        }
+    }
+    (modeled, deferred)
 }
 
 /// Status for `Telemetry`. Reports which top-level sections (tracing /
@@ -2391,7 +2467,9 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_ingress_surfaces_deferred_field() {
+    fn sidecar_supported_ingress_is_modeled_not_deferred() {
+        // A loopback HTTP listener is modeled (F6 §6.2): reported via
+        // `ingress_modeled`, NOT flagged deferred.
         let obj = object(
             "networking.istio.io/v1",
             "Sidecar",
@@ -2403,6 +2481,11 @@ mod tests {
         );
         let updates = plan_istio_status_updates(&[obj], options());
         let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        assert_eq!(
+            detail["translation"]["ingress_modeled"].as_u64(),
+            Some(1),
+            "a loopback HTTP listener is modeled"
+        );
         let deferred: Vec<&str> = detail["translation"]["deferred_fields"]
             .as_array()
             .unwrap()
@@ -2410,8 +2493,48 @@ mod tests {
             .filter_map(Value::as_str)
             .collect();
         assert!(
-            deferred.iter().any(|f| f.contains("ingress")),
-            "Sidecar ingress should be flagged as deferred, got {deferred:?}"
+            deferred.is_empty(),
+            "a fully supported ingress listener is not deferred, got {deferred:?}"
+        );
+    }
+
+    #[test]
+    fn sidecar_unsupported_ingress_surfaces_deferred_field() {
+        // Unix-socket and non-HTTP-family listeners stay deferred even though
+        // the resource is accepted; a supported sibling is still counted as
+        // modeled.
+        let obj = object(
+            "networking.istio.io/v1",
+            "Sidecar",
+            "ingress-sidecar",
+            json!({
+                "ingress": [
+                    { "port": { "number": 9080, "protocol": "HTTP" }, "defaultEndpoint": "127.0.0.1:8080" },
+                    { "port": { "number": 7000, "protocol": "GRPC" }, "defaultEndpoint": "unix:///var/run/grpc.sock" },
+                    { "port": { "number": 6000, "protocol": "TCP" }, "defaultEndpoint": "127.0.0.1:6000" }
+                ]
+            }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options());
+        let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        assert_eq!(
+            detail["translation"]["ingress_modeled"].as_u64(),
+            Some(1),
+            "only the loopback HTTP listener is modeled"
+        );
+        let deferred: Vec<&str> = detail["translation"]["deferred_fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            deferred.iter().any(|f| f.contains("unix://")),
+            "unix-socket listener must be deferred, got {deferred:?}"
+        );
+        assert!(
+            deferred.iter().any(|f| f.contains("non-HTTP-family")),
+            "TCP listener must be deferred, got {deferred:?}"
         );
     }
 

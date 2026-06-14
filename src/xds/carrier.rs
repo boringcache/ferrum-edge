@@ -44,8 +44,8 @@ use std::collections::BTreeMap;
 
 use crate::modes::mesh::config::{
     MeshPolicy, MeshProxyConfig, MeshRequestAuthentication, MeshService, MeshTelemetryResource,
-    MultiClusterConfig, OutboundTrafficPolicy, PeerAuthentication, ServiceEntry, TrustBundleSet,
-    Workload,
+    MultiClusterConfig, OutboundTrafficPolicy, PeerAuthentication, ResolvedIngressListener,
+    ServiceEntry, TrustBundleSet, Workload,
 };
 use crate::modes::mesh::slice::{MeshEgressScopeSnapshot, MeshSlice};
 
@@ -68,6 +68,12 @@ pub const FERRUM_ECDS_LOCAL_INBOUND_SERVICES_TYPE_URL: &str =
 /// when identity narrowing drops it from the `Workloads` carrier.
 pub const FERRUM_ECDS_LOCAL_INBOUND_WORKLOADS_TYPE_URL: &str =
     "type.googleapis.com/ferrum.config.extension.v3.LocalInboundWorkloadsCarrier";
+/// Inner `type_url` for the resolved Sidecar `ingress[]` custom inbound
+/// listeners (F6 §6.2). Distinct from the service-derived inbound views: these
+/// are operator-declared listener ports → loopback `defaultEndpoint`s and,
+/// when present, replace the default per-service-port inbound materialization.
+pub const FERRUM_ECDS_LOCAL_INGRESS_LISTENERS_TYPE_URL: &str =
+    "type.googleapis.com/ferrum.config.extension.v3.LocalIngressListenersCarrier";
 /// Inner `type_url` for the per-pod workload / endpoint carrier.
 pub const FERRUM_ECDS_WORKLOADS_TYPE_URL: &str =
     "type.googleapis.com/ferrum.config.extension.v3.WorkloadsCarrier";
@@ -119,6 +125,7 @@ pub enum MeshSliceCarrier {
     Services(Vec<MeshService>),
     LocalInboundServices(Vec<MeshService>),
     LocalInboundWorkloads(Vec<Workload>),
+    LocalIngressListeners(Vec<ResolvedIngressListener>),
     Workloads(Vec<Workload>),
     WorkloadLabels(BTreeMap<String, String>),
     MeshPolicies(Vec<MeshPolicy>),
@@ -144,6 +151,9 @@ impl MeshSliceCarrier {
             MeshSliceCarrier::LocalInboundWorkloads(_) => {
                 FERRUM_ECDS_LOCAL_INBOUND_WORKLOADS_TYPE_URL
             }
+            MeshSliceCarrier::LocalIngressListeners(_) => {
+                FERRUM_ECDS_LOCAL_INGRESS_LISTENERS_TYPE_URL
+            }
             MeshSliceCarrier::Workloads(_) => FERRUM_ECDS_WORKLOADS_TYPE_URL,
             MeshSliceCarrier::WorkloadLabels(_) => FERRUM_ECDS_LABELS_TYPE_URL,
             MeshSliceCarrier::MeshPolicies(_) => FERRUM_ECDS_MESH_POLICIES_TYPE_URL,
@@ -165,6 +175,7 @@ impl MeshSliceCarrier {
             MeshSliceCarrier::Services(_) => "services",
             MeshSliceCarrier::LocalInboundServices(_) => "local-inbound-services",
             MeshSliceCarrier::LocalInboundWorkloads(_) => "local-inbound-workloads",
+            MeshSliceCarrier::LocalIngressListeners(_) => "local-ingress-listeners",
             MeshSliceCarrier::Workloads(_) => "workloads",
             MeshSliceCarrier::WorkloadLabels(_) => "workload-labels",
             MeshSliceCarrier::MeshPolicies(_) => "mesh-policies",
@@ -187,6 +198,7 @@ impl MeshSliceCarrier {
             MeshSliceCarrier::Services(value) => encode(value),
             MeshSliceCarrier::LocalInboundServices(value) => encode(value),
             MeshSliceCarrier::LocalInboundWorkloads(value) => encode(value),
+            MeshSliceCarrier::LocalIngressListeners(value) => encode(value),
             MeshSliceCarrier::Workloads(value) => encode(value),
             MeshSliceCarrier::WorkloadLabels(value) => encode(value),
             MeshSliceCarrier::MeshPolicies(value) => encode(value),
@@ -223,6 +235,9 @@ impl MeshSliceCarrier {
             }
             FERRUM_ECDS_LOCAL_INBOUND_WORKLOADS_TYPE_URL => {
                 MeshSliceCarrier::LocalInboundWorkloads(decode_json(value)?)
+            }
+            FERRUM_ECDS_LOCAL_INGRESS_LISTENERS_TYPE_URL => {
+                MeshSliceCarrier::LocalIngressListeners(decode_json(value)?)
             }
             FERRUM_ECDS_WORKLOADS_TYPE_URL => MeshSliceCarrier::Workloads(decode_json(value)?),
             FERRUM_ECDS_LABELS_TYPE_URL => MeshSliceCarrier::WorkloadLabels(decode_json(value)?),
@@ -272,6 +287,9 @@ pub fn carrier_resource_name_for_type_url(type_url: &str) -> Option<&'static str
         }
         FERRUM_ECDS_LOCAL_INBOUND_WORKLOADS_TYPE_URL => {
             Some("ferrum-mesh-carrier/local-inbound-workloads")
+        }
+        FERRUM_ECDS_LOCAL_INGRESS_LISTENERS_TYPE_URL => {
+            Some("ferrum-mesh-carrier/local-ingress-listeners")
         }
         FERRUM_ECDS_WORKLOADS_TYPE_URL => Some("ferrum-mesh-carrier/workloads"),
         FERRUM_ECDS_LABELS_TYPE_URL => Some("ferrum-mesh-carrier/workload-labels"),
@@ -332,6 +350,11 @@ pub fn build_slice_carriers(slice: &MeshSlice) -> Vec<MeshSliceCarrier> {
     // materialize nothing); absence means no narrowing (fall back to workloads).
     if let Some(local) = slice.local_inbound_workloads.as_ref() {
         carriers.push(MeshSliceCarrier::LocalInboundWorkloads(local.clone()));
+    }
+    if !slice.local_ingress_listeners.is_empty() {
+        carriers.push(MeshSliceCarrier::LocalIngressListeners(
+            slice.local_ingress_listeners.clone(),
+        ));
     }
     if !slice.workloads.is_empty() {
         carriers.push(MeshSliceCarrier::Workloads(slice.workloads.clone()));
@@ -402,6 +425,7 @@ pub fn apply_carrier(slice: &mut MeshSlice, carrier: MeshSliceCarrier) {
         MeshSliceCarrier::LocalInboundWorkloads(value) => {
             slice.local_inbound_workloads = Some(value)
         }
+        MeshSliceCarrier::LocalIngressListeners(value) => slice.local_ingress_listeners = value,
         MeshSliceCarrier::Workloads(value) => slice.workloads = value,
         MeshSliceCarrier::WorkloadLabels(value) => slice.labels = value,
         MeshSliceCarrier::MeshPolicies(value) => slice.mesh_policies = value,
@@ -481,6 +505,13 @@ mod tests {
             MeshSliceCarrier::Services(Vec::new()),
             MeshSliceCarrier::LocalInboundServices(Vec::new()),
             MeshSliceCarrier::LocalInboundWorkloads(Vec::new()),
+            MeshSliceCarrier::LocalIngressListeners(vec![ResolvedIngressListener {
+                port: 8443,
+                endpoint_host: "127.0.0.1".to_string(),
+                endpoint_port: 8080,
+                owner_namespace: "default".to_string(),
+                owner_service: "reviews".to_string(),
+            }]),
             MeshSliceCarrier::Workloads(Vec::new()),
             MeshSliceCarrier::WorkloadLabels(BTreeMap::from([(
                 "app".to_string(),
@@ -562,6 +593,7 @@ mod tests {
             MeshSliceCarrier::Services(Vec::new()),
             MeshSliceCarrier::LocalInboundServices(Vec::new()),
             MeshSliceCarrier::LocalInboundWorkloads(Vec::new()),
+            MeshSliceCarrier::LocalIngressListeners(Vec::new()),
             MeshSliceCarrier::Workloads(Vec::new()),
             MeshSliceCarrier::WorkloadLabels(BTreeMap::from([(
                 "app".to_string(),

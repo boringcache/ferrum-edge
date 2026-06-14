@@ -3,12 +3,13 @@
 use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain};
 use ferrum_edge::modes::mesh::config::{
-    AppProtocol, ConditionMatch, EastWestGateway, JwtHeader, MeshConfig, MeshDestinationRule,
-    MeshEndpoint, MeshJwtRule, MeshPolicy, MeshRequestAuthentication, MeshRule, MeshService,
-    MeshSidecar, MeshSidecarEgress, MeshSubset, MeshTrafficPolicy, MtlsMode, MultiClusterConfig,
-    ParsedCidr, PeerAuthentication, PolicyAction, PolicyScope, PrincipalMatch, RemoteCluster,
-    RequestMatch, Resolution, ServiceEntry, ServiceEntryLocation, ServicePort, TrustBundle,
-    TrustBundleSet, Workload, WorkloadPort, WorkloadRef, WorkloadSelector, validate_mesh_config,
+    AppProtocol, ConditionMatch, EastWestGateway, IngressListenerUnsupported, JwtHeader,
+    MeshConfig, MeshDestinationRule, MeshEndpoint, MeshJwtRule, MeshPolicy,
+    MeshRequestAuthentication, MeshRule, MeshService, MeshSidecar, MeshSidecarEgress,
+    MeshSidecarIngress, MeshSubset, MeshTrafficPolicy, MtlsMode, MultiClusterConfig, ParsedCidr,
+    PeerAuthentication, PolicyAction, PolicyScope, PrincipalMatch, RemoteCluster, RequestMatch,
+    Resolution, ServiceEntry, ServiceEntryLocation, ServicePort, TrustBundle, TrustBundleSet,
+    Workload, WorkloadPort, WorkloadRef, WorkloadSelector, validate_mesh_config,
 };
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -213,6 +214,7 @@ fn mesh_config_validate_rejects_zero_ports_on_full_mesh_resources() {
                 hosts: vec!["./*".into()],
                 port: Some(0),
             }],
+            ingress: Vec::new(),
         }],
         ..MeshConfig::default()
     };
@@ -261,6 +263,7 @@ fn mesh_config_validate_rejects_empty_destination_rule_and_sidecar_fields() {
                     port: None,
                 },
             ],
+            ingress: Vec::new(),
         }],
         ..MeshConfig::default()
     };
@@ -951,6 +954,7 @@ fn sidecar_host_pattern_accepts_valid_patterns() {
                     hosts: vec![pattern.to_string()],
                     port: None,
                 }],
+                ingress: Vec::new(),
             }],
             ..MeshConfig::default()
         };
@@ -1068,4 +1072,171 @@ fn parsed_cidr_bare_ip_treated_as_host_route() {
     let other: IpAddr = "192.168.1.2".parse().unwrap();
     assert!(cidr_v4.contains(exact));
     assert!(!cidr_v4.contains(other));
+}
+
+// ── Sidecar ingress[] listener resolution (F6 §6.2) ──────────────────────
+
+fn ingress_entry(port: u16, protocol: AppProtocol, endpoint: &str) -> MeshSidecarIngress {
+    MeshSidecarIngress {
+        port,
+        protocol,
+        name: None,
+        bind: None,
+        default_endpoint: endpoint.to_string(),
+    }
+}
+
+#[test]
+fn ingress_resolve_accepts_loopback_v4_endpoint() {
+    let resolved = ingress_entry(8443, AppProtocol::Http, "127.0.0.1:8080")
+        .resolve()
+        .expect("loopback v4 endpoint resolves");
+    assert_eq!(resolved.port, 8443);
+    assert_eq!(resolved.endpoint_host, "127.0.0.1");
+    assert_eq!(resolved.endpoint_port, 8080);
+}
+
+#[test]
+fn ingress_resolve_maps_unspecified_v4_to_loopback() {
+    // 0.0.0.0 (instance IP) maps to loopback for a co-located sidecar app.
+    let resolved = ingress_entry(8443, AppProtocol::Http2, "0.0.0.0:9090")
+        .resolve()
+        .expect("0.0.0.0 endpoint resolves to loopback");
+    assert_eq!(resolved.endpoint_host, "127.0.0.1");
+    assert_eq!(resolved.endpoint_port, 9090);
+}
+
+#[test]
+fn ingress_resolve_preserves_v6_address_family() {
+    let resolved = ingress_entry(8443, AppProtocol::Grpc, "[::1]:7000")
+        .resolve()
+        .expect("v6 loopback resolves");
+    assert_eq!(resolved.endpoint_host, "::1");
+    assert_eq!(resolved.endpoint_port, 7000);
+    // The unspecified v6 address maps to ::1 too.
+    let resolved6 = ingress_entry(8443, AppProtocol::Http, "[::]:7000")
+        .resolve()
+        .expect("v6 unspecified resolves to loopback");
+    assert_eq!(resolved6.endpoint_host, "::1");
+}
+
+#[test]
+fn ingress_resolve_unknown_protocol_is_http_family() {
+    // Istio's `unknown`/unset appProtocol defaults to HTTP-family in Ferrum.
+    assert!(
+        ingress_entry(8443, AppProtocol::Unknown, "127.0.0.1:8080")
+            .resolve()
+            .is_ok()
+    );
+}
+
+#[test]
+fn ingress_resolve_rejects_unix_socket_endpoint() {
+    assert_eq!(
+        ingress_entry(8443, AppProtocol::Http, "unix:///var/run/app.sock").resolve(),
+        Err(IngressListenerUnsupported::UnixSocketEndpoint)
+    );
+}
+
+#[test]
+fn ingress_resolve_rejects_non_http_protocol() {
+    assert_eq!(
+        ingress_entry(8443, AppProtocol::Tcp, "127.0.0.1:8080").resolve(),
+        Err(IngressListenerUnsupported::NonHttpProtocol)
+    );
+    assert_eq!(
+        ingress_entry(8443, AppProtocol::Mongo, "127.0.0.1:8080").resolve(),
+        Err(IngressListenerUnsupported::NonHttpProtocol)
+    );
+}
+
+#[test]
+fn ingress_resolve_rejects_arbitrary_ip_endpoint() {
+    // Istio: "Arbitrary IPs are not supported." Ferrum's loopback-only model
+    // fails closed rather than dialing an off-box address.
+    assert_eq!(
+        ingress_entry(8443, AppProtocol::Http, "10.0.0.5:8080").resolve(),
+        Err(IngressListenerUnsupported::UnparseableEndpoint)
+    );
+}
+
+#[test]
+fn ingress_resolve_rejects_unparseable_and_portless_endpoints() {
+    assert_eq!(
+        ingress_entry(8443, AppProtocol::Http, "not-a-socket").resolve(),
+        Err(IngressListenerUnsupported::UnparseableEndpoint)
+    );
+    // host without a port
+    assert_eq!(
+        ingress_entry(8443, AppProtocol::Http, "127.0.0.1").resolve(),
+        Err(IngressListenerUnsupported::UnparseableEndpoint)
+    );
+    // zero endpoint port
+    assert_eq!(
+        ingress_entry(8443, AppProtocol::Http, "127.0.0.1:0").resolve(),
+        Err(IngressListenerUnsupported::ZeroPort)
+    );
+}
+
+#[test]
+fn ingress_resolve_rejects_zero_listener_port() {
+    assert_eq!(
+        ingress_entry(0, AppProtocol::Http, "127.0.0.1:8080").resolve(),
+        Err(IngressListenerUnsupported::ZeroPort)
+    );
+}
+
+#[test]
+fn validate_rejects_zero_ingress_port() {
+    // A zero listener port is structurally invalid. An empty/absent
+    // defaultEndpoint is NOT a hard error (Istio allows omitting it) — it is
+    // deferred and skipped at materialization.
+    let mesh = MeshConfig {
+        sidecars: vec![MeshSidecar {
+            name: "sc".into(),
+            namespace: "default".into(),
+            workload_selector: None,
+            egress_inherits_defaults: false,
+            egress: Vec::new(),
+            ingress: vec![
+                ingress_entry(0, AppProtocol::Http, "127.0.0.1:8080"),
+                ingress_entry(8443, AppProtocol::Http, ""),
+            ],
+        }],
+        ..MeshConfig::default()
+    };
+    let errors = mesh.validate();
+    assert!(
+        errors.iter().any(|e| e.contains("ingress[0].port")),
+        "zero ingress port must be a validation error: {errors:?}"
+    );
+    assert!(
+        !errors.iter().any(|e| e.contains("default_endpoint")),
+        "empty defaultEndpoint is deferred, not a validation error: {errors:?}"
+    );
+}
+
+#[test]
+fn validate_accepts_unsupported_ingress_shapes_for_deferral() {
+    // Unix sockets / non-HTTP protocols are NOT validation errors — they are
+    // accepted (and reported as deferred by the status writer), then skipped
+    // fail-closed at materialization.
+    let mesh = MeshConfig {
+        sidecars: vec![MeshSidecar {
+            name: "sc".into(),
+            namespace: "default".into(),
+            workload_selector: None,
+            egress_inherits_defaults: false,
+            egress: Vec::new(),
+            ingress: vec![
+                ingress_entry(8443, AppProtocol::Http, "unix:///var/run/app.sock"),
+                ingress_entry(9000, AppProtocol::Tcp, "127.0.0.1:9000"),
+            ],
+        }],
+        ..MeshConfig::default()
+    };
+    assert!(
+        mesh.validate().is_empty(),
+        "unsupported-but-well-formed ingress entries are accepted (deferred), not rejected"
+    );
 }

@@ -9,9 +9,9 @@ use crate::modes::mesh::config::{
     MeshConfig, MeshDestinationRule, MeshPolicy, MeshProxyConfig, MeshRequestAuthentication,
     MeshRuntimeOverlay, MeshService, MeshSidecar, MeshSidecarEgress, MeshTelemetryResource,
     MtlsMode, MultiClusterConfig, OutboundTrafficPolicy, PeerAuthentication, PolicyScope,
-    ServiceEntry, SidecarHostPattern, TrustBundleSet, Workload, WorkloadLabels,
-    policy_scope_applies_to_workload, proxy_config_applies_to_workload, scope_applies_to_workload,
-    service_entry_applies_to_workload, workload_selector_matches,
+    ResolvedIngressListener, ServiceEntry, SidecarHostPattern, TrustBundleSet, Workload,
+    WorkloadLabels, policy_scope_applies_to_workload, proxy_config_applies_to_workload,
+    scope_applies_to_workload, service_entry_applies_to_workload, workload_selector_matches,
 };
 use crate::modes::mesh::dns_proxy::DEFAULT_CLUSTER_DOMAIN;
 
@@ -203,6 +203,20 @@ pub struct MeshSlice {
     /// the materializer falls back to the full `workloads`/`services`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_inbound_workloads: Option<Vec<Workload>>,
+    /// Resolved custom inbound listeners from the local workload's applicable
+    /// Istio `Sidecar.ingress[]`. Computed at slice build (the applicable
+    /// Sidecar is resolved CP-side; raw `MeshSidecar` records do not ride the
+    /// slice, only this resolved view — mirroring `local_inbound_services`).
+    /// Per Istio semantics, when this is non-empty it **replaces** the default
+    /// per-service-port inbound materialization for the workload: the inbound
+    /// materializer emits one loopback route per entry (listener port → the
+    /// entry's `defaultEndpoint`) instead of the service-port defaults. Only
+    /// resolvable entries land here; unsupported shapes (Unix-socket /
+    /// non-loopback `defaultEndpoint`, non-HTTP-family protocol) are dropped at
+    /// resolution and reported as deferred. Empty when no Sidecar applies, the
+    /// Sidecar declares no ingress, or no entry resolved.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub local_ingress_listeners: Vec<ResolvedIngressListener>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mesh_policies: Vec<MeshPolicy>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -372,6 +386,7 @@ impl MeshSlice {
             && self.services == other.services
             && self.local_inbound_services == other.local_inbound_services
             && self.local_inbound_workloads == other.local_inbound_workloads
+            && self.local_ingress_listeners == other.local_ingress_listeners
             && self.mesh_policies == other.mesh_policies
             && self.peer_authentications == other.peer_authentications
             && self.service_entries == other.service_entries
@@ -575,6 +590,28 @@ impl MeshSlice {
             resolved_sidecar
         };
 
+        // Resolve the local workload's custom inbound listeners from the
+        // applicable Sidecar's `ingress[]`. Gated like egress narrowing: only
+        // under enforcement (NOT dry-run, which reports but changes nothing —
+        // materializing inbound listeners is a behavior change). Resolution
+        // follows the SAME tier precedence as egress, then keeps only the
+        // routable entries (loopback host:port HTTP listeners); unsupported
+        // shapes are dropped here and reported as deferred by the K8s status
+        // writer. Carried on the slice so the DP materializer never re-resolves
+        // raw `MeshSidecar` records (they do not ride the slice), mirroring the
+        // `local_inbound_services` pattern.
+        let mut local_ingress_listeners: Vec<ResolvedIngressListener> =
+            if sidecar_enforced && !sidecar_dry_run {
+                resolve_applicable_sidecar_ingress(
+                    &mesh.sidecars,
+                    effective_namespace,
+                    &effective_labels,
+                    mesh.istio_root_namespace.as_str(),
+                )
+            } else {
+                Vec::new()
+            };
+
         // Sidecar-only indexes: skip the full scan over `mesh.services` and
         // `mesh.service_entries` when no Sidecar applies (default-off feature,
         // or an enforced workload that no Sidecar resource targets). The
@@ -655,6 +692,33 @@ impl MeshSlice {
             }
             _ => (None, Vec::new()),
         };
+
+        // Stamp the ingress listeners with the owning local service identity
+        // (the first resolved local-inbound service). Both the inbound
+        // materializer and the router/validator derive the listener proxy id
+        // forward from these fields (`mesh_ingress_proxy_id`), so they stay in
+        // lock-step without re-running local-workload resolution. When no local
+        // service resolved (e.g. EndpointSlice lag), drop the listeners — they
+        // have no host identity to anchor and the materializer would skip them
+        // fail-closed anyway.
+        if !local_ingress_listeners.is_empty() {
+            match local_inbound_services.first() {
+                Some(service) => {
+                    for listener in &mut local_ingress_listeners {
+                        listener.owner_namespace = service.namespace.clone();
+                        listener.owner_service = service.name.clone();
+                    }
+                }
+                None => {
+                    debug!(
+                        "Sidecar ingress[] resolved but no local service available to anchor \
+                         listener identity; dropping ingress listeners"
+                    );
+                    local_ingress_listeners.clear();
+                }
+            }
+        }
+
         let mesh_policies: Vec<MeshPolicy> = mesh
             .mesh_policies
             .iter()
@@ -835,6 +899,7 @@ impl MeshSlice {
             services,
             local_inbound_services,
             local_inbound_workloads,
+            local_ingress_listeners,
             mesh_policies,
             peer_authentications,
             service_entries,
@@ -1649,6 +1714,126 @@ fn resolve_applicable_sidecar_egress<'a, L: WorkloadLabels + ?Sized>(
     })
 }
 
+/// Select the single applicable `Sidecar` for a workload by the SAME tier
+/// precedence the egress resolver uses (workload-scoped → root workload-scoped
+/// → namespace default → root-namespace default), with the ASCII-smallest
+/// `name` tiebreak within a tier. Unlike [`resolve_applicable_sidecar_egress`],
+/// this does NOT walk the egress `inherits_defaults` chain: that walk only
+/// redirects which Sidecar's *egress scope* applies, while *ingress* listeners
+/// are always taken from the selected Sidecar's own `ingress[]` (an omitted
+/// `ingress` simply means "no custom listeners").
+fn select_applicable_sidecar<'a, L: WorkloadLabels + ?Sized>(
+    sidecars: &'a [MeshSidecar],
+    workload_namespace: &str,
+    workload_labels: &L,
+    istio_root_namespace: &str,
+) -> Option<&'a MeshSidecar> {
+    let mut workload_scoped: Option<&MeshSidecar> = None;
+    let mut root_workload_scoped: Option<&MeshSidecar> = None;
+    let mut namespace_default: Option<&MeshSidecar> = None;
+    let mut root_namespace_default: Option<&MeshSidecar> = None;
+    let root_namespace = istio_root_namespace.trim();
+
+    let smaller = |candidate: &MeshSidecar, current: Option<&MeshSidecar>| {
+        current
+            .map(|c| candidate.name.as_str() < c.name.as_str())
+            .unwrap_or(true)
+    };
+
+    for sidecar in sidecars {
+        if sidecar.namespace == workload_namespace {
+            match sidecar.workload_selector.as_ref() {
+                Some(selector) if !selector.labels.is_empty() => {
+                    if workload_selector_matches(selector, workload_namespace, workload_labels)
+                        && smaller(sidecar, workload_scoped)
+                    {
+                        workload_scoped = Some(sidecar);
+                    }
+                }
+                _ => {
+                    if smaller(sidecar, namespace_default) {
+                        namespace_default = Some(sidecar);
+                    }
+                }
+            }
+        } else if !root_namespace.is_empty() && sidecar.namespace == root_namespace {
+            match sidecar.workload_selector.as_ref() {
+                Some(selector) if !selector.labels.is_empty() => {
+                    if workload_selector_matches(selector, workload_namespace, workload_labels)
+                        && smaller(sidecar, root_workload_scoped)
+                    {
+                        root_workload_scoped = Some(sidecar);
+                    }
+                }
+                _ => {
+                    if smaller(sidecar, root_namespace_default) {
+                        root_namespace_default = Some(sidecar);
+                    }
+                }
+            }
+        }
+    }
+
+    workload_scoped
+        .or(root_workload_scoped)
+        .or(namespace_default)
+        .or(root_namespace_default)
+}
+
+/// Resolve the routable custom inbound listeners from a workload's applicable
+/// `Sidecar.ingress[]`. Unsupported entries (Unix-socket / non-loopback
+/// `defaultEndpoint`, non-HTTP-family protocol, zero port) are dropped
+/// fail-closed and warned; only the entries that resolve to a loopback
+/// host:port HTTP route are returned. Empty when no Sidecar applies or the
+/// selected Sidecar declares no resolvable ingress.
+fn resolve_applicable_sidecar_ingress<L: WorkloadLabels + ?Sized>(
+    sidecars: &[MeshSidecar],
+    workload_namespace: &str,
+    workload_labels: &L,
+    istio_root_namespace: &str,
+) -> Vec<ResolvedIngressListener> {
+    let Some(sidecar) = select_applicable_sidecar(
+        sidecars,
+        workload_namespace,
+        workload_labels,
+        istio_root_namespace,
+    ) else {
+        return Vec::new();
+    };
+    let mut resolved: Vec<ResolvedIngressListener> = Vec::new();
+    let mut seen_ports: BTreeSet<u16> = BTreeSet::new();
+    for entry in &sidecar.ingress {
+        match entry.resolve() {
+            Ok(listener) => {
+                // Two ingress entries declaring the same listener port is a
+                // config error in the resource; keep the first deterministically
+                // and warn rather than emitting colliding routes.
+                if seen_ports.insert(listener.port) {
+                    resolved.push(listener);
+                } else {
+                    warn!(
+                        sidecar = %sidecar.name,
+                        namespace = %sidecar.namespace,
+                        port = listener.port,
+                        "Duplicate Sidecar ingress[] listener port; keeping the first entry"
+                    );
+                }
+            }
+            Err(reason) => {
+                warn!(
+                    sidecar = %sidecar.name,
+                    namespace = %sidecar.namespace,
+                    port = entry.port,
+                    default_endpoint = %entry.default_endpoint,
+                    reason = ?reason,
+                    "Skipping unsupported Sidecar ingress[] listener (kept in deferred_fields)"
+                );
+            }
+        }
+    }
+    resolved
+}
+
 fn sidecar_host_match_namespace<'a>(
     sidecar: &'a MeshSidecar,
     workload_namespace: &'a str,
@@ -2208,10 +2393,11 @@ mod tests {
     use crate::modes::mesh::config::{
         AppProtocol, EastWestGateway, MeshAccessLoggingConfig, MeshConfig, MeshDestinationRule,
         MeshPolicy, MeshProxyConfig, MeshRequestAuthentication, MeshRule, MeshService, MeshSidecar,
-        MeshSidecarEgress, MeshTelemetryConfig, MeshTelemetryResource, MeshWaypointBinding,
-        MeshWaypointServiceRef, MtlsMode, MultiClusterConfig, PeerAuthentication, PolicyAction,
-        PolicyScope, RemoteCluster, ServiceEntry, ServiceEntryLocation, ServicePort, TrustBundle,
-        TrustBundleSet, Workload, WorkloadPort, WorkloadRef, WorkloadSelector,
+        MeshSidecarEgress, MeshSidecarIngress, MeshTelemetryConfig, MeshTelemetryResource,
+        MeshWaypointBinding, MeshWaypointServiceRef, MtlsMode, MultiClusterConfig,
+        PeerAuthentication, PolicyAction, PolicyScope, RemoteCluster, ServiceEntry,
+        ServiceEntryLocation, ServicePort, TrustBundle, TrustBundleSet, Workload, WorkloadPort,
+        WorkloadRef, WorkloadSelector,
     };
     use std::collections::HashMap;
 
@@ -2504,6 +2690,7 @@ mod tests {
             services: vec![make_service("ns", "web")],
             local_inbound_services: Vec::new(),
             local_inbound_workloads: None,
+            local_ingress_listeners: Vec::new(),
             mesh_policies: vec![make_policy("p1", "ns", PolicyScope::MeshWide)],
             peer_authentications: vec![make_peer_auth("pa1", "ns", None)],
             service_entries: vec![make_service_entry("se1", "ns", vec!["*".into()])],
@@ -4532,6 +4719,7 @@ mod tests {
                     port,
                 })
                 .collect(),
+            ingress: Vec::new(),
         }
     }
 
@@ -4546,6 +4734,7 @@ mod tests {
             workload_selector: Some(workload_selector),
             egress_inherits_defaults: true,
             egress: Vec::new(),
+            ingress: Vec::new(),
         }
     }
 
@@ -4983,6 +5172,114 @@ mod tests {
                 .iter()
                 .any(|s| s.name == "ratings"),
             "a service sharing the service-account SPIFFE but not the local pod's labels is not local"
+        );
+    }
+
+    #[test]
+    fn sidecar_ingress_resolves_and_stamps_owner_under_enforcement() {
+        // End-to-end: a workload-scoped Sidecar with two ingress entries (one
+        // supported loopback HTTP listener, one unix-socket that can't be
+        // modeled). Under enforcement the slice resolves ONLY the supported
+        // listener into `local_ingress_listeners`, stamped with the local
+        // service owner identity for forward-derived materialization.
+        let spiffe = "spiffe://cluster.local/ns/alpha/sa/reviews";
+        let mut reviews_wl = make_workload(
+            "alpha",
+            "reviews",
+            HashMap::from([("app".to_string(), "reviews".to_string())]),
+        );
+        reviews_wl.spiffe_id = SpiffeId::new(spiffe).unwrap();
+        let mut sidecar = make_sidecar(
+            "reviews-sc",
+            "alpha",
+            Some(WorkloadSelector {
+                labels: HashMap::from([("app".to_string(), "reviews".to_string())]),
+                namespace: Some("alpha".to_string()),
+            }),
+            vec![vec!["./checkout"]],
+        );
+        sidecar.ingress = vec![
+            MeshSidecarIngress {
+                port: 8443,
+                protocol: AppProtocol::Http,
+                name: Some("https".to_string()),
+                bind: None,
+                default_endpoint: "127.0.0.1:8080".to_string(),
+            },
+            MeshSidecarIngress {
+                port: 9000,
+                protocol: AppProtocol::Grpc,
+                name: None,
+                bind: None,
+                default_endpoint: "unix:///var/run/grpc.sock".to_string(),
+            },
+        ];
+        let mesh = MeshConfig {
+            sidecars: vec![sidecar],
+            workloads: vec![reviews_wl],
+            services: vec![make_service("alpha", "reviews")],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let request = MeshSliceRequest {
+            workload_spiffe_id: Some(spiffe.to_string()),
+            ..slice_request_enforced_with_labels(
+                "alpha",
+                BTreeMap::from([("app".to_string(), "reviews".to_string())]),
+            )
+        };
+        let slice = MeshSlice::from_gateway_config(&config, request);
+
+        assert_eq!(
+            slice.local_ingress_listeners.len(),
+            1,
+            "only the supported loopback HTTP listener resolves; the unix-socket entry is dropped"
+        );
+        let listener = &slice.local_ingress_listeners[0];
+        assert_eq!(listener.port, 8443);
+        assert_eq!(listener.endpoint_host, "127.0.0.1");
+        assert_eq!(listener.endpoint_port, 8080);
+        assert_eq!(
+            listener.owner_namespace, "alpha",
+            "owner stamped from the resolved local service"
+        );
+        assert_eq!(listener.owner_service, "reviews");
+    }
+
+    #[test]
+    fn sidecar_ingress_not_resolved_under_dry_run() {
+        // Dry-run reports egress but changes nothing — ingress is NOT
+        // materialized (it is a behavior change).
+        let spiffe = "spiffe://cluster.local/ns/alpha/sa/reviews";
+        let mut reviews_wl = make_workload(
+            "alpha",
+            "reviews",
+            HashMap::from([("app".to_string(), "reviews".to_string())]),
+        );
+        reviews_wl.spiffe_id = SpiffeId::new(spiffe).unwrap();
+        let mut sidecar = make_sidecar("reviews-sc", "alpha", None, vec![vec!["./checkout"]]);
+        sidecar.ingress = vec![MeshSidecarIngress {
+            port: 8443,
+            protocol: AppProtocol::Http,
+            name: None,
+            bind: None,
+            default_endpoint: "127.0.0.1:8080".to_string(),
+        }];
+        let mesh = MeshConfig {
+            sidecars: vec![sidecar],
+            workloads: vec![reviews_wl],
+            services: vec![make_service("alpha", "reviews")],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let request = MeshSliceRequest {
+            workload_spiffe_id: Some(spiffe.to_string()),
+            ..slice_request_dry_run("alpha")
+        };
+        let slice = MeshSlice::from_gateway_config(&config, request);
+        assert!(
+            slice.local_ingress_listeners.is_empty(),
+            "dry-run must not resolve ingress listeners"
         );
     }
 
@@ -6284,6 +6581,7 @@ mod tests {
                     workload_selector: None,
                     egress_inherits_defaults: true,
                     egress: Vec::new(),
+                    ingress: Vec::new(),
                 },
             ],
             service_entries: vec![
@@ -6362,6 +6660,7 @@ mod tests {
                     workload_selector: None,
                     egress_inherits_defaults: true,
                     egress: Vec::new(),
+                    ingress: Vec::new(),
                 },
                 make_inheriting_sidecar(
                     "frontend-ingress-only",
@@ -6475,6 +6774,7 @@ mod tests {
                 workload_selector: None,
                 egress_inherits_defaults: false,
                 egress: Vec::new(),
+                ingress: Vec::new(),
             }],
             service_entries: vec![make_se_with_host(
                 "reviews",
@@ -6755,6 +7055,7 @@ mod tests {
                         port: None,
                     },
                 ],
+                ingress: Vec::new(),
             }],
             services: vec![
                 make_service("alpha", "reviews"),

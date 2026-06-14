@@ -1087,7 +1087,7 @@ When `FERRUM_MESH_TOPOLOGY=egress_gateway`, the mesh runtime materializes HTTP-f
 
 ## Sidecar Egress Scoping
 
-Istio `Sidecar` resources narrow which mesh service configuration a workload receives for egress. Ferrum translates the egress portion of a `Sidecar` into a `MeshSidecar` record and applies it at slice build time. Ingress listener configuration on `Sidecar` is intentionally not modeled — egress config scoping is the immediate compatibility gap.
+Istio `Sidecar` resources narrow which mesh service configuration a workload receives for egress. Ferrum translates the egress portion of a `Sidecar` into a `MeshSidecar` record and applies it at slice build time. The `Sidecar.ingress[]` block (custom inbound listeners) is also modeled — see [Sidecar Ingress Listeners](#sidecar-ingress-listeners) below.
 
 ### Behavior
 
@@ -1163,6 +1163,49 @@ Stream-family egress (TCP / UDP / TCP+TLS / UDP+DTLS) is enforced at the connect
 Stream decisions are exported via a sibling counter `ferrum_mesh_outbound_registry_stream_decisions_total` with `mesh_namespace`, `protocol`, and `decision` labels (`protocol` ∈ {`tcp`, `tcp_tls`, `udp`, `udp_dtls`}). Keeping it as a sibling rather than adding a `protocol` label to the HTTP counter preserves Wave-1 dashboard compatibility. Stream rejects do not include a per-host label — the protocol label is the only dimension dashboards need, and TCP closes happen before SNI / Host material is structured. Operators triaging denied stream traffic should consult the gateway's structured `warn!` logs (one per reject) which include `backend_host`, `backend_port`, `listen_port`, and the client IP.
 
 Enforcement is keyed on the runtime's mesh outbound capture listener port set. Stream proxies bound to other ports (inbound, admin, HBONE, east-west gateway, egress gateway) flow through unchanged — outbound policy never gates inbound traffic.
+
+## Sidecar Ingress Listeners
+
+Istio's `Sidecar` resource has an `ingress[]` block letting a workload declare custom inbound listeners: each entry has a `port` (number + protocol + name), an optional `bind` address, and a `defaultEndpoint` (where inbound traffic to that listener is forwarded). Ferrum models these on the **inbound** side, reusing the per-port inbound loopback sibling machinery (the same path that serves the default `:15006` service-port routes).
+
+`Sidecar` resources are always parsed/persisted; ingress materialization is **applied only under `FERRUM_MESH_SIDECAR_ENFORCED=true`** (the same gate as egress narrowing) and **not** under `FERRUM_MESH_SIDECAR_ENFORCED_DRY_RUN=true` (dry-run reports egress scope but changes nothing — materializing inbound listeners is a behavior change). The applicable `Sidecar` is resolved with the same tier precedence as egress (workload-scoped → root workload-scoped → namespace-default → root-namespace-default, ASCII-smallest `name` tiebreak), but ingress is always taken from the selected `Sidecar`'s own `ingress[]` (it does not follow the egress `inherits_defaults` chain — an omitted `ingress` simply means "no custom listeners").
+
+### Materialization model
+
+Each modeled ingress entry becomes one inbound loopback route:
+
+- **hosts** — the union of the local workload's own service FQDN variants (`{name}`, `{name}.{ns}`, `{name}.{ns}.svc`, `{name}.{ns}.svc.{cluster_domain}`). Istio only configures ingress "if and only if the workload is associated with a service"; when no local service resolves (e.g. EndpointSlice lag), the listener is dropped fail-closed (no host-less catch-all route).
+- **backend** — the entry's `defaultEndpoint`, resolved to a loopback `host:port` (see supported forms below).
+- **listen path** — `/` (the route is selected by host, then disambiguated by port).
+- **port disambiguation** — on Ferrum's shared `:15006` inbound listener, the captured original destination (the port the client dialed) **and** a peer sidecar's request authority are matched against the **declared listener port** (not the `defaultEndpoint` port, which is the separate forward target). This reuses `select_mesh_inbound_port_route`: multiple ingress listeners on one workload are siblings disambiguated by listener port, and a request that addresses no declared listener port fails closed with `502` rather than being routed to an arbitrary backend.
+
+### Precedence vs. the default inbound listeners
+
+Per Istio, when `ingress[]` is present it **replaces** the workload's default per-service-port inbound listeners. Ferrum mirrors this: if the applicable `Sidecar` resolves any ingress listener, the inbound materializer emits routes **only** from the `ingress[]` block and skips the service-port default `:15006` → `127.0.0.1:targetPort` materialization for that workload. A workload with no (resolvable) ingress keeps the default service-port inbound behavior unchanged. This avoids any silent host+path conflict — the two never coexist for one workload.
+
+### Supported and deferred `defaultEndpoint` forms
+
+`defaultEndpoint` is resolved fail-closed; an entry that does not map cleanly onto a loopback `host:port` HTTP route is **not** materialized and is reported in the `Sidecar` `status.ferrum.translation.deferred_fields` (the resource is still accepted):
+
+| `defaultEndpoint` / listener | Behavior |
+|---|---|
+| `127.0.0.1:PORT`, `[::1]:PORT` (loopback) | Modeled; dials that loopback address + port (address family preserved). |
+| `0.0.0.0:PORT`, `[::]:PORT` (instance IP) | Modeled; mapped to loopback (`127.0.0.1` / `::1`) — the sidecar app shares the pod network namespace. |
+| `unix:///path/to/socket` | **Deferred** — Ferrum's backend model is `host:port` only; not representable. |
+| Arbitrary off-box IP (`10.0.0.5:PORT`) | **Deferred** — Istio forbids arbitrary IPs; Ferrum's loopback-only model will not dial off-box. |
+| Non-HTTP-family `port.protocol` (`tcp`/`tls`/`mongo`/…) | **Deferred** — raw-TCP inbound has no Host/route and is not modeled here. |
+| Omitted / empty `defaultEndpoint` | **Deferred** — Istio allows omitting it; with no forward target there is nothing to route. |
+
+The status writer reports the count of modeled listeners as `status.ferrum.translation.ingress_modeled` and lists deferral reasons in `deferred_fields`. A listener `port` of `0` is a hard validation error (rejected), not a deferral.
+
+### `bind` and `captureMode` limitations
+
+- **`bind`** — Ferrum's capture model funnels all inbound through the shared `:15006` listener (matched by captured original destination = the dialed listener port), so a custom `bind` address does **not** open a separate OS listener; it is preserved on the parsed model for observability. Unix-socket `bind` values are invalid (Istio rejects them too).
+- **`captureMode`** — Ferrum assumes `IPTABLES`/`DEFAULT` capture (the sidecar redirect model). `captureMode: NONE` (the app handles capture itself) is not separately honored; the listener-port disambiguation relies on the captured original destination or the request authority port being present.
+
+### xDS / file / native parity
+
+The resolved listeners ride the slice as `local_ingress_listeners` (computed CP-side, since raw `MeshSidecar` records do not ride the slice — only the resolved view does, mirroring `local_inbound_services`). On xDS they ride a dedicated ECDS carrier (`LocalIngressListenersCarrier`); on the native and `FERRUM_MESH_CONFIG_PROTOCOL=file` sources the same `MeshSlice::from_gateway_config` builder resolves them, so an xDS-built slice stays functionally equivalent to a native-built one.
 
 ## Config Drift Introspection
 
@@ -1799,7 +1842,7 @@ Each resource gets a single Ferrum-owned `FerrumAccepted` condition (field manag
 
 - **Accepted** — successful translation writes `FerrumAccepted=True` with a per-kind reason (`Accepted`, plus `AllowNothing`/`NoOp` for AuthorizationPolicy empty-rule semantics). The detail block carries kind-specific context: rule/host/route counts, the resolved PeerAuthentication mTLS mode and port overrides, ServiceEntry `resolution`/`location`, RequestAuthentication scope and permissive-by-default note, the WorkloadEntry service account, the Sidecar egress scope, or the Telemetry sections present.
 - **Rejected** — a translator error (`K8sTranslateError`) writes `FerrumAccepted=False`, reason `Invalid`, with the error text in both the condition message and `status.ferrum.translation.error`. This is the gap this surface closes: a hard rejection of any translated kind is now visible to operators instead of being silently dropped from the slice.
-- **Deferred fields** — fields Ferrum parses but does not yet enforce are listed in `status.ferrum.translation.deferred_fields` (and summarized in the condition message) so operators see the gap. Current deferred sets: DestinationRule per-subset `outlierDetection.maxEjectionPercent` (the ejection *cap*; the thresholds are applied per-subset) and `connectionPool.http.{http1MaxPendingRequests,maxRetries,h2UpgradePolicy}` (per-subset `connectionPool.tcp.connectTimeout`, `portLevelSettings[].tls`, and per-subset `outlierDetection` *thresholds* are now applied, not deferred); VirtualService `http[].corsPolicy` **only when it uses `prefix`/`regex` origin matchers** (exact-origin / legacy `allowOrigin` policies are translated to a `cors` plugin; `tcp[]`/`tls[]` L4 route blocks are translated to stream proxies — only their unsupported match predicates / weighted splitting are rejected fail-closed — while `mirror`, `mirrorPercentage`, `redirect`, and `rewrite` are enforced); Sidecar `ingress[]` listener config (Ferrum models egress scope only).
+- **Deferred fields** — fields Ferrum parses but does not yet enforce are listed in `status.ferrum.translation.deferred_fields` (and summarized in the condition message) so operators see the gap. Current deferred sets: DestinationRule per-subset `outlierDetection.maxEjectionPercent` (the ejection *cap*; the thresholds are applied per-subset) and `connectionPool.http.{http1MaxPendingRequests,maxRetries,h2UpgradePolicy}` (per-subset `connectionPool.tcp.connectTimeout`, `portLevelSettings[].tls`, and per-subset `outlierDetection` *thresholds* are now applied, not deferred); VirtualService `http[].corsPolicy` **only when it uses `prefix`/`regex` origin matchers** (exact-origin / legacy `allowOrigin` policies are translated to a `cors` plugin; `tcp[]`/`tls[]` L4 route blocks are translated to stream proxies — only their unsupported match predicates / weighted splitting are rejected fail-closed — while `mirror`, `mirrorPercentage`, `redirect`, and `rewrite` are enforced); Sidecar `ingress[]` listeners that Ferrum cannot model (Unix-socket / non-loopback `defaultEndpoint`, non-HTTP-family protocol, omitted `defaultEndpoint`) — resolvable loopback HTTP listeners are now materialized (see [Sidecar Ingress Listeners](#sidecar-ingress-listeners)) and reported via `status.ferrum.translation.ingress_modeled`.
 
 Ferrum merges its `FerrumAccepted` condition into the live `status.conditions[]` array, preserving conditions written by Istio (`pilot-discovery`/`galley`) and any other controller. `lastTransitionTime` is held stable while the condition's status/reason/message are unchanged. Status writing is read-only with respect to the proxy data plane and never aborts reconcile: if a cluster has stripped the `subresources.status` from a CRD, the writer logs a single warning per resource and no-ops. `ProxyConfig` is translated for proxy/telemetry config but is not watched and gets no status.
 
