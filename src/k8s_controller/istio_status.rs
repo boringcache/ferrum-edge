@@ -1086,11 +1086,13 @@ fn classify_sidecar_ingress_entries(spec: &Value) -> (usize, Vec<&'static str>) 
             .and_then(|p| p.get("protocol"))
             .and_then(Value::as_str);
         // Classify through the SAME shared predicate `MeshSidecarIngress::resolve`
-        // uses (raw string → `app_protocol` → `is_http_family_app_protocol`), so
-        // resolution and this deferred-field report never disagree. Notably
-        // `https` maps to `AppProtocol::Unknown`, which IS HTTP-family and IS
-        // materialized — so an HTTPS listener is counted as modeled below, not
-        // falsely reported as a deferred non-HTTP listener.
+        // uses (raw string → `sidecar_ingress_app_protocol` →
+        // `is_http_family_app_protocol`), so resolution and this deferred-field
+        // report never disagree. `https` is recognized HTTP-family and IS
+        // materialized — counted as modeled below — while a MISSING or
+        // UNRECOGNIZED protocol (e.g. a `HTPS` typo) maps to a non-HTTP
+        // `AppProtocol` and is reported as a deferred non-HTTP listener (it is
+        // NOT routed onto the HTTP request path), matching resolution.
         let http_family =
             crate::config_sources::k8s::sidecar_ingress_protocol_is_http_family(protocol);
         let endpoint = entry
@@ -2542,8 +2544,9 @@ mod tests {
 
     #[test]
     fn sidecar_https_ingress_is_modeled_not_deferred() {
-        // F6 §6.2 (Finding 5): an HTTPS ingress listener maps to
-        // `AppProtocol::Unknown`, which resolution treats as HTTP-family and
+        // F6 §6.2 (round-1 Finding 5, preserved by round-2): an HTTPS ingress
+        // listener is a recognized HTTP-family protocol (mapped to a routable
+        // `AppProtocol` by `sidecar_ingress_app_protocol`), which resolution
         // MATERIALIZES. The status classifier must agree (it routes the protocol
         // through the same shared predicate), so the live listener is reported as
         // modeled — NOT falsely reported as a deferred non-HTTP-family listener.
@@ -2560,7 +2563,7 @@ mod tests {
         assert_eq!(
             detail["translation"]["ingress_modeled"].as_u64(),
             Some(1),
-            "an HTTPS listener (→ Unknown → HTTP-family) is modeled"
+            "an HTTPS listener (recognized HTTP-family) is modeled"
         );
         let deferred: Vec<&str> = detail["translation"]["deferred_fields"]
             .as_array()
@@ -2571,6 +2574,39 @@ mod tests {
         assert!(
             !deferred.iter().any(|f| f.contains("non-HTTP-family")),
             "an HTTPS listener must NOT be reported as a deferred non-HTTP listener, got {deferred:?}"
+        );
+    }
+
+    #[test]
+    fn sidecar_mistyped_ingress_protocol_is_deferred_not_modeled() {
+        // Codex round-2 P2: a mistyped protocol (`HTPS`) must NOT be reported as
+        // modeled — the status writer must keep it in deferred_fields (matching
+        // resolution, which now defers it as a non-HTTP listener) rather than
+        // counting a non-HTTP listener as a live HTTP route.
+        let obj = object(
+            "networking.istio.io/v1",
+            "Sidecar",
+            "typo-sidecar",
+            json!({
+                "ingress": [ { "port": { "number": 8443, "protocol": "HTPS" }, "defaultEndpoint": "127.0.0.1:8080" } ]
+            }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options());
+        let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        assert_eq!(
+            detail["translation"]["ingress_modeled"].as_u64(),
+            Some(0),
+            "a mistyped protocol must not be counted as a modeled listener"
+        );
+        let deferred: Vec<&str> = detail["translation"]["deferred_fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            deferred.iter().any(|f| f.contains("non-HTTP-family")),
+            "a mistyped protocol must be reported as a deferred non-HTTP listener, got {deferred:?}"
         );
     }
 

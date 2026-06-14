@@ -214,6 +214,7 @@ fn mesh_config_validate_rejects_zero_ports_on_full_mesh_resources() {
                 hosts: vec!["./*".into()],
                 port: Some(0),
             }],
+            ingress_declared: false,
             ingress: Vec::new(),
         }],
         ..MeshConfig::default()
@@ -263,6 +264,7 @@ fn mesh_config_validate_rejects_empty_destination_rule_and_sidecar_fields() {
                     port: None,
                 },
             ],
+            ingress_declared: false,
             ingress: Vec::new(),
         }],
         ..MeshConfig::default()
@@ -954,6 +956,7 @@ fn sidecar_host_pattern_accepts_valid_patterns() {
                     hosts: vec![pattern.to_string()],
                     port: None,
                 }],
+                ingress_declared: false,
                 ingress: Vec::new(),
             }],
             ..MeshConfig::default()
@@ -1122,12 +1125,68 @@ fn ingress_resolve_preserves_v6_address_family() {
 
 #[test]
 fn ingress_resolve_unknown_protocol_is_http_family() {
-    // Istio's `unknown`/unset appProtocol defaults to HTTP-family in Ferrum.
+    // `resolve()` treats the `AppProtocol::Unknown` value itself as HTTP-family
+    // (the service-port `unknown → HTTP` convention). NOTE: the K8s ingress
+    // translator no longer PRODUCES `Unknown` for a Sidecar `ingress[]` entry —
+    // `sidecar_ingress_app_protocol` maps `https` → routable and a missing/typo'd
+    // protocol → a non-HTTP value (deferred) — so this exercises the resolve()
+    // contract directly, not the K8s translation path (see istio.rs tests for the
+    // typo/missing-deferral behavior).
     assert!(
         ingress_entry(8443, AppProtocol::Unknown, "127.0.0.1:8080")
             .resolve()
             .is_ok()
     );
+}
+
+#[test]
+fn ingress_resolved_listener_endpoint_revalidation() {
+    use ferrum_edge::modes::mesh::config::ResolvedIngressListener;
+    let valid = ResolvedIngressListener {
+        port: 8443,
+        endpoint_host: "127.0.0.1".to_string(),
+        endpoint_port: 8080,
+        owner_namespace: "default".to_string(),
+        owner_service: "reviews".to_string(),
+    };
+    assert!(valid.endpoint_is_valid(), "loopback v4 host:port is valid");
+
+    let v6 = ResolvedIngressListener {
+        endpoint_host: "::1".to_string(),
+        ..valid.clone()
+    };
+    assert!(v6.endpoint_is_valid(), "loopback v6 host:port is valid");
+
+    // Codex round-2 P2: a carried OFF-BOX host must fail re-validation.
+    let off_box = ResolvedIngressListener {
+        endpoint_host: "10.0.0.5".to_string(),
+        ..valid.clone()
+    };
+    assert!(
+        !off_box.endpoint_is_valid(),
+        "an off-box backend host must fail re-validation"
+    );
+
+    // A carried `:0` backend port fails.
+    let zero_backend = ResolvedIngressListener {
+        endpoint_port: 0,
+        ..valid.clone()
+    };
+    assert!(!zero_backend.endpoint_is_valid());
+
+    // A carried `:0` listener port fails.
+    let zero_listener = ResolvedIngressListener {
+        port: 0,
+        ..valid.clone()
+    };
+    assert!(!zero_listener.endpoint_is_valid());
+
+    // A non-IP / unparseable host fails.
+    let bogus_host = ResolvedIngressListener {
+        endpoint_host: "example.com".to_string(),
+        ..valid.clone()
+    };
+    assert!(!bogus_host.endpoint_is_valid());
 }
 
 #[test]
@@ -1222,6 +1281,7 @@ fn validate_rejects_zero_ingress_port() {
             workload_selector: None,
             egress_inherits_defaults: false,
             egress: Vec::new(),
+            ingress_declared: false,
             ingress: vec![
                 ingress_entry(0, AppProtocol::Http, "127.0.0.1:8080"),
                 ingress_entry(8443, AppProtocol::Http, ""),
@@ -1252,6 +1312,7 @@ fn validate_accepts_unsupported_ingress_shapes_for_deferral() {
             workload_selector: None,
             egress_inherits_defaults: false,
             egress: Vec::new(),
+            ingress_declared: false,
             ingress: vec![
                 ingress_entry(8443, AppProtocol::Http, "unix:///var/run/app.sock"),
                 ingress_entry(9000, AppProtocol::Tcp, "127.0.0.1:9000"),

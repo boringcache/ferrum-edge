@@ -399,6 +399,13 @@ impl MeshSlice {
             && self.local_inbound_services == other.local_inbound_services
             && self.local_inbound_workloads == other.local_inbound_workloads
             && self.local_ingress_listeners == other.local_ingress_listeners
+            // The fail-closed `sidecar_ingress_declared` marker flips independently
+            // of `local_ingress_listeners` (no `ingress[]` → an all-unsupported
+            // `ingress[]` leaves the resolved list empty while the marker goes
+            // `false`→`true`). It MUST be compared so MeshSubscribe/update dedupe
+            // re-sends the slice and the materializer suppresses the now-stale
+            // default inbound routes; omitting it would keep serving them.
+            && self.sidecar_ingress_declared == other.sidecar_ingress_declared
             && self.mesh_policies == other.mesh_policies
             && self.peer_authentications == other.peer_authentications
             && self.service_entries == other.service_entries
@@ -1840,11 +1847,13 @@ fn select_applicable_sidecar<'a, L: WorkloadLabels + ?Sized>(
 /// non-HTTP-family protocol, zero port) are dropped fail-closed and warned; only
 /// the entries that resolve to a loopback host:port HTTP route are returned.
 ///
-/// `ingress_declared` is `true` when the applicable Sidecar declares a NON-EMPTY
-/// `ingress[]` — independent of whether any entry resolved. This is the
-/// fail-closed marker the inbound materializer needs: an operator that declares
-/// ingress (even one whose entries are ALL unsupported) has explicitly opted out
-/// of the default per-service-port inbound listeners (Istio's `ingress[]`
+/// `ingress_declared` is `true` when the applicable Sidecar DECLARED an
+/// `ingress` block — a non-empty `ingress[]` OR an explicit empty `ingress: []`
+/// (Istio distinguishes a declared-empty list from an omitted block) —
+/// independent of whether any entry resolved. This is the fail-closed marker the
+/// inbound materializer needs: an operator that declares ingress (even one whose
+/// entries are ALL unsupported, or an explicit empty list) has explicitly opted
+/// out of the default per-service-port inbound listeners (Istio's `ingress`
 /// REPLACES them), so the materializer must SKIP the default routes rather than
 /// silently exposing them when the resolved list is empty. (Resolved listeners
 /// can be empty while declared is true; declared can never be false while
@@ -1863,7 +1872,16 @@ fn resolve_applicable_sidecar_ingress<L: WorkloadLabels + ?Sized>(
     ) else {
         return (Vec::new(), false);
     };
-    let ingress_declared = !sidecar.ingress.is_empty();
+    // Per Istio, declaring `ingress[]` REPLACES the default per-service-port
+    // inbound listeners — and Istio distinguishes an OMITTED ingress block (keep
+    // defaults) from a DECLARED one, INCLUDING an explicit empty `ingress: []`
+    // (no custom listeners, but defaults still suppressed). `ingress_declared`
+    // (set by the K8s translator on `spec.ingress` PRESENCE; defaults false on
+    // the native path) carries the explicit-empty case; a non-empty `ingress`
+    // always declares regardless. Folding both keeps the fail-closed marker
+    // correct for K8s explicit-`[]`, native non-empty, and native explicit-empty
+    // (operator sets `ingress_declared: true` with an empty list).
+    let ingress_declared = sidecar.ingress_declared || !sidecar.ingress.is_empty();
     let mut resolved: Vec<ResolvedIngressListener> = Vec::new();
     let mut seen_ports: BTreeSet<u16> = BTreeSet::new();
     for entry in &sidecar.ingress {
@@ -2814,6 +2832,29 @@ mod tests {
         };
         let b = MeshSlice::default();
         assert!(!a.content_eq(&b));
+    }
+
+    #[test]
+    fn content_eq_detects_sidecar_ingress_declared_change() {
+        // Codex round-2 P1: the all-unsupported-ingress scenario. A workload
+        // changes from "no ingress[]" to an ingress[] whose entries are ALL
+        // unsupported (or have no local-service anchor): `local_ingress_listeners`
+        // stays empty BUT `sidecar_ingress_declared` flips false→true. If
+        // `content_eq` ignored the marker, MeshSubscribe/update dedupe would treat
+        // the slices as unchanged and keep serving the now-stale default inbound
+        // routes the operator replaced. The marker must be compared.
+        let a = MeshSlice {
+            sidecar_ingress_declared: true,
+            ..MeshSlice::default()
+        };
+        let b = MeshSlice::default();
+        assert!(
+            !a.content_eq(&b),
+            "a flipped sidecar_ingress_declared marker (empty listeners) must be a content change"
+        );
+        // Symmetric, and identical marker values are equal.
+        assert!(!b.content_eq(&a));
+        assert!(a.content_eq(&a.clone()));
     }
 
     #[test]
@@ -4784,6 +4825,7 @@ mod tests {
                     port,
                 })
                 .collect(),
+            ingress_declared: false,
             ingress: Vec::new(),
         }
     }
@@ -4799,6 +4841,7 @@ mod tests {
             workload_selector: Some(workload_selector),
             egress_inherits_defaults: true,
             egress: Vec::new(),
+            ingress_declared: false,
             ingress: Vec::new(),
         }
     }
@@ -5342,6 +5385,7 @@ mod tests {
             }),
             egress_inherits_defaults: true,
             egress: Vec::new(),
+            ingress_declared: false,
             ingress: Vec::new(),
         };
         sidecar.ingress = vec![MeshSidecarIngress {
@@ -6726,6 +6770,7 @@ mod tests {
                     workload_selector: None,
                     egress_inherits_defaults: true,
                     egress: Vec::new(),
+                    ingress_declared: false,
                     ingress: Vec::new(),
                 },
             ],
@@ -6805,6 +6850,7 @@ mod tests {
                     workload_selector: None,
                     egress_inherits_defaults: true,
                     egress: Vec::new(),
+                    ingress_declared: false,
                     ingress: Vec::new(),
                 },
                 make_inheriting_sidecar(
@@ -6919,6 +6965,7 @@ mod tests {
                 workload_selector: None,
                 egress_inherits_defaults: false,
                 egress: Vec::new(),
+                ingress_declared: false,
                 ingress: Vec::new(),
             }],
             service_entries: vec![make_se_with_host(
@@ -7200,6 +7247,7 @@ mod tests {
                         port: None,
                     },
                 ],
+                ingress_declared: false,
                 ingress: Vec::new(),
             }],
             services: vec![
