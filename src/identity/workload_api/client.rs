@@ -125,6 +125,7 @@ impl WorkloadApiClient {
     /// "wait for an SVID to be ready" before proceeding.
     pub async fn fetch_x509_svid_stream(
         &mut self,
+        expected_spiffe_id: Option<SpiffeId>,
     ) -> Result<
         (
             impl Stream<Item = Result<SvidBundle, WorkloadApiClientError>> + Send + 'static,
@@ -162,7 +163,7 @@ impl WorkloadApiClient {
                     debug!("Workload API server pushed an empty X509SVIDResponse — skipping");
                     continue;
                 }
-                let bundle_res = svid_response_to_bundle(msg);
+                let bundle_res = svid_response_to_bundle(msg, expected_spiffe_id.as_ref());
                 let was_ok = bundle_res.is_ok();
                 if out_tx.send(bundle_res).is_err() {
                     return;
@@ -181,7 +182,7 @@ impl WorkloadApiClient {
     /// move on. Production paths should keep the stream open and consume
     /// rotations via [`fetch_x509_svid_stream`](Self::fetch_x509_svid_stream).
     pub async fn fetch_x509_svid_once(&mut self) -> Result<SvidBundle, WorkloadApiClientError> {
-        let (mut stream, _) = self.fetch_x509_svid_stream().await?;
+        let (mut stream, _) = self.fetch_x509_svid_stream(None).await?;
         stream
             .next()
             .await
@@ -204,16 +205,32 @@ fn parse_trust_domain_key(key: &str) -> Result<TrustDomain, String> {
     TrustDomain::new(domain_str.to_string()).map_err(|e| e.to_string())
 }
 
-/// Convert one `X509SVIDResponse` into a [`SvidBundle`]. Picks the first
-/// SVID in the response (per spec, the "default identity" for the workload).
+/// Convert one `X509SVIDResponse` into a [`SvidBundle`]. When an expected
+/// SPIFFE ID is provided, select that exact SVID; otherwise pick the first SVID
+/// in the response (per spec, the "default identity" for the workload).
 fn svid_response_to_bundle(
     msg: super::proto::X509svidResponse,
+    expected_spiffe_id: Option<&SpiffeId>,
 ) -> Result<SvidBundle, WorkloadApiClientError> {
-    let first = msg
-        .svids
-        .into_iter()
-        .next()
-        .ok_or_else(|| WorkloadApiClientError::Rpc("X509SVIDResponse has no SVIDs".into()))?;
+    let first = if let Some(expected) = expected_spiffe_id {
+        let mut returned = Vec::with_capacity(msg.svids.len());
+        let selected = msg.svids.into_iter().find(|svid| {
+            returned.push(svid.spiffe_id.clone());
+            svid.spiffe_id == expected.as_str()
+        });
+        selected.ok_or_else(|| {
+            WorkloadApiClientError::Rpc(format!(
+                "X509SVIDResponse did not include configured SPIFFE ID '{}' (returned: {})",
+                expected,
+                returned.join(", ")
+            ))
+        })?
+    } else {
+        msg.svids
+            .into_iter()
+            .next()
+            .ok_or_else(|| WorkloadApiClientError::Rpc("X509SVIDResponse has no SVIDs".into()))?
+    };
 
     let spiffe_id = SpiffeId::new(first.spiffe_id.clone()).map_err(|e| {
         WorkloadApiClientError::Rpc(format!(
@@ -234,8 +251,52 @@ fn svid_response_to_bundle(
         ));
     }
 
+    // Pin the protobuf `X509SVID.spiffe_id` field to the actual leaf certificate's
+    // URI SAN. They must agree: `SvidBundle.spiffe_id` drives HBONE / source
+    // identity and the configured-workload pin, while peers authenticate against
+    // the leaf the TLS handshake presents. A response whose field matches but
+    // whose leaf SAN differs would let those two identities diverge, so reject it
+    // before the bundle is installed.
+    let leaf_spiffe_id = crate::identity::spiffe::extract_spiffe_id_from_cert(&cert_chain_der[0])
+        .map_err(|e| {
+        WorkloadApiClientError::Rpc(format!(
+            "SVID leaf certificate has no usable SPIFFE URI SAN: {e}"
+        ))
+    })?;
+    if leaf_spiffe_id != spiffe_id {
+        return Err(WorkloadApiClientError::Rpc(format!(
+            "SVID leaf certificate SPIFFE ID '{leaf_spiffe_id}' does not match the X509SVID \
+             spiffe_id field '{spiffe_id}'"
+        )));
+    }
+
+    // Hold the streamed SVID to the same bar as the file-based loader
+    // (`load_svid_bundle_from_sources`): the leaf must be currently valid and not
+    // a CA, and the accompanying private key must match it. A SPIRE response that
+    // is expired / not-yet-valid, a CA cert, or whose key and leaf disagree would
+    // otherwise install and then fail every mesh-mTLS handshake — and, with the
+    // CA-backed inbound identity, as the served certificate too.
+    let leaf_der = &cert_chain_der[0];
+    crate::identity::file_loader::validate_cert_is_current(leaf_der, "SVID leaf certificate")
+        .map_err(|e| WorkloadApiClientError::Rpc(e.to_string()))?;
+    crate::identity::file_loader::validate_leaf_is_not_ca(leaf_der)
+        .map_err(|e| WorkloadApiClientError::Rpc(e.to_string()))?;
+    crate::identity::file_loader::verify_leaf_key_match(leaf_der, &first.x509_svid_key)
+        .map_err(|e| WorkloadApiClientError::Rpc(e.to_string()))?;
+
     let local_bundle_der = split_concatenated_der(&first.bundle)
         .map_err(|e| WorkloadApiClientError::Rpc(format!("trust bundle parse failed: {e}")))?;
+    // Reject an empty local trust bundle the same way the file loader does (its
+    // `read_cert_chain_source` errors on no certs). An SVID with no roots cannot
+    // verify peers, so installing it would let STRICT inbound and HBONE/mesh-mTLS
+    // handshakes fail after listeners bind rather than failing closed here.
+    if local_bundle_der.is_empty() {
+        return Err(WorkloadApiClientError::Rpc(
+            "Workload API X509SVID has an empty trust bundle (no root certificates); peers \
+             cannot be verified"
+                .into(),
+        ));
+    }
 
     let mut trust_bundles = TrustBundleSet {
         local: TrustBundle {
@@ -376,7 +437,9 @@ pub enum WorkloadApiClientError {
 
 #[cfg(test)]
 mod tests {
-    use super::split_concatenated_der;
+    use super::{split_concatenated_der, svid_response_to_bundle};
+    use crate::identity::SpiffeId;
+    use crate::identity::workload_api::proto::{X509svid, X509svidResponse};
 
     #[test]
     fn split_empty_buffer() {
@@ -407,6 +470,94 @@ mod tests {
     fn split_rejects_non_sequence_tag() {
         let blob = [0x31, 0x00];
         assert!(split_concatenated_der(&blob).is_err());
+    }
+
+    // Mint a real self-signed leaf carrying `spiffe_id` as a URI SAN. The bundle
+    // parser now verifies the leaf's SAN against the protobuf `spiffe_id` field
+    // (identity-divergence guard), so the fixture must be a genuine certificate,
+    // not an ASN.1 stub. Each call uses a fresh key, so distinct SVIDs are
+    // distinguishable by their cert/key bytes.
+    fn test_x509_svid(spiffe_id: &str) -> X509svid {
+        use crate::identity::spiffe::spiffe_id_to_san;
+        use rcgen::{CertificateParams, DistinguishedName, IsCa, KeyPair};
+        let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("leaf key");
+        let mut params = CertificateParams::default();
+        params.distinguished_name = DistinguishedName::new();
+        // The bundle parser now enforces the same leaf checks as the file loader
+        // (currently-valid + non-CA + key match), so the fixture must be a current,
+        // non-CA leaf.
+        params.is_ca = IsCa::ExplicitNoCa;
+        params.not_before = time::OffsetDateTime::now_utc() - time::Duration::days(1);
+        params.not_after = time::OffsetDateTime::now_utc() + time::Duration::days(365);
+        let id = SpiffeId::new(spiffe_id).expect("valid SPIFFE ID");
+        params
+            .subject_alt_names
+            .push(spiffe_id_to_san(&id).expect("spiffe SAN"));
+        let cert = params.self_signed(&key).expect("self-signed leaf");
+        X509svid {
+            spiffe_id: spiffe_id.to_string(),
+            x509_svid: cert.der().as_ref().to_vec(),
+            x509_svid_key: key.serialize_der(),
+            bundle: cert.der().as_ref().to_vec(),
+            hint: String::new(),
+        }
+    }
+
+    #[test]
+    fn selects_configured_spiffe_id_from_multi_svid_response() {
+        let expected = SpiffeId::new("spiffe://td/ns/default/sa/edge").unwrap();
+        let first = test_x509_svid("spiffe://td/ns/default/sa/first");
+        let wanted = test_x509_svid(expected.as_str());
+        let wanted_leaf = wanted.x509_svid.clone();
+        let wanted_key = wanted.x509_svid_key.clone();
+        let response = X509svidResponse {
+            svids: vec![first, wanted],
+            crl: Vec::new(),
+            federated_bundles: Default::default(),
+        };
+
+        let bundle = svid_response_to_bundle(response, Some(&expected)).expect("selected bundle");
+
+        assert_eq!(bundle.spiffe_id, expected);
+        assert_eq!(bundle.cert_chain_der, vec![wanted_leaf]);
+        assert_eq!(bundle.private_key_pkcs8_der, wanted_key);
+    }
+
+    #[test]
+    fn rejects_multi_svid_response_without_configured_spiffe_id() {
+        let expected = SpiffeId::new("spiffe://td/ns/default/sa/missing").unwrap();
+        let response = X509svidResponse {
+            svids: vec![test_x509_svid("spiffe://td/ns/default/sa/first")],
+            crl: Vec::new(),
+            federated_bundles: Default::default(),
+        };
+
+        let err = svid_response_to_bundle(response, Some(&expected)).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("did not include configured SPIFFE ID")
+        );
+    }
+
+    #[test]
+    fn rejects_empty_workload_api_trust_bundle() {
+        // An SVID whose local trust bundle has no roots cannot verify peers; reject
+        // it before install, matching the file loader.
+        let expected = SpiffeId::new("spiffe://td/ns/default/sa/edge").unwrap();
+        let mut svid = test_x509_svid(expected.as_str());
+        svid.bundle = Vec::new();
+        let response = X509svidResponse {
+            svids: vec![svid],
+            crl: Vec::new(),
+            federated_bundles: Default::default(),
+        };
+
+        let err = svid_response_to_bundle(response, Some(&expected)).unwrap_err();
+        assert!(
+            err.to_string().contains("empty trust bundle"),
+            "expected empty-trust-bundle rejection, got: {err}"
+        );
     }
 }
 

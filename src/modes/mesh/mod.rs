@@ -44,6 +44,7 @@ use crate::config::types::{
 };
 use crate::dns::{DnsCache, DnsConfig};
 use crate::grpc::dp_client::{DpGrpcTlsReload, GrpcJwtSecret, build_dp_grpc_tls_config};
+use crate::identity::ca::{CaBackend, CertificateAuthority};
 use crate::modes::mesh::config::{
     AppProtocol, EastWestGateway, MeshConfig, MeshDestinationRule, MeshJwtRule, MeshLoadBalancer,
     MeshLocalityLbSetting, MeshOutlierDetection, MeshRequestAuthentication, MeshSimpleLb,
@@ -71,6 +72,7 @@ const DEFAULT_DNS_TTL_SECONDS: u32 = 60;
 const DEFAULT_DNS_ENABLED: bool = false;
 const DEFAULT_DNS_MAX_CONCURRENT_QUERIES: usize = 1024;
 const DEFAULT_EGRESS_LISTEN_ADDR: &str = "0.0.0.0:15090";
+const MESH_CA_INITIAL_SVID_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub const MESH_SPIFFE_IDENTITY_PLUGIN_ID: &str = "__mesh_spiffe_identity";
 pub const MESH_AUTHZ_PLUGIN_ID: &str = "__mesh_authz";
@@ -292,6 +294,9 @@ pub struct MeshRuntimeConfig {
     /// `ISTIO_MUTUAL` is projected onto an upstream.
     /// Sourced from `FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH`.
     pub workload_svid_trust_bundle_path: Option<String>,
+    /// Automatic mesh CA backend used to populate the runtime SVID slot when
+    /// file-based `FERRUM_GATEWAY_SVID_*` material is absent.
+    pub ca_backend: CaBackend,
     /// Whether the transparent DNS proxy is enabled. Opt-in because it
     /// requires iptables/eBPF redirect to be useful.
     /// Sourced from `FERRUM_MESH_DNS_PROXY_ENABLED` (default false).
@@ -436,6 +441,8 @@ impl MeshRuntimeConfig {
         let workload_svid_cert_path = env_config.gateway_svid_cert_path.clone();
         let workload_svid_key_path = env_config.gateway_svid_key_path.clone();
         let workload_svid_trust_bundle_path = env_config.gateway_svid_trust_bundle_path.clone();
+        let ca_backend = CaBackend::from_str_lossy(&env_config.mesh_ca_backend)
+            .map_err(|error| format!("Invalid FERRUM_MESH_CA_BACKEND: {error}"))?;
         let xds_node_cluster = resolve_ferrum_var("FERRUM_MESH_XDS_NODE_CLUSTER")
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| env_config.namespace.clone());
@@ -567,6 +574,7 @@ impl MeshRuntimeConfig {
             workload_svid_cert_path,
             workload_svid_key_path,
             workload_svid_trust_bundle_path,
+            ca_backend,
             dns_enabled,
             dns_listen_addr,
             dns_upstream_addr,
@@ -2964,6 +2972,12 @@ fn apply_destination_rules(
             // below doesn't conflict with the immutable `from_upstream` read.
             let upstream_base_tls = BackendTlsConfig::from_upstream(upstream);
             let upstream_id_for_tls = upstream.id.clone();
+            // Captured owned (like `upstream_base_tls`) so the per-port
+            // `entry()` mutable borrow below does not conflict with reading the
+            // upstream's targets. Gates the ISTIO_MUTUAL CA-backed fail-closed:
+            // mesh-transport upstreams source identity from the gateway SVID
+            // slot, not the generic per-port client material.
+            let upstream_presents_dynamic_svid = upstream_uses_mesh_transport(upstream);
             for (port, port_policy) in &dr.port_level_settings {
                 // The `port_overrides` key(s) this Service-port-scoped entry
                 // must land on. A materialized per-port outbound upstream
@@ -3035,6 +3049,7 @@ fn apply_destination_rules(
                         port_tls,
                         runtime,
                         &format!("{upstream_id_for_tls}/port-{port}"),
+                        upstream_presents_dynamic_svid,
                     )
                     .map_err(|e| {
                         anyhow::anyhow!(
@@ -3262,6 +3277,11 @@ fn resolve_subset_traffic_policy_tls(
             continue;
         };
         let upstream_base_tls = BackendTlsConfig::from_upstream(upstream);
+        // Mesh-transport gate for the ISTIO_MUTUAL CA-backed fail-closed,
+        // computed once per upstream (subsets share the owning upstream's
+        // transport). Mesh-transport upstreams source identity from the
+        // gateway SVID slot, not the generic per-subset client material.
+        let upstream_presents_dynamic_svid = upstream_uses_mesh_transport(upstream);
         let mut resolved_map: HashMap<String, ResolvedSubsetTrafficPolicy> = HashMap::new();
         for subset in subsets {
             let tp = subset.traffic_policy.as_ref();
@@ -3269,8 +3289,14 @@ fn resolve_subset_traffic_policy_tls(
             let resolved_tls = if let Some(subset_tls) = tp.and_then(|tp| tp.tls.as_ref()) {
                 let identity = format!("{}/{}", upstream.id, subset.name);
                 let mut slot = upstream_base_tls.clone();
-                apply_traffic_policy_tls_to_backend_config(&mut slot, subset_tls, runtime, &identity)
-                    .map_err(|e| {
+                apply_traffic_policy_tls_to_backend_config(
+                    &mut slot,
+                    subset_tls,
+                    runtime,
+                    &identity,
+                    upstream_presents_dynamic_svid,
+                )
+                .map_err(|e| {
                         anyhow::anyhow!(
                             "DestinationRule subset trafficPolicy.tls projection failed for upstream={} subset={}: {}",
                             upstream.id,
@@ -3403,6 +3429,47 @@ fn destination_rule_matches_upstream(dr: &MeshDestinationRule, upstream: &Upstre
         || destination_rule_host_matches(&dr.host, &dr.namespace, &upstream.id)
 }
 
+/// True when EVERY target of this upstream dispatches through an SVID-backed
+/// mesh transport (HBONE or Sidecar mTLS), which source the client cert from the
+/// shared gateway SVID slot (gateway_svid_bundle) rather than the generic
+/// backend_tls_client_cert_path fields. For such upstreams a CA-backed dynamic
+/// SVID CAN back ISTIO_MUTUAL, so the generic "can't present a dynamic client
+/// cert" fail-closed must NOT apply.
+///
+/// Uses the same value-aware predicates as runtime dispatch
+/// (`target_hbone_enabled` / `target_mesh_mtls_enabled`, which require a
+/// boolish-true tag value), and requires ALL targets to qualify: if any target
+/// would fall back to the generic backend (a `mesh.hbone=false` tag, or a mixed
+/// upstream with a non-mesh target), clearing the generic client material would
+/// let that target connect with no client cert instead of failing closed.
+fn upstream_uses_mesh_transport(upstream: &Upstream) -> bool {
+    // Every materialized static target must use a mesh transport. A single non-mesh
+    // static target means generic backend TLS still applies to it, so the CA-backed
+    // mesh-transport classification must NOT clear its client cert/key. (Vacuously
+    // true for an empty target list — handled per service-discovery case below.)
+    let all_static_targets_mesh = upstream.targets.iter().all(|t| {
+        crate::proxy::hbone_pool::target_hbone_enabled(t)
+            || crate::proxy::mesh_mtls_pool::target_mesh_mtls_enabled(t)
+    });
+    match upstream.service_discovery.as_ref() {
+        // A NON-mesh service-discovery provider (DNS / Kubernetes / Consul) merges
+        // DISCOVERED targets at runtime that carry no mesh transport tags, so the
+        // upstream can never be uniformly mesh transport regardless of how its
+        // static targets are tagged — fail closed so CA-backed ISTIO_MUTUAL does
+        // not clear the generic client cert/key a discovered TLS backend needs
+        // (Codex: reject non-mesh SD before clearing client mTLS).
+        Some(sd) if sd.provider != crate::config::types::SdProvider::Mesh => false,
+        // Mesh service discovery resolves its targets at runtime with HBONE /
+        // SVID-mTLS tags, so an empty static-target list is mesh transport; any
+        // static fallback targets it ALSO carries are merged unchanged and so must
+        // themselves be mesh-tagged.
+        Some(_) => all_static_targets_mesh,
+        // No service discovery: a classic static upstream — at least one target,
+        // every one mesh-tagged.
+        None => !upstream.targets.is_empty() && all_static_targets_mesh,
+    }
+}
+
 fn destination_rule_host_matches(rule_host: &str, namespace: &str, candidate: &str) -> bool {
     let rule_host = rule_host.trim_end_matches('.').to_ascii_lowercase();
     let candidate = candidate.trim_end_matches('.').to_ascii_lowercase();
@@ -3488,7 +3555,14 @@ fn apply_traffic_policy_tls_to_upstream(
     runtime: &MeshRuntimeConfig,
 ) -> Result<(), anyhow::Error> {
     let mut slot = BackendTlsConfig::from_upstream(upstream);
-    apply_traffic_policy_tls_to_backend_config(&mut slot, tls, runtime, &upstream.id)?;
+    let presents_dynamic_svid = upstream_uses_mesh_transport(upstream);
+    apply_traffic_policy_tls_to_backend_config(
+        &mut slot,
+        tls,
+        runtime,
+        &upstream.id,
+        presents_dynamic_svid,
+    )?;
     upstream.backend_tls_client_cert_path = slot.client_cert_path;
     upstream.backend_tls_client_key_path = slot.client_key_path;
     upstream.backend_tls_server_ca_cert_path = slot.server_ca_cert_path;
@@ -3515,9 +3589,18 @@ fn apply_traffic_policy_tls_to_upstream(
 ///   `ca_certificates`; clear any stale client cert/key.
 /// - `Mutual`: enable server-cert verification; populate CA, client cert,
 ///   and private key from the DR.
-/// - `IstioMutual`: enable server-cert verification; project the workload's
-///   X.509-SVID cert/key paths and trust bundle from the mesh runtime onto the
-///   slot.
+/// - `IstioMutual`: enable server-cert verification and project the workload's
+///   file-backed X.509-SVID cert/key paths and trust bundle from the mesh
+///   runtime onto the slot. When no file SVID paths are configured: a
+///   CA-backed runtime (`ca_backend != None`) fails closed for GENERIC backend
+///   upstreams (`presents_dynamic_svid == false`) because generic backend TLS
+///   cannot present the dynamic SVID material; for mesh-transport upstreams
+///   (`presents_dynamic_svid == true`, i.e. HBONE / Sidecar mTLS) it leaves the
+///   generic client material cleared and projects only the SVID trust bundle,
+///   because those transports source the client identity from the shared
+///   gateway SVID slot. With NO CA backend AND no file SVID there is no dynamic
+///   SVID source at all, so ISTIO_MUTUAL fails closed for EVERY upstream
+///   including mesh transports.
 ///
 /// `insecure_skip_verify=true` always wins: it forces
 /// `verify_server_cert=false` regardless of mode.
@@ -3531,6 +3614,7 @@ fn apply_traffic_policy_tls_to_backend_config(
     tls: &MeshTrafficPolicyTls,
     runtime: &MeshRuntimeConfig,
     identity: &str,
+    presents_dynamic_svid: bool,
 ) -> Result<(), anyhow::Error> {
     match tls.mode {
         MtlsMode::Disable => {
@@ -3555,24 +3639,50 @@ fn apply_traffic_policy_tls_to_backend_config(
             slot.server_ca_cert_path = tls.ca_certificates.clone();
         }
         MtlsMode::IstioMutual => {
-            let (Some(cert_path), Some(key_path)) = (
+            match (
                 runtime.workload_svid_cert_path.clone(),
                 runtime.workload_svid_key_path.clone(),
-            ) else {
-                return Err(anyhow::anyhow!(
-                    "DestinationRule ISTIO_MUTUAL for '{}' requires FERRUM_GATEWAY_SVID_CERT_PATH and FERRUM_GATEWAY_SVID_KEY_PATH",
-                    identity
-                ));
-            };
-            slot.server_ca_cert_path = runtime.workload_svid_trust_bundle_path.clone();
-            if runtime.workload_svid_trust_bundle_path.is_none() {
-                warn!(
-                    identity = %identity,
-                    "DestinationRule ISTIO_MUTUAL requested but workload SVID trust bundle path is not configured; clearing any stale CA and falling back to global/default trust"
-                );
+            ) {
+                (Some(cert_path), Some(key_path)) => {
+                    slot.server_ca_cert_path = runtime.workload_svid_trust_bundle_path.clone();
+                    if runtime.workload_svid_trust_bundle_path.is_none() {
+                        warn!(
+                            identity = %identity,
+                            "DestinationRule ISTIO_MUTUAL requested but workload SVID trust bundle path is not configured; clearing any stale CA and falling back to global/default trust"
+                        );
+                    }
+                    slot.client_cert_path = Some(cert_path);
+                    slot.client_key_path = Some(key_path);
+                }
+                _ if runtime.ca_backend != CaBackend::None && !presents_dynamic_svid => {
+                    return Err(anyhow::anyhow!(
+                        "DestinationRule ISTIO_MUTUAL for '{}' cannot use FERRUM_MESH_CA_BACKEND yet because generic backend TLS cannot present dynamic runtime SVID client certificates; configure FERRUM_GATEWAY_SVID_CERT_PATH/FERRUM_GATEWAY_SVID_KEY_PATH or use MUTUAL with explicit client cert/key paths",
+                        identity
+                    ));
+                }
+                _ if runtime.ca_backend != CaBackend::None => {
+                    // Mesh transport (HBONE / Sidecar mTLS): client identity
+                    // comes from the shared gateway SVID slot
+                    // (gateway_svid_bundle), not slot.client_cert_path — the
+                    // HBONE/mTLS pools read `self.gateway_svid.load_full()`, not
+                    // the generic backend client material. A CA-backed dynamic
+                    // SVID therefore DOES back ISTIO_MUTUAL here, so leave the
+                    // generic client material cleared and project only the SVID
+                    // trust bundle for server verification.
+                    slot.client_cert_path = None;
+                    slot.client_key_path = None;
+                    slot.server_ca_cert_path = runtime.workload_svid_trust_bundle_path.clone();
+                }
+                _ => {
+                    // No file SVID and no CA backend: there is NO dynamic SVID
+                    // source at all, so even a mesh-transport upstream has no
+                    // identity to present. Fail closed for EVERY upstream.
+                    return Err(anyhow::anyhow!(
+                        "DestinationRule ISTIO_MUTUAL for '{}' requires FERRUM_GATEWAY_SVID_CERT_PATH/FERRUM_GATEWAY_SVID_KEY_PATH",
+                        identity
+                    ));
+                }
             }
-            slot.client_cert_path = Some(cert_path);
-            slot.client_key_path = Some(key_path);
         }
         // PeerAuthentication-side modes are rejected at translate time;
         // an in-memory slice that still carries one is a programming
@@ -5421,6 +5531,27 @@ async fn serve_mesh_runtime(
         refresh_mesh_outbound_enforcement(&proxy_state, &runtime, slice);
     }
 
+    // Resolve mTLS mode and start any CA-backed runtime SVID source before pool
+    // warmup / backend capability probes. HBONE capability probes require a
+    // gateway SVID; if the first refresh runs while the slot is empty, HBONE
+    // targets can remain Unknown until the next periodic refresh.
+    let inbound_mtls_mode =
+        startup_inbound_mtls_mode(initial_applied_mesh_slice.as_deref(), &runtime)?;
+    validate_egress_gateway_mtls_config(&runtime, &env_config)?;
+    let mesh_ca_trust_overlay_slot = empty_mesh_inbound_trust_overlay_slot();
+    let mesh_ca_svid_slot = start_mesh_ca_backend_svid_source(
+        &proxy_state,
+        &runtime,
+        &env_config,
+        mesh_ca_trust_overlay_slot.clone(),
+        &mut mesh_background_handles,
+        shutdown_tx.subscribe(),
+    )
+    .await?;
+    let mesh_ca_trust_overlay_slot = mesh_ca_svid_slot
+        .as_ref()
+        .map(|_| mesh_ca_trust_overlay_slot);
+
     for host in proxy_state.plugin_cache.collect_warmup_hostnames() {
         hostnames.push((host, None, None));
     }
@@ -5503,13 +5634,16 @@ async fn serve_mesh_runtime(
         None
     };
 
-    // Resolve mTLS mode from the initial mesh slice. By default this remains a
-    // startup-only decision. When the opt-in live reload flag is enabled, the
-    // mesh accept loops read `proxy_state.mesh_inbound_tls` on every accept and
-    // slice apply may atomically swap the inbound ServerConfig.
-    let inbound_mtls_mode =
-        startup_inbound_mtls_mode(initial_applied_mesh_slice.as_deref(), &runtime)?;
-    validate_egress_gateway_mtls_config(&runtime, &env_config)?;
+    // By default inbound mTLS remains a startup-only decision (`inbound_mtls_mode`
+    // and `validate_egress_gateway_mtls_config` resolved earlier, before the
+    // CA-backend SVID source started). When the opt-in live reload flag is
+    // enabled, the mesh accept loops read `proxy_state.mesh_inbound_tls` on every
+    // accept and slice apply may atomically swap the inbound ServerConfig.
+    //
+    // The inbound server identity resolves from `proxy_state.gateway_svid_bundle`:
+    // the CA-backend SVID source (started above) installs its issued SVID there,
+    // so the SVID-rotating server identity reads the live leaf and fails closed
+    // when the slot is empty.
     let mesh_frontend_identity =
         load_mesh_frontend_server_identity(&env_config, &proxy_state.gateway_svid_bundle)?;
     let initial_inbound_tls_snapshot = if env_config.mesh_peer_auth_live_reload_enabled {
@@ -5525,8 +5659,24 @@ async fn serve_mesh_runtime(
     // material is configured — the listener then keeps operator-CA chain
     // verification. The slot is read live by the verifier and re-published on
     // slice apply so federated trust changes propagate lock-free.
-    let mesh_inbound_spiffe_slot =
-        build_mesh_inbound_spiffe_slot(&env_config, initial_applied_mesh_slice.as_deref());
+    let mesh_inbound_spiffe_slot = build_mesh_inbound_spiffe_slot(
+        &env_config,
+        initial_applied_mesh_slice.as_deref(),
+        mesh_ca_svid_slot.as_ref(),
+    );
+    if mesh_ca_svid_slot.is_some()
+        && let Some(slice) = initial_applied_mesh_slice.as_deref()
+    {
+        publish_staged_spiffe_bundle(
+            &proxy_state,
+            stage_gateway_runtime_spiffe_bundle(
+                &proxy_state,
+                mesh_ca_svid_slot.as_ref(),
+                mesh_ca_trust_overlay_slot.as_ref(),
+                slice,
+            ),
+        );
+    }
     let frontend_tls = load_mesh_frontend_tls(
         &env_config,
         &tls_policy,
@@ -5691,6 +5841,7 @@ async fn serve_mesh_runtime(
             server_identity: mesh_frontend_identity,
             last_snapshot: initial_inbound_tls_snapshot,
             spiffe_bundle_slot: mesh_inbound_spiffe_slot,
+            runtime_trust_overlay_slot: mesh_ca_trust_overlay_slot,
             production: mesh_production_mode,
         },
         shutdown_tx.subscribe(),
@@ -6133,6 +6284,378 @@ struct MeshInboundTlsReloadSnapshot {
     client_ca_bundle: Option<MeshInboundClientCaBundle>,
 }
 
+fn gateway_svid_material_configured(env_config: &EnvConfig) -> bool {
+    env_config.gateway_svid_cert_path.is_some()
+        || env_config.gateway_svid_key_path.is_some()
+        || env_config.gateway_svid_trust_bundle_path.is_some()
+}
+
+fn configured_mesh_workload_spiffe_id(
+    runtime: &MeshRuntimeConfig,
+) -> Result<crate::identity::SpiffeId, anyhow::Error> {
+    let raw = runtime.workload_spiffe_id.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "FERRUM_MESH_CA_BACKEND requires FERRUM_MESH_WORKLOAD_SPIFFE_ID so the issued \
+             runtime SVID matches the local mesh workload identity"
+        )
+    })?;
+    crate::identity::SpiffeId::new(raw.to_string()).map_err(|error| {
+        anyhow::anyhow!(
+            "FERRUM_MESH_WORKLOAD_SPIFFE_ID must be a valid SPIFFE URI when \
+             FERRUM_MESH_CA_BACKEND is enabled: {error}"
+        )
+    })
+}
+
+async fn start_mesh_ca_backend_svid_source(
+    proxy_state: &ProxyState,
+    runtime: &MeshRuntimeConfig,
+    env_config: &EnvConfig,
+    trust_overlay_slot: SharedMeshInboundTrustOverlaySlot,
+    mesh_background_handles: &mut Vec<JoinHandle<()>>,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> Result<Option<tls::SharedBundleSlot>, anyhow::Error> {
+    let backend = CaBackend::from_str_lossy(&env_config.mesh_ca_backend)
+        .map_err(|error| anyhow::anyhow!("Invalid FERRUM_MESH_CA_BACKEND: {error}"))?;
+    if backend == CaBackend::None {
+        return Ok(None);
+    }
+
+    if gateway_svid_material_configured(env_config) {
+        warn!(
+            backend = %backend,
+            "FERRUM_MESH_CA_BACKEND is configured, but file-based FERRUM_GATEWAY_SVID_* \
+             material is also configured; using the explicit file SVID material and not \
+             starting automatic CA-backed SVID issuance"
+        );
+        return Ok(None);
+    }
+
+    let workload_spiffe_id = configured_mesh_workload_spiffe_id(runtime)?;
+    let inbound_slot: tls::SharedBundleSlot = Arc::new(arc_swap::ArcSwap::new(Arc::new(None)));
+    match backend {
+        CaBackend::SpireAgent => {
+            let slot = start_spire_agent_mesh_svid_source(
+                proxy_state,
+                env_config,
+                &workload_spiffe_id,
+                inbound_slot,
+                trust_overlay_slot,
+                mesh_background_handles,
+                shutdown_rx,
+            )
+            .await?;
+            Ok(Some(slot))
+        }
+        CaBackend::Internal => {
+            let slot = start_internal_mesh_svid_source(
+                proxy_state,
+                env_config,
+                workload_spiffe_id,
+                inbound_slot,
+                trust_overlay_slot,
+                mesh_background_handles,
+                shutdown_rx,
+            )
+            .await?;
+            Ok(Some(slot))
+        }
+        CaBackend::None => Ok(None),
+    }
+}
+
+async fn start_spire_agent_mesh_svid_source(
+    proxy_state: &ProxyState,
+    env_config: &EnvConfig,
+    expected_spiffe_id: &crate::identity::SpiffeId,
+    inbound_slot: tls::SharedBundleSlot,
+    trust_overlay_slot: SharedMeshInboundTrustOverlaySlot,
+    mesh_background_handles: &mut Vec<JoinHandle<()>>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> Result<tls::SharedBundleSlot, anyhow::Error> {
+    let handle = crate::identity::workload_api::SvidFetchHandle::from_slot(
+        proxy_state.gateway_svid_bundle.clone(),
+    )
+    .with_revision_tx(proxy_state.backend_svid_rotation_tx.clone())
+    .with_installer({
+        let state = proxy_state.clone();
+        let inbound_slot = inbound_slot.clone();
+        let trust_overlay_slot = trust_overlay_slot.clone();
+        move |bundle| {
+            state.install_gateway_runtime_svid_bundle(bundle);
+            publish_runtime_svid_to_inbound_slot(&state, &inbound_slot, &trust_overlay_slot);
+        }
+    });
+    let fetch_config = crate::identity::workload_api::FetchLoopConfig {
+        socket_path: env_config.mesh_spire_agent_socket.clone(),
+        expected_spiffe_id: Some(expected_spiffe_id.clone()),
+        ..Default::default()
+    };
+    let join =
+        crate::identity::workload_api::spawn_fetch_loop_with_handle(fetch_config, handle.clone());
+
+    if tokio::time::timeout(MESH_CA_INITIAL_SVID_TIMEOUT, handle.wait_for_first_svid())
+        .await
+        .is_err()
+    {
+        join.abort();
+        return Err(anyhow::anyhow!(
+            "timed out after {}s waiting for the initial SPIRE Workload API SVID from {}; \
+                 refusing to bind mesh listeners without runtime identity",
+            MESH_CA_INITIAL_SVID_TIMEOUT.as_secs(),
+            env_config.mesh_spire_agent_socket
+        ));
+    }
+
+    let snapshot = handle.snapshot();
+    let bundle = snapshot.as_ref().as_ref().ok_or_else(|| {
+        join.abort();
+        anyhow::anyhow!("SPIRE Workload API reported initial readiness without an SVID bundle")
+    })?;
+    if &bundle.spiffe_id != expected_spiffe_id {
+        join.abort();
+        anyhow::bail!(
+            "SPIRE Workload API returned SVID '{}' but FERRUM_MESH_WORKLOAD_SPIFFE_ID is '{}'",
+            bundle.spiffe_id,
+            expected_spiffe_id
+        );
+    }
+
+    info!(
+        spiffe_id = %bundle.spiffe_id,
+        trust_domain = %bundle.trust_domain(),
+        "Mesh CA backend loaded runtime SVID from SPIRE Workload API"
+    );
+    let mut join = join;
+    mesh_background_handles.push(tokio::spawn(async move {
+        tokio::select! {
+            result = &mut join => {
+                if let Err(error) = result
+                    && !error.is_cancelled()
+                {
+                    warn!(
+                        error = %error,
+                        "SPIRE Workload API SVID fetch task exited unexpectedly"
+                    );
+                }
+            }
+            _ = wait_for_mesh_shutdown(&mut shutdown_rx) => {
+                join.abort();
+                match join.await {
+                    Ok(()) => {}
+                    Err(error) if error.is_cancelled() => {}
+                    Err(error) => {
+                        warn!(
+                            error = %error,
+                            "SPIRE Workload API SVID fetch task failed while stopping"
+                        );
+                    }
+                }
+            }
+        }
+    }));
+    Ok(inbound_slot)
+}
+
+async fn start_internal_mesh_svid_source(
+    proxy_state: &ProxyState,
+    env_config: &EnvConfig,
+    spiffe_id: crate::identity::SpiffeId,
+    inbound_slot: tls::SharedBundleSlot,
+    trust_overlay_slot: SharedMeshInboundTrustOverlaySlot,
+    mesh_background_handles: &mut Vec<JoinHandle<()>>,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> Result<tls::SharedBundleSlot, anyhow::Error> {
+    let root = crate::identity::ca::bootstrap::bootstrap_dev_root(
+        crate::identity::ca::bootstrap::BootstrapConfig::new(spiffe_id.trust_domain().clone()),
+    )
+    .map_err(|error| anyhow::anyhow!("internal mesh CA bootstrap failed: {error}"))?;
+    let ca = Arc::new(crate::identity::ca::internal::InternalCa::new(
+        crate::identity::ca::internal::InternalCaConfig {
+            root_cert_pem: root.root_cert_pem,
+            root_key_pem: root.root_key_pem,
+            trust_domain: root.trust_domain,
+            bundle_refresh_hint_secs: None,
+            default_svid_ttl_secs: env_config.mesh_cert_ttl_seconds,
+            max_svid_ttl_secs: crate::identity::ca::internal::MAX_SVID_TTL_SECS,
+        },
+    )?) as crate::identity::ca::SharedCa;
+
+    issue_and_install_mesh_ca_svid(
+        proxy_state,
+        ca.as_ref(),
+        &spiffe_id,
+        env_config,
+        &inbound_slot,
+        &trust_overlay_slot,
+        false,
+    )
+    .await?;
+    let state = proxy_state.clone();
+    let loop_env = env_config.clone();
+    let loop_inbound_slot = inbound_slot.clone();
+    let loop_trust_overlay_slot = trust_overlay_slot.clone();
+    mesh_background_handles.push(tokio::spawn(async move {
+        run_internal_mesh_svid_rotation_loop(
+            state,
+            ca,
+            spiffe_id,
+            loop_env,
+            loop_inbound_slot,
+            loop_trust_overlay_slot,
+            shutdown_rx,
+        )
+        .await;
+    }));
+
+    Ok(inbound_slot)
+}
+
+async fn run_internal_mesh_svid_rotation_loop(
+    proxy_state: ProxyState,
+    ca: crate::identity::ca::SharedCa,
+    spiffe_id: crate::identity::SpiffeId,
+    env_config: EnvConfig,
+    inbound_slot: tls::SharedBundleSlot,
+    trust_overlay_slot: SharedMeshInboundTrustOverlaySlot,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    loop {
+        let next_tick = {
+            let snapshot = proxy_state.gateway_svid_bundle.load_full();
+            snapshot
+                .as_ref()
+                .as_ref()
+                .map(|bundle| crate::identity::rotation::decide_next_tick(bundle, 0.5))
+                .unwrap_or(Duration::from_secs(1))
+        };
+
+        tokio::select! {
+            _ = tokio::time::sleep(next_tick) => {}
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
+                    return;
+                }
+                continue;
+            }
+        }
+
+        let needs_rotation = {
+            let snapshot = proxy_state.gateway_svid_bundle.load_full();
+            snapshot
+                .as_ref()
+                .as_ref()
+                .map(|bundle| crate::identity::rotation::is_due_for_rotation(bundle, 0.5))
+                .unwrap_or(true)
+        };
+        if !needs_rotation {
+            continue;
+        }
+
+        if let Err(error) = issue_and_install_mesh_ca_svid(
+            &proxy_state,
+            ca.as_ref(),
+            &spiffe_id,
+            &env_config,
+            &inbound_slot,
+            &trust_overlay_slot,
+            true,
+        )
+        .await
+        {
+            crate::plugins::mesh::prometheus_helpers::increment_mesh_cert_rotation_failure(
+                &spiffe_id, "internal",
+            );
+            warn!(
+                error = %error,
+                spiffe_id = %spiffe_id,
+                "internal mesh CA SVID rotation failed; keeping current identity"
+            );
+        }
+    }
+}
+
+async fn issue_and_install_mesh_ca_svid(
+    proxy_state: &ProxyState,
+    ca: &dyn CertificateAuthority,
+    spiffe_id: &crate::identity::SpiffeId,
+    env_config: &EnvConfig,
+    inbound_slot: &tls::SharedBundleSlot,
+    trust_overlay_slot: &SharedMeshInboundTrustOverlaySlot,
+    publish_revision: bool,
+) -> Result<(), anyhow::Error> {
+    let signed = ca
+        .issue_svid(crate::identity::ca::IssuanceRequest::Generate {
+            spiffe_id: spiffe_id.clone(),
+            ttl_secs: env_config.mesh_cert_ttl_seconds,
+        })
+        .await?;
+    let trust_bundle = ca.trust_bundle(spiffe_id.trust_domain()).await?;
+    let bundle = crate::identity::SvidBundle {
+        spiffe_id: signed.spiffe_id,
+        cert_chain_der: signed.cert_chain_der,
+        private_key_pkcs8_der: signed.private_key_pkcs8_der,
+        trust_bundles: crate::identity::TrustBundleSet::local_only(crate::identity::TrustBundle {
+            trust_domain: trust_bundle.trust_domain.clone(),
+            x509_authorities: trust_bundle.roots_der,
+            jwt_authorities: Vec::new(),
+            refresh_hint_seconds: trust_bundle.refresh_hint_secs,
+        }),
+    };
+    let installed_spiffe_id = bundle.spiffe_id.clone();
+    proxy_state.install_gateway_runtime_svid_bundle(bundle);
+    publish_runtime_svid_to_inbound_slot(proxy_state, inbound_slot, trust_overlay_slot);
+    if publish_revision {
+        proxy_state
+            .backend_svid_rotation_tx
+            .send_modify(|revision| *revision = revision.saturating_add(1));
+    }
+    info!(
+        spiffe_id = %installed_spiffe_id,
+        svid_revision = *proxy_state.backend_svid_rotation_tx.borrow(),
+        "Mesh CA backend installed runtime SVID"
+    );
+    Ok(())
+}
+
+type SharedMeshInboundTrustOverlaySlot =
+    Arc<arc_swap::ArcSwap<Option<crate::identity::TrustBundleSet>>>;
+
+fn empty_mesh_inbound_trust_overlay_slot() -> SharedMeshInboundTrustOverlaySlot {
+    Arc::new(arc_swap::ArcSwap::new(Arc::new(None)))
+}
+
+/// Republish the inbound SPIFFE verifier slot from the CURRENT runtime SVID plus
+/// the current accepted trust overlay.
+///
+/// Both the SVID rotation install path and the slice-apply staged publish call
+/// this, so it serializes on `gateway_svid_update_lock` (the same lock
+/// `install_gateway_runtime_svid_bundle` holds) and re-reads the latest SVID from
+/// `gateway_file_svid_bundle` under that lock rather than trusting a captured
+/// snapshot. Without this, a rotation that completes between a slice apply's
+/// staging and publish could be clobbered by the older staged SVID, leaving the
+/// inbound verifier pinned to stale (possibly near-expiry) cert/key + roots.
+fn publish_runtime_svid_to_inbound_slot(
+    proxy_state: &ProxyState,
+    inbound_slot: &tls::SharedBundleSlot,
+    trust_overlay_slot: &SharedMeshInboundTrustOverlaySlot,
+) {
+    let _guard = proxy_state
+        .gateway_svid_update_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let snapshot = proxy_state.gateway_file_svid_bundle.load_full();
+    let Some(mut bundle) = snapshot.as_ref().clone() else {
+        return;
+    };
+    let trust_overlay = trust_overlay_slot.load_full();
+    match trust_overlay.as_ref() {
+        Some(overlay) => merge_trust_overlay_into_svid_bundle(&mut bundle, overlay),
+        None => retain_svid_local_trust_only(&mut bundle),
+    }
+    inbound_slot.store(Arc::new(Some(bundle)));
+}
+
 struct MeshInboundTlsReloadState {
     server_identity: Option<Arc<tls::MeshServerIdentity>>,
     last_snapshot: Option<MeshInboundTlsReloadSnapshot>,
@@ -6145,6 +6668,7 @@ struct MeshInboundTlsReloadState {
     /// effect without a listener restart (per the lock-free SVID slot model
     /// in `.claude/rules/tls-security.md`).
     spiffe_bundle_slot: Option<tls::SharedBundleSlot>,
+    runtime_trust_overlay_slot: Option<SharedMeshInboundTrustOverlaySlot>,
     /// `FERRUM_MESH_PRODUCTION_MODE` captured once at startup. The live-reload
     /// fail-closed gate (issue #1523) consults this instead of re-reading the
     /// environment on every slice apply: the flag is fixed for the process
@@ -6154,21 +6678,28 @@ struct MeshInboundTlsReloadState {
     production: bool,
 }
 
-/// Build the optional SPIFFE inbound trust-bundle slot from the gateway SVID
-/// file material, merging in the slice's federated trust bundles so inbound
-/// peer SANs from federated trust domains validate too. Returns `None` when no
-/// gateway SVID material is configured (the inbound listener then keeps the
-/// operator client-CA chain verification it has always used). It also returns
-/// `None` (logged) when SVID material *is* configured but fails to load — but
-/// the caller does NOT silently degrade to chain-only in that case (issue
-/// #1523): at startup a configured-but-unloadable SVID is fatal (see the F2
-/// note in the body, and `enforce_mesh_inbound_fail_closed`), and on live reload
-/// the previous trust bundle is retained. See `build_mesh_inbound_spiffe_slot`'s
-/// F2 comment for the precise per-caller disposition.
+/// Build the optional SPIFFE inbound trust-bundle slot from file-backed SVID
+/// material or a CA-backed runtime SVID slot. File material is merged with the
+/// slice's federated trust bundles immediately; runtime slots receive the
+/// accepted slice overlay through `stage_gateway_runtime_spiffe_bundle`.
+/// Returns `None` when no gateway SVID material is configured (the inbound
+/// listener then keeps the operator client-CA chain verification it has always
+/// used). It also returns `None` (logged) when file SVID material *is*
+/// configured but fails to load — but the caller does NOT silently degrade to
+/// chain-only in that case (issue #1523): at startup a configured-but-unloadable
+/// SVID is fatal (see the F2 note in the body, and
+/// `enforce_mesh_inbound_fail_closed`), and on live reload the previous trust
+/// bundle is retained. See `build_mesh_inbound_spiffe_slot`'s F2 comment for
+/// the precise per-caller disposition.
 fn build_mesh_inbound_spiffe_slot(
     env_config: &EnvConfig,
     slice: Option<&MeshSlice>,
+    runtime_svid_slot: Option<&tls::SharedBundleSlot>,
 ) -> Option<tls::SharedBundleSlot> {
+    if let Some(slot) = runtime_svid_slot {
+        return Some(slot.clone());
+    }
+
     let (cert_path, key_path, trust_bundle_path) = match (
         env_config.gateway_svid_cert_path.as_deref(),
         env_config.gateway_svid_key_path.as_deref(),
@@ -6225,7 +6756,8 @@ fn build_mesh_inbound_spiffe_slot(
 /// Overlay the slice's federated (and any extra local) trust bundles onto the
 /// gateway SVID bundle so the inbound SPIFFE verifier accepts peers from
 /// federated trust domains. The SVID's own local bundle (its trust domain's
-/// roots) is preserved; federated entries from the slice are added.
+/// roots) is preserved; federated entries from the slice replace any raw
+/// federated entries already present on the SVID bundle.
 ///
 /// F3 (documented design choice): the CP-pushed slice is the SOLE authority for
 /// inbound trust domains. Unlike the backend/outbound path
@@ -6239,6 +6771,7 @@ fn merge_slice_federation_into_svid_bundle(
     bundle: &mut crate::identity::SvidBundle,
     slice: Option<&MeshSlice>,
 ) {
+    retain_svid_local_trust_only(bundle);
     let Some(slice) = slice else {
         return;
     };
@@ -6256,15 +6789,29 @@ fn merge_slice_federation_into_svid_bundle(
             return;
         }
     };
-    // Add federated bundles from the slice. The local bundle stays anchored to
-    // the gateway SVID's own trust domain (we do not let the slice override the
-    // local roots the SVID itself chains to).
-    for (trust_domain, federated) in runtime.federated {
+    merge_trust_overlay_into_svid_bundle(bundle, &runtime);
+}
+
+fn retain_svid_local_trust_only(bundle: &mut crate::identity::SvidBundle) {
+    bundle.trust_bundles.federated.clear();
+}
+
+fn merge_trust_overlay_into_svid_bundle(
+    bundle: &mut crate::identity::SvidBundle,
+    runtime: &crate::identity::TrustBundleSet,
+) {
+    // CP-pushed slice trust is authoritative for inbound federation. Drop raw
+    // federated bundles from the SVID source before adding accepted slice
+    // bundles. The local bundle stays anchored to the gateway SVID's own trust
+    // domain (we do not let the slice override the local roots the SVID itself
+    // chains to).
+    retain_svid_local_trust_only(bundle);
+    for (trust_domain, federated) in &runtime.federated {
         bundle
             .trust_bundles
             .federated
-            .entry(trust_domain)
-            .or_insert(federated);
+            .entry(trust_domain.clone())
+            .or_insert_with(|| federated.clone());
     }
     // If the slice's local bundle is for a different trust domain than the
     // SVID's, treat it as a federated peer trust domain so cross-trust peers
@@ -6274,7 +6821,7 @@ fn merge_slice_federation_into_svid_bundle(
             .trust_bundles
             .federated
             .entry(runtime.local.trust_domain.clone())
-            .or_insert(runtime.local);
+            .or_insert_with(|| runtime.local.clone());
     }
 }
 
@@ -6286,13 +6833,23 @@ fn merge_slice_federation_into_svid_bundle(
 /// returns `None` (logged) and the caller leaves the previous trust bundles in
 /// place — this never fails the slice.
 fn stage_mesh_inbound_spiffe_bundle(
+    proxy_state: &ProxyState,
     slot: Option<&tls::SharedBundleSlot>,
+    runtime_trust_overlay_slot: Option<&SharedMeshInboundTrustOverlaySlot>,
     env_config: &EnvConfig,
     slice: &MeshSlice,
 ) -> Option<StagedSpiffeBundle> {
     let slot = slot?;
-    match build_mesh_inbound_spiffe_slot(env_config, Some(slice)) {
-        Some(rebuilt) => Some(StagedSpiffeBundle {
+    if !gateway_svid_material_configured(env_config) {
+        return stage_gateway_runtime_spiffe_bundle(
+            proxy_state,
+            Some(slot),
+            runtime_trust_overlay_slot,
+            slice,
+        );
+    }
+    match build_mesh_inbound_spiffe_slot(env_config, Some(slice), None) {
+        Some(rebuilt) => Some(StagedSpiffeBundle::DirectSlot {
             slot: slot.clone(),
             bundle: rebuilt.load_full(),
         }),
@@ -6305,6 +6862,46 @@ fn stage_mesh_inbound_spiffe_bundle(
             None
         }
     }
+}
+
+fn stage_gateway_runtime_spiffe_bundle(
+    proxy_state: &ProxyState,
+    slot: Option<&tls::SharedBundleSlot>,
+    runtime_trust_overlay_slot: Option<&SharedMeshInboundTrustOverlaySlot>,
+    slice: &MeshSlice,
+) -> Option<StagedSpiffeBundle> {
+    let slot = slot?;
+    let runtime_trust_overlay_slot = runtime_trust_overlay_slot?;
+    let trust_overlay = match slice.trust_bundles.as_ref() {
+        Some(serialized) => match serialized.to_runtime() {
+            Ok(runtime) => Some(runtime),
+            Err(error) => {
+                warn!(
+                    %error,
+                    mesh_slice_version = %slice.version,
+                    "Unable to stage mesh inbound SPIFFE trust overlay from slice; \
+                     keeping previous trust bundles"
+                );
+                return None;
+            }
+        },
+        None => None,
+    };
+
+    let snapshot = proxy_state.gateway_file_svid_bundle.load_full();
+    if snapshot.as_ref().is_none() {
+        warn!(
+            mesh_slice_version = %slice.version,
+            "Unable to stage mesh inbound SPIFFE trust overlay because no runtime SVID \
+             bundle is loaded; keeping previous trust bundles"
+        );
+        return None;
+    }
+    Some(StagedSpiffeBundle::RuntimeSlot {
+        slot: slot.clone(),
+        trust_overlay_slot: runtime_trust_overlay_slot.clone(),
+        trust_overlay,
+    })
 }
 
 /// Build the inbound SPIFFE client-cert verifier for the given mTLS mode and
@@ -6415,6 +7012,35 @@ fn load_mesh_frontend_server_identity(
         return Ok(Some(tls::svid_rotating_mesh_server_identity(
             cert_path,
             key_path,
+            gateway_svid_bundle.clone(),
+        )?));
+    }
+    // No explicit FERRUM_FRONTEND_TLS_* override and no FERRUM_GATEWAY_SVID_*
+    // file material, but a CA backend (FERRUM_MESH_CA_BACKEND=spire|internal) is
+    // active: the inbound listener's server identity is the CA-issued runtime
+    // SVID. `start_mesh_ca_backend_svid_source` (run earlier in startup) installs
+    // that SVID into `proxy_state.gateway_svid_bundle` — the same shared slot
+    // passed here — and refreshes it on every rotation, so the inbound server
+    // certificate resolves LIVE from the slot exactly like the gateway-SVID-file
+    // case above. `svid_rotating_mesh_server_identity` validates the slot's
+    // current material and FAILS CLOSED at startup if it is empty (a configured
+    // CA backend that produced no usable SVID is a real fault, not a
+    // dev-plaintext posture). There are no cert/key files, so the descriptor
+    // strings record the CA backend rather than a path.
+    let ca_backend = crate::identity::ca::CaBackend::from_str_lossy(&env_config.mesh_ca_backend)
+        .map_err(|error| anyhow::anyhow!("Invalid FERRUM_MESH_CA_BACKEND: {error}"))?;
+    if ca_backend != crate::identity::ca::CaBackend::None {
+        let descriptor = format!("FERRUM_MESH_CA_BACKEND={ca_backend}");
+        info!(
+            ca_backend = %ca_backend,
+            "Mesh inbound listener using the CA-backed runtime SVID as its TLS \
+             server identity (no explicit FERRUM_FRONTEND_TLS_* or FERRUM_GATEWAY_SVID_* \
+             material set). The inbound server certificate resolves live from the \
+             gateway SVID slot and rotates with each CA-backed issuance."
+        );
+        return Ok(Some(tls::svid_rotating_mesh_server_identity(
+            &descriptor,
+            &descriptor,
             gateway_svid_bundle.clone(),
         )?));
     }
@@ -6583,13 +7209,20 @@ fn load_mesh_frontend_tls(
         );
     }
 
-    let mut tls_config = if let Some(bundle) = client_ca_bundle {
+    let client_ca_bundle_ref = client_ca_bundle.map(|bundle| tls::ClientCaBundleRef {
+        path: bundle.path.as_str(),
+        pem: bundle.pem.as_ref(),
+    });
+    // `MeshServerIdentity` encapsulates both the operator-static credential and
+    // the SVID-rotating credential (CA-backed or gateway-SVID-file); its
+    // `server_cert_resolver` presents the live leaf per handshake for the
+    // rotating source and fails closed when the shared slot is empty. The same
+    // `spiffe_verifier` is wired in below regardless of source, so a CA-backed
+    // inbound listener verifies peer SPIFFE SANs exactly like the file path.
+    let mut tls_config = if let Some(bundle_ref) = client_ca_bundle_ref {
         tls::load_mesh_tls_config_with_identity_and_client_ca_bytes(
             server_identity,
-            Some(tls::ClientCaBundleRef {
-                path: bundle.path.as_str(),
-                pem: bundle.pem.as_ref(),
-            }),
+            Some(bundle_ref),
             client_auth,
             tls_policy,
             env_config.tls_cert_expiry_warning_days,
@@ -6763,9 +7396,17 @@ fn validate_egress_gateway_mtls_config(
         return Ok(());
     }
 
-    if env_config.frontend_tls_cert_path.is_none() || env_config.frontend_tls_key_path.is_none() {
+    let has_explicit_frontend_identity =
+        env_config.frontend_tls_cert_path.is_some() && env_config.frontend_tls_key_path.is_some();
+    let has_file_svid_identity = env_config.gateway_svid_cert_path.is_some()
+        && env_config.gateway_svid_key_path.is_some()
+        && env_config.gateway_svid_trust_bundle_path.is_some();
+    let has_ca_backed_svid_identity = runtime.ca_backend != CaBackend::None;
+    let has_svid_backed_identity = has_file_svid_identity || has_ca_backed_svid_identity;
+
+    if !has_explicit_frontend_identity && !has_svid_backed_identity {
         return Err(anyhow::anyhow!(
-            "FERRUM_MESH_TOPOLOGY=egress_gateway requires FERRUM_FRONTEND_TLS_CERT_PATH and FERRUM_FRONTEND_TLS_KEY_PATH for the egress mTLS listener"
+            "FERRUM_MESH_TOPOLOGY=egress_gateway requires a TLS server identity for the egress mTLS listener: set FERRUM_FRONTEND_TLS_CERT_PATH and FERRUM_FRONTEND_TLS_KEY_PATH, configure FERRUM_GATEWAY_SVID_CERT_PATH / FERRUM_GATEWAY_SVID_KEY_PATH / FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH, or configure FERRUM_MESH_CA_BACKEND with FERRUM_MESH_WORKLOAD_SPIFFE_ID"
         ));
     }
 
@@ -6775,9 +7416,9 @@ fn validate_egress_gateway_mtls_config(
         ));
     }
 
-    if env_config.frontend_tls_client_ca_bundle_path.is_none() {
+    if env_config.frontend_tls_client_ca_bundle_path.is_none() && !has_svid_backed_identity {
         return Err(anyhow::anyhow!(
-            "FERRUM_MESH_TOPOLOGY=egress_gateway requires FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH so sidecar client certificates are verified"
+            "FERRUM_MESH_TOPOLOGY=egress_gateway requires a peer verifier for the egress mTLS listener: set FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH, configure FERRUM_GATEWAY_SVID_CERT_PATH / FERRUM_GATEWAY_SVID_KEY_PATH / FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH, or configure FERRUM_MESH_CA_BACKEND with FERRUM_MESH_WORKLOAD_SPIFFE_ID"
         ));
     }
 
@@ -6832,12 +7473,24 @@ enum MeshInboundTlsReloadPlan {
     },
 }
 
-/// A rebuilt inbound SPIFFE trust-bundle plus the live slot it should be stored
-/// into once the reload is accepted. Staging keeps the live verifier reading
-/// the previous trust bundles until the candidate proxy config is accepted.
-struct StagedSpiffeBundle {
-    slot: tls::SharedBundleSlot,
-    bundle: Arc<Option<crate::identity::SvidBundle>>,
+/// A staged inbound SPIFFE trust update. Staging keeps the live verifier
+/// reading the previous trust bundles until the candidate proxy config is
+/// accepted.
+enum StagedSpiffeBundle {
+    /// File-backed SVID path: replace the dedicated inbound verifier slot.
+    DirectSlot {
+        slot: tls::SharedBundleSlot,
+        bundle: Arc<Option<crate::identity::SvidBundle>>,
+    },
+    /// CA-backed SVID path: update the dedicated runtime inbound verifier slot
+    /// from the latest raw SVID plus the accepted slice trust overlay. The
+    /// SVID itself is intentionally not captured at staging time because a CA
+    /// rotation can complete while the candidate slice is still being planned.
+    RuntimeSlot {
+        slot: tls::SharedBundleSlot,
+        trust_overlay_slot: SharedMeshInboundTrustOverlaySlot,
+        trust_overlay: Option<crate::identity::TrustBundleSet>,
+    },
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6849,6 +7502,7 @@ fn plan_mesh_inbound_tls_reload(
     server_identity: Option<&tls::MeshServerIdentity>,
     last_snapshot: Option<&MeshInboundTlsReloadSnapshot>,
     spiffe_bundle_slot: Option<&tls::SharedBundleSlot>,
+    runtime_trust_overlay_slot: Option<&SharedMeshInboundTrustOverlaySlot>,
     production: bool,
     // Precomputed once by the apply task (topology is process-fixed) so the reload
     // path does not re-derive `runtime.listener_plan()` on every slice apply.
@@ -6874,10 +7528,15 @@ fn plan_mesh_inbound_tls_reload(
     // the candidate proxy config is accepted. The verifier reads the slot live,
     // so this still propagates federated trust-domain changes lock-free even
     // when the operator client CA bundle and mTLS mode are otherwise unchanged.
-    // Only the federated set is recomputed; the SVID local roots/cert/key stay
-    // the file-based startup inputs per the peer-auth reload invariant.
-    let staged_spiffe =
-        stage_mesh_inbound_spiffe_bundle(spiffe_bundle_slot, &proxy_state.env_config, slice);
+    // Only the accepted slice trust overlay is recomputed; the SVID cert/key
+    // and local roots stay anchored to the current file or CA runtime source.
+    let staged_spiffe = stage_mesh_inbound_spiffe_bundle(
+        proxy_state,
+        spiffe_bundle_slot,
+        runtime_trust_overlay_slot,
+        &proxy_state.env_config,
+        slice,
+    );
     if last_snapshot == Some(&next_snapshot) {
         return Some(MeshInboundTlsReloadPlan::Unchanged { staged_spiffe });
     }
@@ -6974,7 +7633,7 @@ async fn apply_mesh_inbound_tls_reload(
             // Listener TLS config is unchanged, but a federated trust-domain
             // change may still need publishing. Now that the proxy config was
             // accepted, store the staged SPIFFE bundle into the live slot.
-            publish_staged_spiffe_bundle(staged_spiffe);
+            publish_staged_spiffe_bundle(proxy_state, staged_spiffe);
         }
         MeshInboundTlsReloadPlan::Swap {
             snapshot,
@@ -6986,7 +7645,7 @@ async fn apply_mesh_inbound_tls_reload(
             // a rejected slice never alters inbound trust. The verifier reads
             // the slot live; the new TLS config's verifier will observe the new
             // bundle on its next handshake.
-            publish_staged_spiffe_bundle(staged_spiffe);
+            publish_staged_spiffe_bundle(proxy_state, staged_spiffe);
             proxy_state
                 .mesh_inbound_tls
                 .store(Arc::new(tls_config.clone()));
@@ -7157,9 +7816,25 @@ fn start_remote_cluster_discovery_reconcile_task(
 /// trusts (or stops trusting) peer domains for a slice the runtime rejected.
 /// The verifier holds an `Arc` to this slot and observes the new bundle on its
 /// next handshake.
-fn publish_staged_spiffe_bundle(staged: Option<StagedSpiffeBundle>) {
-    if let Some(StagedSpiffeBundle { slot, bundle }) = staged {
-        slot.store(bundle);
+fn publish_staged_spiffe_bundle(proxy_state: &ProxyState, staged: Option<StagedSpiffeBundle>) {
+    match staged {
+        Some(StagedSpiffeBundle::DirectSlot { slot, bundle }) => {
+            slot.store(bundle);
+        }
+        Some(StagedSpiffeBundle::RuntimeSlot {
+            slot,
+            trust_overlay_slot,
+            trust_overlay,
+        }) => {
+            // Publish the accepted trust overlay, then republish the inbound slot
+            // from the LATEST runtime SVID under the rotation lock (a CA rotation
+            // may have landed since this slice was staged). `publish_runtime_svid_to_inbound_slot`
+            // re-reads `gateway_file_svid_bundle` itself, so a rotation cannot be
+            // clobbered by a stale staged snapshot.
+            trust_overlay_slot.store(Arc::new(trust_overlay));
+            publish_runtime_svid_to_inbound_slot(proxy_state, &slot, &trust_overlay_slot);
+        }
+        None => {}
     }
 }
 
@@ -7227,6 +7902,7 @@ fn start_mesh_slice_apply_task(
                                 inbound_tls_reload.server_identity.as_deref(),
                                 inbound_tls_reload.last_snapshot.as_ref(),
                                 inbound_tls_reload.spiffe_bundle_slot.as_ref(),
+                                inbound_tls_reload.runtime_trust_overlay_slot.as_ref(),
                                 inbound_tls_reload.production,
                                 has_termination_listener,
                             )
@@ -8321,6 +8997,7 @@ mod tests {
             workload_svid_cert_path: None,
             workload_svid_key_path: None,
             workload_svid_trust_bundle_path: None,
+            ca_backend: CaBackend::None,
             dns_enabled: false,
             dns_listen_addr: DEFAULT_DNS_LISTEN_ADDR.parse().unwrap(),
             dns_upstream_addr: DEFAULT_DNS_UPSTREAM_ADDR.parse().unwrap(),
@@ -8426,6 +9103,7 @@ mod tests {
             workload_svid_cert_path: None,
             workload_svid_key_path: None,
             workload_svid_trust_bundle_path: None,
+            ca_backend: CaBackend::None,
             dns_enabled: false,
             dns_listen_addr: DEFAULT_DNS_LISTEN_ADDR.parse().unwrap(),
             dns_upstream_addr: DEFAULT_DNS_UPSTREAM_ADDR.parse().unwrap(),
@@ -11309,6 +11987,256 @@ mod tests {
             err.to_string()
                 .contains("requires FERRUM_GATEWAY_SVID_CERT_PATH"),
             "got: {err}"
+        );
+    }
+
+    #[test]
+    fn dr_tls_istio_mutual_rejects_ca_backed_runtime_svid_source_for_generic_backend_tls() {
+        let mut upstream =
+            destination_rule_test_upstream("u1", "reviews.default.svc.cluster.local");
+        upstream.backend_tls_client_cert_path = Some("/existing/client.pem".to_string());
+        upstream.backend_tls_client_key_path = Some("/existing/client.key".to_string());
+        upstream.backend_tls_server_ca_cert_path = Some("/stale/ca.pem".to_string());
+        upstream.backend_tls_verify_server_cert = false;
+        let runtime = MeshRuntimeConfig {
+            workload_svid_cert_path: None,
+            workload_svid_key_path: None,
+            workload_svid_trust_bundle_path: None,
+            ca_backend: CaBackend::Internal,
+            ..test_mesh_runtime_config()
+        };
+
+        let policy = MeshTrafficPolicy {
+            tls: Some(MeshTrafficPolicyTls {
+                mode: MtlsMode::IstioMutual,
+                ..MeshTrafficPolicyTls::default()
+            }),
+            ..MeshTrafficPolicy::default()
+        };
+        let err = apply_traffic_policy_to_upstream(&mut upstream, &policy, &runtime)
+            .expect_err("CA-backed runtime SVID source must fail closed for generic backend TLS");
+
+        let message = err.to_string();
+        assert!(message.contains("FERRUM_MESH_CA_BACKEND"), "got: {err}");
+        assert!(
+            message.contains("generic backend TLS cannot present dynamic runtime SVID"),
+            "got: {err}"
+        );
+        assert!(!upstream.backend_tls_verify_server_cert);
+        assert_eq!(
+            upstream.backend_tls_client_cert_path.as_deref(),
+            Some("/existing/client.pem")
+        );
+        assert_eq!(
+            upstream.backend_tls_client_key_path.as_deref(),
+            Some("/existing/client.key")
+        );
+        assert_eq!(
+            upstream.backend_tls_server_ca_cert_path.as_deref(),
+            Some("/stale/ca.pem")
+        );
+    }
+
+    #[test]
+    fn dr_tls_istio_mutual_ca_backed_allowed_for_mesh_transport_upstream() {
+        // A mesh-transport upstream (HBONE / Sidecar mTLS) sources its client
+        // identity from the shared gateway SVID slot (`gateway_svid_bundle`),
+        // not the generic `backend_tls_client_cert_path` fields. So a CA-backed
+        // runtime SVID (no file SVID paths) DOES back ISTIO_MUTUAL here, and the
+        // slice must NOT be rejected — unlike the generic-backend case above.
+        let mut upstream =
+            destination_rule_test_upstream("u1", "reviews.default.svc.cluster.local");
+        // Mark the target for HBONE dispatch. `upstream_uses_mesh_transport`
+        // keys off this tag (the materializer stamps it on every HBONE /
+        // Sidecar-mTLS egress target).
+        upstream.targets[0].tags.insert(
+            crate::proxy::hbone_pool::HBONE_TARGET_TAG.to_string(),
+            "true".to_string(),
+        );
+        // Pre-existing generic client material that must be cleared: identity
+        // comes from the SVID slot, not these fields.
+        upstream.backend_tls_client_cert_path = Some("/existing/client.pem".to_string());
+        upstream.backend_tls_client_key_path = Some("/existing/client.key".to_string());
+        upstream.backend_tls_server_ca_cert_path = Some("/stale/ca.pem".to_string());
+        upstream.backend_tls_verify_server_cert = false;
+
+        let runtime = MeshRuntimeConfig {
+            workload_svid_cert_path: None,
+            workload_svid_key_path: None,
+            workload_svid_trust_bundle_path: Some(
+                "/var/run/secrets/ferrum/trust-bundle.pem".to_string(),
+            ),
+            ca_backend: CaBackend::Internal,
+            ..test_mesh_runtime_config()
+        };
+
+        let policy = MeshTrafficPolicy {
+            tls: Some(MeshTrafficPolicyTls {
+                mode: MtlsMode::IstioMutual,
+                ..MeshTrafficPolicyTls::default()
+            }),
+            ..MeshTrafficPolicy::default()
+        };
+        apply_traffic_policy_to_upstream(&mut upstream, &policy, &runtime)
+            .expect("CA-backed ISTIO_MUTUAL is allowed for mesh-transport upstreams");
+
+        // Generic client material is cleared (identity comes from the SVID slot).
+        assert_eq!(upstream.backend_tls_client_cert_path, None);
+        assert_eq!(upstream.backend_tls_client_key_path, None);
+        // Server verification is enabled and CA is the SVID trust bundle.
+        assert!(upstream.backend_tls_verify_server_cert);
+        assert_eq!(
+            upstream.backend_tls_server_ca_cert_path.as_deref(),
+            Some("/var/run/secrets/ferrum/trust-bundle.pem")
+        );
+    }
+
+    #[test]
+    fn dr_tls_istio_mutual_ca_backed_allowed_for_mesh_service_discovery_upstream() {
+        // A mesh service-discovery upstream resolves its targets at runtime, so
+        // `targets` is EMPTY at slice apply (`service_discovery::mesh` stamps the
+        // HBONE transport tag later). `upstream_uses_mesh_transport` must still
+        // recognize it as a mesh transport up front — otherwise a CA-backed
+        // ISTIO_MUTUAL DR takes the generic fail-closed branch and rejects the
+        // whole slice for an upstream that will present the runtime SVID over
+        // HBONE (Codex #15).
+        let mut upstream =
+            destination_rule_test_upstream("u1", "reviews.default.svc.cluster.local");
+        upstream.targets.clear(); // mesh SD resolves targets at runtime
+        upstream.service_discovery = Some(crate::config::types::ServiceDiscoveryConfig {
+            provider: crate::config::types::SdProvider::Mesh,
+            dns_sd: None,
+            kubernetes: None,
+            consul: None,
+            mesh: Some(crate::config::types::MeshSdConfig {
+                service_name: "reviews".to_string(),
+                namespace: Some("default".to_string()),
+                port: None,
+                poll_interval_seconds: 30,
+            }),
+            default_weight: 1,
+        });
+        upstream.backend_tls_client_cert_path = Some("/existing/client.pem".to_string());
+        upstream.backend_tls_client_key_path = Some("/existing/client.key".to_string());
+
+        let runtime = MeshRuntimeConfig {
+            workload_svid_cert_path: None,
+            workload_svid_key_path: None,
+            workload_svid_trust_bundle_path: Some(
+                "/var/run/secrets/ferrum/trust-bundle.pem".to_string(),
+            ),
+            ca_backend: CaBackend::Internal,
+            ..test_mesh_runtime_config()
+        };
+        let policy = MeshTrafficPolicy {
+            tls: Some(MeshTrafficPolicyTls {
+                mode: MtlsMode::IstioMutual,
+                ..MeshTrafficPolicyTls::default()
+            }),
+            ..MeshTrafficPolicy::default()
+        };
+
+        apply_traffic_policy_to_upstream(&mut upstream, &policy, &runtime).expect(
+            "CA-backed ISTIO_MUTUAL is allowed for mesh service-discovery upstreams (targets resolved at runtime)",
+        );
+        // Generic client material is cleared — identity comes from the SVID slot.
+        assert_eq!(upstream.backend_tls_client_cert_path, None);
+        assert_eq!(upstream.backend_tls_client_key_path, None);
+    }
+
+    #[test]
+    fn dr_tls_istio_mutual_ca_backed_rejected_for_mesh_sd_with_static_non_mesh_target() {
+        // An SD-mesh upstream that ALSO carries a static, non-mesh-tagged fallback
+        // target must NOT be classified as all-mesh: service discovery merges that
+        // static target into the LB set unchanged, so it needs generic client mTLS.
+        // CA-backed ISTIO_MUTUAL must therefore fail closed rather than clear the
+        // generic client cert/key and dispatch that target without client auth
+        // (Codex: check static targets before allowing CA-backed ISTIO_MUTUAL).
+        let mut upstream =
+            destination_rule_test_upstream("u1", "reviews.default.svc.cluster.local");
+        // Keep the default static (non-mesh-tagged) target AND mark it mesh-SD.
+        upstream.service_discovery = Some(crate::config::types::ServiceDiscoveryConfig {
+            provider: crate::config::types::SdProvider::Mesh,
+            dns_sd: None,
+            kubernetes: None,
+            consul: None,
+            mesh: Some(crate::config::types::MeshSdConfig {
+                service_name: "reviews".to_string(),
+                namespace: Some("default".to_string()),
+                port: None,
+                poll_interval_seconds: 30,
+            }),
+            default_weight: 1,
+        });
+
+        let runtime = MeshRuntimeConfig {
+            workload_svid_cert_path: None,
+            workload_svid_key_path: None,
+            workload_svid_trust_bundle_path: Some(
+                "/var/run/secrets/ferrum/trust-bundle.pem".to_string(),
+            ),
+            ca_backend: CaBackend::Internal,
+            ..test_mesh_runtime_config()
+        };
+        let policy = MeshTrafficPolicy {
+            tls: Some(MeshTrafficPolicyTls {
+                mode: MtlsMode::IstioMutual,
+                ..MeshTrafficPolicyTls::default()
+            }),
+            ..MeshTrafficPolicy::default()
+        };
+
+        assert!(
+            apply_traffic_policy_to_upstream(&mut upstream, &policy, &runtime).is_err(),
+            "CA-backed ISTIO_MUTUAL must fail closed when an SD-mesh upstream also carries a \
+             static non-mesh target"
+        );
+    }
+
+    #[test]
+    fn dr_tls_istio_mutual_ca_backed_rejected_for_non_mesh_service_discovery() {
+        // A non-mesh SD provider (DNS / Kubernetes / Consul) merges discovered
+        // targets at runtime that carry no mesh transport tags, so even an upstream
+        // whose STATIC targets are all mesh-tagged cannot be treated as uniformly
+        // mesh transport. CA-backed ISTIO_MUTUAL must fail closed rather than clear
+        // the client cert/key a discovered TLS backend needs (Codex: reject non-mesh
+        // SD before clearing client mTLS).
+        let mut upstream =
+            destination_rule_test_upstream("u1", "reviews.default.svc.cluster.local");
+        upstream.targets[0].tags.insert(
+            crate::proxy::hbone_pool::HBONE_TARGET_TAG.to_string(),
+            "true".to_string(),
+        );
+        upstream.service_discovery = Some(crate::config::types::ServiceDiscoveryConfig {
+            provider: crate::config::types::SdProvider::DnsSd,
+            dns_sd: None,
+            kubernetes: None,
+            consul: None,
+            mesh: None,
+            default_weight: 1,
+        });
+
+        let runtime = MeshRuntimeConfig {
+            workload_svid_cert_path: None,
+            workload_svid_key_path: None,
+            workload_svid_trust_bundle_path: Some(
+                "/var/run/secrets/ferrum/trust-bundle.pem".to_string(),
+            ),
+            ca_backend: CaBackend::Internal,
+            ..test_mesh_runtime_config()
+        };
+        let policy = MeshTrafficPolicy {
+            tls: Some(MeshTrafficPolicyTls {
+                mode: MtlsMode::IstioMutual,
+                ..MeshTrafficPolicyTls::default()
+            }),
+            ..MeshTrafficPolicy::default()
+        };
+
+        assert!(
+            apply_traffic_policy_to_upstream(&mut upstream, &policy, &runtime).is_err(),
+            "CA-backed ISTIO_MUTUAL must fail closed for a non-mesh SD upstream even when its \
+             static targets are mesh-tagged"
         );
     }
 
@@ -14321,6 +15249,7 @@ mod tests {
                 server_identity: None,
                 last_snapshot: None,
                 spiffe_bundle_slot: None,
+                runtime_trust_overlay_slot: None,
                 production: false,
             },
             shutdown_rx,
@@ -14378,6 +15307,7 @@ mod tests {
                 server_identity: mesh_frontend_identity,
                 last_snapshot: Some(initial_snapshot),
                 spiffe_bundle_slot: None,
+                runtime_trust_overlay_slot: None,
                 production: false,
             },
             shutdown_rx,
@@ -14460,6 +15390,7 @@ mod tests {
                 server_identity: mesh_frontend_identity,
                 last_snapshot: Some(initial_snapshot),
                 spiffe_bundle_slot: None,
+                runtime_trust_overlay_slot: None,
                 production: false,
             },
             shutdown_rx,
@@ -14572,6 +15503,7 @@ mod tests {
                 server_identity: None,
                 last_snapshot: Some(initial_snapshot),
                 spiffe_bundle_slot: None,
+                runtime_trust_overlay_slot: None,
                 production: false,
             },
             shutdown_rx,
@@ -14653,6 +15585,7 @@ mod tests {
             identity.as_deref(),
             None,
             None,
+            None,
             true, // production
             true, // has a TLS-terminating inbound listener (Sidecar)
         );
@@ -14669,6 +15602,7 @@ mod tests {
             &disable_slice,
             config::MtlsMode::Disable,
             identity.as_deref(),
+            None,
             None,
             None,
             false, // dev
@@ -15165,7 +16099,7 @@ mod tests {
         // operator-CA chain verification (the pre-existing behavior).
         let env = EnvConfig::default();
         assert!(env.gateway_svid_cert_path.is_none());
-        assert!(build_mesh_inbound_spiffe_slot(&env, None).is_none());
+        assert!(build_mesh_inbound_spiffe_slot(&env, None, None).is_none());
     }
 
     #[test]
@@ -15210,14 +16144,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn staged_spiffe_bundle_publishes_only_on_apply() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn staged_spiffe_bundle_publishes_only_on_apply() {
         // F4: a rebuilt inbound SPIFFE trust-bundle must NOT reach the live slot
         // until the slice is accepted. `publish_staged_spiffe_bundle` is the
         // post-accept publish step; until it runs the live slot keeps its
         // previous value, and `None` (rejected/no-slot) leaves it untouched.
         use crate::identity::{SvidBundle, TrustBundle, TrustBundleSet};
 
+        let state = make_test_proxy_state(GatewayConfig::default());
         let td = TrustDomain::new("td.stage-test").unwrap();
         let id = SpiffeId::from_parts(&td, "ns/foo/sa/bar").unwrap();
         let original = Arc::new(Some(SvidBundle {
@@ -15234,7 +16169,7 @@ mod tests {
         let slot: tls::SharedBundleSlot = Arc::new(arc_swap::ArcSwap::new(original.clone()));
 
         // A `None` staged bundle (rejected slice or no SVID slot) is a no-op.
-        publish_staged_spiffe_bundle(None);
+        publish_staged_spiffe_bundle(&state, None);
         assert!(
             Arc::ptr_eq(&slot.load_full(), &original),
             "publishing None must leave the live slot untouched"
@@ -15253,7 +16188,7 @@ mod tests {
                 refresh_hint_seconds: None,
             }),
         }));
-        let staged = Some(StagedSpiffeBundle {
+        let staged = Some(StagedSpiffeBundle::DirectSlot {
             slot: slot.clone(),
             bundle: replacement.clone(),
         });
@@ -15263,10 +16198,97 @@ mod tests {
         );
 
         // Publishing (post-accept) swaps the slot to the staged bundle.
-        publish_staged_spiffe_bundle(staged);
+        publish_staged_spiffe_bundle(&state, staged);
         assert!(
             Arc::ptr_eq(&slot.load_full(), &replacement),
             "publish must store the staged bundle into the live slot"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runtime_spiffe_overlay_preserves_fresh_ca_roots_on_rotation() {
+        use crate::identity::{SvidBundle, TrustBundle, TrustBundleSet};
+        use base64::Engine;
+
+        let state = make_test_proxy_state(GatewayConfig::default());
+        let inbound_slot: tls::SharedBundleSlot = Arc::new(arc_swap::ArcSwap::new(Arc::new(None)));
+        let overlay_slot = empty_mesh_inbound_trust_overlay_slot();
+        let td = TrustDomain::new("td.runtime").unwrap();
+        let stale_td = TrustDomain::new("stale.runtime").unwrap();
+        let id = SpiffeId::from_parts(&td, "ns/foo/sa/bar").unwrap();
+
+        let svid_bundle = |local_roots: Vec<Vec<u8>>| SvidBundle {
+            spiffe_id: id.clone(),
+            cert_chain_der: vec![vec![1, 2, 3]],
+            private_key_pkcs8_der: Vec::new(),
+            trust_bundles: TrustBundleSet {
+                local: TrustBundle {
+                    trust_domain: td.clone(),
+                    x509_authorities: local_roots,
+                    jwt_authorities: Vec::new(),
+                    refresh_hint_seconds: None,
+                },
+                federated: HashMap::from([(
+                    stale_td.clone(),
+                    TrustBundle {
+                        trust_domain: stale_td.clone(),
+                        x509_authorities: vec![vec![42]],
+                        jwt_authorities: Vec::new(),
+                        refresh_hint_seconds: None,
+                    },
+                )]),
+            },
+        };
+
+        state.install_gateway_runtime_svid_bundle(svid_bundle(vec![vec![1]]));
+        let engine = base64::engine::general_purpose::STANDARD;
+        let slice = MeshSlice {
+            version: "trust-overlay".to_string(),
+            trust_bundles: Some(config::TrustBundleSet {
+                local: config::TrustBundle {
+                    trust_domain: td.clone(),
+                    x509_authorities: vec![engine.encode(b"old-local-root")],
+                    jwt_authorities: Vec::new(),
+                    refresh_hint_seconds: None,
+                },
+                federated: vec![config::TrustBundle {
+                    trust_domain: TrustDomain::new("partner.runtime").unwrap(),
+                    x509_authorities: vec![engine.encode(b"partner-root")],
+                    jwt_authorities: Vec::new(),
+                    refresh_hint_seconds: Some(300),
+                }],
+            }),
+            ..MeshSlice::default()
+        };
+
+        let staged = stage_gateway_runtime_spiffe_bundle(
+            &state,
+            Some(&inbound_slot),
+            Some(&overlay_slot),
+            &slice,
+        );
+
+        state.install_gateway_runtime_svid_bundle(svid_bundle(vec![vec![9]]));
+        publish_runtime_svid_to_inbound_slot(&state, &inbound_slot, &overlay_slot);
+        publish_staged_spiffe_bundle(&state, staged);
+
+        let active = inbound_slot.load_full();
+        let bundle = active.as_ref().as_ref().expect("inbound bundle");
+        assert_eq!(
+            bundle.trust_bundles.local.x509_authorities,
+            vec![vec![9]],
+            "runtime CA local roots must come from the rotated SVID, not the stale slice overlay"
+        );
+        assert!(
+            bundle
+                .trust_bundles
+                .federated
+                .contains_key(&TrustDomain::new("partner.runtime").unwrap()),
+            "accepted slice federation should remain overlaid after rotation"
+        );
+        assert!(
+            !bundle.trust_bundles.federated.contains_key(&stale_td),
+            "raw SPIRE federated roots must not remain in the inbound verifier"
         );
     }
 
@@ -15438,6 +16460,31 @@ mod tests {
     }
 
     #[test]
+    fn egress_gateway_accepts_svid_backed_mtls_materials() {
+        let ca_runtime = MeshRuntimeConfig {
+            topology: MeshTopology::EgressGateway,
+            ca_backend: CaBackend::SpireAgent,
+            workload_spiffe_id: Some("spiffe://cluster.local/ns/default/sa/egress".to_string()),
+            ..test_mesh_runtime_config()
+        };
+        validate_egress_gateway_mtls_config(&ca_runtime, &EnvConfig::default())
+            .expect("CA-backed runtime SVID should satisfy egress gateway mTLS validation");
+
+        let file_svid_runtime = MeshRuntimeConfig {
+            topology: MeshTopology::EgressGateway,
+            ..test_mesh_runtime_config()
+        };
+        let file_svid_env = EnvConfig {
+            gateway_svid_cert_path: Some("tests/certs/server.crt".to_string()),
+            gateway_svid_key_path: Some("tests/certs/server.key".to_string()),
+            gateway_svid_trust_bundle_path: Some("tests/certs/ca.crt".to_string()),
+            ..EnvConfig::default()
+        };
+        validate_egress_gateway_mtls_config(&file_svid_runtime, &file_svid_env)
+            .expect("file SVID material should satisfy egress gateway mTLS validation");
+    }
+
+    #[test]
     fn strict_peer_auth_fails_closed_without_frontend_tls_materials() {
         let env = EnvConfig::default();
         let tls_policy = TlsPolicy::from_env_config(&env).expect("tls policy");
@@ -15551,6 +16598,10 @@ mod tests {
             .expect("gateway SVID load should succeed")
             .expect("gateway SVID must back the inbound server identity");
         assert_eq!(identity.cert_path(), "tests/certs/server.crt");
+        assert!(
+            identity.is_svid_rotating(),
+            "gateway SVID material must back a live-rotating inbound identity"
+        );
 
         // Explicit frontend TLS takes precedence over the SVID fallback (a
         // broken SVID path here must be ignored because frontend TLS is set).
@@ -15565,6 +16616,10 @@ mod tests {
             .expect("explicit frontend TLS load should succeed")
             .expect("explicit frontend TLS identity");
         assert_eq!(identity.cert_path(), "tests/certs/server.crt");
+        assert!(
+            !identity.is_svid_rotating(),
+            "explicit frontend TLS must be a static (operator-owned) identity"
+        );
 
         // Neither configured → no server identity (not an error here; the
         // fail-closed gate decides what to do with a plaintext posture).
@@ -15575,6 +16630,118 @@ mod tests {
             )
             .expect("no identity is not a load error")
             .is_none()
+        );
+    }
+
+    #[test]
+    fn load_mesh_frontend_server_identity_uses_ca_backend_svid() {
+        // Ported from #1608's `load_mesh_frontend_server_identity_uses_runtime_svid_slot`.
+        // With a CA backend active (FERRUM_MESH_CA_BACKEND=internal|spire) and no
+        // explicit FERRUM_FRONTEND_TLS_* / FERRUM_GATEWAY_SVID_* file material, the
+        // inbound server identity is the CA-issued runtime SVID, which
+        // `start_mesh_ca_backend_svid_source` installs into
+        // `proxy_state.gateway_svid_bundle` (the slot passed here). It must be a
+        // live SVID-rotating identity, not a static one.
+        ensure_crypto_provider();
+        let slot = valid_dynamic_spiffe_slot();
+        let env = EnvConfig {
+            mesh_ca_backend: "internal".to_string(),
+            ..EnvConfig::default()
+        };
+        let identity = load_mesh_frontend_server_identity(&env, &slot)
+            .expect("CA-backed runtime SVID identity should load")
+            .expect("CA backend must back the inbound server identity from the gateway SVID slot");
+        assert!(
+            identity.is_svid_rotating(),
+            "CA-backed inbound identity must rotate live with the gateway SVID slot"
+        );
+
+        // Explicit frontend TLS takes precedence over the CA-backed SVID.
+        let env = EnvConfig {
+            mesh_ca_backend: "internal".to_string(),
+            frontend_tls_cert_path: Some("tests/certs/server.crt".to_string()),
+            frontend_tls_key_path: Some("tests/certs/server.key".to_string()),
+            ..EnvConfig::default()
+        };
+        let identity = load_mesh_frontend_server_identity(&env, &slot)
+            .expect("explicit frontend TLS should load")
+            .expect("explicit frontend TLS identity");
+        assert!(
+            !identity.is_svid_rotating(),
+            "explicit frontend TLS must take precedence over the CA-backed SVID (static)"
+        );
+        assert_eq!(identity.cert_path(), "tests/certs/server.crt");
+    }
+
+    #[test]
+    fn load_mesh_frontend_server_identity_ca_backend_fails_closed_on_empty_slot() {
+        // Ported fail-closed intent from #1608's
+        // `load_mesh_frontend_tls_rejects_unusable_dynamic_spiffe_identity`: a
+        // configured CA backend whose gateway SVID slot holds no material must
+        // hard-error at startup rather than fall open to a plaintext posture.
+        ensure_crypto_provider();
+        let empty_slot: crate::identity::SharedSvidBundle =
+            Arc::new(arc_swap::ArcSwap::new(Arc::new(None)));
+        let env = EnvConfig {
+            mesh_ca_backend: "internal".to_string(),
+            ..EnvConfig::default()
+        };
+        let err = load_mesh_frontend_server_identity(&env, &empty_slot)
+            .expect_err("CA backend with an empty gateway SVID slot must fail closed");
+        assert!(
+            err.to_string()
+                .contains("gateway SVID slot holds no material"),
+            "error should report the empty gateway SVID slot, got: {err}"
+        );
+    }
+
+    #[test]
+    fn load_mesh_frontend_tls_builds_with_svid_rotating_identity() {
+        // Ported from #1608's `load_mesh_frontend_tls_builds_with_dynamic_spiffe_identity`.
+        // An SVID-rotating identity (the merged replacement for the dropped
+        // DynamicSpiffe variant) must build a usable inbound TLS config that
+        // advertises h2.
+        ensure_crypto_provider();
+        let env = EnvConfig::default();
+        let tls_policy = TlsPolicy::from_env_config(&env).expect("tls policy");
+        let slot = valid_dynamic_spiffe_slot();
+        let identity =
+            tls::svid_rotating_mesh_server_identity("test-runtime-svid", "test-runtime-svid", slot)
+                .expect("valid SVID slot must back a rotating identity");
+
+        let tls_config = load_mesh_frontend_tls(
+            &env,
+            &tls_policy,
+            &[],
+            config::MtlsMode::Permissive,
+            Some(identity.as_ref()),
+            None,
+            None,
+        )
+        .expect("SVID-rotating identity should build TLS config")
+        .expect("TLS config present");
+
+        assert!(
+            tls_config.alpn_protocols.contains(&b"h2".to_vec()),
+            "mesh frontend TLS must advertise h2"
+        );
+    }
+
+    #[test]
+    fn svid_rotating_identity_rejects_unusable_slot() {
+        // Ported fail-closed intent from #1608's
+        // `load_mesh_frontend_tls_rejects_unusable_dynamic_spiffe_identity`: a slot
+        // whose material cannot back a server certificate must hard-error at
+        // construction, before any listener binds. The merged API fails closed in
+        // `svid_rotating_mesh_server_identity` rather than at TLS-config build time.
+        ensure_crypto_provider();
+        let slot = populated_spiffe_slot();
+        let err =
+            tls::svid_rotating_mesh_server_identity("test-runtime-svid", "test-runtime-svid", slot)
+                .expect_err("malformed SVID material must fail before listener bind");
+        assert!(
+            !err.to_string().is_empty(),
+            "fail-closed error should be reported, got: {err}"
         );
     }
 
@@ -15765,6 +16932,38 @@ mod tests {
             trust_bundles: TrustBundleSet::local_only(TrustBundle {
                 trust_domain: td,
                 x509_authorities: vec![vec![4, 5, 6]],
+                jwt_authorities: Vec::new(),
+                refresh_hint_seconds: None,
+            }),
+        };
+        Arc::new(arc_swap::ArcSwap::new(Arc::new(Some(bundle))))
+    }
+
+    fn valid_dynamic_spiffe_slot() -> tls::SharedBundleSlot {
+        use crate::identity::{SvidBundle, TrustBundle, TrustBundleSet};
+
+        let td = TrustDomain::new("td.dynamic-wiring").unwrap();
+        let id = SpiffeId::from_parts(&td, "ns/foo/sa/bar").unwrap();
+        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+            .expect("generate dynamic SVID key");
+        let mut params = rcgen::CertificateParams::default();
+        params.is_ca = rcgen::IsCa::ExplicitNoCa;
+        params
+            .subject_alt_names
+            .push(crate::identity::spiffe::spiffe_id_to_san(&id).expect("spiffe SAN"));
+        params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        let cert = params
+            .self_signed(&key_pair)
+            .expect("self-sign dynamic SVID");
+        let cert_chain_der = vec![cert.der().to_vec()];
+        let bundle = SvidBundle {
+            spiffe_id: id,
+            cert_chain_der: cert_chain_der.clone(),
+            private_key_pkcs8_der: key_pair.serialize_der(),
+            trust_bundles: TrustBundleSet::local_only(TrustBundle {
+                trust_domain: td,
+                x509_authorities: cert_chain_der,
                 jwt_authorities: Vec::new(),
                 refresh_hint_seconds: None,
             }),

@@ -1,14 +1,14 @@
 //! SPIFFE-aware rustls server / client configurations.
 //!
-//! Phase A exposes ready-to-use builders that Phase C will wire into mesh
-//! listeners. They consume the `Arc<ArcSwap<Option<SvidBundle>>>` slot
-//! produced by [`crate::identity::workload_api::fetch_loop`] /
+//! These builders back the mesh data-plane mode's dynamic SPIFFE identity:
+//! [`crate::modes::mesh`] wires them into the inbound server cert resolver,
+//! the SPIFFE peer-cert verifier, and the outbound client config for
+//! `FERRUM_MESH_CA_BACKEND`-issued (and file-gateway) SVIDs. They consume the
+//! `Arc<ArcSwap<Option<SvidBundle>>>` slot produced by
+//! [`crate::identity::workload_api::fetch_loop`] /
 //! [`crate::identity::rotation`] so cert rotation is lock-free and atomic
 //! from the rustls resolver's perspective — no listener restart, no per-
 //! request cloning of the bundle.
-//!
-//! The builders are deliberately additive: nothing in the codebase calls
-//! them yet. Phase C plugs them into the mesh data-plane mode.
 //!
 //! ## Verifier semantics
 //!
@@ -27,7 +27,8 @@
 use arc_swap::ArcSwap;
 use rustls::client::WantsClientCert;
 use rustls::pki_types::{
-    CertificateDer, CertificateRevocationListDer, PrivateKeyDer, ServerName, UnixTime,
+    CertificateDer, CertificateRevocationListDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName,
+    UnixTime,
 };
 use rustls::server::{WantsServerCert, WebPkiClientVerifier};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
@@ -188,6 +189,14 @@ impl SpiffeServerCertResolver {
     fn build_cert_key(&self) -> Option<Arc<rustls::sign::CertifiedKey>> {
         let snapshot = self.slot.load_full();
         cached_certified_key(&self.certified_key_cache, snapshot, "server")
+    }
+
+    pub fn validate_current(&self) -> Result<(), SpiffeTlsError> {
+        let snapshot = self.slot.load_full();
+        let bundle = snapshot.as_ref().as_ref().ok_or(SpiffeTlsError::NoSvid)?;
+        certified_key_from_bundle(bundle)
+            .map(|_| ())
+            .map_err(SpiffeTlsError::BadKeyMaterial)
     }
 }
 
@@ -449,8 +458,9 @@ fn certified_key_from_bundle(bundle: &SvidBundle) -> Result<rustls::sign::Certif
         .iter()
         .map(|d| CertificateDer::from(d.clone()))
         .collect();
-    let key = PrivateKeyDer::try_from(bundle.private_key_pkcs8_der.clone())
-        .map_err(|e| format!("invalid private key: {e}"))?;
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+        bundle.private_key_pkcs8_der.clone(),
+    ));
     let signing_key = rustls::crypto::ring::sign::any_supported_type(&key)
         .map_err(|e| format!("ring sign init failed: {e}"))?;
     Ok(rustls::sign::CertifiedKey::new(chain, signing_key))
