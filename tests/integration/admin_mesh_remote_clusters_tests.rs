@@ -1,14 +1,16 @@
 //! Integration coverage for `GET /mesh/remote-clusters` (F7.2).
 //!
-//! Exercises the end-to-end admin surface: AdminState is built with a
-//! `MeshRuntimeState`, a discovered-remote-cluster snapshot is staged in the
-//! `RemoteEndpointStore`, an accepted slice carrying a `MultiClusterConfig` is
-//! installed, and the handler must reflect the `discovered` counts, the
-//! `configured` list, the `discovered`-cross-reference flag, and the
-//! `discovery_enabled` flag. The pure response-builder logic is covered by
-//! inline unit tests in `src/admin/mesh_remote_clusters.rs`; this leg
-//! validates JWT gating, the not-in-mesh-mode 404 case, and the
-//! snapshot/slice → admin response contract.
+//! Exercises the parts of the admin surface that genuinely need a live gateway:
+//! JWT gating, the not-in-mesh-mode `404`, the empty-before-discovery shape, and
+//! the accepted-slice → `configured` view contract (including that an accepted
+//! `MultiClusterConfig` with no successfully-polled cluster yields an empty
+//! `discovered` list — the discovery store is fed from the *received* slice and
+//! is intentionally NOT mutable through any production API). The pure
+//! response-builder logic — discovered counts/age, sorting, counts-only payload,
+//! and the accepted-slice scoping that filters a received-but-rejected slice's
+//! clusters out of `discovered` — is covered by the unit suite in
+//! `tests/unit/admin/mesh_remote_clusters_tests.rs`, which can stage a
+//! `RemoteEndpointSnapshot` directly without a runtime store seeder.
 
 use arc_swap::ArcSwap;
 use chrono::Utc;
@@ -20,18 +22,13 @@ use ferrum_edge::admin::{
 use ferrum_edge::config::env_config::EnvConfig;
 use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::dns::{DnsCache, DnsConfig};
-use ferrum_edge::identity::{SpiffeId, TrustDomain};
-use ferrum_edge::modes::mesh::config::{
-    MeshConfig, MeshService, MultiClusterConfig, RemoteCluster, ServicePort, Workload, WorkloadRef,
-    WorkloadSelector,
-};
-use ferrum_edge::modes::mesh::multicluster::{RemoteClusterEndpoints, RemoteClusterEntry};
+use ferrum_edge::identity::TrustDomain;
+use ferrum_edge::modes::mesh::config::{MeshConfig, MultiClusterConfig, RemoteCluster};
 use ferrum_edge::modes::mesh::runtime::MeshRuntimeState;
 use ferrum_edge::modes::mesh::slice::MeshSlice;
 use ferrum_edge::proxy::ProxyState;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::{Value, json};
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -152,76 +149,6 @@ fn td(raw: &str) -> TrustDomain {
     TrustDomain::new(raw).expect("trust domain")
 }
 
-fn spiffe(raw: &str) -> SpiffeId {
-    SpiffeId::new(raw.to_string()).expect("spiffe id")
-}
-
-fn workload(spiffe_id: &str, service: &str, address: &str) -> Workload {
-    let id = spiffe(spiffe_id);
-    let trust_domain = id.trust_domain().clone();
-    Workload {
-        spiffe_id: id,
-        selector: WorkloadSelector::default(),
-        service_name: service.to_string(),
-        addresses: vec![address.to_string()],
-        ports: vec![],
-        trust_domain,
-        namespace: "default".to_string(),
-        network: None,
-        cluster: None,
-        weight: None,
-        locality: None,
-        service_account: None,
-        pod_uid: None,
-    }
-}
-
-fn service(name: &str) -> MeshService {
-    MeshService {
-        cluster_ips: Vec::new(),
-        name: name.to_string(),
-        namespace: "default".to_string(),
-        ports: vec![ServicePort {
-            port: 8080,
-            protocol: Default::default(),
-            name: Some("http".to_string()),
-            target_port: None,
-        }],
-        workloads: vec![WorkloadRef {
-            spiffe_id: spiffe("spiffe://east.example.com/ns/default/sa/reviews"),
-        }],
-        protocol_overrides: HashMap::new(),
-    }
-}
-
-/// Stage a discovered remote cluster into the runtime's `RemoteEndpointStore`
-/// via the `#[doc(hidden)]` test-support seeder.
-fn seed_discovered(runtime: &MeshRuntimeState, cluster: &str, trust_domain: &str, fetched_at: u64) {
-    runtime
-        .remote_endpoint_store()
-        .install_for_test(RemoteClusterEntry {
-            cluster_name: cluster.to_string(),
-            trust_domain: td(trust_domain),
-            network: Some("net2".to_string()),
-            endpoints: RemoteClusterEndpoints {
-                workloads: vec![
-                    workload(
-                        "spiffe://east.example.com/ns/default/sa/reviews",
-                        "reviews",
-                        "10.9.0.1",
-                    ),
-                    workload(
-                        "spiffe://east.example.com/ns/default/sa/reviews",
-                        "reviews",
-                        "10.9.0.2",
-                    ),
-                ],
-                services: vec![service("reviews")],
-            },
-            fetched_at_unix_seconds: fetched_at,
-        });
-}
-
 /// Install an accepted slice carrying a `MultiClusterConfig` declaring two
 /// remote clusters (one discoverable, one federation-only).
 fn install_accepted_slice_with_config(runtime: &MeshRuntimeState) {
@@ -330,14 +257,16 @@ async fn remote_clusters_endpoint_returns_200_empty_before_discovery() {
 }
 
 #[tokio::test]
-async fn remote_clusters_endpoint_reflects_discovered_and_configured() {
+async fn remote_clusters_endpoint_reflects_accepted_config_with_empty_discovered() {
+    // An accepted slice declares two remote clusters but nothing has been
+    // successfully polled yet (the discovery store is only populated by the live
+    // poller, never by the admin/test surface). The end-to-end contract: the
+    // `configured` view reflects the accepted slice, every entry reports
+    // `discovered: false`, the `discovered` list is empty, and the
+    // control-plane / federation URLs never appear in the payload.
     let tc = TestConfig::default();
     let token = generate_test_token(&tc);
     let runtime = MeshRuntimeState::new();
-    // Discovered: remote-east, fetched 5s ago. Configured: remote-east +
-    // remote-west (federation-only).
-    let fetched_at = (Utc::now().timestamp().max(0) as u64).saturating_sub(5);
-    seed_discovered(&runtime, "remote-east", "east.example.com", fetched_at);
     install_accepted_slice_with_config(&runtime);
 
     let state = build_admin_state(create_test_jwt_manager(&tc), Some(runtime), 60);
@@ -355,23 +284,11 @@ async fn remote_clusters_endpoint_reflects_discovered_and_configured() {
 
     assert_eq!(body["discovery_enabled"], true);
 
-    // ── discovered view ──────────────────────────────────────────────────
+    // Nothing polled → discovered is empty (and scoped to the accepted slice).
     let discovered = body["discovered"].as_array().expect("discovered array");
-    assert_eq!(discovered.len(), 1);
-    let east = &discovered[0];
-    assert_eq!(east["cluster_name"], "remote-east");
-    assert_eq!(east["trust_domain"], "east.example.com");
-    assert_eq!(east["network"], "net2");
-    assert_eq!(east["workload_count"], 2);
-    assert_eq!(east["service_count"], 1);
-    assert_eq!(east["fetched_at_unix_seconds"], fetched_at);
-    let age = east["age_seconds"].as_u64().expect("age_seconds u64");
-    assert!(age >= 5, "age_seconds should be at least 5, got {age}");
-    // The payload must NOT leak raw workload addresses / SPIFFE IDs.
-    let east_str = serde_json::to_string(east).unwrap();
     assert!(
-        !east_str.contains("10.9.0.1") && !east_str.contains("spiffe://"),
-        "discovered entry must not expose raw addresses or SPIFFE IDs: {east_str}"
+        discovered.is_empty(),
+        "no cluster has been polled; discovered must be empty: {discovered:?}"
     );
 
     // ── configured view ──────────────────────────────────────────────────
@@ -381,11 +298,12 @@ async fn remote_clusters_endpoint_reflects_discovered_and_configured() {
     let cfg_east = &configured[0];
     assert_eq!(cfg_east["cluster_name"], "remote-east");
     assert_eq!(cfg_east["trust_domain"], "east.example.com");
+    assert_eq!(cfg_east["network"], "net2");
     assert_eq!(cfg_east["control_plane_configured"], true);
     assert_eq!(cfg_east["federation_endpoint_configured"], true);
     assert_eq!(
-        cfg_east["discovered"], true,
-        "remote-east is both configured and discovered"
+        cfg_east["discovered"], false,
+        "remote-east is configured but nothing has been polled yet"
     );
 
     let cfg_west = &configured[1];
@@ -395,10 +313,7 @@ async fn remote_clusters_endpoint_reflects_discovered_and_configured() {
         "remote-west is federation-only"
     );
     assert_eq!(cfg_west["federation_endpoint_configured"], true);
-    assert_eq!(
-        cfg_west["discovered"], false,
-        "remote-west is configured but not discovered — the operator's signal"
-    );
+    assert_eq!(cfg_west["discovered"], false);
 
     // Control-plane / federation URLs must never appear in the payload.
     let body_str = serde_json::to_string(&body).unwrap();

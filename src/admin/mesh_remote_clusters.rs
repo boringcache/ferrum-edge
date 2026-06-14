@@ -38,8 +38,11 @@
 //! See `docs/mesh.md` "Cross-Cluster Endpoint Discovery" for the operator
 //! playbook.
 
+use std::collections::{HashMap, HashSet};
+
 use serde::{Deserialize, Serialize};
 
+use crate::identity::TrustDomain;
 use crate::modes::mesh::config::MultiClusterConfig;
 use crate::modes::mesh::multicluster::RemoteEndpointSnapshot;
 
@@ -146,12 +149,45 @@ pub struct MeshRemoteClustersInputs<'a> {
 
 /// Build the response from staged inputs. Pure function — no I/O, no clock
 /// reads. Unit-tested directly to lock down the shape.
+///
+/// Both views are derived from the **accepted** slice's `MultiClusterConfig`.
+/// The discovery store is fed from the *received* slice, which can transiently
+/// diverge from the accepted one during a rejected-slice window: the store
+/// could hold clusters declared by a slice the proxy REJECTED. Surfacing those
+/// would make an invalid slice look like live cross-cluster discovery, so a
+/// discovered cluster is scoped to the accepted config — matched by **cluster
+/// name and declared trust domain** — and a cluster absent from the accepted
+/// config (or present under a different trust domain) is **omitted** from
+/// `discovered`. Fail closed: when no slice is accepted (or it carries no
+/// `MultiClusterConfig`), the accepted set is empty and `discovered` is empty
+/// regardless of what the store holds.
 pub fn build_response(inputs: MeshRemoteClustersInputs<'_>) -> MeshRemoteClustersResponse {
-    // Discovered view: one entry per fetched cluster, counts only.
+    // Accepted remote-cluster set: name → declared trust domain. Discovery
+    // entries are only surfaced when they match an accepted (name, trust
+    // domain) pair, so a rejected slice's clusters never appear as live
+    // discovery. Empty when no slice / no multicluster config is accepted.
+    let accepted: HashMap<&str, &TrustDomain> = inputs
+        .multi_cluster
+        .map(|mc| {
+            mc.remote_clusters
+                .iter()
+                .map(|remote| (remote.name.as_str(), &remote.trust_domain))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Discovered view: one entry per fetched cluster, counts only — filtered to
+    // the accepted slice's clusters (by name AND trust domain), so a
+    // received-but-rejected slice's clusters are not reported as discovered.
     let mut discovered: Vec<DiscoveredRemoteCluster> = inputs
         .snapshot
         .clusters
         .values()
+        .filter(|entry| {
+            accepted
+                .get(entry.cluster_name.as_str())
+                .is_some_and(|accepted_td| **accepted_td == entry.trust_domain)
+        })
         .map(|entry| DiscoveredRemoteCluster {
             cluster_name: entry.cluster_name.clone(),
             trust_domain: entry.trust_domain.as_str().to_string(),
@@ -168,9 +204,15 @@ pub fn build_response(inputs: MeshRemoteClustersInputs<'_>) -> MeshRemoteCluster
         .collect();
     discovered.sort_by(|a, b| a.cluster_name.cmp(&b.cluster_name));
 
+    // Names that survived the accepted-scope filter, so the `configured`
+    // view's `discovered` flag reflects the SAME scoped set the operator sees
+    // under `discovered` (never a rejected-slice cluster).
+    let discovered_names: HashSet<&str> =
+        discovered.iter().map(|d| d.cluster_name.as_str()).collect();
+
     // Configured view: one entry per declared remote cluster. `discovered`
-    // flag cross-references the live snapshot so operators see at a glance
-    // which configured clusters are actually returning endpoints.
+    // flag cross-references the scoped discovered set so operators see at a
+    // glance which configured clusters are actually returning endpoints.
     let configured: Vec<ConfiguredRemoteCluster> = inputs
         .multi_cluster
         .map(|mc| {
@@ -189,7 +231,7 @@ pub fn build_response(inputs: MeshRemoteClustersInputs<'_>) -> MeshRemoteCluster
                         .federation_endpoint
                         .as_deref()
                         .is_some_and(|url| !url.trim().is_empty()),
-                    discovered: inputs.snapshot.clusters.contains_key(&remote.name),
+                    discovered: discovered_names.contains(remote.name.as_str()),
                 })
                 .collect();
             entries.sort_by(|a, b| a.cluster_name.cmp(&b.cluster_name));
@@ -201,309 +243,5 @@ pub fn build_response(inputs: MeshRemoteClustersInputs<'_>) -> MeshRemoteCluster
         discovery_enabled: inputs.discovery_enabled,
         discovered,
         configured,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::identity::TrustDomain;
-    use crate::modes::mesh::config::{
-        MeshService, RemoteCluster, ServicePort, Workload, WorkloadRef, WorkloadSelector,
-    };
-    use crate::modes::mesh::multicluster::{RemoteClusterEndpoints, RemoteClusterEntry};
-    use std::collections::HashMap;
-
-    fn td(raw: &str) -> TrustDomain {
-        TrustDomain::new(raw).expect("trust domain")
-    }
-
-    fn spiffe(raw: &str) -> crate::identity::SpiffeId {
-        crate::identity::SpiffeId::new(raw.to_string()).expect("spiffe id")
-    }
-
-    fn workload(spiffe_id: &str, service: &str, address: &str) -> Workload {
-        let id = spiffe(spiffe_id);
-        let trust_domain = id.trust_domain().clone();
-        Workload {
-            spiffe_id: id,
-            selector: WorkloadSelector::default(),
-            service_name: service.to_string(),
-            addresses: vec![address.to_string()],
-            ports: vec![],
-            trust_domain,
-            namespace: "default".to_string(),
-            network: None,
-            cluster: None,
-            weight: None,
-            locality: None,
-            service_account: None,
-            pod_uid: None,
-        }
-    }
-
-    fn service(name: &str) -> MeshService {
-        MeshService {
-            cluster_ips: Vec::new(),
-            name: name.to_string(),
-            namespace: "default".to_string(),
-            ports: vec![ServicePort {
-                port: 8080,
-                protocol: Default::default(),
-                name: Some("http".to_string()),
-                target_port: None,
-            }],
-            workloads: vec![WorkloadRef {
-                spiffe_id: spiffe("spiffe://remote.local/ns/default/sa/reviews"),
-            }],
-            protocol_overrides: HashMap::new(),
-        }
-    }
-
-    fn snapshot_with(entries: Vec<RemoteClusterEntry>) -> RemoteEndpointSnapshot {
-        let mut clusters = HashMap::new();
-        for entry in entries {
-            clusters.insert(entry.cluster_name.clone(), entry);
-        }
-        RemoteEndpointSnapshot { clusters }
-    }
-
-    fn entry(
-        cluster: &str,
-        trust_domain: &str,
-        network: Option<&str>,
-        workloads: Vec<Workload>,
-        services: Vec<MeshService>,
-        fetched_at: u64,
-    ) -> RemoteClusterEntry {
-        RemoteClusterEntry {
-            cluster_name: cluster.to_string(),
-            trust_domain: td(trust_domain),
-            network: network.map(str::to_string),
-            endpoints: RemoteClusterEndpoints {
-                workloads,
-                services,
-            },
-            fetched_at_unix_seconds: fetched_at,
-        }
-    }
-
-    #[test]
-    fn empty_when_no_discovery_and_no_config() {
-        let snapshot = RemoteEndpointSnapshot::default();
-        let resp = build_response(MeshRemoteClustersInputs {
-            snapshot: &snapshot,
-            multi_cluster: None,
-            discovery_enabled: false,
-            now_unix_seconds: 1_000,
-        });
-        assert!(!resp.discovery_enabled);
-        assert!(resp.discovered.is_empty());
-        assert!(resp.configured.is_empty());
-    }
-
-    #[test]
-    fn discovered_surfaces_counts_and_age() {
-        let snapshot = snapshot_with(vec![entry(
-            "remote-east",
-            "remote.local",
-            Some("net2"),
-            vec![
-                workload(
-                    "spiffe://remote.local/ns/default/sa/reviews",
-                    "reviews",
-                    "10.9.0.1",
-                ),
-                workload(
-                    "spiffe://remote.local/ns/default/sa/reviews",
-                    "reviews",
-                    "10.9.0.2",
-                ),
-            ],
-            vec![service("reviews")],
-            900,
-        )]);
-        let resp = build_response(MeshRemoteClustersInputs {
-            snapshot: &snapshot,
-            multi_cluster: None,
-            discovery_enabled: true,
-            now_unix_seconds: 1_000,
-        });
-
-        assert!(resp.discovery_enabled);
-        assert_eq!(resp.discovered.len(), 1);
-        let d = &resp.discovered[0];
-        assert_eq!(d.cluster_name, "remote-east");
-        assert_eq!(d.trust_domain, "remote.local");
-        assert_eq!(d.network.as_deref(), Some("net2"));
-        assert_eq!(d.workload_count, 2);
-        assert_eq!(d.service_count, 1);
-        assert_eq!(d.fetched_at_unix_seconds, 900);
-        assert_eq!(d.age_seconds, 100);
-        // No config → no configured view even when discovery returned data.
-        assert!(resp.configured.is_empty());
-    }
-
-    #[test]
-    fn discovered_is_sorted_by_cluster_name() {
-        let snapshot = snapshot_with(vec![
-            entry("zulu", "z.local", None, vec![], vec![], 10),
-            entry("alpha", "a.local", None, vec![], vec![], 10),
-            entry("mike", "m.local", None, vec![], vec![], 10),
-        ]);
-        let resp = build_response(MeshRemoteClustersInputs {
-            snapshot: &snapshot,
-            multi_cluster: None,
-            discovery_enabled: true,
-            now_unix_seconds: 10,
-        });
-        let names: Vec<&str> = resp
-            .discovered
-            .iter()
-            .map(|d| d.cluster_name.as_str())
-            .collect();
-        assert_eq!(names, vec!["alpha", "mike", "zulu"]);
-    }
-
-    #[test]
-    fn future_fetch_timestamp_clamps_age_to_zero() {
-        // Clock skew: the remote CP stamped a fetch time ahead of our `now`.
-        let snapshot = snapshot_with(vec![entry(
-            "remote-east",
-            "remote.local",
-            None,
-            vec![],
-            vec![],
-            2_000,
-        )]);
-        let resp = build_response(MeshRemoteClustersInputs {
-            snapshot: &snapshot,
-            multi_cluster: None,
-            discovery_enabled: true,
-            now_unix_seconds: 1_000,
-        });
-        assert_eq!(resp.discovered[0].age_seconds, 0);
-    }
-
-    fn multi_cluster_with(remotes: Vec<RemoteCluster>) -> MultiClusterConfig {
-        MultiClusterConfig {
-            local_cluster: Some("local".to_string()),
-            federation_endpoint: None,
-            remote_clusters: remotes,
-            east_west_gateways: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn configured_reflects_declared_remotes_with_url_booleans() {
-        let mc = multi_cluster_with(vec![
-            RemoteCluster {
-                name: "remote-east".to_string(),
-                trust_domain: td("remote.local"),
-                network: Some("net2".to_string()),
-                control_plane_url: Some("grpcs://cp.remote.local:50051".to_string()),
-                federation_endpoint: Some("https://spire.remote.local/bundle".to_string()),
-            },
-            RemoteCluster {
-                name: "remote-west".to_string(),
-                trust_domain: td("west.local"),
-                network: None,
-                // Federation-only cluster: no control plane, never discoverable.
-                control_plane_url: None,
-                federation_endpoint: Some("https://spire.west.local/bundle".to_string()),
-            },
-        ]);
-        // Only remote-east has been discovered.
-        let snapshot = snapshot_with(vec![entry(
-            "remote-east",
-            "remote.local",
-            Some("net2"),
-            vec![workload(
-                "spiffe://remote.local/ns/default/sa/reviews",
-                "reviews",
-                "10.9.0.1",
-            )],
-            vec![],
-            900,
-        )]);
-
-        let resp = build_response(MeshRemoteClustersInputs {
-            snapshot: &snapshot,
-            multi_cluster: Some(&mc),
-            discovery_enabled: true,
-            now_unix_seconds: 1_000,
-        });
-
-        assert_eq!(resp.configured.len(), 2);
-        // Sorted: remote-east before remote-west.
-        let east = &resp.configured[0];
-        assert_eq!(east.cluster_name, "remote-east");
-        assert_eq!(east.trust_domain, "remote.local");
-        assert_eq!(east.network.as_deref(), Some("net2"));
-        assert!(east.control_plane_configured);
-        assert!(east.federation_endpoint_configured);
-        assert!(east.discovered, "remote-east is in the snapshot");
-
-        let west = &resp.configured[1];
-        assert_eq!(west.cluster_name, "remote-west");
-        assert!(!west.control_plane_configured);
-        assert!(west.federation_endpoint_configured);
-        assert!(
-            !west.discovered,
-            "remote-west is configured (federation-only) but not discovered"
-        );
-    }
-
-    #[test]
-    fn configured_treats_blank_urls_as_unset() {
-        // Whitespace-only URLs are not real configuration — the poller's
-        // `poll_targets_for_multi_cluster` trims-and-drops them, so the
-        // introspection view must agree (`control_plane_configured: false`).
-        let mc = multi_cluster_with(vec![RemoteCluster {
-            name: "remote-blank".to_string(),
-            trust_domain: td("blank.local"),
-            network: None,
-            control_plane_url: Some("   ".to_string()),
-            federation_endpoint: Some(String::new()),
-        }]);
-        let snapshot = RemoteEndpointSnapshot::default();
-        let resp = build_response(MeshRemoteClustersInputs {
-            snapshot: &snapshot,
-            multi_cluster: Some(&mc),
-            discovery_enabled: true,
-            now_unix_seconds: 0,
-        });
-        assert_eq!(resp.configured.len(), 1);
-        assert!(!resp.configured[0].control_plane_configured);
-        assert!(!resp.configured[0].federation_endpoint_configured);
-        assert!(!resp.configured[0].discovered);
-    }
-
-    #[test]
-    fn response_round_trips_and_omits_absent_network() {
-        // The serialized shape must be stable for dashboards: `network` is
-        // elided when absent (skip_serializing_if), counts are always present.
-        let snapshot = snapshot_with(vec![entry(
-            "remote-east",
-            "remote.local",
-            None,
-            vec![],
-            vec![],
-            500,
-        )]);
-        let resp = build_response(MeshRemoteClustersInputs {
-            snapshot: &snapshot,
-            multi_cluster: None,
-            discovery_enabled: true,
-            now_unix_seconds: 500,
-        });
-        let value = serde_json::to_value(&resp).expect("serialize");
-        assert_eq!(value["discovery_enabled"], true);
-        assert!(value["discovered"][0].get("network").is_none());
-        assert_eq!(value["discovered"][0]["workload_count"], 0);
-        assert_eq!(value["discovered"][0]["service_count"], 0);
-        assert_eq!(value["discovered"][0]["age_seconds"], 0);
-        // `configured` is always an array (possibly empty), never null.
-        assert!(value["configured"].is_array());
     }
 }

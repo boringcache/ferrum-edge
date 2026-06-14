@@ -2136,14 +2136,22 @@ paths:
           the native `MeshSubscribe` stream, keyed by cluster name, each with
           per-cluster `workload_count` / `service_count`, the
           `fetched_at_unix_seconds` of the last successful poll, and the
-          derived `age_seconds`. Empty when discovery is disabled
+          derived `age_seconds`. `age_seconds` tracks the last successful
+          poll, not the last endpoint change: a stable cluster refreshes its
+          fetch timestamp every poll, so it does not look stale. This view is
+          scoped to the **accepted** slice's clusters (matched by name and
+          trust domain) — a cluster in the discovery store but absent from the
+          accepted config (e.g. left over from a rejected slice) is omitted,
+          so a rejected slice never appears as live discovery. Empty when
+          discovery is disabled
           (`FERRUM_MESH_REMOTE_DISCOVERY_POLL_INTERVAL_SECONDS` is `0`), no
-          remote cluster is trust-eligible, or no poll has succeeded yet.
+          slice has been accepted, no remote cluster is trust-eligible, or no
+          poll has succeeded yet.
         - `configured`: remote clusters declared in the **accepted** slice's
           multicluster config — name, trust domain, network, and whether a
           control plane (`control_plane_configured`) / federation endpoint
           (`federation_endpoint_configured`) is set. Each carries a
-          `discovered` flag cross-referencing the live snapshot so a
+          `discovered` flag cross-referencing the scoped `discovered` view so a
           configured-but-unreachable cluster is visible.
 
         The payload is a topology-shape summary — counts and provenance,
@@ -2177,7 +2185,11 @@ paths:
                       configuration.
                   discovered:
                     type: array
-                    description: Remote clusters this DP has fetched endpoints from, sorted by `cluster_name`.
+                    description: |
+                      Remote clusters this DP has fetched endpoints from,
+                      sorted by `cluster_name`. Scoped to the accepted slice's
+                      configured clusters (by name + trust domain); clusters
+                      from a received-but-rejected slice are omitted.
                     items:
                       type: object
                       required:
@@ -2207,11 +2219,18 @@ paths:
                         fetched_at_unix_seconds:
                           type: integer
                           format: int64
-                          description: Unix timestamp (seconds) of the most recent successful poll of this cluster.
+                          description: |
+                            Unix timestamp (seconds) of the most recent
+                            successful poll of this cluster. Refreshed on every
+                            successful poll, including no-op polls that returned
+                            unchanged endpoints.
                         age_seconds:
                           type: integer
                           format: int64
-                          description: Seconds since `fetched_at_unix_seconds`. Saturates at 0.
+                          description: |
+                            Seconds since the last successful poll
+                            (`fetched_at_unix_seconds`), not since the last
+                            endpoint change. Saturates at 0 on clock skew.
                   configured:
                     type: array
                     description: Remote clusters declared in the accepted slice's multicluster config, sorted by `cluster_name`.
@@ -2246,7 +2265,9 @@ paths:
                           description: Whether a `federation_endpoint` is set for SPIFFE trust-bundle exchange.
                         discovered:
                           type: boolean
-                          description: Whether a cluster of this name is present in the live `discovered` map.
+                          description: |
+                            Whether this cluster is present in the scoped
+                            `discovered` view (matched by name + trust domain).
               examples:
                 discovery-active:
                   value:

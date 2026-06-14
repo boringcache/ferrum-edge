@@ -175,18 +175,13 @@ impl RemoteEndpointStore {
     /// step. Production code must use `register_cluster` + `install` so the
     /// generation token is passed through the poll task.
     ///
-    /// `#[doc(hidden)]` rather than `#[cfg(test)]` so the integration-test crate
-    /// (which compiles against this crate as an external dependency, where
-    /// `cfg(test)` is inactive) can stage a discovered-remote-cluster snapshot
-    /// for the `GET /mesh/remote-clusters` admin handler — mirroring the
-    /// `runtime_overlay_consumers::test_lock` test-support convention. It is not
-    /// part of the supported API and performs the same register+install the
-    /// discovery loop does, so it is harmless if ever reached in a non-test
-    /// build. The runtime crate / binary never call it (only the inline unit
-    /// tests and the integration-test crate do), hence `#[allow(dead_code)]`.
-    #[doc(hidden)]
-    #[allow(dead_code)]
-    pub fn install_for_test(&self, entry: RemoteClusterEntry) {
+    /// `#[cfg(test)]` so this seeder is NEVER compiled into production builds and
+    /// can never be reached through the public `MeshRuntimeState` API — staging
+    /// a discovered snapshot is exclusively an in-crate unit-test concern (see
+    /// the `build_response` unit test for the response-shape coverage that used
+    /// to lean on this in the integration crate).
+    #[cfg(test)]
+    fn install_for_test(&self, entry: RemoteClusterEntry) {
         let new_gen = self.register_cluster(&entry.cluster_name);
         self.install(entry, new_gen);
     }
@@ -213,31 +208,27 @@ impl RemoteEndpointStore {
     /// is discarded — closing the abort→install race (F6).
     ///
     /// When the endpoints are byte-identical to what is already stored, the
-    /// revision is NOT bumped and the apply task is not woken (F2).
+    /// apply task is NOT woken and the revision is NOT bumped (F2) — but the
+    /// stored `fetched_at_unix_seconds` IS refreshed to this poll's timestamp.
+    /// That keeps the admin endpoint's `age_seconds` measuring time-since-last-
+    /// successful-POLL rather than time-since-last-endpoint-CHANGE, so a healthy
+    /// but stable remote cluster does not look stale to operator alerting. The
+    /// refresh writes a new snapshot through the same `inner.rcu` (so it stays
+    /// atomic with `remove()` and the generation guard) but deliberately does
+    /// not touch `revision_tx`/`first_ready`, preserving the
+    /// "no reconcile on unchanged endpoints" optimization.
     ///
-    /// Returns `true` only when this call actually mutated the snapshot (a real
-    /// install), so callers can avoid logging "installed" on a deduped or
-    /// retired-cluster no-op.
+    /// Returns `true` only when this call actually changed the endpoint set (a
+    /// real install), so callers can avoid logging "installed" on a deduped
+    /// (timestamp-only refresh) or retired-cluster no-op.
     fn install(&self, entry: RemoteClusterEntry, task_generation: u64) -> bool {
         let name = entry.cluster_name.clone();
         // Fast-path generation check: bail out early if the task's cluster slot
-        // was already retired, avoiding the dedup load + clone for stale tasks.
-        // This is re-validated atomically inside the rcu below — it is only an
+        // was already retired, avoiding the swap for stale tasks. This is
+        // re-validated atomically inside the rcu below — it is only an
         // optimization, not the authoritative check.
         if !self.cluster_generation_matches(&name, task_generation) {
             return false;
-        }
-        // No-op dedup: skip the revision bump when the endpoints are unchanged.
-        {
-            let current = self.inner.load();
-            if current
-                .clusters
-                .get(&name)
-                .is_some_and(|existing| existing.endpoints == entry.endpoints)
-            {
-                // Endpoints are identical — do not wake the apply task.
-                return false;
-            }
         }
         // CAS loop so two concurrent successful polls (different clusters)
         // cannot stomp each other's snapshot clone. The generation is re-checked
@@ -251,22 +242,48 @@ impl RemoteEndpointStore {
         // cluster. Without the in-closure recheck, a stale task could insert
         // after `remove` had already cleared the cluster (the F6 race, widened
         // to the trust-withdrawal case).
-        let mut installed = false;
+        //
+        // `endpoints_changed` distinguishes a real install (insert/replace the
+        // endpoint set → wake the apply task) from a no-op poll whose ONLY
+        // effect is refreshing `fetched_at_unix_seconds` (skip the wake). Both
+        // are computed fresh on every closure iteration so a CAS retry never
+        // carries a stale verdict.
+        let mut endpoints_changed = false;
         self.inner.rcu(|current| {
+            endpoints_changed = false;
             if !self.cluster_generation_matches(&name, task_generation) {
-                installed = false;
                 return Arc::clone(current);
             }
-            let mut next = (**current).clone();
-            next.clusters.insert(name.clone(), entry.clone());
-            installed = true;
-            Arc::new(next)
+            match current.clusters.get(&name) {
+                // No-op dedup: endpoints identical to what is stored. Refresh
+                // only the poll timestamp (so `age_seconds` tracks polls) and
+                // do NOT wake the apply task. When the timestamp is also
+                // unchanged (e.g. two polls in the same wall-clock second) skip
+                // the swap entirely — nothing to write.
+                Some(existing) if existing.endpoints == entry.endpoints => {
+                    if existing.fetched_at_unix_seconds == entry.fetched_at_unix_seconds {
+                        return Arc::clone(current);
+                    }
+                    let mut next = (**current).clone();
+                    if let Some(slot) = next.clusters.get_mut(&name) {
+                        slot.fetched_at_unix_seconds = entry.fetched_at_unix_seconds;
+                    }
+                    Arc::new(next)
+                }
+                // First sight or changed endpoints: full install.
+                _ => {
+                    let mut next = (**current).clone();
+                    next.clusters.insert(name.clone(), entry.clone());
+                    endpoints_changed = true;
+                    Arc::new(next)
+                }
+            }
         });
-        if installed {
+        if endpoints_changed {
             self.first_ready.store(true, Ordering::Release);
             self.revision_tx.send_modify(|revision| *revision += 1);
         }
-        installed
+        endpoints_changed
     }
 
     /// Whether `task_generation` still matches the cluster's registered
@@ -2035,6 +2052,109 @@ mod tests {
         assert!(
             !rx.has_changed().unwrap(),
             "no-op poll with identical endpoints must not bump revision"
+        );
+    }
+
+    /// Finding 1: a no-op poll (identical endpoints) with a NEWER fetch
+    /// timestamp must refresh the stored `fetched_at_unix_seconds` so the admin
+    /// endpoint's `age_seconds` tracks the last successful POLL — not the last
+    /// endpoint CHANGE — WITHOUT waking the apply task. A healthy-but-stable
+    /// remote cluster otherwise looks stale to operator alerting.
+    #[test]
+    fn no_op_poll_refreshes_fetch_timestamp_without_bumping_revision() {
+        let store = RemoteEndpointStore::new();
+        let mut rx = store.subscribe();
+        let endpoints = RemoteClusterEndpoints {
+            workloads: vec![workload(
+                "spiffe://remote.local/ns/default/sa/a",
+                "reviews",
+                "10.2.0.1",
+                Some("remote-west"),
+            )],
+            services: vec![],
+        };
+        let entry_at = |fetched_at: u64| RemoteClusterEntry {
+            cluster_name: "west".to_string(),
+            trust_domain: td("remote.local"),
+            network: None,
+            endpoints: endpoints.clone(),
+            fetched_at_unix_seconds: fetched_at,
+        };
+
+        // First poll at t=100 installs and bumps the revision.
+        let gen1 = store.register_cluster("west");
+        assert!(
+            store.install(entry_at(100), gen1),
+            "first install changes endpoints → returns true"
+        );
+        assert!(rx.has_changed().unwrap(), "first install bumps revision");
+        rx.mark_unchanged();
+        assert_eq!(
+            store
+                .snapshot()
+                .clusters
+                .get("west")
+                .map(|e| e.fetched_at_unix_seconds),
+            Some(100)
+        );
+
+        // Second poll at t=160: SAME endpoints, NEWER timestamp. Must refresh
+        // the stored timestamp but NOT wake the apply task and NOT report a
+        // change.
+        let gen2 = store.register_cluster("west");
+        assert!(
+            !store.install(entry_at(160), gen2),
+            "no-op poll (same endpoints) returns false even though it refreshed the timestamp"
+        );
+        assert!(
+            !rx.has_changed().unwrap(),
+            "timestamp-only refresh must not bump revision / wake apply"
+        );
+        assert_eq!(
+            store
+                .snapshot()
+                .clusters
+                .get("west")
+                .map(|e| e.fetched_at_unix_seconds),
+            Some(160),
+            "age must track the latest successful poll, not the last endpoint change"
+        );
+    }
+
+    /// Finding 1 (fail-closed): the timestamp refresh on a no-op poll must
+    /// respect the generation guard. A retired cluster (removed / trust
+    /// withdrawn) whose in-flight task lands a no-op poll must NOT have its age
+    /// refreshed or its endpoints reinstated — the cluster is gone.
+    #[test]
+    fn no_op_refresh_is_blocked_for_retired_cluster() {
+        let store = RemoteEndpointStore::new();
+        let endpoints = RemoteClusterEndpoints {
+            workloads: vec![workload(
+                "spiffe://remote.local/ns/default/sa/a",
+                "reviews",
+                "10.2.0.1",
+                None,
+            )],
+            services: vec![],
+        };
+        let entry_at = |fetched_at: u64| RemoteClusterEntry {
+            cluster_name: "west".to_string(),
+            trust_domain: td("remote.local"),
+            network: None,
+            endpoints: endpoints.clone(),
+            fetched_at_unix_seconds: fetched_at,
+        };
+        // Install once, then retire the cluster.
+        let stale_gen = store.register_cluster("west");
+        assert!(store.install(entry_at(100), stale_gen));
+        store.remove("west");
+        assert!(store.snapshot().is_empty(), "remove clears the cluster");
+        // The stale task's next (no-op) poll must be dropped, not refresh a
+        // resurrected entry.
+        assert!(!store.install(entry_at(160), stale_gen));
+        assert!(
+            store.snapshot().is_empty(),
+            "retired cluster must not be reinstated by a no-op timestamp refresh"
         );
     }
 
