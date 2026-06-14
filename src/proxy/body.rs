@@ -1888,13 +1888,47 @@ impl<B> IdleReadTimeoutBody<B> {
     }
 }
 
+/// Error produced by [`IdleReadTimeoutBody`]: either the wrapped body's own
+/// error, or a per-frame idle read timeout.
+///
+/// A concrete (Sized) error type is required so
+/// `StripHopByHopTrailers<IdleReadTimeoutBody<_>>` still satisfies the
+/// `FrameSource` bound `B::Error: Error + Send + Sync + 'static` — a boxed
+/// `dyn Error` does NOT implement `Error`. `source()` exposes the inner error
+/// (or the `TimedOut` io error) so `retry::classify_typed_chain` walks the
+/// chain and classifies a stall as `ReadWriteTimeout` and a wrapped backend
+/// error exactly as it would unwrapped.
+#[derive(Debug)]
+enum IdleReadTimeoutError<E> {
+    Inner(E),
+    Timeout(std::io::Error),
+}
+
+impl<E: std::fmt::Display> std::fmt::Display for IdleReadTimeoutError<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Inner(e) => write!(f, "{e}"),
+            Self::Timeout(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl<E: std::error::Error + 'static> std::error::Error for IdleReadTimeoutError<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Inner(e) => Some(e),
+            Self::Timeout(e) => Some(e),
+        }
+    }
+}
+
 impl<B> http_body::Body for IdleReadTimeoutBody<B>
 where
     B: http_body::Body<Data = Bytes> + Unpin,
     B::Error: std::error::Error + Send + Sync + 'static,
 {
     type Data = Bytes;
-    type Error = ProxyBodyError;
+    type Error = IdleReadTimeoutError<B::Error>;
 
     fn poll_frame(
         self: Pin<&mut Self>,
@@ -1909,16 +1943,18 @@ where
                     .reset(tokio::time::Instant::now() + this.timeout);
                 Poll::Ready(Some(Ok(frame)))
             }
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(Box::new(e) as ProxyBodyError))),
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(IdleReadTimeoutError::Inner(e)))),
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => match std::future::Future::poll(this.deadline.as_mut(), cx) {
-                Poll::Ready(()) => Poll::Ready(Some(Err(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    format!(
-                        "backend response body read timeout after {}ms",
-                        this.timeout.as_millis()
+                Poll::Ready(()) => Poll::Ready(Some(Err(IdleReadTimeoutError::Timeout(
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "backend response body read timeout after {}ms",
+                            this.timeout.as_millis()
+                        ),
                     ),
-                )) as ProxyBodyError))),
+                )))),
                 Poll::Pending => Poll::Pending,
             },
         }
@@ -2183,11 +2219,9 @@ pub(crate) fn direct_streaming_h2_body_strip_hop_by_hop_trailers(
         content_length,
     };
     if read_timeout_ms > 0 {
-        // `IdleReadTimeoutBody::Error` is already `ProxyBodyError`, so no
-        // `map_err` boxing is needed on this branch.
         let timed = IdleReadTimeoutBody::new(direct, read_timeout_ms);
         let stripped = StripHopByHopTrailers::new(timed);
-        ProxyBody::streaming(Box::pin(stripped))
+        ProxyBody::streaming(Box::pin(stripped.map_err(|e| Box::new(e) as BoxError)))
     } else {
         let stripped = StripHopByHopTrailers::new(direct);
         ProxyBody::streaming(Box::pin(stripped.map_err(|e| Box::new(e) as BoxError)))
