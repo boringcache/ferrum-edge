@@ -2358,6 +2358,25 @@ where
             // trailer-only) gRPC trailer is reconciled onto the wire identically
             // on H1/H2 and H3 (#1614). `resp.headers` is left untouched as the
             // pristine backend initial-header reference for that reconciliation.
+            //
+            // Capture the backend's true gRPC terminal status for the
+            // admission/adaptive-concurrency sample BEFORE building the plugin
+            // view or running ANY response hook — exactly like the main gRPC
+            // buffered path (`proxy::handle_proxy_request`, which snapshots
+            // `grpc_backend_dispatch_status` before its merge/writeback). gRPC
+            // application failures ride in the `grpc-status` trailer under
+            // HTTP 200, and a sanitizing/rejecting hook may later rewrite, drop,
+            // or reject on that trailer; sampling the limiter from post-hook
+            // output (or the raw HTTP 200) would mislabel an UNAVAILABLE/INTERNAL
+            // backend as healthy. `resp.trailers` / `resp.headers` are the
+            // untouched backend maps here, so this is the backend result, not
+            // plugin output.
+            let grpc_backend_dispatch_status =
+                crate::proxy::grpc_proxy::grpc_admission_status_from_maps(
+                    &resp.trailers,
+                    &resp.headers,
+                    resp.status,
+                );
             let (mut plugin_response_headers, header_shadowed_trailer_keys) =
                 crate::proxy::grpc_proxy::build_grpc_plugin_header_view(
                     &resp.headers,
@@ -2430,15 +2449,17 @@ where
                     false,
                     backend_start.elapsed(),
                 );
-                // Feed the limiter the BACKEND status, not the gateway policy reject
-                // in `outcome.response_status`: the backend responded fine and an
-                // after_proxy hook rejected it locally, so training on the policy
-                // status would wrongly shrink a healthy backend limit. gRPC errors
-                // ride on HTTP 200, and a rejected response is never forwarded, so use
-                // the backend `resp.status` directly (matching the plain buffered path).
+                // Feed the limiter the BACKEND result, not the gateway policy reject
+                // in `outcome.response_status`: an after_proxy hook rejected locally,
+                // so training on the policy status would wrongly shrink the backend
+                // limit. But the backend result is the gRPC terminal status, not the
+                // raw HTTP 200 — gRPC failures ride on HTTP 200, and a hook can reject
+                // *because* of a backend `grpc-status: 14`. Use the pre-hook
+                // `grpc_backend_dispatch_status` (mapped from the untouched backend
+                // trailers) so a failing backend still shrinks, matching the main path.
                 record_cross_protocol_backend_admission_outcome(
                     &mut backend_admission_permits,
-                    resp.status,
+                    grpc_backend_dispatch_status,
                     false,
                     None,
                     backend_admission_start.elapsed(),
@@ -2576,17 +2597,12 @@ where
                 sticky_cookie_needed,
                 &mut response_headers,
             );
-            // Capture the backend's true gRPC terminal status for the admission
-            // sample BEFORE the trailers may be cleared just below: when a
-            // transform (grpc_web) converts the response away from native gRPC we
-            // drop the native TRAILERS frame, but adaptive concurrency must still
-            // see a failing backend (grpc-status 14/INTERNAL, etc.) shrink rather
-            // than be recorded as a healthy HTTP 200.
-            let grpc_admission_status = crate::proxy::grpc_proxy::grpc_admission_status_from_maps(
-                &response_trailers,
-                &response_headers,
-                response_status,
-            );
+            // The backend's true gRPC terminal status for the admission sample was
+            // captured as `grpc_backend_dispatch_status` at the top of this arm,
+            // before any hook could rewrite/drop `grpc-status` and before the
+            // grpc_web trailer-clear just below — adaptive concurrency trains on the
+            // backend result, not plugin output (matching the main gRPC path).
+            //
             // A transform that converted away from native gRPC (grpc_web appends
             // a gRPC-Web trailer frame to the body and relabels the content-type)
             // must not ALSO emit native H3 trailers, or terminal status would be
@@ -2662,11 +2678,12 @@ where
                 backend_start.elapsed(),
             );
             // A completed buffered gRPC response carries its backend outcome in the
-            // grpc-status trailer (HTTP 200), so map it for the admission sample —
-            // an UNAVAILABLE/INTERNAL backend must shrink, not look healthy. An
-            // incomplete stream stays a client disconnect (ignored), matching H1/H2.
+            // grpc-status trailer (HTTP 200), captured pre-hook as
+            // `grpc_backend_dispatch_status`, so an UNAVAILABLE/INTERNAL backend must
+            // shrink, not look healthy. An incomplete stream stays a client
+            // disconnect (ignored), matching H1/H2.
             let admission_status = if body_completed {
-                grpc_admission_status
+                grpc_backend_dispatch_status
             } else {
                 response_status
             };
