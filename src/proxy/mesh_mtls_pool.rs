@@ -503,6 +503,10 @@ impl MeshMtlsConnectionPool {
     /// preserve-host / multi-port logic as the HTTP-family egress path so parity
     /// holds byte-for-byte. Separating them mirrors `proxy_to_backend_mesh_mtls`,
     /// where the dial target and the inner request authority are distinct.
+    /// `path_and_query` is the client's request target (`:path`), preserved
+    /// byte-for-byte so a non-root upgrade (`ws://svc-b/ws?room=1`) reaches the
+    /// peer as `/ws?room=1` rather than `/` — the destination routes and builds
+    /// the local backend WebSocket URL on the path the client requested.
     ///
     /// Like [`Self::open_connect_tunnel`] (raw-TCP egress) this is **1:1**: each
     /// WebSocket session gets its OWN mesh-mTLS H2 connection carrying exactly
@@ -529,6 +533,7 @@ impl MeshMtlsConnectionPool {
         dial_host: &str,
         mtls_port: u16,
         authority: &str,
+        path_and_query: &str,
         expected_peer: &SpiffeId,
         ws_handshake_headers: &[(String, String)],
     ) -> Result<H2WsConnectTunnel, HbonePoolError> {
@@ -548,7 +553,14 @@ impl MeshMtlsConnectionPool {
         .await?;
         tokio::time::timeout(
             Duration::from_millis(proxy.backend_connect_timeout_ms),
-            open_h2_ws_connect_stream(sender, authority, ws_handshake_headers, None, None),
+            open_h2_ws_connect_stream(
+                sender,
+                authority,
+                path_and_query,
+                ws_handshake_headers,
+                None,
+                None,
+            ),
         )
         .await
         .map_err(|_| HbonePoolError::ConnectStream {

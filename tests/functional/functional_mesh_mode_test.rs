@@ -3702,3 +3702,51 @@ async fn functional_mesh_sidecar_ws_egress_rejects_untrusted_client_gateway() {
         );
     }
 }
+
+/// WebSocket egress keystone (Ambient, F2 §3.2): a WebSocket upgrade captured at
+/// gateway A reaches the WS echo backend behind Ambient gateway B over a **BARE
+/// HBONE CONNECT byte tunnel** to B's `:15008` HBONE listener, with the
+/// WebSocket spoken as an inner HTTP/1.1 upgrade THROUGH the tunnel — NOT an
+/// Extended CONNECT. Ambient/Waypoint materialize NO inbound routes, so B's
+/// transparent HBONE relay (`build_inbound_hbone_relay_proxy`, bare-CONNECT-
+/// gated) byte-copies the tunnel straight to the loopback WS app, which performs
+/// the upgrade. This is the codex-finding-#1 fix: the prior implementation sent a
+/// `:protocol=websocket` Extended CONNECT to `:15008`, which the relay EXCLUDES
+/// (it requires `:protocol` absent) so it 404'd for every Ambient destination.
+/// Proves Ambient WS egress actually works end-to-end A→B→app→B→A over HBONE.
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_ambient_ws_egress_routes_a_to_b_over_hbone() {
+    let (reply, logs) = drive_websocket_egress_a_to_b("ambient", true)
+        .await
+        .expect("ambient websocket egress drive");
+    assert!(
+        reply.contains("backend-ws:mesh-ws-hello"),
+        "the WebSocket frame must traverse A's HBONE byte-tunnel egress to B's WS backend \
+         (inner H1 upgrade relayed to the loopback app) and echo back; reply: {reply:?}\n{logs}"
+    );
+}
+
+/// WebSocket egress HBONE negative (Ambient): a source gateway whose SVID does
+/// NOT chain to the mesh CA must not reach B's WS backend. The HBONE byte-tunnel
+/// dial underpinning the WebSocket fails SVID verification (A rejects B's server
+/// SVID; B's HBONE listener rejects A's client cert), so the upgrade fails
+/// closed — it must never echo a backend frame. Proves the Ambient WS egress
+/// path verifies SVIDs rather than blindly tunneling, and never silently falls
+/// back to a plaintext dial of a `mesh.hbone` destination.
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_ambient_ws_egress_rejects_untrusted_client_gateway() {
+    // The driver returns `Err` when the upgrade never completes (the expected
+    // fail-closed outcome: the HBONE dial underpinning the WebSocket fails SVID
+    // verification before the inner handshake). It returns `Ok(reply)` only if a
+    // handshake somehow succeeded — in which case the reply must NOT carry a
+    // backend frame.
+    if let Ok((reply, logs)) = drive_websocket_egress_a_to_b("ambient", false).await {
+        assert!(
+            !reply.contains("backend-ws:"),
+            "an untrusted gateway's Ambient WebSocket egress must fail closed, not echo a \
+             backend frame: {reply:?}\n{logs}"
+        );
+    }
+}

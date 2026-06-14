@@ -531,19 +531,29 @@ impl HboneConnectionPool {
         })?
     }
 
-    /// Open a WebSocket Extended CONNECT (RFC 8441) byte tunnel to a peer's
-    /// HBONE listener over a FRESH SVID-mTLS H2 connection, carrying the HBONE
-    /// protocol marker and the W3C source-identity baggage just like
+    /// Open a **bare** HBONE CONNECT byte tunnel to a peer's HBONE listener over
+    /// a FRESH SVID-mTLS H2 connection for a WebSocket egress session, carrying
+    /// the HBONE protocol marker and the W3C source-identity baggage just like
     /// [`Self::get_tunnel`]. The connection is DIALED to `dial_host:hbone_port`
-    /// (the peer's pod address + `:15008`/`mesh.hbone_port`); the Extended
-    /// CONNECT `:authority` is the pre-built `authority` — the original
-    /// destination the peer's transparent HBONE relay dials locally (parity with
-    /// the HBONE inner-request authority).
+    /// (the peer's pod address + `:15008`/`mesh.hbone_port`); the bare CONNECT
+    /// `:authority` is `app_host:app_port` — the destination workload's app
+    /// address+port the peer's transparent HBONE relay byte-copies to locally.
+    ///
+    /// This is the WebSocket analogue of [`Self::get_tunnel`] / the raw-TCP HBONE
+    /// egress path, NOT an Extended CONNECT. Ambient/Waypoint materialize NO
+    /// inbound routes, and the route-miss transparent-relay fallback
+    /// (`build_inbound_hbone_relay_proxy`) is gated on a BARE CONNECT
+    /// (`is_connect_request` requires `:protocol` to be ABSENT) — so an Extended
+    /// CONNECT carrying `:protocol=websocket` to `:15008` would 404 before any WS
+    /// handler runs. Instead the caller dials this bare byte tunnel to the app
+    /// addr:port and speaks the WebSocket (inner H1 upgrade) THROUGH it: the
+    /// relay byte-copies the upgrade to the loopback app, which performs the WS
+    /// handshake — no destination-side change.
     ///
     /// Unlike HTTP-family Ambient egress (which multiplexes over the pooled HBONE
-    /// connections) this dials its OWN H2 connection carrying exactly ONE
-    /// Extended CONNECT stream (1:1, dropped when the WebSocket session closes) —
-    /// the same model the Sidecar/Ambient raw-TCP egress paths use. A proxied
+    /// connections) this dials its OWN H2 connection carrying exactly ONE CONNECT
+    /// stream (1:1, dropped when the WebSocket session closes) — the same model
+    /// the Sidecar raw-TCP / Sidecar WebSocket egress paths use. A proxied
     /// WebSocket already opens one dedicated backend connection (its lifetime is
     /// bounded by `DestinationRule.maxConnections` via `BackendConnectionGuard`),
     /// so a per-session H2 connection keeps long-lived WebSocket sessions off the
@@ -551,15 +561,15 @@ impl HboneConnectionPool {
     /// SVID rotation is automatic because every new session dials with the
     /// current SVID. The dial PINS `expected_peer`; a missing gateway SVID fails
     /// closed before the dial.
-    pub async fn get_ws_tunnel(
+    pub async fn get_ws_byte_tunnel(
         &self,
         proxy: &Proxy,
         dial_host: &str,
         hbone_port: u16,
-        authority: &str,
+        app_host: &str,
+        app_port: u16,
         expected_peer: Option<&crate::identity::SpiffeId>,
-        ws_handshake_headers: &[(String, String)],
-    ) -> Result<H2WsConnectTunnel, HbonePoolError> {
+    ) -> Result<H2ConnectTunnel, HbonePoolError> {
         let (source_identity, _fingerprint) = self.current_svid_identity_cached()?;
         let pool_config = self.pool_config.for_proxy(proxy);
         let sender = dial_h2_connect_sender(
@@ -575,19 +585,13 @@ impl HboneConnectionPool {
         let baggage = baggage_header_for_source(&source_identity);
         tokio::time::timeout(
             Duration::from_millis(proxy.backend_connect_timeout_ms),
-            open_h2_ws_connect_stream(
-                sender,
-                authority,
-                ws_handshake_headers,
-                Some(&baggage),
-                Some("hbone"),
-            ),
+            open_h2_connect_stream(sender, app_host, app_port, Some(&baggage), Some("hbone")),
         )
         .await
         .map_err(|_| HbonePoolError::ConnectStream {
-            authority: authority.to_string(),
+            authority: authority_for_host_port(app_host, app_port),
             message: format!(
-                "timed out after {}ms waiting for HBONE WebSocket Extended CONNECT response",
+                "timed out after {}ms waiting for HBONE WebSocket byte-tunnel CONNECT response",
                 proxy.backend_connect_timeout_ms
             ),
         })?
@@ -1308,7 +1312,10 @@ pub struct H2WsConnectTunnel {
 /// computes it with the same preserve-host / multi-port logic as the HTTP-family
 /// mesh egress path so parity holds byte-for-byte (e.g. a port-less service
 /// Host). It is independent of the connection's dial target (the connection is
-/// already established on `sender`).
+/// already established on `sender`). `path_and_query` is the client's request
+/// target (`:path`), preserved byte-for-byte so `ws://svc-b/ws?room=1` reaches
+/// the destination as `/ws?room=1` (not `/`) — the caller derives it from the
+/// computed backend URL and guarantees a leading `/`.
 ///
 /// `ws_handshake_headers` are the forwardable WebSocket request headers (e.g.
 /// `Sec-WebSocket-Protocol`, `Sec-WebSocket-Extensions`, identity headers) that
@@ -1326,6 +1333,7 @@ pub struct H2WsConnectTunnel {
 pub(crate) async fn open_h2_ws_connect_stream(
     sender: SendRequest<Bytes>,
     authority: &str,
+    path_and_query: &str,
     ws_handshake_headers: &[(String, String)],
     baggage: Option<&str>,
     marker: Option<&'static str>,
@@ -1334,8 +1342,15 @@ pub(crate) async fn open_h2_ws_connect_stream(
     let authority = authority.to_string();
     // RFC 8441 Extended CONNECT keeps `:scheme` and `:path` (unlike a bare
     // CONNECT, which drops them). h2 derives them from the request URI, so build
-    // a full `https://<authority>/` URI rather than a bare authority.
-    let uri = format!("https://{authority}/");
+    // a full `https://<authority><path_and_query>` URI rather than a bare
+    // authority. `path_and_query` is the CLIENT's request target (e.g.
+    // `/ws?room=1`), preserved byte-for-byte so the destination routes + builds
+    // the local backend WebSocket URL on the same path the client requested
+    // (parity with direct WS forwarding and the HTTP mesh paths). Callers
+    // normalize it to start with `/`; an empty/relative value would make
+    // `https://authority` parse as an opaque URI with no path, so the caller
+    // guarantees a leading `/`.
+    let uri = format!("https://{authority}{path_and_query}");
     let mut request = Request::builder()
         .method(Method::CONNECT)
         .version(Version::HTTP_2)
@@ -2627,6 +2642,7 @@ mod tests {
         let result = open_h2_ws_connect_stream(
             sender,
             "orders.default.svc.cluster.local:8080",
+            "/",
             &[],
             None,
             None,
@@ -2673,6 +2689,17 @@ mod tests {
                     .get::<h2::ext::Protocol>()
                     .map(|p| p.as_str().to_string()),
                 Some("websocket".to_string())
+            );
+            // The client's non-root `:path` must be preserved byte-for-byte
+            // (codex finding #2): a hard-coded `/` would drop `?room=1` and the
+            // destination would route + build the local WS backend URL wrong.
+            assert_eq!(
+                request
+                    .uri()
+                    .path_and_query()
+                    .map(|pq| pq.as_str().to_string()),
+                Some("/ws?room=1".to_string()),
+                "the WebSocket :path+query must survive the Extended CONNECT"
             );
             assert_eq!(
                 request
@@ -2725,6 +2752,7 @@ mod tests {
         let ws = open_h2_ws_connect_stream(
             sender,
             "orders.default.svc.cluster.local:8080",
+            "/ws?room=1",
             &[("Sec-WebSocket-Protocol".to_string(), "chat".to_string())],
             None,
             None,
