@@ -2720,9 +2720,16 @@ async fn handle_h3_request(
         // relay loop would only rediscover the dead stream on its first
         // send_data and there is no backend data worth pulling for it.
         'outer: while !client_disconnected {
-            // Re-arm the read deadline only after the previous frame has been
-            // sent downstream, so the send interval is excluded from the budget.
-            if read_timeout_active && just_received_backend_frame {
+            // Re-arm the read deadline only once the previous backend frame has
+            // actually been flushed downstream (`coalesce_buf` empty), so neither
+            // the direct send NOR a slow flush of a buffered sub-target chunk is
+            // charged to the backend. A coalesced chunk buffered below the
+            // coalesce-min threshold keeps `just_received_backend_frame` set but
+            // does NOT re-arm until `flush_timer` (or the next threshold flush)
+            // drains the buffer — otherwise a slow client holding that flush
+            // longer than `backend_read_timeout_ms` would expire the deadline
+            // against a healthy backend.
+            if read_timeout_active && just_received_backend_frame && coalesce_buf.is_empty() {
                 read_deadline.as_mut().reset(
                     tokio::time::Instant::now()
                         + std::time::Duration::from_millis(backend_read_timeout_ms),
@@ -3366,8 +3373,18 @@ async fn handle_h3_request(
         // Prefer the body class so a body-only ClientDisconnect is recognized as
         // a client-side (non-backend) signal by passive health / the breaker
         // instead of a phantom success (the terminal `h3_error_class` is None for
-        // a mid-body client disconnect). Shared with the admission outcome below.
-        let backend_outcome_error_class = h3_stream_result.body_error_class.or(h3_error_class);
+        // a mid-body client disconnect). EXCEPTION: when the backend itself
+        // returned a server error (>= 500), a concurrent client disconnect during
+        // the response send must NOT neutralize that backend failure —
+        // client-side classes skip CB / passive-health entirely — so fall back to
+        // the dispatch class (or None) and let the 5xx status drive the recorded
+        // outcome. Shared with the admission outcome below.
+        let backend_outcome_error_class = match h3_stream_result.body_error_class {
+            Some(crate::retry::ErrorClass::ClientDisconnect) if backend_status >= 500 => {
+                h3_error_class
+            }
+            other => other.or(h3_error_class),
+        };
         crate::proxy::backend_dispatch::record_backend_outcome(
             &state,
             &proxy,
@@ -4819,7 +4836,7 @@ async fn stream_h3_open_response_to_client(
     let mut just_received_backend_frame = false;
 
     'outer: loop {
-        if read_timeout_active && just_received_backend_frame {
+        if read_timeout_active && just_received_backend_frame && coalesce_buf.is_empty() {
             read_deadline.as_mut().reset(
                 tokio::time::Instant::now()
                     + std::time::Duration::from_millis(backend_read_timeout_ms),
@@ -5261,7 +5278,7 @@ async fn proxy_to_backend_h3_streaming(
     let mut just_received_backend_frame = false;
 
     'outer: loop {
-        if read_timeout_active && just_received_backend_frame {
+        if read_timeout_active && just_received_backend_frame && coalesce_buf.is_empty() {
             read_deadline.as_mut().reset(
                 tokio::time::Instant::now()
                     + std::time::Duration::from_millis(backend_read_timeout_ms),

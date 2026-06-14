@@ -579,6 +579,35 @@ fn client_side_no_backend_signal(error_class: Option<ErrorClass>) -> bool {
     )
 }
 
+/// A post-wire backend failure: the request reached the backend's application
+/// layer (response headers already arrived) and then the response stalled or the
+/// transport broke before the body/trailers completed.
+///
+/// These classes are NOT connection errors — the request went on the wire, so
+/// `connection_error` stays false and connect-failure retry replay must respect
+/// method idempotency — but they ARE backend-health failures that the circuit
+/// breaker / passive health / least-latency accounting must count. Without this,
+/// a backend that returns `200` headers and then times out or RSTs mid-stream is
+/// recorded as healthy because neither `connection_error` nor a 5xx status is
+/// set (see the streaming `IdleReadTimeoutBody` / native-H3 read-timeout paths).
+///
+/// `ClientDisconnect` / `RequestBodyTooLarge` are deliberately excluded — they
+/// are client/gateway-side and already neutralized by
+/// `client_side_no_backend_signal`; `ResponseBodyTooLarge` is a gateway-imposed
+/// cap, not a backend fault; `GracefulRemoteClose` is a clean close.
+#[inline]
+fn error_class_is_post_wire_backend_failure(error_class: Option<ErrorClass>) -> bool {
+    matches!(
+        error_class,
+        Some(
+            ErrorClass::ReadWriteTimeout
+                | ErrorClass::ConnectionReset
+                | ErrorClass::ConnectionClosed
+                | ErrorClass::ProtocolError
+        )
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn record_backend_outcome_inner(
     state: &ProxyState,
@@ -613,9 +642,16 @@ fn record_backend_outcome_inner(
     //      exist, they provide consistent, controlled RTT measurements and take
     //      precedence over passive TTFB which includes variable application processing time
     let client_side_no_backend_signal = client_side_no_backend_signal(error_class);
+    // A post-wire backend failure (a streaming `ReadWriteTimeout`, or a
+    // mid-response reset/close) is NOT a `connection_error` — the request
+    // reached the wire — but it must still count as a backend-health failure.
+    // Fold it into the failure signal used for latency / circuit-breaker /
+    // passive-health accounting below, WITHOUT touching `connection_error`
+    // itself (which gates connect-failure retry replay).
+    let backend_failure = connection_error || error_class_is_post_wire_backend_failure(error_class);
 
     if !client_side_no_backend_signal
-        && !connection_error
+        && !backend_failure
         && response_status < 500
         && let (Some(upstream_id), Some(target)) = (proxy.upstream_id.as_deref(), upstream_target)
     {
@@ -641,10 +677,13 @@ fn record_backend_outcome_inner(
                 .get_or_create(&proxy.id, final_cb_target_key, cb_config);
         if client_side_no_backend_signal {
             cb.record_neutral(is_half_open_probe);
-        } else if connection_error {
-            // Always route connection errors through record_failure().
-            // When trip_on_connection_errors=false, record_failure() treats
-            // them as neutral while still releasing half-open probe slots.
+        } else if backend_failure {
+            // Route both connection errors and post-wire backend failures (a
+            // backend that returned headers then stalled / RST mid-response)
+            // through record_failure() as connection-level so they can trip the
+            // breaker even when the response status is a healthy 2xx. When
+            // trip_on_connection_errors=false, record_failure() treats them as
+            // neutral while still releasing half-open probe slots.
             cb.record_failure(response_status, true, is_half_open_probe);
         } else if cb.config().failure_status_codes.contains(&response_status) {
             cb.record_failure(response_status, false, is_half_open_probe);
@@ -672,7 +711,7 @@ fn record_backend_outcome_inner(
             &proxy.id,
             target,
             response_status,
-            connection_error,
+            backend_failure,
             passive,
         );
     }
