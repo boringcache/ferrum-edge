@@ -3806,6 +3806,15 @@ async fn handle_h3_request(
         stream.send_response(resp).await?;
         stream.send_data(Bytes::from(response_body)).await?;
 
+        // Response-body plugins cannot inspect or transform trailers today.
+        // Conservatively drop backend trailers whenever the buffered response
+        // plugin pipeline ran successfully, rather than forwarding
+        // backend-controlled fields that may contain policy-relevant content
+        // the configured plugins never saw.
+        if !plugins.is_empty() {
+            response_trailers = None;
+        }
+
         // Forward backend response trailers, if any (issue #1630). Strip
         // response-direction hop-by-hop trailer names (RFC 9110 §7.6.1) with
         // the same helper the streaming path's
@@ -5417,10 +5426,10 @@ struct H3BufferedDispatchResult {
     status: u16,
     body: Vec<u8>,
     headers: HashMap<String, String>,
-    /// Backend response trailers (issue #1630), still unsanitized. Forwarded to
-    /// the H3 client (after stripping response-direction hop-by-hop names) on
-    /// the buffered native-H3 send path, mirroring the streaming path's
-    /// `finish_h3_response_with_backend_trailers`. `None` on every
+    /// Backend response trailers (issue #1630), still unsanitized. The buffered
+    /// native-H3 send path drops them when response plugins are active because
+    /// plugins cannot inspect trailers today; otherwise it strips
+    /// response-direction hop-by-hop names before forwarding. `None` on every
     /// gateway-synthesized error/reject below (no backend trailers to forward),
     /// and `None` for a successful response that carried no trailers.
     trailers: Option<http::HeaderMap>,
