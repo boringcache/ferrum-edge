@@ -2767,7 +2767,10 @@ mod keepalive_tests {
         #[cfg(target_os = "macos")]
         let time_name = libc::TCP_KEEPALIVE;
         let time = getsockopt_int(fd, libc::IPPROTO_TCP, time_name);
-        assert_eq!(time, 222, "global keepalive seconds must apply as idle time");
+        assert_eq!(
+            time, 222,
+            "global keepalive seconds must apply as idle time"
+        );
     }
 
     #[tokio::test]
