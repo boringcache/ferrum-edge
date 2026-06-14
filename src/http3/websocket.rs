@@ -262,6 +262,16 @@ fn collect_forwardable_h3_headers(
         ":path",
         ":protocol",
         ":status",
+        // Reserved consumer identity headers. Client-supplied values are already
+        // stripped by RequestContext::materialize_headers, and the H3 server
+        // injects the authenticated values into the proxy header map with
+        // mixed-case keys. Strip whatever is in the forwarded map here so the
+        // authoritative values can be re-injected below with override semantics
+        // (one header each), instead of being lower-cased through and then
+        // appended a second time. Mirrors the H1/H2 WebSocket path, which strips
+        // these reserved names before injecting authenticated identity.
+        "x-consumer-username",
+        "x-consumer-custom-id",
     ];
 
     let mut out: Vec<(String, String)> = headers
@@ -280,6 +290,18 @@ fn collect_forwardable_h3_headers(
     }
 
     out
+}
+
+/// Insert or replace a header in the forwardable list, removing any existing
+/// case-insensitive match first so a reserved name cannot appear twice. Mirrors
+/// `proxy::push_forwardable_header_override` on the H1/H2 path.
+fn push_h3_forwardable_header_override(
+    headers: &mut Vec<(String, String)>,
+    name: &str,
+    value: String,
+) {
+    headers.retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
+    headers.push((name.to_string(), value));
 }
 
 /// Write a small JSON error body on the H3 stream and finish.
@@ -539,11 +561,23 @@ pub(crate) async fn handle_h3_websocket(
 
     // ── Build forwardable header list for the backend handshake ─────
     let mut client_headers = collect_forwardable_h3_headers(&proxy_headers, is_early_data);
+    // Override semantics (not append): collect_forwardable_h3_headers already
+    // strips any reserved identity headers from the forwarded map, but use the
+    // override helper anyway so a single authoritative value is guaranteed even
+    // if a future change reintroduces one of these names upstream.
     if let Some(username) = ctx.backend_consumer_username() {
-        client_headers.push(("x-consumer-username".to_string(), username.to_string()));
+        push_h3_forwardable_header_override(
+            &mut client_headers,
+            "x-consumer-username",
+            username.to_string(),
+        );
     }
     if let Some(custom_id) = ctx.backend_consumer_custom_id() {
-        client_headers.push(("x-consumer-custom-id".to_string(), custom_id.to_string()));
+        push_h3_forwardable_header_override(
+            &mut client_headers,
+            "x-consumer-custom-id",
+            custom_id.to_string(),
+        );
     }
     crate::modes::mesh::hbone::strip_egress_baggage_in_vec(
         &mut client_headers,
@@ -1605,5 +1639,63 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         panic!("send pump wait timeout should abort and drop the task future");
+    }
+
+    #[test]
+    fn collect_strips_reserved_consumer_identity_headers() {
+        // The H3 server injects authenticated identity into the proxy header
+        // map with mixed-case keys (`X-Consumer-Username` / `X-Consumer-Custom-Id`).
+        // collect_forwardable_h3_headers must treat these as reserved and strip
+        // them so handle_h3_websocket can re-inject a single authoritative value,
+        // matching the H1/H2 WebSocket path.
+        let headers = make_headers(&[
+            ("X-Consumer-Username", "spoofed-or-injected"),
+            ("X-Consumer-Custom-Id", "spoofed-or-injected-id"),
+            ("x-trace-id", "keepme"),
+        ]);
+        let out = collect_forwardable_h3_headers(&headers, false);
+        assert!(
+            !has_key(&out, "x-consumer-username"),
+            "reserved x-consumer-username must be stripped from the forwarded map"
+        );
+        assert!(
+            !has_key(&out, "x-consumer-custom-id"),
+            "reserved x-consumer-custom-id must be stripped from the forwarded map"
+        );
+        assert_eq!(value_for(&out, "x-trace-id"), Some("keepme"));
+    }
+
+    #[test]
+    fn override_helper_yields_single_authoritative_identity_header() {
+        // Simulate the handle_h3_websocket injection flow: even if a reserved
+        // identity header survived into the forwardable list, the override
+        // helper must replace it (case-insensitively) so the backend receives
+        // exactly one header with the authenticated value — never a duplicate.
+        let headers = make_headers(&[
+            ("X-Consumer-Username", "mixed-case-leftover"),
+            ("x-trace-id", "keepme"),
+        ]);
+        let mut out = collect_forwardable_h3_headers(&headers, false);
+        // Defensively re-introduce a stray case variant to prove the override
+        // collapses it rather than appending a second value.
+        out.push(("X-Consumer-Username".to_string(), "stray".to_string()));
+        push_h3_forwardable_header_override(
+            &mut out,
+            "x-consumer-username",
+            "authenticated-user".to_string(),
+        );
+        let count = out
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("x-consumer-username"))
+            .count();
+        assert_eq!(
+            count, 1,
+            "exactly one x-consumer-username must reach the backend handshake"
+        );
+        assert_eq!(
+            value_for(&out, "x-consumer-username"),
+            Some("authenticated-user")
+        );
+        assert_eq!(value_for(&out, "x-trace-id"), Some("keepme"));
     }
 }
