@@ -3,7 +3,8 @@
 use ferrum_edge::ebpf::NodeAgentMetrics;
 use ferrum_edge::plugins::mesh::prometheus_helpers;
 use ferrum_edge::plugins::prometheus_metrics::{
-    CounterKey, HboneRelayFailureKey, MetricsRegistry, PrometheusMetrics, global_registry,
+    CounterKey, HboneRelayFailureKey, MeshTcpEgressConnKey, MetricsRegistry, PrometheusMetrics,
+    global_registry,
 };
 use ferrum_edge::plugins::{
     ALL_PROTOCOLS, Direction, Plugin, StreamTransactionSummary, TransactionSummary,
@@ -335,6 +336,44 @@ async fn test_registry_increments_counter_on_repeated_requests() {
     };
     let count = registry.request_counter.get(&key).unwrap();
     assert_eq!(count.value.load(Ordering::Relaxed), 5);
+}
+
+#[tokio::test]
+async fn test_registry_renders_mesh_tcp_egress_connection_counter() {
+    let registry = MetricsRegistry::new();
+    // Two successful HBONE (Ambient) relays, one failed mesh-mTLS (Sidecar) relay.
+    registry.record_mesh_tcp_egress_connection("hbone", true);
+    registry.record_mesh_tcp_egress_connection("hbone", true);
+    registry.record_mesh_tcp_egress_connection("mtls", false);
+
+    let output = registry.render();
+    assert!(
+        output.contains(
+            "ferrum_mesh_tcp_egress_connections_total{transport=\"hbone\",result=\"success\""
+        ),
+        "hbone success series must render: {output}"
+    );
+    assert!(
+        output.contains(
+            "ferrum_mesh_tcp_egress_connections_total{transport=\"mtls\",result=\"failure\""
+        ),
+        "mtls failure series must render: {output}"
+    );
+
+    // The two successful HBONE relays accumulate on one labelled series.
+    let key = MeshTcpEgressConnKey {
+        transport: "hbone",
+        result: "success",
+    };
+    assert_eq!(
+        registry
+            .mesh_tcp_egress_connection_counter
+            .get(&key)
+            .unwrap()
+            .value
+            .load(Ordering::Relaxed),
+        2
+    );
 }
 
 #[tokio::test]
