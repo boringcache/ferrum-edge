@@ -10849,7 +10849,16 @@ async fn handle_proxy_request_inner(
                 ctx.orig_dst.map(|addr| addr.port()),
                 authority_port,
             ) {
-                Ok(rm) => Some(rm),
+                Ok((rm, ingress_authz_port)) => {
+                    // F6 §6.2 (security): for a Sidecar `ingress[]` route, stamp
+                    // the DECLARED listener port so `mesh_authz` authorizes on it
+                    // (not the `defaultEndpoint` backend port the route forwards
+                    // to). `None` for service-port default inbound routes — they
+                    // authorize on the backend/container port (Istio inbound
+                    // authz). Stamped before the plugin chain runs.
+                    ctx.mesh_inbound_listener_authz_port = ingress_authz_port;
+                    Some(rm)
+                }
                 Err(reason) => {
                     debug!(
                         proxy_id = %representative_id.id,

@@ -623,6 +623,17 @@ pub struct RequestContext {
     /// port to disambiguate multi-port services; the address is reserved for
     /// the raw-TCP egress follow-up.
     pub orig_dst: Option<std::net::SocketAddr>,
+    /// Authorization destination port for a matched Sidecar `ingress[]` route
+    /// (F6 §6.2): the operator-declared LISTENER port (e.g. `8443`), stamped by
+    /// the request handler from `select_mesh_inbound_port_route` when the matched
+    /// route is an ingress group. `mesh_authz` uses this so an
+    /// `AuthorizationPolicy` `port` / `destination.port` rule scoped to the
+    /// listener port matches — the route forwards to a different
+    /// `defaultEndpoint` backend port, and authorizing on that backend port
+    /// would let a DENY on the listener port fail OPEN. `None` for service-port
+    /// default inbound routes (which authorize on the container/backend port,
+    /// matching Istio inbound authz) and for all non-ingress traffic.
+    pub mesh_inbound_listener_authz_port: Option<u16>,
 }
 
 fn merge_metadata_value(metadata: &mut HashMap<String, String>, key: &str, value: &str) {
@@ -694,6 +705,7 @@ impl RequestContext {
             node_waypoint_policy_scope: None,
             mesh_direction: None,
             orig_dst: None,
+            mesh_inbound_listener_authz_port: None,
         }
     }
 
@@ -758,6 +770,7 @@ impl RequestContext {
             node_waypoint_policy_scope: self.node_waypoint_policy_scope.clone(),
             mesh_direction: self.mesh_direction,
             orig_dst: self.orig_dst,
+            mesh_inbound_listener_authz_port: self.mesh_inbound_listener_authz_port,
         }
     }
 

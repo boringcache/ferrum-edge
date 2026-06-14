@@ -13,6 +13,11 @@ mod mesh_config;
 // the translator's "emit cors plugin vs. leave unprojected" decision and the
 // status writer's deferred-field reporting use one predicate and never diverge.
 pub(crate) use istio::cors_policy_translatable;
+// Shared with the Istio status writer the same way: the Sidecar `ingress[]`
+// HTTP-family classification used by resolution and by deferred-field reporting
+// is one predicate, so an HTTPS (→ Unknown → HTTP-family) listener is never
+// modeled by resolution yet reported as a deferred non-HTTP listener.
+pub(crate) use istio::sidecar_ingress_protocol_is_http_family;
 
 use std::collections::{HashMap, HashSet};
 
@@ -88,6 +93,17 @@ pub struct K8sTranslationOptions {
     /// Opt-in core Kubernetes Pod/Service/EndpointSlice discovery. Default
     /// false for the first rollout so operators can enable it deliberately.
     pub pod_discovery_enabled: bool,
+    /// Whether Sidecar `ingress[]` custom inbound listeners are actually
+    /// MATERIALIZED on the data plane (F6 §6.2) — the effective enforcement gate
+    /// `FERRUM_MESH_SIDECAR_ENFORCED && !FERRUM_MESH_SIDECAR_ENFORCED_DRY_RUN`,
+    /// mirroring the slice builder's `sidecar_enforced && !sidecar_dry_run`
+    /// ingress predicate. The Istio status writer reports `ingress_modeled > 0`
+    /// only when this is true, so the `FerrumAccepted` status never claims a
+    /// listener is modeled while the data plane is still serving the default
+    /// inbound behavior (dry-run / default-off). Default false (matches the env
+    /// default and the slice builder). Egress narrowing has its OWN, looser gate
+    /// (`enforced || dry_run`) and is not affected by this.
+    pub mesh_sidecar_ingress_enforced: bool,
     source_namespaces: Option<HashSet<String>>,
 }
 
@@ -101,12 +117,23 @@ impl K8sTranslationOptions {
             istio_root_namespace: "istio-system".to_string(),
             cluster_domain: "cluster.local".to_string(),
             pod_discovery_enabled: false,
+            mesh_sidecar_ingress_enforced: false,
             source_namespaces: Some(source_namespaces),
         }
     }
 
     pub fn with_pod_discovery_enabled(mut self, enabled: bool) -> Self {
         self.pod_discovery_enabled = enabled;
+        self
+    }
+
+    /// Set the effective Sidecar ingress enforcement gate
+    /// (`FERRUM_MESH_SIDECAR_ENFORCED && !FERRUM_MESH_SIDECAR_ENFORCED_DRY_RUN`).
+    /// The Istio status writer reports `ingress_modeled` as materialized only
+    /// when this is true, keeping the status in lock-step with what the slice
+    /// builder actually materializes.
+    pub fn with_mesh_sidecar_ingress_enforced(mut self, enforced: bool) -> Self {
+        self.mesh_sidecar_ingress_enforced = enforced;
         self
     }
 

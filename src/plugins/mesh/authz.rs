@@ -224,39 +224,65 @@ fn parse_client_ip(client_ip: &str) -> Option<std::net::IpAddr> {
 /// Destination port for mesh authorization (`to.operation.ports` /
 /// `when: destination.port`).
 ///
-/// For materialized sidecar **inbound** routes the request is delivered to the
-/// local app at the route's backend (workload/container) port, which is the
-/// port Istio inbound authz matches on — NOT the shared mTLS listener socket
-/// (e.g. 15006). A host-routed inbound `Proxy` carries `listen_port == None`,
-/// so without this the port would fall back to `frontend_listen_port` (the
-/// listener) and a port-scoped DENY on the app port would silently fail to
-/// match — a fail-open hole for DENY policies. Non-mesh and outbound traffic
-/// keep the existing listener/`listen_port` derivation.
+/// For materialized sidecar **inbound** routes the authorized port depends on
+/// which KIND of inbound route matched:
+///
+///   * **Service-port default inbound** (`__mesh-inbound-*`): the request is
+///     delivered to the local app at the route's backend (workload/container)
+///     port, which is the port Istio inbound authz matches on — so authorize on
+///     `proxy.backend_port`.
+///   * **Sidecar `ingress[]` custom listener** (`__mesh-ingress-*`, F6 §6.2):
+///     the listener declares a port (e.g. `8443`) and forwards to a SEPARATE
+///     `defaultEndpoint` backend port (e.g. `8080`). Istio scopes
+///     `AuthorizationPolicy` `port` / `destination.port` to the **declared
+///     listener port**, so authorize on `ingress_listener_authz_port` (stamped
+///     by the request handler from port selection), NOT the backend port.
+///     Authorizing on the backend port would let an ALLOW miss and — worse — a
+///     DENY scoped to the listener port FAIL OPEN.
+///
+/// A host-routed inbound `Proxy` carries `listen_port == None`, so without this
+/// the port would fall back to `frontend_listen_port` (the shared `:15006`
+/// listener socket) and a port-scoped rule would never match. Non-mesh and
+/// outbound traffic keep the existing listener/`listen_port` derivation.
 fn mesh_authz_destination_port(
     mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
     matched_proxy: Option<&crate::config::types::Proxy>,
+    ingress_listener_authz_port: Option<u16>,
     frontend_listen_port: Option<u16>,
 ) -> Option<u16> {
     mesh_inbound_app_port(
         mesh_direction,
         matched_proxy.map(|proxy| (proxy.id.as_str(), proxy.backend_port)),
+        ingress_listener_authz_port,
     )
     .or(frontend_listen_port)
     .or_else(|| matched_proxy.and_then(|proxy| proxy.listen_port))
 }
 
-/// The app (workload/container) port a materialized sidecar inbound route
-/// forwards to, when the matched route is one — else `None` so the caller falls
-/// back to the listener-port derivation. Pure over `(proxy id, backend_port)`
-/// for testability.
+/// The authorization destination port for a materialized sidecar inbound route,
+/// when the matched route is one — else `None` so the caller falls back to the
+/// listener-port derivation. For a Sidecar `ingress[]` route it is the declared
+/// LISTENER port (`ingress_listener_authz_port`); for a service-port default
+/// inbound route it is the route's backend (container) port. Pure over its
+/// inputs for testability.
 fn mesh_inbound_app_port(
     mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
     matched: Option<(&str, u16)>,
+    ingress_listener_authz_port: Option<u16>,
 ) -> Option<u16> {
     if mesh_direction == Some(crate::modes::mesh::MeshTrafficDirection::Inbound)
         && let Some((id, backend_port)) = matched
         && crate::modes::mesh::is_mesh_inbound_route_id(id)
     {
+        // Ingress listener routes authorize on the DECLARED listener port, not
+        // the `defaultEndpoint` backend port the route forwards to (F6 §6.2
+        // security). The handler stamps the listener port for ingress routes;
+        // if it is somehow absent for an ingress id, fail closed by keeping the
+        // backend port out of the authz decision (return `None` → fall back to
+        // the listener-socket port) rather than authorizing on the wrong port.
+        if crate::modes::mesh::is_mesh_ingress_route_id(id) {
+            return ingress_listener_authz_port;
+        }
         return Some(backend_port);
     }
     None
@@ -765,6 +791,7 @@ impl Plugin for MeshAuthz {
         let port = mesh_authz_destination_port(
             ctx.mesh_direction,
             ctx.matched_proxy.as_deref(),
+            ctx.mesh_inbound_listener_authz_port,
             ctx.frontend_listen_port,
         );
         // Istio source IP matchers. `source.ip` is the immediate downstream
@@ -1227,7 +1254,9 @@ fn default_trusted_hbone_assertors() -> Vec<TrustedAssertor> {
 #[cfg(test)]
 mod tests {
     use super::mesh_inbound_app_port;
-    use crate::modes::mesh::{MESH_INBOUND_PROXY_ID_PREFIX, MeshTrafficDirection};
+    use crate::modes::mesh::{
+        MESH_INBOUND_PROXY_ID_PREFIX, MESH_INGRESS_PROXY_ID_PREFIX, MeshTrafficDirection,
+    };
 
     #[test]
     fn mesh_inbound_app_port_uses_backend_port_for_inbound_routes() {
@@ -1235,11 +1264,48 @@ mod tests {
         assert_eq!(
             mesh_inbound_app_port(
                 Some(MeshTrafficDirection::Inbound),
-                Some((id.as_str(), 8080))
+                Some((id.as_str(), 8080)),
+                None,
             ),
             Some(8080),
-            "a materialized inbound route must authorize on the app/backend port, \
-             not the mTLS listener port"
+            "a materialized service-port inbound route must authorize on the app/backend \
+             port, not the mTLS listener port"
+        );
+    }
+
+    #[test]
+    fn mesh_inbound_app_port_uses_listener_port_for_ingress_routes() {
+        // F6 §6.2 security: an ingress listener `8443 → 127.0.0.1:8080` must
+        // authorize on the DECLARED listener port (8443), not the backend port
+        // (8080) — otherwise a DENY scoped to 8443 fails open. The handler
+        // stamps the listener port; the backend port is ignored for ingress.
+        let id = format!("{MESH_INGRESS_PROXY_ID_PREFIX}default-reviews-8443");
+        assert_eq!(
+            mesh_inbound_app_port(
+                Some(MeshTrafficDirection::Inbound),
+                Some((id.as_str(), 8080)),
+                Some(8443),
+            ),
+            Some(8443),
+            "an ingress listener route must authorize on the declared listener port"
+        );
+    }
+
+    #[test]
+    fn mesh_inbound_app_port_ingress_without_stamped_port_fails_closed() {
+        // If the listener port is somehow missing for an ingress id, do NOT fall
+        // back to the backend port (which would silently let a listener-port DENY
+        // miss). Return `None` → the caller falls back to the listener socket
+        // port, never the backend port.
+        let id = format!("{MESH_INGRESS_PROXY_ID_PREFIX}default-reviews-8443");
+        assert_eq!(
+            mesh_inbound_app_port(
+                Some(MeshTrafficDirection::Inbound),
+                Some((id.as_str(), 8080)),
+                None,
+            ),
+            None,
+            "ingress route with no stamped listener port must not authorize on the backend port"
         );
     }
 
@@ -1251,20 +1317,25 @@ mod tests {
         assert_eq!(
             mesh_inbound_app_port(
                 Some(MeshTrafficDirection::Outbound),
-                Some((id.as_str(), 8080))
+                Some((id.as_str(), 8080)),
+                None,
             ),
             None,
         );
-        assert_eq!(mesh_inbound_app_port(None, Some((id.as_str(), 8080))), None);
+        assert_eq!(
+            mesh_inbound_app_port(None, Some((id.as_str(), 8080)), None),
+            None
+        );
         assert_eq!(
             mesh_inbound_app_port(
                 Some(MeshTrafficDirection::Inbound),
                 Some(("operator-route", 8080)),
+                None,
             ),
             None,
         );
         assert_eq!(
-            mesh_inbound_app_port(Some(MeshTrafficDirection::Inbound), None),
+            mesh_inbound_app_port(Some(MeshTrafficDirection::Inbound), None, None),
             None,
         );
     }

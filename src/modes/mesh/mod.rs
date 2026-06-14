@@ -805,6 +805,62 @@ fn prepare_normalized_gateway_config_for_mesh(
             .local_inbound_workloads
             .is_some()
             .then(|| mesh_slice.local_inbound_services.clone());
+        // Back-project the resolved Sidecar ingress[] listeners so the router's
+        // ingress sibling grouping and the listen-path uniqueness exemption
+        // derive the same listener set `materialize_sidecar_inbound_proxies`
+        // emitted (F6 §6.2). Forward-derived from the slice, never parsed from
+        // ids.
+        //
+        // Re-validate each carried listener at this single chokepoint (consumed by
+        // BOTH the router grouping and the materializer) before it is trusted. A
+        // `ResolvedIngressListener` can arrive already resolved over the xDS/native
+        // slice carrier, where every field — backend `endpoint_host`/`endpoint_port`
+        // AND the stamped `owner_namespace`/`owner_service` — is decoded straight
+        // from untrusted wire JSON. Drop a listener that fails EITHER guard:
+        //   - an invalid backend (off-box host / `:0` port) the raw Sidecar
+        //     resolution path would have deferred fail-closed, and
+        //   - an owner-less entry that has no host identity of its own (in a mixed
+        //     malformed carrier it would otherwise be grouped/materialized under
+        //     another listener's service host).
+        // Applying the IDENTICAL pair of guards the materializer applies keeps the
+        // router's `declared_http_ports` count and the materialized routes in
+        // lock-step and fails closed instead of routing somewhere resolution would
+        // refuse.
+        mesh.local_ingress_listeners = mesh_slice
+            .local_ingress_listeners
+            .iter()
+            .filter(|listener| {
+                if !listener.endpoint_is_valid() {
+                    warn!(
+                        listener_port = listener.port,
+                        endpoint_host = %listener.endpoint_host,
+                        endpoint_port = listener.endpoint_port,
+                        "Dropping carried Sidecar ingress[] listener with an invalid backend endpoint \
+                         (not a loopback host:port); failing closed rather than routing it"
+                    );
+                    return false;
+                }
+                if listener.owner_namespace.is_empty() || listener.owner_service.is_empty() {
+                    warn!(
+                        listener_port = listener.port,
+                        "Dropping carried Sidecar ingress[] listener with no stamped owner identity \
+                         (no local service anchor); failing closed rather than grouping it under \
+                         another listener's service host"
+                    );
+                    return false;
+                }
+                true
+            })
+            .cloned()
+            .collect();
+        // Back-project the DECLARED HTTP-family ingress port count untouched by
+        // the re-validation drops above (F6 §6.2). The drops reduce the
+        // materialized `local_ingress_listeners` (siblings), but the declared
+        // count must reflect what the operator declared so a partially
+        // materialized group stays ambiguous: `mesh_ingress_listener_groups`
+        // floors it at the surviving sibling count, so a hostile carrier can
+        // never push it BELOW what materialized.
+        mesh.declared_ingress_http_ports = mesh_slice.declared_ingress_http_ports;
     }
     config.normalize_fields();
     config.resolve_upstream_tls();
@@ -1477,13 +1533,40 @@ fn mesh_service_host_variants(name: &str, namespace: &str, cluster_domain: &str)
 /// loopback instead of the mesh).
 pub(crate) const MESH_INBOUND_PROXY_ID_PREFIX: &str = "__mesh-inbound-";
 
-/// Whether a proxy id names a materialized sidecar inbound route.
+/// Reserved id prefix for materialized Sidecar `ingress[]` custom inbound
+/// listener routes (F6 §6.2). Also inbound-direction (served only on the
+/// inbound listener), but a DISTINCT prefix from the service-port default
+/// inbound routes so the two are never conflated: ingress routes are keyed by
+/// the operator-declared listener port and forward to the entry's
+/// `defaultEndpoint`, and (per Istio) REPLACE the default service-port inbound
+/// materialization when present. Treated as `Inbound` by
+/// [`is_mesh_inbound_route_id`] / [`mesh_route_direction`].
+pub(crate) const MESH_INGRESS_PROXY_ID_PREFIX: &str = "__mesh-ingress-";
+
+/// Whether a proxy id names a materialized sidecar inbound route — either a
+/// service-port default inbound route or a Sidecar `ingress[]` custom listener
+/// route. Both are inbound-direction (served only on the inbound listener) and
+/// share the request-path inbound port-selection arm.
 pub(crate) fn is_mesh_inbound_route_id(id: &str) -> bool {
-    id.starts_with(MESH_INBOUND_PROXY_ID_PREFIX)
+    id.starts_with(MESH_INBOUND_PROXY_ID_PREFIX) || id.starts_with(MESH_INGRESS_PROXY_ID_PREFIX)
+}
+
+/// Whether a proxy id names a Sidecar `ingress[]` custom inbound listener route
+/// specifically (a subset of [`is_mesh_inbound_route_id`]).
+pub(crate) fn is_mesh_ingress_route_id(id: &str) -> bool {
+    id.starts_with(MESH_INGRESS_PROXY_ID_PREFIX)
 }
 
 fn mesh_inbound_proxy_id(namespace: &str, name: &str, port: u16) -> String {
     format!("{MESH_INBOUND_PROXY_ID_PREFIX}{namespace}-{name}-{port}").replace(['/', '.'], "-")
+}
+
+/// Id for a materialized Sidecar `ingress[]` listener route, one per declared
+/// listener port. The local workload's namespace + service name scope the id so
+/// it never collides with another local service's ingress siblings; the port
+/// disambiguates listeners. Like the inbound id, sanitized of `/`/`.`.
+fn mesh_ingress_proxy_id(namespace: &str, name: &str, port: u16) -> String {
+    format!("{MESH_INGRESS_PROXY_ID_PREFIX}{namespace}-{name}-{port}").replace(['/', '.'], "-")
 }
 
 /// Reserved id prefix for materialized mesh OUTBOUND (egress) routes. Like the
@@ -1509,6 +1592,9 @@ pub(crate) fn is_mesh_outbound_route_id(id: &str) -> bool {
 /// authz — never on upstream ids. `mesh_outbound_upstream_id` deliberately uses a
 /// non-overlapping `__mesh-out-upstream-` prefix (not `__mesh-outbound-`) so an
 /// upstream id can never be misclassified as an Outbound route here.
+///
+/// Sidecar `ingress[]` custom-listener routes (`__mesh-ingress-*`) classify as
+/// `Inbound` too (via [`is_mesh_inbound_route_id`]).
 pub(crate) fn mesh_route_direction(id: &str) -> Option<MeshTrafficDirection> {
     if is_mesh_inbound_route_id(id) {
         Some(MeshTrafficDirection::Inbound)
@@ -1674,6 +1760,53 @@ pub(crate) fn mesh_inbound_service_groups(
         .collect()
 }
 
+/// Expected per-port sibling routes for the local workload's Sidecar
+/// `ingress[]` custom listeners (F6 §6.2). Mirrors [`mesh_inbound_service_groups`]
+/// for ingress: forward-derived from the resolved listeners
+/// (`mesh.local_ingress_listeners`, back-projected by mesh preparation), never
+/// by parsing ids. All of a workload's ingress listeners form ONE group
+/// (they share the local service's host identity + `/` and disambiguate by the
+/// declared LISTENER port), so `declared_http_ports` is the listener count and
+/// `siblings` carries `(listener_port, ingress_proxy_id)` for every listener.
+/// The router groups them into `mesh_inbound_ports` and the listen-path
+/// uniqueness exemption treats them as one (service, ingress-direction) owner.
+/// Empty when no ingress was modeled.
+pub(crate) fn mesh_ingress_listener_groups(
+    mesh: &crate::modes::mesh::config::MeshConfig,
+) -> Vec<MeshOutboundServiceGroup> {
+    if mesh.local_ingress_listeners.is_empty() {
+        return Vec::new();
+    }
+    let siblings: Vec<(u16, String)> = mesh
+        .local_ingress_listeners
+        .iter()
+        .map(|listener| {
+            (
+                listener.port,
+                mesh_ingress_proxy_id(
+                    &listener.owner_namespace,
+                    &listener.owner_service,
+                    listener.port,
+                ),
+            )
+        })
+        .collect();
+    // `declared_http_ports` is the count of DISTINCT HTTP-family listener ports
+    // the operator DECLARED (`MeshConfig.declared_ingress_http_ports`), NOT the
+    // materialized sibling count — so an HTTP-family entry whose `defaultEndpoint`
+    // was unroutable (or a listener dropped at carrier re-validation) still keeps
+    // the group ambiguous: an orig-dst-less request fails closed in the router
+    // (`PortSignalUnavailable`) instead of the surviving sibling absorbing the
+    // skipped port's traffic. Floored at the materialized sibling count so a
+    // hostile/stale carrier count below what materialized can never collapse a
+    // multi-listener group back to the single-listener no-signal pass-through.
+    let declared_http_ports = mesh.declared_ingress_http_ports.max(siblings.len());
+    vec![MeshOutboundServiceGroup {
+        declared_http_ports,
+        siblings,
+    }]
+}
+
 /// Upstream id for a materialized mesh outbound route, one per HTTP-family
 /// service port (per-port upstreams keep LB counters, hash rings, passive
 /// health, and pool keys isolated per app port). Deliberately
@@ -1764,6 +1897,45 @@ fn materialize_sidecar_inbound_proxies(
             mesh_slice.workloads.as_slice(),
         ),
     };
+
+    // F6 §6.2: when the local workload's applicable Sidecar declares
+    // `ingress[]` listeners, Istio configures the workload's inbound listeners
+    // explicitly and they REPLACE the default per-service-port inbound
+    // materialization. Mirror that, FAIL CLOSED on the "declared" signal — NOT
+    // on whether any listener resolved:
+    //   * `sidecar_ingress_declared` is the authoritative marker that the
+    //     operator declared a non-empty `ingress[]` (the slice builder sets it
+    //     independent of how many entries resolved; it rides its own ECDS
+    //     carrier so it survives an empty resolved list on the xDS path).
+    //   * `local_ingress_listeners` is the subset that resolved into routable
+    //     loopback HTTP routes.
+    // When ingress is DECLARED we materialize the resolved listeners (possibly
+    // none) and RETURN, skipping the service-port defaults. An all-unsupported
+    // `ingress[]` (declared, but empty resolved list) therefore yields NO
+    // inbound routes rather than silently exposing the default `:15006`
+    // loopback routes the operator explicitly replaced — exposing those would
+    // be a fail-open regression. (`local_ingress_listeners` non-empty implies
+    // declared, so the OR also covers a pre-marker slice that somehow carries
+    // listeners without the flag.)
+    if mesh_slice.sidecar_ingress_declared || !mesh_slice.local_ingress_listeners.is_empty() {
+        if mesh_slice.local_ingress_listeners.is_empty() {
+            warn!(
+                local_spiffe,
+                "Sidecar ingress[] declared but no listener resolved into a routable inbound \
+                 route (all entries unsupported, or no local service anchored them); failing \
+                 closed — emitting NO default service-port inbound routes for this workload"
+            );
+        }
+        materialize_sidecar_ingress_listener_proxies(
+            config,
+            runtime,
+            mesh_slice,
+            local_spiffe,
+            now,
+        );
+        return;
+    }
+
     let mut materialized = 0usize;
     for workload in crate::modes::mesh::slice::resolve_local_workloads(
         local_workload_src,
@@ -1944,12 +2116,204 @@ fn materialize_sidecar_inbound_proxies(
     }
 }
 
+/// Materialize the workload's Sidecar `ingress[]` custom inbound listeners as
+/// loopback routes (F6 §6.2). Called only when the slice resolved at least one
+/// listener; per Istio these REPLACE the default per-service-port inbound
+/// routes, so the caller returns without running the service-port path.
+///
+/// Each listener becomes one route: hosts = the union of its owning local
+/// service's FQDN variants (the owner identity the slice builder stamped from
+/// the resolved local-inbound view — Istio only configures ingress "if and only
+/// if the workload is associated with a service"); backend = the entry's
+/// resolved loopback `defaultEndpoint`; listen path `/`. The listener port
+/// disambiguates per-port siblings exactly like the default inbound path, but
+/// the captured original destination matches the LISTENER port (the dialed
+/// port) rather than the backend port — see
+/// `HostRouteTable::select_mesh_inbound_port_route` and the router's ingress
+/// grouping. Operator-proxy yield mirrors the default inbound path.
+fn materialize_sidecar_ingress_listener_proxies(
+    config: &mut GatewayConfig,
+    runtime: &MeshRuntimeConfig,
+    mesh_slice: &MeshSlice,
+    local_spiffe: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    // Re-validate every carried listener before using it. A
+    // `ResolvedIngressListener` can arrive already resolved over the xDS/native
+    // slice carrier, where every field — `endpoint_host`/`endpoint_port` AND the
+    // stamped `owner_namespace`/`owner_service` — is decoded straight from
+    // untrusted wire JSON. Drop a listener that fails EITHER guard, fail-closed:
+    //
+    //   1. Backend endpoint: must pass the same loopback/instance-IP +
+    //      nonzero-port allowlist `MeshSidecarIngress::resolve` enforces, so the
+    //      carrier path can never dial somewhere resolution would have refused.
+    //   2. Owner anchor: must carry a non-empty `owner_namespace`/`owner_service`
+    //      (the slice builder stamps these from the resolved local service; it
+    //      clears ALL listeners when no local service anchors them). An owner-less
+    //      entry has NO host identity of its own. In a MIXED malformed carrier
+    //      (one stamped listener + one owner-less one) the `hosts` set below would
+    //      be non-empty from the stamped entry, so without this guard the
+    //      owner-less listener would be materialized with another service's hosts
+    //      and an `__mesh-ingress--PORT` id — routing the service host to a
+    //      listener that failed the local-service anchor check. Drop it instead.
+    //
+    // Filtering at this single point keeps `hosts`, the sibling-id set, and the
+    // materialization loop all operating on the same stamped-and-valid set (the
+    // back-projection that feeds the router's `mesh_ingress_listener_groups`
+    // applies the identical pair of guards, so router grouping and materialized
+    // routes stay in lock-step).
+    let listeners: Vec<&crate::modes::mesh::config::ResolvedIngressListener> = mesh_slice
+        .local_ingress_listeners
+        .iter()
+        .filter(|listener| {
+            if !listener.endpoint_is_valid() {
+                warn!(
+                    local_spiffe,
+                    listener_port = listener.port,
+                    endpoint_host = %listener.endpoint_host,
+                    endpoint_port = listener.endpoint_port,
+                    "Dropping carried Sidecar ingress[] listener with an invalid backend endpoint \
+                     (not a loopback host:port); failing closed rather than dialing it"
+                );
+                return false;
+            }
+            if listener.owner_namespace.is_empty() || listener.owner_service.is_empty() {
+                warn!(
+                    local_spiffe,
+                    listener_port = listener.port,
+                    "Dropping carried Sidecar ingress[] listener with no stamped owner identity \
+                     (no local service anchor); failing closed rather than routing it under \
+                     another listener's service host"
+                );
+                return false;
+            }
+            true
+        })
+        .collect();
+
+    // Host identity for the ingress routes: the union of each listener's owning
+    // local service FQDN variants (the owner the slice builder stamped from the
+    // resolved local-inbound view). Every surviving listener carries a non-empty
+    // owner (owner-less entries were dropped fail-closed above), so this is the
+    // union of all stamped owners. A peer-sidecar dial addressed to the service
+    // host matches here; an orig-dst-captured plain inbound dial is disambiguated
+    // by the listener port post-match.
+    let mut hosts: Vec<String> = Vec::new();
+    for listener in &listeners {
+        for host in mesh_service_host_variants(
+            &listener.owner_service,
+            &listener.owner_namespace,
+            &runtime.cluster_domain,
+        ) {
+            if !hosts.contains(&host) {
+                hosts.push(host);
+            }
+        }
+    }
+    if hosts.is_empty() {
+        // Every listener was dropped (no valid, owner-stamped entry survived the
+        // filter above) so there is no local service to anchor a host identity.
+        // Fail closed: a host-less `/` route would read as a catch-all and could
+        // shadow unrelated traffic. Istio also only configures ingress when the
+        // workload is associated with a service. (The slice builder normally
+        // drops listeners in this case; this is a defensive backstop.)
+        warn!(
+            local_spiffe,
+            "Sidecar ingress[] declared but no local service resolved to anchor the listener host \
+             identity; skipping ingress materialization (no routes emitted)"
+        );
+        return;
+    }
+
+    // Expected sibling id set for this workload's ingress listeners — used to
+    // exclude a listener's OWN siblings from the operator-overlap scan (they
+    // intentionally share hosts + `/` and are grouped by the router), exactly
+    // as the default inbound path scopes its `sibling_ids`. Ids are derived
+    // forward from each listener's stamped owner identity, identical to the
+    // router/validator (`mesh_ingress_listener_groups`).
+    let sibling_ids: std::collections::HashSet<String> = listeners
+        .iter()
+        .map(|listener| {
+            mesh_ingress_proxy_id(
+                &listener.owner_namespace,
+                &listener.owner_service,
+                listener.port,
+            )
+        })
+        .collect();
+
+    let mut materialized = 0usize;
+    for listener in listeners.iter().copied() {
+        let proxy = mesh_inbound_loopback_proxy_to(
+            &mesh_ingress_proxy_id(
+                &listener.owner_namespace,
+                &listener.owner_service,
+                listener.port,
+            ),
+            hosts.clone(),
+            &listener.owner_namespace,
+            &listener.endpoint_host,
+            listener.endpoint_port,
+            now,
+        );
+        // Yield to an explicit operator proxy already routing this host/path,
+        // exactly like the default inbound path. Exclude this workload's OWN
+        // ingress siblings (grouped by the router); another proxy still wins
+        // first-materialized.
+        if config.proxies.iter().any(|p| {
+            if sibling_ids.contains(p.id.as_str()) || p.dispatch_kind.is_stream() {
+                return false;
+            }
+            let shadows_or_collides = p.listen_path == proxy.listen_path
+                || p.listen_path.is_none()
+                || p.listen_path
+                    .as_deref()
+                    .is_some_and(|lp| lp.starts_with('~'));
+            shadows_or_collides && crate::config::types::hosts_overlap(&p.hosts, &proxy.hosts)
+        }) {
+            debug!(
+                proxy_id = %proxy.id,
+                "Skipping ingress listener materialization; an existing proxy already routes this host/path"
+            );
+            continue;
+        }
+        if let Some(existing) = config.proxies.iter_mut().find(|p| p.id == proxy.id) {
+            *existing = proxy;
+        } else {
+            config.proxies.push(proxy);
+        }
+        materialized += 1;
+    }
+
+    if materialized > 0 {
+        info!(
+            ingress_listeners = materialized,
+            local_spiffe,
+            "Materialized Sidecar ingress[] custom inbound listeners to the local application"
+        );
+    }
+}
+
 /// A loopback-backend HTTP proxy: inbound mesh traffic matching `hosts` is
 /// forwarded in plaintext to the co-located application at `127.0.0.1:<port>`.
 fn mesh_inbound_loopback_proxy(
     id: &str,
     hosts: Vec<String>,
     namespace: &str,
+    port: u16,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Proxy {
+    mesh_inbound_loopback_proxy_to(id, hosts, namespace, "127.0.0.1", port, now)
+}
+
+/// Like [`mesh_inbound_loopback_proxy`] but with an explicit loopback backend
+/// host (`127.0.0.1` or `::1`). Used by Sidecar `ingress[]` materialization,
+/// where the resolved `defaultEndpoint` selects the address family.
+fn mesh_inbound_loopback_proxy_to(
+    id: &str,
+    hosts: Vec<String>,
+    namespace: &str,
+    backend_host: &str,
     port: u16,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Proxy {
@@ -1961,7 +2325,7 @@ fn mesh_inbound_loopback_proxy(
         listen_path: Some("/".to_string()),
         backend_scheme: Some(BackendScheme::Http),
         dispatch_kind: Default::default(),
-        backend_host: "127.0.0.1".to_string(),
+        backend_host: backend_host.to_string(),
         backend_port: port,
         backend_path: None,
         strip_listen_path: false,
@@ -13610,6 +13974,9 @@ mod tests {
             services: Vec::new(),
             local_inbound_services: Vec::new(),
             local_inbound_workloads: None,
+            local_ingress_listeners: Vec::new(),
+            sidecar_ingress_declared: false,
+            declared_ingress_http_ports: 0,
             mesh_policies: Vec::new(),
             peer_authentications: Vec::new(),
             service_entries: Vec::new(),
@@ -19514,6 +19881,476 @@ mod tests {
                 .iter()
                 .any(|p| p.listen_port == Some(egress_port)),
             "no stream proxy should bind on the mesh egress listener port"
+        );
+    }
+
+    // ── Sidecar ingress[] custom inbound listeners (F6 §6.2) ──────────────
+
+    fn ingress_listener(
+        port: u16,
+        host: &str,
+        endpoint_port: u16,
+    ) -> crate::modes::mesh::config::ResolvedIngressListener {
+        crate::modes::mesh::config::ResolvedIngressListener {
+            port,
+            endpoint_host: host.to_string(),
+            endpoint_port,
+            owner_namespace: "default".to_string(),
+            owner_service: "reviews".to_string(),
+        }
+    }
+
+    #[test]
+    fn sidecar_ingress_listener_materializes_route_to_default_endpoint() {
+        // One ingress[] listener → one inbound loopback route forwarding to the
+        // entry's defaultEndpoint host:port (NOT the service targetPort).
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(spiffe.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![workload("reviews", "reviews")],
+            services: vec![http_mesh_service("reviews", 80, spiffe)],
+            local_inbound_services: vec![http_mesh_service("reviews", 80, spiffe)],
+            local_inbound_workloads: Some(vec![workload("reviews", "reviews")]),
+            local_ingress_listeners: vec![ingress_listener(8443, "127.0.0.1", 8080)],
+            ..MeshSlice::default()
+        };
+
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+        let ingress: Vec<_> = config
+            .proxies
+            .iter()
+            .filter(|p| p.id.starts_with("__mesh-ingress-"))
+            .collect();
+        assert_eq!(ingress.len(), 1, "one ingress listener → one route");
+        let route = ingress[0];
+        assert_eq!(route.id, "__mesh-ingress-default-reviews-8443");
+        assert_eq!(route.backend_host, "127.0.0.1");
+        assert_eq!(
+            route.backend_port, 8080,
+            "route forwards to the defaultEndpoint port, not the service port"
+        );
+        assert_eq!(route.listen_path.as_deref(), Some("/"));
+        assert!(
+            route
+                .hosts
+                .iter()
+                .any(|h| h == "reviews.default.svc.cluster.local"),
+            "ingress route carries the local service host identity: {:?}",
+            route.hosts
+        );
+        // Ingress REPLACES the service-port default inbound materialization.
+        assert!(
+            !config
+                .proxies
+                .iter()
+                .any(|p| p.id.starts_with("__mesh-inbound-")),
+            "ingress[] present → no service-port default inbound routes"
+        );
+    }
+
+    #[test]
+    fn sidecar_ingress_listener_ipv6_default_endpoint_dials_loopback_v6() {
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(spiffe.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![workload("reviews", "reviews")],
+            services: vec![http_mesh_service("reviews", 80, spiffe)],
+            local_inbound_services: vec![http_mesh_service("reviews", 80, spiffe)],
+            local_inbound_workloads: Some(vec![workload("reviews", "reviews")]),
+            local_ingress_listeners: vec![ingress_listener(8443, "::1", 9000)],
+            ..MeshSlice::default()
+        };
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+        let route = config
+            .proxies
+            .iter()
+            .find(|p| p.id.starts_with("__mesh-ingress-"))
+            .expect("ingress route");
+        assert_eq!(route.backend_host, "::1");
+        assert_eq!(route.backend_port, 9000);
+    }
+
+    #[test]
+    fn sidecar_ingress_multi_listener_disambiguates_by_listener_port() {
+        // Two ingress listeners on the same workload disambiguate by the
+        // captured original destination = the dialed LISTENER port, NOT the
+        // backend (defaultEndpoint) port — and validate_unique_listen_paths
+        // exempts the sibling pair.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(spiffe.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![workload("reviews", "reviews")],
+            services: vec![http_mesh_service("reviews", 80, spiffe)],
+            local_inbound_services: vec![http_mesh_service("reviews", 80, spiffe)],
+            local_inbound_workloads: Some(vec![workload("reviews", "reviews")]),
+            local_ingress_listeners: vec![
+                ingress_listener(8080, "127.0.0.1", 5000),
+                ingress_listener(8443, "127.0.0.1", 6000),
+            ],
+            ..MeshSlice::default()
+        };
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+        // Both listener routes materialize and pass listen-path uniqueness.
+        let mut ids: Vec<&str> = config
+            .proxies
+            .iter()
+            .filter(|p| p.id.starts_with("__mesh-ingress-"))
+            .map(|p| p.id.as_str())
+            .collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec![
+                "__mesh-ingress-default-reviews-8080",
+                "__mesh-ingress-default-reviews-8443"
+            ]
+        );
+        config
+            .validate_unique_listen_paths()
+            .expect("ingress siblings are exempt from the host+path uniqueness check");
+        // Router-level orig-dst/authority disambiguation by the LISTENER port is
+        // covered by `mesh_ingress_port_group_selects_sibling_by_listener_port`
+        // in `router_cache` (where the route table is accessible).
+    }
+
+    #[test]
+    fn sidecar_ingress_listener_yields_to_operator_proxy() {
+        // An explicit operator proxy already routing the service host at "/"
+        // wins; the ingress route is not materialized (would collide).
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(spiffe.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![workload("reviews", "reviews")],
+            services: vec![http_mesh_service("reviews", 80, spiffe)],
+            local_inbound_services: vec![http_mesh_service("reviews", 80, spiffe)],
+            local_inbound_workloads: Some(vec![workload("reviews", "reviews")]),
+            local_ingress_listeners: vec![ingress_listener(8443, "127.0.0.1", 8080)],
+            ..MeshSlice::default()
+        };
+        let mut config = GatewayConfig::default();
+        config.proxies.push(mesh_inbound_loopback_proxy(
+            "operator-reviews",
+            mesh_service_host_variants("reviews", "default", "cluster.local"),
+            "default",
+            7777,
+            chrono::Utc::now(),
+        ));
+        materialize_sidecar_inbound_proxies(&mut config, &runtime, &slice);
+        assert!(
+            !config
+                .proxies
+                .iter()
+                .any(|p| p.id.starts_with("__mesh-ingress-")),
+            "ingress route must yield to an overlapping operator proxy"
+        );
+        assert!(config.proxies.iter().any(|p| p.id == "operator-reviews"));
+    }
+
+    #[test]
+    fn sidecar_ingress_listener_absent_without_owner_identity() {
+        // Defensive backstop: an ingress listener with no stamped owner identity
+        // (the slice builder clears listeners when no local service resolved)
+        // materializes no route rather than a host-less catch-all.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(spiffe.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let unstamped = crate::modes::mesh::config::ResolvedIngressListener {
+            port: 8443,
+            endpoint_host: "127.0.0.1".to_string(),
+            endpoint_port: 8080,
+            owner_namespace: String::new(),
+            owner_service: String::new(),
+        };
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![workload("reviews", "reviews")],
+            local_inbound_workloads: Some(vec![workload("reviews", "reviews")]),
+            local_ingress_listeners: vec![unstamped],
+            ..MeshSlice::default()
+        };
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+        assert!(
+            !config
+                .proxies
+                .iter()
+                .any(|p| p.id.starts_with("__mesh-ingress-")),
+            "an unstamped (owner-less) ingress listener materializes no route"
+        );
+    }
+
+    #[test]
+    fn sidecar_ingress_mixed_carrier_drops_owner_less_listener() {
+        // Codex round-3 P2: a MIXED malformed carrier carries one stamped listener
+        // AND a separate valid-but-owner-less listener. The host set is non-empty
+        // from the stamped entry, so without the per-listener owner guard the
+        // owner-less entry would be materialized with the stamped listener's
+        // service hosts and an `__mesh-ingress--PORT` id — routing the service
+        // host to a listener that failed the local-service anchor check. The
+        // owner-less entry must be dropped fail-closed; only the stamped listener
+        // materializes.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(spiffe.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let stamped = ingress_listener(8443, "127.0.0.1", 8080);
+        let owner_less = crate::modes::mesh::config::ResolvedIngressListener {
+            port: 9443,
+            endpoint_host: "127.0.0.1".to_string(),
+            endpoint_port: 9090,
+            owner_namespace: String::new(),
+            owner_service: String::new(),
+        };
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![workload("reviews", "reviews")],
+            services: vec![http_mesh_service("reviews", 80, spiffe)],
+            local_inbound_services: vec![http_mesh_service("reviews", 80, spiffe)],
+            local_inbound_workloads: Some(vec![workload("reviews", "reviews")]),
+            local_ingress_listeners: vec![stamped, owner_less],
+            sidecar_ingress_declared: true,
+            ..MeshSlice::default()
+        };
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+        let ingress: Vec<&str> = config
+            .proxies
+            .iter()
+            .filter(|p| p.id.starts_with("__mesh-ingress-"))
+            .map(|p| p.id.as_str())
+            .collect();
+        assert_eq!(
+            ingress,
+            vec!["__mesh-ingress-default-reviews-8443"],
+            "only the stamped listener materializes; the owner-less entry is dropped"
+        );
+        assert!(
+            !config
+                .proxies
+                .iter()
+                .any(|p| p.id.contains("__mesh-ingress--")),
+            "no owner-less `__mesh-ingress--PORT` route may be materialized"
+        );
+        // The owner-less port must also NOT appear in the router's ingress sibling
+        // grouping (back-projection applies the same guard), so the materialized
+        // route and the group stay in lock-step.
+        let groups =
+            mesh_ingress_listener_groups(config.mesh.as_ref().expect("mesh config back-projected"));
+        let grouped_ports: Vec<u16> = groups
+            .iter()
+            .flat_map(|g| g.siblings.iter().map(|(port, _)| *port))
+            .collect();
+        assert_eq!(
+            grouped_ports,
+            vec![8443],
+            "only the stamped listener port is grouped by the router"
+        );
+    }
+
+    #[test]
+    fn sidecar_ingress_declared_all_unsupported_fails_closed_no_default_routes() {
+        // F6 §6.2 (Finding 1, fail closed): the applicable Sidecar DECLARED
+        // `ingress[]` but every entry was unsupported, so the resolved listener
+        // list is EMPTY (`sidecar_ingress_declared == true`,
+        // `local_ingress_listeners == []`). The operator opted out of the
+        // default per-service-port inbound listeners (Istio's `ingress[]`
+        // replaces them), so the materializer must emit NEITHER ingress routes
+        // NOR the default `__mesh-inbound-*` routes — exposing the defaults would
+        // be a fail-open regression.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(spiffe.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![workload("reviews", "reviews")],
+            services: vec![http_mesh_service("reviews", 80, spiffe)],
+            local_inbound_services: vec![http_mesh_service("reviews", 80, spiffe)],
+            local_inbound_workloads: Some(vec![workload("reviews", "reviews")]),
+            // Declared, but NOTHING resolved (all entries unsupported).
+            local_ingress_listeners: Vec::new(),
+            sidecar_ingress_declared: true,
+            ..MeshSlice::default()
+        };
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+        assert!(
+            !config
+                .proxies
+                .iter()
+                .any(|p| p.id.starts_with("__mesh-ingress-")),
+            "all-unsupported ingress materializes no ingress routes"
+        );
+        assert!(
+            !config
+                .proxies
+                .iter()
+                .any(|p| p.id.starts_with("__mesh-inbound-")),
+            "declared-but-unresolved ingress must FAIL CLOSED: no default \
+             service-port inbound routes (operator replaced them)"
+        );
+    }
+
+    #[test]
+    fn sidecar_no_ingress_declared_keeps_default_inbound_routes() {
+        // Control for the fail-closed test: when NO ingress was declared
+        // (`sidecar_ingress_declared == false`, no listeners), the default
+        // service-port inbound materialization runs as before.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(spiffe.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![workload("reviews", "reviews")],
+            services: vec![http_mesh_service("reviews", 80, spiffe)],
+            local_inbound_services: vec![http_mesh_service("reviews", 80, spiffe)],
+            local_inbound_workloads: Some(vec![workload("reviews", "reviews")]),
+            local_ingress_listeners: Vec::new(),
+            sidecar_ingress_declared: false,
+            ..MeshSlice::default()
+        };
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+        assert!(
+            config
+                .proxies
+                .iter()
+                .any(|p| p.id.starts_with("__mesh-inbound-")),
+            "no ingress declared → default service-port inbound routes materialize"
+        );
+    }
+
+    #[test]
+    fn sidecar_ingress_carried_off_box_endpoint_fails_closed() {
+        // Codex round-2 P2: a `local_ingress_listeners` entry can arrive already
+        // resolved over the xDS/native slice carrier. A malformed or hostile
+        // carrier pointing the listener at an OFF-BOX host (not loopback) must be
+        // dropped fail-closed — re-validated against the same allowlist
+        // `MeshSidecarIngress::resolve` applies — never dialed. With ingress
+        // DECLARED, dropping the only listener must also NOT fall back to the
+        // default service-port routes.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(spiffe.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![workload("reviews", "reviews")],
+            services: vec![http_mesh_service("reviews", 80, spiffe)],
+            local_inbound_services: vec![http_mesh_service("reviews", 80, spiffe)],
+            local_inbound_workloads: Some(vec![workload("reviews", "reviews")]),
+            // Hostile carrier: off-box backend host.
+            local_ingress_listeners: vec![ingress_listener(8443, "10.0.0.5", 8080)],
+            sidecar_ingress_declared: true,
+            ..MeshSlice::default()
+        };
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+        assert!(
+            !config
+                .proxies
+                .iter()
+                .any(|p| p.id.starts_with("__mesh-ingress-")),
+            "a carried off-box ingress endpoint must be dropped, not materialized"
+        );
+        assert!(
+            !config
+                .proxies
+                .iter()
+                .any(|p| p.id.starts_with("__mesh-inbound-")),
+            "dropping the only declared ingress listener must still fail closed (no defaults)"
+        );
+    }
+
+    #[test]
+    fn sidecar_ingress_carried_zero_port_endpoint_fails_closed() {
+        // Codex round-2 P2: a carried `:0` backend port (which `resolve()` would
+        // have rejected as ZeroPort) must be dropped at the materializer, never
+        // dialed.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(spiffe.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![workload("reviews", "reviews")],
+            services: vec![http_mesh_service("reviews", 80, spiffe)],
+            local_inbound_services: vec![http_mesh_service("reviews", 80, spiffe)],
+            local_inbound_workloads: Some(vec![workload("reviews", "reviews")]),
+            // One valid listener + one hostile carrier (`:0` backend port).
+            local_ingress_listeners: vec![
+                ingress_listener(8443, "127.0.0.1", 8080),
+                ingress_listener(9443, "127.0.0.1", 0),
+            ],
+            sidecar_ingress_declared: true,
+            ..MeshSlice::default()
+        };
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+        let ingress: Vec<_> = config
+            .proxies
+            .iter()
+            .filter(|p| p.id.starts_with("__mesh-ingress-"))
+            .collect();
+        assert_eq!(
+            ingress.len(),
+            1,
+            "only the valid carried listener materializes; the :0-port carrier is dropped"
+        );
+        assert_eq!(ingress[0].id, "__mesh-ingress-default-reviews-8443");
+        assert!(
+            !config
+                .proxies
+                .iter()
+                .any(|p| p.id == "__mesh-ingress-default-reviews-9443"),
+            "the :0-port carried listener must not materialize a route"
         );
     }
 }

@@ -2073,21 +2073,25 @@ impl GatewayConfig {
         // a single lowest-port representative per (service, direction) and
         // the request path disambiguates by the captured
         // original-destination port (outbound) or by inbound orig-dst /
-        // authority port (sidecar inbound), so they never route
-        // non-deterministically. Map each expected sibling id to its owning
-        // (direction, service) pair (derived FORWARD from the mesh block by
-        // the same helpers the router grouping uses — id parsing would be
-        // lossy across the `{ns}-{name}` join and could conflate distinct
-        // services); pairs with equal owners are exempt below. The owner key
-        // is DIRECTION-DISTINCT on purpose: an inbound and an outbound route
-        // of the same service must never legitimately coexist (the outbound
-        // materializer yields to existing inbound routes), so their
-        // coexistence is a materializer bug that should keep failing
-        // validation. Operator configs cannot reach this: resource-id
-        // validation rejects ids starting with `_`, so `__mesh-*` ids exist
-        // only via mesh materialization. Different services' routes still
-        // conflict normally. Empty (and zero-cost) outside mesh mode.
-        let mesh_sibling_owner: HashMap<String, (bool, usize)> = self
+        // authority port (sidecar inbound + Sidecar `ingress[]`), so they
+        // never route non-deterministically. Map each expected sibling id to
+        // its owning (direction, service) pair (derived FORWARD from the mesh
+        // block by the same helpers the router grouping uses — id parsing
+        // would be lossy across the `{ns}-{name}` join and could conflate
+        // distinct services); pairs with equal owners are exempt below. The
+        // owner key is DIRECTION-DISTINCT on purpose: an inbound and an
+        // outbound route of the same service must never legitimately coexist
+        // (the outbound materializer yields to existing inbound routes), so
+        // their coexistence is a materializer bug that should keep failing
+        // validation. Direction codes: 0 = outbound, 1 = service-port inbound,
+        // 2 = Sidecar `ingress[]` (its listeners replace the service-port
+        // defaults, so the two never coexist for one workload — but they get
+        // distinct codes so a stray pair still fails closed). Operator configs
+        // cannot reach this: resource-id validation rejects ids starting with
+        // `_`, so `__mesh-*` ids exist only via mesh materialization. Different
+        // services' routes still conflict normally. Empty (and zero-cost)
+        // outside mesh mode.
+        let mesh_sibling_owner: HashMap<String, (u8, usize)> = self
             .mesh
             .as_deref()
             .map(|mesh| {
@@ -2098,7 +2102,7 @@ impl GatewayConfig {
                         group
                             .siblings
                             .into_iter()
-                            .map(move |(_, id)| (id, (false, service_index)))
+                            .map(move |(_, id)| (id, (0u8, service_index)))
                     })
                     .chain(
                         crate::modes::mesh::mesh_inbound_service_groups(mesh)
@@ -2108,7 +2112,18 @@ impl GatewayConfig {
                                 group
                                     .siblings
                                     .into_iter()
-                                    .map(move |(_, id)| (id, (true, service_index)))
+                                    .map(move |(_, id)| (id, (1u8, service_index)))
+                            }),
+                    )
+                    .chain(
+                        crate::modes::mesh::mesh_ingress_listener_groups(mesh)
+                            .into_iter()
+                            .enumerate()
+                            .flat_map(|(service_index, group)| {
+                                group
+                                    .siblings
+                                    .into_iter()
+                                    .map(move |(_, id)| (id, (2u8, service_index)))
                             }),
                     )
                     .collect()

@@ -674,6 +674,8 @@ mod tests {
                 hosts: vec!["./reviews".to_string()],
                 port: None,
             }],
+            ingress_declared: false,
+            ingress: Vec::new(),
         }];
         let config = GatewayConfig {
             mesh: Some(Box::new(mesh)),

@@ -255,8 +255,12 @@ pub struct MeshRule {
     pub action: PolicyAction,
 }
 
-fn is_false(value: &bool) -> bool {
+pub(crate) fn is_false(value: &bool) -> bool {
     !*value
+}
+
+pub(crate) fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -1262,6 +1266,278 @@ pub struct MeshSidecar {
     pub egress_inherits_defaults: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub egress: Vec<MeshSidecarEgress>,
+    /// `true` when Kubernetes `spec.ingress` was PRESENT — including an explicit
+    /// empty `ingress: []` — as opposed to omitted. Istio distinguishes the two:
+    /// an OMITTED `ingress` block lets the workload keep the automatic
+    /// per-service-port inbound defaults, while a DECLARED `ingress` (even empty)
+    /// configures the workload's inbound listeners explicitly and REPLACES those
+    /// defaults. So an explicit `ingress: []` must suppress the default inbound
+    /// routes (the operator declared "no custom inbound listeners"), not fall
+    /// back to exposing the service-port defaults. The slice builder folds this
+    /// with `!ingress.is_empty()` into the fail-closed `sidecar_ingress_declared`
+    /// marker (a non-empty `ingress` always declares; this bool adds the
+    /// explicit-empty case for both the K8s and native paths).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub ingress_declared: bool,
+    /// Istio `spec.ingress[]` — custom inbound listeners the workload declares
+    /// (a listener port + optional bind address + a `defaultEndpoint` to
+    /// forward inbound traffic to). Per Istio semantics, when `ingress` is
+    /// present it **replaces** the default per-service-port inbound listeners
+    /// for the workload (Ferrum mirrors that: the sidecar inbound materializer
+    /// emits routes from these entries instead of the service-port defaults —
+    /// see `materialize_sidecar_inbound_proxies`). Empty / absent keeps the
+    /// default inbound behavior unchanged unless `ingress_declared` is set (an
+    /// explicit empty `ingress: []`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ingress: Vec<MeshSidecarIngress>,
+}
+
+/// A single ingress listener entry under a [`MeshSidecar`] (`spec.ingress[]`).
+///
+/// Mirrors Istio's `IstioIngressListener`: inbound traffic arriving on `port`
+/// is forwarded to `default_endpoint`. In Ferrum's sidecar capture model all
+/// inbound is iptables-REDIRECTed to the shared `:15006` listener, so `port`
+/// is the port the client originally dialed (recovered from the captured
+/// original destination, or a peer sidecar's request authority) and selects
+/// which ingress route serves the request — exactly the per-port sibling
+/// disambiguation the default inbound materializer uses, but keyed by the
+/// declared listener port instead of the resolved container port.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeshSidecarIngress {
+    /// The listener port the workload declares. Inbound traffic addressed to
+    /// this port (captured original destination, or a peer's request
+    /// authority) is forwarded to `default_endpoint`.
+    pub port: u16,
+    /// Application-layer protocol of the listener. Only recognized HTTP-family
+    /// listeners (`http`/`http2`/`grpc`/`https`) materialize an HTTP route;
+    /// stream (`tcp`/`tls`/db) listeners — and a MISSING or UNRECOGNIZED protocol
+    /// — are not modeled here (raw-TCP inbound has no Host/route and is captured
+    /// separately) and are reported as deferred.
+    ///
+    /// Fail-closed across sources: on the K8s path the translator's
+    /// `sidecar_ingress_app_protocol` maps a missing/typo'd protocol to a non-HTTP
+    /// `AppProtocol` (never `Unknown`). On the native/file/xDS path this field
+    /// deserializes directly, so an OMITTED `protocol` falls back to
+    /// `AppProtocol::default()` (`Unknown`) and an explicit `"unknown"` parses to
+    /// `Unknown`; `resolve()` REJECTS `Unknown` (via `is_http_family_app_protocol`)
+    /// so a listener whose protocol the source omitted or garbled defers rather
+    /// than being guessed onto the HTTP request path — matching the K8s behavior.
+    #[serde(default)]
+    pub protocol: AppProtocol,
+    /// Istio `port.name` — informational; preserved for observability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Istio `bind` — the address the listener binds. Ferrum's capture model
+    /// funnels all inbound through the shared `:15006` listener, so a custom
+    /// `bind` does not create a separate OS listener; it is preserved for
+    /// observability and surfaced as a documented limitation when non-default.
+    /// Unix sockets are not valid here (Istio rejects them too).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bind: Option<String>,
+    /// Istio `defaultEndpoint` — where inbound traffic is forwarded. Supported
+    /// forms (per Istio): `127.0.0.1:PORT`, `[::1]:PORT` (loopback), and
+    /// `0.0.0.0:PORT` / `[::]:PORT` (the instance IP, modeled as loopback in
+    /// Ferrum's co-located-app deployment). `unix:///path` Unix-domain-socket
+    /// endpoints are **not** representable by Ferrum's host:port backend model
+    /// and fail closed (the entry is skipped at materialization and kept in the
+    /// `deferred_fields` report) rather than being mis-modeled.
+    ///
+    /// **Optional** in Istio (an entry may omit it — Istio then defers the
+    /// listener). The native/file/xDS mesh model must mirror that: an omitted
+    /// `defaultEndpoint` deserializes to the empty string and is deferred at
+    /// `resolve()` (the empty value fails the `host:port` parse →
+    /// `UnparseableEndpoint`), exactly like the K8s translation path which fills
+    /// an empty string for an omitted field. Without `#[serde(default)]` an
+    /// omitted field would fail DESERIALIZATION before validation could defer
+    /// the listener — a native-path-only break the K8s path never hit.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub default_endpoint: String,
+}
+
+/// A resolved, routable form of one [`MeshSidecarIngress`] entry, computed at
+/// slice-build time and carried on the slice so the DP materializer never
+/// re-resolves the applicable Sidecar (raw `MeshSidecar` records do not ride
+/// the slice — only the resolved local-inbound views do, mirroring
+/// `local_inbound_services`).
+///
+/// Forward-derived (the listener port + the parsed `defaultEndpoint`), never
+/// reconstructed by parsing materialized proxy ids. Unsupported shapes
+/// (Unix-socket / non-loop, non-instance-IP `defaultEndpoint`; non-HTTP-family
+/// protocol) are dropped before this is built and reported as deferred.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedIngressListener {
+    /// The declared listener port (the dialed/authority port used for
+    /// per-port disambiguation on the shared inbound listener).
+    pub port: u16,
+    /// Backend host the route forwards to — always loopback (`127.0.0.1` or
+    /// `::1`) in Ferrum's co-located-app sidecar model.
+    pub endpoint_host: String,
+    /// Backend port parsed from `defaultEndpoint`.
+    pub endpoint_port: u16,
+    /// Namespace of the local service whose host identity anchors the listener
+    /// route. Carried so the materializer and the router/validator derive the
+    /// SAME materialized proxy id forward (`mesh_ingress_proxy_id`) without
+    /// re-running local-workload resolution.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub owner_namespace: String,
+    /// Name of the local service anchoring the listener route (see
+    /// `owner_namespace`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub owner_service: String,
+}
+
+impl ResolvedIngressListener {
+    /// Re-validate a CARRIED resolved listener's backend endpoint against the
+    /// same loopback / instance-IP allowlist + nonzero-port invariants that
+    /// [`MeshSidecarIngress::resolve`] applies at resolution.
+    ///
+    /// A `ResolvedIngressListener` can arrive already resolved over the xDS /
+    /// native slice carrier (`LocalIngressListeners`), where the
+    /// `endpoint_host`/`endpoint_port` are decoded straight from untrusted wire
+    /// JSON. A malformed or hostile carrier could therefore point a listener at
+    /// an off-box host or a `:0` backend that the raw `Sidecar` path would have
+    /// deferred fail-closed. The inbound materializer re-checks this before
+    /// dialing so the carrier path enforces the SAME invariant as resolution
+    /// (loopback host — `127.0.0.1`/`::1`, the only forms `resolve()` ever emits
+    /// after collapsing the instance-IP wildcards — and a nonzero listener +
+    /// backend port).
+    ///
+    /// `pub` (like `MeshSidecarIngress::resolve`) so it is testable from the
+    /// external mesh-validation test crate; it is a pure, side-effect-free
+    /// validator over already-public fields.
+    pub fn endpoint_is_valid(&self) -> bool {
+        if self.port == 0 || self.endpoint_port == 0 {
+            return false;
+        }
+        match self.endpoint_host.parse::<std::net::IpAddr>() {
+            Ok(ip) => ip.is_loopback(),
+            Err(_) => false,
+        }
+    }
+}
+
+/// Why a [`MeshSidecarIngress`] entry could not be modeled as a routable
+/// inbound listener. Surfaced so the K8s status writer can keep the entry in
+/// the Sidecar `deferred_fields` report rather than silently dropping it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IngressListenerUnsupported {
+    /// `defaultEndpoint` is a `unix://` socket — not representable by the
+    /// host:port backend model.
+    UnixSocketEndpoint,
+    /// `defaultEndpoint` did not parse as a supported `host:port` (missing
+    /// port, malformed, or an arbitrary non-loopback / non-instance IP).
+    UnparseableEndpoint,
+    /// `port` or the parsed endpoint port was `0`.
+    ZeroPort,
+    /// The listener protocol is stream-family (raw TCP / TLS / DB) — inbound
+    /// raw-TCP has no Host/route and is not modeled here.
+    NonHttpProtocol,
+}
+
+impl MeshSidecarIngress {
+    /// Resolve this ingress entry into a routable [`ResolvedIngressListener`],
+    /// or the reason it cannot be modeled. Fail-closed: anything that does not
+    /// map cleanly onto a loopback host:port HTTP route is rejected, never
+    /// guessed.
+    pub fn resolve(&self) -> Result<ResolvedIngressListener, IngressListenerUnsupported> {
+        if !is_http_family_app_protocol(self.protocol) {
+            return Err(IngressListenerUnsupported::NonHttpProtocol);
+        }
+        if self.port == 0 {
+            return Err(IngressListenerUnsupported::ZeroPort);
+        }
+        let (host, port) = parse_ingress_default_endpoint(&self.default_endpoint)?;
+        Ok(ResolvedIngressListener {
+            port: self.port,
+            endpoint_host: host,
+            endpoint_port: port,
+            // Stamped by the slice builder once the local service is known.
+            owner_namespace: String::new(),
+            owner_service: String::new(),
+        })
+    }
+
+    /// Whether this entry counts toward the workload's DECLARED HTTP-family
+    /// ingress listener port set — i.e. it names an HTTP-family protocol on a
+    /// usable (nonzero) listener port, so it WOULD materialize an inbound route
+    /// were its `defaultEndpoint` routable. This is the port-ambiguity predicate
+    /// (a superset of [`resolve`](Self::resolve) success): it deliberately
+    /// returns `true` for an HTTP-family entry whose endpoint is omitted /
+    /// `unix://` / off-box (a `resolve()` failure), because such an entry STILL
+    /// declared a distinct inbound listener port — so a partially materialized
+    /// group must stay ambiguous to an orig-dst-less request rather than letting
+    /// a surviving sibling absorb the skipped port's traffic (F6 §6.2). It
+    /// excludes only listeners that are not HTTP-family at all (deferred raw-TCP,
+    /// never an HTTP route) and zero-port entries (no port to disambiguate on).
+    /// The slice resolver dedups by port, so the DECLARED COUNT is over distinct
+    /// HTTP-family ports, mirroring the resolved-set dedup.
+    pub(crate) fn is_declared_http_family_listener(&self) -> bool {
+        self.port != 0 && is_http_family_app_protocol(self.protocol)
+    }
+}
+
+/// HTTP-family classification for Sidecar `ingress[]` listeners, shared by
+/// ingress-listener resolution ([`MeshSidecarIngress::resolve`]) and the K8s
+/// status writer's deferred-field report (via
+/// [`sidecar_ingress_protocol_is_http_family`](crate::config_sources::k8s::sidecar_ingress_protocol_is_http_family)),
+/// kept here so the config model can resolve ingress entries without importing
+/// the mode module and so the two callers can never disagree on whether a
+/// listener is modeled.
+///
+/// **Fail-closed on `Unknown`** (unlike the service-port default path's separate
+/// `is_http_family_mesh_protocol`, which keeps the `unknown → HTTP` convention).
+/// On the K8s path the raw `port.protocol` string is pre-classified by
+/// `sidecar_ingress_app_protocol`, which maps `https` → `Http2` (routed) and a
+/// missing/mistyped protocol → `Tcp` (deferred) and NEVER yields `Unknown`. But
+/// the native/file/xDS source stores `MeshSidecarIngress.protocol` directly via
+/// serde, where an OMITTED `protocol` falls back to `AppProtocol::default()`
+/// (`Unknown`) and an explicit `"unknown"` deserializes to `Unknown`. Treating
+/// `Unknown` as HTTP-family there would materialize a custom inbound listener
+/// the K8s translator (and the documented fail-closed rule) would have deferred.
+/// Excluding `Unknown` here defers it on every source — matching the K8s path's
+/// missing/garbled-protocol behavior — without affecting the status-writer
+/// lock-step (that caller only ever passes the routable values
+/// `sidecar_ingress_app_protocol` emits, never `Unknown`).
+pub(crate) fn is_http_family_app_protocol(protocol: AppProtocol) -> bool {
+    matches!(
+        protocol,
+        AppProtocol::Http | AppProtocol::Http2 | AppProtocol::Grpc
+    )
+}
+
+/// Parse an Istio `defaultEndpoint` into a `(loopback_host, port)` pair.
+///
+/// Supported (per Istio's "Arbitrary IPs are not supported" rule): loopback
+/// (`127.0.0.1` / `::1`) and the instance-IP wildcards (`0.0.0.0` / `::`),
+/// which in Ferrum's co-located-app sidecar model both resolve to loopback (the
+/// app shares the pod network namespace). Unix sockets and arbitrary IPs are
+/// rejected fail-closed.
+fn parse_ingress_default_endpoint(
+    endpoint: &str,
+) -> Result<(String, u16), IngressListenerUnsupported> {
+    let endpoint = endpoint.trim();
+    if endpoint.starts_with("unix://") {
+        return Err(IngressListenerUnsupported::UnixSocketEndpoint);
+    }
+    // `host:port` where host is an IP literal (IPv4 dotted, or bracketed IPv6).
+    let socket: std::net::SocketAddr = endpoint
+        .parse()
+        .map_err(|_| IngressListenerUnsupported::UnparseableEndpoint)?;
+    if socket.port() == 0 {
+        return Err(IngressListenerUnsupported::ZeroPort);
+    }
+    let ip = socket.ip();
+    let host = if ip.is_loopback() || ip.is_unspecified() {
+        // `127.0.0.1`/`::1` (loopback) and `0.0.0.0`/`::` (instance IP) both
+        // map to loopback for a co-located sidecar app. Preserve the address
+        // family so an IPv6 endpoint dials `::1`.
+        if ip.is_ipv6() { "::1" } else { "127.0.0.1" }
+    } else {
+        // Arbitrary IP — Istio forbids these and Ferrum's loopback-only model
+        // can't honor them; fail closed rather than dial an off-box address.
+        return Err(IngressListenerUnsupported::UnparseableEndpoint);
+    };
+    Ok((host.to_string(), socket.port()))
 }
 
 /// A single egress listener entry under a [`MeshSidecar`]. Carries the
@@ -1800,6 +2076,26 @@ pub struct MeshConfig {
     /// outbound registry / egress scope must not widen to the local service).
     #[serde(skip)]
     pub local_inbound_services: Option<Vec<MeshService>>,
+    /// Runtime-only back-projection of the slice's resolved Sidecar `ingress[]`
+    /// custom inbound listeners (`MeshSlice.local_ingress_listeners`), set by
+    /// mesh preparation. The router's INBOUND per-port sibling grouping and the
+    /// listen-path uniqueness exemption read this (via
+    /// `mesh_ingress_listener_groups`) so they see the same listeners
+    /// `materialize_sidecar_inbound_proxies` materialized. `serde(skip)`: never
+    /// operator-settable, never serialized.
+    #[serde(skip)]
+    pub local_ingress_listeners: Vec<ResolvedIngressListener>,
+    /// Runtime-only back-projection of `MeshSlice.declared_ingress_http_ports`
+    /// (F6 §6.2), set by mesh preparation. The count of DISTINCT HTTP-family
+    /// `ingress[]` listener ports the workload DECLARED — which can EXCEED
+    /// `local_ingress_listeners.len()` when an HTTP-family entry's
+    /// `defaultEndpoint` is unroutable. `mesh_ingress_listener_groups` uses it as
+    /// the ingress group's `declared_http_ports` so a partially materialized
+    /// group stays AMBIGUOUS to an orig-dst-less request (fail closed) instead of
+    /// the surviving sibling absorbing the skipped port's traffic. `serde(skip)`:
+    /// never operator-settable, never serialized.
+    #[serde(skip)]
+    pub declared_ingress_http_ports: usize,
 }
 
 pub fn default_istio_root_namespace() -> String {
@@ -1830,6 +2126,8 @@ impl Default for MeshConfig {
             outbound_traffic_policy: None,
             extension_configs: Vec::new(),
             local_inbound_services: None,
+            local_ingress_listeners: Vec::new(),
+            declared_ingress_http_ports: 0,
         }
     }
 }
@@ -2388,6 +2686,19 @@ fn validate_mesh_config_internal(
                     &mut errors,
                 );
             }
+        }
+        // Ingress listeners: the listener port is a mandatory structural field.
+        // The `defaultEndpoint` routability decision — empty, Unix sockets,
+        // non-HTTP-family protocols, arbitrary IPs — is NOT a validation error
+        // (Istio allows omitting `defaultEndpoint`): those entries are accepted,
+        // reported as deferred by the status writer, and skipped fail-closed at
+        // materialization.
+        for (i, ingress) in sidecar.ingress.iter().enumerate() {
+            validate_non_zero_port(
+                format!("MeshSidecar '{}'.ingress[{}].port", sidecar.name, i),
+                ingress.port,
+                &mut errors,
+            );
         }
     }
 
