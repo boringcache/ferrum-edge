@@ -574,14 +574,25 @@ pub mod _test_support {
     }
 
     /// Exercise the startup decision behind the `FERRUM_WEBSOCKET_TUNNEL_MODE`
-    /// frame-loss-risk warning. Returns the number of HTTP-family proxies the
-    /// caveat applies to (`0` when tunnel mode is disabled or no HTTP-family
-    /// proxy is present, i.e. no warning is emitted).
+    /// frame-loss-risk warning. Builds a `PluginCache` from `config` (the same
+    /// source of truth the gateway uses to decide whether a proxy takes the
+    /// lossy raw-tunnel path) and returns the number of HTTP-family proxies the
+    /// caveat applies to: `0` when tunnel mode is disabled, no HTTP-family proxy
+    /// is present, or every HTTP-family proxy requires WS frame hooks (so no
+    /// warning is emitted).
+    ///
+    /// Returns `Err` only if the config has an invalid plugin configuration that
+    /// `PluginCache` construction rejects — tests pass valid configs.
     pub fn warn_if_websocket_tunnel_mode_frame_loss_risk_for_test(
         config: &crate::config::types::GatewayConfig,
         websocket_tunnel_mode: bool,
-    ) -> usize {
-        crate::proxy::warn_if_websocket_tunnel_mode_frame_loss_risk(config, websocket_tunnel_mode)
+    ) -> Result<usize, String> {
+        let plugin_cache = crate::plugin_cache::PluginCache::new(config)?;
+        Ok(crate::proxy::warn_if_websocket_tunnel_mode_frame_loss_risk(
+            config,
+            &plugin_cache,
+            websocket_tunnel_mode,
+        ))
     }
 
     /// Construct a streaming `ProxyBody` for use in unit/integration tests.

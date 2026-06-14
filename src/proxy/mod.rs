@@ -64,7 +64,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::Poll;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 use tokio::net::TcpListener;
@@ -1004,13 +1004,24 @@ fn warn_if_h3_backend_tls_policy_incompatible(
 /// operational logs without reading source.
 ///
 /// Returns the number of HTTP-family proxies the caveat applies to (the proxies
-/// that can actually carry WebSocket traffic) so the decision is unit-testable;
-/// returns `0` (and logs nothing) when tunnel mode is disabled or no HTTP-family
-/// proxy is configured. The warning is intentionally per-instance, not
+/// that would actually take the lossy raw-tunnel path) so the decision is
+/// unit-testable; returns `0` (and logs nothing) when tunnel mode is disabled or
+/// no such proxy is configured. The warning is intentionally per-instance, not
 /// per-session: tunnel mode is a global flag and per-session residual cannot be
 /// detected (no buffer accessor), so this is a coarse, once-at-startup signal.
+///
+/// A proxy is only exposed to the frame-loss caveat when it would take the raw
+/// `copy_bidirectional` fast path, which `run_websocket_proxy` enters only when
+/// `websocket_tunnel_mode && ws_frame_plugins.is_empty()` — i.e. the proxy has
+/// no plugin that opted into per-frame WebSocket hooks. Proxies whose effective
+/// plugin set requires WS frame hooks parse every frame and never hit the lossy
+/// path, so they are excluded from the count. The same `PluginCache` predicate
+/// that `run_websocket_proxy` uses to populate `ws_frame_plugins`
+/// (`requires_ws_frame_hooks(proxy_id)`) is the source of truth here so the
+/// reported count and the actual fast-path condition cannot drift.
 pub(crate) fn warn_if_websocket_tunnel_mode_frame_loss_risk(
     config: &GatewayConfig,
+    plugin_cache: &PluginCache,
     websocket_tunnel_mode: bool,
 ) -> usize {
     if !websocket_tunnel_mode {
@@ -1020,11 +1031,15 @@ pub(crate) fn warn_if_websocket_tunnel_mode_frame_loss_risk(
     // Only HTTP-family proxies (http/https + ws/wss/grpc runtime flavors) can
     // serve a WebSocket upgrade; stream-family proxies (tcp/udp/dtls) never
     // reach the tunnel-mode raw-copy branch. `DispatchKind::is_http_family()`
-    // is exactly `HttpPool | HttpsPool`.
+    // is exactly `HttpPool | HttpsPool`. Of those, exclude proxies whose plugin
+    // set requires per-frame WS hooks — they parse frames instead of taking the
+    // raw-copy fast path, so they carry no first-frame-loss exposure.
     let affected_proxy_count = config
         .proxies
         .iter()
-        .filter(|proxy| proxy.dispatch_kind.is_http_family())
+        .filter(|proxy| {
+            proxy.dispatch_kind.is_http_family() && !plugin_cache.requires_ws_frame_hooks(&proxy.id)
+        })
         .count();
     if affected_proxy_count == 0 {
         return 0;
@@ -2296,6 +2311,15 @@ pub struct ProxyState {
     pub max_websocket_frame_size_bytes: usize,
     pub websocket_write_buffer_size: usize,
     pub websocket_tunnel_mode: bool,
+    /// One-time latch for the `FERRUM_WEBSOCKET_TUNNEL_MODE` first-frame-loss
+    /// startup warning (issue #1619). Set to `true` once the warning has been
+    /// evaluated against a non-empty config — by the constructor for db/file
+    /// modes, or by the first non-empty config-apply for DP mode (which starts
+    /// with an empty default config and receives its real config from the CP
+    /// later). Guards `warn_websocket_tunnel_mode_frame_loss_once` so the
+    /// periodic DB/CP poll/apply loop cannot re-emit the warning on every
+    /// reload.
+    pub tunnel_mode_frame_loss_warned: Arc<AtomicBool>,
     /// Parsed trusted proxy CIDRs for X-Forwarded-For client IP resolution.
     /// Pre-parsed from `env_config.trusted_proxies` to avoid re-parsing on every request.
     pub trusted_proxies: Arc<client_ip::TrustedProxies>,
@@ -3524,7 +3548,6 @@ impl ProxyState {
         let global_pool_config = PoolConfig::from_env();
         let tls_policy_arc = tls_policy.map(Arc::new);
         warn_if_h3_backend_tls_policy_incompatible(&config, tls_policy_arc.as_deref());
-        warn_if_websocket_tunnel_mode_frame_loss_risk(&config, websocket_tunnel_mode);
         let crls = crate::tls::load_crls(env_config.tls_crl_file_path.as_deref())?;
         let shared_crls = crate::tls::shared_crl_list(crls.clone());
         let backend_svid_generation = Arc::new(AtomicU64::new(0));
@@ -3636,6 +3659,27 @@ impl ProxyState {
             PluginCache::with_http_client(&config, plugin_http_client.clone())
                 .map_err(|e| anyhow::anyhow!("{}", e))?,
         );
+        // Surface the WebSocket tunnel-mode first-frame-loss caveat once at
+        // startup (issue #1619). db/file modes hand the constructor the real
+        // config, so the warning evaluates here. DP starts with an empty
+        // `GatewayConfig::default()` and installs its real config later via
+        // `update_config`/`apply_incremental` — for that case the latch below
+        // stays unset so the first non-empty apply emits the warning instead.
+        // The `compare_exchange` in `warn_websocket_tunnel_mode_frame_loss_once`
+        // keeps the two paths idempotent (at most one warning per instance).
+        let config_has_proxies = !config.proxies.is_empty();
+        if websocket_tunnel_mode && config_has_proxies {
+            warn_if_websocket_tunnel_mode_frame_loss_risk(
+                &config,
+                &plugin_cache,
+                websocket_tunnel_mode,
+            );
+        }
+        // Latch the one-time warning as "already evaluated" only when the
+        // constructor saw a non-empty config (db/file). Leaving it unset for an
+        // empty startup config lets the first real config-apply (DP first CP
+        // snapshot) run the evaluation exactly once.
+        let tunnel_mode_frame_loss_warned = Arc::new(AtomicBool::new(config_has_proxies));
         let plugin_http_client_for_state = plugin_http_client.clone();
         // Build credential-indexed consumer lookup for O(1) auth
         let consumer_index = Arc::new(ConsumerIndex::new(&config.consumers));
@@ -3919,6 +3963,7 @@ impl ProxyState {
             max_websocket_frame_size_bytes,
             websocket_write_buffer_size,
             websocket_tunnel_mode,
+            tunnel_mode_frame_loss_warned,
             trusted_proxies,
             websocket_conn_limit,
             per_ip_request_counts: if max_concurrent_requests_per_ip > 0 {
@@ -5218,6 +5263,41 @@ impl ProxyState {
         self.config.store(Arc::clone(&published.config));
     }
 
+    /// Emit the `FERRUM_WEBSOCKET_TUNNEL_MODE` first-frame-loss startup warning
+    /// at most once per instance (issue #1619).
+    ///
+    /// The constructor evaluates this for db/file modes, where the real config
+    /// is present at construction. DP starts with an empty
+    /// `GatewayConfig::default()` and installs its real config later via the CP
+    /// gRPC stream, so the constructor's empty-config evaluation never warns;
+    /// this hook lets the first non-empty config-apply emit the warning instead.
+    /// The `compare_exchange` latch makes the two paths idempotent and stops the
+    /// periodic DB/CP poll/apply loop from re-emitting on every reload.
+    ///
+    /// `config` and `plugin_cache` MUST be the freshly applied ones so the
+    /// affected-proxy count reflects the new state. Callers in the apply path
+    /// invoke this only after `mirror_request_epoch_wrappers` has published the
+    /// new plugin cache.
+    fn warn_websocket_tunnel_mode_frame_loss_once(
+        &self,
+        config: &GatewayConfig,
+        plugin_cache: &PluginCache,
+    ) {
+        if !self.websocket_tunnel_mode {
+            return;
+        }
+        // Latch first so concurrent appliers (or constructor + first apply)
+        // can never double-warn; only the winner of the swap evaluates.
+        if self
+            .tunnel_mode_frame_loss_warned
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        warn_if_websocket_tunnel_mode_frame_loss_risk(config, plugin_cache, true);
+    }
+
     /// Update the proxy configuration. Returns `true` if changes were applied.
     pub fn update_config(&self, mut new_config: GatewayConfig) -> bool {
         use crate::config_delta::ConfigDelta;
@@ -5332,6 +5412,11 @@ impl ProxyState {
             }
 
             warn_if_h3_backend_tls_policy_incompatible(&new_config, self.tls_policy.as_deref());
+            // First non-empty config-apply (e.g. a DP receiving its first full
+            // CP snapshot): emit the tunnel-mode first-frame-loss warning now
+            // that the new plugin cache is published. No-op for db/file (the
+            // latch was set in the constructor) and on every later reload.
+            self.warn_websocket_tunnel_mode_frame_loss_once(&new_config, &self.plugin_cache);
             self.spawn_backend_capability_refresh();
 
             // Reconcile stream proxy listeners (TCP/UDP)
@@ -5496,6 +5581,10 @@ impl ProxyState {
         }
 
         warn_if_h3_backend_tls_policy_incompatible(&new_config, self.tls_policy.as_deref());
+        // Idempotent one-time tunnel-mode frame-loss warning. Covers a gateway
+        // that started with an empty config and first becomes non-empty via a
+        // delta-shaped reload; the latch makes it a no-op once already emitted.
+        self.warn_websocket_tunnel_mode_frame_loss_once(&new_config, &self.plugin_cache);
         self.spawn_backend_capability_refresh();
 
         // Reconcile stream proxy listeners if any proxies changed.
@@ -5879,6 +5968,11 @@ impl ProxyState {
         }
 
         warn_if_h3_backend_tls_policy_incompatible(&new_config, self.tls_policy.as_deref());
+        // Idempotent one-time tunnel-mode frame-loss warning. A DP whose first
+        // CP message is a DELTA against the empty startup config lands here; the
+        // latch keeps it to a single emission across this and the full-snapshot
+        // path, and a no-op on every subsequent incremental poll/apply.
+        self.warn_websocket_tunnel_mode_frame_loss_once(&new_config, &self.plugin_cache);
 
         // Trigger a coalesced capability refresh so added/modified HTTPS
         // backends get classified immediately instead of waiting up to the
