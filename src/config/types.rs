@@ -249,8 +249,16 @@ pub struct SubsetTrafficPolicy {
     /// (consecutive errors, interval, base-ejection time, min-health) are
     /// consulted per-subset by `passive_health_for_target` for proxies bound to
     /// this subset, overriding the upstream-level passive health. The
-    /// `maxEjectionPercent` *cap* is resolved through the LoadBalancerCache at
-    /// the upstream level and is not yet per-subset (see docs/mesh.md).
+    /// `maxEjectionPercent` *cap* is also resolved per-subset, by
+    /// `LoadBalancerCache::max_ejection_percent_resolved_from` with the SAME
+    /// per-port > per-subset > upstream tier precedence as the thresholds, so
+    /// the cap and the thresholds come from the same tier. The cap is also
+    /// scoped to the subset's candidate pool (the denominator is the subset
+    /// target count, not the whole upstream). The per-port cap tier applies
+    /// only when a single dispatch port is resolvable pre-selection (non-subset
+    /// dispatch, single-port upstreams, or port-pinned retries); for a
+    /// subset-routed dispatch on a multi-port upstream the subset cap governs
+    /// (see `max_ejection_percent_resolved_from`'s pre-selection-asymmetry note).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub passive_health_check: Option<PassiveHealthCheck>,
 }
@@ -485,12 +493,17 @@ pub struct ResolvedSubsetTrafficPolicy {
     /// so the hot path can swap one `BackendTlsConfig` for another without
     /// re-running the overlay).
     pub tls: Option<BackendTlsConfig>,
-    /// Subset-resolved passive health (ejection thresholds), from the subset's
-    /// `outlierDetection`. `Some` when the subset configured outlier detection;
-    /// consulted by `passive_health_for_target` ahead of the upstream-level
-    /// passive health for proxies bound to this subset. The `maxEjectionPercent`
-    /// cap is resolved at the upstream level (LoadBalancerCache) and is not yet
-    /// per-subset.
+    /// Subset-resolved passive health (ejection thresholds AND the
+    /// `maxEjectionPercent` cap), from the subset's `outlierDetection`. `Some`
+    /// when the subset configured outlier detection; consulted by
+    /// `passive_health_for_target` ahead of the upstream-level passive health for
+    /// proxies bound to this subset. The `maxEjectionPercent` cap is resolved
+    /// per-subset by `LoadBalancerCache::max_ejection_percent_resolved_from`
+    /// (reading this overlay), with the SAME per-port > per-subset > upstream
+    /// tier precedence as the thresholds, and is scoped to the subset's
+    /// candidate pool (denominator = subset target count). The per-port tier
+    /// applies only when a single dispatch port is resolvable pre-selection;
+    /// for subset dispatch on a multi-port upstream the subset cap governs.
     pub passive_health_check: Option<PassiveHealthCheck>,
 }
 

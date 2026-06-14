@@ -1869,24 +1869,14 @@ fn translate_subset(
         .map(|tp| translate_traffic_policy(acc, object, tp))
         .transpose()?;
 
-    // A subset's `connectionPool.tcp.connectTimeout`, `tls`, and
-    // `outlierDetection` *thresholds* (consecutive errors / interval /
-    // base-ejection / min-health) are now applied per-subset by the cold-path
-    // apply in `src/modes/mesh/mod.rs`. The one residual is the
-    // `outlierDetection.maxEjectionPercent` *cap*, still resolved at the
-    // upstream level (LoadBalancerCache), so warn when a subset sets outlier
-    // detection that its ejection cap is not yet per-subset.
-    if let Some(policy) = traffic_policy.as_ref()
-        && policy
-            .outlier_detection
-            .as_ref()
-            .is_some_and(|od| od.max_ejection_percent.is_some())
-    {
-        acc.warnings.push(format!(
-            "DestinationRule {}/{} subset '{}' outlierDetection thresholds are applied per-subset, but the maxEjectionPercent cap uses the upstream-level value",
-            object.metadata.namespace, object.metadata.name, name
-        ));
-    }
+    // A subset's `connectionPool.tcp.connectTimeout`, `tls`, and the full
+    // `outlierDetection` (both the *thresholds* and the `maxEjectionPercent`
+    // *cap*) are now applied per-subset by the cold-path apply in
+    // `src/modes/mesh/mod.rs`: the thresholds via the subset passive-health
+    // overlay consulted by `passive_health_for_target`, and the cap via
+    // `LoadBalancerCache::max_ejection_percent_resolved_from` with the SAME
+    // per-port > per-subset > upstream precedence. So no per-subset
+    // outlier-detection field is deferred here anymore.
 
     Ok(MeshSubset {
         name,
@@ -7987,7 +7977,7 @@ extensionProviders:
     }
 
     #[test]
-    fn destination_rule_subset_outlier_max_ejection_percent_warns() {
+    fn destination_rule_subset_outlier_max_ejection_percent_does_not_warn() {
         let result = translate_k8s_objects(
             &[object(
                 "DestinationRule",
@@ -8009,14 +7999,16 @@ extensionProviders:
         )
         .expect("subset traffic policy translates");
 
-        // Only the maxEjectionPercent *cap* remains upstream-level, so a subset
-        // that sets it surfaces the residual warning; the thresholds still apply.
+        // The maxEjectionPercent *cap* is now applied per-subset (resolved with
+        // the same per-port > per-subset > upstream precedence as the
+        // thresholds), so a subset that sets it must NOT surface any residual
+        // upstream-level-cap warning.
         assert!(
-            result
+            !result
                 .warnings
                 .iter()
-                .any(|w| w.contains("subset 'v1'") && w.contains("maxEjectionPercent cap")),
-            "subset with maxEjectionPercent must warn about the upstream-level cap, got {:?}",
+                .any(|w| w.contains("subset 'v1'") && w.contains("maxEjectionPercent")),
+            "subset maxEjectionPercent is applied per-subset now and must not warn, got {:?}",
             result.warnings
         );
     }
