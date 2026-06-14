@@ -2041,15 +2041,6 @@ async fn handle_h3_request(
                         && body_data.len() + bytes.len() > content_length_limit
                     {
                         record_request(&state, 413);
-                        send_h3_error_flavor_aware(
-                            &mut stream,
-                            http_flavor,
-                            StatusCode::PAYLOAD_TOO_LARGE,
-                            r#"{"error":"Request body exceeds maximum size"}"#,
-                            crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
-                            "Request body exceeds maximum size",
-                        )
-                        .await?;
                         // The circuit-breaker check above may have admitted this
                         // request as a half-open probe (cb_is_half_open_probe),
                         // reserving a slot. This cross-protocol prebuffering
@@ -2060,6 +2051,15 @@ async fn handle_h3_request(
                         // gauge. Without it, a single oversized upload during
                         // HALF_OPEN permanently wedges the breaker (same leak
                         // class as the native-H3 streaming path).
+                        //
+                        // Record this BEFORE the client-facing 413 write below: if
+                        // the client resets while the 413 is being written, that
+                        // `.await?` returns Err and the early return runs before
+                        // any code after it, so recording the outcome after the
+                        // write would skip the release and leak the probe slot
+                        // (wedging a single-slot breaker). The native-H3 reject /
+                        // read-error paths in this same patch release before their
+                        // client-facing writes for exactly this reason.
                         //
                         // An oversized client upload is client-caused, so
                         // ClientDisconnect drives the outcome:
@@ -2089,6 +2089,15 @@ async fn handle_h3_request(
                             false,
                             backend_start.elapsed(),
                         );
+                        send_h3_error_flavor_aware(
+                            &mut stream,
+                            http_flavor,
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            r#"{"error":"Request body exceeds maximum size"}"#,
+                            crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
+                            "Request body exceeds maximum size",
+                        )
+                        .await?;
                         return Ok(());
                     }
                     body_data.extend_from_slice(bytes);
