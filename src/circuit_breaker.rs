@@ -367,23 +367,35 @@ impl CircuitBreaker {
                 self.success_count.store(0, Ordering::Relaxed);
                 loop {
                     let p = self.packed.load(Ordering::Acquire);
-                    if packed_state(p) != STATE_HALF_OPEN {
-                        // Another thread already moved us out of HALF_OPEN
-                        // (closed by a sibling probe, or reopened first).
-                        break;
-                    }
-                    if self
-                        .packed
-                        .compare_exchange_weak(
-                            p,
-                            pack(STATE_OPEN, 0),
-                            Ordering::AcqRel,
-                            Ordering::Relaxed,
-                        )
-                        .is_ok()
-                    {
-                        warn!("Circuit breaker reopening (probe failed)");
-                        break;
+                    match packed_state(p) {
+                        // A sibling probe failure already reopened — done.
+                        STATE_OPEN => break,
+                        // HALF_OPEN (the normal case) OR CLOSED — a sibling probe
+                        // reached the success threshold and closed the breaker
+                        // before we got here. Either way an admitted half-open
+                        // probe FAILED, and the half-open policy is that ANY probe
+                        // failure reopens, so reopen even from the freshly-closed
+                        // state (matching the prior code, which published OPEN
+                        // unconditionally after observing HALF_OPEN). Dropping the
+                        // failure on a lost close race would otherwise leave the
+                        // breaker CLOSED despite a failed probe when
+                        // half_open_max_requests > 1. Clears the in-flight count
+                        // in the same CAS.
+                        _ => {
+                            if self
+                                .packed
+                                .compare_exchange_weak(
+                                    p,
+                                    pack(STATE_OPEN, 0),
+                                    Ordering::AcqRel,
+                                    Ordering::Relaxed,
+                                )
+                                .is_ok()
+                            {
+                                warn!("Circuit breaker reopening (probe failed)");
+                                break;
+                            }
+                        }
                     }
                 }
             }

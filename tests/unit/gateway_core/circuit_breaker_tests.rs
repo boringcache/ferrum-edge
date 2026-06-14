@@ -1640,3 +1640,63 @@ fn test_half_open_bound_and_no_wedge_under_admit_reopen_race_stress() {
         cb.half_open_in_flight()
     );
 }
+
+/// A half-open probe failure that loses the race to a sibling probe closing the
+/// breaker must still reopen. The half-open policy is that ANY admitted probe
+/// failure reopens, even when other probes reached the success threshold and
+/// closed the breaker first. Regression for the packed-atomic reopen loop, which
+/// `break`ed on a non-HALF_OPEN state and silently dropped the failure when the
+/// close raced ahead of it (possible only with `half_open_max_requests > 1`).
+#[test]
+fn test_half_open_probe_failure_reopens_even_when_close_races() {
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    for _ in 0..400 {
+        let config = CircuitBreakerConfig {
+            failure_threshold: 1,
+            success_threshold: 2, // two successes close the breaker
+            timeout_seconds: 0,
+            failure_status_codes: vec![500],
+            half_open_max_requests: 3,
+            trip_on_connection_errors: true,
+        };
+        let cb = Arc::new(CircuitBreaker::new(config));
+
+        // Trip open, then admit 3 half-open probes.
+        cb.record_failure(500, false, false);
+        assert!(cb.can_execute().is_ok());
+        assert!(cb.can_execute().is_ok());
+        assert!(cb.can_execute().is_ok());
+        assert_eq!(cb.state_name(), "half_open");
+
+        // Two probes succeed (reaching the success threshold → close) while a
+        // third fails — all concurrently. Whatever the interleaving, the failed
+        // probe must leave the breaker OPEN: if it loses the race to the close,
+        // it must still reopen rather than drop the failure.
+        let barrier = Arc::new(Barrier::new(3));
+        let mut handles = Vec::new();
+        for i in 0..3 {
+            let cb = cb.clone();
+            let barrier = barrier.clone();
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                if i == 0 {
+                    cb.record_failure(500, false, true);
+                } else {
+                    cb.record_success(true);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(
+            cb.state_name(),
+            "open",
+            "a half-open probe failure must reopen the breaker even when sibling \
+             probes closed it first"
+        );
+    }
+}
