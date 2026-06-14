@@ -98,6 +98,16 @@ pub struct HboneRelayFailureKey {
     pub error_class: &'static str,
 }
 
+/// Composite key for raw-TCP mesh egress relay connections, labelled by the
+/// transport that carried them (`hbone` for Ambient, `mtls` for Sidecar) and
+/// the relay outcome. Bounded cardinality: both labels are compiled-in
+/// constants, never attacker-controllable.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MeshTcpEgressConnKey {
+    pub transport: &'static str,
+    pub result: &'static str,
+}
+
 /// TLS certificate inventory gauge key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TlsCertGaugeKey {
@@ -359,6 +369,13 @@ pub struct MetricsRegistry {
     /// Incremented when the background CONNECT relay observes a copy failure
     /// after the client already received `200 OK`.
     pub hbone_relay_failure_counter: DashMap<HboneRelayFailureKey, TimestampedCounter>,
+    /// Raw-TCP mesh egress relay connections keyed by (transport, result).
+    /// Incremented once per captured raw-TCP connection that established a
+    /// tunnel, labelled by the transport (`hbone`/`mtls`) and relay outcome
+    /// (`success`/`failure`). Unlike `hbone_relay_failure_counter` this also
+    /// counts successes and covers BOTH transports, giving operators a
+    /// per-transport view of raw-TCP egress volume + health.
+    pub mesh_tcp_egress_connection_counter: DashMap<MeshTcpEgressConnKey, TimestampedCounter>,
     /// Mesh outbound registry decisions keyed by mesh namespace and host.
     ///
     /// Cardinality contract: caller must never pass attacker-controllable
@@ -431,6 +448,7 @@ impl MetricsRegistry {
             stream_disconnect_counter: DashMap::new(),
             mesh_dns_upstream_id_exhaustions: AtomicU64::new(0),
             hbone_relay_failure_counter: DashMap::new(),
+            mesh_tcp_egress_connection_counter: DashMap::new(),
             mesh_outbound_registry_decisions: DashMap::new(),
             mesh_outbound_registry_stream_decisions: DashMap::new(),
             tls_cert_gauges: DashMap::new(),
@@ -527,6 +545,23 @@ impl MetricsRegistry {
             error_class: error_class.as_str(),
         };
         self.hbone_relay_failure_counter
+            .entry(key)
+            .or_insert_with(|| TimestampedCounter::new(self.epoch))
+            .increment(self.epoch);
+
+        self.maybe_invalidate_cache();
+    }
+
+    /// Record one completed raw-TCP mesh egress relay connection. `transport`
+    /// is the static transport label (`"hbone"` / `"mtls"`); `success` is the
+    /// relay outcome (no copy failure observed). Both labels are compiled-in
+    /// constants, so cardinality stays bounded.
+    pub fn record_mesh_tcp_egress_connection(&self, transport: &'static str, success: bool) {
+        let key = MeshTcpEgressConnKey {
+            transport,
+            result: if success { "success" } else { "failure" },
+        };
+        self.mesh_tcp_egress_connection_counter
             .entry(key)
             .or_insert_with(|| TimestampedCounter::new(self.epoch))
             .increment(self.epoch);
@@ -884,6 +919,14 @@ impl MetricsRegistry {
             keep
         });
 
+        self.mesh_tcp_egress_connection_counter.retain(|_, v| {
+            let keep = v.nanos_since_update(self.epoch) < ttl_nanos;
+            if !keep {
+                evicted += 1;
+            }
+            keep
+        });
+
         self.tls_source_fetch_duration_buckets.retain(|_, v| {
             let keep = v.nanos_since_update(self.epoch) < ttl_nanos;
             if !keep {
@@ -954,6 +997,7 @@ impl MetricsRegistry {
             + self.stream_connection_counter.len() * 200
             + self.stream_duration_buckets.len() * 800
             + self.hbone_relay_failure_counter.len() * 240
+            + self.mesh_tcp_egress_connection_counter.len() * 120
             + self
                 .mesh_outbound_registry_decisions
                 .iter()
@@ -1194,6 +1238,21 @@ impl MetricsRegistry {
                 output.push_str(&format!(
                     "ferrum_mesh_hbone_relay_failures_total{{proxy_id=\"{}\",direction=\"{}\",error_class=\"{}\"{}}} {}\n",
                     proxy_id, key.direction, error_class, ns_label, count
+                ));
+            }
+        }
+
+        if !self.mesh_tcp_egress_connection_counter.is_empty() {
+            output.push_str(
+                "# HELP ferrum_mesh_tcp_egress_connections_total Raw-TCP mesh egress relay connections by transport and outcome.\n",
+            );
+            output.push_str("# TYPE ferrum_mesh_tcp_egress_connections_total counter\n");
+            for entry in self.mesh_tcp_egress_connection_counter.iter() {
+                let key = entry.key();
+                let count = entry.value().value.load(Ordering::Relaxed);
+                output.push_str(&format!(
+                    "ferrum_mesh_tcp_egress_connections_total{{transport=\"{}\",result=\"{}\"{}}} {}\n",
+                    key.transport, key.result, ns_label, count
                 ));
             }
         }

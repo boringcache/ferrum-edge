@@ -64,7 +64,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::Poll;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 use tokio::net::TcpListener;
@@ -72,7 +72,8 @@ use tokio::sync::{Semaphore, watch};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
 use tokio_tungstenite::{
-    WebSocketStream, client_async_tls_with_config, tungstenite::handshake::derive_accept_key,
+    WebSocketStream, client_async_tls_with_config, client_async_with_config,
+    tungstenite::handshake::derive_accept_key,
 };
 use tracing::{debug, error, info, trace, warn};
 
@@ -984,6 +985,93 @@ fn warn_if_h3_backend_tls_policy_incompatible(
             err
         );
     }
+}
+
+/// Emit a one-time startup warning when `FERRUM_WEBSOCKET_TUNNEL_MODE` is
+/// enabled and the loaded config has HTTP-family proxies that could carry
+/// WebSocket traffic.
+///
+/// Tunnel mode (raw `copy_bidirectional` after the upgrade, taken only when a
+/// proxy has no frame-level WebSocket plugins) cannot recover backend frame
+/// bytes that tokio-tungstenite coalesced into its internal read buffer while
+/// parsing the backend `101 Switching Protocols` response: `into_inner()`
+/// returns only the underlying socket and discards the codec's buffered tail.
+/// tokio-tungstenite/tungstenite expose no accessor for that residual (verified
+/// against the pinned 0.29 release and upstream `master`), so the first
+/// backend→client push frame can be silently dropped for backends that send
+/// immediately after upgrade (stock tickers, Socket.IO server broadcasts,
+/// MQTT-over-WS). The caveat is documented in code comments and `ferrum.conf`;
+/// surfacing it as a structured startup `warn!` makes the risk visible in
+/// operational logs without reading source.
+///
+/// Returns the number of HTTP-family proxies the caveat applies to (the proxies
+/// that would actually take the lossy raw-tunnel path) so the decision is
+/// unit-testable; returns `0` (and logs nothing) when tunnel mode is disabled or
+/// no such proxy is configured. The warning is intentionally per-instance, not
+/// per-session: tunnel mode is a global flag and per-session residual cannot be
+/// detected (no buffer accessor), so this is a coarse, once-at-startup signal.
+///
+/// A proxy is only exposed to the frame-loss caveat when it would take the raw
+/// `copy_bidirectional` fast path, which `run_websocket_proxy` enters only when
+/// `websocket_tunnel_mode && ws_frame_plugins.is_empty()` — i.e. the proxy has
+/// no plugin that opted into per-frame WebSocket hooks. Proxies whose effective
+/// plugin set requires WS frame hooks parse every frame and never hit the lossy
+/// path, so they are excluded from the count. The same `PluginCache` predicate
+/// that `run_websocket_proxy` uses to populate `ws_frame_plugins`
+/// (`requires_ws_frame_hooks(proxy_id)`) is the source of truth here so the
+/// reported count and the actual fast-path condition cannot drift.
+/// Count the HTTP-family proxies exposed to the tunnel-mode first-frame-loss
+/// risk: those that would take the raw-copy fast path in `run_websocket_proxy`.
+///
+/// Only HTTP-family proxies (http/https + ws/wss/grpc runtime flavors) can serve
+/// a WebSocket upgrade; stream-family proxies (tcp/udp/dtls) never reach the
+/// tunnel-mode raw-copy branch. `DispatchKind::is_http_family()` is exactly
+/// `HttpPool | HttpsPool`. Of those, exclude proxies whose plugin set requires
+/// per-frame WS hooks — they parse frames instead of taking the raw-copy fast
+/// path, so they carry no first-frame-loss exposure. Shared by the warning
+/// emitter and the one-time latch so the count and the actual fast-path
+/// condition (`requires_ws_frame_hooks`) cannot drift.
+pub(crate) fn websocket_tunnel_mode_frame_loss_affected_count(
+    config: &GatewayConfig,
+    plugin_cache: &PluginCache,
+) -> usize {
+    config
+        .proxies
+        .iter()
+        .filter(|proxy| {
+            proxy.dispatch_kind.is_http_family() && !plugin_cache.requires_ws_frame_hooks(&proxy.id)
+        })
+        .count()
+}
+
+pub(crate) fn warn_if_websocket_tunnel_mode_frame_loss_risk(
+    config: &GatewayConfig,
+    plugin_cache: &PluginCache,
+    websocket_tunnel_mode: bool,
+) -> usize {
+    if !websocket_tunnel_mode {
+        return 0;
+    }
+
+    let affected_proxy_count =
+        websocket_tunnel_mode_frame_loss_affected_count(config, plugin_cache);
+    if affected_proxy_count == 0 {
+        return 0;
+    }
+
+    warn!(
+        affected_proxy_count,
+        "FERRUM_WEBSOCKET_TUNNEL_MODE is enabled: WebSocket sessions on \
+         HTTP-family proxies without a frame-level plugin use raw TCP copy and \
+         can drop the first backend push frame if the backend coalesces it into \
+         the same TCP segment as the 101 Switching Protocols response (residual \
+         bytes buffered by tokio-tungstenite during the backend handshake are \
+         not recoverable). Disable FERRUM_WEBSOCKET_TUNNEL_MODE or attach a \
+         frame-level WebSocket plugin for any backend that pushes immediately \
+         after upgrade; request/response protocols are unaffected."
+    );
+
+    affected_proxy_count
 }
 
 /// Check if the request is a WebSocket upgrade request.
@@ -2237,6 +2325,15 @@ pub struct ProxyState {
     pub max_websocket_frame_size_bytes: usize,
     pub websocket_write_buffer_size: usize,
     pub websocket_tunnel_mode: bool,
+    /// One-time latch for the `FERRUM_WEBSOCKET_TUNNEL_MODE` first-frame-loss
+    /// startup warning (issue #1619). Set to `true` once the warning has been
+    /// evaluated against a non-empty config — by the constructor for db/file
+    /// modes, or by the first non-empty config-apply for DP mode (which starts
+    /// with an empty default config and receives its real config from the CP
+    /// later). Guards `warn_websocket_tunnel_mode_frame_loss_once` so the
+    /// periodic DB/CP poll/apply loop cannot re-emit the warning on every
+    /// reload.
+    pub tunnel_mode_frame_loss_warned: Arc<AtomicBool>,
     /// Parsed trusted proxy CIDRs for X-Forwarded-For client IP resolution.
     /// Pre-parsed from `env_config.trusted_proxies` to avoid re-parsing on every request.
     pub trusted_proxies: Arc<client_ip::TrustedProxies>,
@@ -3576,6 +3673,34 @@ impl ProxyState {
             PluginCache::with_http_client(&config, plugin_http_client.clone())
                 .map_err(|e| anyhow::anyhow!("{}", e))?,
         );
+        // Surface the WebSocket tunnel-mode first-frame-loss caveat once at
+        // startup (issue #1619). db/file modes hand the constructor the real
+        // config, so the warning evaluates here. DP starts with an empty
+        // `GatewayConfig::default()` and installs its real config later via
+        // `update_config`/`apply_incremental` — for that case the latch below
+        // stays unset so the first non-empty apply emits the warning instead.
+        // The `compare_exchange` in `warn_websocket_tunnel_mode_frame_loss_once`
+        // keeps the two paths idempotent (at most one warning per instance).
+        let config_has_proxies = !config.proxies.is_empty();
+        // Emit the one-time warning here for modes that hand the constructor the
+        // real config (db/file). `warn_if_...` returns the affected-proxy count
+        // (0 when tunnel mode is off OR no exposed proxy), and we latch the
+        // one-time warning as "already emitted" ONLY when it actually warned.
+        // If the constructor config has proxies but none are affected (all
+        // stream-family, or every HTTP proxy carries a frame-level plugin), the
+        // latch stays open so a later reload that introduces a pluginless HTTP
+        // proxy still warns exactly once. The empty-config DP path also leaves
+        // it unset, emitting on the first non-empty apply instead. The
+        // `compare_exchange` in `warn_websocket_tunnel_mode_frame_loss_once`
+        // keeps the two paths idempotent (at most one warning per instance).
+        let constructor_warned = websocket_tunnel_mode
+            && config_has_proxies
+            && warn_if_websocket_tunnel_mode_frame_loss_risk(
+                &config,
+                &plugin_cache,
+                websocket_tunnel_mode,
+            ) > 0;
+        let tunnel_mode_frame_loss_warned = Arc::new(AtomicBool::new(constructor_warned));
         let plugin_http_client_for_state = plugin_http_client.clone();
         // Build credential-indexed consumer lookup for O(1) auth
         let consumer_index = Arc::new(ConsumerIndex::new(&config.consumers));
@@ -3859,6 +3984,7 @@ impl ProxyState {
             max_websocket_frame_size_bytes,
             websocket_write_buffer_size,
             websocket_tunnel_mode,
+            tunnel_mode_frame_loss_warned,
             trusted_proxies,
             websocket_conn_limit,
             per_ip_request_counts: if max_concurrent_requests_per_ip > 0 {
@@ -5158,6 +5284,53 @@ impl ProxyState {
         self.config.store(Arc::clone(&published.config));
     }
 
+    /// Emit the `FERRUM_WEBSOCKET_TUNNEL_MODE` first-frame-loss startup warning
+    /// at most once per instance (issue #1619).
+    ///
+    /// The constructor evaluates this for db/file modes, where the real config
+    /// is present at construction. DP starts with an empty
+    /// `GatewayConfig::default()` and installs its real config later via the CP
+    /// gRPC stream, so the constructor's empty-config evaluation never warns;
+    /// this hook lets the first non-empty config-apply emit the warning instead.
+    /// The `compare_exchange` latch makes the two paths idempotent and stops the
+    /// periodic DB/CP poll/apply loop from re-emitting on every reload.
+    ///
+    /// `config` and `plugin_cache` MUST be the freshly applied ones so the
+    /// affected-proxy count reflects the new state. Callers in the apply path
+    /// invoke this only after `mirror_request_epoch_wrappers` has published the
+    /// new plugin cache.
+    fn warn_websocket_tunnel_mode_frame_loss_once(
+        &self,
+        config: &GatewayConfig,
+        plugin_cache: &PluginCache,
+    ) {
+        if !self.websocket_tunnel_mode {
+            return;
+        }
+        // Fast path: already warned once.
+        if self.tunnel_mode_frame_loss_warned.load(Ordering::Acquire) {
+            return;
+        }
+        // Count affected proxies WITHOUT emitting, and latch only when there is
+        // at least one. Otherwise the first config that happens to expose no
+        // affected proxy (a DP whose first CP delta carried only stream proxies,
+        // or whose HTTP proxies all had frame-level plugins) would flip the latch
+        // and a later reload that introduces a pluginless HTTP proxy would skip
+        // the warning entirely.
+        if websocket_tunnel_mode_frame_loss_affected_count(config, plugin_cache) == 0 {
+            return;
+        }
+        // Latch now (winner emits) so concurrent appliers can never double-warn.
+        if self
+            .tunnel_mode_frame_loss_warned
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        warn_if_websocket_tunnel_mode_frame_loss_risk(config, plugin_cache, true);
+    }
+
     /// Update the proxy configuration. Returns `true` if changes were applied.
     pub fn update_config(&self, mut new_config: GatewayConfig) -> bool {
         use crate::config_delta::ConfigDelta;
@@ -5272,6 +5445,11 @@ impl ProxyState {
             }
 
             warn_if_h3_backend_tls_policy_incompatible(&new_config, self.tls_policy.as_deref());
+            // First non-empty config-apply (e.g. a DP receiving its first full
+            // CP snapshot): emit the tunnel-mode first-frame-loss warning now
+            // that the new plugin cache is published. No-op for db/file (the
+            // latch was set in the constructor) and on every later reload.
+            self.warn_websocket_tunnel_mode_frame_loss_once(&new_config, &self.plugin_cache);
             self.spawn_backend_capability_refresh();
 
             // Reconcile stream proxy listeners (TCP/UDP)
@@ -5323,7 +5501,41 @@ impl ProxyState {
             |current| {
                 let delta = ConfigDelta::compute(&current.config, &new_config);
                 if delta.is_empty() {
-                    return Ok(None);
+                    // No proxy / upstream / consumer / plugin delta. The mesh
+                    // block (`config.mesh`) is NOT diffed by `ConfigDelta`
+                    // (it carries no `id`/`updated_at`), and mesh endpoints
+                    // (`mesh.workloads`/`mesh.services`) are resolved at REQUEST
+                    // time from the live request-epoch's `config.mesh` (e.g. the
+                    // inbound HBONE relay destination guard, and the mesh
+                    // service discoverer) — NOT from any materialized
+                    // `Upstream.targets`. So a mesh-only change (a federation
+                    // bundle refresh, or a cross-cluster remote-cluster
+                    // scale-up/down merged in by
+                    // `merge_remote_endpoints_into_mesh`) leaves the delta empty
+                    // yet genuinely changes routable state. Republish the epoch
+                    // with the fresh config so the request path observes the new
+                    // `config.mesh`; the pre-computed caches (routes, plugins,
+                    // consumers, LB) are unchanged and reused as-is
+                    // (`route_changed = false`, `lb_changed = false`).
+                    //
+                    // Without this, the `Ok(None)` no-delta path below updates
+                    // only `ProxyState.config` (the ArcSwap the request path
+                    // does NOT read for mesh), leaving `request_epoch.config`
+                    // stale — so a remote scale-up / trust-bundle overlay never
+                    // reaches the live proxy until an unrelated proxy/upstream
+                    // delta forces a republish (codex F7.2 round-5, finding 3).
+                    if current.config.mesh == new_config.mesh {
+                        return Ok(None);
+                    }
+                    return Ok(Some(StagedRequestEpoch {
+                        config: Arc::clone(&staged_config),
+                        route_table: Arc::clone(&current.route_table),
+                        plugin_cache: Arc::clone(&current.plugin_cache),
+                        consumer_index: Arc::clone(&current.consumer_index),
+                        load_balancer: Arc::clone(&current.load_balancer),
+                        route_changed: false,
+                        lb_changed: false,
+                    }));
                 }
                 let staged = self.stage_incremental_request_epoch(
                     current,
@@ -5357,7 +5569,18 @@ impl ProxyState {
         };
         PluginCache::retain_active_uris_for_inner(&published.plugin_cache);
 
-        let delta = applied_delta.expect("delta captured when publish_result is Some");
+        // Mesh-only republish (no proxy/upstream/consumer/plugin delta — only
+        // `config.mesh` changed): the pre-computed caches were reused unchanged,
+        // so there is nothing to prune, warm, reconcile, or restart. The fresh
+        // epoch (and the mirrored `ProxyState.config`) already carry the new
+        // `config.mesh` for the request path. `mirror_request_epoch_wrappers`
+        // published the new config above. Return without running the
+        // delta-keyed maintenance below (it would all be a no-op anyway, and
+        // `applied_delta` is `None` here).
+        let Some(delta) = applied_delta else {
+            debug!("Config update: mesh-only change republished (caches reused)");
+            return true;
+        };
         let proxy_plugin_rebuild_count = delta.proxy_ids_needing_plugin_rebuild(&new_config).len();
 
         // --- CircuitBreakerCache: prune breakers for deleted proxies ---
@@ -5436,6 +5659,10 @@ impl ProxyState {
         }
 
         warn_if_h3_backend_tls_policy_incompatible(&new_config, self.tls_policy.as_deref());
+        // Idempotent one-time tunnel-mode frame-loss warning. Covers a gateway
+        // that started with an empty config and first becomes non-empty via a
+        // delta-shaped reload; the latch makes it a no-op once already emitted.
+        self.warn_websocket_tunnel_mode_frame_loss_once(&new_config, &self.plugin_cache);
         self.spawn_backend_capability_refresh();
 
         // Reconcile stream proxy listeners if any proxies changed.
@@ -5819,6 +6046,11 @@ impl ProxyState {
         }
 
         warn_if_h3_backend_tls_policy_incompatible(&new_config, self.tls_policy.as_deref());
+        // Idempotent one-time tunnel-mode frame-loss warning. A DP whose first
+        // CP message is a DELTA against the empty startup config lands here; the
+        // latch keeps it to a single emission across this and the full-snapshot
+        // path, and a no-op on every subsequent incremental poll/apply.
+        self.warn_websocket_tunnel_mode_frame_loss_once(&new_config, &self.plugin_cache);
 
         // Trigger a coalesced capability refresh so added/modified HTTPS
         // backends get classified immediately instead of waiting up to the
@@ -6273,6 +6505,12 @@ async fn handle_websocket_request_authenticated(
     // If the backend is unreachable, we return 502 instead of a premature 101.
     // Supports retry with upstream target rotation for connection failures.
     let env_config = state.env_config.clone();
+    // The client-sent Host: the mesh egress Extended CONNECT `:authority` is
+    // derived from it (the egress route is `preserve_host_header`) so the peer's
+    // inbound route matches on the SERVICE host, exactly like HTTP egress. Read
+    // from `ctx.headers` (the WS framing headers, incl. Host, are stripped from
+    // `client_headers`). Stable across retry attempts.
+    let ws_client_host = ctx.headers.get("host").cloned();
     let mut current_backend_url = backend_url;
     let mut current_target = upstream_target;
     let mut backend_admission_permits: Option<BackendAdmissionPermitSet>;
@@ -6376,19 +6614,60 @@ async fn handle_websocket_request_authenticated(
             }
         };
 
-        match connect_websocket_backend(
-            &current_backend_url,
-            &proxy,
-            &env_config,
-            &client_headers,
-            state.tls_policy.as_deref(),
-            &state.crls,
-            state.max_websocket_frame_size_bytes,
-            state.websocket_write_buffer_size,
-            ws_idle_tracker.clone(),
-        )
-        .await
-        {
+        // Mesh egress (Sidecar `mesh.mtls` / Ambient `mesh.hbone`): route the WS
+        // upgrade through an RFC 8441 Extended CONNECT over the SVID-mTLS / HBONE
+        // tunnel instead of a direct plaintext/TLS dial. Fail-closed — a
+        // mesh-tagged target that cannot dispatch over its secured transport
+        // (missing SVID, unpinned peer, peer without Extended CONNECT) errors and
+        // is NEVER dialed in plaintext (`connect_mesh_websocket_backend` never
+        // calls `connect_websocket_backend`). Recomputed per attempt because the
+        // retry loop may rotate `current_target`.
+        let ws_mesh_egress = current_target.as_deref().and_then(websocket_mesh_egress);
+        // The client's request target (`:path`), preserved byte-for-byte into the
+        // mesh WS dial so `ws://svc-b/ws?room=1` reaches the destination as
+        // `/ws?room=1` (not `/`). Derived from the SAME computed backend URL the
+        // direct path dials (`build_websocket_backend_url_with_target`, which
+        // already applied `strip_listen_path` + any target path override), so the
+        // mesh path and the direct path forward the identical path+query. Default
+        // to `/` if the URL somehow carries none (Extended CONNECT / inner H1
+        // both require a leading `/`).
+        let ws_path_and_query: std::borrow::Cow<'_, str> = current_backend_url
+            .parse::<hyper::Uri>()
+            .ok()
+            .and_then(|uri| uri.path_and_query().map(|pq| pq.as_str().to_string()))
+            .map(std::borrow::Cow::Owned)
+            .unwrap_or(std::borrow::Cow::Borrowed("/"));
+        let ws_dial_result: Result<WsBackendHandshake, Box<dyn std::error::Error + Send + Sync>> =
+            match (&ws_mesh_egress, current_target.as_deref()) {
+                (Some(egress), Some(target)) => connect_mesh_websocket_backend(
+                    &state,
+                    &proxy,
+                    target,
+                    egress,
+                    ws_client_host.as_deref(),
+                    ws_path_and_query.as_ref(),
+                    &client_headers,
+                    state.max_websocket_frame_size_bytes,
+                    state.websocket_write_buffer_size,
+                    ws_idle_tracker.clone(),
+                )
+                .await
+                .map(|handshake| WsBackendHandshake::Mesh(Box::new(handshake))),
+                _ => connect_websocket_backend(
+                    &current_backend_url,
+                    &proxy,
+                    &env_config,
+                    &client_headers,
+                    state.tls_policy.as_deref(),
+                    &state.crls,
+                    state.max_websocket_frame_size_bytes,
+                    state.websocket_write_buffer_size,
+                    ws_idle_tracker.clone(),
+                )
+                .await
+                .map(|handshake| WsBackendHandshake::Direct(Box::new(handshake))),
+            };
+        match ws_dial_result {
             Ok(handshake) => {
                 backend_conn_guard = conn_slot;
                 break handshake;
@@ -6766,10 +7045,9 @@ async fn handle_websocket_request_authenticated(
     // 8441 §5.2). Clients that send `Sec-WebSocket-Protocol` expect the
     // server to confirm the selected value; dropping it breaks
     // subprotocol-based dispatch in application code.
-    if let Some(proto) = backend_handshake.negotiated_subprotocol.clone() {
+    if let Some(proto) = backend_handshake.negotiated_subprotocol().cloned() {
         ws_resp_builder = ws_resp_builder.header("sec-websocket-protocol", proto);
     }
-    let backend_ws_stream = backend_handshake.stream;
 
     // Inject sticky session cookie on WebSocket upgrade responses
     if sticky_cookie_needed
@@ -6902,28 +7180,60 @@ async fn handle_websocket_request_authenticated(
                 // this wrap and passes its own duplex adapter directly
                 // to `run_websocket_proxy`, which is now generic over
                 // the client transport type.
-                if let Err(e) = run_websocket_proxy(
-                    TokioIo::new(upgraded),
-                    backend_ws_stream,
-                    &proxy_id,
-                    ws_conn_id,
-                    ws_frame_plugins,
-                    ws_disconnect_plugins,
-                    session_meta,
-                    ws_connection_permit,
-                    max_ws_frame,
-                    ws_write_buf,
-                    ws_tunnel,
-                    // H1/H2: RFC 6455 / RFC 8441 mandate masked
-                    // client-to-server frames. The H3 caller in
-                    // `src/http3/websocket.rs` passes `true` for
-                    // RFC 9220 §5 compliance.
-                    false,
-                    ws_idle_tracker,
-                    &adaptive_buf,
-                )
-                .await
-                {
+                //
+                // `run_websocket_proxy` is also generic over the backend
+                // transport, so dispatch on the handshake variant: a direct
+                // TCP/TLS backend stream, or a mesh egress
+                // `WebSocketStream<H2ConnectTunnel>` over an Extended CONNECT
+                // tunnel. Both share the same frame relay and plugin pipeline.
+                let client_io = TokioIo::new(upgraded);
+                let relay_result = match backend_handshake {
+                    WsBackendHandshake::Direct(handshake) => {
+                        let handshake = *handshake;
+                        run_websocket_proxy(
+                            client_io,
+                            handshake.stream,
+                            &proxy_id,
+                            ws_conn_id,
+                            ws_frame_plugins,
+                            ws_disconnect_plugins,
+                            session_meta,
+                            ws_connection_permit,
+                            max_ws_frame,
+                            ws_write_buf,
+                            ws_tunnel,
+                            // H1/H2: RFC 6455 / RFC 8441 mandate masked
+                            // client-to-server frames. The H3 caller in
+                            // `src/http3/websocket.rs` passes `true` for
+                            // RFC 9220 §5 compliance.
+                            false,
+                            ws_idle_tracker,
+                            &adaptive_buf,
+                        )
+                        .await
+                    }
+                    WsBackendHandshake::Mesh(handshake) => {
+                        let handshake = *handshake;
+                        run_websocket_proxy(
+                            client_io,
+                            handshake.stream,
+                            &proxy_id,
+                            ws_conn_id,
+                            ws_frame_plugins,
+                            ws_disconnect_plugins,
+                            session_meta,
+                            ws_connection_permit,
+                            max_ws_frame,
+                            ws_write_buf,
+                            ws_tunnel,
+                            false,
+                            ws_idle_tracker,
+                            &adaptive_buf,
+                        )
+                        .await
+                    }
+                };
+                if let Err(e) = relay_result {
                     error!("WebSocket proxying error for {}: {}", proxy_id, e);
                 }
             }
@@ -7352,6 +7662,41 @@ pub(crate) struct BackendWsHandshake {
     pub negotiated_subprotocol: Option<hyper::header::HeaderValue>,
 }
 
+/// Backend WebSocket transport for a mesh egress session: the raw WebSocket
+/// frame stream carried over an HTTP/2 Extended CONNECT (RFC 8441) byte tunnel
+/// (`H2ConnectTunnel`), wrapped in the byte-level idle adapter beneath the
+/// framer exactly like the TCP/TLS backend path. The tunnel already rides
+/// SVID-mTLS (Sidecar `:15006`) or HBONE (Ambient `:15008`); there is no second
+/// TLS layer.
+type MeshBackendWsStream = WebSocketStream<WsActivityIo<crate::proxy::hbone_pool::H2ConnectTunnel>>;
+
+pub(crate) struct MeshBackendWsHandshake {
+    pub stream: MeshBackendWsStream,
+    pub negotiated_subprotocol: Option<hyper::header::HeaderValue>,
+}
+
+/// Unified backend WebSocket handshake: either a direct TCP/TLS upgrade (the
+/// pre-mesh / non-mesh path) or a mesh egress Extended CONNECT tunnel (Sidecar
+/// mesh-mTLS or Ambient HBONE). Both feed the SAME generic `run_websocket_proxy`
+/// frame relay — only the backend transport type differs, so the session spawn
+/// dispatches on the variant.
+pub(crate) enum WsBackendHandshake {
+    // Both variants are boxed: the direct TCP/TLS handshake is ~1.4 KB and the
+    // mesh tunnel ~0.4 KB, so boxing keeps the enum (and every WS dispatch that
+    // names it) pointer-sized.
+    Direct(Box<BackendWsHandshake>),
+    Mesh(Box<MeshBackendWsHandshake>),
+}
+
+impl WsBackendHandshake {
+    fn negotiated_subprotocol(&self) -> Option<&hyper::header::HeaderValue> {
+        match self {
+            Self::Direct(handshake) => handshake.negotiated_subprotocol.as_ref(),
+            Self::Mesh(handshake) => handshake.negotiated_subprotocol.as_ref(),
+        }
+    }
+}
+
 /// Connect to backend WebSocket server before sending 101 to client.
 /// Returns the connected backend stream + negotiated handshake metadata,
 /// or an error if the backend is unreachable.
@@ -7452,6 +7797,256 @@ pub(crate) async fn connect_websocket_backend(
         stream: backend_ws_stream,
         negotiated_subprotocol,
     })
+}
+
+/// The mesh egress transport a WebSocket upgrade should ride, derived from the
+/// LB-selected upstream target's tags. `None` means the target is not mesh-egress
+/// tagged, so the ordinary direct TCP/TLS WebSocket path is used.
+enum MeshWsEgress {
+    /// Sidecar SVID-mTLS (`mesh.mtls`): dial the peer sidecar's inbound mTLS
+    /// listener over a fresh mesh-mTLS H2 connection and RFC 8441 Extended
+    /// CONNECT (Sidecar materializes inbound WS routes).
+    SidecarMtls,
+    /// Ambient HBONE (`mesh.hbone`): dial the peer's `:15008` HBONE listener
+    /// over a fresh SVID-mTLS H2 connection and a BARE HBONE CONNECT byte tunnel
+    /// to the workload's app addr:port, then an inner H1 WebSocket handshake
+    /// THROUGH the tunnel — Ambient/Waypoint materialize NO inbound routes, so
+    /// the transparent HBONE relay (bare-CONNECT-gated) byte-copies the upgrade
+    /// to the loopback app (an Extended CONNECT to `:15008` would 404).
+    AmbientHbone,
+}
+
+/// Decide whether a WebSocket upgrade to `target` must ride a mesh egress
+/// transport, keyed purely on the target's transport tag. Returns `None` only
+/// for non-mesh targets (the direct TCP/TLS path applies). A mesh-tagged target
+/// is ALWAYS reported as mesh egress — even when the gateway SVID is missing —
+/// so the upgrade fails closed in `connect_mesh_websocket_backend` (where the
+/// pool errors `NoSvid` before any dial) rather than silently falling back to a
+/// plaintext dial of a `mesh.mtls`/`mesh.hbone` destination. This is the
+/// WebSocket analogue of the `supports_mesh_mtls_backend` / `supports_hbone_backend`
+/// fail-closed contract, but the SVID/capability check is deferred to the dial
+/// because returning `None` here would route to the plaintext path.
+fn websocket_mesh_egress(target: &UpstreamTarget) -> Option<MeshWsEgress> {
+    if mesh_mtls_pool::target_mesh_mtls_enabled(target) {
+        Some(MeshWsEgress::SidecarMtls)
+    } else if hbone_pool::target_hbone_enabled(target) {
+        Some(MeshWsEgress::AmbientHbone)
+    } else {
+        None
+    }
+}
+
+/// Open a backend WebSocket transport over a mesh egress tunnel for a
+/// `mesh.mtls`-tagged (Sidecar) or `mesh.hbone`-tagged (Ambient) destination.
+/// The returned stream carries raw WebSocket frames over the SVID-mTLS / HBONE
+/// byte tunnel; the destination bridges/relays it to the local app's WebSocket
+/// (transport-agnostic on the destination side — no peer change needed).
+///
+/// **The two topologies ride DIFFERENT inbound primitives** (this is the trap
+/// the original implementation fell into):
+///
+///   * **Sidecar (`mesh.mtls`)** — an **RFC 8441 Extended CONNECT**
+///     (`:protocol=websocket`) on the peer's `:15006` mTLS listener. Sidecar
+///     materializes inbound WebSocket routes, so its `:15006` listener
+///     (`enable_connect_protocol`) recognizes the Extended CONNECT as a
+///     client-originated upgrade and bridges it to the local app. The Extended
+///     CONNECT 200 IS the WS upgrade, so the tunnel is the raw frame transport
+///     directly (no inner H1 handshake).
+///   * **Ambient/Waypoint (`mesh.hbone`)** — a **BARE HBONE CONNECT byte tunnel**
+///     to the destination workload's app addr:port, then an INNER HTTP/1.1
+///     WebSocket handshake spoken THROUGH the tunnel. Ambient/Waypoint
+///     materialize NO inbound routes; the route-miss transparent-relay fallback
+///     (`build_inbound_hbone_relay_proxy`) is gated on a BARE CONNECT
+///     (`is_connect_request` requires `:protocol` ABSENT), so a `:protocol=
+///     websocket` Extended CONNECT to `:15008` would 404 before any WS handler
+///     runs. Instead we open the same byte tunnel raw-TCP egress uses and run a
+///     client WebSocket handshake over it; the destination's transparent HBONE
+///     relay byte-copies the upgrade to the loopback app, which performs the WS
+///     handshake. This makes Ambient WS egress actually work end-to-end.
+///
+/// For Sidecar the connection is dialed to the peer's pod address + `:15006`,
+/// while the Extended CONNECT `:authority` is the SERVICE routing key the peer's
+/// inbound route matches on — computed exactly like `proxy_to_backend_mesh_mtls`'s
+/// inner `:authority`: the preserved client `Host` (the egress route sets
+/// `preserve_host_header`), rewritten to `<host>:<service_port>` for a
+/// multi-port Sidecar destination (`mesh.mtls_authority_port`), or the dial
+/// authority (`<target.host>:<target.port>`) when no client Host is available.
+/// For Ambient the bare CONNECT `:authority` IS the dial app addr:port
+/// (`<target.host>:<target.port>`) the relay byte-copies to, and the SERVICE
+/// `:authority` rides the inner H1 `Host` header instead. `path_and_query` (the
+/// client's `:path`) is preserved on both transports.
+///
+/// Identity is PINNED via `mesh.spiffe_id` (mandatory for `mesh.mtls`; carried
+/// when present for `mesh.hbone`). Fails closed: a missing gateway SVID, an
+/// absent/invalid pinned identity, a peer that never negotiated Extended CONNECT
+/// (Sidecar), or a relay/handshake failure (Ambient) errors instead of falling
+/// back to a plaintext dial.
+#[allow(clippy::too_many_arguments)]
+async fn connect_mesh_websocket_backend(
+    state: &ProxyState,
+    proxy: &Proxy,
+    target: &UpstreamTarget,
+    egress: &MeshWsEgress,
+    client_host: Option<&str>,
+    path_and_query: &str,
+    client_headers: &[(String, String)],
+    max_websocket_frame_size_bytes: usize,
+    websocket_write_buffer_size: usize,
+    idle_tracker: Option<Arc<WsIdleTracker>>,
+) -> Result<MeshBackendWsHandshake, Box<dyn std::error::Error + Send + Sync>> {
+    let mut ws_config = WebSocketConfig::default();
+    ws_config.max_frame_size = Some(max_websocket_frame_size_bytes);
+    ws_config.max_message_size = Some(max_websocket_frame_size_bytes.saturating_mul(4));
+    ws_config.write_buffer_size = websocket_write_buffer_size;
+
+    match egress {
+        MeshWsEgress::SidecarMtls => {
+            // Compute the Extended CONNECT `:authority` the destination routes
+            // on, mirroring `proxy_to_backend_mesh_mtls`'s inner `:authority`
+            // BYTE-FOR-BYTE so the WS path and HTTP path are interchangeable on
+            // the peer:
+            //   * preserve-host + multi-port Sidecar → `<client_host>:<service_port>`
+            //     (`mesh_mtls_request_authority`, the rewrite tag the peer's
+            //     per-port inbound siblings disambiguate by — `:15006` dials are
+            //     direct/never NATed);
+            //   * preserve-host + single-port → the client Host VERBATIM (incl.
+            //     any explicit port, and NO port when the client sent none —
+            //     matching the HTTP single-port path exactly);
+            //   * otherwise → the dial authority (`<target.host>:<target.port>`).
+            let authority = match client_host {
+                Some(host) if proxy.preserve_host_header && !host.is_empty() => {
+                    match mesh_mtls_pool::target_mesh_mtls_authority_port(target) {
+                        Some(service_port) => mesh_mtls_request_authority(host, service_port),
+                        None => host.to_string(),
+                    }
+                }
+                _ => hbone_pool::authority_for_host_port(&target.host, target.port),
+            };
+            let expected_peer = mesh_mtls_pool::target_mesh_mtls_expected_peer(target)?;
+            let mtls_port = mesh_mtls_pool::target_mesh_mtls_port(target);
+            let ws_tunnel = state
+                .mesh_mtls_pool
+                .open_ws_connect_tunnel(
+                    proxy,
+                    &target.host,
+                    target.port,
+                    mtls_port,
+                    &authority,
+                    path_and_query,
+                    &expected_peer,
+                    client_headers,
+                )
+                .await?;
+
+            // The Extended CONNECT response (200) already confirmed the upgrade,
+            // so the tunnel IS the raw WebSocket frame transport — wrap it as a
+            // CLIENT-role framer directly (no inner H1 handshake). The byte-level
+            // idle adapter sits under the framer, matching the TCP/TLS path.
+            let stream = WebSocketStream::from_raw_socket(
+                WsActivityIo::new(ws_tunnel.tunnel, idle_tracker),
+                tokio_tungstenite::tungstenite::protocol::Role::Client,
+                Some(ws_config),
+            )
+            .await;
+
+            Ok(MeshBackendWsHandshake {
+                stream,
+                negotiated_subprotocol: ws_tunnel.negotiated_subprotocol,
+            })
+        }
+        MeshWsEgress::AmbientHbone => {
+            let expected_peer = hbone_pool::target_expected_peer_spiffe(target)?;
+            let hbone_port = hbone_pool::target_hbone_port(target);
+            // Bare HBONE byte tunnel to the destination workload's app addr:port
+            // (the CONNECT `:authority` the relay byte-copies to) — NOT an
+            // Extended CONNECT (see this fn's doc comment + `get_ws_byte_tunnel`).
+            let tunnel = state
+                .hbone_pool
+                .get_ws_byte_tunnel(
+                    proxy,
+                    &target.host,
+                    hbone_port,
+                    &target.host,
+                    target.port,
+                    expected_peer.as_ref(),
+                )
+                .await?;
+
+            // Speak the WebSocket THROUGH the byte tunnel with an inner H1
+            // client handshake (`Sec-WebSocket-Key`/`Upgrade`/`Connection`,
+            // which tungstenite generates). The SERVICE `:authority` the
+            // destination's app routes on rides the inner `Host` header
+            // (mirroring `proxy_to_backend_hbone`, which forwards the client
+            // Host over the relay); `path_and_query` is the preserved client
+            // `:path`. The relay forwards these plaintext bytes to the loopback
+            // app, which completes the upgrade.
+            let inner_host = match client_host {
+                Some(host) if proxy.preserve_host_header && !host.is_empty() => host.to_string(),
+                _ => hbone_pool::authority_for_host_port(&target.host, target.port),
+            };
+            let ws_url = format!("ws://{inner_host}{path_and_query}");
+            let mut ws_request = ws_url.into_client_request()?;
+            // Force the routing Host the destination app matches on (the URL
+            // host already sets it, but be explicit for bracketed-IPv6 / port
+            // forms and to mirror the HTTP relay's preserved Host).
+            ws_request.headers_mut().insert(
+                hyper::header::HOST,
+                hyper::header::HeaderValue::from_str(&inner_host)?,
+            );
+            for (name, value) in client_headers {
+                if let (Ok(header_name), Ok(header_value)) = (
+                    hyper::header::HeaderName::from_bytes(name.as_bytes()),
+                    hyper::header::HeaderValue::from_str(value),
+                ) {
+                    ws_request.headers_mut().append(header_name, header_value);
+                }
+            }
+
+            // Bound the inner handshake by the per-proxy connect budget: a relay
+            // that wires the tunnel but whose app never answers the upgrade must
+            // not stall the WS dispatch indefinitely. A timeout is a pre-wire
+            // setup failure (the upgrade never completed), surfaced as a
+            // `HbonePoolError::ConnectStream` so the WS failure handler keeps
+            // connect-failure semantics via `classify_boxed_setup_error`'s
+            // `HbonePoolError` downcast.
+            let connect_timeout =
+                std::time::Duration::from_millis(proxy.backend_connect_timeout_ms);
+            let handshake_authority =
+                hbone_pool::authority_for_host_port(&target.host, target.port);
+            let (stream, response) = match tokio::time::timeout(
+                connect_timeout,
+                client_async_with_config(
+                    ws_request,
+                    WsActivityIo::new(tunnel, idle_tracker),
+                    Some(ws_config),
+                ),
+            )
+            .await
+            {
+                Ok(result) => result?,
+                Err(_) => {
+                    return Err(Box::new(hbone_pool::HbonePoolError::ConnectStream {
+                        authority: handshake_authority,
+                        message: format!(
+                            "timed out after {}ms waiting for HBONE WebSocket inner handshake \
+                             response",
+                            proxy.backend_connect_timeout_ms
+                        ),
+                    }));
+                }
+            };
+
+            let negotiated_subprotocol = response
+                .headers()
+                .get(hyper::header::SEC_WEBSOCKET_PROTOCOL)
+                .cloned();
+
+            Ok(MeshBackendWsHandshake {
+                stream,
+                negotiated_subprotocol,
+            })
+        }
+    }
 }
 
 /// Run bidirectional WebSocket proxying between upgraded client and connected backend.
@@ -7792,9 +8387,9 @@ where
 /// on the H3 path; strict RFC 9220 §5 enforcement (close 1002 on a
 /// masked H3 frame) is a future-work follow-up.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn run_websocket_proxy<C>(
+pub(crate) async fn run_websocket_proxy<C, B>(
     client_io: C,
-    backend_ws_stream: BackendWsStream,
+    backend_ws_stream: WebSocketStream<B>,
     proxy_id: &str,
     connection_id: u64,
     ws_frame_plugins: Vec<Arc<dyn Plugin>>,
@@ -7810,6 +8405,13 @@ pub(crate) async fn run_websocket_proxy<C>(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    // Generic over the backend transport so the H1/H2/H3 paths (a TCP/TLS
+    // backend stream via `connect_websocket_backend`) and the Sidecar/Ambient
+    // mesh egress paths (a `WebSocketStream<H2ConnectTunnel>` over an Extended
+    // CONNECT byte tunnel) share one frame relay. The tunnel-mode raw-copy
+    // fast path is H1-only; both transports satisfy the bound, so the early
+    // return below stays generic.
+    B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     // Invariant: the tunnel-mode raw-copy fast path is only reachable from H1
     // frontends. RFC 6455 (H1.1) and RFC 8441 (H2 Extended CONNECT) mandate
@@ -7852,9 +8454,20 @@ where
         // carried WebSocket frame bytes in the same TCP segment as the 101
         // Switching Protocols response, tungstenite may have already pulled
         // those bytes into its internal read buffer during handshake parsing,
-        // and `into_inner()` will drop them. Deployments where the backend
-        // sends immediately after upgrade should use frame-parsing mode (set
-        // a frame-level plugin or disable `FERRUM_WEBSOCKET_TUNNEL_MODE`).
+        // and `into_inner()` will drop them. This residual is NOT recoverable
+        // through tokio-tungstenite's public API: `WebSocketStream::into_inner`
+        // / `get_ref` only expose the underlying socket, and the codec's
+        // `in_buffer` (`tungstenite::protocol::frame::FrameCodec`) is reachable
+        // only through the private `WebSocket.context` field — verified against
+        // the pinned 0.29 release and upstream `master`. Fully recovering it
+        // would require hand-rolling the backend HTTP/1.1 Upgrade (so the
+        // gateway owns the read buffer) or vendoring a tungstenite patch that
+        // exposes the tail; both are out of scope for this fast path. The risk
+        // is surfaced operationally by `warn_if_websocket_tunnel_mode_frame_loss_risk`,
+        // which logs a one-time startup `warn!` when tunnel mode is enabled.
+        // Deployments where the backend sends immediately after upgrade should
+        // use frame-parsing mode (set a frame-level plugin or disable
+        // `FERRUM_WEBSOCKET_TUNNEL_MODE`).
         let backend = backend_ws_stream.into_inner();
         let buf_size = adaptive_buffer.get_buffer_size(proxy_id);
         let copy_result = tcp_proxy::bidirectional_copy_for_relay(
@@ -10434,7 +11047,16 @@ async fn handle_proxy_request_inner(
                 ctx.orig_dst.map(|addr| addr.port()),
                 authority_port,
             ) {
-                Ok(rm) => Some(rm),
+                Ok((rm, ingress_authz_port)) => {
+                    // F6 §6.2 (security): for a Sidecar `ingress[]` route, stamp
+                    // the DECLARED listener port so `mesh_authz` authorizes on it
+                    // (not the `defaultEndpoint` backend port the route forwards
+                    // to). `None` for service-port default inbound routes — they
+                    // authorize on the backend/container port (Istio inbound
+                    // authz). Stamped before the plugin chain runs.
+                    ctx.mesh_inbound_listener_authz_port = ingress_authz_port;
+                    Some(rm)
+                }
                 Err(reason) => {
                     debug!(
                         proxy_id = %representative_id.id,
@@ -11152,6 +11774,19 @@ async fn handle_proxy_request_inner(
                 warn!(
                     "WebSocket upgrade rejected: Origin '{}' not in allowed_ws_origins for proxy {}",
                     origin, proxy.id
+                );
+                // The circuit-breaker check above may have admitted this request
+                // as a HALF_OPEN probe. This origin reject happens before any
+                // backend dispatch, so release the claimed probe slot — otherwise
+                // repeated rejected origin probes leak `half_open_in_flight` slots
+                // and wedge the breaker. Mirrors the H3 origin reject in
+                // `src/http3/server.rs` and the other H1/H2 WebSocket gateway-side
+                // rejects (missing OnUpgrade, connection limits, backend admission).
+                release_circuit_breaker_probe_on_admission_reject(
+                    &state,
+                    &proxy,
+                    cb_target_key.as_deref(),
+                    cb_is_half_open_probe,
                 );
                 record_request(&state, 403);
                 return Ok(build_response(
@@ -12278,12 +12913,23 @@ async fn handle_proxy_request_inner(
                 let cl = response_headers
                     .get("content-length")
                     .and_then(|v| v.parse::<u64>().ok());
+                // gRPC streaming body deadline: the post-plugin `grpc-timeout`
+                // (uncapped), with `backend_read_timeout_ms` as the fallback only
+                // when the client set no deadline (see
+                // `grpc_proxy::streaming_effective_timeout_ms`). The gRPC deadline
+                // otherwise bounds only the response-header wait, so without this
+                // a backend that streams headers then stalls would pin the
+                // streaming guards until the client disconnects. `0` (no client
+                // deadline and no operator fallback) leaves long-lived server/bidi
+                // streams that legitimately idle between messages unbounded.
+                let grpc_stream_read_timeout_ms = grpc_streaming.response_read_timeout_ms;
                 let body = if state.response_buffer_cutoff_bytes == 0
                     && state.max_response_body_size_bytes == 0
                 {
                     crate::proxy::body::direct_streaming_h2_body_strip_hop_by_hop_trailers(
                         grpc_streaming.body,
                         cl,
+                        grpc_stream_read_timeout_ms,
                     )
                 } else if state.max_response_body_size_bytes > 0 {
                     crate::proxy::body::size_limited_coalescing_h2_body_strip_hop_by_hop_trailers(
@@ -12291,12 +12937,14 @@ async fn handle_proxy_request_inner(
                         state.max_response_body_size_bytes,
                         cl,
                         state.h2_coalesce_target_bytes,
+                        grpc_stream_read_timeout_ms,
                     )
                 } else {
                     crate::proxy::body::coalescing_h2_body_strip_hop_by_hop_trailers(
                         grpc_streaming.body,
                         cl,
                         state.h2_coalesce_target_bytes,
+                        grpc_stream_read_timeout_ms,
                     )
                 };
                 let mut body = if let Some(logger) = deferred_grpc_logger {
@@ -12467,17 +13115,11 @@ async fn handle_proxy_request_inner(
                 // not feed plugins (or the wire) the bogus header copy, so
                 // the trailing value wins in the view and the header copy is
                 // stripped on the non-empty wire path below.
-                let mut plugin_response_headers = response_headers.clone();
-                let mut header_shadowed_trailer_keys: HashSet<String> = HashSet::new();
-                for (k, v) in &response_trailers {
-                    if response_headers.contains_key(k)
-                        && !grpc_proxy::is_reserved_grpc_terminal_metadata(k)
-                    {
-                        header_shadowed_trailer_keys.insert(k.clone());
-                    } else {
-                        plugin_response_headers.insert(k.clone(), v.clone());
-                    }
-                }
+                let (mut plugin_response_headers, header_shadowed_trailer_keys) =
+                    grpc_proxy::build_grpc_plugin_header_view(
+                        &response_headers,
+                        &response_trailers,
+                    );
 
                 // after_proxy hooks
                 let mut after_proxy_rejected = false;
@@ -12690,19 +13332,12 @@ async fn handle_proxy_request_inner(
                     // hook left it untouched, keep the backend's true trailer
                     // value (faithful split wire shape). Removal of a shadowed
                     // key still suppresses the hidden trailer.
-                    response_trailers.retain(|k, v| match plugin_response_headers.get(k) {
-                        Some(plugin_value) => {
-                            if header_shadowed_trailer_keys.contains(k) {
-                                if response_headers.get(k) != Some(plugin_value) {
-                                    *v = plugin_value.clone();
-                                }
-                            } else if plugin_value != v {
-                                *v = plugin_value.clone();
-                            }
-                            true
-                        }
-                        None => false,
-                    });
+                    grpc_proxy::reconcile_grpc_trailers_from_view(
+                        &mut response_trailers,
+                        &plugin_response_headers,
+                        &response_headers,
+                        &header_shadowed_trailer_keys,
+                    );
                     response_headers = plugin_response_headers;
                 }
                 if response_body.is_empty() {
@@ -14099,6 +14734,7 @@ async fn handle_proxy_request_inner(
                 crate::proxy::body::direct_streaming_h2_body_strip_hop_by_hop_trailers(
                     resp.into_body(),
                     cl,
+                    proxy.backend_read_timeout_ms,
                 )
             } else if state.max_response_body_size_bytes > 0 && cl.is_none() {
                 // No Content-Length — enforce response-size limits while
@@ -14109,6 +14745,7 @@ async fn handle_proxy_request_inner(
                     state.max_response_body_size_bytes,
                     cl,
                     state.h2_coalesce_target_bytes,
+                    proxy.backend_read_timeout_ms,
                 )
             } else if use_passthrough {
                 // Response too large to benefit from coalescing — stream
@@ -14119,12 +14756,14 @@ async fn handle_proxy_request_inner(
                 crate::proxy::body::direct_streaming_h2_body_strip_hop_by_hop_trailers(
                     resp.into_body(),
                     cl,
+                    proxy.backend_read_timeout_ms,
                 )
             } else {
                 crate::proxy::body::coalescing_h2_body_strip_hop_by_hop_trailers(
                     resp.into_body(),
                     cl,
                     state.h2_coalesce_target_bytes,
+                    proxy.backend_read_timeout_ms,
                 )
             };
             let mut body = body.with_lb_connection_guard(lb_connection_guard);
@@ -18346,7 +18985,12 @@ async fn proxy_to_backend_http3(
                             )
                             .await
                             {
-                                Ok(body) => body,
+                                // Trailers (issue #1630) are not forwarded on this
+                                // H1/H2-frontend → H3-backend path: emitting them to
+                                // an H1/H2 client needs chunked-trailer / trailers-
+                                // frame machinery that is out of scope. Discard the
+                                // trailer slot the drain helper now returns.
+                                Ok((body, _trailers)) => body,
                                 Err(crate::http3::client::H3BodyDrainError::ResponseTooLarge {
                                     ..
                                 }) => {
@@ -18812,12 +19456,18 @@ async fn proxy_to_backend_http3(
 
         match h3_result {
             Ok(response) => {
-                debug!(proxy_id = %proxy.id, status = response.0, "HTTP/3 backend request successful");
+                debug!(proxy_id = %proxy.id, status = response.status, "HTTP/3 backend request successful");
+                // Backend trailers (`response.trailers`) are intentionally
+                // dropped on this H1/H2-frontend → H3-backend path: forwarding
+                // them would require H1 chunked-trailer / H2 trailers-frame
+                // emission on the client side, which is out of scope for issue
+                // #1630 (limited to the plain H3-frontend → H3-backend buffered
+                // path). The H3-frontend buffered path forwards them.
                 (
                     retry::BackendResponse {
-                        status_code: response.0,
-                        body: ResponseBody::Buffered(response.1),
-                        headers: response.2,
+                        status_code: response.status,
+                        body: ResponseBody::Buffered(response.body),
+                        headers: response.headers,
                         connection_error: false,
                         backend_resolved_ip: resolved_ip,
                         error_class: None,
@@ -19242,7 +19892,7 @@ async fn proxy_to_backend_http3_retry(
         Ok(response) => {
             debug!(
                 proxy_id = %proxy.id,
-                status = response.0,
+                status = response.status,
                 "HTTP/3 backend retry request successful"
             );
             // Belt-and-suspenders size guard. The H3 pool enforces this while
@@ -19250,11 +19900,11 @@ async fn proxy_to_backend_http3_retry(
             // full buffering; keep this post-return check to protect future
             // alternate H3 collection paths.
             if state.max_response_body_size_bytes > 0
-                && response.1.len() > state.max_response_body_size_bytes
+                && response.body.len() > state.max_response_body_size_bytes
             {
                 warn!(
                     "Backend response body ({} bytes) exceeds limit ({} bytes)",
-                    response.1.len(),
+                    response.body.len(),
                     state.max_response_body_size_bytes
                 );
                 return retry::BackendResponse {
@@ -19270,10 +19920,14 @@ async fn proxy_to_backend_http3_retry(
                     error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
                 };
             }
+            // Backend trailers (`response.trailers`) are dropped here for the
+            // same reason as the non-retry H1/H2-frontend → H3-backend path:
+            // emitting them to an H1/H2 client needs chunked-trailer / trailers-
+            // frame machinery that is out of scope for issue #1630.
             retry::BackendResponse {
-                status_code: response.0,
-                body: ResponseBody::Buffered(response.1),
-                headers: response.2,
+                status_code: response.status,
+                body: ResponseBody::Buffered(response.body),
+                headers: response.headers,
                 connection_error: false,
                 backend_resolved_ip: resolved_ip,
                 error_class: None,
@@ -23907,6 +24561,109 @@ mod tests {
             "valid config must be swapped into hot state"
         );
         assert_eq!(post.proxies[0].id, "p1");
+    }
+
+    /// Codex F7.2 round-5, finding 3: a config update whose ONLY change is the
+    /// `mesh` block (no proxy / upstream / consumer / plugin delta) must still
+    /// republish the request epoch, so request-time readers of
+    /// `request_epoch.config.mesh` (e.g. the inbound HBONE relay destination
+    /// guard, the mesh service discoverer) observe the new endpoints. Before the
+    /// fix, the empty-`ConfigDelta` path updated only `ProxyState.config` (the
+    /// ArcSwap the request path does NOT read for mesh) and left
+    /// `request_epoch.config` stale.
+    #[tokio::test]
+    async fn update_config_mesh_only_change_republishes_request_epoch() {
+        use crate::identity::spiffe::{SpiffeId, TrustDomain};
+        use crate::modes::mesh::config::{MeshConfig, Workload, WorkloadSelector};
+
+        fn remote_workload(addr: &str) -> Workload {
+            Workload {
+                spiffe_id: SpiffeId::new("spiffe://remote.local/ns/default/sa/reviews".to_string())
+                    .unwrap(),
+                selector: WorkloadSelector::default(),
+                service_name: "reviews".to_string(),
+                addresses: vec![addr.to_string()],
+                ports: vec![],
+                trust_domain: TrustDomain::new("remote.local").unwrap(),
+                namespace: "default".to_string(),
+                network: None,
+                cluster: Some("remote".to_string()),
+                weight: None,
+                locality: None,
+                service_account: None,
+                pod_uid: None,
+            }
+        }
+
+        // The SAME proxy instance backs both configs, so its `id`/`updated_at`
+        // are identical and `ConfigDelta` reports no proxy change — isolating the
+        // mesh-only delta path.
+        let proxy = make_validation_proxy("p1", "/api");
+        let mut config_v1 = make_validation_config(vec![proxy.clone()]);
+        let mut mesh_v1 = MeshConfig::default();
+        mesh_v1.workloads.push(remote_workload("10.2.0.1"));
+        config_v1.mesh = Some(Box::new(mesh_v1));
+
+        let state = make_test_proxy_state(GatewayConfig::default());
+        assert!(state.update_config(config_v1), "initial apply succeeds");
+        let epoch_v1 = state.request_epoch.load();
+        assert_eq!(
+            epoch_v1
+                .config
+                .mesh
+                .as_ref()
+                .map(|m| m.workloads.len())
+                .unwrap_or(0),
+            1,
+            "initial mesh workload is in the request epoch"
+        );
+
+        // v2: identical proxy (same instance → same `updated_at`, so no proxy
+        // delta), mesh block gains a second remote workload. `Proxy::updated_at`
+        // defaults to `Utc::now()` on deserialize, so the proxy MUST be cloned
+        // rather than rebuilt to keep `ConfigDelta` from seeing a proxy change.
+        let mut mesh_v2 = MeshConfig::default();
+        mesh_v2.workloads.push(remote_workload("10.2.0.1"));
+        mesh_v2.workloads.push(remote_workload("10.2.0.2"));
+        let mut config_v2 = make_validation_config(vec![proxy.clone()]);
+        config_v2.mesh = Some(Box::new(mesh_v2));
+
+        assert!(
+            state.update_config(config_v2),
+            "a mesh-only change must report applied=true (epoch republished)"
+        );
+        let epoch_v2 = state.request_epoch.load();
+        assert_eq!(
+            epoch_v2
+                .config
+                .mesh
+                .as_ref()
+                .map(|m| m.workloads.len())
+                .unwrap_or(0),
+            2,
+            "the request epoch's config.mesh must carry the new endpoint set, not the stale one"
+        );
+        assert!(
+            !Arc::ptr_eq(&epoch_v1, &epoch_v2),
+            "a real mesh change must publish a NEW request epoch"
+        );
+
+        // Re-applying an equivalent config (same cloned proxy, same mesh) must
+        // NOT republish: the epoch pointer is unchanged and update_config
+        // returns false.
+        let mut mesh_again = MeshConfig::default();
+        mesh_again.workloads.push(remote_workload("10.2.0.1"));
+        mesh_again.workloads.push(remote_workload("10.2.0.2"));
+        let mut config_v2_again = make_validation_config(vec![proxy]);
+        config_v2_again.mesh = Some(Box::new(mesh_again));
+        assert!(
+            !state.update_config(config_v2_again),
+            "an identical mesh + proxy config is a genuine no-op"
+        );
+        assert!(
+            Arc::ptr_eq(&epoch_v2, &state.request_epoch.load()),
+            "a no-op apply must not republish the request epoch"
+        );
     }
 
     // ── DestinationRule per-port connect-timeout dispatch wiring ──────────

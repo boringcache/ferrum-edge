@@ -54,6 +54,7 @@ fn runtime() -> MeshRuntimeConfig {
         workload_svid_trust_bundle_path: None,
         ca_backend: ferrum_edge::identity::ca::CaBackend::None,
         egress_stream_enabled: false,
+        egress_stream_allow_plaintext: false,
         request_auth_require_exp: true,
     }
 }

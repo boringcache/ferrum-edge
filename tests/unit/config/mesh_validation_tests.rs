@@ -3,12 +3,13 @@
 use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain};
 use ferrum_edge::modes::mesh::config::{
-    AppProtocol, ConditionMatch, EastWestGateway, JwtHeader, MeshConfig, MeshDestinationRule,
-    MeshEndpoint, MeshJwtRule, MeshPolicy, MeshRequestAuthentication, MeshRule, MeshService,
-    MeshSidecar, MeshSidecarEgress, MeshSubset, MeshTrafficPolicy, MtlsMode, MultiClusterConfig,
-    ParsedCidr, PeerAuthentication, PolicyAction, PolicyScope, PrincipalMatch, RemoteCluster,
-    RequestMatch, Resolution, ServiceEntry, ServiceEntryLocation, ServicePort, TrustBundle,
-    TrustBundleSet, Workload, WorkloadPort, WorkloadRef, WorkloadSelector, validate_mesh_config,
+    AppProtocol, ConditionMatch, EastWestGateway, IngressListenerUnsupported, JwtHeader,
+    MeshConfig, MeshDestinationRule, MeshEndpoint, MeshJwtRule, MeshPolicy,
+    MeshRequestAuthentication, MeshRule, MeshService, MeshSidecar, MeshSidecarEgress,
+    MeshSidecarIngress, MeshSubset, MeshTrafficPolicy, MtlsMode, MultiClusterConfig, ParsedCidr,
+    PeerAuthentication, PolicyAction, PolicyScope, PrincipalMatch, RemoteCluster, RequestMatch,
+    Resolution, ServiceEntry, ServiceEntryLocation, ServicePort, TrustBundle, TrustBundleSet,
+    Workload, WorkloadPort, WorkloadRef, WorkloadSelector, validate_mesh_config,
 };
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -213,6 +214,8 @@ fn mesh_config_validate_rejects_zero_ports_on_full_mesh_resources() {
                 hosts: vec!["./*".into()],
                 port: Some(0),
             }],
+            ingress_declared: false,
+            ingress: Vec::new(),
         }],
         ..MeshConfig::default()
     };
@@ -261,6 +264,8 @@ fn mesh_config_validate_rejects_empty_destination_rule_and_sidecar_fields() {
                     port: None,
                 },
             ],
+            ingress_declared: false,
+            ingress: Vec::new(),
         }],
         ..MeshConfig::default()
     };
@@ -951,6 +956,8 @@ fn sidecar_host_pattern_accepts_valid_patterns() {
                     hosts: vec![pattern.to_string()],
                     port: None,
                 }],
+                ingress_declared: false,
+                ingress: Vec::new(),
             }],
             ..MeshConfig::default()
         };
@@ -1068,4 +1075,294 @@ fn parsed_cidr_bare_ip_treated_as_host_route() {
     let other: IpAddr = "192.168.1.2".parse().unwrap();
     assert!(cidr_v4.contains(exact));
     assert!(!cidr_v4.contains(other));
+}
+
+// ── Sidecar ingress[] listener resolution (F6 §6.2) ──────────────────────
+
+fn ingress_entry(port: u16, protocol: AppProtocol, endpoint: &str) -> MeshSidecarIngress {
+    MeshSidecarIngress {
+        port,
+        protocol,
+        name: None,
+        bind: None,
+        default_endpoint: endpoint.to_string(),
+    }
+}
+
+#[test]
+fn ingress_resolve_accepts_loopback_v4_endpoint() {
+    let resolved = ingress_entry(8443, AppProtocol::Http, "127.0.0.1:8080")
+        .resolve()
+        .expect("loopback v4 endpoint resolves");
+    assert_eq!(resolved.port, 8443);
+    assert_eq!(resolved.endpoint_host, "127.0.0.1");
+    assert_eq!(resolved.endpoint_port, 8080);
+}
+
+#[test]
+fn ingress_resolve_maps_unspecified_v4_to_loopback() {
+    // 0.0.0.0 (instance IP) maps to loopback for a co-located sidecar app.
+    let resolved = ingress_entry(8443, AppProtocol::Http2, "0.0.0.0:9090")
+        .resolve()
+        .expect("0.0.0.0 endpoint resolves to loopback");
+    assert_eq!(resolved.endpoint_host, "127.0.0.1");
+    assert_eq!(resolved.endpoint_port, 9090);
+}
+
+#[test]
+fn ingress_resolve_preserves_v6_address_family() {
+    let resolved = ingress_entry(8443, AppProtocol::Grpc, "[::1]:7000")
+        .resolve()
+        .expect("v6 loopback resolves");
+    assert_eq!(resolved.endpoint_host, "::1");
+    assert_eq!(resolved.endpoint_port, 7000);
+    // The unspecified v6 address maps to ::1 too.
+    let resolved6 = ingress_entry(8443, AppProtocol::Http, "[::]:7000")
+        .resolve()
+        .expect("v6 unspecified resolves to loopback");
+    assert_eq!(resolved6.endpoint_host, "::1");
+}
+
+#[test]
+fn ingress_resolve_rejects_unknown_protocol() {
+    // Codex round-3 P2: a Sidecar `ingress[]` listener whose protocol is
+    // `AppProtocol::Unknown` must FAIL CLOSED (defer), not be routed as HTTP. On
+    // the native/file/xDS path `MeshSidecarIngress.protocol` deserializes
+    // directly: an OMITTED `protocol` falls back to `AppProtocol::default()`
+    // (`Unknown`) and an explicit `"unknown"` parses to `Unknown`. Either way the
+    // source did not declare a routable HTTP-family listener, so `resolve()`
+    // defers it as a non-HTTP listener — matching the K8s translator (which maps
+    // a missing/garbled protocol to a non-HTTP `AppProtocol`) and the documented
+    // fail-closed rule. This is independent of the service-port default path's
+    // `unknown → HTTP` convention (a separate predicate).
+    assert_eq!(
+        ingress_entry(8443, AppProtocol::Unknown, "127.0.0.1:8080").resolve(),
+        Err(IngressListenerUnsupported::NonHttpProtocol),
+        "an Unknown-protocol ingress listener must defer, never route as HTTP"
+    );
+}
+
+#[test]
+fn ingress_omitted_protocol_deserializes_to_unknown_then_defers() {
+    // Native/file/xDS parity with the K8s path: a Sidecar `ingress[]` entry that
+    // OMITS `protocol` must deserialize (the field is `#[serde(default)]`), land
+    // on `AppProtocol::Unknown`, and DEFER at `resolve()` — never be guessed onto
+    // the HTTP request path. Mirrors `sidecar_ingress_missing_protocol_is_deferred`
+    // on the K8s translator side.
+    let entry: MeshSidecarIngress = serde_json::from_value(serde_json::json!({
+        "port": 8443,
+        "default_endpoint": "127.0.0.1:8080"
+        // protocol intentionally omitted
+    }))
+    .expect("an omitted protocol must still deserialize (defaulted field)");
+    assert_eq!(
+        entry.protocol,
+        AppProtocol::Unknown,
+        "an omitted ingress protocol defaults to Unknown"
+    );
+    assert_eq!(
+        entry.resolve(),
+        Err(IngressListenerUnsupported::NonHttpProtocol),
+        "an omitted (Unknown) protocol defers fail-closed, it does not route"
+    );
+
+    // An explicit `"unknown"` string parses to `Unknown` and defers identically.
+    let explicit: MeshSidecarIngress = serde_json::from_value(serde_json::json!({
+        "port": 8443,
+        "protocol": "unknown",
+        "default_endpoint": "127.0.0.1:8080"
+    }))
+    .expect("an explicit unknown protocol deserializes");
+    assert_eq!(explicit.protocol, AppProtocol::Unknown);
+    assert_eq!(
+        explicit.resolve(),
+        Err(IngressListenerUnsupported::NonHttpProtocol)
+    );
+}
+
+#[test]
+fn ingress_resolved_listener_endpoint_revalidation() {
+    use ferrum_edge::modes::mesh::config::ResolvedIngressListener;
+    let valid = ResolvedIngressListener {
+        port: 8443,
+        endpoint_host: "127.0.0.1".to_string(),
+        endpoint_port: 8080,
+        owner_namespace: "default".to_string(),
+        owner_service: "reviews".to_string(),
+    };
+    assert!(valid.endpoint_is_valid(), "loopback v4 host:port is valid");
+
+    let v6 = ResolvedIngressListener {
+        endpoint_host: "::1".to_string(),
+        ..valid.clone()
+    };
+    assert!(v6.endpoint_is_valid(), "loopback v6 host:port is valid");
+
+    // Codex round-2 P2: a carried OFF-BOX host must fail re-validation.
+    let off_box = ResolvedIngressListener {
+        endpoint_host: "10.0.0.5".to_string(),
+        ..valid.clone()
+    };
+    assert!(
+        !off_box.endpoint_is_valid(),
+        "an off-box backend host must fail re-validation"
+    );
+
+    // A carried `:0` backend port fails.
+    let zero_backend = ResolvedIngressListener {
+        endpoint_port: 0,
+        ..valid.clone()
+    };
+    assert!(!zero_backend.endpoint_is_valid());
+
+    // A carried `:0` listener port fails.
+    let zero_listener = ResolvedIngressListener {
+        port: 0,
+        ..valid.clone()
+    };
+    assert!(!zero_listener.endpoint_is_valid());
+
+    // A non-IP / unparseable host fails.
+    let bogus_host = ResolvedIngressListener {
+        endpoint_host: "example.com".to_string(),
+        ..valid.clone()
+    };
+    assert!(!bogus_host.endpoint_is_valid());
+}
+
+#[test]
+fn ingress_resolve_rejects_unix_socket_endpoint() {
+    assert_eq!(
+        ingress_entry(8443, AppProtocol::Http, "unix:///var/run/app.sock").resolve(),
+        Err(IngressListenerUnsupported::UnixSocketEndpoint)
+    );
+}
+
+#[test]
+fn ingress_resolve_rejects_non_http_protocol() {
+    assert_eq!(
+        ingress_entry(8443, AppProtocol::Tcp, "127.0.0.1:8080").resolve(),
+        Err(IngressListenerUnsupported::NonHttpProtocol)
+    );
+    assert_eq!(
+        ingress_entry(8443, AppProtocol::Mongo, "127.0.0.1:8080").resolve(),
+        Err(IngressListenerUnsupported::NonHttpProtocol)
+    );
+}
+
+#[test]
+fn ingress_resolve_rejects_arbitrary_ip_endpoint() {
+    // Istio: "Arbitrary IPs are not supported." Ferrum's loopback-only model
+    // fails closed rather than dialing an off-box address.
+    assert_eq!(
+        ingress_entry(8443, AppProtocol::Http, "10.0.0.5:8080").resolve(),
+        Err(IngressListenerUnsupported::UnparseableEndpoint)
+    );
+}
+
+#[test]
+fn ingress_resolve_rejects_unparseable_and_portless_endpoints() {
+    assert_eq!(
+        ingress_entry(8443, AppProtocol::Http, "not-a-socket").resolve(),
+        Err(IngressListenerUnsupported::UnparseableEndpoint)
+    );
+    // host without a port
+    assert_eq!(
+        ingress_entry(8443, AppProtocol::Http, "127.0.0.1").resolve(),
+        Err(IngressListenerUnsupported::UnparseableEndpoint)
+    );
+    // zero endpoint port
+    assert_eq!(
+        ingress_entry(8443, AppProtocol::Http, "127.0.0.1:0").resolve(),
+        Err(IngressListenerUnsupported::ZeroPort)
+    );
+}
+
+#[test]
+fn ingress_resolve_rejects_zero_listener_port() {
+    assert_eq!(
+        ingress_entry(0, AppProtocol::Http, "127.0.0.1:8080").resolve(),
+        Err(IngressListenerUnsupported::ZeroPort)
+    );
+}
+
+#[test]
+fn ingress_omitted_default_endpoint_deserializes_then_defers() {
+    // F6 §6.2 (Finding 3): Istio treats `defaultEndpoint` as OPTIONAL. The
+    // native model must DESERIALIZE an entry that omits it (it must not be a
+    // required serde field), defaulting to the empty string, which then defers
+    // at `resolve()` — matching the K8s translation path (which fills an empty
+    // string for an omitted field).
+    let entry: MeshSidecarIngress = serde_json::from_value(serde_json::json!({
+        "port": 8443,
+        "protocol": "http"
+        // defaultEndpoint intentionally omitted
+    }))
+    .expect("an omitted defaultEndpoint must still deserialize (optional field)");
+    assert_eq!(
+        entry.default_endpoint, "",
+        "omitted endpoint defaults to empty"
+    );
+    assert_eq!(
+        entry.resolve(),
+        Err(IngressListenerUnsupported::UnparseableEndpoint),
+        "an empty defaultEndpoint defers (fail-closed), it is not a hard error"
+    );
+}
+
+#[test]
+fn validate_rejects_zero_ingress_port() {
+    // A zero listener port is structurally invalid. An empty/absent
+    // defaultEndpoint is NOT a hard error (Istio allows omitting it) — it is
+    // deferred and skipped at materialization.
+    let mesh = MeshConfig {
+        sidecars: vec![MeshSidecar {
+            name: "sc".into(),
+            namespace: "default".into(),
+            workload_selector: None,
+            egress_inherits_defaults: false,
+            egress: Vec::new(),
+            ingress_declared: false,
+            ingress: vec![
+                ingress_entry(0, AppProtocol::Http, "127.0.0.1:8080"),
+                ingress_entry(8443, AppProtocol::Http, ""),
+            ],
+        }],
+        ..MeshConfig::default()
+    };
+    let errors = mesh.validate();
+    assert!(
+        errors.iter().any(|e| e.contains("ingress[0].port")),
+        "zero ingress port must be a validation error: {errors:?}"
+    );
+    assert!(
+        !errors.iter().any(|e| e.contains("default_endpoint")),
+        "empty defaultEndpoint is deferred, not a validation error: {errors:?}"
+    );
+}
+
+#[test]
+fn validate_accepts_unsupported_ingress_shapes_for_deferral() {
+    // Unix sockets / non-HTTP protocols are NOT validation errors — they are
+    // accepted (and reported as deferred by the status writer), then skipped
+    // fail-closed at materialization.
+    let mesh = MeshConfig {
+        sidecars: vec![MeshSidecar {
+            name: "sc".into(),
+            namespace: "default".into(),
+            workload_selector: None,
+            egress_inherits_defaults: false,
+            egress: Vec::new(),
+            ingress_declared: false,
+            ingress: vec![
+                ingress_entry(8443, AppProtocol::Http, "unix:///var/run/app.sock"),
+                ingress_entry(9000, AppProtocol::Tcp, "127.0.0.1:9000"),
+            ],
+        }],
+        ..MeshConfig::default()
+    };
+    assert!(
+        mesh.validate().is_empty(),
+        "unsupported-but-well-formed ingress entries are accepted (deferred), not rejected"
+    );
 }

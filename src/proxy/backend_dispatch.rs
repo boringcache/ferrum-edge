@@ -215,23 +215,21 @@ pub(crate) fn select_upstream_target(
 
     let balancers = &epoch.load_balancer;
 
-    // Resolve the ejection cap from the upstream's passive health config.
+    // Resolve the ejection cap with the SAME precedence the passive-health
+    // thresholds use in `passive_health_for_target` (per-port > per-subset >
+    // upstream) so the cap and the thresholds are always drawn from one tier.
     let dispatch_port = initial_dispatch_port(
         proxy,
         LoadBalancerCache::initial_dispatch_port_override_from(balancers, upstream_id),
     );
     let has_port_override =
         has_effective_port_override(proxy, balancers, upstream_id, dispatch_port);
-    let max_ejection_percent = if has_port_override {
-        LoadBalancerCache::max_ejection_percent_for_port_from(
-            balancers,
-            upstream_id,
-            proxy,
-            dispatch_port,
-        )
-    } else {
-        LoadBalancerCache::max_ejection_percent_from(balancers, upstream_id)
-    };
+    let max_ejection_percent = LoadBalancerCache::max_ejection_percent_resolved_from(
+        balancers,
+        upstream_id,
+        proxy,
+        has_port_override.then_some(dispatch_port),
+    );
 
     let health_ctx = HealthContext {
         active_unhealthy: &state.health_checker.active_unhealthy_targets,
@@ -580,16 +578,19 @@ fn client_side_no_backend_signal(error_class: Option<ErrorClass>) -> bool {
 }
 
 /// A post-wire backend failure: the request reached the backend's application
-/// layer (response headers already arrived) and then the response stalled or the
-/// transport broke before the body/trailers completed.
+/// layer (response headers already arrived) and then the response stalled, the
+/// transport broke, or the backend over-sent before the body/trailers completed.
 ///
 /// These classes are NOT connection errors — the request went on the wire, so
 /// `connection_error` stays false and connect-failure retry replay must respect
 /// method idempotency — but they ARE backend-health failures that the circuit
-/// breaker / passive health / least-latency accounting must count. Without this,
-/// a backend that returns `200` headers and then times out or RSTs mid-stream is
-/// recorded as healthy because neither `connection_error` nor a 5xx status is
-/// set (see the streaming `IdleReadTimeoutBody` / native-H3 read-timeout paths).
+/// breaker / passive health / least-latency accounting AND the adaptive
+/// concurrency limiter (`AdaptiveConcurrencyPermit::record`) must count. Without
+/// this, a backend that returns `200` headers and then times out / RSTs
+/// mid-stream (or floods past the response-size cap) is recorded as healthy
+/// because neither `connection_error` nor a 5xx status is set (see the streaming
+/// `IdleReadTimeoutBody` / native-H3 read-timeout paths and
+/// `record_deferred_backend_admission`).
 ///
 /// `ResponseBodyTooLarge` IS included: an oversized backend response is a backend
 /// fault (the existing limiter contract), even though the gateway is the one that
@@ -741,8 +742,10 @@ pub(crate) fn passive_health_for_target<'a>(
         .and_then(|override_config| override_config.passive_health_check.as_ref())
         .or_else(|| {
             // Subset-bound proxy: prefer the subset's resolved passive-health
-            // thresholds over the upstream-level ones. (The maxEjectionPercent
-            // cap is still resolved at upstream scope via the LoadBalancerCache.)
+            // overlay over the upstream-level one. The maxEjectionPercent cap is
+            // resolved with this SAME precedence by
+            // `LoadBalancerCache::max_ejection_percent_resolved_from`, so the cap
+            // and these thresholds always come from the same tier.
             proxy
                 .upstream_subset
                 .as_deref()
@@ -868,16 +871,15 @@ pub(crate) fn select_next_retry_target(
             .passive_health
             .get(&proxy.id)
             .map(|r| r.value().clone()),
-        max_ejection_percent: if let Some(port) = retry_override_port {
-            LoadBalancerCache::max_ejection_percent_for_port_from(
-                &epoch.load_balancer,
-                upstream_id,
-                proxy,
-                port,
-            )
-        } else {
-            LoadBalancerCache::max_ejection_percent_from(&epoch.load_balancer, upstream_id)
-        },
+        // Same precedence as the steady-state path and `passive_health_for_target`
+        // (per-port > per-subset > upstream). `retry_override_port` is already
+        // `Some` only when a live per-port override covers the retried target.
+        max_ejection_percent: LoadBalancerCache::max_ejection_percent_resolved_from(
+            &epoch.load_balancer,
+            upstream_id,
+            proxy,
+            retry_override_port,
+        ),
     };
 
     if let Some(subset_name) = proxy.upstream_subset.as_deref() {

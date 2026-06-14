@@ -3501,6 +3501,7 @@ async fn handle_h3_request(
             mut response_status,
             response_body,
             mut response_headers,
+            mut response_trailers,
             h3_error_class,
             h3_request_on_wire,
             final_cb_target_key,
@@ -3510,6 +3511,7 @@ async fn handle_h3_request(
                 result.status,
                 result.body,
                 result.headers,
+                result.trailers,
                 result.error_class,
                 result.request_on_wire,
                 cb_target_key,
@@ -3657,6 +3659,7 @@ async fn handle_h3_request(
                 result.status,
                 result.body,
                 result.headers,
+                result.trailers,
                 result.error_class,
                 result.request_on_wire,
                 current_cb_target_key,
@@ -3681,6 +3684,7 @@ async fn handle_h3_request(
                 result.status,
                 result.body,
                 result.headers,
+                result.trailers,
                 result.error_class,
                 result.request_on_wire,
                 cb_target_key,
@@ -3735,6 +3739,10 @@ async fn handle_h3_request(
                     .or_insert_with(|| "application/json".to_string());
                 response_body = reject.body;
                 after_proxy_rejected = true;
+                // The body/headers are now gateway-synthesized; the backend's
+                // trailers no longer describe this response, so drop them
+                // (issue #1630).
+                response_trailers = None;
             }
             plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
         }
@@ -3772,6 +3780,9 @@ async fn handle_h3_request(
                             response_headers
                                 .insert("content-type".to_string(), "application/json".to_string());
                             response_body = b"Internal Server Error".to_vec();
+                            // Synthesized error body — backend trailers no
+                            // longer apply (issue #1630).
+                            response_trailers = None;
                             break;
                         };
                         debug!(
@@ -3793,6 +3804,8 @@ async fn handle_h3_request(
                     reject,
                 )
                 .await;
+                // Backend trailers no longer describe this (rejected) response.
+                response_trailers = None;
             }
             plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
         }
@@ -3810,6 +3823,12 @@ async fn handle_h3_request(
                     response_headers
                         .insert("content-length".to_string(), transformed.len().to_string());
                     response_body = transformed;
+                    // A plugin (response_transformer, compression, grpc_web, …)
+                    // replaced the bytes sent to the client. The backend's
+                    // trailers (digest/checksum/app-status) described the
+                    // ORIGINAL body, so they no longer apply — drop them, the
+                    // same way the reject paths above do (issue #1630).
+                    response_trailers = None;
                 }
             }
             plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
@@ -3840,6 +3859,9 @@ async fn handle_h3_request(
                             response_headers
                                 .insert("content-type".to_string(), "application/json".to_string());
                             response_body = b"Internal Server Error".to_vec();
+                            // Synthesized error body — backend trailers no
+                            // longer apply (issue #1630).
+                            response_trailers = None;
                             break;
                         };
                         debug!(
@@ -3861,6 +3883,8 @@ async fn handle_h3_request(
                     reject,
                 )
                 .await;
+                // Backend trailers no longer describe this (rejected) response.
+                response_trailers = None;
             }
             plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
         }
@@ -3926,7 +3950,37 @@ async fn handle_h3_request(
             .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 proxy response: {}", e))?;
         stream.send_response(resp).await?;
         stream.send_data(Bytes::from(response_body)).await?;
-        stream.finish().await?;
+
+        // Forward backend response trailers, if any (issue #1630). Strip
+        // response-direction hop-by-hop trailer names (RFC 9110 §7.6.1) with
+        // the same helper the streaming path's
+        // `finish_h3_response_with_backend_trailers` uses, then send them
+        // before FIN. An empty map after stripping is skipped — emit a bare
+        // `finish()` exactly as before.
+        match response_trailers {
+            Some(mut trailers) => {
+                strip_response_hop_by_hop_trailers(&mut trailers);
+                if !trailers.is_empty()
+                    && let Err(err) = stream.send_trailers(trailers).await
+                {
+                    // The trailers are valid for the backend but the H3 client
+                    // could not accept them (e.g. they exceed its advertised
+                    // field-section size → HeaderTooBig). The body has already
+                    // been sent successfully, so DROP the trailers and still
+                    // emit a clean FIN rather than `?`-propagating and turning
+                    // an otherwise-complete buffered response into a downstream
+                    // stream error (issue #1630).
+                    debug!(
+                        error = %err,
+                        "H3 send_trailers failed on buffered response; dropping trailers and finishing cleanly"
+                    );
+                }
+                stream.finish().await?;
+            }
+            None => {
+                stream.finish().await?;
+            }
+        }
     }
 
     Ok(())
@@ -4617,6 +4671,7 @@ async fn collect_h3_open_response_body(
             status: 502,
             body: br#"{"error":"Backend response body exceeds maximum size"}"#.to_vec(),
             headers: HashMap::new(),
+            trailers: None,
             error_class: Some(crate::retry::ErrorClass::ResponseBodyTooLarge),
             request_on_wire: true,
         };
@@ -4651,6 +4706,7 @@ async fn collect_h3_open_response_body(
                         status: 504,
                         body: br#"{"error":"Backend timeout"}"#.to_vec(),
                         headers: HashMap::new(),
+                        trailers: None,
                         error_class: Some(crate::retry::ErrorClass::ReadWriteTimeout),
                         request_on_wire: true,
                     };
@@ -4669,6 +4725,7 @@ async fn collect_h3_open_response_body(
                         status: 502,
                         body: br#"{"error":"Backend response body exceeds maximum size"}"#.to_vec(),
                         headers: HashMap::new(),
+                        trailers: None,
                         error_class: Some(crate::retry::ErrorClass::ResponseBodyTooLarge),
                         request_on_wire: true,
                     };
@@ -4704,6 +4761,7 @@ async fn collect_h3_open_response_body(
                     status: 502,
                     body: br#"{"error":"Backend unavailable"}"#.to_vec(),
                     headers: HashMap::new(),
+                    trailers: None,
                     error_class: Some(h3_error_class),
                     request_on_wire: true,
                 };
@@ -4711,12 +4769,101 @@ async fn collect_h3_open_response_body(
         }
     }
 
+    // Body fully drained (FIN or a recoverable graceful close). Read any
+    // backend trailers so the buffered native-H3 send path can forward them
+    // (issue #1630), bounded by the same `backend_read_timeout_ms` deadline as
+    // the body frames above. Trailers are optional: a read timeout, a graceful
+    // close at the trailer phase, or no trailers each yield `Ok(None)` rather
+    // than failing an otherwise-complete response — mirrors
+    // `drain_h3_response_body` in the H3 pool. A genuine non-graceful trailer
+    // error is a backend protocol violation: surface it as a 502 backend
+    // failure (with capability downgrade) exactly like the body-read error
+    // branch above, rather than swallowing it and serving a response that hides
+    // the violation.
+    let response_trailers = match read_refined_h3_trailers(proxy, &mut recv_stream).await {
+        Ok(trailers) => trailers,
+        Err(error) => {
+            error!(
+                "Error reading backend h3 trailers during refined buffering: {}",
+                error
+            );
+            let h3_error_class = crate::http3::client::classify_http3_error(&error);
+            crate::proxy::record_port_exhaustion_if_class(&state.overload, h3_error_class);
+            if crate::proxy::is_h3_transport_error_class(h3_error_class) {
+                state
+                    .backend_capabilities
+                    .mark_h3_unsupported(proxy, upstream_target);
+            }
+            return H3BufferedDispatchResult {
+                status: 502,
+                body: br#"{"error":"Backend unavailable"}"#.to_vec(),
+                headers: HashMap::new(),
+                trailers: None,
+                error_class: Some(h3_error_class),
+                request_on_wire: true,
+            };
+        }
+    };
+
     H3BufferedDispatchResult {
         status: response_status,
         body: response_body,
         headers: response_headers,
+        trailers: response_trailers,
         error_class: None,
         request_on_wire: true,
+    }
+}
+
+/// Read backend response trailers for the refined-buffered H3 path, bounded by
+/// `proxy.backend_read_timeout_ms`.
+///
+/// Returns `Ok(None)` for the benign trailer-absence cases — a read timeout, a
+/// graceful close at the trailer phase, or simply no trailers — because
+/// trailers are optional and their absence must not fail an otherwise-complete
+/// buffered response. A genuine non-graceful `recv_trailers()` error
+/// (malformed/oversized trailers, invalid post-body frame) propagates as
+/// `Err(StreamError)` so the caller can surface it as a backend failure (502 +
+/// capability downgrade), mirroring `drain_h3_response_body` in the H3 pool and
+/// the streaming path's `H3TrailerFinishError::Backend(...)`. Swallowing it to
+/// `None` would hide the protocol violation and keep an unhealthy H3 backend in
+/// rotation.
+async fn read_refined_h3_trailers(
+    proxy: &Proxy,
+    recv_stream: &mut crate::http3::client::H3RequestStream,
+) -> Result<Option<http::HeaderMap>, h3::error::StreamError> {
+    let recv_result = if proxy.backend_read_timeout_ms > 0 {
+        match tokio::time::timeout(
+            Duration::from_millis(proxy.backend_read_timeout_ms),
+            recv_stream.recv_trailers(),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                debug!(
+                    proxy_id = %proxy.id,
+                    timeout_ms = proxy.backend_read_timeout_ms,
+                    "HTTP/3 backend trailer read timed out (refined path); forwarding response without trailers"
+                );
+                return Ok(None);
+            }
+        }
+    } else {
+        recv_stream.recv_trailers().await
+    };
+
+    match recv_result {
+        Ok(trailers) => Ok(trailers),
+        Err(error) if crate::http3::client::is_h3_graceful_close(&error) => Ok(None),
+        Err(error) => {
+            debug!(
+                proxy_id = %proxy.id,
+                error = %error,
+                "HTTP/3 backend trailer read failed non-gracefully (refined path); propagating as backend failure"
+            );
+            Err(error)
+        }
     }
 }
 
@@ -5511,6 +5658,13 @@ struct H3BufferedDispatchResult {
     status: u16,
     body: Vec<u8>,
     headers: HashMap<String, String>,
+    /// Backend response trailers (issue #1630), still unsanitized. Forwarded to
+    /// the H3 client (after stripping response-direction hop-by-hop names) on
+    /// the buffered native-H3 send path, mirroring the streaming path's
+    /// `finish_h3_response_with_backend_trailers`. `None` on every
+    /// gateway-synthesized error/reject below (no backend trailers to forward),
+    /// and `None` for a successful response that carried no trailers.
+    trailers: Option<http::HeaderMap>,
     error_class: Option<crate::retry::ErrorClass>,
     request_on_wire: bool,
 }
@@ -5565,8 +5719,14 @@ async fn proxy_to_backend_h3(
     };
 
     match result {
-        Ok((status, resp_body, resp_headers)) => {
+        Ok(response) => {
             // Hop-by-hop headers already filtered during collection in the H3 pool.
+            let crate::http3::client::H3BufferedResponse {
+                status,
+                body: resp_body,
+                headers: resp_headers,
+                trailers: resp_trailers,
+            } = response;
 
             // Enforce response body size limit
             if state.max_response_body_size_bytes > 0
@@ -5583,6 +5743,7 @@ async fn proxy_to_backend_h3(
                         .as_bytes()
                         .to_vec(),
                     headers: HashMap::new(),
+                    trailers: None,
                     error_class: Some(crate::retry::ErrorClass::ResponseBodyTooLarge),
                     // We received the full response from the backend before
                     // discovering the size violation; the request reached
@@ -5596,6 +5757,10 @@ async fn proxy_to_backend_h3(
                 status,
                 body: resp_body,
                 headers: resp_headers,
+                // Forward backend trailers verbatim; the buffered send path
+                // strips response-direction hop-by-hop names before emitting
+                // them to the client (issue #1630).
+                trailers: resp_trailers,
                 error_class: None,
                 // Successful response — the request was committed and
                 // the response was received. `request_on_wire=true` means
@@ -5633,6 +5798,7 @@ async fn proxy_to_backend_h3(
                 status: reject_status.as_u16(),
                 body: reject_body.as_bytes().to_vec(),
                 headers: HashMap::new(),
+                trailers: None,
                 error_class: Some(h3_error_class),
                 request_on_wire,
             }

@@ -2228,7 +2228,7 @@ Handles Cross-Origin Resource Sharing at the gateway level.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `allowed_origins` | String[] | `["*"]` | Permitted origins |
+| `allowed_origins` | (String \| Object)[] | `["*"]` | Permitted origins. Each entry is a string (`"*"`, an exact `scheme://host[:port]` origin, or a `*.suffix.com` wildcard subdomain) or an Istio `StringMatch` object with one of `exact` / `prefix` / `regex` (literal prefix / RE2 full match). |
 | `allowed_methods` | String[] | `["GET","HEAD","POST","PUT","PATCH","DELETE","OPTIONS"]` | Allowed methods |
 | `allowed_headers` | String[] | `["Accept","Authorization","Content-Type","Origin","X-Requested-With"]` | Allowed headers |
 | `exposed_headers` | String[] | `[]` | Response headers exposed to browser JavaScript |
