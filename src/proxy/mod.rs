@@ -12297,6 +12297,7 @@ async fn handle_proxy_request_inner(
                     crate::proxy::body::direct_streaming_h2_body_strip_hop_by_hop_trailers(
                         grpc_streaming.body,
                         cl,
+                        proxy.backend_read_timeout_ms,
                     )
                 } else if state.max_response_body_size_bytes > 0 {
                     crate::proxy::body::size_limited_coalescing_h2_body_strip_hop_by_hop_trailers(
@@ -12304,12 +12305,14 @@ async fn handle_proxy_request_inner(
                         state.max_response_body_size_bytes,
                         cl,
                         state.h2_coalesce_target_bytes,
+                        proxy.backend_read_timeout_ms,
                     )
                 } else {
                     crate::proxy::body::coalescing_h2_body_strip_hop_by_hop_trailers(
                         grpc_streaming.body,
                         cl,
                         state.h2_coalesce_target_bytes,
+                        proxy.backend_read_timeout_ms,
                     )
                 };
                 let mut body = if let Some(logger) = deferred_grpc_logger {
@@ -14099,6 +14102,7 @@ async fn handle_proxy_request_inner(
                 crate::proxy::body::direct_streaming_h2_body_strip_hop_by_hop_trailers(
                     resp.into_body(),
                     cl,
+                    proxy.backend_read_timeout_ms,
                 )
             } else if state.max_response_body_size_bytes > 0 && cl.is_none() {
                 // No Content-Length — enforce response-size limits while
@@ -14109,6 +14113,7 @@ async fn handle_proxy_request_inner(
                     state.max_response_body_size_bytes,
                     cl,
                     state.h2_coalesce_target_bytes,
+                    proxy.backend_read_timeout_ms,
                 )
             } else if use_passthrough {
                 // Response too large to benefit from coalescing — stream
@@ -14119,12 +14124,14 @@ async fn handle_proxy_request_inner(
                 crate::proxy::body::direct_streaming_h2_body_strip_hop_by_hop_trailers(
                     resp.into_body(),
                     cl,
+                    proxy.backend_read_timeout_ms,
                 )
             } else {
                 crate::proxy::body::coalescing_h2_body_strip_hop_by_hop_trailers(
                     resp.into_body(),
                     cl,
                     state.h2_coalesce_target_bytes,
+                    proxy.backend_read_timeout_ms,
                 )
             };
             let mut body = body.with_lb_connection_guard(lb_connection_guard);

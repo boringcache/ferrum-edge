@@ -1852,6 +1852,87 @@ impl http_body::Body for DirectH2Body {
     }
 }
 
+/// Wraps a streaming HTTP/2 response body with a per-frame idle read deadline.
+///
+/// After the response headers have arrived, a backend can stop producing body
+/// frames while keeping the H2 connection alive. Without a deadline the
+/// streaming relay stays parked on the next `poll_frame`, pinning the request's
+/// lifetime guards (overload `RequestGuard`, per-IP request accounting, the
+/// least-connections LB guard, backend-admission permits) until the client
+/// disconnects or the backend eventually resumes.
+///
+/// This wrapper resets a pinned `Sleep` on every received frame; if no frame
+/// arrives within `backend_read_timeout_ms`, `poll_frame` yields a
+/// `std::io::Error` of kind `TimedOut`. That kind is mapped to
+/// `ErrorClass::ReadWriteTimeout` (post-wire) by `retry::classify_typed_chain`,
+/// so deferred backend/admission accounting records a read timeout rather than
+/// an indefinite in-flight stream — matching the buffered H2 body collection
+/// (`collect_hyper_body_with_limit`) and the native-H3 streaming read timeout.
+///
+/// `backend_read_timeout_ms == 0` keeps the unbounded opt-out: the call sites
+/// skip this wrapper entirely in that case.
+struct IdleReadTimeoutBody<B> {
+    inner: B,
+    timeout: std::time::Duration,
+    deadline: Pin<Box<tokio::time::Sleep>>,
+}
+
+impl<B> IdleReadTimeoutBody<B> {
+    fn new(inner: B, timeout_ms: u64) -> Self {
+        let timeout = std::time::Duration::from_millis(timeout_ms);
+        Self {
+            inner,
+            timeout,
+            deadline: Box::pin(tokio::time::sleep(timeout)),
+        }
+    }
+}
+
+impl<B> http_body::Body for IdleReadTimeoutBody<B>
+where
+    B: http_body::Body<Data = Bytes> + Unpin,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
+    type Data = Bytes;
+    type Error = ProxyBodyError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                // A backend frame arrived — reset the idle deadline.
+                this.deadline
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + this.timeout);
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(Box::new(e) as ProxyBodyError))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => match std::future::Future::poll(this.deadline.as_mut(), cx) {
+                Poll::Ready(()) => Poll::Ready(Some(Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "backend response body read timeout after {}ms",
+                        this.timeout.as_millis()
+                    ),
+                )) as ProxyBodyError))),
+                Poll::Pending => Poll::Pending,
+            },
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
 struct DirectH3Body<S = crate::http3::client::H3RequestStream> {
     source: H3FrameSource<S>,
     content_length: Option<u64>,
@@ -2043,10 +2124,21 @@ pub(crate) fn coalescing_h2_body_strip_hop_by_hop_trailers(
     body: Incoming,
     content_length: Option<u64>,
     coalesce_target: usize,
+    read_timeout_ms: u64,
 ) -> ProxyBody {
-    let stripped = StripHopByHopTrailers::new(body);
-    let coalescing = Coalescing::new(stripped, coalesce_target, content_length);
-    ProxyBody::streaming(Box::pin(coalescing))
+    // Bound the per-frame backend read by `backend_read_timeout_ms` (>0) so a
+    // backend that sends headers then stalls cannot pin the streaming relay
+    // indefinitely. See `IdleReadTimeoutBody`.
+    if read_timeout_ms > 0 {
+        let timed = IdleReadTimeoutBody::new(body, read_timeout_ms);
+        let stripped = StripHopByHopTrailers::new(timed);
+        let coalescing = Coalescing::new(stripped, coalesce_target, content_length);
+        ProxyBody::streaming(Box::pin(coalescing))
+    } else {
+        let stripped = StripHopByHopTrailers::new(body);
+        let coalescing = Coalescing::new(stripped, coalesce_target, content_length);
+        ProxyBody::streaming(Box::pin(coalescing))
+    }
 }
 
 /// Size-limited coalescing HTTP/2 streaming body with hop-by-hop trailer
@@ -2058,11 +2150,20 @@ pub(crate) fn size_limited_coalescing_h2_body_strip_hop_by_hop_trailers(
     max_bytes: usize,
     content_length: Option<u64>,
     coalesce_target: usize,
+    read_timeout_ms: u64,
 ) -> ProxyBody {
-    let stripped = StripHopByHopTrailers::new(body);
-    let limited = SizeLimitedFrameSource::new(stripped, max_bytes);
-    let coalescing = Coalescing::new(limited, coalesce_target, content_length);
-    ProxyBody::streaming(Box::pin(coalescing))
+    if read_timeout_ms > 0 {
+        let timed = IdleReadTimeoutBody::new(body, read_timeout_ms);
+        let stripped = StripHopByHopTrailers::new(timed);
+        let limited = SizeLimitedFrameSource::new(stripped, max_bytes);
+        let coalescing = Coalescing::new(limited, coalesce_target, content_length);
+        ProxyBody::streaming(Box::pin(coalescing))
+    } else {
+        let stripped = StripHopByHopTrailers::new(body);
+        let limited = SizeLimitedFrameSource::new(stripped, max_bytes);
+        let coalescing = Coalescing::new(limited, coalesce_target, content_length);
+        ProxyBody::streaming(Box::pin(coalescing))
+    }
 }
 
 /// Direct (non-coalesced) HTTP/2 streaming body wrapped in
@@ -2073,6 +2174,7 @@ pub(crate) fn size_limited_coalescing_h2_body_strip_hop_by_hop_trailers(
 pub(crate) fn direct_streaming_h2_body_strip_hop_by_hop_trailers(
     body: Incoming,
     content_length: Option<u64>,
+    read_timeout_ms: u64,
 ) -> ProxyBody {
     use http_body_util::BodyExt;
 
@@ -2080,8 +2182,16 @@ pub(crate) fn direct_streaming_h2_body_strip_hop_by_hop_trailers(
         inner: body,
         content_length,
     };
-    let stripped = StripHopByHopTrailers::new(direct);
-    ProxyBody::streaming(Box::pin(stripped.map_err(|e| Box::new(e) as BoxError)))
+    if read_timeout_ms > 0 {
+        // `IdleReadTimeoutBody::Error` is already `ProxyBodyError`, so no
+        // `map_err` boxing is needed on this branch.
+        let timed = IdleReadTimeoutBody::new(direct, read_timeout_ms);
+        let stripped = StripHopByHopTrailers::new(timed);
+        ProxyBody::streaming(Box::pin(stripped))
+    } else {
+        let stripped = StripHopByHopTrailers::new(direct);
+        ProxyBody::streaming(Box::pin(stripped.map_err(|e| Box::new(e) as BoxError)))
+    }
 }
 
 /// A body wrapper that filters hop-by-hop response headers out of any
