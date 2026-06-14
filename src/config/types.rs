@@ -1960,20 +1960,49 @@ pub fn validate_namespace(ns: &str) -> Result<(), String> {
 
 /// Auto-anchor a regex listen_path pattern for full-path matching.
 ///
-/// Prepends `^` if not already present and appends `$` if not already present,
-/// ensuring the pattern must match the entire request path rather than just a
-/// prefix. Operators who need prefix-style matching can end their pattern with
-/// `.*` to opt out of the end anchor.
+/// Wraps the operator pattern in a non-capturing group and anchors the group,
+/// ensuring alternation and other top-level regex operators still apply to the
+/// full request path. Operators who need prefix-style matching can end their
+/// pattern with `.*` to opt out of strict suffix matching.
 pub fn anchor_regex_pattern(pattern: &str) -> String {
-    let mut anchored = if pattern.starts_with('^') {
-        pattern.to_string()
-    } else {
-        format!("^{}", pattern)
-    };
-    if !anchored.ends_with('$') {
-        anchored.push('$');
+    let mut core = pattern;
+    if let Some(stripped) = core.strip_prefix('^') {
+        core = stripped;
     }
-    anchored
+    if has_unescaped_trailing_dollar(core) {
+        core = &core[..core.len() - 1];
+    }
+    let wrapped = format!("^(?:{})$", core);
+    // In verbose mode `(?x)`, a trailing `#` line comment in the operator
+    // pattern (e.g. `~(?x)/foo$ # exact route`) swallows the closing `)$` we
+    // append, leaving the non-capturing group unclosed so the regex no longer
+    // compiles. Only when the plain wrap fails to compile AND terminating the
+    // comment with a newline before the close makes it compile do we use the
+    // newline form. Non-verbose patterns always compile plainly, so they never
+    // get the newline (which would otherwise be a literal `\n` that breaks
+    // matching). A genuinely invalid pattern still fails both and is rejected
+    // by the caller's compile check.
+    if Regex::new(&wrapped).is_err() {
+        let newline_wrapped = format!("^(?:{}\n)$", core);
+        if Regex::new(&newline_wrapped).is_ok() {
+            return newline_wrapped;
+        }
+    }
+    wrapped
+}
+
+fn has_unescaped_trailing_dollar(pattern: &str) -> bool {
+    let Some(before_dollar) = pattern.strip_suffix('$') else {
+        return false;
+    };
+
+    let escaping_backslashes = before_dollar
+        .as_bytes()
+        .iter()
+        .rev()
+        .take_while(|&&byte| byte == b'\\')
+        .count();
+    escaping_backslashes % 2 == 0
 }
 
 /// Detects single-encoded (`%2F`/`%2f`) or double-encoded (`%252F`/`%252f`)

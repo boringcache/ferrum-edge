@@ -2962,7 +2962,7 @@ pub fn create_plugin_with_http_client(
         "ai_prompt_shield" => Ok(Some(Arc::new(ai_prompt_shield::AiPromptShield::new(
             config,
         )?))),
-        "ai_semantic_firewall" | "semantic_ai_firewall" => Ok(Some(Arc::new(
+        "ai_semantic_firewall" => Ok(Some(Arc::new(
             ai_semantic_firewall::AiSemanticFirewall::new(config, http_client.clone())?,
         ))),
         "ai_semantic_cache" => Ok(Some(Arc::new(ai_semantic_cache::AiSemanticCache::new(
@@ -3018,6 +3018,16 @@ pub fn create_plugin_with_http_client(
             Ok(Some(Arc::new(plugin)))
         }
         _ => {
+            // Reserve retired security-plugin aliases before the custom plugin
+            // registry: a custom plugin sharing a retired name (e.g.
+            // `semantic_ai_firewall`) must not silently instantiate and bypass
+            // the fail-closed handling, which only fires on `Ok(None)` in
+            // `plugin_cache::try_create_plugin`. Returning `Ok(None)` here routes
+            // the retired name to that fatal fail-closed path regardless of any
+            // custom plugin registered under the same name.
+            if is_removed_security_plugin(name) {
+                return Ok(None);
+            }
             // Fall through to custom plugins registry
             let result = crate::custom_plugins::create_custom_plugin(name, config, http_client)?;
             if result.is_none() {
@@ -3069,7 +3079,6 @@ pub fn is_security_plugin(name: &str) -> bool {
             | "ip_restriction"
             | "waf"
             | "ai_semantic_firewall"
-            | "semantic_ai_firewall"
             | "security_headers"
             | "openapi_validator"
             | "mcp_gateway"
@@ -3083,7 +3092,7 @@ pub fn is_security_plugin(name: &str) -> bool {
 /// These names are intentionally fail-closed during config load so upgrades
 /// cannot silently drop authentication/authorization protections.
 pub fn is_removed_security_plugin(name: &str) -> bool {
-    matches!(name, "oauth2_auth")
+    matches!(name, "oauth2_auth" | "semantic_ai_firewall")
 }
 
 pub fn available_plugins() -> Vec<&'static str> {

@@ -2471,6 +2471,13 @@ fn test_regex_listen_path_valid() {
 }
 
 #[test]
+fn test_regex_listen_path_valid_literal_trailing_dollar() {
+    let mut config = empty_config();
+    config.proxies = vec![make_proxy("p1", r"~/prices/\$")];
+    assert!(config.validate_regex_listen_paths().is_ok());
+}
+
+#[test]
 fn test_regex_listen_path_invalid_pattern() {
     let mut config = empty_config();
     config.proxies = vec![make_proxy("p1", "~(invalid[regex")];
@@ -2581,28 +2588,42 @@ fn test_exact_listen_path_rejects_empty_path() {
 fn test_anchor_regex_pattern_adds_both_anchors() {
     use ferrum_edge::config::types::anchor_regex_pattern;
 
-    assert_eq!(anchor_regex_pattern("/users/[^/]+"), "^/users/[^/]+$");
+    assert_eq!(anchor_regex_pattern("/users/[^/]+"), "^(?:/users/[^/]+)$");
 }
 
 #[test]
 fn test_anchor_regex_pattern_preserves_existing_start() {
     use ferrum_edge::config::types::anchor_regex_pattern;
 
-    assert_eq!(anchor_regex_pattern("^/users/[^/]+"), "^/users/[^/]+$");
+    assert_eq!(anchor_regex_pattern("^/users/[^/]+"), "^(?:/users/[^/]+)$");
 }
 
 #[test]
 fn test_anchor_regex_pattern_preserves_existing_end() {
     use ferrum_edge::config::types::anchor_regex_pattern;
 
-    assert_eq!(anchor_regex_pattern("/users/[^/]+$"), "^/users/[^/]+$");
+    assert_eq!(anchor_regex_pattern("/users/[^/]+$"), "^(?:/users/[^/]+)$");
+}
+
+#[test]
+fn test_anchor_regex_pattern_preserves_escaped_trailing_dollar() {
+    use ferrum_edge::config::types::anchor_regex_pattern;
+
+    assert_eq!(anchor_regex_pattern(r"/prices/\$"), r"^(?:/prices/\$)$");
 }
 
 #[test]
 fn test_anchor_regex_pattern_preserves_both_existing() {
     use ferrum_edge::config::types::anchor_regex_pattern;
 
-    assert_eq!(anchor_regex_pattern("^/users/[^/]+$"), "^/users/[^/]+$");
+    assert_eq!(anchor_regex_pattern("^/users/[^/]+$"), "^(?:/users/[^/]+)$");
+}
+
+#[test]
+fn test_anchor_regex_pattern_groups_top_level_alternation() {
+    use ferrum_edge::config::types::anchor_regex_pattern;
+
+    assert_eq!(anchor_regex_pattern("/api|/admin"), "^(?:/api|/admin)$");
 }
 
 #[test]
@@ -2612,8 +2633,28 @@ fn test_anchor_regex_pattern_wildcard_suffix_preserved() {
     // Operators use .* to opt out of strict end-anchoring
     assert_eq!(
         anchor_regex_pattern("/users/[^/]+/orders.*"),
-        "^/users/[^/]+/orders.*$"
+        "^(?:/users/[^/]+/orders.*)$"
     );
+}
+
+#[test]
+fn test_anchor_regex_pattern_verbose_mode_trailing_comment_stays_valid() {
+    use ferrum_edge::config::types::anchor_regex_pattern;
+
+    // Verbose-mode `(?x)` pattern ending in a `#` line comment: the plain
+    // `^(?:...)$` wrap would leave the group unclosed (the comment swallows the
+    // appended `)$`), so the anchorer terminates the comment with a newline
+    // before the close. anchor_regex_pattern only returns this form when it
+    // compiles, so this also confirms the result is a valid regex.
+    assert_eq!(
+        anchor_regex_pattern("(?x)/foo$ # exact route"),
+        "^(?:(?x)/foo$ # exact route\n)$"
+    );
+
+    // Non-verbose patterns are untouched — no spurious newline (which would be
+    // a literal `\n` that breaks matching).
+    assert_eq!(anchor_regex_pattern("/users/[^/]+"), "^(?:/users/[^/]+)$");
+    assert_eq!(anchor_regex_pattern("/api|/admin"), "^(?:/api|/admin)$");
 }
 
 // ---- Stream proxy validation tests ----
