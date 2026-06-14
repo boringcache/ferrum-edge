@@ -79,33 +79,23 @@ impl CircuitBreaker {
                         Ordering::Acquire,
                     ) {
                         Ok(_) => {
-                            // CAS winner: initialize half-open state
-                            self.half_open_in_flight.store(1, Ordering::Relaxed);
+                            // CAS winner: start the half-open cycle. The in-flight
+                            // counter is already 0 here — it is reset to 0 both on
+                            // close (success) and on reopen (probe failure) — so the
+                            // winner claims its slot through the SAME bounded CAS as
+                            // every other admission. The old code did a blind
+                            // `store(1)` here, which raced with concurrent increments
+                            // from threads that had already observed HALF_OPEN and
+                            // could overwrite them, admitting MORE than
+                            // `half_open_max_requests`.
                             self.success_count.store(0, Ordering::Relaxed);
                             info!("Circuit breaker transitioning from Open to Half-Open");
-                            Ok(true)
+                            self.try_acquire_half_open_slot()
                         }
                         Err(current) => {
                             // CAS loser: another thread already transitioned.
-                            // Fall through to handle the current state.
                             if current == STATE_HALF_OPEN {
-                                // Use CAS loop to atomically claim a slot
-                                loop {
-                                    let in_flight =
-                                        self.half_open_in_flight.load(Ordering::Acquire);
-                                    if in_flight >= self.config.half_open_max_requests {
-                                        return Err(CircuitOpenError);
-                                    }
-                                    match self.half_open_in_flight.compare_exchange_weak(
-                                        in_flight,
-                                        in_flight + 1,
-                                        Ordering::AcqRel,
-                                        Ordering::Acquire,
-                                    ) {
-                                        Ok(_) => return Ok(true),
-                                        Err(_) => continue,
-                                    }
-                                }
+                                self.try_acquire_half_open_slot()
                             } else {
                                 // State changed to something else (e.g. Closed)
                                 Ok(false)
@@ -116,25 +106,40 @@ impl CircuitBreaker {
                     Err(CircuitOpenError)
                 }
             }
-            STATE_HALF_OPEN => {
-                // Use CAS loop to atomically claim a slot without exceeding the limit.
-                loop {
-                    let current = self.half_open_in_flight.load(Ordering::Acquire);
-                    if current >= self.config.half_open_max_requests {
-                        return Err(CircuitOpenError);
-                    }
-                    match self.half_open_in_flight.compare_exchange_weak(
-                        current,
-                        current + 1,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    ) {
-                        Ok(_) => return Ok(true),
-                        Err(_) => continue,
-                    }
-                }
-            }
+            STATE_HALF_OPEN => self.try_acquire_half_open_slot(),
             _ => Ok(false),
+        }
+    }
+
+    /// Atomically claim one half-open probe slot without exceeding the limit.
+    ///
+    /// All three admission paths — the OPEN→HALF_OPEN transition winner, a CAS
+    /// loser that finds the state already HALF_OPEN, and a steady-state
+    /// HALF_OPEN request — funnel through this single bounded CAS loop, so the
+    /// number of admitted probes can never exceed `half_open_max_requests`. The
+    /// counter is reset to 0 at the start of every half-open cycle (on close and
+    /// on reopen), so there is no blind `store(1)` at admission time that could
+    /// overwrite a concurrent increment and over-admit.
+    ///
+    /// The limit is floored at 1: a breaker configured with
+    /// `half_open_max_requests == 0` must still admit a single probe to be able
+    /// to recover, matching the previous behavior.
+    fn try_acquire_half_open_slot(&self) -> Result<bool, CircuitOpenError> {
+        let max = self.config.half_open_max_requests.max(1);
+        loop {
+            let in_flight = self.half_open_in_flight.load(Ordering::Acquire);
+            if in_flight >= max {
+                return Err(CircuitOpenError);
+            }
+            match self.half_open_in_flight.compare_exchange_weak(
+                in_flight,
+                in_flight + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(true),
+                Err(_) => continue,
+            }
         }
     }
 
@@ -297,19 +302,22 @@ impl CircuitBreaker {
             }
             STATE_HALF_OPEN => {
                 if is_half_open_probe {
-                    // Decrement in-flight before reopening. The fetch_update handles
-                    // the count correctly even with concurrent probe failures — each
-                    // thread atomically decrements once. We intentionally do NOT
-                    // follow up with an unconditional store(0): that would race with
-                    // concurrent decrements from other probe threads, potentially
-                    // clobbering a value that hasn't been decremented yet. The count
-                    // reaches 0 naturally as all probes report in, and transitioning
-                    // to OPEN prevents new probes from being admitted.
                     self.release_half_open_slot(Ordering::SeqCst, Ordering::SeqCst);
                 }
                 warn!("Circuit breaker reopening (probe failed)");
-                self.state.store(STATE_OPEN, Ordering::SeqCst);
                 self.success_count.store(0, Ordering::Relaxed);
+                // Reset the in-flight counter to 0 for the next half-open cycle
+                // BEFORE republishing STATE_OPEN, so a thread that transitions
+                // OPEN→HALF_OPEN again (e.g. with timeout_seconds=0) always starts
+                // the new cycle from 0 and `try_acquire_half_open_slot` bounds it
+                // from the transition onward. This is what lets the transition
+                // winner drop its old blind `store(1)`. Safe under concurrency:
+                // probe-slot increments only happen while HALF_OPEN, OPEN rejects
+                // new admissions, and `release_half_open_slot` decrements with a
+                // saturating `checked_sub`, so a straggler from the old cycle lands
+                // on 0 rather than underflowing.
+                self.half_open_in_flight.store(0, Ordering::SeqCst);
+                self.state.store(STATE_OPEN, Ordering::SeqCst);
             }
             STATE_OPEN if is_half_open_probe => {
                 // A concurrent record_failure already reopened the circuit between
