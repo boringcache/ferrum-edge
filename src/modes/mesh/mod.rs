@@ -348,12 +348,19 @@ pub struct MeshRuntimeConfig {
     /// (default `false`).
     pub sidecar_identity_narrowing: bool,
     /// Opt-in for stream-family (TCP/UDP) egress proxy materialization.
-    /// Default `false` because stream egress proxies bind plaintext listeners
-    /// (frontend_tls: false) and mesh_authz cannot authenticate connections
-    /// without TLS client certs. Operators must explicitly enable via
-    /// `FERRUM_MESH_EGRESS_STREAM_ENABLED=true` after configuring alternative
-    /// authentication for stream listeners.
+    /// Default `false`. When enabled, the materialized per-port stream egress
+    /// proxies terminate SVID-mTLS (reusing the mesh-inbound `ServerConfig`)
+    /// and run `mesh_authz` at accept — the same authn/z as HTTP egress —
+    /// unless [`Self::egress_stream_allow_plaintext`] flips them back to the
+    /// legacy plaintext posture. Sourced from `FERRUM_MESH_EGRESS_STREAM_ENABLED`.
     pub egress_stream_enabled: bool,
+    /// Explicit opt-out that makes stream-family egress listeners plaintext +
+    /// unauthenticated (the legacy posture). Default `false`: stream egress
+    /// listeners terminate SVID-mTLS and run `mesh_authz`. Sourced from
+    /// `FERRUM_MESH_EGRESS_STREAM_ALLOW_PLAINTEXT`. Only meaningful when
+    /// [`Self::egress_stream_enabled`] is `true`; a loud warning is emitted at
+    /// startup when it is enabled.
+    pub egress_stream_allow_plaintext: bool,
     /// Whether the auto-injected mesh `RequestAuthentication` (`jwks_auth`)
     /// plugin requires the JWT `exp` claim. Defaults to `true` (secure):
     /// `exp`-less tokens are rejected so they cannot live forever. Sourced
@@ -589,6 +596,7 @@ impl MeshRuntimeConfig {
             sidecar_enforced_dry_run: env_config.mesh_sidecar_enforced_dry_run,
             sidecar_identity_narrowing: env_config.mesh_sidecar_identity_narrowing,
             egress_stream_enabled: env_config.mesh_egress_stream_enabled,
+            egress_stream_allow_plaintext: env_config.mesh_egress_stream_allow_plaintext,
             request_auth_require_exp: env_config.mesh_request_auth_require_exp,
         })
     }
@@ -3849,6 +3857,7 @@ fn materialize_egress_gateway_proxies(
         &runtime.namespace,
         &mesh_reserved_ports,
         runtime.egress_stream_enabled,
+        runtime.egress_stream_allow_plaintext,
     );
 
     if proxies.is_empty() {
@@ -3903,7 +3912,7 @@ fn materialize_egress_gateway_proxies(
 /// can't safely disambiguate ports).
 ///
 /// Stream-family ports (`tcp`, `mongo`, `redis`, `mysql`, `postgres`) are
-/// materialized as raw L4 stream proxies bound on the ServiceEntry's own
+/// materialized as L4 stream proxies bound on the ServiceEntry's own
 /// port (e.g., `mongo.external.io:27017/TCP` produces a TCP listener on
 /// port 27017). Each `listen_port` admits at most one stream proxy; later
 /// SEs requesting the same port are skipped with a warning. The materialized
@@ -3913,11 +3922,17 @@ fn materialize_egress_gateway_proxies(
 /// with `mesh_reserved_ports` (the egress gateway's own listener port) are
 /// skipped with a warning instead of materializing — letting them through
 /// would fail at listener bind time with EADDRINUSE.
+///
+/// Stream egress listeners terminate SVID-mTLS (`frontend_tls: true`, sharing
+/// the mesh-inbound `ServerConfig` slot) and run `mesh_authz` at accept — the
+/// same authn/z as HTTP egress — unless `egress_stream_allow_plaintext` is set,
+/// which restores the legacy plaintext + unauthenticated posture.
 fn build_egress_proxies_and_upstreams(
     service_entries: &[ServiceEntry],
     namespace: &str,
     mesh_reserved_ports: &std::collections::HashSet<u16>,
     egress_stream_enabled: bool,
+    egress_stream_allow_plaintext: bool,
 ) -> (Vec<Proxy>, Vec<Upstream>) {
     let mut proxies = Vec::new();
     let mut upstreams = Vec::new();
@@ -3966,10 +3981,10 @@ fn build_egress_proxies_and_upstreams(
                         namespace = %entry.namespace,
                         port = port_spec.port,
                         protocol = ?port_spec.protocol,
-                        "Skipping stream egress ServiceEntry port: stream egress proxies \
-                         bind plaintext listeners without mTLS and mesh_authz cannot \
-                         authenticate connections. Set FERRUM_MESH_EGRESS_STREAM_ENABLED=true \
-                         to opt in after configuring alternative authentication."
+                        "Skipping stream egress ServiceEntry port: stream-family egress is \
+                         disabled. Set FERRUM_MESH_EGRESS_STREAM_ENABLED=true to materialize \
+                         per-port stream egress listeners (they terminate SVID-mTLS and run \
+                         mesh_authz by default)."
                     );
                     continue;
                 }
@@ -3980,6 +3995,7 @@ fn build_egress_proxies_and_upstreams(
                     namespace,
                     now,
                     mesh_reserved_ports,
+                    egress_stream_allow_plaintext,
                     &mut materialized_stream_ports,
                     &mut proxies,
                     &mut upstreams,
@@ -4092,6 +4108,7 @@ fn build_stream_egress_for_entry(
     namespace: &str,
     now: chrono::DateTime<chrono::Utc>,
     mesh_reserved_ports: &std::collections::HashSet<u16>,
+    allow_plaintext: bool,
     materialized_stream_ports: &mut std::collections::HashSet<u16>,
     proxies: &mut Vec<Proxy>,
     upstreams: &mut Vec<Upstream>,
@@ -4194,6 +4211,7 @@ fn build_stream_egress_for_entry(
         port_spec.port,
         port_spec.protocol,
         &upstream_id,
+        allow_plaintext,
         now,
     );
     proxies.push(proxy);
@@ -4435,6 +4453,7 @@ fn stream_egress_gateway_proxy(
     listen_port: u16,
     protocol: AppProtocol,
     upstream_id: &str,
+    allow_plaintext: bool,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Proxy {
     let protocol_label = egress_app_protocol_label(protocol);
@@ -4489,20 +4508,32 @@ fn stream_egress_gateway_proxy(
         retry: None,
         response_body_mode: ResponseBodyMode::Stream,
         listen_port: Some(listen_port),
-        // Stream egress proxies own their own per-port plaintext listener
-        // (e.g., 27017 for Mongo) and forward to the external backend with
+        // Stream egress proxies own their own per-port listener (e.g., 27017
+        // for Mongo) and forward to the external backend with
         // `BackendScheme::Tcp`. They are NOT raw SNI passthrough (that's the
         // east-west gateway flow) — passthrough is false so the bytes pass
         // through the regular TCP proxy pipeline (idle timeouts, transaction
-        // logging, etc.) rather than `splice(2)` between sockets.
+        // logging, plugin `on_stream_connect` admission, etc.) rather than
+        // `splice(2)` between sockets.
         //
-        // `frontend_tls: false` reflects the per-port stream LISTENER being
-        // plain TCP. Sidecar traffic still routes to the egress gateway by
-        // way of the workload's outbound capture; the inbound mTLS sidecar
-        // boundary lives on the egress mTLS-termination listener (15090) for
-        // HTTP-family flows, which is a sibling listener — it is not the
-        // termination point for this per-port stream listener.
-        frontend_tls: false,
+        // By default `frontend_tls: true`: the per-port stream listener
+        // terminates SVID-mTLS using the SAME mesh-inbound `ServerConfig`
+        // (server identity = gateway SVID leaf+key, peer verifier = SPIFFE
+        // against the trust bundle) that backs the egress 15090 HTTP listener
+        // — it is shared with the listener manager via
+        // `set_frontend_tls_config`/`swap_frontend_tls_config`. The injected
+        // `__mesh_spiffe_identity` stream hook then extracts the peer SPIFFE
+        // id from the verified client cert and `__mesh_authz` enforces policy
+        // at accept, BEFORE the external backend is dialed, so stream egress
+        // gets the same authn/z as HTTP egress. Fail-closed by construction:
+        // if no mTLS `ServerConfig` is loaded, the stream listener manager
+        // DEFERS the bind (never binds plaintext) — mirroring the inbound
+        // posture (`enforce_mesh_inbound_fail_closed`).
+        //
+        // `allow_plaintext` (FERRUM_MESH_EGRESS_STREAM_ALLOW_PLAINTEXT)
+        // restores the legacy plaintext + unauthenticated listener for
+        // operators who genuinely need it (a loud startup warning is emitted).
+        frontend_tls: !allow_plaintext,
         passthrough: false,
         udp_idle_timeout_seconds: 60,
         udp_max_response_amplification_factor: None,
@@ -5533,6 +5564,23 @@ async fn serve_mesh_runtime(
     let inbound_mtls_mode =
         startup_inbound_mtls_mode(initial_applied_mesh_slice.as_deref(), &runtime)?;
     validate_egress_gateway_mtls_config(&runtime, &env_config)?;
+    // Loud warning when stream egress is opted out of SVID-mTLS. The default
+    // (false) terminates SVID-mTLS + runs mesh_authz on stream egress listeners
+    // (parity with HTTP egress); enabling plaintext means any pod that can reach
+    // the gateway reaches the external service through it with no SPIFFE authn/z.
+    if runtime.topology == MeshTopology::EgressGateway
+        && runtime.egress_stream_enabled
+        && runtime.egress_stream_allow_plaintext
+    {
+        warn!(
+            "FERRUM_MESH_EGRESS_STREAM_ALLOW_PLAINTEXT=true: stream-family (TCP/UDP) egress \
+             listeners are running PLAINTEXT and UNAUTHENTICATED. mesh_authz cannot verify SPIFFE \
+             peer identity without mTLS, so any pod that can reach this egress gateway can reach \
+             the external ServiceEntry backends through it with no authorization check. Unset \
+             FERRUM_MESH_EGRESS_STREAM_ALLOW_PLAINTEXT to terminate SVID-mTLS (parity with HTTP \
+             egress); keep it enabled only with compensating network controls."
+        );
+    }
     let mesh_ca_trust_overlay_slot = empty_mesh_inbound_trust_overlay_slot();
     let mesh_ca_svid_slot = start_mesh_ca_backend_svid_source(
         &proxy_state,
@@ -5677,6 +5725,7 @@ async fn serve_mesh_runtime(
         &tls_policy,
         &crls,
         inbound_mtls_mode,
+        runtime.topology,
         mesh_frontend_identity.as_deref(),
         initial_inbound_tls_snapshot
             .as_ref()
@@ -7059,6 +7108,16 @@ enum MeshClientAuthDecision {
     /// [`tls::MeshClientAuth::None`] (no CertificateRequest), and the caller is
     /// expected to warn once.
     PermissiveNoTrustAnchor,
+    /// EgressGateway-only fail-closed decision: the egress mTLS listener is a
+    /// security boundary that MUST authenticate every client, but PERMISSIVE
+    /// resolved with no trust anchor at all (no client-CA bundle, no SVID
+    /// material), so it cannot. Optional-no-verify mTLS would admit cert-less
+    /// peers straight onto the external backend, so [`load_mesh_frontend_tls`]
+    /// turns this into a hard error rather than serving it. In practice
+    /// [`validate_egress_gateway_mtls_config`] already requires a peer verifier
+    /// for this topology, so this is defense-in-depth for the
+    /// reload/non-validated paths.
+    EgressGatewayNoTrustAnchor,
 }
 
 impl MeshClientAuthDecision {
@@ -7066,7 +7125,8 @@ impl MeshClientAuthDecision {
     fn client_auth(self) -> tls::MeshClientAuth {
         match self {
             MeshClientAuthDecision::Resolved(auth) => auth,
-            MeshClientAuthDecision::PermissiveNoTrustAnchor => tls::MeshClientAuth::None,
+            MeshClientAuthDecision::PermissiveNoTrustAnchor
+            | MeshClientAuthDecision::EgressGatewayNoTrustAnchor => tls::MeshClientAuth::None,
         }
     }
 }
@@ -7082,9 +7142,26 @@ impl MeshClientAuthDecision {
 ///   cert and verifies it when offered, but cert-less peers are still admitted.
 ///   This is what lets PERMISSIVE record `peer_spiffe_id` for a peer that
 ///   presents a valid SVID instead of silently treating it as anonymous.
-/// - `PERMISSIVE` with **no** trust anchor → [`MeshClientAuthDecision::PermissiveNoTrustAnchor`]:
-///   no CertificateRequest is sent because a presented cert could not be
-///   verified anyway. The caller emits a single loud warning.
+///   **EgressGateway is the exception**: that topology's TLS listener (the
+///   `:15090` HTTP mTLS inbound AND the F6.1 stream-family egress listeners that
+///   share the same `ServerConfig`) is a security boundary onto external
+///   networks. A cert-less client admitted there reaches the external backend
+///   unauthenticated, so PERMISSIVE-with-anchor is escalated to `Required`:
+///   every egress client MUST present a verifiable SVID. STRICT, the explicit
+///   `FERRUM_MESH_EGRESS_STREAM_ALLOW_PLAINTEXT` opt-out (handled before this
+///   resolver, plaintext listener), and PeerAuthentication `DISABLE` (rejected
+///   for EgressGateway by [`validate_inbound_mtls_mode_for_topology`]) are the
+///   only ways an egress client skips client-cert verification.
+/// - `PERMISSIVE` with **no** trust anchor → [`MeshClientAuthDecision::PermissiveNoTrustAnchor`]
+///   for non-egress topologies: no CertificateRequest is sent because a
+///   presented cert could not be verified anyway. The caller emits a single
+///   loud warning. For **EgressGateway** the same input is
+///   [`MeshClientAuthDecision::EgressGatewayNoTrustAnchor`]: the security
+///   boundary cannot authenticate clients at all, so the caller fails closed
+///   (hard error) instead of serving optional-no-verify mTLS.
+///   ([`validate_egress_gateway_mtls_config`] already requires a peer verifier
+///   for this topology at config time; this is defense-in-depth for the
+///   live-reload/non-validated paths.)
 /// - `DISABLE` never reaches here (handled by the plaintext-listener early
 ///   return in [`load_mesh_frontend_tls`]).
 /// - `Simple` / `Mutual` / `IstioMutual` are client-side `DestinationRule.tls`
@@ -7094,11 +7171,29 @@ fn resolve_mesh_inbound_client_auth(
     mtls_mode: config::MtlsMode,
     has_client_ca_bundle: bool,
     has_spiffe_verifier: bool,
+    topology: MeshTopology,
 ) -> MeshClientAuthDecision {
+    let is_egress_gateway = topology == MeshTopology::EgressGateway;
     match mtls_mode {
         config::MtlsMode::Strict => MeshClientAuthDecision::Resolved(tls::MeshClientAuth::Required),
         config::MtlsMode::Permissive if has_client_ca_bundle || has_spiffe_verifier => {
-            MeshClientAuthDecision::Resolved(tls::MeshClientAuth::Optional)
+            // EgressGateway is a security boundary onto external networks: a
+            // cert-less client must NOT be admitted to the external backend.
+            // Escalate PERMISSIVE-with-anchor from Optional to Required so every
+            // egress client presents a verifiable SVID. Non-egress topologies
+            // keep the standard PERMISSIVE-optional posture (verify-if-offered,
+            // still admit cert-less peers) unchanged.
+            if is_egress_gateway {
+                MeshClientAuthDecision::Resolved(tls::MeshClientAuth::Required)
+            } else {
+                MeshClientAuthDecision::Resolved(tls::MeshClientAuth::Optional)
+            }
+        }
+        // EgressGateway with no trust anchor cannot authenticate clients at all;
+        // serving optional-no-verify mTLS would admit cert-less peers onto the
+        // external backend. Fail closed instead (the caller hard-errors).
+        config::MtlsMode::Permissive if is_egress_gateway => {
+            MeshClientAuthDecision::EgressGatewayNoTrustAnchor
         }
         config::MtlsMode::Permissive => MeshClientAuthDecision::PermissiveNoTrustAnchor,
         // DISABLE has no TLS and is handled before this resolver runs.
@@ -7115,11 +7210,17 @@ fn resolve_mesh_inbound_client_auth(
 ///
 /// - `Strict` / `Permissive`: Load TLS with the appropriate client-auth mode.
 /// - `Disable`: Return `None` (plaintext listener).
+///
+/// `topology` drives the EgressGateway client-auth escalation (PERMISSIVE +
+/// trust anchor → Required; PERMISSIVE + no anchor → fail closed) — see
+/// [`resolve_mesh_inbound_client_auth`].
+#[allow(clippy::too_many_arguments)]
 fn load_mesh_frontend_tls(
     env_config: &EnvConfig,
     tls_policy: &TlsPolicy,
     crls: &[rustls::pki_types::CertificateRevocationListDer<'static>],
     mtls_mode: config::MtlsMode,
+    topology: MeshTopology,
     server_identity: Option<&tls::MeshServerIdentity>,
     client_ca_bundle: Option<&MeshInboundClientCaBundle>,
     spiffe_bundle_slot: Option<&tls::SharedBundleSlot>,
@@ -7157,6 +7258,7 @@ fn load_mesh_frontend_tls(
         mtls_mode,
         client_ca_bundle_path.is_some(),
         spiffe_verifier.is_some(),
+        topology,
     ) {
         MeshClientAuthDecision::Resolved(auth) => {
             // A client-side `DestinationRule.tls` mode reaching this server-side
@@ -7175,6 +7277,25 @@ fn load_mesh_frontend_tls(
                 );
             }
             auth
+        }
+        MeshClientAuthDecision::EgressGatewayNoTrustAnchor => {
+            // Fail closed: an EgressGateway is a security boundary onto external
+            // networks. PERMISSIVE resolved here with no trust anchor at all, so
+            // it cannot authenticate clients; serving optional-no-verify mTLS
+            // would admit cert-less peers straight onto the external backend.
+            // Refuse to build the listener rather than silently downgrade the
+            // egress boundary. (`validate_egress_gateway_mtls_config` already
+            // requires a peer verifier at config time; this guards the
+            // live-reload/non-validated paths.)
+            return Err(anyhow::anyhow!(
+                "Mesh PeerAuthentication resolved to PERMISSIVE on EgressGateway topology but no \
+                 FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH or gateway SVID material is configured, \
+                 so the egress mTLS listener cannot verify sidecar client certificates. The egress \
+                 gateway must authenticate every client; configure a client-CA bundle or gateway \
+                 SVID material, use STRICT PeerAuthentication, or set \
+                 FERRUM_MESH_EGRESS_STREAM_ALLOW_PLAINTEXT=true to explicitly opt the stream egress \
+                 listeners into unauthenticated plaintext"
+            ));
         }
         decision @ MeshClientAuthDecision::PermissiveNoTrustAnchor => {
             // Loud, single warning: PERMISSIVE with no trust anchor at all means
@@ -7548,6 +7669,7 @@ fn plan_mesh_inbound_tls_reload(
         tls_policy,
         &proxy_state.crls,
         mtls_mode,
+        runtime.topology,
         server_identity,
         next_snapshot.client_ca_bundle.as_ref(),
         spiffe_bundle_slot,
@@ -9007,6 +9129,7 @@ mod tests {
             sidecar_enforced_dry_run: false,
             sidecar_identity_narrowing: false,
             egress_stream_enabled: false,
+            egress_stream_allow_plaintext: false,
             request_auth_require_exp: true,
         };
         let config = prepare_gateway_config_for_mesh(GatewayConfig::default(), &runtime).unwrap();
@@ -9113,6 +9236,7 @@ mod tests {
             sidecar_enforced_dry_run: false,
             sidecar_identity_narrowing: false,
             egress_stream_enabled: false,
+            egress_stream_allow_plaintext: false,
             request_auth_require_exp: true,
         }
     }
@@ -16524,6 +16648,7 @@ mod tests {
             &tls_policy,
             &[],
             config::MtlsMode::Strict,
+            MeshTopology::Sidecar,
             None,
             None,
             None,
@@ -16546,6 +16671,7 @@ mod tests {
             &tls_policy,
             &[],
             config::MtlsMode::Permissive,
+            MeshTopology::Sidecar,
             None,
             None,
             None,
@@ -16574,6 +16700,7 @@ mod tests {
             &tls_policy,
             &[],
             config::MtlsMode::Permissive,
+            MeshTopology::Sidecar,
             mesh_frontend_identity.as_deref(),
             None,
             None,
@@ -16744,6 +16871,7 @@ mod tests {
             &tls_policy,
             &[],
             config::MtlsMode::Permissive,
+            MeshTopology::Sidecar,
             Some(identity.as_ref()),
             None,
             None,
@@ -16868,6 +16996,7 @@ mod tests {
             &tls_policy,
             &[],
             config::MtlsMode::Permissive,
+            MeshTopology::Sidecar,
             identity.as_deref(),
             None,
             None,
@@ -16900,48 +17029,114 @@ mod tests {
         use config::MtlsMode;
         use tls::MeshClientAuth;
 
-        // STRICT always requires a peer cert, regardless of trust anchors.
+        // The non-egress topologies (Sidecar/Ambient/waypoints) all share the
+        // standard inbound mTLS posture; assert against Sidecar as the
+        // representative non-egress topology so the EgressGateway escalation
+        // below is isolated.
+        let non_egress = MeshTopology::Sidecar;
+
+        // STRICT always requires a peer cert, regardless of trust anchors or
+        // topology.
         for (has_ca, has_spiffe) in [(false, false), (true, false), (false, true), (true, true)] {
-            assert_eq!(
-                resolve_mesh_inbound_client_auth(MtlsMode::Strict, has_ca, has_spiffe),
-                MeshClientAuthDecision::Resolved(MeshClientAuth::Required),
-                "STRICT must require a peer cert"
-            );
+            for topology in [non_egress, MeshTopology::EgressGateway] {
+                assert_eq!(
+                    resolve_mesh_inbound_client_auth(
+                        MtlsMode::Strict,
+                        has_ca,
+                        has_spiffe,
+                        topology
+                    ),
+                    MeshClientAuthDecision::Resolved(MeshClientAuth::Required),
+                    "STRICT must require a peer cert ({topology:?})"
+                );
+            }
         }
 
-        // PERMISSIVE with any trust anchor → Optional (request + verify-if-offered,
-        // still admit cert-less peers). This is the finding's core fix: identity
-        // is recorded when a cert is offered instead of degrading to anonymous.
+        // PERMISSIVE with any trust anchor → Optional for NON-egress topologies
+        // (request + verify-if-offered, still admit cert-less peers). This is
+        // the original finding's core fix: identity is recorded when a cert is
+        // offered instead of degrading to anonymous. EgressGateway must NOT
+        // regress this for Sidecar/Ambient.
         for (has_ca, has_spiffe) in [(true, false), (false, true), (true, true)] {
             assert_eq!(
-                resolve_mesh_inbound_client_auth(MtlsMode::Permissive, has_ca, has_spiffe),
+                resolve_mesh_inbound_client_auth(
+                    MtlsMode::Permissive,
+                    has_ca,
+                    has_spiffe,
+                    non_egress
+                ),
                 MeshClientAuthDecision::Resolved(MeshClientAuth::Optional),
-                "PERMISSIVE with a trust anchor (ca={has_ca}, spiffe={has_spiffe}) must request \
-                 and verify-if-offered, not skip client auth"
+                "PERMISSIVE on a non-egress topology with a trust anchor \
+                 (ca={has_ca}, spiffe={has_spiffe}) must request and verify-if-offered, \
+                 not skip client auth"
             );
         }
 
-        // PERMISSIVE with NO trust anchor → the explicit degraded decision (the
-        // caller warns once); it maps to no client auth.
-        let no_anchor = resolve_mesh_inbound_client_auth(MtlsMode::Permissive, false, false);
+        // P1 fix: PERMISSIVE with any trust anchor on an EgressGateway is
+        // ESCALATED to Required. The egress mTLS listener (the :15090 HTTP
+        // inbound AND the F6.1 stream-family egress listeners that share the
+        // same ServerConfig) is a security boundary onto external networks — a
+        // cert-less client must NOT be admitted. Without this, a cert-less TLS
+        // client would reach the external backend unauthenticated in a
+        // default-allow (no STRICT PeerAuthentication) mesh.
+        for (has_ca, has_spiffe) in [(true, false), (false, true), (true, true)] {
+            assert_eq!(
+                resolve_mesh_inbound_client_auth(
+                    MtlsMode::Permissive,
+                    has_ca,
+                    has_spiffe,
+                    MeshTopology::EgressGateway
+                ),
+                MeshClientAuthDecision::Resolved(MeshClientAuth::Required),
+                "PERMISSIVE on an EgressGateway with a trust anchor \
+                 (ca={has_ca}, spiffe={has_spiffe}) must REQUIRE a client cert (security \
+                 boundary), not admit cert-less peers"
+            );
+        }
+
+        // PERMISSIVE with NO trust anchor on a non-egress topology → the
+        // explicit degraded decision (the caller warns once); maps to no client
+        // auth.
+        let no_anchor =
+            resolve_mesh_inbound_client_auth(MtlsMode::Permissive, false, false, non_egress);
         assert_eq!(no_anchor, MeshClientAuthDecision::PermissiveNoTrustAnchor);
         assert_eq!(no_anchor.client_auth(), MeshClientAuth::None);
 
+        // PERMISSIVE with NO trust anchor on an EgressGateway → the fail-closed
+        // decision: the security boundary cannot authenticate clients at all, so
+        // the caller (load_mesh_frontend_tls) hard-errors rather than serving
+        // optional-no-verify mTLS. (validate_egress_gateway_mtls_config already
+        // requires a verifier at config time; this is defense-in-depth.)
+        let egress_no_anchor = resolve_mesh_inbound_client_auth(
+            MtlsMode::Permissive,
+            false,
+            false,
+            MeshTopology::EgressGateway,
+        );
+        assert_eq!(
+            egress_no_anchor,
+            MeshClientAuthDecision::EgressGatewayNoTrustAnchor,
+            "PERMISSIVE EgressGateway with no trust anchor must fail closed, not degrade to \
+             no-client-auth"
+        );
+
         // Client-side DR.tls modes must never request client auth on a
-        // server-side listener even if anchors happen to exist.
+        // server-side listener even if anchors happen to exist (any topology).
         for mode in [MtlsMode::Simple, MtlsMode::Mutual, MtlsMode::IstioMutual] {
-            assert_eq!(
-                resolve_mesh_inbound_client_auth(mode, true, true),
-                MeshClientAuthDecision::Resolved(MeshClientAuth::None),
-                "client-side DR.tls mode {mode:?} must not request client auth"
-            );
+            for topology in [non_egress, MeshTopology::EgressGateway] {
+                assert_eq!(
+                    resolve_mesh_inbound_client_auth(mode, true, true, topology),
+                    MeshClientAuthDecision::Resolved(MeshClientAuth::None),
+                    "client-side DR.tls mode {mode:?} must not request client auth ({topology:?})"
+                );
+            }
         }
 
         // DISABLE never reaches the resolver in production (early return in
         // load_mesh_frontend_tls), but the defensive mapping that replaced the
         // former unreachable!() must stay no-client-auth and never panic.
         assert_eq!(
-            resolve_mesh_inbound_client_auth(MtlsMode::Disable, true, true),
+            resolve_mesh_inbound_client_auth(MtlsMode::Disable, true, true, non_egress),
             MeshClientAuthDecision::Resolved(MeshClientAuth::None),
             "DISABLE must map to no client auth, never panic"
         );
@@ -17044,6 +17239,7 @@ mod tests {
             &tls_policy,
             &[],
             config::MtlsMode::Permissive,
+            MeshTopology::Sidecar,
             mesh_frontend_identity.as_deref(),
             None,
             Some(&slot),
@@ -17077,7 +17273,12 @@ mod tests {
                 .expect("mesh frontend identity");
 
         assert_eq!(
-            resolve_mesh_inbound_client_auth(config::MtlsMode::Permissive, true, false),
+            resolve_mesh_inbound_client_auth(
+                config::MtlsMode::Permissive,
+                true,
+                false,
+                MeshTopology::Sidecar
+            ),
             MeshClientAuthDecision::Resolved(tls::MeshClientAuth::Optional),
             "PERMISSIVE with only an operator CA bundle must resolve to Optional"
         );
@@ -17087,6 +17288,7 @@ mod tests {
             &tls_policy,
             &[],
             config::MtlsMode::Permissive,
+            MeshTopology::Sidecar,
             mesh_frontend_identity.as_deref(),
             None,
             None,
@@ -17126,6 +17328,7 @@ mod tests {
             &tls_policy,
             &[],
             config::MtlsMode::Strict,
+            MeshTopology::Sidecar,
             mesh_frontend_identity.as_deref(),
             None,
             None,
@@ -17161,6 +17364,7 @@ mod tests {
             &tls_policy,
             &[],
             config::MtlsMode::Strict,
+            MeshTopology::Sidecar,
             mesh_frontend_identity.as_deref(),
             snapshot.client_ca_bundle.as_ref(),
             None,
@@ -17381,6 +17585,7 @@ mod tests {
             &tls_policy,
             &[],
             config::MtlsMode::Permissive,
+            MeshTopology::Sidecar,
             mesh_frontend_identity.as_deref(),
             None,
             None,
@@ -17471,6 +17676,7 @@ mod tests {
             "default",
             &std::collections::HashSet::new(),
             true,
+            false,
         );
 
         assert_eq!(proxies.len(), 1);
@@ -17533,6 +17739,7 @@ mod tests {
             "default",
             &std::collections::HashSet::new(),
             true,
+            false,
         );
 
         assert!(proxies.is_empty());
@@ -17568,6 +17775,7 @@ mod tests {
             "default",
             &std::collections::HashSet::new(),
             true,
+            false,
         );
 
         assert!(proxies.is_empty());
@@ -17589,6 +17797,7 @@ mod tests {
             "default",
             &std::collections::HashSet::new(),
             true,
+            false,
         );
         assert!(proxies.is_empty());
         assert!(upstreams.is_empty());
@@ -17599,6 +17808,7 @@ mod tests {
             "default",
             &std::collections::HashSet::new(),
             true,
+            false,
         );
         assert_eq!(proxies.len(), 1);
         assert_eq!(upstreams.len(), 1);
@@ -17631,6 +17841,7 @@ mod tests {
             "default",
             &std::collections::HashSet::new(),
             true,
+            false,
         );
         assert_eq!(proxies.len(), 1);
         assert_eq!(upstreams.len(), 1);
@@ -17641,7 +17852,8 @@ mod tests {
         assert_eq!(proxy.listen_port, Some(3306));
         assert_eq!(proxy.backend_scheme, Some(BackendScheme::Tcp));
         assert!(!proxy.passthrough);
-        assert!(!proxy.frontend_tls);
+        // Stream egress terminates SVID-mTLS by default (parity with HTTP egress).
+        assert!(proxy.frontend_tls);
         assert_eq!(
             proxy.name.as_deref(),
             Some("mesh egress mysql db.external.com:3306")
@@ -17667,6 +17879,7 @@ mod tests {
             "default",
             &std::collections::HashSet::new(),
             true,
+            false,
         );
 
         assert_eq!(proxies.len(), 1);
@@ -17725,6 +17938,7 @@ mod tests {
             "default",
             &std::collections::HashSet::new(),
             true,
+            false,
         );
 
         // Host-only HTTP proxies cannot safely distinguish multiple ports for
@@ -17787,6 +18001,7 @@ mod tests {
             "default",
             &std::collections::HashSet::new(),
             true,
+            false,
         );
 
         assert_eq!(proxies.len(), 1);
@@ -17820,6 +18035,7 @@ mod tests {
             "default",
             &std::collections::HashSet::new(),
             true,
+            false,
         );
 
         assert_eq!(upstreams.len(), 2);
@@ -17857,6 +18073,7 @@ mod tests {
             "default",
             &std::collections::HashSet::new(),
             true,
+            false,
         );
 
         assert_eq!(upstreams.len(), 1);
@@ -17887,6 +18104,7 @@ mod tests {
             "default",
             &std::collections::HashSet::new(),
             true,
+            false,
         );
         let mut config = GatewayConfig {
             upstreams,
@@ -17950,6 +18168,7 @@ mod tests {
             "default",
             &std::collections::HashSet::new(),
             true,
+            false,
         );
         assert!(proxies.is_empty());
         assert!(upstreams.is_empty());
@@ -18139,6 +18358,7 @@ mod tests {
             "default",
             &std::collections::HashSet::new(),
             true,
+            false,
         );
 
         assert_eq!(proxies.len(), 1);
@@ -18185,6 +18405,7 @@ mod tests {
             "default",
             &std::collections::HashSet::new(),
             true,
+            false,
         );
 
         assert_eq!(proxies.len(), 1);
@@ -18223,6 +18444,7 @@ mod tests {
             "default",
             &std::collections::HashSet::new(),
             true,
+            false,
         );
         assert!(proxies.is_empty());
         assert!(upstreams.is_empty());
@@ -18354,6 +18576,7 @@ mod tests {
             "default",
             &std::collections::HashSet::new(),
             true,
+            false,
         );
 
         assert_eq!(proxies.len(), 1);
@@ -18368,7 +18591,8 @@ mod tests {
         assert_eq!(proxy.listen_port, Some(6380));
         assert_eq!(proxy.backend_scheme, Some(BackendScheme::Tcp));
         assert!(!proxy.passthrough);
-        assert!(!proxy.frontend_tls);
+        // Stream egress terminates SVID-mTLS by default (parity with HTTP egress).
+        assert!(proxy.frontend_tls);
         assert_eq!(
             proxy.upstream_id.as_deref(),
             Some("mesh-egress-up-default-raw-tcp-raw-dot-external-dot-io-6380")
@@ -18378,6 +18602,47 @@ mod tests {
         assert_eq!(upstream.targets.len(), 1);
         assert_eq!(upstream.targets[0].host, "raw.external.io");
         assert_eq!(upstream.targets[0].port, 6380);
+    }
+
+    #[test]
+    fn egress_stream_proxy_frontend_tls_follows_allow_plaintext_gate() {
+        // F6 §6.1: `allow_plaintext` is the ONLY input that flips a stream
+        // egress listener between SVID-mTLS termination (default) and the
+        // legacy plaintext posture. Same ServiceEntry, both gate values.
+        let service_entries = vec![test_external_stream_service_entry(
+            "raw-tcp",
+            "raw.external.io",
+            6380,
+            AppProtocol::Tcp,
+        )];
+
+        // Default (allow_plaintext = false): terminate SVID-mTLS.
+        let (mtls_proxies, _) = build_egress_proxies_and_upstreams(
+            &service_entries,
+            "default",
+            &std::collections::HashSet::new(),
+            true,
+            false,
+        );
+        assert_eq!(mtls_proxies.len(), 1);
+        assert!(
+            mtls_proxies[0].frontend_tls,
+            "default stream egress must terminate SVID-mTLS"
+        );
+
+        // Explicit opt-out (allow_plaintext = true): legacy plaintext listener.
+        let (plaintext_proxies, _) = build_egress_proxies_and_upstreams(
+            &service_entries,
+            "default",
+            &std::collections::HashSet::new(),
+            true,
+            true,
+        );
+        assert_eq!(plaintext_proxies.len(), 1);
+        assert!(
+            !plaintext_proxies[0].frontend_tls,
+            "allow_plaintext opt-out must produce a plaintext stream listener"
+        );
     }
 
     #[test]
@@ -18394,6 +18659,7 @@ mod tests {
             "default",
             &std::collections::HashSet::new(),
             true,
+            false,
         );
 
         assert_eq!(proxies.len(), 1);
@@ -18448,6 +18714,7 @@ mod tests {
             "default",
             &std::collections::HashSet::new(),
             true,
+            false,
         );
 
         assert_eq!(proxies.len(), 1);
@@ -18487,6 +18754,7 @@ mod tests {
             "default",
             &std::collections::HashSet::new(),
             true,
+            false,
         );
 
         assert_eq!(proxies.len(), 1, "only the first SE wins on port collision");
@@ -18522,6 +18790,7 @@ mod tests {
             "default",
             &std::collections::HashSet::new(),
             true,
+            false,
         );
 
         assert_eq!(proxies.len(), 2);
@@ -18584,6 +18853,7 @@ mod tests {
             "default",
             &std::collections::HashSet::new(),
             true,
+            false,
         );
 
         assert_eq!(proxies.len(), 2);
@@ -18621,6 +18891,7 @@ mod tests {
             "default",
             &std::collections::HashSet::new(),
             true,
+            false,
         );
 
         let stream_proxy = proxies
@@ -18679,6 +18950,7 @@ mod tests {
             "default",
             &std::collections::HashSet::new(),
             true,
+            false,
         );
 
         assert_eq!(
@@ -18879,7 +19151,7 @@ mod tests {
         )];
 
         let (proxies, upstreams) =
-            build_egress_proxies_and_upstreams(&service_entries, "default", &reserved, true);
+            build_egress_proxies_and_upstreams(&service_entries, "default", &reserved, true, false);
 
         assert!(
             proxies.is_empty(),
@@ -18909,6 +19181,7 @@ mod tests {
             "default",
             &std::collections::HashSet::new(),
             true,
+            false,
         );
 
         assert!(
