@@ -2982,14 +2982,22 @@ async fn handle_h3_request(
             | Some(crate::retry::ErrorClass::ClientDisconnect) => false,
             Some(_) => true,
         };
-        // When the backend itself returned a server error (>= 500), a concurrent
-        // client disconnect during the response send must NOT mask it:
-        // `ClientDisconnect` is client-side and skips CB / passive-health
-        // entirely, so a real backend 5xx would be neutralized. Drop the body
-        // class in that case so the 5xx status drives the recorded outcome.
-        // Mirrors the refined/cross-protocol consumer's handling further below.
+        // When the backend itself returned a failure status (a 5xx, or any status
+        // the proxy configured as a circuit-breaker failure), a concurrent client
+        // disconnect during the response send must NOT mask it: `ClientDisconnect`
+        // is client-side and skips CB / passive-health entirely, so a real backend
+        // failure would be neutralized. Drop the body class in that case so the
+        // failure status drives the recorded outcome. Provenance matters and only
+        // the caller has it — `record_backend_outcome` cannot tell this backend
+        // status apart from a synthetic 5xx emitted on a client upload-abort, so
+        // this stays caller-side. Mirrors the refined/cross-protocol consumer.
+        let backend_failure_status = response_status >= 500
+            || proxy
+                .circuit_breaker
+                .as_ref()
+                .is_some_and(|cb| cb.failure_status_codes.contains(&response_status));
         let body_outcome_error_class = match body_error_class {
-            Some(crate::retry::ErrorClass::ClientDisconnect) if response_status >= 500 => None,
+            Some(crate::retry::ErrorClass::ClientDisconnect) if backend_failure_status => None,
             other => other,
         };
         crate::proxy::backend_dispatch::record_backend_outcome(
@@ -3384,13 +3392,19 @@ async fn handle_h3_request(
         // a client-side (non-backend) signal by passive health / the breaker
         // instead of a phantom success (the terminal `h3_error_class` is None for
         // a mid-body client disconnect). EXCEPTION: when the backend itself
-        // returned a server error (>= 500), a concurrent client disconnect during
-        // the response send must NOT neutralize that backend failure —
-        // client-side classes skip CB / passive-health entirely — so fall back to
-        // the dispatch class (or None) and let the 5xx status drive the recorded
-        // outcome. Shared with the admission outcome below.
+        // returned a failure status (a 5xx, or any status the proxy configured as
+        // a circuit-breaker failure), a concurrent client disconnect during the
+        // response send must NOT neutralize that backend failure — client-side
+        // classes skip CB / passive-health entirely — so fall back to the dispatch
+        // class (or None) and let the failure status drive the recorded outcome.
+        // Shared with the admission outcome below.
+        let backend_failure_status = backend_status >= 500
+            || proxy
+                .circuit_breaker
+                .as_ref()
+                .is_some_and(|cb| cb.failure_status_codes.contains(&backend_status));
         let backend_outcome_error_class = match h3_stream_result.body_error_class {
-            Some(crate::retry::ErrorClass::ClientDisconnect) if backend_status >= 500 => {
+            Some(crate::retry::ErrorClass::ClientDisconnect) if backend_failure_status => {
                 h3_error_class
             }
             other => other.or(h3_error_class),
