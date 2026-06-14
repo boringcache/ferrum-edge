@@ -791,10 +791,20 @@ pub struct EnvConfig {
     /// by admitted services. Default `false` for a one-release rollout window.
     pub mesh_sidecar_identity_narrowing: bool,
     /// Opt-in for stream-family (TCP/UDP) egress proxy materialization in
-    /// `EgressGateway` topology. Default `false` because stream egress
-    /// listeners are plaintext (no frontend TLS / DTLS) and `mesh_authz`
-    /// cannot verify SPIFFE peer identity without mTLS.
+    /// `EgressGateway` topology. Default `false`. When enabled, the per-port
+    /// stream egress listeners terminate SVID-mTLS (reusing the mesh-inbound
+    /// `ServerConfig`) and run `mesh_authz` at accept — the same authn/z as
+    /// HTTP egress — unless `mesh_egress_stream_allow_plaintext` is set.
     pub mesh_egress_stream_enabled: bool,
+    /// Explicit opt-out that makes stream-family egress listeners plaintext +
+    /// unauthenticated again (the legacy posture). Default `false`: with
+    /// `mesh_egress_stream_enabled=true` the per-port stream listeners
+    /// terminate SVID-mTLS and run `mesh_authz`. Set to `true` ONLY when
+    /// operators genuinely need plaintext and have compensating network
+    /// controls — any pod that can reach the gateway then reaches the external
+    /// service through it with no SPIFFE authn/z. A loud warning is emitted at
+    /// startup when enabled. Ignored unless `mesh_egress_stream_enabled=true`.
+    pub mesh_egress_stream_allow_plaintext: bool,
 
     /// Opt-in live reload for PeerAuthentication-derived inbound mTLS mode
     /// and client CA verifier. Cert/key paths remain static operational
@@ -1705,6 +1715,7 @@ impl Default for EnvConfig {
             mesh_sidecar_enforced_dry_run: false,
             mesh_sidecar_identity_narrowing: false,
             mesh_egress_stream_enabled: false,
+            mesh_egress_stream_allow_plaintext: false,
             mesh_peer_auth_live_reload_enabled: false,
             mesh_request_auth_require_exp: true,
             mesh_federation_poll_interval_seconds: 300,
@@ -2057,6 +2068,7 @@ impl EnvConfig {
             mesh_sidecar_enforced_dry_run: bool = "FERRUM_MESH_SIDECAR_ENFORCED_DRY_RUN" => false;
             mesh_sidecar_identity_narrowing: bool = "FERRUM_MESH_SIDECAR_IDENTITY_NARROWING" => false;
             mesh_egress_stream_enabled: bool = "FERRUM_MESH_EGRESS_STREAM_ENABLED" => false;
+            mesh_egress_stream_allow_plaintext: bool = "FERRUM_MESH_EGRESS_STREAM_ALLOW_PLAINTEXT" => false;
             mesh_peer_auth_live_reload_enabled: bool = "FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED" => false;
             mesh_request_auth_require_exp: bool = "FERRUM_MESH_REQUEST_AUTH_REQUIRE_EXP" => true;
             mesh_federation_poll_interval_seconds: u64 = "FERRUM_MESH_FEDERATION_POLL_INTERVAL_SECONDS" => 300u64;
@@ -2651,6 +2663,7 @@ impl EnvConfig {
             mesh_sidecar_enforced_dry_run,
             mesh_sidecar_identity_narrowing,
             mesh_egress_stream_enabled,
+            mesh_egress_stream_allow_plaintext,
             mesh_peer_auth_live_reload_enabled,
             mesh_request_auth_require_exp,
             mesh_federation_poll_interval_seconds,
