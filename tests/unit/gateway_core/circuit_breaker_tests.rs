@@ -1544,3 +1544,99 @@ fn test_cache_can_execute_returns_probe_flag() {
     let (_cb2, is_probe2) = cache.can_execute("p1", None, &config).unwrap();
     assert!(is_probe2);
 }
+
+/// Stress: race `can_execute()` against probe-failure reopens and successes,
+/// asserting the half-open in-flight count never exceeds `half_open_max_requests`
+/// and the breaker is never wedged.
+///
+/// This targets the three transition/admission races that fall out of tracking
+/// `state` and the probe counter in SEPARATE atomics: over-admission during a
+/// reopen (the counter is cleared while the state is still HALF_OPEN),
+/// admit-after-reopen (a delayed admission increments the counter after the
+/// breaker reopened), and a wedged HALF_OPEN with no admitted request to release
+/// a slot. The packed `(state, count)` atomic makes every transition and
+/// admission a single CAS, so the bound holds and the breaker always recovers.
+///
+/// Unlike the sequential-admit tests above, `can_execute()` here runs
+/// CONCURRENTLY with the reopen — the only way to exercise those races.
+#[test]
+fn test_half_open_bound_and_no_wedge_under_admit_reopen_race_stress() {
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::thread;
+
+    const MAX: u32 = 4;
+    let config = CircuitBreakerConfig {
+        failure_threshold: 1,
+        success_threshold: 1000, // keep it churning in half-open, rarely closing
+        timeout_seconds: 0,      // a reopen is immediately re-admittable
+        failure_status_codes: vec![500],
+        half_open_max_requests: MAX,
+        trip_on_connection_errors: true,
+    };
+    let cb = Arc::new(CircuitBreaker::new(config));
+    cb.record_failure(500, false, false); // trip OPEN
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let peak = Arc::new(AtomicU32::new(0));
+
+    // Monitor: continuously sample the in-flight count and track the peak. If
+    // any admission/transition race over-admits, the peak exceeds MAX.
+    let monitor = {
+        let cb = cb.clone();
+        let stop = stop.clone();
+        let peak = peak.clone();
+        thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                peak.fetch_max(cb.half_open_in_flight(), Ordering::Relaxed);
+            }
+            peak.fetch_max(cb.half_open_in_flight(), Ordering::Relaxed);
+        })
+    };
+
+    // Workers: hammer the admit → release/reopen cycle so `can_execute()` races
+    // concurrent reopens. Every admitted probe is released (via a success or a
+    // reopening failure), so no slot is leaked across the run.
+    let mut handles = Vec::new();
+    for t in 0..8u32 {
+        let cb = cb.clone();
+        handles.push(thread::spawn(move || {
+            for i in 0..20_000u32 {
+                if cb.can_execute().is_ok() {
+                    if t.wrapping_add(i) % 3 == 0 {
+                        cb.record_failure(500, false, true); // reopen
+                    } else {
+                        cb.record_success(true);
+                    }
+                }
+            }
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+    stop.store(true, Ordering::Relaxed);
+    monitor.join().unwrap();
+
+    let observed_peak = peak.load(Ordering::Relaxed);
+    assert!(
+        observed_peak <= MAX,
+        "half_open_in_flight peaked at {observed_peak}, exceeding the configured \
+         max {MAX} — a transition/admission race over-admitted probes"
+    );
+
+    // Every admitted probe was released, so no slot is held now. The breaker
+    // must NOT be wedged: a fresh request can still be admitted (OPEN re-admits
+    // immediately at timeout=0, HALF_OPEN admits a free slot, CLOSED admits as a
+    // non-probe). A wedge would strand it HALF_OPEN at capacity with no holder.
+    assert!(
+        cb.half_open_in_flight() <= MAX,
+        "post-run in_flight {} exceeds max {MAX}",
+        cb.half_open_in_flight()
+    );
+    assert!(
+        cb.can_execute().is_ok(),
+        "breaker wedged after admit/reopen churn: state={} in_flight={}",
+        cb.state_name(),
+        cb.half_open_in_flight()
+    );
+}
