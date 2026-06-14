@@ -231,7 +231,10 @@ mod tests {
     fn dtls_client_hello_with_sni_is_parseable_by_the_gateway_sni_peek() {
         let hello = dtls_client_hello_with_sni("backend-a.test");
         let extracted = ferrum_edge::proxy::sni::extract_sni_from_dtls_client_hello(&hello);
-        assert_eq!(extracted.as_deref(), Some("backend-a.test"));
+        assert_eq!(
+            extracted,
+            ferrum_edge::proxy::sni::DtlsSniResult::Hostname("backend-a.test".to_string())
+        );
     }
 
     #[test]
@@ -240,6 +243,9 @@ mod tests {
         // string is what we expect the gateway to see.
         let hello = dtls_client_hello_with_sni("Backend-B.Test");
         let extracted = ferrum_edge::proxy::sni::extract_sni_from_dtls_client_hello(&hello);
-        assert_eq!(extracted.as_deref(), Some("backend-b.test"));
+        assert_eq!(
+            extracted,
+            ferrum_edge::proxy::sni::DtlsSniResult::Hostname("backend-b.test".to_string())
+        );
     }
 }
