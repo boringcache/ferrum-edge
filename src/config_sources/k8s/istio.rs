@@ -3266,26 +3266,39 @@ fn cors_string_array(cors: &Value, key: &str) -> Option<Vec<String>> {
 }
 
 /// Extract CORS allowed origins from an Istio `corsPolicy`, mapped to the
-/// `cors` plugin's `allowed_origins` form. Supports `allowOrigins[].exact` (and
-/// the literal `"*"`) plus the legacy `allowOrigin` string list. Returns `None`
-/// if no origins are present or any matcher is unrepresentable (`prefix` /
-/// `regex` / non-string): Ferrum's `cors` plugin has no prefix or regex origin
-/// form, so those are left for the `cors` plugin configured directly rather
-/// than silently approximated.
-fn cors_allowed_origins(cors: &Value) -> Option<Vec<String>> {
+/// `cors` plugin's `allowed_origins` form (a JSON array). Supports the full
+/// Istio `allowOrigins[]` `StringMatch` set — `exact` (emitted as a plain
+/// string, byte-identical to the prior exact-only projection), `prefix`
+/// (emitted as `{"prefix": ...}`), and `regex` (emitted as `{"regex": ...}`) —
+/// plus the legacy `allowOrigin` string list (exact strings). The extended
+/// `cors` plugin matches these the same way Ferrum matches Istio `StringMatch`
+/// elsewhere (literal prefix; RE2 full match for regex).
+///
+/// Returns `None` (policy left unprojected, surfaced as a `deferred_fields`
+/// entry by the status writer) when there is no origin list, when any entry is
+/// not a single-key `exact`/`prefix`/`regex` `StringMatch` (an unknown or
+/// multi-key matcher is fail-closed, not approximated), when a string is empty,
+/// or when a `regex` matcher does not compile — so a policy this returns `Some`
+/// for is ALWAYS projectable into a valid `cors` plugin config (no
+/// translate-then-silently-drop gap). `cors_policy_translatable` and the actual
+/// projection both go through here, so the predicate and the emitted config can
+/// never disagree on which shapes are representable.
+fn cors_allowed_origins(cors: &Value) -> Option<Vec<Value>> {
     if let Some(arr) = cors.get("allowOrigins").and_then(Value::as_array) {
         let mut origins = Vec::with_capacity(arr.len());
         for entry in arr {
-            // Istio StringMatch: only `exact` maps cleanly to the cors plugin.
-            let exact = entry.get("exact").and_then(Value::as_str)?;
-            origins.push(exact.to_string());
+            origins.push(cors_origin_matcher_value(entry)?);
         }
         (!origins.is_empty()).then_some(origins)
     } else if let Some(arr) = cors.get("allowOrigin").and_then(Value::as_array) {
         // Deprecated Istio field: a plain list of exact origin strings.
         let mut origins = Vec::with_capacity(arr.len());
         for entry in arr {
-            origins.push(entry.as_str()?.to_string());
+            let s = entry.as_str()?;
+            if s.is_empty() {
+                return None;
+            }
+            origins.push(Value::String(s.to_string()));
         }
         (!origins.is_empty()).then_some(origins)
     } else {
@@ -3293,11 +3306,58 @@ fn cors_allowed_origins(cors: &Value) -> Option<Vec<String>> {
     }
 }
 
+/// Map one Istio `allowOrigins[]` `StringMatch` entry to the `cors` plugin's
+/// `allowed_origins` entry form. Returns `None` (unrepresentable → policy stays
+/// deferred) when the entry is not an object carrying EXACTLY ONE non-empty
+/// `exact` / `prefix` / `regex` string, or when a `regex` fails to compile.
+/// `regex` is compiled here (cold path) purely to gate translatability — the
+/// plugin re-compiles it at config time as the runtime matcher; an invalid
+/// pattern is never reflected into a header.
+fn cors_origin_matcher_value(entry: &Value) -> Option<Value> {
+    let obj = entry.as_object()?;
+    // Istio `StringMatch` contract: EXACTLY ONE recognized key with a string
+    // value, nothing else. A malformed matcher (extra/unknown key, a non-string
+    // value, or multiple keys — e.g. `{"prefix":"x","regex":123}`) is NOT
+    // representable, so return None and leave the policy DEFERRED (fail-closed)
+    // rather than silently dropping the bad key and approximating it. Mirrors
+    // `CorsPlugin::parse_origin_matcher` via the shared StringMatch validator, so
+    // the translator, the plugin, and the deferred-field status writer agree.
+    if !super::string_match_has_exactly_one_supported_operator(entry, &["exact", "prefix", "regex"])
+    {
+        return None;
+    }
+    let exact = obj.get("exact").and_then(Value::as_str);
+    let prefix = obj.get("prefix").and_then(Value::as_str);
+    let regex = obj.get("regex").and_then(Value::as_str);
+
+    match (exact, prefix, regex) {
+        (Some(exact), None, None) => (!exact.is_empty()).then(|| Value::String(exact.to_string())),
+        (None, Some(prefix), None) => {
+            (!prefix.is_empty()).then(|| serde_json::json!({ "prefix": prefix }))
+        }
+        (None, None, Some(regex)) => {
+            if regex.is_empty() {
+                return None;
+            }
+            // Only translatable if it compiles — otherwise the projected plugin
+            // config would fail validation and be silently dropped, defeating
+            // the route's CORS policy. Keep it deferred instead.
+            regex::Regex::new(regex).ok()?;
+            Some(serde_json::json!({ "regex": regex }))
+        }
+        _ => None,
+    }
+}
+
 /// Whether a VirtualService `http[].corsPolicy` can be faithfully translated to
 /// a `cors` plugin. Shared by the translator (emit vs. warn-and-skip) and the
 /// Istio status writer (deferred-field reporting) so the two never disagree on
 /// whether a given policy is projected. A policy is translatable when it has at
-/// least one representable origin and any `maxAge` parses as a duration.
+/// least one representable origin (`allowOrigins[]` `exact`/`prefix`/`regex`
+/// `StringMatch` — `regex` must compile — or the legacy `allowOrigin` exact
+/// list) and any `maxAge` parses as a duration. A malformed/unknown origin
+/// matcher (or an un-compilable `regex`) makes the policy non-translatable so it
+/// is left unprojected (deferred) rather than silently approximated.
 pub(crate) fn cors_policy_translatable(cors: &Value) -> bool {
     let origins_ok = cors_allowed_origins(cors).is_some();
     let max_age_ok = match cors.get("maxAge") {
@@ -3310,26 +3370,31 @@ pub(crate) fn cors_policy_translatable(cors: &Value) -> bool {
 
 /// Build a proxy-scoped `cors` plugin for an Istio `VirtualService.http[].corsPolicy`.
 /// Returns `None` when there is no `corsPolicy`, or when the policy is not
-/// faithfully representable (`prefix`/`regex` origins, or an unparseable
-/// `maxAge`) — in that case it is left unprojected (warned, and reported as a
-/// deferred field by the status writer) rather than failing the whole
-/// VirtualService or silently approximating. This reuses the existing `cors`
+/// faithfully representable (a malformed/unknown origin matcher, an
+/// un-compilable `regex`, or an unparseable `maxAge`) — in that case it is left
+/// unprojected (warned, and reported as a deferred field by the status writer)
+/// rather than failing the whole VirtualService or silently approximating.
+/// `allowOrigins[]` `exact`/`prefix`/`regex` `StringMatch` and the legacy
+/// `allowOrigin` exact list are all projected. This reuses the existing `cors`
 /// plugin instead of duplicating preflight/header logic, mirroring the
 /// `request_mirror` approach for `http[].mirror`.
 fn route_cors_plugin(object: &K8sObject, http: &Value, proxy_id: &str) -> Option<PluginConfig> {
     let cors = http.get("corsPolicy")?;
+    // `cors_policy_translatable` is the single shared gate; the actual origin
+    // projection below goes through the SAME `cors_allowed_origins`, so the
+    // predicate and the emitted config can never disagree on representability.
     if !cors_policy_translatable(cors) {
         tracing::warn!(
             namespace = %object.metadata.namespace,
             name = %object.metadata.name,
-            "VirtualService http[].corsPolicy is not faithfully translatable (only \
-             allowOrigins[].exact / the legacy allowOrigin list and a parseable maxAge are \
-             supported); leaving it unprojected. Configure the `cors` plugin directly for \
-             prefix/regex origins."
+            "VirtualService http[].corsPolicy is not faithfully translatable (allowOrigins[] \
+             must be exact/prefix/regex StringMatch with a compilable regex, or the legacy \
+             allowOrigin exact list, plus a parseable maxAge); leaving it unprojected. \
+             Configure the `cors` plugin directly."
         );
         return None;
     }
-    // Guaranteed `Some` by `cors_policy_translatable`.
+    // Guaranteed non-empty `Some` by `cors_policy_translatable`.
     let origins = cors_allowed_origins(cors).unwrap_or_default();
 
     let mut config = serde_json::Map::new();
