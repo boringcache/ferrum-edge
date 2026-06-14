@@ -1901,7 +1901,7 @@ impl http_body::Body for DirectH2Body {
 struct IdleReadTimeoutBody<B> {
     inner: B,
     timeout: std::time::Duration,
-    deadline: Pin<Box<tokio::time::Sleep>>,
+    deadline: Option<Pin<Box<tokio::time::Sleep>>>,
     /// `true` once an inner `Pending` poll has begun a backend-read wait, reset
     /// to `false` whenever a frame is delivered. The deadline is re-armed only
     /// on the `false -> true` edge so it never counts downstream-drain time.
@@ -1911,12 +1911,23 @@ struct IdleReadTimeoutBody<B> {
 impl<B> IdleReadTimeoutBody<B> {
     fn new(inner: B, timeout_ms: u64) -> Self {
         let timeout = std::time::Duration::from_millis(timeout_ms);
+        let deadline = tokio::time::Instant::now()
+            .checked_add(timeout)
+            .map(tokio::time::sleep_until)
+            .map(Box::pin);
         Self {
             inner,
             timeout,
-            deadline: Box::pin(tokio::time::sleep(timeout)),
+            deadline,
             waiting: false,
         }
+    }
+
+    fn reset_deadline(&mut self) {
+        self.deadline = tokio::time::Instant::now()
+            .checked_add(self.timeout)
+            .map(tokio::time::sleep_until)
+            .map(Box::pin);
     }
 }
 
@@ -1965,19 +1976,24 @@ where
                     // backend-read wait now so any downstream-drain interval that
                     // just elapsed is excluded from the timeout budget.
                     this.waiting = true;
-                    this.deadline
-                        .as_mut()
-                        .reset(tokio::time::Instant::now() + this.timeout);
+                    this.reset_deadline();
                 }
-                match std::future::Future::poll(this.deadline.as_mut(), cx) {
-                    Poll::Ready(()) => Poll::Ready(Some(Err(Box::new(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        format!(
-                            "backend response body read timeout after {}ms",
-                            this.timeout.as_millis()
-                        ),
-                    )) as BoxError))),
-                    Poll::Pending => Poll::Pending,
+                match this.deadline.as_mut() {
+                    Some(deadline) => match std::future::Future::poll(deadline.as_mut(), cx) {
+                        Poll::Ready(()) => Poll::Ready(Some(Err(Box::new(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            format!(
+                                "backend response body read timeout after {}ms",
+                                this.timeout.as_millis()
+                            ),
+                        ))
+                            as BoxError))),
+                        Poll::Pending => Poll::Pending,
+                    },
+                    // A pathologically large client-controlled deadline can
+                    // exceed Tokio's representable `Instant` range. Treat it as
+                    // effectively unbounded rather than panicking the proxy path.
+                    None => Poll::Pending,
                 }
             }
         }
