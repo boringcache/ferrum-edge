@@ -4628,10 +4628,37 @@ async fn collect_h3_open_response_body(
     // backend trailers so the buffered native-H3 send path can forward them
     // (issue #1630), bounded by the same `backend_read_timeout_ms` deadline as
     // the body frames above. Trailers are optional: a read timeout, a graceful
-    // close at the trailer phase, or no trailers each yield `None` rather than
-    // failing an otherwise-complete response — mirrors `drain_h3_response_body`
-    // in the H3 pool.
-    let response_trailers = read_refined_h3_trailers(proxy, &mut recv_stream).await;
+    // close at the trailer phase, or no trailers each yield `Ok(None)` rather
+    // than failing an otherwise-complete response — mirrors
+    // `drain_h3_response_body` in the H3 pool. A genuine non-graceful trailer
+    // error is a backend protocol violation: surface it as a 502 backend
+    // failure (with capability downgrade) exactly like the body-read error
+    // branch above, rather than swallowing it and serving a response that hides
+    // the violation.
+    let response_trailers = match read_refined_h3_trailers(proxy, &mut recv_stream).await {
+        Ok(trailers) => trailers,
+        Err(error) => {
+            error!(
+                "Error reading backend h3 trailers during refined buffering: {}",
+                error
+            );
+            let h3_error_class = crate::http3::client::classify_http3_error(&error);
+            crate::proxy::record_port_exhaustion_if_class(&state.overload, h3_error_class);
+            if crate::proxy::is_h3_transport_error_class(h3_error_class) {
+                state
+                    .backend_capabilities
+                    .mark_h3_unsupported(proxy, upstream_target);
+            }
+            return H3BufferedDispatchResult {
+                status: 502,
+                body: br#"{"error":"Backend unavailable"}"#.to_vec(),
+                headers: HashMap::new(),
+                trailers: None,
+                error_class: Some(h3_error_class),
+                request_on_wire: true,
+            };
+        }
+    };
 
     H3BufferedDispatchResult {
         status: response_status,
@@ -4644,13 +4671,22 @@ async fn collect_h3_open_response_body(
 }
 
 /// Read backend response trailers for the refined-buffered H3 path, bounded by
-/// `proxy.backend_read_timeout_ms`. Returns `None` on timeout, graceful close,
-/// any trailer read error, or simply no trailers — trailers are optional and
-/// their absence must not fail an otherwise-complete buffered response.
+/// `proxy.backend_read_timeout_ms`.
+///
+/// Returns `Ok(None)` for the benign trailer-absence cases — a read timeout, a
+/// graceful close at the trailer phase, or simply no trailers — because
+/// trailers are optional and their absence must not fail an otherwise-complete
+/// buffered response. A genuine non-graceful `recv_trailers()` error
+/// (malformed/oversized trailers, invalid post-body frame) propagates as
+/// `Err(StreamError)` so the caller can surface it as a backend failure (502 +
+/// capability downgrade), mirroring `drain_h3_response_body` in the H3 pool and
+/// the streaming path's `H3TrailerFinishError::Backend(...)`. Swallowing it to
+/// `None` would hide the protocol violation and keep an unhealthy H3 backend in
+/// rotation.
 async fn read_refined_h3_trailers(
     proxy: &Proxy,
     recv_stream: &mut crate::http3::client::H3RequestStream,
-) -> Option<http::HeaderMap> {
+) -> Result<Option<http::HeaderMap>, h3::error::StreamError> {
     let recv_result = if proxy.backend_read_timeout_ms > 0 {
         match tokio::time::timeout(
             Duration::from_millis(proxy.backend_read_timeout_ms),
@@ -4665,7 +4701,7 @@ async fn read_refined_h3_trailers(
                     timeout_ms = proxy.backend_read_timeout_ms,
                     "HTTP/3 backend trailer read timed out (refined path); forwarding response without trailers"
                 );
-                return None;
+                return Ok(None);
             }
         }
     } else {
@@ -4673,15 +4709,15 @@ async fn read_refined_h3_trailers(
     };
 
     match recv_result {
-        Ok(trailers) => trailers,
-        Err(error) if crate::http3::client::is_h3_graceful_close(&error) => None,
+        Ok(trailers) => Ok(trailers),
+        Err(error) if crate::http3::client::is_h3_graceful_close(&error) => Ok(None),
         Err(error) => {
             debug!(
                 proxy_id = %proxy.id,
                 error = %error,
-                "HTTP/3 backend trailer read failed (refined path); forwarding response without trailers"
+                "HTTP/3 backend trailer read failed non-gracefully (refined path); propagating as backend failure"
             );
-            None
+            Err(error)
         }
     }
 }

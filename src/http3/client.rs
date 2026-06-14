@@ -321,18 +321,29 @@ pub(crate) async fn drain_h3_response_body(
     // backend trailers so the buffered native-H3 server path can forward them
     // — the streaming path already does this via
     // `finish_h3_response_with_backend_trailers`. Bound by the same
-    // `backend_read_timeout_ms` deadline as `recv_data`. Trailers are optional:
-    // a read timeout, a graceful close at the trailer phase, or no trailers at
-    // all each yield `None` rather than failing an otherwise-complete response.
+    // `backend_read_timeout_ms` deadline as `recv_data`.
+    //
+    // Trailer absence is benign and yields `None` (not an error): a read
+    // timeout (collapsed to `Ok(None)` inside the helper), a graceful close at
+    // the trailer phase (`is_h3_graceful_close`), or simply no trailers must
+    // NOT fail an otherwise-complete response. A genuine non-graceful
+    // `recv_trailers()` error (malformed/oversized trailers, an invalid
+    // post-body frame), however, is a real backend protocol violation and
+    // propagates as `H3BodyDrainError::Stream` — the buffered path then
+    // surfaces it as a backend failure (mapped to `H3PoolError::post_wire`,
+    // driving CB / passive-health accounting), mirroring the streaming path's
+    // `H3TrailerFinishError::Backend(...)` classification. Swallowing it to
+    // `None` would hide the violation and keep an unhealthy H3 backend in
+    // rotation.
     let trailers = match read_h3_trailers_with_timeout(stream, backend_read_timeout_ms).await {
         Ok(trailers) => trailers,
         Err(e) if is_h3_graceful_close(&e) => None,
         Err(e) => {
             debug!(
                 error = %e,
-                "H3 recv_trailers failed after complete body; forwarding response without trailers"
+                "H3 recv_trailers failed non-gracefully after complete body; propagating as backend failure"
             );
-            None
+            return Err(e.into());
         }
     };
     Ok((body, trailers))
