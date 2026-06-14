@@ -628,8 +628,17 @@ impl ProxyBody {
         } else {
             error_class
         };
+        // `connection_error` means exactly "the request body never reached the
+        // backend's application layer" (see the Connection-Error Classification
+        // Boundary). By the time a streaming body is producing deferred
+        // outcomes the response headers have already arrived, so a terminal
+        // body error — including the `ReadWriteTimeout` raised by
+        // `IdleReadTimeoutBody` — is post-wire and must NOT be flagged as a
+        // connection error. Derive it from the canonical `request_reached_wire`
+        // predicate instead of "anything that isn't a client disconnect", which
+        // wrongly painted mid-stream read timeouts / resets as connect failures.
         let connection_error =
-            error_class.is_some_and(|class| class != ErrorClass::ClientDisconnect);
+            error_class.is_some_and(|class| !crate::retry::request_reached_wire(class));
         // Prefer the gRPC trailer's mapped status (a non-OK grpc-status finishes
         // HTTP 200) so a backend gRPC failure shrinks the limit; falls back to the
         // header status for non-gRPC streams or an OK/absent trailer.
@@ -665,8 +674,15 @@ impl ProxyBody {
         } else {
             error_class.or(outcome.error_class)
         };
+        // Post-wire body errors (mid-stream read timeout, reset, close) are not
+        // connection errors — the request already reached the backend's
+        // application layer. Preserve any dispatch-phase connection error
+        // recorded at construction, but derive the body-error contribution from
+        // the canonical `request_reached_wire` predicate rather than treating
+        // every non-disconnect class as a connect failure. See the matching
+        // note in `record_deferred_backend_admission`.
         let connection_error = outcome.connection_error
-            || error_class.is_some_and(|class| class != ErrorClass::ClientDisconnect);
+            || error_class.is_some_and(|class| !crate::retry::request_reached_wire(class));
         let response_status = outcome
             .grpc_trailer_http_status
             .unwrap_or(outcome.response_status);
@@ -1861,13 +1877,24 @@ impl http_body::Body for DirectH2Body {
 /// least-connections LB guard, backend-admission permits) until the client
 /// disconnects or the backend eventually resumes.
 ///
-/// This wrapper resets a pinned `Sleep` on every received frame; if no frame
-/// arrives within `backend_read_timeout_ms`, `poll_frame` yields a
+/// This wrapper arms a pinned `Sleep` only while it is actually waiting on the
+/// backend (a `Pending` inner poll); if no frame arrives within
+/// `backend_read_timeout_ms` of beginning that wait, `poll_frame` yields a
 /// `std::io::Error` of kind `TimedOut`. That kind is mapped to
 /// `ErrorClass::ReadWriteTimeout` (post-wire) by `retry::classify_typed_chain`,
-/// so deferred backend/admission accounting records a read timeout rather than
-/// an indefinite in-flight stream — matching the buffered H2 body collection
+/// so deferred backend/admission accounting records a read timeout (and, being
+/// post-wire, NOT a connection error) rather than an indefinite in-flight
+/// stream — matching the buffered H2 body collection
 /// (`collect_hyper_body_with_limit`) and the native-H3 streaming read timeout.
+///
+/// The deadline is (re)armed only on the transition from "have a frame" to
+/// "waiting on the backend" — NOT on every received frame. A slow downstream
+/// client can keep the relay from polling this body for an arbitrary interval
+/// (H2 flow-control backpressure), and that interval is the client's latency,
+/// not the backend's. Arming on the false→true `waiting` edge measures
+/// contiguous backend-read latency and avoids charging downstream stalls to the
+/// backend, which would spuriously time out a healthy-but-flow-controlled
+/// stream.
 ///
 /// `backend_read_timeout_ms == 0` keeps the unbounded opt-out: the call sites
 /// skip this wrapper entirely in that case.
@@ -1875,6 +1902,10 @@ struct IdleReadTimeoutBody<B> {
     inner: B,
     timeout: std::time::Duration,
     deadline: Pin<Box<tokio::time::Sleep>>,
+    /// `true` once an inner `Pending` poll has begun a backend-read wait, reset
+    /// to `false` whenever a frame is delivered. The deadline is re-armed only
+    /// on the `false -> true` edge so it never counts downstream-drain time.
+    waiting: bool,
 }
 
 impl<B> IdleReadTimeoutBody<B> {
@@ -1884,6 +1915,7 @@ impl<B> IdleReadTimeoutBody<B> {
             inner,
             timeout,
             deadline: Box::pin(tokio::time::sleep(timeout)),
+            waiting: false,
         }
     }
 }
@@ -1937,26 +1969,41 @@ where
         let this = self.get_mut();
         match Pin::new(&mut this.inner).poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
-                // A backend frame arrived — reset the idle deadline.
-                this.deadline
-                    .as_mut()
-                    .reset(tokio::time::Instant::now() + this.timeout);
+                // A backend frame arrived — we are no longer waiting on the
+                // backend. Do NOT arm the deadline here: the interval until the
+                // next `poll_frame` can be dominated by a slow client draining
+                // this frame (H2 flow-control backpressure), which is downstream
+                // latency, not backend latency. The deadline is armed on the
+                // next `Pending` instead, so it only ever measures contiguous
+                // backend-read wait time.
+                this.waiting = false;
                 Poll::Ready(Some(Ok(frame)))
             }
             Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(IdleReadTimeoutError::Inner(e)))),
             Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => match std::future::Future::poll(this.deadline.as_mut(), cx) {
-                Poll::Ready(()) => Poll::Ready(Some(Err(IdleReadTimeoutError::Timeout(
-                    std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        format!(
-                            "backend response body read timeout after {}ms",
-                            this.timeout.as_millis()
+            Poll::Pending => {
+                if !this.waiting {
+                    // First `Pending` since the last delivered frame: begin the
+                    // backend-read wait now so any downstream-drain interval that
+                    // just elapsed is excluded from the timeout budget.
+                    this.waiting = true;
+                    this.deadline
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + this.timeout);
+                }
+                match std::future::Future::poll(this.deadline.as_mut(), cx) {
+                    Poll::Ready(()) => Poll::Ready(Some(Err(IdleReadTimeoutError::Timeout(
+                        std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            format!(
+                                "backend response body read timeout after {}ms",
+                                this.timeout.as_millis()
+                            ),
                         ),
-                    ),
-                )))),
-                Poll::Pending => Poll::Pending,
-            },
+                    )))),
+                    Poll::Pending => Poll::Pending,
+                }
+            }
         }
     }
 
