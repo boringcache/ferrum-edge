@@ -218,7 +218,7 @@ impl From<h3::error::StreamError> for H3BodyDrainError {
 /// backend sent none, the trailer read timed out, or it ended with a graceful
 /// close.
 #[derive(Debug)]
-pub(crate) struct H3BufferedResponse {
+pub struct H3BufferedResponse {
     pub status: u16,
     pub body: Vec<u8>,
     pub headers: HashMap<String, String>,
