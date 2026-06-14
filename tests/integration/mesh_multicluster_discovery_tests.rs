@@ -23,8 +23,8 @@ use ferrum_edge::consumer_index::ConsumerIndex;
 use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain};
 use ferrum_edge::load_balancer::{HealthContext, LoadBalancerCache};
 use ferrum_edge::modes::mesh::config::{
-    AppProtocol, MeshConfig, MeshService, ServicePort, Workload, WorkloadPort, WorkloadRef,
-    WorkloadSelector,
+    AppProtocol, MeshConfig, MeshService, MultiClusterConfig, RemoteCluster, ServicePort, Workload,
+    WorkloadPort, WorkloadRef, WorkloadSelector,
 };
 use ferrum_edge::modes::mesh::multicluster::{
     RemoteClusterEndpoints, RemoteClusterEntry, RemoteEndpointSnapshot,
@@ -90,15 +90,35 @@ fn remote_snapshot(endpoints: RemoteClusterEndpoints) -> RemoteEndpointSnapshot 
     let mut clusters = HashMap::new();
     clusters.insert(
         "west".to_string(),
-        RemoteClusterEntry {
-            cluster_name: "west".to_string(),
-            trust_domain: td("remote.local"),
-            network: Some("net2".to_string()),
+        RemoteClusterEntry::new(
+            "west".to_string(),
+            td("remote.local"),
+            Some("net2".to_string()),
+            // Matches `admitting_candidate`'s declared (normalized) URL so the
+            // full-poll-identity merge filter admits these endpoints.
+            Some("https://cp.remote.example:15010".to_string()),
             endpoints,
-            fetched_at_unix_seconds: 1,
-        },
+            1,
+        ),
     );
     RemoteEndpointSnapshot { clusters }
+}
+
+/// Candidate `MultiClusterConfig` that admits the `remote_snapshot` cluster
+/// identity (`west` / `remote.local` / `net2`) so the same-generation merge
+/// filter passes — the slice-apply path always merges against the candidate
+/// slice's `multi_cluster`.
+fn admitting_candidate() -> MultiClusterConfig {
+    MultiClusterConfig {
+        remote_clusters: vec![RemoteCluster {
+            name: "west".to_string(),
+            trust_domain: td("remote.local"),
+            network: Some("net2".to_string()),
+            control_plane_url: Some("https://cp.remote.example:15010".to_string()),
+            federation_endpoint: None,
+        }],
+        ..MultiClusterConfig::default()
+    }
 }
 
 fn epoch_store(mesh: MeshConfig) -> Arc<RequestEpochStore> {
@@ -148,8 +168,12 @@ async fn mesh_multicluster_discoverer_resolves_local_and_remote_targets() {
     let snapshot = remote_snapshot(remote);
 
     // Merge (as the slice-apply path does) then run the discoverer.
-    let (workloads, services) =
-        merge_remote_endpoints_into_mesh(&local_workloads, &local_services, &snapshot);
+    let (workloads, services) = merge_remote_endpoints_into_mesh(
+        &local_workloads,
+        &local_services,
+        &snapshot,
+        Some(&admitting_candidate()),
+    );
     let mesh = MeshConfig {
         workloads,
         services,

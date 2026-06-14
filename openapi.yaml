@@ -2117,6 +2117,193 @@ paths:
                   error:
                     type: string
 
+  # ── Mesh remote-cluster discovery (mesh mode, F7.2) ──────────────────
+  /mesh/remote-clusters:
+    get:
+      operationId: getMeshRemoteClusters
+      summary: Inspect the data plane's view of multicluster east-west discovery
+      description: |
+        Returns this DP's view of remote-cluster discovery: which remote
+        clusters it has actually fetched endpoints from (cross-cluster
+        endpoint discovery), and which remote clusters the accepted slice
+        declares. Operators previously inferred remote-cluster state only
+        indirectly from `GET /mesh/config-drift`'s workload/service
+        `resources` counts; this surface names the clusters directly and
+        distinguishes "configured but never polled" from "not configured".
+
+        Two views are returned:
+        - `discovered`: remote clusters this DP has successfully polled over
+          the native `MeshSubscribe` stream, keyed by cluster name, each with
+          per-cluster `workload_count` / `service_count`, the
+          `fetched_at_unix_seconds` of the last successful poll, and the
+          derived `age_seconds`. `age_seconds` tracks the last successful
+          poll, not the last endpoint change: a stable cluster refreshes its
+          fetch timestamp every poll, so it does not look stale. This view is
+          scoped to the **accepted** slice's clusters (matched by name and
+          trust domain) — a cluster in the discovery store but absent from the
+          accepted config (e.g. left over from a rejected slice) is omitted,
+          so a rejected slice never appears as live discovery. Empty when
+          discovery is disabled
+          (`FERRUM_MESH_REMOTE_DISCOVERY_POLL_INTERVAL_SECONDS` is `0`), no
+          slice has been accepted, no remote cluster is trust-eligible, or no
+          poll has succeeded yet.
+        - `configured`: remote clusters declared in the **accepted** slice's
+          multicluster config — name, trust domain, network, and whether a
+          control plane (`control_plane_configured`) / federation endpoint
+          (`federation_endpoint_configured`) is set. Each carries a
+          `discovered` flag cross-referencing the scoped `discovered` view so a
+          configured-but-unreachable cluster is visible.
+
+        The payload is a topology-shape summary — counts and provenance,
+        never raw workload addresses, SPIFFE IDs, or control-plane URLs
+        (those are surfaced only as booleans) — so the sensitive detail kept
+        off `/metrics` stays off this surface too while the JWT gates the
+        topology shape it does reveal.
+
+        Returns `404 Not Found` outside mesh mode (when the mesh runtime
+        state is not wired into the admin API). Both lists are empty (not
+        `404`) when in mesh mode with nothing configured or discovered yet,
+        so dashboards can poll continuously across boot.
+      tags: [Mesh Remote Clusters]
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Remote-cluster discovery and configuration snapshot
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [discovery_enabled, discovered, configured]
+                properties:
+                  discovery_enabled:
+                    type: boolean
+                    description: |
+                      `true` when cross-cluster endpoint discovery is enabled
+                      (`FERRUM_MESH_REMOTE_DISCOVERY_POLL_INTERVAL_SECONDS > 0`).
+                      When `false`, `discovered` is always empty regardless of
+                      configuration.
+                  discovered:
+                    type: array
+                    description: |
+                      Remote clusters this DP has fetched endpoints from,
+                      sorted by `cluster_name`. Scoped to the accepted slice's
+                      configured clusters (by name + trust domain); clusters
+                      from a received-but-rejected slice are omitted.
+                    items:
+                      type: object
+                      required:
+                        - cluster_name
+                        - trust_domain
+                        - workload_count
+                        - service_count
+                        - fetched_at_unix_seconds
+                        - age_seconds
+                      properties:
+                        cluster_name:
+                          type: string
+                          description: Operator-facing remote cluster name (snapshot key, validated unique).
+                        trust_domain:
+                          type: string
+                          description: SPIFFE trust domain the remote endpoints were ingested under.
+                        network:
+                          type: string
+                          nullable: true
+                          description: Istio network label of the remote cluster, when declared.
+                        workload_count:
+                          type: integer
+                          description: Number of remote workloads merged into the local registry from this cluster.
+                        service_count:
+                          type: integer
+                          description: Number of remote services merged into the local registry from this cluster.
+                        fetched_at_unix_seconds:
+                          type: integer
+                          format: int64
+                          description: |
+                            Unix timestamp (seconds) of the most recent
+                            successful poll of this cluster. Refreshed on every
+                            successful poll, including no-op polls that returned
+                            unchanged endpoints.
+                        age_seconds:
+                          type: integer
+                          format: int64
+                          description: |
+                            Seconds since the last successful poll
+                            (`fetched_at_unix_seconds`), not since the last
+                            endpoint change. Saturates at 0 on clock skew.
+                  configured:
+                    type: array
+                    description: Remote clusters declared in the accepted slice's multicluster config, sorted by `cluster_name`.
+                    items:
+                      type: object
+                      required:
+                        - cluster_name
+                        - trust_domain
+                        - control_plane_configured
+                        - federation_endpoint_configured
+                        - discovered
+                      properties:
+                        cluster_name:
+                          type: string
+                          description: Operator-facing remote cluster name.
+                        trust_domain:
+                          type: string
+                          description: SPIFFE trust domain declared for the remote cluster.
+                        network:
+                          type: string
+                          nullable: true
+                          description: Istio network label, when declared.
+                        control_plane_configured:
+                          type: boolean
+                          description: |
+                            Whether a `control_plane_url` is set — i.e. whether
+                            this cluster is a candidate for endpoint discovery
+                            at all. `false` means federation-only; it will
+                            never appear under `discovered`.
+                        federation_endpoint_configured:
+                          type: boolean
+                          description: Whether a `federation_endpoint` is set for SPIFFE trust-bundle exchange.
+                        discovered:
+                          type: boolean
+                          description: |
+                            Whether this cluster is present in the scoped
+                            `discovered` view (matched by name + trust domain).
+              examples:
+                discovery-active:
+                  value:
+                    discovery_enabled: true
+                    discovered:
+                      - cluster_name: remote-east
+                        trust_domain: east.example.com
+                        network: net2
+                        workload_count: 12
+                        service_count: 3
+                        fetched_at_unix_seconds: 1747595531
+                        age_seconds: 8
+                    configured:
+                      - cluster_name: remote-east
+                        trust_domain: east.example.com
+                        network: net2
+                        control_plane_configured: true
+                        federation_endpoint_configured: true
+                        discovered: true
+                      - cluster_name: remote-west
+                        trust_domain: west.example.com
+                        control_plane_configured: false
+                        federation_endpoint_configured: true
+                        discovered: false
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: Not in mesh mode (mesh runtime state not wired into the admin API)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+
   # ── Mesh runtime overlay (mesh mode, GAP-3E) ─────────────────────────
   /mesh/runtime-overlay:
     get:
@@ -11164,9 +11351,39 @@ components:
         allowed_origins:
           type: array
           items:
-            type: string
+            oneOf:
+              - type: string
+              - type: object
+                additionalProperties: false
+                minProperties: 1
+                maxProperties: 1
+                description: >-
+                  Istio StringMatch-shaped origin matcher: EXACTLY ONE of
+                  exact / prefix / regex (no extra or unknown keys). Empty or
+                  multi-key objects are rejected at config time.
+                properties:
+                  exact:
+                    type: string
+                    description: Exact origin match (case-insensitive).
+                  prefix:
+                    type: string
+                    description: >-
+                      Literal byte-prefix of the request Origin header
+                      (case-sensitive), e.g. "https://app.".
+                  regex:
+                    type: string
+                    description: >-
+                      RE2 pattern that must FULLY match the request Origin
+                      header. Compiled (and size-bounded) at config time; an
+                      invalid pattern is rejected.
           default: ["*"]
-          description: Permitted origins
+          description: >-
+            Permitted origins. Each entry is either a string (`"*"` for any
+            origin, an exact `scheme://host[:port]` origin matched
+            case-insensitively, or a `*.suffix.com` wildcard-subdomain pattern)
+            or an Istio `StringMatch`-shaped object carrying exactly one of
+            `exact` / `prefix` / `regex`. A matching origin is reflected verbatim
+            into `Access-Control-Allow-Origin`.
         allowed_methods:
           type: array
           items:

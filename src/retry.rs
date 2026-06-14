@@ -349,6 +349,25 @@ fn classify_typed_chain(
 ) -> Option<ErrorClass> {
     let mut current = start;
     while let Some(err) = current {
+        // `HbonePoolError` is the shared dial/setup error for ALL mesh-transport
+        // tunnels (HBONE raw-TCP, Sidecar mesh-mTLS, and the WebSocket Extended
+        // CONNECT egress). Every variant is a pre-wire DIAL/setup failure, so its
+        // own `error_class()` is the authoritative, phase-correct mapping — match
+        // it FIRST so a boxed `HbonePoolError` keeps connect-failure semantics
+        // (missing gateway SVID / invalid `mesh.spiffe_id` → `ConnectionPoolError`,
+        // DNS failure → `DnsLookupError`, peer without Extended CONNECT →
+        // `ProtocolError`) instead of falling through to its `#[source]` io error
+        // (which the connect-phase io arm would map to `ConnectionRefused`) or to
+        // the substring fallback. Mirrors how the HTTP HBONE / mesh-mTLS dispatch
+        // paths classify `HbonePoolError` via `error_class()` directly; the
+        // WebSocket dial returns the same error boxed, so without this downcast
+        // the WS failure handler (`classify_boxed_setup_error`) would misclassify
+        // pre-wire mesh setup failures as post-wire and corrupt
+        // `retry_on_connect_failure`, backend-admission `connection_error`, and
+        // circuit-breaker passive health.
+        if let Some(hbone_err) = err.downcast_ref::<crate::proxy::hbone_pool::HbonePoolError>() {
+            return Some(hbone_err.error_class());
+        }
         if let Some(setup_err) = err.downcast_ref::<crate::proxy::stream_error::StreamSetupError>()
         {
             return Some(classify_stream_setup_kind(setup_err.kind));

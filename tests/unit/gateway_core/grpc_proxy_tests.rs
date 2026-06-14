@@ -1,3 +1,5 @@
+use std::collections::{HashMap, HashSet};
+
 use chrono::Utc;
 use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, Proxy};
 use ferrum_edge::proxy::build_backend_url;
@@ -519,4 +521,226 @@ async fn test_grpc_connection_pool_creation() {
         result.is_err(),
         "Connection to unreachable port should fail"
     );
+}
+
+// --- Buffered gRPC plugin header/trailer view + reconciliation ---
+//
+// These cover the shared helpers the main gRPC buffered path
+// (`proxy::handle_proxy_request`) and the HTTP/3 cross-protocol bridge
+// (`http3::cross_protocol`) both use so a response-hook sanitizer reaches the
+// wire trailers identically across H1/H2 and H3 (#1614 / #1612).
+
+fn grpc_map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+    pairs
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+
+#[test]
+fn build_view_merges_trailer_only_keys_and_tracks_no_shadow() {
+    let headers = grpc_map(&[("content-type", "application/grpc")]);
+    let trailers = grpc_map(&[("grpc-status", "0"), ("x-trailer-only", "tv")]);
+
+    let (view, shadowed) = grpc_proxy::build_grpc_plugin_header_view(&headers, &trailers);
+
+    // Trailer-only keys are merged into the view so hooks can see/sanitize them.
+    assert_eq!(
+        view.get("content-type").map(String::as_str),
+        Some("application/grpc")
+    );
+    assert_eq!(view.get("grpc-status").map(String::as_str), Some("0"));
+    assert_eq!(view.get("x-trailer-only").map(String::as_str), Some("tv"));
+    assert!(
+        shadowed.is_empty(),
+        "no key was duplicated across headers and trailers"
+    );
+}
+
+#[test]
+fn build_view_tracks_header_shadowed_key_without_overriding_header_value() {
+    let headers = grpc_map(&[("x-dup", "header-val")]);
+    let trailers = grpc_map(&[("x-dup", "trailer-val")]);
+
+    let (view, shadowed) = grpc_proxy::build_grpc_plugin_header_view(&headers, &trailers);
+
+    // A trailer never overrides a real header in the merged view.
+    assert_eq!(view.get("x-dup").map(String::as_str), Some("header-val"));
+    assert!(
+        shadowed.contains("x-dup"),
+        "the duplicated key must be tracked as shadowed"
+    );
+}
+
+#[test]
+fn build_view_reserved_terminal_keys_are_never_shadowed() {
+    // A malformed backend duplicated grpc-status into the initial headers with a
+    // bogus value; the real terminal status rides the trailer. Reserved terminal
+    // keys are trailer-authoritative, so the trailer value wins in the view and
+    // the key is NOT treated as shadowed (the bogus header copy must be stripped
+    // off the wire by the caller, never fed to plugins or the client).
+    let headers = grpc_map(&[("grpc-status", "99"), ("grpc-message", "bogus")]);
+    let trailers = grpc_map(&[("grpc-status", "0"), ("grpc-message", "OK")]);
+
+    let (view, shadowed) = grpc_proxy::build_grpc_plugin_header_view(&headers, &trailers);
+
+    assert_eq!(view.get("grpc-status").map(String::as_str), Some("0"));
+    assert_eq!(view.get("grpc-message").map(String::as_str), Some("OK"));
+    assert!(!shadowed.contains("grpc-status"));
+    assert!(!shadowed.contains("grpc-message"));
+}
+
+#[test]
+fn reconcile_propagates_hook_edit_of_shadowed_key_into_trailer() {
+    let original_headers = grpc_map(&[("x-dup", "orig")]);
+    let mut trailers = grpc_map(&[("x-dup", "trailer-orig")]);
+    let shadowed: HashSet<String> = ["x-dup".to_string()].into_iter().collect();
+    // Hook rewrote the visible header copy in the view.
+    let view = grpc_map(&[("x-dup", "redacted-by-hook")]);
+
+    grpc_proxy::reconcile_grpc_trailers_from_view(
+        &mut trailers,
+        &view,
+        &original_headers,
+        &shadowed,
+    );
+
+    // The sanitized value must scrub the hidden trailer copy too.
+    assert_eq!(
+        trailers.get("x-dup").map(String::as_str),
+        Some("redacted-by-hook")
+    );
+}
+
+#[test]
+fn reconcile_keeps_backend_trailer_value_for_untouched_shadowed_key() {
+    let original_headers = grpc_map(&[("x-dup", "header-untouched")]);
+    let mut trailers = grpc_map(&[("x-dup", "trailer-untouched")]);
+    let shadowed: HashSet<String> = ["x-dup".to_string()].into_iter().collect();
+    // Hook left the shadowed key at its original header value.
+    let view = grpc_map(&[("x-dup", "header-untouched")]);
+
+    grpc_proxy::reconcile_grpc_trailers_from_view(
+        &mut trailers,
+        &view,
+        &original_headers,
+        &shadowed,
+    );
+
+    // An untouched shadowed trailer must keep the backend's true trailing value,
+    // NOT be clobbered by the (equal-or-not) header value.
+    assert_eq!(
+        trailers.get("x-dup").map(String::as_str),
+        Some("trailer-untouched")
+    );
+}
+
+#[test]
+fn reconcile_drops_hook_removed_keys() {
+    let original_headers = grpc_map(&[("x-shadow", "hv")]);
+    let mut trailers = grpc_map(&[
+        ("grpc-status", "0"),
+        ("x-removed-trailer", "tv"),
+        ("x-shadow", "tv"),
+    ]);
+    let shadowed: HashSet<String> = ["x-shadow".to_string()].into_iter().collect();
+    // Hook removed both the trailer-only key and the shadowed key from the view.
+    let view = grpc_map(&[("grpc-status", "0")]);
+
+    grpc_proxy::reconcile_grpc_trailers_from_view(
+        &mut trailers,
+        &view,
+        &original_headers,
+        &shadowed,
+    );
+
+    assert_eq!(trailers.get("grpc-status").map(String::as_str), Some("0"));
+    assert!(
+        !trailers.contains_key("x-removed-trailer"),
+        "hook removal drops trailer-only key"
+    );
+    assert!(
+        !trailers.contains_key("x-shadow"),
+        "hook removal drops the hidden shadowed trailer too"
+    );
+}
+
+#[test]
+fn reconcile_propagates_trailer_only_edit_and_keeps_untouched() {
+    let original_headers = grpc_map(&[]);
+    let mut trailers = grpc_map(&[("x-edited", "orig"), ("x-kept", "v")]);
+    let shadowed: HashSet<String> = HashSet::new();
+    let view = grpc_map(&[("x-edited", "edited"), ("x-kept", "v")]);
+
+    grpc_proxy::reconcile_grpc_trailers_from_view(
+        &mut trailers,
+        &view,
+        &original_headers,
+        &shadowed,
+    );
+
+    assert_eq!(trailers.get("x-edited").map(String::as_str), Some("edited"));
+    assert_eq!(trailers.get("x-kept").map(String::as_str), Some("v"));
+}
+
+#[test]
+fn build_then_reconcile_matches_buffered_writeback_scenario() {
+    // Mirrors the wire-trailer assertions of the main-path integration test
+    // `grpc_buffered_trailer_writeback_honors_hook_removal_and_duplicate_keys`,
+    // exercising the exact merge + reconcile the H3 cross-protocol bridge now
+    // shares with the main gRPC path.
+    let backend_headers = grpc_map(&[
+        ("content-type", "application/grpc"),
+        ("x-dup-key", "header-untouched"),
+        ("x-dup-untouched", "header-untouched"),
+        ("x-shadowed-removed", "hv"),
+    ]);
+    let backend_trailers = grpc_map(&[
+        ("grpc-status", "0"),
+        ("grpc-message", "OK"),
+        ("x-dup-key", "trailer-untouched"),
+        ("x-dup-untouched", "trailer-untouched"),
+        ("x-removed-trailer", "tv"),
+        ("x-shadowed-removed", "tv"),
+    ]);
+
+    let (mut view, shadowed) =
+        grpc_proxy::build_grpc_plugin_header_view(&backend_headers, &backend_trailers);
+
+    // Simulate a response_transformer that updates x-dup-key and removes
+    // x-removed-trailer + x-shadowed-removed (operating on the merged view).
+    view.insert("x-dup-key".to_string(), "redacted-by-hook".to_string());
+    view.remove("x-removed-trailer");
+    view.remove("x-shadowed-removed");
+
+    let mut wire_trailers = backend_trailers.clone();
+    grpc_proxy::reconcile_grpc_trailers_from_view(
+        &mut wire_trailers,
+        &view,
+        &backend_headers,
+        &shadowed,
+    );
+
+    // Terminal status keeps the backend's true trailing values.
+    assert_eq!(
+        wire_trailers.get("grpc-status").map(String::as_str),
+        Some("0")
+    );
+    assert_eq!(
+        wire_trailers.get("grpc-message").map(String::as_str),
+        Some("OK")
+    );
+    // Hook-edited shadowed key: sanitized value reaches the wire trailer.
+    assert_eq!(
+        wire_trailers.get("x-dup-key").map(String::as_str),
+        Some("redacted-by-hook")
+    );
+    // Untouched shadowed key: backend's true trailer value preserved.
+    assert_eq!(
+        wire_trailers.get("x-dup-untouched").map(String::as_str),
+        Some("trailer-untouched")
+    );
+    // Hook removals suppress both a trailer-only key and a shadowed trailer.
+    assert!(!wire_trailers.contains_key("x-removed-trailer"));
+    assert!(!wire_trailers.contains_key("x-shadowed-removed"));
 }

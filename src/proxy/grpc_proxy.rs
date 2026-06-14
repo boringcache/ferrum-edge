@@ -30,7 +30,7 @@ use hyper::body::Incoming;
 use hyper::client::conn::http2;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -1251,6 +1251,74 @@ pub(crate) fn is_reserved_grpc_terminal_metadata(key: &str) -> bool {
     )
 }
 
+/// Build the merged header+trailer view buffered gRPC response-hook plugins run
+/// on, plus the set of trailer keys the backend ALSO sent as real initial
+/// headers ("header-shadowed" keys).
+///
+/// Plugins historically saw a single merged map because trailers were inserted
+/// into the response headers before hooks ran. This reproduces that view: a
+/// trailer-only key is merged in so hooks can see and sanitize it; a key the
+/// backend also sent as a real header is recorded in the returned set instead
+/// of overriding the header value (a trailer never overrides a real header in
+/// the view), so post-hook writeback can tell a genuine hook edit from the
+/// backend's distinct trailer value. The reserved gRPC terminal-status keys
+/// (`grpc-status` / `grpc-message` / `grpc-status-details-bin`) are
+/// trailer-authoritative and never treated as shadowed.
+///
+/// Shared by the main buffered gRPC path (`proxy::handle_proxy_request`) and the
+/// HTTP/3 cross-protocol bridge (`http3::cross_protocol`) so a response-hook
+/// sanitizer reaches the wire trailers identically on both — see
+/// [`reconcile_grpc_trailers_from_view`] for the writeback half.
+pub fn build_grpc_plugin_header_view(
+    response_headers: &HashMap<String, String>,
+    response_trailers: &HashMap<String, String>,
+) -> (HashMap<String, String>, HashSet<String>) {
+    let mut plugin_response_headers = response_headers.clone();
+    let mut header_shadowed_trailer_keys: HashSet<String> = HashSet::new();
+    for (k, v) in response_trailers {
+        if response_headers.contains_key(k) && !is_reserved_grpc_terminal_metadata(k) {
+            header_shadowed_trailer_keys.insert(k.clone());
+        } else {
+            plugin_response_headers.insert(k.clone(), v.clone());
+        }
+    }
+    (plugin_response_headers, header_shadowed_trailer_keys)
+}
+
+/// Reconcile response-hook mutations made on the merged plugin view (built by
+/// [`build_grpc_plugin_header_view`]) back into the wire `response_trailers`.
+///
+/// `original_response_headers` must be the backend's initial headers as they
+/// were before hooks ran. A trailer key now absent from the view was removed by
+/// a hook (drop it). A header-shadowed key was merged into the view at the
+/// *header* value, so its view value is not comparable to the trailer's own
+/// value — detect a genuine hook edit by comparing the view value against the
+/// original header value and only then copy the sanitized value into the hidden
+/// wire trailer (a sanitizer must scrub every client-visible copy); an
+/// untouched shadowed trailer keeps the backend's true trailing value. A
+/// non-shadowed (trailer-only) key whose view value changed was edited by a
+/// hook; copy it.
+pub fn reconcile_grpc_trailers_from_view(
+    response_trailers: &mut HashMap<String, String>,
+    plugin_response_headers: &HashMap<String, String>,
+    original_response_headers: &HashMap<String, String>,
+    header_shadowed_trailer_keys: &HashSet<String>,
+) {
+    response_trailers.retain(|k, v| match plugin_response_headers.get(k) {
+        Some(plugin_value) => {
+            if header_shadowed_trailer_keys.contains(k) {
+                if original_response_headers.get(k) != Some(plugin_value) {
+                    *v = plugin_value.clone();
+                }
+            } else if plugin_value != v {
+                *v = plugin_value.clone();
+            }
+            true
+        }
+        None => false,
+    });
+}
+
 /// HTTP/3 admission rejects use `425 Too Early` for 0-RTT policy failures.
 /// gRPC clients should see that transport retry signal as UNAVAILABLE.
 pub(crate) fn h3_http_reject_status_to_grpc_status(status: StatusCode) -> u32 {
@@ -1619,23 +1687,27 @@ pub async fn proxy_grpc_request_streaming(
     // the proxy boundary. Mirrors `proxy_grpc_request_core` so the two
     // gRPC response paths cannot drift.
     let status = response.status().as_u16();
-    let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
-    // Snapshot any Connection-listed names before the canonical strip so
-    // we can also remove them per RFC 9110 §7.6.1. Hyper rejects
-    // `Connection` on H2 frames (RFC 9113 §8.2.2), so this is typically
-    // a no-op for valid gRPC backends — present for defence in depth.
+    // Collect backend response headers through the shared collector that the
+    // plain-HTTP path uses, instead of a bespoke `insert` loop that overwrote
+    // duplicate names. Repeated `Set-Cookie` values are newline-joined (RFC 6265
+    // — they MUST be emitted as separate header lines, never comma-folded), other
+    // repeated headers are comma-folded, and both the canonical hop-by-hop set
+    // (RFC 9110 §7.6.1) and any `Connection`-listed names are stripped.
+    // `apply_response_headers()` in the consuming path later splits the
+    // newline-joined `Set-Cookie` back into individual header lines. Reusing the
+    // shared collector keeps the gRPC and generic paths from drifting and stops
+    // duplicate response headers (e.g. multiple `Set-Cookie`) from collapsing to
+    // a single value. Hyper rejects `Connection` on H2 frames (RFC 9113 §8.2.2),
+    // so the Connection-listed strip is typically a no-op for valid gRPC backends
+    // — present for defence in depth.
+    let mut resp_headers = HashMap::new();
     let connection_listed = parse_connection_listed_headers(response.headers());
-    for (k, v) in response.headers() {
-        if is_backend_response_strip_header(k.as_str()) {
-            continue;
-        }
-        if connection_listed.iter().any(|n| n == k) {
-            continue;
-        }
-        if let Ok(vs) = v.to_str() {
-            resp_headers.insert(k.as_str().to_string(), vs.to_string());
-        }
-    }
+    super::collect_response_headers_generic(
+        response.headers().keys_len(),
+        response.headers().iter(),
+        &mut resp_headers,
+        &connection_listed,
+    );
     Ok(GrpcResponseKind::Streaming(GrpcStreamingResponse {
         status,
         headers: resp_headers,
@@ -1824,23 +1896,25 @@ pub(crate) async fn proxy_grpc_request_core(
         send_fut.await.map_err(map_send_err)?
     };
 
-    // Extract response status and headers, stripping hop-by-hop headers
-    // per RFC 9110 §7.6.1 (canonical predicate in `proxy::headers`),
-    // including any header NAMED in the response's `Connection` field.
+    // Extract response status and headers through the shared collector the
+    // plain-HTTP path uses, instead of a bespoke `insert` loop that overwrote
+    // duplicate names. Repeated `Set-Cookie` values are newline-joined (RFC 6265
+    // — emitted as separate header lines, never comma-folded), other repeated
+    // headers are comma-folded, and both the canonical hop-by-hop set (RFC 9110
+    // §7.6.1) and any `Connection`-listed names are stripped.
+    // `apply_response_headers()` later splits the newline-joined `Set-Cookie`
+    // back into individual lines. Reusing the shared collector keeps the two
+    // gRPC paths and the generic path from drifting and stops duplicate response
+    // headers from collapsing to a single value.
     let status = response.status().as_u16();
-    let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
+    let mut resp_headers = HashMap::new();
     let connection_listed = parse_connection_listed_headers(response.headers());
-    for (k, v) in response.headers() {
-        if is_backend_response_strip_header(k.as_str()) {
-            continue;
-        }
-        if connection_listed.iter().any(|n| n == k) {
-            continue;
-        }
-        if let Ok(vs) = v.to_str() {
-            resp_headers.insert(k.as_str().to_string(), vs.to_string());
-        }
-    }
+    super::collect_response_headers_generic(
+        response.headers().keys_len(),
+        response.headers().iter(),
+        &mut resp_headers,
+        &connection_listed,
+    );
 
     // Streaming mode: return the live Incoming body without buffering.
     // The caller (mod.rs) wraps it in CoalescingH2Body so hyper
@@ -2805,5 +2879,49 @@ mod tests {
         collect_buffered_grpc_trailers(&trailer_map, &mut out);
         assert_eq!(out.len(), 1);
         assert_eq!(out.get("grpc-status").map(String::as_str), Some("0"));
+    }
+
+    #[test]
+    fn grpc_response_header_collection_preserves_duplicate_set_cookie() {
+        // Regression for the bug where the gRPC response-header copy used a
+        // HashMap `insert` loop and collapsed duplicate header values — notably
+        // multiple `Set-Cookie` — to the last value, breaking session
+        // stickiness / auth flows. Both the streaming and buffered gRPC paths
+        // now delegate to `collect_response_headers_generic`, matching the
+        // plain-HTTP path: `Set-Cookie` is newline-joined (so the consuming
+        // `apply_response_headers` re-emits separate header lines), other
+        // duplicates are comma-folded, and hop-by-hop names are stripped. This
+        // test exercises the collector exactly as the two gRPC paths now call it.
+        let mut source = http::HeaderMap::new();
+        source.append("set-cookie", http::HeaderValue::from_static("session=a"));
+        source.append("set-cookie", http::HeaderValue::from_static("theme=dark"));
+        source.append("x-multi", http::HeaderValue::from_static("1"));
+        source.append("x-multi", http::HeaderValue::from_static("2"));
+        // Response-direction hop-by-hop header — must be stripped.
+        source.insert("keep-alive", http::HeaderValue::from_static("timeout=5"));
+
+        let mut out: HashMap<String, String> = HashMap::new();
+        let connection_listed = crate::proxy::headers::parse_connection_listed_headers(&source);
+        crate::proxy::collect_response_headers_generic(
+            source.keys_len(),
+            source.iter(),
+            &mut out,
+            &connection_listed,
+        );
+
+        assert_eq!(
+            out.get("set-cookie").map(String::as_str),
+            Some("session=a\ntheme=dark"),
+            "duplicate Set-Cookie must be newline-joined, not collapsed to the last value"
+        );
+        assert_eq!(
+            out.get("x-multi").map(String::as_str),
+            Some("1, 2"),
+            "other duplicate response headers are comma-folded"
+        );
+        assert!(
+            !out.contains_key("keep-alive"),
+            "hop-by-hop response headers must be stripped"
+        );
     }
 }
