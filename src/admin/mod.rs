@@ -6,6 +6,7 @@ mod backup;
 pub(crate) mod crud;
 pub mod jwt_auth;
 pub mod mesh_config_drift;
+pub mod mesh_remote_clusters;
 pub mod spec_codec;
 mod tls_management;
 
@@ -1419,6 +1420,14 @@ pub async fn handle_admin_request(
             handle_mesh_config_drift_get(&state, query.as_deref()).await
         }
 
+        // F7.2: remote-cluster discovery introspection. Read-only operator
+        // view of the DP's multicluster east-west state — clusters it has
+        // actually fetched endpoints from (with per-cluster workload/service
+        // counts + fetch age) and the remote clusters declared in the accepted
+        // slice. 404 outside mesh mode — same shape as the other `/mesh/*`
+        // endpoints.
+        (Method::GET, ["mesh", "remote-clusters"]) => handle_mesh_remote_clusters_get(&state).await,
+
         // MESH-T6-D: aggregated recent mesh_authz denies for ad-hoc triage.
         // The recorder is process-singleton and exception-path only — only
         // `mesh_authz` rejects touch it, and they record under a single
@@ -1691,6 +1700,67 @@ async fn handle_mesh_config_drift_get(
             Ok(json_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &json!({"error": "Failed to serialize mesh config-drift response"}),
+            ))
+        }
+    }
+}
+
+/// `GET /mesh/remote-clusters` (F7.2): the DP's view of multicluster east-west
+/// discovery. JWT-authenticated (falls through the admin auth gate); `404`
+/// outside mesh mode like the other `/mesh/*` introspection endpoints. The
+/// payload surfaces remote-cluster provenance + per-cluster endpoint counts —
+/// never raw workload addresses, SPIFFE IDs, or control-plane URLs.
+async fn handle_mesh_remote_clusters_get(
+    state: &AdminState,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    let Some(mesh_runtime) = state.mesh_runtime_state.as_ref() else {
+        return Ok(json_response(
+            StatusCode::NOT_FOUND,
+            &json!({"error": "No active mesh runtime state"}),
+        ));
+    };
+
+    // Lock-free read of the live discovered-remote-cluster snapshot.
+    let snapshot = mesh_runtime.remote_endpoint_store().snapshot();
+
+    // The configured remote clusters come from the proxy-accepted slice — a
+    // received-but-rejected slice must not appear as the DP's effective
+    // multicluster config, matching `/mesh/config-drift`'s accepted-slice read.
+    let applied_slice = mesh_runtime.applied_snapshot();
+    let multi_cluster = applied_slice
+        .as_ref()
+        .as_ref()
+        .and_then(|slice| slice.multi_cluster.as_ref());
+
+    // Discovery is enabled only when the poll interval is positive. Read from
+    // the DP's own env config so the flag is populated even before the first
+    // slice / poll. `proxy_state` is always `Some(...)` in mesh mode, but treat
+    // `None` as "disabled" rather than 503 — the discovered/configured views
+    // are still meaningful for debugging unwired test states.
+    let discovery_enabled = state
+        .proxy_state
+        .as_ref()
+        .is_some_and(|ps| ps.env_config.mesh_remote_discovery_poll_interval_seconds > 0);
+
+    let resp =
+        mesh_remote_clusters::build_response(mesh_remote_clusters::MeshRemoteClustersInputs {
+            snapshot: snapshot.as_ref(),
+            multi_cluster,
+            discovery_enabled,
+            // `timestamp()` is non-negative for any realistic wall clock; clamp the
+            // theoretical pre-epoch case to 0 rather than casting a negative i64.
+            now_unix_seconds: chrono::Utc::now().timestamp().max(0) as u64,
+        });
+
+    // `MeshRemoteClustersResponse` is fully serde-derived; treat a serialize
+    // error as a 500 rather than `.unwrap()`-ing on the admin path.
+    match serde_json::to_value(&resp) {
+        Ok(value) => Ok(json_response(StatusCode::OK, &value)),
+        Err(err) => {
+            error!(error = %err, "failed to serialize mesh remote-clusters response");
+            Ok(json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &json!({"error": "Failed to serialize mesh remote-clusters response"}),
             ))
         }
     }

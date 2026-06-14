@@ -308,10 +308,11 @@ impl MeshRuntimeState {
 
     /// Returns the live remote-cluster endpoint store. Always present, even
     /// when no discovery poller has been spawned; in that case its snapshot is
-    /// simply empty. (Unlike `FederationStore`, no production "has discovery
-    /// populated anything" introspection is exposed yet — there is no
-    /// `/mesh/remote-clusters` admin surface, so `has_first_success` remains
-    /// test-only until one lands.)
+    /// simply empty. The `GET /mesh/remote-clusters` admin handler reads its
+    /// `snapshot()` lock-free for the `discovered` view (scoped to the accepted
+    /// slice's configured clusters). The store is only mutated by the live
+    /// discovery poller — there is no production seeder, so the snapshot can
+    /// never be staged through this public accessor.
     pub fn remote_endpoint_store(&self) -> &RemoteEndpointStore {
         &self.remote_endpoint_store
     }

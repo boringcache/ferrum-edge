@@ -232,11 +232,14 @@ pub(crate) async fn handle_mesh_tcp_egress(
             .bytes_client_to_backend
             .saturating_add(result.bytes_backend_to_client),
     );
+    // Per-transport raw-TCP egress connection counter (success/failure),
+    // covering BOTH HBONE and mesh-mTLS (mesh plan F7.4).
+    crate::plugins::prometheus_metrics::global_registry()
+        .record_mesh_tcp_egress_connection(transport, result.first_failure.is_none());
     if let Some((direction, class, side, message)) = result.first_failure.as_ref() {
-        // The relay-failure metric is HBONE-named; record it for the HBONE
-        // transport only. A transport-labelled raw-TCP egress connection
-        // counter covering both transports is a planned observability
-        // follow-up (mesh plan F7.4).
+        // The legacy per-direction relay-failure metric is HBONE-named, so keep
+        // recording it for the HBONE transport only; mesh-mTLS failures surface
+        // in the transport-labelled connections counter above + the warn log.
         if transport == "hbone" {
             crate::plugins::prometheus_metrics::global_registry()
                 .record_hbone_relay_failure(&proxy.id, *direction, *class);

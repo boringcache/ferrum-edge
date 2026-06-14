@@ -47,6 +47,12 @@ pub struct K8sControllerConfig {
     pub watch_gateway_api: bool,
     pub pod_discovery_enabled: bool,
     pub watch_node_locality: bool,
+    /// Effective Sidecar `ingress[]` materialization gate
+    /// (`FERRUM_MESH_SIDECAR_ENFORCED && !FERRUM_MESH_SIDECAR_ENFORCED_DRY_RUN`).
+    /// Threaded to the Istio status writer so it reports `ingress_modeled` only
+    /// when the data plane actually materializes the listeners (F6 §6.2),
+    /// matching the slice builder's ingress gate.
+    pub mesh_sidecar_ingress_enforced: bool,
     pub debounce_ms: u64,
     pub full_sync_interval_secs: u64,
     pub kubeconfig_path: Option<String>,
@@ -126,6 +132,7 @@ pub async fn start_k8s_controller(
         debounce_ms: controller_config.debounce_ms,
         full_sync_interval_secs: controller_config.full_sync_interval_secs,
         pod_discovery_enabled: controller_config.pod_discovery_enabled,
+        mesh_sidecar_ingress_enforced: controller_config.mesh_sidecar_ingress_enforced,
     };
     let gateway_status_writer = controller_config
         .watch_gateway_api

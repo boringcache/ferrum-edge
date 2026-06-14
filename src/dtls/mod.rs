@@ -933,7 +933,16 @@ impl DtlsServer {
         let mut app_out_rx = Some(app_out_rx);
         let (app_in_tx, mut app_in_rx) = mpsc::channel::<Vec<u8>>(256);
         let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
-        let sni_hostname = crate::proxy::sni::extract_sni_from_dtls_client_hello(&initial_packet);
+        // Terminating DTLS: this is best-effort SNI for the session's identity /
+        // logging field only — dimpl runs the real handshake and rejects malformed
+        // input itself, so a continuation fragment or no-SNI ClientHello both map
+        // to `None` here (no drop-routing like the passthrough path does).
+        let sni_hostname =
+            match crate::proxy::sni::extract_sni_from_dtls_client_hello(&initial_packet) {
+                crate::proxy::sni::DtlsSniResult::Hostname(host) => Some(host),
+                crate::proxy::sni::DtlsSniResult::NoSni
+                | crate::proxy::sni::DtlsSniResult::InvalidFragment => None,
+            };
 
         self.sessions.insert(
             peer_addr,
@@ -1587,8 +1596,8 @@ mod tests {
     fn dtls_client_hello_sni_is_extracted_for_server_connections() {
         let packet = dtls_client_hello_packet_with_sni("Admin.Mesh.Internal");
         assert_eq!(
-            crate::proxy::sni::extract_sni_from_dtls_client_hello(&packet).as_deref(),
-            Some("admin.mesh.internal")
+            crate::proxy::sni::extract_sni_from_dtls_client_hello(&packet),
+            crate::proxy::sni::DtlsSniResult::Hostname("admin.mesh.internal".to_string())
         );
     }
 

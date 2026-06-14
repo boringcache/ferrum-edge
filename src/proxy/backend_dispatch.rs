@@ -215,23 +215,21 @@ pub(crate) fn select_upstream_target(
 
     let balancers = &epoch.load_balancer;
 
-    // Resolve the ejection cap from the upstream's passive health config.
+    // Resolve the ejection cap with the SAME precedence the passive-health
+    // thresholds use in `passive_health_for_target` (per-port > per-subset >
+    // upstream) so the cap and the thresholds are always drawn from one tier.
     let dispatch_port = initial_dispatch_port(
         proxy,
         LoadBalancerCache::initial_dispatch_port_override_from(balancers, upstream_id),
     );
     let has_port_override =
         has_effective_port_override(proxy, balancers, upstream_id, dispatch_port);
-    let max_ejection_percent = if has_port_override {
-        LoadBalancerCache::max_ejection_percent_for_port_from(
-            balancers,
-            upstream_id,
-            proxy,
-            dispatch_port,
-        )
-    } else {
-        LoadBalancerCache::max_ejection_percent_from(balancers, upstream_id)
-    };
+    let max_ejection_percent = LoadBalancerCache::max_ejection_percent_resolved_from(
+        balancers,
+        upstream_id,
+        proxy,
+        has_port_override.then_some(dispatch_port),
+    );
 
     let health_ctx = HealthContext {
         active_unhealthy: &state.health_checker.active_unhealthy_targets,
@@ -579,6 +577,40 @@ fn client_side_no_backend_signal(error_class: Option<ErrorClass>) -> bool {
     )
 }
 
+/// A post-wire backend failure: the request reached the backend's application
+/// layer (response headers already arrived) and then the response stalled, the
+/// transport broke, or the backend over-sent before the body/trailers completed.
+///
+/// These classes are NOT connection errors — the request went on the wire, so
+/// `connection_error` stays false and connect-failure retry replay must respect
+/// method idempotency — but they ARE backend-health failures that the circuit
+/// breaker / passive health / least-latency accounting AND the adaptive
+/// concurrency limiter (`AdaptiveConcurrencyPermit::record`) must count. Without
+/// this, a backend that returns `200` headers and then times out / RSTs
+/// mid-stream (or floods past the response-size cap) is recorded as healthy
+/// because neither `connection_error` nor a 5xx status is set (see the streaming
+/// `IdleReadTimeoutBody` / native-H3 read-timeout paths and
+/// `record_deferred_backend_admission`).
+///
+/// `ResponseBodyTooLarge` IS included: an oversized backend response is a backend
+/// fault (the existing limiter contract), even though the gateway is the one that
+/// cuts it. `ClientDisconnect` / `RequestBodyTooLarge` are excluded — they are
+/// client/gateway-side and already neutralized by `client_side_no_backend_signal`;
+/// `GracefulRemoteClose` is a clean close.
+#[inline]
+pub(crate) fn error_class_is_post_wire_backend_failure(error_class: Option<ErrorClass>) -> bool {
+    matches!(
+        error_class,
+        Some(
+            ErrorClass::ReadWriteTimeout
+                | ErrorClass::ConnectionReset
+                | ErrorClass::ConnectionClosed
+                | ErrorClass::ProtocolError
+                | ErrorClass::ResponseBodyTooLarge
+        )
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn record_backend_outcome_inner(
     state: &ProxyState,
@@ -613,9 +645,16 @@ fn record_backend_outcome_inner(
     //      exist, they provide consistent, controlled RTT measurements and take
     //      precedence over passive TTFB which includes variable application processing time
     let client_side_no_backend_signal = client_side_no_backend_signal(error_class);
+    // A post-wire backend failure (a streaming `ReadWriteTimeout`, or a
+    // mid-response reset/close) is NOT a `connection_error` — the request
+    // reached the wire — but it must still count as a backend-health failure.
+    // Fold it into the failure signal used for latency / circuit-breaker /
+    // passive-health accounting below, WITHOUT touching `connection_error`
+    // itself (which gates connect-failure retry replay).
+    let backend_failure = connection_error || error_class_is_post_wire_backend_failure(error_class);
 
     if !client_side_no_backend_signal
-        && !connection_error
+        && !backend_failure
         && response_status < 500
         && let (Some(upstream_id), Some(target)) = (proxy.upstream_id.as_deref(), upstream_target)
     {
@@ -642,12 +681,23 @@ fn record_backend_outcome_inner(
         if client_side_no_backend_signal {
             cb.record_neutral(is_half_open_probe);
         } else if connection_error {
-            // Always route connection errors through record_failure().
-            // When trip_on_connection_errors=false, record_failure() treats
-            // them as neutral while still releasing half-open probe slots.
+            // Pre-wire connection error → routed as connection-level, gated by
+            // trip_on_connection_errors. When that is false, record_failure()
+            // treats it as neutral while still releasing half-open probe slots.
             cb.record_failure(response_status, true, is_half_open_probe);
         } else if cb.config().failure_status_codes.contains(&response_status) {
+            // A configured failure status (5xx etc.) trips the breaker
+            // regardless of connection-error gating. Checked BEFORE the
+            // post-wire arm so a backend that returns a failure status AND then
+            // stalls / RSTs mid-body still records the (ungated) status-code
+            // failure rather than a trip_on_connection_errors-gated one.
             cb.record_failure(response_status, false, is_half_open_probe);
+        } else if error_class_is_post_wire_backend_failure(error_class) {
+            // Post-wire backend failure with a non-failure status (a 2xx stream
+            // that then timed out / reset mid-body): route through the
+            // connection-level path so it can trip even though the status looked
+            // healthy, gated by trip_on_connection_errors like a transport fault.
+            cb.record_failure(response_status, true, is_half_open_probe);
         } else {
             cb.record_success(is_half_open_probe);
         }
@@ -672,7 +722,7 @@ fn record_backend_outcome_inner(
             &proxy.id,
             target,
             response_status,
-            connection_error,
+            backend_failure,
             passive,
         );
     }
@@ -692,8 +742,10 @@ pub(crate) fn passive_health_for_target<'a>(
         .and_then(|override_config| override_config.passive_health_check.as_ref())
         .or_else(|| {
             // Subset-bound proxy: prefer the subset's resolved passive-health
-            // thresholds over the upstream-level ones. (The maxEjectionPercent
-            // cap is still resolved at upstream scope via the LoadBalancerCache.)
+            // overlay over the upstream-level one. The maxEjectionPercent cap is
+            // resolved with this SAME precedence by
+            // `LoadBalancerCache::max_ejection_percent_resolved_from`, so the cap
+            // and these thresholds always come from the same tier.
             proxy
                 .upstream_subset
                 .as_deref()
@@ -819,16 +871,15 @@ pub(crate) fn select_next_retry_target(
             .passive_health
             .get(&proxy.id)
             .map(|r| r.value().clone()),
-        max_ejection_percent: if let Some(port) = retry_override_port {
-            LoadBalancerCache::max_ejection_percent_for_port_from(
-                &epoch.load_balancer,
-                upstream_id,
-                proxy,
-                port,
-            )
-        } else {
-            LoadBalancerCache::max_ejection_percent_from(&epoch.load_balancer, upstream_id)
-        },
+        // Same precedence as the steady-state path and `passive_health_for_target`
+        // (per-port > per-subset > upstream). `retry_override_port` is already
+        // `Some` only when a live per-port override covers the retried target.
+        max_ejection_percent: LoadBalancerCache::max_ejection_percent_resolved_from(
+            &epoch.load_balancer,
+            upstream_id,
+            proxy,
+            retry_override_port,
+        ),
     };
 
     if let Some(subset_name) = proxy.upstream_subset.as_deref() {

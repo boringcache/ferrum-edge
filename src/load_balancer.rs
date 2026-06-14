@@ -145,6 +145,37 @@ impl HealthBitset {
         }
         remaining.trailing_zeros() as usize
     }
+
+    /// Build a bitset directly from a raw `u128` mask, recomputing `len` from
+    /// the population count. Used to construct candidate masks (e.g. subset∩port)
+    /// without a per-request `Vec` — the result stays a stack `u128`.
+    #[inline]
+    fn from_bits(bits: u128) -> Self {
+        Self {
+            bits,
+            len: bits.count_ones() as u8,
+        }
+    }
+
+    /// Intersection of two bitsets (`self & other`) as a new stack `u128`.
+    /// Alloc-free analogue of intersecting two index slices.
+    #[inline]
+    fn intersect(&self, other: &Self) -> Self {
+        Self::from_bits(self.bits & other.bits)
+    }
+
+    /// Invoke `f` once per set bit, in ascending index order, without
+    /// allocating. Iterates by repeatedly reading and clearing the lowest set
+    /// bit — O(popcount) on register-width integers.
+    #[inline]
+    fn for_each_set_bit(&self, mut f: impl FnMut(usize)) {
+        let mut remaining = self.bits;
+        while remaining != 0 {
+            let idx = remaining.trailing_zeros() as usize;
+            f(idx);
+            remaining &= remaining - 1; // clear lowest set bit
+        }
+    }
 }
 
 fn bitset_for_indices(indices: &[usize]) -> HealthBitset {
@@ -812,6 +843,84 @@ impl LoadBalancerCache {
             return port_passive.max_ejection_percent;
         }
 
+        Self::max_ejection_percent_from(snapshot, upstream_id)
+    }
+
+    /// Resolve the passive-health `maxEjectionPercent` cap for a dispatch using
+    /// the SAME tier precedence the *thresholds* use in
+    /// `backend_dispatch::passive_health_for_target`:
+    ///
+    /// per-port override (`portLevelSettings[].outlierDetection`) > per-subset
+    /// (`subsets[].trafficPolicy.outlierDetection`) > upstream-level.
+    ///
+    /// `port` is `Some` only when a single dispatch port is resolvable for this
+    /// dispatch AND a per-port override is actually in effect for it (the caller
+    /// has already confirmed via `has_effective_port_override` /
+    /// `retry_port_override_dispatch_port` + `has_port_override_state_from`);
+    /// pass `None` otherwise so a phantom `dispatch_port_overrides` entry
+    /// without a live balancer lane is ignored.
+    ///
+    /// PRE-SELECTION ASYMMETRY — this cap is resolved *before* a concrete target
+    /// (and therefore its port) is chosen, so the per-port tier only applies
+    /// when a single dispatch port is resolvable up front: non-subset dispatch
+    /// or subset dispatch on a single-port upstream (one full-coverage port via
+    /// `initial_dispatch_port_override`), and explicitly port-pinned retries.
+    /// For subset-routed dispatch on a *multi-port* upstream no single dispatch
+    /// port exists pre-selection (`initial_dispatch_port_override` is 0), so the
+    /// caller passes `None` and the **subset** cap governs the subset candidate
+    /// pool (falling back to the upstream cap). This mirrors the long-standing
+    /// thresholds-vs-cap asymmetry: the thresholds in `passive_health_for_target`
+    /// reach a per-port overlay only because they run *per selected target*,
+    /// keyed by `target.port` after selection. Resolving a per-port cap for a
+    /// homogeneous single-port subset (all its endpoints on one port) is a
+    /// possible future refinement; today it resolves the subset/upstream cap,
+    /// matching the pre-PR behavior (which never resolved a port cap here).
+    ///
+    /// INVARIANT — the tiers are **wholesale**: a present overlay replaces all
+    /// lower tiers *even when its own `max_ejection_percent` is `None`*. This
+    /// MUST match `passive_health_for_target`'s wholesale `.or_else()` chain so
+    /// the cap and the thresholds are always drawn from the SAME tier — a subset
+    /// (or per-port) `outlierDetection` that omits `maxEjectionPercent` must not
+    /// silently fall back to the upstream-level cap while its thresholds come
+    /// from the subset, which would mix policy from two tiers.
+    ///
+    /// Hot-path safe: snapshot map lookups only; `snapshot.upstreams` already
+    /// holds the `Arc<Upstream>`, so the subset tier borrows it without cloning.
+    #[inline]
+    pub fn max_ejection_percent_resolved_from(
+        snapshot: &LoadBalancerCacheInner,
+        upstream_id: &str,
+        proxy: &Proxy,
+        port: Option<u16>,
+    ) -> Option<u8> {
+        // Per-port tier: a live override lane whose `passive_health_check` is
+        // present wins wholesale (its cap may be `None`).
+        if let Some(port) = port
+            && Self::has_port_override_state_from(snapshot, upstream_id, port)
+            && let Some(port_passive) = proxy
+                .dispatch_port_overrides
+                .as_ref()
+                .and_then(|overrides| overrides.get(&port))
+                .and_then(|override_config| override_config.passive_health_check.as_ref())
+        {
+            return port_passive.max_ejection_percent;
+        }
+
+        // Per-subset tier: a subset-bound proxy whose subset resolved an
+        // `outlierDetection` overlay wins wholesale over the upstream level
+        // (mirrors how `passive_health_for_target` reaches the subset overlay
+        // via `resolved_subset_tls`).
+        if let Some(subset) = proxy.upstream_subset.as_deref()
+            && let Some(subset_passive) = snapshot
+                .upstreams
+                .get(upstream_id)
+                .and_then(|u| u.resolved_subset_tls.get(subset))
+                .and_then(|resolved| resolved.passive_health_check.as_ref())
+        {
+            return subset_passive.max_ejection_percent;
+        }
+
+        // Upstream tier.
         Self::max_ejection_percent_from(snapshot, upstream_id)
     }
 
@@ -1870,6 +1979,64 @@ impl LoadBalancer {
         bitset
     }
 
+    /// Alloc-free analogue of [`Self::compute_health_bitset_for_indices`] that
+    /// takes a candidate `mask` (a stack `u128` bitset) instead of an index
+    /// slice. The passive max-ejection cap is sized against the mask's popcount
+    /// (`mask.count()`) — the candidate-pool size — so subset / subset∩port
+    /// dispatches scope the cap to the actual candidates without allocating a
+    /// per-request index `Vec`. The returned healthy bitset is a subset of
+    /// `mask` (only candidates in the mask can be set).
+    #[inline]
+    fn compute_health_bitset_for_mask(
+        &self,
+        health: Option<&HealthContext<'_>>,
+        mask: &HealthBitset,
+    ) -> HealthBitset {
+        let Some(h) = health else {
+            return *mask;
+        };
+
+        if h.active_unhealthy.is_empty()
+            && h.proxy_passive
+                .as_ref()
+                .is_none_or(|ps| ps.unhealthy.is_empty())
+        {
+            return *mask;
+        }
+
+        let candidate_count = mask.count();
+        let mut bitset = HealthBitset::empty();
+        let mut passive_ejected: Vec<(usize, u64)> = Vec::new();
+
+        mask.for_each_set_bit(|i| {
+            debug_assert!(i < self.targets.len());
+            if i >= self.targets.len() {
+                return;
+            }
+            if h.active_unhealthy.contains_key(&self.target_keys[i]) {
+                return;
+            }
+            if let Some(ref ps) = h.proxy_passive
+                && let Some(entry) = ps.unhealthy.get(&self.host_port_keys[i])
+            {
+                passive_ejected.push((i, *entry));
+                return;
+            }
+            bitset.set(i);
+        });
+
+        let to_readmit = passive_ejections_to_readmit(
+            &mut passive_ejected,
+            candidate_count,
+            h.max_ejection_percent,
+        );
+        for &(idx, _) in passive_ejected.iter().take(to_readmit) {
+            bitset.set(idx);
+        }
+
+        bitset
+    }
+
     /// Collect healthy targets into a Vec — fallback for upstreams with >128
     /// targets that cannot use the bitset fast path.
     fn healthy_targets_vec(
@@ -2216,8 +2383,32 @@ impl LoadBalancer {
         first_eligible
     }
 
-    fn subset_membership_mask(&self, subset_indices: &[usize]) -> Vec<bool> {
-        membership_mask_for_indices(self.targets.len(), subset_indices)
+    /// Candidate mask for a port+subset dispatch: the indices present in BOTH
+    /// `subset_indices` and `port_indices` (subset∩port), as a stack `u128`
+    /// bitset. Used to scope the passive ejection cap to subset∩port instead of
+    /// the whole port. Both slices hold in-bounds indices `< MAX_BITSET_TARGETS`
+    /// (this is the ≤128-target bitset path), so the intersection is a register
+    /// AND of two stack `u128`s — no per-request heap allocation.
+    #[inline]
+    fn subset_port_mask(&self, subset_indices: &[usize], port_indices: &[usize]) -> HealthBitset {
+        bitset_for_indices(subset_indices).intersect(&bitset_for_indices(port_indices))
+    }
+
+    /// Vec-fallback (>128 targets) equivalent of [`Self::subset_port_mask`].
+    /// Indices may be `>= MAX_BITSET_TARGETS`, so port membership is tested
+    /// against a `Vec<bool>` mask sized to the full target count instead of a
+    /// `u128` bitset.
+    fn subset_port_intersection_vec(
+        &self,
+        subset_indices: &[usize],
+        port_indices: &[usize],
+    ) -> Vec<usize> {
+        let port_mask = membership_mask_for_indices(self.targets.len(), port_indices);
+        subset_indices
+            .iter()
+            .copied()
+            .filter(|&idx| port_mask.get(idx).copied().unwrap_or(false))
+            .collect()
     }
 
     pub fn select(
@@ -2292,14 +2483,12 @@ impl LoadBalancer {
             );
         }
 
-        // Compute health bitset and intersect with subset membership.
-        let healthy = self.compute_health_bitset(health);
-        let mut subset_healthy = HealthBitset::empty();
-        for &idx in subset_target_indices {
-            if healthy.contains(idx) {
-                subset_healthy.set(idx);
-            }
-        }
+        // Compute the health bitset scoped to the subset's candidate pool, so a
+        // subset-scoped ejection cap is sized against the subset target count —
+        // not the full upstream (which would dilute the cap and let a
+        // small-subset/large-upstream combination keep the whole subset ejected).
+        // The returned bitset is already subset-scoped; no post-hoc intersect.
+        let subset_healthy = self.compute_health_bitset_for_indices(health, subset_target_indices);
 
         if subset_healthy.is_empty() {
             return None;
@@ -2416,14 +2605,17 @@ impl LoadBalancer {
             );
         }
 
-        let healthy = self.compute_health_bitset_for_indices(health, &port_state.target_indices);
-        let subset_mask = bitset_for_indices(subset_target_indices);
-        let mut port_subset_healthy = HealthBitset::empty();
-        for &idx in &port_state.target_indices {
-            if healthy.contains(idx) && subset_mask.contains(idx) {
-                port_subset_healthy.set(idx);
-            }
+        // The candidate pool for a port+subset dispatch is subset∩port, so the
+        // ejection cap must be sized against that intersection — not the whole
+        // port (which would over-count the denominator and keep too many
+        // subset∩port targets ejected). Build the intersection as an alloc-free
+        // stack `u128` mask (no per-request `Vec`); the returned bitset is
+        // already scoped to it, so no post-hoc subset mask is needed.
+        let intersection = self.subset_port_mask(subset_target_indices, &port_state.target_indices);
+        if intersection.is_empty() {
+            return None;
         }
+        let port_subset_healthy = self.compute_health_bitset_for_mask(health, &intersection);
 
         if port_subset_healthy.is_empty() {
             return None;
@@ -2494,12 +2686,13 @@ impl LoadBalancer {
         subset_indices: &[usize],
         health: Option<&HealthContext<'_>>,
     ) -> Option<TargetSelection> {
-        let subset_mask = self.subset_membership_mask(subset_indices);
-        let candidates: Vec<(usize, &Arc<UpstreamTarget>)> = self
-            .healthy_targets_vec_for_indices(health, &port_state.target_indices)
-            .into_iter()
-            .filter(|(idx, _)| subset_mask[*idx])
-            .collect();
+        // Cap against subset∩port (mirrors the bitset path), not the whole port.
+        let intersection =
+            self.subset_port_intersection_vec(subset_indices, &port_state.target_indices);
+        if intersection.is_empty() {
+            return None;
+        }
+        let candidates = self.healthy_targets_vec_for_indices(health, &intersection);
         if candidates.is_empty() {
             return None;
         }
@@ -2532,17 +2725,10 @@ impl LoadBalancer {
         subset_indices: &[usize],
         health: Option<&HealthContext<'_>>,
     ) -> Option<TargetSelection> {
-        let all_healthy = self.healthy_targets_vec(health);
-        let mut healthy_mask = vec![false; self.targets.len()];
-        for (idx, _) in all_healthy {
-            healthy_mask[idx] = true;
-        }
-
-        let subset_healthy: Vec<(usize, &Arc<UpstreamTarget>)> = subset_indices
-            .iter()
-            .filter(|&&i| healthy_mask[i])
-            .map(|&i| (i, &self.targets[i]))
-            .collect();
+        // Scope the ejection cap to the subset candidate pool (mirrors the
+        // bitset path's `compute_health_bitset_for_indices`): cap against the
+        // subset target count, not the full upstream.
+        let subset_healthy = self.healthy_targets_vec_for_indices(health, subset_indices);
 
         if subset_healthy.is_empty() {
             return None;
@@ -2950,17 +3136,21 @@ impl LoadBalancer {
             );
         }
 
-        let mut healthy = self.compute_health_bitset(health);
+        // Drop the excluded (previously tried) target from the candidate mask
+        // BEFORE sizing the ejection cap, so the cap's denominator and
+        // readmission budget evaluate over the actual retry candidates. If the
+        // excluded target were the earliest-ejected one, capping first would
+        // spend the readmission on it and then clearing it would leave the
+        // remaining candidate ejected — wrongly returning None. Building the
+        // mask is an alloc-free stack `u128` (no per-request `Vec`).
+        let mut candidate_mask = bitset_for_indices(subset_target_indices);
         if let Some(ei) = exclude_idx {
-            healthy.clear(ei);
+            candidate_mask.clear(ei);
         }
-
-        let mut subset_healthy = HealthBitset::empty();
-        for &idx in subset_target_indices {
-            if healthy.contains(idx) {
-                subset_healthy.set(idx);
-            }
+        if candidate_mask.is_empty() {
+            return None;
         }
+        let subset_healthy = self.compute_health_bitset_for_mask(health, &candidate_mask);
 
         if subset_healthy.is_empty() {
             return None;
@@ -3015,19 +3205,20 @@ impl LoadBalancer {
             );
         }
 
-        let mut healthy =
-            self.compute_health_bitset_for_indices(health, &port_state.target_indices);
+        // Build the subset∩port candidate mask alloc-free (stack `u128`) and
+        // drop the excluded (previously tried) target from it BEFORE sizing the
+        // ejection cap, so the cap's denominator and readmission budget evaluate
+        // over the actual retry candidates rather than spending the budget on
+        // the excluded target (see `select_excluding_from_subset`).
+        let mut candidate_mask =
+            self.subset_port_mask(subset_target_indices, &port_state.target_indices);
         if let Some(ei) = exclude_idx {
-            healthy.clear(ei);
+            candidate_mask.clear(ei);
         }
-
-        let subset_mask = bitset_for_indices(subset_target_indices);
-        let mut port_subset_healthy = HealthBitset::empty();
-        for &idx in &port_state.target_indices {
-            if healthy.contains(idx) && subset_mask.contains(idx) {
-                port_subset_healthy.set(idx);
-            }
+        if candidate_mask.is_empty() {
+            return None;
         }
+        let port_subset_healthy = self.compute_health_bitset_for_mask(health, &candidate_mask);
 
         if port_subset_healthy.is_empty() {
             return None;
@@ -3131,12 +3322,20 @@ impl LoadBalancer {
         exclude_idx: Option<usize>,
         health: Option<&HealthContext<'_>>,
     ) -> Option<Arc<UpstreamTarget>> {
-        let subset_mask = self.subset_membership_mask(subset_indices);
-        let candidates: Vec<(usize, &Arc<UpstreamTarget>)> = self
-            .healthy_targets_vec_for_indices(health, &port_state.target_indices)
-            .into_iter()
-            .filter(|(idx, _)| subset_mask[*idx] && exclude_idx.is_none_or(|ei| ei != *idx))
-            .collect();
+        // Build subset∩port, then drop the excluded (previously tried) target
+        // from the candidate list BEFORE sizing the ejection cap (mirrors the
+        // bitset path), so the cap's denominator/budget evaluate over the actual
+        // retry candidates rather than spending the readmission on the excluded
+        // target. A `Vec` here is acceptable — this is the >128-target fallback.
+        let mut intersection =
+            self.subset_port_intersection_vec(subset_indices, &port_state.target_indices);
+        if let Some(ei) = exclude_idx {
+            intersection.retain(|&idx| idx != ei);
+        }
+        if intersection.is_empty() {
+            return None;
+        }
+        let candidates = self.healthy_targets_vec_for_indices(health, &intersection);
         if candidates.is_empty() {
             return None;
         }
@@ -3165,18 +3364,23 @@ impl LoadBalancer {
         exclude_idx: Option<usize>,
         health: Option<&HealthContext<'_>>,
     ) -> Option<Arc<UpstreamTarget>> {
-        let all_healthy = self.healthy_targets_vec(health);
-        let mut healthy_mask = vec![false; self.targets.len()];
-        for (idx, _) in all_healthy {
-            healthy_mask[idx] = true;
+        // Drop the excluded (previously tried) target from the subset candidate
+        // list BEFORE sizing the ejection cap (mirrors the bitset path), so the
+        // cap's denominator/budget evaluate over the actual retry candidates
+        // rather than spending the readmission on the excluded target. A `Vec`
+        // here is acceptable — this is the >128-target fallback.
+        let candidate_indices: Vec<usize> = match exclude_idx {
+            Some(ei) => subset_indices
+                .iter()
+                .copied()
+                .filter(|&idx| idx != ei)
+                .collect(),
+            None => subset_indices.to_vec(),
+        };
+        if candidate_indices.is_empty() {
+            return None;
         }
-
-        let subset_healthy: Vec<(usize, &Arc<UpstreamTarget>)> = subset_indices
-            .iter()
-            .copied()
-            .filter(|&i| healthy_mask[i] && exclude_idx.is_none_or(|ei| ei != i))
-            .map(|i| (i, &self.targets[i]))
-            .collect();
+        let subset_healthy = self.healthy_targets_vec_for_indices(health, &candidate_indices);
 
         if subset_healthy.is_empty() {
             return None;
@@ -3758,6 +3962,51 @@ mod tests {
         assert_eq!(bs.count(), 127);
         assert!(bs.contains(126));
         assert!(!bs.contains(127));
+    }
+
+    #[test]
+    fn bitset_from_bits_recomputes_len() {
+        // len must reflect popcount, not the number of set() calls.
+        let bs = HealthBitset::from_bits(0b1011);
+        assert_eq!(bs.count(), 3);
+        assert!(bs.contains(0));
+        assert!(bs.contains(1));
+        assert!(!bs.contains(2));
+        assert!(bs.contains(3));
+
+        let empty = HealthBitset::from_bits(0);
+        assert!(empty.is_empty());
+        assert_eq!(empty.count(), 0);
+    }
+
+    #[test]
+    fn bitset_intersect_keeps_common_bits() {
+        let a = bitset_for_indices(&[0, 1, 2, 5]);
+        let b = bitset_for_indices(&[1, 5, 9]);
+        let both = a.intersect(&b);
+        assert_eq!(both.count(), 2);
+        assert!(both.contains(1));
+        assert!(both.contains(5));
+        assert!(!both.contains(0));
+        assert!(!both.contains(2));
+        assert!(!both.contains(9));
+
+        // Disjoint sets intersect to empty.
+        let disjoint = bitset_for_indices(&[0, 1]).intersect(&bitset_for_indices(&[2, 3]));
+        assert!(disjoint.is_empty());
+    }
+
+    #[test]
+    fn bitset_for_each_set_bit_visits_ascending() {
+        let bs = bitset_for_indices(&[5, 0, 127, 42]);
+        let mut visited = Vec::new();
+        bs.for_each_set_bit(|i| visited.push(i));
+        assert_eq!(visited, vec![0, 5, 42, 127]);
+
+        // Empty bitset invokes the closure zero times.
+        let mut count = 0;
+        HealthBitset::empty().for_each_set_bit(|_| count += 1);
+        assert_eq!(count, 0);
     }
 
     // ── Golden ratio hash distribution ──────────────────────────────────

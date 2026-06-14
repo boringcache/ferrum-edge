@@ -1145,6 +1145,14 @@ pub async fn run(
             watch_gateway_api: env_config.k8s_watch_gateway_api_crds,
             pod_discovery_enabled: env_config.k8s_pod_discovery_enabled,
             watch_node_locality: env_config.k8s_node_locality_enabled,
+            // Effective Sidecar ingress materialization gate (F6 §6.2): ingress
+            // is materialized only when enforcement is on AND not dry-run,
+            // mirroring the slice builder's `sidecar_enforced && !sidecar_dry_run`
+            // ingress predicate. The status writer reports `ingress_modeled` only
+            // under this gate so it never over-reports in the default dry-run /
+            // disabled posture.
+            mesh_sidecar_ingress_enforced: env_config.mesh_sidecar_enforced
+                && !env_config.mesh_sidecar_enforced_dry_run,
             debounce_ms: env_config.k8s_reconcile_debounce_ms,
             full_sync_interval_secs: env_config.k8s_full_sync_interval_secs,
             kubeconfig_path: env_config.k8s_kubeconfig_path.clone(),

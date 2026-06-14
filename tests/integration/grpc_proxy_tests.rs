@@ -960,47 +960,48 @@ async fn start_grpc_backend_with_trailer_fixture() -> (SocketAddr, tokio::task::
                 let builder = Http2ServerBuilder::new(TokioExecutor::new());
 
                 let service = service_fn(move |_req: Request<Incoming>| async move {
-                    let (tx, rx) = tokio::sync::mpsc::channel::<
-                        Result<Frame<Bytes>, std::convert::Infallible>,
-                    >(4);
+                    let mut trailers = hyper::HeaderMap::new();
+                    trailers.insert(
+                        hyper::header::HeaderName::from_static("grpc-status"),
+                        hyper::header::HeaderValue::from_static("0"),
+                    );
+                    trailers.insert(
+                        hyper::header::HeaderName::from_static("grpc-message"),
+                        hyper::header::HeaderValue::from_static("OK"),
+                    );
+                    trailers.insert(
+                        hyper::header::HeaderName::from_static("x-dup-key"),
+                        hyper::header::HeaderValue::from_static("trailer-value"),
+                    );
+                    trailers.insert(
+                        hyper::header::HeaderName::from_static("x-removed-trailer"),
+                        hyper::header::HeaderValue::from_static("should-not-reach-client"),
+                    );
+                    trailers.insert(
+                        hyper::header::HeaderName::from_static("x-shadowed-removed"),
+                        hyper::header::HeaderValue::from_static("trailer-secret"),
+                    );
+                    // Header-shadowed key that NO hook touches: the wire
+                    // trailer must keep the backend's distinct trailing
+                    // value, not be clobbered by the initial-header value.
+                    trailers.insert(
+                        hyper::header::HeaderName::from_static("x-dup-untouched"),
+                        hyper::header::HeaderValue::from_static("trailer-untouched"),
+                    );
 
-                    tokio::spawn(async move {
-                        let _ = tx
-                            .send(Ok(Frame::data(Bytes::from_static(b"grpc-payload"))))
-                            .await;
-                        let mut trailers = hyper::HeaderMap::new();
-                        trailers.insert(
-                            hyper::header::HeaderName::from_static("grpc-status"),
-                            hyper::header::HeaderValue::from_static("0"),
-                        );
-                        trailers.insert(
-                            hyper::header::HeaderName::from_static("grpc-message"),
-                            hyper::header::HeaderValue::from_static("OK"),
-                        );
-                        trailers.insert(
-                            hyper::header::HeaderName::from_static("x-dup-key"),
-                            hyper::header::HeaderValue::from_static("trailer-value"),
-                        );
-                        trailers.insert(
-                            hyper::header::HeaderName::from_static("x-removed-trailer"),
-                            hyper::header::HeaderValue::from_static("should-not-reach-client"),
-                        );
-                        trailers.insert(
-                            hyper::header::HeaderName::from_static("x-shadowed-removed"),
-                            hyper::header::HeaderValue::from_static("trailer-secret"),
-                        );
-                        // Header-shadowed key that NO hook touches: the wire
-                        // trailer must keep the backend's distinct trailing
-                        // value, not be clobbered by the initial-header value.
-                        trailers.insert(
-                            hyper::header::HeaderName::from_static("x-dup-untouched"),
-                            hyper::header::HeaderValue::from_static("trailer-untouched"),
-                        );
-                        let _ = tx.send(Ok(Frame::trailers(trailers))).await;
-                    });
-
-                    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-                    let body = StreamBody::new(stream);
+                    // Deterministic frame delivery: a synchronous stream yields the
+                    // DATA frame then the TRAILERS frame back-to-back. The previous
+                    // spawned-task + mpsc body left a scheduling window between the
+                    // two frames; under CI load that window could let the gateway's
+                    // buffered gRPC collection observe stream completion before the
+                    // trailers were flushed, which manifested as a flaky gateway
+                    // gRPC error response (HTTP 200 + `application/grpc`) instead of
+                    // the plugin-transformed response.
+                    let frames: Vec<Result<Frame<Bytes>, std::convert::Infallible>> = vec![
+                        Ok(Frame::data(Bytes::from_static(b"grpc-payload"))),
+                        Ok(Frame::trailers(trailers)),
+                    ];
+                    let body = StreamBody::new(tokio_stream::iter(frames));
 
                     let response = Response::builder()
                         .status(200)
