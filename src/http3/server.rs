@@ -2876,7 +2876,7 @@ async fn handle_h3_request(
                     bytes_streamed += data_len;
                     flush_timer.as_mut().reset(tokio::time::Instant::now() + flush_interval);
                 }
-                _ = &mut read_deadline, if read_timeout_active && !stream_done => {
+                _ = &mut read_deadline, if read_timeout_active && !stream_done && coalesce_buf.is_empty() => {
                     warn!(
                         "Backend read timeout ({}ms) during HTTP/3 streaming response body; aborting",
                         backend_read_timeout_ms
@@ -2982,6 +2982,16 @@ async fn handle_h3_request(
             | Some(crate::retry::ErrorClass::ClientDisconnect) => false,
             Some(_) => true,
         };
+        // When the backend itself returned a server error (>= 500), a concurrent
+        // client disconnect during the response send must NOT mask it:
+        // `ClientDisconnect` is client-side and skips CB / passive-health
+        // entirely, so a real backend 5xx would be neutralized. Drop the body
+        // class in that case so the 5xx status drives the recorded outcome.
+        // Mirrors the refined/cross-protocol consumer's handling further below.
+        let body_outcome_error_class = match body_error_class {
+            Some(crate::retry::ErrorClass::ClientDisconnect) if response_status >= 500 => None,
+            other => other,
+        };
         crate::proxy::backend_dispatch::record_backend_outcome(
             &state,
             &proxy,
@@ -2991,7 +3001,7 @@ async fn handle_h3_request(
             cb_target_key.as_deref(),
             response_status,
             body_outcome_connection_error,
-            body_error_class,
+            body_outcome_error_class,
             cb_is_half_open_probe,
             false,
             backend_start.elapsed(),
@@ -3000,7 +3010,7 @@ async fn handle_h3_request(
             &mut backend_admission_permits,
             response_status,
             body_outcome_connection_error,
-            body_error_class,
+            body_outcome_error_class,
             backend_admission_response_elapsed,
         );
 
@@ -4929,7 +4939,7 @@ async fn stream_h3_open_response_to_client(
                 bytes_streamed += data_len;
                 flush_timer.as_mut().reset(tokio::time::Instant::now() + flush_interval);
             }
-            _ = &mut read_deadline, if read_timeout_active && !stream_done => {
+            _ = &mut read_deadline, if read_timeout_active && !stream_done && coalesce_buf.is_empty() => {
                 warn!(
                     "Backend read timeout ({}ms) during HTTP/3 refined streaming response body; aborting",
                     backend_read_timeout_ms
@@ -5385,7 +5395,7 @@ async fn proxy_to_backend_h3_streaming(
                 bytes_streamed += data_len;
                 flush_timer.as_mut().reset(tokio::time::Instant::now() + flush_interval);
             }
-            _ = &mut read_deadline, if read_timeout_active && !stream_done => {
+            _ = &mut read_deadline, if read_timeout_active && !stream_done && coalesce_buf.is_empty() => {
                 warn!(
                     "Backend read timeout ({}ms) during HTTP/3 streaming response body; aborting",
                     backend_read_timeout_ms
