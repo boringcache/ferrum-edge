@@ -12442,9 +12442,14 @@ async fn handle_proxy_request_inner(
                 // header in the view), but split the wire response back into
                 // HEADERS + DATA + TRAILERS when the final body is non-empty.
                 // Trailer keys the backend ALSO sent as real initial headers
-                // are tracked so the post-hook writeback never copies the
-                // header's value into the wire trailer (the view value for
-                // those keys belongs to the header, not the trailer).
+                // are tracked (`header_shadowed_trailer_keys`) so post-hook
+                // writeback can distinguish the backend's split wire shape from
+                // keys that originated only as trailers. The merged view carries
+                // the *header* value for a shadowed key, so writeback below
+                // copies a hook-updated value into the hidden wire trailer too
+                // (a sanitizer rewriting the visible key must not leave the
+                // trailer at the backend's original value), while an untouched
+                // shadowed trailer keeps the backend's true trailing value.
                 //
                 // Exception: the reserved gRPC terminal-status keys
                 // (grpc-status / grpc-message / grpc-status-details-bin) are
@@ -12660,26 +12665,34 @@ async fn handle_proxy_request_inner(
                     // from the view was removed by a hook (honor the removal,
                     // matching the pre-split behavior where trailers lived in
                     // the headers map plugins mutated); a changed value is a
-                    // hook edit. Keys shadowed by a real backend header were
-                    // never plugin-visible as trailers, so while the key is
-                    // still in the view they keep the backend's true trailer
-                    // value — but a hook that removed the key from the view
-                    // suppresses the hidden trailer too (a security plugin
-                    // stripping a sensitive key must not leak its trailer
-                    // copy on the wire).
-                    response_trailers.retain(|k, v| {
-                        if header_shadowed_trailer_keys.contains(k) {
-                            return plugin_response_headers.contains_key(k);
-                        }
-                        match plugin_response_headers.get(k) {
-                            Some(plugin_value) => {
-                                if plugin_value != v {
+                    // hook edit.
+                    //
+                    // A key shadowed by a real backend header was merged into
+                    // the view at the *header* value (a trailer never overrides
+                    // a real header), so the view value is NOT comparable to the
+                    // trailer's own value — a blind copy would clobber a distinct
+                    // backend trailer value even when no hook touched it. Detect
+                    // a genuine hook edit by comparing the post-hook view value
+                    // against the original initial-header value (`response_headers`
+                    // still holds the backend headers here; it is reassigned
+                    // below): if a hook rewrote the visible key, propagate the
+                    // sanitized value into the hidden wire trailer too (a
+                    // sanitizer must scrub every client-visible copy); if the
+                    // hook left it untouched, keep the backend's true trailer
+                    // value (faithful split wire shape). Removal of a shadowed
+                    // key still suppresses the hidden trailer.
+                    response_trailers.retain(|k, v| match plugin_response_headers.get(k) {
+                        Some(plugin_value) => {
+                            if header_shadowed_trailer_keys.contains(k) {
+                                if response_headers.get(k) != Some(plugin_value) {
                                     *v = plugin_value.clone();
                                 }
-                                true
+                            } else if plugin_value != v {
+                                *v = plugin_value.clone();
                             }
-                            None => false,
+                            true
                         }
+                        None => false,
                     });
                     response_headers = plugin_response_headers;
                 }

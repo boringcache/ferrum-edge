@@ -989,6 +989,13 @@ async fn start_grpc_backend_with_trailer_fixture() -> (SocketAddr, tokio::task::
                             hyper::header::HeaderName::from_static("x-shadowed-removed"),
                             hyper::header::HeaderValue::from_static("trailer-secret"),
                         );
+                        // Header-shadowed key that NO hook touches: the wire
+                        // trailer must keep the backend's distinct trailing
+                        // value, not be clobbered by the initial-header value.
+                        trailers.insert(
+                            hyper::header::HeaderName::from_static("x-dup-untouched"),
+                            hyper::header::HeaderValue::from_static("trailer-untouched"),
+                        );
                         let _ = tx.send(Ok(Frame::trailers(trailers))).await;
                     });
 
@@ -1000,6 +1007,7 @@ async fn start_grpc_backend_with_trailer_fixture() -> (SocketAddr, tokio::task::
                         .header("content-type", "application/grpc")
                         .header("x-dup-key", "header-value")
                         .header("x-shadowed-removed", "header-secret")
+                        .header("x-dup-untouched", "header-untouched")
                         // Malformed duplicates: terminal status must only ride
                         // in the trailers for a non-empty response.
                         .header("grpc-status", "13")
@@ -1024,9 +1032,11 @@ async fn start_grpc_backend_with_trailer_fixture() -> (SocketAddr, tokio::task::
 /// Buffered gRPC writeback reconciliation:
 /// - a trailer key removed by a response hook (response_transformer `remove`)
 ///   must NOT be forwarded in the wire trailers;
-/// - a key the backend sent in BOTH initial headers and trailers must keep the
-///   backend's true trailer value in the wire TRAILERS frame while the initial
-///   header stays an initial header (H3 bridge wire shape);
+/// - a header-shadowed key (sent by the backend in BOTH initial headers and
+///   trailers) that a hook UPDATES must carry the sanitized value into both the
+///   initial header and the wire TRAILERS frame (no unredacted trailer leak);
+/// - a header-shadowed key that NO hook touches must keep the backend's distinct
+///   trailing value on the wire (the header value must not clobber it);
 /// - a header-shadowed key removed by a hook must be suppressed in BOTH the
 ///   initial headers and the wire trailers (no hidden trailer leak);
 /// - malformed duplicate `grpc-status`/`grpc-message` initial headers are
@@ -1048,6 +1058,7 @@ async fn grpc_buffered_trailer_writeback_honors_hook_removal_and_duplicate_keys(
         enabled: true,
         config: serde_json::json!({
             "rules": [
+                { "target": "header", "operation": "update", "key": "x-dup-key", "value": "redacted-by-hook" },
                 { "target": "header", "operation": "remove", "key": "x-removed-trailer" },
                 { "target": "header", "operation": "remove", "key": "x-shadowed-removed" }
             ]
@@ -1096,8 +1107,16 @@ async fn grpc_buffered_trailer_writeback_honors_hook_removal_and_duplicate_keys(
             .headers()
             .get("x-dup-key")
             .and_then(|v| v.to_str().ok()),
-        Some("header-value"),
-        "backend initial header duplicated in trailers must stay an initial header"
+        Some("redacted-by-hook"),
+        "hook-updated duplicate key must stay an initial header with the sanitized value"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-dup-untouched")
+            .and_then(|v| v.to_str().ok()),
+        Some("header-untouched"),
+        "an untouched header-shadowed key must keep its initial-header value"
     );
     assert!(
         response.headers().get("x-removed-trailer").is_none(),
@@ -1138,8 +1157,16 @@ async fn grpc_buffered_trailer_writeback_honors_hook_removal_and_duplicate_keys(
     );
     assert_eq!(
         trailers.get("x-dup-key").and_then(|v| v.to_str().ok()),
-        Some("trailer-value"),
-        "wire trailer must carry the backend's true trailer value, not the duplicate initial header value"
+        Some("redacted-by-hook"),
+        "wire trailer must carry the hook-updated value for a header-shadowed key"
+    );
+    assert_eq!(
+        trailers
+            .get("x-dup-untouched")
+            .and_then(|v| v.to_str().ok()),
+        Some("trailer-untouched"),
+        "an untouched header-shadowed key must keep the backend's true trailer \
+         value on the wire, not be clobbered by the initial-header value"
     );
     assert!(
         trailers.get("x-removed-trailer").is_none(),
