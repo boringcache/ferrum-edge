@@ -584,6 +584,119 @@ fn egress_gateway_stream_skips_service_entries_that_collide_with_egress_listener
     );
 }
 
+// ── F6 §6.1: stream egress SVID-mTLS termination ─────────────────────────
+
+#[test]
+fn egress_gateway_stream_proxies_terminate_mtls_by_default() {
+    // F6 §6.1: with stream egress enabled (and the plaintext opt-out NOT set),
+    // every materialized per-port stream egress proxy is `frontend_tls: true`.
+    // The stream listener then terminates SVID-mTLS using the shared mesh-
+    // inbound `ServerConfig` and runs `__mesh_spiffe_identity` + `__mesh_authz`
+    // at accept — parity with HTTP egress. (`egress_runtime()` sets
+    // `egress_stream_enabled = true` and leaves `egress_stream_allow_plaintext`
+    // at its secure default `false`.)
+    let runtime = egress_runtime();
+    assert!(
+        !runtime.egress_stream_allow_plaintext,
+        "default posture must keep plaintext disabled"
+    );
+
+    let mut mesh = mesh_config_with(Vec::new(), Vec::new(), Vec::new());
+    mesh.service_entries.push(external_stream_service_entry(
+        "redis-ext",
+        "redis.external.io",
+        6379,
+        AppProtocol::Redis,
+    ));
+    mesh.service_entries.push(external_stream_service_entry(
+        "pg-ext",
+        "pg.external.io",
+        5432,
+        AppProtocol::Postgres,
+    ));
+    let config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
+    let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("egress prepared");
+
+    let stream_proxies: Vec<_> = prepared
+        .proxies
+        .iter()
+        .filter(|p| p.listen_port.is_some())
+        .collect();
+    assert_eq!(
+        stream_proxies.len(),
+        2,
+        "both stream ServiceEntries should materialize a stream proxy"
+    );
+    for proxy in stream_proxies {
+        assert!(
+            proxy.frontend_tls,
+            "stream egress proxy on port {:?} must terminate SVID-mTLS by default",
+            proxy.listen_port
+        );
+        // mTLS termination is NOT raw SNI passthrough: the bytes flow through
+        // the normal TCP pipeline so the on_stream_connect mesh_authz hook runs.
+        assert!(
+            !proxy.passthrough,
+            "stream egress must terminate (not passthrough) so mesh_authz runs"
+        );
+    }
+}
+
+#[test]
+fn egress_gateway_stream_proxies_allow_plaintext_opt_out() {
+    // The explicit opt-out `FERRUM_MESH_EGRESS_STREAM_ALLOW_PLAINTEXT=true`
+    // restores the legacy plaintext + unauthenticated listener
+    // (`frontend_tls: false`) for operators who genuinely need it.
+    let mut runtime = egress_runtime();
+    runtime.egress_stream_allow_plaintext = true;
+
+    let mut mesh = mesh_config_with(Vec::new(), Vec::new(), Vec::new());
+    mesh.service_entries.push(external_stream_service_entry(
+        "redis-ext",
+        "redis.external.io",
+        6379,
+        AppProtocol::Redis,
+    ));
+    let config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
+    let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("egress prepared");
+
+    let stream_proxy = prepared
+        .proxies
+        .iter()
+        .find(|p| p.listen_port == Some(6379))
+        .expect("stream egress proxy materialised");
+    assert!(
+        !stream_proxy.frontend_tls,
+        "plaintext opt-out must produce a plaintext (frontend_tls: false) stream listener"
+    );
+}
+
+#[test]
+fn egress_gateway_stream_allow_plaintext_is_noop_without_stream_enabled() {
+    // `egress_stream_allow_plaintext` only matters when stream egress is
+    // enabled. With stream egress OFF, stream ServiceEntries are skipped
+    // regardless of the plaintext flag, so HTTP egress alone materializes.
+    let mut runtime = runtime_for_topology(MeshTopology::EgressGateway);
+    runtime.namespace = DEFAULT_NAMESPACE.to_string();
+    runtime.egress_stream_enabled = false;
+    runtime.egress_stream_allow_plaintext = true;
+
+    let mut mesh = mesh_config_with(Vec::new(), Vec::new(), Vec::new());
+    mesh.service_entries.push(external_stream_service_entry(
+        "redis-ext",
+        "redis.external.io",
+        6379,
+        AppProtocol::Redis,
+    ));
+    let config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
+    let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("egress prepared");
+
+    assert!(
+        prepared.proxies.iter().all(|p| p.listen_port.is_none()),
+        "stream egress must not materialize when FERRUM_MESH_EGRESS_STREAM_ENABLED is off"
+    );
+}
+
 // ── MeshRuntimeState smoke ────────────────────────────────────────────────
 
 #[test]

@@ -22,7 +22,7 @@ The CORS plugin is configured via the `plugin_configs` section in your YAML conf
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `allowed_origins` | `string[]` | `["*"]` | Origins permitted to make cross-origin requests. Use `["*"]` to allow any origin, list specific origins for exact matching, or use wildcard subdomain patterns like `"*.company.com"` to allow all subdomains. These can be mixed (see examples below). If `"*"` appears anywhere in the list, all origins are allowed. |
+| `allowed_origins` | `(string \| object)[]` | `["*"]` | Origins permitted to make cross-origin requests. Each entry is either a **string** (`"*"` to allow any origin, an exact `scheme://host[:port]` origin for case-insensitive exact matching, or a wildcard subdomain pattern like `"*.company.com"`) or an **Istio `StringMatch`-shaped object** carrying exactly one of `exact` / `prefix` / `regex` — `{ "prefix": "https://app." }` (literal byte-prefix of the `Origin`, case-sensitive) or `{ "regex": "https://.*\\.example\\.com" }` (RE2 pattern that must fully match the `Origin`). String and object entries can be mixed (see examples below). If `"*"` appears anywhere in the list, all origins are allowed. A matching origin is reflected verbatim into `Access-Control-Allow-Origin`. |
 | `allowed_methods` | `string[]` | `["GET","HEAD","POST","PUT","PATCH","DELETE","OPTIONS"]` | HTTP methods returned in the `Access-Control-Allow-Methods` preflight header. Preflight requests for unlisted methods are rejected with 403. |
 | `allowed_headers` | `string[]` | `["Accept","Authorization","Content-Type","Origin","X-Requested-With"]` | Request headers returned in the `Access-Control-Allow-Headers` preflight header. |
 | `exposed_headers` | `string[]` | `[]` | Response headers the browser is allowed to access via JavaScript, returned in `Access-Control-Expose-Headers`. |
@@ -149,7 +149,33 @@ This allows:
 
 > **Note:** Wildcard subdomain patterns match the host portion of the origin only. `*.company.com` matches any origin whose host ends with `.company.com`, regardless of scheme or port. The bare domain (`company.com` without a subdomain) does **not** match — add it as a separate exact entry if needed.
 
-### Example 5: Backend Handles OPTIONS
+### Example 5: Prefix / Regex Origin Matchers (Istio `StringMatch`)
+
+For finer-grained control — and for parity with Istio `VirtualService` `corsPolicy.allowOrigins[]`, which the mesh translator projects onto this plugin — `allowed_origins` entries may be `StringMatch`-shaped objects. Each object carries exactly one of `exact`, `prefix`, or `regex`.
+
+```yaml
+plugin_configs:
+  - id: "cors-stringmatch"
+    plugin_name: "cors"
+    config:
+      allowed_origins:
+        - { exact: "https://app.example.com" }
+        - { prefix: "https://preview-" }
+        - { regex: "https://.*\\.api\\.example\\.com" }
+    scope: global
+    enabled: true
+```
+
+This allows:
+- `https://app.example.com` ✅ (exact)
+- `https://preview-pr-42.example.com` ✅ (starts with the literal prefix `https://preview-`)
+- `https://v2.api.example.com` ✅ (full-matches the regex)
+- `https://preview.example.com` ❌ (does not start with `https://preview-`)
+- `https://app.example.com.evil.com` ❌ (regex is a **full** match, not a substring search)
+
+> **Semantics:** `prefix` is a literal, case-sensitive byte-prefix of the request `Origin` header. `regex` is an RE2 pattern (the `regex` crate) that must match the **entire** `Origin` — there is no implicit `.*` on either end — mirroring how Ferrum evaluates Istio `StringMatch` regex elsewhere. The pattern is compiled (and bounded by the regex engine's size limit, so a hostile pattern cannot cause catastrophic backtracking) at config-load time; an invalid pattern is rejected when the plugin is created. Use `(?i)` inside the pattern for case-insensitive regex matching.
+
+### Example 6: Backend Handles OPTIONS
 
 If your backend service implements its own preflight handling and you only want the gateway to add response headers, set `preflight_continue: true`.
 

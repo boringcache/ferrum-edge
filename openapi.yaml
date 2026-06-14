@@ -11164,9 +11164,39 @@ components:
         allowed_origins:
           type: array
           items:
-            type: string
+            oneOf:
+              - type: string
+              - type: object
+                additionalProperties: false
+                minProperties: 1
+                maxProperties: 1
+                description: >-
+                  Istio StringMatch-shaped origin matcher: EXACTLY ONE of
+                  exact / prefix / regex (no extra or unknown keys). Empty or
+                  multi-key objects are rejected at config time.
+                properties:
+                  exact:
+                    type: string
+                    description: Exact origin match (case-insensitive).
+                  prefix:
+                    type: string
+                    description: >-
+                      Literal byte-prefix of the request Origin header
+                      (case-sensitive), e.g. "https://app.".
+                  regex:
+                    type: string
+                    description: >-
+                      RE2 pattern that must FULLY match the request Origin
+                      header. Compiled (and size-bounded) at config time; an
+                      invalid pattern is rejected.
           default: ["*"]
-          description: Permitted origins
+          description: >-
+            Permitted origins. Each entry is either a string (`"*"` for any
+            origin, an exact `scheme://host[:port]` origin matched
+            case-insensitively, or a `*.suffix.com` wildcard-subdomain pattern)
+            or an Istio `StringMatch`-shaped object carrying exactly one of
+            `exact` / `prefix` / `regex`. A matching origin is reflected verbatim
+            into `Access-Control-Allow-Origin`.
         allowed_methods:
           type: array
           items:

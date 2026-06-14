@@ -7,10 +7,20 @@
 //! `"*.company.com"` matches `https://app.company.com`). When `allowed_origins`
 //! contains `"*"`, all origins are allowed. Preflight requests are short-circuited
 //! with a 204 response before reaching the backend.
+//!
+//! In addition to the plain-string forms, `allowed_origins` entries may be
+//! Istio `StringMatch`-shaped objects — `{"exact": ...}`, `{"prefix": ...}`, or
+//! `{"regex": ...}` — so a VirtualService `corsPolicy` that uses `prefix` /
+//! `regex` origin matchers can be projected onto this plugin. `prefix` is a
+//! literal byte-prefix of the request `Origin` header; `regex` is an RE2
+//! full match of the entire `Origin` (same semantics Ferrum already applies to
+//! Istio `StringMatch` elsewhere). A matching origin is reflected verbatim into
+//! `Access-Control-Allow-Origin`.
 
 use async_trait::async_trait;
 use http::Method;
 use http::header::HeaderName;
+use regex::Regex;
 use serde_json::Value;
 use std::collections::HashMap;
 use tracing::{debug, warn};
@@ -40,6 +50,17 @@ enum OriginPattern {
     /// `*.company.com` matches `https://app.company.com` and
     /// `https://deep.sub.company.com` but NOT `https://company.com`.
     WildcardSubdomain(String),
+    /// Istio `StringMatch.prefix` on the request `Origin` header: the origin
+    /// must START WITH this literal string (case-sensitive, matching Istio's
+    /// literal prefix semantics — e.g. `"https://app."` matches
+    /// `https://app.company.com`).
+    Prefix(String),
+    /// Istio `StringMatch.regex` on the request `Origin` header: the compiled
+    /// RE2 pattern must FULLY match the entire origin. Compiled once at config
+    /// time with the regex crate's default size limit (no catastrophic
+    /// backtracking — the engine is finite-automaton based); an invalid pattern
+    /// is rejected at config validation, never panicked on.
+    Regex(Regex),
 }
 
 /// How allowed origins are configured.
@@ -128,12 +149,21 @@ impl CorsPlugin {
 
     /// Parse the `allowed_origins` config field.
     ///
-    /// Supports three forms:
+    /// Supports plain-string forms:
     /// - `["*"]` or any list containing `"*"` → `AllowedOrigins::Wildcard`
     /// - `["https://example.com"]` → exact match
     /// - `["*.company.com"]` → wildcard subdomain (matches any `*.company.com`)
     ///
-    /// These can be mixed: `["https://exact.com", "*.company.com"]`.
+    /// and Istio `StringMatch`-shaped object forms (so a VirtualService
+    /// `corsPolicy` with `prefix` / `regex` origin matchers can project here):
+    /// - `[{"exact": "https://example.com"}]` → exact match (same as the string
+    ///   form)
+    /// - `[{"prefix": "https://app."}]` → literal byte-prefix of the `Origin`
+    /// - `[{"regex": "https://.*\\.example\\.com"}]` → RE2 full match of the
+    ///   `Origin`
+    ///
+    /// String and object entries can be mixed. An object entry must carry
+    /// exactly one of `exact` / `prefix` / `regex`.
     fn parse_origins(config: &Value) -> Result<AllowedOrigins, String> {
         match config.get("allowed_origins") {
             None | Some(Value::Null) => Ok(AllowedOrigins::Wildcard),
@@ -147,33 +177,140 @@ impl CorsPlugin {
 
                 let mut patterns = Vec::with_capacity(arr.len());
                 for value in arr {
-                    let origin = value.as_str().ok_or_else(|| {
-                        format!("cors: 'allowed_origins' entries must be strings, got: {value}")
-                    })?;
-                    let origin = origin.trim();
-                    if origin.is_empty() {
-                        return Err(
-                            "cors: 'allowed_origins' entries must be non-empty strings".to_string()
-                        );
-                    }
-                    if origin == "*" {
-                        return Ok(AllowedOrigins::Wildcard);
-                    }
-                    if origin.starts_with('*') {
-                        patterns.push(OriginPattern::WildcardSubdomain(validate_wildcard_origin(
-                            origin,
-                        )?));
-                    } else {
-                        validate_exact_origin(origin)?;
-                        patterns.push(OriginPattern::Exact(origin.to_string()));
+                    match value {
+                        Value::String(_) => {
+                            // Safe: matched `Value::String`.
+                            let origin = value.as_str().unwrap_or_default().trim();
+                            if origin.is_empty() {
+                                return Err(
+                                    "cors: 'allowed_origins' entries must be non-empty strings"
+                                        .to_string(),
+                                );
+                            }
+                            if origin == "*" {
+                                return Ok(AllowedOrigins::Wildcard);
+                            }
+                            if origin.starts_with('*') {
+                                patterns.push(OriginPattern::WildcardSubdomain(
+                                    validate_wildcard_origin(origin)?,
+                                ));
+                            } else {
+                                validate_exact_origin(origin)?;
+                                patterns.push(OriginPattern::Exact(origin.to_string()));
+                            }
+                        }
+                        Value::Object(_) => {
+                            patterns.push(Self::parse_origin_matcher(value)?);
+                        }
+                        other => {
+                            return Err(format!(
+                                "cors: 'allowed_origins' entries must be strings or \
+                                 {{exact|prefix|regex}} objects, got: {other}"
+                            ));
+                        }
                     }
                 }
 
                 Ok(AllowedOrigins::List(patterns))
             }
             Some(other) => Err(format!(
-                "cors: 'allowed_origins' must be an array of strings, got: {other}"
+                "cors: 'allowed_origins' must be an array of strings or \
+                 {{exact|prefix|regex}} objects, got: {other}"
             )),
+        }
+    }
+
+    /// Parse a single Istio `StringMatch`-shaped origin matcher object
+    /// (`{"exact": ...}` / `{"prefix": ...}` / `{"regex": ...}`). Exactly one of
+    /// the three keys must be present and a non-empty string. The `regex`
+    /// pattern is compiled here (config time) so an invalid pattern is a config
+    /// error, never a request-path panic.
+    fn parse_origin_matcher(value: &Value) -> Result<OriginPattern, String> {
+        // Istio `StringMatch` contract: EXACTLY ONE recognized key, and nothing
+        // else. Reject unknown keys, extra keys, or a non-string value rather
+        // than silently coercing — mirrors
+        // `config_sources::k8s::string_match_has_exactly_one_supported_operator`
+        // used for Istio request matchers. Without this, a malformed config like
+        // `{"prefix":"x","regex":123}` would slip through as a bare prefix
+        // matcher, dropping the invalid second key.
+        const MATCHER_KEYS: [&str; 3] = ["exact", "prefix", "regex"];
+        let obj = value.as_object().ok_or_else(|| {
+            "cors: 'allowed_origins' object matcher must be a JSON object with one of \
+             'exact', 'prefix', or 'regex'"
+                .to_string()
+        })?;
+        if obj.len() != 1 || !obj.keys().all(|key| MATCHER_KEYS.contains(&key.as_str())) {
+            return Err(
+                "cors: 'allowed_origins' object matcher must specify exactly one of \
+                 'exact', 'prefix', or 'regex' (no extra or unknown keys)"
+                    .to_string(),
+            );
+        }
+        let exact = value.get("exact").and_then(Value::as_str);
+        let prefix = value.get("prefix").and_then(Value::as_str);
+        let regex = value.get("regex").and_then(Value::as_str);
+
+        match (exact, prefix, regex) {
+            (Some(exact), None, None) => {
+                let exact = exact.trim();
+                if exact.is_empty() {
+                    return Err(
+                        "cors: 'allowed_origins' exact matcher must be a non-empty string"
+                            .to_string(),
+                    );
+                }
+                validate_exact_origin(exact)?;
+                Ok(OriginPattern::Exact(exact.to_string()))
+            }
+            (None, Some(prefix), None) => {
+                // Istio prefix is a literal string prefix of the Origin header;
+                // do NOT trim (leading/trailing spaces would change matching)
+                // beyond rejecting an all-empty value. An empty prefix would
+                // match every origin (an open CORS policy by accident), so it
+                // is rejected rather than silently allow-all.
+                if prefix.is_empty() {
+                    return Err(
+                        "cors: 'allowed_origins' prefix matcher must be a non-empty string \
+                         (an empty prefix would match every origin)"
+                            .to_string(),
+                    );
+                }
+                Ok(OriginPattern::Prefix(prefix.to_string()))
+            }
+            (None, None, Some(regex)) => {
+                if regex.is_empty() {
+                    return Err(
+                        "cors: 'allowed_origins' regex matcher must be a non-empty string"
+                            .to_string(),
+                    );
+                }
+                // Istio `StringMatch.regex` is a FULL match. Anchor at compile
+                // time (the shared Ferrum convention for Istio-style regex, also
+                // strips a redundant leading `^`/trailing `$`) so matching can
+                // use `is_match`: checking only the first unanchored `find`
+                // would reject an Origin that a LATER alternation branch fully
+                // matches (e.g. `https://app|https://app\.example\.com` vs
+                // `https://app.example.com`, where `find` returns the shorter
+                // `https://app`). Compile with the regex crate's default size
+                // limit; the engine is finite-automaton based, so a hostile
+                // pattern cannot trigger catastrophic backtracking. A pattern
+                // that fails to compile is rejected here, not at request time.
+                let anchored = crate::config::types::anchor_regex_pattern(regex);
+                let compiled = Regex::new(&anchored).map_err(|e| {
+                    format!("cors: 'allowed_origins' regex matcher '{regex}' is invalid: {e}")
+                })?;
+                Ok(OriginPattern::Regex(compiled))
+            }
+            (None, None, None) => Err(
+                "cors: 'allowed_origins' object matcher must specify one of \
+                 'exact', 'prefix', or 'regex'"
+                    .to_string(),
+            ),
+            _ => Err(
+                "cors: 'allowed_origins' object matcher must specify exactly one of \
+                 'exact', 'prefix', or 'regex'"
+                    .to_string(),
+            ),
         }
     }
 
@@ -218,6 +355,11 @@ impl CorsPlugin {
     /// with the stored suffix (e.g. `.company.com`). This means
     /// `*.company.com` matches `https://app.company.com` but NOT
     /// `https://company.com` (bare domain has no subdomain prefix).
+    /// For `Prefix` patterns (Istio `StringMatch.prefix`): the origin must
+    /// start with the literal prefix (case-sensitive).
+    /// For `Regex` patterns (Istio `StringMatch.regex`): the compiled RE2
+    /// pattern must FULLY match the entire origin (same anchoring Ferrum
+    /// applies to Istio `StringMatch` regex elsewhere).
     fn is_origin_allowed(&self, origin: &str) -> bool {
         if origin.is_empty() {
             return false;
@@ -228,6 +370,12 @@ impl CorsPlugin {
                 OriginPattern::Exact(expected) => expected.eq_ignore_ascii_case(origin),
                 OriginPattern::WildcardSubdomain(suffix) => origin_host(origin)
                     .is_some_and(|host| ascii_ends_with_ignore_case(host, suffix.as_str())),
+                OriginPattern::Prefix(prefix) => origin.starts_with(prefix.as_str()),
+                // The compiled pattern is anchored at parse time
+                // (`anchor_regex_pattern`), so a full-string match is exactly
+                // `is_match` — and it tries every alternation branch, unlike the
+                // first unanchored `find`.
+                OriginPattern::Regex(re) => re.is_match(origin),
             }),
         }
     }
