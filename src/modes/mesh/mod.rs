@@ -2961,11 +2961,9 @@ fn materialize_mesh_outbound_tcp_upstreams(
     // to exactly that workload. Strict exact match; the route-table index
     // (`mesh_tcp_egress_by_workload`) and the accept-loop fallback enforce it.
     let mut bywl_materialized = 0usize;
-    for spec in mesh_outbound_tcp_bywl_upstreams(
-        &mesh_slice.services,
-        &mesh_slice.workloads,
-        local_cluster,
-    ) {
+    for spec in
+        mesh_outbound_tcp_bywl_upstreams(&mesh_slice.services, &mesh_slice.workloads, local_cluster)
+    {
         // One tagged target dialing the resolved container port, identity-pinned
         // to this workload — built with the SAME transport tag builders the VIP
         // path uses, so `mesh.spiffe_id` / `mesh.protocol` / the transport tag
@@ -3097,9 +3095,10 @@ pub(crate) fn mesh_outbound_tcp_bywl_relay_proxy(
     canonical_ip: std::net::IpAddr,
     upstream_id: &str,
 ) -> Proxy {
-    let id =
-        format!("{MESH_OUTBOUND_TCP_BYWL_RELAY_PROXY_ID_PREFIX}{namespace}-{name}-{port}-{canonical_ip}")
-            .replace(['/', '.', ':'], "-");
+    let id = format!(
+        "{MESH_OUTBOUND_TCP_BYWL_RELAY_PROXY_ID_PREFIX}{namespace}-{name}-{port}-{canonical_ip}"
+    )
+    .replace(['/', '.', ':'], "-");
     mesh_outbound_tcp_relay_proxy_with_id(id, namespace, upstream_id)
 }
 
@@ -3529,11 +3528,9 @@ fn apply_destination_rules(
     // same map under their owning Service stream-family port, so a
     // `portLevelSettings` entry authored on that port fans onto them exactly like
     // the VIP per-port upstreams (same forward-derivation source).
-    for spec in mesh_outbound_tcp_bywl_upstreams(
-        &mesh_slice.services,
-        &mesh_slice.workloads,
-        local_cluster,
-    ) {
+    for spec in
+        mesh_outbound_tcp_bywl_upstreams(&mesh_slice.services, &mesh_slice.workloads, local_cluster)
+    {
         outbound_upstream_owner_port.insert(spec.upstream_id, spec.service_port.port);
     }
 
@@ -10747,7 +10744,10 @@ mod tests {
             );
             assert_eq!(upstream.targets.len(), 1, "single-target per workload IP");
             let target = &upstream.targets[0];
-            assert_eq!(target.host, "10.0.0.7", "dials the workload pod IP, not a VIP");
+            assert_eq!(
+                target.host, "10.0.0.7",
+                "dials the workload pod IP, not a VIP"
+            );
             assert_eq!(target.port, 6380, "dials the resolved targetPort");
             assert_eq!(
                 target.tags.get(want_tag).map(String::as_str),

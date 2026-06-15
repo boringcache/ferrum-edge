@@ -20299,16 +20299,21 @@ mod tests {
             }],
         }))
         .expect("upstream deserializes");
-        let mut config = GatewayConfig::default();
-        config.upstreams = vec![upstream];
-        config.mesh = Some(Box::new(MeshConfig {
-            services: vec![svc],
-            workloads: vec![wl],
-            ..MeshConfig::default()
-        }));
+        let config = GatewayConfig {
+            upstreams: vec![upstream],
+            mesh: Some(Box::new(MeshConfig {
+                services: vec![svc],
+                workloads: vec![wl],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
 
-        let upstream_map: HashMap<&str, &Upstream> =
-            config.upstreams.iter().map(|u| (u.id.as_str(), u)).collect();
+        let upstream_map: HashMap<&str, &Upstream> = config
+            .upstreams
+            .iter()
+            .map(|u| (u.id.as_str(), u))
+            .collect();
         let mut seen = std::collections::HashSet::new();
         let mut targets = Vec::new();
         ProxyState::collect_mesh_tcp_egress_capability_targets(

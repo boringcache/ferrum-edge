@@ -1452,13 +1452,14 @@ impl RouterCache {
                 local_cluster,
             ) {
                 let decision = if upstream_ids.contains(spec.upstream_id.as_str()) {
-                    let relay_proxy = Arc::new(crate::modes::mesh::mesh_outbound_tcp_bywl_relay_proxy(
-                        &spec.service.namespace,
-                        &spec.service.name,
-                        spec.service_port.port,
-                        spec.canonical_ip,
-                        &spec.upstream_id,
-                    ));
+                    let relay_proxy =
+                        Arc::new(crate::modes::mesh::mesh_outbound_tcp_bywl_relay_proxy(
+                            &spec.service.namespace,
+                            &spec.service.name,
+                            spec.service_port.port,
+                            spec.canonical_ip,
+                            &spec.upstream_id,
+                        ));
                     let service_fqdn = config
                         .upstreams
                         .iter()
@@ -3424,11 +3425,11 @@ mod tests {
         // F3 §3.4: a HEADLESS service (no cluster_ips) backed by a workload whose
         // pod IP a client dials directly routes via the by-workload index, keyed
         // by `(workload IP, resolved target port)`, NOT the VIP table.
+        use crate::identity::spiffe::{SpiffeId, TrustDomain};
         use crate::modes::mesh::config::{
             AppProtocol, MeshConfig, MeshService, ServicePort, ServiceTargetPort, Workload,
             WorkloadPort, WorkloadRef, WorkloadSelector,
         };
-        use crate::identity::spiffe::{SpiffeId, TrustDomain};
 
         let spiffe = "spiffe://cluster.local/ns/default/sa/redis";
         let service = MeshService {
@@ -3478,13 +3479,12 @@ mod tests {
             6379,
             "10.0.0.7".parse().unwrap(),
         );
-        let upstream: crate::config::types::Upstream =
-            serde_json::from_value(serde_json::json!({
-                "id": bywl_id,
-                "name": "redis.default.svc.cluster.local",
-                "targets": [{"host": "10.0.0.7", "port": 6380}],
-            }))
-            .expect("upstream deserializes");
+        let upstream: crate::config::types::Upstream = serde_json::from_value(serde_json::json!({
+            "id": bywl_id,
+            "name": "redis.default.svc.cluster.local",
+            "targets": [{"host": "10.0.0.7", "port": 6380}],
+        }))
+        .expect("upstream deserializes");
         let config = GatewayConfig {
             upstreams: vec![upstream],
             mesh: Some(Box::new(MeshConfig {
@@ -3506,7 +3506,10 @@ mod tests {
         match bywl("10.0.0.7:6380") {
             Some(MeshTcpEgressDecision::Relay(entry)) => {
                 assert_eq!(entry.upstream_id, bywl_id);
-                assert_eq!(entry.relay_proxy.upstream_id.as_deref(), Some(bywl_id.as_str()));
+                assert_eq!(
+                    entry.relay_proxy.upstream_id.as_deref(),
+                    Some(bywl_id.as_str())
+                );
             }
             _ => panic!("expected a by-workload Relay for the pod IP + target port"),
         }
@@ -3521,7 +3524,11 @@ mod tests {
         // A different (undeclared) pod IP is never matched.
         assert!(bywl("10.0.0.8:6380").is_none());
         // The VIP table is empty (headless), so it never matches either.
-        assert!(table.mesh_tcp_egress_decision("10.0.0.7:6380".parse().unwrap()).is_none());
+        assert!(
+            table
+                .mesh_tcp_egress_decision("10.0.0.7:6380".parse().unwrap())
+                .is_none()
+        );
 
         // Declared backing workload whose per-workload upstream did NOT
         // materialize: mesh-owned but unroutable — close, never guess.
