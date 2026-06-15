@@ -11098,9 +11098,14 @@ async fn handle_proxy_request_inner(
             let representative_id = Arc::clone(&rm.proxy);
             match epoch
                 .route_table
-                .select_mesh_outbound_port_route(rm, ctx.orig_dst.map(|addr| addr.port()))
-            {
-                Ok(rm) => Some(rm),
+                .select_mesh_outbound_port_route_with_authz_port(
+                    rm,
+                    ctx.orig_dst.map(|addr| addr.port()),
+                ) {
+                Ok((rm, authz_port)) => {
+                    ctx.mesh_outbound_destination_authz_port = authz_port;
+                    Some(rm)
+                }
                 Err(reason) => {
                     debug!(
                         proxy_id = %representative_id.id,

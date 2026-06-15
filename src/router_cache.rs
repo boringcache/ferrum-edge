@@ -362,18 +362,36 @@ impl HostRouteTable {
         current: RouteMatch,
         orig_dst_port: Option<u16>,
     ) -> Result<RouteMatch, MeshOutboundPortSelectError> {
+        self.select_mesh_outbound_port_route_with_authz_port(current, orig_dst_port)
+            .map(|(route_match, _)| route_match)
+    }
+
+    /// Same selection as [`Self::select_mesh_outbound_port_route`], plus the
+    /// service port that authorization policy should see as
+    /// `destination.port` when the selected route belongs to a mesh outbound
+    /// service group.
+    pub(crate) fn select_mesh_outbound_port_route_with_authz_port(
+        &self,
+        current: RouteMatch,
+        orig_dst_port: Option<u16>,
+    ) -> Result<(RouteMatch, Option<u16>), MeshOutboundPortSelectError> {
         let Some(group) = self.mesh_outbound_ports.get(&current.proxy.id) else {
-            return Ok(current);
+            return Ok((current, None));
         };
         match orig_dst_port {
-            None if group.declared_http_ports == 1 => Ok(current),
+            None if group.declared_http_ports == 1 => {
+                Ok((current, group.ports.first().map(|(port, _)| *port)))
+            }
             None => Err(MeshOutboundPortSelectError::OrigDstUnavailable),
             Some(port) => match group.ports.iter().find(|(p, _)| *p == port) {
-                Some((_, proxy)) => Ok(RouteMatch {
-                    proxy: Arc::clone(proxy),
-                    path_params: current.path_params,
-                    matched_prefix_len: current.matched_prefix_len,
-                }),
+                Some((selected_port, proxy)) => Ok((
+                    RouteMatch {
+                        proxy: Arc::clone(proxy),
+                        path_params: current.path_params,
+                        matched_prefix_len: current.matched_prefix_len,
+                    },
+                    Some(*selected_port),
+                )),
                 None => Err(MeshOutboundPortSelectError::PortNotMaterialized),
             },
         }
