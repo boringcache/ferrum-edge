@@ -1,6 +1,6 @@
 # Mesh Mode
 
-Ferrum Edge runs as a service mesh data plane when `FERRUM_MODE=mesh`. In this mode the gateway consumes mesh configuration from a Ferrum Control Plane (native `MeshSubscribe` gRPC) or a standard xDS ADS server, materializes SPIFFE-identity-aware proxies and authorization policies, and serves traffic with automatic mTLS, identity propagation, and Istio-compatible observability. The mesh subsystem deliberately reuses the existing proxy/plugin chain so all 69 gateway plugins work unchanged in mesh context.
+Ferrum Edge runs as a service mesh data plane when `FERRUM_MODE=mesh`. In this mode the gateway consumes mesh configuration from a Ferrum Control Plane (native `MeshSubscribe` gRPC) or a standard xDS ADS server, materializes SPIFFE-identity-aware proxies and authorization policies, and serves traffic with automatic mTLS, identity propagation, and Istio-compatible observability. The mesh subsystem deliberately reuses the existing proxy/plugin chain so the full gateway plugin set works unchanged in mesh context.
 
 Concepts map directly to the Istio service mesh model: `Workload` corresponds to a pod or VM identity, `MeshPolicy` to `AuthorizationPolicy`, `PeerAuthentication` to per-port mTLS modes, `ServiceEntry` to external service registration, and `MeshRequestAuthentication` to `RequestAuthentication` JWT declarations. The Ferrum mesh layer adds multi-cluster east-west gateways, egress gateway materialization, node-waypoint operation for sidecarless pod capture, service-scoped Ambient waypoints, a transparent DNS proxy for `ServiceEntry` resolution, and a Kubernetes sidecar injector.
 
@@ -2017,7 +2017,7 @@ Mesh-specific environment variables are listed below. For the full reference of 
 
 | Variable | Default | Description |
 |---|---|---|
-| `FERRUM_MESH_CONFIG_PROTOCOL` | `native` | Config consumption protocol: `native` or `xds` |
+| `FERRUM_MESH_CONFIG_PROTOCOL` | `native` | Config consumption protocol: `native`, `xds`, or `file` (localized file source — requires `FERRUM_MESH_FILE_CONFIG_PATH`) |
 | `FERRUM_MESH_NODE_ID` | `$HOSTNAME` or `ferrum-mesh-node` | Node identifier sent to the CP |
 | `FERRUM_MESH_TOPOLOGY` | `sidecar` | Topology: `sidecar`, `ambient`, `node_waypoint`, `service_waypoint`, `east_west_gateway`, `egress_gateway` |
 | `FERRUM_MESH_WAYPOINT_NAME` | (none) | Required when `FERRUM_MESH_TOPOLOGY=service_waypoint`; names the GAMMA waypoint binding requested from the CP |
@@ -2028,7 +2028,7 @@ Mesh-specific environment variables are listed below. For the full reference of 
 | `FERRUM_MESH_SIDECAR_ENFORCED` | `false` | When `true`, applies Istio `Sidecar` egress scope narrowing to `services` / `service_entries` / `destination_rules` per workload. Sidecars are always parsed; this flag gates only the slice-narrowing pass. Opt in after vetting your `Sidecar` resources |
 | `FERRUM_MESH_SIDECAR_ENFORCED_DRY_RUN` | `false` | Computes and reports the applicable `Sidecar` egress scope while leaving the slice unchanged. Use with `/mesh/egress-scope` before enabling enforcement |
 | `FERRUM_MESH_SIDECAR_IDENTITY_NARROWING` | `false` | When `true` and `FERRUM_MESH_SIDECAR_ENFORCED=true`, filters `workloads` to SPIFFE identities referenced by services admitted by the applicable Sidecar. Default-off for rollout; trust-bundle mTLS validation and HBONE trust-domain aliasing do not depend on this list |
-| `FERRUM_MESH_EGRESS_STREAM_ENABLED` | `false` | Opt-in for stream-family (TCP / UDP) egress proxy materialization in `EgressGateway` topology. Default-off because stream egress listeners are plaintext and `mesh_authz` cannot verify SPIFFE peer identity without mTLS. HTTP-family egress is unaffected |
+| `FERRUM_MESH_EGRESS_STREAM_ENABLED` | `false` | Opt-in for stream-family (TCP / UDP) egress proxy materialization in `EgressGateway` topology. When enabled, each per-port stream listener **terminates SVID-mTLS and runs `mesh_authz`** at accept (same authn/z as HTTP egress, reusing the mesh-inbound `ServerConfig` + SPIFFE peer verifier; client certs required). Default-off because protocol-aware mediation is absent and the mTLS datapath is not yet live-e2e verified. Set `FERRUM_MESH_EGRESS_STREAM_ALLOW_PLAINTEXT=true` to restore the legacy plaintext + unauthenticated listener. HTTP-family egress is unaffected |
 | `FERRUM_MESH_NODE_WAYPOINT_CGROUP_SWEEP_INTERVAL_SECS` | `30` | NodeWaypoint cgroup-inode lifecycle sweep interval. Set to `0` to disable |
 | `FERRUM_MESH_REQUEST_AUTH_REQUIRE_EXP` | `true` | Whether the auto-injected mesh `RequestAuthentication` (`jwks_auth`) plugin requires the JWT `exp` claim. Secure default `true` rejects `exp`-less tokens. Set `false` only for issuers that legitimately omit `exp`; a present-but-expired `exp` is always rejected regardless |
 | `FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED` | `false` | Opt in to live reload of the PeerAuthentication-derived inbound mTLS mode, client CA verifier, and federated SVID bundle slot on slice apply. Does not rotate frontend cert/key material (use `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED`) |
@@ -2049,6 +2049,8 @@ Mesh-specific environment variables are listed below. For the full reference of 
 | `FERRUM_MESH_HBONE_LISTEN_ADDR` | `0.0.0.0:15008` | Ambient HBONE listener |
 | `FERRUM_MESH_EAST_WEST_LISTEN_PORT` | `15443` | East-west gateway shared listener port |
 | `FERRUM_MESH_EGRESS_LISTEN_ADDR` | `0.0.0.0:15090` | Egress gateway mTLS listener |
+| `FERRUM_MESH_EGRESS_HBONE_PORT` | `15008` | Destination HBONE transport port dialed for Ambient/Waypoint mesh egress (the peer's HBONE listener). Stamped as the `mesh.hbone_port` upstream tag |
+| `FERRUM_MESH_EGRESS_MTLS_PORT` | `15006` | Destination SVID-mTLS transport port dialed for Sidecar mesh egress (the peer sidecar's inbound listener). Stamped as the `mesh.mtls_port` upstream tag |
 
 ### DNS Proxy
 
@@ -2061,7 +2063,7 @@ Mesh-specific environment variables are listed below. For the full reference of 
 | `FERRUM_MESH_DNS_MAX_CONCURRENT_QUERIES` | `1024` | Concurrent query semaphore limit |
 | `FERRUM_MESH_CLUSTER_DOMAIN` | `cluster.local` | Kubernetes cluster domain for FQDN synthesis |
 | `FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY` | `allow_any` | Mesh-wide outbound policy: `allow_any` or `registry_only` |
-| `FERRUM_MESH_OUTBOUND_REGISTRY_REJECT_STATUS` | `502` | HTTP 4xx/5xx status returned when `registry_only` rejects an unknown HTTP-family destination |
+| `FERRUM_MESH_OUTBOUND_REGISTRY_REJECT_STATUS` | `502` | HTTP error status returned when `registry_only` rejects an unknown HTTP-family destination |
 
 ### Identity / CA
 
@@ -2073,7 +2075,7 @@ Mesh-specific environment variables are listed below. For the full reference of 
 | `FERRUM_MESH_PRODUCTION_MODE` | `false` | Master production guardrail. When `true`, the dev-only self-signed CA bootstrap and the dev-only static attestor are refused unconditionally. Read directly by the identity helpers (not parsed into `EnvConfig`). Set in every production deployment. See [Internal Dev CA and Production Guardrails](#internal-dev-ca-and-production-guardrails) |
 | `FERRUM_MESH_CA_BOOTSTRAP_DEV` | `false` | Dev-only opt-in to mint a self-signed mesh root for the `internal` CA backend. The bootstrap helper refuses unless this is `true` **and** `FERRUM_MESH_PRODUCTION_MODE` is not `true`. Lab/test only |
 | `FERRUM_MESH_ALLOW_STATIC_ID` | `false` | Dev-only opt-in for the `StaticAttestor` (hard-coded SPIFFE ID for any peer). Refused unless `true` and `FERRUM_MESH_PRODUCTION_MODE` is not `true`. Lab/test only |
-| `FERRUM_MESH_ALLOW_NO_CA` | `false` | Dev/test opt-in to start `mesh` mode with **no workload identity** (no file-based gateway SVID material; the CA backend doesn't load a runtime SVID yet). Without it, an identity-less mesh fails startup closed (no mTLS ⇒ PERMISSIVE accepts plaintext). Read directly from the environment (not `ferrum.conf`); refused unconditionally when `FERRUM_MESH_PRODUCTION_MODE=true`. Lab/test only — see [Internal Dev CA and Production Guardrails](#internal-dev-ca-and-production-guardrails) |
+| `FERRUM_MESH_ALLOW_NO_CA` | `false` | Dev/test opt-in to start `mesh` mode with **no workload identity** — i.e. neither file-based gateway SVID material (`FERRUM_GATEWAY_SVID_*`) **nor** a CA backend (`FERRUM_MESH_CA_BACKEND=spire_agent|internal` + `FERRUM_MESH_WORKLOAD_SPIFFE_ID`). Without it, an identity-less mesh fails startup closed (no mTLS ⇒ PERMISSIVE accepts plaintext). Read directly from the environment (not `ferrum.conf`); refused unconditionally when `FERRUM_MESH_PRODUCTION_MODE=true`. Lab/test only — see [Internal Dev CA and Production Guardrails](#internal-dev-ca-and-production-guardrails) |
 
 ### xDS
 
@@ -2115,6 +2117,26 @@ Mesh-specific environment variables are listed below. For the full reference of 
 | `FERRUM_MESH_CAPTURE_MODE` | `explicit` | Traffic capture mode: `explicit`, `iptables`, `ebpf` |
 | `FERRUM_MESH_PROXY_UID` | `1337` | Proxy user ID in injected sidecars |
 | `FERRUM_MESH_IP6TABLES_ENABLED` | `auto` | IPv6 iptables fan-out: `auto`, `true` (required/all-or-nothing), or `false` |
+
+### Kubernetes Controller
+
+These configure the in-cluster Istio / Gateway API translation controller and native service-registry discovery (CP / mesh modes). See [Istio CRD Status](#istio-crd-status) and [Pod Auto-Discovery](#pod-auto-discovery).
+
+| Variable | Default | Description |
+|---|---|---|
+| `FERRUM_K8S_CONTROLLER_ENABLED` | auto (true in-pod, false outside) | Enable the in-cluster Istio/Gateway-API translation controller. Detected from `KUBERNETES_SERVICE_HOST`; explicit operator value wins |
+| `FERRUM_K8S_POD_DISCOVERY_ENABLED` | auto (true in-pod, false outside) | Watch Pod/Service/EndpointSlice/Node for native service-registry discovery |
+| `FERRUM_K8S_WATCH_ISTIO_CRDS` | `true` | Watch and translate Istio CRDs (and write `status.conditions[]`) |
+| `FERRUM_K8S_WATCH_GATEWAY_API_CRDS` | `true` | Watch and translate Gateway API CRDs (GatewayClass/Gateway/HTTPRoute/GRPCRoute) and write their status |
+| `FERRUM_K8S_WATCH_MESH_CONFIG` | `true` | Watch the `istio` ConfigMap (MeshConfig) so name-only Telemetry providers resolve |
+| `FERRUM_K8S_WATCH_NAMESPACES` | (CP scope) | Comma-separated namespace watch scope; unset falls back to the CP namespace scope |
+| `FERRUM_K8S_ISTIO_ROOT_NAMESPACE` | `istio-system` | Root namespace for mesh-wide (selector-less) Istio resources |
+| `FERRUM_K8S_CLUSTER_DOMAIN` | `cluster.local` | Cluster DNS domain for FQDN synthesis on the control plane |
+| `FERRUM_K8S_TRUST_DOMAIN` | `cluster.local` | SPIFFE trust domain used by the controller |
+| `FERRUM_K8S_NODE_LOCALITY_ENABLED` | `false` | Stamp Node `topology.kubernetes.io/region\|zone` labels onto workload locality |
+| `FERRUM_K8S_FULL_SYNC_INTERVAL_SECS` | `300` | Periodic full reconcile interval (seconds); safety valve against missed watch events |
+| `FERRUM_K8S_RECONCILE_DEBOUNCE_MS` | `500` | Debounce window coalescing rapid watch events before a reconcile |
+| `FERRUM_K8S_KUBECONFIG_PATH` | (in-cluster) | Path to a kubeconfig; unset uses the in-cluster service-account config |
 
 ### Shared with CP/DP
 
