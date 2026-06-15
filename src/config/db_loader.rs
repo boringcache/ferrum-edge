@@ -1907,7 +1907,7 @@ impl DatabaseStore {
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
     ) -> Result<Vec<PluginConfig>, anyhow::Error> {
         let rows: Vec<AnyRow> = sqlx::query(
-            &self.q("SELECT * FROM plugin_configs WHERE plugin_name = ? AND enabled != 0"),
+            &self.q("SELECT * FROM plugin_configs WHERE plugin_name = ? AND enabled = 1"),
         )
         .bind("mesh_route_dispatch")
         .fetch_all(&mut **tx)
@@ -4368,7 +4368,7 @@ impl DatabaseStore {
         }
 
         let plugin_rows: Vec<AnyRow> = sqlx::query(
-            &self.q("SELECT * FROM plugin_configs WHERE plugin_name = ? AND enabled != 0"),
+            &self.q("SELECT * FROM plugin_configs WHERE plugin_name = ? AND enabled = 1"),
         )
         .bind("mesh_route_dispatch")
         .fetch_all(&mut **tx)
