@@ -4650,7 +4650,19 @@ fn materialize_egress_gateway_proxies(
     }
 }
 
+/// One-time guard so the "UDP egress materialization deferred" warning fires at
+/// most once per process instead of on every slice apply that carries a UDP
+/// ServiceEntry. Reset is intentionally not provided — F3 §3.3 stage 1 is inert
+/// for UDP and the later datapath stage removes the skip entirely.
+static UDP_EGRESS_DEFERRED_WARNED: AtomicBool = AtomicBool::new(false);
+
 /// Build proxy + upstream pairs from external `ServiceEntry` resources.
+///
+/// UDP ServiceEntry ports (`AppProtocol::Udp`) are classified but NOT
+/// materialized in this F3 §3.3 stage (schema-only / inert) — they are skipped
+/// with a one-time deferred warning so no premature UDP listener is emitted (no
+/// port-only TCP/UDP dedup collision, no unseeded-DTLS deferral). UDP egress
+/// materialization arrives in a later stage.
 ///
 /// Only entries with `location == MeshExternal` are materialized. For each
 /// qualifying entry, one upstream per port is created (keyed by host + port
@@ -4711,6 +4723,31 @@ fn build_egress_proxies_and_upstreams(
         }
 
         for port_spec in &entry.ports {
+            // F3 §3.3 stage 1 is schema-only and INERT for UDP: a `protocol: UDP`
+            // ServiceEntry port classifies as `AppProtocol::Udp` (so it is no
+            // longer mis-routed as HTTP-family) but must NOT yet materialize an
+            // egress listener. Materializing it now would (a) collide with a
+            // sibling TCP port on the same number under the port-only stream
+            // dedup (e.g. DNS TCP/53 + UDP/53) and (b) build a `frontend_tls`
+            // listener that mesh never seeds DTLS material for, deferring it
+            // indefinitely. UDP egress materialization (with protocol-aware
+            // dedup + DTLS seeding) belongs to a later F3 §3.3 stage; skip it
+            // here so Stage 1 stays inert. Warn once per process to flag the
+            // deferral without log spam across repeated slice applies.
+            if matches!(port_spec.protocol, AppProtocol::Udp) {
+                if !UDP_EGRESS_DEFERRED_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    warn!(
+                        service_entry = %entry.name,
+                        namespace = %entry.namespace,
+                        port = port_spec.port,
+                        "UDP egress materialization deferred to a later F3 §3.3 stage: \
+                         UDP ServiceEntry ports are classified but not yet materialized \
+                         as egress listeners (no UDP capture/egress datapath in this stage)."
+                    );
+                }
+                continue;
+            }
+
             let Some(backend_scheme) = egress_backend_scheme(port_spec.protocol) else {
                 // Defensive: every AppProtocol variant maps to a concrete
                 // scheme today (HTTP-family or stream-family). Future
@@ -19109,6 +19146,103 @@ mod tests {
         assert_eq!(upstream.targets.len(), 1);
         assert_eq!(upstream.targets[0].host, "db.external.com");
         assert_eq!(upstream.targets[0].port, 3306);
+    }
+
+    #[test]
+    fn egress_does_not_materialize_udp_service_entry_in_stage_1() {
+        // F3 §3.3 stage 1 is INERT for UDP: a `protocol: UDP` ServiceEntry port
+        // is classified `AppProtocol::Udp` but must NOT materialize an egress
+        // listener yet (no premature UDP listener → no port-only TCP/UDP dedup
+        // collision, no unseeded-DTLS deferral). UDP egress arrives in a later
+        // stage. Even with stream egress ENABLED, a UDP-only ServiceEntry yields
+        // zero proxies and zero upstreams.
+        let service_entries = vec![ServiceEntry {
+            name: "dns".to_string(),
+            namespace: "default".to_string(),
+            hosts: vec!["dns.external.com".to_string()],
+            endpoints: Vec::new(),
+            resolution: Resolution::Dns,
+            location: ServiceEntryLocation::MeshExternal,
+            ports: vec![ServicePort {
+                port: 53,
+                protocol: AppProtocol::Udp,
+                name: Some("dns".to_string()),
+                target_port: None,
+            }],
+            export_to: Vec::new(),
+            workload_selector: None,
+        }];
+
+        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+            &service_entries,
+            "default",
+            &std::collections::HashSet::new(),
+            true,  // egress_stream_enabled
+            false, // egress_stream_allow_plaintext
+        );
+
+        assert!(
+            proxies.is_empty(),
+            "UDP ServiceEntry must materialize NO egress proxy in stage 1 (inert), got {proxies:?}"
+        );
+        assert!(
+            upstreams.is_empty(),
+            "UDP ServiceEntry must materialize NO egress upstream in stage 1 (inert)"
+        );
+    }
+
+    #[test]
+    fn egress_materializes_tcp_but_not_udp_for_dual_protocol_service() {
+        // A DNS-like service exposing BOTH TCP/53 and UDP/53: the TCP/53 stream
+        // listener still materializes, while UDP/53 is skipped (deferred). This
+        // pins that the inert UDP skip does NOT also drop the coexisting TCP port
+        // and that no UDP listener is emitted on the same number (the port-only
+        // dedup collision codex flagged never arises because UDP never enters
+        // the stream materializer).
+        let service_entries = vec![ServiceEntry {
+            name: "dns".to_string(),
+            namespace: "default".to_string(),
+            hosts: vec!["dns.external.com".to_string()],
+            endpoints: Vec::new(),
+            resolution: Resolution::Dns,
+            location: ServiceEntryLocation::MeshExternal,
+            ports: vec![
+                ServicePort {
+                    port: 53,
+                    protocol: AppProtocol::Tcp,
+                    name: Some("dns-tcp".to_string()),
+                    target_port: None,
+                },
+                ServicePort {
+                    port: 53,
+                    protocol: AppProtocol::Udp,
+                    name: Some("dns-udp".to_string()),
+                    target_port: None,
+                },
+            ],
+            export_to: Vec::new(),
+            workload_selector: None,
+        }];
+
+        let (proxies, upstreams) = build_egress_proxies_and_upstreams(
+            &service_entries,
+            "default",
+            &std::collections::HashSet::new(),
+            true,
+            false,
+        );
+
+        // Exactly one stream proxy (the TCP/53 listener); the UDP/53 port is
+        // skipped, so it neither adds a second listener nor collides with TCP.
+        assert_eq!(
+            proxies.len(),
+            1,
+            "only the TCP/53 stream listener must materialize (UDP/53 deferred)"
+        );
+        assert_eq!(proxies[0].listen_port, Some(53));
+        assert_eq!(proxies[0].backend_scheme, Some(BackendScheme::Tcp));
+        assert_eq!(upstreams.len(), 1);
+        assert_eq!(upstreams[0].targets[0].port, 53);
     }
 
     #[test]

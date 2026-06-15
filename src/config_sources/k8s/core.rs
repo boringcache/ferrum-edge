@@ -580,6 +580,19 @@ fn string_array_from_value(value: &Value, field: &str) -> Vec<String> {
 }
 
 fn service_app_protocol(port_entry: &Value, port_name: Option<&str>) -> AppProtocol {
+    // L4 transport wins over any L7 naming/appProtocol hint: a Service port with
+    // `protocol: UDP` is UDP regardless of an `appProtocol: http` or a name like
+    // `http3`, because those L7 hints describe the application protocol carried
+    // OVER the transport, not the transport itself. Classifying a UDP port as
+    // HTTP-family from a hint would route it into TCP/H2 route materialization
+    // instead of the inert UDP lane. Check the L4 protocol FIRST and short-circuit
+    // when it is a non-HTTP-routable transport (today: `Udp`). TCP stays
+    // hint-overridable (the long-standing convention — a `protocol: TCP` port
+    // named `http` is an HTTP listener over TCP), so only `Udp` pre-empts here.
+    let l4 = workload_port_protocol(string_field(port_entry, "protocol"));
+    if matches!(l4, AppProtocol::Udp) {
+        return l4;
+    }
     if let Some(protocol) = string_field(port_entry, "appProtocol").and_then(app_protocol_from_hint)
     {
         return protocol;
@@ -587,7 +600,7 @@ fn service_app_protocol(port_entry: &Value, port_name: Option<&str>) -> AppProto
     if let Some(protocol) = port_name.and_then(app_protocol_from_hint) {
         return protocol;
     }
-    workload_port_protocol(string_field(port_entry, "protocol"))
+    l4
 }
 
 fn workload_port_protocol(protocol: Option<&str>) -> AppProtocol {
@@ -819,6 +832,58 @@ mod tests {
         assert_eq!(workload_port_protocol(Some("TCP")), AppProtocol::Tcp);
         assert_eq!(workload_port_protocol(None), AppProtocol::Tcp);
         assert_eq!(workload_port_protocol(Some("SCTP")), AppProtocol::Unknown);
+    }
+
+    #[test]
+    fn service_app_protocol_l4_udp_overrides_l7_name_and_appprotocol_hints() {
+        // L4 `protocol: UDP` must WIN over any L7 appProtocol / port-name hint:
+        // a UDP port carrying `appProtocol: http` or a name like `http3` is still
+        // the UDP transport (the hint describes what rides OVER UDP, not the
+        // transport), so it must classify `Udp` and partition out of HTTP route
+        // materialization rather than becoming HTTP-family.
+        let udp_with_http_appprotocol = json!({
+            "name": "metrics",
+            "port": 8125,
+            "protocol": "UDP",
+            "appProtocol": "http"
+        });
+        assert_eq!(
+            service_app_protocol(&udp_with_http_appprotocol, Some("metrics")),
+            AppProtocol::Udp,
+            "protocol: UDP must override an appProtocol: http hint"
+        );
+
+        let udp_named_http3 = json!({
+            "name": "http3",
+            "port": 443,
+            "protocol": "UDP"
+        });
+        assert_eq!(
+            service_app_protocol(&udp_named_http3, Some("http3")),
+            AppProtocol::Udp,
+            "protocol: UDP must override an http3 port-name hint"
+        );
+
+        // Regression guard: a TCP port keeps the long-standing hint-override
+        // convention (a `protocol: TCP` port named `http` is an HTTP listener),
+        // so only Udp pre-empts the L7 hint — not every L4 protocol.
+        let tcp_named_http = json!({
+            "name": "http",
+            "port": 80,
+            "protocol": "TCP"
+        });
+        assert_eq!(
+            service_app_protocol(&tcp_named_http, Some("http")),
+            AppProtocol::Http,
+            "protocol: TCP must stay hint-overridable (http name → HTTP)"
+        );
+
+        // And a UDP port with NO HTTP hint still classifies Udp via the L4 field.
+        let bare_udp = json!({ "name": "dns", "port": 53, "protocol": "UDP" });
+        assert_eq!(
+            service_app_protocol(&bare_udp, Some("dns")),
+            AppProtocol::Udp
+        );
     }
 
     #[test]
