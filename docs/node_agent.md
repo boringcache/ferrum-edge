@@ -80,12 +80,20 @@ BPF map read are gated behind `#[cfg(all(feature = "ebpf", target_os = "linux"))
 >   image" below). It is **Linux-only** (linux/amd64 + linux/arm64; the aya
 >   kernel loader compiles only on Linux) and requires a node kernel **≥ 5.7**
 >   with cgroup v2 and the capabilities in
->   [`docs/node_agent_security.md`](node_agent_security.md)
->   (`CAP_BPF`/`CAP_NET_ADMIN`/`CAP_PERFMON`, plus `CAP_SYS_ADMIN` on 5.7.x).
->   On an older kernel it still starts but the kernel probe degrades to the same
->   mock backend (gauge + warning, no capture). The `-ebpf` variant is published
->   independently of the GitHub release, so a variant build failure never blocks
->   the default image or the binary assets.
+>   [`docs/node_agent_security.md`](node_agent_security.md): on kernel ≥ 5.8
+>   `CAP_BPF`/`CAP_NET_ADMIN`/`CAP_PERFMON`; on the 5.7.x window `CAP_SYS_ADMIN`
+>   (+ `CAP_NET_ADMIN`), because `CAP_BPF`/`CAP_PERFMON` did not exist until 5.8.
+>   On a node that fails the kernel/cgroup/bpffs probe the `-ebpf` pod does **not**
+>   silently degrade to the mock backend: `run()` hands off to `handle_fallback`,
+>   whose default `FERRUM_NODE_AGENT_FALLBACK_MODE=fail` returns an error and the
+>   pod **exits** (crash-loops). The only continuing fallback is the explicit
+>   `FERRUM_NODE_AGENT_FALLBACK_MODE=iptables`, which switches to host iptables
+>   capture (not the mock) and requires a runtime image with `/bin/sh` +
+>   `iptables`/`ip6tables` — see [Kernel fallback](#kernel-fallback). (The mock
+>   backend is only ever selected by a build *without* `--features ebpf`, e.g. the
+>   default image, never by the `-ebpf` image on a bad kernel.) The `-ebpf`
+>   variant is published independently of the GitHub release, so a variant build
+>   failure never blocks the default image or the binary assets.
 
 **Building the capture image.** The compiled BPF ELF and the `--features ebpf`
 binary are produced by the root `Dockerfile` (also exercised by the

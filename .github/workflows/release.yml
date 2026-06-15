@@ -130,7 +130,13 @@ jobs:
 
   create-release:
     name: Create GitHub Release
-    needs: [build-release-binaries, docker-manifest]
+    # Wait for BOTH manifests: the release notes advertise the `:<tag>` default
+    # image AND the `:<tag>-ebpf` variant, so the GitHub Release must not publish
+    # until the eBPF manifest exists — otherwise the notes link `-ebpf` tags that
+    # were never pushed. Both `docker-manifest` and `docker-ebpf-manifest` run
+    # unconditionally on every `v*` tag (no `if:`/path filters), so this keeps the
+    # default release path intact.
+    needs: [build-release-binaries, docker-manifest, docker-ebpf-manifest]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -187,8 +193,16 @@ jobs:
           The default image ships the no-op **mock** eBPF capture backend. For
           real ambient / node-waypoint eBPF capture, pull the **Linux-only**
           \`-ebpf\` variant (built with \`--features ebpf\`; requires kernel
-          ≥ 5.7 and \`CAP_BPF\`/\`CAP_NET_ADMIN\`/\`CAP_PERFMON\` — see
-          [docs/node_agent_security.md](https://github.com/ferrum-edge/ferrum-edge/blob/main/docs/node_agent_security.md)):
+          ≥ 5.7 with cgroup v2 + bpffs). Capabilities depend on the kernel: on
+          **≥ 5.8** use \`CAP_BPF\`/\`CAP_PERFMON\`/\`CAP_NET_ADMIN\`; on the
+          **5.7.x** window use \`CAP_SYS_ADMIN\` + \`CAP_NET_ADMIN\` instead,
+          because \`CAP_BPF\`/\`CAP_PERFMON\` were only split out of
+          \`CAP_SYS_ADMIN\` in 5.8 — see
+          [docs/node_agent_security.md](https://github.com/ferrum-edge/ferrum-edge/blob/main/docs/node_agent_security.md).
+          On a node whose kernel/cgroup/bpffs probe fails, the \`-ebpf\` pod
+          **exits** (default \`FERRUM_NODE_AGENT_FALLBACK_MODE=fail\`) rather than
+          degrading; set \`FERRUM_NODE_AGENT_FALLBACK_MODE=iptables\` to fall back
+          to host iptables capture instead:
 
           \`\`\`bash
           docker pull ferrumedge/ferrum-edge:$TAG_NAME-ebpf
@@ -385,9 +399,11 @@ jobs:
   # platform builds natively (no QEMU) so the from-source Rust + nightly eBPF
   # build stays within sane time limits.
   #
-  # The default image is unchanged. This variant is independent of
-  # `create-release`, so a variant build failure never blocks the default
-  # image, the binary assets, or the GitHub release.
+  # The default image is unchanged: a variant build failure never blocks the
+  # default `:<tag>` image or the binary assets (those flow through `docker` /
+  # `docker-manifest`). It DOES gate the GitHub Release, because `create-release`
+  # `needs: docker-ebpf-manifest` — the release notes advertise the `-ebpf` tags,
+  # so the release must not publish until those manifests actually exist.
   docker-ebpf:
     name: Docker eBPF variant (${{ matrix.platform }})
     runs-on: ${{ matrix.os }}
