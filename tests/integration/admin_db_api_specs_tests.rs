@@ -3290,6 +3290,83 @@ async fn delete_proxy_cleans_up_orphaned_upstream() {
 }
 
 #[tokio::test]
+async fn update_proxy_reassignment_cleans_up_orphaned_old_upstream() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+
+    let old_upstream_id = uid("old-upstream");
+    let shared_old_upstream_id = uid("shared-old-upstream");
+    let new_upstream_id = uid("new-upstream");
+    for upstream_id in [&old_upstream_id, &shared_old_upstream_id, &new_upstream_id] {
+        store
+            .create_upstream(&make_upstream(upstream_id, ns))
+            .await
+            .expect("create upstream");
+    }
+
+    let proxy_id = uid("proxy-reassign");
+    let mut proxy = make_proxy(&proxy_id, ns);
+    proxy.upstream_id = Some(old_upstream_id.clone());
+    store.create_proxy(&proxy).await.expect("create proxy");
+
+    proxy.upstream_id = Some(new_upstream_id.clone());
+    store
+        .update_proxy(&proxy)
+        .await
+        .expect("reassign proxy upstream");
+
+    let old_after_reassign = store
+        .get_upstream(&old_upstream_id)
+        .await
+        .expect("get old upstream after reassignment");
+    assert!(
+        old_after_reassign.is_none(),
+        "old upstream must be deleted when reassignment leaves it orphaned"
+    );
+
+    let new_after_reassign = store
+        .get_upstream(&new_upstream_id)
+        .await
+        .expect("get new upstream after reassignment");
+    assert!(
+        new_after_reassign.is_some(),
+        "new upstream must survive because the proxy now references it"
+    );
+
+    let first_shared_proxy_id = uid("first-shared-proxy");
+    let second_shared_proxy_id = uid("second-shared-proxy");
+    let mut first_shared_proxy = make_proxy(&first_shared_proxy_id, ns);
+    first_shared_proxy.upstream_id = Some(shared_old_upstream_id.clone());
+    store
+        .create_proxy(&first_shared_proxy)
+        .await
+        .expect("create first shared proxy");
+
+    let mut second_shared_proxy = make_proxy(&second_shared_proxy_id, ns);
+    second_shared_proxy.upstream_id = Some(shared_old_upstream_id.clone());
+    store
+        .create_proxy(&second_shared_proxy)
+        .await
+        .expect("create second shared proxy");
+
+    first_shared_proxy.upstream_id = Some(new_upstream_id);
+    store
+        .update_proxy(&first_shared_proxy)
+        .await
+        .expect("reassign first shared proxy");
+
+    let shared_old_after_reassign = store
+        .get_upstream(&shared_old_upstream_id)
+        .await
+        .expect("get shared old upstream after reassignment");
+    assert!(
+        shared_old_after_reassign.is_some(),
+        "old upstream must survive while another proxy still references it"
+    );
+}
+
+#[tokio::test]
 async fn delete_proxy_removes_drifted_spec_owned_upstream() {
     let dir = TempDir::new().unwrap();
     let store = make_store(&dir).await;

@@ -1095,6 +1095,12 @@ impl DatabaseStore {
         };
 
         let mut tx = self.pool().begin().await?;
+        let old_upstream_id: Option<String> =
+            sqlx::query(&self.q("SELECT upstream_id FROM proxies WHERE id = ?"))
+                .bind(&proxy.id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .and_then(|row| row.try_get::<String, _>("upstream_id").ok());
 
         let hosts_json = serde_json::to_string(&proxy.hosts)?;
 
@@ -1170,6 +1176,13 @@ impl DatabaseStore {
         // Clean up orphaned proxy_group plugin configs (no remaining associations)
         self.cleanup_orphaned_proxy_group_plugins(&mut tx).await?;
 
+        if let Some(old_upstream_id) = old_upstream_id.as_deref()
+            && proxy.upstream_id.as_deref() != Some(old_upstream_id)
+        {
+            self.cleanup_orphaned_upstream_tx(&mut tx, old_upstream_id)
+                .await?;
+        }
+
         tx.commit().await?;
 
         self.check_slow_query("update_proxy", start);
@@ -1242,24 +1255,7 @@ impl DatabaseStore {
 
         // If the proxy had an upstream, check if it's now orphaned and delete it
         if let Some(ref uid) = upstream_id {
-            let ref_rows: Vec<AnyRow> =
-                sqlx::query(&self.q("SELECT id FROM proxies WHERE upstream_id = ? LIMIT 1"))
-                    .bind(uid)
-                    .fetch_all(&mut *tx)
-                    .await?;
-            let dispatch_ref = if ref_rows.is_empty() {
-                self.find_mesh_route_dispatch_upstream_ref_tx(&mut tx, uid)
-                    .await?
-            } else {
-                None
-            };
-            if ref_rows.is_empty() && dispatch_ref.is_none() {
-                info!("Cascade-deleting orphaned upstream {}", uid);
-                sqlx::query(&self.q("DELETE FROM upstreams WHERE id = ?"))
-                    .bind(uid)
-                    .execute(&mut *tx)
-                    .await?;
-            }
+            self.cleanup_orphaned_upstream_tx(&mut tx, uid).await?;
         }
 
         tx.commit().await?;
@@ -1291,6 +1287,35 @@ impl DatabaseStore {
             info!("Cascade-deleting orphaned proxy_group plugin config {}", id);
             sqlx::query(&self.q("DELETE FROM plugin_configs WHERE id = ?"))
                 .bind(id)
+                .execute(&mut **tx)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn cleanup_orphaned_upstream_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        upstream_id: &str,
+    ) -> Result<(), anyhow::Error> {
+        let ref_rows: Vec<AnyRow> =
+            sqlx::query(&self.q("SELECT id FROM proxies WHERE upstream_id = ? LIMIT 1"))
+                .bind(upstream_id)
+                .fetch_all(&mut **tx)
+                .await?;
+
+        let dispatch_ref = if ref_rows.is_empty() {
+            self.find_mesh_route_dispatch_upstream_ref_tx(tx, upstream_id)
+                .await?
+        } else {
+            None
+        };
+
+        if ref_rows.is_empty() && dispatch_ref.is_none() {
+            info!("Cleaning up orphaned upstream {}", upstream_id);
+            sqlx::query(&self.q("DELETE FROM upstreams WHERE id = ?"))
+                .bind(upstream_id)
                 .execute(&mut **tx)
                 .await?;
         }
@@ -1985,29 +2010,8 @@ impl DatabaseStore {
         let start = Instant::now();
         let mut tx = self.pool().begin().await?;
 
-        let ref_rows: Vec<AnyRow> =
-            sqlx::query(&self.q("SELECT id FROM proxies WHERE upstream_id = ? LIMIT 1"))
-                .bind(old_upstream_id)
-                .fetch_all(&mut *tx)
-                .await?;
-
-        let dispatch_ref = if ref_rows.is_empty() {
-            self.find_mesh_route_dispatch_upstream_ref_tx(&mut tx, old_upstream_id)
-                .await?
-        } else {
-            None
-        };
-
-        if ref_rows.is_empty() && dispatch_ref.is_none() {
-            info!(
-                "Cleaning up orphaned upstream {} after proxy reassignment",
-                old_upstream_id
-            );
-            sqlx::query(&self.q("DELETE FROM upstreams WHERE id = ?"))
-                .bind(old_upstream_id)
-                .execute(&mut *tx)
-                .await?;
-        }
+        self.cleanup_orphaned_upstream_tx(&mut tx, old_upstream_id)
+            .await?;
 
         tx.commit().await?;
 
