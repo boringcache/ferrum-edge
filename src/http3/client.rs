@@ -212,11 +212,11 @@ impl From<h3::error::StreamError> for H3BodyDrainError {
 /// `headers` carries the response headers (hop-by-hop names already stripped
 /// during collection). `trailers` carries any backend response trailers read
 /// after the body (issue #1630), still unsanitized — the buffered native-H3
-/// server send path strips response-direction hop-by-hop trailer names and
-/// forwards them to the client before FIN, mirroring the streaming path's
-/// `finish_h3_response_with_backend_trailers`. `trailers` is `None` when the
-/// backend sent none, the trailer read timed out, or it ended with a graceful
-/// close.
+/// server send path either drops them when response plugins are active (plugins
+/// cannot inspect trailers today) or strips response-direction hop-by-hop
+/// trailer names before forwarding them to the client. `trailers` is `None`
+/// when the backend sent none, the trailer read timed out, or it ended with a
+/// graceful close.
 #[derive(Debug)]
 pub struct H3BufferedResponse {
     pub status: u16,
