@@ -72,7 +72,7 @@ src/
 │   ├── database.rs            # Database mode
 │   ├── file.rs                # File mode
 │   └── migrate.rs             # Database migration mode
-├── plugins/                   # Plugin system (42 built-in plugins)
+├── plugins/                   # Plugin system (75+ built-in plugins)
 │   ├── mod.rs                 # Plugin framework, registry, and priority constants
 │   ├── access_control.rs      # Consumer-based authorization
 │   ├── basic_auth.rs          # HTTP Basic auth with bcrypt
@@ -143,7 +143,7 @@ tests/
 │
 ├── unit_tests.rs                       # Entry point: unit test crate
 ├── unit/                               # Unit tests by component
-│   ├── plugins/                        # All 42 plugin tests
+│   ├── plugins/                        # Plugin tests
 │   ├── config/                         # Configuration parsing tests
 │   ├── admin/                          # Admin API tests
 │   ├── gateway_core/                   # Core data structure tests
@@ -341,8 +341,8 @@ High-performance HTTP client connection pooling with backend mTLS support:
 
 Extensible plugin architecture for authentication, authorization, and transformations:
 
-**23 Plugins Registered**:
-- **Authentication**: `jwks_auth`, `jwt_auth`, `key_auth`, `basic_auth`, `hmac_auth`, `mtls_auth`
+**Plugin categories** (representative — see [docs/plugins.md](docs/plugins.md) for the full set of 75+ built-in plugins):
+- **Authentication**: `jwks_auth`, `jwt_auth`, `key_auth`, `basic_auth`, `hmac_auth`, `mtls_auth`, `ldap_auth`, `oauth2_introspection`, `oidc_relying_party`
 - **Authorization**: `access_control`, `ip_restriction`
 - **Security**: `cors`, `bot_detection`
 - **Rate Limiting**: `rate_limiting`
@@ -370,7 +370,7 @@ RESTful API for dynamic configuration management:
 
 ### **7. Operating Modes (`src/modes/`)**
 
-Five operating modes for different deployment scenarios:
+Ferrum supports eight operating modes. The five core modes (Database, File, Control Plane, Data Plane, Migrate) are detailed below; the mesh-family modes — Mesh, Injector, Node Agent — are documented in `docs/mesh.md` and `docs/node_agent.md`:
 
 #### **Database Mode (`database.rs`)**
 - Single gateway instance with database storage

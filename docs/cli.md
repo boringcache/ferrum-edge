@@ -46,7 +46,7 @@ ferrum-edge run [OPTIONS]
 |------|-------|-------------|
 | `--settings <PATH>` | `-s` | Path to `ferrum.conf` (operational settings) |
 | `--spec <PATH>` | `-c` | Path to resources YAML/JSON (proxies, consumers, upstreams, plugins) |
-| `--mode <MODE>` | `-m` | Operating mode: `database`, `file`, `cp`, `dp`, `migrate` |
+| `--mode <MODE>` | `-m` | Operating mode: `database`, `file`, `cp`, `dp`, `mesh`, `injector`, `node_agent`, `migrate` |
 | `--verbose` | `-v` | Increase log verbosity (repeatable: `-v`=info, `-vv`=debug, `-vvv`=trace) |
 
 ### Examples
@@ -89,7 +89,7 @@ ferrum-edge validate [OPTIONS]
 
 ### What is validated
 
-1. **Settings** (`ferrum.conf`) — all 90+ environment variables are parsed and validated (ports, paths, TLS configuration, pool sizes, etc.)
+1. **Settings** (`ferrum.conf`) — all 300+ environment variables are parsed and validated (ports, paths, TLS configuration, pool sizes, etc.)
 2. **Spec** (resources YAML/JSON, file mode only):
    - YAML/JSON syntax and deserialization
    - Field-level validation on all proxies, consumers, upstreams, and plugin configs
