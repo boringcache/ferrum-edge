@@ -1106,10 +1106,13 @@ impl RequestContext {
                     // spec), and hyper normalizes HTTP/1.1 header names to
                     // lowercase at parse time. No `to_lowercase()` needed.
                     let key = name.as_str();
-                    // Reserved gateway-asserted identity headers are never
-                    // trusted from clients. They are injected after
-                    // authentication from `identified_consumer`.
-                    if matches!(key, "x-consumer-username" | "x-consumer-custom-id") {
+                    // Reserved gateway-asserted headers are never trusted from
+                    // clients. Identity headers are injected after
+                    // authentication; path-param headers are injected after
+                    // route matching from regex captures.
+                    if matches!(key, "x-consumer-username" | "x-consumer-custom-id")
+                        || key.starts_with("x-path-param-")
+                    {
                         continue;
                     }
                     let separator = repeated_request_header_separator(key);
