@@ -861,13 +861,21 @@ fn test_upstream_target_locality_too_long() {
 fn test_upstream_source_locality_rejected_by_admin_api() {
     let mut upstream = make_upstream("test");
     upstream.source_locality = Some("us-west/us-west-1/a".into());
+    // The projected-field rejection is scoped to the admin write path
+    // (`validate_admin_only_fields`), NOT `validate_fields` (which also runs on
+    // the runtime mesh-apply path, where the field is legitimately projected).
     let errs = upstream
-        .validate_fields()
-        .expect_err("source_locality must be rejected at admit time");
+        .validate_admin_only_fields()
+        .expect_err("source_locality must be rejected on the admin write path");
     assert!(
         errs.iter().any(|e| e.contains("source_locality")
             && e.contains("cannot be set directly via the admin API")),
         "expected source_locality admin-API rejection, got: {errs:?}"
+    );
+    // Runtime apply must NOT reject (no false "misconfigured" warning).
+    assert!(
+        upstream.validate_fields().is_ok(),
+        "validate_fields must not reject a mesh-projected source_locality on the runtime path"
     );
 }
 
@@ -876,12 +884,17 @@ fn test_upstream_locality_lb_strict_rejected_by_admin_api() {
     let mut upstream = make_upstream("test");
     upstream.locality_lb_strict = true;
     let errs = upstream
-        .validate_fields()
-        .expect_err("locality_lb_strict must be rejected at admit time");
+        .validate_admin_only_fields()
+        .expect_err("locality_lb_strict must be rejected on the admin write path");
     assert!(
         errs.iter().any(|e| e.contains("locality_lb_strict")
             && e.contains("cannot be set directly via the admin API")),
         "expected locality_lb_strict admin-API rejection, got: {errs:?}"
+    );
+    // Runtime apply (mesh slice prep SETS this) must NOT reject.
+    assert!(
+        upstream.validate_fields().is_ok(),
+        "validate_fields must not reject a mesh-projected locality_lb_strict on the runtime path"
     );
 }
 
@@ -906,12 +919,17 @@ fn test_upstream_locality_lb_setting_rejected_by_admin_api() {
         }],
     });
     let errs = upstream
-        .validate_fields()
-        .expect_err("locality_lb_setting must be rejected at admit time");
+        .validate_admin_only_fields()
+        .expect_err("locality_lb_setting must be rejected on the admin write path");
     assert!(
         errs.iter().any(|e| e.contains("locality_lb_setting")
             && e.contains("cannot be set directly via the admin API")),
         "expected locality_lb_setting admin-API rejection, got: {errs:?}"
+    );
+    // Runtime apply must NOT reject.
+    assert!(
+        upstream.validate_fields().is_ok(),
+        "validate_fields must not reject a mesh-projected locality_lb_setting on the runtime path"
     );
 }
 

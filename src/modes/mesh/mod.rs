@@ -941,7 +941,20 @@ fn project_mesh_source_locality(
     runtime: &MeshRuntimeConfig,
     mesh_slice: &MeshSlice,
 ) {
-    let loaded_at = config.loaded_at;
+    // When a projection actually changes an upstream we must advance its
+    // `updated_at` so `ConfigDelta` (which detects upstream changes by
+    // `id` + `updated_at`) rebuilds the LB cache. We bump to a FRESH wall-clock
+    // timestamp (the same convention the mesh materializers use, `now`), NOT to
+    // `config.loaded_at`: `loaded_at` is derived from `slice.version` and is
+    // therefore STABLE across re-applies of the same slice version. A remote
+    // scale-up/down re-applies the same slice version but with a different
+    // merged target set; clobbering `updated_at` to the stable `loaded_at` could
+    // leave it equal to the previously-applied upstream's `updated_at`, so the
+    // delta would miss the change and the mesh-only path (which reuses the LB
+    // cache) would keep serving the STALE target set. A fresh timestamp can
+    // never collide with a prior apply. Unchanged upstreams are left untouched
+    // (their materializer timestamp is preserved) so this is not per-apply churn.
+    let bump = chrono::Utc::now();
 
     // Stamp the operator's strict local-first locality preference onto every
     // mesh upstream regardless of whether a source locality resolves: strict
@@ -952,7 +965,7 @@ fn project_mesh_source_locality(
     for upstream in &mut config.upstreams {
         if upstream.locality_lb_strict != strict {
             upstream.locality_lb_strict = strict;
-            upstream.updated_at = loaded_at;
+            upstream.updated_at = bump;
         }
     }
 
@@ -962,7 +975,7 @@ fn project_mesh_source_locality(
     for upstream in &mut config.upstreams {
         if upstream.source_locality.as_deref() != Some(locality) {
             upstream.source_locality = Some(locality.to_string());
-            upstream.updated_at = loaded_at;
+            upstream.updated_at = bump;
         }
     }
 }
@@ -1394,12 +1407,9 @@ fn matched_local_service_workloads<'a>(
             continue;
         };
         used_workload_indices.insert(workload_index);
-        if local_cluster.is_some_and(|local_cluster| {
-            workload
-                .cluster
-                .as_deref()
-                .is_some_and(|cluster| cluster != local_cluster)
-        }) {
+        // Shared remote-provenance predicate (single source of truth with the
+        // SD materialization path) so "remote" never means two different things.
+        if crate::modes::mesh::multicluster::workload_is_remote(workload, local_cluster) {
             continue;
         }
         matched.push(workload);
@@ -6669,27 +6679,47 @@ async fn serve_mesh_runtime(
         // F1: warn when discovery is enabled but the local workload locality
         // is absent. Without a source locality the priority-tier load balancer
         // has no source region to prefer, so `target_locality_ranks` stays
-        // empty and ALL candidates (local + remote) are returned together —
-        // failing open rather than local-first. This is not a bug in the LB
-        // itself; it is the expected behavior when no locality is configured.
-        // However it is surprising to operators who enabled discovery expecting
-        // local-first failover. Emit a startup WARN so the misconfiguration is
-        // visible.
+        // empty. The behavior in that case depends on FERRUM_MESH_LOCALITY_LB_STRICT:
+        // default (fail-open) returns ALL candidates (local + remote) together;
+        // strict (fail-closed-to-local) restricts to LOCAL endpoints, widening to
+        // remote only when no local endpoint is healthy. The warning text below is
+        // branched accordingly so it never tells a strict-mode operator that local
+        // and remote are selected together (which would be false). This is not a
+        // bug in the LB; it is the expected behavior when no locality is
+        // configured. Emit a startup WARN so the posture is visible to an operator
+        // who enabled discovery expecting local-first failover.
         if initial_applied_mesh_slice
             .as_deref()
             .is_none_or(|slice| mesh_source_workload_locality(slice).is_none())
         {
-            warn!(
-                poll_interval_seconds = env_config.mesh_remote_discovery_poll_interval_seconds,
-                "Cross-cluster endpoint discovery is enabled \
-                 (FERRUM_MESH_REMOTE_DISCOVERY_POLL_INTERVAL_SECONDS > 0) but the local \
-                 workload source locality is not set (topology.kubernetes.io/region+zone \
-                 labels missing or SPIFFE-matched workload has no locality). \
-                 The locality-aware priority-tier load balancer requires a source locality \
-                 to prefer local endpoints over remote ones; without it, local and remote \
-                 endpoints are selected together (fails open, not local-first). \
-                 See docs/mesh.md \"Cross-Cluster Endpoint Discovery\" for the precondition."
-            );
+            if runtime.locality_lb_strict {
+                warn!(
+                    poll_interval_seconds = env_config.mesh_remote_discovery_poll_interval_seconds,
+                    "Cross-cluster endpoint discovery is enabled \
+                     (FERRUM_MESH_REMOTE_DISCOVERY_POLL_INTERVAL_SECONDS > 0) but the local \
+                     workload source locality is not set (topology.kubernetes.io/region+zone \
+                     labels missing or SPIFFE-matched workload has no locality). \
+                     FERRUM_MESH_LOCALITY_LB_STRICT is on, so without a source locality the \
+                     load balancer restricts selection to LOCAL endpoints (fail-closed-to-local), \
+                     widening to remote endpoints only when no local endpoint is healthy. \
+                     Set the workload's topology.kubernetes.io/region+zone labels to enable \
+                     full local-first priority-tier failover. \
+                     See docs/mesh.md \"Cross-Cluster Endpoint Discovery\" for details."
+                );
+            } else {
+                warn!(
+                    poll_interval_seconds = env_config.mesh_remote_discovery_poll_interval_seconds,
+                    "Cross-cluster endpoint discovery is enabled \
+                     (FERRUM_MESH_REMOTE_DISCOVERY_POLL_INTERVAL_SECONDS > 0) but the local \
+                     workload source locality is not set (topology.kubernetes.io/region+zone \
+                     labels missing or SPIFFE-matched workload has no locality). \
+                     The locality-aware priority-tier load balancer requires a source locality \
+                     to prefer local endpoints over remote ones; without it (and with strict \
+                     mode off), local and remote endpoints are selected together (fails open, \
+                     not local-first). \
+                     See docs/mesh.md \"Cross-Cluster Endpoint Discovery\" for the precondition."
+                );
+            }
         }
         let remote_discovery_manager = multicluster::RemoteDiscoveryManager::new(
             Some(remote_discovery_config),
@@ -16005,8 +16035,15 @@ mod tests {
         source.locality = Some("us-east/us-east-1/a".to_string());
         let source_spiffe = source.spiffe_id.as_str().to_string();
         let mut config = GatewayConfig::default();
+        // `loaded_at` is derived from the slice version and is STABLE across
+        // re-applies of the same version. The projection must NOT clobber the
+        // upstream's `updated_at` with it (that would hide a real change from
+        // `ConfigDelta` on a same-version remote scale event); it bumps to a
+        // fresh wall-clock timestamp instead. Seed the upstream's `updated_at`
+        // to `loaded_at` so a buggy clobber-to-`loaded_at` would be a no-op and
+        // the assertion below would catch it.
         let loaded_at = config.loaded_at;
-        let now = chrono::Utc::now();
+        let before = chrono::Utc::now();
         config.upstreams.push(Upstream {
             id: "reviews".to_string(),
             namespace: "default".to_string(),
@@ -16037,8 +16074,8 @@ mod tests {
             backend_tls_san_allow_list: Vec::new(),
             resolved_subset_tls: HashMap::new(),
             api_spec_id: None,
-            created_at: now,
-            updated_at: now,
+            created_at: loaded_at,
+            updated_at: loaded_at,
         });
         let mesh_slice = MeshSlice {
             namespace: "default".to_string(),
@@ -16054,7 +16091,17 @@ mod tests {
             config.upstreams[0].source_locality.as_deref(),
             Some("us-east/us-east-1/a")
         );
-        assert_eq!(config.upstreams[0].updated_at, loaded_at);
+        // The projection changed `source_locality`, so `updated_at` must have
+        // advanced to a FRESH timestamp (>= the pre-projection wall clock), NOT
+        // been clobbered back to the stable, slice-version-derived `loaded_at`.
+        assert!(
+            config.upstreams[0].updated_at >= before,
+            "updated_at must advance to a fresh timestamp on projection change"
+        );
+        assert_ne!(
+            config.upstreams[0].updated_at, loaded_at,
+            "updated_at must NOT be clobbered to the stable loaded_at (same-slice-version re-applies would hide the change from ConfigDelta)"
+        );
     }
 
     #[test]

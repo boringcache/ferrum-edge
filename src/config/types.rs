@@ -4497,66 +4497,17 @@ impl Upstream {
             ));
         }
 
-        // `port_overrides` is mesh-derived state populated at apply time by
-        // `apply_destination_rules` from `DestinationRule.portLevelSettings`.
-        // Admin POST/PUT setting it directly is rejected because (a) the SQL
-        // / MongoDB schemas do not persist this field — INSERT/UPDATE drops
-        // it silently, leaving operators with a "successful write" that
-        // didn't take effect, and (b) the canonical place to express per-
-        // port traffic policy is a DestinationRule, not a back-channel POST
-        // to /upstreams. Mesh-injected upstreams populate this in-memory and
-        // skip admin admission entirely.
-        if !self.port_overrides.is_empty() {
-            errors.push(
-                "port_overrides is populated by mesh DestinationRule \
-                 portLevelSettings and cannot be set directly via the admin \
-                 API — express per-port traffic policy as a DestinationRule"
-                    .to_string(),
-            );
-        }
-
-        // `source_locality` follows the same pattern as `port_overrides`: it
-        // is mesh-derived state populated at slice-apply time by
-        // `project_mesh_source_locality` from the workload's locality. SQL
-        // backends do not persist it (no column), so an admin write would
-        // succeed and silently vanish on the next reload. The canonical place
-        // to express source locality is the mesh `Workload.locality` field.
-        if self.source_locality.is_some() {
-            errors.push(
-                "source_locality is projected from the mesh workload's \
-                 locality and cannot be set directly via the admin API — \
-                 set it on the Workload / pod topology labels instead"
-                    .to_string(),
-            );
-        }
-
-        // `locality_lb_strict` is mesh-derived state stamped at slice-apply time
-        // from the `FERRUM_MESH_LOCALITY_LB_STRICT` env flag. SQL backends do
-        // not persist it, so an admin write would succeed and silently vanish on
-        // the next reload. The canonical surface is the env var, mirroring
-        // `source_locality` above.
-        if self.locality_lb_strict {
-            errors.push(
-                "locality_lb_strict is projected from the \
-                 FERRUM_MESH_LOCALITY_LB_STRICT environment flag and cannot be \
-                 set directly via the admin API — set the env var instead"
-                    .to_string(),
-            );
-        }
-
-        // `locality_lb_setting` is mesh-derived state populated at slice-apply
-        // time from `DestinationRule.trafficPolicy.localityLbSetting`. The
-        // canonical surface is a DestinationRule, mirroring `port_overrides`
-        // and `source_locality` above.
-        if self.locality_lb_setting.is_some() {
-            errors.push(
-                "locality_lb_setting is projected from a mesh \
-                 DestinationRule's trafficPolicy.localityLbSetting and \
-                 cannot be set directly via the admin API — express \
-                 weighted distribute and failover via a DestinationRule"
-                    .to_string(),
-            );
-        }
+        // NOTE: rejection of mesh-PROJECTED fields that an operator must not set
+        // directly (`port_overrides`, `source_locality`, `locality_lb_strict`,
+        // `locality_lb_setting`) lives in [`Upstream::validate_admin_only_fields`],
+        // NOT here. `validate_fields` runs on BOTH the admin-write/admission path
+        // AND the runtime config-apply path (file/db/dp/cp loaders and mesh slice
+        // apply, via `GatewayConfig::validate_all_fields_with_ip_policy`). The
+        // mesh slice-prep path SETS those fields itself, so rejecting them in the
+        // shared validator made every mesh reload / remote-endpoint update emit a
+        // false "misconfigured" warning. The rejection is correct only for direct
+        // admin writes, so admin admission calls `validate_admin_only_fields`
+        // explicitly in addition to `validate_fields`.
 
         // Validate individual targets
         for (i, target) in self.targets.iter().enumerate() {
@@ -4768,6 +4719,70 @@ impl Upstream {
                 );
             }
             _ => {}
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
+    /// Reject mesh-PROJECTED fields that an operator must not set directly.
+    ///
+    /// `port_overrides`, `source_locality`, `locality_lb_strict`, and
+    /// `locality_lb_setting` are all populated by the mesh slice-apply layer (from
+    /// DestinationRules / the workload locality / `FERRUM_MESH_LOCALITY_LB_STRICT`),
+    /// NOT by operators. None of them are persisted by the SQL / MongoDB schemas,
+    /// so a direct admin POST/PUT would "succeed" and then silently vanish on the
+    /// next reload. The canonical surface for each is named in its message.
+    ///
+    /// This is **scoped to the admin write / admission path** and is deliberately
+    /// SEPARATE from [`Upstream::validate_fields`]: `validate_fields` also runs on
+    /// the runtime config-apply path (file/db/dp/cp loaders + mesh slice apply via
+    /// [`GatewayConfig::validate_all_fields_with_ip_policy`]), where these fields
+    /// are LEGITIMATELY present because the mesh layer projected them. Rejecting
+    /// them there produced a false "misconfigured" warning on every mesh reload /
+    /// remote-endpoint update. Admin admission therefore calls this in addition to
+    /// `validate_fields`; runtime apply never does.
+    pub fn validate_admin_only_fields(&self) -> Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+
+        if !self.port_overrides.is_empty() {
+            errors.push(
+                "port_overrides is populated by mesh DestinationRule \
+                 portLevelSettings and cannot be set directly via the admin \
+                 API — express per-port traffic policy as a DestinationRule"
+                    .to_string(),
+            );
+        }
+
+        if self.source_locality.is_some() {
+            errors.push(
+                "source_locality is projected from the mesh workload's \
+                 locality and cannot be set directly via the admin API — \
+                 set it on the Workload / pod topology labels instead"
+                    .to_string(),
+            );
+        }
+
+        if self.locality_lb_strict {
+            errors.push(
+                "locality_lb_strict is projected from the \
+                 FERRUM_MESH_LOCALITY_LB_STRICT environment flag and cannot be \
+                 set directly via the admin API — set the env var instead"
+                    .to_string(),
+            );
+        }
+
+        if self.locality_lb_setting.is_some() {
+            errors.push(
+                "locality_lb_setting is projected from a mesh \
+                 DestinationRule's trafficPolicy.localityLbSetting and \
+                 cannot be set directly via the admin API — express \
+                 weighted distribute and failover via a DestinationRule"
+                    .to_string(),
+            );
         }
 
         if errors.is_empty() {

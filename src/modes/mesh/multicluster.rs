@@ -460,11 +460,43 @@ fn default_remote_locality(cluster_name: &str, network: Option<&str>) -> String 
 }
 
 /// Region prefix stamped on remote-cluster endpoints by
-/// [`default_remote_locality`]. A real local region can never begin with this
-/// (it is not a valid Kubernetes region label fragment in practice and is
-/// reserved here), so the locality-aware load balancer uses it to tell remote
-/// endpoints apart from local ones in strict local-first mode.
+/// [`default_remote_locality`] so a remote workload that carries no locality of
+/// its own still tiers BELOW the local source region in the priority-tier load
+/// balancer. This is a LOCALITY fallback only — it is NOT used to decide whether
+/// a target is remote (a real local region could legitimately be named
+/// `remote-foo`). Remote provenance is keyed on the explicit [`MESH_REMOTE_TAG`]
+/// stamped from the workload's cross-cluster identity.
 pub(crate) const REMOTE_LOCALITY_PREFIX: &str = "remote-";
+
+/// Per-target tag key marking a target as a REMOTE-cluster-discovered endpoint.
+/// Stamped (`= "true"`) at materialization time in
+/// [`crate::service_discovery::mesh`] from the workload's cross-cluster identity
+/// ([`workload_is_remote`]) — the AUTHORITATIVE remote-provenance signal. Strict
+/// local-first locality LB (`Upstream.locality_lb_strict`) keys local vs. remote
+/// on the ABSENCE of this tag, so a real local Kubernetes region whose name
+/// happens to begin with `remote-` is never misclassified as remote. Absent on
+/// local-cluster and non-mesh targets.
+pub(crate) const MESH_REMOTE_TAG: &str = "mesh.remote";
+
+/// Whether a workload is a REMOTE-cluster endpoint relative to this mesh's
+/// `local_cluster`. A workload is remote when it carries a `cluster` identity
+/// that differs from the configured local cluster name — the same explicit
+/// provenance [`tag_remote_workloads`] stamps on cross-cluster-discovered
+/// workloads (`workload.cluster = Some(remote_cluster_name)`). When no
+/// `local_cluster` is configured, or the workload carries no `cluster`, the
+/// workload is treated as LOCAL (the default single-cluster posture). This is
+/// the single source of truth shared by the materialization path
+/// ([`crate::service_discovery::mesh`]) and the east-west / outbound local-only
+/// filters ([`super::matched_local_service_workloads`]) so they never drift on
+/// what "remote" means.
+#[inline]
+pub(crate) fn workload_is_remote(workload: &Workload, local_cluster: Option<&str>) -> bool {
+    match (workload.cluster.as_deref(), local_cluster) {
+        (Some(workload_cluster), Some(local_cluster)) => workload_cluster != local_cluster,
+        // No workload cluster, or no configured local cluster: treat as local.
+        _ => false,
+    }
+}
 
 /// Tag a remote cluster's workloads with provenance and a fail-safe locality.
 ///
@@ -1500,6 +1532,36 @@ mod tests {
             service_account: None,
             pod_uid: None,
         }
+    }
+
+    #[test]
+    fn workload_is_remote_keys_on_cross_cluster_identity_not_locality() {
+        let mut local = workload("spiffe://cluster.local/ns/d/sa/a", "svc", "10.0.0.1", None);
+        local.cluster = Some("east".to_string());
+        // A workload whose cluster matches the local cluster is LOCAL.
+        assert!(!workload_is_remote(&local, Some("east")));
+        // A workload whose cluster differs from the local cluster is REMOTE.
+        assert!(workload_is_remote(&local, Some("west")));
+
+        // No `cluster` on the workload → local regardless of local_cluster.
+        let no_cluster = workload("spiffe://cluster.local/ns/d/sa/b", "svc", "10.0.0.2", None);
+        assert!(!workload_is_remote(&no_cluster, Some("east")));
+        // No configured local_cluster → nothing is classified remote (consistent
+        // with the egress local-only filter).
+        assert!(!workload_is_remote(&local, None));
+
+        // Regression guard for the codex finding: a LOCAL workload whose region
+        // is literally named `remote-us` (carrying NO foreign cluster) must NOT
+        // be classified remote — provenance is the cluster identity, not the
+        // locality string prefix.
+        let local_named_remote = workload(
+            "spiffe://cluster.local/ns/d/sa/c",
+            "svc",
+            "10.0.0.3",
+            Some("remote-us/zone-a"),
+        );
+        assert!(!workload_is_remote(&local_named_remote, Some("east")));
+        assert!(!workload_is_remote(&local_named_remote, None));
     }
 
     fn service(name: &str, refs: &[&str]) -> MeshService {

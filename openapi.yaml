@@ -7486,6 +7486,21 @@ components:
             SANs. Mesh DestinationRule `trafficPolicy.tls.subjectAltNames`
             projects to this field. Stored/projected only — SAN allow-list
             verification is not yet enforced (tracked by GAP-1C).
+        locality_lb_strict:
+          type: boolean
+          default: false
+          readOnly: true
+          description: >-
+            Strict local-first locality load balancing for this upstream. Mesh
+            slice apply projects this from the `FERRUM_MESH_LOCALITY_LB_STRICT`
+            environment flag onto mesh upstreams; it is `false` for non-mesh
+            upstreams. When `true` and no source locality resolves, the load
+            balancer restricts selection to local-cluster endpoints
+            (fail-closed-to-local), widening to remote endpoints only when no
+            local endpoint is healthy; when `false` (default) it returns the
+            mixed local+remote pool (fail-open). Read-only / projected — a direct
+            value in a create/update request body is REJECTED (set the env var
+            instead); it can appear in `GET`/list responses.
         api_spec_id:
           type: [string, "null"]
           description: |

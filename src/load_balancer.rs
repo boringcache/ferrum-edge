@@ -317,20 +317,20 @@ const LATENCY_UNSET: u64 = u64::MAX;
 /// across endpoints in the same matching locality.
 const LOCALITY_DISTRIBUTE_WEIGHT_SCALE: u64 = 1_000_000;
 
-/// Whether a target's locality marks it as a LOCAL (same-cluster) endpoint for
-/// strict local-first locality LB. Remote-cluster endpoints carry a synthetic
-/// `remote-<cluster>` locality (see
-/// [`crate::modes::mesh::multicluster::REMOTE_LOCALITY_PREFIX`]); everything
-/// else — including a target with no locality at all — is treated as local.
-/// Used at construction to precompute `LoadBalancer.local_locality_mask`.
+/// Whether a target is a LOCAL (same-cluster) endpoint for strict local-first
+/// locality LB. Keyed on the EXPLICIT remote-provenance tag
+/// [`crate::modes::mesh::multicluster::MESH_REMOTE_TAG`] (`mesh.remote`), stamped
+/// at materialization time from the workload's cross-cluster identity — NOT on a
+/// locality string prefix. This is correct even when a real local Kubernetes
+/// region is named `remote-<something>`: such a target carries no `mesh.remote`
+/// tag and stays LOCAL. A target without the tag (local-cluster, non-mesh, or
+/// operator-authored) is treated as local. Used at construction to precompute
+/// `LoadBalancer.local_locality_mask`.
 #[inline]
-fn is_local_locality(locality: Option<&str>) -> bool {
-    match locality {
-        Some(locality) => {
-            !locality.starts_with(crate::modes::mesh::multicluster::REMOTE_LOCALITY_PREFIX)
-        }
-        None => true,
-    }
+fn target_is_local(target: &UpstreamTarget) -> bool {
+    !target
+        .tags
+        .contains_key(crate::modes::mesh::multicluster::MESH_REMOTE_TAG)
 }
 
 /// Warm-up bias subtracted from `min_known_ewma` for unsampled (late-joiner)
@@ -1447,13 +1447,15 @@ pub struct LoadBalancer {
     /// widening to the full pool" warning is logged at most once per balancer
     /// instance instead of on every request that hits the fallback.
     locality_strict_widen_warned: AtomicBool,
-    /// Per-target "is a LOCAL-locality endpoint" mask, index-aligned with
-    /// `targets`. A target is local when its locality is absent OR does not
-    /// begin with the synthetic remote-cluster prefix (`remote-`). Only
-    /// populated (non-empty) when `locality_lb_strict` is `true`; empty
-    /// otherwise so the default path pays nothing. Computed at construction so
-    /// the strict hot path is an O(n) bitset build over a precomputed mask
-    /// rather than per-request string parsing.
+    /// Per-target "is a LOCAL endpoint" mask, index-aligned with `targets`. A
+    /// target is local unless it carries the explicit `mesh.remote` provenance
+    /// tag (stamped at materialization from the workload's cross-cluster
+    /// identity — see [`crate::modes::mesh::multicluster::MESH_REMOTE_TAG`]); the
+    /// locality string is NOT consulted, so a real local region named
+    /// `remote-<something>` stays local. Only populated (non-empty) when
+    /// `locality_lb_strict` is `true`; empty otherwise so the default path pays
+    /// nothing. Computed at construction so the strict hot path is an O(n) bitset
+    /// build over a precomputed mask rather than per-request tag lookups.
     local_locality_mask: Vec<bool>,
 }
 
@@ -1767,15 +1769,13 @@ impl LoadBalancer {
 
         // Strict local-first locality LB: precompute which targets are LOCAL so
         // the request path can restrict to them when no source locality
-        // resolves, without re-parsing localities per request. A target is
-        // local when it carries no locality OR its locality does not begin with
-        // the synthetic remote-cluster prefix. Only built when strict mode is
-        // enabled so the default path allocates nothing.
+        // resolves, without re-checking provenance per request. A target is
+        // local unless it carries the explicit `mesh.remote` provenance tag
+        // (stamped at materialization from the workload's cross-cluster
+        // identity). Only built when strict mode is enabled so the default path
+        // allocates nothing.
         let local_locality_mask: Vec<bool> = if locality_lb_strict {
-            targets
-                .iter()
-                .map(|target| is_local_locality(target.locality.as_deref()))
-                .collect()
+            targets.iter().map(target_is_local).collect()
         } else {
             Vec::new()
         };

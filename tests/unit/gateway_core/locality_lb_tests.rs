@@ -571,10 +571,19 @@ fn locality_priority_disabled_when_source_locality_absent() {
 
 // ── FERRUM_MESH_LOCALITY_LB_STRICT (strict local-first) ───────────────────
 
+/// Explicit per-target remote-provenance marker (matches
+/// `multicluster::MESH_REMOTE_TAG`). Strict local-first LB keys local vs.
+/// remote on the PRESENCE of this tag — stamped at materialization from the
+/// workload's cross-cluster identity — NOT on the locality string. Tests use
+/// this helper so they exercise the real signal rather than a locality prefix.
+fn remote_target(host: &str, locality: Option<&str>) -> UpstreamTarget {
+    tagged_target(host, 8080, locality, ("mesh.remote", "true"))
+}
+
 /// Build an upstream with `locality_lb_strict` set and (optionally) no source
 /// locality, mirroring how `project_mesh_source_locality` stamps the flag at
-/// slice apply. The runtime selects on `target.locality`: remote endpoints
-/// carry a synthetic `remote-<cluster>` locality, local ones do not.
+/// slice apply. Remote endpoints carry the explicit `mesh.remote` tag
+/// ([`remote_target`]); local ones do not.
 fn strict_upstream(source_locality: Option<&str>, targets: Vec<UpstreamTarget>) -> Upstream {
     let mut up = make_upstream(
         "u1",
@@ -600,15 +609,15 @@ fn seen_hosts(snapshot: &ferrum_edge::load_balancer::LoadBalancerCacheInner) -> 
 #[test]
 fn strict_locality_absent_source_selects_only_local_endpoints() {
     // Absent source locality + strict ON: selection must restrict to LOCAL
-    // endpoints (no `remote-` locality) and NEVER pick the remote-cluster
+    // endpoints (no `mesh.remote` tag) and NEVER pick the remote-cluster
     // targets, even though every target is healthy.
     let up = strict_upstream(
         None,
         vec![
             target("local-a.local", Some("us-west/us-west-1/a")),
             target("local-b.local", Some("us-west/us-west-1/b")),
-            target("remote-a.local", Some("remote-cluster-east")),
-            target("remote-b.local", Some("remote-cluster-east/net2")),
+            remote_target("remote-a.local", Some("remote-cluster-east")),
+            remote_target("remote-b.local", Some("remote-cluster-east/net2")),
         ],
     );
     let cache = LoadBalancerCache::new(&config(up));
@@ -626,14 +635,46 @@ fn strict_locality_absent_source_selects_only_local_endpoints() {
 }
 
 #[test]
+fn strict_locality_local_region_named_remote_stays_local() {
+    // Regression guard for the codex finding: remote provenance must NOT be
+    // inferred from a `remote-` locality prefix. A real local Kubernetes region
+    // literally named `remote-us` (carrying NO `mesh.remote` tag) must remain a
+    // LOCAL endpoint under strict mode and keep receiving traffic — while a
+    // genuinely remote-cluster target (with the tag) is excluded.
+    let up = strict_upstream(
+        None,
+        vec![
+            // Local workload whose region happens to be named "remote-us".
+            target("local-region-remote-us.local", Some("remote-us/zone-a")),
+            // Actually remote-cluster-discovered endpoint.
+            remote_target("really-remote.local", Some("remote-cluster-east")),
+        ],
+    );
+    let cache = LoadBalancerCache::new(&config(up));
+    let snapshot = cache.load();
+
+    let seen = seen_hosts(&snapshot);
+    assert!(
+        seen.contains("local-region-remote-us.local"),
+        "a local region named `remote-us` must stay LOCAL (provenance is the \
+         mesh.remote tag, not the locality prefix) — saw {seen:?}"
+    );
+    assert!(
+        !seen.contains("really-remote.local"),
+        "the tagged remote-cluster target must be excluded while a local exists — saw {seen:?}"
+    );
+}
+
+#[test]
 fn strict_locality_absent_source_treats_unlabeled_targets_as_local() {
-    // A target with NO locality at all is treated as local (not remote): it must
-    // remain eligible under strict mode while `remote-` targets are excluded.
+    // A target with NO `mesh.remote` tag is treated as local (not remote): it
+    // must remain eligible under strict mode while tagged remote targets are
+    // excluded.
     let up = strict_upstream(
         None,
         vec![
             target("unlabeled.local", None),
-            target("remote-only.local", Some("remote-cluster-east")),
+            remote_target("remote-only.local", Some("remote-cluster-east")),
         ],
     );
     let cache = LoadBalancerCache::new(&config(up));
@@ -662,8 +703,8 @@ fn non_strict_absent_source_returns_mixed_local_and_remote() {
         vec![
             target("local-a.local", Some("us-west/us-west-1/a")),
             target("local-b.local", Some("us-west/us-west-1/b")),
-            target("remote-a.local", Some("remote-cluster-east")),
-            target("remote-b.local", Some("remote-cluster-east/net2")),
+            remote_target("remote-a.local", Some("remote-cluster-east")),
+            remote_target("remote-b.local", Some("remote-cluster-east/net2")),
         ],
     );
     assert!(
@@ -691,7 +732,7 @@ fn strict_locality_present_source_unchanged_priority_tier() {
         vec![
             target("exact.local", Some("us-west/us-west-1/a")),
             target("same-zone.local", Some("us-west/us-west-1/b")),
-            target("remote.local", Some("remote-cluster-east")),
+            remote_target("remote.local", Some("remote-cluster-east")),
         ],
     );
     let cache = LoadBalancerCache::new(&config(up));
@@ -710,14 +751,14 @@ fn strict_locality_present_source_unchanged_priority_tier() {
 
 #[test]
 fn strict_locality_no_local_endpoints_falls_back_to_full_pool() {
-    // Strict ON, absent source locality, and EVERY target is remote: rather than
-    // black-holing, selection must widen to the full healthy pool so traffic
-    // still flows.
+    // Strict ON, absent source locality, and EVERY target is remote (tagged):
+    // rather than black-holing, selection must widen to the full healthy pool so
+    // traffic still flows.
     let up = strict_upstream(
         None,
         vec![
-            target("remote-a.local", Some("remote-cluster-east")),
-            target("remote-b.local", Some("remote-cluster-west")),
+            remote_target("remote-a.local", Some("remote-cluster-east")),
+            remote_target("remote-b.local", Some("remote-cluster-west")),
         ],
     );
     let cache = LoadBalancerCache::new(&config(up));

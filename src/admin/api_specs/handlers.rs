@@ -1203,11 +1203,20 @@ async fn validate_bundle(
     // Upstream
     if let Some(ref mut upstream) = bundle.upstream {
         upstream.normalize_fields();
+        // Spec import is an admin write, so reject mesh-projected fields too
+        // (the rejection is scoped to admin paths; runtime apply does not run it).
+        let mut upstream_errors = Vec::new();
         if let Err(e) = upstream.validate_fields() {
+            upstream_errors.extend(e);
+        }
+        if let Err(e) = upstream.validate_admin_only_fields() {
+            upstream_errors.extend(e);
+        }
+        if !upstream_errors.is_empty() {
             failures.push(ValidationFailure {
                 resource_type: "upstream",
                 id: upstream.id.clone(),
-                errors: e,
+                errors: upstream_errors,
             });
         }
     }

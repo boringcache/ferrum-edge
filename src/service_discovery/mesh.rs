@@ -197,6 +197,23 @@ impl super::ServiceDiscoverer for MeshServiceDiscoverer {
 
         let mut targets = Vec::new();
         let mut seen = HashSet::new();
+        // Local-cluster name for remote-provenance classification. Remote
+        // endpoints reach this discoverer via `merge_remote_endpoints_into_mesh`
+        // carrying `workload.cluster = Some(remote_cluster)` (stamped by the poll
+        // loop's `tag_remote_workloads`); we mark them with the explicit
+        // `mesh.remote` tag so strict local-first LB keys on real cross-cluster
+        // provenance, NOT a locality-string prefix. This uses the SAME
+        // `workload_is_remote` predicate as the egress local-only filter
+        // (`matched_local_service_workloads`), so "remote" never means two
+        // different things. Precondition: classification requires
+        // `MultiClusterConfig.local_cluster` to be set (a workload's `cluster`
+        // is "remote" only relative to a known local cluster name); with it
+        // unset, nothing is classified remote — consistent with the egress
+        // filter — so a strict multi-cluster deployment should set it.
+        let local_cluster = mesh
+            .multi_cluster
+            .as_ref()
+            .and_then(|mc| mc.local_cluster.as_deref());
         let matching_service_spiffe_ids: HashSet<&str> = mesh
             .workloads
             .iter()
@@ -214,6 +231,9 @@ impl super::ServiceDiscoverer for MeshServiceDiscoverer {
                 continue;
             };
 
+            let is_remote =
+                crate::modes::mesh::multicluster::workload_is_remote(workload, local_cluster);
+
             for address in &workload.addresses {
                 if address.is_empty() {
                     continue;
@@ -227,11 +247,18 @@ impl super::ServiceDiscoverer for MeshServiceDiscoverer {
                     continue;
                 }
 
+                let mut tags = Self::tags_for_target(service, workload, &selected_port);
+                if is_remote {
+                    tags.insert(
+                        crate::modes::mesh::multicluster::MESH_REMOTE_TAG.to_string(),
+                        "true".to_string(),
+                    );
+                }
                 targets.push(UpstreamTarget {
                     host: address.clone(),
                     port: selected_port.port,
                     weight: self.default_weight,
-                    tags: Self::tags_for_target(service, workload, &selected_port),
+                    tags,
                     locality: workload.locality.clone(),
                     path: None,
                 });
