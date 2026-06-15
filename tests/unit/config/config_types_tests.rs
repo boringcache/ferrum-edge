@@ -48,6 +48,7 @@ fn make_proxy(id: &str, listen_path: &str) -> Proxy {
         pool_http2_max_frame_size: None,
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
+        h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
         pool_tcp_keepalive_seconds: None,
         upstream_id: None,
@@ -336,6 +337,51 @@ fn upstream_port_override_connection_pool_http_fields_round_trip_through_serde()
     assert_eq!(round_tripped.http_max_requests_per_connection, Some(100));
     assert_eq!(round_tripped.http_idle_timeout_ms, Some(90_000));
     assert_eq!(round_tripped.h2_max_concurrent_streams, Some(500));
+}
+
+/// codex round-3 Finding 3: `H2UpgradePolicy` must deserialize from the
+/// operator-facing Istio spelling (`DO_NOT_UPGRADE`, SCREAMING_SNAKE_CASE, like
+/// the sibling `MeshSimpleLb`) — not the Rust variant name `DoNotUpgrade` — so a
+/// native/file mesh slice (`FERRUM_MESH_CONFIG_PROTOCOL=file`) or an xDS carrier
+/// authored with the Istio value parses. The snake alias is also accepted.
+#[test]
+fn h2_upgrade_policy_serde_uses_istio_screaming_names_with_snake_alias() {
+    use ferrum_edge::config::types::H2UpgradePolicy;
+
+    // Istio SCREAMING_SNAKE_CASE form (the canonical operator-facing spelling).
+    for (s, expected) in [
+        ("\"DEFAULT\"", H2UpgradePolicy::Default),
+        ("\"UPGRADE\"", H2UpgradePolicy::Upgrade),
+        ("\"DO_NOT_UPGRADE\"", H2UpgradePolicy::DoNotUpgrade),
+    ] {
+        let parsed: H2UpgradePolicy = serde_json::from_str(s).expect("parse SCREAMING form");
+        assert_eq!(parsed, expected, "SCREAMING form {s} must parse");
+    }
+
+    // snake_case aliases also accepted for ergonomics.
+    for (s, expected) in [
+        ("\"default\"", H2UpgradePolicy::Default),
+        ("\"upgrade\"", H2UpgradePolicy::Upgrade),
+        ("\"do_not_upgrade\"", H2UpgradePolicy::DoNotUpgrade),
+    ] {
+        let parsed: H2UpgradePolicy = serde_json::from_str(s).expect("parse snake alias");
+        assert_eq!(parsed, expected, "snake alias {s} must parse");
+    }
+
+    // Serialization emits the canonical SCREAMING form (carrier round-trip).
+    assert_eq!(
+        serde_json::to_value(H2UpgradePolicy::DoNotUpgrade).expect("serialize"),
+        serde_json::json!("DO_NOT_UPGRADE")
+    );
+
+    // The real file-config path: `MeshConnectionPoolHttp.h2_upgrade_policy`
+    // deserialized with the Istio value must land on `DoNotUpgrade`.
+    use ferrum_edge::modes::mesh::config::MeshConnectionPoolHttp;
+    let http: MeshConnectionPoolHttp = serde_json::from_value(serde_json::json!({
+        "h2_upgrade_policy": "DO_NOT_UPGRADE",
+    }))
+    .expect("MeshConnectionPoolHttp deserializes the Istio value");
+    assert_eq!(http.h2_upgrade_policy, Some(H2UpgradePolicy::DoNotUpgrade));
 }
 
 #[test]
@@ -835,6 +881,7 @@ fn test_unique_listen_paths_valid() {
                 pool_http2_max_frame_size: None,
                 pool_http2_max_concurrent_streams: None,
                 pool_http3_connections_per_backend: None,
+                h2_upgrade_policy: None,
                 pool_max_requests_per_connection: None,
                 pool_tcp_keepalive_seconds: Some(10),
                 upstream_id: None,
@@ -892,6 +939,7 @@ fn test_unique_listen_paths_valid() {
                 pool_http2_max_frame_size: None,
                 pool_http2_max_concurrent_streams: None,
                 pool_http3_connections_per_backend: None,
+                h2_upgrade_policy: None,
                 pool_max_requests_per_connection: None,
                 pool_tcp_keepalive_seconds: Some(10),
                 upstream_id: None,
@@ -965,6 +1013,7 @@ fn test_unique_listen_paths_duplicate() {
                 pool_http2_max_frame_size: None,
                 pool_http2_max_concurrent_streams: None,
                 pool_http3_connections_per_backend: None,
+                h2_upgrade_policy: None,
                 pool_max_requests_per_connection: None,
                 pool_tcp_keepalive_seconds: Some(10),
                 upstream_id: None,
@@ -1022,6 +1071,7 @@ fn test_unique_listen_paths_duplicate() {
                 pool_http2_max_frame_size: None,
                 pool_http2_max_concurrent_streams: None,
                 pool_http3_connections_per_backend: None,
+                h2_upgrade_policy: None,
                 pool_max_requests_per_connection: None,
                 pool_tcp_keepalive_seconds: Some(10),
                 upstream_id: None,

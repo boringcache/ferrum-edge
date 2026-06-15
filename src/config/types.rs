@@ -263,6 +263,59 @@ pub struct SubsetTrafficPolicy {
     pub passive_health_check: Option<PassiveHealthCheck>,
 }
 
+/// Whether plain-HTTP backend dispatch may upgrade to HTTP/2.
+///
+/// Mapped from Istio DestinationRule
+/// `connectionPool.http.h2UpgradePolicy`. Only the plain-HTTPS h1-vs-h2
+/// dispatch fork in `proxy_to_backend` consults this — it does NOT touch
+/// gRPC (always H2), HBONE, or mesh-mTLS transport selection. Projected
+/// onto `Proxy.h2_upgrade_policy` per target port.
+///
+/// All three Istio values are represented. `Default` and `None` (field
+/// absent) are treated identically by dispatch — probe-driven — but they are
+/// kept distinct in the typed model so an EXPLICIT port-level `DEFAULT` can
+/// CLEAR an inherited top-level `UPGRADE`/`DO_NOT_UPGRADE` for that port
+/// (operator explicitly chose probe-driven), whereas an OMITTED port-level
+/// value leaves the inherited slot untouched. See
+/// `apply_connection_pool_http_to_port_override` in `src/modes/mesh/mod.rs`.
+///
+/// **Serde names** match the operator-facing Istio surface, not Rust variant
+/// spelling: `SCREAMING_SNAKE_CASE` (`DEFAULT` / `UPGRADE` / `DO_NOT_UPGRADE`)
+/// like the sibling mesh enum `MeshSimpleLb`. This enum is serde-deserialized on
+/// the native/file mesh config path (`MeshConnectionPoolHttp.h2_upgrade_policy`
+/// for `FERRUM_MESH_CONFIG_PROTOCOL=file`) and round-tripped through the xDS
+/// `MeshSliceCarrier`, so a slice authored with the Istio value must
+/// deserialize. The lowercase/snake aliases (`do_not_upgrade`, etc.) are also
+/// accepted for ergonomics. The K8s/Istio translator parses the CRD string
+/// manually in `translate_h2_upgrade_policy` (not via serde), so this naming is
+/// independent of that path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum H2UpgradePolicy {
+    /// Istio `DEFAULT`: probe-driven. Behaves identically to "field absent"
+    /// at the dispatch fork, but as an EXPLICIT port-level value it clears an
+    /// inherited top-level `Upgrade`/`DoNotUpgrade` (back to probe-driven for
+    /// that port). Carried (not collapsed to `None` at parse) so absent and
+    /// explicit-`DEFAULT` are distinguishable in port-level merge semantics.
+    #[serde(alias = "default")]
+    Default,
+    /// Istio `UPGRADE`: prefer HTTP/2 to the backend. Used as a hint when
+    /// the capability registry has not yet classified the target
+    /// (`Unknown` → try direct-H2 instead of defaulting to reqwest/H1).
+    /// Stays fail-safe: a target proven `Unsupported` (e.g. ALPN
+    /// negotiated H1) is NOT forced onto H2.
+    #[serde(alias = "upgrade")]
+    Upgrade,
+    /// Istio `DO_NOT_UPGRADE`: force the HTTP/1.1 path (reqwest). Skips the
+    /// direct-H2 pool even when the capability registry marks the target
+    /// `h2_tls` Supported, and restricts the reqwest client's ALPN to
+    /// `http/1.1` so the backend cannot ALPN-negotiate h2 either. (A
+    /// backend-TLS SNI override still requires direct-H2 because reqwest
+    /// cannot apply a per-request SNI — that case wins and is documented.)
+    #[serde(alias = "do_not_upgrade")]
+    DoNotUpgrade,
+}
+
 /// Per-destination-port traffic policy overrides on an upstream.
 ///
 /// Populated from an Istio DestinationRule's `trafficPolicy.portLevelSettings[]`
@@ -364,6 +417,22 @@ pub struct UpstreamPortOverride {
     /// its own pool rather than sharing a connection with another port.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<BackendTlsConfig>,
+    /// Per-port HTTP/2 upgrade policy, mapped from DestinationRule
+    /// `connectionPool.http.h2UpgradePolicy`. Projected onto the per-target
+    /// effective proxy's `h2_upgrade_policy` and consulted at the
+    /// plain-HTTPS H2-vs-H1 dispatch fork. `DEFAULT`/absent leaves probe-driven
+    /// behavior unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub h2_upgrade_policy: Option<H2UpgradePolicy>,
+    /// Per-port retry-count cap, mapped from DestinationRule
+    /// `connectionPool.http.maxRetries`. Interpreted as an upper bound on the
+    /// per-request `Proxy.retry.max_retries` (NOT Envoy's cluster-wide
+    /// outstanding-retry budget — see `docs/mesh.md`). Applied via
+    /// `cap_proxy_retry_for_target` once the dispatch target port is known:
+    /// effective `max_retries = min(existing, this)`; never increases retries
+    /// and never synthesizes a retry policy when the proxy has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_retries: Option<u32>,
 }
 
 /// Per-target TCP keepalive override. Mirrors Istio's
@@ -419,6 +488,8 @@ pub struct ResolvedPortOverride {
     pub http_idle_timeout_ms: Option<u64>,
     pub h2_max_concurrent_streams: Option<u32>,
     pub tls: Option<BackendTlsConfig>,
+    pub h2_upgrade_policy: Option<H2UpgradePolicy>,
+    pub max_retries: Option<u32>,
 }
 
 impl ResolvedPortOverride {
@@ -439,6 +510,8 @@ impl ResolvedPortOverride {
             http_idle_timeout_ms: value.http_idle_timeout_ms,
             h2_max_concurrent_streams: value.h2_max_concurrent_streams,
             tls,
+            h2_upgrade_policy: value.h2_upgrade_policy,
+            max_retries: value.max_retries,
         };
         (!resolved.is_empty()).then_some(resolved)
     }
@@ -455,6 +528,8 @@ impl ResolvedPortOverride {
             && self.http_idle_timeout_ms.is_none()
             && self.h2_max_concurrent_streams.is_none()
             && self.tls.is_none()
+            && self.h2_upgrade_policy.is_none()
+            && self.max_retries.is_none()
     }
 }
 
@@ -1661,6 +1736,25 @@ pub struct Proxy {
     /// When set, overrides the global `FERRUM_HTTP3_CONNECTIONS_PER_BACKEND` default.
     #[serde(default)]
     pub pool_http3_connections_per_backend: Option<usize>,
+    /// Istio DestinationRule `connectionPool.http.h2UpgradePolicy`. Controls
+    /// the plain-HTTPS backend HTTP/1.1-vs-HTTP/2 dispatch fork in
+    /// `proxy_to_backend`: `DoNotUpgrade` forces the reqwest/H1 path even when
+    /// the capability registry marks the target H2-capable; `Upgrade` prefers
+    /// direct-H2 (and treats an `Unknown` capability as a hint to try H2
+    /// instead of defaulting to reqwest). `Default`/`None` leaves the
+    /// probe-driven behavior unchanged.
+    ///
+    /// **Derived-only — never an input field.** It is projected at dispatch
+    /// time by `resolve_effective_proxy_for_target` from the DestinationRule
+    /// `Upstream.port_overrides[port].h2_upgrade_policy` slot, exactly like
+    /// `resolved_tls` / `dispatch_port_overrides`. It is `#[serde(skip)]` so
+    /// the file/admin/API config surface (and the SQL/Mongo loaders, which
+    /// never persist a column for it) can neither accept nor emit it — an
+    /// operator value would otherwise be silently dropped on reload. The DB
+    /// loaders therefore always start it at `None`. Does NOT affect gRPC
+    /// (always H2) or HBONE/mesh-mTLS transport selection.
+    #[serde(skip)]
+    pub h2_upgrade_policy: Option<H2UpgradePolicy>,
     /// Istio DestinationRule `connectionPool.http.maxRequestsPerConnection`
     /// (wire-projected). Populated at admit time directly, and at dispatch
     /// time by `resolve_effective_proxy_for_target` from
@@ -3322,6 +3416,28 @@ impl Proxy {
         if self.backend_scheme.is_none() && !self.dispatch_kind.is_stream() {
             self.backend_scheme = Some(scheme);
         }
+    }
+
+    /// Whether the reqwest-backed HTTP backend client for this (effective)
+    /// proxy must be restricted to HTTP/1.1 on the wire — i.e. the
+    /// DestinationRule `connectionPool.http.h2UpgradePolicy` resolved to
+    /// `DO_NOT_UPGRADE`.
+    ///
+    /// `DoNotUpgrade` first makes the dispatch fork skip the direct-H2 pool
+    /// (`should_dispatch_direct_h2`), routing the request through the reqwest
+    /// pool. But for a TLS backend that advertises h2, the reqwest client must
+    /// ALSO not ALPN-negotiate h2, or `DO_NOT_UPGRADE` would not actually
+    /// prevent HTTP/2. So the reqwest client built for such a dial restricts
+    /// its rustls ALPN to `http/1.1` (and additionally sets reqwest's
+    /// `http1_only()` preference). Because that produces a DIFFERENT client
+    /// from the default (h2-capable) one, this discriminator is part of the
+    /// reqwest pool key — a protocol/ALPN distinction (legitimate pool-key
+    /// content per `.claude/rules/proxy-protocols.md`), NOT a policy field.
+    ///
+    /// `Default` / `Upgrade` / absent all return `false` (probe-driven; the
+    /// h2c-plaintext case is already H1-only via reqwest's lack of h2c).
+    pub fn forces_backend_http1_only(&self) -> bool {
+        matches!(self.h2_upgrade_policy, Some(H2UpgradePolicy::DoNotUpgrade))
     }
 
     /// Normalize proxy fields to their canonical in-memory form.

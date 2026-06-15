@@ -1218,6 +1218,7 @@ fn east_west_gateway_proxy(gateway: &EastWestGateway, listen_port: u16) -> Proxy
         pool_http2_max_frame_size: None,
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
+        h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
         upstream_id: None,
         upstream_subset: None,
@@ -1471,6 +1472,7 @@ fn east_west_service_proxy(
         pool_http2_max_frame_size: None,
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
+        h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
         upstream_id: Some(upstream_id.to_string()),
         upstream_subset: None,
@@ -2356,6 +2358,7 @@ fn mesh_inbound_loopback_proxy_to(
         pool_http2_max_frame_size: None,
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
+        h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
         upstream_id: None,
         upstream_subset: None,
@@ -2433,6 +2436,7 @@ pub(crate) fn mesh_inbound_hbone_relay_proxy(host: &str, port: u16) -> Proxy {
         pool_http2_max_frame_size: None,
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
+        h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
         upstream_id: None,
         upstream_subset: None,
@@ -2853,6 +2857,7 @@ pub(crate) fn mesh_outbound_tcp_relay_proxy(
         pool_http2_max_frame_size: None,
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
+        h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
         upstream_id: Some(upstream_id.to_string()),
         upstream_subset: None,
@@ -3040,6 +3045,7 @@ fn mesh_outbound_route_proxy(
         pool_http2_max_frame_size: None,
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
+        h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
         upstream_id: Some(upstream_id.to_string()),
         upstream_subset: None,
@@ -3748,9 +3754,28 @@ fn apply_traffic_policy_to_port_override(
 
 /// Project an HTTP connection-pool overlay onto a per-port slot.
 ///
-/// Each field is overlaid independently — `None` leaves the existing slot
-/// value untouched so a per-port partial overlay can layer over a top-level
-/// fan-out without clearing fields the operator did not respecify.
+/// Each field is overlaid independently — `None` (field absent) leaves the
+/// existing slot value untouched so a per-port partial overlay can layer over
+/// a top-level fan-out without clearing fields the operator did not respecify.
+///
+/// **Field-level merge — a known divergence from Istio.** Istio treats a
+/// matching `portLevelSettings` entry as a COMPLETE REPLACEMENT of the
+/// destination-level `connectionPool` for that port; Ferrum instead does a
+/// per-field merge (top-level fan-out, then this additive per-port overlay).
+/// This is pre-existing and CONSISTENT across every `connectionPool` knob
+/// (`maxRequestsPerConnection` / `idleTimeout` / `http2MaxRequests` /
+/// `maxConnections` / `tcpKeepalive`), so unifying it to complete-replacement
+/// is a separate uniform follow-up (it would change existing
+/// idleTimeout/http2MaxRequests behavior + their tests). It is documented in
+/// `docs/mesh.md`.
+///
+/// `h2_upgrade_policy` carries an explicit `H2UpgradePolicy::Default` rather
+/// than collapsing Istio's `DEFAULT` to `None`. That distinction matters HERE:
+/// a port-level explicit `Some(Default)` SETS the slot to `Default`, which
+/// clears an inherited top-level `Upgrade`/`DoNotUpgrade` for that port (the
+/// operator explicitly chose probe-driven). An OMITTED port-level value
+/// (`None`) leaves the inherited slot untouched. The effective-proxy/dispatch
+/// path treats `Default` and `None` identically (probe-driven).
 fn apply_connection_pool_http_to_port_override(
     slot: &mut UpstreamPortOverride,
     http: &crate::modes::mesh::config::MeshConnectionPoolHttp,
@@ -3763,6 +3788,14 @@ fn apply_connection_pool_http_to_port_override(
     }
     if let Some(max_streams) = http.http2_max_requests {
         slot.h2_max_concurrent_streams = Some(max_streams);
+    }
+    // An explicit `Some(Default)` (port-level `DEFAULT`) overwrites an
+    // inherited `Upgrade`/`DoNotUpgrade`; absent (`None`) leaves it untouched.
+    if let Some(policy) = http.h2_upgrade_policy {
+        slot.h2_upgrade_policy = Some(policy);
+    }
+    if let Some(max_retries) = http.max_retries {
+        slot.max_retries = Some(max_retries);
     }
 }
 
@@ -4785,6 +4818,7 @@ fn egress_gateway_proxy(
         pool_http2_max_frame_size: None,
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
+        h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
         upstream_id: Some(upstream_id.to_string()),
         upstream_subset: None,
@@ -4873,6 +4907,7 @@ fn stream_egress_gateway_proxy(
         pool_http2_max_frame_size: None,
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
+        h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
         upstream_id: Some(upstream_id.to_string()),
         upstream_subset: None,
