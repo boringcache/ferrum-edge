@@ -59,20 +59,39 @@ The capture programs live in the `ebpf/` Cargo workspace (`ferrum-ebpf`, a
 `ferrum-ebpf-common`. The userspace aya loader (`src/ebpf/loader.rs`) and every
 BPF map read are gated behind `#[cfg(all(feature = "ebpf", target_os = "linux"))]`.
 
-> **What the published images ship.** The Docker Hub / GHCR release images
-> (`latest`, `v*`) are built from `Dockerfile.release` with
-> `--features cloud-secrets`. That Dockerfile has **no `ebpf-builder` stage, no
-> compiled ELF, and does not set `FERRUM_NODE_AGENT_BPF_ELF_PATH`** — so the
-> released node-agent always selects the mock backend: it attaches nothing,
-> captures nothing, sets
-> `ferrum_mesh_node_topology_degraded{reason="ebpf_feature_disabled"}=1`, and
-> logs a loud startup warning. Real capture ships **only** in an image you build
-> yourself from the root `Dockerfile` with `FEATURES=...,ebpf` (below).
-> Publishing a Linux capture image from the release pipeline is a follow-up.
+> **What the published images ship.** Two image variants are published per
+> release tag:
+>
+> - **Default (mock).** `ferrumedge/ferrum-edge:<tag>` /
+>   `ghcr.io/ferrum-edge/ferrum-edge:<tag>` (multi-platform: linux/amd64,
+>   linux/arm64, plus the macOS/Windows binaries) are built from
+>   `Dockerfile.release` with `--features cloud-secrets`. That Dockerfile has
+>   **no `ebpf-builder` stage, no compiled ELF, and does not set
+>   `FERRUM_NODE_AGENT_BPF_ELF_PATH`** — so this node-agent always selects the
+>   mock backend: it attaches nothing, captures nothing, sets
+>   `ferrum_mesh_node_topology_degraded{reason="ebpf_feature_disabled"}=1`, and
+>   logs a loud startup warning. The default image is unchanged.
+> - **`-ebpf` (real capture, Linux-only).**
+>   `ferrumedge/ferrum-edge:<tag>-ebpf` /
+>   `ghcr.io/ferrum-edge/ferrum-edge:<tag>-ebpf` are built **from source** by
+>   the release pipeline's `docker-ebpf` job using the root `Dockerfile` with
+>   `--build-arg FEATURES=cloud-secrets,ebpf`, which compiles in the aya loader
+>   **and** embeds the compiled `ferrum-ebpf` BPF ELF (see "Building the capture
+>   image" below). It is **Linux-only** (linux/amd64 + linux/arm64; the aya
+>   kernel loader compiles only on Linux) and requires a node kernel **≥ 5.7**
+>   with cgroup v2 and the capabilities in
+>   [`docs/node_agent_security.md`](node_agent_security.md)
+>   (`CAP_BPF`/`CAP_NET_ADMIN`/`CAP_PERFMON`, plus `CAP_SYS_ADMIN` on 5.7.x).
+>   On an older kernel it still starts but the kernel probe degrades to the same
+>   mock backend (gauge + warning, no capture). The `-ebpf` variant is published
+>   independently of the GitHub release, so a variant build failure never blocks
+>   the default image or the binary assets.
 
 **Building the capture image.** The compiled BPF ELF and the `--features ebpf`
 binary are produced by the root `Dockerfile` (also exercised by the
-`gateway-api-conformance` CI job's `docker build .`):
+`gateway-api-conformance` CI job's `docker build .`, and published as the
+`-ebpf` release variant by the `docker-ebpf` job in
+[`.github/workflows/release.yml`](../.github/workflows/release.yml)):
 
 - The `ebpf-builder` stage installs nightly + `rust-src` + `bpf-linker` and runs
   `cargo +nightly build -p ferrum-ebpf --target bpfel-unknown-none -Z build-std=core --release`
