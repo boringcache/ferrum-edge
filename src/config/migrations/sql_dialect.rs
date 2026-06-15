@@ -73,6 +73,9 @@ impl V001SqlBuilder {
     }
 
     pub(super) async fn apply(&self, pool: &AnyPool) -> Result<(), anyhow::Error> {
+        // MySQL auto-commits DDL, so a mid-V001 failure cannot be rolled back.
+        // Keep every statement idempotent and only let MigrationRunner record
+        // V001 after this full apply path returns successfully.
         self.enable_sqlite_foreign_keys(pool).await?;
         self.create_tables(pool).await?;
         self.create_indexes(pool).await?;
@@ -185,7 +188,7 @@ impl V001SqlBuilder {
             "CREATE INDEX IF NOT EXISTS idx_proxies_api_spec_id ON proxies (api_spec_id)",
             "CREATE INDEX IF NOT EXISTS idx_plugin_configs_api_spec_id ON plugin_configs (api_spec_id)",
             "CREATE INDEX IF NOT EXISTS idx_upstreams_api_spec_id ON upstreams (api_spec_id)",
-            "CREATE INDEX IF NOT EXISTS idx_audit_events_namespace_ts ON audit_events (namespace, ts)",
+            "CREATE INDEX IF NOT EXISTS idx_audit_events_namespace_ts_id ON audit_events (namespace, ts, id)",
             "CREATE INDEX IF NOT EXISTS idx_audit_events_actor ON audit_events (actor)",
             "CREATE INDEX IF NOT EXISTS idx_audit_events_resource_type ON audit_events (resource_type)",
         ];
@@ -284,7 +287,7 @@ impl V001SqlBuilder {
                 subsets TEXT,
                 backend_tls_client_cert_path VARCHAR(2048),
                 backend_tls_client_key_path VARCHAR(2048),
-                backend_tls_verify_server_cert TINYINT NOT NULL DEFAULT 1,
+                backend_tls_verify_server_cert INTEGER NOT NULL DEFAULT 1,
                 backend_tls_server_ca_cert_path VARCHAR(2048),
                 backend_tls_sni VARCHAR(255) COLLATE utf8mb4_0900_as_cs,
                 backend_tls_san_allow_list MEDIUMTEXT,
@@ -774,6 +777,20 @@ mod tests {
         assert!(
             sql.contains("backend_tls_san_allow_list MEDIUMTEXT"),
             "SAN allow-list JSON can exceed MySQL TEXT when every allowed entry is near the per-entry cap"
+        );
+    }
+
+    #[test]
+    fn test_mysql_upstreams_tls_verify_column_matches_reader_type() {
+        let builder = V001SqlBuilder::new("mysql");
+        let sql = builder.create_upstreams_sql();
+        assert!(
+            sql.contains("backend_tls_verify_server_cert INTEGER NOT NULL DEFAULT 1"),
+            "upstream TLS verify flag must match row_to_upstream's i32 reader"
+        );
+        assert!(
+            !sql.contains("backend_tls_verify_server_cert TINYINT"),
+            "upstream TLS verify flag must not use a narrower MySQL-only type"
         );
     }
 
