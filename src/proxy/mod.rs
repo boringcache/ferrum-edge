@@ -1867,55 +1867,62 @@ fn streaming_dispatch_should_defer(
             .is_some_and(|cb| cb.failure_status_codes.contains(&response_status))
 }
 
-/// Releases a gRPC streaming **HALF_OPEN probe's** circuit-breaker slot at
-/// **request-upload termination** rather than response-header time, recording a
-/// NEUTRAL outcome (slot release only, no health change).
+/// Owns the gRPC **streaming** circuit-breaker outcome, settling it at the join of
+/// request-upload termination and response-body completion so a streaming RPC is
+/// classified correctly without pinning a HALF_OPEN probe slot (#1649 item 3,
+/// building on the #1640 upload-termination machinery).
 ///
-/// #1649 item 3: the probe's real backend-health outcome is no longer decided
-/// here from the response-header status — a streaming RPC can send `2xx` headers
-/// then stall, reset mid-body, or carry a non-OK `grpc-status` trailer, none of
-/// which are visible at header time. That outcome is now recorded once, at
-/// response-**body** completion, by the deferred backend-dispatch outcome on the
-/// streaming body (`with_deferred_backend_dispatch_outcome` with
-/// `skip_circuit_breaker_record = false`), as a non-probe — see
-/// `record_deferred_backend_dispatch` / `record_backend_outcome_inner`, which
-/// already classify the grpc-trailer-mapped status and the terminal body error
-/// class and honor the late client-upload-overflow flag (NEUTRAL).
+/// A streaming RPC has three signals that arrive at different times: the response
+/// can send `2xx` headers then stall / reset / carry a non-OK `grpc-status`
+/// trailer (response-body completion), the client upload can overflow
+/// `max_grpc_recv_size_bytes` at any point (the shared `request_body_exceeded`
+/// flag), and either of upload or response can finish first (bidi /
+/// client-streaming). The recorder reconciles them:
 ///
-/// This recorder therefore only owns the **probe-slot release**, decoupled from
-/// the health outcome. Keeping the release keyed on upload termination (not
-/// response-body completion) preserves the #1640 timing: the single HALF_OPEN
-/// slot is freed as soon as the client finishes uploading, never pinned for the
-/// duration of a long-lived server/bidi response stream. The release happens
-/// **exactly once**, at the join of two events:
-///  1. `note_headers_arrived` — response headers are known (header time), set by
-///     the proxy handler before response hooks run.
-///  2. `on_upload_terminated` — the request upload reached a terminal state
-///     (clean EOF / overflow abort / stream drop), fired from the request body's
-///     `Drop` via [`grpc_proxy::GrpcUploadTerminationObserver`].
+///  * **Probe-slot release** (HALF_OPEN only) happens at the join of
+///    `headers_seen` + `upload_terminated` (or the post-header upload guard) —
+///    the #1640 timing, so the single slot is freed as soon as the upload ends
+///    and never pinned for a long-lived response stream. It is a NEUTRAL release
+///    (`record_neutral`), decoupled from the health outcome.
+///  * **A backend FAILURE** (post-wire body error / non-OK grpc-status trailer)
+///    is recorded as soon as the response terminates — a real failure should trip
+///    promptly and need not wait for the upload — UNLESS the client upload
+///    already overflowed (client-side → NEUTRAL).
+///  * **A clean SUCCESS** is deferred until upload termination so the overflow
+///    flag is final: a backend can legally complete `200`/`grpc-status: 0` before
+///    the client finishes uploading, and a late overflow must not be able to
+///    falsely heal a HALF_OPEN breaker.
 ///
-/// Whichever event happens *second* performs the release (a `released` CAS keeps
-/// it exactly-once). `headers_seen` doubles as the activation gate: until the
-/// handler calls `note_headers_arrived` the recorder is inert, so an overflow
-/// detected BEFORE headers (which surfaces as `GrpcProxyError::ResourceExhausted`
-/// and releases the slot NEUTRAL via the handler's error arm) is not
-/// double-released here. A bounded post-header upload timer releases the slot
-/// (NEUTRAL) if a client keeps the upload open past the route/client timeout, so
-/// HALF_OPEN probe slots cannot be pinned by an unended bidi/client-streaming
-/// upload.
+/// `health_recorded` is a single exactly-once CAS shared by every settle path
+/// (eager known-failure record at header time via `mark_health_recorded`, the
+/// prompt-failure path, the clean-success join, and the post-header guard's
+/// NEUTRAL fallback). The response outcome is delivered by
+/// [`body::GrpcResponseTerminalObserver`]; upload termination by
+/// [`grpc_proxy::GrpcUploadTerminationObserver`].
 struct GrpcStreamingProbeRecorder {
     cb: Arc<crate::circuit_breaker::CircuitBreaker>,
     is_half_open_probe: bool,
+    /// Shared with `GrpcBody::Streaming.exceeded`: a late client-upload overflow.
+    /// Re-read at every settle point so an overflow that trips after a clean
+    /// response is still classified NEUTRAL.
+    request_body_exceeded: Arc<std::sync::atomic::AtomicBool>,
     headers_seen: std::sync::atomic::AtomicBool,
     upload_terminated: std::sync::atomic::AtomicBool,
-    released: std::sync::atomic::AtomicBool,
+    /// Set when the response body terminated CLEAN (no failure outcome). The
+    /// clean success is then recorded at the upload-termination join.
+    response_clean: std::sync::atomic::AtomicBool,
+    /// The clean response's effective status (grpc-trailer-mapped), captured for
+    /// the deferred clean-success record.
+    clean_response_status: std::sync::atomic::AtomicU16,
+    /// HALF_OPEN probe-slot release (NEUTRAL), exactly-once.
+    slot_released: std::sync::atomic::AtomicBool,
+    /// Backend-health outcome (success / failure / neutral), exactly-once across
+    /// all settle paths.
+    health_recorded: std::sync::atomic::AtomicBool,
     /// Post-header upload guard window in milliseconds, or `None` when no guard
-    /// applies. Stored as a duration rather than an absolute deadline so the
-    /// guard is measured from response-header arrival (in
-    /// `start_post_header_upload_timeout`) instead of from dispatch start —
-    /// otherwise a backend that returns headers slowly would burn the window
-    /// before the upload phase even begins and a healthy probe slot could be
-    /// released prematurely.
+    /// applies. Measured from response-header arrival (in
+    /// `start_post_header_upload_timeout`), not dispatch start, so a slow-header
+    /// backend does not consume the window.
     post_header_upload_timeout_ms: Option<u64>,
 }
 
@@ -1923,44 +1930,79 @@ impl GrpcStreamingProbeRecorder {
     fn new(
         cb: Arc<crate::circuit_breaker::CircuitBreaker>,
         is_half_open_probe: bool,
+        request_body_exceeded: Arc<std::sync::atomic::AtomicBool>,
         post_header_upload_timeout_ms: Option<u64>,
     ) -> Self {
         Self {
             cb,
             is_half_open_probe,
+            request_body_exceeded,
             headers_seen: std::sync::atomic::AtomicBool::new(false),
             upload_terminated: std::sync::atomic::AtomicBool::new(false),
-            released: std::sync::atomic::AtomicBool::new(false),
+            response_clean: std::sync::atomic::AtomicBool::new(false),
+            clean_response_status: std::sync::atomic::AtomicU16::new(0),
+            slot_released: std::sync::atomic::AtomicBool::new(false),
+            health_recorded: std::sync::atomic::AtomicBool::new(false),
             post_header_upload_timeout_ms,
         }
     }
 
-    /// Activate the recorder once response headers are known. Releases the probe
-    /// slot now if the upload has already terminated; otherwise starts a
-    /// post-header upload guard so a client cannot pin the HALF_OPEN probe slot
-    /// indefinitely by keeping a bidi/client-streaming upload open.
+    /// Activate the recorder once response headers are known. Settles the probe
+    /// slot / clean success if their other join input is already present, and
+    /// starts the post-header upload guard.
     fn note_headers_arrived(self: &Arc<Self>) {
         self.headers_seen.store(true, Ordering::Release);
         self.start_post_header_upload_timeout();
-        self.try_release();
+        self.try_release_slot();
+        self.try_record_clean_success();
     }
 
-    /// Release the probe slot (NEUTRAL) exactly once, when BOTH the headers are
-    /// known AND the upload has terminated. The `released` CAS makes the two
-    /// callers (`note_headers_arrived` / `on_upload_terminated`) race-safe. The
-    /// backend-health outcome itself is recorded separately, at response-body
-    /// completion, by the deferred backend-dispatch outcome (as a non-probe).
-    fn try_release(&self) {
-        if !self.headers_seen.load(Ordering::Acquire) {
+    /// Mark the breaker outcome as already recorded (used by the eager
+    /// known-failure-status header-time path) so no settle path double-records.
+    fn mark_health_recorded(&self) {
+        self.health_recorded.store(true, Ordering::Release);
+    }
+
+    /// Release the HALF_OPEN probe slot (NEUTRAL) at the join of headers + upload
+    /// termination, exactly once. Decoupled from the health outcome.
+    fn try_release_slot(&self) {
+        if !self.is_half_open_probe {
             return;
         }
-        if !self.upload_terminated.load(Ordering::Acquire) {
+        if !self.headers_seen.load(Ordering::Acquire)
+            || !self.upload_terminated.load(Ordering::Acquire)
+        {
             return;
         }
-        if self.released.swap(true, Ordering::AcqRel) {
+        if self.slot_released.swap(true, Ordering::AcqRel) {
             return;
         }
-        self.cb.record_neutral(self.is_half_open_probe);
+        self.cb.record_neutral(true);
+    }
+
+    /// Record a clean SUCCESS at the join of a clean response + upload
+    /// termination, re-checking the overflow flag (a late overflow → NEUTRAL).
+    fn try_record_clean_success(&self) {
+        if !self.response_clean.load(Ordering::Acquire)
+            || !self.upload_terminated.load(Ordering::Acquire)
+        {
+            return;
+        }
+        if self.request_body_exceeded.load(Ordering::Acquire) {
+            // Late client-upload overflow after a clean response → NEUTRAL.
+            self.health_recorded.store(true, Ordering::Release);
+            return;
+        }
+        if self.health_recorded.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        backend_dispatch::apply_circuit_breaker_outcome(
+            &self.cb,
+            self.clean_response_status.load(Ordering::Acquire),
+            false,
+            None,
+            false,
+        );
     }
 
     fn start_post_header_upload_timeout(self: &Arc<Self>) {
@@ -1970,44 +2012,88 @@ impl GrpcStreamingProbeRecorder {
         if self.upload_terminated.load(Ordering::Acquire) {
             return;
         }
-        // Measure the guard window from response-header arrival (now), because
-        // this method runs from `note_headers_arrived` when the headers are first
-        // known. Anchoring to dispatch start instead would let the time the
-        // backend spent producing headers consume the window, so a healthy
-        // probe behind a slow-header backend could have its slot released
-        // prematurely the instant headers arrive.
         let Some(timeout) = grpc_post_header_upload_guard_duration(timeout_ms) else {
-            self.release_neutral_if_upload_still_open();
+            self.settle_neutral_if_upload_still_open();
             return;
         };
         let recorder = Arc::clone(self);
         std::mem::drop(tokio::spawn(async move {
             tokio::time::sleep(timeout).await;
-            recorder.release_neutral_if_upload_still_open();
+            recorder.settle_neutral_if_upload_still_open();
         }));
     }
 
-    fn release_neutral_if_upload_still_open(&self) {
+    /// Post-header upload guard: if the upload has not terminated by the deadline,
+    /// release the probe slot and settle the health outcome NEUTRAL. A clean
+    /// success cannot be confirmed without upload termination (overflow check),
+    /// and any backend FAILURE already recorded health promptly (so the
+    /// `health_recorded` CAS no-ops here).
+    fn settle_neutral_if_upload_still_open(&self) {
         if !self.headers_seen.load(Ordering::Acquire) {
             return;
         }
         if self.upload_terminated.load(Ordering::Acquire) {
             return;
         }
-        if self.released.swap(true, Ordering::AcqRel) {
+        // Release the slot the unended upload is pinning (NEUTRAL), once.
+        if self.is_half_open_probe && !self.slot_released.swap(true, Ordering::AcqRel) {
+            self.cb.record_neutral(true);
+        }
+        if self.health_recorded.swap(true, Ordering::AcqRel) {
             return;
         }
         warn!(
-            "gRPC streaming HALF_OPEN probe upload did not terminate before its deadline; releasing probe slot (neutral)",
+            "gRPC streaming probe upload did not terminate before its deadline; settling neutral",
         );
-        self.cb.record_neutral(self.is_half_open_probe);
     }
 }
 
 impl crate::proxy::grpc_proxy::GrpcUploadTerminationObserver for GrpcStreamingProbeRecorder {
     fn on_upload_terminated(&self) {
         self.upload_terminated.store(true, Ordering::Release);
-        self.try_release();
+        self.try_release_slot();
+        self.try_record_clean_success();
+    }
+}
+
+impl crate::proxy::body::GrpcResponseTerminalObserver for GrpcStreamingProbeRecorder {
+    fn on_response_terminal(
+        &self,
+        response_status: u16,
+        connection_error: bool,
+        error_class: Option<retry::ErrorClass>,
+    ) {
+        // A client-upload overflow (set before/at the terminating reset) is a
+        // client-side size violation → NEUTRAL, never a backend failure.
+        if self.request_body_exceeded.load(Ordering::Acquire) {
+            self.health_recorded.store(true, Ordering::Release);
+            return;
+        }
+        if backend_dispatch::circuit_breaker_outcome_is_failure(
+            &self.cb.config().failure_status_codes,
+            response_status,
+            connection_error,
+            error_class,
+        ) {
+            // A real backend failure (post-wire body error / non-OK grpc-status
+            // trailer) trips promptly — no need to wait for upload termination.
+            if !self.health_recorded.swap(true, Ordering::AcqRel) {
+                backend_dispatch::apply_circuit_breaker_outcome(
+                    &self.cb,
+                    response_status,
+                    connection_error,
+                    error_class,
+                    false,
+                );
+            }
+            return;
+        }
+        // Clean response: defer the SUCCESS to upload termination so a late
+        // overflow can't falsely heal the breaker.
+        self.clean_response_status
+            .store(response_status, Ordering::Release);
+        self.response_clean.store(true, Ordering::Release);
+        self.try_record_clean_success();
     }
 }
 
@@ -12248,9 +12334,17 @@ async fn handle_proxy_request_inner(
                 // single slot release. A CLOSED-state (non-probe) request has no
                 // slot to settle.
                 let body_size_exceeded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                // Build the recorder whenever a breaker is configured (not just for
+                // HALF_OPEN probes): on the fully-streaming path it owns the gRPC
+                // circuit-breaker outcome, settling it at the join of request-upload
+                // termination and response-body completion so a clean SUCCESS waits
+                // for the overflow flag to be final while a body FAILURE trips
+                // promptly (#1649 item 3 / #1640). `is_half_open_probe` controls
+                // only the probe-slot release; CLOSED-state requests still defer the
+                // health outcome to the join.
                 let upload_observer: Option<Arc<dyn grpc_proxy::GrpcUploadTerminationObserver>> =
-                    match (grpc_cb_probe_slot, proxy.circuit_breaker.as_ref()) {
-                        (true, Some(cb_config)) => {
+                    match proxy.circuit_breaker.as_ref() {
+                        Some(cb_config) => {
                             let cb = state.circuit_breaker_cache.get_or_create(
                                 &proxy.id,
                                 grpc_final_cb_key.as_deref(),
@@ -12268,6 +12362,7 @@ async fn handle_proxy_request_inner(
                             let recorder = Arc::new(GrpcStreamingProbeRecorder::new(
                                 cb,
                                 grpc_cb_probe_slot,
+                                Arc::clone(&body_size_exceeded),
                                 post_header_upload_timeout_ms,
                             ));
                             grpc_streaming_probe_recorder = Some(Arc::clone(&recorder));
@@ -12278,11 +12373,9 @@ async fn handle_proxy_request_inner(
                                 recorder;
                             Some(observer)
                         }
-                        // Non-probe (CLOSED state) or no breaker: no HALF_OPEN
-                        // probe slot to settle. The backend-health outcome is
-                        // recorded at body completion via the deferred dispatch
-                        // outcome, like every streaming response.
-                        _ => None,
+                        // No breaker: nothing to record. The deferred dispatch
+                        // outcome still records passive-health + least-latency.
+                        None => None,
                     };
                 backend_admission_permits = match backend_dispatch::run_backend_admission_plugins(
                     backend_admission_plugins.as_ref(),
@@ -12751,19 +12844,19 @@ async fn handle_proxy_request_inner(
                     grpc_streaming.status,
                 );
                 // #1649 item 3: a healthy 2xx streaming header defers the circuit
-                // breaker to body completion (the real grpc-status trailer / a
-                // post-wire body error decides it there). A KNOWN failure status
-                // at header time (a trailers-only error mapped to 5xx, or a
-                // sandwiched LB 5xx) is recorded EAGERLY now so the breaker trips
-                // promptly instead of waiting out a possibly long-lived/stalled
-                // upload (matches `grpc_streaming_closed_state_backend_failure_
-                // trips_breaker_at_header_time`). The probe slot was already
-                // released by `finalize_*` above, so the eager record is a
-                // non-probe; the deferred dispatch then skips the CB.
-                // A gRPC Trailers-Only response (grpc-status in headers, END_STREAM
-                // at the header block) is already end-of-stream: its outcome is
-                // known now and its body is dropped without being polled, so record
-                // it eagerly rather than deferring (#1649 round-2 finding C).
+                // breaker — for the fully-streaming path the recorder settles it at
+                // the upload-termination + response-completion join (overflow-aware,
+                // #1640), and for the buffered-request path the deferred dispatch
+                // records it at response completion. A KNOWN failure status at
+                // header time (a trailers-only error mapped to 5xx, or a sandwiched
+                // LB 5xx) — and an already-end-of-stream body (gRPC Trailers-Only)
+                // whose outcome is final now — is recorded EAGERLY here so the
+                // breaker trips/heals promptly instead of waiting out a possibly
+                // long-lived/stalled upload (matches
+                // `grpc_streaming_closed_state_backend_failure_trips_breaker_at_header_time`
+                // and #1649 round-2 finding C). The eager record is a non-probe (the
+                // recorder owns the slot release); the recorder is then marked so it
+                // does not double-record.
                 let grpc_body_ended = http_body::Body::is_end_stream(&grpc_streaming.body);
                 let grpc_cb_recorded_eagerly = if grpc_skip_final_cb_record {
                     // A rotated retry already recorded (and released) the prior
@@ -12782,6 +12875,9 @@ async fn handle_proxy_request_inner(
                         cb_config,
                     );
                     record_grpc_backend_status_outcome(&cb, grpc_backend_dispatch_status, false);
+                    if let Some(recorder) = &grpc_streaming_probe_recorder {
+                        recorder.mark_health_recorded();
+                    }
                     true
                 } else {
                     // No breaker configured — nothing to record or defer.
@@ -12815,17 +12911,18 @@ async fn handle_proxy_request_inner(
                             });
                         }
                         // #1649 item 3: record passive-health + least-latency for
-                        // the rejected streaming response, but keep the circuit
-                        // breaker NEUTRAL on the deferred (2xx) path. A known
-                        // failure status was already recorded eagerly above
-                        // (`grpc_cb_recorded_eagerly`); for a healthy 2xx header the
-                        // upload may STILL overflow (`request_body_exceeded`) after
-                        // this gateway-side reject, so recording a synchronous
-                        // success here would let a client reject + overflow yet
-                        // still heal the breaker (round-2 finding A). The recorder
-                        // (wired to the request body's `Drop`) releases the HALF_OPEN
-                        // probe slot with the correct overflow-neutral semantics, so
-                        // the CB is intentionally skipped here for the 2xx case.
+                        // the rejected streaming response. The circuit breaker is
+                        // owned by the recorder on the fully-streaming path
+                        // (settled at the upload-termination join, overflow-aware) —
+                        // signal it the header outcome here since the rejected
+                        // response body is never wrapped, so a healthy 2xx still
+                        // heals once the upload terminates without overflow, while a
+                        // client that rejects + overflows cannot falsely heal
+                        // (round-2 finding A / round-3 findings). The buffered-request
+                        // path (no recorder, upload already complete) records the CB
+                        // directly here unless it was recorded eagerly (round-3 B).
+                        let reject_skip_cb =
+                            grpc_streaming_probe_recorder.is_some() || grpc_cb_recorded_eagerly;
                         backend_dispatch::record_backend_outcome_no_conn_end(
                             &state,
                             &proxy,
@@ -12837,9 +12934,17 @@ async fn handle_proxy_request_inner(
                             false,
                             None,
                             false,
-                            true, // skip_circuit_breaker_record: eager already recorded failures; 2xx stays neutral
+                            reject_skip_cb,
                             grpc_backend_admission_elapsed,
                         );
+                        if let Some(recorder) = &grpc_streaming_probe_recorder {
+                            crate::proxy::body::GrpcResponseTerminalObserver::on_response_terminal(
+                                recorder.as_ref(),
+                                grpc_backend_dispatch_status,
+                                false,
+                                None,
+                            );
+                        }
                         drop(grpc_lb_connection_guard.take());
                         // Use `original_request_path` so the log records the
                         // path the client actually requested, not the
@@ -13095,6 +13200,16 @@ async fn handle_proxy_request_inner(
                 if let Some(guard) = grpc_lb_connection_guard.take() {
                     body = body.with_lb_connection_guard(guard);
                 }
+                // #1649 item 3: the deferred dispatch outcome records passive-health
+                // + least-latency at response-body completion. The circuit breaker
+                // is owned by the recorder on the fully-streaming path (it settles
+                // it at the upload-termination join, overflow-aware) — so skip the CB
+                // here and hand the terminal outcome to the recorder via the
+                // response-terminal observer. On the buffered-request path (no
+                // recorder, upload already complete) the CB is recorded here at
+                // response completion unless it was already recorded eagerly.
+                let grpc_dispatch_skip_cb =
+                    grpc_streaming_probe_recorder.is_some() || grpc_cb_recorded_eagerly;
                 body = body
                     .with_deferred_backend_dispatch_outcome(
                         Arc::clone(&state),
@@ -13107,26 +13222,21 @@ async fn handle_proxy_request_inner(
                         false, // connection_error: post-wire, derived at body completion
                         None,  // error_class: derived from the terminal body error
                         false, // is_half_open_probe: slot released separately by the recorder
-                        // #1649 item 3: for a healthy 2xx streaming header, record
-                        // the circuit breaker HERE, at body completion — so a
-                        // `2xx`-then-stall / mid-stream reset / non-OK grpc-status
-                        // trailer trips the breaker instead of banking a phantom
-                        // header-time success. When a known failure status was
-                        // already recorded eagerly above
-                        // (`grpc_cb_recorded_eagerly`), skip the CB here to avoid
-                        // double-recording (passive-health + least-latency still
-                        // record). The HALF_OPEN probe slot is released
-                        // independently by `GrpcStreamingProbeRecorder` (NEUTRAL,
-                        // at upload termination), so this records as a non-probe and
-                        // a late client-upload overflow is neutralized via
-                        // `with_deferred_dispatch_request_body_exceeded_flag` below.
-                        grpc_cb_recorded_eagerly, // skip_circuit_breaker_record
+                        grpc_dispatch_skip_cb,
                         grpc_backend_admission_elapsed,
                     )
                     .with_grpc_trailer_backend_dispatch_classification()
                     .with_deferred_dispatch_request_body_exceeded_flag(
                         grpc_streaming.request_body_exceeded.clone(),
                     );
+                if let Some(recorder) = &grpc_streaming_probe_recorder {
+                    let recorder = Arc::clone(recorder);
+                    // `let`-binding drives the `Arc<Concrete>` -> `Arc<dyn Trait>`
+                    // unsizing coercion.
+                    let observer: Arc<dyn crate::proxy::body::GrpcResponseTerminalObserver> =
+                        recorder;
+                    body = body.with_grpc_response_terminal_observer(observer);
+                }
                 if let Some(permits) = backend_admission_permits.take() {
                     body = body
                         .with_deferred_backend_admission_outcome(
@@ -20517,6 +20627,10 @@ mod tests {
     mod grpc_streaming_probe_slot {
         use crate::circuit_breaker::CircuitBreaker;
         use crate::config::types::CircuitBreakerConfig;
+        use crate::proxy::body::GrpcResponseTerminalObserver;
+        use crate::proxy::grpc_proxy::GrpcUploadTerminationObserver;
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
 
         fn half_open_probe_config() -> CircuitBreakerConfig {
             CircuitBreakerConfig {
@@ -20540,13 +20654,26 @@ mod tests {
             cb
         }
 
+        fn no_overflow() -> Arc<AtomicBool> {
+            Arc::new(AtomicBool::new(false))
+        }
+
         fn recorder(
-            cb: std::sync::Arc<CircuitBreaker>,
+            cb: Arc<CircuitBreaker>,
             post_header_upload_timeout_ms: Option<u64>,
-        ) -> std::sync::Arc<super::super::GrpcStreamingProbeRecorder> {
-            std::sync::Arc::new(super::super::GrpcStreamingProbeRecorder::new(
+        ) -> Arc<super::super::GrpcStreamingProbeRecorder> {
+            recorder_with_overflow(cb, no_overflow(), post_header_upload_timeout_ms)
+        }
+
+        fn recorder_with_overflow(
+            cb: Arc<CircuitBreaker>,
+            overflow: Arc<AtomicBool>,
+            post_header_upload_timeout_ms: Option<u64>,
+        ) -> Arc<super::super::GrpcStreamingProbeRecorder> {
+            Arc::new(super::super::GrpcStreamingProbeRecorder::new(
                 cb,
                 true,
+                overflow,
                 post_header_upload_timeout_ms,
             ))
         }
@@ -20702,34 +20829,95 @@ mod tests {
         }
 
         #[test]
-        fn deferred_non_probe_outcome_drives_heal_and_trip_after_release() {
-            // Models the #1649 split at the breaker primitive: the recorder
-            // releases the HALF_OPEN slot (NEUTRAL), then the deferred dispatch
-            // outcome — recorded as a NON-probe at body completion — heals on a
-            // clean stream or reopens on a `2xx`-then-stall.
-            //
-            // Clean completion: neutral release, then a non-probe success closes
-            // the breaker (success_threshold == 1).
-            let cb = breaker_with_admitted_half_open_probe();
-            cb.record_neutral(true);
-            assert_eq!(cb.half_open_in_flight(), 0, "slot released by the recorder");
-            assert_eq!(cb.state_name(), "half_open");
-            cb.record_success(false);
+        fn clean_response_then_upload_termination_heals() {
+            // A clean 2xx/grpc-status:0 response heals the breaker — but only once
+            // the upload terminates (so the overflow flag is final). The slot is
+            // released NEUTRAL at the join; the success is recorded as a non-probe.
+            let cb = Arc::new(breaker_with_admitted_half_open_probe());
+            let recorder = recorder(Arc::clone(&cb), None);
+
+            recorder.note_headers_arrived();
+            recorder.on_response_terminal(200, false, None);
+            assert_eq!(
+                cb.state_name(),
+                "half_open",
+                "a clean response must NOT heal before upload termination"
+            );
+
+            GrpcUploadTerminationObserver::on_upload_terminated(recorder.as_ref());
             assert_eq!(
                 cb.state_name(),
                 "closed",
-                "a clean stream completing heals via the deferred non-probe success"
+                "clean response + upload termination (no overflow) heals the breaker"
             );
+            assert_eq!(cb.half_open_in_flight(), 0, "slot released");
+        }
 
-            // 2xx-then-stall: neutral release, then a non-probe failure (post-wire
-            // ReadWriteTimeout routes through `record_failure`) reopens.
-            let cb = breaker_with_admitted_half_open_probe();
-            cb.record_neutral(true);
-            cb.record_failure(503, true, false);
+        #[test]
+        fn clean_response_then_late_overflow_does_not_heal() {
+            // #1649 round-3 A: a backend can complete a clean response BEFORE the
+            // client upload, then the upload overflows. The deferred clean success
+            // must re-check the overflow flag at upload termination and stay
+            // NEUTRAL — it must not falsely heal the HALF_OPEN breaker.
+            let cb = Arc::new(breaker_with_admitted_half_open_probe());
+            let overflow = no_overflow();
+            let recorder = recorder_with_overflow(Arc::clone(&cb), Arc::clone(&overflow), None);
+
+            recorder.note_headers_arrived();
+            recorder.on_response_terminal(200, false, None);
+            // Client upload overflows AFTER the clean response.
+            overflow.store(true, std::sync::atomic::Ordering::Release);
+            GrpcUploadTerminationObserver::on_upload_terminated(recorder.as_ref());
+
+            assert_eq!(
+                cb.state_name(),
+                "half_open",
+                "a late client-upload overflow must not heal a clean-response probe"
+            );
+            assert_eq!(cb.half_open_in_flight(), 0, "slot still released");
+        }
+
+        #[test]
+        fn post_wire_failure_trips_promptly_before_upload_termination() {
+            // A 2xx-then-stall body (post-wire ReadWriteTimeout) is a real backend
+            // failure: it trips the breaker at response completion WITHOUT waiting
+            // for the upload to terminate.
+            let cb = Arc::new(breaker_with_admitted_half_open_probe());
+            let recorder = recorder(Arc::clone(&cb), None);
+
+            recorder.note_headers_arrived();
+            recorder.on_response_terminal(
+                200,
+                false,
+                Some(crate::retry::ErrorClass::ReadWriteTimeout),
+            );
             assert_eq!(
                 cb.state_name(),
                 "open",
-                "a 2xx-then-stall body reopens via the deferred non-probe failure"
+                "a post-wire body failure reopens the breaker promptly at response completion"
+            );
+        }
+
+        #[test]
+        fn overflow_at_response_terminal_is_neutral() {
+            // A client-upload overflow that resets the response stream is
+            // client-side: NEUTRAL, never a backend failure, even though it
+            // surfaces as a stream reset.
+            let cb = Arc::new(breaker_with_admitted_half_open_probe());
+            let overflow = Arc::new(AtomicBool::new(true));
+            let recorder = recorder_with_overflow(Arc::clone(&cb), overflow, None);
+
+            recorder.note_headers_arrived();
+            recorder.on_response_terminal(
+                200,
+                false,
+                Some(crate::retry::ErrorClass::ConnectionReset),
+            );
+            GrpcUploadTerminationObserver::on_upload_terminated(recorder.as_ref());
+            assert_eq!(
+                cb.state_name(),
+                "half_open",
+                "a client-upload overflow reset must be neutral, not a backend failure"
             );
         }
     }

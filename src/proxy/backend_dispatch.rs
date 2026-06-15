@@ -669,6 +669,57 @@ pub(crate) fn error_class_is_post_wire_backend_failure(error_class: Option<Error
     )
 }
 
+/// Classify a backend outcome and apply it to `cb`. This is the circuit-breaker
+/// arm of [`record_backend_outcome_inner`], extracted so the gRPC streaming probe
+/// recorder can settle the breaker at the upload-termination / response-completion
+/// join (#1649 item 3) using the identical classification rules:
+///   * client-side (disconnect / request-body-too-large) → NEUTRAL,
+///   * pre-wire connection error → connection-level failure (gated by
+///     `trip_on_connection_errors`),
+///   * configured `failure_status_codes` → status failure (ungated),
+///   * post-wire backend failure (mid-stream timeout / reset) → connection-level
+///     failure even with a healthy status,
+///   * otherwise → success.
+pub(crate) fn apply_circuit_breaker_outcome(
+    cb: &crate::circuit_breaker::CircuitBreaker,
+    response_status: u16,
+    connection_error: bool,
+    error_class: Option<ErrorClass>,
+    is_half_open_probe: bool,
+) {
+    if client_side_no_backend_signal(error_class) {
+        cb.record_neutral(is_half_open_probe);
+    } else if connection_error {
+        cb.record_failure(response_status, true, is_half_open_probe);
+    } else if cb.config().failure_status_codes.contains(&response_status) {
+        cb.record_failure(response_status, false, is_half_open_probe);
+    } else if error_class_is_post_wire_backend_failure(error_class) {
+        cb.record_failure(response_status, true, is_half_open_probe);
+    } else {
+        cb.record_success(is_half_open_probe);
+    }
+}
+
+/// Whether [`apply_circuit_breaker_outcome`] would record a backend FAILURE (as
+/// opposed to a success or a client-side neutral). Lets the gRPC streaming probe
+/// recorder record failures promptly at response completion while deferring a
+/// clean SUCCESS until request-upload termination, so a late client-upload
+/// overflow cannot falsely heal the breaker.
+pub(crate) fn circuit_breaker_outcome_is_failure(
+    failure_status_codes: &[u16],
+    response_status: u16,
+    connection_error: bool,
+    error_class: Option<ErrorClass>,
+) -> bool {
+    if client_side_no_backend_signal(error_class) {
+        false
+    } else {
+        connection_error
+            || failure_status_codes.contains(&response_status)
+            || error_class_is_post_wire_backend_failure(error_class)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn record_backend_outcome_inner(
     state: &ProxyState,
@@ -736,29 +787,13 @@ fn record_backend_outcome_inner(
             state
                 .circuit_breaker_cache
                 .get_or_create(&proxy.id, final_cb_target_key, cb_config);
-        if client_side_no_backend_signal {
-            cb.record_neutral(is_half_open_probe);
-        } else if connection_error {
-            // Pre-wire connection error → routed as connection-level, gated by
-            // trip_on_connection_errors. When that is false, record_failure()
-            // treats it as neutral while still releasing half-open probe slots.
-            cb.record_failure(response_status, true, is_half_open_probe);
-        } else if cb.config().failure_status_codes.contains(&response_status) {
-            // A configured failure status (5xx etc.) trips the breaker
-            // regardless of connection-error gating. Checked BEFORE the
-            // post-wire arm so a backend that returns a failure status AND then
-            // stalls / RSTs mid-body still records the (ungated) status-code
-            // failure rather than a trip_on_connection_errors-gated one.
-            cb.record_failure(response_status, false, is_half_open_probe);
-        } else if error_class_is_post_wire_backend_failure(error_class) {
-            // Post-wire backend failure with a non-failure status (a 2xx stream
-            // that then timed out / reset mid-body): route through the
-            // connection-level path so it can trip even though the status looked
-            // healthy, gated by trip_on_connection_errors like a transport fault.
-            cb.record_failure(response_status, true, is_half_open_probe);
-        } else {
-            cb.record_success(is_half_open_probe);
-        }
+        apply_circuit_breaker_outcome(
+            &cb,
+            response_status,
+            connection_error,
+            error_class,
+            is_half_open_probe,
+        );
     }
 
     // Passive health check reporting (O(1) upstream lookup via index).

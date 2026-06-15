@@ -111,6 +111,22 @@ struct DeferredBackendAdmissionOutcome {
     grpc_trailer_http_status: Option<u16>,
 }
 
+/// Notified when a gRPC streaming RESPONSE body reaches its terminal state, with
+/// the same `(response_status, connection_error, error_class)` the deferred
+/// backend-dispatch outcome would record. Implemented by the gRPC streaming probe
+/// recorder (`proxy::mod`), which owns the circuit-breaker outcome and settles it
+/// at the join of response completion + request-upload termination (#1649 item 3)
+/// — recording a failure promptly but deferring a clean success until upload
+/// termination so a late client-upload overflow cannot falsely heal the breaker.
+pub(crate) trait GrpcResponseTerminalObserver: Send + Sync {
+    fn on_response_terminal(
+        &self,
+        response_status: u16,
+        connection_error: bool,
+        error_class: Option<ErrorClass>,
+    );
+}
+
 struct DeferredBackendDispatchOutcome {
     state: Arc<super::ProxyState>,
     proxy: Arc<crate::config::types::Proxy>,
@@ -127,6 +143,12 @@ struct DeferredBackendDispatchOutcome {
     request_body_exceeded: Option<Arc<std::sync::atomic::AtomicBool>>,
     classify_grpc_trailer: bool,
     grpc_trailer_http_status: Option<u16>,
+    /// gRPC streaming: the recorder that owns the circuit-breaker outcome at the
+    /// upload-termination join. When set, the CB is NOT recorded by
+    /// `record_backend_outcome_no_conn_end` here (`skip_circuit_breaker_record`
+    /// is `true`); instead the terminal `(status, connection_error, error_class)`
+    /// is handed to the recorder, which settles the breaker.
+    grpc_response_observer: Option<Arc<dyn GrpcResponseTerminalObserver>>,
 }
 
 /// Inner body variant — buffered, streaming, or tracked-streaming.
@@ -457,6 +479,7 @@ impl ProxyBody {
             request_body_exceeded: None,
             classify_grpc_trailer: false,
             grpc_trailer_http_status: None,
+            grpc_response_observer: None,
         });
         self
     }
@@ -467,6 +490,22 @@ impl ProxyBody {
     pub(crate) fn with_grpc_trailer_backend_dispatch_classification(mut self) -> Self {
         if let Some(outcome) = self.backend_dispatch_outcome.as_mut() {
             outcome.classify_grpc_trailer = true;
+        }
+        self
+    }
+
+    /// Hand the gRPC streaming circuit-breaker outcome to `observer` (the probe
+    /// recorder) at response-body completion instead of recording it here.
+    /// Pairs with `skip_circuit_breaker_record = true` so the deferred outcome
+    /// still records passive-health + least-latency but the recorder settles the
+    /// breaker at the upload-termination join. No-op when no deferred dispatch
+    /// outcome is attached.
+    pub(crate) fn with_grpc_response_terminal_observer(
+        mut self,
+        observer: Arc<dyn GrpcResponseTerminalObserver>,
+    ) -> Self {
+        if let Some(outcome) = self.backend_dispatch_outcome.as_mut() {
+            outcome.grpc_response_observer = Some(observer);
         }
         self
     }
@@ -661,13 +700,10 @@ impl ProxyBody {
         let Some(outcome) = self.backend_dispatch_outcome.take() else {
             return;
         };
-        if outcome
+        let request_body_exceeded = outcome
             .request_body_exceeded
             .as_ref()
-            .is_some_and(|flag| flag.load(Ordering::Acquire))
-        {
-            return;
-        }
+            .is_some_and(|flag| flag.load(Ordering::Acquire));
 
         let error_class = if client_disconnected {
             Some(ErrorClass::ClientDisconnect)
@@ -686,6 +722,23 @@ impl ProxyBody {
         let response_status = outcome
             .grpc_trailer_http_status
             .unwrap_or(outcome.response_status);
+
+        // gRPC streaming (#1649 item 3): hand the terminal outcome to the probe
+        // recorder, which owns the circuit breaker and settles it at the
+        // upload-termination join (overflow-aware). Signal it unconditionally —
+        // it reads the shared overflow flag itself — even when the overflow short
+        // circuit below skips passive-health / least-latency.
+        if let Some(observer) = &outcome.grpc_response_observer {
+            observer.on_response_terminal(response_status, connection_error, error_class);
+        }
+
+        // A late client-upload overflow is a client/gateway-side size violation,
+        // not a backend fault — skip passive-health, least-latency, and the
+        // breaker (the recorder records NEUTRAL via the shared flag above).
+        if request_body_exceeded {
+            return;
+        }
+
         super::backend_dispatch::record_backend_outcome_no_conn_end(
             &outcome.state,
             &outcome.proxy,
