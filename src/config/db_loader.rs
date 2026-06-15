@@ -5793,6 +5793,10 @@ fn row_to_upstream(row: &AnyRow) -> Result<Upstream, anyhow::Error> {
         // backends do not persist it (no column), and `Upstream::validate_fields`
         // rejects operator writes via the admin API. SQL rows always start `None`.
         source_locality: None,
+        // Mesh-only projection (`FERRUM_MESH_LOCALITY_LB_STRICT`): SQL backends
+        // do not persist it and `Upstream::validate_fields` rejects operator
+        // writes, so SQL rows always start `false`.
+        locality_lb_strict: false,
         locality_lb_setting: None,
         backend_tls_client_cert_path: row.try_get("backend_tls_client_cert_path").ok(),
         backend_tls_client_key_path: row.try_get("backend_tls_client_key_path").ok(),

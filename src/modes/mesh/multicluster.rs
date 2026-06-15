@@ -452,10 +452,19 @@ pub trait RemoteServiceSource: Send + Sync {
 /// `remote-<cluster>` that can never collide with a real local region.
 fn default_remote_locality(cluster_name: &str, network: Option<&str>) -> String {
     match network {
-        Some(network) if !network.is_empty() => format!("remote-{cluster_name}/{network}"),
-        _ => format!("remote-{cluster_name}"),
+        Some(network) if !network.is_empty() => {
+            format!("{REMOTE_LOCALITY_PREFIX}{cluster_name}/{network}")
+        }
+        _ => format!("{REMOTE_LOCALITY_PREFIX}{cluster_name}"),
     }
 }
+
+/// Region prefix stamped on remote-cluster endpoints by
+/// [`default_remote_locality`]. A real local region can never begin with this
+/// (it is not a valid Kubernetes region label fragment in practice and is
+/// reserved here), so the locality-aware load balancer uses it to tell remote
+/// endpoints apart from local ones in strict local-first mode.
+pub(crate) const REMOTE_LOCALITY_PREFIX: &str = "remote-";
 
 /// Tag a remote cluster's workloads with provenance and a fail-safe locality.
 ///

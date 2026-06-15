@@ -108,6 +108,7 @@ fn make_upstream(id: &str) -> Upstream {
         subsets: None,
         port_overrides: HashMap::new(),
         source_locality: None,
+        locality_lb_strict: false,
         locality_lb_setting: None,
         backend_tls_client_cert_path: None,
         backend_tls_client_key_path: None,
@@ -867,6 +868,20 @@ fn test_upstream_source_locality_rejected_by_admin_api() {
         errs.iter().any(|e| e.contains("source_locality")
             && e.contains("cannot be set directly via the admin API")),
         "expected source_locality admin-API rejection, got: {errs:?}"
+    );
+}
+
+#[test]
+fn test_upstream_locality_lb_strict_rejected_by_admin_api() {
+    let mut upstream = make_upstream("test");
+    upstream.locality_lb_strict = true;
+    let errs = upstream
+        .validate_fields()
+        .expect_err("locality_lb_strict must be rejected at admit time");
+    assert!(
+        errs.iter().any(|e| e.contains("locality_lb_strict")
+            && e.contains("cannot be set directly via the admin API")),
+        "expected locality_lb_strict admin-API rejection, got: {errs:?}"
     );
 }
 
@@ -2156,6 +2171,7 @@ fn test_validate_backend_ip_policy_upstream_target_denied() {
         subsets: None,
         port_overrides: HashMap::new(),
         source_locality: None,
+        locality_lb_strict: false,
         locality_lb_setting: None,
         backend_tls_client_cert_path: None,
         backend_tls_client_key_path: None,

@@ -317,6 +317,22 @@ const LATENCY_UNSET: u64 = u64::MAX;
 /// across endpoints in the same matching locality.
 const LOCALITY_DISTRIBUTE_WEIGHT_SCALE: u64 = 1_000_000;
 
+/// Whether a target's locality marks it as a LOCAL (same-cluster) endpoint for
+/// strict local-first locality LB. Remote-cluster endpoints carry a synthetic
+/// `remote-<cluster>` locality (see
+/// [`crate::modes::mesh::multicluster::REMOTE_LOCALITY_PREFIX`]); everything
+/// else — including a target with no locality at all — is treated as local.
+/// Used at construction to precompute `LoadBalancer.local_locality_mask`.
+#[inline]
+fn is_local_locality(locality: Option<&str>) -> bool {
+    match locality {
+        Some(locality) => {
+            !locality.starts_with(crate::modes::mesh::multicluster::REMOTE_LOCALITY_PREFIX)
+        }
+        None => true,
+    }
+}
+
 /// Warm-up bias subtracted from `min_known_ewma` for unsampled (late-joiner)
 /// targets during the mixed warm-up phase.
 ///
@@ -432,6 +448,7 @@ impl LoadBalancerCache {
                     Some(&upstream.port_overrides),
                     upstream.source_locality.as_deref(),
                     upstream.locality_lb_setting.as_ref(),
+                    upstream.locality_lb_strict,
                 )),
             );
         }
@@ -490,6 +507,7 @@ impl LoadBalancerCache {
                     Some(&upstream.port_overrides),
                     upstream.source_locality.as_deref(),
                     upstream.locality_lb_setting.as_ref(),
+                    upstream.locality_lb_strict,
                 )),
             );
         }
@@ -568,6 +586,7 @@ impl LoadBalancerCache {
         let existing_port_overrides = existing_upstream.port_overrides.clone();
         let existing_source_locality = existing_upstream.source_locality.clone();
         let existing_locality_lb_setting = existing_upstream.locality_lb_setting.clone();
+        let existing_locality_lb_strict = existing_upstream.locality_lb_strict;
         new_balancers.insert(
             upstream_id.to_string(),
             Arc::new(LoadBalancer::with_subsets_and_port_overrides(
@@ -579,6 +598,7 @@ impl LoadBalancerCache {
                 Some(&existing_port_overrides),
                 existing_source_locality.as_deref(),
                 existing_locality_lb_setting.as_ref(),
+                existing_locality_lb_strict,
             )),
         );
 
@@ -1413,6 +1433,28 @@ pub struct LoadBalancer {
     /// tier preference. Computed at construction so request-time work is
     /// limited to bitset masks and a small weighted bucket pick.
     locality_lb: Option<LocalityLbState>,
+    /// Strict local-first locality LB. Projected from
+    /// `FERRUM_MESH_LOCALITY_LB_STRICT` onto mesh upstreams. When `true` and the
+    /// upstream has no resolved source locality (`target_locality_ranks` empty),
+    /// the locality filter restricts selection to LOCAL-locality targets (those
+    /// not tagged with the synthetic `remote-<cluster>` locality) instead of
+    /// returning the mixed local + remote pool. Falls back to the full candidate
+    /// set (with a one-time warn) when no local target exists, so traffic is
+    /// never black-holed. `false` (default) preserves the historical fail-open
+    /// mixed-pool behavior and skips all strict-mode work on the hot path.
+    locality_lb_strict: bool,
+    /// One-time guard so the "strict locality LB found no local endpoints,
+    /// widening to the full pool" warning is logged at most once per balancer
+    /// instance instead of on every request that hits the fallback.
+    locality_strict_widen_warned: AtomicBool,
+    /// Per-target "is a LOCAL-locality endpoint" mask, index-aligned with
+    /// `targets`. A target is local when its locality is absent OR does not
+    /// begin with the synthetic remote-cluster prefix (`remote-`). Only
+    /// populated (non-empty) when `locality_lb_strict` is `true`; empty
+    /// otherwise so the default path pays nothing. Computed at construction so
+    /// the strict hot path is an O(n) bitset build over a precomputed mask
+    /// rather than per-request string parsing.
+    local_locality_mask: Vec<bool>,
 }
 
 /// Per-target state derived from `UpstreamLocalityLbSetting` so the hot
@@ -1496,6 +1538,7 @@ impl LoadBalancer {
             None,
             None,
             None,
+            false,
         )
     }
 
@@ -1511,6 +1554,7 @@ impl LoadBalancer {
         port_overrides: Option<&HashMap<u16, UpstreamPortOverride>>,
         source_locality: Option<&str>,
         locality_lb_setting: Option<&UpstreamLocalityLbSetting>,
+        locality_lb_strict: bool,
     ) -> Self {
         let wrr_weights: Vec<i64> = vec![0; targets.len()];
         // Pre-compute host:port keys for internal use (active connections, latency, hash ring)
@@ -1721,6 +1765,21 @@ impl LoadBalancer {
         // pre-compute below is allowed to populate one, the other, or neither.
         let locality_lb = build_locality_lb_state(locality_lb_setting, source_locality, targets);
 
+        // Strict local-first locality LB: precompute which targets are LOCAL so
+        // the request path can restrict to them when no source locality
+        // resolves, without re-parsing localities per request. A target is
+        // local when it carries no locality OR its locality does not begin with
+        // the synthetic remote-cluster prefix. Only built when strict mode is
+        // enabled so the default path allocates nothing.
+        let local_locality_mask: Vec<bool> = if locality_lb_strict {
+            targets
+                .iter()
+                .map(|target| is_local_locality(target.locality.as_deref()))
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         Self {
             targets: targets.iter().cloned().map(Arc::new).collect(),
             target_keys,
@@ -1744,6 +1803,9 @@ impl LoadBalancer {
             port_overrides: port_states,
             initial_dispatch_port_override,
             locality_lb,
+            locality_lb_strict,
+            locality_strict_widen_warned: AtomicBool::new(false),
+            local_locality_mask,
         }
     }
 
@@ -2190,8 +2252,14 @@ impl LoadBalancer {
             // fallback.
         }
 
-        // No source locality → no tier preference; return the input unchanged.
+        // No source locality → no tier preference. Default (fail-open) returns
+        // the input unchanged — the mixed local + remote pool. Strict mode
+        // (fail-closed-to-local) instead restricts to LOCAL endpoints, widening
+        // back to the full set only when none are local.
         if self.target_locality_ranks.is_empty() {
+            if self.locality_lb_strict {
+                return self.strict_local_bitset(candidates);
+            }
             return *candidates;
         }
 
@@ -2264,7 +2332,13 @@ impl LoadBalancer {
             }
         }
 
+        // No source locality → no tier preference. Default returns the mixed
+        // local + remote pool; strict mode restricts to LOCAL endpoints (Vec-
+        // path counterpart of `strict_local_bitset`), widening only when none.
         if self.target_locality_ranks.is_empty() {
+            if self.locality_lb_strict {
+                return self.strict_local_candidates(candidates);
+            }
             return candidates;
         }
 
@@ -2300,6 +2374,85 @@ impl LoadBalancer {
             }
         }
 
+        candidates
+    }
+
+    /// Log the "strict locality LB found no local endpoints" widen-to-full-pool
+    /// warning at most once per balancer instance. Used by both the bitset and
+    /// Vec strict paths so the message is identical and never spams the hot path.
+    #[cold]
+    fn warn_strict_locality_widen(&self) {
+        if !self
+            .locality_strict_widen_warned
+            .swap(true, Ordering::Relaxed)
+        {
+            tracing::warn!(
+                upstream = %self.upstream_id_log(),
+                "FERRUM_MESH_LOCALITY_LB_STRICT is set but this upstream has no \
+                 source locality AND no local-locality endpoints; widening to the \
+                 full healthy pool (local + remote) to avoid black-holing traffic. \
+                 Set the workload's topology.kubernetes.io/region|zone labels (or \
+                 FERRUM_K8S_NODE_LOCALITY_ENABLED) so local-first preference can \
+                 apply."
+            );
+        }
+    }
+
+    /// Best-effort upstream id for diagnostics, recovered from the precomputed
+    /// `target_keys` (format `upstream_id::host:port`). Used only on the cold
+    /// strict-widen warning path, so a linear peek at the first key is fine.
+    fn upstream_id_log(&self) -> &str {
+        self.target_keys
+            .first()
+            .and_then(|key| key.split("::").next())
+            .unwrap_or("<unknown>")
+    }
+
+    /// Strict local-first restriction for the bitset path: keep only candidates
+    /// whose locality marks them LOCAL (precomputed in `local_locality_mask`).
+    /// When no candidate is local, widen back to the full input (warn once)
+    /// rather than black-holing — preserving availability over strictness.
+    #[inline]
+    fn strict_local_bitset(&self, candidates: &HealthBitset) -> HealthBitset {
+        if self.local_locality_mask.is_empty() {
+            // Defensive: mask is always populated when strict mode is on, but if
+            // it is somehow empty there is no local/remote signal — return the
+            // input unchanged rather than dropping every candidate.
+            return *candidates;
+        }
+        let mut local = HealthBitset::empty();
+        for idx in 0..self.targets.len() {
+            if candidates.contains(idx)
+                && self.local_locality_mask.get(idx).copied().unwrap_or(true)
+            {
+                local.set(idx);
+            }
+        }
+        if !local.is_empty() {
+            return local;
+        }
+        self.warn_strict_locality_widen();
+        *candidates
+    }
+
+    /// Vec-path counterpart of [`Self::strict_local_bitset`] for the >128-target
+    /// fallback.
+    fn strict_local_candidates<'a>(
+        &self,
+        candidates: Vec<(usize, &'a Arc<UpstreamTarget>)>,
+    ) -> Vec<(usize, &'a Arc<UpstreamTarget>)> {
+        if self.local_locality_mask.is_empty() {
+            return candidates;
+        }
+        let local: Vec<(usize, &'a Arc<UpstreamTarget>)> = candidates
+            .iter()
+            .copied()
+            .filter(|(idx, _)| self.local_locality_mask.get(*idx).copied().unwrap_or(true))
+            .collect();
+        if !local.is_empty() {
+            return local;
+        }
+        self.warn_strict_locality_widen();
         candidates
     }
 
@@ -4322,6 +4475,7 @@ mod tests {
             Some(&port_overrides),
             None,
             None,
+            false,
         );
 
         let random_state = lb.port_overrides.get(&8080).expect("random override");

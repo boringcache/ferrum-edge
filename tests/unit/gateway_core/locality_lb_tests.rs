@@ -65,6 +65,7 @@ fn make_upstream(
         subsets: None,
         port_overrides: HashMap::new(),
         source_locality: source_locality.map(str::to_string),
+        locality_lb_strict: false,
         locality_lb_setting: None,
         backend_tls_client_cert_path: None,
         backend_tls_client_key_path: None,
@@ -565,6 +566,168 @@ fn locality_priority_disabled_when_source_locality_absent() {
         3,
         "without source locality, round-robin must visit every target — saw {:?}",
         seen
+    );
+}
+
+// ── FERRUM_MESH_LOCALITY_LB_STRICT (strict local-first) ───────────────────
+
+/// Build an upstream with `locality_lb_strict` set and (optionally) no source
+/// locality, mirroring how `project_mesh_source_locality` stamps the flag at
+/// slice apply. The runtime selects on `target.locality`: remote endpoints
+/// carry a synthetic `remote-<cluster>` locality, local ones do not.
+fn strict_upstream(source_locality: Option<&str>, targets: Vec<UpstreamTarget>) -> Upstream {
+    let mut up = make_upstream(
+        "u1",
+        LoadBalancerAlgorithm::RoundRobin,
+        source_locality,
+        targets,
+    );
+    up.locality_lb_strict = true;
+    up
+}
+
+fn seen_hosts(snapshot: &ferrum_edge::load_balancer::LoadBalancerCacheInner) -> HashSet<String> {
+    let mut seen: HashSet<String> = HashSet::new();
+    for i in 0..40 {
+        let selection =
+            LoadBalancerCache::select_target_from(snapshot, "u1", &format!("k-{i}"), no_health())
+                .expect("selected");
+        seen.insert(selection.target.host.clone());
+    }
+    seen
+}
+
+#[test]
+fn strict_locality_absent_source_selects_only_local_endpoints() {
+    // Absent source locality + strict ON: selection must restrict to LOCAL
+    // endpoints (no `remote-` locality) and NEVER pick the remote-cluster
+    // targets, even though every target is healthy.
+    let up = strict_upstream(
+        None,
+        vec![
+            target("local-a.local", Some("us-west/us-west-1/a")),
+            target("local-b.local", Some("us-west/us-west-1/b")),
+            target("remote-a.local", Some("remote-cluster-east")),
+            target("remote-b.local", Some("remote-cluster-east/net2")),
+        ],
+    );
+    let cache = LoadBalancerCache::new(&config(up));
+    let snapshot = cache.load();
+
+    let seen = seen_hosts(&snapshot);
+    assert!(
+        seen.contains("local-a.local") && seen.contains("local-b.local"),
+        "strict mode must keep serving local endpoints — saw {seen:?}"
+    );
+    assert!(
+        !seen.contains("remote-a.local") && !seen.contains("remote-b.local"),
+        "strict mode must NOT widen to remote endpoints when locals exist — saw {seen:?}"
+    );
+}
+
+#[test]
+fn strict_locality_absent_source_treats_unlabeled_targets_as_local() {
+    // A target with NO locality at all is treated as local (not remote): it must
+    // remain eligible under strict mode while `remote-` targets are excluded.
+    let up = strict_upstream(
+        None,
+        vec![
+            target("unlabeled.local", None),
+            target("remote-only.local", Some("remote-cluster-east")),
+        ],
+    );
+    let cache = LoadBalancerCache::new(&config(up));
+    let snapshot = cache.load();
+
+    let seen = seen_hosts(&snapshot);
+    assert!(
+        seen.contains("unlabeled.local"),
+        "unlabeled target must count as local under strict mode — saw {seen:?}"
+    );
+    assert!(
+        !seen.contains("remote-only.local"),
+        "remote target must be excluded while a local exists — saw {seen:?}"
+    );
+}
+
+#[test]
+fn non_strict_absent_source_returns_mixed_local_and_remote() {
+    // Default (strict OFF): absent source locality must keep today's fail-open
+    // behavior and visit BOTH local and remote endpoints. Same target set as
+    // the strict test above, only the flag differs.
+    let up = make_upstream(
+        "u1",
+        LoadBalancerAlgorithm::RoundRobin,
+        None,
+        vec![
+            target("local-a.local", Some("us-west/us-west-1/a")),
+            target("local-b.local", Some("us-west/us-west-1/b")),
+            target("remote-a.local", Some("remote-cluster-east")),
+            target("remote-b.local", Some("remote-cluster-east/net2")),
+        ],
+    );
+    assert!(
+        !up.locality_lb_strict,
+        "default upstream must not be strict"
+    );
+    let cache = LoadBalancerCache::new(&config(up));
+    let snapshot = cache.load();
+
+    let seen = seen_hosts(&snapshot);
+    assert_eq!(
+        seen.len(),
+        4,
+        "without strict mode, absent source locality must visit every target \
+         (mixed local + remote) — saw {seen:?}"
+    );
+}
+
+#[test]
+fn strict_locality_present_source_unchanged_priority_tier() {
+    // With a resolved source locality, strict mode is inert: priority-tier
+    // preference still picks the exact-match local target and ignores the flag.
+    let up = strict_upstream(
+        Some("us-west/us-west-1/a"),
+        vec![
+            target("exact.local", Some("us-west/us-west-1/a")),
+            target("same-zone.local", Some("us-west/us-west-1/b")),
+            target("remote.local", Some("remote-cluster-east")),
+        ],
+    );
+    let cache = LoadBalancerCache::new(&config(up));
+    let snapshot = cache.load();
+
+    for i in 0..8 {
+        let selection =
+            LoadBalancerCache::select_target_from(&snapshot, "u1", &format!("c-{i}"), no_health())
+                .expect("selected");
+        assert_eq!(
+            selection.target.host, "exact.local",
+            "present source locality must keep exact-tier preference under strict mode"
+        );
+    }
+}
+
+#[test]
+fn strict_locality_no_local_endpoints_falls_back_to_full_pool() {
+    // Strict ON, absent source locality, and EVERY target is remote: rather than
+    // black-holing, selection must widen to the full healthy pool so traffic
+    // still flows.
+    let up = strict_upstream(
+        None,
+        vec![
+            target("remote-a.local", Some("remote-cluster-east")),
+            target("remote-b.local", Some("remote-cluster-west")),
+        ],
+    );
+    let cache = LoadBalancerCache::new(&config(up));
+    let snapshot = cache.load();
+
+    let seen = seen_hosts(&snapshot);
+    assert_eq!(
+        seen.len(),
+        2,
+        "with no local endpoints, strict mode must widen to the full pool — saw {seen:?}"
     );
 }
 

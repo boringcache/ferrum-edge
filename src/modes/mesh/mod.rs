@@ -367,6 +367,16 @@ pub struct MeshRuntimeConfig {
     /// from `FERRUM_MESH_REQUEST_AUTH_REQUIRE_EXP`. Present-but-expired tokens
     /// are always rejected regardless of this flag.
     pub request_auth_require_exp: bool,
+    /// Strict local-first locality load balancing. Default `false` preserves the
+    /// historical fail-open behavior: when an upstream's source locality is
+    /// absent/unresolved, the locality-aware LB returns mixed local + remote
+    /// endpoints. When `true`, an absent source locality fails closed to LOCAL
+    /// endpoints only (targets not tagged with the synthetic `remote-<cluster>`
+    /// locality); if there are no local endpoints the LB falls back to the full
+    /// healthy pool with a one-time warning. Stamped onto materialized upstreams
+    /// at slice apply so the load balancer reads it at cache-build time without a
+    /// per-request env lookup. Sourced from `FERRUM_MESH_LOCALITY_LB_STRICT`.
+    pub locality_lb_strict: bool,
 }
 
 impl MeshRuntimeConfig {
@@ -598,6 +608,7 @@ impl MeshRuntimeConfig {
             egress_stream_enabled: env_config.mesh_egress_stream_enabled,
             egress_stream_allow_plaintext: env_config.mesh_egress_stream_allow_plaintext,
             request_auth_require_exp: env_config.mesh_request_auth_require_exp,
+            locality_lb_strict: env_config.mesh_locality_lb_strict,
         })
     }
 
@@ -781,7 +792,7 @@ fn prepare_normalized_gateway_config_for_mesh(
     materialize_mesh_outbound_proxies(&mut config, runtime, mesh_slice);
     materialize_mesh_outbound_tcp_upstreams(&mut config, runtime, mesh_slice);
     apply_destination_rules(&mut config, runtime, mesh_slice)?;
-    project_mesh_source_locality(&mut config, mesh_slice);
+    project_mesh_source_locality(&mut config, runtime, mesh_slice);
     // Project slice-filtered ServiceEntries back into the prepared mesh
     // block so introspection consumers (admin diagnostics, projected-config
     // snapshots, future helpers) see the same `export_to` / sidecar-narrowed
@@ -925,11 +936,29 @@ fn prepare_normalized_gateway_config_for_mesh(
     Ok(config)
 }
 
-fn project_mesh_source_locality(config: &mut GatewayConfig, mesh_slice: &MeshSlice) {
+fn project_mesh_source_locality(
+    config: &mut GatewayConfig,
+    runtime: &MeshRuntimeConfig,
+    mesh_slice: &MeshSlice,
+) {
+    let loaded_at = config.loaded_at;
+
+    // Stamp the operator's strict local-first locality preference onto every
+    // mesh upstream regardless of whether a source locality resolves: strict
+    // mode's whole point is to govern the *absent-source-locality* case, so the
+    // flag must reach upstreams that have no `source_locality` too. The load
+    // balancer reads this at cache-build time (no per-request env lookup).
+    let strict = runtime.locality_lb_strict;
+    for upstream in &mut config.upstreams {
+        if upstream.locality_lb_strict != strict {
+            upstream.locality_lb_strict = strict;
+            upstream.updated_at = loaded_at;
+        }
+    }
+
     let Some(locality) = mesh_source_workload_locality(mesh_slice) else {
         return;
     };
-    let loaded_at = config.loaded_at;
     for upstream in &mut config.upstreams {
         if upstream.source_locality.as_deref() != Some(locality) {
             upstream.source_locality = Some(locality.to_string());
@@ -1304,6 +1333,7 @@ fn build_east_west_service_proxies_and_upstreams(
             subsets: None,
             port_overrides: HashMap::new(),
             source_locality: None,
+            locality_lb_strict: false,
             locality_lb_setting: None,
             backend_tls_client_cert_path: None,
             backend_tls_client_key_path: None,
@@ -3435,6 +3465,7 @@ fn mesh_outbound_route_upstream(
         subsets: None,
         port_overrides: HashMap::new(),
         source_locality: None,
+        locality_lb_strict: false,
         locality_lb_setting: None,
         backend_tls_client_cert_path: None,
         backend_tls_client_key_path: None,
@@ -5030,6 +5061,7 @@ fn build_egress_upstream(
         subsets: None,
         port_overrides: HashMap::new(),
         source_locality: None,
+        locality_lb_strict: false,
         locality_lb_setting: None,
         backend_tls_client_cert_path: None,
         backend_tls_client_key_path: None,
@@ -10028,6 +10060,7 @@ mod tests {
             egress_stream_enabled: false,
             egress_stream_allow_plaintext: false,
             request_auth_require_exp: true,
+            locality_lb_strict: false,
         };
         let config = prepare_gateway_config_for_mesh(GatewayConfig::default(), &runtime).unwrap();
         let mesh_state = MeshRuntimeState::new();
@@ -10135,6 +10168,7 @@ mod tests {
             egress_stream_enabled: false,
             egress_stream_allow_plaintext: false,
             request_auth_require_exp: true,
+            locality_lb_strict: false,
         }
     }
 
@@ -12751,6 +12785,7 @@ mod tests {
             subsets: None,
             port_overrides: HashMap::new(),
             source_locality: None,
+            locality_lb_strict: false,
             locality_lb_setting: None,
             backend_tls_client_cert_path: None,
             backend_tls_client_key_path: None,
@@ -15992,6 +16027,7 @@ mod tests {
             subsets: None,
             port_overrides: HashMap::new(),
             source_locality: None,
+            locality_lb_strict: false,
             locality_lb_setting: None,
             backend_tls_client_cert_path: None,
             backend_tls_client_key_path: None,
@@ -16012,7 +16048,7 @@ mod tests {
             ..MeshSlice::default()
         };
 
-        project_mesh_source_locality(&mut config, &mesh_slice);
+        project_mesh_source_locality(&mut config, &test_mesh_runtime_config(), &mesh_slice);
 
         assert_eq!(
             config.upstreams[0].source_locality.as_deref(),

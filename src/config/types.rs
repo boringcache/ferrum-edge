@@ -1110,6 +1110,17 @@ pub struct Upstream {
     /// balancing. Projected from the selected workload at slice-apply time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_locality: Option<String>,
+    /// Strict local-first locality LB for this upstream. Default `false`
+    /// (fail-open): when `source_locality` is absent the locality-aware LB
+    /// returns mixed local + remote endpoints. When `true` (fail-closed-to-
+    /// local): an absent `source_locality` restricts selection to LOCAL-locality
+    /// endpoints (targets not tagged with the synthetic `remote-<cluster>`
+    /// locality), widening to the full healthy pool only when there are no local
+    /// endpoints. Projected from `FERRUM_MESH_LOCALITY_LB_STRICT` onto mesh
+    /// upstreams at slice apply; the load balancer reads it at cache-build time.
+    /// Stays `false` for non-mesh upstreams, preserving existing behavior.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub locality_lb_strict: bool,
     /// Optional projection of Istio
     /// `DestinationRule.trafficPolicy.localityLbSetting`. Populated by the
     /// mesh apply layer from a matching `MeshDestinationRule`; `None` for
@@ -4515,6 +4526,20 @@ impl Upstream {
                 "source_locality is projected from the mesh workload's \
                  locality and cannot be set directly via the admin API — \
                  set it on the Workload / pod topology labels instead"
+                    .to_string(),
+            );
+        }
+
+        // `locality_lb_strict` is mesh-derived state stamped at slice-apply time
+        // from the `FERRUM_MESH_LOCALITY_LB_STRICT` env flag. SQL backends do
+        // not persist it, so an admin write would succeed and silently vanish on
+        // the next reload. The canonical surface is the env var, mirroring
+        // `source_locality` above.
+        if self.locality_lb_strict {
+            errors.push(
+                "locality_lb_strict is projected from the \
+                 FERRUM_MESH_LOCALITY_LB_STRICT environment flag and cannot be \
+                 set directly via the admin API — set the env var instead"
                     .to_string(),
             );
         }
