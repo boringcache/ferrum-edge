@@ -478,23 +478,66 @@ pub(crate) const REMOTE_LOCALITY_PREFIX: &str = "remote-";
 /// local-cluster and non-mesh targets.
 pub(crate) const MESH_REMOTE_TAG: &str = "mesh.remote";
 
+/// The EXACT value the discoverer stamps for [`MESH_REMOTE_TAG`] when a target
+/// is a remote-cluster endpoint. Strict local-first locality LB classifies a
+/// target as remote ONLY when the tag equals this value, NOT on mere key
+/// presence: some mesh/east-west target builders copy workload/operator labels
+/// into `UpstreamTarget.tags`, so a local target could carry a `mesh.remote`
+/// key with a different value (e.g. `false`) or as a non-provenance label.
+/// Keying the local mask on this exact value keeps such targets LOCAL. Single
+/// source of truth shared by the stamp site
+/// ([`crate::service_discovery::mesh`]) and the check site
+/// ([`crate::load_balancer`]) so they can never drift.
+pub(crate) const MESH_REMOTE_TAG_VALUE: &str = "true";
+
 /// Whether a workload is a REMOTE-cluster endpoint relative to this mesh's
-/// `local_cluster`. A workload is remote when it carries a `cluster` identity
-/// that differs from the configured local cluster name — the same explicit
+/// [`MultiClusterConfig`]. A workload is remote when it carries a `cluster`
+/// identity that the configuration places in another cluster — the same explicit
 /// provenance [`tag_remote_workloads`] stamps on cross-cluster-discovered
-/// workloads (`workload.cluster = Some(remote_cluster_name)`). When no
-/// `local_cluster` is configured, or the workload carries no `cluster`, the
-/// workload is treated as LOCAL (the default single-cluster posture). This is
-/// the single source of truth shared by the materialization path
+/// workloads (`workload.cluster = Some(remote_cluster_name)`, where the name is a
+/// configured [`RemoteCluster::name`]).
+///
+/// Classification is by **discovery provenance**, NOT a locality string prefix,
+/// and crucially does NOT depend on `local_cluster` being set:
+///
+/// - `local_cluster` set: remote iff `workload.cluster` differs from it (the
+///   classic relative test).
+/// - `local_cluster` UNSET: remote iff `workload.cluster` matches a configured
+///   `remote_clusters[].name`. Remote endpoints reach the registry only via
+///   [`merge_remote_endpoints_into_mesh`] / [`tag_remote_workloads`], which stamp
+///   exactly that name, so this is the authoritative cross-cluster signal even
+///   when the operator omits the optional `local_cluster`. (Without this, a
+///   remote-discovered endpoint would be misclassified LOCAL and strict
+///   local-first LB would keep sending to it while locals are healthy.)
+/// - No workload cluster, or no `MultiClusterConfig` at all: LOCAL (default
+///   single-cluster posture).
+///
+/// Single source of truth shared by the materialization path
 /// ([`crate::service_discovery::mesh`]) and the east-west / outbound local-only
 /// filters ([`super::matched_local_service_workloads`]) so they never drift on
 /// what "remote" means.
 #[inline]
-pub(crate) fn workload_is_remote(workload: &Workload, local_cluster: Option<&str>) -> bool {
-    match (workload.cluster.as_deref(), local_cluster) {
-        (Some(workload_cluster), Some(local_cluster)) => workload_cluster != local_cluster,
-        // No workload cluster, or no configured local cluster: treat as local.
-        _ => false,
+pub(crate) fn workload_is_remote(
+    workload: &Workload,
+    multi_cluster: Option<&MultiClusterConfig>,
+) -> bool {
+    let Some(workload_cluster) = workload.cluster.as_deref() else {
+        // A workload with no cluster identity is always local.
+        return false;
+    };
+    let Some(multi_cluster) = multi_cluster else {
+        // No multi-cluster config: single-cluster posture, treat as local.
+        return false;
+    };
+    match multi_cluster.local_cluster.as_deref() {
+        // Relative to a known local cluster: remote iff it differs.
+        Some(local_cluster) => workload_cluster != local_cluster,
+        // No local cluster name: classify by discovery provenance — the workload
+        // is remote iff its stamped cluster is a configured remote cluster.
+        None => multi_cluster
+            .remote_clusters
+            .iter()
+            .any(|remote| remote.name == workload_cluster),
     }
 }
 

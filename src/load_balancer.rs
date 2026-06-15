@@ -319,18 +319,27 @@ const LOCALITY_DISTRIBUTE_WEIGHT_SCALE: u64 = 1_000_000;
 
 /// Whether a target is a LOCAL (same-cluster) endpoint for strict local-first
 /// locality LB. Keyed on the EXPLICIT remote-provenance tag
-/// [`crate::modes::mesh::multicluster::MESH_REMOTE_TAG`] (`mesh.remote`), stamped
+/// [`crate::modes::mesh::multicluster::MESH_REMOTE_TAG`] (`mesh.remote`) carrying
+/// the discoverer's exact internal value
+/// [`crate::modes::mesh::multicluster::MESH_REMOTE_TAG_VALUE`] (`"true"`), stamped
 /// at materialization time from the workload's cross-cluster identity — NOT on a
-/// locality string prefix. This is correct even when a real local Kubernetes
-/// region is named `remote-<something>`: such a target carries no `mesh.remote`
-/// tag and stays LOCAL. A target without the tag (local-cluster, non-mesh, or
-/// operator-authored) is treated as local. Used at construction to precompute
-/// `LoadBalancer.local_locality_mask`.
+/// locality string prefix, and NOT on mere key presence. Checking the VALUE (not
+/// the key) is load-bearing: some mesh/east-west target builders copy
+/// workload/operator labels into `UpstreamTarget.tags` (e.g. east-west targets
+/// use `workload.selector.labels`), so a LOCAL target can legitimately carry a
+/// `mesh.remote` key whose value is not the provenance marker (e.g. `false`, or a
+/// hand-authored label); such a target must stay LOCAL. This is also correct when
+/// a real local Kubernetes region is named `remote-<something>`: that target
+/// carries no provenance `mesh.remote=true` tag and stays LOCAL. A target without
+/// the marker (local-cluster, non-mesh, or operator-authored) is treated as
+/// local. Used at construction to precompute `LoadBalancer.local_locality_mask`.
 #[inline]
 fn target_is_local(target: &UpstreamTarget) -> bool {
-    !target
+    target
         .tags
-        .contains_key(crate::modes::mesh::multicluster::MESH_REMOTE_TAG)
+        .get(crate::modes::mesh::multicluster::MESH_REMOTE_TAG)
+        .map(String::as_str)
+        != Some(crate::modes::mesh::multicluster::MESH_REMOTE_TAG_VALUE)
 }
 
 /// Warm-up bias subtracted from `min_known_ewma` for unsampled (late-joiner)

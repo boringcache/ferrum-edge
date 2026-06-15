@@ -197,23 +197,22 @@ impl super::ServiceDiscoverer for MeshServiceDiscoverer {
 
         let mut targets = Vec::new();
         let mut seen = HashSet::new();
-        // Local-cluster name for remote-provenance classification. Remote
+        // Multi-cluster config for remote-provenance classification. Remote
         // endpoints reach this discoverer via `merge_remote_endpoints_into_mesh`
         // carrying `workload.cluster = Some(remote_cluster)` (stamped by the poll
-        // loop's `tag_remote_workloads`); we mark them with the explicit
-        // `mesh.remote` tag so strict local-first LB keys on real cross-cluster
-        // provenance, NOT a locality-string prefix. This uses the SAME
-        // `workload_is_remote` predicate as the egress local-only filter
+        // loop's `tag_remote_workloads` with a configured `RemoteCluster.name`);
+        // we mark them with the explicit `mesh.remote=true` tag so strict
+        // local-first LB keys on real cross-cluster provenance, NOT a
+        // locality-string prefix. This uses the SAME `workload_is_remote`
+        // predicate as the egress local-only filter
         // (`matched_local_service_workloads`), so "remote" never means two
-        // different things. Precondition: classification requires
-        // `MultiClusterConfig.local_cluster` to be set (a workload's `cluster`
-        // is "remote" only relative to a known local cluster name); with it
-        // unset, nothing is classified remote — consistent with the egress
-        // filter — so a strict multi-cluster deployment should set it.
-        let local_cluster = mesh
-            .multi_cluster
-            .as_ref()
-            .and_then(|mc| mc.local_cluster.as_deref());
+        // different things. Classification is provenance-based and does NOT
+        // require `MultiClusterConfig.local_cluster`: when `local_cluster` is
+        // omitted, a workload is remote iff its stamped cluster matches a
+        // configured remote cluster — so remote-discovered endpoints are still
+        // tagged (and strict LB still fails over local→remote correctly)
+        // regardless of whether the operator sets the optional `local_cluster`.
+        let multi_cluster = mesh.multi_cluster.as_ref();
         let matching_service_spiffe_ids: HashSet<&str> = mesh
             .workloads
             .iter()
@@ -232,7 +231,7 @@ impl super::ServiceDiscoverer for MeshServiceDiscoverer {
             };
 
             let is_remote =
-                crate::modes::mesh::multicluster::workload_is_remote(workload, local_cluster);
+                crate::modes::mesh::multicluster::workload_is_remote(workload, multi_cluster);
 
             for address in &workload.addresses {
                 if address.is_empty() {
@@ -251,7 +250,7 @@ impl super::ServiceDiscoverer for MeshServiceDiscoverer {
                 if is_remote {
                     tags.insert(
                         crate::modes::mesh::multicluster::MESH_REMOTE_TAG.to_string(),
-                        "true".to_string(),
+                        crate::modes::mesh::multicluster::MESH_REMOTE_TAG_VALUE.to_string(),
                     );
                 }
                 targets.push(UpstreamTarget {
