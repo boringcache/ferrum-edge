@@ -311,17 +311,26 @@ impl CircuitBreaker {
             .store(now_epoch_ms(), Ordering::Relaxed);
 
         match packed_state(packed) {
-            // A half-open probe failure that finds the breaker already CLOSED lost
-            // the race to a sibling probe reaching the success threshold and
-            // closing it. Reopen unconditionally — any admitted probe failure
-            // reopens — rather than fall through to the closed-state
-            // failure-threshold arm below, where a concurrent CLOSED-state success
-            // resetting failure_count could drop the failure and leave the breaker
-            // CLOSED despite a failed probe (only reachable with
-            // half_open_max_requests > 1, where sibling probes can close while
-            // this one fails).
-            STATE_CLOSED if is_half_open_probe => self.reopen_after_probe_failure(),
             STATE_CLOSED => {
+                // A half-open probe whose failure arrives only AFTER the breaker
+                // has already left HALF_OPEN — a sibling reached the success
+                // threshold and closed it, or this is a stale straggler from a
+                // bygone half-open cycle that outlived a full reopen→close cycle —
+                // is processed against the CURRENT closed state, matching standard
+                // breaker semantics (e.g. sony/gobreaker): release the slot it
+                // nominally still holds (a no-op once the close cleared the count)
+                // and count the failure toward the closed-state failure_threshold.
+                // It is deliberately NOT special-cased into a reopen: a probe that
+                // observes CLOSED here cannot be distinguished from an
+                // arbitrarily-stale straggler without per-probe generation
+                // tracking, so reopening would let a long-hung straggler trip a
+                // breaker that has since recovered. The "any probe failure reopens"
+                // rule still holds while the breaker is HALF_OPEN (the arm below):
+                // a failure that observes HALF_OPEN is current-cycle by
+                // construction and reopens even if it then races a sibling close.
+                if is_half_open_probe {
+                    self.release_half_open_slot();
+                }
                 let failures = self.failure_count.fetch_add(1, Ordering::Relaxed) + 1;
                 if failures >= self.config.failure_threshold {
                     // Re-read the counter before and after the transition attempt.
@@ -374,15 +383,19 @@ impl CircuitBreaker {
         }
     }
 
-    /// Reopen the breaker after a half-open probe failure (or a non-probe failure
-    /// observed while HALF_OPEN). Publishes OPEN and clears the in-flight count in
-    /// ONE CAS — so HALF_OPEN admissions stop at the same instant the count is
-    /// zeroed (no over-admission window during the reopen) — reopening from
-    /// HALF_OPEN OR a freshly-raced CLOSED (a sibling probe reached the success
-    /// threshold and closed the breaker first). Any admitted probe failure
-    /// reopens; only an already-published OPEN is left alone. The failing probe's
-    /// slot is subsumed by the count reset, and a straggler from this cycle
-    /// releases as a no-op at 0.
+    /// Reopen the breaker after a failure that was observed WHILE the breaker is
+    /// HALF_OPEN (the only caller — the top-level `STATE_HALF_OPEN` arm).
+    /// Publishes OPEN and clears the in-flight count in ONE CAS — so HALF_OPEN
+    /// admissions stop at the same instant the count is zeroed (no over-admission
+    /// window during the reopen). The loop also reopens a breaker that a
+    /// concurrent sibling success closed between this failure observing HALF_OPEN
+    /// and the CAS (the sibling-close race): such a failure is current-cycle by
+    /// construction, so reopening is correct. A failure that instead observes
+    /// CLOSED at the top of `record_failure` is NOT routed here — it counts
+    /// toward the closed-state threshold — because it cannot be distinguished
+    /// from a stale straggler. Only an already-published OPEN is left alone. The
+    /// failing probe's slot is subsumed by the count reset, and a straggler from
+    /// this cycle releases as a no-op at 0.
     fn reopen_after_probe_failure(&self) {
         self.success_count.store(0, Ordering::Relaxed);
         loop {

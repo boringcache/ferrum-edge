@@ -1648,73 +1648,73 @@ fn test_half_open_bound_and_no_wedge_under_admit_reopen_race_stress() {
     );
 }
 
-/// A half-open probe failure that loses the race to a sibling probe closing the
-/// breaker must still reopen. The half-open policy is that ANY admitted probe
-/// failure reopens, even when other probes reached the success threshold and
-/// closed the breaker first. Regression for the packed-atomic reopen loop, which
-/// `break`ed on a non-HALF_OPEN state and silently dropped the failure when the
-/// close raced ahead of it (possible only with `half_open_max_requests > 1`).
+/// A half-open probe whose failure arrives only AFTER a sibling has already
+/// closed the breaker is processed against the CURRENT closed state: it counts
+/// toward the closed-state `failure_threshold` and must NOT reopen the recovered
+/// breaker. A probe that observes CLOSED cannot be distinguished from an
+/// arbitrarily-stale straggler (one that outlived a full reopen→close cycle)
+/// without per-probe half-open generation tracking, so reopening here would let
+/// a long-hung straggler trip a breaker that has since recovered. The
+/// reopen-on-any-probe-failure rule still applies WHILE the breaker is HALF_OPEN
+/// (exercised by the admit/reopen stress test above).
 #[test]
-fn test_half_open_probe_failure_reopens_even_when_close_races() {
-    use std::sync::{Arc, Barrier};
-    use std::thread;
-
-    for _ in 0..400 {
-        let config = CircuitBreakerConfig {
-            // > 1 on purpose: a probe failure that finds the breaker already
-            // CLOSED must reopen via the half-open-probe path, NOT the
-            // closed-state failure-threshold path. With failure_threshold == 1
-            // the CLOSED arm would open on a single failure regardless, masking a
-            // regression that drops the probe-reopen; with 3 the test only stays
-            // OPEN when the `is_half_open_probe` CLOSED arm actually reopens (a
-            // single closed-state failure with the count reset by the sibling
-            // close cannot reach the threshold).
-            failure_threshold: 3,
-            success_threshold: 2, // two successes close the breaker
-            timeout_seconds: 0,
-            failure_status_codes: vec![500],
-            half_open_max_requests: 3,
-            trip_on_connection_errors: true,
-        };
-        let cb = Arc::new(CircuitBreaker::new(config));
-
-        // Trip open (failure_threshold = 3), then admit 3 half-open probes.
+fn half_open_probe_failure_after_recovery_counts_toward_threshold_not_reopen() {
+    let config = CircuitBreakerConfig {
+        failure_threshold: 3, // > 1 so a single counted failure does not trip
+        success_threshold: 1, // one success closes the breaker
+        timeout_seconds: 0,
+        failure_status_codes: vec![500],
+        half_open_max_requests: 2, // admit two probes so one can straggle
+        trip_on_connection_errors: true,
+    };
+    let cb = CircuitBreaker::new(config);
+    for _ in 0..3 {
         cb.record_failure(500, false, false);
-        cb.record_failure(500, false, false);
-        cb.record_failure(500, false, false);
-        assert_eq!(cb.state_name(), "open");
-        assert!(cb.can_execute().is_ok());
-        assert!(cb.can_execute().is_ok());
-        assert!(cb.can_execute().is_ok());
-        assert_eq!(cb.state_name(), "half_open");
-
-        // Two probes succeed (reaching the success threshold → close) while a
-        // third fails — all concurrently. Whatever the interleaving, the failed
-        // probe must leave the breaker OPEN: if it loses the race to the close,
-        // it must still reopen rather than drop the failure.
-        let barrier = Arc::new(Barrier::new(3));
-        let mut handles = Vec::new();
-        for i in 0..3 {
-            let cb = cb.clone();
-            let barrier = barrier.clone();
-            handles.push(thread::spawn(move || {
-                barrier.wait();
-                if i == 0 {
-                    cb.record_failure(500, false, true);
-                } else {
-                    cb.record_success(true);
-                }
-            }));
-        }
-        for h in handles {
-            h.join().unwrap();
-        }
-
-        assert_eq!(
-            cb.state_name(),
-            "open",
-            "a half-open probe failure must reopen the breaker even when sibling \
-             probes closed it first"
-        );
     }
+    assert_eq!(cb.state_name(), "open");
+
+    // Admit two half-open probes.
+    assert!(cb.can_execute().unwrap());
+    assert!(cb.can_execute().unwrap());
+    assert_eq!(cb.state_name(), "half_open");
+    assert_eq!(cb.half_open_in_flight(), 2);
+
+    // One probe succeeds and closes the breaker (success_threshold = 1) while the
+    // other is still nominally "in flight".
+    cb.record_success(true);
+    assert_eq!(
+        cb.state_name(),
+        "closed",
+        "the sibling success must recover the breaker"
+    );
+
+    // The straggler now fails, observing the breaker already CLOSED. It must be
+    // counted as a single closed-state failure (1 < threshold 3) and must NOT
+    // reopen the recovered breaker, nor leak its slot.
+    cb.record_failure(500, false, true);
+    assert_eq!(
+        cb.state_name(),
+        "closed",
+        "a probe failure arriving after recovery must not reopen the breaker"
+    );
+    assert_eq!(
+        cb.failure_count(),
+        1,
+        "the straggler failure is counted toward the closed-state threshold, not dropped"
+    );
+    assert_eq!(
+        cb.half_open_in_flight(),
+        0,
+        "the straggler must not leak a slot"
+    );
+
+    // Two more closed-state failures reach the threshold and trip normally,
+    // confirming the straggler genuinely counted rather than being special-cased.
+    cb.record_failure(500, false, false);
+    cb.record_failure(500, false, false);
+    assert_eq!(
+        cb.state_name(),
+        "open",
+        "the threshold is reached via the counted failures"
+    );
 }
