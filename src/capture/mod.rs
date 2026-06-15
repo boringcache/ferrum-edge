@@ -181,6 +181,24 @@ pub struct CaptureConfig {
     /// matches it to steer them to the local-delivery table. See
     /// [`DEFAULT_TPROXY_MARK`] for the collision analysis.
     pub tproxy_mark: u32,
+    /// `true` when these rules are applied in the HOST network namespace (the
+    /// node-agent DaemonSet, `hostNetwork: true`), `false` for the injector init
+    /// container (the POD's own network namespace).
+    ///
+    /// This gates ONLY the UDP TPROXY direction split. The TCP path separates
+    /// inbound vs outbound by netfilter HOOK (`nat PREROUTING` vs `nat OUTPUT`),
+    /// which is netns-agnostic, so it is unaffected. The UDP TPROXY path cannot
+    /// use `OUTPUT` (TPROXY is `PREROUTING`-only) so it splits direction by
+    /// destination ADDRESS TYPE (`-m addrtype --dst-type LOCAL`). That
+    /// discriminator is only correct in the POD netns, where the pod's own IP is
+    /// `LOCAL`: in the HOST netns pod IPs are FORWARDED (not `LOCAL`), so inbound
+    /// UDP to a pod would match the OUTBOUND chain's `! --dst-type LOCAL`
+    /// discriminator and be mis-captured. There is no host-netns-safe
+    /// `addrtype`-style discriminator without per-pod IP knowledge the iptables
+    /// fallback does not carry, so the host-netns UDP iptables fallback emits NO
+    /// UDP TPROXY rules (eBPF is the node-agent's supported UDP capture path). See
+    /// [`udp_tproxy_commands_for_family`].
+    pub host_netns: bool,
 }
 
 impl CaptureConfig {
@@ -212,6 +230,9 @@ impl CaptureConfig {
             udp_capture_enabled: false,
             udp_outbound_port: DEFAULT_UDP_OUTBOUND_PORT,
             tproxy_mark: DEFAULT_TPROXY_MARK,
+            // The injector (pod netns) is the canonical `explicit`-config caller;
+            // the node-agent (host netns) sets this `true` after `from_env`.
+            host_netns: false,
         }
     }
 
@@ -268,6 +289,12 @@ impl CaptureConfig {
             udp_capture_enabled,
             udp_outbound_port,
             tproxy_mark,
+            // `from_env` is the node-agent's capture-config source. The node-agent
+            // runs `hostNetwork: true`, but the host-netns flag is set explicitly
+            // by `NodeAgentConfig::from_env_config` (not inferred here) so a test
+            // or future non-host-netns caller of `from_env` is not forced into the
+            // host-netns UDP suppression. Default `false`; the node-agent flips it.
+            host_netns: false,
         })
     }
 
@@ -1010,6 +1037,31 @@ fn commands_for_family(
 /// (a failed add aborts the script). Only the delete-before-add (idempotence)
 /// keeps `|| true`. TPROXY rules and routing are installed TOGETHER or not at
 /// all — never the half-state of TPROXY-without-routing.
+///
+/// **Routing is installed BEFORE the PREROUTING jumps (codex r5).** The two
+/// `mangle PREROUTING` jumps are what actually start steering UDP into the
+/// (initially empty of route) chains; the fwmark `ip rule` + local `ip route`
+/// are what make the marked datagrams deliverable. The injector init container
+/// runs the whole `set -e` script with NO cleanup trap, so if `ip rule`/`ip
+/// route` failed AFTER the jumps were appended the pod would come up with TPROXY
+/// chains live but no policy routing — exactly the black-hole this stage avoids.
+/// Emitting the routing FIRST means a routing failure aborts the `set -e` script
+/// BEFORE any capture is wired (and benefits the node-agent's sequential runner
+/// identically). The chains/rules themselves are inert until the jumps are
+/// appended last.
+///
+/// **Host-netns direction split (codex r5).** The inbound vs outbound split
+/// below uses `-m addrtype --dst-type LOCAL` / `! --dst-type LOCAL`. That is
+/// correct ONLY in the POD netns (the injector), where the pod's own IP is
+/// `LOCAL`. The node-agent runs `hostNetwork: true` (host netns) where pod IPs
+/// are FORWARDED, not `LOCAL`, so inbound UDP to a pod would match the OUTBOUND
+/// `! --dst-type LOCAL` discriminator and be TPROXY'd by the outbound chain
+/// (bypassing inbound exclusions). There is no host-netns-safe `addrtype`-style
+/// discriminator here without per-pod IP knowledge the iptables fallback does not
+/// carry, and this path is inert (flag-gated default-off, no Stage-3 listener,
+/// eBPF is the node-agent's primary/supported UDP capture path), so the
+/// host-netns case emits NO UDP TPROXY rules rather than silently
+/// mis-capturing inbound as outbound. See [`CaptureConfig::host_netns`].
 fn udp_tproxy_commands_for_family(
     binary: &str,
     config: &CaptureConfig,
@@ -1017,32 +1069,45 @@ fn udp_tproxy_commands_for_family(
     include_cidrs: &[&str],
     exclude_cidrs: &[&str],
 ) -> Vec<String> {
-    // Cross-family exclusion (codex r4, finding #1): when the include list is
-    // EXPLICIT and NONE of its CIDRs belong to THIS family (e.g. an IPv6-only
-    // `::/0` include leaving the IPv4 family with no include), emit NOTHING for
-    // this family — no chains, no PREROUTING jumps, no TPROXY rule, no routing.
-    // This is DELIBERATELY the OPPOSITE of the TCP cross-family fallback
-    // (`emit_outbound_redirect_commands`, which fails closed to a catch-all
-    // REDIRECT): a REDIRECT delivers to the existing TCP outbound listener, but an
-    // unqualified UDP `-j TPROXY` (the unconditional outbound AND inbound
-    // catch-alls below) would divert ALL of this family's UDP (DNS included) into
-    // the marked routing table, and until the Stage 3 UDP listener exists that is
-    // a silent black-hole. The operator selected only the other family, so the
-    // safe failure is to capture nothing here. An IMPLICIT default
-    // (`!include_cidrs_explicit`) or a genuinely-empty/ports-only explicit config
-    // (no family carries an include CIDR) does NOT trip this — the catch-all is
-    // the intended capture there.
-    if config.include_cidrs_explicit && include_cidrs.is_empty() {
-        let has_include_cidrs_for_other_family = config
+    // Host-netns UDP suppression (codex r5, finding #1). The `addrtype --dst-type
+    // LOCAL` direction split below is only valid in the pod netns; in the host
+    // netns it mis-captures inbound-to-pod UDP as outbound. Rather than wire a
+    // wrong direction split, the host-netns iptables fallback emits no UDP TPROXY
+    // rules at all — eBPF is the node-agent's supported UDP capture path. The
+    // node-agent logs the limitation once when it would otherwise emit these.
+    if config.host_netns {
+        return Vec::new();
+    }
+
+    // Cross-family CATCH-ALL suppression (codex r4 finding #1, narrowed by codex
+    // r5 finding #2): when the include list is EXPLICIT and NONE of its CIDRs
+    // belong to THIS family (e.g. an IPv6-only include leaving the IPv4 family
+    // with no include CIDR), this family was NOT selected by CIDR. We must NOT
+    // emit the unqualified `-j TPROXY` CATCH-ALLs (the implicit outbound catch-all
+    // AND the inbound `--dst-type LOCAL` catch-all) — an unqualified UDP TPROXY
+    // would divert ALL of this family's UDP (DNS included) into the marked routing
+    // table, and until the Stage 3 UDP listener exists that is a silent
+    // black-hole. This is DELIBERATELY the OPPOSITE of the TCP cross-family
+    // fallback (`emit_outbound_redirect_commands`, which fails closed to a
+    // catch-all REDIRECT that delivers to the existing TCP outbound listener).
+    //
+    // BUT port includes (`includeOutboundPorts`/`--dport`) are NOT family-scoped:
+    // an IPv4 DNS-port (53) include must still emit its IPv4 `--dport` TPROXY rule
+    // even when only an IPv6 CIDR is set (codex r5 finding #2 — the old whole-
+    // family early-return silently dropped it). So this suppresses only the
+    // unqualified catch-alls; the per-port `--dport` and per-CIDR `-d` rules below
+    // still emit. If nothing else emits a TPROXY rule the family produces no UDP
+    // state at all (computed at the end), preserving the original behavior for the
+    // pure-CIDR cross-family case. An IMPLICIT default (`!include_cidrs_explicit`)
+    // or a genuinely-empty/ports-only explicit config (no family carries an
+    // include CIDR) does NOT trip this — the catch-all is the intended capture.
+    let suppress_catch_all = config.include_cidrs_explicit
+        && include_cidrs.is_empty()
+        && config
             .include_cidrs
             .iter()
             .any(|cidr| cidr_family(cidr).is_some_and(|cidr_family| cidr_family != family));
-        if has_include_cidrs_for_other_family {
-            return Vec::new();
-        }
-    }
 
-    let mut commands = Vec::new();
     let mark = config.tproxy_mark;
     let mark_arg = format!("0x{mark:x}/0x{TPROXY_MARK_MASK:x}");
     let tproxy_jump = format!(
@@ -1056,38 +1121,90 @@ fn udp_tproxy_commands_for_family(
     // chain's job, scoped with the complementary `--dst-type LOCAL`).
     let outbound_dst_scope = "-m addrtype ! --dst-type LOCAL";
 
-    // FAIL CLOSED if `ip` is missing: TPROXY local delivery is useless without
-    // the `ip rule`/`ip route local` plumbing, so a runtime image without
-    // `iproute2` must NOT come up with TPROXY-without-routing (a silent UDP
-    // black-hole). Emitted FIRST, before any UDP mangle/TPROXY rule, so the
-    // `set -e` script exits non-zero and installs NOTHING when `ip` is absent —
-    // TPROXY rules and routing are installed together or not at all (codex r2).
-    commands.push(
+    // Build the OUTBOUND TPROXY rules first into a temp list. The unqualified
+    // catch-alls (`include_all_outbound_ports` and the implicit-CIDR catch-all)
+    // are suppressed when this family was NOT CIDR-selected (cross-family case);
+    // the per-CIDR `-d` and per-port `--dport` rules always emit (codex r5
+    // finding #2 — port includes are not family-scoped).
+    let mut outbound_tproxy_rules: Vec<String> = Vec::new();
+    if config.include_all_outbound_ports {
+        if !suppress_catch_all {
+            outbound_tproxy_rules.push(format!("-p udp {outbound_dst_scope} {tproxy_jump}"));
+        }
+    } else {
+        let emit_include_cidrs =
+            config.include_outbound_ports.is_empty() || config.include_cidrs_explicit;
+        if emit_include_cidrs {
+            if include_cidrs.is_empty() {
+                // Unqualified outbound catch-all — emitted only when this family is
+                // NOT cross-family-suppressed (an IMPLICIT `0.0.0.0/0`/`::/0`
+                // default or a genuinely-empty / ports-only explicit config — both
+                // of which intend full-family UDP capture). Suppressed for a family
+                // the operator did not select by CIDR (codex r4 + r5).
+                if !suppress_catch_all {
+                    outbound_tproxy_rules
+                        .push(format!("-p udp {outbound_dst_scope} {tproxy_jump}"));
+                }
+            } else {
+                for cidr in include_cidrs {
+                    outbound_tproxy_rules.push(format!(
+                        "-p udp -d {cidr} {outbound_dst_scope} {tproxy_jump}"
+                    ));
+                }
+            }
+        }
+        // Port includes (`--dport`) are NOT family-scoped: an IPv4 DNS-port (53)
+        // include emits its IPv4 `--dport` rule even when only an IPv6 CIDR is set
+        // (codex r5 finding #2). These survive the cross-family catch-all
+        // suppression above.
+        for port in &config.include_outbound_ports {
+            outbound_tproxy_rules.push(format!(
+                "-p udp --dport {port} {outbound_dst_scope} {tproxy_jump}"
+            ));
+        }
+    }
+
+    // The inbound catch-all is itself an unqualified `-j TPROXY` diversion, so it
+    // is suppressed for a cross-family-unselected family too (codex r5 finding #2)
+    // — capturing nothing inbound for the unselected family rather than diverting
+    // all its inbound UDP into the marked routing void.
+    let emit_inbound_catch_all = !suppress_catch_all;
+
+    // If this family emits NO TPROXY rule at all (e.g. a pure-CIDR cross-family
+    // skip with no port includes), produce NO UDP state for it — no chains, no
+    // PREROUTING jumps, no routing — preserving the original cross-family behavior
+    // (codex r4) while letting port includes survive (codex r5).
+    if outbound_tproxy_rules.is_empty() && !emit_inbound_catch_all {
+        return Vec::new();
+    }
+
+    // The fixed prefix (in order):
+    //   1. FAIL CLOSED if `ip` is missing — TPROXY local delivery is useless
+    //      without the `ip rule`/`ip route local` plumbing, so a runtime image
+    //      without `iproute2` must NOT come up with TPROXY-without-routing (a
+    //      silent UDP black-hole). Emitted FIRST, before any UDP mangle/TPROXY
+    //      rule, so the `set -e` script exits non-zero and installs NOTHING when
+    //      `ip` is absent — TPROXY rules and routing go in together or not at all
+    //      (codex r2).
+    //   2/3. (idempotently) create both mangle chains.
+    //   4/5. FLUSH the UDP chains after creating them, BEFORE adding any rule
+    //      (codex r3). The per-rule `-C ... || -A` guard is an EXACT match, so on
+    //      a reconfiguration that changes `FERRUM_MESH_CAPTURE_UDP_PORT` /
+    //      `FERRUM_MESH_TPROXY_MARK` the new TPROXY rule never matches the old
+    //      one's `-C` check and is APPENDED AFTER it; iptables preserves rule
+    //      order, so the stale rule (old port/mark) stays ahead and black-holes
+    //      UDP. Flushing first clears any prior rules so the chain is rebuilt with
+    //      only the current config. Flush is idempotent (`-F ... || true`) and
+    //      harmless on a fresh chain, keeping the create+flush+populate sequence
+    //      rerun-safe.
+    let mut commands = vec![
         "command -v ip >/dev/null 2>&1 || { echo \"iproute2 (ip) is required for UDP TPROXY transparent routing\" >&2; exit 1; }"
             .to_string(),
-    );
-
-    commands.push(idempotent_new_chain(
-        binary,
-        "mangle",
-        "FERRUM_MESH_UDP_INBOUND",
-    ));
-    commands.push(idempotent_new_chain(
-        binary,
-        "mangle",
-        "FERRUM_MESH_UDP_OUTBOUND",
-    ));
-    // FLUSH the UDP chains after (idempotently) creating them, BEFORE adding any
-    // rule (codex r3). The per-rule `-C ... || -A` guard is an EXACT match, so on
-    // a reconfiguration that changes `FERRUM_MESH_CAPTURE_UDP_PORT` /
-    // `FERRUM_MESH_TPROXY_MARK` the new TPROXY rule never matches the old one's
-    // `-C` check and is APPENDED AFTER it; iptables preserves rule order, so the
-    // stale rule (old port/mark) stays ahead and black-holes UDP. Flushing first
-    // clears any prior rules so the chain is rebuilt with only the current
-    // config. Flush is idempotent (`-F ... || true`) and harmless on a fresh
-    // chain, keeping the whole create+flush+populate sequence rerun-safe.
-    commands.push(flush_chain(binary, "mangle", "FERRUM_MESH_UDP_INBOUND"));
-    commands.push(flush_chain(binary, "mangle", "FERRUM_MESH_UDP_OUTBOUND"));
+        idempotent_new_chain(binary, "mangle", "FERRUM_MESH_UDP_INBOUND"),
+        idempotent_new_chain(binary, "mangle", "FERRUM_MESH_UDP_OUTBOUND"),
+        flush_chain(binary, "mangle", "FERRUM_MESH_UDP_INBOUND"),
+        flush_chain(binary, "mangle", "FERRUM_MESH_UDP_OUTBOUND"),
+    ];
 
     // Outbound exclusions first (RETURN wins by rule order), mirroring TCP.
     for cidr in exclude_cidrs {
@@ -1113,50 +1230,13 @@ fn udp_tproxy_commands_for_family(
     // The proxy's own UDP egress is locally generated, so it is captured only by
     // an OUTPUT path, which is DEFERRED to a later stage (a MARK-only OUTPUT
     // chain — TPROXY cannot run in OUTPUT). See the fn doc.
-
-    if config.include_all_outbound_ports {
+    for rule in &outbound_tproxy_rules {
         commands.push(idempotent_append(
             binary,
             "mangle",
             "FERRUM_MESH_UDP_OUTBOUND",
-            &format!("-p udp {outbound_dst_scope} {tproxy_jump}"),
+            rule,
         ));
-    } else {
-        let emit_include_cidrs =
-            config.include_outbound_ports.is_empty() || config.include_cidrs_explicit;
-        if emit_include_cidrs {
-            if include_cidrs.is_empty() {
-                // Unqualified outbound catch-all. Reached only when this family is
-                // NOT cross-family-excluded (the early return above already bailed
-                // for an explicit include set that selected only the other family),
-                // i.e. an IMPLICIT `0.0.0.0/0`/`::/0` default or a genuinely-empty /
-                // ports-only explicit config — both of which intend full-family UDP
-                // capture, so the catch-all is correct here (codex r4).
-                commands.push(idempotent_append(
-                    binary,
-                    "mangle",
-                    "FERRUM_MESH_UDP_OUTBOUND",
-                    &format!("-p udp {outbound_dst_scope} {tproxy_jump}"),
-                ));
-            } else {
-                for cidr in include_cidrs {
-                    commands.push(idempotent_append(
-                        binary,
-                        "mangle",
-                        "FERRUM_MESH_UDP_OUTBOUND",
-                        &format!("-p udp -d {cidr} {outbound_dst_scope} {tproxy_jump}"),
-                    ));
-                }
-            }
-        }
-        for port in &config.include_outbound_ports {
-            commands.push(idempotent_append(
-                binary,
-                "mangle",
-                "FERRUM_MESH_UDP_OUTBOUND",
-                &format!("-p udp --dport {port} {outbound_dst_scope} {tproxy_jump}"),
-            ));
-        }
     }
 
     // Inbound exclusions before the catch-all TPROXY (RETURN must precede it,
@@ -1173,45 +1253,28 @@ fn udp_tproxy_commands_for_family(
     // captures ONLY genuinely-inbound UDP — never pod egress that fell through the
     // OUTBOUND chain (e.g. an excluded-CIDR RETURN). This is the complement of the
     // OUTBOUND chain's `! --dst-type LOCAL` and is how the two PREROUTING chains
-    // stay direction-disjoint without knowing the pod IP (codex r2).
-    commands.push(idempotent_append(
-        binary,
-        "mangle",
-        "FERRUM_MESH_UDP_INBOUND",
-        &format!("-p udp -m addrtype --dst-type LOCAL {tproxy_jump}"),
-    ));
-
-    // PREROUTING jumps carry remotely-originated UDP in both capture directions
-    // (TPROXY runs ONLY in PREROUTING). The OUTBOUND jump is installed BEFORE the
-    // INBOUND jump so pod EGRESS is matched/routed first: the inbound catch-all
-    // (xt_TPROXY returns NF_ACCEPT, ending traversal) must not swallow egress and
-    // bypass the outbound include/exclude/CIDR/port rules. The two chains are also
-    // destination-scoped (`! --dst-type LOCAL` outbound, `--dst-type LOCAL`
-    // inbound) so each captures only its own direction regardless of order; the
-    // ordering is the belt-and-suspenders mirror of the TCP chains (codex r2).
-    //
-    // There is deliberately NO `mangle OUTPUT` jump: the OUTBOUND chain ends in
-    // `-j TPROXY`, and TPROXY is invalid for locally-generated (OUTPUT) packets —
-    // jumping into it from OUTPUT can make iptables setup fail outright.
-    // Sidecar-self-egress (locally-generated) UDP capture needs a separate
-    // MARK-only OUTPUT chain and is DEFERRED to a later stage (see the fn doc +
-    // docs/mesh.md).
-    commands.push(idempotent_append(
-        binary,
-        "mangle",
-        "PREROUTING",
-        "-p udp -j FERRUM_MESH_UDP_OUTBOUND",
-    ));
-    commands.push(idempotent_append(
-        binary,
-        "mangle",
-        "PREROUTING",
-        "-p udp -j FERRUM_MESH_UDP_INBOUND",
-    ));
+    // stay direction-disjoint without knowing the pod IP (codex r2). Suppressed
+    // for a cross-family-unselected family (codex r5 finding #2).
+    if emit_inbound_catch_all {
+        commands.push(idempotent_append(
+            binary,
+            "mangle",
+            "FERRUM_MESH_UDP_INBOUND",
+            &format!("-p udp -m addrtype --dst-type LOCAL {tproxy_jump}"),
+        ));
+    }
 
     // Transparent-routing plumbing: raw `ip` commands (NOT iptables). The fwmark
     // selector must match the `--tproxy-mark` value above so marked datagrams are
     // steered to the local-delivery table.
+    //
+    // INSTALLED BEFORE THE PREROUTING JUMPS (codex r5 finding #3). The jumps are
+    // what start steering UDP into the chains; if `ip rule`/`ip route` failed
+    // AFTER the jumps were appended, the injector's trap-less `set -e` init script
+    // would leave the pod with TPROXY chains live but no policy routing — the
+    // half-installed black-hole. Emitting routing first means a routing failure
+    // aborts the script BEFORE any capture is wired (the chains/rules above are
+    // inert until the jumps below are appended).
     //
     // FAIL CLOSED (codex r2): TPROXY local delivery is USELESS without this
     // routing, so the load-bearing ADD commands are NOT `|| true` — under the
@@ -1251,6 +1314,36 @@ fn udp_tproxy_commands_for_family(
     )));
     commands.push(format!(
         "{ip} route add {local_route} table {TPROXY_ROUTE_TABLE}"
+    ));
+
+    // PREROUTING jumps LAST (codex r5 finding #3): these start steering UDP into
+    // the now-fully-built chains, and the routing above is already installed, so
+    // there is no window where TPROXY is wired without policy routing. The
+    // OUTBOUND jump is installed BEFORE the INBOUND jump so pod EGRESS is
+    // matched/routed first: the inbound catch-all (xt_TPROXY returns NF_ACCEPT,
+    // ending traversal) must not swallow egress and bypass the outbound
+    // include/exclude/CIDR/port rules. The two chains are also destination-scoped
+    // (`! --dst-type LOCAL` outbound, `--dst-type LOCAL` inbound) so each captures
+    // only its own direction regardless of order; the ordering is the
+    // belt-and-suspenders mirror of the TCP chains (codex r2).
+    //
+    // There is deliberately NO `mangle OUTPUT` jump: the OUTBOUND chain ends in
+    // `-j TPROXY`, and TPROXY is invalid for locally-generated (OUTPUT) packets —
+    // jumping into it from OUTPUT can make iptables setup fail outright.
+    // Sidecar-self-egress (locally-generated) UDP capture needs a separate
+    // MARK-only OUTPUT chain and is DEFERRED to a later stage (see the fn doc +
+    // docs/mesh.md).
+    commands.push(idempotent_append(
+        binary,
+        "mangle",
+        "PREROUTING",
+        "-p udp -j FERRUM_MESH_UDP_OUTBOUND",
+    ));
+    commands.push(idempotent_append(
+        binary,
+        "mangle",
+        "PREROUTING",
+        "-p udp -j FERRUM_MESH_UDP_INBOUND",
     ));
 
     commands
@@ -3168,6 +3261,202 @@ mod tests {
                     && c.contains("-p udp -d fd00::/8 -m addrtype ! --dst-type LOCAL -j TPROXY")),
             "IPv6 UDP TPROXY CIDR rule must still be emitted for the selected family: {:?}",
             plan.v6_commands
+        );
+    }
+
+    #[test]
+    fn udp_port_includes_survive_cross_family_catch_all_skip() {
+        // codex r5 (finding #2): the cross-family CATCH-ALL skip (codex r4) must
+        // NOT also drop family-agnostic `--dport` port includes. With an IPv6-only
+        // include CIDR plus an `includeOutboundPorts` port (e.g. DNS/53), the IPv4
+        // family is cross-family-skipped for the CIDR catch-all but must STILL emit
+        // its IPv4 `--dport 53` TPROXY rule — a port include is not family-scoped.
+        let mut config = udp_enabled_iptables_config();
+        config.include_cidrs = vec!["fd00::/8".to_string()];
+        config.include_cidrs_explicit = true;
+        config.include_outbound_ports = vec![53];
+
+        let plan = IptablesPlan::for_config(&config);
+
+        // The IPv4 `--dport 53` outbound TPROXY rule MUST be present (the port
+        // include survives the catch-all skip).
+        assert!(
+            plan.v4_commands
+                .iter()
+                .any(|c| c.contains("iptables -t mangle")
+                    && c.contains("FERRUM_MESH_UDP_OUTBOUND")
+                    && c.contains(&format!(
+                        "-p udp --dport 53 -m addrtype ! --dst-type LOCAL -j TPROXY --on-port {}",
+                        DEFAULT_UDP_OUTBOUND_PORT
+                    ))),
+            "IPv4 --dport port include must survive the cross-family catch-all skip: {:?}",
+            plan.v4_commands
+        );
+        // Because the port include emits an IPv4 UDP rule, the IPv4 family now also
+        // gets its mangle chains, PREROUTING jumps, and routing.
+        assert!(
+            plan.v4_commands
+                .iter()
+                .any(|c| c.contains("iptables -t mangle")
+                    && c.contains("-N FERRUM_MESH_UDP_OUTBOUND")),
+            "IPv4 UDP chains must be created when a port include emits a rule: {:?}",
+            plan.v4_commands
+        );
+        assert!(
+            plan.v4_commands
+                .iter()
+                .any(|c| c.contains("ip rule add priority")
+                    && c.contains("fwmark")
+                    && !c.contains("ip -6")),
+            "IPv4 routing must be installed when a port include emits a rule: {:?}",
+            plan.v4_commands
+        );
+        // But the IPv4 family must STILL NOT get either UNQUALIFIED catch-all — the
+        // implicit outbound catch-all OR the inbound `--dst-type LOCAL` catch-all
+        // (both would black-hole all IPv4 UDP though only IPv6 was CIDR-selected).
+        assert!(
+            !plan
+                .v4_commands
+                .iter()
+                .any(|c| c.contains("FERRUM_MESH_UDP_OUTBOUND")
+                    && c.contains("-j TPROXY")
+                    && !c.contains("--dport")
+                    && !c.contains("-d ")),
+            "IPv4 outbound catch-all must stay suppressed for the unselected family: {:?}",
+            plan.v4_commands
+        );
+        assert!(
+            !plan
+                .v4_commands
+                .iter()
+                .any(|c| c.contains("FERRUM_MESH_UDP_INBOUND") && c.contains("-j TPROXY")),
+            "IPv4 inbound catch-all must stay suppressed for the unselected family: {:?}",
+            plan.v4_commands
+        );
+        // The IPv6 family keeps its CIDR-qualified outbound rule AND its inbound
+        // catch-all (it IS the selected family). The port include also fans onto
+        // IPv6 (port includes are family-agnostic).
+        assert!(
+            plan.v6_commands
+                .iter()
+                .any(|c| c.contains("ip6tables -t mangle")
+                    && c.contains("-p udp -d fd00::/8 -m addrtype ! --dst-type LOCAL -j TPROXY")),
+            "IPv6 selected-family CIDR rule missing: {:?}",
+            plan.v6_commands
+        );
+        assert!(
+            plan.v6_commands
+                .iter()
+                .any(|c| c.contains("FERRUM_MESH_UDP_INBOUND")
+                    && c.contains("-m addrtype --dst-type LOCAL")
+                    && c.contains("-j TPROXY")),
+            "IPv6 selected-family inbound catch-all missing: {:?}",
+            plan.v6_commands
+        );
+    }
+
+    #[test]
+    fn udp_host_netns_emits_no_udp_tproxy_rules() {
+        // codex r5 (finding #1): the node-agent runs `hostNetwork: true` (host
+        // netns), where the `addrtype --dst-type LOCAL` direction split is wrong
+        // (pod IPs are FORWARDED, not LOCAL). The host-netns iptables fallback must
+        // therefore emit NO UDP TPROXY rules at all (eBPF is the supported
+        // node-agent UDP path) rather than silently mis-capturing inbound as
+        // outbound. TCP capture is unaffected.
+        let mut config = udp_enabled_iptables_config();
+        config.host_netns = true;
+        config.include_cidrs = vec!["10.0.0.0/8".to_string(), "fd00::/8".to_string()];
+        config.include_cidrs_explicit = true;
+        config.include_outbound_ports = vec![53];
+
+        let plan = IptablesPlan::for_config(&config);
+
+        for cmd in plan.v4_commands.iter().chain(plan.v6_commands.iter()) {
+            assert!(
+                !cmd.contains("mangle")
+                    && !cmd.contains("TPROXY")
+                    && !cmd.contains("FERRUM_MESH_UDP")
+                    && !cmd.contains("-p udp")
+                    && !cmd.contains("fwmark")
+                    && !cmd.starts_with("ip rule")
+                    && !cmd.starts_with("ip -6 rule")
+                    && !cmd.starts_with("ip route")
+                    && !cmd.starts_with("ip -6 route"),
+                "host-netns UDP-enabled plan must emit no UDP/TPROXY/routing rules: {cmd}"
+            );
+        }
+        // TCP capture chains MUST remain — only the UDP TPROXY path is suppressed.
+        assert!(
+            plan.v4_commands
+                .iter()
+                .any(|c| c.contains("FERRUM_MESH_INBOUND") || c.contains("FERRUM_MESH_OUTBOUND")),
+            "host-netns plan must keep TCP capture chains: {:?}",
+            plan.v4_commands
+        );
+        // The pod-netns (injector) equivalent DOES emit UDP rules — confirm the
+        // suppression is keyed strictly on `host_netns`.
+        let mut pod_config = config.clone();
+        pod_config.host_netns = false;
+        let pod_plan = IptablesPlan::for_config(&pod_config);
+        assert!(
+            pod_plan
+                .v4_commands
+                .iter()
+                .any(|c| c.contains("FERRUM_MESH_UDP")),
+            "pod-netns plan with the same config must still emit UDP rules: {:?}",
+            pod_plan.v4_commands
+        );
+    }
+
+    #[test]
+    fn udp_routing_installed_before_prerouting_jumps() {
+        // codex r5 (finding #3): the injector init container runs the whole `set -e`
+        // script with NO cleanup trap, so the routing plumbing (`ip rule`/`ip
+        // route`) must be installed BEFORE the `mangle PREROUTING` jumps that start
+        // steering UDP into the chains. Otherwise an `ip rule`/`ip route` failure
+        // after the jumps were appended leaves TPROXY live without policy routing —
+        // a half-installed black-hole.
+        let plan = IptablesPlan::for_config(&udp_enabled_iptables_config());
+        let cmds = &plan.v4_commands;
+
+        let route_add = cmds
+            .iter()
+            .position(|c| c.contains(&format!("rule add priority {TPROXY_ROUTE_RULE_PRIORITY}")))
+            .expect("ip rule add present");
+        let local_route_add = cmds
+            .iter()
+            .position(|c| c.contains("route add local 0.0.0.0/0 dev lo"))
+            .expect("ip route add present");
+        let outbound_jump = cmds
+            .iter()
+            .position(|c| {
+                c.contains("-t mangle")
+                    && c.contains("PREROUTING")
+                    && c.contains("-j FERRUM_MESH_UDP_OUTBOUND")
+            })
+            .expect("PREROUTING -> UDP outbound jump");
+        let inbound_jump = cmds
+            .iter()
+            .position(|c| {
+                c.contains("-t mangle")
+                    && c.contains("PREROUTING")
+                    && c.contains("-j FERRUM_MESH_UDP_INBOUND")
+            })
+            .expect("PREROUTING -> UDP inbound jump");
+
+        assert!(
+            route_add < outbound_jump && route_add < inbound_jump,
+            "fwmark `ip rule add` must precede BOTH PREROUTING jumps: {cmds:?}"
+        );
+        assert!(
+            local_route_add < outbound_jump && local_route_add < inbound_jump,
+            "`ip route add local` must precede BOTH PREROUTING jumps: {cmds:?}"
+        );
+        // And the outbound jump still precedes the inbound catch-all jump (codex r2
+        // ordering preserved by the reorder).
+        assert!(
+            outbound_jump < inbound_jump,
+            "outbound PREROUTING jump must still precede the inbound jump: {cmds:?}"
         );
     }
 

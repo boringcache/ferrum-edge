@@ -1588,9 +1588,12 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   destination**, so the Stage 3 listener recovers the original destination
   per-datagram from the `IP_RECVORIGDSTADDR` cmsg. New `mangle`-table chains
   `FERRUM_MESH_UDP_INBOUND` / `FERRUM_MESH_UDP_OUTBOUND` mirror the TCP
-  include/exclude/CIDR/proxy-UID logic with `-p udp ... -j TPROXY --on-port
+  include/exclude/CIDR scoping with `-p udp ... -j TPROXY --on-port
   <FERRUM_MESH_CAPTURE_UDP_PORT> --tproxy-mark <FERRUM_MESH_TPROXY_MARK>/<mask>`,
-  jumped from `mangle PREROUTING`. The UDP listener port (default `15011`) is
+  jumped from `mangle PREROUTING`. The UDP chains are **PREROUTING-only**, so —
+  unlike the TCP `nat OUTPUT` outbound chain — they carry **no proxy-UID `-m owner
+  --uid-owner` self-exclusion** (owner-match is OUTPUT-context only; see the
+  PREROUTING-only note below). The UDP listener port (default `15011`) is
   **distinct from the TCP outbound port** (`15001`) because UDP and TCP cannot
   share one listener socket.
 - **Direction scoping (both chains ride PREROUTING).** The TCP chains stay
@@ -1604,7 +1607,19 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   catch-all (xt_TPROXY returns `NF_ACCEPT`, ending PREROUTING traversal) would
   swallow egress and bypass the outbound include/exclude/CIDR/port rules. The
   `addrtype` match needs no extra capability beyond the `NET_ADMIN` the init
-  container already grants.
+  container already grants. **Pod-netns only (host-netns node-agent limitation).**
+  The `--dst-type LOCAL` discriminator is correct only in the **pod** network
+  namespace, where the pod's own IP is `LOCAL` — exactly the injector init
+  container's context. The **node-agent DaemonSet runs `hostNetwork: true`** (host
+  netns), where pod IPs are **FORWARDED, not `LOCAL`**, so inbound UDP to a pod
+  would match the OUTBOUND chain's `! --dst-type LOCAL` discriminator and be
+  mis-captured as egress. There is no host-netns-safe `addrtype`-style
+  discriminator without per-pod IP knowledge the iptables fallback does not carry,
+  so the **node-agent's host-netns iptables fallback emits NO UDP TPROXY rules**
+  (`CaptureConfig::host_netns` short-circuits `udp_tproxy_commands_for_family`) and
+  logs the limitation when `FERRUM_MESH_CAPTURE_UDP_ENABLED=true`. **eBPF is the
+  supported node-agent UDP capture path**; the iptables fallback is TCP-only in the
+  host netns. The injector (pod-netns) UDP path is unaffected.
 - **Transparent-routing plumbing** (raw `ip` commands, not iptables): TPROXY
   delivery additionally needs `ip rule add priority <P> fwmark <mark>/<mask> lookup
   <table>` plus `ip route add local 0.0.0.0/0 dev lo table <table>` (and the `ip -6`
@@ -1627,7 +1642,16 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   best-effort. **Idempotent setup:** `ip rule add` appends, so the rule is assigned
   the explicit priority (`100`) and is delete-by-priority **before** add (and the
   route is delete-before-add), so a node-agent fallback crash/retry before cleanup
-  never stacks a duplicate rule. The mark (default `0xFE3`, 4067) is **Ferrum-owned
+  never stacks a duplicate rule. **Routing installed BEFORE the PREROUTING jumps.**
+  The `ip rule`/`ip route` plumbing is emitted **before** the two `mangle
+  PREROUTING -j FERRUM_MESH_UDP_*` jumps (which is what actually starts steering UDP
+  into the chains). The injector init container runs the whole `set -e` script with
+  **no cleanup trap**, so installing the jumps first and then failing on `ip
+  rule`/`ip route` would leave the pod with TPROXY chains live but no policy routing
+  — the exact half-installed black-hole this design avoids. Emitting routing first
+  means a routing failure aborts the `set -e` script before any capture is wired
+  (the chains/rules are inert until the jumps are appended last); the node-agent's
+  sequential runner gets the same ordering. The mark (default `0xFE3`, 4067) is **Ferrum-owned
   and deliberately NOT Istio's conventional TPROXY mark `0x539`**: Ferrum's
   higher-priority fwmark rule (priority `100`) matches the mark and steers it to
   the Ferrum table, so defaulting to `0x539` would hijack a co-resident Istio's

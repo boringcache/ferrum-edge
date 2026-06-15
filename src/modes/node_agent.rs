@@ -104,6 +104,12 @@ impl NodeAgentConfig {
         }
 
         let mut capture_config = CaptureConfig::from_env()?;
+        // The node-agent DaemonSet runs `hostNetwork: true` (host netns), so the
+        // UDP TPROXY `addrtype --dst-type LOCAL` direction split (valid only in a
+        // pod netns) is suppressed for the iptables fallback — see
+        // `CaptureConfig::host_netns` and `udp_tproxy_commands_for_family`. eBPF is
+        // the node-agent's supported UDP capture path.
+        capture_config.host_netns = true;
         // Both the node-agent and the mesh proxy read FERRUM_MESH_OUTBOUND_LISTEN_ADDR
         // (default 127.0.0.1:15001), so the eBPF connect4 rewrite port and the
         // proxy's in-netns listener stay aligned — co-deployed node-waypoint
@@ -1986,6 +1992,25 @@ where
             let include_v6_cleanup = true;
             let udp_capture_enabled = config.capture_config.udp_capture_enabled;
 
+            // The node-agent runs in the HOST netns, where the UDP TPROXY
+            // `addrtype --dst-type LOCAL` direction split is wrong (pod IPs are
+            // FORWARDED, not LOCAL), so `udp_tproxy_commands_for_family` emits NO
+            // UDP TPROXY rules for `host_netns`. Surface that explicitly so an
+            // operator who set FERRUM_MESH_CAPTURE_UDP_ENABLED=true on the
+            // node-agent is not silently left without UDP capture: eBPF is the
+            // supported node-agent UDP capture path; the iptables fallback is
+            // TCP-only in the host netns.
+            if udp_capture_enabled && config.capture_config.host_netns {
+                warn!(
+                    "FERRUM_MESH_CAPTURE_UDP_ENABLED=true but the node-agent iptables \
+                     fallback runs in the host network namespace, where the UDP TPROXY \
+                     direction split (addrtype --dst-type LOCAL) cannot distinguish \
+                     inbound-to-pod from outbound traffic. No UDP TPROXY rules will be \
+                     installed (TCP capture is unaffected). Use eBPF capture (kernel >= 5.7 \
+                     with cgroup v2 + bpffs) for node-agent UDP capture."
+                );
+            }
+
             // UNCONDITIONAL pre-setup teardown of the EXACT Ferrum-owned UDP TPROXY
             // state, regardless of the CURRENT `udp_capture_enabled` flag (codex
             // r4). A prior UDP-enabled run that crashed before its shutdown cleanup
@@ -2436,6 +2461,7 @@ mod tests {
                 udp_capture_enabled: false,
                 udp_outbound_port: crate::capture::DEFAULT_UDP_OUTBOUND_PORT,
                 tproxy_mark: crate::capture::DEFAULT_TPROXY_MARK,
+                host_netns: true,
             },
             cgroup_root: "/sys/fs/cgroup".to_string(),
             bpf_fs_path: "/sys/fs/bpf".to_string(),
