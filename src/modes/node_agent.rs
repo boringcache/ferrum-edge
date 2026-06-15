@@ -1985,6 +1985,34 @@ where
             // created ip6tables chains even when the current plan has none.
             let include_v6_cleanup = true;
             let udp_capture_enabled = config.capture_config.udp_capture_enabled;
+
+            // UNCONDITIONAL pre-setup teardown of the EXACT Ferrum-owned UDP TPROXY
+            // state, regardless of the CURRENT `udp_capture_enabled` flag (codex
+            // r4). A prior UDP-enabled run that crashed before its shutdown cleanup
+            // leaves the UDP mangle chains/jumps + the fwmark `ip rule` + the local
+            // route installed; restarting with `FERRUM_MESH_CAPTURE_UDP_ENABLED=false`
+            // would otherwise NEVER remove them (both the shutdown cleanup and the
+            // setup-failure cleanup gate the UDP teardown on the now-false flag, and
+            // disabled setup emits no UDP rules to overwrite them), so captured UDP
+            // stays diverted into table 33133 while disabled — and with no Stage 3
+            // listener that is a black-hole. This teardown touches ONLY exact
+            // Ferrum-owned UDP state (mangle chains by name + fwmark rule by stable
+            // priority + route by exact table spec) — never the TCP nat chains,
+            // which setup is about to rebuild — and every command is
+            // idempotent/best-effort (`|| true`), so it is harmless when no stale
+            // UDP state exists. Setup then (re)installs the UDP rules only when the
+            // current flag is enabled. Failures only warn — a stale-state cleanup
+            // must never block bringing the current capture posture up.
+            let pre_setup_udp_teardown = udp_pre_setup_teardown_commands(include_v6_cleanup);
+            if let Err(teardown_err) =
+                execute(pre_setup_udp_teardown, "pre-setup UDP teardown").await
+            {
+                warn!(
+                    error = %teardown_err,
+                    "Failed to tear down stale Ferrum UDP capture state before setup; continuing"
+                );
+            }
+
             let setup = setup_commands_for_plan(&plan);
             if let Err(setup_err) = execute(setup, "setup").await {
                 let cleanup = cleanup_commands_for_plan(include_v6_cleanup, udp_capture_enabled);
@@ -2087,6 +2115,32 @@ fn cleanup_commands_for_plan(include_v6: bool, udp_capture_enabled: bool) -> Vec
         // the probe would leak the rule/route and keep diverting marked UDP after
         // shutdown when `ip6tables` is missing (codex r3). It carries its own
         // best-effort `|| true`.
+        commands.extend(v6.ip_routing);
+    }
+    commands
+}
+
+/// The UNCONDITIONAL pre-setup teardown of the EXACT Ferrum-owned UDP TPROXY
+/// state, regardless of the current `udp_capture_enabled` (codex r4). Mirrors
+/// [`cleanup_commands_for_plan`]'s ip6tables-guard discipline, but composes ONLY
+/// the UDP teardown (mangle chains + fwmark rule by stable priority + local
+/// route) — never the TCP nat chains, which setup is about to rebuild — so it can
+/// run before setup to reap stale UDP state from a prior UDP-enabled-then-crashed
+/// run without disturbing TCP capture. The IPv6 table half is guarded behind the
+/// `ip6tables` probe; the raw `ip`/`ip -6` routing halves are emitted
+/// unconditionally (they do not depend on `ip6tables` and must not leak the
+/// fwmark rule/route when it is absent). Every command is idempotent/best-effort.
+fn udp_pre_setup_teardown_commands(include_v6: bool) -> Vec<String> {
+    let v4 = IptablesPlan::udp_teardown_split();
+    let mut commands = v4.iptables;
+    commands.extend(v4.ip_routing);
+    if include_v6 {
+        let v6 = IptablesPlan::udp_teardown_v6_split();
+        commands.extend(
+            v6.iptables
+                .iter()
+                .map(|cmd| ip6tables_best_effort_wrapped_command(cmd)),
+        );
         commands.extend(v6.ip_routing);
     }
     commands
@@ -2723,7 +2777,10 @@ mod tests {
         assert!(startup_ready.load(Ordering::Acquire));
         assert_eq!(
             *phases.lock().expect("phases mutex"),
-            vec!["setup", "cleanup"]
+            // The unconditional pre-setup UDP teardown (codex r4) always runs
+            // first to reap stale UDP state from a prior UDP-enabled run, before
+            // the current capture posture is (re)installed.
+            vec!["pre-setup UDP teardown", "setup", "cleanup"]
         );
         // The degraded gauge must reflect the first-failing kernel
         // prerequisite even when iptables setup succeeded — operators rely
@@ -2788,7 +2845,10 @@ mod tests {
         assert!(!startup_ready.load(Ordering::Acquire));
         assert_eq!(
             *phases.lock().expect("phases mutex"),
-            vec!["setup", "cleanup"]
+            // The unconditional pre-setup UDP teardown (codex r4) always runs
+            // first to reap stale UDP state from a prior UDP-enabled run, before
+            // the current capture posture is (re)installed.
+            vec!["pre-setup UDP teardown", "setup", "cleanup"]
         );
         let command_counts = command_counts.lock().expect("command counts mutex");
         assert!(
@@ -2884,6 +2944,55 @@ mod tests {
     }
 
     #[test]
+    fn udp_pre_setup_teardown_is_unconditional_udp_only_and_v6_safe() {
+        // codex r4 (finding #3): the node-agent runs a pre-setup UDP teardown
+        // UNCONDITIONALLY (no `udp_capture_enabled` flag) so a prior
+        // UDP-enabled-then-crashed run is cleaned even when the current config sets
+        // `FERRUM_MESH_CAPTURE_UDP_ENABLED=false`. It must tear down ONLY the exact
+        // Ferrum-owned UDP state (never the TCP nat chains) and keep the codex-r3
+        // v6 discipline (raw `ip -6` routing unconditional; ip6tables-table guarded).
+        let commands = udp_pre_setup_teardown_commands(true);
+
+        // UDP mangle chains are torn down.
+        assert!(
+            commands
+                .iter()
+                .any(|c| c.contains("-t mangle") && c.contains("-X FERRUM_MESH_UDP_OUTBOUND")),
+            "pre-setup teardown must delete the UDP mangle chains: {commands:?}"
+        );
+        // The fwmark rule is deleted by stable priority (mark-independent).
+        assert!(
+            commands.iter().any(|c| c.contains("ip rule del")
+                && c.contains("priority 100")
+                && c.contains("lookup 33133")
+                && !c.contains("fwmark")
+                && !c.contains("ip -6")),
+            "pre-setup teardown must delete the v4 fwmark rule by priority: {commands:?}"
+        );
+        // It must NOT touch the TCP nat chains (those are rebuilt by setup).
+        assert!(
+            !commands
+                .iter()
+                .any(|c| c.contains("FERRUM_MESH_INBOUND") || c.contains("FERRUM_MESH_OUTBOUND")),
+            "pre-setup UDP teardown must not touch the TCP nat chains: {commands:?}"
+        );
+        // The raw `ip -6` routing teardown is emitted unconditionally (codex r3).
+        assert!(
+            commands.iter().any(|c| c.contains("ip -6 rule del")
+                && c.contains("lookup 33133")
+                && !c.contains("ip6tables")),
+            "pre-setup teardown must emit unconditional v6 `ip -6 rule del`: {commands:?}"
+        );
+        // The v6 mangle-chain teardown stays behind the ip6tables probe.
+        assert!(
+            commands.iter().any(|c| c.contains("ip6tables")
+                && c.contains("FERRUM_MESH_UDP")
+                && c.contains("command -v ip6tables")),
+            "v6 mangle-chain teardown must stay ip6tables-guarded: {commands:?}"
+        );
+    }
+
+    #[test]
     fn setup_commands_wait_for_xtables_lock() {
         let plan = IptablesPlan::for_config(&CaptureConfig::explicit(15006, 15001));
         let commands = setup_commands_for_plan(&plan);
@@ -2949,7 +3058,10 @@ mod tests {
         assert!(!startup_ready.load(Ordering::Acquire));
         assert_eq!(
             *phases.lock().expect("phases mutex"),
-            vec!["setup", "cleanup"]
+            // The unconditional pre-setup UDP teardown (codex r4) always runs
+            // first to reap stale UDP state from a prior UDP-enabled run, before
+            // the current capture posture is (re)installed.
+            vec!["pre-setup UDP teardown", "setup", "cleanup"]
         );
     }
 
