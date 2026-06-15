@@ -705,6 +705,46 @@ pub struct TcpProxyMetrics {
     pub backend_inflight: BackendConnectionLimiter,
 }
 
+struct TcpActiveConnectionGuard {
+    metrics: Arc<TcpProxyMetrics>,
+}
+
+impl TcpActiveConnectionGuard {
+    fn new(metrics: Arc<TcpProxyMetrics>) -> Self {
+        metrics.active_connections.fetch_add(1, Ordering::Relaxed);
+        Self { metrics }
+    }
+}
+
+impl Drop for TcpActiveConnectionGuard {
+    fn drop(&mut self) {
+        self.metrics
+            .active_connections
+            .fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tcp_active_connection_guard_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    use super::{TcpActiveConnectionGuard, TcpProxyMetrics};
+
+    #[test]
+    fn guard_releases_listener_metric_on_drop() {
+        let metrics = Arc::new(TcpProxyMetrics::default());
+        assert_eq!(metrics.active_connections.load(Ordering::Relaxed), 0);
+
+        {
+            let _guard = TcpActiveConnectionGuard::new(Arc::clone(&metrics));
+            assert_eq!(metrics.active_connections.load(Ordering::Relaxed), 1);
+        }
+
+        assert_eq!(metrics.active_connections.load(Ordering::Relaxed), 0);
+    }
+}
+
 struct TcpBackendSessionGuard<'a> {
     metrics: &'a TcpProxyMetrics,
 }
@@ -1058,7 +1098,6 @@ async fn run_tcp_accept_loop(
                 }
 
                 state.metrics.total_connections.fetch_add(1, Ordering::Relaxed);
-                state.metrics.active_connections.fetch_add(1, Ordering::Relaxed);
 
                 let port = state.port;
                 let proxy_id = state.proxy_id.clone();
@@ -1093,6 +1132,7 @@ async fn run_tcp_accept_loop(
                     state.node_waypoint_identity_resolver.clone();
 
                 tokio::spawn(async move {
+                    let _active_metric_guard = TcpActiveConnectionGuard::new(metrics.clone());
                     // Track this connection for global overload accounting and graceful drain.
                     // The guard decrements the counter on drop (all exit paths).
                     let _conn_guard = crate::overload::ConnectionGuard::new(&overload_for_conn);
@@ -1358,8 +1398,6 @@ async fn run_tcp_accept_loop(
                             }
                         }
                     }
-
-                    metrics.active_connections.fetch_sub(1, Ordering::Relaxed);
                 });
             }
             _ = shutdown_rx.changed() => {
@@ -5688,6 +5726,20 @@ fn create_splice_pipe(desired_size: usize) -> Result<(i32, i32), anyhow::Error> 
 /// carries read_watermark — they share scope with the watchdog instead of
 /// going through `Arc`.
 #[cfg(target_os = "linux")]
+fn refresh_splice_write_progress(
+    last_activity: Option<&AtomicU64>,
+    write_watermark: Option<&AtomicU64>,
+) {
+    let now = coarse_now_ms();
+    if let Some(la) = last_activity {
+        la.store(now, Ordering::Relaxed);
+    }
+    if let Some(wm) = write_watermark {
+        wm.store(now, Ordering::Relaxed);
+    }
+}
+
+#[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 async fn splice_one_direction_no_guard(
     src: &TcpStream,
@@ -5756,9 +5808,10 @@ async fn splice_one_direction_no_guard(
                 if written > 0 {
                     remaining -= written as usize;
                     bytes.fetch_add(written as u64, Ordering::Relaxed);
-                    if let Some(ref wm) = write_watermark {
-                        wm.store(coarse_now_ms(), Ordering::Relaxed);
-                    }
+                    refresh_splice_write_progress(
+                        last_activity.as_deref(),
+                        write_watermark.as_deref(),
+                    );
                 } else if written == 0 {
                     // See the synchronous libc fallback above: a clean
                     // terminal write-side condition should still propagate
@@ -6238,6 +6291,8 @@ mod ktls_param_tests {
 
 #[cfg(test)]
 mod splice_readiness_wait_tests {
+    #[cfg(target_os = "linux")]
+    use super::refresh_splice_write_progress;
     use super::splice_poll_timeout_ms_at;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -6305,6 +6360,20 @@ mod splice_readiness_wait_tests {
 
         let wait = splice_poll_timeout_ms_at(now, 1_000, &activity, None, 0, None, 0);
         assert_eq!(wait, 1_000);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn splice_write_progress_refreshes_idle_clock_and_write_watermark() {
+        let idle = AtomicU64::new(u64::MAX);
+        let write = AtomicU64::new(u64::MAX);
+
+        refresh_splice_write_progress(Some(&idle), Some(&write));
+
+        let idle_value = idle.load(Ordering::Relaxed);
+        let write_value = write.load(Ordering::Relaxed);
+        assert_ne!(idle_value, u64::MAX);
+        assert_eq!(idle_value, write_value);
     }
 }
 
