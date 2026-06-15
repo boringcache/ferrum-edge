@@ -628,7 +628,10 @@ pub fn extract_known_ids(
 /// Returns `None` for SQLite URLs (file-based, no network host) or
 /// if the host portion is already an IP address literal.
 pub fn extract_db_hostname(db_url: &str) -> Option<String> {
-    let parsed = url::Url::parse(db_url).ok()?;
+    let parsed = match url::Url::parse(db_url) {
+        Ok(parsed) => parsed,
+        Err(_) => return extract_mongodb_multi_host_hostname(db_url),
+    };
 
     let scheme = parsed.scheme().to_lowercase();
     if scheme.contains("sqlite") {
@@ -675,8 +678,106 @@ pub fn redact_url(url: &str) -> String {
             }
             parsed.to_string()
         }
-        Err(_) => "<invalid-url>".to_string(),
+        Err(_) => redact_mongodb_multi_host_url(url).unwrap_or_else(|| "<invalid-url>".to_string()),
     }
+}
+
+fn extract_mongodb_multi_host_hostname(db_url: &str) -> Option<String> {
+    let authority = mongodb_multi_host_authority(db_url)?;
+    let hosts = strip_mongodb_userinfo(authority);
+    let first_host = hosts.split(',').next()?.trim();
+    if first_host.is_empty() {
+        return None;
+    }
+
+    let host = if let Some(rest) = first_host.strip_prefix('[') {
+        rest.split(']').next()?
+    } else {
+        first_host.split(':').next().unwrap_or(first_host)
+    };
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if bare.parse::<std::net::IpAddr>().is_ok() {
+        return None;
+    }
+
+    Some(host.to_string())
+}
+
+fn redact_mongodb_multi_host_url(raw_url: &str) -> Option<String> {
+    let scheme_len = mongodb_multi_host_scheme_len(raw_url)?;
+    let rest = &raw_url[scheme_len..];
+    let authority_end = rest
+        .find(|ch| ['/', '?', '#'].contains(&ch))
+        .unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    if !authority.contains(',') {
+        return None;
+    }
+
+    let redacted_authority = if let Some(at) = authority.rfind('@') {
+        format!("***@{}", &authority[at + 1..])
+    } else {
+        authority.to_string()
+    };
+    let suffix = redact_url_suffix_query(&rest[authority_end..]);
+    Some(format!(
+        "{}{}{}",
+        &raw_url[..scheme_len],
+        redacted_authority,
+        suffix
+    ))
+}
+
+fn mongodb_multi_host_authority(db_url: &str) -> Option<&str> {
+    let scheme_len = mongodb_multi_host_scheme_len(db_url)?;
+    let rest = &db_url[scheme_len..];
+    let authority_end = rest
+        .find(|ch| ['/', '?', '#'].contains(&ch))
+        .unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    authority.contains(',').then_some(authority)
+}
+
+fn mongodb_multi_host_scheme_len(db_url: &str) -> Option<usize> {
+    const MONGODB_SCHEME: &str = "mongodb://";
+    db_url
+        .get(..MONGODB_SCHEME.len())
+        .filter(|scheme| scheme.eq_ignore_ascii_case(MONGODB_SCHEME))
+        .map(str::len)
+}
+
+fn strip_mongodb_userinfo(authority: &str) -> &str {
+    authority
+        .rfind('@')
+        .map(|at| &authority[at + 1..])
+        .unwrap_or(authority)
+}
+
+fn redact_url_suffix_query(suffix: &str) -> String {
+    let Some(query_start) = suffix.find('?') else {
+        return suffix.to_string();
+    };
+    let (before_query, query_and_fragment) = suffix.split_at(query_start + 1);
+    let (query, fragment) = match query_and_fragment.find('#') {
+        Some(fragment_start) => query_and_fragment.split_at(fragment_start),
+        None => (query_and_fragment, ""),
+    };
+    let redacted_query = redact_query_string(query);
+    format!("{before_query}{redacted_query}{fragment}")
+}
+
+fn redact_query_string(query: &str) -> String {
+    let pairs = url::form_urlencoded::parse(query.as_bytes()).map(|(key, value)| {
+        let value = if is_sensitive_url_query_key(&key) {
+            std::borrow::Cow::Borrowed("***")
+        } else {
+            value
+        };
+        (key, value)
+    });
+    url::form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(pairs)
+        .finish()
 }
 
 fn is_sensitive_url_query_key(key: &str) -> bool {

@@ -45,6 +45,21 @@ fn extract_hostname_mongodb_with_options() {
     assert_eq!(extract_db_hostname(url), Some("mongo.internal".to_string()));
 }
 
+#[test]
+fn extract_hostname_mongodb_multi_host_uses_first_dns_host() {
+    let url = "mongodb://user:pass@mongo1.internal:27017,mongo2.internal:27017,mongo3.internal:27017/ferrum?replicaSet=rs0";
+    assert_eq!(
+        extract_db_hostname(url),
+        Some("mongo1.internal".to_string())
+    );
+}
+
+#[test]
+fn extract_hostname_mongodb_multi_host_first_ip_literal_returns_none() {
+    let url = "mongodb://user:pass@192.0.2.10:27017,mongo2.internal:27017/ferrum?replicaSet=rs0";
+    assert_eq!(extract_db_hostname(url), None);
+}
+
 // ---------------------------------------------------------------------------
 // redact_url — tests for MongoDB URLs
 // ---------------------------------------------------------------------------
@@ -109,6 +124,20 @@ fn redact_url_hides_mongodb_and_sqlite_query_secrets() {
     let sqlite_pairs: HashMap<String, String> = parsed_sqlite.query_pairs().into_owned().collect();
     assert_eq!(sqlite_pairs.get("key").map(String::as_str), Some("***"));
     assert_eq!(sqlite_pairs.get("mode").map(String::as_str), Some("rwc"));
+}
+
+#[test]
+fn redact_url_handles_mongodb_multi_host_replica_set_urls() {
+    let redacted = redact_url(
+        "mongodb://user:secretpass@host1:27017,host2:27017,host3:27017/ferrum?replicaSet=rs0&password=query-secret",
+    );
+
+    assert!(!redacted.contains("user"));
+    assert!(!redacted.contains("secretpass"));
+    assert!(!redacted.contains("query-secret"));
+    assert!(redacted.starts_with("mongodb://***@host1:27017,host2:27017,host3:27017/ferrum?"));
+    assert!(redacted.contains("replicaSet=rs0"));
+    assert!(redacted.contains("password=***"));
 }
 
 #[test]
