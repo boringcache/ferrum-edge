@@ -195,6 +195,14 @@ pub(crate) struct HostRouteTable {
     /// stream is handed to hyper. Built forward from the prepared `mesh`
     /// block (stream-family ports × `cluster_ips`); empty outside mesh mode.
     mesh_tcp_egress: HashMap<(std::net::IpAddr, u16), MeshTcpEgressDecision>,
+    /// Direct-pod-IP / headless raw-TCP mesh egress lookup (F3 §3.4): strict
+    /// `(backing workload IP, resolved target port)` → relay entry, consulted
+    /// AFTER `mesh_tcp_egress` misses (a client that resolved a headless
+    /// service itself and dialed a POD IP directly bypasses the VIP table).
+    /// Built forward from the prepared `mesh` block (stream-family ports ×
+    /// backing workload addresses, canonicalized the SAME way as the VIP keys);
+    /// empty outside mesh mode.
+    mesh_tcp_egress_by_workload: HashMap<(std::net::IpAddr, u16), MeshTcpEgressDecision>,
 }
 
 /// One routable raw-TCP egress destination: the per-port upstream to
@@ -489,6 +497,24 @@ impl HostRouteTable {
         // Canonicalized so an IPv4-mapped IPv6 capture address
         // (`::ffff:a.b.c.d`) still matches the IPv4 VIP the slice declared.
         self.mesh_tcp_egress
+            .get(&(orig_dst.ip().to_canonical(), orig_dst.port()))
+    }
+
+    /// Direct-pod-IP / headless raw-TCP egress lookup (F3 §3.4) for a captured
+    /// connection's pre-NAT original destination, consulted by the accept loop
+    /// only AFTER [`HostRouteTable::mesh_tcp_egress_decision`] (the VIP table)
+    /// misses. `None` ⇒ the `(IP, port)` matches neither a service VIP nor a
+    /// declared backing workload address: fall through to the HTTP handling path
+    /// unchanged. Strict exact match, fail closed — a declared-but-unroutable
+    /// workload pair is `CloseNotRoutable`, never guessed.
+    pub(crate) fn mesh_tcp_egress_by_workload_decision(
+        &self,
+        orig_dst: std::net::SocketAddr,
+    ) -> Option<&MeshTcpEgressDecision> {
+        if self.mesh_tcp_egress_by_workload.is_empty() {
+            return None;
+        }
+        self.mesh_tcp_egress_by_workload
             .get(&(orig_dst.ip().to_canonical(), orig_dst.port()))
     }
 }
@@ -1401,6 +1427,63 @@ impl RouterCache {
             }
         }
 
+        // ── Direct-pod-IP / headless raw-TCP egress (F3 §3.4) ───────────────
+        // Strict `(backing workload IP, resolved target port)` → relay entry,
+        // consulted only AFTER the VIP table above misses. Forward-derived from
+        // the SAME `mesh_outbound_tcp_bywl_upstreams` source the materializer
+        // used (keys + ids + capability keys agree by construction); routable
+        // when its per-workload upstream materialized, otherwise the declared
+        // pair is mesh-owned but unroutable and the accept loop closes it (never
+        // guesses). IPs are canonicalized so mapped-IPv6 captures match.
+        let mut mesh_tcp_egress_by_workload: HashMap<
+            (std::net::IpAddr, u16),
+            MeshTcpEgressDecision,
+        > = HashMap::new();
+        if let Some(mesh) = config.mesh.as_deref() {
+            let upstream_ids: std::collections::HashSet<&str> =
+                config.upstreams.iter().map(|u| u.id.as_str()).collect();
+            let local_cluster = mesh
+                .multi_cluster
+                .as_ref()
+                .and_then(|mc| mc.local_cluster.as_deref());
+            for spec in crate::modes::mesh::mesh_outbound_tcp_bywl_upstreams(
+                &mesh.services,
+                &mesh.workloads,
+                local_cluster,
+            ) {
+                let decision = if upstream_ids.contains(spec.upstream_id.as_str()) {
+                    let relay_proxy =
+                        Arc::new(crate::modes::mesh::mesh_outbound_tcp_bywl_relay_proxy(
+                            &spec.service.namespace,
+                            &spec.service.name,
+                            spec.service_port.port,
+                            spec.canonical_ip,
+                            &spec.upstream_id,
+                        ));
+                    let service_fqdn = config
+                        .upstreams
+                        .iter()
+                        .find(|u| u.id == spec.upstream_id)
+                        .and_then(|u| u.name.clone())
+                        .unwrap_or_else(|| {
+                            format!("{}.{}", spec.service.name, spec.service.namespace)
+                        });
+                    MeshTcpEgressDecision::Relay(Arc::new(MeshTcpEgressEntry {
+                        upstream_id: spec.upstream_id,
+                        relay_proxy,
+                        service_fqdn,
+                    }))
+                } else {
+                    MeshTcpEgressDecision::CloseNotRoutable
+                };
+                // First-wins on a `(IP, port)` collision, matching the spec's
+                // first-wins de-dupe and the VIP table's `or_insert`.
+                mesh_tcp_egress_by_workload
+                    .entry((spec.canonical_ip, spec.target_port))
+                    .or_insert(decision);
+            }
+        }
+
         for proxy in config
             .proxies
             .iter()
@@ -1635,6 +1718,7 @@ impl RouterCache {
             mesh_outbound_ports,
             mesh_inbound_ports,
             mesh_tcp_egress,
+            mesh_tcp_egress_by_workload,
         }
     }
 }
@@ -3332,6 +3416,134 @@ mod tests {
         let table = cache.route_table.load();
         assert!(matches!(
             table.mesh_tcp_egress_decision("10.96.0.1:6379".parse().expect("addr")),
+            Some(MeshTcpEgressDecision::CloseNotRoutable)
+        ));
+    }
+
+    #[test]
+    fn mesh_tcp_egress_by_workload_routes_direct_pod_ip_dials() {
+        // F3 §3.4: a HEADLESS service (no cluster_ips) backed by a workload whose
+        // pod IP a client dials directly routes via the by-workload index, keyed
+        // by `(workload IP, resolved target port)`, NOT the VIP table.
+        use crate::identity::spiffe::{SpiffeId, TrustDomain};
+        use crate::modes::mesh::config::{
+            AppProtocol, MeshConfig, MeshService, ServicePort, ServiceTargetPort, Workload,
+            WorkloadPort, WorkloadRef, WorkloadSelector,
+        };
+
+        let spiffe = "spiffe://cluster.local/ns/default/sa/redis";
+        let service = MeshService {
+            name: "redis".to_string(),
+            namespace: "default".to_string(),
+            ports: vec![ServicePort {
+                port: 6379,
+                protocol: AppProtocol::Redis,
+                name: Some("redis".to_string()),
+                // targetPort 6380: the index is keyed by the RESOLVED target
+                // port, not the service port — a direct pod-IP dial hits :6380.
+                target_port: Some(ServiceTargetPort::Number(6380)),
+            }],
+            workloads: vec![WorkloadRef {
+                spiffe_id: SpiffeId::new(spiffe).unwrap(),
+            }],
+            protocol_overrides: std::collections::HashMap::new(),
+            // Headless: no VIP at all — the whole point of the by-workload path.
+            cluster_ips: Vec::new(),
+        };
+        let workload = Workload {
+            spiffe_id: SpiffeId::new(spiffe).unwrap(),
+            selector: WorkloadSelector::default(),
+            service_name: "redis".to_string(),
+            addresses: vec!["10.0.0.7".to_string()],
+            ports: vec![WorkloadPort {
+                port: 6380,
+                protocol: AppProtocol::Redis,
+                name: Some("redis".to_string()),
+            }],
+            trust_domain: TrustDomain::new("cluster.local").unwrap(),
+            namespace: "default".to_string(),
+            network: None,
+            cluster: None,
+            weight: None,
+            locality: None,
+            service_account: None,
+            pod_uid: None,
+        };
+
+        // The single-target per-workload upstream the materializer would emit,
+        // keyed by the canonical workload IP. Built here with the deterministic
+        // id helper (forward-derived, never parsed) + the resolved target port.
+        let bywl_id = crate::modes::mesh::mesh_outbound_tcp_bywl_upstream_id(
+            "default",
+            "redis",
+            6379,
+            "10.0.0.7".parse().unwrap(),
+        );
+        let upstream: crate::config::types::Upstream = serde_json::from_value(serde_json::json!({
+            "id": bywl_id,
+            "name": "redis.default.svc.cluster.local",
+            "targets": [{"host": "10.0.0.7", "port": 6380}],
+        }))
+        .expect("upstream deserializes");
+        let config = GatewayConfig {
+            upstreams: vec![upstream],
+            mesh: Some(Box::new(MeshConfig {
+                services: vec![service.clone()],
+                workloads: vec![workload.clone()],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+        let cache = RouterCache::new(&config, 100);
+        let table = cache.route_table.load();
+
+        let bywl = |addr: &str| {
+            table.mesh_tcp_egress_by_workload_decision(addr.parse().expect("socket addr"))
+        };
+
+        // Exact (workload IP, target port) routes to the pinned single-target
+        // upstream. The dial is to the RESOLVED targetPort (6380), not 6379.
+        match bywl("10.0.0.7:6380") {
+            Some(MeshTcpEgressDecision::Relay(entry)) => {
+                assert_eq!(entry.upstream_id, bywl_id);
+                assert_eq!(
+                    entry.relay_proxy.upstream_id.as_deref(),
+                    Some(bywl_id.as_str())
+                );
+            }
+            _ => panic!("expected a by-workload Relay for the pod IP + target port"),
+        }
+        // Mapped-IPv6 capture of the same pod IP still matches (canonicalized).
+        assert!(matches!(
+            bywl("[::ffff:10.0.0.7]:6380"),
+            Some(MeshTcpEgressDecision::Relay(_))
+        ));
+        // The SERVICE port (6379) is not a workload target port → no by-workload
+        // route (only the resolved targetPort 6380 is indexed).
+        assert!(bywl("10.0.0.7:6379").is_none());
+        // A different (undeclared) pod IP is never matched.
+        assert!(bywl("10.0.0.8:6380").is_none());
+        // The VIP table is empty (headless), so it never matches either.
+        assert!(
+            table
+                .mesh_tcp_egress_decision("10.0.0.7:6380".parse().unwrap())
+                .is_none()
+        );
+
+        // Declared backing workload whose per-workload upstream did NOT
+        // materialize: mesh-owned but unroutable — close, never guess.
+        let config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                services: vec![service],
+                workloads: vec![workload],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+        let cache = RouterCache::new(&config, 100);
+        let table = cache.route_table.load();
+        assert!(matches!(
+            table.mesh_tcp_egress_by_workload_decision("10.0.0.7:6380".parse().unwrap()),
             Some(MeshTcpEgressDecision::CloseNotRoutable)
         ));
     }
