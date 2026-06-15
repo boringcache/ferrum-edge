@@ -336,7 +336,7 @@ Service / namespace names embedded in destination hosts are matched case-sensiti
 | `FERRUM_K8S_WATCH_GATEWAY_API_CRDS` | No | `true` | Enable watching Gateway API CRDs (`gateway.networking.k8s.io`: GatewayClass/Gateway/HTTPRoute/GRPCRoute) in the CP K8s controller. Only effective when `FERRUM_K8S_CONTROLLER_ENABLED=true` |
 | `FERRUM_K8S_FULL_SYNC_INTERVAL_SECS` | No | `300` | Periodic full re-list interval (seconds) for the K8s controller. Safety valve against missed watch events |
 | `FERRUM_K8S_RECONCILE_DEBOUNCE_MS` | No | `500` | Debounce window (ms) for the K8s controller — watch events arriving within this window are batched into a single reconciliation |
-| `FERRUM_K8S_KUBECONFIG_PATH` | No | — | Override kubeconfig path for out-of-cluster development. Unset uses the in-cluster service-account config |
+| `FERRUM_K8S_KUBECONFIG_PATH` | No | — | Override kubeconfig path for out-of-cluster development. When unset, the controller tries the in-cluster service-account config first, then falls back to standard kubeconfig inference (`KUBECONFIG` / `~/.kube/config`) |
 | `FERRUM_INJECTOR_LISTEN_ADDR` | Injector mode | `0.0.0.0:9443` | Admission webhook bind address for `POST /mutate` |
 | `FERRUM_INJECTOR_ADMISSION_REVIEW_MAX_BODY_SIZE_MIB` | No | `4` | Maximum `POST /mutate` AdmissionReview request body size, in MiB, accepted before JSON parsing. Values must be 1..64 |
 | `FERRUM_INJECTOR_SIDECAR_IMAGE` | No | `ferrum-edge:latest` | Image injected into workload pods as the Ferrum mesh sidecar |
