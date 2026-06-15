@@ -21,15 +21,24 @@ pub const DEFAULT_UDP_OUTBOUND_PORT: u16 = 15011;
 
 /// Default firewall mark (a.k.a. `fwmark`) stamped on TPROXY'd UDP datagrams so
 /// the policy routing rule (`ip rule add fwmark <mark> lookup <table>`) steers
-/// them to the local-delivery table. `0x539` == 1337 decimal.
+/// them to the local-delivery table. `0xFE3` == 4067 decimal.
 ///
-/// Collision analysis: Ferrum uses NO other packet marks anywhere (verified:
-/// the only `1337` is the proxy `--uid-owner` UID, a *socket owner* match in a
-/// disjoint namespace from `skb->mark`, and `node_agent_hbone_redirect_port`
-/// `16008` is a port, not a mark). The value is the conventional Istio
-/// outbound/TPROXY mark, so it also avoids clobbering a co-resident Istio
-/// install's expectations. Operators can override via `FERRUM_MESH_TPROXY_MARK`.
-pub const DEFAULT_TPROXY_MARK: u32 = 0x539;
+/// **Ferrum-owned, deliberately NOT Istio's `0x539` (codex r3).** The default
+/// must NOT collide with a co-resident Istio install's marks. Ferrum's higher-
+/// priority fwmark `ip rule` (priority [`TPROXY_ROUTE_RULE_PRIORITY`] == 100,
+/// below `main`) matches this mark and steers it to the Ferrum-owned table
+/// [`TPROXY_ROUTE_TABLE`]; if the default were Istio's conventional TPROXY mark
+/// `0x539`, Istio's own marked packets would be hijacked into Ferrum's table and
+/// Istio traffic would break. `0xFE3` ("FE" = Ferrum Edge, `3` = F3 §3.3) sits
+/// in a gap clear of Istio (`0x539`/`0x53a`/`0x111`/`0x222`), Cilium
+/// (`0x200`/`0xA00`/`0xF00`/`0x800`), and Calico (`0x10000`+) marks.
+///
+/// Collision analysis (within Ferrum): Ferrum uses NO other packet marks
+/// anywhere (verified: the only `1337` is the proxy `--uid-owner` UID, a *socket
+/// owner* match in a disjoint namespace from `skb->mark`, and
+/// `node_agent_hbone_redirect_port` `16008` is a port, not a mark). Operators
+/// can override via `FERRUM_MESH_TPROXY_MARK`.
+pub const DEFAULT_TPROXY_MARK: u32 = 0xFE3;
 
 /// `skb->mark` mask matched alongside [`DEFAULT_TPROXY_MARK`]. A full-width mask
 /// keeps the TPROXY mark from aliasing onto other mark bits a co-resident CNI
@@ -473,13 +482,20 @@ where
 }
 
 /// Parse a boolean capture env var. Absent / blank defaults to `false`. Accepts
-/// the same `true`/`false` spelling the rest of the boolean envs use.
+/// the repo-wide boolean env forms (`EnvValue for bool` in
+/// `config::env_config_macro`): case-insensitive `true`/`false` plus `1`/`0`.
+/// Rust's `bool::from_str` (used previously) rejected `1`/`0`/`TRUE`, diverging
+/// from every sibling `FERRUM_MESH_*` bool env (codex r3).
 fn parse_bool_env(raw: Option<&str>, var: &str) -> Result<bool, String> {
     match raw.map(str::trim).filter(|s| !s.is_empty()) {
         None => Ok(false),
-        Some(value) => value
-            .parse::<bool>()
-            .map_err(|_| format!("Invalid {var} '{value}'. Expected true or false")),
+        Some(value) => match value.to_ascii_lowercase().as_str() {
+            "true" | "1" => Ok(true),
+            "false" | "0" => Ok(false),
+            _ => Err(format!(
+                "Invalid {var} '{value}'. Expected true, false, 1, or 0"
+            )),
+        },
     }
 }
 
@@ -579,12 +595,64 @@ impl IptablesPlan {
     /// `mangle` chains and the Ferrum-owned routing rule/route. The UDP teardown
     /// is gated so a non-UDP install never touches routing state it never
     /// created (codex r1); pass the install's `udp_capture_enabled` flag.
+    /// Flat IPv4 cleanup (iptables-table teardown then raw routing teardown).
+    /// Test-only convenience; production node-agent code uses [`Self::cleanup_split`]
+    /// so it can guard only the table portion behind the `ip6tables` probe.
+    #[cfg(test)]
     pub fn cleanup_commands(udp_capture_enabled: bool) -> Vec<String> {
+        cleanup_commands_for("iptables", udp_capture_enabled).into_flat()
+    }
+
+    /// Flat IPv6 cleanup. Test-only; see [`Self::cleanup_v6_split`].
+    #[cfg(test)]
+    pub fn cleanup_v6_commands(udp_capture_enabled: bool) -> Vec<String> {
+        cleanup_commands_for("ip6tables", udp_capture_enabled).into_flat()
+    }
+
+    /// The IPv4 cleanup split into the iptables-table teardown vs. the raw `ip`
+    /// routing teardown. The node-agent emits the routing teardown UNCONDITIONALLY
+    /// (it is `ip`, not `iptables`/`ip6tables`); see [`Self::cleanup_v6_split`].
+    pub fn cleanup_split(udp_capture_enabled: bool) -> CleanupCommands {
         cleanup_commands_for("iptables", udp_capture_enabled)
     }
 
-    pub fn cleanup_v6_commands(udp_capture_enabled: bool) -> Vec<String> {
+    /// The IPv6 cleanup split into the **ip6tables-table** teardown (`iptables`,
+    /// which the node-agent guards behind an `ip6tables` availability probe) and
+    /// the **raw `ip -6` routing** teardown (`ip_routing`, the fwmark rule + local
+    /// route). The routing teardown MUST be emitted UNCONDITIONALLY — `ip -6` can
+    /// remove the rule/route even when `ip6tables` is missing, so wrapping it in
+    /// the ip6tables guard would leak the fwmark rule + local route and keep
+    /// diverting marked UDP after shutdown (codex r3).
+    pub fn cleanup_v6_split(udp_capture_enabled: bool) -> CleanupCommands {
         cleanup_commands_for("ip6tables", udp_capture_enabled)
+    }
+}
+
+/// A capture-cleanup command list split by whether each command touches an
+/// iptables/ip6tables TABLE (`iptables`) or is a raw `ip`/`ip -6` routing command
+/// (`ip_routing`). The node-agent guards only the `iptables` portion behind an
+/// `ip6tables`-availability probe for IPv6; the `ip_routing` portion is always
+/// emitted so routing state is torn down regardless of `ip6tables` availability.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CleanupCommands {
+    /// `iptables`/`ip6tables` table teardown (jump deletes, chain flush, chain
+    /// delete) — for the IPv6 family these are guarded behind an `ip6tables`
+    /// availability probe by the node-agent.
+    pub iptables: Vec<String>,
+    /// Raw `ip`/`ip -6` routing teardown (fwmark `ip rule` + local `ip route`).
+    /// Emitted unconditionally — `ip` does not depend on `ip6tables`.
+    pub ip_routing: Vec<String>,
+}
+
+impl CleanupCommands {
+    /// iptables-table teardown first, then the routing teardown — preserving the
+    /// original flat ordering for the init-container cleanup script. Test-only
+    /// (production composes the two halves with per-half guarding).
+    #[cfg(test)]
+    fn into_flat(self) -> Vec<String> {
+        let mut commands = self.iptables;
+        commands.extend(self.ip_routing);
+        commands
     }
 }
 
@@ -965,6 +1033,17 @@ fn udp_tproxy_commands_for_family(
         "mangle",
         "FERRUM_MESH_UDP_OUTBOUND",
     ));
+    // FLUSH the UDP chains after (idempotently) creating them, BEFORE adding any
+    // rule (codex r3). The per-rule `-C ... || -A` guard is an EXACT match, so on
+    // a reconfiguration that changes `FERRUM_MESH_CAPTURE_UDP_PORT` /
+    // `FERRUM_MESH_TPROXY_MARK` the new TPROXY rule never matches the old one's
+    // `-C` check and is APPENDED AFTER it; iptables preserves rule order, so the
+    // stale rule (old port/mark) stays ahead and black-holes UDP. Flushing first
+    // clears any prior rules so the chain is rebuilt with only the current
+    // config. Flush is idempotent (`-F ... || true`) and harmless on a fresh
+    // chain, keeping the whole create+flush+populate sequence rerun-safe.
+    commands.push(flush_chain(binary, "mangle", "FERRUM_MESH_UDP_INBOUND"));
+    commands.push(flush_chain(binary, "mangle", "FERRUM_MESH_UDP_OUTBOUND"));
 
     // Outbound exclusions first (RETURN wins by rule order), mirroring TCP.
     for cidr in exclude_cidrs {
@@ -1171,13 +1250,13 @@ fn iptables_script(
     chunks.join("\n")
 }
 
-fn cleanup_commands_for(binary: &str, udp_capture_enabled: bool) -> Vec<String> {
+fn cleanup_commands_for(binary: &str, udp_capture_enabled: bool) -> CleanupCommands {
     let family = if binary == "ip6tables" {
         CidrFamily::V6
     } else {
         CidrFamily::V4
     };
-    let mut commands = vec![
+    let mut iptables = vec![
         // Step 1: remove jump rules from built-in chains
         idempotent_delete(binary, "nat", "OUTPUT", "-p tcp -j FERRUM_MESH_OUTBOUND"),
         idempotent_delete(binary, "nat", "PREROUTING", "-p tcp -j FERRUM_MESH_INBOUND"),
@@ -1188,6 +1267,7 @@ fn cleanup_commands_for(binary: &str, udp_capture_enabled: bool) -> Vec<String> 
         delete_chain(binary, "nat", "FERRUM_MESH_INBOUND"),
         delete_chain(binary, "nat", "FERRUM_MESH_OUTBOUND"),
     ];
+    let mut ip_routing = Vec::new();
 
     // UDP TPROXY teardown is GATED on `udp_capture_enabled`: when this install
     // never emitted UDP rules, we must not touch routing state we never created
@@ -1196,8 +1276,9 @@ fn cleanup_commands_for(binary: &str, udp_capture_enabled: bool) -> Vec<String> 
     if udp_capture_enabled {
         // mangle chain teardown: jumps first, then flush, then delete. There is
         // NO `mangle OUTPUT` jump to remove — setup never installs one (TPROXY is
-        // PREROUTING-only).
-        commands.extend([
+        // PREROUTING-only). These are ip6tables-TABLE commands, so for IPv6 the
+        // node-agent guards them behind its `ip6tables` availability probe.
+        iptables.extend([
             idempotent_delete(
                 binary,
                 "mangle",
@@ -1221,21 +1302,33 @@ fn cleanup_commands_for(binary: &str, udp_capture_enabled: bool) -> Vec<String> 
         // an unrelated rule pointing at the table) and never `ip route flush
         // table` (would wipe any co-resident route, e.g. an Istio table). Delete
         // the rule by its explicit priority and the route by its exact spec.
+        //
+        // These are RAW `ip`/`ip -6` commands — independent of `iptables`/
+        // `ip6tables`. They go in `ip_routing` so the node-agent emits them
+        // UNCONDITIONALLY: gating the `ip -6 rule/route del` behind an `ip6tables`
+        // probe (codex r3) would leak the fwmark rule + local route whenever
+        // `ip6tables` is missing, and marked UDP would keep diverting after
+        // shutdown even though `ip -6` could have removed it. (IPv4 routing
+        // teardown was already emitted unconditionally — this keeps both families
+        // symmetric.)
         let (ip, local_route) = match family {
             CidrFamily::V6 => ("ip -6", "local ::/0 dev lo"),
             CidrFamily::V4 => ("ip", "local 0.0.0.0/0 dev lo"),
         };
         // Cleanup deletes stay best-effort (`|| true`): teardown must never fail
         // on already-absent routing state or a missing `ip` binary.
-        commands.push(ip_delete_best_effort(&format!(
+        ip_routing.push(ip_delete_best_effort(&format!(
             "{ip} rule del priority {TPROXY_ROUTE_RULE_PRIORITY} lookup {TPROXY_ROUTE_TABLE}"
         )));
-        commands.push(ip_delete_best_effort(&format!(
+        ip_routing.push(ip_delete_best_effort(&format!(
             "{ip} route del {local_route} table {TPROXY_ROUTE_TABLE}"
         )));
     }
 
-    commands
+    CleanupCommands {
+        iptables,
+        ip_routing,
+    }
 }
 
 fn idempotent_new_chain(binary: &str, table: &str, chain: &str) -> String {
@@ -2415,6 +2508,37 @@ mod tests {
     }
 
     #[test]
+    fn udp_setup_flushes_chains_before_adding_rules() {
+        // codex r3: changing FERRUM_MESH_CAPTURE_UDP_PORT / FERRUM_MESH_TPROXY_MARK
+        // on reconfiguration must NOT leave a stale rule ahead of the new one. The
+        // per-rule `-C ... || -A` guard is exact-match, so a changed rule is
+        // appended AFTER the old one and (iptables preserves order) the stale rule
+        // black-holes UDP. Setup must FLUSH each UDP chain after creating it and
+        // BEFORE adding any rule to it.
+        let plan = IptablesPlan::for_config(&udp_enabled_iptables_config());
+        let cmds = &plan.v4_commands;
+
+        for chain in ["FERRUM_MESH_UDP_INBOUND", "FERRUM_MESH_UDP_OUTBOUND"] {
+            let flush = cmds
+                .iter()
+                .position(|c| c.contains("-t mangle") && c.contains(&format!("-F {chain}")))
+                .unwrap_or_else(|| panic!("setup missing flush of {chain}: {cmds:?}"));
+            // The flush must precede every append/check into this chain so the
+            // chain is rebuilt cleanly.
+            let first_rule = cmds.iter().position(|c| {
+                c.contains("-t mangle")
+                    && (c.contains(&format!("-A {chain}")) || c.contains(&format!("-C {chain}")))
+            });
+            if let Some(first_rule) = first_rule {
+                assert!(
+                    flush < first_rule,
+                    "flush of {chain} must precede its first rule add: {cmds:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn udp_setup_ip_rule_and_route_are_idempotent_delete_before_add() {
         // A node-agent fallback crash before cleanup then a re-run must not stack
         // a duplicate `ip rule`: setup deletes by explicit priority before adding,
@@ -2815,6 +2939,63 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_v6_split_separates_raw_ip_routing_from_ip6tables_tables() {
+        // codex r3: the raw `ip -6 rule/route del` teardown must be in `ip_routing`
+        // (emitted unconditionally by the node-agent) and NOT in `iptables` (which
+        // the node-agent guards behind an `ip6tables` availability probe). Wrapping
+        // the `ip -6` teardown in that probe would leak the fwmark rule + local
+        // route when `ip6tables` is missing.
+        let split = IptablesPlan::cleanup_v6_split(true);
+
+        // The raw `ip -6` rule/route teardown lives in `ip_routing`.
+        assert!(
+            split.ip_routing.iter().any(|c| c.contains("ip -6 rule del")
+                && c.contains(&format!("lookup {TPROXY_ROUTE_TABLE}"))),
+            "v6 ip_routing must carry `ip -6 rule del ... lookup <table>`: {:?}",
+            split.ip_routing
+        );
+        assert!(
+            split
+                .ip_routing
+                .iter()
+                .any(|c| c.contains("ip -6 route del local ::/0 dev lo")),
+            "v6 ip_routing must carry `ip -6 route del local ::/0 dev lo`: {:?}",
+            split.ip_routing
+        );
+        // The `iptables`/table portion must NOT contain any raw `ip -6` routing.
+        assert!(
+            !split
+                .iptables
+                .iter()
+                .any(|c| c.contains("ip -6 rule") || c.contains("ip -6 route")),
+            "v6 iptables (table) portion must not contain raw `ip -6` routing: {:?}",
+            split.iptables
+        );
+        // The table portion still tears down the mangle chains (ip6tables-guarded).
+        assert!(
+            split
+                .iptables
+                .iter()
+                .any(|c| c.contains("ip6tables") && c.contains("FERRUM_MESH_UDP")),
+            "v6 iptables portion must tear down the UDP mangle chains: {:?}",
+            split.iptables
+        );
+    }
+
+    #[test]
+    fn cleanup_v6_split_routing_empty_when_udp_disabled() {
+        // When UDP capture was never enabled, there is no routing state to tear
+        // down (gated like the v4 path); both halves carry only the TCP nat-chain
+        // teardown and no `ip -6` routing.
+        let split = IptablesPlan::cleanup_v6_split(false);
+        assert!(
+            split.ip_routing.is_empty(),
+            "UDP-disabled v6 cleanup must emit no routing teardown: {:?}",
+            split.ip_routing
+        );
+    }
+
+    #[test]
     fn cleanup_gated_off_emits_no_udp_or_routing_teardown() {
         // When this install never enabled UDP capture, cleanup must not touch any
         // UDP mangle chain OR routing state it never created (codex r1).
@@ -2922,5 +3103,45 @@ mod tests {
         with_capture_env(&[("FERRUM_MESH_TPROXY_MARK", "nothex")], || {
             assert!(CaptureConfig::from_env().is_err());
         });
+    }
+
+    // codex r3: the DEFAULT mark must be Ferrum-owned and NOT Istio's conventional
+    // TPROXY mark `0x539`. With Ferrum's higher-priority fwmark rule (priority 100)
+    // matching the mark, defaulting to `0x539` would hijack a co-resident Istio's
+    // marked packets into Ferrum's table and break Istio traffic. Compile-time so a
+    // regression to `0x539` fails the build, not just a test run.
+    const _: () = assert!(
+        DEFAULT_TPROXY_MARK != 0x539,
+        "default TPROXY mark must not collide with Istio's conventional `0x539`"
+    );
+    const _: () = assert!(
+        DEFAULT_TPROXY_MARK == 0xFE3,
+        "default TPROXY mark is the Ferrum-owned `0xFE3` (4067)"
+    );
+
+    #[test]
+    fn from_env_accepts_repo_wide_bool_forms_for_udp_enabled() {
+        // codex r3: `FERRUM_MESH_CAPTURE_UDP_ENABLED` must accept the same forms as
+        // every other `FERRUM_MESH_*` bool env (`EnvValue for bool`): case-
+        // insensitive `true`/`false` plus `1`/`0`. The previous `bool::from_str`
+        // rejected `1`/`0`/`TRUE`.
+        for truthy in ["true", "TRUE", "True", "1"] {
+            with_capture_env(&[("FERRUM_MESH_CAPTURE_UDP_ENABLED", truthy)], || {
+                let config = CaptureConfig::from_env().expect("config");
+                assert!(
+                    config.udp_capture_enabled,
+                    "'{truthy}' must parse as UDP-enabled"
+                );
+            });
+        }
+        for falsy in ["false", "FALSE", "False", "0"] {
+            with_capture_env(&[("FERRUM_MESH_CAPTURE_UDP_ENABLED", falsy)], || {
+                let config = CaptureConfig::from_env().expect("config");
+                assert!(
+                    !config.udp_capture_enabled,
+                    "'{falsy}' must parse as UDP-disabled"
+                );
+            });
+        }
     }
 }

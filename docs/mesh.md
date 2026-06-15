@@ -1627,10 +1627,13 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   best-effort. **Idempotent setup:** `ip rule add` appends, so the rule is assigned
   the explicit priority (`100`) and is delete-by-priority **before** add (and the
   route is delete-before-add), so a node-agent fallback crash/retry before cleanup
-  never stacks a duplicate rule. The mark (default `0x539`) is collision-free —
-  Ferrum uses no other packet marks; the `1337` proxy UID is a socket-owner match,
-  a disjoint namespace from `skb->mark` — and matches the conventional Istio
-  outbound/TPROXY mark.
+  never stacks a duplicate rule. The mark (default `0xFE3`, 4067) is **Ferrum-owned
+  and deliberately NOT Istio's conventional TPROXY mark `0x539`**: Ferrum's
+  higher-priority fwmark rule (priority `100`) matches the mark and steers it to
+  the Ferrum table, so defaulting to `0x539` would hijack a co-resident Istio's
+  marked packets into Ferrum's table and break Istio traffic. Within Ferrum it is
+  collision-free — Ferrum uses no other packet marks; the `1337` proxy UID is a
+  socket-owner match, a disjoint namespace from `skb->mark`.
 - **Default OFF.** The consuming UDP listener arrives in **Stage 3**; an upgraded
   injector with UDP capture on but no listener would redirect UDP into a void, so
   the flag defaults off and, when off, emits **no** `mangle`/TPROXY/routing rules

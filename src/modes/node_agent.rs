@@ -2065,15 +2065,29 @@ fn cleanup_commands_for_plan(include_v6: bool, udp_capture_enabled: bool) -> Vec
     // `udp_capture_enabled` gates the UDP TPROXY teardown (mangle chains + the
     // Ferrum-owned `ip rule`/`ip route`): when this node never installs UDP
     // capture, cleanup must not touch routing state it never created (codex r1).
-    let mut commands = IptablesPlan::cleanup_commands(udp_capture_enabled);
+    //
+    // The cleanup is split into the iptables-TABLE teardown and the RAW `ip`
+    // routing teardown. The IPv4 routing teardown is already emitted
+    // unconditionally (raw `ip`, no iptables dependency).
+    let v4 = IptablesPlan::cleanup_split(udp_capture_enabled);
+    let mut commands = v4.iptables;
+    commands.extend(v4.ip_routing);
     if include_v6 {
-        // Keep cleanup best-effort per command; stale v6 chains from an earlier
-        // config should not make node-agent fallback cleanup fail.
+        let v6 = IptablesPlan::cleanup_v6_split(udp_capture_enabled);
+        // Only the ip6tables-TABLE teardown is guarded behind an `ip6tables`
+        // availability probe — stale v6 chains from an earlier config should not
+        // make node-agent fallback cleanup fail when `ip6tables` is absent.
         commands.extend(
-            IptablesPlan::cleanup_v6_commands(udp_capture_enabled)
+            v6.iptables
                 .iter()
                 .map(|cmd| ip6tables_best_effort_wrapped_command(cmd)),
         );
+        // The RAW `ip -6` routing teardown (fwmark rule + local route) is emitted
+        // UNCONDITIONALLY — `ip -6` does not depend on `ip6tables`, so gating it on
+        // the probe would leak the rule/route and keep diverting marked UDP after
+        // shutdown when `ip6tables` is missing (codex r3). It carries its own
+        // best-effort `|| true`.
+        commands.extend(v6.ip_routing);
     }
     commands
 }
@@ -2823,6 +2837,49 @@ mod tests {
                 .iter()
                 .any(|cmd| cmd.contains("ip6tables not found; skipping IPv6 mesh capture rules")),
             "required-mode cleanup should remain best-effort when ip6tables is absent"
+        );
+    }
+
+    #[test]
+    fn cleanup_emits_v6_ip_routing_unconditionally_not_ip6tables_gated() {
+        // codex r3: the raw `ip -6 rule/route del` UDP routing teardown must be
+        // emitted UNCONDITIONALLY (NOT wrapped in the `ip6tables` availability
+        // probe) — `ip -6` can remove the fwmark rule + local route even when
+        // `ip6tables` is missing, so gating it would leak routing state and keep
+        // marked UDP diverting after shutdown.
+        let commands = cleanup_commands_for_plan(true, true);
+
+        // The v6 `ip -6 rule del`/`ip -6 route del` must appear as standalone
+        // commands, NOT embedded inside an `if command -v ip6tables` wrapper.
+        let v6_rule_del = commands
+            .iter()
+            .find(|cmd| cmd.contains("ip -6 rule del") && cmd.contains("lookup 33133"))
+            .expect("v6 ip rule del must be present");
+        assert!(
+            !v6_rule_del.contains("ip6tables"),
+            "v6 `ip -6 rule del` must not be wrapped in the ip6tables probe: {v6_rule_del}"
+        );
+        let v6_route_del = commands
+            .iter()
+            .find(|cmd| cmd.contains("ip -6 route del local ::/0 dev lo"))
+            .expect("v6 ip route del must be present");
+        assert!(
+            !v6_route_del.contains("ip6tables"),
+            "v6 `ip -6 route del` must not be wrapped in the ip6tables probe: {v6_route_del}"
+        );
+        // The IPv6 mangle-CHAIN teardown stays ip6tables-guarded (table ops).
+        assert!(
+            commands.iter().any(|cmd| cmd.contains("ip6tables")
+                && cmd.contains("FERRUM_MESH_UDP")
+                && cmd.contains("command -v ip6tables")),
+            "v6 mangle-chain teardown should remain behind the ip6tables probe: {commands:?}"
+        );
+        // The IPv4 routing teardown is also emitted unconditionally (raw `ip`).
+        assert!(
+            commands.iter().any(|cmd| cmd.contains("ip rule del")
+                && cmd.contains("lookup 33133")
+                && !cmd.contains("ip6tables")),
+            "v4 `ip rule del` routing teardown must be unconditional: {commands:?}"
         );
     }
 
