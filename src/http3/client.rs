@@ -818,6 +818,10 @@ impl AsRef<dyn std::error::Error + Send + Sync + 'static> for H3PoolError {
 /// Result type alias for the H3 pool.
 pub type H3PoolResult<T> = std::result::Result<T, H3PoolError>;
 
+fn should_probe_selected_h3_cache_after_fast_path(fast_path_failed_pre_wire: bool) -> bool {
+    !fast_path_failed_pre_wire
+}
+
 /// Result of a streaming HTTP/3 request — headers received, body still in flight.
 ///
 /// The caller reads response body chunks via `recv_stream.recv_data()`.
@@ -1363,6 +1367,7 @@ impl Http3ConnectionPool {
         // the backend on this stream, so replaying it on another connection
         // would double-execute a possibly non-idempotent request and bypass the
         // gateway's retry_on_methods policy — surface it immediately instead.
+        let mut fast_path_failed_pre_wire = false;
         if let Some(pooled) = cached {
             let mut sr = pooled.send_request;
             match Self::do_request(
@@ -1381,6 +1386,7 @@ impl Http3ConnectionPool {
                 Err(_) => {
                     // Pre-wire cached failure — fall through to the full
                     // retry/reconnect path below which allocates pool keys.
+                    fast_path_failed_pre_wire = true;
                 }
             }
         }
@@ -1389,8 +1395,17 @@ impl Http3ConnectionPool {
         // and new connection creation.
         let key = self.pool_key_with_generation(proxy, start, svid_generation);
 
-        // Try cached connection on the selected index first
-        if let Some(pooled) = self.pool.cached(&key) {
+        let mut try_fallback_indices = fast_path_failed_pre_wire;
+        if fast_path_failed_pre_wire {
+            self.pool.invalidate(&key);
+        }
+
+        // Try cached connection on the selected index first, unless the
+        // thread-local fast path already tried that same entry and failed
+        // before the request reached the wire.
+        if should_probe_selected_h3_cache_after_fast_path(fast_path_failed_pre_wire)
+            && let Some(pooled) = self.pool.cached(&key)
+        {
             let mut sr = pooled.send_request;
             match Self::do_request(
                 &mut sr,
@@ -1408,31 +1423,34 @@ impl Http3ConnectionPool {
                 Err(e) => {
                     debug!("HTTP/3 cached connection failed, reconnecting: {}", e);
                     self.pool.invalidate(&key);
+                    try_fallback_indices = true;
+                }
+            }
+        }
 
-                    // Try other cached indices before creating a new connection
-                    for offset in 1..conns_per_backend {
-                        let fallback_index = (start + offset) % conns_per_backend;
-                        let fallback_key =
-                            self.pool_key_with_generation(proxy, fallback_index, svid_generation);
-                        if let Some(fallback_pooled) = self.pool.cached(&fallback_key) {
-                            let mut fallback_sr = fallback_pooled.send_request;
-                            match Self::do_request(
-                                &mut fallback_sr,
-                                proxy,
-                                method,
-                                backend_url,
-                                headers,
-                                body.clone(),
-                                max_response_body_size_bytes,
-                            )
-                            .await
-                            {
-                                Ok(result) => return Ok(result),
-                                Err(e) if e.request_on_wire() => return Err(e),
-                                Err(_) => {
-                                    self.pool.invalidate(&fallback_key);
-                                }
-                            }
+        if try_fallback_indices {
+            // Try other cached indices before creating a new connection.
+            for offset in 1..conns_per_backend {
+                let fallback_index = (start + offset) % conns_per_backend;
+                let fallback_key =
+                    self.pool_key_with_generation(proxy, fallback_index, svid_generation);
+                if let Some(fallback_pooled) = self.pool.cached(&fallback_key) {
+                    let mut fallback_sr = fallback_pooled.send_request;
+                    match Self::do_request(
+                        &mut fallback_sr,
+                        proxy,
+                        method,
+                        backend_url,
+                        headers,
+                        body.clone(),
+                        max_response_body_size_bytes,
+                    )
+                    .await
+                    {
+                        Ok(result) => return Ok(result),
+                        Err(e) if e.request_on_wire() => return Err(e),
+                        Err(_) => {
+                            self.pool.invalidate(&fallback_key);
                         }
                     }
                 }
@@ -2612,6 +2630,7 @@ impl Http3ConnectionPool {
         // POST-WIRE failure means the request already reached the backend on
         // this stream, so return it immediately rather than replaying it (see
         // `request()`).
+        let mut fast_path_failed_pre_wire = false;
         if let Some(pooled) = cached {
             let mut sr = pooled.send_request;
             match Self::do_request_streaming(
@@ -2626,14 +2645,23 @@ impl Http3ConnectionPool {
             {
                 Ok(result) => return Ok(result),
                 Err(e) if e.request_on_wire() => return Err(e),
-                Err(_) => {}
+                Err(_) => {
+                    fast_path_failed_pre_wire = true;
+                }
             }
         }
 
         // Slow path: allocate pool key String
         let key = self.pool_key_with_generation(proxy, start, svid_generation);
 
-        if let Some(pooled) = self.pool.cached(&key) {
+        let mut try_fallback_indices = fast_path_failed_pre_wire;
+        if fast_path_failed_pre_wire {
+            self.pool.invalidate(&key);
+        }
+
+        if should_probe_selected_h3_cache_after_fast_path(fast_path_failed_pre_wire)
+            && let Some(pooled) = self.pool.cached(&key)
+        {
             let mut sr = pooled.send_request;
             match Self::do_request_streaming(
                 &mut sr,
@@ -2650,29 +2678,32 @@ impl Http3ConnectionPool {
                 Err(e) => {
                     debug!("HTTP/3 cached connection failed, reconnecting: {}", e);
                     self.pool.invalidate(&key);
+                    try_fallback_indices = true;
+                }
+            }
+        }
 
-                    for offset in 1..conns_per_backend {
-                        let fallback_index = (start + offset) % conns_per_backend;
-                        let fallback_key =
-                            self.pool_key_with_generation(proxy, fallback_index, svid_generation);
-                        if let Some(fallback_pooled) = self.pool.cached(&fallback_key) {
-                            let mut fallback_sr = fallback_pooled.send_request;
-                            match Self::do_request_streaming(
-                                &mut fallback_sr,
-                                proxy,
-                                method,
-                                backend_url,
-                                headers,
-                                body.clone(),
-                            )
-                            .await
-                            {
-                                Ok(result) => return Ok(result),
-                                Err(e) if e.request_on_wire() => return Err(e),
-                                Err(_) => {
-                                    self.pool.invalidate(&fallback_key);
-                                }
-                            }
+        if try_fallback_indices {
+            for offset in 1..conns_per_backend {
+                let fallback_index = (start + offset) % conns_per_backend;
+                let fallback_key =
+                    self.pool_key_with_generation(proxy, fallback_index, svid_generation);
+                if let Some(fallback_pooled) = self.pool.cached(&fallback_key) {
+                    let mut fallback_sr = fallback_pooled.send_request;
+                    match Self::do_request_streaming(
+                        &mut fallback_sr,
+                        proxy,
+                        method,
+                        backend_url,
+                        headers,
+                        body.clone(),
+                    )
+                    .await
+                    {
+                        Ok(result) => return Ok(result),
+                        Err(e) if e.request_on_wire() => return Err(e),
+                        Err(_) => {
+                            self.pool.invalidate(&fallback_key);
                         }
                     }
                 }
@@ -3102,6 +3133,18 @@ mod h3_pool_error_tests {
 
         let post = H3PoolError::post_wire(anyhow::anyhow!("recv_response failed"));
         assert!(post.promote_on_wire_if(true).request_on_wire());
+    }
+
+    #[test]
+    fn fast_path_pre_wire_failure_skips_selected_slow_cache_probe() {
+        assert!(
+            should_probe_selected_h3_cache_after_fast_path(false),
+            "cache misses or absent fast-path entries should still probe the selected slow-path key"
+        );
+        assert!(
+            !should_probe_selected_h3_cache_after_fast_path(true),
+            "a pre-wire fast-path failure already tried the selected entry, so the slow path must skip it"
+        );
     }
 
     #[test]
