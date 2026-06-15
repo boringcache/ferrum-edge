@@ -29,6 +29,18 @@ path = "src/main.rs"
 name = "secrets_functional"
 path = "tests/secrets_functional/mod.rs"
 
+# Functional integration tests for external middleware that must be validated
+# against the REAL third-party software (a service registry, a directory
+# server, …), imitated locally with free OSS containers via `testcontainers`
+# (Docker) — never a managed/cloud service. Lives in a subdirectory so it can
+# carry shared container helpers. Container-backed tests self-skip when Docker
+# is unavailable (graceful locally) and hard-fail in CI; see
+# `tests/service_integration/`. Run e.g.
+# `cargo test --test service_integration consul`.
+[[test]]
+name = "service_integration"
+path = "tests/service_integration/mod.rs"
+
 [dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full"] }

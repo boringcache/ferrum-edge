@@ -76,6 +76,14 @@ tests/
 │   ├── functional_grpc_test.rs         # gRPC proxying: h2c echo, errors, metadata
 │   └── functional_websocket_test.rs    # WebSocket proxying: ws/wss echo
 │
+├── secrets_functional/                 # External secret backends, own [[test]] crate
+│   └── ...                             # Vault/AWS via testcontainers; GCP/Azure via wiremock
+├── service_integration/                # External middleware via OSS containers, own [[test]] crate
+│   ├── README.md                       # What it covers + recipe for adding services
+│   ├── common/containers.rs            # Consul + OpenLDAP fixtures, fail_in_ci_else_skip
+│   ├── consul.rs                       # Consul SD: ConsulDiscoverer::discover() parsing
+│   └── ldap.rs                         # ldap_auth bind / search-then-bind / group membership
+│
 ├── helpers/
 │   └── bin/                            # Standalone test server binaries
 │       ├── websocket_echo_server.rs    # WS echo server (port 8080)
@@ -141,6 +149,20 @@ cargo test --test functional_tests functional_websocket -- --ignored --nocapture
 
 # Load balancing: algorithms, health checks, target failover, observability headers
 cargo test --test functional_tests functional_load_balancer -- --ignored --nocapture
+```
+
+### Service Integration Tests (external middleware via OSS containers)
+These validate the REAL integration code against live third-party software run
+as local containers (`testcontainers`/Docker). With Docker available they run;
+without it they self-skip (and hard-fail in CI). See
+[`service_integration/README.md`](service_integration/README.md).
+
+```bash
+# Consul service discovery (ConsulDiscoverer::discover health-API parsing)
+cargo test --test service_integration consul
+
+# LDAP auth (bind / search-then-bind / group membership against OpenLDAP)
+cargo test --test service_integration ldap
 ```
 
 ### Performance Tests
