@@ -118,6 +118,39 @@ jobs:
         env:
           RUST_BACKTRACE: 1
 
+  test-service-integration:
+    name: Service Integration (${{ matrix.name }})
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # One isolated job per external middleware so a single backend failure
+        # does not mask the others. Each runs the REAL third-party software as a
+        # local container via testcontainers (Docker, available on
+        # ubuntu-latest) and drives the real integration code against it:
+        #   - consul → ConsulDiscoverer::discover() health-API JSON parsing
+        #   - ldap   → ldap_auth bind / search-then-bind / group membership
+        # GitHub Actions sets CI=true, so a container that fails to start is a
+        # hard failure (see fail_in_ci_else_skip) rather than a silent skip.
+        include:
+          - name: consul
+            filters: consul
+          - name: ldap
+            filters: ldap
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          shared-key: "ci-test-service-integration-${{ matrix.name }}"
+
+      - name: Run service-integration tests
+        # The test-name filter selects the backend module (consul / ldap).
+        run: cargo test --test service_integration -- ${{ matrix.filters }}
+        env:
+          RUST_BACKTRACE: 1
+
   test-pkcs11-softhsm:
     name: PKCS#11 SoftHSM Smoke Test
     if: github.event_name == 'pull_request'
@@ -1048,6 +1081,7 @@ jobs:
       - test-unit
       - test-lib
       - test-secrets
+      - test-service-integration
       - build-integration-tests-archive
       - test-integration
       - test-conformance
@@ -1066,6 +1100,7 @@ jobs:
           echo "| Unit | ${{ needs.test-unit.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Inline lib | ${{ needs.test-lib.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Secret backends | ${{ needs.test-secrets.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Service integration | ${{ needs.test-service-integration.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Integration archive build | ${{ needs.build-integration-tests-archive.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Integration | ${{ needs.test-integration.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Mesh conformance | ${{ needs.test-conformance.result }} |" >> $GITHUB_STEP_SUMMARY
@@ -1077,6 +1112,7 @@ jobs:
           if [ "${{ needs.test-unit.result }}" != "success" ] ||
              [ "${{ needs.test-lib.result }}" != "success" ] ||
              [ "${{ needs.test-secrets.result }}" != "success" ] ||
+             [ "${{ needs.test-service-integration.result }}" != "success" ] ||
              [ "${{ needs.build-integration-tests-archive.result }}" != "success" ] ||
              [ "${{ needs.test-integration.result }}" != "success" ] ||
              [ "${{ needs.test-conformance.result }}" != "success" ] ||
