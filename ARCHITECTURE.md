@@ -341,8 +341,8 @@ High-performance HTTP client connection pooling with backend mTLS support:
 
 Extensible plugin architecture for authentication, authorization, and transformations:
 
-**23 Plugins Registered**:
-- **Authentication**: `jwks_auth`, `jwt_auth`, `key_auth`, `basic_auth`, `hmac_auth`, `mtls_auth`
+**Plugin categories** (representative — see [docs/plugins.md](docs/plugins.md) for the full set of 75+ built-in plugins):
+- **Authentication**: `jwks_auth`, `jwt_auth`, `key_auth`, `basic_auth`, `hmac_auth`, `mtls_auth`, `ldap_auth`, `oauth2_introspection`, `oidc_relying_party`
 - **Authorization**: `access_control`, `ip_restriction`
 - **Security**: `cors`, `bot_detection`
 - **Rate Limiting**: `rate_limiting`
@@ -370,7 +370,7 @@ RESTful API for dynamic configuration management:
 
 ### **7. Operating Modes (`src/modes/`)**
 
-Eight operating modes for different deployment scenarios (Database, File, Control Plane, Data Plane, Mesh, Injector, Node Agent, Migrate — see `docs/mesh.md` and `docs/node_agent.md` for the mesh-related modes):
+Ferrum supports eight operating modes. The five core modes (Database, File, Control Plane, Data Plane, Migrate) are detailed below; the mesh-family modes — Mesh, Injector, Node Agent — are documented in `docs/mesh.md` and `docs/node_agent.md`:
 
 #### **Database Mode (`database.rs`)**
 - Single gateway instance with database storage
