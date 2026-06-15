@@ -48,6 +48,8 @@ const CLEANUP_INTERVAL_SECS: u64 = 30;
 /// run.
 const CLEANUP_NEVER: u64 = u64::MAX;
 
+const DEDUP_KEY_METADATA: &str = "_dedup_key";
+
 /// Monotonic seconds since process start. Immune to wall-clock steps, matching
 /// the `Instant`-based entry expiry.
 fn monotonic_secs() -> u64 {
@@ -76,6 +78,7 @@ fn decrement_atomic(value: &AtomicUsize) -> usize {
         .unwrap_or(0)
 }
 
+use super::utils::body_transform::is_event_stream_content_type;
 use super::utils::cache_headers::sanitize_cached_headers;
 use super::utils::redis_rate_limiter::{RedisConfig, RedisRateLimitClient};
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
@@ -718,6 +721,19 @@ impl Plugin for RequestDeduplication {
         true
     }
 
+    fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
+        ctx.metadata.contains_key(DEDUP_KEY_METADATA)
+    }
+
+    fn should_buffer_response_body_for_content_type(
+        &self,
+        ctx: &RequestContext,
+        content_type: Option<&str>,
+    ) -> bool {
+        self.should_buffer_response_body(ctx)
+            && !content_type.is_some_and(is_event_stream_content_type)
+    }
+
     async fn before_proxy(
         &self,
         ctx: &mut RequestContext,
@@ -803,7 +819,7 @@ impl Plugin for RequestDeduplication {
         }
 
         // Store the key in metadata so on_final_response_body can cache the response
-        ctx.metadata.insert("_dedup_key".to_string(), key);
+        ctx.metadata.insert(DEDUP_KEY_METADATA.to_string(), key);
 
         PluginResult::Continue
     }
@@ -816,7 +832,7 @@ impl Plugin for RequestDeduplication {
         body: &[u8],
     ) -> PluginResult {
         // Only cache if we have a dedup key from before_proxy
-        let key = match ctx.metadata.get("_dedup_key") {
+        let key = match ctx.metadata.get(DEDUP_KEY_METADATA) {
             Some(k) => k.clone(),
             None => return PluginResult::Continue,
         };

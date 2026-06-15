@@ -418,6 +418,67 @@ fn test_requires_response_body_buffering() {
     assert!(plugin.requires_response_body_buffering());
 }
 
+#[tokio::test]
+async fn test_response_buffering_only_for_fresh_dedup_keys() {
+    let config = json!({});
+    let plugin = make_plugin(config);
+
+    let mut get_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api".to_string(),
+    );
+    let mut get_headers = HashMap::new();
+    get_headers.insert("idempotency-key".to_string(), "get-key".to_string());
+    let result = plugin.before_proxy(&mut get_ctx, &mut get_headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!plugin.should_buffer_response_body(&get_ctx));
+
+    let mut keyless_post_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut keyless_post_headers = HashMap::new();
+    let result = plugin
+        .before_proxy(&mut keyless_post_ctx, &mut keyless_post_headers)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!plugin.should_buffer_response_body(&keyless_post_ctx));
+
+    let mut keyed_post_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut keyed_post_headers = HashMap::new();
+    keyed_post_headers.insert("idempotency-key".to_string(), "post-key".to_string());
+    let result = plugin
+        .before_proxy(&mut keyed_post_ctx, &mut keyed_post_headers)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(plugin.should_buffer_response_body(&keyed_post_ctx));
+}
+
+#[tokio::test]
+async fn test_response_buffering_releases_event_stream_content_type() {
+    let config = json!({});
+    let plugin = make_plugin(config);
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut headers = HashMap::new();
+    headers.insert("idempotency-key".to_string(), "stream-key".to_string());
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+
+    assert!(plugin.should_buffer_response_body_for_content_type(&ctx, Some("application/json")));
+    assert!(!plugin.should_buffer_response_body_for_content_type(&ctx, Some("text/event-stream")));
+}
+
 #[test]
 fn test_tracked_keys_count() {
     let config = json!({});
