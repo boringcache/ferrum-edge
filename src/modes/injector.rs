@@ -26,7 +26,8 @@ use tracing::{debug, error, info, warn};
 use crate::capture::{
     CaptureConfig, CaptureMode, DEFAULT_PROXY_UID, FERRUM_INCLUDE_OUTBOUND_PORTS_ANNOTATION,
     ISTIO_INCLUDE_OUTBOUND_PORTS_ANNOTATION, IncludeOutboundPorts, Ip6TablesMode, IptablesPlan,
-    include_outbound_ports_from_annotations, validate_cidr_list,
+    UdpCaptureSettings, include_outbound_ports_from_annotations, udp_capture_settings_from_env,
+    validate_cidr_list,
 };
 use crate::config::EnvConfig;
 use crate::config::conf_file::resolve_ferrum_var;
@@ -121,6 +122,15 @@ pub struct InjectorConfig {
     /// pod annotation `excludeOutboundIPRanges` APPENDS to this value.
     pub exclude_outbound_cidrs: Vec<String>,
     pub ip6tables_mode: Ip6TablesMode,
+    /// Whether the injected init container emits UDP TPROXY capture rules
+    /// (F3 §3.3 Stage 2). Default `false`: the consuming UDP listener arrives in
+    /// Stage 3, so an upgraded injector must not redirect UDP into a void.
+    pub udp_capture_enabled: bool,
+    /// UDP TPROXY listener port (Stage 3 consumer); distinct from the TCP
+    /// outbound REDIRECT port.
+    pub udp_outbound_port: u16,
+    /// Firewall mark stamped on TPROXY'd UDP datagrams.
+    pub tproxy_mark: u32,
     pub trust_domain: String,
     pub tls_cert_path: Option<String>,
     pub tls_key_path: Option<String>,
@@ -178,6 +188,11 @@ impl InjectorConfig {
             &resolve_ferrum_var("FERRUM_MESH_IP6TABLES_ENABLED")
                 .unwrap_or_else(|| "auto".to_string()),
         )?;
+        let UdpCaptureSettings {
+            udp_capture_enabled,
+            udp_outbound_port,
+            tproxy_mark,
+        } = udp_capture_settings_from_env()?;
         let trust_domain = resolve_ferrum_var("FERRUM_INJECTOR_TRUST_DOMAIN")
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| DEFAULT_INJECTOR_TRUST_DOMAIN.to_string());
@@ -213,6 +228,9 @@ impl InjectorConfig {
             include_outbound_cidrs,
             exclude_outbound_cidrs,
             ip6tables_mode,
+            udp_capture_enabled,
+            udp_outbound_port,
+            tproxy_mark,
             trust_domain,
             tls_cert_path,
             tls_key_path,
@@ -1101,6 +1119,10 @@ fn init_container(config: &InjectorConfig, pod: &Value) -> Result<Value, String>
             "runAsUser": 0,
             "runAsNonRoot": false,
             "allowPrivilegeEscalation": false,
+            // NET_ADMIN already covers everything UDP TPROXY capture needs
+            // (the TPROXY target, the fwmark `ip rule`, and `ip route add local`
+            // into the dedicated table), so no extra capability is required when
+            // `udp_capture_enabled` is on. NET_RAW remains for the TCP path.
             "capabilities": {
                 "drop": ["ALL"],
                 "add": ["NET_ADMIN", "NET_RAW"]
@@ -1141,6 +1163,11 @@ fn capture_config(config: &InjectorConfig, pod: &Value) -> Result<CaptureConfig,
     capture.exclude_ports = exclude_outbound_ports_for_pod(config, pod)?;
     capture.exclude_inbound_ports = exclude_inbound_ports_for_pod(config, pod)?;
     capture.ip6tables_mode = config.ip6tables_mode;
+    // UDP TPROXY capture (F3 §3.3 Stage 2), flag-gated default-off. When off the
+    // emitted plan contains no mangle/TPROXY rules at all.
+    capture.udp_capture_enabled = config.udp_capture_enabled;
+    capture.udp_outbound_port = config.udp_outbound_port;
+    capture.tproxy_mark = config.tproxy_mark;
 
     // CIDR resolution layered on top of injector-level defaults:
     //   - `includeOutboundIPRanges` REPLACES the env-derived include list when
@@ -1316,6 +1343,9 @@ mod tests {
             include_outbound_cidrs: Vec::new(),
             exclude_outbound_cidrs: Vec::new(),
             ip6tables_mode: Ip6TablesMode::Auto,
+            udp_capture_enabled: false,
+            udp_outbound_port: crate::capture::DEFAULT_UDP_OUTBOUND_PORT,
+            tproxy_mark: crate::capture::DEFAULT_TPROXY_MARK,
             trust_domain: "cluster.local".to_string(),
             tls_cert_path: None,
             tls_key_path: None,

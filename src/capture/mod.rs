@@ -13,6 +13,36 @@ use crate::config::conf_file::resolve_ferrum_var;
 pub const DEFAULT_PROXY_UID: u32 = 1337;
 pub(crate) const XTABLES_LOCK_WAIT_SECONDS: u8 = 5;
 
+/// Default UDP TPROXY listener port (Stage 3 consumer). Distinct from the TCP
+/// outbound REDIRECT port (15001) because UDP and TCP cannot share one listener
+/// socket — a UDP datagram delivered transparently by TPROXY has to land on a
+/// `SO_REUSEADDR`/`IP_TRANSPARENT` UDP socket, not the TCP outbound listener.
+pub const DEFAULT_UDP_OUTBOUND_PORT: u16 = 15011;
+
+/// Default firewall mark (a.k.a. `fwmark`) stamped on TPROXY'd UDP datagrams so
+/// the policy routing rule (`ip rule add fwmark <mark> lookup <table>`) steers
+/// them to the local-delivery table. `0x539` == 1337 decimal.
+///
+/// Collision analysis: Ferrum uses NO other packet marks anywhere (verified:
+/// the only `1337` is the proxy `--uid-owner` UID, a *socket owner* match in a
+/// disjoint namespace from `skb->mark`, and `node_agent_hbone_redirect_port`
+/// `16008` is a port, not a mark). The value is the conventional Istio
+/// outbound/TPROXY mark, so it also avoids clobbering a co-resident Istio
+/// install's expectations. Operators can override via `FERRUM_MESH_TPROXY_MARK`.
+pub const DEFAULT_TPROXY_MARK: u32 = 0x539;
+
+/// `skb->mark` mask matched alongside [`DEFAULT_TPROXY_MARK`]. A full-width mask
+/// keeps the TPROXY mark from aliasing onto other mark bits a co-resident CNI
+/// might use; rendered as `<mark>/<mask>` in the `--tproxy-mark` argument and as
+/// the `ip rule` `fwmark <mark>/<mask>` selector.
+pub(crate) const TPROXY_MARK_MASK: u32 = 0xffff_ffff;
+
+/// Dedicated policy routing table for transparent UDP local delivery. Istio uses
+/// table 133 for its inbound TPROXY route; reusing the number keeps the
+/// `ip route` plumbing recognizable and avoids the main table. Inert until the
+/// Stage 3 UDP listener binds.
+pub(crate) const TPROXY_ROUTE_TABLE: u16 = 133;
+
 /// Istio-compatible `includeOutboundPorts` annotation. The injector and the
 /// node-agent eBPF backend both read this key — keep the spelling exactly
 /// in sync with Istio so existing operator annotations apply unchanged.
@@ -101,6 +131,23 @@ pub struct CaptureConfig {
     /// so traffic to the port bypasses the mesh sidecar entirely.
     pub exclude_inbound_ports: Vec<u16>,
     pub ip6tables_mode: Ip6TablesMode,
+    /// Whether UDP TPROXY capture rules are emitted (F3 §3.3 Stage 2). Default
+    /// `false`: UDP cannot use the TCP REDIRECT model (REDIRECT rewrites the
+    /// destination and offers no per-datagram recoverable original address), so
+    /// captured UDP uses TPROXY in the `mangle` table, which delivers the
+    /// datagram WITHOUT rewriting its destination (recovered per-datagram from
+    /// the `IP_RECVORIGDSTADDR` cmsg by the Stage 3 listener). This stage emits
+    /// rules ONLY; the consuming UDP listener arrives in Stage 3, so leaving
+    /// this off keeps an upgraded injector from redirecting UDP into a void.
+    pub udp_capture_enabled: bool,
+    /// UDP TPROXY listener port the captured datagrams are delivered to. Distinct
+    /// from [`Self::outbound_port`] (the TCP REDIRECT target) because UDP+TCP
+    /// cannot share one listener socket.
+    pub udp_outbound_port: u16,
+    /// Firewall mark stamped on TPROXY'd UDP datagrams; the policy routing rule
+    /// matches it to steer them to the local-delivery table. See
+    /// [`DEFAULT_TPROXY_MARK`] for the collision analysis.
+    pub tproxy_mark: u32,
 }
 
 impl CaptureConfig {
@@ -129,6 +176,9 @@ impl CaptureConfig {
             exclude_ports: Vec::new(),
             exclude_inbound_ports: Vec::new(),
             ip6tables_mode: Ip6TablesMode::Auto,
+            udp_capture_enabled: false,
+            udp_outbound_port: DEFAULT_UDP_OUTBOUND_PORT,
+            tproxy_mark: DEFAULT_TPROXY_MARK,
         }
     }
 
@@ -163,6 +213,11 @@ impl CaptureConfig {
             &resolve_ferrum_var("FERRUM_MESH_IP6TABLES_ENABLED")
                 .unwrap_or_else(|| "auto".to_string()),
         )?;
+        let UdpCaptureSettings {
+            udp_capture_enabled,
+            udp_outbound_port,
+            tproxy_mark,
+        } = udp_capture_settings_from_env()?;
         Ok(Self {
             mode,
             proxy_uid,
@@ -177,6 +232,9 @@ impl CaptureConfig {
             exclude_ports,
             exclude_inbound_ports,
             ip6tables_mode,
+            udp_capture_enabled,
+            udp_outbound_port,
+            tproxy_mark,
         })
     }
 
@@ -185,6 +243,39 @@ impl CaptureConfig {
             self.exclude_ports.push(port);
         }
     }
+}
+
+/// UDP TPROXY capture settings parsed from the environment (F3 §3.3 Stage 2).
+/// Shared by [`CaptureConfig::from_env`] (node-agent capture fallback) and the
+/// injector so the three vars are parsed in exactly one place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UdpCaptureSettings {
+    pub udp_capture_enabled: bool,
+    pub udp_outbound_port: u16,
+    pub tproxy_mark: u32,
+}
+
+/// Parse `FERRUM_MESH_CAPTURE_UDP_ENABLED` (default `false`),
+/// `FERRUM_MESH_CAPTURE_UDP_PORT` (default [`DEFAULT_UDP_OUTBOUND_PORT`]), and
+/// `FERRUM_MESH_TPROXY_MARK` (default [`DEFAULT_TPROXY_MARK`]).
+pub fn udp_capture_settings_from_env() -> Result<UdpCaptureSettings, String> {
+    let udp_capture_enabled = parse_bool_env(
+        resolve_ferrum_var("FERRUM_MESH_CAPTURE_UDP_ENABLED").as_deref(),
+        "FERRUM_MESH_CAPTURE_UDP_ENABLED",
+    )?;
+    let udp_outbound_port = match resolve_ferrum_var("FERRUM_MESH_CAPTURE_UDP_PORT") {
+        Some(raw) => parse_single_port(&raw, "FERRUM_MESH_CAPTURE_UDP_PORT")?,
+        None => DEFAULT_UDP_OUTBOUND_PORT,
+    };
+    let tproxy_mark = match resolve_ferrum_var("FERRUM_MESH_TPROXY_MARK") {
+        Some(raw) => parse_tproxy_mark(&raw)?,
+        None => DEFAULT_TPROXY_MARK,
+    };
+    Ok(UdpCaptureSettings {
+        udp_capture_enabled,
+        udp_outbound_port,
+        tproxy_mark,
+    })
 }
 
 fn parse_cidr_env(raw: &str) -> Vec<String> {
@@ -355,6 +446,52 @@ where
         all_ports: false,
         ports,
     })
+}
+
+/// Parse a boolean capture env var. Absent / blank defaults to `false`. Accepts
+/// the same `true`/`false` spelling the rest of the boolean envs use.
+fn parse_bool_env(raw: Option<&str>, var: &str) -> Result<bool, String> {
+    match raw.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok(false),
+        Some(value) => value
+            .parse::<bool>()
+            .map_err(|_| format!("Invalid {var} '{value}'. Expected true or false")),
+    }
+}
+
+/// Parse a single 1..=65535 destination port from an env var.
+fn parse_single_port(raw: &str, var: &str) -> Result<u16, String> {
+    let trimmed = raw.trim();
+    let port = trimmed
+        .parse::<u16>()
+        .map_err(|_| format!("Invalid {var} '{raw}'. Expected a port in 1-65535"))?;
+    if port == 0 {
+        return Err(format!("Invalid {var} '{raw}': port must be 1-65535"));
+    }
+    Ok(port)
+}
+
+/// Parse the TPROXY firewall mark, accepting `0x`-prefixed hex or decimal. A
+/// zero mark is rejected — the policy routing rule and `--tproxy-mark` selector
+/// would match unmarked packets and steer all local traffic into the TPROXY
+/// table.
+fn parse_tproxy_mark(raw: &str) -> Result<u32, String> {
+    let trimmed = raw.trim();
+    let parsed = if let Some(hex) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
+        u32::from_str_radix(hex, 16)
+    } else {
+        trimmed.parse::<u32>()
+    }
+    .map_err(|_| {
+        format!("Invalid FERRUM_MESH_TPROXY_MARK '{raw}'. Expected a 32-bit hex (0x...) or decimal value")
+    })?;
+    if parsed == 0 {
+        return Err("Invalid FERRUM_MESH_TPROXY_MARK '0': mark must be non-zero".to_string());
+    }
+    Ok(parsed)
 }
 
 fn parse_proxy_uid(raw: &str) -> Result<u32, String> {
@@ -581,7 +718,7 @@ fn commands_for_family(
     commands.push(idempotent_new_chain(binary, "nat", "FERRUM_MESH_INBOUND"));
     commands.push(idempotent_new_chain(binary, "nat", "FERRUM_MESH_OUTBOUND"));
 
-    for cidr in exclude_cidrs {
+    for cidr in &exclude_cidrs {
         commands.push(idempotent_append(
             binary,
             "nat",
@@ -633,7 +770,7 @@ fn commands_for_family(
                     ));
                 }
             } else {
-                for cidr in include_cidrs {
+                for cidr in &include_cidrs {
                     commands.push(idempotent_append(
                         binary,
                         "nat",
@@ -690,7 +827,207 @@ fn commands_for_family(
         "OUTPUT",
         "-p tcp -j FERRUM_MESH_OUTBOUND",
     ));
+    if config.udp_capture_enabled {
+        commands.extend(udp_tproxy_commands_for_family(
+            binary,
+            config,
+            family,
+            &include_cidrs,
+            &exclude_cidrs,
+        ));
+    }
     commands
+}
+
+/// Emit UDP TPROXY capture rules for one address family (F3 §3.3 Stage 2).
+///
+/// Unlike the TCP path (`nat`-table REDIRECT, which rewrites the destination to
+/// the proxy port), UDP capture uses TPROXY in the `mangle` table: TPROXY
+/// delivers the datagram to a transparent socket WITHOUT rewriting its
+/// destination, so the Stage 3 listener recovers the original destination
+/// per-datagram from the `IP_RECVORIGDSTADDR` cmsg. Transparent delivery
+/// additionally needs a firewall mark plus an `ip rule`/`ip route local` so the
+/// kernel routes the marked datagram to the local socket.
+///
+/// The include/exclude/CIDR/uid logic mirrors the TCP outbound chain so
+/// operator capture scoping (`includeOutboundPorts`, `excludeOutboundPorts`,
+/// include/exclude CIDRs, the proxy-UID self-exclusion) applies identically to
+/// UDP.
+///
+/// **TPROXY-in-OUTPUT limitation:** the TPROXY target only runs in `PREROUTING`,
+/// never for locally-generated (OUTPUT) packets. For a sidecar capturing the
+/// pod's OWN UDP egress, the Istio-equivalent pattern is `mangle OUTPUT ...
+/// -j MARK` + reinjection through the routing rule; here we install the
+/// `mangle OUTPUT` MARK rule and rely on PREROUTING TPROXY in the pod netns.
+/// Sidecar-self-egress UDP is therefore NOT claimed to work until the
+/// `netns-capture-live` job validates it (see `docs/mesh.md`).
+fn udp_tproxy_commands_for_family(
+    binary: &str,
+    config: &CaptureConfig,
+    family: CidrFamily,
+    include_cidrs: &[&str],
+    exclude_cidrs: &[&str],
+) -> Vec<String> {
+    let mut commands = Vec::new();
+    let mark = config.tproxy_mark;
+    let mark_arg = format!("0x{mark:x}/0x{TPROXY_MARK_MASK:x}");
+    let tproxy_jump = format!(
+        "-j TPROXY --on-port {} --tproxy-mark {mark_arg}",
+        config.udp_outbound_port
+    );
+
+    commands.push(idempotent_new_chain(
+        binary,
+        "mangle",
+        "FERRUM_MESH_UDP_INBOUND",
+    ));
+    commands.push(idempotent_new_chain(
+        binary,
+        "mangle",
+        "FERRUM_MESH_UDP_OUTBOUND",
+    ));
+
+    // Outbound exclusions first (RETURN wins by rule order), mirroring TCP.
+    for cidr in exclude_cidrs {
+        commands.push(idempotent_append(
+            binary,
+            "mangle",
+            "FERRUM_MESH_UDP_OUTBOUND",
+            &format!("-p udp -d {cidr} -j RETURN"),
+        ));
+    }
+    for port in &config.exclude_ports {
+        commands.push(idempotent_append(
+            binary,
+            "mangle",
+            "FERRUM_MESH_UDP_OUTBOUND",
+            &format!("-p udp --dport {port} -j RETURN"),
+        ));
+    }
+    if let Some(uid) = config.proxy_uid {
+        // The proxy's own UDP egress must bypass capture. `-m owner` is only
+        // valid for locally-generated packets, so it sits in the OUTPUT-fed
+        // chain just like the TCP `nat` OUTPUT exclusion.
+        commands.push(idempotent_append(
+            binary,
+            "mangle",
+            "FERRUM_MESH_UDP_OUTBOUND",
+            &format!("-m owner --uid-owner {uid} -j RETURN"),
+        ));
+    }
+
+    if config.include_all_outbound_ports {
+        commands.push(idempotent_append(
+            binary,
+            "mangle",
+            "FERRUM_MESH_UDP_OUTBOUND",
+            &format!("-p udp {tproxy_jump}"),
+        ));
+    } else {
+        let emit_include_cidrs =
+            config.include_outbound_ports.is_empty() || config.include_cidrs_explicit;
+        if emit_include_cidrs {
+            if include_cidrs.is_empty() {
+                let has_include_cidrs_for_other_family = config
+                    .include_cidrs
+                    .iter()
+                    .any(|cidr| cidr_family(cidr).is_some_and(|cidr_family| cidr_family != family));
+                if config.include_cidrs_explicit || !has_include_cidrs_for_other_family {
+                    commands.push(idempotent_append(
+                        binary,
+                        "mangle",
+                        "FERRUM_MESH_UDP_OUTBOUND",
+                        &format!("-p udp {tproxy_jump}"),
+                    ));
+                }
+            } else {
+                for cidr in include_cidrs {
+                    commands.push(idempotent_append(
+                        binary,
+                        "mangle",
+                        "FERRUM_MESH_UDP_OUTBOUND",
+                        &format!("-p udp -d {cidr} {tproxy_jump}"),
+                    ));
+                }
+            }
+        }
+        for port in &config.include_outbound_ports {
+            commands.push(idempotent_append(
+                binary,
+                "mangle",
+                "FERRUM_MESH_UDP_OUTBOUND",
+                &format!("-p udp --dport {port} {tproxy_jump}"),
+            ));
+        }
+    }
+
+    // Inbound exclusions before the catch-all TPROXY (RETURN must precede it,
+    // mirroring the TCP inbound chain).
+    for port in &config.exclude_inbound_ports {
+        commands.push(idempotent_append(
+            binary,
+            "mangle",
+            "FERRUM_MESH_UDP_INBOUND",
+            &format!("-p udp --dport {port} -j RETURN"),
+        ));
+    }
+    commands.push(idempotent_append(
+        binary,
+        "mangle",
+        "FERRUM_MESH_UDP_INBOUND",
+        &format!("-p udp {tproxy_jump}"),
+    ));
+
+    // PREROUTING jump carries both directions of remotely-originated UDP
+    // (TPROXY only runs here). The proxy-UID RETURN above is in the OUTBOUND
+    // chain because owner-match needs OUTPUT context.
+    commands.push(idempotent_append(
+        binary,
+        "mangle",
+        "PREROUTING",
+        "-p udp -j FERRUM_MESH_UDP_INBOUND",
+    ));
+    commands.push(idempotent_append(
+        binary,
+        "mangle",
+        "PREROUTING",
+        "-p udp -j FERRUM_MESH_UDP_OUTBOUND",
+    ));
+    // OUTPUT MARK for locally-generated UDP egress (TPROXY-in-OUTPUT limitation,
+    // see the fn doc): mark it so the routing rule reinjects it; the proxy-UID
+    // RETURN sits ahead of this in the same chain so the proxy's own datagrams
+    // are not marked-and-looped.
+    commands.push(idempotent_append(
+        binary,
+        "mangle",
+        "OUTPUT",
+        "-p udp -j FERRUM_MESH_UDP_OUTBOUND",
+    ));
+
+    // Transparent-routing plumbing: raw `ip` commands (NOT iptables). Each is
+    // guarded by a `command -v ip` preflight and `|| true` so a missing `ip`
+    // binary or an already-present rule never aborts the (set -e) setup script.
+    // The fwmark selector must match the `--tproxy-mark` value above so marked
+    // datagrams are steered to the local-delivery table.
+    let (ip, local_route) = match family {
+        CidrFamily::V4 => ("ip", "local 0.0.0.0/0 dev lo"),
+        CidrFamily::V6 => ("ip -6", "local ::/0 dev lo"),
+    };
+    commands.push(ip_guarded(&format!(
+        "{ip} rule add fwmark 0x{mark:x}/0x{TPROXY_MARK_MASK:x} lookup {TPROXY_ROUTE_TABLE}"
+    )));
+    commands.push(ip_guarded(&format!(
+        "{ip} route add {local_route} table {TPROXY_ROUTE_TABLE}"
+    )));
+
+    commands
+}
+
+/// Wrap a raw `ip` command with a `command -v ip` preflight and `|| true`. The
+/// preflight mirrors the existing `ip6tables` best-effort guard: a runtime image
+/// without `iproute2` skips the routing plumbing instead of failing the script.
+fn ip_guarded(cmd: &str) -> String {
+    format!("command -v ip >/dev/null 2>&1 && {{ {cmd} 2>/dev/null || true; }} || true")
 }
 
 fn iptables_script(
@@ -732,7 +1069,18 @@ fn iptables_script(
 }
 
 fn cleanup_commands_for(binary: &str) -> Vec<String> {
-    vec![
+    // UDP TPROXY teardown is emitted UNCONDITIONALLY (best-effort, like the rest
+    // of cleanup): chain/table identifiers are fixed, so a teardown reverses any
+    // prior `udp_capture_enabled` run even though cleanup carries no config. The
+    // `ip rule`/`ip route` plumbing is removed BY TABLE (`lookup <table>`),
+    // independent of which `tproxy_mark` was used, so a custom mark still cleans
+    // up and stale routing state never leaks.
+    let family = if binary == "ip6tables" {
+        CidrFamily::V6
+    } else {
+        CidrFamily::V4
+    };
+    let mut commands = vec![
         // Step 1: remove jump rules from built-in chains
         idempotent_delete(binary, "nat", "OUTPUT", "-p tcp -j FERRUM_MESH_OUTBOUND"),
         idempotent_delete(binary, "nat", "PREROUTING", "-p tcp -j FERRUM_MESH_INBOUND"),
@@ -742,7 +1090,48 @@ fn cleanup_commands_for(binary: &str) -> Vec<String> {
         // Step 3: delete custom chains (must be empty first)
         delete_chain(binary, "nat", "FERRUM_MESH_INBOUND"),
         delete_chain(binary, "nat", "FERRUM_MESH_OUTBOUND"),
-    ]
+        // UDP TPROXY mangle teardown: jumps first, then flush, then delete.
+        idempotent_delete(
+            binary,
+            "mangle",
+            "PREROUTING",
+            "-p udp -j FERRUM_MESH_UDP_INBOUND",
+        ),
+        idempotent_delete(
+            binary,
+            "mangle",
+            "PREROUTING",
+            "-p udp -j FERRUM_MESH_UDP_OUTBOUND",
+        ),
+        idempotent_delete(
+            binary,
+            "mangle",
+            "OUTPUT",
+            "-p udp -j FERRUM_MESH_UDP_OUTBOUND",
+        ),
+        flush_chain(binary, "mangle", "FERRUM_MESH_UDP_INBOUND"),
+        flush_chain(binary, "mangle", "FERRUM_MESH_UDP_OUTBOUND"),
+        delete_chain(binary, "mangle", "FERRUM_MESH_UDP_INBOUND"),
+        delete_chain(binary, "mangle", "FERRUM_MESH_UDP_OUTBOUND"),
+    ];
+    // Remove the transparent-routing rule + route table (mark-independent).
+    commands.push(ip_guarded(&format!(
+        "{} rule del lookup {TPROXY_ROUTE_TABLE}",
+        if family == CidrFamily::V6 {
+            "ip -6"
+        } else {
+            "ip"
+        }
+    )));
+    commands.push(ip_guarded(&format!(
+        "{} route flush table {TPROXY_ROUTE_TABLE}",
+        if family == CidrFamily::V6 {
+            "ip -6"
+        } else {
+            "ip"
+        }
+    )));
+    commands
 }
 
 fn idempotent_new_chain(binary: &str, table: &str, chain: &str) -> String {
@@ -1548,6 +1937,9 @@ mod tests {
             "FERRUM_MESH_CAPTURE_EXCLUDE_PORTS",
             "FERRUM_MESH_CAPTURE_EXCLUDE_INBOUND_PORTS",
             "FERRUM_MESH_IP6TABLES_ENABLED",
+            "FERRUM_MESH_CAPTURE_UDP_ENABLED",
+            "FERRUM_MESH_CAPTURE_UDP_PORT",
+            "FERRUM_MESH_TPROXY_MARK",
         ];
         for key in keys {
             // SAFETY: test-only env mutation, serialized by ENV_LOCK above.
@@ -1780,5 +2172,374 @@ mod tests {
         )])
         .expect_err("malformed token");
         assert!(err.contains("invalid ferrum.io/includeOutboundPorts"));
+    }
+
+    // ---- F3 §3.3 Stage 2: UDP TPROXY capture rules (flag-gated, default-off) ----
+
+    fn udp_enabled_iptables_config() -> CaptureConfig {
+        let mut config = CaptureConfig::explicit(15006, 15001);
+        config.mode = CaptureMode::Iptables;
+        config.udp_capture_enabled = true;
+        config
+    }
+
+    #[test]
+    fn udp_capture_disabled_by_default_emits_no_mangle_or_tproxy() {
+        // The default (UDP off) plan must contain NO mangle/TPROXY/ip-routing
+        // rules — Stage 2 is inert until explicitly enabled.
+        let mut config = CaptureConfig::explicit(15006, 15001);
+        config.mode = CaptureMode::Iptables;
+        assert!(!config.udp_capture_enabled);
+        assert_eq!(config.udp_outbound_port, DEFAULT_UDP_OUTBOUND_PORT);
+        assert_eq!(config.tproxy_mark, DEFAULT_TPROXY_MARK);
+
+        let plan = IptablesPlan::for_config(&config);
+        for cmd in plan.v4_commands.iter().chain(plan.v6_commands.iter()) {
+            assert!(
+                !cmd.contains("mangle")
+                    && !cmd.contains("TPROXY")
+                    && !cmd.contains("FERRUM_MESH_UDP")
+                    && !cmd.contains("-p udp")
+                    && !cmd.contains("ip rule")
+                    && !cmd.contains("ip route")
+                    && !cmd.contains("fwmark"),
+                "UDP-disabled plan must emit no UDP/TPROXY/routing rules: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn udp_capture_enabled_emits_mangle_chains_tproxy_and_routing() {
+        let config = udp_enabled_iptables_config();
+        let plan = IptablesPlan::for_config(&config);
+        let cmds = &plan.v4_commands;
+
+        // New mangle-table chains are created.
+        assert!(
+            cmds.iter()
+                .any(|c| c.contains("-t mangle") && c.contains("-N FERRUM_MESH_UDP_INBOUND")),
+            "missing UDP inbound mangle chain: {cmds:?}"
+        );
+        assert!(
+            cmds.iter()
+                .any(|c| c.contains("-t mangle") && c.contains("-N FERRUM_MESH_UDP_OUTBOUND")),
+            "missing UDP outbound mangle chain: {cmds:?}"
+        );
+
+        // Catch-all TPROXY jump on both directions, on the UDP port with the mark.
+        let tproxy_arg = format!(
+            "-j TPROXY --on-port {} --tproxy-mark 0x{:x}/0x{:x}",
+            DEFAULT_UDP_OUTBOUND_PORT, DEFAULT_TPROXY_MARK, TPROXY_MARK_MASK
+        );
+        assert!(
+            cmds.iter().any(|c| c.contains("FERRUM_MESH_UDP_OUTBOUND")
+                && c.contains("-p udp")
+                && c.contains(&tproxy_arg)),
+            "missing outbound UDP TPROXY jump: {cmds:?}"
+        );
+        assert!(
+            cmds.iter().any(|c| c.contains("FERRUM_MESH_UDP_INBOUND")
+                && c.contains("-p udp")
+                && c.contains(&tproxy_arg)),
+            "missing inbound UDP TPROXY jump: {cmds:?}"
+        );
+
+        // mangle PREROUTING jumps for both chains + OUTPUT mark chain.
+        assert!(
+            cmds.iter().any(|c| c.contains("-t mangle")
+                && c.contains("PREROUTING")
+                && c.contains("-j FERRUM_MESH_UDP_INBOUND")),
+            "missing mangle PREROUTING -> UDP inbound jump: {cmds:?}"
+        );
+        assert!(
+            cmds.iter().any(|c| c.contains("-t mangle")
+                && c.contains("PREROUTING")
+                && c.contains("-j FERRUM_MESH_UDP_OUTBOUND")),
+            "missing mangle PREROUTING -> UDP outbound jump: {cmds:?}"
+        );
+        assert!(
+            cmds.iter().any(|c| c.contains("-t mangle")
+                && c.contains("OUTPUT")
+                && c.contains("-j FERRUM_MESH_UDP_OUTBOUND")),
+            "missing mangle OUTPUT -> UDP outbound mark jump (TPROXY-OUTPUT limitation): {cmds:?}"
+        );
+
+        // Transparent-routing plumbing: ip rule (fwmark -> table) + ip route local.
+        assert!(
+            cmds.iter().any(|c| c.contains("command -v ip")
+                && c.contains("rule add fwmark")
+                && c.contains(&format!("lookup {TPROXY_ROUTE_TABLE}"))),
+            "missing guarded `ip rule add fwmark ... lookup <table>`: {cmds:?}"
+        );
+        assert!(
+            cmds.iter().any(|c| c.contains("command -v ip")
+                && c.contains("route add local 0.0.0.0/0 dev lo")
+                && c.contains(&format!("table {TPROXY_ROUTE_TABLE}"))),
+            "missing guarded `ip route add local ... table <table>`: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn udp_capture_mirrors_exclude_and_uid_rules() {
+        let mut config = udp_enabled_iptables_config();
+        config.exclude_cidrs = vec!["10.0.0.0/8".to_string()];
+        config.exclude_ports = vec![53];
+        config.exclude_inbound_ports = vec![5353];
+
+        let plan = IptablesPlan::for_config(&config);
+        let cmds = &plan.v4_commands;
+
+        assert!(
+            cmds.iter().any(|c| c.contains("FERRUM_MESH_UDP_OUTBOUND")
+                && c.contains("-p udp -d 10.0.0.0/8 -j RETURN")),
+            "UDP outbound exclude CIDR RETURN missing: {cmds:?}"
+        );
+        assert!(
+            cmds.iter().any(|c| c.contains("FERRUM_MESH_UDP_OUTBOUND")
+                && c.contains("-p udp --dport 53 -j RETURN")),
+            "UDP outbound exclude port RETURN missing: {cmds:?}"
+        );
+        assert!(
+            cmds.iter().any(|c| c.contains("FERRUM_MESH_UDP_OUTBOUND")
+                && c.contains("-m owner --uid-owner 1337 -j RETURN")),
+            "UDP proxy-UID self-exclusion RETURN missing: {cmds:?}"
+        );
+
+        // Inbound exclude RETURN must precede the inbound catch-all TPROXY.
+        let return_pos = cmds
+            .iter()
+            .position(|c| {
+                c.contains("FERRUM_MESH_UDP_INBOUND") && c.contains("-p udp --dport 5353 -j RETURN")
+            })
+            .expect("UDP inbound exclude RETURN");
+        let tproxy_pos = cmds
+            .iter()
+            .position(|c| c.contains("FERRUM_MESH_UDP_INBOUND") && c.contains("-j TPROXY"))
+            .expect("UDP inbound TPROXY");
+        assert!(
+            return_pos < tproxy_pos,
+            "UDP inbound RETURN must precede the inbound TPROXY: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn udp_capture_per_port_tproxy_when_include_ports_set() {
+        let mut config = udp_enabled_iptables_config();
+        config.include_outbound_ports = vec![5432, 9092];
+
+        let plan = IptablesPlan::for_config(&config);
+        for port in [5432, 9092] {
+            assert!(
+                plan.v4_commands.iter().any(|c| c.contains(&format!(
+                    "-p udp --dport {port} -j TPROXY --on-port {}",
+                    DEFAULT_UDP_OUTBOUND_PORT
+                ))),
+                "per-port UDP TPROXY missing for {port}: {:?}",
+                plan.v4_commands
+            );
+        }
+        // includeOutboundPorts without explicit include CIDRs must not also emit
+        // an OUTBOUND catch-all `-p udp -j TPROXY` (mirrors the TCP narrowing
+        // semantics). The INBOUND chain keeps its protocol-wide catch-all, like
+        // the TCP inbound REDIRECT, so scope this check to the outbound chain.
+        assert!(
+            !plan
+                .v4_commands
+                .iter()
+                .any(|c| c.contains("FERRUM_MESH_UDP_OUTBOUND") && c.contains("-p udp -j TPROXY")),
+            "implicit catch-all outbound UDP TPROXY must not fire when includeOutboundPorts narrows: {:?}",
+            plan.v4_commands
+        );
+    }
+
+    #[test]
+    fn udp_capture_partitions_ipv4_and_ipv6() {
+        let mut config = udp_enabled_iptables_config();
+        config.include_cidrs = vec!["172.16.0.0/12".to_string(), "2001:db8::/32".to_string()];
+        config.include_cidrs_explicit = true;
+
+        let plan = IptablesPlan::for_config(&config);
+
+        // IPv4 TPROXY rules use `iptables` + IPv4 routing; no IPv6 leakage.
+        assert!(
+            plan.v4_commands
+                .iter()
+                .any(|c| c.contains("iptables -t mangle")
+                    && c.contains("-p udp -d 172.16.0.0/12 -j TPROXY")),
+            "IPv4 UDP TPROXY CIDR rule missing: {:?}",
+            plan.v4_commands
+        );
+        assert!(
+            plan.v4_commands
+                .iter()
+                .any(|c| c.contains("ip rule add fwmark") && !c.contains("ip -6")),
+            "IPv4 transparent routing must use `ip` (not `ip -6`): {:?}",
+            plan.v4_commands
+        );
+        assert!(
+            !plan
+                .v4_commands
+                .iter()
+                .any(|c| c.contains("::/") || c.contains("2001:db8") || c.contains("ip -6")),
+            "IPv6 UDP rules must not appear in IPv4 commands: {:?}",
+            plan.v4_commands
+        );
+
+        // IPv6 TPROXY rules use `ip6tables -t mangle` + `ip -6` routing.
+        assert!(
+            plan.v6_commands
+                .iter()
+                .any(|c| c.contains("ip6tables -t mangle")
+                    && c.contains("-p udp -d 2001:db8::/32 -j TPROXY")),
+            "IPv6 UDP TPROXY CIDR rule missing: {:?}",
+            plan.v6_commands
+        );
+        assert!(
+            plan.v6_commands
+                .iter()
+                .any(|c| c.contains("ip -6 rule add fwmark")
+                    && c.contains(&format!("lookup {TPROXY_ROUTE_TABLE}"))),
+            "IPv6 transparent routing rule missing: {:?}",
+            plan.v6_commands
+        );
+        assert!(
+            plan.v6_commands
+                .iter()
+                .any(|c| c.contains("ip -6 route add local ::/0 dev lo")),
+            "IPv6 local route missing: {:?}",
+            plan.v6_commands
+        );
+    }
+
+    #[test]
+    fn cleanup_removes_udp_tproxy_chains_and_routing() {
+        let cleanup = IptablesPlan::cleanup_commands();
+
+        // mangle chain teardown (jumps, flush, delete).
+        for chain in ["FERRUM_MESH_UDP_INBOUND", "FERRUM_MESH_UDP_OUTBOUND"] {
+            assert!(
+                cleanup
+                    .iter()
+                    .any(|c| c.contains("-t mangle") && c.contains(&format!("-F {chain}"))),
+                "cleanup missing flush of {chain}"
+            );
+            assert!(
+                cleanup
+                    .iter()
+                    .any(|c| c.contains("-t mangle") && c.contains(&format!("-X {chain}"))),
+                "cleanup missing delete of {chain}"
+            );
+        }
+        assert!(
+            cleanup.iter().any(|c| c.contains("-t mangle")
+                && c.contains("OUTPUT")
+                && c.contains("-D")
+                && c.contains("FERRUM_MESH_UDP_OUTBOUND")),
+            "cleanup missing mangle OUTPUT jump delete"
+        );
+
+        // Routing teardown is mark-independent (by table) and ip-guarded.
+        assert!(
+            cleanup.iter().any(|c| c.contains("command -v ip")
+                && c.contains(&format!("rule del lookup {TPROXY_ROUTE_TABLE}"))),
+            "cleanup missing `ip rule del lookup <table>`: {cleanup:?}"
+        );
+        assert!(
+            cleanup.iter().any(|c| c.contains("command -v ip")
+                && c.contains(&format!("route flush table {TPROXY_ROUTE_TABLE}"))),
+            "cleanup missing `ip route flush table <table>`: {cleanup:?}"
+        );
+        // Every cleanup command stays best-effort.
+        for cmd in &cleanup {
+            assert!(
+                cmd.contains("|| true"),
+                "UDP cleanup command must tolerate missing state: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn udp_capture_v6_suppressed_when_ip6tables_disabled() {
+        let mut config = udp_enabled_iptables_config();
+        config.ip6tables_mode = Ip6TablesMode::Disabled;
+        config.include_cidrs = vec!["10.0.0.0/8".to_string(), "2001:db8::/32".to_string()];
+
+        let plan = IptablesPlan::for_config(&config);
+        assert!(
+            plan.v6_commands.is_empty(),
+            "disabled ip6tables must suppress IPv6 UDP TPROXY rules: {:?}",
+            plan.v6_commands
+        );
+        // IPv4 UDP rules still emit.
+        assert!(
+            plan.v4_commands
+                .iter()
+                .any(|c| c.contains("FERRUM_MESH_UDP_OUTBOUND") && c.contains("TPROXY")),
+            "IPv4 UDP TPROXY must remain when ip6tables disabled: {:?}",
+            plan.v4_commands
+        );
+    }
+
+    #[test]
+    fn udp_setup_script_keeps_set_e_and_idempotent_guards() {
+        // The TPROXY rules ride the same fail-closed `set -e` script as the TCP
+        // rules; the raw `ip` commands must stay self-guarded so they never abort
+        // it (missing `iproute2` or an already-present rule).
+        let script = IptablesPlan::for_config(&udp_enabled_iptables_config()).script();
+        assert!(script.starts_with("set -e\n"));
+        assert!(script.contains("command -v ip >/dev/null 2>&1"));
+        assert!(script.contains("FERRUM_MESH_UDP_OUTBOUND"));
+        assert!(script.contains("-j TPROXY"));
+    }
+
+    #[test]
+    fn from_env_defaults_udp_capture_off() {
+        with_capture_env(&[], || {
+            let config = CaptureConfig::from_env().expect("config");
+            assert!(!config.udp_capture_enabled);
+            assert_eq!(config.udp_outbound_port, DEFAULT_UDP_OUTBOUND_PORT);
+            assert_eq!(config.tproxy_mark, DEFAULT_TPROXY_MARK);
+        });
+    }
+
+    #[test]
+    fn from_env_parses_udp_capture_settings() {
+        with_capture_env(
+            &[
+                ("FERRUM_MESH_CAPTURE_UDP_ENABLED", "true"),
+                ("FERRUM_MESH_CAPTURE_UDP_PORT", "16011"),
+                ("FERRUM_MESH_TPROXY_MARK", "0x1234"),
+            ],
+            || {
+                let config = CaptureConfig::from_env().expect("config");
+                assert!(config.udp_capture_enabled);
+                assert_eq!(config.udp_outbound_port, 16011);
+                assert_eq!(config.tproxy_mark, 0x1234);
+            },
+        );
+    }
+
+    #[test]
+    fn from_env_parses_decimal_tproxy_mark() {
+        with_capture_env(&[("FERRUM_MESH_TPROXY_MARK", "1337")], || {
+            let config = CaptureConfig::from_env().expect("config");
+            assert_eq!(config.tproxy_mark, 1337);
+        });
+    }
+
+    #[test]
+    fn from_env_rejects_invalid_udp_settings() {
+        with_capture_env(&[("FERRUM_MESH_CAPTURE_UDP_ENABLED", "maybe")], || {
+            assert!(CaptureConfig::from_env().is_err());
+        });
+        with_capture_env(&[("FERRUM_MESH_CAPTURE_UDP_PORT", "0")], || {
+            assert!(CaptureConfig::from_env().is_err());
+        });
+        with_capture_env(&[("FERRUM_MESH_TPROXY_MARK", "0")], || {
+            assert!(CaptureConfig::from_env().is_err());
+        });
+        with_capture_env(&[("FERRUM_MESH_TPROXY_MARK", "nothex")], || {
+            assert!(CaptureConfig::from_env().is_err());
+        });
     }
 }
