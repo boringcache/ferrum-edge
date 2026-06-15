@@ -6,10 +6,10 @@ use ferrum_edge::config::types::{
     MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES, MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRY_LENGTH,
     MAX_CREDENTIAL_VALUE_LENGTH, MAX_CREDENTIALS_SIZE, MAX_FILE_PATH_LENGTH, MAX_HOSTS_PER_PROXY,
     MAX_HTTP2_MAX_FRAME_SIZE, MAX_HTTP3_CONNECTIONS_PER_BACKEND, MAX_LISTEN_PATH_LENGTH,
-    MAX_NAME_LENGTH, MAX_PLUGIN_CONFIG_SIZE, MAX_SD_STRING_LENGTH, MAX_TARGETS_PER_UPSTREAM,
-    MAX_TIMEOUT_MS, MAX_USERNAME_LENGTH, MIN_HTTP2_MAX_FRAME_SIZE, MIN_HTTP2_WINDOW_SIZE,
-    MeshSdConfig, PassiveHealthCheck, PluginConfig, PluginScope, Proxy, RetryConfig, SdProvider,
-    ServiceDiscoveryConfig, Upstream, UpstreamTarget,
+    MAX_NAME_LENGTH, MAX_PLUGIN_CONFIG_SIZE, MAX_POOL_SQL_INTEGER_VALUE, MAX_SD_STRING_LENGTH,
+    MAX_TARGETS_PER_UPSTREAM, MAX_TIMEOUT_MS, MAX_USERNAME_LENGTH, MIN_HTTP2_MAX_FRAME_SIZE,
+    MIN_HTTP2_WINDOW_SIZE, MeshSdConfig, PassiveHealthCheck, PluginConfig, PluginScope, Proxy,
+    RetryConfig, SdProvider, ServiceDiscoveryConfig, Upstream, UpstreamTarget,
 };
 use std::collections::HashMap;
 
@@ -1283,9 +1283,42 @@ fn test_proxy_http2_max_concurrent_streams_zero() {
 }
 
 #[test]
+fn test_proxy_http2_max_concurrent_streams_above_sql_integer_limit() {
+    let mut proxy = make_proxy("test", "/api");
+    proxy.pool_http2_max_concurrent_streams = Some(MAX_POOL_SQL_INTEGER_VALUE as u32 + 1);
+    let errs = proxy.validate_fields().unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("pool_http2_max_concurrent_streams"))
+    );
+}
+
+#[test]
 fn test_proxy_http2_max_concurrent_streams_valid() {
     let mut proxy = make_proxy("test", "/api");
     proxy.pool_http2_max_concurrent_streams = Some(1000);
+    assert!(proxy.validate_fields().is_ok());
+    proxy.pool_http2_max_concurrent_streams = Some(MAX_POOL_SQL_INTEGER_VALUE as u32);
+    assert!(proxy.validate_fields().is_ok());
+}
+
+#[test]
+fn test_proxy_pool_max_requests_per_connection_above_sql_integer_limit() {
+    let mut proxy = make_proxy("test", "/api");
+    proxy.pool_max_requests_per_connection = Some(MAX_POOL_SQL_INTEGER_VALUE + 1);
+    let errs = proxy.validate_fields().unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("pool_max_requests_per_connection"))
+    );
+}
+
+#[test]
+fn test_proxy_pool_max_requests_per_connection_valid_bounds() {
+    let mut proxy = make_proxy("test", "/api");
+    proxy.pool_max_requests_per_connection = Some(0);
+    assert!(proxy.validate_fields().is_ok());
+    proxy.pool_max_requests_per_connection = Some(MAX_POOL_SQL_INTEGER_VALUE);
     assert!(proxy.validate_fields().is_ok());
 }
 
