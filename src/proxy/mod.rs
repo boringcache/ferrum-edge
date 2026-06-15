@@ -4204,6 +4204,45 @@ impl ProxyState {
                 }
             }
         }
+
+        // Second pass: the DIRECT-pod-IP / headless per-workload raw-TCP egress
+        // upstreams (F3 §3.4). Same trap as the VIP upstreams — referenced by NO
+        // config proxy, so without enrollment `retain_keys` evicts their HBONE
+        // records and every Ambient by-workload dial 502s `hbone_required`
+        // forever. Built from the SAME deterministic per-workload relay proxy the
+        // index/dispatch use, so probe and dispatch capability keys agree.
+        // `mesh.mtls` (Sidecar) per-workload targets are skipped (no probe),
+        // exactly like the VIP pass.
+        let local_cluster = mesh
+            .multi_cluster
+            .as_ref()
+            .and_then(|mc| mc.local_cluster.as_deref());
+        for spec in crate::modes::mesh::mesh_outbound_tcp_bywl_upstreams(
+            &mesh.services,
+            &mesh.workloads,
+            local_cluster,
+        ) {
+            let Some(upstream) = upstream_map.get(spec.upstream_id.as_str()) else {
+                continue;
+            };
+            let relay_proxy = crate::modes::mesh::mesh_outbound_tcp_bywl_relay_proxy(
+                &spec.service.namespace,
+                &spec.service.name,
+                spec.service_port.port,
+                spec.canonical_ip,
+                &spec.upstream_id,
+            );
+            for target in &upstream.targets {
+                if !crate::proxy::hbone_pool::target_hbone_enabled(target) {
+                    continue;
+                }
+                let probe_target =
+                    BackendCapabilityProbeTarget::from_proxy(&relay_proxy, Some(target));
+                if seen.insert(probe_target.key.clone()) {
+                    targets.push(probe_target);
+                }
+            }
+        }
     }
 
     fn collect_mesh_route_dispatch_capability_targets(
@@ -9681,7 +9720,22 @@ async fn run_accept_loop(
                                 && let Some(dst) = orig_dst
                             {
                                 let epoch = state.request_epoch.load();
-                                match epoch.route_table.mesh_tcp_egress_decision(dst).cloned() {
+                                // Try the VIP table first (strict `(cluster_ip,
+                                // service port)`), then fall back to the
+                                // direct-pod-IP / headless by-workload index
+                                // (strict `(workload IP, target port)`, F3 §3.4)
+                                // — a client that resolved a headless service
+                                // itself dials a POD IP, bypassing the VIP table.
+                                let decision = epoch
+                                    .route_table
+                                    .mesh_tcp_egress_decision(dst)
+                                    .or_else(|| {
+                                        epoch
+                                            .route_table
+                                            .mesh_tcp_egress_by_workload_decision(dst)
+                                    })
+                                    .cloned();
+                                match decision {
                                     Some(crate::router_cache::MeshTcpEgressDecision::Relay(
                                         entry,
                                     )) => {
@@ -19992,6 +20046,124 @@ mod tests {
     use async_trait::async_trait;
     use http::header::HeaderValue;
     use serde_json::json;
+
+    /// F3 §3.4: the direct-pod-IP / headless per-workload raw-TCP egress
+    /// upstreams are referenced by NO config proxy, so without a dedicated
+    /// capability-enrollment pass `retain_keys` would evict their HBONE records
+    /// and every Ambient by-workload dial would 502 `hbone_required` forever.
+    /// `collect_mesh_tcp_egress_capability_targets` must enroll the Ambient
+    /// `mesh.hbone` per-workload targets (keyed by the SAME deterministic
+    /// per-workload relay proxy the index/dispatch use) and skip `mesh.mtls`.
+    #[test]
+    fn collect_mesh_tcp_egress_capability_targets_enrolls_per_workload_hbone() {
+        use crate::identity::spiffe::{SpiffeId, TrustDomain};
+        use crate::modes::mesh::config::{
+            AppProtocol, MeshConfig, MeshService, ServicePort, ServiceTargetPort, Workload,
+            WorkloadPort, WorkloadRef, WorkloadSelector,
+        };
+
+        // Build a headless Ambient (HBONE) raw-TCP service backed by a pod IP.
+        // We build `config.mesh` + the materialized by-workload upstream directly
+        // (the collector forward-derives candidates from `config.mesh` and looks
+        // them up in the upstream map), so the test needs no `MeshRuntimeConfig`.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/redis";
+        let svc = MeshService {
+            name: "redis".to_string(),
+            namespace: "default".to_string(),
+            ports: vec![ServicePort {
+                port: 6379,
+                protocol: AppProtocol::Redis,
+                name: Some("redis".to_string()),
+                target_port: Some(ServiceTargetPort::Number(6380)),
+            }],
+            workloads: vec![WorkloadRef {
+                spiffe_id: SpiffeId::new(spiffe).unwrap(),
+            }],
+            protocol_overrides: HashMap::new(),
+            cluster_ips: Vec::new(),
+        };
+        let wl = Workload {
+            spiffe_id: SpiffeId::new(spiffe).unwrap(),
+            selector: WorkloadSelector::default(),
+            service_name: "redis".to_string(),
+            addresses: vec!["10.0.0.7".to_string()],
+            ports: vec![WorkloadPort {
+                port: 6380,
+                protocol: AppProtocol::Redis,
+                name: Some("redis".to_string()),
+            }],
+            trust_domain: TrustDomain::new("cluster.local").unwrap(),
+            namespace: "default".to_string(),
+            network: None,
+            cluster: None,
+            weight: None,
+            locality: None,
+            service_account: None,
+            pod_uid: None,
+        };
+
+        let bywl_id = crate::modes::mesh::mesh_outbound_tcp_bywl_upstream_id(
+            "default",
+            "redis",
+            6379,
+            "10.0.0.7".parse().unwrap(),
+        );
+        // The single-target HBONE-tagged, identity-pinned upstream the Ambient
+        // materializer would emit.
+        let upstream: Upstream = serde_json::from_value(json!({
+            "id": bywl_id,
+            "name": "redis.default.svc.cluster.local",
+            "targets": [{
+                "host": "10.0.0.7",
+                "port": 6380,
+                "tags": {"mesh.hbone": "true", "mesh.spiffe_id": spiffe},
+            }],
+        }))
+        .expect("upstream deserializes");
+        let mut config = GatewayConfig::default();
+        config.upstreams = vec![upstream];
+        config.mesh = Some(Box::new(MeshConfig {
+            services: vec![svc],
+            workloads: vec![wl],
+            ..MeshConfig::default()
+        }));
+
+        let upstream_map: HashMap<&str, &Upstream> =
+            config.upstreams.iter().map(|u| (u.id.as_str(), u)).collect();
+        let mut seen = std::collections::HashSet::new();
+        let mut targets = Vec::new();
+        ProxyState::collect_mesh_tcp_egress_capability_targets(
+            &config,
+            &upstream_map,
+            &mut seen,
+            &mut targets,
+        );
+
+        // The expected probe key is the one the by-workload relay proxy + the
+        // materialized target produce — exactly what dispatch will look up.
+        let relay = crate::modes::mesh::mesh_outbound_tcp_bywl_relay_proxy(
+            "default",
+            "redis",
+            6379,
+            "10.0.0.7".parse().unwrap(),
+            &bywl_id,
+        );
+        let expected =
+            BackendCapabilityProbeTarget::from_proxy(&relay, Some(&config.upstreams[0].targets[0]));
+        let enrolled = targets
+            .iter()
+            .find(|t| t.key == expected.key)
+            .expect("the per-workload Ambient HBONE target is enrolled for probing");
+        assert!(
+            enrolled.hbone_hint,
+            "the enrolled per-workload target opts into HBONE probing"
+        );
+        assert_eq!(
+            enrolled.hbone_expected_peer.as_ref().map(|p| p.as_str()),
+            Some(spiffe),
+            "the HBONE probe pins the same destination identity dispatch uses"
+        );
+    }
 
     /// Directly exercises the gRPC streaming circuit-breaker classification:
     /// a late client-upload overflow is gateway-side and must be NEUTRAL, while
