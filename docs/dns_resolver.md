@@ -29,6 +29,9 @@ The final TTL is always clamped to at least `FERRUM_DNS_MIN_TTL_SECONDS`.
 | `FERRUM_DNS_RESOLVER_ADDRESS` | `String` | System resolv.conf | Comma-separated nameserver addresses (`ip[:port]`). Supports IPv4 and IPv6. Port defaults to 53 if omitted. |
 | `FERRUM_DNS_RESOLVER_HOSTS_FILE` | `String` | `/etc/hosts` | Path to a custom hosts file. Entries in this file take priority over DNS queries. |
 | `FERRUM_DNS_ORDER` | `String` | `CACHE,SRV,A,CNAME` | Comma-separated, case-insensitive list of DNS record types to query, in order. See [DNS Order](#dns-order) below. |
+| `FERRUM_DNS_TRY_TCP_ON_ERROR` | `bool` | `true` | Retry over TCP when a UDP DNS response is truncated (`TC` bit) or errors. |
+| `FERRUM_DNS_NUM_CONCURRENT_REQS` | `usize` | `3` | Number of nameservers queried concurrently per lookup (the fastest answer wins). Range: 1-10. |
+| `FERRUM_DNS_MAX_ACTIVE_REQUESTS` | `usize` | `512` | Max in-flight DNS queries per multiplexed upstream connection (Hickory `ResolverOpts::max_active_requests`) — **not** a resolver-wide cap. Range: 1-4096. |
 
 ### TTL Settings
 

@@ -391,6 +391,7 @@ UDP is connectionless, so the gateway tracks sessions by client source address (
 - **Session creation**: First datagram from a new client creates a session
 - **Session cleanup**: Background task runs every `FERRUM_UDP_CLEANUP_INTERVAL_SECONDS` (default 10s), removing sessions idle longer than `udp_idle_timeout_seconds`
 - **Max sessions**: Limit of `FERRUM_UDP_MAX_SESSIONS` (default 10,000) concurrent sessions per proxy to prevent resource exhaustion
+- **Adaptive batching**: When `FERRUM_ADAPTIVE_BATCH_LIMIT_ENABLED=true` (default), the per-proxy recv drain limit moves across fixed internal tiers (64 / 256 / 2000 / 6000 datagrams) by observed per-proxy traffic via an EWMA — independent of `FERRUM_ADAPTIVE_BATCH_LIMIT_DEFAULT`, which only sets the limit used when adaptation is disabled or before a proxy's first sample. TCP/WebSocket tunnel copy buffers similarly adapt between `FERRUM_ADAPTIVE_BUFFER_MIN_SIZE` (8 KiB) and `FERRUM_ADAPTIVE_BUFFER_MAX_SIZE` (256 KiB) when `FERRUM_ADAPTIVE_BUFFER_ENABLED=true`. See [configuration.md](configuration.md) for the full `FERRUM_ADAPTIVE_*` set.
 - **Reply routing**: Each session spawns a receiver task that forwards backend replies back to the correct client
 - **Reply-source selection (`FERRUM_UDP_PKTINFO_ENABLED=auto`, Linux)**: On wildcard / multi-homed binds, `IP_PKTINFO` / `IPV6_PKTINFO` captures the per-datagram local destination address (and interface index) on recv and reuses it as the reply source on send. This saves one kernel routing lookup per `sendmsg` flush (combined with `UDP_SEGMENT`/GSO in a single cmsg buffer) and ensures replies exit the same interface the client targeted — important for NAT-sensitive middleboxes, anycast, and scoped IPv6 (link-local `fe80::/10`, where the ifindex is required to disambiguate the source zone). The captured address is stored per-session via `OnceLock` on the first datagram that exposes pktinfo; subsequent datagrams reuse it lock-free. When pktinfo is active, the recv loop uses `readable() + recvmmsg` instead of `recv_from`, so the first datagram of each wakeup also surfaces cmsg — one-shot UDP flows (e.g. DNS) get the correct reply source even when the drain loop never fires.
 
@@ -432,7 +433,7 @@ Notes:
 | `FERRUM_TCP_IDLE_TIMEOUT_SECONDS` | `300` | Default TCP idle timeout (5 min). Per-proxy `tcp_idle_timeout_seconds` overrides. 0 = disabled |
 | `FERRUM_UDP_MAX_SESSIONS` | `10000` | Maximum concurrent UDP sessions per proxy |
 | `FERRUM_UDP_CLEANUP_INTERVAL_SECONDS` | `10` | Interval between UDP session cleanup sweeps |
-| `FERRUM_UDP_RECV_BATCH_LIMIT` | `6000` | Max datagrams drained per recv wakeup. Higher values improve burst throughput; lower values improve event loop fairness |
+| `FERRUM_ADAPTIVE_BATCH_LIMIT_DEFAULT` | `6000` | Datagrams drained per UDP recv wakeup when adaptive batching is **disabled** (`FERRUM_ADAPTIVE_BATCH_LIMIT_ENABLED=false`), and the initial value before a proxy's first traffic sample. When adaptation is enabled (default) the per-proxy limit then moves across fixed internal tiers (64 / 256 / 2000 / 6000) by observed traffic and is **not** capped by this value. Raising it increases the disabled/initial limit |
 
 ### Linux Performance Tuning
 
