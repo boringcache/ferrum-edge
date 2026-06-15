@@ -3377,6 +3377,54 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn idle_read_timeout_pathological_deadline_is_unbounded_not_panic() {
+        // A client-controlled `grpc-timeout` (e.g. `18446744073709551615m`)
+        // reaches the streaming response body as a millisecond value so large
+        // that `Instant::now() + Duration::from_millis(ms)` overflows Tokio's
+        // representable `Instant` range. Constructing the wrapper must NOT
+        // panic the proxy path; the deadline collapses to `None` (effectively
+        // unbounded), matching the buffered path's `tokio::time::timeout`
+        // far-future behavior.
+        let inner = Coalescing::new(MockSource::new(vec![MockStep::Pending]), 100, None);
+        let mut body = IdleReadTimeoutBody::new(inner, u64::MAX);
+        assert!(
+            body.deadline.is_none(),
+            "u64::MAX ms deadline must collapse to None (unbounded), not a live timer",
+        );
+
+        // Polling a pending inner must stay live (Pending) without panicking:
+        // the inner body's waker keeps the task scheduled, and no timer fires.
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(
+            matches!(Pin::new(&mut body).poll_frame(&mut cx), Poll::Pending),
+            "pathological deadline must poll Pending, never panic or time out",
+        );
+        // The first `Pending` poll began the backend-read wait and re-derived
+        // the deadline via `reset_deadline()`, which must also stay `None`.
+        assert!(
+            body.waiting,
+            "first Pending poll must begin the backend-read wait",
+        );
+        assert!(
+            body.deadline.is_none(),
+            "reset_deadline() must keep the pathological deadline unbounded",
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_read_timeout_representable_deadline_arms_live_timer() {
+        // A normal, representable timeout must still arm a live deadline so the
+        // idle-read watchdog continues to bound stalled backends.
+        let inner = Coalescing::new(MockSource::new(vec![MockStep::Pending]), 100, None);
+        let body = IdleReadTimeoutBody::new(inner, 1_000);
+        assert!(
+            body.deadline.is_some(),
+            "a representable timeout must arm a live deadline",
+        );
+    }
+
     #[test]
     fn not_sync_body_is_indeed_send_but_not_sync() {
         // Sanity: confirm the witness type has the expected trait shape.
