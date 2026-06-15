@@ -69,6 +69,55 @@ jobs:
         env:
           RUST_BACKTRACE: 1
 
+  test-secrets:
+    name: Secret Backends (${{ matrix.name }})
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # One isolated job per provider so a single backend failure does not
+        # mask the others. `file`/`all` exercise the resolver registry
+        # (no Docker); `vault`/`aws` use testcontainers (Docker, available on
+        # ubuntu-latest); `gcp`/`azure` use in-process wiremock fakes.
+        include:
+          - name: file
+            features: ""
+            filters: "file_backend cross_backend"
+          - name: vault
+            features: "secrets-vault"
+            filters: "vault_backend"
+          - name: aws
+            features: "secrets-aws"
+            filters: "aws_backend"
+          - name: gcp
+            features: "secrets-gcp"
+            filters: "gcp_backend"
+          - name: azure
+            features: "secrets-azure"
+            filters: "azure_backend"
+          - name: all
+            features: "secrets-vault,secrets-aws,secrets-gcp,secrets-azure"
+            filters: "cross_backend"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          shared-key: "ci-test-secrets-${{ matrix.name }}"
+
+      - name: Run secret-backend functional tests
+        # Test-name filters are passed after `--` so multiple substrings (e.g.
+        # `file_backend cross_backend`) are accepted as an OR set by libtest.
+        run: |
+          if [ -n "${{ matrix.features }}" ]; then
+            cargo test --features "${{ matrix.features }}" --test secrets_functional -- ${{ matrix.filters }}
+          else
+            cargo test --test secrets_functional -- ${{ matrix.filters }}
+          fi
+        env:
+          RUST_BACKTRACE: 1
+
   test-pkcs11-softhsm:
     name: PKCS#11 SoftHSM Smoke Test
     if: github.event_name == 'pull_request'
@@ -998,6 +1047,7 @@ jobs:
     needs:
       - test-unit
       - test-lib
+      - test-secrets
       - build-integration-tests-archive
       - test-integration
       - test-conformance
@@ -1015,6 +1065,7 @@ jobs:
           echo "| --- | --- |" >> $GITHUB_STEP_SUMMARY
           echo "| Unit | ${{ needs.test-unit.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Inline lib | ${{ needs.test-lib.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Secret backends | ${{ needs.test-secrets.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Integration archive build | ${{ needs.build-integration-tests-archive.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Integration | ${{ needs.test-integration.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Mesh conformance | ${{ needs.test-conformance.result }} |" >> $GITHUB_STEP_SUMMARY
@@ -1025,6 +1076,7 @@ jobs:
 
           if [ "${{ needs.test-unit.result }}" != "success" ] ||
              [ "${{ needs.test-lib.result }}" != "success" ] ||
+             [ "${{ needs.test-secrets.result }}" != "success" ] ||
              [ "${{ needs.build-integration-tests-archive.result }}" != "success" ] ||
              [ "${{ needs.test-integration.result }}" != "success" ] ||
              [ "${{ needs.test-conformance.result }}" != "success" ] ||

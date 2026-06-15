@@ -14,6 +14,19 @@ pub fn resolve_ref(key: &str) -> Option<String> {
     env::var(&gcp_key).ok().filter(|s| !s.is_empty())
 }
 
+/// Optional override for the Secret Manager service endpoint.
+///
+/// When `FERRUM_GCP_SECRET_MANAGER_ENDPOINT` is set, the client is built against
+/// that base URL instead of `secretmanager.googleapis.com`. This is the seam
+/// used to point the real client at a local fake/emulator (or an in-cluster
+/// proxy) without changing any other behavior. When unset, the standard
+/// Application Default Credentials path is used unchanged.
+fn endpoint_override() -> Option<String> {
+    env::var("FERRUM_GCP_SECRET_MANAGER_ENDPOINT")
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
 /// Reusable GCP Secret Manager client for batch secret resolution.
 /// Created once and shared across multiple GCP secret fetches.
 pub struct GcpClientWrapper {
@@ -21,9 +34,20 @@ pub struct GcpClientWrapper {
 }
 
 impl GcpClientWrapper {
-    /// Create a new GCP Secret Manager client using Application Default Credentials.
+    /// Create a new GCP Secret Manager client.
+    ///
+    /// Without an endpoint override this uses Application Default Credentials
+    /// against the production endpoint. With `FERRUM_GCP_SECRET_MANAGER_ENDPOINT`
+    /// set, it targets that endpoint using anonymous credentials so the client
+    /// does not attempt to discover ADC for a non-Google host.
     pub async fn new() -> Result<Self, String> {
-        let client = google_cloud_secretmanager_v1::client::SecretManagerService::builder()
+        let mut builder = google_cloud_secretmanager_v1::client::SecretManagerService::builder();
+        if let Some(endpoint) = endpoint_override() {
+            builder = builder.with_endpoint(endpoint).with_credentials(
+                google_cloud_auth::credentials::anonymous::Builder::new().build(),
+            );
+        }
+        let client = builder
             .build()
             .await
             .map_err(|e| format!("Failed to build GCP Secret Manager client: {}", e))?;
