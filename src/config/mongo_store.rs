@@ -1269,8 +1269,11 @@ mod inner {
                 doc.insert("diff", other);
                 None
             }
-            None => None,
+            None => Some(serde_json::Value::Object(serde_json::Map::new())),
         };
+        if diff.is_some() {
+            doc.insert("diff", Bson::Document(Document::new()));
+        }
 
         let mut event: crate::admin::audit::AuditEvent = mongodb::bson::from_document(doc)?;
         if let Some(diff) = diff {
