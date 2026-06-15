@@ -7570,7 +7570,16 @@ components:
         - least_latency
         - consistent_hashing
         - random
+        - passthrough
       default: round_robin
+      description: >-
+        Load-balancing algorithm. `passthrough` (mesh DestinationRule
+        `loadBalancer.simple=PASSTHROUGH`) dials the request's captured original
+        destination when it matches a target in the upstream's pool, bypassing
+        load balancing; requests with no captured original destination, or one
+        that matches no (healthy) pool target, fall back to round-robin. Outside
+        the mesh capture data path no original destination is available, so
+        `passthrough` behaves as `round_robin`.
 
     # ── Hash-On Cookie Config ────────────────────────────────────────
     HashOnCookieConfig:

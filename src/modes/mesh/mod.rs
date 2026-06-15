@@ -4532,8 +4532,10 @@ fn mesh_lb_to_ferrum(lb: &Option<MeshLoadBalancer>) -> Option<LoadBalancerAlgori
             MeshSimpleLb::RoundRobin => Some(LoadBalancerAlgorithm::RoundRobin),
             MeshSimpleLb::LeastRequest => Some(LoadBalancerAlgorithm::LeastConnections),
             MeshSimpleLb::Random => Some(LoadBalancerAlgorithm::Random),
-            // Istio PASSTHROUGH means direct-to-original-IP; Ferrum always routes via upstreams so RoundRobin is the closest approximation.
-            MeshSimpleLb::Passthrough => Some(LoadBalancerAlgorithm::RoundRobin),
+            // Istio PASSTHROUGH = dial the captured original destination. The
+            // request path (`select_upstream_target`) dials orig-dst when it
+            // matches a pool target and round-robins otherwise.
+            MeshSimpleLb::Passthrough => Some(LoadBalancerAlgorithm::Passthrough),
         },
         Some(MeshLoadBalancer::ConsistentHash(_)) => Some(LoadBalancerAlgorithm::ConsistentHashing),
         None => None,
