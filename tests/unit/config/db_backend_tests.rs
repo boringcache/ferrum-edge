@@ -3,6 +3,7 @@ use ferrum_edge::config::db_backend::{
     IncrementalResult, extract_db_hostname, extract_known_ids, redact_url,
 };
 use ferrum_edge::config::types::GatewayConfig;
+use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
 // extract_db_hostname — tests for MongoDB URLs
@@ -64,6 +65,62 @@ fn redact_mongodb_srv_url() {
     let redacted = redact_url(url);
     assert!(!redacted.contains("pass"));
     assert!(redacted.contains("cluster0.abc123.mongodb.net"));
+}
+
+#[test]
+fn redact_url_hides_sensitive_query_credentials() {
+    let url = concat!(
+        "postgres://db.example.com:5432/ferrum?",
+        "user=alice&password=supersecret&sslpassword=tls-secret&",
+        "token=bearer-token&sslmode=require"
+    );
+    let redacted = redact_url(url);
+
+    assert!(!redacted.contains("alice"));
+    assert!(!redacted.contains("supersecret"));
+    assert!(!redacted.contains("tls-secret"));
+    assert!(!redacted.contains("bearer-token"));
+
+    let parsed = url::Url::parse(&redacted).expect("redacted URL should parse");
+    let pairs: HashMap<String, String> = parsed.query_pairs().into_owned().collect();
+    assert_eq!(pairs.get("user").map(String::as_str), Some("***"));
+    assert_eq!(pairs.get("password").map(String::as_str), Some("***"));
+    assert_eq!(pairs.get("sslpassword").map(String::as_str), Some("***"));
+    assert_eq!(pairs.get("token").map(String::as_str), Some("***"));
+    assert_eq!(pairs.get("sslmode").map(String::as_str), Some("require"));
+}
+
+#[test]
+fn redact_url_hides_mongodb_and_sqlite_query_secrets() {
+    let mongo =
+        redact_url("mongodb://mongo.example.com:27017/ferrum?authSource=admin&password=leakytoken");
+    assert!(!mongo.contains("leakytoken"));
+    let parsed_mongo = url::Url::parse(&mongo).expect("redacted MongoDB URL should parse");
+    let mongo_pairs: HashMap<String, String> = parsed_mongo.query_pairs().into_owned().collect();
+    assert_eq!(
+        mongo_pairs.get("authSource").map(String::as_str),
+        Some("admin")
+    );
+    assert_eq!(mongo_pairs.get("password").map(String::as_str), Some("***"));
+
+    let sqlite = redact_url("sqlite://ferrum.db?key=supersecret&mode=rwc");
+    assert!(!sqlite.contains("supersecret"));
+    let parsed_sqlite = url::Url::parse(&sqlite).expect("redacted SQLite URL should parse");
+    let sqlite_pairs: HashMap<String, String> = parsed_sqlite.query_pairs().into_owned().collect();
+    assert_eq!(sqlite_pairs.get("key").map(String::as_str), Some("***"));
+    assert_eq!(sqlite_pairs.get("mode").map(String::as_str), Some("rwc"));
+}
+
+#[test]
+fn redact_url_matches_sensitive_query_keys_case_insensitively() {
+    let redacted = redact_url("postgres://db.example.com/ferrum?Password=secret&Api_Key=token");
+    assert!(!redacted.contains("secret"));
+    assert!(!redacted.contains("token"));
+
+    let parsed = url::Url::parse(&redacted).expect("redacted URL should parse");
+    let pairs: HashMap<String, String> = parsed.query_pairs().into_owned().collect();
+    assert_eq!(pairs.get("Password").map(String::as_str), Some("***"));
+    assert_eq!(pairs.get("Api_Key").map(String::as_str), Some("***"));
 }
 
 // ---------------------------------------------------------------------------

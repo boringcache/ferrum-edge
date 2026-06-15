@@ -649,14 +649,60 @@ pub fn extract_db_hostname(db_url: &str) -> Option<String> {
 pub fn redact_url(url: &str) -> String {
     match url::Url::parse(url) {
         Ok(mut parsed) => {
-            if parsed.password().is_some() {
-                let _ = parsed.set_password(Some("***"));
+            if parsed.password().is_some() && parsed.set_password(Some("***")).is_err() {
+                return "<invalid-url>".to_string();
             }
-            if !parsed.username().is_empty() {
-                let _ = parsed.set_username("***");
+            if !parsed.username().is_empty() && parsed.set_username("***").is_err() {
+                return "<invalid-url>".to_string();
+            }
+            if parsed.query().is_some() {
+                let redacted_pairs: Vec<(String, String)> = parsed
+                    .query_pairs()
+                    .map(|(key, value)| {
+                        let value = if is_sensitive_url_query_key(&key) {
+                            "***".to_string()
+                        } else {
+                            value.into_owned()
+                        };
+                        (key.into_owned(), value)
+                    })
+                    .collect();
+                parsed.query_pairs_mut().clear().extend_pairs(
+                    redacted_pairs
+                        .iter()
+                        .map(|(key, value)| (key.as_str(), value.as_str())),
+                );
             }
             parsed.to_string()
         }
         Err(_) => "<invalid-url>".to_string(),
     }
+}
+
+fn is_sensitive_url_query_key(key: &str) -> bool {
+    const SENSITIVE_KEYS: &[&str] = &[
+        "access_token",
+        "api_key",
+        "apikey",
+        "auth_token",
+        "client_secret",
+        "credential",
+        "credentials",
+        "key",
+        "pass",
+        "passwd",
+        "password",
+        "private_key",
+        "refresh_token",
+        "secret",
+        "sslkey",
+        "sslpassword",
+        "token",
+        "user",
+        "username",
+    ];
+
+    SENSITIVE_KEYS
+        .iter()
+        .any(|sensitive| key.eq_ignore_ascii_case(sensitive))
 }
