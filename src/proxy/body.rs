@@ -1901,7 +1901,7 @@ impl http_body::Body for DirectH2Body {
 struct IdleReadTimeoutBody<B> {
     inner: B,
     timeout: std::time::Duration,
-    deadline: Pin<Box<tokio::time::Sleep>>,
+    deadline: Option<Pin<Box<tokio::time::Sleep>>>,
     /// `true` once an inner `Pending` poll has begun a backend-read wait, reset
     /// to `false` whenever a frame is delivered. The deadline is re-armed only
     /// on the `false -> true` edge so it never counts downstream-drain time.
@@ -1911,11 +1911,33 @@ struct IdleReadTimeoutBody<B> {
 impl<B> IdleReadTimeoutBody<B> {
     fn new(inner: B, timeout_ms: u64) -> Self {
         let timeout = std::time::Duration::from_millis(timeout_ms);
+        let deadline = tokio::time::Instant::now()
+            .checked_add(timeout)
+            .map(tokio::time::sleep_until)
+            .map(Box::pin);
         Self {
             inner,
             timeout,
-            deadline: Box::pin(tokio::time::sleep(timeout)),
+            deadline,
             waiting: false,
+        }
+    }
+
+    fn reset_deadline(&mut self) {
+        // `reset_deadline` runs on every "delivered a frame → waiting on the
+        // backend again" transition, i.e. once per inter-frame gap on a
+        // streaming response — the proxy hot path. Reuse the already-pinned
+        // `Sleep` in place (no per-rearm `Box` allocation or timer-wheel
+        // churn), matching the original `reset()` behavior, while keeping the
+        // overflow guard: a pathologically large client-controlled deadline
+        // that exceeds Tokio's representable `Instant` range collapses to
+        // `None` (effectively unbounded) instead of panicking the proxy path.
+        match tokio::time::Instant::now().checked_add(self.timeout) {
+            Some(deadline_at) => match self.deadline.as_mut() {
+                Some(sleep) => sleep.as_mut().reset(deadline_at),
+                None => self.deadline = Some(Box::pin(tokio::time::sleep_until(deadline_at))),
+            },
+            None => self.deadline = None,
         }
     }
 }
@@ -1965,19 +1987,24 @@ where
                     // backend-read wait now so any downstream-drain interval that
                     // just elapsed is excluded from the timeout budget.
                     this.waiting = true;
-                    this.deadline
-                        .as_mut()
-                        .reset(tokio::time::Instant::now() + this.timeout);
+                    this.reset_deadline();
                 }
-                match std::future::Future::poll(this.deadline.as_mut(), cx) {
-                    Poll::Ready(()) => Poll::Ready(Some(Err(Box::new(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        format!(
-                            "backend response body read timeout after {}ms",
-                            this.timeout.as_millis()
-                        ),
-                    )) as BoxError))),
-                    Poll::Pending => Poll::Pending,
+                match this.deadline.as_mut() {
+                    Some(deadline) => match std::future::Future::poll(deadline.as_mut(), cx) {
+                        Poll::Ready(()) => Poll::Ready(Some(Err(Box::new(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            format!(
+                                "backend response body read timeout after {}ms",
+                                this.timeout.as_millis()
+                            ),
+                        ))
+                            as BoxError))),
+                        Poll::Pending => Poll::Pending,
+                    },
+                    // A pathologically large client-controlled deadline can
+                    // exceed Tokio's representable `Instant` range. Treat it as
+                    // effectively unbounded rather than panicking the proxy path.
+                    None => Poll::Pending,
                 }
             }
         }
@@ -3358,6 +3385,63 @@ mod tests {
         assert!(
             trailer_map.get("connection").is_none(),
             "hop-by-hop name stripped before reaching Coalescing",
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_read_timeout_pathological_deadline_never_panics() {
+        // A client-controlled `grpc-timeout` (e.g. `18446744073709551615m`)
+        // reaches the streaming response body as `u64::MAX` ms. Whether
+        // `Instant::now() + Duration::from_millis(u64::MAX)` overflows is
+        // platform-dependent: it overflows on macOS/Windows (where `Instant`
+        // spans only ~584 years) but NOT on Linux (where `Instant` is backed by
+        // `CLOCK_MONOTONIC` and spans billions of years). The guard must never
+        // panic on either platform — an unrepresentable deadline collapses to
+        // `None` (effectively unbounded), a representable one arms a live timer.
+        let overflows = tokio::time::Instant::now()
+            .checked_add(std::time::Duration::from_millis(u64::MAX))
+            .is_none();
+
+        let inner = Coalescing::new(MockSource::new(vec![MockStep::Pending]), 100, None);
+        let mut body = IdleReadTimeoutBody::new(inner, u64::MAX);
+        assert_eq!(
+            body.deadline.is_none(),
+            overflows,
+            "deadline must be None exactly when the platform `Instant` range overflows",
+        );
+
+        // Polling a pending inner must stay live (Pending) without panicking on
+        // either platform: either the (far-future) timer is pending, or the
+        // unbounded `None` arm returns Pending and relies on the inner waker.
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(
+            matches!(Pin::new(&mut body).poll_frame(&mut cx), Poll::Pending),
+            "pathological deadline must poll Pending, never panic or time out",
+        );
+        // The first `Pending` poll began the backend-read wait and re-armed the
+        // deadline via `reset_deadline()`, which must hold the same
+        // representability invariant without panicking.
+        assert!(
+            body.waiting,
+            "first Pending poll must begin the backend-read wait",
+        );
+        assert_eq!(
+            body.deadline.is_none(),
+            overflows,
+            "reset_deadline() must preserve the representability invariant",
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_read_timeout_representable_deadline_arms_live_timer() {
+        // A normal, representable timeout must still arm a live deadline so the
+        // idle-read watchdog continues to bound stalled backends.
+        let inner = Coalescing::new(MockSource::new(vec![MockStep::Pending]), 100, None);
+        let body = IdleReadTimeoutBody::new(inner, 1_000);
+        assert!(
+            body.deadline.is_some(),
+            "a representable timeout must arm a live deadline",
         );
     }
 
