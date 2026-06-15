@@ -2573,6 +2573,10 @@ where
             // detection. Strip the merged trailer copies (and any trailer-only
             // keys) out of the initial headers; header-shadowed keys stay real
             // headers whose true trailing value rides the wire trailer.
+            //
+            // Capture the backend's original trailer `set-cookie` (issue #1638)
+            // before reconciliation overwrites it, mirroring the main gRPC path.
+            let original_trailer_set_cookie = response_trailers.get("set-cookie").cloned();
             crate::proxy::grpc_proxy::reconcile_grpc_trailers_from_view(
                 &mut response_trailers,
                 &plugin_response_headers,
@@ -2585,6 +2589,16 @@ where
                     response_headers.remove(k);
                 }
             }
+            // Re-home a hook-mutated trailer-only `set-cookie` onto the initial
+            // HEADERS (issue #1638) so browsers / gRPC-Web clients can store it,
+            // identically to the main gRPC path. Runs after the strip loop and
+            // before sticky-cookie injection and the gRPC-Web trailer-clear
+            // guard below.
+            crate::proxy::grpc_proxy::rehome_hook_mutated_trailer_set_cookie(
+                &mut response_headers,
+                &mut response_trailers,
+                original_trailer_set_cookie.as_deref(),
+            );
             // Inject the sticky-affinity cookie onto the final initial headers,
             // matching the main gRPC path's ordering. Doing it here rather than on
             // the merged view ensures it lands in the wire HEADERS frame even when
