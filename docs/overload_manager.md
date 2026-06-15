@@ -4,12 +4,13 @@ The overload manager monitors system resource pressure and progressively sheds l
 
 ## How It Works
 
-A single background task polls three resource signals at a configurable interval (default: 1 second):
+A single background task polls four resource signals at a configurable interval (default: 1 second):
 
 | Signal | Source | Why It Matters |
 |--------|--------|----------------|
 | **File descriptors** | OS `getrlimit(RLIMIT_NOFILE)` | Hitting the FD limit makes `accept()` fail with EMFILE — the gateway becomes completely unresponsive |
 | **Active connections** | `ConnectionGuard` counter | Tracks all proxy connections (HTTP/1.1, H2, H3, gRPC, TCP, UDP) |
+| **Active requests** | `RequestGuard` counter | Tracks in-flight requests — the real concurrency driver (one H2/gRPC connection can carry many). Only evaluated when a request cap is set (`FERRUM_MAX_REQUESTS` > 0) |
 | **Event loop latency** | `yield_now()` scheduling delay | Detects thread starvation from blocking operations accidentally run on the async runtime |
 
 Each signal produces a 0.0-1.0 pressure ratio. When a ratio exceeds a threshold, the monitor sets an atomic action flag.
@@ -22,6 +23,7 @@ Actions escalate with pressure. Each action is additive — higher pressure acti
 |----------------|--------|--------|---------------|
 | **0.80** (pressure) | Disable keepalive | Responses include `Connection: close`, causing HTTP/1.1 clients to disconnect after each request. This naturally frees connection slots | 1 `AtomicBool::load` per response (~1ns) |
 | **0.95** (critical) | Reject new connections | TCP connections are accepted and immediately dropped (HTTP/H2). H3 connections are refused via QUIC. Existing connections continue serving | 1 `AtomicBool::load` per accept loop iteration (~1ns) |
+| **0.95** (critical) | Reject new requests | New requests are rejected with `503` (gRPC `UNAVAILABLE`) once active requests reach `FERRUM_OVERLOAD_REQ_CRITICAL_THRESHOLD` of `FERRUM_MAX_REQUESTS`. Only active when a request cap is configured (`FERRUM_MAX_REQUESTS` > 0) | 1 `AtomicBool::load` per request (~1ns) |
 
 State transitions are logged at `warn` (entering overload) and `info` (recovering).
 
@@ -40,6 +42,10 @@ FERRUM_OVERLOAD_FD_CRITICAL_THRESHOLD=0.95    # reject connections
 # Connection thresholds (ratio of active connections to FERRUM_MAX_CONNECTIONS)
 FERRUM_OVERLOAD_CONN_PRESSURE_THRESHOLD=0.85  # disable keepalive
 FERRUM_OVERLOAD_CONN_CRITICAL_THRESHOLD=0.95  # reject connections
+
+# Request thresholds (ratio of active requests to FERRUM_MAX_REQUESTS; only active when max > 0)
+FERRUM_OVERLOAD_REQ_PRESSURE_THRESHOLD=0.85   # disable keepalive
+FERRUM_OVERLOAD_REQ_CRITICAL_THRESHOLD=0.95   # reject new requests (503 / gRPC UNAVAILABLE)
 
 # Event loop latency thresholds (microseconds)
 FERRUM_OVERLOAD_LOOP_WARN_US=10000            # log warning (10ms)

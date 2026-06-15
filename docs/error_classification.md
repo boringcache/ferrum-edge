@@ -63,6 +63,7 @@ pub enum StreamSetupKind {
     RejectedByPlugin,       // umbrella for ACL/policy/throttle rejections (client-side)
     NoHealthyTargets,       // LB pool empty or all targets failing active health checks (backend-side)
     CircuitBreakerOpen,     // per-proxy passive-health circuit breaker is open (backend-side)
+    BackendMaxConnectionsExceeded, // DestinationRule connectionPool.tcp.maxConnections cap hit at backend dial (backend-side)
 }
 ```
 
