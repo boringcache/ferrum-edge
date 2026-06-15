@@ -16,6 +16,7 @@ Ferrum Edge provides built-in load balancing to distribute traffic across multip
   - [Least Latency](#least-latency)
   - [Consistent Hashing](#consistent-hashing)
   - [Random](#random)
+  - [Passthrough](#passthrough)
 - [Health Checks](#health-checks)
   - [Active Health Checks](#active-health-checks)
   - [Passive Health Checks](#passive-health-checks)
@@ -418,6 +419,25 @@ upstreams:
 ```
 
 **Best for:** Simple use cases where no specific distribution pattern is needed.
+
+### Passthrough
+
+**Algorithm:** `passthrough`
+
+Dials the request's captured original destination instead of load balancing, mirroring Istio's `loadBalancer.simple=PASSTHROUGH`. This is only meaningful on the **service-mesh capture data path**, where the original destination is captured via `SO_ORIGINAL_DST` (TCP REDIRECT). When the captured destination matches a target in the upstream's pool, that target is dialed directly (bypassing the load balancer); the selected target still respects active and passive health, so an ejected original-destination target falls back to round-robin among healthy targets. When no original destination is available (any non-mesh / non-captured path, including HTTP/3) or it matches no pool target, selection falls back to round-robin (with a warning).
+
+```yaml
+upstreams:
+  - id: "my-upstream"
+    algorithm: passthrough
+    targets:
+      - host: "10.0.1.1"
+        port: 8080
+      - host: "10.0.1.2"
+        port: 8080
+```
+
+**Best for:** Mesh upstreams whose clients address concrete pod IPs and expect the proxy to preserve that destination. Outside the mesh capture path it behaves as `round_robin`. See [mesh DestinationRule translation](mesh.md) for the Istio `PASSTHROUGH` mapping.
 
 ## Health Checks
 

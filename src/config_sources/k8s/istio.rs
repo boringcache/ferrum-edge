@@ -1911,7 +1911,7 @@ fn translate_load_balancer(
             "RANDOM" => MeshSimpleLb::Random,
             "PASSTHROUGH" => {
                 acc.warnings.push(format!(
-                    "DestinationRule {}/{} loadBalancer.simple=PASSTHROUGH is approximated as ROUND_ROBIN; Ferrum always routes via configured upstream targets and cannot preserve the original destination IP",
+                    "DestinationRule {}/{} loadBalancer.simple=PASSTHROUGH dials the captured original destination when it matches a configured upstream target; requests with no captured original destination (e.g. non-mesh / non-captured paths) or one that matches no target fall back to round-robin",
                     object.metadata.namespace, object.metadata.name
                 ));
                 MeshSimpleLb::Passthrough
@@ -8020,11 +8020,10 @@ extensionProviders:
         )
         .expect("PASSTHROUGH translates with warning");
         assert!(
-            result
-                .warnings
-                .iter()
-                .any(|w| w.contains("PASSTHROUGH") && w.contains("ROUND_ROBIN")),
-            "expected PASSTHROUGH approximation warning, got {:?}",
+            result.warnings.iter().any(|w| w.contains("PASSTHROUGH")
+                && w.contains("original destination")
+                && w.contains("round-robin")),
+            "expected PASSTHROUGH true-passthrough-with-RR-fallback warning, got {:?}",
             result.warnings
         );
     }

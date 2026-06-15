@@ -11810,12 +11810,16 @@ async fn handle_proxy_request_inner(
     };
 
     // Resolve upstream target and hash key from the request epoch.
+    // `ctx.orig_dst` (the captured SO_ORIGINAL_DST on mesh capture listeners)
+    // enables true PASSTHROUGH load balancing when the upstream's algorithm is
+    // Passthrough; it is ignored for every other algorithm.
     let selection = backend_dispatch::select_upstream_target(
         &proxy,
         &state,
         &epoch,
         &ctx.client_ip,
         proxy_headers,
+        ctx.orig_dst,
     );
     let lb_hash_key = selection.lb_hash_key;
     let upstream_target = backend_dispatch::concretize_wildcard_target_for_request(

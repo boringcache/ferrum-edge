@@ -1842,12 +1842,17 @@ async fn handle_h3_request(
     // UDP/H3 are out of mesh scope) and these are DestinationRule-derived
     // (mesh-only). A uniform H3-override pass is a tracked follow-up — see
     // `docs/mesh.md` "Dispatch-path coverage".
+    // PASSTHROUGH orig-dst is `None` on H3: mesh capture is TCP-only
+    // (SO_ORIGINAL_DST/REDIRECT; H3/UDP are out of mesh scope), so an H3
+    // frontend never carries a captured original destination. A Passthrough
+    // upstream therefore round-robins here (with the existing warn).
     let selection = crate::proxy::backend_dispatch::select_upstream_target(
         &proxy,
         &state,
         &epoch,
         &ctx.client_ip,
         &proxy_headers,
+        None,
     );
     let lb_hash_key = selection.lb_hash_key;
     let upstream_target = crate::proxy::backend_dispatch::concretize_wildcard_target_for_request(

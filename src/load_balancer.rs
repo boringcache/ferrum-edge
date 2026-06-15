@@ -752,6 +752,38 @@ impl LoadBalancerCache {
         balancer.select_for_port_from_subset(ctx_key, port, subset_name, health)
     }
 
+    /// Resolve the effective LB algorithm for `(upstream, port_override, subset)`
+    /// from a snapshot, with the same precedence the `select*` family uses.
+    /// Returns `None` only when the upstream id is unknown.
+    #[inline]
+    pub fn effective_algorithm_from(
+        snapshot: &LoadBalancerCacheInner,
+        upstream_id: &str,
+        port: Option<u16>,
+        subset_name: Option<&str>,
+    ) -> Option<LoadBalancerAlgorithm> {
+        snapshot
+            .balancers
+            .get(upstream_id)
+            .map(|b| b.effective_algorithm(port, subset_name))
+    }
+
+    /// PASSTHROUGH selection from a snapshot: return the pool target matching
+    /// the captured original destination (subset∩port-scoped, health-respecting),
+    /// or `None` to signal a round-robin fallback.
+    #[inline]
+    pub fn select_passthrough_from(
+        snapshot: &LoadBalancerCacheInner,
+        upstream_id: &str,
+        orig_dst: std::net::SocketAddr,
+        port: Option<u16>,
+        subset_name: Option<&str>,
+        health: Option<&HealthContext<'_>>,
+    ) -> Option<Arc<UpstreamTarget>> {
+        let balancer = snapshot.balancers.get(upstream_id)?;
+        balancer.select_passthrough(orig_dst, port, subset_name, health)
+    }
+
     /// Select next target, excluding a previously tried target (for retries).
     pub fn select_next_target(
         &self,
@@ -2765,6 +2797,28 @@ impl LoadBalancer {
             .unwrap_or(self.algorithm)
     }
 
+    /// Resolve the effective algorithm a selection for `(port_override, subset)`
+    /// would use, with the SAME precedence as the `select*` family: a per-port
+    /// override (when present) wins over a subset override, which wins over the
+    /// upstream-level algorithm. Used by `select_upstream_target` to decide
+    /// whether to attempt PASSTHROUGH orig-dst matching before dispatching.
+    #[inline]
+    pub fn effective_algorithm(
+        &self,
+        port: Option<u16>,
+        subset_name: Option<&str>,
+    ) -> LoadBalancerAlgorithm {
+        if let Some(p) = port
+            && let Some(port_state) = self.port_overrides.get(&p)
+        {
+            return port_state.algorithm;
+        }
+        match subset_name {
+            Some(name) => self.subset_algorithm(name),
+            None => self.algorithm,
+        }
+    }
+
     #[inline]
     fn subset_wrr_state(&self, subset_name: &str) -> &std::sync::Mutex<Vec<i64>> {
         self.subset_wrr_state
@@ -2862,7 +2916,9 @@ impl LoadBalancer {
         };
         let all = healthy.is_all(self.targets.len());
         match algorithm {
-            LoadBalancerAlgorithm::RoundRobin => {
+            // `Passthrough` reaches the balancer only as the fallback after the
+            // request path's orig-dst match missed; behave as round-robin.
+            LoadBalancerAlgorithm::RoundRobin | LoadBalancerAlgorithm::Passthrough => {
                 let idx = rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
                 let target_idx = if all {
                     idx % self.targets.len()
@@ -2962,7 +3018,9 @@ impl LoadBalancer {
             candidates
         };
         match algorithm {
-            LoadBalancerAlgorithm::RoundRobin => {
+            // `Passthrough` reaches the balancer only as the round-robin
+            // fallback after the request path's orig-dst match missed.
+            LoadBalancerAlgorithm::RoundRobin | LoadBalancerAlgorithm::Passthrough => {
                 let idx = rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
                 Some(Arc::clone(candidates[idx % candidates.len()].1))
             }
@@ -2984,6 +3042,90 @@ impl LoadBalancer {
                 self.select_consistent_hash_vec_with_ring(ctx_key, candidates, hash_ring)
             }
         }
+    }
+
+    /// PASSTHROUGH selection: dial the target whose canonical `(IP, port)`
+    /// equals the captured original destination, bypassing load balancing
+    /// (Istio `loadBalancer.simple=PASSTHROUGH`).
+    ///
+    /// `port` / `subset_name` scope the candidate pool exactly like the
+    /// `select*` family (subset∩port-aware): a passthrough target must be a
+    /// member of the same pool a load-balanced selection would have drawn from,
+    /// so passthrough composes with subset/port-override routing instead of
+    /// reaching past it.
+    ///
+    /// Returns `Some(target)` only when the orig-dst matches a pool target AND
+    /// that target is currently healthy (active + passive). On no match or an
+    /// unhealthy match it returns `None`, signalling the caller to fall back to
+    /// round-robin — an ejected orig-dst target must not be dialed.
+    ///
+    /// Hot-path clean: a single match scan over the (already small) target set,
+    /// no per-request allocation. The orig-dst IP is canonicalized the SAME way
+    /// the mesh VIP / by-workload routing keys are (`IpAddr::to_canonical`), so
+    /// an IPv4-mapped-IPv6 capture matches an IPv4 target host and vice-versa.
+    pub fn select_passthrough(
+        &self,
+        orig_dst: std::net::SocketAddr,
+        port: Option<u16>,
+        subset_name: Option<&str>,
+        health: Option<&HealthContext<'_>>,
+    ) -> Option<Arc<UpstreamTarget>> {
+        if self.targets.is_empty() {
+            return None;
+        }
+        let want_ip = orig_dst.ip().to_canonical();
+        let want_port = orig_dst.port();
+
+        // Restrict the candidate pool to the subset∩port the caller would have
+        // load-balanced over, so passthrough never escapes subset/port scoping.
+        let port_indices = port
+            .and_then(|p| self.port_overrides.get(&p))
+            .map(|ps| ps.target_indices.as_slice());
+        let subset_indices = subset_name.and_then(|name| {
+            self.subset_indices
+                .get(name)
+                .filter(|indices| !indices.is_empty())
+                .map(Vec::as_slice)
+        });
+        // A named-but-unknown/empty subset has no candidate pool at all.
+        if subset_name.is_some() && subset_indices.is_none() {
+            return None;
+        }
+
+        let in_pool = |idx: usize| -> bool {
+            port_indices.is_none_or(|p| p.contains(&idx))
+                && subset_indices.is_none_or(|s| s.contains(&idx))
+        };
+
+        let matched_idx = self.targets.iter().enumerate().find_map(|(idx, t)| {
+            if !in_pool(idx) {
+                return None;
+            }
+            if t.port != want_port {
+                return None;
+            }
+            // Targets carry host strings; only an IP-literal host can be an
+            // original-destination match (mesh capture dials concrete IPs).
+            let host_ip = t.host.parse::<std::net::IpAddr>().ok()?.to_canonical();
+            (host_ip == want_ip).then_some(idx)
+        })?;
+
+        // Respect active + passive health: never dial an ejected orig-dst
+        // target. Use the same health computation the load-balanced path uses
+        // so the max-ejection-percent re-admission stays consistent; the Vec
+        // path covers the rare >128-target pool the bitset can't represent.
+        let matched_healthy = if self.targets.len() > MAX_BITSET_TARGETS {
+            self.healthy_targets_vec(health)
+                .iter()
+                .any(|(idx, _)| *idx == matched_idx)
+        } else {
+            self.compute_health_bitset(health).contains(matched_idx)
+        };
+        if !matched_healthy {
+            return None;
+        }
+
+        Some(Arc::clone(&self.targets[matched_idx]))
     }
 
     pub fn select_excluding(
@@ -4330,5 +4472,154 @@ mod tests {
             assert_eq!(selection.target.port, again.target.port);
             assert!(again.is_fallback);
         }
+    }
+
+    // ── PASSTHROUGH (loadBalancer.simple=PASSTHROUGH) ──────────────────
+
+    /// `Passthrough` builds no hash ring / WRR state and selects like
+    /// round-robin via the public `select()` (the orig-dst match lives in
+    /// `select_passthrough`, not `select`).
+    #[test]
+    fn passthrough_algorithm_constructs_like_round_robin() {
+        let targets = vec![make_target("10.0.0.1", 8080), make_target("10.0.0.2", 8080)];
+        let lb = LoadBalancer::new(
+            "upstream-pt",
+            LoadBalancerAlgorithm::Passthrough,
+            &targets,
+            None,
+        );
+        assert!(lb.hash_ring.is_empty(), "Passthrough must have empty ring");
+        // select() (the LB fallback) still returns a target, RR-style.
+        assert!(lb.select("ignored", None).is_some());
+    }
+
+    /// orig-dst matching a pool target selects exactly that target, bypassing
+    /// round-robin (repeated calls always return the matched target).
+    #[test]
+    fn passthrough_matches_pool_target_and_bypasses_rr() {
+        let targets = vec![make_target("10.0.0.1", 8080), make_target("10.0.0.2", 8080)];
+        let lb = LoadBalancer::new(
+            "upstream-pt",
+            LoadBalancerAlgorithm::Passthrough,
+            &targets,
+            None,
+        );
+        let orig: std::net::SocketAddr = "10.0.0.2:8080".parse().unwrap();
+        for _ in 0..20 {
+            let target = lb
+                .select_passthrough(orig, None, None, None)
+                .expect("orig-dst matches a pool target");
+            assert_eq!(target.host, "10.0.0.2");
+            assert_eq!(target.port, 8080);
+        }
+    }
+
+    /// orig-dst that matches no pool target returns `None` (caller falls back
+    /// to round-robin). Both a wrong IP and a wrong port miss.
+    #[test]
+    fn passthrough_unmatched_orig_dst_returns_none() {
+        let targets = vec![make_target("10.0.0.1", 8080), make_target("10.0.0.2", 8080)];
+        let lb = LoadBalancer::new(
+            "upstream-pt",
+            LoadBalancerAlgorithm::Passthrough,
+            &targets,
+            None,
+        );
+        // Wrong IP.
+        let wrong_ip: std::net::SocketAddr = "10.9.9.9:8080".parse().unwrap();
+        assert!(lb.select_passthrough(wrong_ip, None, None, None).is_none());
+        // Right IP, wrong port.
+        let wrong_port: std::net::SocketAddr = "10.0.0.1:9999".parse().unwrap();
+        assert!(
+            lb.select_passthrough(wrong_port, None, None, None)
+                .is_none()
+        );
+    }
+
+    /// An IPv4-mapped-IPv6 capture of an IPv4 target host still matches
+    /// (canonicalized the same way the mesh VIP / by-workload keys are).
+    #[test]
+    fn passthrough_matches_ipv4_mapped_ipv6_capture() {
+        let targets = vec![make_target("10.0.0.5", 8080)];
+        let lb = LoadBalancer::new(
+            "upstream-pt",
+            LoadBalancerAlgorithm::Passthrough,
+            &targets,
+            None,
+        );
+        // ::ffff:10.0.0.5 is the IPv4-mapped form of 10.0.0.5.
+        let mapped: std::net::SocketAddr = "[::ffff:10.0.0.5]:8080".parse().unwrap();
+        let target = lb
+            .select_passthrough(mapped, None, None, None)
+            .expect("mapped-IPv6 capture matches the IPv4 target");
+        assert_eq!(target.host, "10.0.0.5");
+    }
+
+    /// A passthrough-selected target that is active-unhealthy returns `None`
+    /// (caller falls back to round-robin among healthy targets).
+    #[test]
+    fn passthrough_unhealthy_target_falls_back() {
+        let targets = vec![make_target("10.0.0.1", 8080), make_target("10.0.0.2", 8080)];
+        let lb = LoadBalancer::new(
+            "upstream-pt",
+            LoadBalancerAlgorithm::Passthrough,
+            &targets,
+            None,
+        );
+        // Eject the orig-dst target via active health.
+        let active_unhealthy: DashMap<String, u64> = DashMap::new();
+        active_unhealthy.insert(target_key("upstream-pt", &targets[1]), 1);
+        let health = HealthContext {
+            active_unhealthy: &active_unhealthy,
+            proxy_passive: None,
+            max_ejection_percent: None,
+        };
+        let orig: std::net::SocketAddr = "10.0.0.2:8080".parse().unwrap();
+        assert!(
+            lb.select_passthrough(orig, None, Some(&health)).is_none(),
+            "an ejected orig-dst target must not be passthrough-selected"
+        );
+        // A healthy orig-dst target on the same upstream still passes through.
+        let healthy_orig: std::net::SocketAddr = "10.0.0.1:8080".parse().unwrap();
+        let target = lb
+            .select_passthrough(healthy_orig, None, Some(&health))
+            .expect("healthy orig-dst still passes through");
+        assert_eq!(target.host, "10.0.0.1");
+    }
+
+    /// Passthrough composes with subset scoping: a match must be a member of
+    /// the named subset, and an orig-dst outside the subset misses.
+    #[test]
+    fn passthrough_respects_subset_scope() {
+        let mut t_v1 = make_target("10.0.0.1", 8080);
+        t_v1.tags.insert("version".to_string(), "v1".to_string());
+        let mut t_v2 = make_target("10.0.0.2", 8080);
+        t_v2.tags.insert("version".to_string(), "v2".to_string());
+        let targets = vec![t_v1, t_v2];
+        let subsets = vec![SubsetDefinition {
+            name: "v1".to_string(),
+            labels: HashMap::from([("version".to_string(), "v1".to_string())]),
+            traffic_policy: None,
+        }];
+        let lb = LoadBalancer::with_subsets(
+            "upstream-pt",
+            LoadBalancerAlgorithm::Passthrough,
+            &targets,
+            None,
+            Some(&subsets),
+        );
+        // In-subset orig-dst matches.
+        let in_subset: std::net::SocketAddr = "10.0.0.1:8080".parse().unwrap();
+        let target = lb
+            .select_passthrough(in_subset, None, Some("v1"), None)
+            .expect("in-subset orig-dst matches");
+        assert_eq!(target.host, "10.0.0.1");
+        // Out-of-subset orig-dst (the v2 target) misses when scoped to v1.
+        let out_subset: std::net::SocketAddr = "10.0.0.2:8080".parse().unwrap();
+        assert!(
+            lb.select_passthrough(out_subset, None, Some("v1"), None)
+                .is_none(),
+            "orig-dst outside the named subset must miss"
+        );
     }
 }
