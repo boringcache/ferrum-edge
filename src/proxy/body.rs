@@ -1924,10 +1924,21 @@ impl<B> IdleReadTimeoutBody<B> {
     }
 
     fn reset_deadline(&mut self) {
-        self.deadline = tokio::time::Instant::now()
-            .checked_add(self.timeout)
-            .map(tokio::time::sleep_until)
-            .map(Box::pin);
+        // `reset_deadline` runs on every "delivered a frame → waiting on the
+        // backend again" transition, i.e. once per inter-frame gap on a
+        // streaming response — the proxy hot path. Reuse the already-pinned
+        // `Sleep` in place (no per-rearm `Box` allocation or timer-wheel
+        // churn), matching the original `reset()` behavior, while keeping the
+        // overflow guard: a pathologically large client-controlled deadline
+        // that exceeds Tokio's representable `Instant` range collapses to
+        // `None` (effectively unbounded) instead of panicking the proxy path.
+        match tokio::time::Instant::now().checked_add(self.timeout) {
+            Some(deadline_at) => match self.deadline.as_mut() {
+                Some(sleep) => sleep.as_mut().reset(deadline_at),
+                None => self.deadline = Some(Box::pin(tokio::time::sleep_until(deadline_at))),
+            },
+            None => self.deadline = None,
+        }
     }
 }
 
@@ -3378,38 +3389,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn idle_read_timeout_pathological_deadline_is_unbounded_not_panic() {
+    async fn idle_read_timeout_pathological_deadline_never_panics() {
         // A client-controlled `grpc-timeout` (e.g. `18446744073709551615m`)
-        // reaches the streaming response body as a millisecond value so large
-        // that `Instant::now() + Duration::from_millis(ms)` overflows Tokio's
-        // representable `Instant` range. Constructing the wrapper must NOT
-        // panic the proxy path; the deadline collapses to `None` (effectively
-        // unbounded), matching the buffered path's `tokio::time::timeout`
-        // far-future behavior.
+        // reaches the streaming response body as `u64::MAX` ms. Whether
+        // `Instant::now() + Duration::from_millis(u64::MAX)` overflows is
+        // platform-dependent: it overflows on macOS/Windows (where `Instant`
+        // spans only ~584 years) but NOT on Linux (where `Instant` is backed by
+        // `CLOCK_MONOTONIC` and spans billions of years). The guard must never
+        // panic on either platform — an unrepresentable deadline collapses to
+        // `None` (effectively unbounded), a representable one arms a live timer.
+        let overflows = tokio::time::Instant::now()
+            .checked_add(std::time::Duration::from_millis(u64::MAX))
+            .is_none();
+
         let inner = Coalescing::new(MockSource::new(vec![MockStep::Pending]), 100, None);
         let mut body = IdleReadTimeoutBody::new(inner, u64::MAX);
-        assert!(
+        assert_eq!(
             body.deadline.is_none(),
-            "u64::MAX ms deadline must collapse to None (unbounded), not a live timer",
+            overflows,
+            "deadline must be None exactly when the platform `Instant` range overflows",
         );
 
-        // Polling a pending inner must stay live (Pending) without panicking:
-        // the inner body's waker keeps the task scheduled, and no timer fires.
+        // Polling a pending inner must stay live (Pending) without panicking on
+        // either platform: either the (far-future) timer is pending, or the
+        // unbounded `None` arm returns Pending and relies on the inner waker.
         let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
         assert!(
             matches!(Pin::new(&mut body).poll_frame(&mut cx), Poll::Pending),
             "pathological deadline must poll Pending, never panic or time out",
         );
-        // The first `Pending` poll began the backend-read wait and re-derived
-        // the deadline via `reset_deadline()`, which must also stay `None`.
+        // The first `Pending` poll began the backend-read wait and re-armed the
+        // deadline via `reset_deadline()`, which must hold the same
+        // representability invariant without panicking.
         assert!(
             body.waiting,
             "first Pending poll must begin the backend-read wait",
         );
-        assert!(
+        assert_eq!(
             body.deadline.is_none(),
-            "reset_deadline() must keep the pathological deadline unbounded",
+            overflows,
+            "reset_deadline() must preserve the representability invariant",
         );
     }
 
