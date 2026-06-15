@@ -1984,9 +1984,10 @@ where
             // Always try IPv6 cleanup: an earlier process/config may have
             // created ip6tables chains even when the current plan has none.
             let include_v6_cleanup = true;
+            let udp_capture_enabled = config.capture_config.udp_capture_enabled;
             let setup = setup_commands_for_plan(&plan);
             if let Err(setup_err) = execute(setup, "setup").await {
-                let cleanup = cleanup_commands_for_plan(include_v6_cleanup);
+                let cleanup = cleanup_commands_for_plan(include_v6_cleanup, udp_capture_enabled);
                 if let Err(cleanup_err) = execute(cleanup, "cleanup").await {
                     warn!(
                         error = %cleanup_err,
@@ -2002,7 +2003,7 @@ where
             wait_for_shutdown(shutdown_tx).await;
 
             info!("Shutdown signal received, cleaning up iptables rules");
-            let cleanup = cleanup_commands_for_plan(include_v6_cleanup);
+            let cleanup = cleanup_commands_for_plan(include_v6_cleanup, udp_capture_enabled);
             if let Err(e) = execute(cleanup, "cleanup").await {
                 warn!(error = %e, "Failed to clean up iptables fallback rules");
             }
@@ -2060,13 +2061,16 @@ fn setup_commands_for_plan(plan: &IptablesPlan) -> Vec<String> {
     commands
 }
 
-fn cleanup_commands_for_plan(include_v6: bool) -> Vec<String> {
-    let mut commands = IptablesPlan::cleanup_commands();
+fn cleanup_commands_for_plan(include_v6: bool, udp_capture_enabled: bool) -> Vec<String> {
+    // `udp_capture_enabled` gates the UDP TPROXY teardown (mangle chains + the
+    // Ferrum-owned `ip rule`/`ip route`): when this node never installs UDP
+    // capture, cleanup must not touch routing state it never created (codex r1).
+    let mut commands = IptablesPlan::cleanup_commands(udp_capture_enabled);
     if include_v6 {
         // Keep cleanup best-effort per command; stale v6 chains from an earlier
         // config should not make node-agent fallback cleanup fail.
         commands.extend(
-            IptablesPlan::cleanup_v6_commands()
+            IptablesPlan::cleanup_v6_commands(udp_capture_enabled)
                 .iter()
                 .map(|cmd| ip6tables_best_effort_wrapped_command(cmd)),
         );
@@ -2790,7 +2794,7 @@ mod tests {
 
     #[test]
     fn cleanup_commands_try_ipv6_teardown_when_ip6tables_disabled() {
-        let commands = cleanup_commands_for_plan(true);
+        let commands = cleanup_commands_for_plan(true, false);
 
         assert!(
             commands.iter().any(|cmd| cmd.contains("ip6tables")),
@@ -2806,7 +2810,7 @@ mod tests {
 
     #[test]
     fn cleanup_commands_wrap_required_ipv6_teardown_best_effort() {
-        let commands = cleanup_commands_for_plan(true);
+        let commands = cleanup_commands_for_plan(true, false);
 
         assert!(
             commands
