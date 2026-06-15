@@ -12,12 +12,13 @@
 //! never on the hot request path.
 
 use arc_swap::ArcSwap;
+use crossbeam_utils::CachePadded;
 use dashmap::DashMap;
 use regex::{Regex, RegexSet};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use tracing::{debug, warn};
 
 use crate::config::types::{GatewayConfig, Proxy, wildcard_matches};
@@ -28,6 +29,10 @@ thread_local! {
     /// per-lookup String allocation on cache hits (the 99%+ fast path).
     static CACHE_KEY_BUF: std::cell::RefCell<String> = std::cell::RefCell::new(String::with_capacity(128));
 }
+
+const ROUTER_CACHE_EVICTION_SAMPLE_LIMIT: usize = 256;
+const ROUTER_CACHE_EVICTION_MAX_REMOVALS: usize = 64;
+const ROUTER_CACHE_EVICTION_ROTATION_WINDOWS: usize = 16;
 
 /// How [`RouterCache::search_route_table`] treats direction-scoped materialized
 /// mesh routes (`__mesh-inbound-*` / `__mesh-outbound-*`). The inbound and
@@ -558,7 +563,7 @@ struct CountMinSketch {
     row1: AlignedCounterRow,
     width_mask: usize,
     /// Total increments across all keys, for triggering periodic aging.
-    total_increments: AtomicU64,
+    total_increments: CachePadded<AtomicU64>,
     /// Age (halve all counters) after this many increments.
     age_threshold: u64,
 }
@@ -574,7 +579,7 @@ impl CountMinSketch {
             row0,
             row1,
             width_mask: width - 1,
-            total_increments: AtomicU64::new(0),
+            total_increments: CachePadded::new(AtomicU64::new(0)),
             age_threshold,
         }
     }
@@ -678,6 +683,12 @@ pub struct RouterCache {
     regex_cache: DashMap<String, RegexCacheEntry>,
     /// Maximum entries in each cache partition before eviction.
     max_cache_entries: usize,
+    /// Approximate prefix cache entries maintained on insert/remove so cold
+    /// inserts do not scan all DashMap shards through `len()`.
+    prefix_cache_entries: AtomicUsize,
+    /// Approximate regex cache entries maintained on insert/remove so cold
+    /// inserts do not scan all DashMap shards through `len()`.
+    regex_cache_entries: AtomicUsize,
     /// Resolved DashMap shard count used by the lookup caches.
     #[cfg(test)]
     cache_shard_amount: usize,
@@ -706,8 +717,8 @@ impl RouterCache {
     /// clamped to `[10_000, 1_000_000]`. That keeps direct callers aligned
     /// with production env-var resolution while still getting a usable cache.
     /// Without this,
-    /// `frequency_aware_evict`'s `max_entries / 4 == 0` short-circuit would leave
-    /// the cache unbounded under load.
+    /// the tiny-cache eviction short-circuit would leave the cache unbounded
+    /// under load.
     #[allow(dead_code)]
     pub fn new(config: &GatewayConfig, max_cache_entries: usize) -> Self {
         Self::with_shard_amount(config, max_cache_entries, 0)
@@ -752,6 +763,8 @@ impl RouterCache {
             prefix_cache: DashMap::with_capacity_and_shard_amount(max_cache_entries, shards),
             regex_cache: DashMap::with_capacity_and_shard_amount(max_cache_entries / 4 + 1, shards),
             max_cache_entries,
+            prefix_cache_entries: AtomicUsize::new(0),
+            regex_cache_entries: AtomicUsize::new(0),
             #[cfg(test)]
             cache_shard_amount: shards,
             prefix_eviction_counter: AtomicU64::new(0),
@@ -771,14 +784,38 @@ impl RouterCache {
         route_generation: u64,
     ) {
         self.route_table.store(table);
-        self.route_generation
-            .store(route_generation, Ordering::Release);
+        let previous_generation = self
+            .route_generation
+            .swap(route_generation, Ordering::Release);
+        if previous_generation != route_generation {
+            self.clear_lookup_caches();
+        }
     }
 
     pub(crate) fn clear_lookup_caches(&self) {
         self.prefix_cache.clear();
         self.regex_cache.clear();
+        self.prefix_cache_entries.store(0, Ordering::Relaxed);
+        self.regex_cache_entries.store(0, Ordering::Relaxed);
         self.frequency_sketch.reset();
+    }
+
+    fn insert_prefix_cache_entry(&self, cache_key: String, entry: PrefixCacheEntry) {
+        if self.prefix_cache.insert(cache_key, entry).is_none() {
+            let entries = self.prefix_cache_entries.fetch_add(1, Ordering::Relaxed) + 1;
+            if entries > self.max_cache_entries {
+                self.evict_prefix_sample();
+            }
+        }
+    }
+
+    fn insert_regex_cache_entry(&self, cache_key: String, entry: RegexCacheEntry) {
+        if self.regex_cache.insert(cache_key, entry).is_none() {
+            let entries = self.regex_cache_entries.fetch_add(1, Ordering::Relaxed) + 1;
+            if entries > self.max_cache_entries {
+                self.evict_regex_sample();
+            }
+        }
     }
 
     /// Find the matching proxy for a request host and path.
@@ -871,13 +908,8 @@ impl RouterCache {
                     || is_exact_path_proxy(&route_match.proxy) =>
             {
                 // Regex/exact match → regex cache (stores matched length).
-                if self.regex_cache.len() >= self.max_cache_entries
-                    && !self.regex_cache.contains_key(&cache_key)
-                {
-                    self.evict_regex_sample();
-                }
                 self.frequency_sketch.increment(&cache_key);
-                self.regex_cache.insert(
+                self.insert_regex_cache_entry(
                     cache_key,
                     RegexCacheEntry {
                         proxy: Arc::clone(&route_match.proxy),
@@ -889,13 +921,8 @@ impl RouterCache {
             }
             Some(route_match) => {
                 // Prefix match → prefix cache
-                if self.prefix_cache.len() >= self.max_cache_entries
-                    && !self.prefix_cache.contains_key(&cache_key)
-                {
-                    self.evict_prefix_sample();
-                }
                 self.frequency_sketch.increment(&cache_key);
-                self.prefix_cache.insert(
+                self.insert_prefix_cache_entry(
                     cache_key,
                     PrefixCacheEntry {
                         proxy: Some(Arc::clone(&route_match.proxy)),
@@ -905,13 +932,8 @@ impl RouterCache {
             }
             None => {
                 // Negative entry → prefix cache (both tiers missed)
-                if self.prefix_cache.len() >= self.max_cache_entries
-                    && !self.prefix_cache.contains_key(&cache_key)
-                {
-                    self.evict_prefix_sample();
-                }
                 self.frequency_sketch.increment(&cache_key);
-                self.prefix_cache.insert(
+                self.insert_prefix_cache_entry(
                     cache_key,
                     PrefixCacheEntry {
                         proxy: None,
@@ -1079,8 +1101,8 @@ impl RouterCache {
     /// Cache statistics for metrics: (prefix_entries, regex_entries, prefix_evictions, regex_evictions, max_entries).
     pub fn cache_stats(&self) -> (usize, usize, u64, u64, usize) {
         (
-            self.prefix_cache.len(),
-            self.regex_cache.len(),
+            self.prefix_cache_entries.load(Ordering::Relaxed),
+            self.regex_cache_entries.load(Ordering::Relaxed),
             self.prefix_eviction_counter.load(Ordering::Relaxed),
             self.regex_eviction_counter.load(Ordering::Relaxed),
             self.max_cache_entries,
@@ -1090,13 +1112,13 @@ impl RouterCache {
     /// Number of entries currently in the prefix cache (for testing).
     #[allow(dead_code)] // Library integration tests exercise this API; the binary target does not.
     pub fn cache_len(&self) -> usize {
-        self.prefix_cache.len()
+        self.prefix_cache_entries.load(Ordering::Relaxed)
     }
 
     /// Number of entries currently in the regex cache (for testing).
     #[allow(dead_code)] // Library integration tests exercise this API; the binary target does not.
     pub fn regex_cache_len(&self) -> usize {
-        self.regex_cache.len()
+        self.regex_cache_entries.load(Ordering::Relaxed)
     }
 
     /// Resolved DashMap shard count used by `prefix_cache` and `regex_cache`.
@@ -1150,37 +1172,47 @@ impl RouterCache {
 
     /// Evict low-frequency entries from the prefix cache using frequency-guided sampling.
     ///
-    /// Samples up to `8 * target_removals` entries from the DashMap, estimates each
-    /// entry's access frequency via the Count-Min Sketch, and removes the least
-    /// frequent entries. This protects hot cache entries from eviction while keeping
-    /// the eviction cost proportional to the sample size, not the cache size.
+    /// Samples a small bounded window from the DashMap, estimates each entry's
+    /// access frequency via the Count-Min Sketch, and removes the least frequent
+    /// entries. This protects hot cache entries from eviction while keeping the
+    /// eviction cost bounded by constants, not cache capacity.
     fn evict_prefix_sample(&self) {
+        let cursor = self.prefix_eviction_counter.load(Ordering::Relaxed);
         let removed = frequency_aware_evict(
             &self.prefix_cache,
             &self.frequency_sketch,
             self.max_cache_entries,
+            cursor,
         );
-        self.prefix_eviction_counter
-            .fetch_add(removed as u64, Ordering::Relaxed);
-        debug!(
-            "Router prefix cache evicted {} entries (was at capacity {})",
-            removed, self.max_cache_entries
-        );
+        if removed > 0 {
+            subtract_cache_entries(&self.prefix_cache_entries, removed);
+            self.prefix_eviction_counter
+                .fetch_add(removed as u64, Ordering::Relaxed);
+            debug!(
+                "Router prefix cache evicted {} entries (was at capacity {})",
+                removed, self.max_cache_entries
+            );
+        }
     }
 
     /// Evict low-frequency entries from the regex cache using frequency-guided sampling.
     fn evict_regex_sample(&self) {
+        let cursor = self.regex_eviction_counter.load(Ordering::Relaxed);
         let removed = frequency_aware_evict(
             &self.regex_cache,
             &self.frequency_sketch,
             self.max_cache_entries,
+            cursor,
         );
-        self.regex_eviction_counter
-            .fetch_add(removed as u64, Ordering::Relaxed);
-        debug!(
-            "Router regex cache evicted {} entries (was at capacity {})",
-            removed, self.max_cache_entries
-        );
+        if removed > 0 {
+            subtract_cache_entries(&self.regex_cache_entries, removed);
+            self.regex_eviction_counter
+                .fetch_add(removed as u64, Ordering::Relaxed);
+            debug!(
+                "Router regex cache evicted {} entries (was at capacity {})",
+                removed, self.max_cache_entries
+            );
+        }
     }
 
     /// Build a pre-computed host route table from config.
@@ -1798,7 +1830,6 @@ fn find_prefix_match_indexed(routes: &IndexedPrefixRoutes, path: &str) -> Option
     // 2. Walk backwards through "/" boundaries for longest-prefix match.
     //    At each "/" position, try both "with slash" (for listen_paths ending in "/")
     //    and "without slash" (for listen_paths like "/api" matching "/api/users").
-    let bytes = match_path.as_bytes();
     let mut search_end = match_path.len();
     loop {
         match match_path[..search_end].rfind('/') {
@@ -1827,18 +1858,15 @@ fn find_prefix_match_indexed(routes: &IndexedPrefixRoutes, path: &str) -> Option
                 }
 
                 // Try without trailing slash: "/api" matching "/api/users"
-                // The char at listen_path.len() must be '/' or '?' (boundary check)
+                // `without_slash` is built directly from `slash_pos`, so the
+                // next byte is the segment boundary that made this candidate.
                 let without_slash = &match_path[..slash_pos];
                 if let Some(proxy) = routes.path_index.get(without_slash) {
-                    // Verify boundary: char after the prefix must be '/'
-                    // (we know it is because we found the slash at slash_pos)
-                    if bytes[slash_pos] == b'/' {
-                        return Some(RouteMatch {
-                            proxy: Arc::clone(proxy),
-                            path_params: Vec::new(),
-                            matched_prefix_len: without_slash.len(),
-                        });
-                    }
+                    return Some(RouteMatch {
+                        proxy: Arc::clone(proxy),
+                        path_params: Vec::new(),
+                        matched_prefix_len: without_slash.len(),
+                    });
                 }
 
                 search_end = slash_pos;
@@ -1918,35 +1946,53 @@ fn resolve_auto_router_cache_entries(proxy_count: usize) -> usize {
     proxy_count.saturating_mul(3).clamp(10_000, 1_000_000)
 }
 
+fn subtract_cache_entries(counter: &AtomicUsize, removed: usize) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |entries| {
+        Some(entries.saturating_sub(removed))
+    });
+}
+
 /// Evict entries from a DashMap using frequency-guided sampling.
 ///
-/// Samples a bounded number of entries, estimates each entry's access frequency
-/// via the Count-Min Sketch, then removes the least frequent entries from the sample.
-/// This approach is O(sample_size), not O(cache_size), and protects frequently
-/// accessed entries from eviction (similar to Redis LFU and TinyUFO).
+/// Samples a bounded rotating window of entries, estimates each entry's access
+/// frequency via the Count-Min Sketch, then removes the least frequent entries
+/// from the sample. This approach is bounded by fixed constants rather than
+/// cache capacity, and protects frequently accessed entries from eviction
+/// (similar to Redis LFU and TinyUFO).
 ///
 /// Returns the number of entries actually removed.
 fn frequency_aware_evict<V>(
     map: &DashMap<String, V>,
     sketch: &CountMinSketch,
     max_entries: usize,
+    cursor: u64,
 ) -> usize {
-    let target_removals = max_entries / 4;
-    if target_removals == 0 {
+    let sample_size = max_entries.min(ROUTER_CACHE_EVICTION_SAMPLE_LIMIT);
+    if sample_size < 4 {
         return 0;
     }
-    let sample_size = target_removals * 8;
 
-    // Collect a sample of (key, frequency) pairs by iterating the DashMap.
-    // DashMap::iter() yields entries in shard order (pseudo-random relative to
-    // insertion order), so taking the first N entries is effectively a random sample.
+    let target_removals = (sample_size / 4).clamp(1, ROUTER_CACHE_EVICTION_MAX_REMOVALS);
+    let skip_window = sample_size.saturating_mul(ROUTER_CACHE_EVICTION_ROTATION_WINDOWS);
+    let skip = if skip_window > 0 {
+        (cursor as usize).wrapping_mul(sample_size) % skip_window
+    } else {
+        0
+    };
+
+    // Collect a bounded sample of (key, frequency) pairs. DashMap iteration is
+    // shard ordered, so each eviction advances through a small rotating window
+    // instead of repeatedly sampling the same first entries under churn.
     let mut sample: Vec<(String, u8)> = Vec::with_capacity(sample_size);
-    for entry in map.iter() {
-        if sample.len() >= sample_size {
-            break;
-        }
+    for entry in map.iter().skip(skip).take(sample_size) {
         let freq = sketch.estimate(entry.key());
         sample.push((entry.key().clone(), freq));
+    }
+    if sample.is_empty() && skip > 0 {
+        for entry in map.iter().take(sample_size) {
+            let freq = sketch.estimate(entry.key());
+            sample.push((entry.key().clone(), freq));
+        }
     }
 
     if sample.is_empty() {
@@ -2202,7 +2248,7 @@ mod tests {
             }
         }
 
-        let removed = frequency_aware_evict(&map, &sketch, 100);
+        let removed = frequency_aware_evict(&map, &sketch, 100, 0);
         assert!(removed > 0, "Should have evicted some entries");
         assert!(map.len() < 100, "Map should be smaller after eviction");
 
@@ -2231,26 +2277,47 @@ mod tests {
     fn evict_empty_map_is_noop() {
         let sketch = CountMinSketch::new(64, 1000);
         let map: DashMap<String, ()> = DashMap::new();
-        let removed = frequency_aware_evict(&map, &sketch, 100);
+        let removed = frequency_aware_evict(&map, &sketch, 100, 0);
         assert_eq!(removed, 0);
     }
 
     #[test]
     fn evict_very_small_capacity_is_noop() {
-        // target_removals = max_entries / 4 = 3 / 4 = 0
+        // Tiny capacities skip sampling because there is no meaningful LFU set.
         let sketch = CountMinSketch::new(64, 1000);
         let map: DashMap<String, ()> = DashMap::new();
         map.insert("a".into(), ());
-        let removed = frequency_aware_evict(&map, &sketch, 3);
+        let removed = frequency_aware_evict(&map, &sketch, 3, 0);
         assert_eq!(removed, 0);
+    }
+
+    #[test]
+    fn evict_large_capacity_uses_bounded_sample() {
+        let sketch = CountMinSketch::new(65_536, 1_000_000);
+        let map: DashMap<String, ()> = DashMap::new();
+
+        for i in 0..1_000 {
+            let key = format!("key-{i}");
+            map.insert(key.clone(), ());
+            sketch.increment(&key);
+        }
+
+        let removed = frequency_aware_evict(&map, &sketch, 10_000, 0);
+        assert!(
+            removed <= ROUTER_CACHE_EVICTION_MAX_REMOVALS,
+            "eviction removed {removed} entries despite bounded sample"
+        );
+        assert!(
+            map.len() >= 1_000 - ROUTER_CACHE_EVICTION_MAX_REMOVALS,
+            "eviction should not scan and remove the whole map"
+        );
     }
 
     // ── RouterCache::new auto-resolution tests ──────────────────────────
     //
     // FERRUM_ROUTER_CACHE_MAX_ENTRIES=0 is the documented "auto" sentinel.
     // Harden `new` itself so direct callers (tests, future refactors) can't
-    // end up with an effectively unbounded cache — `frequency_aware_evict`
-    // returns 0 when `max_entries / 4 == 0`.
+    // end up with an effectively unbounded cache under tiny explicit capacities.
 
     fn minimal_proxy_for_routing(id: &str, listen_path: &str) -> Proxy {
         use crate::config::types::{
@@ -2787,6 +2854,37 @@ mod tests {
             after.3, before.3,
             "replacing the same stale regex key should not evict another entry"
         );
+    }
+
+    #[test]
+    fn store_route_table_snapshot_clears_lookup_caches_on_generation_change() {
+        let old_config = GatewayConfig {
+            proxies: vec![minimal_proxy_for_routing("old", "/api")],
+            ..GatewayConfig::default()
+        };
+        let cache = RouterCache::new(&old_config, 100);
+
+        let old = cache
+            .find_proxy(None, "/api/resource")
+            .expect("old route should match");
+        assert_eq!(old.proxy.id, "old");
+        assert_eq!(cache.cache_len(), 1);
+
+        let new_config = GatewayConfig {
+            proxies: vec![minimal_proxy_for_routing("new", "/api")],
+            ..GatewayConfig::default()
+        };
+        cache.store_route_table_snapshot(RouterCache::build_route_table_snapshot(&new_config), 2);
+
+        let (prefix, regex, _, _, _) = cache.cache_stats();
+        assert_eq!(prefix, 0, "prefix cache should clear on route reload");
+        assert_eq!(regex, 0, "regex cache should clear on route reload");
+
+        let new = cache
+            .find_proxy(None, "/api/resource")
+            .expect("new route should match");
+        assert_eq!(new.proxy.id, "new");
+        assert_eq!(cache.cache_len(), 1);
     }
 
     #[test]
