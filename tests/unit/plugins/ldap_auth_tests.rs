@@ -940,3 +940,19 @@ fn test_filter_escape_injection_attempt() {
     let escaped = escape_filter_value("admin)(objectClass=*");
     assert_eq!(escaped, "admin\\29\\28objectClass=\\2a");
 }
+
+#[test]
+fn test_filter_escape_preserves_utf8() {
+    // A non-ASCII filter value (e.g. an accented username/group) must keep its
+    // real UTF-8 bytes — only the five RFC 4515 metacharacters are escaped.
+    // Iterating bytes and doing `byte as char` re-encodes each UTF-8 byte as a
+    // separate code point, corrupting the value so the directory search never
+    // matches the entry (a non-ASCII user in search-then-bind / group lookup is
+    // wrongly denied). `escape_dn_value` already handles this correctly; the
+    // filter path must match.
+    assert_eq!(escape_filter_value("café"), "café");
+    assert_eq!(escape_filter_value("café").into_bytes(), "café".as_bytes());
+    // Multi-byte characters and the metacharacter escaping must coexist.
+    assert_eq!(escape_filter_value("café*"), "café\\2a");
+    assert_eq!(escape_filter_value("naïve(user)"), "naïve\\28user\\29");
+}
