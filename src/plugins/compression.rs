@@ -538,6 +538,15 @@ impl Plugin for CompressionPlugin {
         !self.config.algorithms.is_empty() && ctx.headers.contains_key("accept-encoding")
     }
 
+    fn should_buffer_response_body_for_content_type(
+        &self,
+        ctx: &RequestContext,
+        content_type: Option<&str>,
+    ) -> bool {
+        self.should_buffer_response_body(ctx)
+            && content_type.is_some_and(|ct| self.is_compressible_content_type(ct))
+    }
+
     fn applies_after_proxy_on_reject(&self) -> bool {
         true
     }
@@ -645,6 +654,14 @@ impl Plugin for CompressionPlugin {
 
         // Skip uncompressible status codes.
         if UNCOMPRESSIBLE_STATUS_CODES.contains(&response_status) {
+            return PluginResult::Continue;
+        }
+
+        // Range responses carry byte offsets for the original representation.
+        // Compressing them changes those byte positions and corrupts range
+        // semantics, even if a backend sends Content-Range with a non-206
+        // status.
+        if response_status == 206 || response_headers.contains_key("content-range") {
             return PluginResult::Continue;
         }
 

@@ -312,6 +312,81 @@ async fn test_skips_non_compressible_content_type() {
     assert!(!resp_headers.contains_key("content-encoding"));
 }
 
+#[test]
+fn test_response_buffering_is_narrowed_by_content_type() {
+    let plugin = make_plugin(json!({}));
+    let ctx = make_ctx(Some("gzip"));
+
+    assert!(plugin.should_buffer_response_body(&ctx));
+    assert!(plugin.should_buffer_response_body_for_content_type(&ctx, Some("text/html")));
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json; charset=utf-8")
+    ));
+    assert!(!plugin.should_buffer_response_body_for_content_type(&ctx, Some("text/event-stream")));
+    assert!(!plugin.should_buffer_response_body_for_content_type(&ctx, Some("image/png")));
+    assert!(
+        !plugin
+            .should_buffer_response_body_for_content_type(&ctx, Some("application/octet-stream"))
+    );
+    assert!(!plugin.should_buffer_response_body_for_content_type(&ctx, None));
+}
+
+#[test]
+fn test_response_buffering_still_requires_accept_encoding() {
+    let plugin = make_plugin(json!({}));
+    let ctx = make_ctx(None);
+
+    assert!(!plugin.should_buffer_response_body(&ctx));
+    assert!(!plugin.should_buffer_response_body_for_content_type(&ctx, Some("application/json")));
+}
+
+#[tokio::test]
+async fn test_skips_partial_content_responses() {
+    let plugin = make_plugin(json!({}));
+    let mut ctx = make_ctx(Some("gzip"));
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "text/html".to_string());
+    resp_headers.insert("content-length".to_string(), "100".to_string());
+    resp_headers.insert("content-range".to_string(), "bytes 0-99/5000".to_string());
+
+    plugin.after_proxy(&mut ctx, 206, &mut resp_headers).await;
+
+    assert!(!ctx.metadata.contains_key("compression:algorithm"));
+    assert!(!resp_headers.contains_key("content-encoding"));
+    assert_eq!(resp_headers.get("content-length").unwrap(), "100");
+    assert_eq!(
+        resp_headers.get("content-range").unwrap(),
+        "bytes 0-99/5000"
+    );
+}
+
+#[tokio::test]
+async fn test_skips_content_range_header_on_non_partial_status() {
+    let plugin = make_plugin(json!({}));
+    let mut ctx = make_ctx(Some("gzip"));
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "text/html".to_string());
+    resp_headers.insert("content-length".to_string(), "100".to_string());
+    resp_headers.insert("content-range".to_string(), "bytes 0-99/5000".to_string());
+
+    plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+
+    assert!(!ctx.metadata.contains_key("compression:algorithm"));
+    assert!(!resp_headers.contains_key("content-encoding"));
+    assert_eq!(resp_headers.get("content-length").unwrap(), "100");
+    assert_eq!(
+        resp_headers.get("content-range").unwrap(),
+        "bytes 0-99/5000"
+    );
+}
+
 #[tokio::test]
 async fn test_skips_below_min_content_length() {
     let plugin = make_plugin(json!({"min_content_length": 1000}));
