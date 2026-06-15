@@ -3846,9 +3846,9 @@ impl DatabaseStore {
             && current_resource_hash.as_deref() == Some(desired_resource_hash.as_str())
         {
             // Bundle is unchanged — only update the api_specs metadata row.
-            let tags_json = serde_json::to_string(&spec.tags).unwrap_or_else(|_| "[]".to_string());
+            let tags_json = serialize_api_spec_string_list(&spec.id, "tags", &spec.tags)?;
             let server_urls_json =
-                serde_json::to_string(&spec.server_urls).unwrap_or_else(|_| "[]".to_string());
+                serialize_api_spec_string_list(&spec.id, "server_urls", &spec.server_urls)?;
             let spec_format_str = match spec.spec_format {
                 crate::config::types::SpecFormat::Json => "json",
                 crate::config::types::SpecFormat::Yaml => "yaml",
@@ -4172,9 +4172,9 @@ impl DatabaseStore {
         self.cleanup_orphaned_proxy_group_plugins(&mut tx).await?;
 
         // Update the api_specs row (no CASCADE delete needed since proxy survives).
-        let tags_json = serde_json::to_string(&spec.tags).unwrap_or_else(|_| "[]".to_string());
+        let tags_json = serialize_api_spec_string_list(&spec.id, "tags", &spec.tags)?;
         let server_urls_json =
-            serde_json::to_string(&spec.server_urls).unwrap_or_else(|_| "[]".to_string());
+            serialize_api_spec_string_list(&spec.id, "server_urls", &spec.server_urls)?;
         let spec_format_str = match spec.spec_format {
             crate::config::types::SpecFormat::Json => "json",
             crate::config::types::SpecFormat::Yaml => "yaml",
@@ -4404,9 +4404,9 @@ impl DatabaseStore {
             crate::config::types::SpecFormat::Json => "json",
             crate::config::types::SpecFormat::Yaml => "yaml",
         };
-        let tags_json = serde_json::to_string(&spec.tags).unwrap_or_else(|_| "[]".to_string());
+        let tags_json = serialize_api_spec_string_list(&spec.id, "tags", &spec.tags)?;
         let server_urls_json =
-            serde_json::to_string(&spec.server_urls).unwrap_or_else(|_| "[]".to_string());
+            serialize_api_spec_string_list(&spec.id, "server_urls", &spec.server_urls)?;
         sqlx::query(&self.q("INSERT INTO api_specs \
              (id, namespace, proxy_id, spec_version, spec_format, spec_content, \
               content_encoding, uncompressed_size, content_hash, title, info_version, \
@@ -5664,7 +5664,7 @@ fn row_to_plugin_config(row: &AnyRow) -> Result<PluginConfig, anyhow::Error> {
             .try_get::<Option<i32>, _>("priority_override")
             .ok()
             .flatten()
-            .map(|v| v as u16),
+            .map(|v| v.clamp(0, 10_000) as u16),
         // See row_to_proxy for the rationale: preserve here so admin reads
         // get the real owning spec id; runtime callers strip via
         // strip_api_spec_id_from_runtime_config.
@@ -5737,10 +5737,17 @@ fn row_to_upstream(row: &AnyRow) -> Result<Upstream, anyhow::Error> {
             Err(_) => None,
         };
 
-    let hash_on_cookie_config: Option<crate::config::types::HashOnCookieConfig> = row
-        .try_get::<String, _>("hash_on_cookie_config")
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok());
+    let hash_on_cookie_config: Option<crate::config::types::HashOnCookieConfig> =
+        match row.try_get::<Option<String>, _>("hash_on_cookie_config") {
+            Ok(Some(s)) => Some(serde_json::from_str(&s).map_err(|e| {
+                anyhow::anyhow!(
+                    "Upstream {}: failed to parse hash_on_cookie_config JSON: {}",
+                    id_preview,
+                    e
+                )
+            })?),
+            Ok(None) | Err(_) => None,
+        };
 
     // Parse backend TLS fields
     let backend_tls_verify_server_cert: bool = row
@@ -5948,35 +5955,54 @@ fn audit_ts_string(ts: &DateTime<Utc>) -> String {
     ts.to_rfc3339_opts(SecondsFormat::Nanos, true)
 }
 
+fn serialize_api_spec_string_list(
+    spec_id: &str,
+    field: &str,
+    values: &[String],
+) -> Result<String, anyhow::Error> {
+    serde_json::to_string(values).map_err(|e| {
+        anyhow::anyhow!(
+            "ApiSpec {}: failed to serialize {} JSON: {}",
+            spec_id,
+            field,
+            e
+        )
+    })
+}
+
 fn row_namespace_or_default(row: &AnyRow) -> String {
     row.try_get::<String, _>("namespace")
         .unwrap_or_else(|_| crate::config::types::default_namespace())
 }
 
-/// Parse a datetime column from a database row, falling back to `Utc::now()` if
-/// the column is missing or the value cannot be parsed. Database stores timestamps
-/// as RFC 3339 strings or SQLite `CURRENT_TIMESTAMP` format.
+/// Parse a datetime column from a database row. Database stores timestamps as
+/// RFC 3339 strings or SQLite `CURRENT_TIMESTAMP` format.
 fn parse_datetime_column(row: &AnyRow, column: &str) -> chrono::DateTime<Utc> {
-    row.try_get::<String, _>(column)
-        .ok()
-        .and_then(|s| {
-            chrono::DateTime::parse_from_rfc3339(&s)
-                .map(|dt| dt.with_timezone(&Utc))
-                .ok()
-                .or_else(|| {
-                    // SQLite CURRENT_TIMESTAMP format: "YYYY-MM-DD HH:MM:SS"
-                    chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S")
-                        .map(|ndt| ndt.and_utc())
-                        .ok()
-                })
-        })
-        .unwrap_or_else(|| {
-            debug!(
-                "Could not parse '{}' column, falling back to Utc::now()",
-                column
+    match row.try_get::<String, _>(column) {
+        Ok(raw) => chrono::DateTime::parse_from_rfc3339(&raw)
+            .map(|dt| dt.with_timezone(&Utc))
+            .or_else(|_| {
+                // SQLite CURRENT_TIMESTAMP format: "YYYY-MM-DD HH:MM:SS"
+                chrono::NaiveDateTime::parse_from_str(&raw, "%Y-%m-%d %H:%M:%S")
+                    .map(|ndt| ndt.and_utc())
+            })
+            .unwrap_or_else(|_| {
+                warn!(
+                    column,
+                    value = %raw,
+                    "Could not parse datetime column, falling back to Utc::now()"
+                );
+                Utc::now()
+            }),
+        Err(error) => {
+            warn!(
+                column,
+                error = %error,
+                "Could not read datetime column, falling back to Utc::now()"
             );
             Utc::now()
-        })
+        }
+    }
 }
 
 #[cfg(test)]
