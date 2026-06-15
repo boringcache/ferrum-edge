@@ -1547,8 +1547,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn http2_manager_pool_key_uses_global_mtls_fallback() {
+    #[tokio::test]
+    async fn http2_manager_pool_key_uses_global_mtls_fallback() {
         let proxy = http2_pool_test_proxy();
         let mut env_config = crate::config::EnvConfig::default();
         env_config.backend_tls_client_cert_path = Some("/global/client.pem".to_string());
