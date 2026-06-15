@@ -7,13 +7,16 @@
 //! two frontend paths.
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use hyper::Request;
 use tracing::{debug, warn};
 
-use crate::config::types::{HttpFlavor, PassiveHealthCheck, Proxy, Upstream, UpstreamTarget};
+use crate::config::types::{
+    HttpFlavor, LoadBalancerAlgorithm, PassiveHealthCheck, Proxy, Upstream, UpstreamTarget,
+};
 use crate::load_balancer::{
     HashOnStrategy, HealthContext, LoadBalancer, LoadBalancerCache, LoadBalancerCacheInner,
 };
@@ -196,6 +199,7 @@ pub(crate) fn select_upstream_target(
     epoch: &RequestEpoch,
     client_ip: &str,
     proxy_headers: &HashMap<String, String>,
+    orig_dst: Option<SocketAddr>,
 ) -> UpstreamSelection {
     let Some(upstream_id) = proxy.upstream_id.as_deref() else {
         return UpstreamSelection {
@@ -245,6 +249,60 @@ pub(crate) fn select_upstream_target(
     let (hash_key, needs_set) = resolve_hash_key(&strategy, client_ip, proxy_headers);
 
     let selected_balancer = balancers.get_balancer(upstream_id);
+
+    let subset_name = proxy.upstream_subset.as_deref();
+    let port_scope = has_port_override.then_some(dispatch_port);
+
+    // PASSTHROUGH (Istio `loadBalancer.simple=PASSTHROUGH`): when this upstream's
+    // effective algorithm is Passthrough, dial the captured original destination
+    // if it matches a healthy target in the (subset∩port-scoped) candidate pool,
+    // bypassing load balancing. Absent or unmatched orig-dst falls through to the
+    // normal selection below, which treats Passthrough as round-robin.
+    if LoadBalancerCache::effective_algorithm_from(balancers, upstream_id, port_scope, subset_name)
+        == Some(LoadBalancerAlgorithm::Passthrough)
+    {
+        match orig_dst {
+            Some(dst) => {
+                if let Some(target) = LoadBalancerCache::select_passthrough_from(
+                    balancers,
+                    upstream_id,
+                    dst,
+                    port_scope,
+                    subset_name,
+                    Some(&health_ctx),
+                ) {
+                    debug!(
+                        proxy_id = %proxy.id,
+                        upstream_id = %upstream_id,
+                        target_host = %target.host,
+                        target_port = target.port,
+                        orig_dst = %dst,
+                        "PASSTHROUGH: dialing captured original destination"
+                    );
+                    return UpstreamSelection {
+                        lb_hash_key: Some(hash_key),
+                        target: Some(target),
+                        balancer: selected_balancer,
+                        is_fallback: false,
+                        sticky_cookie_needed: needs_set,
+                    };
+                }
+                warn!(
+                    proxy_id = %proxy.id,
+                    upstream_id = %upstream_id,
+                    orig_dst = %dst,
+                    "PASSTHROUGH: original destination unmatched, falling back to round-robin"
+                );
+            }
+            None => {
+                warn!(
+                    proxy_id = %proxy.id,
+                    upstream_id = %upstream_id,
+                    "PASSTHROUGH: original destination absent, falling back to round-robin"
+                );
+            }
+        }
+    }
 
     // Use subset routing when the proxy specifies an upstream_subset.
     let selection_result = if let Some(ref subset_name) = proxy.upstream_subset {
@@ -1032,7 +1090,7 @@ mod tests {
         let mut headers = HashMap::new();
         headers.insert("x-user".to_string(), "alice".to_string());
 
-        let selection = select_upstream_target(proxy, &state, &epoch, "192.0.2.10", &headers);
+        let selection = select_upstream_target(proxy, &state, &epoch, "192.0.2.10", &headers, None);
 
         assert_eq!(selection.lb_hash_key.as_deref(), Some("alice"));
         assert_eq!(selection.target.as_ref().map(|t| t.port), Some(8080));
@@ -1079,8 +1137,8 @@ mod tests {
         let mut headers = HashMap::new();
         headers.insert("x-user".to_string(), "alice".to_string());
 
-        let first = select_upstream_target(proxy, &state, &epoch, "192.0.2.10", &headers);
-        let second = select_upstream_target(proxy, &state, &epoch, "192.0.2.10", &headers);
+        let first = select_upstream_target(proxy, &state, &epoch, "192.0.2.10", &headers, None);
+        let second = select_upstream_target(proxy, &state, &epoch, "192.0.2.10", &headers, None);
 
         assert_eq!(first.lb_hash_key.as_deref(), Some("192.0.2.10"));
         assert_eq!(second.lb_hash_key.as_deref(), Some("192.0.2.10"));
@@ -1088,6 +1146,115 @@ mod tests {
             first.target.as_ref().map(|t| t.port),
             second.target.as_ref().map(|t| t.port),
             "mixed-port upstreams must keep using the upstream-level balancer until a target is selected"
+        );
+    }
+
+    /// Build a single-proxy `ProxyState` for an upstream using
+    /// `loadBalancer.simple=PASSTHROUGH` (algorithm `passthrough`) with two
+    /// same-port targets, so PASSTHROUGH orig-dst selection is unambiguous.
+    async fn passthrough_state() -> crate::proxy::ProxyState {
+        let mut config: crate::config::types::GatewayConfig =
+            serde_json::from_value(serde_json::json!({
+                "version": "1",
+                "consumers": [],
+                "plugin_configs": [],
+                "proxies": [{
+                    "id": "mesh-egress",
+                    "listen_path": "/",
+                    "backend_scheme": "http",
+                    "backend_host": "unused.local",
+                    "backend_port": 8080,
+                    "upstream_id": "mesh-upstream"
+                }],
+                "upstreams": [{
+                    "id": "mesh-upstream",
+                    "targets": [
+                        {"host": "10.0.0.1", "port": 8080},
+                        {"host": "10.0.0.2", "port": 8080}
+                    ],
+                    "algorithm": "passthrough"
+                }]
+            }))
+            .expect("test config should deserialize");
+        config.normalize_fields();
+        let dns_cache = crate::dns::DnsCache::new(crate::dns::DnsConfig::default());
+        let env_config = crate::config::env_config::EnvConfig::default();
+        crate::proxy::ProxyState::new(config, dns_cache, env_config, None, None)
+            .expect("test proxy state should build")
+            .0
+    }
+
+    /// PASSTHROUGH + orig-dst matching a pool target dials that exact target,
+    /// repeatably (bypassing round-robin).
+    #[tokio::test]
+    async fn passthrough_selects_captured_orig_dst() {
+        let state = passthrough_state().await;
+        let epoch = state.request_epoch.load();
+        let proxy = &epoch.config.proxies[0];
+        let orig: SocketAddr = "10.0.0.2:8080".parse().unwrap();
+        for _ in 0..20 {
+            let selection = select_upstream_target(
+                proxy,
+                &state,
+                &epoch,
+                "192.0.2.10",
+                &HashMap::new(),
+                Some(orig),
+            );
+            assert_eq!(
+                selection.target.as_ref().map(|t| (t.host.as_str(), t.port)),
+                Some(("10.0.0.2", 8080)),
+                "PASSTHROUGH must dial the captured original destination"
+            );
+            assert!(!selection.is_fallback);
+        }
+    }
+
+    /// PASSTHROUGH with no captured orig-dst falls back to round-robin
+    /// (selects a target, rotating across the pool).
+    #[tokio::test]
+    async fn passthrough_absent_orig_dst_falls_back_to_round_robin() {
+        let state = passthrough_state().await;
+        let epoch = state.request_epoch.load();
+        let proxy = &epoch.config.proxies[0];
+        let first =
+            select_upstream_target(proxy, &state, &epoch, "192.0.2.10", &HashMap::new(), None);
+        let second =
+            select_upstream_target(proxy, &state, &epoch, "192.0.2.10", &HashMap::new(), None);
+        assert!(first.target.is_some(), "RR fallback must select a target");
+        assert!(second.target.is_some());
+        // Two same-port targets under RR rotate.
+        assert_ne!(
+            first.target.as_ref().map(|t| t.host.clone()),
+            second.target.as_ref().map(|t| t.host.clone()),
+            "RR fallback should rotate across the pool"
+        );
+    }
+
+    /// PASSTHROUGH with an orig-dst that matches no pool target falls back to
+    /// round-robin (still selects a healthy target).
+    #[tokio::test]
+    async fn passthrough_unmatched_orig_dst_falls_back_to_round_robin() {
+        let state = passthrough_state().await;
+        let epoch = state.request_epoch.load();
+        let proxy = &epoch.config.proxies[0];
+        let orig: SocketAddr = "10.9.9.9:8080".parse().unwrap();
+        let selection = select_upstream_target(
+            proxy,
+            &state,
+            &epoch,
+            "192.0.2.10",
+            &HashMap::new(),
+            Some(orig),
+        );
+        assert!(
+            selection.target.is_some(),
+            "unmatched orig-dst must fall back to a round-robin target"
+        );
+        let host = selection.target.as_ref().map(|t| t.host.as_str());
+        assert!(
+            host == Some("10.0.0.1") || host == Some("10.0.0.2"),
+            "RR fallback must pick a real pool target, got {host:?}"
         );
     }
 
@@ -1167,7 +1334,7 @@ mod tests {
         );
 
         let selection =
-            select_upstream_target(proxy, &state, &epoch, "192.0.2.10", &HashMap::new());
+            select_upstream_target(proxy, &state, &epoch, "192.0.2.10", &HashMap::new(), None);
 
         assert!(
             selection.is_fallback,
@@ -1217,7 +1384,7 @@ mod tests {
         let proxy = &epoch.config.proxies[0];
 
         let selection =
-            select_upstream_target(proxy, &state, &epoch, "192.0.2.10", &HashMap::new());
+            select_upstream_target(proxy, &state, &epoch, "192.0.2.10", &HashMap::new(), None);
         let balancer = selection
             .balancer
             .clone()

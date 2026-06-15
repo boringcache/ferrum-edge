@@ -214,6 +214,16 @@ pub enum LoadBalancerAlgorithm {
     LeastLatency,
     ConsistentHashing,
     Random,
+    /// Istio `loadBalancer.simple=PASSTHROUGH`: dial the original destination
+    /// the client addressed, bypassing load balancing. Only meaningful when a
+    /// captured original-destination is available (mesh capture paths) AND it
+    /// matches a target in the upstream's pool; the request path
+    /// (`select_upstream_target`) intercepts this algorithm to do the orig-dst
+    /// match. When orig-dst is absent or unmatched, selection falls back to
+    /// round-robin, so the balancer's internal selectors treat `Passthrough`
+    /// exactly like `RoundRobin` (no hash ring / WRR / latency state is built
+    /// for it at construction).
+    Passthrough,
 }
 
 /// Per-subset traffic policy overrides (Istio DestinationRule subset.trafficPolicy).

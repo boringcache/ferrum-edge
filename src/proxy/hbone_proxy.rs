@@ -384,8 +384,14 @@ pub(super) async fn handle_hbone_request(
         return build_response_from_normalized_reject(reject);
     }
 
-    let selection =
-        backend_dispatch::select_upstream_target(proxy, state, epoch, &ctx.client_ip, &ctx.headers);
+    let selection = backend_dispatch::select_upstream_target(
+        proxy,
+        state,
+        epoch,
+        &ctx.client_ip,
+        &ctx.headers,
+        ctx.orig_dst,
+    );
     let upstream_target = selection.target;
     let upstream_balancer = selection.balancer;
 
