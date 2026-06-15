@@ -244,6 +244,7 @@ async fn mesh_peer_auth_live_reload_tcp_tls_swap_takes_effect_on_next_accept() {
         pool_http2_max_frame_size: None,
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
+        h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
         upstream_id: None,
         upstream_subset: None,

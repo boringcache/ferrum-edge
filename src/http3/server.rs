@@ -1831,6 +1831,17 @@ async fn handle_h3_request(
     let needs_response_buffering = has_retry || !should_stream_response;
 
     // --- Upstream target selection and circuit breaker ---
+    // NOTE (pre-existing, moot for mesh): this standalone H3 frontend selects
+    // upstream targets but does NOT run the per-target effective-proxy override
+    // pipeline (`resolve_effective_proxy_for_target` / `cap_proxy_retry_for_target`)
+    // that the H1/H2 dispatch path uses, so NONE of the DR per-port
+    // effective-proxy overrides (h2UpgradePolicy / maxRetries plus the
+    // pre-existing idleTimeout / http2MaxRequests / connectTimeout /
+    // maxConnections / tcpKeepalive / per-port LB+outlier) are applied here.
+    // This is moot for mesh: mesh capture is TCP-only (SO_ORIGINAL_DST/REDIRECT;
+    // UDP/H3 are out of mesh scope) and these are DestinationRule-derived
+    // (mesh-only). A uniform H3-override pass is a tracked follow-up — see
+    // `docs/mesh.md` "Dispatch-path coverage".
     let selection = crate::proxy::backend_dispatch::select_upstream_target(
         &proxy,
         &state,

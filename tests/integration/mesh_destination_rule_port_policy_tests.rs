@@ -423,6 +423,11 @@ fn destination_rule_top_level_connection_pool_http_fans_out_to_target_ports() {
                         max_requests_per_connection: Some(75),
                         idle_timeout_ms: Some(45_000),
                         http2_max_requests: Some(250),
+                        // F5.1: the two newly-projected knobs also fan out.
+                        h2_upgrade_policy: Some(
+                            ferrum_edge::config::types::H2UpgradePolicy::DoNotUpgrade,
+                        ),
+                        max_retries: Some(2),
                     }),
                     ..MeshTrafficPolicy::default()
                 }),
@@ -443,6 +448,11 @@ fn destination_rule_top_level_connection_pool_http_fans_out_to_target_ports() {
     assert_eq!(port_override.http_max_requests_per_connection, Some(75));
     assert_eq!(port_override.http_idle_timeout_ms, Some(45_000));
     assert_eq!(port_override.h2_max_concurrent_streams, Some(250));
+    assert_eq!(
+        port_override.h2_upgrade_policy,
+        Some(ferrum_edge::config::types::H2UpgradePolicy::DoNotUpgrade)
+    );
+    assert_eq!(port_override.max_retries, Some(2));
 
     // Dispatch projection: the per-port overlay reaches every referencing
     // proxy via `resolve_dispatch_port_overrides`.
@@ -454,6 +464,11 @@ fn destination_rule_top_level_connection_pool_http_fans_out_to_target_ports() {
     assert_eq!(dispatch_override.http_max_requests_per_connection, Some(75));
     assert_eq!(dispatch_override.http_idle_timeout_ms, Some(45_000));
     assert_eq!(dispatch_override.h2_max_concurrent_streams, Some(250));
+    assert_eq!(
+        dispatch_override.h2_upgrade_policy,
+        Some(ferrum_edge::config::types::H2UpgradePolicy::DoNotUpgrade)
+    );
+    assert_eq!(dispatch_override.max_retries, Some(2));
 }
 
 #[test]
@@ -490,6 +505,8 @@ fn destination_rule_port_level_connection_pool_http_overrides_top_level_fan_out(
                         max_requests_per_connection: Some(75),
                         idle_timeout_ms: Some(45_000),
                         http2_max_requests: Some(250),
+                        h2_upgrade_policy: None,
+                        max_retries: None,
                     }),
                     ..MeshTrafficPolicy::default()
                 }),
@@ -529,6 +546,8 @@ fn destination_rule_connection_pool_http_only_per_port_no_fan_out() {
                 max_requests_per_connection: Some(10),
                 idle_timeout_ms: Some(30_000),
                 http2_max_requests: Some(20),
+                h2_upgrade_policy: None,
+                max_retries: None,
             }),
             ..MeshTrafficPolicy::default()
         },
@@ -563,6 +582,80 @@ fn destination_rule_connection_pool_http_only_per_port_no_fan_out() {
     // Phantom-port guard: 9090 isn't on any target, so it must NOT receive
     // the per-port overlay either (would be a phantom-port skip with warn).
     assert!(!prepared.upstreams[0].port_overrides.contains_key(&9090));
+}
+
+#[test]
+fn destination_rule_port_level_explicit_default_clears_inherited_h2_upgrade_policy() {
+    use ferrum_edge::config::types::H2UpgradePolicy;
+    use ferrum_edge::modes::mesh::config::MeshConnectionPoolHttp;
+
+    // codex round-1 Finding 3: a top-level `UPGRADE` fans out to every port,
+    // but an EXPLICIT port-level `DEFAULT` on 8080 must CLEAR the inherited
+    // `UPGRADE` for that port (operator explicitly chose probe-driven), not
+    // leave it inherited. `H2UpgradePolicy::Default` is carried (not collapsed
+    // to `None`) precisely so the apply layer can distinguish explicit-DEFAULT
+    // from absent.
+    let mut port_level_settings = HashMap::new();
+    port_level_settings.insert(
+        8080,
+        MeshTrafficPolicy {
+            connection_pool_http: Some(MeshConnectionPoolHttp {
+                // Explicit DEFAULT: clears the inherited top-level UPGRADE.
+                h2_upgrade_policy: Some(H2UpgradePolicy::Default),
+                ..MeshConnectionPoolHttp::default()
+            }),
+            ..MeshTrafficPolicy::default()
+        },
+    );
+    let mut config = GatewayConfig {
+        proxies: vec![proxy()],
+        upstreams: vec![upstream()],
+        mesh: Some(Box::new(MeshConfig {
+            destination_rules: vec![MeshDestinationRule {
+                name: "reviews-dr".to_string(),
+                namespace: "default".to_string(),
+                host: "reviews.default.svc.cluster.local".to_string(),
+                traffic_policy: Some(MeshTrafficPolicy {
+                    connection_pool_http: Some(MeshConnectionPoolHttp {
+                        // Top-level UPGRADE fans out to every port first.
+                        h2_upgrade_policy: Some(H2UpgradePolicy::Upgrade),
+                        ..MeshConnectionPoolHttp::default()
+                    }),
+                    ..MeshTrafficPolicy::default()
+                }),
+                port_level_settings,
+                subsets: Vec::new(),
+            }],
+            ..MeshConfig::default()
+        })),
+        ..GatewayConfig::default()
+    };
+    config.normalize_fields();
+
+    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh config");
+    let port_override = prepared.upstreams[0]
+        .port_overrides
+        .get(&8080)
+        .expect("per-port overlay present");
+    // Explicit port-level DEFAULT overwrote the inherited UPGRADE → Default
+    // (probe-driven), NOT Upgrade.
+    assert_eq!(
+        port_override.h2_upgrade_policy,
+        Some(H2UpgradePolicy::Default),
+        "explicit port-level DEFAULT must clear the inherited top-level UPGRADE"
+    );
+
+    // Dispatch projection carries the cleared value, so dispatch is
+    // probe-driven for that port (Default and None are identical at the fork).
+    let dispatch_override = prepared.proxies[0]
+        .dispatch_port_overrides
+        .as_ref()
+        .and_then(|overrides| overrides.get(&8080))
+        .expect("proxy dispatch port override projected");
+    assert_eq!(
+        dispatch_override.h2_upgrade_policy,
+        Some(H2UpgradePolicy::Default)
+    );
 }
 
 // `resolve_effective_proxy_for_target` is `pub(crate)`, so the per-field
