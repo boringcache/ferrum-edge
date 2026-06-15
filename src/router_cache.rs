@@ -1442,14 +1442,10 @@ impl RouterCache {
         if let Some(mesh) = config.mesh.as_deref() {
             let upstream_ids: std::collections::HashSet<&str> =
                 config.upstreams.iter().map(|u| u.id.as_str()).collect();
-            let local_cluster = mesh
-                .multi_cluster
-                .as_ref()
-                .and_then(|mc| mc.local_cluster.as_deref());
             for spec in crate::modes::mesh::mesh_outbound_tcp_bywl_upstreams(
                 &mesh.services,
                 &mesh.workloads,
-                local_cluster,
+                mesh.multi_cluster.as_ref(),
             ) {
                 let decision = if upstream_ids.contains(spec.upstream_id.as_str()) {
                     let relay_proxy =

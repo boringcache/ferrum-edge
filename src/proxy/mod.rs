@@ -4254,14 +4254,10 @@ impl ProxyState {
         // index/dispatch use, so probe and dispatch capability keys agree.
         // `mesh.mtls` (Sidecar) per-workload targets are skipped (no probe),
         // exactly like the VIP pass.
-        let local_cluster = mesh
-            .multi_cluster
-            .as_ref()
-            .and_then(|mc| mc.local_cluster.as_deref());
         for spec in crate::modes::mesh::mesh_outbound_tcp_bywl_upstreams(
             &mesh.services,
             &mesh.workloads,
-            local_cluster,
+            mesh.multi_cluster.as_ref(),
         ) {
             let Some(upstream) = upstream_map.get(spec.upstream_id.as_str()) else {
                 continue;

@@ -1577,20 +1577,41 @@ mod tests {
         }
     }
 
+    /// Local-cluster-relative `MultiClusterConfig` fixture: `local_cluster`
+    /// set, plus `west` declared as a remote cluster (so the provenance branch
+    /// has something to match when `local_cluster` is later cleared).
+    fn relative_to(local: &str) -> MultiClusterConfig {
+        MultiClusterConfig {
+            local_cluster: Some(local.to_string()),
+            remote_clusters: vec![RemoteCluster {
+                name: "west".to_string(),
+                trust_domain: td("west.local"),
+                network: None,
+                control_plane_url: None,
+                federation_endpoint: None,
+            }],
+            ..MultiClusterConfig::default()
+        }
+    }
+
     #[test]
     fn workload_is_remote_keys_on_cross_cluster_identity_not_locality() {
+        let east_local = relative_to("east");
         let mut local = workload("spiffe://cluster.local/ns/d/sa/a", "svc", "10.0.0.1", None);
         local.cluster = Some("east".to_string());
         // A workload whose cluster matches the local cluster is LOCAL.
-        assert!(!workload_is_remote(&local, Some("east")));
+        assert!(!workload_is_remote(&local, Some(&east_local)));
         // A workload whose cluster differs from the local cluster is REMOTE.
-        assert!(workload_is_remote(&local, Some("west")));
+        let mut from_west = local.clone();
+        from_west.cluster = Some("west".to_string());
+        assert!(workload_is_remote(&from_west, Some(&east_local)));
 
-        // No `cluster` on the workload → local regardless of local_cluster.
+        // No `cluster` on the workload → local regardless of config.
         let no_cluster = workload("spiffe://cluster.local/ns/d/sa/b", "svc", "10.0.0.2", None);
-        assert!(!workload_is_remote(&no_cluster, Some("east")));
-        // No configured local_cluster → nothing is classified remote (consistent
-        // with the egress local-only filter).
+        assert!(!workload_is_remote(&no_cluster, Some(&east_local)));
+
+        // No `MultiClusterConfig` at all → nothing is classified remote
+        // (single-cluster posture).
         assert!(!workload_is_remote(&local, None));
 
         // Regression guard for the codex finding: a LOCAL workload whose region
@@ -1603,8 +1624,52 @@ mod tests {
             "10.0.0.3",
             Some("remote-us/zone-a"),
         );
-        assert!(!workload_is_remote(&local_named_remote, Some("east")));
+        assert!(!workload_is_remote(&local_named_remote, Some(&east_local)));
         assert!(!workload_is_remote(&local_named_remote, None));
+    }
+
+    /// codex r2 finding #1: remote provenance must NOT require
+    /// `MultiClusterConfig.local_cluster`. When `local_cluster` is omitted, a
+    /// workload is remote iff its stamped cluster matches a configured remote
+    /// cluster — so remote-discovered endpoints are still classified remote and
+    /// the egress local-only filter / strict locality LB still fail over
+    /// local→remote correctly.
+    #[test]
+    fn workload_is_remote_provenance_without_local_cluster() {
+        // `local_cluster` UNSET, `west` declared remote.
+        let no_local = MultiClusterConfig {
+            local_cluster: None,
+            remote_clusters: vec![RemoteCluster {
+                name: "west".to_string(),
+                trust_domain: td("west.local"),
+                network: None,
+                control_plane_url: None,
+                federation_endpoint: None,
+            }],
+            ..MultiClusterConfig::default()
+        };
+
+        // A workload stamped with a configured remote cluster's name is REMOTE
+        // even though no `local_cluster` is set.
+        let mut from_west = workload("spiffe://cluster.local/ns/d/sa/a", "svc", "10.0.0.1", None);
+        from_west.cluster = Some("west".to_string());
+        assert!(
+            workload_is_remote(&from_west, Some(&no_local)),
+            "a workload from a configured remote cluster must be REMOTE even with local_cluster unset"
+        );
+
+        // A workload stamped with a cluster the config does NOT list as remote
+        // stays LOCAL (single-cluster / local-tagged posture).
+        let mut from_other = from_west.clone();
+        from_other.cluster = Some("east".to_string());
+        assert!(
+            !workload_is_remote(&from_other, Some(&no_local)),
+            "a cluster not declared remote stays LOCAL when local_cluster is unset"
+        );
+
+        // No `cluster` on the workload → still LOCAL.
+        let no_cluster = workload("spiffe://cluster.local/ns/d/sa/b", "svc", "10.0.0.2", None);
+        assert!(!workload_is_remote(&no_cluster, Some(&no_local)));
     }
 
     fn service(name: &str, refs: &[&str]) -> MeshService {

@@ -941,19 +941,26 @@ fn project_mesh_source_locality(
     runtime: &MeshRuntimeConfig,
     mesh_slice: &MeshSlice,
 ) {
-    // When a projection actually changes an upstream we must advance its
-    // `updated_at` so `ConfigDelta` (which detects upstream changes by
-    // `id` + `updated_at`) rebuilds the LB cache. We bump to a FRESH wall-clock
-    // timestamp (the same convention the mesh materializers use, `now`), NOT to
-    // `config.loaded_at`: `loaded_at` is derived from `slice.version` and is
-    // therefore STABLE across re-applies of the same slice version. A remote
-    // scale-up/down re-applies the same slice version but with a different
-    // merged target set; clobbering `updated_at` to the stable `loaded_at` could
-    // leave it equal to the previously-applied upstream's `updated_at`, so the
-    // delta would miss the change and the mesh-only path (which reuses the LB
-    // cache) would keep serving the STALE target set. A fresh timestamp can
-    // never collide with a prior apply. Unchanged upstreams are left untouched
-    // (their materializer timestamp is preserved) so this is not per-apply churn.
+    // When a projection actually changes an upstream's locality content we
+    // advance its `updated_at` so `ConfigDelta` (which detects upstream changes
+    // by `id` + `updated_at`) rebuilds the LB cache. We bump to a FRESH
+    // wall-clock timestamp (the same convention the mesh materializers use,
+    // `now`), NOT to `config.loaded_at`: `loaded_at` is derived from
+    // `slice.version` and is therefore STABLE across re-applies of the same
+    // slice version, so clobbering `updated_at` to it could collide with the
+    // previously-applied upstream's `updated_at` and hide a real same-version
+    // change. A fresh timestamp can never collide.
+    //
+    // NOTE on per-apply churn: this projection runs DURING preparation, where
+    // every upstream was just freshly materialized and therefore ALWAYS enters
+    // with `source_locality = None` — so on a re-apply with a resolved source
+    // locality this branch re-stamps `updated_at` on EVERY upstream, not only
+    // genuinely changed ones. Preventing that churn is NOT this function's job:
+    // the slice-apply boundary runs `reconcile_mesh_upstream_timestamps` against
+    // the previously-accepted config AFTER preparation, which restores the prior
+    // timestamp for any upstream whose FINAL (post-projection) content is
+    // unchanged. So a fresh bump here is safe: it is the correct timestamp for a
+    // genuinely changed upstream and is reconciled away for an unchanged one.
     let bump = chrono::Utc::now();
 
     // Stamp the operator's strict local-first locality preference onto every
@@ -1024,6 +1031,88 @@ fn mesh_source_workload_locality(mesh_slice: &MeshSlice) -> Option<&str> {
         }
     }
     matched_locality
+}
+
+/// Preserve materialized-mesh upstream timestamps across re-applies of the same
+/// content.
+///
+/// Mesh upstreams are FRESHLY MATERIALIZED on every slice apply: the
+/// materializers (`materialize_mesh_outbound_proxies`, the east-west / egress /
+/// inbound builders) each stamp `created_at`/`updated_at` with a per-apply
+/// `chrono::Utc::now()`, and `project_mesh_source_locality` then bumps
+/// `updated_at` again whenever it stamps `source_locality`/`locality_lb_strict`
+/// onto an upstream that entered the projection with `source_locality = None`
+/// (which a freshly materialized upstream ALWAYS does). `ConfigDelta` keys
+/// upstream identity on `id` and detects modification by `updated_at != old`
+/// (`src/config_delta.rs`), so without reconciliation EVERY mesh upstream would
+/// look "modified" on EVERY apply — and a "modified" upstream rebuilds a fresh
+/// `LoadBalancer` (`LoadBalancerCache::build_delta_inner`), discarding its
+/// round-robin counters, latency EWMAs, hash rings, and passive-health state.
+/// That means an unrelated mesh-only update (a federation/trust-bundle overlay
+/// refresh, or a remote-cluster scale event for a DIFFERENT service) would reset
+/// LB + health for every materialized upstream.
+///
+/// This step runs at the slice-apply boundary — the only place that has the
+/// PREVIOUSLY-ACCEPTED config — and copies the previous upstream's
+/// `created_at`/`updated_at` onto a candidate upstream whose CONTENT is identical
+/// (every field except the two timestamps; see [`upstream_content_eq`]). A
+/// candidate whose content genuinely changed (target set, locality, strict flag,
+/// DR-projected overrides, …) keeps its fresh timestamp, so a real change still
+/// rebuilds exactly that one LB. New upstream ids (not present in the previous
+/// config) are left untouched — `ConfigDelta` classifies them as ADDED, which
+/// builds a fresh LB regardless of timestamp. This makes a no-op re-apply produce
+/// an EMPTY upstream delta and preserves per-upstream LB/health state.
+fn reconcile_mesh_upstream_timestamps(candidate: &mut GatewayConfig, previous: &GatewayConfig) {
+    if candidate.upstreams.is_empty() || previous.upstreams.is_empty() {
+        return;
+    }
+    let previous_by_id: HashMap<&str, &Upstream> = previous
+        .upstreams
+        .iter()
+        .map(|upstream| (upstream.id.as_str(), upstream))
+        .collect();
+    for upstream in &mut candidate.upstreams {
+        if let Some(old) = previous_by_id.get(upstream.id.as_str())
+            && upstream_content_eq(upstream, old)
+        {
+            // Content-identical to the last accepted projection: preserve the
+            // prior timestamps so `ConfigDelta` sees no change and the LB +
+            // passive-health state for this upstream is reused as-is.
+            upstream.created_at = old.created_at;
+            upstream.updated_at = old.updated_at;
+        }
+    }
+}
+
+/// Whether two upstreams are identical in everything EXCEPT their
+/// `created_at`/`updated_at` timestamps.
+///
+/// Compares by serializing both sides with the timestamps normalized to a single
+/// value, so the comparison is automatically complete over the whole `Upstream`
+/// schema (it picks up future fields with no code change) and ignores the
+/// `#[serde(skip)]` `resolved_subset_tls` derived overlay — which is safe because
+/// that overlay is a pure function of `subsets[].traffic_policy.tls`, so two
+/// upstreams with equal serialized content always resolve it identically. This is
+/// a cold-path comparison (slice apply only), so correctness/robustness wins over
+/// avoiding the clone.
+fn upstream_content_eq(a: &Upstream, b: &Upstream) -> bool {
+    fn content_value(upstream: &Upstream) -> serde_json::Value {
+        let mut normalized = upstream.clone();
+        // Neutralize both timestamps so only the remaining fields drive equality.
+        let epoch =
+            chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap_or_else(chrono::Utc::now);
+        normalized.created_at = epoch;
+        normalized.updated_at = epoch;
+        serde_json::to_value(&normalized).unwrap_or(serde_json::Value::Null)
+    }
+    let a_value = content_value(a);
+    // A serialization failure yields `Null`; never treat two failed (`Null`)
+    // serializations as "equal" (that would silently preserve a stale timestamp
+    // and hide a real change), so bail to "changed" when either side is `Null`.
+    if a_value.is_null() {
+        return false;
+    }
+    a_value == content_value(b)
 }
 
 fn gateway_config_from_mesh_slice(
@@ -1310,10 +1399,7 @@ fn build_east_west_service_proxies_and_upstreams(
         let targets = build_east_west_service_targets(
             service,
             &mesh_slice.workloads,
-            mesh_slice
-                .multi_cluster
-                .as_ref()
-                .and_then(|multi_cluster| multi_cluster.local_cluster.as_deref()),
+            mesh_slice.multi_cluster.as_ref(),
         );
         if targets.is_empty() {
             debug!(
@@ -1385,7 +1471,7 @@ fn build_east_west_service_proxies_and_upstreams(
 fn matched_local_service_workloads<'a>(
     service: &crate::modes::mesh::config::MeshService,
     workloads: &'a [crate::modes::mesh::config::Workload],
-    local_cluster: Option<&str>,
+    multi_cluster: Option<&crate::modes::mesh::config::MultiClusterConfig>,
 ) -> Vec<&'a crate::modes::mesh::config::Workload> {
     let mut matched = Vec::new();
     let mut used_workload_indices = std::collections::HashSet::new();
@@ -1409,7 +1495,10 @@ fn matched_local_service_workloads<'a>(
         used_workload_indices.insert(workload_index);
         // Shared remote-provenance predicate (single source of truth with the
         // SD materialization path) so "remote" never means two different things.
-        if crate::modes::mesh::multicluster::workload_is_remote(workload, local_cluster) {
+        // Provenance-based and does NOT require `MultiClusterConfig.local_cluster`:
+        // with `local_cluster` omitted, a workload is remote iff its stamped
+        // cluster matches a configured remote cluster.
+        if crate::modes::mesh::multicluster::workload_is_remote(workload, multi_cluster) {
             continue;
         }
         matched.push(workload);
@@ -1426,10 +1515,10 @@ fn matched_local_service_workloads<'a>(
 fn build_east_west_service_targets(
     service: &crate::modes::mesh::config::MeshService,
     workloads: &[crate::modes::mesh::config::Workload],
-    local_cluster: Option<&str>,
+    multi_cluster: Option<&crate::modes::mesh::config::MultiClusterConfig>,
 ) -> Vec<UpstreamTarget> {
     let mut targets = Vec::new();
-    for workload in matched_local_service_workloads(service, workloads, local_cluster) {
+    for workload in matched_local_service_workloads(service, workloads, multi_cluster) {
         // Backend (container) port for this workload address: honor the first
         // service port's `targetPort` (Kubernetes' authoritative
         // service-port→container-port binding). A DECLARED targetPort is
@@ -2008,7 +2097,7 @@ impl MeshTcpBywlUpstreamSpec<'_> {
 pub(crate) fn mesh_outbound_tcp_bywl_upstreams<'a>(
     services: &'a [crate::modes::mesh::config::MeshService],
     workloads: &'a [crate::modes::mesh::config::Workload],
-    local_cluster: Option<&str>,
+    multi_cluster: Option<&crate::modes::mesh::config::MultiClusterConfig>,
 ) -> Vec<MeshTcpBywlUpstreamSpec<'a>> {
     let mut specs = Vec::new();
     for service in services {
@@ -2027,7 +2116,7 @@ pub(crate) fn mesh_outbound_tcp_bywl_upstreams<'a>(
             // upstream per `(IP, port)`.
             let mut seen: std::collections::HashSet<(std::net::IpAddr, u16)> =
                 std::collections::HashSet::new();
-            for workload in matched_local_service_workloads(service, workloads, local_cluster) {
+            for workload in matched_local_service_workloads(service, workloads, multi_cluster) {
                 // Same app-port resolution as `build_outbound_mesh_targets`:
                 // a DECLARED targetPort is authoritative (resolve or SKIP);
                 // only an ABSENT one falls back to the service port.
@@ -2770,12 +2859,11 @@ fn materialize_mesh_outbound_proxies(
     let now = chrono::Utc::now();
     // Exclude remote-cluster endpoints: direct outbound HBONE targets a
     // destination service's LOCAL-cluster pods (remote clusters are reached via
-    // the east-west gateway, not a per-pod HBONE tunnel). Local workloads are
-    // `None` or `Some(local_cluster)`; remote ones carry a different cluster.
-    let local_cluster = mesh_slice
-        .multi_cluster
-        .as_ref()
-        .and_then(|mc| mc.local_cluster.as_deref());
+    // the east-west gateway, not a per-pod HBONE tunnel). Classification is by
+    // discovery provenance (`workload_is_remote`): a local workload is `None`,
+    // `Some(local_cluster)`, or a cluster the config does not list as remote;
+    // a remote one carries a configured remote cluster's name.
+    let multi_cluster = mesh_slice.multi_cluster.as_ref();
     let mut materialized = 0usize;
     for service in &mesh_slice.services {
         // HTTP-family routability is read from the SERVICE port protocol
@@ -2814,7 +2902,7 @@ fn materialize_mesh_outbound_proxies(
                 service_port,
                 protocol,
                 &mesh_slice.workloads,
-                local_cluster,
+                multi_cluster,
                 multi_port_service,
             );
             if targets.is_empty() {
@@ -2957,10 +3045,7 @@ fn materialize_mesh_outbound_tcp_upstreams(
         MeshTopology::Sidecar => MeshEgressTransport::SidecarMtls,
         _ => return,
     };
-    let local_cluster = mesh_slice
-        .multi_cluster
-        .as_ref()
-        .and_then(|mc| mc.local_cluster.as_deref());
+    let multi_cluster = mesh_slice.multi_cluster.as_ref();
     let now = chrono::Utc::now();
     let mut materialized = 0usize;
     for service in &mesh_slice.services {
@@ -2994,7 +3079,7 @@ fn materialize_mesh_outbound_tcp_upstreams(
                 service_port,
                 protocol,
                 &mesh_slice.workloads,
-                local_cluster,
+                multi_cluster,
                 false,
             );
             if targets.is_empty() {
@@ -3044,7 +3129,7 @@ fn materialize_mesh_outbound_tcp_upstreams(
     // (`mesh_tcp_egress_by_workload`) and the accept-loop fallback enforce it.
     let mut bywl_materialized = 0usize;
     for spec in
-        mesh_outbound_tcp_bywl_upstreams(&mesh_slice.services, &mesh_slice.workloads, local_cluster)
+        mesh_outbound_tcp_bywl_upstreams(&mesh_slice.services, &mesh_slice.workloads, multi_cluster)
     {
         // One tagged target dialing the resolved container port, identity-pinned
         // to this workload — built with the SAME transport tag builders the VIP
@@ -3279,11 +3364,11 @@ fn build_outbound_mesh_targets(
     service_port: &crate::modes::mesh::config::ServicePort,
     protocol: AppProtocol,
     workloads: &[crate::modes::mesh::config::Workload],
-    local_cluster: Option<&str>,
+    multi_cluster: Option<&crate::modes::mesh::config::MultiClusterConfig>,
     multi_port_service: bool,
 ) -> Vec<UpstreamTarget> {
     let mut targets = Vec::new();
-    for workload in matched_local_service_workloads(service, workloads, local_cluster) {
+    for workload in matched_local_service_workloads(service, workloads, multi_cluster) {
         // App (container) port the request is for. A DECLARED `targetPort` is
         // authoritative: resolve it, or SKIP this target (fail closed) rather
         // than fall back to the service port — an unresolved named targetPort
@@ -3582,10 +3667,7 @@ fn apply_destination_rules(
     // exactly its own port's policy.
     // The raw-TCP per-port upstreams (`__mesh-out-tcp-upstream-*`) join the
     // same map: identical owner-port semantics, distinct id space.
-    let local_cluster = mesh_slice
-        .multi_cluster
-        .as_ref()
-        .and_then(|mc| mc.local_cluster.as_deref());
+    let multi_cluster = mesh_slice.multi_cluster.as_ref();
     let mut outbound_upstream_owner_port: std::collections::HashMap<String, u16> = mesh_slice
         .services
         .iter()
@@ -3612,7 +3694,7 @@ fn apply_destination_rules(
     // `portLevelSettings` entry authored on that port fans onto them exactly like
     // the VIP per-port upstreams (same forward-derivation source).
     for spec in
-        mesh_outbound_tcp_bywl_upstreams(&mesh_slice.services, &mesh_slice.workloads, local_cluster)
+        mesh_outbound_tcp_bywl_upstreams(&mesh_slice.services, &mesh_slice.workloads, multi_cluster)
     {
         outbound_upstream_owner_port.insert(spec.upstream_id, spec.service_port.port);
     }
@@ -8895,9 +8977,24 @@ async fn apply_mesh_slice_generation(
         Some(federation_snapshot),
         Some(remote_snapshot),
     ) {
-        Ok(config) => {
-            let previous_loaded_at = proxy_state.config.load_full().loaded_at;
+        Ok(mut config) => {
+            let previous_config = proxy_state.config.load_full();
+            let previous_loaded_at = previous_config.loaded_at;
             let candidate_loaded_at = config.loaded_at;
+            // Materialized mesh upstreams are rebuilt with fresh per-apply
+            // timestamps every slice apply (the materializers stamp `Utc::now()`
+            // and `project_mesh_source_locality` re-bumps when it stamps the
+            // source locality onto the freshly materialized `source_locality =
+            // None`). Reconcile each candidate upstream's timestamps against the
+            // previously-accepted config so an upstream whose CONTENT is unchanged
+            // keeps its prior `updated_at`: otherwise `ConfigDelta` would flag
+            // every mesh upstream as modified on every apply and rebuild its
+            // `LoadBalancer` — resetting round-robin/EWMA/hash-ring/passive-health
+            // state on unrelated mesh-only updates (federation/trust overlays, a
+            // different service's remote scale event). A genuinely changed
+            // upstream keeps its fresh timestamp and still rebuilds exactly that
+            // one LB. Must run BEFORE `update_config` computes the delta.
+            reconcile_mesh_upstream_timestamps(&mut config, &previous_config);
             // GAP-2M.4: build node-waypoint per-pod policy scopes before
             // config apply, but publish them only after update_config accepts
             // the candidate. Pre-swapping scopes can pair old policies with a
@@ -16101,6 +16198,155 @@ mod tests {
         assert_ne!(
             config.upstreams[0].updated_at, loaded_at,
             "updated_at must NOT be clobbered to the stable loaded_at (same-slice-version re-applies would hide the change from ConfigDelta)"
+        );
+    }
+
+    /// Build a minimal mesh-style upstream with one target on `port`, stamped
+    /// with `now` as both timestamps (mirrors the materializers).
+    fn reconcile_test_upstream(
+        id: &str,
+        port: u16,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Upstream {
+        Upstream {
+            id: id.to_string(),
+            namespace: "default".to_string(),
+            name: Some(id.to_string()),
+            targets: vec![UpstreamTarget {
+                host: "10.0.0.5".to_string(),
+                port,
+                weight: 1,
+                tags: HashMap::new(),
+                locality: Some("us-east/us-east-1/b".to_string()),
+                path: None,
+            }],
+            algorithm: LoadBalancerAlgorithm::RoundRobin,
+            hash_on: None,
+            hash_on_cookie_config: None,
+            health_checks: None,
+            service_discovery: None,
+            subsets: None,
+            port_overrides: HashMap::new(),
+            source_locality: None,
+            locality_lb_strict: false,
+            locality_lb_setting: None,
+            backend_tls_client_cert_path: None,
+            backend_tls_client_key_path: None,
+            backend_tls_verify_server_cert: true,
+            backend_tls_server_ca_cert_path: None,
+            backend_tls_sni: None,
+            backend_tls_san_allow_list: Vec::new(),
+            resolved_subset_tls: HashMap::new(),
+            api_spec_id: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// An UNCHANGED mesh re-apply must produce no upstream delta even though the
+    /// upstream is freshly materialized (fresh `now` timestamp) and re-projected
+    /// from `source_locality = None`: `reconcile_mesh_upstream_timestamps`
+    /// restores the prior timestamp for content-identical upstreams so
+    /// `ConfigDelta` sees no change and the LB / passive-health state is reused.
+    #[test]
+    fn reconcile_mesh_upstream_timestamps_no_op_reapply_yields_empty_delta() {
+        let source = {
+            let mut w = workload("api", "api");
+            w.addresses = vec!["10.0.0.9".to_string()];
+            w.locality = Some("us-east/us-east-1/a".to_string());
+            w
+        };
+        let mesh_slice = MeshSlice {
+            namespace: "default".to_string(),
+            workload_spiffe_id: Some(source.spiffe_id.as_str().to_string()),
+            workloads: vec![source],
+            ..MeshSlice::default()
+        };
+        let runtime = test_mesh_runtime_config();
+
+        // First apply: materialize (fresh now) + project source locality.
+        let first_now = chrono::Utc::now();
+        let mut accepted = GatewayConfig::default();
+        accepted
+            .upstreams
+            .push(reconcile_test_upstream("reviews", 8080, first_now));
+        project_mesh_source_locality(&mut accepted, &runtime, &mesh_slice);
+        // The projection stamped the source locality; no previous config to
+        // reconcile against on the first apply, so this becomes the baseline.
+        assert_eq!(
+            accepted.upstreams[0].source_locality.as_deref(),
+            Some("us-east/us-east-1/a")
+        );
+
+        // Second apply: a DIFFERENT fresh `now` (later wall clock), same content.
+        let second_now = first_now + chrono::Duration::seconds(5);
+        let mut candidate = GatewayConfig::default();
+        candidate
+            .upstreams
+            .push(reconcile_test_upstream("reviews", 8080, second_now));
+        project_mesh_source_locality(&mut candidate, &runtime, &mesh_slice);
+        // Pre-reconcile, the projection re-bumped `updated_at` (freshly
+        // materialized → entered with `source_locality = None`), so the raw
+        // candidate disagrees with the accepted config's timestamp.
+        assert_ne!(
+            candidate.upstreams[0].updated_at, accepted.upstreams[0].updated_at,
+            "freshly materialized + re-projected upstream must carry a fresh timestamp before reconcile"
+        );
+
+        reconcile_mesh_upstream_timestamps(&mut candidate, &accepted);
+
+        // After reconcile the content-identical upstream regained the prior
+        // timestamp, so `ConfigDelta` reports no modification.
+        assert_eq!(
+            candidate.upstreams[0].updated_at, accepted.upstreams[0].updated_at,
+            "reconcile must restore the prior timestamp for an unchanged upstream"
+        );
+        let delta = crate::config_delta::ConfigDelta::compute(&accepted, &candidate);
+        assert!(
+            delta.modified_upstreams.is_empty()
+                && delta.added_upstreams.is_empty()
+                && delta.removed_upstream_ids.is_empty(),
+            "an unchanged mesh re-apply must yield an empty upstream delta, got {} modified / {} added / {} removed",
+            delta.modified_upstreams.len(),
+            delta.added_upstreams.len(),
+            delta.removed_upstream_ids.len(),
+        );
+    }
+
+    /// A genuine upstream content change (here: a target port) across a re-apply
+    /// must NOT be reconciled away — `ConfigDelta` must still report it modified
+    /// so its LoadBalancer is rebuilt.
+    #[test]
+    fn reconcile_mesh_upstream_timestamps_real_change_keeps_modified_delta() {
+        let first_now = chrono::Utc::now();
+        let mut accepted = GatewayConfig::default();
+        accepted
+            .upstreams
+            .push(reconcile_test_upstream("reviews", 8080, first_now));
+
+        // Re-apply with a CHANGED target port and a fresh timestamp.
+        let second_now = first_now + chrono::Duration::seconds(5);
+        let mut candidate = GatewayConfig::default();
+        candidate
+            .upstreams
+            .push(reconcile_test_upstream("reviews", 9090, second_now));
+
+        reconcile_mesh_upstream_timestamps(&mut candidate, &accepted);
+
+        // Content differs, so the fresh timestamp is preserved (NOT reconciled).
+        assert_ne!(
+            candidate.upstreams[0].updated_at, accepted.upstreams[0].updated_at,
+            "a genuinely changed upstream must keep its fresh timestamp"
+        );
+        let delta = crate::config_delta::ConfigDelta::compute(&accepted, &candidate);
+        assert_eq!(
+            delta
+                .modified_upstreams
+                .iter()
+                .map(|u| u.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["reviews"],
+            "a real upstream change must be reported modified so its LB rebuilds"
         );
     }
 

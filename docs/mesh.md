@@ -1054,6 +1054,7 @@ multi_cluster:
 
 - `federation_endpoint` feeds the [trust-bundle federation poller](#trust-federation) (cross-cluster mTLS verification material).
 - `control_plane_url` feeds **cross-cluster endpoint discovery** (below).
+- `local_cluster` is **optional**. Remote-cluster provenance — the marker that makes [strict locality LB](#locality-aware-load-balancing) and the egress local-only filter treat an endpoint as remote — is keyed on the workload's cross-cluster identity: a discovered endpoint carries a configured `remote_clusters[].name`, so it is classified remote whether or not `local_cluster` is set. Set `local_cluster` only when you also want a *locally* declared workload that carries an explicit `cluster` tag distinguished from your remote clusters.
 
 ### Cross-Cluster Endpoint Discovery
 
