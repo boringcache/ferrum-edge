@@ -1448,103 +1448,6 @@ pub enum GrpcResponseKind {
     Streaming(GrpcStreamingResponse),
 }
 
-/// Proxy a gRPC request to the backend using hyper's HTTP/2 client.
-///
-/// Collects the incoming request body, then delegates to the core send logic.
-/// Returns the collected request body bytes alongside the result so the caller
-/// can replay them on retry.
-///
-/// When `stream_response` is true, the response body is NOT buffered — it is
-/// returned as a live `Incoming` stream so frames flow frame-by-frame to the
-/// downstream client. This is only safe when retries are NOT configured (the
-/// body has already been consumed by the time we know if a retry is needed).
-#[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
-pub async fn proxy_grpc_request(
-    req: Request<Incoming>,
-    proxy: &Proxy,
-    backend_url: &str,
-    grpc_pool: &GrpcConnectionPool,
-    dns_cache: &DnsCache,
-    proxy_headers: &HashMap<String, String>,
-    stream_response: bool,
-    max_grpc_recv_size_bytes: usize,
-    max_response_body_size_bytes: usize,
-) -> (Result<GrpcResponseKind, GrpcProxyError>, Bytes) {
-    // Collect the incoming body for potential retry replay
-    let (parts, body) = req.into_parts();
-    let body_bytes = if max_grpc_recv_size_bytes > 0 {
-        // Use http_body_util::Limited to enforce max gRPC recv size during body collection
-        let limited = http_body_util::Limited::new(body, max_grpc_recv_size_bytes);
-        match BodyExt::collect(limited).await {
-            Ok(collected) => collected.to_bytes(),
-            Err(e) => {
-                if is_length_limit_error(e.as_ref()) {
-                    return (
-                        Err(GrpcProxyError::ResourceExhausted(format!(
-                            "gRPC request payload size exceeds maximum of {} bytes",
-                            max_grpc_recv_size_bytes
-                        ))),
-                        Bytes::new(),
-                    );
-                }
-                return (
-                    Err(GrpcProxyError::Internal(format!(
-                        "Failed to read request body: {}",
-                        e
-                    ))),
-                    Bytes::new(),
-                );
-            }
-        }
-    } else {
-        match BodyExt::collect(body).await {
-            Ok(collected) => collected.to_bytes(),
-            Err(e) => {
-                return (
-                    Err(GrpcProxyError::Internal(format!(
-                        "Failed to read request body: {}",
-                        e
-                    ))),
-                    Bytes::new(),
-                );
-            }
-        }
-    };
-
-    // Request body has been collected into `body_bytes` above. Preserve it
-    // for the retry loop regardless of whether the response is streamed —
-    // retries fire on connection errors BEFORE any response is received, so
-    // response-body streaming does not prevent retry, and the request body
-    // is what we need to replay on a fresh attempt.
-    //
-    // Previously this code returned `Bytes::new()` on the streaming path,
-    // which bundled two orthogonal concerns (request replay vs response
-    // streaming) and forced the caller to buffer the response whenever
-    // retry was enabled. That in turn held gRPC trailers behind the last
-    // data frame on buffered-response paths, inflating server-streaming
-    // RPC p99 latency (500 KB p50 = 9 ms, p99 = 732 ms under 100 conc).
-    // Move method+headers into the core call instead of cloning. `parts` is
-    // not used after this await, so the deep HeaderMap clone (O(header count))
-    // and the Method clone are pure waste. `body_bytes.clone()` is just an Arc
-    // refcount bump (Bytes is shared) and is necessary because we still need
-    // to return the original body for retry replay.
-    let result = proxy_grpc_request_core(
-        parts.method,
-        parts.headers,
-        body_bytes.clone(),
-        proxy,
-        backend_url,
-        grpc_pool,
-        dns_cache,
-        proxy_headers,
-        stream_response,
-        max_response_body_size_bytes,
-    )
-    .await;
-    (result, body_bytes)
-}
-
 /// Proxy a gRPC request using pre-collected body bytes.
 ///
 /// Used for retry attempts where the request body has already been buffered,
@@ -2294,11 +2197,6 @@ mod tests {
     //! * Fix 3: the buffered-response `Vec<u8>` starting capacity moved
     //!   from `unwrap_or(256)` to a 16 KiB default so that large responses
     //!   with no `content-length` stop hitting ~14 reallocations.
-    //! * Fix 4: the streaming-response decision in `proxy_grpc_request` no
-    //!   longer conflates "retry preserves request body" with "retry
-    //!   prevents response streaming". The `proxy_grpc_request` wrapper
-    //!   unconditionally returns collected `body_bytes` so the outer
-    //!   retry loop in `mod.rs` has them.
 
     // -----------------------------------------------------------------------
     // GRPC_POOL_KEY_BUF thread-local helper tests
@@ -2741,68 +2639,6 @@ mod tests {
         );
     }
 
-    /// Fix 4: `proxy_grpc_request` must ALWAYS return the collected
-    /// `body_bytes` on the SUCCESS path — even when `stream_response=true`
-    /// — so the outer retry loop can replay the request body. The old
-    /// code had `if stream_response { (result, Bytes::new()) } else
-    /// { (result, body_bytes) }` which forced the caller to disable
-    /// streaming whenever retry was configured.
-    ///
-    /// The error paths (body collection failure, length limit exceeded)
-    /// legitimately return `Bytes::new()` because no body was collected.
-    /// Those return sites are INSIDE `Err(...)` match arms — fine.
-    ///
-    /// The regression we guard against is the OLD `if stream_response`
-    /// branching on the success path. We look for any `if stream_response`
-    /// in the function body (outside error handling) — Fix 4 eliminated
-    /// that branch entirely.
-    #[test]
-    fn proxy_grpc_request_always_preserves_body_bytes_for_retry() {
-        let src = include_str!("grpc_proxy.rs");
-        let fn_start = src
-            .find("pub async fn proxy_grpc_request(")
-            .expect("proxy_grpc_request signature not found");
-        let tail = &src[fn_start..];
-        let fn_end = tail
-            .find("\n}\n")
-            .expect("failed to locate end of proxy_grpc_request body");
-        let body = &tail[..fn_end];
-
-        // Flag the OLD return-splitting pattern:
-        //   if stream_response {
-        //       ...
-        //       (result, Bytes::new())
-        //   } else {
-        //       ...
-        //       (result, body_bytes)
-        //   }
-        // In the fixed version, there is a single return of
-        // `(result, body_bytes)` and no `if stream_response` branch
-        // inside `proxy_grpc_request` itself. The `stream_response`
-        // parameter is still passed THROUGH to `proxy_grpc_request_core`
-        // (one line with `stream_response,` as an argument) but must
-        // not appear as a top-level `if stream_response {` branch.
-        for (i, line) in body.lines().enumerate() {
-            let trimmed = line.trim_start();
-            if trimmed.starts_with("//") || trimmed.starts_with("///") {
-                continue;
-            }
-            // Match the OLD pattern specifically — the FIXED code passes
-            // `stream_response,` as an argument to the core helper,
-            // which is permitted. Only a conditional branch on it is
-            // the regression.
-            assert!(
-                !trimmed.starts_with("if stream_response"),
-                "regression at line {} of proxy_grpc_request: found \
-                 `if stream_response` branch. Fix 4 removed this split \
-                 so retry replay always has access to the collected \
-                 request body. Offending line:\n  {}",
-                i + 1,
-                line
-            );
-        }
-    }
-
     /// F11: the buffered gRPC path must apply a CLIENT-SUPPLIED `grpc-timeout`
     /// as ONE end-to-end budget (a single shared `timeout_at` deadline spanning
     /// the header wait + body collection), while the OPERATOR
@@ -2810,8 +2646,7 @@ mod tests {
     /// `tokio::time::timeout` in each phase.
     ///
     /// Guarded structurally because the unit harness has no mock H2 backend to
-    /// drive paused-clock timing (mirrors the source-introspection precedent in
-    /// `proxy_grpc_request_always_preserves_body_bytes_for_retry`).
+    /// drive paused-clock timing.
     #[test]
     fn proxy_grpc_request_core_shares_one_client_deadline_but_per_phase_fallback() {
         let src = include_str!("grpc_proxy.rs");

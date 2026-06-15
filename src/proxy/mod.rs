@@ -12044,8 +12044,8 @@ async fn handle_proxy_request_inner(
         //     retry, so retry alone is NOT a reason to buffer.
         //   * The REQUEST body still has to be collected up-front when
         //     retry is configured (caller side), so the retry loop can
-        //     replay it. `proxy_grpc_request` preserves the collected
-        //     request bytes regardless of the `stream_response` flag.
+        //     replay the collected request bytes regardless of the
+        //     `stream_response` flag.
         //   * Streaming IS unsafe when a plugin (or explicit
         //     `response_body_mode = Buffer`) requires the full response
         //     body in memory to make an admission decision.
@@ -12071,9 +12071,9 @@ async fn handle_proxy_request_inner(
         // `proxy_grpc_request_streaming` streams BOTH the request AND the
         // response, which means the request body is consumed on the wire
         // and cannot be replayed — incompatible with retry. Gate it on
-        // `!grpc_has_retry` so retry-enabled streaming proxies still flow
-        // via `proxy_grpc_request` (collects request body up-front,
-        // streams response frame-by-frame).
+        // `!grpc_has_retry` so retry-enabled streaming proxies still use the
+        // buffered-request path (collects request body up-front, streams
+        // response frame-by-frame).
         let grpc_can_use_streaming_fast_path = grpc_should_stream && !grpc_has_retry;
         // Deferred circuit-breaker probe recorder for the fully-streaming fast
         // path. Set only when that path is taken AND the request was admitted as
@@ -12183,8 +12183,7 @@ async fn handle_proxy_request_inner(
             // `Bytes::new()` here on the streaming branch silently fed the
             // retry loop an empty body whenever a body-hook proxy also had
             // `retry_on_connect_failure` enabled. Mirrors the same
-            // single-return contract documented in
-            // `proxy_grpc_request`.
+            // single-return contract used by the buffered-request gRPC path.
             backend_admission_permits = match backend_dispatch::run_backend_admission_plugins(
                 backend_admission_plugins.as_ref(),
                 &ctx,
