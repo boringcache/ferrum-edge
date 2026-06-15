@@ -4576,13 +4576,14 @@ mod tests {
         };
         let orig: std::net::SocketAddr = "10.0.0.2:8080".parse().unwrap();
         assert!(
-            lb.select_passthrough(orig, None, Some(&health)).is_none(),
+            lb.select_passthrough(orig, None, None, Some(&health))
+                .is_none(),
             "an ejected orig-dst target must not be passthrough-selected"
         );
         // A healthy orig-dst target on the same upstream still passes through.
         let healthy_orig: std::net::SocketAddr = "10.0.0.1:8080".parse().unwrap();
         let target = lb
-            .select_passthrough(healthy_orig, None, Some(&health))
+            .select_passthrough(healthy_orig, None, None, Some(&health))
             .expect("healthy orig-dst still passes through");
         assert_eq!(target.host, "10.0.0.1");
     }
