@@ -65,6 +65,15 @@ mod inner {
     const MONGO_ERR_INDEX_OPTIONS_CONFLICT: i32 = 85;
     const MONGO_ERR_INDEX_KEY_SPECS_CONFLICT: i32 = 86;
 
+    fn mongo_rfc3339_utc(ts: DateTime<Utc>) -> String {
+        let mut s = ts.to_rfc3339();
+        if s.ends_with("+00:00") {
+            s.truncate(s.len() - "+00:00".len());
+            s.push('Z');
+        }
+        s
+    }
+
     fn is_mongo_command_error_with_code(err: &mongodb::error::Error, code: i32) -> bool {
         matches!(
             err.kind.as_ref(),
@@ -1231,6 +1240,7 @@ mod inner {
     ) -> Result<Document, anyhow::Error> {
         let mut doc = mongodb::bson::to_document(event)?;
         doc.insert("_id", event.id.as_str());
+        doc.insert("diff", serde_json::to_string(&event.diff)?);
         doc.insert(
             "ts",
             Bson::DateTime(BsonDateTime::from_millis(event.ts.timestamp_millis())),
@@ -1253,7 +1263,20 @@ mod inner {
             }
             None => {}
         }
-        Ok(mongodb::bson::from_document(doc)?)
+        let diff = match doc.remove("diff") {
+            Some(Bson::String(diff_json)) => Some(serde_json::from_str(&diff_json)?),
+            Some(other) => {
+                doc.insert("diff", other);
+                None
+            }
+            None => None,
+        };
+
+        let mut event: crate::admin::audit::AuditEvent = mongodb::bson::from_document(doc)?;
+        if let Some(diff) = diff {
+            event.diff = diff;
+        }
+        Ok(event)
     }
 
     fn doc_to_api_spec(mut doc: Document) -> Result<ApiSpec, anyhow::Error> {
@@ -1495,10 +1518,10 @@ mod inner {
             let poll_timestamp = Utc::now();
 
             // Safety margin: 1 second before `since` to avoid missing boundary writes.
-            // The `updated_at` field is stored as an RFC 3339 string (chrono serde),
-            // which is lexicographically sortable, so $gte on strings works correctly.
+            // Resource `updated_at` values are stored as UTC RFC 3339 strings
+            // with a `Z` suffix, so use the same byte format for the watermark.
             let since_with_margin = since - chrono::Duration::seconds(1);
-            let since_str = since_with_margin.to_rfc3339();
+            let since_str = mongo_rfc3339_utc(since_with_margin);
             let filter = doc! { "namespace": namespace, "updated_at": { "$gte": &since_str } };
 
             // Load changed resources.
@@ -3538,7 +3561,7 @@ mod inner {
                 );
             }
             if let Some(ref since) = filter.updated_since {
-                filter_doc.insert("updated_at", doc! { "$gte": since.to_rfc3339() });
+                filter_doc.insert("updated_at", doc! { "$gte": mongo_rfc3339_utc(*since) });
             }
             if let Some(ref tag) = filter.has_tag {
                 // Native array membership query (multikey index used).
@@ -4111,6 +4134,18 @@ mod inner {
         }
 
         #[test]
+        fn mongo_rfc3339_utc_matches_stored_utc_suffix() {
+            let ts = DateTime::parse_from_rfc3339("2026-05-18T01:00:00.123Z")
+                .expect("timestamp")
+                .with_timezone(&Utc);
+
+            let formatted = mongo_rfc3339_utc(ts);
+
+            assert_eq!(formatted, "2026-05-18T01:00:00.123Z");
+            assert!(!formatted.ends_with("+00:00"));
+        }
+
+        #[test]
         fn audit_event_to_doc_stores_ts_as_bson_datetime() {
             let ts = DateTime::parse_from_rfc3339("2026-05-18T01:00:00.123Z")
                 .expect("timestamp")
@@ -4123,7 +4158,15 @@ mod inner {
                 resource_type: "proxy".to_string(),
                 resource_id: "proxy-1".to_string(),
                 namespace: "ferrum".to_string(),
-                diff: serde_json::json!({"changed": true}),
+                diff: serde_json::json!({
+                    "changed": true,
+                    "after": {
+                        "config": {
+                            "$api_key": "[REDACTED]",
+                            "nested.value": true
+                        }
+                    }
+                }),
             };
 
             let doc = audit_event_to_doc(&event).expect("audit event document");
@@ -4134,9 +4177,14 @@ mod inner {
                     ts.timestamp_millis()
                 )))
             );
+            assert!(
+                matches!(doc.get("diff"), Some(Bson::String(_))),
+                "Mongo audit diff must be stored as opaque JSON text"
+            );
 
             let round_trip = doc_to_audit_event(doc).expect("audit event round-trips");
             assert_eq!(round_trip.ts.timestamp_millis(), ts.timestamp_millis());
+            assert_eq!(round_trip.diff, event.diff);
         }
 
         // -------------------------------------------------------------------
