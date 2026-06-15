@@ -4,12 +4,13 @@ use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain};
 use ferrum_edge::modes::mesh::config::{
     AppProtocol, ConditionMatch, EastWestGateway, IngressListenerUnsupported, JwtHeader,
-    MeshConfig, MeshDestinationRule, MeshEndpoint, MeshJwtRule, MeshPolicy,
-    MeshRequestAuthentication, MeshRule, MeshService, MeshSidecar, MeshSidecarEgress,
-    MeshSidecarIngress, MeshSubset, MeshTrafficPolicy, MtlsMode, MultiClusterConfig, ParsedCidr,
-    PeerAuthentication, PolicyAction, PolicyScope, PrincipalMatch, RemoteCluster, RequestMatch,
-    Resolution, ServiceEntry, ServiceEntryLocation, ServicePort, TrustBundle, TrustBundleSet,
-    Workload, WorkloadPort, WorkloadRef, WorkloadSelector, validate_mesh_config,
+    MeshConfig, MeshDestinationRule, MeshEndpoint, MeshJwtRule, MeshOutlierDetection, MeshPolicy,
+    MeshProxyConfig, MeshRequestAuthentication, MeshRule, MeshService, MeshSidecar,
+    MeshSidecarEgress, MeshSidecarIngress, MeshSubset, MeshTelemetryConfig, MeshTelemetryResource,
+    MeshTracingConfig, MeshTrafficPolicy, MeshTrafficPolicyTls, MtlsMode, MultiClusterConfig,
+    ParsedCidr, PeerAuthentication, PolicyAction, PolicyScope, PrincipalMatch, RemoteCluster,
+    RequestMatch, Resolution, ServiceEntry, ServiceEntryLocation, ServicePort, TrustBundle,
+    TrustBundleSet, Workload, WorkloadPort, WorkloadRef, WorkloadSelector, validate_mesh_config,
 };
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -1364,5 +1365,162 @@ fn validate_accepts_unsupported_ingress_shapes_for_deferral() {
     assert!(
         mesh.validate().is_empty(),
         "unsupported-but-well-formed ingress entries are accepted (deferred), not rejected"
+    );
+}
+
+#[test]
+fn mesh_config_validate_rejects_destination_rule_outlier_range_gaps() {
+    let mesh = MeshConfig {
+        destination_rules: vec![MeshDestinationRule {
+            name: "dr".into(),
+            namespace: "default".into(),
+            host: "reviews.default.svc.cluster.local".into(),
+            traffic_policy: Some(MeshTrafficPolicy {
+                outlier_detection: Some(MeshOutlierDetection {
+                    consecutive_errors: Some(0),
+                    interval_seconds: Some(0),
+                    base_ejection_seconds: None,
+                    max_ejection_percent: Some(200),
+                }),
+                ..MeshTrafficPolicy::default()
+            }),
+            port_level_settings: HashMap::new(),
+            subsets: Vec::new(),
+        }],
+        ..MeshConfig::default()
+    };
+
+    let errors = mesh.validate();
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("consecutive_errors") && e.contains("greater than 0")),
+        "expected consecutive_errors lower-bound error, got: {errors:?}"
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("interval_seconds") && e.contains("greater than 0")),
+        "expected interval_seconds lower-bound error, got: {errors:?}"
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("max_ejection_percent") && e.contains("0 to 100")),
+        "expected max_ejection_percent range error, got: {errors:?}"
+    );
+}
+
+#[test]
+fn mesh_config_validate_rejects_destination_rule_tls_inconsistency() {
+    let mut port_level_settings = HashMap::new();
+    port_level_settings.insert(
+        8080,
+        MeshTrafficPolicy {
+            tls: Some(MeshTrafficPolicyTls {
+                mode: MtlsMode::Strict,
+                ..MeshTrafficPolicyTls::default()
+            }),
+            ..MeshTrafficPolicy::default()
+        },
+    );
+
+    let mesh = MeshConfig {
+        destination_rules: vec![MeshDestinationRule {
+            name: "dr".into(),
+            namespace: "default".into(),
+            host: "reviews.default.svc.cluster.local".into(),
+            traffic_policy: Some(MeshTrafficPolicy {
+                tls: Some(MeshTrafficPolicyTls {
+                    mode: MtlsMode::Mutual,
+                    client_certificate: Some("/cert.pem".into()),
+                    private_key: None,
+                    ..MeshTrafficPolicyTls::default()
+                }),
+                ..MeshTrafficPolicy::default()
+            }),
+            port_level_settings,
+            subsets: vec![MeshSubset {
+                name: "v1".into(),
+                labels: HashMap::new(),
+                traffic_policy: Some(MeshTrafficPolicy {
+                    tls: Some(MeshTrafficPolicyTls {
+                        mode: MtlsMode::IstioMutual,
+                        client_certificate: Some("/operator-cert.pem".into()),
+                        ..MeshTrafficPolicyTls::default()
+                    }),
+                    ..MeshTrafficPolicy::default()
+                }),
+            }],
+        }],
+        ..MeshConfig::default()
+    };
+
+    let errors = mesh.validate();
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("private_key") && e.contains("must be set")),
+        "expected MUTUAL private_key error, got: {errors:?}"
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("port_level_settings[8080].tls.mode")),
+        "expected server-side mode error, got: {errors:?}"
+    );
+    assert!(
+        errors.iter().any(|e| {
+            e.contains("subsets[0].traffic_policy.tls.client_certificate")
+                && e.contains("must be absent")
+        }),
+        "expected ISTIO_MUTUAL explicit-cert error, got: {errors:?}"
+    );
+}
+
+#[test]
+fn mesh_config_validate_rejects_tracing_percentage_bounds() {
+    let mesh = MeshConfig {
+        telemetry_resources: vec![MeshTelemetryResource {
+            name: "telemetry".into(),
+            namespace: "default".into(),
+            scope: PolicyScope::MeshWide,
+            config: MeshTelemetryConfig {
+                tracing: Some(MeshTracingConfig {
+                    mode: None,
+                    sampling_percentage: Some(101.0),
+                    disable_span_reporting: None,
+                    custom_tags: HashMap::new(),
+                    custom_header_tags: HashMap::new(),
+                    providers: Vec::new(),
+                }),
+                ..MeshTelemetryConfig::default()
+            },
+        }],
+        proxy_configs: vec![MeshProxyConfig {
+            name: "proxy".into(),
+            namespace: "default".into(),
+            tracing_sampling: Some(f64::NAN),
+            ..MeshProxyConfig::default()
+        }],
+        ..MeshConfig::default()
+    };
+
+    let errors = mesh.validate();
+    assert!(
+        errors.iter().any(|e| {
+            e.contains("MeshTelemetryResource 'telemetry'")
+                && e.contains("sampling_percentage")
+                && e.contains("0 to 100")
+        }),
+        "expected Telemetry sampling range error, got: {errors:?}"
+    );
+    assert!(
+        errors.iter().any(|e| {
+            e.contains("MeshProxyConfig 'proxy'")
+                && e.contains("tracing_sampling")
+                && e.contains("0 to 100")
+        }),
+        "expected ProxyConfig sampling range error, got: {errors:?}"
     );
 }
