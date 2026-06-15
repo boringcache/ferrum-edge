@@ -21,9 +21,13 @@ pub fn resolve_ref(key: &str) -> Option<String> {
 /// used to point the real client at a local fake/emulator (or an in-cluster
 /// proxy) without changing any other behavior. When unset, the standard
 /// Application Default Credentials path is used unchanged.
+///
+/// Resolved through the conf-file-aware helper (the same one used for
+/// `FERRUM_SECRET_FETCH_TIMEOUT_SECONDS`) so the value is honored whether it is
+/// set in the process environment or in `ferrum.conf`. Secret resolution runs
+/// before `EnvConfig` is parsed, so this cannot read it from `EnvConfig`.
 fn endpoint_override() -> Option<String> {
-    env::var("FERRUM_GCP_SECRET_MANAGER_ENDPOINT")
-        .ok()
+    crate::config::conf_file::resolve_ferrum_var("FERRUM_GCP_SECRET_MANAGER_ENDPOINT")
         .filter(|s| !s.is_empty())
 }
 

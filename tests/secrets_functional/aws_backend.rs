@@ -2,10 +2,13 @@
 //!
 //! Connectivity tests run against LocalStack (Secrets Manager) started in
 //! Docker via testcontainers, pointed at by `AWS_ENDPOINT_URL_SECRETS_MANAGER`.
-//! They self-skip (with a printed notice) when Docker is unavailable. The
-//! timeout test needs no Docker (it uses an in-process delaying endpoint).
+//! When LocalStack is unavailable they FAIL in CI (where Docker is required)
+//! and skip with a printed notice locally. The timeout test needs no Docker (it
+//! uses an in-process delaying endpoint).
 
-use crate::common::containers::{LocalStackContainer, start_localstack_for_aws_secretsmanager};
+use crate::common::containers::{
+    LocalStackContainer, fail_in_ci_else_skip, start_localstack_for_aws_secretsmanager,
+};
 use crate::common::env::{EnvGuard, assert_resolved_var};
 use ferrum_edge::secrets::resolve_all_env_secrets;
 use serial_test::serial;
@@ -31,13 +34,13 @@ fn set_aws_env(guard: &EnvGuard, endpoint: &str) {
     guard.set("AWS_ENDPOINT_URL", endpoint);
 }
 
-/// Start LocalStack, or print a skip notice and return `None` when Docker is
-/// unavailable.
+/// Start LocalStack. Fails the test in CI and skips it locally when the
+/// container is unavailable.
 async fn try_localstack(test: &str) -> Option<LocalStackContainer> {
     match start_localstack_for_aws_secretsmanager().await {
         Ok(ls) => Some(ls),
         Err(e) => {
-            eprintln!("SKIP {test}: LocalStack unavailable (Docker?): {e}");
+            fail_in_ci_else_skip(test, "LocalStack", &e);
             None
         }
     }

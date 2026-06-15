@@ -1,11 +1,11 @@
 //! HashiCorp Vault (KV v2) functional tests.
 //!
 //! Connectivity tests run against a Vault dev server started in Docker via
-//! testcontainers and self-skip (with a printed notice) when Docker is
-//! unavailable. Reference-shape, missing-credential, and timeout tests need no
-//! Vault server and always run.
+//! testcontainers. When the container is unavailable they FAIL in CI (where
+//! Docker is required) and skip with a printed notice locally. Reference-shape,
+//! missing-credential, and timeout tests need no Vault server and always run.
 
-use crate::common::containers::{VaultContainer, start_vault_dev_container};
+use crate::common::containers::{VaultContainer, fail_in_ci_else_skip, start_vault_dev_container};
 use crate::common::env::{EnvGuard, assert_resolved_var};
 use ferrum_edge::secrets::resolve_all_env_secrets;
 use serial_test::serial;
@@ -13,13 +13,13 @@ use std::time::Duration;
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-/// Start a seeded Vault dev server, or print a skip notice and return `None`
-/// when Docker is unavailable.
+/// Start a seeded Vault dev server. Fails the test in CI and skips it locally
+/// when the container is unavailable.
 async fn try_vault(test: &str) -> Option<VaultContainer> {
     match start_vault_dev_container().await {
         Ok(v) => Some(v),
         Err(e) => {
-            eprintln!("SKIP {test}: Vault dev container unavailable (Docker?): {e}");
+            fail_in_ci_else_skip(test, "Vault dev container", &e);
             None
         }
     }

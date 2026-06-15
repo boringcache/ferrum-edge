@@ -14,6 +14,21 @@ use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
+/// Decide how to handle an unavailable container.
+///
+/// In CI (`CI` env var set, e.g. GitHub Actions) a container that fails to
+/// start is a HARD failure: the `test-secrets` matrix runs on Docker-enabled
+/// runners, so an image-pull error, a changed wait condition, or broken setup
+/// must fail the job rather than let it pass without ever executing the
+/// assertions. Outside CI (no Docker locally) it is a graceful skip so the
+/// suite stays runnable on a developer machine.
+pub fn fail_in_ci_else_skip(test: &str, provider: &str, err: &BoxError) {
+    if std::env::var("CI").is_ok() {
+        panic!("{test}: {provider} is required in CI but failed to start: {err}");
+    }
+    eprintln!("SKIP {test}: {provider} unavailable (Docker?): {err}");
+}
+
 // ---------------------------------------------------------------------------
 // HashiCorp Vault dev server (KV v2)
 // ---------------------------------------------------------------------------
