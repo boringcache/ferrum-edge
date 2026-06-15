@@ -22,7 +22,7 @@ Ferrum Edge is a lightweight, extensible edge proxy designed for modern microser
 
 - **Multi-protocol**: HTTP/1.1, HTTP/2, HTTP/3 (QUIC), WebSocket, gRPC, raw TCP/UDP with TLS/DTLS
 - **Built-in plugin system**: Authentication, authorization, OPA policy decisions, adaptive concurrency, WAF content threat detection, OpenAPI contract validation, rate limiting, fault injection, compression, response security headers, SSE stream handling, transformation, response mocking, spec exposure, serverless functions, AI/LLM-specific plugins (including AI federation for multi-provider routing), MCP / Agent Tool Gateway routing, A2A agent gateway observability/policy, load testing, API chargeback, and observability
-- **Seven operating modes**: Database, File, Control Plane, Data Plane, Mesh, Injector, and Migrate
+- **Eight operating modes**: Database, File, Control Plane, Data Plane, Mesh, Injector, Node Agent, and Migrate
 - **Lock-free hot path**: All request-path reads use `ArcSwap` or `DashMap` — no mutexes on the proxy path
 - **Zero-downtime config reloads**: Atomic config swap via DB polling, SIGHUP, or CP push
 - **Service mesh**: Six topologies (sidecar, ambient, node waypoint, service waypoint, east-west gateway, egress), native MeshSubscribe, xDS ADS, or localized file config consumption, SPIFFE identity, HBONE, transparent DNS proxy, mesh authorization, REGISTRY_ONLY outbound policy, and Istio/GAMMA RED metrics. See [docs/mesh.md](docs/mesh.md)
@@ -41,6 +41,7 @@ For the full feature list, see [FEATURES.md](FEATURES.md).
 | **Data Plane** | `FERRUM_MODE=dp` | Horizontally scalable traffic processing nodes | Read-only | Yes |
 | **Mesh** | `FERRUM_MODE=mesh` | Service-mesh data plane consuming native MeshSubscribe, xDS ADS, or a localized config file with six topologies | Read-only | Yes |
 | **Injector** | `FERRUM_MODE=injector` | Kubernetes admission webhook that injects Ferrum mesh sidecars/init capture | No | No |
+| **Node Agent** | `FERRUM_MODE=node_agent` | Per-node eBPF capture manager for ambient mesh; no proxy listeners. See [docs/node_agent.md](docs/node_agent.md) | No | No |
 | **Migrate** | `FERRUM_MODE=migrate` | Runs DB schema migrations then exits | No | No |
 
 See [docs/cp_dp_mode.md](docs/cp_dp_mode.md) for distributed deployment details.
@@ -208,7 +209,7 @@ Ferrum Edge is configured through environment variables, with an optional `ferru
 | `FERRUM_DB_URL` | DB/CP | — | Database connection string |
 | `FERRUM_FILE_CONFIG_PATH` | File mode | — | Path to YAML/JSON config file |
 
-For the full list of 90+ environment variables, see [docs/configuration.md](docs/configuration.md).
+For the full list of 300+ environment variables, see [docs/configuration.md](docs/configuration.md).
 
 Operational note: all logging flows through a **non-blocking writer** (channel → dedicated background thread → stdout), so log calls never block request-processing threads. Keep application logs on `stdout`/`stderr` by default. In containers, let the container runtime or platform collect and rotate the stream. On VMs, prefer running Ferrum Edge under `systemd` or another supervisor and let `journald`, `rsyslog`, `logrotate`, or a host log agent handle retention and rotation. Only add application-level file logging if you have a specific requirement for local log files. Under extreme throughput, tune `FERRUM_LOG_BUFFER_CAPACITY` to reduce log loss (the default 128,000 line buffer is lossy — new events are dropped when full to avoid backpressure).
 

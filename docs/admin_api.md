@@ -1086,3 +1086,15 @@ Returns `404 Not Found` outside mesh mode (when the mesh runtime state is not wi
 
 - `FERRUM_MESH_REMOTE_DISCOVERY_POLL_INTERVAL_SECONDS` — poll interval for cross-cluster endpoint discovery; `0` (default) disables it and forces `discovered` empty.
 - `FERRUM_MESH_REMOTE_DISCOVERY_POLL_TIMEOUT_SECONDS` — per-poll request timeout (default `30`).
+
+## Mesh Federation (mesh mode)
+
+`GET /mesh/federation` is JWT-authenticated and mesh-only. It returns the currently cached cross-cluster SPIFFE trust bundles fetched by the federation poller — the poller hits each `MultiClusterConfig.remote_clusters[].federation_endpoint` at `FERRUM_MESH_FEDERATION_POLL_INTERVAL_SECONDS` and overlays the validated bundle on `TrustBundleSet.federated`. Each entry reports the originating cluster name, trust domain, endpoint URL, fetch timestamp, derived bundle age, and X.509/JWT authority counts. Returns `404` outside mesh mode or before any federation bundle has been cached. Raw workload addresses and bundle contents are never exposed.
+
+## Mesh Runtime Overlay (mesh mode)
+
+`GET /mesh/runtime-overlay` is JWT-authenticated and mesh-only. It returns the merged xDS RTDS runtime overlay built from every `envoy.service.runtime.v3.Runtime` layer the mesh xDS client has received: each layer's top-level fields are flattened into a single keyed map, with later layers overriding earlier ones on key conflicts. Values are typed (`number` → `f64`, `string` → UTF-8 string, etc.). Returns `404` when no overlay is active (no RTDS layers received, or outside mesh mode).
+
+## Mesh Policy Denies (mesh mode)
+
+`GET /mesh/policy-denies/recent` is JWT-authenticated and mesh-only. It returns the top-N most recent `mesh_authz` deny events grouped by the `(rule, source, destination, reason)` tuple, for ad-hoc triage. The recorder is a process-singleton bounded FIFO ring (`FERRUM_MESH_POLICY_DENY_LOG_CAPACITY`, default `10000`) written only on the `mesh_authz` deny branch — the proxy hot path never touches it. The endpoint reads a one-shot snapshot, filters to a recent `window`, groups by the 4-tuple, sorts by count descending, and truncates to `limit`. Identity / route / policy metadata only; no request bodies, headers, or credentials. Set `FERRUM_MESH_POLICY_DENY_LOG_CAPACITY=0` to disable the recorder (the endpoint still serves an empty `grouped` array).

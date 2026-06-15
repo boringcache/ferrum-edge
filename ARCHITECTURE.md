@@ -72,7 +72,7 @@ src/
 │   ├── database.rs            # Database mode
 │   ├── file.rs                # File mode
 │   └── migrate.rs             # Database migration mode
-├── plugins/                   # Plugin system (42 built-in plugins)
+├── plugins/                   # Plugin system (75+ built-in plugins)
 │   ├── mod.rs                 # Plugin framework, registry, and priority constants
 │   ├── access_control.rs      # Consumer-based authorization
 │   ├── basic_auth.rs          # HTTP Basic auth with bcrypt
@@ -143,7 +143,7 @@ tests/
 │
 ├── unit_tests.rs                       # Entry point: unit test crate
 ├── unit/                               # Unit tests by component
-│   ├── plugins/                        # All 42 plugin tests
+│   ├── plugins/                        # Plugin tests
 │   ├── config/                         # Configuration parsing tests
 │   ├── admin/                          # Admin API tests
 │   ├── gateway_core/                   # Core data structure tests
@@ -370,7 +370,7 @@ RESTful API for dynamic configuration management:
 
 ### **7. Operating Modes (`src/modes/`)**
 
-Five operating modes for different deployment scenarios:
+Eight operating modes for different deployment scenarios (Database, File, Control Plane, Data Plane, Mesh, Injector, Node Agent, Migrate — see `docs/mesh.md` and `docs/node_agent.md` for the mesh-related modes):
 
 #### **Database Mode (`database.rs`)**
 - Single gateway instance with database storage
