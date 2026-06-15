@@ -13310,6 +13310,11 @@ async fn handle_proxy_request_inner(
                     crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
                 }
 
+                // Capture the backend's original trailer `set-cookie` (issue
+                // #1638) before reconciliation overwrites it, so the re-homing
+                // step below can distinguish a hook-contributed value from the
+                // backend's untouched trailer.
+                let original_trailer_set_cookie = response_trailers.get("set-cookie").cloned();
                 if !after_proxy_rejected {
                     // Reconcile hook mutations from the merged view back into
                     // the wire trailers: a trailer-originated key now absent
@@ -13364,6 +13369,17 @@ async fn handle_proxy_request_inner(
                         }
                     }
                 }
+
+                // Re-home a hook-mutated trailer-only `set-cookie` onto the
+                // initial HEADERS (issue #1638) so browsers / gRPC-Web clients
+                // can store it. Runs after the strip loop and before the
+                // gRPC-Web trailer-clear guard and sticky-cookie injection
+                // below — see `rehome_hook_mutated_trailer_set_cookie`.
+                grpc_proxy::rehome_hook_mutated_trailer_set_cookie(
+                    &mut response_headers,
+                    &mut response_trailers,
+                    original_trailer_set_cookie.as_deref(),
+                );
 
                 // A response transform that re-encodes the gRPC terminal
                 // status into the body (e.g. `grpc_web` appends a gRPC-Web
