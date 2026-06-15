@@ -2711,6 +2711,53 @@ impl GatewayConfig {
                                 ));
                             }
                         }
+                        let retry_can_trigger = proxy.retry.as_ref().is_some_and(|retry| {
+                            retry.max_retries > 0
+                                && (retry.retry_on_connect_failure
+                                    || (!retry.retryable_status_codes.is_empty()
+                                        && !retry.retryable_methods.is_empty()))
+                        });
+                        if retry_can_trigger {
+                            let selected_subset =
+                                proxy.upstream_subset.as_deref().and_then(|subset_name| {
+                                    upstream.subsets.as_ref().and_then(|subsets| {
+                                        subsets.iter().find(|subset| subset.name == subset_name)
+                                    })
+                                });
+                            let target_selected = |target: &UpstreamTarget| match selected_subset {
+                                Some(subset) => subset.labels.iter().all(|(key, value)| {
+                                    target.tags.get(key).is_some_and(|tag| tag == value)
+                                }),
+                                None => true,
+                            };
+                            for target in upstream.targets.iter().filter(|t| target_selected(t)) {
+                                let required_transport = if target
+                                    .tags
+                                    .get("mesh.hbone")
+                                    .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+                                {
+                                    Some("mesh.hbone")
+                                } else if target
+                                    .tags
+                                    .get("mesh.mtls")
+                                    .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+                                {
+                                    Some("mesh.mtls")
+                                } else {
+                                    None
+                                };
+                                if let Some(required_transport) = required_transport {
+                                    errors.push(format!(
+                                        "Proxy '{}' enables retry but upstream_id '{}' target '{}:{}' requires {} dispatch; retry over required mesh transports is not supported",
+                                        proxy.id,
+                                        uid,
+                                        target.host,
+                                        target.port,
+                                        required_transport
+                                    ));
+                                }
+                            }
+                        }
                     }
                     None => {
                         errors.push(format!(

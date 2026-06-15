@@ -2,8 +2,8 @@ use chrono::Utc;
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, BackendTlsConfig, Consumer, DispatchKind, GatewayConfig,
     LocalityPreference, PluginAssociation, PluginConfig, PluginScope, Proxy,
-    ResolvedSubsetTrafficPolicy, Upstream, UpstreamPortOverride, UpstreamTarget, hosts_overlap,
-    validate_host_entry, validate_resource_id, wildcard_matches,
+    ResolvedSubsetTrafficPolicy, RetryConfig, Upstream, UpstreamPortOverride, UpstreamTarget,
+    hosts_overlap, validate_host_entry, validate_resource_id, wildcard_matches,
 };
 use ferrum_edge::modes::mesh::config::{MeshTracingConfig, TracingProvider};
 use std::collections::HashMap;
@@ -1629,6 +1629,69 @@ fn test_upstream_references_none_ok() {
     let p1 = make_proxy("p1", "/api");
     let mut config = empty_config();
     config.proxies = vec![p1];
+    assert!(config.validate_upstream_references().is_ok());
+}
+
+#[test]
+fn retry_proxy_rejects_required_mesh_transport_upstream_targets() {
+    for tag in ["mesh.hbone", "mesh.mtls"] {
+        let mut upstream = make_upstream("mesh-upstream");
+        upstream.targets[0]
+            .tags
+            .insert(tag.to_string(), "true".to_string());
+        let mut proxy = make_proxy("p1", "/api");
+        proxy.upstream_id = Some("mesh-upstream".into());
+        proxy.retry = Some(RetryConfig::default());
+        let mut config = empty_config();
+        config.upstreams = vec![upstream];
+        config.proxies = vec![proxy];
+
+        let err = config.validate_upstream_references().unwrap_err();
+        assert!(
+            err.iter()
+                .any(|msg| msg.contains("enables retry") && msg.contains(tag)),
+            "expected retry/{tag} conflict, got {err:?}"
+        );
+    }
+}
+
+#[test]
+fn retry_proxy_allows_mesh_transport_target_outside_selected_subset() {
+    let mut upstream = make_upstream("mixed-upstream");
+    upstream.targets = vec![
+        UpstreamTarget {
+            host: "plain.local".into(),
+            port: 8080,
+            weight: 100,
+            tags: HashMap::from([("version".to_string(), "plain".to_string())]),
+            locality: None,
+            path: None,
+        },
+        UpstreamTarget {
+            host: "mesh.local".into(),
+            port: 8080,
+            weight: 100,
+            tags: HashMap::from([
+                ("version".to_string(), "mesh".to_string()),
+                ("mesh.hbone".to_string(), "true".to_string()),
+            ]),
+            locality: None,
+            path: None,
+        },
+    ];
+    upstream.subsets = Some(vec![ferrum_edge::config::types::SubsetDefinition {
+        name: "plain".to_string(),
+        labels: HashMap::from([("version".to_string(), "plain".to_string())]),
+        traffic_policy: None,
+    }]);
+    let mut proxy = make_proxy("p1", "/api");
+    proxy.upstream_id = Some("mixed-upstream".into());
+    proxy.upstream_subset = Some("plain".into());
+    proxy.retry = Some(RetryConfig::default());
+    let mut config = empty_config();
+    config.upstreams = vec![upstream];
+    config.proxies = vec![proxy];
+
     assert!(config.validate_upstream_references().is_ok());
 }
 
