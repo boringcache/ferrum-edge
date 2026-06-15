@@ -31,7 +31,7 @@ The final TTL is always clamped to at least `FERRUM_DNS_MIN_TTL_SECONDS`.
 | `FERRUM_DNS_ORDER` | `String` | `CACHE,SRV,A,CNAME` | Comma-separated, case-insensitive list of DNS record types to query, in order. See [DNS Order](#dns-order) below. |
 | `FERRUM_DNS_TRY_TCP_ON_ERROR` | `bool` | `true` | Retry over TCP when a UDP DNS response is truncated (`TC` bit) or errors. |
 | `FERRUM_DNS_NUM_CONCURRENT_REQS` | `usize` | `3` | Number of nameservers queried concurrently per lookup (the fastest answer wins). Range: 1-10. |
-| `FERRUM_DNS_MAX_ACTIVE_REQUESTS` | `usize` | `512` | Global cap on concurrent in-flight DNS lookups across the resolver. Range: 1-4096. |
+| `FERRUM_DNS_MAX_ACTIVE_REQUESTS` | `usize` | `512` | Max in-flight DNS queries per multiplexed upstream connection (Hickory `ResolverOpts::max_active_requests`) — **not** a resolver-wide cap. Range: 1-4096. |
 
 ### TTL Settings
 
