@@ -1422,14 +1422,22 @@ pub struct GrpcStreamingResponse {
     /// this flag and abort the response if set — the backend received a
     /// truncated request so the response is likely invalid.
     pub request_body_exceeded: Option<Arc<AtomicBool>>,
-    /// Per-frame idle read timeout (ms) the response-body consumer must apply to
-    /// the streaming `body`, derived from [`streaming_effective_timeout_ms`]: the
-    /// post-plugin client `grpc-timeout` (uncapped), falling back to
-    /// `backend_read_timeout_ms` only when the client set no deadline. `0` =
-    /// unbounded. The gRPC deadline otherwise only bounds the response-header
-    /// wait, so without this a backend that sends headers then stalls would pin
-    /// the streaming guards until the client disconnects.
+    /// Per-frame idle read timeout (ms) the response-body consumer applies to
+    /// the streaming `body` in the FALLBACK regime (no client `grpc-timeout`):
+    /// `backend_read_timeout_ms`, or `0` for unbounded. Ignored when
+    /// [`Self::client_grpc_deadline_ms`] is `Some` — that regime uses an absolute
+    /// end-to-end deadline instead. Without a bound a backend that sends headers
+    /// then stalls would pin the streaming guards until the client disconnects.
     pub response_read_timeout_ms: u64,
+    /// The post-plugin client `grpc-timeout` in milliseconds, if the client set
+    /// one (issue #1649). When `Some`, the response-body consumer enforces it as
+    /// an ABSOLUTE end-to-end deadline (anchored at request receipt) via
+    /// `TotalDeadlineBody`, so a backend cannot keep the streaming body open past
+    /// the client's RPC deadline by trickling frames under a per-frame idle
+    /// interval. When `None`, the per-frame [`Self::response_read_timeout_ms`]
+    /// fallback applies. Uncapped: a pathologically large value is handled by the
+    /// consumer's overflow guard (treated as unbounded, never a panic).
+    pub client_grpc_deadline_ms: Option<u64>,
 }
 
 /// Either a fully-buffered or streaming gRPC response.
@@ -1665,6 +1673,11 @@ pub async fn proxy_grpc_request_streaming(
     // as a safety net against indefinitely stalled backends. Slow uploads
     // without deadlines should be bounded.
     let effective_timeout_ms = streaming_effective_timeout_ms(&headers, proxy);
+    // Client end-to-end RPC deadline (issue #1649): when the client set a
+    // `grpc-timeout`, the streaming response body is bounded by an ABSOLUTE
+    // deadline rather than a per-frame idle timeout. Captured here before
+    // `headers` is moved into the backend request below.
+    let client_grpc_deadline_ms = parse_grpc_timeout_ms(&headers);
 
     let mut backend_req = Request::new(grpc_body);
     *backend_req.method_mut() = parts.method;
@@ -1769,6 +1782,7 @@ pub async fn proxy_grpc_request_streaming(
             None
         },
         response_read_timeout_ms: effective_timeout_ms.unwrap_or(0),
+        client_grpc_deadline_ms,
     }))
 }
 
@@ -1890,6 +1904,10 @@ pub(crate) async fn proxy_grpc_request_core(
     // client disconnects. Unused on the buffered path. 0 = unbounded.
     let streaming_response_read_timeout_ms =
         streaming_effective_timeout_ms(&headers, proxy).unwrap_or(0);
+    // Client end-to-end RPC deadline (issue #1649), captured before `headers` is
+    // moved below. When set, the streaming response body is bounded by an
+    // ABSOLUTE deadline rather than the per-frame idle fallback.
+    let streaming_client_grpc_deadline_ms = parse_grpc_timeout_ms(&headers);
 
     let mut backend_req = Request::new(GrpcBody::Buffered(Full::new(body_bytes)));
     *backend_req.method_mut() = method;
@@ -1987,6 +2005,7 @@ pub(crate) async fn proxy_grpc_request_core(
             body: response.into_body(),
             request_body_exceeded: None, // buffered request body — already fully sent
             response_read_timeout_ms: streaming_response_read_timeout_ms,
+            client_grpc_deadline_ms: streaming_client_grpc_deadline_ms,
         }));
     }
 
