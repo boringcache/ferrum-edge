@@ -33,6 +33,13 @@ pub use registry::{
     resolve_secret,
 };
 
+// Azure Key Vault credential injection + reference parsing are exposed so the
+// data-plane fetch path can be exercised against a local fake Key Vault with a
+// pre-acquired bearer token (no Entra ID round trip). `AzureCredentials`
+// carries `from_static_token()` for that injection.
+#[cfg(feature = "secrets-azure")]
+pub use azure::{AzureCredentials, parse_keyvault_reference as azure_parse_keyvault_reference};
+
 #[cfg(all(test, any(feature = "secrets-aws", feature = "secrets-vault")))]
 mod tests {
     use super::split_reference_field;
