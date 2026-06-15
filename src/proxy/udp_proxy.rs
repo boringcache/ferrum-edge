@@ -1940,9 +1940,6 @@ async fn forward_client_datagram_to_backend(
     session: &Arc<UdpSession>,
     data: &[u8],
 ) -> Result<(), anyhow::Error> {
-    session
-        .last_activity
-        .store(coarse_epoch_millis(), Ordering::Relaxed);
     let send_result = if let Some(ref dtls) = session.dtls_conn {
         dtls.send(data)
             .await
@@ -1956,6 +1953,9 @@ async fn forward_client_datagram_to_backend(
 
     match send_result {
         Ok(_) => {
+            session
+                .last_activity
+                .store(coarse_epoch_millis(), Ordering::Relaxed);
             session
                 .bytes_sent
                 .fetch_add(data.len() as u64, Ordering::Relaxed);
@@ -3999,7 +3999,7 @@ mod tests {
         STREAM_ERR_BACKEND_DTLS_HANDSHAKE_FAILED, UdpDisconnectContext, UdpSession,
         build_dtls_stream_summary, build_udp_stream_summary, cached_backend_dtls_config,
         dtls_disconnect_cause, dtls_disconnect_direction, emit_udp_stream_disconnect,
-        reserve_udp_session_slot, udp_session_shard_amount,
+        forward_client_datagram_to_backend, reserve_udp_session_slot, udp_session_shard_amount,
     };
     use crate::config::types::{BackendScheme, BackendTlsConfig, Proxy};
     use crate::plugins::{Plugin, StreamTransactionSummary};
@@ -4009,6 +4009,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Mutex, MutexGuard};
+    use tokio::net::UdpSocket;
 
     fn make_udp_session() -> UdpSession {
         UdpSession {
@@ -4050,6 +4051,42 @@ mod tests {
             // emission only.
             _overload_guard: None,
         }
+    }
+
+    #[tokio::test]
+    async fn failed_backend_forward_does_not_refresh_last_activity() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let mut raw_session = make_udp_session();
+        raw_session.backend_socket = Some(socket);
+        raw_session
+            .last_activity
+            .store(1_710_000_000_500, Ordering::Relaxed);
+        let session = Arc::new(raw_session);
+        super::COARSE_EPOCH_MS.store(1_710_000_001_000, Ordering::Relaxed);
+
+        let err = forward_client_datagram_to_backend(&session, b"payload")
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("send to backend failed"),
+            "expected unconnected UDP socket send failure, got {err}"
+        );
+        assert_eq!(
+            session.last_activity.load(Ordering::Relaxed),
+            1_710_000_000_500,
+            "failed client-to-backend forwards must not refresh idle activity"
+        );
+        assert_eq!(
+            session.bytes_sent.load(Ordering::Relaxed),
+            128,
+            "failed sends must not increment bytes_sent"
+        );
+        assert_eq!(
+            session.last_request_size.load(Ordering::Relaxed),
+            64,
+            "failed sends must not update last_request_size"
+        );
     }
 
     fn test_dtls_proxy() -> Proxy {
