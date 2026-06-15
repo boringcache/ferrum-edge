@@ -42,7 +42,8 @@ use tracing::{debug, error, info, warn};
 #[allow(unused_imports)]
 pub use crate::config::db_backend::{
     ApiSpecListFilter, ApiSpecSortBy, DatabaseBackend, GatewayTrustBundlePoll, IncrementalResult,
-    PaginatedResult, SortOrder, extract_db_hostname, extract_known_ids, redact_url,
+    PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult, SortOrder, extract_db_hostname, extract_known_ids,
+    redact_url,
 };
 
 struct PluginConfigRef {
@@ -92,6 +93,18 @@ fn consumer_credential_index_entries(consumer: &Consumer) -> Vec<ConsumerCredent
     }
 
     entries
+}
+
+fn proxy_route_key_hash(listen_path: Option<&str>) -> String {
+    let mut hasher = Sha256::new();
+    match listen_path {
+        Some(path) => {
+            hasher.update(b"path\0");
+            hasher.update(path.as_bytes());
+        }
+        None => hasher.update(b"host-only\0"),
+    }
+    hex::encode(hasher.finalize())
 }
 
 fn format_consumer_identity_conflict(
@@ -375,6 +388,148 @@ impl DatabaseStore {
             }
         }
         result
+    }
+
+    fn proxy_route_lock_insert_sql(&self) -> String {
+        match self.db_type.as_str() {
+            "mysql" => "INSERT IGNORE INTO proxy_route_locks \
+                 (namespace, route_key_hash, created_at) VALUES (?, ?, ?)"
+                .to_string(),
+            "sqlite" => "INSERT OR IGNORE INTO proxy_route_locks \
+                 (namespace, route_key_hash, created_at) VALUES (?, ?, ?)"
+                .to_string(),
+            _ => self.q("INSERT INTO proxy_route_locks \
+                 (namespace, route_key_hash, created_at) VALUES (?, ?, ?) \
+                 ON CONFLICT (namespace, route_key_hash) DO NOTHING"),
+        }
+    }
+
+    fn listen_path_candidate_sql(
+        &self,
+        listen_path: Option<&str>,
+        exclude_id: Option<&str>,
+    ) -> String {
+        let path_filter = if listen_path.is_some() {
+            "listen_path = ?"
+        } else {
+            "listen_path IS NULL"
+        };
+        let exclude_filter = if exclude_id.is_some() {
+            " AND id != ?"
+        } else {
+            ""
+        };
+        self.q(&format!(
+            "SELECT id, hosts FROM proxies WHERE namespace = ? \
+             AND backend_scheme NOT IN ('tcp', 'tcps', 'udp', 'dtls') \
+             AND {path_filter}{exclude_filter}"
+        ))
+    }
+
+    async fn listen_path_candidate_rows_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        namespace: &str,
+        listen_path: Option<&str>,
+        exclude_id: Option<&str>,
+    ) -> Result<Vec<AnyRow>, anyhow::Error> {
+        let sql = self.listen_path_candidate_sql(listen_path, exclude_id);
+        let mut query = sqlx::query(&sql).bind(namespace);
+        if let Some(path) = listen_path {
+            query = query.bind(path);
+        }
+        if let Some(eid) = exclude_id {
+            query = query.bind(eid);
+        }
+        Ok(query.fetch_all(&mut **tx).await?)
+    }
+
+    fn listen_path_rows_are_unique(
+        listen_path: Option<&str>,
+        hosts: &[String],
+        rows: &[AnyRow],
+    ) -> bool {
+        if listen_path.is_none() && hosts.is_empty() {
+            return false;
+        }
+        if rows.is_empty() {
+            return true;
+        }
+        if listen_path.is_some() && hosts.is_empty() {
+            return false;
+        }
+
+        for row in rows {
+            let existing_hosts: Vec<String> = row
+                .try_get::<String, _>("hosts")
+                .ok()
+                .and_then(|s| match serde_json::from_str(&s) {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        warn!("Failed to parse hosts JSON during uniqueness check: {}", e);
+                        None
+                    }
+                })
+                .unwrap_or_default();
+
+            if crate::config::types::hosts_overlap(hosts, &existing_hosts) {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    async fn lock_proxy_route_bucket_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        namespace: &str,
+        listen_path: Option<&str>,
+    ) -> Result<(), anyhow::Error> {
+        let route_key_hash = proxy_route_key_hash(listen_path);
+        let now = Utc::now().to_rfc3339();
+        let insert_sql = self.proxy_route_lock_insert_sql();
+        sqlx::query(&insert_sql)
+            .bind(namespace)
+            .bind(&route_key_hash)
+            .bind(now)
+            .execute(&mut **tx)
+            .await?;
+
+        if self.db_type != "sqlite" {
+            let lock_sql = self.q("SELECT route_key_hash FROM proxy_route_locks \
+                 WHERE namespace = ? AND route_key_hash = ? FOR UPDATE");
+            sqlx::query(&lock_sql)
+                .bind(namespace)
+                .bind(&route_key_hash)
+                .fetch_optional(&mut **tx)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn ensure_proxy_route_unique_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        proxy: &Proxy,
+        exclude_id: Option<&str>,
+    ) -> Result<(), anyhow::Error> {
+        if proxy.dispatch_kind.is_stream() {
+            return Ok(());
+        }
+
+        let listen_path = proxy.listen_path.as_deref();
+        self.lock_proxy_route_bucket_tx(tx, &proxy.namespace, listen_path)
+            .await?;
+        let rows = self
+            .listen_path_candidate_rows_tx(tx, &proxy.namespace, listen_path, exclude_id)
+            .await?;
+        if !Self::listen_path_rows_are_unique(listen_path, &proxy.hosts, &rows) {
+            anyhow::bail!(PROXY_ROUTE_CONFLICT_ERROR);
+        }
+
+        Ok(())
     }
 
     async fn delete_consumer_credential_index_tx(
@@ -959,6 +1114,8 @@ impl DatabaseStore {
         };
 
         let mut tx = self.pool().begin().await?;
+        self.ensure_proxy_route_unique_tx(&mut tx, proxy, None)
+            .await?;
 
         let hosts_json = serde_json::to_string(&proxy.hosts)?;
 
@@ -1095,6 +1252,8 @@ impl DatabaseStore {
         };
 
         let mut tx = self.pool().begin().await?;
+        self.ensure_proxy_route_unique_tx(&mut tx, proxy, Some(&proxy.id))
+            .await?;
 
         let hosts_json = serde_json::to_string(&proxy.hosts)?;
 
@@ -2054,82 +2213,18 @@ impl DatabaseStore {
         }
 
         let start = Instant::now();
-        let base_filter = "namespace = ? \
-              AND backend_scheme NOT IN ('tcp', 'tcps', 'udp', 'dtls')";
-        let path_filter = if listen_path.is_some() {
-            "listen_path = ?"
-        } else {
-            "listen_path IS NULL"
-        };
-
-        let rows: Vec<AnyRow> = match (exclude_id, listen_path) {
-            (Some(eid), Some(path)) => sqlx::query(&self.q(&format!(
-                "SELECT id, hosts FROM proxies WHERE {base_filter} AND {path_filter} AND id != ?"
-            )))
-            .bind(namespace)
-            .bind(path)
-            .bind(eid)
-            .fetch_all(&self.pool())
-            .await?,
-            (Some(eid), None) => sqlx::query(&self.q(&format!(
-                "SELECT id, hosts FROM proxies WHERE {base_filter} AND {path_filter} AND id != ?"
-            )))
-            .bind(namespace)
-            .bind(eid)
-            .fetch_all(&self.pool())
-            .await?,
-            (None, Some(path)) => {
-                sqlx::query(&self.q(&format!(
-                    "SELECT id, hosts FROM proxies WHERE {base_filter} AND {path_filter}"
-                )))
-                .bind(namespace)
-                .bind(path)
-                .fetch_all(&self.pool())
-                .await?
-            }
-            (None, None) => {
-                sqlx::query(&self.q(&format!(
-                    "SELECT id, hosts FROM proxies WHERE {base_filter} AND {path_filter}"
-                )))
-                .bind(namespace)
-                .fetch_all(&self.pool())
-                .await?
-            }
-        };
+        let sql = self.listen_path_candidate_sql(listen_path, exclude_id);
+        let mut query = sqlx::query(&sql).bind(namespace);
+        if let Some(path) = listen_path {
+            query = query.bind(path);
+        }
+        if let Some(eid) = exclude_id {
+            query = query.bind(eid);
+        }
+        let rows: Vec<AnyRow> = query.fetch_all(&self.pool()).await?;
 
         self.check_slow_query("check_listen_path_unique", start);
-
-        // No other proxy with this listen_path bucket — unique
-        if rows.is_empty() {
-            return Ok(true);
-        }
-
-        // `Some(path) + empty hosts` is a catch-all for the path — any existing
-        // row in this bucket is a conflict regardless of its hosts.
-        if listen_path.is_some() && hosts.is_empty() {
-            return Ok(false);
-        }
-
-        // Otherwise check if any existing proxy's hosts overlap with the new hosts
-        for row in &rows {
-            let existing_hosts: Vec<String> = row
-                .try_get::<String, _>("hosts")
-                .ok()
-                .and_then(|s| match serde_json::from_str(&s) {
-                    Ok(v) => Some(v),
-                    Err(e) => {
-                        warn!("Failed to parse hosts JSON during uniqueness check: {}", e);
-                        None
-                    }
-                })
-                .unwrap_or_default();
-
-            if crate::config::types::hosts_overlap(hosts, &existing_hosts) {
-                return Ok(false);
-            }
-        }
-
-        Ok(true)
+        Ok(Self::listen_path_rows_are_unique(listen_path, hosts, &rows))
     }
 
     /// Check if a proxy name is unique (when present).
@@ -2855,6 +2950,9 @@ impl DatabaseStore {
             self.q("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)");
 
         for proxy in proxies {
+            self.ensure_proxy_route_unique_tx(&mut tx, proxy, None)
+                .await?;
+
             let circuit_breaker_json = proxy
                 .circuit_breaker
                 .as_ref()
@@ -3632,6 +3730,7 @@ impl DatabaseStore {
         // and the `replace_api_spec_bundle` UPDATE path).
         {
             let p = &bundle.proxy;
+            self.ensure_proxy_route_unique_tx(&mut tx, p, None).await?;
             let hosts_json = serde_json::to_string(&p.hosts)?;
             let circuit_breaker_json = p
                 .circuit_breaker
@@ -3983,6 +4082,8 @@ impl DatabaseStore {
         // hand-added plugins whose proxy_id FK points at this row are unaffected).
         {
             let p = &bundle.proxy;
+            self.ensure_proxy_route_unique_tx(&mut tx, p, Some(&p.id))
+                .await?;
             let hosts_json = serde_json::to_string(&p.hosts)?;
             let circuit_breaker_json = p
                 .circuit_breaker

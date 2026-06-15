@@ -9,6 +9,10 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use std::collections::HashSet;
 
+/// User-facing proxy route conflict message shared by preflight and persistence checks.
+pub const PROXY_ROUTE_CONFLICT_ERROR: &str =
+    "A proxy with overlapping hosts and listen_path already exists";
+
 // ---------------------------------------------------------------------------
 // ApiSpec list filter types (Wave 5)
 // ---------------------------------------------------------------------------

@@ -96,6 +96,7 @@ impl V001SqlBuilder {
             self.create_consumers_sql(),
             self.create_consumer_credential_index_sql(),
             self.create_proxies_sql(),
+            self.create_proxy_route_locks_sql(),
             self.create_plugin_configs_sql(),
             self.create_proxy_plugins_sql(),
             // api_specs must come AFTER proxies (api_specs.proxy_id FKs
@@ -539,6 +540,28 @@ impl V001SqlBuilder {
         }
     }
 
+    fn create_proxy_route_locks_sql(&self) -> &'static str {
+        if self.is_mysql() {
+            r#"
+            CREATE TABLE IF NOT EXISTS proxy_route_locks (
+                namespace VARCHAR(255) COLLATE utf8mb4_0900_as_cs NOT NULL,
+                route_key_hash VARCHAR(64) COLLATE utf8mb4_0900_as_cs NOT NULL,
+                created_at VARCHAR(64) NOT NULL,
+                PRIMARY KEY (namespace, route_key_hash)
+            )
+            "#
+        } else {
+            r#"
+            CREATE TABLE IF NOT EXISTS proxy_route_locks (
+                namespace TEXT NOT NULL,
+                route_key_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (namespace, route_key_hash)
+            )
+            "#
+        }
+    }
+
     fn create_proxy_plugins_sql(&self) -> &'static str {
         if self.is_mysql() {
             r#"
@@ -904,6 +927,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_proxy_route_lock_table_uses_compact_route_hash_key() {
+        for dialect in ["postgres", "mysql", "sqlite"] {
+            let builder = V001SqlBuilder::new(dialect);
+            let sql = builder.create_proxy_route_locks_sql();
+            assert!(
+                sql.contains("proxy_route_locks"),
+                "{dialect} must create the route-lock table"
+            );
+            assert!(
+                sql.contains("route_key_hash"),
+                "{dialect} must key route locks by the compact route hash"
+            );
+            assert!(
+                sql.contains("PRIMARY KEY (namespace, route_key_hash)"),
+                "{dialect} must serialize writers per namespace and route bucket"
+            );
+        }
+    }
+
     // ------------------------------------------------------------------
     // Collation regression tests
     //
@@ -1021,6 +1064,13 @@ mod tests {
     }
 
     #[test]
+    fn test_mysql_proxy_route_locks_collation_on_key_columns() {
+        let builder = V001SqlBuilder::new("mysql");
+        let sql = builder.create_proxy_route_locks_sql();
+        assert_columns_have_collation(sql, "proxy_route_locks", &["namespace", "route_key_hash"]);
+    }
+
+    #[test]
     fn test_non_mysql_dialects_have_no_mysql_collation_clause() {
         for dialect in ["postgres", "sqlite"] {
             let builder = V001SqlBuilder::new(dialect);
@@ -1028,6 +1078,7 @@ mod tests {
                 builder.create_upstreams_sql(),
                 builder.create_consumers_sql(),
                 builder.create_proxies_sql(),
+                builder.create_proxy_route_locks_sql(),
                 builder.create_plugin_configs_sql(),
                 builder.create_proxy_plugins_sql(),
                 builder.create_api_specs_sql(),
