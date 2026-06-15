@@ -278,19 +278,33 @@ pub struct SubsetTrafficPolicy {
 /// (operator explicitly chose probe-driven), whereas an OMITTED port-level
 /// value leaves the inherited slot untouched. See
 /// `apply_connection_pool_http_to_port_override` in `src/modes/mesh/mod.rs`.
+///
+/// **Serde names** match the operator-facing Istio surface, not Rust variant
+/// spelling: `SCREAMING_SNAKE_CASE` (`DEFAULT` / `UPGRADE` / `DO_NOT_UPGRADE`)
+/// like the sibling mesh enum `MeshSimpleLb`. This enum is serde-deserialized on
+/// the native/file mesh config path (`MeshConnectionPoolHttp.h2_upgrade_policy`
+/// for `FERRUM_MESH_CONFIG_PROTOCOL=file`) and round-tripped through the xDS
+/// `MeshSliceCarrier`, so a slice authored with the Istio value must
+/// deserialize. The lowercase/snake aliases (`do_not_upgrade`, etc.) are also
+/// accepted for ergonomics. The K8s/Istio translator parses the CRD string
+/// manually in `translate_h2_upgrade_policy` (not via serde), so this naming is
+/// independent of that path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum H2UpgradePolicy {
     /// Istio `DEFAULT`: probe-driven. Behaves identically to "field absent"
     /// at the dispatch fork, but as an EXPLICIT port-level value it clears an
     /// inherited top-level `Upgrade`/`DoNotUpgrade` (back to probe-driven for
     /// that port). Carried (not collapsed to `None` at parse) so absent and
     /// explicit-`DEFAULT` are distinguishable in port-level merge semantics.
+    #[serde(alias = "default")]
     Default,
     /// Istio `UPGRADE`: prefer HTTP/2 to the backend. Used as a hint when
     /// the capability registry has not yet classified the target
     /// (`Unknown` → try direct-H2 instead of defaulting to reqwest/H1).
     /// Stays fail-safe: a target proven `Unsupported` (e.g. ALPN
     /// negotiated H1) is NOT forced onto H2.
+    #[serde(alias = "upgrade")]
     Upgrade,
     /// Istio `DO_NOT_UPGRADE`: force the HTTP/1.1 path (reqwest). Skips the
     /// direct-H2 pool even when the capability registry marks the target
@@ -298,6 +312,7 @@ pub enum H2UpgradePolicy {
     /// `http/1.1` so the backend cannot ALPN-negotiate h2 either. (A
     /// backend-TLS SNI override still requires direct-H2 because reqwest
     /// cannot apply a per-request SNI — that case wins and is documented.)
+    #[serde(alias = "do_not_upgrade")]
     DoNotUpgrade,
 }
 

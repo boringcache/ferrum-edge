@@ -11773,13 +11773,14 @@ async fn handle_proxy_request_inner(
     let sticky_cookie_needed = selection.sticky_cookie_needed;
 
     // Apply the DestinationRule `connectionPool.http.maxRetries` per-request
-    // retry-count CAP before any retry loop (HTTP / gRPC / WebSocket) reads
-    // `proxy.retry`. The cap is the MINIMUM `maxRetries` across ALL per-port
-    // overrides (not just the initial target's port) so a mid-request target
-    // rotation onto a stricter-capped port can't bypass it. This caps an
-    // existing retry policy to `min(existing, min_over_ports)`; it never enables
-    // retries when the proxy has none. No-op (no Arc clone) in the common case.
-    let proxy = cap_proxy_retry_for_target(proxy);
+    // retry-count CAP now that the dispatch target's port is known, before any
+    // retry loop (HTTP / gRPC / WebSocket) reads `proxy.retry`. The cap comes
+    // from the SELECTED target's port override; retries stay in that port's lane
+    // (see `cap_proxy_retry_for_target`), so the selected-port cap governs the
+    // whole sequence. This caps an existing retry policy to `min(existing,
+    // dr_max)`; it never enables retries when the proxy has none. No-op (no Arc
+    // clone) in the common case.
+    let proxy = cap_proxy_retry_for_target(proxy, upstream_target.as_deref());
     ctx.matched_proxy = Some(Arc::clone(&proxy));
 
     let backend_admission_plugins = plugin_cache_view.backend_admission_plugins();
@@ -15169,7 +15170,7 @@ pub(crate) fn resolve_effective_proxy_for_target<'a>(
 }
 
 /// Cap a proxy's per-request retry count from the DestinationRule
-/// `connectionPool.http.maxRetries` per-port overrides.
+/// `connectionPool.http.maxRetries` override for the dispatch target's port.
 ///
 /// **Honest semantics (read this):** Envoy's `connectionPool.http.maxRetries`
 /// is a *cluster-wide outstanding-retry concurrency budget*. Ferrum's retry
@@ -15177,48 +15178,51 @@ pub(crate) fn resolve_effective_proxy_for_target<'a>(
 /// an upper bound on the per-request retry count, NOT Envoy's gauge. See
 /// `docs/mesh.md` "DestinationRule maxRetries semantics".
 ///
-/// **Why min-across-ports, not the initial target's port:** the per-request
-/// retry loop (`select_next_retry_target`) may *rotate* the target across dial
-/// ports between attempts (e.g. a named `targetPort` that resolves to different
-/// ports across replicas). Keying the cap on only the *initial* target's port
-/// could then let a retry rotate onto a port whose override has a *stricter*
-/// `maxRetries` — bypassing it. To be robust under rotation we cap at the
-/// MINIMUM `max_retries` across ALL `dispatch_port_overrides` that set one.
-/// Because the cap already bounds every reachable port, no per-attempt recompute
-/// is needed — one scan at dispatch suffices.
+/// **Why the SELECTED target's port, not a min across every port:** the cap
+/// must come from the port the request actually dials. Retries stay in the
+/// selected target's PORT LANE — `select_next_retry_target` resolves the next
+/// target with `select_next_target_for_port_*_from` whenever the failed
+/// target's port has a live per-port override (see
+/// `retry_port_override_dispatch_port` + `LoadBalancerCache::has_port_override_state_from`),
+/// so a per-port `maxRetries` does NOT rotate across ports between attempts.
+/// The selected-port cap therefore governs the whole retry sequence. Taking the
+/// MINIMUM across every override would instead let a higher-cap port inherit an
+/// unrelated sibling port's lower cap (port 8080 cap 5 wrongly limited to 1
+/// because port 9090 has cap 1) — that is what we must NOT do.
 ///
 /// In practice, for MESH upstreams — the only place `maxRetries` applies, since
 /// it is DestinationRule-derived — the per-port caps fan out UNIFORMLY: the
 /// translator (`apply_destination_rules`) fans one owning-service-port entry to
 /// every target dial port, so all of one upstream's port-override caps are
-/// equal and rotation cannot actually bypass. The min-across-ports scan is thus
-/// conservative defense-in-depth, behaviorally identical to keying on the
-/// initial port for that uniform case.
+/// equal anyway. Keying on the selected port is correct for the uniform mesh
+/// case and avoids the cross-port leakage in the mixed-cap non-mesh case.
 ///
-/// Precedence / no-double-retry (unchanged):
+/// Precedence / no-double-retry:
 /// * If the proxy already has a retry policy, the effective `max_retries`
-///   becomes `min(existing, min_over_ports)` — never *increases* retries.
+///   becomes `min(existing, dr_max_retries)` — never *increases* retries.
 /// * If the proxy has NO retry policy, DR `maxRetries` alone does NOT enable
 ///   retries (an Istio `maxRetries` is a budget, not a retry-policy enabler),
 ///   so we leave `retry == None`.
 ///
-/// Applied once, in `handle_proxy_request_inner`, at dispatch and BEFORE
-/// `proxy.retry` is consumed by the HTTP / gRPC / WebSocket retry loops.
-/// Returns the same `Arc` (no clone) in the common case: no port override sets
-/// `maxRetries`, no retry policy, or the cap is already >= the configured count.
+/// Applied once, in `handle_proxy_request_inner`, right after the dispatch
+/// target (hence its port) is resolved and BEFORE `proxy.retry` is consumed
+/// by the HTTP / gRPC / WebSocket retry loops. Returns the same `Arc` (no
+/// clone) in the common case: no port override, no `maxRetries`, no retry
+/// policy, or the cap is already >= the configured count.
 ///
-/// Hot-path discipline: a single small scan of the already-present, precomputed
-/// `Proxy.dispatch_port_overrides` map (no `ArcSwap` load, no allocation unless
-/// a clone is actually needed to reduce the count).
+/// Hot-path discipline: a single map lookup on the already-present, precomputed
+/// `Proxy.dispatch_port_overrides` (no `ArcSwap` load, no allocation unless a
+/// clone is actually needed to reduce the count).
 ///
-/// NOTE: this no longer keys on a specific dispatch target, so it takes no
-/// `UpstreamTarget` — the min already bounds every port the request could
-/// rotate to. The pre-existing H1/H2 dispatch path is where DR per-port
-/// effective-proxy overrides (all of them, not just this cap) are applied; the
-/// standalone H3 frontend (`src/http3/server.rs`) applies NONE of them. That is
-/// pre-existing and moot for mesh (TCP-only capture; H3 is out of mesh scope) —
-/// see `docs/mesh.md` "Dispatch-path coverage".
-pub(crate) fn cap_proxy_retry_for_target(proxy: Arc<Proxy>) -> Arc<Proxy> {
+/// NOTE on the H3 frontend: the pre-existing H1/H2 dispatch path is where DR
+/// per-port effective-proxy overrides (all of them, not just this cap) are
+/// applied; the standalone H3 frontend (`src/http3/server.rs`) applies NONE of
+/// them. That is pre-existing and moot for mesh (TCP-only capture; H3 is out of
+/// mesh scope) — see `docs/mesh.md` "Dispatch-path coverage".
+pub(crate) fn cap_proxy_retry_for_target(
+    proxy: Arc<Proxy>,
+    upstream_target: Option<&UpstreamTarget>,
+) -> Arc<Proxy> {
     // No retry policy → DR maxRetries does not synthesize one.
     let Some(existing) = proxy.retry.as_ref() else {
         return proxy;
@@ -15226,9 +15230,12 @@ pub(crate) fn cap_proxy_retry_for_target(proxy: Arc<Proxy>) -> Arc<Proxy> {
     let Some(overrides) = proxy.dispatch_port_overrides.as_ref() else {
         return proxy;
     };
-    // Minimum maxRetries across every port override that sets one. `None` when
-    // no port override carries a cap — the common non-mesh / no-cap case.
-    let Some(cap) = overrides.values().filter_map(|o| o.max_retries).min() else {
+    let Some(target) = upstream_target else {
+        return proxy;
+    };
+    // Cap from the SELECTED dispatch target's port override. Retries stay in
+    // this port's lane (see docstring), so this cap governs the whole sequence.
+    let Some(cap) = overrides.get(&target.port).and_then(|o| o.max_retries) else {
         return proxy;
     };
     if existing.max_retries <= cap {
@@ -16253,6 +16260,18 @@ async fn proxy_to_backend(
     // The client uses our DnsCacheResolver for transparent DNS cache lookups.
     // All upstream targets share one reqwest::Client since it handles
     // per-host pooling and SNI internally.
+    //
+    // Force-H1 (`h2UpgradePolicy: DO_NOT_UPGRADE`) reaches this reqwest fallback
+    // too: `proxy` here is the EFFECTIVE proxy (rebound at function entry via
+    // `resolve_effective_proxy_for_target`, which projects per-port
+    // `h2_upgrade_policy`), so when DO_NOT_UPGRADE applies — top-level or
+    // port-level — `proxy.forces_backend_http1_only()` is true and `get_client`
+    // builds the `h1`-discriminated, ALPN-`http/1.1`-restricted client (see
+    // `ConnectionPool` pool-key + `BackendTlsConfigBuilder::build_reqwest`).
+    // The direct-H2 block above uses `direct_h2_proxy` only to skip the H2 pool;
+    // the force-H1 ALPN/pool-key guarantee on this path rides this rebind, so a
+    // first/non-retry request cannot ALPN-negotiate h2 despite DO_NOT_UPGRADE.
+    // `proxy_to_backend_retry` rebinds identically for the retry path.
     let client = match state.connection_pool.get_client(proxy).await {
         Ok(client) => client,
         Err(e) => {
@@ -25253,6 +25272,49 @@ mod tests {
         );
     }
 
+    /// codex round-3 Finding 1: force-H1 must reach the REQWEST FALLBACK, not
+    /// just the direct-H2 skip. The reqwest fallback in `proxy_to_backend`
+    /// (and `proxy_to_backend_retry`) calls `get_client(proxy)` with the
+    /// effective proxy that `resolve_effective_proxy_for_target` produces at
+    /// function entry (the `let proxy = effective_proxy.as_ref()` rebind). This
+    /// test pins the contract the reqwest pool key + ALPN restriction depend on:
+    /// when a per-port `DO_NOT_UPGRADE` applies, that EFFECTIVE proxy must report
+    /// `forces_backend_http1_only()`, so `get_client` builds the `h1`-keyed
+    /// ALPN-restricted client (see `connection_pool_key_force_http1_discriminator`
+    /// for the pool-key/ALPN side). Asserting the resolution — not a hand-set
+    /// `Proxy.h2_upgrade_policy` — proves force-H1 survives the dispatch path,
+    /// not just the builder in isolation.
+    #[test]
+    fn effective_proxy_for_reqwest_fallback_forces_http1_under_do_not_upgrade() {
+        use crate::config::types::H2UpgradePolicy;
+
+        // Per-port DO_NOT_UPGRADE → the effective proxy the reqwest fallback's
+        // `get_client` receives must force H1.
+        let proxy = proxy_with_h2_upgrade_override(H2UpgradePolicy::DoNotUpgrade);
+        assert!(
+            !proxy.forces_backend_http1_only(),
+            "base proxy carries no top-level policy, so it is not force-H1 on its own"
+        );
+        let target = target_for_test(8080);
+        let effective = resolve_effective_proxy_for_target(&proxy, Some(&target));
+        assert!(
+            effective.forces_backend_http1_only(),
+            "the EFFECTIVE proxy passed to the reqwest fallback's get_client must force H1 \
+             so the h1 pool-key discriminator + ALPN restriction apply"
+        );
+
+        // Probe-driven policies (Upgrade / Default) must NOT force H1 — the
+        // reqwest fallback stays h2-capable.
+        for probe_driven in [H2UpgradePolicy::Upgrade, H2UpgradePolicy::Default] {
+            let p = proxy_with_h2_upgrade_override(probe_driven);
+            let eff = resolve_effective_proxy_for_target(&p, Some(&target));
+            assert!(
+                !eff.forces_backend_http1_only(),
+                "{probe_driven:?} must NOT force H1 on the reqwest fallback"
+            );
+        }
+    }
+
     #[test]
     fn resolve_effective_proxy_borrows_when_h2_upgrade_policy_matches() {
         use crate::config::types::H2UpgradePolicy;
@@ -25354,7 +25416,8 @@ mod tests {
     }
 
     /// Build a proxy whose `dispatch_port_overrides` carries a `max_retries` on
-    /// each `(port, cap)` pair — for asserting the min-across-ports cap.
+    /// each `(port, cap)` pair — for asserting the cap is keyed by the SELECTED
+    /// target's port (a higher-cap port must not inherit a sibling's lower cap).
     fn proxy_with_max_retries_overrides(caps: &[(u16, u32)]) -> Arc<Proxy> {
         let mut proxy = proxy_with_port_overrides_for_test(5000, &[]);
         proxy.dispatch_port_overrides = Some(
@@ -25382,7 +25445,8 @@ mod tests {
             ..Default::default()
         });
         let proxy = Arc::new(inner);
-        let capped = cap_proxy_retry_for_target(proxy);
+        let target = target_for_test(8080);
+        let capped = cap_proxy_retry_for_target(proxy, Some(&target));
         assert_eq!(
             capped.retry.as_ref().unwrap().max_retries,
             2,
@@ -25391,22 +25455,23 @@ mod tests {
     }
 
     #[test]
-    fn cap_proxy_retry_caps_at_min_across_all_port_overrides() {
-        // Two port-overrides (caps 5 and 2) + Proxy.retry.max_retries=10 →
-        // effective cap = 2 (the MINIMUM across ports), independent of which
-        // target/port is initially selected, so a mid-request rotation onto the
-        // stricter-capped port cannot bypass it.
-        let mut inner = (*proxy_with_max_retries_overrides(&[(8080, 5), (9090, 2)])).clone();
+    fn cap_proxy_retry_caps_from_selected_port_not_sibling() {
+        // Two port-overrides: port 8080 cap 5, port 9090 cap 1. A request
+        // dispatched to port 8080 must be capped to 5 (its OWN port's cap), NOT
+        // to the sibling port 9090's stricter cap of 1. Retries stay in the
+        // selected target's port lane, so the selected-port cap governs.
+        let mut inner = (*proxy_with_max_retries_overrides(&[(8080, 5), (9090, 1)])).clone();
         inner.retry = Some(crate::config::types::RetryConfig {
             max_retries: 10,
             ..Default::default()
         });
         let proxy = Arc::new(inner);
-        let capped = cap_proxy_retry_for_target(proxy);
+        let target = target_for_test(8080);
+        let capped = cap_proxy_retry_for_target(proxy, Some(&target));
         assert_eq!(
             capped.retry.as_ref().unwrap().max_retries,
-            2,
-            "cap must be the minimum maxRetries across ALL port overrides"
+            5,
+            "cap must come from the SELECTED port (8080→5), not a sibling port's lower cap (9090→1)"
         );
     }
 
@@ -25419,7 +25484,8 @@ mod tests {
             ..Default::default()
         });
         let proxy = Arc::new(inner);
-        let capped = cap_proxy_retry_for_target(proxy.clone());
+        let target = target_for_test(8080);
+        let capped = cap_proxy_retry_for_target(proxy.clone(), Some(&target));
         assert_eq!(
             capped.retry.as_ref().unwrap().max_retries,
             1,
@@ -25437,7 +25503,8 @@ mod tests {
         // not a retry-policy enabler).
         let proxy = proxy_with_max_retries_override(Some(3));
         assert!(proxy.retry.is_none());
-        let capped = cap_proxy_retry_for_target(proxy.clone());
+        let target = target_for_test(8080);
+        let capped = cap_proxy_retry_for_target(proxy.clone(), Some(&target));
         assert!(
             capped.retry.is_none(),
             "DR maxRetries must NOT synthesize a retry policy when none exists"
@@ -25449,15 +25516,15 @@ mod tests {
     }
 
     #[test]
-    fn cap_proxy_retry_noop_without_port_override() {
-        // No port override carries maxRetries → no cap, same Arc.
-        let mut inner = proxy_with_port_overrides_for_test(5000, &[]);
+    fn cap_proxy_retry_noop_without_target_or_override() {
+        // No upstream target → cannot resolve a port → no cap, same Arc.
+        let mut inner = (*proxy_with_max_retries_override(Some(1))).clone();
         inner.retry = Some(crate::config::types::RetryConfig {
             max_retries: 5,
             ..Default::default()
         });
         let proxy = Arc::new(inner);
-        let capped = cap_proxy_retry_for_target(proxy.clone());
+        let capped = cap_proxy_retry_for_target(proxy.clone(), None);
         assert_eq!(capped.retry.as_ref().unwrap().max_retries, 5);
         assert!(Arc::ptr_eq(&proxy, &capped));
     }
