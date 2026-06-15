@@ -2028,7 +2028,7 @@ Mesh-specific environment variables are listed below. For the full reference of 
 | `FERRUM_MESH_SIDECAR_ENFORCED` | `false` | When `true`, applies Istio `Sidecar` egress scope narrowing to `services` / `service_entries` / `destination_rules` per workload. Sidecars are always parsed; this flag gates only the slice-narrowing pass. Opt in after vetting your `Sidecar` resources |
 | `FERRUM_MESH_SIDECAR_ENFORCED_DRY_RUN` | `false` | Computes and reports the applicable `Sidecar` egress scope while leaving the slice unchanged. Use with `/mesh/egress-scope` before enabling enforcement |
 | `FERRUM_MESH_SIDECAR_IDENTITY_NARROWING` | `false` | When `true` and `FERRUM_MESH_SIDECAR_ENFORCED=true`, filters `workloads` to SPIFFE identities referenced by services admitted by the applicable Sidecar. Default-off for rollout; trust-bundle mTLS validation and HBONE trust-domain aliasing do not depend on this list |
-| `FERRUM_MESH_EGRESS_STREAM_ENABLED` | `false` | Opt-in for stream-family (TCP / UDP) egress proxy materialization in `EgressGateway` topology. When enabled, each per-port stream listener **terminates SVID-mTLS and runs `mesh_authz`** at accept (same authn/z as HTTP egress, reusing the mesh-inbound `ServerConfig` + SPIFFE peer verifier; client certs required). Default-off because protocol-aware mediation is absent and the mTLS datapath is not yet live-e2e verified. Set `FERRUM_MESH_EGRESS_STREAM_ALLOW_PLAINTEXT=true` to restore the legacy plaintext + unauthenticated listener. HTTP-family egress is unaffected |
+| `FERRUM_MESH_EGRESS_STREAM_ENABLED` | `false` | Opt-in for **TCP** stream egress proxy materialization in `EgressGateway` topology. When enabled, each per-port TCP listener **terminates SVID-mTLS and runs `mesh_authz`** at accept (same authn/z as HTTP egress, reusing the mesh-inbound `ServerConfig` + SPIFFE peer verifier; client certs required). UDP ServiceEntry ports are classified but **not yet materialized** (deferred with a warning — the UDP capture/egress + DTLS datapath is unimplemented), so this flag produces no UDP listener today. Default-off because protocol-aware mediation is absent and the mTLS datapath is not yet live-e2e verified. Set `FERRUM_MESH_EGRESS_STREAM_ALLOW_PLAINTEXT=true` to restore the legacy plaintext + unauthenticated listener. HTTP-family egress is unaffected |
 | `FERRUM_MESH_NODE_WAYPOINT_CGROUP_SWEEP_INTERVAL_SECS` | `30` | NodeWaypoint cgroup-inode lifecycle sweep interval. Set to `0` to disable |
 | `FERRUM_MESH_REQUEST_AUTH_REQUIRE_EXP` | `true` | Whether the auto-injected mesh `RequestAuthentication` (`jwks_auth`) plugin requires the JWT `exp` claim. Secure default `true` rejects `exp`-less tokens. Set `false` only for issuers that legitimately omit `exp`; a present-but-expired `exp` is always rejected regardless |
 | `FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED` | `false` | Opt in to live reload of the PeerAuthentication-derived inbound mTLS mode, client CA verifier, and federated SVID bundle slot on slice apply. Does not rotate frontend cert/key material (use `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED`) |
@@ -2120,7 +2120,7 @@ Mesh-specific environment variables are listed below. For the full reference of 
 
 ### Kubernetes Controller
 
-These configure the in-cluster Istio / Gateway API translation controller and native service-registry discovery (CP / mesh modes). See [Istio CRD Status](#istio-crd-status) and [Pod Auto-Discovery](#pod-auto-discovery).
+These configure the in-cluster Istio / Gateway API translation controller and native service-registry discovery. The controller runs on the **control plane** (`FERRUM_MODE=cp`; started from `src/modes/control_plane.rs`) — a mesh-mode data plane does **not** run it, even in-cluster, so set these on the CP. See [Istio CRD Status](#istio-crd-status) and [Pod Auto-Discovery](#pod-auto-discovery).
 
 | Variable | Default | Description |
 |---|---|---|
@@ -2136,14 +2136,14 @@ These configure the in-cluster Istio / Gateway API translation controller and na
 | `FERRUM_K8S_NODE_LOCALITY_ENABLED` | `false` | Stamp Node `topology.kubernetes.io/region\|zone` labels onto workload locality |
 | `FERRUM_K8S_FULL_SYNC_INTERVAL_SECS` | `300` | Periodic full reconcile interval (seconds); safety valve against missed watch events |
 | `FERRUM_K8S_RECONCILE_DEBOUNCE_MS` | `500` | Debounce window coalescing rapid watch events before a reconcile |
-| `FERRUM_K8S_KUBECONFIG_PATH` | (in-cluster) | Path to a kubeconfig; unset uses the in-cluster service-account config |
+| `FERRUM_K8S_KUBECONFIG_PATH` | (in-cluster) | Path to a kubeconfig for out-of-cluster runs. When unset, the controller tries the in-cluster service-account config first, then falls back to standard kubeconfig inference (`KUBECONFIG` / `~/.kube/config`) — so an out-of-cluster CP often needs no explicit path |
 
 ### Shared with CP/DP
 
 Mesh mode reuses several CP/DP environment variables. See [cp_dp_mode.md](cp_dp_mode.md) for details:
 
-- `FERRUM_DP_CP_GRPC_URLS` (required) -- CP endpoints for config subscription.
-- `FERRUM_CP_DP_GRPC_JWT_SECRET` (required) -- shared JWT secret for gRPC auth.
+- `FERRUM_DP_CP_GRPC_URLS` (required for `native`/`xds`) -- CP endpoints for config subscription. Not required when `FERRUM_MESH_CONFIG_PROTOCOL=file` (no control plane).
+- `FERRUM_CP_DP_GRPC_JWT_SECRET` (required for `native`/`xds`) -- shared JWT secret for gRPC auth. Not required for the `file` protocol.
 - `FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS` -- primary CP retry interval on fallback.
 - `FERRUM_XDS_STREAM_CHANNEL_CAPACITY` -- per-ADS-stream response queue capacity.
 - DP gRPC TLS variables (`FERRUM_DP_GRPC_TLS_*`).
