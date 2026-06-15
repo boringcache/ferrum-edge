@@ -201,8 +201,14 @@ jobs:
           [docs/node_agent_security.md](https://github.com/ferrum-edge/ferrum-edge/blob/main/docs/node_agent_security.md).
           On a node whose kernel/cgroup/bpffs probe fails, the \`-ebpf\` pod
           **exits** (default \`FERRUM_NODE_AGENT_FALLBACK_MODE=fail\`) rather than
-          degrading; set \`FERRUM_NODE_AGENT_FALLBACK_MODE=iptables\` to fall back
-          to host iptables capture instead:
+          degrading. The published \`-ebpf\` image is **distroless** — it has no
+          \`/bin/sh\` and no \`iptables\`, and the fallback runs commands via
+          \`sh -c\`, so \`FERRUM_NODE_AGENT_FALLBACK_MODE=iptables\` on the
+          published image **crash-loops**. To use the iptables fallback, build a
+          custom runtime image that adds \`/bin/sh\` + \`iptables\`/\`ip6tables\`
+          (see [docs/node_agent.md](https://github.com/ferrum-edge/ferrum-edge/blob/main/docs/node_agent.md#kernel-fallback)),
+          then set \`FERRUM_NODE_AGENT_FALLBACK_MODE=iptables\` to fall back to
+          host iptables capture:
 
           \`\`\`bash
           docker pull ferrumedge/ferrum-edge:$TAG_NAME-ebpf
@@ -466,7 +472,16 @@ jobs:
 
   docker-ebpf-manifest:
     name: Docker eBPF Manifest
-    needs: docker-ebpf
+    # Gate the public `:<tag>-ebpf` registry tags on the CORE release path, not
+    # just the eBPF build. `create-release`'s `needs` only blocks the GitHub
+    # Release *page* — it cannot retract tags this job already pushed. So if the
+    # core artifacts (`build-release-binaries`) or the default `:<tag>` manifest
+    # (`docker-manifest`) failed, we must NOT publish the `-ebpf` variant either,
+    # or the registry advertises an `-ebpf` image for a release whose core
+    # artifacts never shipped. `docker-manifest` already transitively requires
+    # `docker` (per-arch core build), and `docker-ebpf` is added here so the
+    # eBPF build still gates its own manifest. The graph stays acyclic.
+    needs: [build-release-binaries, docker-manifest, docker-ebpf]
     runs-on: ubuntu-latest
     permissions:
       contents: read

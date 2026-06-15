@@ -91,9 +91,21 @@ BPF map read are gated behind `#[cfg(all(feature = "ebpf", target_os = "linux"))
 >   capture (not the mock) and requires a runtime image with `/bin/sh` +
 >   `iptables`/`ip6tables` — see [Kernel fallback](#kernel-fallback). (The mock
 >   backend is only ever selected by a build *without* `--features ebpf`, e.g. the
->   default image, never by the `-ebpf` image on a bad kernel.) The `-ebpf`
->   variant is published independently of the GitHub release, so a variant build
->   failure never blocks the default image or the binary assets.
+>   default image, never by the `-ebpf` image on a bad kernel.) **Release
+>   gating:** the default `:<tag>` image and the per-platform binary assets
+>   publish **independently** of the `-ebpf` variant — a variant build failure
+>   never blocks them (they flow through the `docker` / `docker-manifest` jobs).
+>   The **GitHub Release page**, however, is now gated on the `-ebpf` manifest:
+>   `create-release` `needs: docker-ebpf-manifest`, because the release notes
+>   advertise the `-ebpf` tags and must not publish until those manifests exist.
+>   So if the default image + binaries push but the `-ebpf` build/manifest fails,
+>   you will see the core artifacts in the registry with **no GitHub Release**;
+>   re-run the failed `docker-ebpf` / `docker-ebpf-manifest` jobs (and then
+>   `create-release`) from
+>   [`.github/workflows/release.yml`](../.github/workflows/release.yml) to finish
+>   the release. Conversely, `docker-ebpf-manifest` itself `needs:` the core
+>   release path, so the `-ebpf` tags are never published for a release whose
+>   core artifacts failed.
 
 **Building the capture image.** The compiled BPF ELF and the `--features ebpf`
 binary are produced by the root `Dockerfile` (also exercised by the
