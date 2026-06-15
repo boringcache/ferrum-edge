@@ -20,6 +20,15 @@ license = "PolyForm-Noncommercial-1.0.0"
 name = "ferrum-edge"
 path = "src/main.rs"
 
+# Functional tests for external secret-provider integrations. Lives in a
+# subdirectory (not a single tests/*.rs file) so it can carry shared helper
+# modules, which requires an explicit target declaration. Provider-specific
+# modules are gated behind the matching `secrets-*` feature; run e.g.
+# `cargo test --features secrets-vault --test secrets_functional vault_backend`.
+[[test]]
+name = "secrets_functional"
+path = "tests/secrets_functional/mod.rs"
+
 [dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -164,6 +173,12 @@ vaultrs = { version = "0.8", optional = true }
 aws-config = { version = "1.8", features = ["behavior-version-latest"], optional = true }
 aws-sdk-secretsmanager = { version = "1", optional = true }
 google-cloud-secretmanager-v1 = { version = "1.9", optional = true }
+# Provides anonymous credentials so the GCP Secret Manager client can target a
+# local fake/emulator endpoint (`FERRUM_GCP_SECRET_MANAGER_ENDPOINT`) without
+# attempting Application Default Credentials discovery. Already in the tree
+# transitively via google-cloud-secretmanager-v1 → gaxi; pinned here so the
+# direct `with_credentials(..)` call site has a declared dependency.
+google-cloud-auth = { version = "1", optional = true }
 azure_security_keyvault_secrets = { version = "0.14", optional = true }
 azure_identity = { version = "0.35", optional = true }
 azure_core = { version = "0.35", optional = true }
@@ -214,7 +229,7 @@ pkcs11 = ["dep:cryptoki"]
 cloud-secrets = ["secrets-vault", "secrets-aws", "secrets-gcp", "secrets-azure"]
 secrets-vault = ["dep:vaultrs"]
 secrets-aws = ["dep:aws-config", "dep:aws-sdk-secretsmanager"]
-secrets-gcp = ["dep:google-cloud-secretmanager-v1"]
+secrets-gcp = ["dep:google-cloud-secretmanager-v1", "dep:google-cloud-auth"]
 secrets-azure = ["dep:azure_identity", "dep:azure_security_keyvault_secrets", "dep:azure_core"]
 ebpf = ["dep:aya", "dep:aya-log", "ferrum-ebpf-common/userspace"]
 
@@ -274,6 +289,11 @@ tonic-prost-build = "0.14.6"
 # `src/config/mongo_store.rs`. Keeping it dev-only would re-introduce the
 # `cargo check --lib` break (see the dependency-section comment).
 wiremock = "0.6"
+# Functional secret-backend tests: Vault dev server + LocalStack run in Docker
+# via testcontainers; env-mutating tests serialize via serial_test. Only the
+# `secrets_functional` test target uses these. See tests/secrets_functional/.
+testcontainers = "0.27"
+serial_test = "3"
 # Functional testing dependencies
 rand = "0.10"
 futures = "0.3"

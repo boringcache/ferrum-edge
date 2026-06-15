@@ -717,11 +717,26 @@ impl GrpcPoolManager {
         // Disable Nagle for lower latency
         let _ = tcp.set_nodelay(true);
 
-        // Apply TCP keepalive using per-proxy pool config
+        // Apply TCP keepalive: honor the DestinationRule
+        // `connectionPool.tcp.tcpKeepalive` per-port override (keyed by the
+        // dial target's port, `proxy.backend_port`), falling back to the
+        // global pool keepalive. NOTE: keepalive is NOT in the pool key
+        // (forbidden by `.claude/rules/proxy-protocols.md`), and this
+        // connection is pooled+shared, so the first dispatcher to materialize
+        // the connection wins — same first-materializer tradeoff documented
+        // for `idleTimeout` / `maxRequestsPerConnection`.
         let pool_config = self.global_pool_config.for_proxy(proxy);
-        if pool_config.enable_http_keep_alive {
-            Self::set_tcp_keepalive(&tcp, pool_config.tcp_keepalive_seconds);
-        }
+        crate::socket_opts::apply_pooled_tcp_keepalive(
+            "grpc_proxy",
+            &tcp,
+            proxy
+                .dispatch_port_overrides
+                .as_ref()
+                .and_then(|m| m.get(&port))
+                .and_then(|o| o.tcp_keepalive.as_ref()),
+            pool_config.enable_http_keep_alive,
+            pool_config.tcp_keepalive_seconds,
+        );
 
         let use_tls = matches!(proxy.backend_scheme, Some(BackendScheme::Https));
 
@@ -788,25 +803,6 @@ impl GrpcPoolManager {
         }
 
         builder
-    }
-
-    /// Set TCP keepalive on a stream to detect dead backend connections.
-    fn set_tcp_keepalive(stream: &TcpStream, keepalive_seconds: u64) {
-        #[cfg(unix)]
-        use std::os::fd::AsFd;
-        #[cfg(windows)]
-        use std::os::windows::io::AsSocket;
-
-        #[cfg(unix)]
-        let borrowed = stream.as_fd();
-        #[cfg(windows)]
-        let borrowed = stream.as_socket();
-        let socket = socket2::SockRef::from(&borrowed);
-        let keepalive =
-            socket2::TcpKeepalive::new().with_time(Duration::from_secs(keepalive_seconds));
-        if let Err(e) = socket.set_tcp_keepalive(&keepalive) {
-            debug!("gRPC: failed to set TCP keepalive: {}", e);
-        }
     }
 
     /// Create an h2c (cleartext HTTP/2) connection using prior knowledge.
@@ -1317,6 +1313,53 @@ pub fn reconcile_grpc_trailers_from_view(
         }
         None => false,
     });
+}
+
+/// Re-home a hook-mutated trailer-only `set-cookie` onto the buffered gRPC
+/// initial HEADERS (issue #1638).
+///
+/// On the buffered gRPC path response hooks run on a merged header+trailer view
+/// ([`build_grpc_plugin_header_view`]). If the backend sent `set-cookie` only as
+/// a gRPC **trailer** and a hook then mutates it, [`reconcile_grpc_trailers_from_view`]
+/// writes the hook's value back into the wire trailer and the non-empty-body
+/// strip loop removes it from the initial HEADERS — so the cookie rides a
+/// trailer and browsers / gRPC-Web clients never store it. A hook that touches
+/// `set-cookie` clearly intends a client-visible cookie, so move the hook's
+/// value onto the initial HEADERS, mirroring the post-strip treatment the
+/// sticky-affinity cookie already gets.
+///
+/// Scope guards (match issue #1638 exactly, to minimize wire-shape change):
+/// - Acts only when `set-cookie` is **trailer-only** after the strip loop
+///   (absent from `response_headers`). A header-shadowed `set-cookie` already
+///   reaches the client as a real header, so its faithful (sanitized) trailer
+///   copy is left alone; the empty-body Trailers-Only collapse is likewise a
+///   no-op (the cookie is already a header there).
+/// - Acts only when a hook actually **changed** the value
+///   (`original_trailer_set_cookie` differs from the current wire trailer). An
+///   untouched backend trailer keeps the backend's faithful split wire shape.
+///
+/// Must be called AFTER the strip loop and BEFORE sticky-cookie injection (so an
+/// injected sticky `set-cookie` cannot mask the trailer-only check) and BEFORE
+/// the gRPC-Web trailer-clear guard. Shared by the main buffered gRPC path
+/// (`proxy::handle_proxy_request`) and the H3 cross-protocol bridge
+/// (`http3::cross_protocol`) so both stay byte-for-byte identical (#1614).
+pub fn rehome_hook_mutated_trailer_set_cookie(
+    response_headers: &mut HashMap<String, String>,
+    response_trailers: &mut HashMap<String, String>,
+    original_trailer_set_cookie: Option<&str>,
+) {
+    if response_headers.contains_key("set-cookie") {
+        return;
+    }
+    let Some(current) = response_trailers.get("set-cookie") else {
+        return;
+    };
+    if original_trailer_set_cookie == Some(current.as_str()) {
+        return;
+    }
+    if let Some(value) = response_trailers.remove("set-cookie") {
+        response_headers.insert("set-cookie".to_string(), value);
+    }
 }
 
 /// HTTP/3 admission rejects use `425 Too Early` for 0-RTT policy failures.
@@ -2294,6 +2337,7 @@ mod tests {
             pool_http2_max_frame_size: None,
             pool_http2_max_concurrent_streams: None,
             pool_http3_connections_per_backend: None,
+            h2_upgrade_policy: None,
             pool_max_requests_per_connection: None,
             upstream_id: None,
             upstream_subset: None,
@@ -2942,5 +2986,97 @@ mod tests {
             !out.contains_key("keep-alive"),
             "hop-by-hop response headers must be stripped"
         );
+    }
+
+    #[test]
+    fn rehome_moves_hook_mutated_trailer_only_set_cookie_to_headers() {
+        // Backend sent set-cookie only as a gRPC trailer ("a=1"); a response
+        // hook appended a session cookie, so the post-reconcile wire trailer
+        // ("a=1\nsession=x") differs from the captured original ("a=1"). The
+        // strip loop already removed set-cookie from the initial headers
+        // (issue #1638): it must be re-homed onto the headers so clients store
+        // it, and must not also ride the wire trailer.
+        let mut headers: HashMap<String, String> = HashMap::new();
+        headers.insert("content-type".into(), "application/grpc".into());
+        let mut trailers: HashMap<String, String> = HashMap::new();
+        trailers.insert("grpc-status".into(), "0".into());
+        trailers.insert("set-cookie".into(), "a=1\nsession=x".into());
+
+        rehome_hook_mutated_trailer_set_cookie(&mut headers, &mut trailers, Some("a=1"));
+
+        assert_eq!(
+            headers.get("set-cookie").map(String::as_str),
+            Some("a=1\nsession=x"),
+            "hook-mutated trailer-only set-cookie must be re-homed onto the initial HEADERS",
+        );
+        assert!(
+            !trailers.contains_key("set-cookie"),
+            "the re-homed cookie must not also ride the wire trailer",
+        );
+        assert_eq!(
+            trailers.get("grpc-status").map(String::as_str),
+            Some("0"),
+            "the terminal status trailer is untouched",
+        );
+    }
+
+    #[test]
+    fn rehome_leaves_untouched_backend_trailer_set_cookie_as_a_trailer() {
+        // No hook touched the backend's trailer set-cookie (original == current
+        // wire value), so the faithful split wire shape is preserved — issue
+        // #1638 scopes the re-homing to hook-contributed values only.
+        let mut headers: HashMap<String, String> = HashMap::new();
+        let mut trailers: HashMap<String, String> = HashMap::new();
+        trailers.insert("set-cookie".into(), "a=1".into());
+
+        rehome_hook_mutated_trailer_set_cookie(&mut headers, &mut trailers, Some("a=1"));
+
+        assert!(
+            !headers.contains_key("set-cookie"),
+            "an untouched backend trailer set-cookie is not re-homed",
+        );
+        assert_eq!(
+            trailers.get("set-cookie").map(String::as_str),
+            Some("a=1"),
+            "an untouched backend trailer set-cookie keeps its wire shape",
+        );
+    }
+
+    #[test]
+    fn rehome_skips_header_shadowed_set_cookie() {
+        // set-cookie already reaches the client as a real header (shadowed); its
+        // faithful (sanitized) trailer copy is left alone and never duplicated
+        // onto the header, even though the trailer value "changed".
+        let mut headers: HashMap<String, String> = HashMap::new();
+        headers.insert("set-cookie".into(), "h=1".into());
+        let mut trailers: HashMap<String, String> = HashMap::new();
+        trailers.insert("set-cookie".into(), "h=1".into());
+
+        rehome_hook_mutated_trailer_set_cookie(&mut headers, &mut trailers, Some("t=1"));
+
+        assert_eq!(
+            headers.get("set-cookie").map(String::as_str),
+            Some("h=1"),
+            "an already-present header set-cookie must not be appended to",
+        );
+        assert_eq!(
+            trailers.get("set-cookie").map(String::as_str),
+            Some("h=1"),
+            "the trailer copy is left untouched when set-cookie is already a header",
+        );
+    }
+
+    #[test]
+    fn rehome_is_noop_without_a_trailer_set_cookie() {
+        let mut headers: HashMap<String, String> = HashMap::new();
+        headers.insert("content-type".into(), "application/grpc".into());
+        let mut trailers: HashMap<String, String> = HashMap::new();
+        trailers.insert("grpc-status".into(), "0".into());
+
+        rehome_hook_mutated_trailer_set_cookie(&mut headers, &mut trailers, None);
+
+        assert!(!headers.contains_key("set-cookie"));
+        assert!(!trailers.contains_key("set-cookie"));
+        assert_eq!(trailers.len(), 1, "unrelated trailers are untouched");
     }
 }

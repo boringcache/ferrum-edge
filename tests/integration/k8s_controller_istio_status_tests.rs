@@ -520,10 +520,12 @@ fn root_namespace_peer_authentication_resolves_to_mesh_wide_scope() {
 }
 
 /// DestinationRule deferred-fields tracking: when an operator uses a
-/// parsed-but-unenforced field (here `connectionPool.http.maxRetries`), the
-/// detail block surfaces it as a deferred field so they know Ferrum parsed it
-/// but does not enforce it. (`portLevelSettings[].tls` was the example here
-/// before it became applied per-port, so it is no longer deferred.)
+/// parsed-but-unenforced field (here `connectionPool.http.http1MaxPendingRequests`,
+/// the only remaining deferred HTTP knob — `maxRetries` and `h2UpgradePolicy`
+/// became applied in F5.1), the detail block surfaces it as a deferred field so
+/// they know Ferrum parsed it but does not enforce it.
+/// (`portLevelSettings[].tls` was the example here before it became applied
+/// per-port, so it is no longer deferred.)
 #[test]
 fn destination_rule_deferred_fields_listed_in_detail() {
     let obj = object(
@@ -533,7 +535,7 @@ fn destination_rule_deferred_fields_listed_in_detail() {
         json!({
             "host": "secured.default.svc.cluster.local",
             "trafficPolicy": {
-                "connectionPool": { "http": { "maxRetries": 3 } }
+                "connectionPool": { "http": { "http1MaxPendingRequests": 64 } }
             }
         }),
     );
@@ -545,7 +547,18 @@ fn destination_rule_deferred_fields_listed_in_detail() {
         .iter()
         .filter_map(Value::as_str)
         .collect();
-    assert!(deferred.iter().any(|f| f.contains("maxRetries")));
+    assert!(
+        deferred
+            .iter()
+            .any(|f| f.contains("http1MaxPendingRequests"))
+    );
+    // The now-applied fields must NOT appear as deferred.
+    assert!(
+        !deferred
+            .iter()
+            .any(|f| f.contains("maxRetries") || f.contains("h2UpgradePolicy")),
+        "maxRetries/h2UpgradePolicy are applied now, not deferred; got: {deferred:?}"
+    );
     let message = find_condition(
         updates[0].status["conditions"].as_array().unwrap(),
         "FerrumAccepted",

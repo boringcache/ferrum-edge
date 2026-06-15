@@ -1739,15 +1739,15 @@ pub struct MeshTrafficPolicy {
     /// Optional `DestinationRule.trafficPolicy.connectionPool.http` block.
     /// When present, the K8s translator has parsed at least one of the
     /// supported HTTP connection-pool knobs (`maxRequestsPerConnection`,
-    /// `idleTimeout`, `http2MaxRequests`); the mesh apply layer projects
-    /// these onto the matching upstream's `port_overrides[port]` slot
-    /// (top-level fan-out applies to every target port; per-port
-    /// `portLevelSettings` overrides per-port). Old DPs reading new slices
-    /// see this as a no-op via the serde default. Currently-deferred
-    /// Istio HTTP knobs (`http1MaxPendingRequests`, `maxRetries`,
-    /// `h2UpgradePolicy`) are intentionally absent — the K8s translator
-    /// emits a debug line when an operator sets them and otherwise drops
-    /// them.
+    /// `idleTimeout`, `http2MaxRequests`, `h2UpgradePolicy`, `maxRetries`);
+    /// the mesh apply layer projects these onto the matching upstream's
+    /// `port_overrides[port]` slot (top-level fan-out applies to every
+    /// target port; per-port `portLevelSettings` overrides per-port). Old
+    /// DPs reading new slices see this as a no-op via the serde default.
+    /// The only currently-deferred Istio HTTP knob,
+    /// `http1MaxPendingRequests`, is intentionally absent — the K8s
+    /// translator emits a warning when an operator sets it and otherwise
+    /// drops it (it needs a Ferrum-side pending-request gauge).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connection_pool_http: Option<MeshConnectionPoolHttp>,
 }
@@ -1781,6 +1781,24 @@ pub struct MeshConnectionPoolHttp {
     /// builder knobs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http2_max_requests: Option<u32>,
+    /// Mapped from `h2UpgradePolicy`. Controls whether plain-HTTP backend
+    /// dispatch upgrades to HTTP/2. Projects onto
+    /// `Proxy.h2_upgrade_policy` per port and is consulted at the
+    /// plain-HTTPS H2-vs-H1 dispatch fork in `proxy_to_backend`. Does NOT
+    /// affect gRPC (always H2) or HBONE/mesh-mTLS transport selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub h2_upgrade_policy: Option<crate::config::types::H2UpgradePolicy>,
+    /// Mapped from `maxRetries`. Interpreted as a per-request retry-count
+    /// CAP (an upper bound on `Proxy.retry.max_retries`), NOT Envoy's
+    /// cluster-wide outstanding-retry concurrency budget — see the honest
+    /// semantics note in `docs/mesh.md` and `cap_proxy_retry_for_target`
+    /// in `src/proxy/mod.rs`. When a proxy already carries a retry policy
+    /// the effective `max_retries` becomes `min(existing, this)`; when no
+    /// policy exists this field does NOT synthesize one (an Istio
+    /// `maxRetries` is a budget, not a retry-policy enabler). Always
+    /// positive when set (zero/negative rejected at translate time).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_retries: Option<u32>,
 }
 
 /// `DestinationRule.trafficPolicy.tls` settings mapped from Istio's

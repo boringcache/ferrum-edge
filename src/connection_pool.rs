@@ -166,6 +166,17 @@ impl PoolManager for ReqwestPoolManager {
         );
         let scheme_disc = proxy.backend_scheme.map(|s| s as u8).unwrap_or(u8::MAX);
         let _ = write!(buf, "{}|", scheme_disc);
+        // Force-H1 (DestinationRule `h2UpgradePolicy = DO_NOT_UPGRADE`) builds a
+        // reqwest client with ALPN restricted to `http/1.1` (see
+        // `BackendTlsConfigBuilder::build_reqwest`). That is a DIFFERENT,
+        // protocol-incompatible client from the default (h2-capable) one, so it
+        // must NOT share a pool entry. This is a protocol/ALPN distinction
+        // (legitimate pool-key content per `.claude/rules/proxy-protocols.md`),
+        // NOT a policy field. `h1` marks the force-H1 client; absent otherwise.
+        if proxy.forces_backend_http1_only() {
+            buf.push_str("h1");
+        }
+        buf.push('|');
         append_optional_pool_key_component(buf, proxy.dns_override.as_deref());
         buf.push('|');
         // Subset name partitions backend pools so two proxies that share

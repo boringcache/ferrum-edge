@@ -28,7 +28,6 @@ use std::fmt::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio_rustls::TlsConnector;
 use tracing::debug;
@@ -428,6 +427,7 @@ impl MeshMtlsConnectionPool {
         self.get_or_create_sender(
             proxy,
             target_host,
+            app_port,
             mtls_port,
             expected_peer,
             &key,
@@ -470,6 +470,13 @@ impl MeshMtlsConnectionPool {
         // identity-less (parity with `get_sender` and the HBONE raw-TCP path).
         let _ = self.current_svid_fingerprint_cached()?;
         let pool_config = self.pool_config.for_proxy(proxy);
+        // DR keepalive override resolved for the destination's APP port
+        // (`target_port`), not the transport `mtls_port`.
+        let keepalive_override = proxy
+            .dispatch_port_overrides
+            .as_ref()
+            .and_then(|m| m.get(&target_port))
+            .and_then(|o| o.tcp_keepalive.as_ref());
         let sender = dial_h2_connect_sender(
             &self.dns_cache,
             &self.gateway_svid,
@@ -478,6 +485,7 @@ impl MeshMtlsConnectionPool {
             mtls_port,
             Some(expected_peer),
             &pool_config,
+            keepalive_override,
         )
         .await?;
         tokio::time::timeout(
@@ -531,6 +539,7 @@ impl MeshMtlsConnectionPool {
         &self,
         proxy: &Proxy,
         dial_host: &str,
+        app_port: u16,
         mtls_port: u16,
         authority: &str,
         path_and_query: &str,
@@ -541,6 +550,15 @@ impl MeshMtlsConnectionPool {
         // identity-less (parity with `open_connect_tunnel` and `get_sender`).
         let _ = self.current_svid_fingerprint_cached()?;
         let pool_config = self.pool_config.for_proxy(proxy);
+        // DR keepalive override resolved for the destination's APP port, not
+        // the transport `mtls_port`. `authority` carries the SERVICE routing
+        // port for the inner request; the socket-level keepalive uses the
+        // dial target's app port like the other mesh-mTLS sites.
+        let keepalive_override = proxy
+            .dispatch_port_overrides
+            .as_ref()
+            .and_then(|m| m.get(&app_port))
+            .and_then(|o| o.tcp_keepalive.as_ref());
         let sender = dial_h2_connect_sender(
             &self.dns_cache,
             &self.gateway_svid,
@@ -549,6 +567,7 @@ impl MeshMtlsConnectionPool {
             mtls_port,
             Some(expected_peer),
             &pool_config,
+            keepalive_override,
         )
         .await?;
         tokio::time::timeout(
@@ -573,10 +592,12 @@ impl MeshMtlsConnectionPool {
         })?
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn get_or_create_sender(
         &self,
         proxy: &Proxy,
         target_host: &str,
+        app_port: u16,
         mtls_port: u16,
         expected_peer: &SpiffeId,
         key: &str,
@@ -616,9 +637,25 @@ impl MeshMtlsConnectionPool {
         // verifier read the slot at HANDSHAKE time, so "slot unchanged across
         // the dial" proves the session was built from exactly this material.
         let svid_slot_before_dial = self.gateway_svid.load_full();
+        // Resolve the DR `connectionPool.tcp.tcpKeepalive` per-port override for
+        // the destination's APP port (`app_port`), NOT the transport
+        // `mtls_port` (always `:15006`). Falls back to the global pool
+        // keepalive inside `create_sender` when absent.
+        let keepalive_override = proxy
+            .dispatch_port_overrides
+            .as_ref()
+            .and_then(|m| m.get(&app_port))
+            .and_then(|o| o.tcp_keepalive.as_ref());
         let sender = match tokio::time::timeout(
             remaining,
-            self.create_sender(proxy, target_host, mtls_port, expected_peer, pool_config),
+            self.create_sender(
+                proxy,
+                target_host,
+                mtls_port,
+                expected_peer,
+                pool_config,
+                keepalive_override,
+            ),
         )
         .await
         {
@@ -765,6 +802,7 @@ impl MeshMtlsConnectionPool {
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn create_sender(
         &self,
         proxy: &Proxy,
@@ -772,6 +810,7 @@ impl MeshMtlsConnectionPool {
         mtls_port: u16,
         expected_peer: &SpiffeId,
         pool_config: &PoolConfig,
+        keepalive_override: Option<&crate::config::types::TcpKeepaliveCfg>,
     ) -> Result<MeshMtlsSender, HbonePoolError> {
         let resolved_ip = self
             .dns_cache
@@ -804,9 +843,21 @@ impl MeshMtlsConnectionPool {
             source,
         })?;
         let _ = tcp.set_nodelay(true);
-        if pool_config.enable_http_keep_alive {
-            set_tcp_keepalive(&tcp, pool_config.tcp_keepalive_seconds);
-        }
+        // Honor the DR `connectionPool.tcp.tcpKeepalive` per-port override
+        // resolved by the caller for the app port (NOT this transport
+        // `mtls_port`), falling back to the global pool keepalive. NOTE:
+        // keepalive is NOT in the pool key (forbidden by
+        // `.claude/rules/proxy-protocols.md`), and mesh-mTLS pool connections
+        // are shared, so the first dispatcher to materialize the connection
+        // wins — same first-materializer tradeoff as `idleTimeout` /
+        // `maxRequestsPerConnection`.
+        crate::socket_opts::apply_pooled_tcp_keepalive(
+            "mesh_mtls_pool",
+            &tcp,
+            keepalive_override,
+            pool_config.enable_http_keep_alive,
+            pool_config.tcp_keepalive_seconds,
+        );
 
         // Plain mesh HTTP over mTLS speaks h2 to the peer sidecar's frontend
         // (which advertises h2 and preface-sniffs via `auto`), so advertise h2
@@ -924,23 +975,6 @@ fn prune_pool_entries(entries: &mut Vec<MeshMtlsPoolEntry>) -> usize {
 fn record_mesh_mtls_evictions(count: usize) {
     crate::runtime_metrics::global_ref()
         .record_pool_evictions(crate::runtime_metrics::PoolKind::MeshMtls, count as u64);
-}
-
-fn set_tcp_keepalive(stream: &TcpStream, keepalive_seconds: u64) {
-    #[cfg(unix)]
-    use std::os::fd::AsFd;
-    #[cfg(windows)]
-    use std::os::windows::io::AsSocket;
-
-    #[cfg(unix)]
-    let borrowed = stream.as_fd();
-    #[cfg(windows)]
-    let borrowed = stream.as_socket();
-    let socket = socket2::SockRef::from(&borrowed);
-    let keepalive = socket2::TcpKeepalive::new().with_time(Duration::from_secs(keepalive_seconds));
-    if let Err(e) = socket.set_tcp_keepalive(&keepalive) {
-        debug!("mesh_mtls_pool: failed to set TCP keepalive: {}", e);
-    }
 }
 
 #[allow(clippy::too_many_arguments)]

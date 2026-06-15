@@ -1218,6 +1218,7 @@ fn east_west_gateway_proxy(gateway: &EastWestGateway, listen_port: u16) -> Proxy
         pool_http2_max_frame_size: None,
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
+        h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
         upstream_id: None,
         upstream_subset: None,
@@ -1471,6 +1472,7 @@ fn east_west_service_proxy(
         pool_http2_max_frame_size: None,
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
+        h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
         upstream_id: Some(upstream_id.to_string()),
         upstream_subset: None,
@@ -1826,6 +1828,174 @@ fn mesh_outbound_upstream_id(namespace: &str, name: &str, port: u16) -> String {
 /// fan-out between its HTTP and TCP lanes. Same non-route prefix rationale.
 pub(crate) fn mesh_outbound_tcp_upstream_id(namespace: &str, name: &str, port: u16) -> String {
     format!("__mesh-out-tcp-upstream-{namespace}-{name}-{port}").replace(['/', '.'], "-")
+}
+
+/// Upstream id for a raw-TCP egress upstream addressed by a DIRECT pod IP
+/// (headless / direct-dial path; F3 §3.4), one per
+/// (stream-family service port × backing workload IP). A captured raw-TCP dial
+/// whose `SO_ORIGINAL_DST` IP+port matches a declared workload address+port —
+/// NOT a service VIP — routes here to a SINGLE-TARGET upstream pinned to that
+/// workload's identity. Distinct id space from both
+/// [`mesh_outbound_upstream_id`] (HTTP per-port) and
+/// [`mesh_outbound_tcp_upstream_id`] (VIP per-port) so LB counters / passive
+/// health / DR fan-out never conflate the three lanes. The canonical IP is
+/// folded into the id (replacing `.`/`:` like the rest) so each backing
+/// workload IP of a service port gets its own deterministic, single-target
+/// upstream; same non-route prefix rationale so it is never misclassified as a
+/// direction-scoped route id. The id is always derived FORWARD from
+/// config — never parsed back.
+pub(crate) fn mesh_outbound_tcp_bywl_upstream_id(
+    namespace: &str,
+    name: &str,
+    port: u16,
+    canonical_ip: std::net::IpAddr,
+) -> String {
+    format!("__mesh-out-tcp-bywl-upstream-{namespace}-{name}-{port}-{canonical_ip}")
+        .replace(['/', '.', ':'], "-")
+}
+
+/// One direct-pod-IP raw-TCP egress upstream candidate (F3 §3.4): a single
+/// backing workload IP of a service's stream-family port, resolved to its
+/// container/target port and pinned to the workload's SPIFFE identity. The
+/// SINGLE forward-derivation source shared by every consumer — materialization
+/// (`materialize_mesh_outbound_tcp_upstreams`), the route-table
+/// `mesh_tcp_egress_by_workload` index (`router_cache::build_route_table`), the
+/// HBONE capability enrollment (`collect_mesh_tcp_egress_capability_targets`),
+/// and DestinationRule per-port fan-out (`apply_destination_rules`) — so the
+/// deterministic upstream id, the `(IP, port)` index key, the capability key,
+/// and the DR owner-port map can never drift. Borrows from the prepared
+/// `MeshConfig` (the slice's `workloads`/`services`).
+pub(crate) struct MeshTcpBywlUpstreamSpec<'a> {
+    /// Deterministic per-(service-port, workload-IP) upstream id.
+    pub(crate) upstream_id: String,
+    /// The backing workload address canonicalized to an `IpAddr` (mapped-IPv6
+    /// folded the SAME way the VIP path keys `mesh_tcp_egress`) — the IP half of
+    /// the strict `(IP, target_port)` index key.
+    pub(crate) canonical_ip: std::net::IpAddr,
+    /// Resolved container/target port the dial uses — the port half of the
+    /// index key and the `UpstreamTarget.port`.
+    pub(crate) target_port: u16,
+    /// The service this workload backs (for tag building + the relay proxy /
+    /// FQDN identity, all forward-derived).
+    pub(crate) service: &'a crate::modes::mesh::config::MeshService,
+    /// The owning Service stream-family port (for the relay proxy id, the DR
+    /// owner-port map, and protocol classification).
+    pub(crate) service_port: &'a crate::modes::mesh::config::ServicePort,
+    /// The backing workload (carries the pinned `spiffe_id` + tags + locality).
+    pub(crate) workload: &'a crate::modes::mesh::config::Workload,
+    /// The service's effective protocol on this port (override-aware) — passed
+    /// to the transport tag builders so the materialized target's `mesh.protocol`
+    /// matches the VIP path.
+    pub(crate) protocol: crate::modes::mesh::config::AppProtocol,
+}
+
+impl MeshTcpBywlUpstreamSpec<'_> {
+    /// FQDN the relay upstream is named after (DR-matchable), built forward from
+    /// the service + cluster domain exactly like the VIP per-port path.
+    pub(crate) fn service_fqdn(&self, cluster_domain: &str) -> String {
+        format!(
+            "{}.{}.svc.{}",
+            self.service.name,
+            self.service.namespace,
+            cluster_domain.trim_matches('.')
+        )
+    }
+}
+
+/// Forward-derive the direct-pod-IP raw-TCP egress upstream candidates (F3
+/// §3.4): for every in-mesh service's stream-family port, every backing
+/// local-cluster workload, every workload address that parses as an IP. DNS-name
+/// workload addresses are skipped (the index is keyed by `IpAddr` and a raw
+/// `SO_ORIGINAL_DST` is always an IP). The container/target port is resolved
+/// with the SAME fail-closed rule the VIP path uses
+/// (`build_outbound_mesh_targets`): a DECLARED `targetPort` must resolve (numeric
+/// non-zero, or named matching a workload port) or the candidate is dropped — an
+/// unresolved named targetPort never falls back to the service port; only an
+/// ABSENT targetPort falls back. Duplicate `(canonical_ip, target_port)` pairs
+/// (e.g. two replicas whose distinct address strings canonicalize to one IP, or
+/// a `targetPort` that collapses two ports) collapse to the FIRST candidate —
+/// the strict index can route a given `(IP, port)` to exactly one workload, and
+/// the first-wins choice is deterministic given a stable slice order. Empty when
+/// `workloads` is empty or no service declares a routable stream port.
+///
+/// Takes the three slices directly (rather than a `MeshConfig`/`MeshSlice`) so
+/// both the materializer (`MeshSlice`) and the route-table / capability /
+/// DR consumers (`MeshConfig` via `config.mesh`) share ONE derivation — the
+/// upstream id, the `(IP, port)` index key, the capability key, and the DR
+/// owner-port map can never drift.
+pub(crate) fn mesh_outbound_tcp_bywl_upstreams<'a>(
+    services: &'a [crate::modes::mesh::config::MeshService],
+    workloads: &'a [crate::modes::mesh::config::Workload],
+    local_cluster: Option<&str>,
+) -> Vec<MeshTcpBywlUpstreamSpec<'a>> {
+    let mut specs = Vec::new();
+    for service in services {
+        let tcp_ports = service_tcp_stream_ports(service);
+        if tcp_ports.is_empty() {
+            continue;
+        }
+        for service_port in tcp_ports {
+            let protocol = service
+                .protocol_overrides
+                .get(&service_port.port)
+                .copied()
+                .unwrap_or(service_port.protocol);
+            // De-dupe within ONE service port so a workload listed twice (or two
+            // replicas collapsing to one canonical IP) yields one routable
+            // upstream per `(IP, port)`.
+            let mut seen: std::collections::HashSet<(std::net::IpAddr, u16)> =
+                std::collections::HashSet::new();
+            for workload in matched_local_service_workloads(service, workloads, local_cluster) {
+                // Same app-port resolution as `build_outbound_mesh_targets`:
+                // a DECLARED targetPort is authoritative (resolve or SKIP);
+                // only an ABSENT one falls back to the service port.
+                let app_port = match service_port.target_port.as_ref() {
+                    Some(_) => match crate::modes::mesh::config::resolve_target_port(
+                        service_port.target_port.as_ref(),
+                        &workload.ports,
+                    ) {
+                        Some(p) if p != 0 => p,
+                        _ => continue,
+                    },
+                    None => service_port.port,
+                };
+                if app_port == 0 {
+                    continue;
+                }
+                for address in &workload.addresses {
+                    if address.is_empty() {
+                        continue;
+                    }
+                    // The index is keyed by IpAddr — a raw captured original
+                    // destination is always an IP. Skip DNS-name workload
+                    // addresses (they can never match an orig-dst IP, and
+                    // HTTP-family headless already routes by Host).
+                    let Ok(parsed) = address.parse::<std::net::IpAddr>() else {
+                        continue;
+                    };
+                    let canonical_ip = parsed.to_canonical();
+                    if !seen.insert((canonical_ip, app_port)) {
+                        continue;
+                    }
+                    specs.push(MeshTcpBywlUpstreamSpec {
+                        upstream_id: mesh_outbound_tcp_bywl_upstream_id(
+                            &service.namespace,
+                            &service.name,
+                            service_port.port,
+                            canonical_ip,
+                        ),
+                        canonical_ip,
+                        target_port: app_port,
+                        service,
+                        service_port,
+                        workload,
+                        protocol,
+                    });
+                }
+            }
+        }
+    }
+    specs
 }
 
 /// Materialize inbound routes for the sidecar's **local** workload so that
@@ -2356,6 +2526,7 @@ fn mesh_inbound_loopback_proxy_to(
         pool_http2_max_frame_size: None,
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
+        h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
         upstream_id: None,
         upstream_subset: None,
@@ -2433,6 +2604,7 @@ pub(crate) fn mesh_inbound_hbone_relay_proxy(host: &str, port: u16) -> Proxy {
         pool_http2_max_frame_size: None,
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
+        h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
         upstream_id: None,
         upstream_subset: None,
@@ -2779,13 +2951,99 @@ fn materialize_mesh_outbound_tcp_upstreams(
         }
     }
 
-    if materialized > 0 {
+    // ── Direct-pod-IP / headless raw-TCP egress (F3 §3.4) ──────────────────
+    // The VIP loop above routes ONLY `(cluster_ip VIP, service port)` dials. A
+    // client that resolved a HEADLESS service itself and dials a POD IP
+    // directly bypasses the VIP table; a VIP-less service warns+skips above.
+    // For each backing workload IP of a stream-family service port, materialize
+    // a SINGLE-TARGET upstream pinned to THAT workload's identity over the
+    // topology's transport, so a captured `(pod IP, target port)` dial routes
+    // to exactly that workload. Strict exact match; the route-table index
+    // (`mesh_tcp_egress_by_workload`) and the accept-loop fallback enforce it.
+    let mut bywl_materialized = 0usize;
+    for spec in
+        mesh_outbound_tcp_bywl_upstreams(&mesh_slice.services, &mesh_slice.workloads, local_cluster)
+    {
+        // One tagged target dialing the resolved container port, identity-pinned
+        // to this workload — built with the SAME transport tag builders the VIP
+        // path uses, so `mesh.spiffe_id` / `mesh.protocol` / the transport tag
+        // match (the VIP path stamps a `mesh.mtls_authority_port` only for
+        // MULTI-port destinations; a direct pod-IP dial already carries the app
+        // port in its orig-dst, so no `:authority` rewrite is needed and the tag
+        // is intentionally absent — the destination's inbound relay dials the
+        // CONNECT authority `host:target_port` directly).
+        let mut tags = match transport {
+            MeshEgressTransport::Hbone => crate::service_discovery::mesh::mesh_hbone_target_tags(
+                spec.service,
+                spec.workload,
+                spec.protocol,
+                spec.service_port.name.as_deref(),
+            ),
+            MeshEgressTransport::SidecarMtls => {
+                crate::service_discovery::mesh::mesh_sidecar_mtls_target_tags(
+                    spec.service,
+                    spec.workload,
+                    spec.protocol,
+                    spec.service_port.name.as_deref(),
+                )
+            }
+        };
+        // Non-default egress dial port (heterogeneous meshes / functional
+        // harness), exactly like the VIP path.
+        match transport {
+            MeshEgressTransport::Hbone => {
+                if runtime.egress_hbone_port != hbone::ISTIO_HBONE_PORT {
+                    tags.insert(
+                        crate::proxy::hbone_pool::HBONE_PORT_TAG.to_string(),
+                        runtime.egress_hbone_port.to_string(),
+                    );
+                }
+            }
+            MeshEgressTransport::SidecarMtls => {
+                if runtime.egress_mtls_port
+                    != crate::proxy::mesh_mtls_pool::ISTIO_SIDECAR_INBOUND_PORT
+                {
+                    tags.insert(
+                        crate::proxy::mesh_mtls_pool::MESH_MTLS_PORT_TAG.to_string(),
+                        runtime.egress_mtls_port.to_string(),
+                    );
+                }
+            }
+        }
+        let target = UpstreamTarget {
+            // Dial the workload's own (canonicalized) IP, not the VIP.
+            host: spec.canonical_ip.to_string(),
+            port: spec.target_port,
+            weight: 1,
+            tags,
+            locality: spec.workload.locality.clone(),
+            path: None,
+        };
+        let service_fqdn = spec.service_fqdn(&runtime.cluster_domain);
+        let upstream = mesh_outbound_route_upstream(
+            &spec.upstream_id,
+            &spec.service.namespace,
+            &service_fqdn,
+            vec![target],
+            now,
+        );
+        if let Some(existing) = config.upstreams.iter_mut().find(|u| u.id == upstream.id) {
+            *existing = upstream;
+        } else {
+            config.upstreams.push(upstream);
+        }
+        bywl_materialized += 1;
+    }
+
+    if materialized > 0 || bywl_materialized > 0 {
         info!(
             tcp_upstreams = materialized,
+            tcp_bywl_upstreams = bywl_materialized,
             topology = ?runtime.topology,
             "Materialized mesh raw-TCP egress upstreams for in-mesh services (relayed over the \
              topology's CONNECT transport, selected by captured original destination against \
-             service VIPs)"
+             service VIPs and — for direct pod-IP / headless dials — against backing workload \
+             addresses)"
         );
     }
 }
@@ -2797,6 +3055,13 @@ fn materialize_mesh_outbound_tcp_upstreams(
 /// per-proxy pool-config / connect-budget resolution and the capability-probe
 /// key have a stable proxy identity shared between probing and dispatch.
 pub(crate) const MESH_OUTBOUND_TCP_RELAY_PROXY_ID_PREFIX: &str = "__mesh-out-tcp-relay-";
+
+/// Reserved id prefix for the synthesized DIRECT-pod-IP raw-TCP egress relay
+/// proxies (F3 §3.4) — the by-workload-addr counterpart of
+/// [`MESH_OUTBOUND_TCP_RELAY_PROXY_ID_PREFIX`]. Same non-route-prefix rationale;
+/// a distinct prefix so a VIP relay proxy and a by-workload relay proxy for the
+/// same service port never collide.
+pub(crate) const MESH_OUTBOUND_TCP_BYWL_RELAY_PROXY_ID_PREFIX: &str = "__mesh-out-tcp-bywl-relay-";
 
 /// Build the synthesized relay proxy backing one raw-TCP egress entry.
 /// DETERMINISTIC apart from timestamps: the capability registry keys off the
@@ -2812,9 +3077,39 @@ pub(crate) fn mesh_outbound_tcp_relay_proxy(
     port: u16,
     upstream_id: &str,
 ) -> Proxy {
-    let now = chrono::Utc::now();
     let id = format!("{MESH_OUTBOUND_TCP_RELAY_PROXY_ID_PREFIX}{namespace}-{name}-{port}")
         .replace(['/', '.'], "-");
+    mesh_outbound_tcp_relay_proxy_with_id(id, namespace, upstream_id)
+}
+
+/// Build the synthesized relay proxy backing one DIRECT-pod-IP raw-TCP egress
+/// entry (F3 §3.4). Same shape and capability/pool-config contract as
+/// [`mesh_outbound_tcp_relay_proxy`] (it shares the builder), but its id folds
+/// in the canonical workload IP and points at the per-workload upstream, so the
+/// capability key + LB-selection upstream agree between the index, dispatch, and
+/// probe enrollment. The id is forward-derived, never parsed.
+pub(crate) fn mesh_outbound_tcp_bywl_relay_proxy(
+    namespace: &str,
+    name: &str,
+    port: u16,
+    canonical_ip: std::net::IpAddr,
+    upstream_id: &str,
+) -> Proxy {
+    let id = format!(
+        "{MESH_OUTBOUND_TCP_BYWL_RELAY_PROXY_ID_PREFIX}{namespace}-{name}-{port}-{canonical_ip}"
+    )
+    .replace(['/', '.', ':'], "-");
+    mesh_outbound_tcp_relay_proxy_with_id(id, namespace, upstream_id)
+}
+
+/// Shared body for the raw-TCP egress relay proxies (VIP and by-workload). The
+/// only fields that vary between the two are the `id` and the `upstream_id` it
+/// dispatches through — everything else (the `BackendScheme::Tcp` capability
+/// gate, the connect/read/write budgets, the stream idle default) is identical,
+/// so both relay flavors stay byte-for-byte consistent in the capability key /
+/// pool-config dimensions.
+fn mesh_outbound_tcp_relay_proxy_with_id(id: String, namespace: &str, upstream_id: &str) -> Proxy {
+    let now = chrono::Utc::now();
     Proxy {
         name: Some(format!("mesh raw-tcp egress {id}")),
         id,
@@ -2853,6 +3148,7 @@ pub(crate) fn mesh_outbound_tcp_relay_proxy(
         pool_http2_max_frame_size: None,
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
+        h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
         upstream_id: Some(upstream_id.to_string()),
         upstream_subset: None,
@@ -3040,6 +3336,7 @@ fn mesh_outbound_route_proxy(
         pool_http2_max_frame_size: None,
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
+        h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
         upstream_id: Some(upstream_id.to_string()),
         upstream_subset: None,
@@ -3202,7 +3499,11 @@ fn apply_destination_rules(
     // exactly its own port's policy.
     // The raw-TCP per-port upstreams (`__mesh-out-tcp-upstream-*`) join the
     // same map: identical owner-port semantics, distinct id space.
-    let outbound_upstream_owner_port: std::collections::HashMap<String, u16> = mesh_slice
+    let local_cluster = mesh_slice
+        .multi_cluster
+        .as_ref()
+        .and_then(|mc| mc.local_cluster.as_deref());
+    let mut outbound_upstream_owner_port: std::collections::HashMap<String, u16> = mesh_slice
         .services
         .iter()
         .flat_map(|svc| {
@@ -3223,6 +3524,15 @@ fn apply_destination_rules(
                 .collect::<Vec<_>>()
         })
         .collect();
+    // Direct-pod-IP / headless raw-TCP per-workload upstreams (F3 §3.4) join the
+    // same map under their owning Service stream-family port, so a
+    // `portLevelSettings` entry authored on that port fans onto them exactly like
+    // the VIP per-port upstreams (same forward-derivation source).
+    for spec in
+        mesh_outbound_tcp_bywl_upstreams(&mesh_slice.services, &mesh_slice.workloads, local_cluster)
+    {
+        outbound_upstream_owner_port.insert(spec.upstream_id, spec.service_port.port);
+    }
 
     for dr in sorted_destination_rules {
         let matching_upstream_indices: Vec<usize> = config
@@ -3748,9 +4058,28 @@ fn apply_traffic_policy_to_port_override(
 
 /// Project an HTTP connection-pool overlay onto a per-port slot.
 ///
-/// Each field is overlaid independently — `None` leaves the existing slot
-/// value untouched so a per-port partial overlay can layer over a top-level
-/// fan-out without clearing fields the operator did not respecify.
+/// Each field is overlaid independently — `None` (field absent) leaves the
+/// existing slot value untouched so a per-port partial overlay can layer over
+/// a top-level fan-out without clearing fields the operator did not respecify.
+///
+/// **Field-level merge — a known divergence from Istio.** Istio treats a
+/// matching `portLevelSettings` entry as a COMPLETE REPLACEMENT of the
+/// destination-level `connectionPool` for that port; Ferrum instead does a
+/// per-field merge (top-level fan-out, then this additive per-port overlay).
+/// This is pre-existing and CONSISTENT across every `connectionPool` knob
+/// (`maxRequestsPerConnection` / `idleTimeout` / `http2MaxRequests` /
+/// `maxConnections` / `tcpKeepalive`), so unifying it to complete-replacement
+/// is a separate uniform follow-up (it would change existing
+/// idleTimeout/http2MaxRequests behavior + their tests). It is documented in
+/// `docs/mesh.md`.
+///
+/// `h2_upgrade_policy` carries an explicit `H2UpgradePolicy::Default` rather
+/// than collapsing Istio's `DEFAULT` to `None`. That distinction matters HERE:
+/// a port-level explicit `Some(Default)` SETS the slot to `Default`, which
+/// clears an inherited top-level `Upgrade`/`DoNotUpgrade` for that port (the
+/// operator explicitly chose probe-driven). An OMITTED port-level value
+/// (`None`) leaves the inherited slot untouched. The effective-proxy/dispatch
+/// path treats `Default` and `None` identically (probe-driven).
 fn apply_connection_pool_http_to_port_override(
     slot: &mut UpstreamPortOverride,
     http: &crate::modes::mesh::config::MeshConnectionPoolHttp,
@@ -3763,6 +4092,14 @@ fn apply_connection_pool_http_to_port_override(
     }
     if let Some(max_streams) = http.http2_max_requests {
         slot.h2_max_concurrent_streams = Some(max_streams);
+    }
+    // An explicit `Some(Default)` (port-level `DEFAULT`) overwrites an
+    // inherited `Upgrade`/`DoNotUpgrade`; absent (`None`) leaves it untouched.
+    if let Some(policy) = http.h2_upgrade_policy {
+        slot.h2_upgrade_policy = Some(policy);
+    }
+    if let Some(max_retries) = http.max_retries {
+        slot.max_retries = Some(max_retries);
     }
 }
 
@@ -4785,6 +5122,7 @@ fn egress_gateway_proxy(
         pool_http2_max_frame_size: None,
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
+        h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
         upstream_id: Some(upstream_id.to_string()),
         upstream_subset: None,
@@ -4873,6 +5211,7 @@ fn stream_egress_gateway_proxy(
         pool_http2_max_frame_size: None,
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
+        h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
         upstream_id: Some(upstream_id.to_string()),
         upstream_subset: None,
@@ -10317,10 +10656,13 @@ mod tests {
     }
 
     #[test]
-    fn mesh_outbound_tcp_upstreams_skip_vipless() {
+    fn mesh_outbound_tcp_upstreams_skip_vipless_for_the_vip_path() {
         // VIP-less (headless) service: a raw stream carries no Host and a bare
-        // port number is ambiguous, so original destinations cannot be mapped
-        // to it — nothing materializes on either captured topology.
+        // port number is ambiguous, so the captured original destination cannot
+        // be mapped to a VIP — NO `__mesh-out-tcp-upstream-*` (VIP per-port)
+        // upstream materializes on either captured topology. (Direct pod-IP
+        // routing for the same headless service is covered separately by the
+        // by-workload test below.)
         let spiffe = "spiffe://cluster.local/ns/default/sa/redis";
         for runtime in [ambient_runtime(), test_mesh_runtime_config()] {
             let mut headless = http_mesh_service("redis", 6379, spiffe);
@@ -10334,8 +10676,137 @@ mod tests {
             let mut config = GatewayConfig::default();
             materialize_mesh_outbound_tcp_upstreams(&mut config, &runtime, &slice);
             assert!(
-                config.upstreams.is_empty(),
-                "a VIP-less service cannot be raw-TCP egress-routed ({:?})",
+                !config
+                    .upstreams
+                    .iter()
+                    .any(|u| u.id == "__mesh-out-tcp-upstream-default-redis-6379"),
+                "a VIP-less service cannot be VIP raw-TCP egress-routed ({:?})",
+                runtime.topology
+            );
+        }
+    }
+
+    #[test]
+    fn mesh_outbound_tcp_bywl_upstreams_materialize_for_direct_pod_ip() {
+        // F3 §3.4: a HEADLESS (VIP-less) service backed by a workload with a pod
+        // IP materializes a SINGLE-TARGET per-workload raw-TCP egress upstream
+        // dialing the resolved targetPort, identity-pinned, tagged for the
+        // topology transport — so a direct pod-IP dial is routable even though
+        // the VIP table has nothing. NO route proxy (raw streams carry no Host).
+        let spiffe = "spiffe://cluster.local/ns/default/sa/redis";
+        for (runtime, want_tag, other_tag) in [
+            (ambient_runtime(), "mesh.hbone", "mesh.mtls"),
+            (test_mesh_runtime_config(), "mesh.mtls", "mesh.hbone"),
+        ] {
+            let mut headless = http_mesh_service("redis", 6379, spiffe);
+            headless.ports[0].protocol = AppProtocol::Redis;
+            headless.ports[0].target_port = Some(ServiceTargetPort::Number(6380));
+            // No cluster_ips — headless.
+            let mut wl = workload_with_address("redis", "redis", "10.0.0.7");
+            // The workload must advertise the container port for a numeric
+            // targetPort fallback path; numeric resolves regardless, but keep it
+            // realistic.
+            wl.ports = vec![WorkloadPort {
+                port: 6380,
+                protocol: AppProtocol::Redis,
+                name: Some("redis".to_string()),
+            }];
+            let slice = MeshSlice {
+                namespace: "default".to_string(),
+                workloads: vec![wl],
+                services: vec![headless],
+                ..MeshSlice::default()
+            };
+            let mut config = GatewayConfig::default();
+            materialize_mesh_outbound_tcp_upstreams(&mut config, &runtime, &slice);
+            assert!(
+                config.proxies.is_empty(),
+                "raw-TCP egress materializes upstreams only, never route proxies ({:?})",
+                runtime.topology
+            );
+            let bywl_id = mesh_outbound_tcp_bywl_upstream_id(
+                "default",
+                "redis",
+                6379,
+                "10.0.0.7".parse().unwrap(),
+            );
+            let upstream = config
+                .upstreams
+                .iter()
+                .find(|u| u.id == bywl_id)
+                .unwrap_or_else(|| {
+                    panic!("per-workload raw-TCP upstream for {:?}", runtime.topology)
+                });
+            assert_eq!(
+                upstream.name.as_deref(),
+                Some("redis.default.svc.cluster.local"),
+                "FQDN-named so DestinationRules match"
+            );
+            assert_eq!(upstream.targets.len(), 1, "single-target per workload IP");
+            let target = &upstream.targets[0];
+            assert_eq!(
+                target.host, "10.0.0.7",
+                "dials the workload pod IP, not a VIP"
+            );
+            assert_eq!(target.port, 6380, "dials the resolved targetPort");
+            assert_eq!(
+                target.tags.get(want_tag).map(String::as_str),
+                Some("true"),
+                "per-workload target rides the {want_tag} transport ({:?})",
+                runtime.topology
+            );
+            assert!(
+                !target.tags.contains_key(other_tag),
+                "a target carries exactly one transport tag ({:?})",
+                runtime.topology
+            );
+            assert_eq!(
+                target.tags.get("mesh.spiffe_id").map(String::as_str),
+                Some(spiffe),
+                "destination identity stays pinned"
+            );
+            // A direct pod-IP dial already carries the app port in its orig-dst,
+            // so NO `:authority` rewrite tag is stamped (that is a VIP-multi-port
+            // concern only).
+            assert!(
+                !target
+                    .tags
+                    .contains_key(crate::proxy::mesh_mtls_pool::MESH_MTLS_AUTHORITY_PORT_TAG),
+                "direct pod-IP dials never rewrite the authority ({:?})",
+                runtime.topology
+            );
+        }
+    }
+
+    #[test]
+    fn mesh_outbound_tcp_bywl_upstreams_skip_when_no_addresses() {
+        // A VIP-less service whose workload has no pod address yet (or only
+        // DNS-name addresses) materializes nothing on either path — there is no
+        // IP to key the by-workload index by.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/redis";
+        for runtime in [ambient_runtime(), test_mesh_runtime_config()] {
+            let mut headless = http_mesh_service("redis", 6379, spiffe);
+            headless.ports[0].protocol = AppProtocol::Redis;
+            // Workload declared but NO addresses (pod IP unassigned) ...
+            let no_addr = workload("redis", "redis");
+            // ... and a second workload with only a DNS-name address (skipped).
+            let mut dns_only = workload_with_address("redis2", "redis", "redis-0.redis.default");
+            dns_only.spiffe_id =
+                SpiffeId::new("spiffe://cluster.local/ns/default/sa/redis").unwrap();
+            let slice = MeshSlice {
+                namespace: "default".to_string(),
+                workloads: vec![no_addr, dns_only],
+                services: vec![headless],
+                ..MeshSlice::default()
+            };
+            let mut config = GatewayConfig::default();
+            materialize_mesh_outbound_tcp_upstreams(&mut config, &runtime, &slice);
+            assert!(
+                !config
+                    .upstreams
+                    .iter()
+                    .any(|u| u.id.starts_with("__mesh-out-tcp-bywl-upstream-")),
+                "no IP workload address ⇒ no by-workload upstream ({:?})",
                 runtime.topology
             );
         }

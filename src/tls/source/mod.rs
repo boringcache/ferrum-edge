@@ -800,6 +800,13 @@ fn resolve_k8s_secret_reference_blocking(
         .map_err(|_| "TLS Kubernetes Secret loader thread panicked".to_string())?
 }
 
+// Each arm gates a DISTINCT `cfg!(feature = ...)`, so the
+// `match_like_matches_macro` suggestion (`matches!(scheme, Vault | Aws | ...)`)
+// is incorrect: in a build with only some providers enabled it would report
+// every scheme as supported. clippy only sees the post-`cfg!`-expansion form
+// (all arms collapse to the same bool when all features are on), hence the
+// false positive — suppress it rather than change the semantics.
+#[allow(clippy::match_like_matches_macro)]
 fn secret_scheme_supported_in_build(scheme: SourceScheme) -> bool {
     match scheme {
         SourceScheme::Vault => cfg!(feature = "secrets-vault"),

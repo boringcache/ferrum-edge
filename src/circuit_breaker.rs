@@ -8,20 +8,48 @@
 use crate::config::types::CircuitBreakerConfig;
 use dashmap::DashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use tracing::{info, warn};
 
 const STATE_CLOSED: u8 = 0;
 const STATE_OPEN: u8 = 1;
 const STATE_HALF_OPEN: u8 = 2;
 
+// The breaker's `state` and its `half_open_in_flight` probe counter are packed
+// into a SINGLE `AtomicU32` so that every state transition and every probe
+// admission is one atomic compare-exchange. With two separate atomics, no
+// ordering of two stores can make "publish state X" and "set/clear the probe
+// count" happen together, leaving a race window in which a concurrent
+// `can_execute()` observes a transient (state, count) pair and over-admits,
+// admits after a reopen, or wedges the breaker at capacity. Packing them
+// removes the window entirely: the high 2 bits hold the state, the low 30 bits
+// hold the in-flight count (far beyond any realistic `half_open_max_requests`).
+const STATE_SHIFT: u32 = 30;
+const COUNT_MASK: u32 = (1u32 << STATE_SHIFT) - 1;
+
+#[inline]
+const fn pack(state: u8, count: u32) -> u32 {
+    ((state as u32) << STATE_SHIFT) | (count & COUNT_MASK)
+}
+
+#[inline]
+const fn packed_state(packed: u32) -> u8 {
+    (packed >> STATE_SHIFT) as u8
+}
+
+#[inline]
+const fn packed_count(packed: u32) -> u32 {
+    packed & COUNT_MASK
+}
+
 /// Circuit breaker state for a single proxy or target.
 pub struct CircuitBreaker {
-    state: AtomicU8,
+    /// Packed `(state, half_open_in_flight)` — high 2 bits state, low 30 bits
+    /// probe count. See the module-level note above for why these are fused.
+    packed: AtomicU32,
     failure_count: AtomicU32,
     success_count: AtomicU32,
     last_failure_epoch_ms: AtomicU64,
-    half_open_in_flight: AtomicU32,
     config: CircuitBreakerConfig,
 }
 
@@ -38,11 +66,10 @@ impl std::fmt::Display for CircuitOpenError {
 impl CircuitBreaker {
     pub fn new(config: CircuitBreakerConfig) -> Self {
         Self {
-            state: AtomicU8::new(STATE_CLOSED),
+            packed: AtomicU32::new(pack(STATE_CLOSED, 0)),
             failure_count: AtomicU32::new(0),
             success_count: AtomicU32::new(0),
             last_failure_epoch_ms: AtomicU64::new(0),
-            half_open_in_flight: AtomicU32::new(0),
             config,
         }
     }
@@ -61,8 +88,8 @@ impl CircuitBreaker {
         // memory architectures, allowing requests to leak through after the
         // circuit opens. The ~5-15ns cost of Acquire is acceptable given that
         // circuit breaker checks are not the bottleneck at scale.
-        let state = self.state.load(Ordering::Acquire);
-        match state {
+        let packed = self.packed.load(Ordering::Acquire);
+        match packed_state(packed) {
             STATE_CLOSED => Ok(false),
             STATE_OPEN => {
                 // Check if timeout has elapsed
@@ -71,70 +98,90 @@ impl CircuitBreaker {
                 let timeout_ms = self.config.timeout_seconds.saturating_mul(1000);
 
                 if now.saturating_sub(last_failure) >= timeout_ms {
-                    // Attempt transition to half-open (only one thread wins the CAS)
-                    match self.state.compare_exchange(
-                        STATE_OPEN,
-                        STATE_HALF_OPEN,
+                    // Transition OPEN → HALF_OPEN AND claim the first probe slot
+                    // in ONE CAS: the published HALF_OPEN already carries
+                    // count=1. There is no instant where HALF_OPEN is visible
+                    // with a stale/zeroed count (so no over-admission during a
+                    // reopen), and the transition winner *is* an admission, so it
+                    // can never be rejected after publishing HALF_OPEN (no wedge).
+                    // OPEN always carries count=0 — reopen/close zero the count
+                    // atomically and slot releases are no-ops at 0 — so the
+                    // expected value below is exact.
+                    match self.packed.compare_exchange(
+                        pack(STATE_OPEN, 0),
+                        pack(STATE_HALF_OPEN, 1),
                         Ordering::AcqRel,
                         Ordering::Acquire,
                     ) {
                         Ok(_) => {
-                            // CAS winner: initialize half-open state
-                            self.half_open_in_flight.store(1, Ordering::Relaxed);
                             self.success_count.store(0, Ordering::Relaxed);
                             info!("Circuit breaker transitioning from Open to Half-Open");
                             Ok(true)
                         }
-                        Err(current) => {
-                            // CAS loser: another thread already transitioned.
-                            // Fall through to handle the current state.
-                            if current == STATE_HALF_OPEN {
-                                // Use CAS loop to atomically claim a slot
-                                loop {
-                                    let in_flight =
-                                        self.half_open_in_flight.load(Ordering::Acquire);
-                                    if in_flight >= self.config.half_open_max_requests {
-                                        return Err(CircuitOpenError);
-                                    }
-                                    match self.half_open_in_flight.compare_exchange_weak(
-                                        in_flight,
-                                        in_flight + 1,
-                                        Ordering::AcqRel,
-                                        Ordering::Acquire,
-                                    ) {
-                                        Ok(_) => return Ok(true),
-                                        Err(_) => continue,
-                                    }
-                                }
-                            } else {
-                                // State changed to something else (e.g. Closed)
-                                Ok(false)
-                            }
-                        }
+                        Err(actual) => match packed_state(actual) {
+                            // Another thread already opened the half-open cycle;
+                            // claim a slot through the same bounded CAS.
+                            STATE_HALF_OPEN => self.try_acquire_half_open_slot(),
+                            // Recovered to closed in the meantime.
+                            STATE_CLOSED => Ok(false),
+                            // Still open (lost the race to a concurrent reopen) —
+                            // reject.
+                            _ => Err(CircuitOpenError),
+                        },
                     }
                 } else {
                     Err(CircuitOpenError)
                 }
             }
-            STATE_HALF_OPEN => {
-                // Use CAS loop to atomically claim a slot without exceeding the limit.
-                loop {
-                    let current = self.half_open_in_flight.load(Ordering::Acquire);
-                    if current >= self.config.half_open_max_requests {
+            STATE_HALF_OPEN => self.try_acquire_half_open_slot(),
+            _ => Ok(false),
+        }
+    }
+
+    /// Claim one half-open probe slot without exceeding the limit, checking the
+    /// state and the count together in a single CAS.
+    ///
+    /// The OPEN→HALF_OPEN transition winner claims its first slot directly in
+    /// `can_execute()` (count=1 is published atomically with HALF_OPEN). The
+    /// remaining admission paths — a transition CAS-loser that finds the state
+    /// already HALF_OPEN, and a steady-state HALF_OPEN request — funnel through
+    /// this bounded CAS, so the number of concurrently admitted probes can never
+    /// exceed `half_open_max_requests`. Because the expected value carries BOTH
+    /// the state and the count, an admission cannot succeed once the breaker has
+    /// left HALF_OPEN (a concurrent reopen or close), which closes the
+    /// admit-after-reopen race.
+    ///
+    /// The limit is floored at 1 (a breaker configured with
+    /// `half_open_max_requests == 0` must still admit a single probe to be able
+    /// to recover) and capped at the 30-bit count field.
+    fn try_acquire_half_open_slot(&self) -> Result<bool, CircuitOpenError> {
+        let max = self.config.half_open_max_requests.clamp(1, COUNT_MASK);
+        loop {
+            let packed = self.packed.load(Ordering::Acquire);
+            match packed_state(packed) {
+                STATE_HALF_OPEN => {
+                    let count = packed_count(packed);
+                    if count >= max {
                         return Err(CircuitOpenError);
                     }
-                    match self.half_open_in_flight.compare_exchange_weak(
-                        current,
-                        current + 1,
+                    match self.packed.compare_exchange_weak(
+                        packed,
+                        pack(STATE_HALF_OPEN, count + 1),
                         Ordering::AcqRel,
                         Ordering::Acquire,
                     ) {
                         Ok(_) => return Ok(true),
+                        // State or count moved under us — re-evaluate against the
+                        // fresh value (which may now be OPEN/CLOSED).
                         Err(_) => continue,
                     }
                 }
+                // Reopened after the caller observed HALF_OPEN — do not admit.
+                STATE_OPEN => return Err(CircuitOpenError),
+                // Recovered to closed — normal closed-state admission.
+                STATE_CLOSED => return Ok(false),
+                _ => return Ok(false),
             }
-            _ => Ok(false),
         }
     }
 
@@ -148,52 +195,61 @@ impl CircuitBreaker {
     /// must NOT decrement the counter since they never held a slot.
     #[allow(dead_code)] // Public API — called by retry/proxy logic when circuit is half-open
     pub fn record_success(&self, is_half_open_probe: bool) {
-        let state = self.state.load(Ordering::Acquire);
-        match state {
+        match packed_state(self.packed.load(Ordering::Acquire)) {
             STATE_HALF_OPEN => {
                 if is_half_open_probe {
                     // Decrement in-flight counter so new probe requests can be admitted
-                    self.release_half_open_slot(Ordering::SeqCst, Ordering::SeqCst);
+                    self.release_half_open_slot();
                 }
                 // Re-check state: another thread may have reopened the circuit
                 // between our initial load and now.
-                if self.state.load(Ordering::Acquire) != STATE_HALF_OPEN {
+                if packed_state(self.packed.load(Ordering::Acquire)) != STATE_HALF_OPEN {
                     return;
                 }
                 let successes = self.success_count.fetch_add(1, Ordering::Relaxed) + 1;
                 if successes >= self.config.success_threshold {
-                    // Use CAS to transition: only one thread should close the circuit
-                    if self
-                        .state
-                        .compare_exchange(
-                            STATE_HALF_OPEN,
-                            STATE_CLOSED,
-                            Ordering::SeqCst,
-                            Ordering::Relaxed,
-                        )
-                        .is_ok()
-                    {
-                        info!("Circuit breaker closing (recovered)");
-                        self.failure_count.store(0, Ordering::Relaxed);
-                        self.success_count.store(0, Ordering::Relaxed);
-                        self.half_open_in_flight.store(0, Ordering::Relaxed);
+                    // HALF_OPEN → CLOSED, clearing the in-flight count in the
+                    // SAME CAS. Loop so a concurrent admission (count change)
+                    // does not abandon the close; bail if another thread already
+                    // moved the breaker out of HALF_OPEN.
+                    loop {
+                        let p = self.packed.load(Ordering::Acquire);
+                        if packed_state(p) != STATE_HALF_OPEN {
+                            break;
+                        }
+                        if self
+                            .packed
+                            .compare_exchange_weak(
+                                p,
+                                pack(STATE_CLOSED, 0),
+                                Ordering::SeqCst,
+                                Ordering::Relaxed,
+                            )
+                            .is_ok()
+                        {
+                            info!("Circuit breaker closing (recovered)");
+                            self.failure_count.store(0, Ordering::Relaxed);
+                            self.success_count.store(0, Ordering::Relaxed);
+                            break;
+                        }
                     }
                 }
             }
             STATE_OPEN if is_half_open_probe => {
                 // A concurrent record_failure already reopened the circuit between
                 // our can_execute() and this record_success(). We still own a slot
-                // from when the breaker was HALF_OPEN, so decrement it. The
-                // checked_sub prevents underflow if this is a spurious call.
-                self.release_half_open_slot(Ordering::SeqCst, Ordering::SeqCst);
+                // from when the breaker was HALF_OPEN, so release it (a no-op if
+                // the reopen already cleared the count).
+                self.release_half_open_slot();
             }
             STATE_CLOSED => {
                 // A different half-open probe can close the breaker before
                 // this probe records success. The request still owns one
                 // half-open slot from its can_execute() admission, so release
-                // it even though the state is already CLOSED.
+                // it even though the state is already CLOSED (a no-op if the
+                // close already cleared the count).
                 if is_half_open_probe {
-                    self.release_half_open_slot(Ordering::SeqCst, Ordering::SeqCst);
+                    self.release_half_open_slot();
                 }
                 // Reset failure count on success
                 if self.failure_count.load(Ordering::Relaxed) > 0 {
@@ -212,7 +268,7 @@ impl CircuitBreaker {
         if !is_half_open_probe {
             return;
         }
-        self.release_half_open_slot(Ordering::SeqCst, Ordering::SeqCst);
+        self.release_half_open_slot();
     }
 
     /// Record a failed response.
@@ -237,7 +293,7 @@ impl CircuitBreaker {
             if !self.config.trip_on_connection_errors {
                 // Filtered failure — release the probe slot without state transition
                 if is_half_open_probe {
-                    self.release_half_open_slot(Ordering::AcqRel, Ordering::Acquire);
+                    self.release_half_open_slot();
                 }
                 return;
             }
@@ -245,17 +301,36 @@ impl CircuitBreaker {
             // Non-failure status codes are neutral — release probe slot without
             // state transition
             if is_half_open_probe {
-                self.release_half_open_slot(Ordering::AcqRel, Ordering::Acquire);
+                self.release_half_open_slot();
             }
             return;
         }
 
-        let state = self.state.load(Ordering::Acquire);
+        let packed = self.packed.load(Ordering::Acquire);
         self.last_failure_epoch_ms
             .store(now_epoch_ms(), Ordering::Relaxed);
 
-        match state {
+        match packed_state(packed) {
             STATE_CLOSED => {
+                // A half-open probe whose failure arrives only AFTER the breaker
+                // has already left HALF_OPEN — a sibling reached the success
+                // threshold and closed it, or this is a stale straggler from a
+                // bygone half-open cycle that outlived a full reopen→close cycle —
+                // is processed against the CURRENT closed state, matching standard
+                // breaker semantics (e.g. sony/gobreaker): release the slot it
+                // nominally still holds (a no-op once the close cleared the count)
+                // and count the failure toward the closed-state failure_threshold.
+                // It is deliberately NOT special-cased into a reopen: a probe that
+                // observes CLOSED here cannot be distinguished from an
+                // arbitrarily-stale straggler without per-probe generation
+                // tracking, so reopening would let a long-hung straggler trip a
+                // breaker that has since recovered. The "any probe failure reopens"
+                // rule still holds while the breaker is HALF_OPEN (the arm below):
+                // a failure that observes HALF_OPEN is current-cycle by
+                // construction and reopens even if it then races a sibling close.
+                if is_half_open_probe {
+                    self.release_half_open_slot();
+                }
                 let failures = self.failure_count.fetch_add(1, Ordering::Relaxed) + 1;
                 if failures >= self.config.failure_threshold {
                     // Re-read the counter before and after the transition attempt.
@@ -268,11 +343,13 @@ impl CircuitBreaker {
                     if self.failure_count.load(Ordering::Acquire) < self.config.failure_threshold {
                         return;
                     }
+                    // CLOSED always carries count=0, so the expected/desired
+                    // values both hold count=0; the transition only flips state.
                     if self
-                        .state
+                        .packed
                         .compare_exchange(
-                            STATE_CLOSED,
-                            STATE_OPEN,
+                            pack(STATE_CLOSED, 0),
+                            pack(STATE_OPEN, 0),
                             Ordering::AcqRel,
                             Ordering::Relaxed,
                         )
@@ -280,9 +357,9 @@ impl CircuitBreaker {
                     {
                         let current_failures = self.failure_count.load(Ordering::Acquire);
                         if current_failures < self.config.failure_threshold {
-                            let _ = self.state.compare_exchange(
-                                STATE_OPEN,
-                                STATE_CLOSED,
+                            let _ = self.packed.compare_exchange(
+                                pack(STATE_OPEN, 0),
+                                pack(STATE_CLOSED, 0),
                                 Ordering::AcqRel,
                                 Ordering::Relaxed,
                             );
@@ -295,36 +372,73 @@ impl CircuitBreaker {
                     }
                 }
             }
-            STATE_HALF_OPEN => {
-                if is_half_open_probe {
-                    // Decrement in-flight before reopening. The fetch_update handles
-                    // the count correctly even with concurrent probe failures — each
-                    // thread atomically decrements once. We intentionally do NOT
-                    // follow up with an unconditional store(0): that would race with
-                    // concurrent decrements from other probe threads, potentially
-                    // clobbering a value that hasn't been decremented yet. The count
-                    // reaches 0 naturally as all probes report in, and transitioning
-                    // to OPEN prevents new probes from being admitted.
-                    self.release_half_open_slot(Ordering::SeqCst, Ordering::SeqCst);
-                }
-                warn!("Circuit breaker reopening (probe failed)");
-                self.state.store(STATE_OPEN, Ordering::SeqCst);
-                self.success_count.store(0, Ordering::Relaxed);
-            }
+            STATE_HALF_OPEN => self.reopen_after_probe_failure(),
             STATE_OPEN if is_half_open_probe => {
                 // A concurrent record_failure already reopened the circuit between
-                // our can_execute() (when it was HALF_OPEN) and now. We still own
-                // a slot, so decrement it.
-                self.release_half_open_slot(Ordering::SeqCst, Ordering::SeqCst);
+                // our can_execute() (when it was HALF_OPEN) and now. Release our
+                // slot (a no-op if the reopen already cleared the count).
+                self.release_half_open_slot();
             }
             _ => {}
         }
     }
 
-    fn release_half_open_slot(&self, set_order: Ordering, fetch_order: Ordering) {
+    /// Reopen the breaker after a failure that was observed WHILE the breaker is
+    /// HALF_OPEN (the only caller — the top-level `STATE_HALF_OPEN` arm).
+    /// Publishes OPEN and clears the in-flight count in ONE CAS — so HALF_OPEN
+    /// admissions stop at the same instant the count is zeroed (no over-admission
+    /// window during the reopen). The loop also reopens a breaker that a
+    /// concurrent sibling success closed between this failure observing HALF_OPEN
+    /// and the CAS (the sibling-close race): such a failure is current-cycle by
+    /// construction, so reopening is correct. A failure that instead observes
+    /// CLOSED at the top of `record_failure` is NOT routed here — it counts
+    /// toward the closed-state threshold — because it cannot be distinguished
+    /// from a stale straggler. Only an already-published OPEN is left alone. The
+    /// failing probe's slot is subsumed by the count reset, and a straggler from
+    /// this cycle releases as a no-op at 0.
+    fn reopen_after_probe_failure(&self) {
+        self.success_count.store(0, Ordering::Relaxed);
+        loop {
+            let p = self.packed.load(Ordering::Acquire);
+            match packed_state(p) {
+                // A sibling probe failure already reopened — done.
+                STATE_OPEN => break,
+                // HALF_OPEN or CLOSED → reopen, clearing the count in the same CAS.
+                _ => {
+                    if self
+                        .packed
+                        .compare_exchange_weak(
+                            p,
+                            pack(STATE_OPEN, 0),
+                            Ordering::AcqRel,
+                            Ordering::Relaxed,
+                        )
+                        .is_ok()
+                    {
+                        warn!("Circuit breaker reopening (probe failed)");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Release one half-open probe slot, decrementing the in-flight count while
+    /// preserving the state bits and never underflowing. A no-op once the count
+    /// is already 0 — e.g. the slot was cleared en masse by a concurrent
+    /// reopen/close — so a straggler from a previous half-open cycle can neither
+    /// drive the counter below 0 nor perturb the packed state.
+    fn release_half_open_slot(&self) {
         let _ = self
-            .half_open_in_flight
-            .fetch_update(set_order, fetch_order, |v| v.checked_sub(1));
+            .packed
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |packed| {
+                let count = packed_count(packed);
+                if count == 0 {
+                    None
+                } else {
+                    Some(pack(packed_state(packed), count - 1))
+                }
+            });
     }
 
     /// Get the config for this circuit breaker.
@@ -346,12 +460,12 @@ impl CircuitBreaker {
     #[doc(hidden)]
     #[allow(dead_code)]
     pub fn half_open_in_flight(&self) -> u32 {
-        self.half_open_in_flight.load(Ordering::Acquire)
+        packed_count(self.packed.load(Ordering::Acquire))
     }
 
     /// Current state name (for metrics/logging).
     pub fn state_name(&self) -> &'static str {
-        match self.state.load(Ordering::Relaxed) {
+        match packed_state(self.packed.load(Ordering::Relaxed)) {
             STATE_CLOSED => "closed",
             STATE_OPEN => "open",
             STATE_HALF_OPEN => "half_open",

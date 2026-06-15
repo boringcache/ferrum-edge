@@ -1544,3 +1544,177 @@ fn test_cache_can_execute_returns_probe_flag() {
     let (_cb2, is_probe2) = cache.can_execute("p1", None, &config).unwrap();
     assert!(is_probe2);
 }
+
+/// Stress: race `can_execute()` against probe-failure reopens and successes,
+/// asserting the half-open in-flight count never exceeds `half_open_max_requests`
+/// and the breaker is never wedged.
+///
+/// This targets the three transition/admission races that fall out of tracking
+/// `state` and the probe counter in SEPARATE atomics: over-admission during a
+/// reopen (the counter is cleared while the state is still HALF_OPEN),
+/// admit-after-reopen (a delayed admission increments the counter after the
+/// breaker reopened), and a wedged HALF_OPEN with no admitted request to release
+/// a slot. The packed `(state, count)` atomic makes every transition and
+/// admission a single CAS, so the bound holds and the breaker always recovers.
+///
+/// Unlike the sequential-admit tests above, `can_execute()` here runs
+/// CONCURRENTLY with the reopen — the only way to exercise those races.
+#[test]
+fn test_half_open_bound_and_no_wedge_under_admit_reopen_race_stress() {
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::thread;
+
+    const MAX: u32 = 4;
+    let config = CircuitBreakerConfig {
+        failure_threshold: 1,
+        success_threshold: 1000, // keep it churning in half-open, rarely closing
+        timeout_seconds: 0,      // a reopen is immediately re-admittable
+        failure_status_codes: vec![500],
+        half_open_max_requests: MAX,
+        trip_on_connection_errors: true,
+    };
+    let cb = Arc::new(CircuitBreaker::new(config));
+    cb.record_failure(500, false, false); // trip OPEN
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let peak = Arc::new(AtomicU32::new(0));
+
+    // Monitor: continuously sample the in-flight count and track the peak. If
+    // any admission/transition race over-admits, the peak exceeds MAX.
+    let monitor = {
+        let cb = cb.clone();
+        let stop = stop.clone();
+        let peak = peak.clone();
+        thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                peak.fetch_max(cb.half_open_in_flight(), Ordering::Relaxed);
+            }
+            peak.fetch_max(cb.half_open_in_flight(), Ordering::Relaxed);
+        })
+    };
+
+    // Workers: hammer the admit → release/reopen cycle so `can_execute()` races
+    // concurrent reopens. Every admitted probe is released (via a success or a
+    // reopening failure), so no slot is leaked across the run.
+    let mut handles = Vec::new();
+    for t in 0..8u32 {
+        let cb = cb.clone();
+        handles.push(thread::spawn(move || {
+            for i in 0..20_000u32 {
+                // Preserve the probe flag `can_execute()` returns: only a request
+                // admitted AS a half-open probe (`Ok(true)`) may complete as one.
+                // A CLOSED-state admission (`Ok(false)`) must record as a
+                // non-probe — passing `true` there would release a half-open slot
+                // the request never held (corrupting the in-flight count) and run
+                // a closed-state failure through the probe-reopen path, masking
+                // the admission bound this test validates.
+                if let Ok(is_probe) = cb.can_execute() {
+                    if t.wrapping_add(i) % 3 == 0 {
+                        cb.record_failure(500, false, is_probe); // reopen iff a probe
+                    } else {
+                        cb.record_success(is_probe);
+                    }
+                }
+            }
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+    stop.store(true, Ordering::Relaxed);
+    monitor.join().unwrap();
+
+    let observed_peak = peak.load(Ordering::Relaxed);
+    assert!(
+        observed_peak <= MAX,
+        "half_open_in_flight peaked at {observed_peak}, exceeding the configured \
+         max {MAX} — a transition/admission race over-admitted probes"
+    );
+
+    // Every admitted probe was released, so no slot is held now. The breaker
+    // must NOT be wedged: a fresh request can still be admitted (OPEN re-admits
+    // immediately at timeout=0, HALF_OPEN admits a free slot, CLOSED admits as a
+    // non-probe). A wedge would strand it HALF_OPEN at capacity with no holder.
+    assert!(
+        cb.half_open_in_flight() <= MAX,
+        "post-run in_flight {} exceeds max {MAX}",
+        cb.half_open_in_flight()
+    );
+    assert!(
+        cb.can_execute().is_ok(),
+        "breaker wedged after admit/reopen churn: state={} in_flight={}",
+        cb.state_name(),
+        cb.half_open_in_flight()
+    );
+}
+
+/// A half-open probe whose failure arrives only AFTER a sibling has already
+/// closed the breaker is processed against the CURRENT closed state: it counts
+/// toward the closed-state `failure_threshold` and must NOT reopen the recovered
+/// breaker. A probe that observes CLOSED cannot be distinguished from an
+/// arbitrarily-stale straggler (one that outlived a full reopen→close cycle)
+/// without per-probe half-open generation tracking, so reopening here would let
+/// a long-hung straggler trip a breaker that has since recovered. The
+/// reopen-on-any-probe-failure rule still applies WHILE the breaker is HALF_OPEN
+/// (exercised by the admit/reopen stress test above).
+#[test]
+fn half_open_probe_failure_after_recovery_counts_toward_threshold_not_reopen() {
+    let config = CircuitBreakerConfig {
+        failure_threshold: 3, // > 1 so a single counted failure does not trip
+        success_threshold: 1, // one success closes the breaker
+        timeout_seconds: 0,
+        failure_status_codes: vec![500],
+        half_open_max_requests: 2, // admit two probes so one can straggle
+        trip_on_connection_errors: true,
+    };
+    let cb = CircuitBreaker::new(config);
+    for _ in 0..3 {
+        cb.record_failure(500, false, false);
+    }
+    assert_eq!(cb.state_name(), "open");
+
+    // Admit two half-open probes.
+    assert!(cb.can_execute().unwrap());
+    assert!(cb.can_execute().unwrap());
+    assert_eq!(cb.state_name(), "half_open");
+    assert_eq!(cb.half_open_in_flight(), 2);
+
+    // One probe succeeds and closes the breaker (success_threshold = 1) while the
+    // other is still nominally "in flight".
+    cb.record_success(true);
+    assert_eq!(
+        cb.state_name(),
+        "closed",
+        "the sibling success must recover the breaker"
+    );
+
+    // The straggler now fails, observing the breaker already CLOSED. It must be
+    // counted as a single closed-state failure (1 < threshold 3) and must NOT
+    // reopen the recovered breaker, nor leak its slot.
+    cb.record_failure(500, false, true);
+    assert_eq!(
+        cb.state_name(),
+        "closed",
+        "a probe failure arriving after recovery must not reopen the breaker"
+    );
+    assert_eq!(
+        cb.failure_count(),
+        1,
+        "the straggler failure is counted toward the closed-state threshold, not dropped"
+    );
+    assert_eq!(
+        cb.half_open_in_flight(),
+        0,
+        "the straggler must not leak a slot"
+    );
+
+    // Two more closed-state failures reach the threshold and trip normally,
+    // confirming the straggler genuinely counted rather than being special-cased.
+    cb.record_failure(500, false, false);
+    cb.record_failure(500, false, false);
+    assert_eq!(
+        cb.state_name(),
+        "open",
+        "the threshold is reached via the counted failures"
+    );
+}

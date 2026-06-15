@@ -5517,6 +5517,10 @@ fn row_to_proxy(
             .try_get::<i64, _>("pool_http3_connections_per_backend")
             .ok()
             .map(|v| v.max(1) as usize),
+        // Derived-only: `h2_upgrade_policy` is projected from the mesh
+        // DestinationRule port overrides at dispatch time, never persisted as a
+        // proxy column, so a DB-loaded proxy always starts at `None`.
+        h2_upgrade_policy: None,
         pool_max_requests_per_connection: row
             .try_get::<i64, _>("pool_max_requests_per_connection")
             .ok()

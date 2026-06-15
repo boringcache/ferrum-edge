@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+#[cfg(test)]
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio_rustls::TlsConnector;
@@ -572,6 +573,13 @@ impl HboneConnectionPool {
     ) -> Result<H2ConnectTunnel, HbonePoolError> {
         let (source_identity, _fingerprint) = self.current_svid_identity_cached()?;
         let pool_config = self.pool_config.for_proxy(proxy);
+        // DR keepalive override resolved for the destination's APP port, not
+        // the transport `hbone_port`.
+        let keepalive_override = proxy
+            .dispatch_port_overrides
+            .as_ref()
+            .and_then(|m| m.get(&app_port))
+            .and_then(|o| o.tcp_keepalive.as_ref());
         let sender = dial_h2_connect_sender(
             &self.dns_cache,
             &self.gateway_svid,
@@ -580,6 +588,7 @@ impl HboneConnectionPool {
             hbone_port,
             expected_peer,
             &pool_config,
+            keepalive_override,
         )
         .await?;
         let baggage = baggage_header_for_source(&source_identity);
@@ -723,9 +732,25 @@ impl HboneConnectionPool {
         // verifier read the slot at HANDSHAKE time, so "slot unchanged across
         // the dial" proves the session was built from exactly this material.
         let svid_slot_before_dial = self.gateway_svid.load_full();
+        // Resolve the DR `connectionPool.tcp.tcpKeepalive` per-port override for
+        // the destination's APP port (`target_port`), NOT the transport
+        // `hbone_port` (always `:15008`). Falls back to the global pool
+        // keepalive inside the dialer when absent.
+        let keepalive_override = proxy
+            .dispatch_port_overrides
+            .as_ref()
+            .and_then(|m| m.get(&target_port))
+            .and_then(|o| o.tcp_keepalive.as_ref());
         let sender = match tokio::time::timeout(
             remaining,
-            self.create_sender(proxy, target_host, hbone_port, expected_peer, pool_config),
+            self.create_sender(
+                proxy,
+                target_host,
+                hbone_port,
+                expected_peer,
+                pool_config,
+                keepalive_override,
+            ),
         )
         .await
         {
@@ -912,10 +937,13 @@ impl HboneConnectionPool {
         hbone_port: u16,
         expected_peer: Option<&crate::identity::SpiffeId>,
         pool_config: &PoolConfig,
+        keepalive_override: Option<&crate::config::types::TcpKeepaliveCfg>,
     ) -> Result<SendRequest<Bytes>, HbonePoolError> {
         // The raw-`h2` dial over SVID-mTLS is the transport primitive shared
         // with the Sidecar mesh-mTLS raw-TCP egress path; only the dial port
-        // (`:15008` here) and the CONNECT request differ.
+        // (`:15008` here) and the CONNECT request differ. `keepalive_override`
+        // is resolved by the caller for the destination's app port (the DR
+        // keying port), not this transport `hbone_port`.
         dial_h2_connect_sender(
             &self.dns_cache,
             &self.gateway_svid,
@@ -924,6 +952,7 @@ impl HboneConnectionPool {
             hbone_port,
             expected_peer,
             pool_config,
+            keepalive_override,
         )
         .await
     }
@@ -1083,6 +1112,19 @@ impl Unpin for H2ConnectTunnel {}
 /// `proxy.backend_connect_timeout_ms`. Advertising `h2` only lets a peer reject
 /// non-mesh clients at ALPN; pinning the peer identity means a same-trust-domain
 /// workload at a reused pod IP cannot impersonate the destination.
+///
+/// `keepalive_override` carries the DestinationRule `connectionPool.tcp.tcpKeepalive`
+/// resolved by the caller for the destination's APP/service port (NOT this
+/// transport `dial_port`, which is always `:15008`/`:15006`). When `Some` it is
+/// applied with full time/interval/probes; otherwise the connection falls back
+/// to the global pool keepalive. NOTE: keepalive is NOT in the pool key
+/// (forbidden by `.claude/rules/proxy-protocols.md`), and HBONE / mesh-mTLS
+/// pool connections are shared across dispatchers, so the first dispatcher to
+/// materialize the connection wins (same first-materializer tradeoff as
+/// `idleTimeout` / `maxRequestsPerConnection`). WebSocket-over-HBONE /
+/// -mesh-mTLS rides this same dialer (`get_ws_byte_tunnel` /
+/// `open_ws_connect_tunnel`), so it inherits the resolved keepalive too.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn dial_h2_connect_sender(
     dns_cache: &DnsCache,
     gateway_svid: &SharedSvidBundle,
@@ -1091,6 +1133,7 @@ pub(crate) async fn dial_h2_connect_sender(
     dial_port: u16,
     expected_peer: Option<&crate::identity::SpiffeId>,
     pool_config: &PoolConfig,
+    keepalive_override: Option<&crate::config::types::TcpKeepaliveCfg>,
 ) -> Result<SendRequest<Bytes>, HbonePoolError> {
     let resolved_ip = dns_cache
         .resolve(
@@ -1122,9 +1165,13 @@ pub(crate) async fn dial_h2_connect_sender(
         source,
     })?;
     let _ = tcp.set_nodelay(true);
-    if pool_config.enable_http_keep_alive {
-        set_tcp_keepalive(&tcp, pool_config.tcp_keepalive_seconds);
-    }
+    crate::socket_opts::apply_pooled_tcp_keepalive(
+        "hbone_pool",
+        &tcp,
+        keepalive_override,
+        pool_config.enable_http_keep_alive,
+        pool_config.tcp_keepalive_seconds,
+    );
 
     let tls_config = build_spiffe_outbound_config(
         gateway_svid.clone(),
@@ -1727,23 +1774,6 @@ fn spawn_h2_keepalive(mut ping_pong: h2::PingPong, interval_seconds: u64, timeou
     });
 }
 
-fn set_tcp_keepalive(stream: &TcpStream, keepalive_seconds: u64) {
-    #[cfg(unix)]
-    use std::os::fd::AsFd;
-    #[cfg(windows)]
-    use std::os::windows::io::AsSocket;
-
-    #[cfg(unix)]
-    let borrowed = stream.as_fd();
-    #[cfg(windows)]
-    let borrowed = stream.as_socket();
-    let socket = socket2::SockRef::from(&borrowed);
-    let keepalive = socket2::TcpKeepalive::new().with_time(Duration::from_secs(keepalive_seconds));
-    if let Err(e) = socket.set_tcp_keepalive(&keepalive) {
-        debug!("hbone_pool: failed to set TCP keepalive: {}", e);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1812,6 +1842,7 @@ mod tests {
             pool_http2_max_frame_size: None,
             pool_http2_max_concurrent_streams: None,
             pool_http3_connections_per_backend: None,
+            h2_upgrade_policy: None,
             pool_max_requests_per_connection: None,
             upstream_id: None,
             upstream_subset: None,
