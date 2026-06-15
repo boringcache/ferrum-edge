@@ -228,6 +228,51 @@ async fn connection_pool_key_with_dns_override() {
     );
 }
 
+/// codex round-1 Finding 1: a `DO_NOT_UPGRADE` (force-H1) proxy builds a
+/// reqwest client with ALPN restricted to `http/1.1`, which is a different,
+/// protocol-incompatible client from the default (h2-capable) one — so it must
+/// get a DISTINCT reqwest pool key (an `h1` discriminator), or the two would
+/// share a connection and `DO_NOT_UPGRADE` would not actually force H1 on a
+/// TLS backend.
+#[tokio::test]
+async fn connection_pool_key_force_http1_discriminator() {
+    use ferrum_edge::config::types::H2UpgradePolicy;
+    let pool = pool_with_defaults();
+
+    let default_proxy = minimal_proxy();
+    let default_key = pool.pool_key_for_warmup(&default_proxy);
+
+    let mut force_h1_proxy = minimal_proxy();
+    force_h1_proxy.h2_upgrade_policy = Some(H2UpgradePolicy::DoNotUpgrade);
+    let force_h1_key = pool.pool_key_for_warmup(&force_h1_proxy);
+
+    assert_ne!(
+        default_key, force_h1_key,
+        "DO_NOT_UPGRADE (force-H1) must NOT share a reqwest pool key with the \
+         default h2-capable client: default={default_key} force_h1={force_h1_key}"
+    );
+    assert!(
+        force_h1_key.contains("|h1|"),
+        "force-H1 key must carry the h1 ALPN discriminator: {force_h1_key}"
+    );
+    assert!(
+        !default_key.contains("|h1|"),
+        "default key must NOT carry the h1 discriminator: {default_key}"
+    );
+
+    // `Upgrade` and `Default` are probe-driven — they stay h2-capable and must
+    // share the default client's key (no fragmentation, no force-H1).
+    for probe_driven in [H2UpgradePolicy::Upgrade, H2UpgradePolicy::Default] {
+        let mut p = minimal_proxy();
+        p.h2_upgrade_policy = Some(probe_driven);
+        let k = pool.pool_key_for_warmup(&p);
+        assert_eq!(
+            k, default_key,
+            "{probe_driven:?} must share the default (h2-capable) reqwest key: {k}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn connection_pool_key_with_backend_ca_cert() {
     let pool = pool_with_defaults();
@@ -337,9 +382,13 @@ async fn connection_pool_key_pipe_delimiter_count() {
     let proxy = minimal_proxy();
     let key = pool.pool_key_for_warmup(&proxy);
     let pipe_count = key.chars().filter(|c| *c == '|').count();
+    // 12 fields (dest, protocol, force-H1 ALPN discriminator, dns, subset, ca,
+    // mtls_cert, mtls_key, sni, san_digest, verify, svid_generation) need 11
+    // pipe delimiters. The force-H1 ALPN discriminator (empty unless
+    // DO_NOT_UPGRADE) was added in F5.1 codex round-1 Finding 1.
     assert_eq!(
-        pipe_count, 10,
-        "11 fields need 10 pipe delimiters, got {pipe_count} in key: {key}"
+        pipe_count, 11,
+        "12 fields need 11 pipe delimiters, got {pipe_count} in key: {key}"
     );
 }
 
@@ -761,18 +810,27 @@ async fn connection_pool_key_no_upstream_vs_upstream_namespace_collision() {
 
 #[tokio::test]
 async fn connection_pool_and_h2_pool_keys_have_same_delimiter() {
-    // Both pools must use | as delimiter for IPv6 safety
+    // Both pools must use | as delimiter for IPv6 safety. The exact field count
+    // differs (the reqwest key carries an extra force-H1 ALPN discriminator
+    // segment added in F5.1 — the direct-H2 pool already partitions H1-vs-H2 by
+    // construction, so it needs none), so assert delimiter USAGE, not an equal
+    // pipe count between the two pools.
     let pool = pool_with_defaults();
     let proxy = minimal_proxy();
 
     let conn_key = pool.pool_key_for_warmup(&proxy);
     let h2_key = Http2ConnectionPool::pool_key_for_warmup(&proxy);
 
-    // Neither should contain field-level colons (only in host:port which is expected)
-    for key in [&conn_key, &h2_key] {
-        let pipe_count = key.chars().filter(|c| *c == '|').count();
-        assert_eq!(pipe_count, 10, "key should use | as delimiter: {key}");
-    }
+    // Both must use | as the field delimiter (>= the documented minimum field
+    // counts), confirming neither switched to a colon-based delimiter that
+    // would be IPv6-unsafe.
+    let conn_pipes = conn_key.chars().filter(|c| *c == '|').count();
+    let h2_pipes = h2_key.chars().filter(|c| *c == '|').count();
+    assert_eq!(
+        conn_pipes, 11,
+        "reqwest key should use | as delimiter: {conn_key}"
+    );
+    assert!(h2_pipes >= 9, "H2 key should use | as delimiter: {h2_key}");
 }
 
 // ---------------------------------------------------------------------------

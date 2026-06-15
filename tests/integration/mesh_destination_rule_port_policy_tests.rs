@@ -584,6 +584,80 @@ fn destination_rule_connection_pool_http_only_per_port_no_fan_out() {
     assert!(!prepared.upstreams[0].port_overrides.contains_key(&9090));
 }
 
+#[test]
+fn destination_rule_port_level_explicit_default_clears_inherited_h2_upgrade_policy() {
+    use ferrum_edge::config::types::H2UpgradePolicy;
+    use ferrum_edge::modes::mesh::config::MeshConnectionPoolHttp;
+
+    // codex round-1 Finding 3: a top-level `UPGRADE` fans out to every port,
+    // but an EXPLICIT port-level `DEFAULT` on 8080 must CLEAR the inherited
+    // `UPGRADE` for that port (operator explicitly chose probe-driven), not
+    // leave it inherited. `H2UpgradePolicy::Default` is carried (not collapsed
+    // to `None`) precisely so the apply layer can distinguish explicit-DEFAULT
+    // from absent.
+    let mut port_level_settings = HashMap::new();
+    port_level_settings.insert(
+        8080,
+        MeshTrafficPolicy {
+            connection_pool_http: Some(MeshConnectionPoolHttp {
+                // Explicit DEFAULT: clears the inherited top-level UPGRADE.
+                h2_upgrade_policy: Some(H2UpgradePolicy::Default),
+                ..MeshConnectionPoolHttp::default()
+            }),
+            ..MeshTrafficPolicy::default()
+        },
+    );
+    let mut config = GatewayConfig {
+        proxies: vec![proxy()],
+        upstreams: vec![upstream()],
+        mesh: Some(Box::new(MeshConfig {
+            destination_rules: vec![MeshDestinationRule {
+                name: "reviews-dr".to_string(),
+                namespace: "default".to_string(),
+                host: "reviews.default.svc.cluster.local".to_string(),
+                traffic_policy: Some(MeshTrafficPolicy {
+                    connection_pool_http: Some(MeshConnectionPoolHttp {
+                        // Top-level UPGRADE fans out to every port first.
+                        h2_upgrade_policy: Some(H2UpgradePolicy::Upgrade),
+                        ..MeshConnectionPoolHttp::default()
+                    }),
+                    ..MeshTrafficPolicy::default()
+                }),
+                port_level_settings,
+                subsets: Vec::new(),
+            }],
+            ..MeshConfig::default()
+        })),
+        ..GatewayConfig::default()
+    };
+    config.normalize_fields();
+
+    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh config");
+    let port_override = prepared.upstreams[0]
+        .port_overrides
+        .get(&8080)
+        .expect("per-port overlay present");
+    // Explicit port-level DEFAULT overwrote the inherited UPGRADE → Default
+    // (probe-driven), NOT Upgrade.
+    assert_eq!(
+        port_override.h2_upgrade_policy,
+        Some(H2UpgradePolicy::Default),
+        "explicit port-level DEFAULT must clear the inherited top-level UPGRADE"
+    );
+
+    // Dispatch projection carries the cleared value, so dispatch is
+    // probe-driven for that port (Default and None are identical at the fork).
+    let dispatch_override = prepared.proxies[0]
+        .dispatch_port_overrides
+        .as_ref()
+        .and_then(|overrides| overrides.get(&8080))
+        .expect("proxy dispatch port override projected");
+    assert_eq!(
+        dispatch_override.h2_upgrade_policy,
+        Some(H2UpgradePolicy::Default)
+    );
+}
+
 // `resolve_effective_proxy_for_target` is `pub(crate)`, so the per-field
 // projection and Cow::Borrowed/Owned branches are tested inline in
 // `src/proxy/mod.rs` (see the `resolve_effective_proxy_*` tests block).

@@ -676,7 +676,39 @@ impl<'a> BackendTlsConfigBuilder<'a> {
         if self.skip_verification() {
             builder = builder.danger_accept_invalid_certs(true);
         }
-        Ok(builder.use_preconfigured_tls(self.build_rustls()?))
+        let rustls_config = self.build_rustls_for_reqwest()?;
+        if self.proxy.forces_backend_http1_only() {
+            // Belt-and-suspenders alongside the ALPN restriction in
+            // `build_rustls_for_reqwest`: set reqwest's HTTP/1-only preference
+            // too (covers the native-tls ALPN path; the rustls ALPN is the
+            // load-bearing part for the preconfigured-rustls path we use).
+            builder = builder.http1_only();
+        }
+        Ok(builder.use_preconfigured_tls(rustls_config))
+    }
+
+    /// Build the rustls `ClientConfig` for the reqwest backend client, applying
+    /// the DestinationRule `connectionPool.http.h2UpgradePolicy = DO_NOT_UPGRADE`
+    /// force-H1 ALPN restriction.
+    ///
+    /// `DO_NOT_UPGRADE` must actually prevent HTTP/2 on a TLS backend, not
+    /// merely skip the direct-H2 pool. reqwest's `use_preconfigured_tls`
+    /// (`BuiltRustls`) path uses this config's ALPN VERBATIM — the connector
+    /// does NOT re-derive ALPN from reqwest's `http1_only()` for a preconfigured
+    /// config — and reqwest only speaks H2 when the wire-negotiated ALPN is
+    /// `h2`. So for a force-H1 proxy we restrict the advertised ALPN to
+    /// `http/1.1`: the backend can no longer ALPN-select h2.
+    ///
+    /// This is reqwest-specific (the shared `build_rustls` is left untouched, so
+    /// the direct-H2 and H3/QUIC backend configs keep their own ALPN). The
+    /// matching force-H1 discriminator in the reqwest pool key keeps this client
+    /// from being shared with a default (h2-capable) one.
+    fn build_rustls_for_reqwest(&self) -> Result<ClientConfig, TlsError> {
+        let mut rustls_config = self.build_rustls()?;
+        if self.proxy.forces_backend_http1_only() {
+            rustls_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        }
+        Ok(rustls_config)
     }
 
     fn build_server_verifier(&self) -> Result<BackendServerVerifier, TlsError> {
@@ -1365,6 +1397,53 @@ mod tests {
             .build_rustls()
             .unwrap_err();
         assert!(matches!(err, TlsError::Pem { .. }));
+    }
+
+    #[test]
+    fn build_rustls_for_reqwest_restricts_alpn_to_http1_under_do_not_upgrade() {
+        use crate::config::types::H2UpgradePolicy;
+        ensure_crypto_provider();
+
+        // codex round-1 Finding 1: a `DO_NOT_UPGRADE` proxy's reqwest rustls
+        // config must advertise ONLY `http/1.1` so a TLS backend cannot
+        // ALPN-negotiate h2. The default (probe-driven) config leaves ALPN
+        // unrestricted (reqwest's preconfigured-rustls path uses it verbatim).
+        let mut proxy = test_proxy();
+
+        // Default proxy: ALPN not restricted to http/1.1-only.
+        let default_cfg = builder_for(&proxy, None, false, None, None, &[])
+            .build_rustls_for_reqwest()
+            .expect("build default reqwest rustls config");
+        assert_ne!(
+            default_cfg.alpn_protocols,
+            vec![b"http/1.1".to_vec()],
+            "default proxy must NOT be force-restricted to http/1.1 ALPN"
+        );
+
+        // DO_NOT_UPGRADE proxy: ALPN restricted to http/1.1 only.
+        proxy.h2_upgrade_policy = Some(H2UpgradePolicy::DoNotUpgrade);
+        let force_h1_cfg = builder_for(&proxy, None, false, None, None, &[])
+            .build_rustls_for_reqwest()
+            .expect("build force-H1 reqwest rustls config");
+        assert_eq!(
+            force_h1_cfg.alpn_protocols,
+            vec![b"http/1.1".to_vec()],
+            "DO_NOT_UPGRADE must restrict reqwest ALPN to http/1.1 so the \
+             backend cannot ALPN-negotiate h2"
+        );
+
+        // Upgrade / Default are probe-driven — not force-restricted.
+        for probe_driven in [H2UpgradePolicy::Upgrade, H2UpgradePolicy::Default] {
+            proxy.h2_upgrade_policy = Some(probe_driven);
+            let cfg = builder_for(&proxy, None, false, None, None, &[])
+                .build_rustls_for_reqwest()
+                .expect("build probe-driven reqwest rustls config");
+            assert_ne!(
+                cfg.alpn_protocols,
+                vec![b"http/1.1".to_vec()],
+                "{probe_driven:?} must not force http/1.1-only ALPN"
+            );
+        }
     }
 
     #[test]
