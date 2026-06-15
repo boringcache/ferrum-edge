@@ -1593,21 +1593,43 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   jumped from `mangle PREROUTING`. The UDP listener port (default `15011`) is
   **distinct from the TCP outbound port** (`15001`) because UDP and TCP cannot
   share one listener socket.
+- **Direction scoping (both chains ride PREROUTING).** The TCP chains stay
+  direction-disjoint by hook (inbound = `nat PREROUTING`, outbound = `nat OUTPUT`);
+  TPROXY cannot use that (it is PREROUTING-only), so both UDP chains ride
+  `mangle PREROUTING` and are kept disjoint by **destination address type**
+  instead: the outbound TPROXY rules carry `-m addrtype ! --dst-type LOCAL` (egress
+  = a remote destination) and the inbound catch-all carries `-m addrtype
+  --dst-type LOCAL` (inbound = the pod's own IP). The **OUTBOUND jump is installed
+  before the INBOUND jump** so pod egress is matched first — otherwise the inbound
+  catch-all (xt_TPROXY returns `NF_ACCEPT`, ending PREROUTING traversal) would
+  swallow egress and bypass the outbound include/exclude/CIDR/port rules. The
+  `addrtype` match needs no extra capability beyond the `NET_ADMIN` the init
+  container already grants.
 - **Transparent-routing plumbing** (raw `ip` commands, not iptables): TPROXY
   delivery additionally needs `ip rule add priority <P> fwmark <mark>/<mask> lookup
   <table>` plus `ip route add local 0.0.0.0/0 dev lo table <table>` (and the `ip -6`
   equivalents under the IPv6 fan-out) so the kernel routes the marked datagram to
-  the local socket. Each `ip` command is guarded by a `command -v ip` preflight and
-  `|| true` so a runtime image without `iproute2` skips the plumbing instead of
-  failing the (`set -e`) setup script. **The routing table is a Ferrum-owned
-  number (`33133`), NOT Istio's inbound-TPROXY table `133`** — a co-resident Istio
-  install owns `133`, and Ferrum must never risk that table's routes. **Idempotent
-  setup:** `ip rule add` appends, so the rule is assigned an **explicit priority**
-  (`33133`) and is delete-by-priority **before** add (and the route is
-  delete-before-add), so a node-agent fallback crash/retry before cleanup never
-  stacks a duplicate rule. The mark (default `0x539`) is collision-free — Ferrum
-  uses no other packet marks; the `1337` proxy UID is a socket-owner match, a
-  disjoint namespace from `skb->mark` — and matches the conventional Istio
+  the local socket. **The `ip rule` priority is a low constant (`100`), separate
+  from the routing TABLE number (`33133`).** The RPDB is priority-ordered and the
+  kernel's built-in `main` table rule is priority `32766`; if the fwmark rule sat
+  above it, `main` would resolve the marked datagram to its normal route before the
+  fwmark lookup engaged and captured UDP would silently black-hole — so the rule
+  must sit BELOW `main`. The **routing table is a Ferrum-owned number (`33133`),
+  NOT Istio's inbound-TPROXY table `133`** — a co-resident Istio install owns
+  `133`, and Ferrum must never risk that table's routes. **Fail closed when the
+  routing is unavailable:** TPROXY local delivery is useless without this `ip
+  rule`/`ip route`, so when UDP capture is enabled the setup script (a) **fatally**
+  preflights `command -v ip` **before** installing any UDP mangle/TPROXY rule (a
+  runtime image without `iproute2` fails the `set -e` script and installs nothing —
+  TPROXY rules and routing go in together or not at all, never the silent
+  half-state), and (b) the load-bearing routing **ADD** commands are **not**
+  `|| true` (a failed add aborts the script). Only the delete-before-add stays
+  best-effort. **Idempotent setup:** `ip rule add` appends, so the rule is assigned
+  the explicit priority (`100`) and is delete-by-priority **before** add (and the
+  route is delete-before-add), so a node-agent fallback crash/retry before cleanup
+  never stacks a duplicate rule. The mark (default `0x539`) is collision-free —
+  Ferrum uses no other packet marks; the `1337` proxy UID is a socket-owner match,
+  a disjoint namespace from `skb->mark` — and matches the conventional Istio
   outbound/TPROXY mark.
 - **Default OFF.** The consuming UDP listener arrives in **Stage 3**; an upgraded
   injector with UDP capture on but no listener would redirect UDP into a void, so
@@ -1628,13 +1650,15 @@ per-datagram recoverable original address, and there is no UDP equivalent of
 
 Cleanup (`IptablesPlan::cleanup_commands(udp_capture_enabled)`) removes the
 `mangle` chains and tears down routing state by deleting **only the EXACT
-Ferrum-owned rule** (`ip rule del priority 33133 lookup 33133`) and **the exact
+Ferrum-owned rule** (`ip rule del priority 100 lookup 33133`) and **the exact
 route** (`ip route del local 0.0.0.0/0 dev lo table 33133`) — never `ip rule del
 lookup <table>` or `ip route flush table <table>`, which could drop a co-resident
-route. The UDP teardown is **gated on `udp_capture_enabled`**, so a non-UDP install
-never touches routing state it never created. The init container already grants
-`NET_ADMIN`, which covers the TPROXY target and the `ip rule`/`ip route` plumbing —
-no extra capability is needed.
+route. Cleanup deletes stay best-effort (`|| true`) — unlike the load-bearing
+setup adds, teardown must never fail on already-absent state or a missing `ip`
+binary. The UDP teardown is **gated on `udp_capture_enabled`**, so a non-UDP
+install never touches routing state it never created. The init container already
+grants `NET_ADMIN`, which covers the TPROXY target, the `addrtype` direction
+scoping, and the `ip rule`/`ip route` plumbing — no extra capability is needed.
 
 ## Control Plane Integration
 

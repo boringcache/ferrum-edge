@@ -46,14 +46,26 @@ pub(crate) const TPROXY_MARK_MASK: u32 = 0xffff_ffff;
 /// binds.
 pub(crate) const TPROXY_ROUTE_TABLE: u16 = 33133;
 
-/// Explicit `ip rule` priority for the Ferrum UDP TPROXY fwmark selector. An
-/// explicit priority makes setup idempotent (delete-by-priority before add, so a
-/// node-agent fallback crash/retry never appends a duplicate rule) and lets
-/// cleanup delete the EXACT Ferrum-owned rule (`ip rule del priority <P>`)
-/// instead of `ip rule del lookup <table>` (which would also drop an unrelated
-/// rule pointing at the same table). High enough to sit below the default
-/// `main`/`local` rules without colliding with common CNI priorities.
-pub(crate) const TPROXY_ROUTE_RULE_PRIORITY: u32 = 33133;
+/// Explicit `ip rule` priority for the Ferrum UDP TPROXY fwmark selector.
+///
+/// Two things this controls, kept deliberately SEPARATE from the routing TABLE
+/// number ([`TPROXY_ROUTE_TABLE`]):
+/// 1. **Idempotency / exact teardown.** An explicit priority makes setup
+///    delete-by-priority before add (so a node-agent fallback crash/retry never
+///    appends a duplicate rule) and lets cleanup delete the EXACT Ferrum-owned
+///    rule (`ip rule del priority <P>`) instead of `ip rule del lookup <table>`
+///    (which would also drop an unrelated rule pointing at the same table).
+/// 2. **RPDB ordering — MUST sit BELOW the kernel's built-in `main` table rule.**
+///    The routing policy database is priority-ordered (lowest number wins) and
+///    the kernel installs `main` at priority **32766**. If Ferrum's fwmark rule
+///    sat ABOVE 32766, `main` would resolve a marked datagram to its normal
+///    (forwarding/remote) route BEFORE the fwmark rule ever steered it to the
+///    local-delivery table — transparent local delivery would never engage and
+///    captured UDP would silently black-hole. A low constant (`100`) keeps the
+///    fwmark lookup ahead of `main` (and of `local` at 0, which only matches
+///    genuinely-local destinations and never the marked egress). The TABLE
+///    number stays the high Ferrum-owned `33133`; only this RULE priority is low.
+pub(crate) const TPROXY_ROUTE_RULE_PRIORITY: u32 = 100;
 
 /// Istio-compatible `includeOutboundPorts` annotation. The injector and the
 /// node-agent eBPF backend both read this key — keep the spelling exactly
@@ -874,6 +886,22 @@ fn commands_for_family(
 /// include/exclude CIDRs, the proxy-UID self-exclusion) applies identically to
 /// UDP.
 ///
+/// **Direction scoping mirrors the TCP chains (codex r2).** The TCP path keeps
+/// the two directions disjoint by HOOK — inbound rides `nat PREROUTING`, outbound
+/// rides `nat OUTPUT` — so neither swallows the other. TPROXY cannot use that
+/// trick (it is `PREROUTING`-only; see below), so BOTH UDP chains are jumped from
+/// `mangle PREROUTING`. To keep them from clobbering each other we instead
+/// discriminate by DESTINATION ADDRESS TYPE, the pod-IP-agnostic equivalent:
+/// - the OUTBOUND chain's TPROXY rules carry `-m addrtype ! --dst-type LOCAL`
+///   (egress = a remote/non-local destination), and
+/// - the INBOUND catch-all TPROXY carries `-m addrtype --dst-type LOCAL`
+///   (inbound = a destination configured on this box, i.e. the pod's own IP).
+///
+/// The OUTBOUND jump is also installed BEFORE the INBOUND jump so egress is
+/// matched/routed first. Without this, the inbound catch-all (xt_TPROXY returns
+/// `NF_ACCEPT`, ending PREROUTING traversal) would grab pod EGRESS too — the
+/// outbound include/exclude/CIDR/port rules would be silently bypassed.
+///
 /// **PREROUTING-only this stage (TPROXY-in-OUTPUT is invalid):** the TPROXY
 /// target runs ONLY in `PREROUTING`, never for locally-generated (OUTPUT)
 /// packets. Jumping into a `-j TPROXY` chain from `mangle OUTPUT` is invalid and
@@ -884,6 +912,17 @@ fn commands_for_family(
 /// and is DEFERRED to a later stage (see `docs/mesh.md`). Because there is no
 /// OUTPUT path, there is also no proxy-UID `-m owner` self-exclusion (owner-match
 /// is OUTPUT-context-only).
+///
+/// **Fail closed when policy routing is unavailable (codex r2).** TPROXY local
+/// delivery REQUIRES the `ip rule` + `ip route local` plumbing; installing the
+/// mangle TPROXY rules without it is a silent black-hole (the pod comes up
+/// "ready" but captured UDP is never delivered). So when UDP capture is enabled
+/// this emits a FATAL `command -v ip` preflight BEFORE any UDP rule (no `ip` ⇒
+/// the `set -e` script exits non-zero, installing neither the TPROXY rules nor
+/// the routing), and the load-bearing routing ADD commands are NOT `|| true`
+/// (a failed add aborts the script). Only the delete-before-add (idempotence)
+/// keeps `|| true`. TPROXY rules and routing are installed TOGETHER or not at
+/// all — never the half-state of TPROXY-without-routing.
 fn udp_tproxy_commands_for_family(
     binary: &str,
     config: &CaptureConfig,
@@ -897,6 +936,23 @@ fn udp_tproxy_commands_for_family(
     let tproxy_jump = format!(
         "-j TPROXY --on-port {} --tproxy-mark {mark_arg}",
         config.udp_outbound_port
+    );
+    // Outbound (egress) discriminator: a remote/non-local destination. Mirrors
+    // the TCP path's hook-based direction separation (which TPROXY can't use,
+    // being PREROUTING-only) via destination address type, so this OUTBOUND chain
+    // never grabs traffic destined for the pod's own IP (that is the INBOUND
+    // chain's job, scoped with the complementary `--dst-type LOCAL`).
+    let outbound_dst_scope = "-m addrtype ! --dst-type LOCAL";
+
+    // FAIL CLOSED if `ip` is missing: TPROXY local delivery is useless without
+    // the `ip rule`/`ip route local` plumbing, so a runtime image without
+    // `iproute2` must NOT come up with TPROXY-without-routing (a silent UDP
+    // black-hole). Emitted FIRST, before any UDP mangle/TPROXY rule, so the
+    // `set -e` script exits non-zero and installs NOTHING when `ip` is absent —
+    // TPROXY rules and routing are installed together or not at all (codex r2).
+    commands.push(
+        "command -v ip >/dev/null 2>&1 || { echo \"iproute2 (ip) is required for UDP TPROXY transparent routing\" >&2; exit 1; }"
+            .to_string(),
     );
 
     commands.push(idempotent_new_chain(
@@ -940,7 +996,7 @@ fn udp_tproxy_commands_for_family(
             binary,
             "mangle",
             "FERRUM_MESH_UDP_OUTBOUND",
-            &format!("-p udp {tproxy_jump}"),
+            &format!("-p udp {outbound_dst_scope} {tproxy_jump}"),
         ));
     } else {
         let emit_include_cidrs =
@@ -956,7 +1012,7 @@ fn udp_tproxy_commands_for_family(
                         binary,
                         "mangle",
                         "FERRUM_MESH_UDP_OUTBOUND",
-                        &format!("-p udp {tproxy_jump}"),
+                        &format!("-p udp {outbound_dst_scope} {tproxy_jump}"),
                     ));
                 }
             } else {
@@ -965,7 +1021,7 @@ fn udp_tproxy_commands_for_family(
                         binary,
                         "mangle",
                         "FERRUM_MESH_UDP_OUTBOUND",
-                        &format!("-p udp -d {cidr} {tproxy_jump}"),
+                        &format!("-p udp -d {cidr} {outbound_dst_scope} {tproxy_jump}"),
                     ));
                 }
             }
@@ -975,7 +1031,7 @@ fn udp_tproxy_commands_for_family(
                 binary,
                 "mangle",
                 "FERRUM_MESH_UDP_OUTBOUND",
-                &format!("-p udp --dport {port} {tproxy_jump}"),
+                &format!("-p udp --dport {port} {outbound_dst_scope} {tproxy_jump}"),
             ));
         }
     }
@@ -990,38 +1046,57 @@ fn udp_tproxy_commands_for_family(
             &format!("-p udp --dport {port} -j RETURN"),
         ));
     }
+    // Inbound catch-all is scoped to a LOCAL destination (the pod's own IP) so it
+    // captures ONLY genuinely-inbound UDP — never pod egress that fell through the
+    // OUTBOUND chain (e.g. an excluded-CIDR RETURN). This is the complement of the
+    // OUTBOUND chain's `! --dst-type LOCAL` and is how the two PREROUTING chains
+    // stay direction-disjoint without knowing the pod IP (codex r2).
     commands.push(idempotent_append(
         binary,
         "mangle",
         "FERRUM_MESH_UDP_INBOUND",
-        &format!("-p udp {tproxy_jump}"),
+        &format!("-p udp -m addrtype --dst-type LOCAL {tproxy_jump}"),
     ));
 
-    // PREROUTING jump carries remotely-originated UDP in both capture directions
-    // (TPROXY runs ONLY in PREROUTING). There is deliberately NO `mangle OUTPUT`
-    // jump: this OUTBOUND chain ends in `-j TPROXY`, and TPROXY is invalid for
-    // locally-generated (OUTPUT) packets — jumping into it from OUTPUT can make
-    // iptables setup fail outright. Sidecar-self-egress (locally-generated) UDP
-    // capture needs a separate MARK-only OUTPUT chain and is DEFERRED to a later
-    // stage (see the fn doc + docs/mesh.md).
-    commands.push(idempotent_append(
-        binary,
-        "mangle",
-        "PREROUTING",
-        "-p udp -j FERRUM_MESH_UDP_INBOUND",
-    ));
+    // PREROUTING jumps carry remotely-originated UDP in both capture directions
+    // (TPROXY runs ONLY in PREROUTING). The OUTBOUND jump is installed BEFORE the
+    // INBOUND jump so pod EGRESS is matched/routed first: the inbound catch-all
+    // (xt_TPROXY returns NF_ACCEPT, ending traversal) must not swallow egress and
+    // bypass the outbound include/exclude/CIDR/port rules. The two chains are also
+    // destination-scoped (`! --dst-type LOCAL` outbound, `--dst-type LOCAL`
+    // inbound) so each captures only its own direction regardless of order; the
+    // ordering is the belt-and-suspenders mirror of the TCP chains (codex r2).
+    //
+    // There is deliberately NO `mangle OUTPUT` jump: the OUTBOUND chain ends in
+    // `-j TPROXY`, and TPROXY is invalid for locally-generated (OUTPUT) packets —
+    // jumping into it from OUTPUT can make iptables setup fail outright.
+    // Sidecar-self-egress (locally-generated) UDP capture needs a separate
+    // MARK-only OUTPUT chain and is DEFERRED to a later stage (see the fn doc +
+    // docs/mesh.md).
     commands.push(idempotent_append(
         binary,
         "mangle",
         "PREROUTING",
         "-p udp -j FERRUM_MESH_UDP_OUTBOUND",
     ));
+    commands.push(idempotent_append(
+        binary,
+        "mangle",
+        "PREROUTING",
+        "-p udp -j FERRUM_MESH_UDP_INBOUND",
+    ));
 
-    // Transparent-routing plumbing: raw `ip` commands (NOT iptables). Each is
-    // guarded by a `command -v ip` preflight and `|| true` so a missing `ip`
-    // binary or an already-present rule never aborts the (set -e) setup script.
-    // The fwmark selector must match the `--tproxy-mark` value above so marked
-    // datagrams are steered to the local-delivery table.
+    // Transparent-routing plumbing: raw `ip` commands (NOT iptables). The fwmark
+    // selector must match the `--tproxy-mark` value above so marked datagrams are
+    // steered to the local-delivery table.
+    //
+    // FAIL CLOSED (codex r2): TPROXY local delivery is USELESS without this
+    // routing, so the load-bearing ADD commands are NOT `|| true` — under the
+    // (set -e) setup script a failed add aborts, rather than leaving a pod that
+    // is "ready" but silently black-holes captured UDP. (`command -v ip` was
+    // already asserted FATALLY at the top of this function, before any UDP rule,
+    // so the adds run only when `ip` exists.) Only the delete-before-add stays
+    // best-effort (`|| true`).
     //
     // Idempotency: `ip rule add` APPENDS, so a retry (e.g. a node-agent fallback
     // crash before cleanup ran) would stack a duplicate rule. We assign an
@@ -1032,27 +1107,30 @@ fn udp_tproxy_commands_for_family(
         CidrFamily::V4 => ("ip", "local 0.0.0.0/0 dev lo"),
         CidrFamily::V6 => ("ip -6", "local ::/0 dev lo"),
     };
-    commands.push(ip_guarded(&format!(
+    commands.push(ip_delete_best_effort(&format!(
         "{ip} rule del priority {TPROXY_ROUTE_RULE_PRIORITY} fwmark 0x{mark:x}/0x{TPROXY_MARK_MASK:x} lookup {TPROXY_ROUTE_TABLE}"
     )));
-    commands.push(ip_guarded(&format!(
+    commands.push(format!(
         "{ip} rule add priority {TPROXY_ROUTE_RULE_PRIORITY} fwmark 0x{mark:x}/0x{TPROXY_MARK_MASK:x} lookup {TPROXY_ROUTE_TABLE}"
-    )));
-    commands.push(ip_guarded(&format!(
+    ));
+    commands.push(ip_delete_best_effort(&format!(
         "{ip} route del {local_route} table {TPROXY_ROUTE_TABLE}"
     )));
-    commands.push(ip_guarded(&format!(
+    commands.push(format!(
         "{ip} route add {local_route} table {TPROXY_ROUTE_TABLE}"
-    )));
+    ));
 
     commands
 }
 
-/// Wrap a raw `ip` command with a `command -v ip` preflight and `|| true`. The
-/// preflight mirrors the existing `ip6tables` best-effort guard: a runtime image
-/// without `iproute2` skips the routing plumbing instead of failing the script.
-fn ip_guarded(cmd: &str) -> String {
-    format!("command -v ip >/dev/null 2>&1 && {{ {cmd} 2>/dev/null || true; }} || true")
+/// Wrap a best-effort `ip` DELETE (the idempotence delete-before-add and the
+/// cleanup teardown) with `|| true` so an already-absent rule/route never aborts
+/// the (`set -e`) script. NOTE: this is for DELETES only — the load-bearing
+/// setup ADDs deliberately do NOT use it (they must fail closed; see
+/// `udp_tproxy_commands_for_family`). A `command -v ip` preflight is asserted
+/// separately and fatally by callers before the load-bearing adds.
+fn ip_delete_best_effort(cmd: &str) -> String {
+    format!("{cmd} 2>/dev/null || true")
 }
 
 fn iptables_script(
@@ -1147,10 +1225,12 @@ fn cleanup_commands_for(binary: &str, udp_capture_enabled: bool) -> Vec<String> 
             CidrFamily::V6 => ("ip -6", "local ::/0 dev lo"),
             CidrFamily::V4 => ("ip", "local 0.0.0.0/0 dev lo"),
         };
-        commands.push(ip_guarded(&format!(
+        // Cleanup deletes stay best-effort (`|| true`): teardown must never fail
+        // on already-absent routing state or a missing `ip` binary.
+        commands.push(ip_delete_best_effort(&format!(
             "{ip} rule del priority {TPROXY_ROUTE_RULE_PRIORITY} lookup {TPROXY_ROUTE_TABLE}"
         )));
-        commands.push(ip_guarded(&format!(
+        commands.push(ip_delete_best_effort(&format!(
             "{ip} route del {local_route} table {TPROXY_ROUTE_TABLE}"
         )));
     }
@@ -2290,31 +2370,40 @@ mod tests {
             "must NOT emit any mangle OUTPUT jump (TPROXY is invalid in OUTPUT): {cmds:?}"
         );
 
-        // Transparent-routing plumbing: idempotent (delete-before-add) ip rule by
-        // explicit priority + ip route local (delete-before-add). The fwmark
-        // selector still matches the --tproxy-mark above.
+        // Transparent-routing plumbing: a FATAL `command -v ip` preflight (codex
+        // r2 fail-closed) + idempotent (delete-before-add) ip rule by explicit
+        // priority + ip route local (delete-before-add). The fwmark selector still
+        // matches the --tproxy-mark above. The load-bearing ADDs are bare (NOT
+        // `command -v ip`-guarded, NOT `|| true`) — they must fail closed.
         assert!(
-            cmds.iter().any(|c| c.contains("command -v ip")
-                && c.contains(&format!("rule add priority {TPROXY_ROUTE_RULE_PRIORITY}"))
-                && c.contains("fwmark")
-                && c.contains(&format!("lookup {TPROXY_ROUTE_TABLE}"))),
-            "missing guarded `ip rule add priority <P> fwmark ... lookup <table>`: {cmds:?}"
+            cmds.iter()
+                .any(|c| c.contains("command -v ip >/dev/null 2>&1")
+                    && c.contains("exit 1")
+                    && c.contains("iproute2")),
+            "missing FATAL `command -v ip || exit 1` preflight for routing: {cmds:?}"
         );
         assert!(
-            cmds.iter().any(|c| c.contains("command -v ip")
-                && c.contains(&format!("rule del priority {TPROXY_ROUTE_RULE_PRIORITY}"))),
+            cmds.iter().any(|c| c
+                .contains(&format!("rule add priority {TPROXY_ROUTE_RULE_PRIORITY}"))
+                && c.contains("fwmark")
+                && c.contains(&format!("lookup {TPROXY_ROUTE_TABLE}"))),
+            "missing `ip rule add priority <P> fwmark ... lookup <table>`: {cmds:?}"
+        );
+        assert!(
+            cmds.iter()
+                .any(|c| c.contains(&format!("rule del priority {TPROXY_ROUTE_RULE_PRIORITY}"))),
             "missing idempotent `ip rule del priority <P>` before the add: {cmds:?}"
         );
         assert!(
-            cmds.iter().any(|c| c.contains("command -v ip")
-                && c.contains("route add local 0.0.0.0/0 dev lo")
-                && c.contains(&format!("table {TPROXY_ROUTE_TABLE}"))),
-            "missing guarded `ip route add local ... table <table>`: {cmds:?}"
+            cmds.iter()
+                .any(|c| c.contains("route add local 0.0.0.0/0 dev lo")
+                    && c.contains(&format!("table {TPROXY_ROUTE_TABLE}"))),
+            "missing `ip route add local ... table <table>`: {cmds:?}"
         );
         assert!(
-            cmds.iter().any(|c| c.contains("command -v ip")
-                && c.contains("route del local 0.0.0.0/0 dev lo")
-                && c.contains(&format!("table {TPROXY_ROUTE_TABLE}"))),
+            cmds.iter()
+                .any(|c| c.contains("route del local 0.0.0.0/0 dev lo")
+                    && c.contains(&format!("table {TPROXY_ROUTE_TABLE}"))),
             "missing idempotent `ip route del local ... table <table>` before the add: {cmds:?}"
         );
         // The Ferrum routing table must NOT be Istio's shared inbound-TPROXY
@@ -2357,6 +2446,154 @@ mod tests {
         assert!(
             route_del < route_add,
             "ip route del must precede add for idempotency: {cmds:?}"
+        );
+    }
+
+    // codex r2 finding 3: the RPDB is priority-ordered and the kernel's built-in
+    // `main` table rule is priority 32766. The Ferrum fwmark rule MUST sit BELOW
+    // it (lower number = evaluated first), or `main` resolves the marked datagram
+    // to its normal route before the fwmark lookup steers it to local delivery —
+    // captured UDP would black-hole. Compile-time assertion (the value is a
+    // const), so a regression to a >=32766 priority fails the build.
+    const _: () = assert!(
+        TPROXY_ROUTE_RULE_PRIORITY < 32766,
+        "fwmark ip-rule priority must be below the kernel `main` rule (32766)"
+    );
+    // The routing TABLE number is intentionally NOT the rule priority — they are
+    // separate concepts (table stays the high Ferrum-owned constant).
+    const _: () = assert!(
+        TPROXY_ROUTE_TABLE as u32 != TPROXY_ROUTE_RULE_PRIORITY,
+        "rule priority must be separate from the routing table number"
+    );
+
+    #[test]
+    fn udp_prerouting_jumps_outbound_before_inbound_catch_all() {
+        // codex r2 finding 2: both UDP chains ride `mangle PREROUTING` (TPROXY is
+        // PREROUTING-only). The OUTBOUND jump must come BEFORE the INBOUND jump so
+        // egress is matched/routed first — otherwise the inbound catch-all
+        // (NF_ACCEPT) swallows pod egress and the outbound rules are bypassed.
+        let plan = IptablesPlan::for_config(&udp_enabled_iptables_config());
+        let cmds = &plan.v4_commands;
+
+        let outbound_jump = cmds
+            .iter()
+            .position(|c| {
+                c.contains("-t mangle")
+                    && c.contains("PREROUTING")
+                    && c.contains("-j FERRUM_MESH_UDP_OUTBOUND")
+            })
+            .expect("PREROUTING -> UDP outbound jump");
+        let inbound_jump = cmds
+            .iter()
+            .position(|c| {
+                c.contains("-t mangle")
+                    && c.contains("PREROUTING")
+                    && c.contains("-j FERRUM_MESH_UDP_INBOUND")
+            })
+            .expect("PREROUTING -> UDP inbound jump");
+        assert!(
+            outbound_jump < inbound_jump,
+            "outbound PREROUTING jump must precede the inbound catch-all jump: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn udp_chains_are_direction_scoped_by_dst_addrtype() {
+        // codex r2 finding 2: the two PREROUTING chains stay direction-disjoint by
+        // destination address type (the pod-IP-agnostic mirror of the TCP chains'
+        // hook separation). Outbound TPROXY = `! --dst-type LOCAL` (remote dest);
+        // the inbound catch-all = `--dst-type LOCAL` (the pod's own IP).
+        let plan = IptablesPlan::for_config(&udp_enabled_iptables_config());
+        let cmds = &plan.v4_commands;
+
+        assert!(
+            cmds.iter().any(|c| c.contains("FERRUM_MESH_UDP_OUTBOUND")
+                && c.contains("-m addrtype ! --dst-type LOCAL")
+                && c.contains("-j TPROXY")),
+            "outbound UDP TPROXY must be scoped to a non-local destination: {cmds:?}"
+        );
+        assert!(
+            cmds.iter().any(|c| c.contains("FERRUM_MESH_UDP_INBOUND")
+                && c.contains("-m addrtype --dst-type LOCAL")
+                && c.contains("-j TPROXY")),
+            "inbound UDP catch-all TPROXY must be scoped to a LOCAL destination: {cmds:?}"
+        );
+        // The inbound catch-all must NOT be an unscoped blanket `-p udp -j TPROXY`
+        // (that is what swallowed egress).
+        assert!(
+            !cmds.iter().any(|c| c.contains("FERRUM_MESH_UDP_INBOUND")
+                && c.contains("-j TPROXY")
+                && !c.contains("--dst-type LOCAL")),
+            "inbound UDP TPROXY must never be an unscoped blanket match: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn udp_routing_fails_closed_when_ip_unavailable() {
+        // codex r2 finding 1: TPROXY local delivery is useless without the
+        // `ip rule`/`ip route` plumbing. When UDP capture is enabled the setup
+        // must (a) fatally preflight `command -v ip` BEFORE installing any UDP
+        // rule, and (b) NOT `|| true` the load-bearing routing ADDs.
+        let plan = IptablesPlan::for_config(&udp_enabled_iptables_config());
+        let cmds = &plan.v4_commands;
+        let script = plan.script();
+
+        // (a) Fatal `command -v ip` preflight present, and ordered before any UDP
+        // mangle/TPROXY rule and before the routing adds.
+        let preflight = cmds
+            .iter()
+            .position(|c| {
+                c.contains("command -v ip >/dev/null 2>&1")
+                    && c.contains("exit 1")
+                    && c.contains("iproute2")
+            })
+            .expect("fatal `command -v ip` preflight");
+        let first_udp_rule = cmds
+            .iter()
+            .position(|c| c.contains("FERRUM_MESH_UDP") || c.contains("-p udp"))
+            .expect("a UDP rule");
+        assert!(
+            preflight < first_udp_rule,
+            "fatal `command -v ip` preflight must precede any UDP rule (install together or not at all): {cmds:?}"
+        );
+        let rule_add = cmds
+            .iter()
+            .position(|c| c.contains(&format!("rule add priority {TPROXY_ROUTE_RULE_PRIORITY}")))
+            .expect("ip rule add");
+        assert!(
+            preflight < rule_add,
+            "preflight must precede the routing add: {cmds:?}"
+        );
+
+        // (b) Load-bearing ADDs are NOT `|| true` (must fail the `set -e` script).
+        for needle in ["rule add priority", "route add local"] {
+            let add = cmds
+                .iter()
+                .find(|c| c.contains(needle))
+                .unwrap_or_else(|| panic!("missing `{needle}` command: {cmds:?}"));
+            assert!(
+                !add.contains("|| true"),
+                "load-bearing routing add must NOT be `|| true` (fail closed): {add}"
+            );
+        }
+        // The delete-before-add (idempotence) DOES stay best-effort.
+        for needle in ["rule del priority", "route del local"] {
+            let del = cmds
+                .iter()
+                .find(|c| c.contains(needle))
+                .unwrap_or_else(|| panic!("missing `{needle}` command: {cmds:?}"));
+            assert!(
+                del.contains("|| true"),
+                "idempotence delete must stay best-effort (`|| true`): {del}"
+            );
+        }
+
+        // The fatal preflight survives into the `set -e` script (it is the gate
+        // that makes `ip`-missing exit non-zero before installing TPROXY).
+        assert!(
+            script.contains("command -v ip >/dev/null 2>&1")
+                && script.contains("iproute2 (ip) is required"),
+            "setup script must carry the fatal `command -v ip` preflight: {script}"
         );
     }
 
@@ -2418,22 +2655,25 @@ mod tests {
         for port in [5432, 9092] {
             assert!(
                 plan.v4_commands.iter().any(|c| c.contains(&format!(
-                    "-p udp --dport {port} -j TPROXY --on-port {}",
+                    "-p udp --dport {port} -m addrtype ! --dst-type LOCAL -j TPROXY --on-port {}",
                     DEFAULT_UDP_OUTBOUND_PORT
                 ))),
-                "per-port UDP TPROXY missing for {port}: {:?}",
+                "per-port UDP TPROXY (non-local-scoped) missing for {port}: {:?}",
                 plan.v4_commands
             );
         }
         // includeOutboundPorts without explicit include CIDRs must not also emit
-        // an OUTBOUND catch-all `-p udp -j TPROXY` (mirrors the TCP narrowing
-        // semantics). The INBOUND chain keeps its protocol-wide catch-all, like
-        // the TCP inbound REDIRECT, so scope this check to the outbound chain.
+        // an OUTBOUND catch-all (no `--dport`/`-d` narrowing) `-p udp ... -j TPROXY`
+        // (mirrors the TCP narrowing semantics). The INBOUND chain keeps its
+        // protocol-wide catch-all, so scope this check to the outbound chain.
         assert!(
             !plan
                 .v4_commands
                 .iter()
-                .any(|c| c.contains("FERRUM_MESH_UDP_OUTBOUND") && c.contains("-p udp -j TPROXY")),
+                .any(|c| c.contains("FERRUM_MESH_UDP_OUTBOUND")
+                    && c.contains("-j TPROXY")
+                    && !c.contains("--dport")
+                    && !c.contains("-d ")),
             "implicit catch-all outbound UDP TPROXY must not fire when includeOutboundPorts narrows: {:?}",
             plan.v4_commands
         );
@@ -2447,12 +2687,15 @@ mod tests {
 
         let plan = IptablesPlan::for_config(&config);
 
-        // IPv4 TPROXY rules use `iptables` + IPv4 routing; no IPv6 leakage.
+        // IPv4 TPROXY rules use `iptables` + IPv4 routing; no IPv6 leakage. The
+        // outbound CIDR rule carries the non-local destination scope.
         assert!(
             plan.v4_commands
                 .iter()
                 .any(|c| c.contains("iptables -t mangle")
-                    && c.contains("-p udp -d 172.16.0.0/12 -j TPROXY")),
+                    && c.contains(
+                        "-p udp -d 172.16.0.0/12 -m addrtype ! --dst-type LOCAL -j TPROXY"
+                    )),
             "IPv4 UDP TPROXY CIDR rule missing: {:?}",
             plan.v4_commands
         );
@@ -2477,7 +2720,9 @@ mod tests {
             plan.v6_commands
                 .iter()
                 .any(|c| c.contains("ip6tables -t mangle")
-                    && c.contains("-p udp -d 2001:db8::/32 -j TPROXY")),
+                    && c.contains(
+                        "-p udp -d 2001:db8::/32 -m addrtype ! --dst-type LOCAL -j TPROXY"
+                    )),
             "IPv6 UDP TPROXY CIDR rule missing: {:?}",
             plan.v6_commands
         );
@@ -2540,16 +2785,18 @@ mod tests {
         // Routing teardown deletes ONLY the EXACT Ferrum-owned rule (by explicit
         // priority) + exact route — never `ip rule del lookup` / `ip route flush
         // table` (which could drop a co-resident route, e.g. an Istio table).
+        // Cleanup deletes are best-effort (`|| true`), not `command -v ip`-gated.
         assert!(
-            cleanup.iter().any(|c| c.contains("command -v ip")
-                && c.contains(&format!("rule del priority {TPROXY_ROUTE_RULE_PRIORITY}"))
+            cleanup.iter().any(|c| c
+                .contains(&format!("rule del priority {TPROXY_ROUTE_RULE_PRIORITY}"))
                 && c.contains(&format!("lookup {TPROXY_ROUTE_TABLE}"))),
             "cleanup missing exact `ip rule del priority <P> lookup <table>`: {cleanup:?}"
         );
         assert!(
-            cleanup.iter().any(|c| c.contains("command -v ip")
-                && c.contains("route del local 0.0.0.0/0 dev lo")
-                && c.contains(&format!("table {TPROXY_ROUTE_TABLE}"))),
+            cleanup
+                .iter()
+                .any(|c| c.contains("route del local 0.0.0.0/0 dev lo")
+                    && c.contains(&format!("table {TPROXY_ROUTE_TABLE}"))),
             "cleanup missing exact `ip route del local ... table <table>`: {cleanup:?}"
         );
         assert!(
