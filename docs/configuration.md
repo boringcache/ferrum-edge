@@ -333,6 +333,10 @@ Service / namespace names embedded in destination hosts are matched case-sensiti
 | `FERRUM_K8S_TRUST_DOMAIN` | No | `cluster.local` | SPIFFE trust domain for derived workload identities. In `node_agent` mode it derives each enrolled pod's workload SPIFFE ID (`spiffe://{trust_domain}/ns/{namespace}/sa/{service_account}`) when writing the `FERRUM_WORKLOAD_IDENTITY` eBPF map, so it must match the CP-side SPIFFE format the node-waypoint resolver enrolls |
 | `FERRUM_K8S_ISTIO_ROOT_NAMESPACE` | No | `istio-system` | Istio root namespace used by the K8s source translator for mesh-wide resources, including root-namespace `Sidecar` defaults/selectors and root-scoped `PeerAuthentication`, `RequestAuthentication`, `Telemetry`, and `ProxyConfig` resources |
 | `FERRUM_K8S_WATCH_MESH_CONFIG` | No | `true` | Watch the root-namespace `istio` ConfigMap for `meshConfig.extensionProviders` / `defaultProviders.tracing` lookup. Requires `configmaps` `get/list/watch` RBAC in the istio root namespace (the watcher is scoped with a `metadata.name=istio` field selector). Set to `false` to skip the watch when the gateway runs in a different trust boundary from `istio-system` and cannot easily grant cross-namespace ConfigMap access. Only effective when `FERRUM_K8S_WATCH_ISTIO_CRDS=true` |
+| `FERRUM_K8S_WATCH_GATEWAY_API_CRDS` | No | `true` | Enable watching Gateway API CRDs (`gateway.networking.k8s.io`: GatewayClass/Gateway/HTTPRoute/GRPCRoute) in the CP K8s controller. Only effective when `FERRUM_K8S_CONTROLLER_ENABLED=true` |
+| `FERRUM_K8S_FULL_SYNC_INTERVAL_SECS` | No | `300` | Periodic full re-list interval (seconds) for the K8s controller. Safety valve against missed watch events |
+| `FERRUM_K8S_RECONCILE_DEBOUNCE_MS` | No | `500` | Debounce window (ms) for the K8s controller — watch events arriving within this window are batched into a single reconciliation |
+| `FERRUM_K8S_KUBECONFIG_PATH` | No | — | Override kubeconfig path for out-of-cluster development. Unset uses the in-cluster service-account config |
 | `FERRUM_INJECTOR_LISTEN_ADDR` | Injector mode | `0.0.0.0:9443` | Admission webhook bind address for `POST /mutate` |
 | `FERRUM_INJECTOR_ADMISSION_REVIEW_MAX_BODY_SIZE_MIB` | No | `4` | Maximum `POST /mutate` AdmissionReview request body size, in MiB, accepted before JSON parsing. Values must be 1..64 |
 | `FERRUM_INJECTOR_SIDECAR_IMAGE` | No | `ferrum-edge:latest` | Image injected into workload pods as the Ferrum mesh sidecar |
@@ -394,6 +398,7 @@ Injected sidecars run as the configured mesh proxy UID with `runAsNonRoot=true`,
 |---|---|---|---|
 | `FERRUM_MIGRATE_ACTION` | No | `up` | Migration action: `up`, `status`, or `config` |
 | `FERRUM_MIGRATE_DRY_RUN` | No | `false` | Preview migration work without applying changes |
+| `FERRUM_AUTO_APPLY_PLUGIN_MIGRATIONS` | No | `false` | When `true`, the `database`/`cp` startup path applies pending custom-plugin migrations (declared via `plugin_migrations()` in `custom_plugins/`) before loading config; a failed migration is fatal. When `false` (default), pending plugin migrations are logged as a `warn!` but the schema is never auto-mutated — run `FERRUM_MODE=migrate FERRUM_MIGRATE_ACTION=up` explicitly. Core gateway schema migrations always run regardless of this flag. The standalone `migrate` mode always applies plugin migrations |
 
 ### Size Limits
 
@@ -567,6 +572,7 @@ See [client_ip_resolution.md](client_ip_resolution.md) for the security model an
 |---|---|---|---|
 | `FERRUM_WORKER_THREADS` | No | CPU cores | Tokio async worker threads |
 | `FERRUM_BLOCKING_THREADS` | No | `512` | Max tokio blocking threads for file/DNS I/O |
+| `FERRUM_POOL_SHARD_AMOUNT` | No | `0` (auto) | Shard count for hot-path `DashMap`s (connection pools, pending creations, RR counters, DNS cache, per-IP request counts, router prefix/regex caches). `0` auto-derives `next_power_of_two(max(64, num_cpus * 16))` (64 on small dev hosts, 256 on a 16-core box, 1024 on a 64-core box). Any positive value is rounded up to the next power of two. Tune up for hosts running 1M+ concurrent flows; tune down only under memory pressure |
 | `FERRUM_MAX_CONNECTIONS` | No | `100000` | Max concurrent proxy connections; queues when full, `0` = unlimited |
 | `FERRUM_MAX_REQUESTS` | No | `0` | Max concurrent in-flight requests/streams; `0` = unlimited |
 | `FERRUM_MAX_CONCURRENT_REQUESTS_PER_IP` | No | `0` | Per-client-IP concurrent request cap; `0` disables |
