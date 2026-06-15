@@ -35,8 +35,8 @@ currently enrolled (machine-gated) set, which is the authoritative answer to
   + `ServiceEntry` HTTP egress + `REGISTRY_ONLY` + `VirtualService` routing +
   `DestinationRule` LB/timeout/outlier. This is the path being driven to GA
   first (semantics are pinned; live-datapath e2e verification is in build-out).
-  An identity-less mesh (no file-based gateway SVID material — the CA backend
-  value is not yet wired to load a runtime SVID) **fails startup closed** (no mTLS ⇒ PERMISSIVE would accept plaintext)
+  An identity-less mesh — no file-based gateway SVID material **and** no CA
+  backend (`FERRUM_MESH_CA_BACKEND=spire_agent|internal` + `FERRUM_MESH_WORKLOAD_SPIFFE_ID`) supplying a runtime SVID — **fails startup closed** (no mTLS ⇒ PERMISSIVE would accept plaintext)
   unless `FERRUM_MESH_ALLOW_NO_CA=true`, and `FERRUM_MESH_PRODUCTION_MODE=true`
   refuses it unconditionally — so the GA path cannot silently degrade to
   unauthenticated plaintext. This is enforced at **both** config-validation time

@@ -96,12 +96,12 @@ DPs handle both types transparently: full snapshots replace the entire config; d
 
 ### Namespace Pairing
 
-A single CP serves a single namespace. Every DP that connects to a CP MUST set `FERRUM_NAMESPACE` to the same value the CP is running with. The CP rejects `Subscribe` and `GetFullConfig` calls from DPs that advertise a different namespace with `FailedPrecondition` and an error message naming both namespaces.
+By default a CP serves a single namespace. Every DP that connects MUST set `FERRUM_NAMESPACE` to a value the CP serves; the CP rejects `Subscribe` and `GetFullConfig` calls from DPs that advertise an unserved namespace with `FailedPrecondition` and an error message naming both namespaces.
 
 This is a hard requirement, not a warning:
 
-- The CP loads only its own namespace from the database, so without this check it would silently serve `production` config to a DP that booted with `FERRUM_NAMESPACE=staging` — a multi-tenant security gap.
-- Operators running multiple namespaces must run multiple CP instances (one per namespace) and point each fleet of DPs at the matching CP.
+- In the default single-namespace mode the CP loads only its own namespace, so without this check it would silently serve `production` config to a DP that booted with `FERRUM_NAMESPACE=staging` — a multi-tenant security gap.
+- A CP can serve **multiple** namespaces by setting `FERRUM_CP_NAMESPACES` (CSV set, or `*` for cluster-wide) with per-namespace broadcast partitioning and an optional `ns` JWT tenancy claim — see [cp_namespace_tenancy.md](cp_namespace_tenancy.md). Operators who keep `FERRUM_CP_NAMESPACES` unset must run one CP per namespace.
 - The DP also re-filters every received snapshot/delta locally (defense in depth) so a future CP regression cannot silently pollute a DP's `GatewayConfig` with cross-namespace resources. Filtered resources are logged as warnings.
 
 ### Resilience
