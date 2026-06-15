@@ -2019,6 +2019,89 @@ where
     }
 }
 
+/// Wraps a streaming response body with an ABSOLUTE end-to-end deadline that
+/// fires at a fixed [`tokio::time::Instant`] regardless of frame cadence.
+///
+/// Used for the gRPC client-`grpc-timeout` regime (issue #1649). `grpc-timeout`
+/// is an end-to-end RPC deadline, so a backend that sends response headers just
+/// before the deadline then trickles body frames — each inter-frame gap under a
+/// per-frame idle timeout — must still be cut at the client's deadline. The
+/// per-frame [`IdleReadTimeoutBody`] cannot bound that: it only measures
+/// inter-frame gaps and re-arms on every delivered frame, so a steady trickle
+/// (or a continuous fast stream) never trips it. This wrapper arms the timer
+/// ONCE and never re-arms, bounding the total streaming duration. The
+/// `backend_read_timeout_ms` fallback regime (no client deadline) keeps the
+/// per-frame `IdleReadTimeoutBody` instead — the two regimes are distinguished
+/// by the dispatch handler from `grpc_proxy::parse_grpc_timeout_ms`.
+///
+/// `deadline == None` means the client deadline was unrepresentable (a
+/// pathologically large `grpc-timeout` overflowing Tokio's `Instant` range);
+/// the timer is inert (effectively unbounded) rather than panicking the proxy
+/// path, matching the buffered gRPC path's `tokio::time::timeout` behavior.
+struct TotalDeadlineBody<B> {
+    inner: B,
+    deadline: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl<B> TotalDeadlineBody<B> {
+    fn new(inner: B, deadline: Option<tokio::time::Instant>) -> Self {
+        Self {
+            inner,
+            deadline: deadline.map(tokio::time::sleep_until).map(Box::pin),
+        }
+    }
+}
+
+impl<B> http_body::Body for TotalDeadlineBody<B>
+where
+    B: http_body::Body<Data = Bytes> + Unpin,
+    B::Error: Into<BoxError>,
+{
+    type Data = Bytes;
+    // Boxed error for the same reason as `IdleReadTimeoutBody`: this wrapper sits
+    // OUTERMOST around the coalescer (whose `Error` is already `BoxError`). The
+    // deadline is emitted as a boxed `io::Error` of kind `TimedOut`, which
+    // `retry::classify_typed_chain` maps to `ErrorClass::ReadWriteTimeout` (a
+    // post-wire read timeout, NOT a connection error), exactly like the
+    // per-frame idle path, so deferred backend/admission accounting classifies
+    // it identically.
+    type Error = BoxError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        // Check the absolute deadline FIRST and on EVERY poll. Unlike the
+        // per-frame idle timer it is armed once and never reset, so it must fire
+        // at the client deadline even for a backend that streams frames
+        // continuously (which would never yield a `Pending` inner poll to drive
+        // an idle check). A `None` deadline (unrepresentable) is inert.
+        if let Some(deadline) = this.deadline.as_mut()
+            && std::future::Future::poll(deadline.as_mut(), cx).is_ready()
+        {
+            return Poll::Ready(Some(Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "gRPC streaming response exceeded the client grpc-timeout deadline",
+            )) as BoxError)));
+        }
+        match Pin::new(&mut this.inner).poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => Poll::Ready(Some(Ok(frame))),
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e.into()))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
 struct DirectH3Body<S = crate::http3::client::H3RequestStream> {
     source: H3FrameSource<S>,
     content_length: Option<u64>,
@@ -2211,22 +2294,28 @@ pub(crate) fn coalescing_h2_body_strip_hop_by_hop_trailers(
     content_length: Option<u64>,
     coalesce_target: usize,
     read_timeout_ms: u64,
+    total_deadline: Option<tokio::time::Instant>,
 ) -> ProxyBody {
-    // Bound the backend read by `backend_read_timeout_ms` (>0) so a backend that
-    // sends headers then stalls cannot pin the streaming relay indefinitely. The
-    // deadline wraps the coalescer OUTERMOST (not the raw body inside it): the
-    // coalescer only reports `Pending` once it has no buffered frame left to
-    // flush AND the backend is pending, so the deadline measures genuine
-    // backend-read waits and never fires while a sub-target frame is buffered
-    // waiting on a slow downstream client. See `IdleReadTimeoutBody`.
-    if read_timeout_ms > 0 {
-        let stripped = StripHopByHopTrailers::new(body);
-        let coalescing = Coalescing::new(stripped, coalesce_target, content_length);
-        let timed = IdleReadTimeoutBody::new(coalescing, read_timeout_ms);
-        ProxyBody::streaming(Box::pin(timed))
+    // Bound the backend read so a backend that sends headers then stalls cannot
+    // pin the streaming relay indefinitely. Two mutually-exclusive regimes
+    // (issue #1649): `total_deadline` (a client `grpc-timeout`) is an ABSOLUTE
+    // end-to-end deadline via `TotalDeadlineBody`; otherwise `read_timeout_ms`
+    // (`backend_read_timeout_ms`) is a PER-FRAME idle timeout via
+    // `IdleReadTimeoutBody`. Either deadline wraps the coalescer OUTERMOST (not
+    // the raw body inside it): the coalescer only reports `Pending` once it has
+    // no buffered frame left to flush AND the backend is pending, so a per-frame
+    // idle deadline measures genuine backend-read waits and never fires while a
+    // sub-target frame is buffered waiting on a slow downstream client.
+    let stripped = StripHopByHopTrailers::new(body);
+    let coalescing = Coalescing::new(stripped, coalesce_target, content_length);
+    if let Some(deadline) = total_deadline {
+        ProxyBody::streaming(Box::pin(TotalDeadlineBody::new(coalescing, Some(deadline))))
+    } else if read_timeout_ms > 0 {
+        ProxyBody::streaming(Box::pin(IdleReadTimeoutBody::new(
+            coalescing,
+            read_timeout_ms,
+        )))
     } else {
-        let stripped = StripHopByHopTrailers::new(body);
-        let coalescing = Coalescing::new(stripped, coalesce_target, content_length);
         ProxyBody::streaming(Box::pin(coalescing))
     }
 }
@@ -2241,20 +2330,23 @@ pub(crate) fn size_limited_coalescing_h2_body_strip_hop_by_hop_trailers(
     content_length: Option<u64>,
     coalesce_target: usize,
     read_timeout_ms: u64,
+    total_deadline: Option<tokio::time::Instant>,
 ) -> ProxyBody {
-    if read_timeout_ms > 0 {
-        // See `coalescing_h2_body_strip_hop_by_hop_trailers`: the deadline wraps
-        // the coalescer OUTERMOST so it never fires while a buffered sub-target
-        // frame is waiting on a slow downstream client.
-        let stripped = StripHopByHopTrailers::new(body);
-        let limited = SizeLimitedFrameSource::new(stripped, max_bytes);
-        let coalescing = Coalescing::new(limited, coalesce_target, content_length);
-        let timed = IdleReadTimeoutBody::new(coalescing, read_timeout_ms);
-        ProxyBody::streaming(Box::pin(timed))
+    // See `coalescing_h2_body_strip_hop_by_hop_trailers` for the two
+    // mutually-exclusive deadline regimes (issue #1649). Either wraps the
+    // coalescer OUTERMOST so a per-frame idle deadline never fires while a
+    // buffered sub-target frame is waiting on a slow downstream client.
+    let stripped = StripHopByHopTrailers::new(body);
+    let limited = SizeLimitedFrameSource::new(stripped, max_bytes);
+    let coalescing = Coalescing::new(limited, coalesce_target, content_length);
+    if let Some(deadline) = total_deadline {
+        ProxyBody::streaming(Box::pin(TotalDeadlineBody::new(coalescing, Some(deadline))))
+    } else if read_timeout_ms > 0 {
+        ProxyBody::streaming(Box::pin(IdleReadTimeoutBody::new(
+            coalescing,
+            read_timeout_ms,
+        )))
     } else {
-        let stripped = StripHopByHopTrailers::new(body);
-        let limited = SizeLimitedFrameSource::new(stripped, max_bytes);
-        let coalescing = Coalescing::new(limited, coalesce_target, content_length);
         ProxyBody::streaming(Box::pin(coalescing))
     }
 }
@@ -2268,6 +2360,7 @@ pub(crate) fn direct_streaming_h2_body_strip_hop_by_hop_trailers(
     body: Incoming,
     content_length: Option<u64>,
     read_timeout_ms: u64,
+    total_deadline: Option<tokio::time::Instant>,
 ) -> ProxyBody {
     use http_body_util::BodyExt;
 
@@ -2275,11 +2368,16 @@ pub(crate) fn direct_streaming_h2_body_strip_hop_by_hop_trailers(
         inner: body,
         content_length,
     };
-    if read_timeout_ms > 0 {
-        // The direct path has no coalescing buffer, so the deadline can wrap the
-        // direct body directly — `Strip` forwards frames without buffering, so
-        // the `waiting`-edge re-arm already excludes downstream-drain time.
-        // `IdleReadTimeoutBody` already yields `BoxError`, so no `map_err`.
+    // The direct path has no coalescing buffer, so the deadline can wrap the
+    // direct body directly — `Strip` forwards frames without buffering. Both
+    // `TotalDeadlineBody` (absolute client `grpc-timeout`, issue #1649) and
+    // `IdleReadTimeoutBody` (per-frame `backend_read_timeout_ms`) already yield
+    // `BoxError`, so no `map_err` is needed in those branches.
+    if let Some(deadline) = total_deadline {
+        let timed = TotalDeadlineBody::new(direct, Some(deadline));
+        let stripped = StripHopByHopTrailers::new(timed);
+        ProxyBody::streaming(Box::pin(stripped))
+    } else if read_timeout_ms > 0 {
         let timed = IdleReadTimeoutBody::new(direct, read_timeout_ms);
         let stripped = StripHopByHopTrailers::new(timed);
         ProxyBody::streaming(Box::pin(stripped))
@@ -3442,6 +3540,71 @@ mod tests {
         assert!(
             body.deadline.is_some(),
             "a representable timeout must arm a live deadline",
+        );
+    }
+
+    #[tokio::test]
+    async fn total_deadline_body_fires_when_deadline_already_elapsed() {
+        // A deadline already in the past fires on the first poll regardless of
+        // the inner's state — the absolute cap is checked before the inner, so
+        // it bounds the stream independent of frame cadence, the case a per-frame
+        // idle timer can never catch because it re-arms on every frame (#1649).
+        // (Uses an already-elapsed instant rather than Tokio's paused-time test
+        // clock, which requires the `test-util` feature this crate does not
+        // enable.)
+        let deadline = tokio::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(3600))
+            .expect("an hour before now is representable");
+        let inner = Coalescing::new(MockSource::new(vec![MockStep::Pending]), 100, None);
+        let mut body = TotalDeadlineBody::new(inner, Some(deadline));
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let polled = Pin::new(&mut body).poll_frame(&mut cx);
+        let Poll::Ready(Some(Err(e))) = polled else {
+            panic!("expected a TimedOut error for an already-elapsed deadline");
+        };
+        let io = e
+            .downcast_ref::<std::io::Error>()
+            .expect("deadline error must be an io::Error");
+        assert_eq!(io.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn total_deadline_body_none_is_unbounded() {
+        // An unrepresentable client deadline collapses to None and must be inert
+        // (effectively unbounded): the wrapper injects no timeout and simply
+        // reflects the inner's Pending.
+        let inner = Coalescing::new(MockSource::new(vec![MockStep::Pending]), 100, None);
+        let mut body = TotalDeadlineBody::new(inner, None);
+        assert!(body.deadline.is_none());
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(
+            matches!(Pin::new(&mut body).poll_frame(&mut cx), Poll::Pending),
+            "a None deadline must never inject a timeout",
+        );
+    }
+
+    #[tokio::test]
+    async fn total_deadline_body_passes_frames_before_deadline() {
+        // A stream that completes before a far-future deadline forwards its
+        // frames and ends cleanly — the deadline never interferes.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3600);
+        let inner = Coalescing::new(
+            MockSource::new(vec![
+                MockStep::Frame(Ok(Frame::data(Bytes::from("hello")))),
+                MockStep::End,
+            ]),
+            100,
+            None,
+        );
+        let mut body = TotalDeadlineBody::new(inner, Some(deadline));
+        let frames = poll_all(&mut body);
+        assert_eq!(frames.len(), 1, "one data frame, then clean end-of-stream");
+        assert_eq!(
+            frames[0].as_ref().unwrap().data_ref().unwrap().as_ref(),
+            b"hello",
         );
     }
 

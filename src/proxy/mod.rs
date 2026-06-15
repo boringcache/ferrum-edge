@@ -13030,23 +13030,39 @@ async fn handle_proxy_request_inner(
                 let cl = response_headers
                     .get("content-length")
                     .and_then(|v| v.parse::<u64>().ok());
-                // gRPC streaming body deadline: the post-plugin `grpc-timeout`
-                // (uncapped), with `backend_read_timeout_ms` as the fallback only
-                // when the client set no deadline (see
-                // `grpc_proxy::streaming_effective_timeout_ms`). The gRPC deadline
-                // otherwise bounds only the response-header wait, so without this
-                // a backend that streams headers then stalls would pin the
-                // streaming guards until the client disconnects. `0` (no client
-                // deadline and no operator fallback) leaves long-lived server/bidi
-                // streams that legitimately idle between messages unbounded.
-                let grpc_stream_read_timeout_ms = grpc_streaming.response_read_timeout_ms;
+                // gRPC streaming body deadline (issue #1649). A client
+                // `grpc-timeout` is an end-to-end RPC deadline, so honor it as an
+                // ABSOLUTE deadline (`grpc_total_deadline`) anchored at request
+                // receipt (`start_time`) plus the client budget: a backend that
+                // sends headers just before the deadline then trickles body
+                // frames is still cut at the client's deadline, instead of
+                // treating `grpc-timeout` as a per-frame idle interval the
+                // backend can reset forever. When the client set NO deadline,
+                // fall back to `backend_read_timeout_ms` as a PER-FRAME idle
+                // timeout (`grpc_read_timeout_ms`) so a stalled backend still
+                // cannot pin the streaming guards. `0` + `None` (no client
+                // deadline, no operator fallback) leaves long-lived server/bidi
+                // streams that legitimately idle between messages unbounded. A
+                // pathologically large client deadline that overflows Tokio's
+                // `Instant` range yields `None` and is treated as unbounded
+                // rather than panicking the proxy path.
+                let (grpc_read_timeout_ms, grpc_total_deadline) =
+                    match grpc_streaming.client_grpc_deadline_ms {
+                        Some(budget_ms) => {
+                            let remaining = std::time::Duration::from_millis(budget_ms)
+                                .saturating_sub(start_time.elapsed());
+                            (0u64, tokio::time::Instant::now().checked_add(remaining))
+                        }
+                        None => (grpc_streaming.response_read_timeout_ms, None),
+                    };
                 let body = if state.response_buffer_cutoff_bytes == 0
                     && state.max_response_body_size_bytes == 0
                 {
                     crate::proxy::body::direct_streaming_h2_body_strip_hop_by_hop_trailers(
                         grpc_streaming.body,
                         cl,
-                        grpc_stream_read_timeout_ms,
+                        grpc_read_timeout_ms,
+                        grpc_total_deadline,
                     )
                 } else if state.max_response_body_size_bytes > 0 {
                     crate::proxy::body::size_limited_coalescing_h2_body_strip_hop_by_hop_trailers(
@@ -13054,14 +13070,16 @@ async fn handle_proxy_request_inner(
                         state.max_response_body_size_bytes,
                         cl,
                         state.h2_coalesce_target_bytes,
-                        grpc_stream_read_timeout_ms,
+                        grpc_read_timeout_ms,
+                        grpc_total_deadline,
                     )
                 } else {
                     crate::proxy::body::coalescing_h2_body_strip_hop_by_hop_trailers(
                         grpc_streaming.body,
                         cl,
                         state.h2_coalesce_target_bytes,
-                        grpc_stream_read_timeout_ms,
+                        grpc_read_timeout_ms,
+                        grpc_total_deadline,
                     )
                 };
                 let mut body = if let Some(logger) = deferred_grpc_logger {
@@ -14868,6 +14886,10 @@ async fn handle_proxy_request_inner(
                     resp.into_body(),
                     cl,
                     proxy.backend_read_timeout_ms,
+                    // Plain HTTP/2 streaming uses only the per-frame idle
+                    // (`backend_read_timeout_ms`) regime — no client end-to-end
+                    // gRPC deadline applies here (issue #1649).
+                    None,
                 )
             } else if state.max_response_body_size_bytes > 0 && cl.is_none() {
                 // No Content-Length — enforce response-size limits while
@@ -14879,6 +14901,10 @@ async fn handle_proxy_request_inner(
                     cl,
                     state.h2_coalesce_target_bytes,
                     proxy.backend_read_timeout_ms,
+                    // Plain HTTP/2 streaming uses only the per-frame idle
+                    // (`backend_read_timeout_ms`) regime — no client end-to-end
+                    // gRPC deadline applies here (issue #1649).
+                    None,
                 )
             } else if use_passthrough {
                 // Response too large to benefit from coalescing — stream
@@ -14890,6 +14916,10 @@ async fn handle_proxy_request_inner(
                     resp.into_body(),
                     cl,
                     proxy.backend_read_timeout_ms,
+                    // Plain HTTP/2 streaming uses only the per-frame idle
+                    // (`backend_read_timeout_ms`) regime — no client end-to-end
+                    // gRPC deadline applies here (issue #1649).
+                    None,
                 )
             } else {
                 crate::proxy::body::coalescing_h2_body_strip_hop_by_hop_trailers(
@@ -14897,6 +14927,10 @@ async fn handle_proxy_request_inner(
                     cl,
                     state.h2_coalesce_target_bytes,
                     proxy.backend_read_timeout_ms,
+                    // Plain HTTP/2 streaming uses only the per-frame idle
+                    // (`backend_read_timeout_ms`) regime — no client end-to-end
+                    // gRPC deadline applies here (issue #1649).
+                    None,
                 )
             };
             let mut body = body.with_lb_connection_guard(lb_connection_guard);
