@@ -44,6 +44,7 @@ pub struct AiTokenMetrics {
     model_key: String,
     estimated_cost_key: String,
     streaming_key: String,
+    buffer_streaming_responses: bool,
     cost_per_prompt_token: Option<f64>,
     cost_per_completion_token: Option<f64>,
 }
@@ -85,6 +86,8 @@ impl AiTokenMetrics {
         };
         let cost_per_prompt_token = optional_f64(config, "cost_per_prompt_token")?;
         let cost_per_completion_token = optional_f64(config, "cost_per_completion_token")?;
+        let buffer_streaming_responses =
+            optional_bool(config, "buffer_streaming_responses")?.unwrap_or(false);
 
         // Reject negative or non-finite cost rates — they would produce
         // nonsensical (negative or NaN/Inf) cost metrics that pollute
@@ -123,6 +126,7 @@ impl AiTokenMetrics {
             model_key,
             estimated_cost_key,
             streaming_key,
+            buffer_streaming_responses,
             cost_per_prompt_token,
             cost_per_completion_token,
         })
@@ -359,6 +363,21 @@ impl Plugin for AiTokenMetrics {
 
     fn should_buffer_response_body(&self, _ctx: &RequestContext) -> bool {
         true
+    }
+
+    fn should_buffer_response_body_for_content_type(
+        &self,
+        ctx: &RequestContext,
+        content_type: Option<&str>,
+    ) -> bool {
+        self.should_buffer_response_body(ctx)
+            && content_type.is_some_and(|ct| {
+                if is_event_stream_content_type(ct) {
+                    self.buffer_streaming_responses
+                } else {
+                    is_json_content_type(ct)
+                }
+            })
     }
 
     async fn on_response_body(

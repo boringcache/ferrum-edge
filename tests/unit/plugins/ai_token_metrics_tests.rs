@@ -66,6 +66,36 @@ async fn test_plugin_name_and_priority() {
     assert!(plugin.should_buffer_response_body(&ctx_with_content_type("GET", "application/json")));
 }
 
+#[test]
+fn test_response_buffering_is_narrowed_by_response_content_type() {
+    let plugin = AiTokenMetrics::new(&json!({})).unwrap();
+    let ctx = ctx_with_content_type("GET", "application/json");
+
+    assert!(plugin.should_buffer_response_body(&ctx));
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json; charset=utf-8")
+    ));
+    assert!(!plugin.should_buffer_response_body_for_content_type(&ctx, Some("text/plain")));
+    assert!(!plugin.should_buffer_response_body_for_content_type(&ctx, Some("text/event-stream")));
+    assert!(!plugin.should_buffer_response_body_for_content_type(&ctx, None));
+}
+
+#[test]
+fn test_streaming_response_buffering_requires_explicit_opt_in() {
+    let default_plugin = AiTokenMetrics::new(&json!({})).unwrap();
+    let opt_in_plugin = AiTokenMetrics::new(&json!({"buffer_streaming_responses": true})).unwrap();
+    let ctx = ctx_with_content_type("POST", "application/json");
+
+    assert!(
+        !default_plugin
+            .should_buffer_response_body_for_content_type(&ctx, Some("text/event-stream"))
+    );
+    assert!(
+        opt_in_plugin.should_buffer_response_body_for_content_type(&ctx, Some("text/event-stream"))
+    );
+}
+
 // ─── OpenAI format ──────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -659,6 +689,10 @@ fn test_invalid_config_shapes_rejected() {
         (
             json!({"include_token_details": "yes"}),
             "include_token_details",
+        ),
+        (
+            json!({"buffer_streaming_responses": "yes"}),
+            "buffer_streaming_responses",
         ),
         (json!({"metadata_prefix": ""}), "metadata_prefix"),
         (
