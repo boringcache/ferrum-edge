@@ -1833,6 +1833,43 @@ fn grpc_request_body_limit_exceeded(flag: &Option<Arc<std::sync::atomic::AtomicB
     flag.as_ref().is_some_and(|f| f.load(Ordering::Acquire))
 }
 
+/// Whether a streaming response's backend-dispatch outcome (CB / passive-health /
+/// least-latency) should be DEFERRED to body completion rather than recorded at
+/// response-header time (#1649 items 2 & 3).
+///
+/// Defer ONLY when the response looks healthy at headers AND can still fail
+/// post-wire — i.e. a `< 500`, non-`failure_status_codes` status WITH a body that
+/// streams. Two header-time-final cases must be recorded eagerly instead:
+///   * **Known failure status** (5xx or a configured CB failure status): it is
+///     already bad, so trip the breaker / report passive health promptly instead
+///     of waiting for a possibly long-lived body (a stalled failing backend would
+///     otherwise keep admitting traffic until the read timeout).
+///   * **No-body response** (HEAD / 204 / 304 / `content-length: 0`): nothing
+///     streams, so a deferred outcome would be misread as a client disconnect by
+///     the never-polled `ProxyBody::Drop` path (`src/proxy/body.rs`) and a
+///     successful no-body probe would never heal a HALF_OPEN breaker.
+fn streaming_dispatch_should_defer(
+    proxy: &Proxy,
+    response_status: u16,
+    method: &str,
+    content_length: Option<u64>,
+) -> bool {
+    let header_looks_healthy = response_status < 500
+        && !proxy
+            .circuit_breaker
+            .as_ref()
+            .is_some_and(|cb| cb.failure_status_codes.contains(&response_status));
+    // `is_response_body_complete(0, ...)` is true exactly for the no-body cases
+    // (HEAD / 204 / 304, or `content-length: 0`) — nothing will stream.
+    let has_streamable_body = !crate::http3::client::is_response_body_complete(
+        0,
+        method,
+        response_status,
+        content_length,
+    );
+    header_looks_healthy && has_streamable_body
+}
+
 /// Releases a gRPC streaming **HALF_OPEN probe's** circuit-breaker slot at
 /// **request-upload termination** rather than response-header time, recording a
 /// NEUTRAL outcome (slot release only, no health change).
@@ -12701,9 +12738,7 @@ async fn handle_proxy_request_inner(
                 // Frame-by-frame streaming path: headers arrived, body not buffered.
                 // Settle the HALF_OPEN probe slot before after_proxy hooks so the
                 // post-header upload guard is measured from header arrival, even
-                // if a response hook blocks. The backend-health outcome itself is
-                // recorded at body completion by the deferred dispatch outcome
-                // (#1649 item 3), not here.
+                // if a response hook blocks.
                 if !grpc_skip_final_cb_record {
                     finalize_grpc_streaming_probe_outcome(
                         grpc_streaming_probe_recorder.as_ref(),
@@ -12718,6 +12753,39 @@ async fn handle_proxy_request_inner(
                     &response_headers,
                     grpc_streaming.status,
                 );
+                // #1649 item 3: a healthy 2xx streaming header defers the circuit
+                // breaker to body completion (the real grpc-status trailer / a
+                // post-wire body error decides it there). A KNOWN failure status
+                // at header time (a trailers-only error mapped to 5xx, or a
+                // sandwiched LB 5xx) is recorded EAGERLY now so the breaker trips
+                // promptly instead of waiting out a possibly long-lived/stalled
+                // upload (matches `grpc_streaming_closed_state_backend_failure_
+                // trips_breaker_at_header_time`). The probe slot was already
+                // released by `finalize_*` above, so the eager record is a
+                // non-probe; the deferred dispatch then skips the CB.
+                let grpc_cb_recorded_eagerly = if grpc_skip_final_cb_record {
+                    // A rotated retry already recorded (and released) the prior
+                    // target's breaker — never record again here.
+                    true
+                } else if streaming_dispatch_should_defer(
+                    &proxy,
+                    grpc_backend_dispatch_status,
+                    "POST",
+                    None,
+                ) {
+                    false
+                } else if let Some(cb_config) = &proxy.circuit_breaker {
+                    let cb = state.circuit_breaker_cache.get_or_create(
+                        &proxy.id,
+                        grpc_final_cb_key.as_deref(),
+                        cb_config,
+                    );
+                    record_grpc_backend_status_outcome(&cb, grpc_backend_dispatch_status, false);
+                    true
+                } else {
+                    // No breaker configured — nothing to record or defer.
+                    true
+                };
                 {
                     let phase_start = Instant::now();
                     if let Some(reject) = run_after_proxy_hooks(
@@ -12745,16 +12813,27 @@ async fn handle_proxy_request_inner(
                                 backend_elapsed: grpc_backend_admission_elapsed,
                             });
                         }
-                        record_grpc_backend_dispatch_outcome(
+                        // #1649 item 3 (finding 6): an after_proxy reject returns
+                        // before the streaming body is wrapped with the deferred
+                        // dispatch outcome, so for the deferred (2xx) case the
+                        // breaker would never be recorded. Record it synchronously
+                        // here from the header-known status — skipping the CB only
+                        // when it was already recorded eagerly above. The header
+                        // was healthy (the reject is gateway-side), so this records
+                        // a backend success; passive-health + least-latency are
+                        // recorded regardless.
+                        backend_dispatch::record_backend_outcome_no_conn_end(
                             &state,
                             &proxy,
                             &epoch.load_balancer,
                             upstream_balancer.as_ref(),
-                            grpc_final_upstream_target.as_ref(),
+                            grpc_final_upstream_target.as_deref(),
                             grpc_final_cb_key.as_deref(),
                             grpc_backend_dispatch_status,
                             false,
                             None,
+                            false,
+                            grpc_cb_recorded_eagerly,
                             grpc_backend_admission_elapsed,
                         );
                         drop(grpc_lb_connection_guard.take());
@@ -13024,16 +13103,20 @@ async fn handle_proxy_request_inner(
                         false, // connection_error: post-wire, derived at body completion
                         None,  // error_class: derived from the terminal body error
                         false, // is_half_open_probe: slot released separately by the recorder
-                        // #1649 item 3: record the circuit breaker here, at body
-                        // completion, NOT at header time — so a `2xx`-then-stall /
-                        // mid-stream reset / non-OK grpc-status trailer trips the
-                        // breaker instead of banking a phantom header-time success.
-                        // The HALF_OPEN probe slot is released independently by
-                        // `GrpcStreamingProbeRecorder` (NEUTRAL, at upload
-                        // termination), so this records as a non-probe and a late
-                        // client-upload overflow is neutralized via
+                        // #1649 item 3: for a healthy 2xx streaming header, record
+                        // the circuit breaker HERE, at body completion — so a
+                        // `2xx`-then-stall / mid-stream reset / non-OK grpc-status
+                        // trailer trips the breaker instead of banking a phantom
+                        // header-time success. When a known failure status was
+                        // already recorded eagerly above
+                        // (`grpc_cb_recorded_eagerly`), skip the CB here to avoid
+                        // double-recording (passive-health + least-latency still
+                        // record). The HALF_OPEN probe slot is released
+                        // independently by `GrpcStreamingProbeRecorder` (NEUTRAL,
+                        // at upload termination), so this records as a non-probe and
+                        // a late client-upload overflow is neutralized via
                         // `with_deferred_dispatch_request_body_exceeded_flag` below.
-                        false, // skip_circuit_breaker_record
+                        grpc_cb_recorded_eagerly, // skip_circuit_breaker_record
                         grpc_backend_admission_elapsed,
                     )
                     .with_grpc_trailer_backend_dispatch_classification()
@@ -14195,23 +14278,37 @@ async fn handle_proxy_request_inner(
     // body completes. Use the no-conn-end variant so the least-connections
     // gauge is not decremented twice per request (guard + this call).
     //
-    // #1649 item 2: HTTP/2 (and HBONE) streaming responses can fail *after*
-    // headers — a 2xx-then-stall body raises a post-wire read-timeout / reset
-    // once the streaming read-timeout window (#1626) fires. Recording the
-    // dispatch outcome here, at header time, would bank a phantom success and
-    // even feed the broken backend's fast TTFB into least-latency, and a
-    // mid-stream failure could never correct it. For the `StreamingH2` arm the
-    // outcome is therefore deferred to body completion via
-    // `with_deferred_backend_dispatch_outcome` (mirroring the gRPC streaming
-    // path), where `record_deferred_backend_dispatch` records the terminal body
-    // error class through the same post-wire-failure handling in
-    // `record_backend_outcome_inner`.
-    //
-    // The HALF_OPEN probe slot is still RELEASED here (the same timing as the
-    // header-time record would release it), only the health *outcome* is
-    // deferred — so a long-lived stream never pins the probe slot, and the
+    // #1649 item 2: a direct-H2 `StreamingH2` response can fail *after* headers —
+    // a 2xx-then-stall body raises a post-wire read-timeout / reset once the
+    // streaming read-timeout window (#1626) fires. Recording the dispatch outcome
+    // here, at header time, would bank a phantom success and even feed the broken
+    // backend's fast TTFB into least-latency, and a mid-stream failure could never
+    // correct it. Only that genuinely-unknown case is deferred to body completion
+    // via `with_deferred_backend_dispatch_outcome` (mirroring the gRPC streaming
+    // path); `streaming_dispatch_should_defer` keeps known-failure-status and
+    // no-body responses on the eager header-time record. The HALF_OPEN probe slot
+    // is still RELEASED here (same timing as the eager record), only the health
+    // *outcome* is deferred — so a long-lived stream never pins the slot, and the
     // deferred record runs as a non-probe (`is_half_open_probe = false`).
-    let defer_streaming_h2_dispatch = matches!(&response_body, ResponseBody::StreamingH2(_));
+    //
+    // HBONE (`current_dispatch_hbone`) flows through the same `StreamingH2` arm
+    // but size-limits the tunneled upload, so a late client-upload overflow could
+    // flip `body_size_exceeded` after headers and be misclassified as a backend
+    // body failure by the deferred path. Until that overflow flag is threaded into
+    // the H2 deferred outcome (the gRPC path's `request_body_exceeded` equivalent),
+    // HBONE keeps the eager header-time record — its 2xx-then-stall accounting is
+    // a documented follow-up.
+    let content_length_for_dispatch = response_headers
+        .get("content-length")
+        .and_then(|v| v.parse::<u64>().ok());
+    let defer_streaming_h2_dispatch = matches!(&response_body, ResponseBody::StreamingH2(_))
+        && !current_dispatch_hbone
+        && streaming_dispatch_should_defer(
+            &proxy,
+            response_status,
+            ctx.method.as_str(),
+            content_length_for_dispatch,
+        );
     // TTFB captured at header arrival; reused whether the deferred outcome is
     // recorded synchronously (an after_proxy reject replaced the streaming body)
     // or at body completion, matching the synchronous path's
