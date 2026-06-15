@@ -1504,8 +1504,10 @@ fn mesh_east_west_service_upstream_id(namespace: &str, name: &str) -> String {
 // ── Sidecar inbound route materialization ─────────────────────────────────
 
 /// True for application protocols routed through the HTTP-family proxy chain.
-/// Stream protocols (raw TCP/TLS and the DB protocols) need an L4 stream proxy
-/// and are materialized by a later stage.
+/// Stream protocols (raw TCP/TLS and the DB protocols) need an L4 stream proxy;
+/// `Udp` is a distinct L4 transport whose capture/egress arrives in a later
+/// stage. Neither is HTTP-family — only `Udp` is also excluded from the
+/// raw-TCP stream lane (see [`service_udp_stream_ports`]).
 fn is_http_family_mesh_protocol(protocol: AppProtocol) -> bool {
     matches!(
         protocol,
@@ -1695,13 +1697,24 @@ pub(crate) fn mesh_outbound_service_groups(
         .collect()
 }
 
+/// True when a (override-resolved) protocol is the distinct UDP L4 transport.
+/// `Udp` is NEITHER HTTP-family NOR raw-TCP-stream — it forms the third leg of
+/// the port partition. Capture/egress for UDP arrives in a later F3 §3.3 stage;
+/// today this only keeps UDP ports out of the other two lanes (they were
+/// previously mis-classified as HTTP via `Unknown`).
+fn is_udp_mesh_protocol(protocol: AppProtocol) -> bool {
+    matches!(protocol, AppProtocol::Udp)
+}
+
 /// Stream-family service ports of an in-mesh service — raw TCP, opaque TLS,
 /// and the DB protocols — with `protocol_overrides` applied: the raw-TCP
-/// egress mirror of [`service_http_family_ports`]. The two predicates
-/// PARTITION `AppProtocol` (a unit test pins this): `Unknown` deliberately
-/// stays HTTP-family (the long-standing default), and `Tls` is opaque-byte
-/// passthrough here — the captured original destination selects the
-/// destination service, no SNI parsing.
+/// egress mirror of [`service_http_family_ports`]. HTTP-family,
+/// raw-TCP-stream, and UDP form a STRICT THREE-WAY PARTITION of `AppProtocol`
+/// (a unit test pins this): `Unknown` deliberately stays HTTP-family (the
+/// long-standing default), `Tls` is opaque-byte passthrough here (the captured
+/// original destination selects the destination service, no SNI parsing), and
+/// `Udp` is EXCLUDED here (it is neither HTTP-family nor a REDIRECT-captured
+/// raw-TCP stream — see [`service_udp_stream_ports`]).
 pub(crate) fn service_tcp_stream_ports(
     service: &crate::modes::mesh::config::MeshService,
 ) -> Vec<&crate::modes::mesh::config::ServicePort> {
@@ -1709,7 +1722,36 @@ pub(crate) fn service_tcp_stream_ports(
         .ports
         .iter()
         .filter(|sp| {
-            !is_http_family_mesh_protocol(
+            let protocol = service
+                .protocol_overrides
+                .get(&sp.port)
+                .copied()
+                .unwrap_or(sp.protocol);
+            !is_http_family_mesh_protocol(protocol) && !is_udp_mesh_protocol(protocol)
+        })
+        .collect()
+}
+
+/// UDP service ports of an in-mesh service, with `protocol_overrides` applied:
+/// the third leg of the HTTP-family / raw-TCP-stream / UDP port partition.
+/// UDP capture/egress is not yet wired (REDIRECT / `SO_ORIGINAL_DST` does not
+/// apply to the UDP model), so this currently materializes nothing — it exists
+/// so a `protocol: UDP` port partitions cleanly out of the other two lanes
+/// instead of being mis-routed as HTTP, and so the later F3 §3.3 datapath stage
+/// has a single forward-derivation source. Mirrors [`service_http_family_ports`]
+/// and [`service_tcp_stream_ports`].
+// Inert in this schema-only stage: the UDP capture/egress materializer that
+// consumes this arrives in a later F3 §3.3 stage. Exercised today only by the
+// partition unit test.
+#[allow(dead_code)]
+pub(crate) fn service_udp_stream_ports(
+    service: &crate::modes::mesh::config::MeshService,
+) -> Vec<&crate::modes::mesh::config::ServicePort> {
+    service
+        .ports
+        .iter()
+        .filter(|sp| {
+            is_udp_mesh_protocol(
                 service
                     .protocol_overrides
                     .get(&sp.port)
@@ -5021,15 +5063,16 @@ fn build_egress_upstream_targets(
 /// HTTP-family protocols (`Http`, `Https/Tls`, `Http2`, `Grpc`, `Unknown`) map
 /// to `Http` / `Https` so the egress gateway terminates inbound mTLS and
 /// re-emits HTTP-family traffic to the external backend. Stream-family
-/// protocols (`Tcp`, `Mongo`, `Redis`, `Mysql`, `Postgres`) map to
-/// `BackendScheme::Tcp` and are materialized as raw L4 stream proxies via
-/// [`build_stream_egress_for_entry`]; protocol-aware mediation
-/// (e.g., Mongo / Redis wire decode) is intentionally out of scope and tracked
-/// separately as T5-C.
+/// protocols (`Tcp`, `Udp`, `Mongo`, `Redis`, `Mysql`, `Postgres`) map to
+/// `BackendScheme::Tcp` / `BackendScheme::Udp` and are materialized as raw L4
+/// stream proxies via [`build_stream_egress_for_entry`]; protocol-aware
+/// mediation (e.g., Mongo / Redis wire decode) is intentionally out of scope
+/// and tracked separately as T5-C.
 fn egress_backend_scheme(protocol: AppProtocol) -> Option<BackendScheme> {
     match protocol {
         AppProtocol::Tls | AppProtocol::Http2 | AppProtocol::Grpc => Some(BackendScheme::Https),
         AppProtocol::Http | AppProtocol::Unknown => Some(BackendScheme::Http),
+        AppProtocol::Udp => Some(BackendScheme::Udp),
         AppProtocol::Tcp
         | AppProtocol::Mongo
         | AppProtocol::Redis
@@ -5046,6 +5089,7 @@ fn egress_is_stream_protocol(protocol: AppProtocol) -> bool {
     matches!(
         protocol,
         AppProtocol::Tcp
+            | AppProtocol::Udp
             | AppProtocol::Mongo
             | AppProtocol::Redis
             | AppProtocol::Mysql
@@ -5065,6 +5109,7 @@ fn egress_app_protocol_label(protocol: AppProtocol) -> &'static str {
         AppProtocol::Grpc => "grpc",
         AppProtocol::Tls => "tls",
         AppProtocol::Tcp => "tcp",
+        AppProtocol::Udp => "udp",
         AppProtocol::Mongo => "mongo",
         AppProtocol::Redis => "redis",
         AppProtocol::Mysql => "mysql",
@@ -10531,14 +10576,16 @@ mod tests {
     }
 
     #[test]
-    fn http_and_tcp_stream_port_predicates_partition_protocols() {
-        // The two routability predicates must PARTITION AppProtocol: every
-        // protocol is claimed by exactly one of HTTP-family routing and the
-        // raw-TCP stream lane. A protocol claimed by both would double-
-        // materialize a port; one claimed by neither would silently dead-end.
+    fn http_tcp_and_udp_stream_port_predicates_partition_protocols() {
+        // The three routability predicates must form a STRICT 3-WAY PARTITION
+        // of AppProtocol: every protocol is claimed by exactly one of
+        // HTTP-family routing, the raw-TCP stream lane, and the UDP L4 lane. A
+        // protocol claimed by more than one would double-materialize a port; one
+        // claimed by none would silently dead-end. `Udp` is the new third leg
+        // (previously folded into HTTP via `Unknown`).
         use crate::modes::mesh::config::AppProtocol::*;
         for protocol in [
-            Http, Http2, Grpc, Tcp, Tls, Mongo, Redis, Mysql, Postgres, Unknown,
+            Http, Http2, Grpc, Tcp, Tls, Udp, Mongo, Redis, Mysql, Postgres, Unknown,
         ] {
             let mut svc = http_mesh_service(
                 "partition",
@@ -10548,12 +10595,85 @@ mod tests {
             svc.ports[0].protocol = protocol;
             let http = service_http_family_ports(&svc).len();
             let tcp = service_tcp_stream_ports(&svc).len();
+            let udp = service_udp_stream_ports(&svc).len();
             assert_eq!(
-                http + tcp,
+                http + tcp + udp,
                 1,
-                "protocol {protocol:?} must be claimed by exactly one predicate                  (http={http}, tcp={tcp})"
+                "protocol {protocol:?} must be claimed by exactly one lane \
+                 (http={http}, tcp={tcp}, udp={udp})"
             );
         }
+    }
+
+    #[test]
+    fn udp_is_its_own_lane_not_http_or_tcp_stream() {
+        // Pin UDP's classification across all three predicates: it is neither
+        // HTTP-family (so it drops out of HTTP route materialization) nor part
+        // of the raw-TCP stream lane (REDIRECT/SO_ORIGINAL_DST does not apply),
+        // and it IS the sole member of the UDP lane.
+        use crate::modes::mesh::config::AppProtocol;
+        assert!(
+            !is_http_family_mesh_protocol(AppProtocol::Udp),
+            "Udp must NOT be HTTP-family"
+        );
+        let mut svc =
+            http_mesh_service("udp-svc", 5353, "spiffe://cluster.local/ns/default/sa/udp");
+        svc.ports[0].protocol = AppProtocol::Udp;
+        assert!(
+            service_http_family_ports(&svc).is_empty(),
+            "Udp port must not appear in HTTP-family ports"
+        );
+        assert!(
+            service_tcp_stream_ports(&svc).is_empty(),
+            "Udp port must not appear in raw-TCP stream ports"
+        );
+        assert_eq!(
+            service_udp_stream_ports(&svc).len(),
+            1,
+            "Udp port must appear in the UDP lane"
+        );
+    }
+
+    #[test]
+    fn udp_egress_backend_scheme_and_label() {
+        // The egress-gateway scheme/label mappings must classify Udp as its own
+        // UDP L4 transport (BackendScheme::Udp, "udp"), stream-family.
+        assert_eq!(
+            egress_backend_scheme(AppProtocol::Udp),
+            Some(BackendScheme::Udp)
+        );
+        assert_eq!(egress_app_protocol_label(AppProtocol::Udp), "udp");
+        assert!(
+            egress_is_stream_protocol(AppProtocol::Udp),
+            "Udp must classify as stream-family for egress"
+        );
+    }
+
+    #[test]
+    fn app_protocol_udp_serde_round_trips_lowercase() {
+        // The enum is serde `rename_all = "lowercase"`, so `Udp` rides the
+        // mesh-slice file and the ECDS `MeshSliceCarrier` as the string "udp".
+        // It is an enum VARIANT (not an unknown field), so `deny_unknown_fields`
+        // on the carrier/document does not reject it. Pin both directions.
+        assert_eq!(
+            serde_json::to_value(AppProtocol::Udp).expect("serialize"),
+            serde_json::json!("udp")
+        );
+        assert_eq!(
+            serde_json::from_value::<AppProtocol>(serde_json::json!("udp")).expect("deserialize"),
+            AppProtocol::Udp
+        );
+        // Sanity: a ServicePort embedding Udp round-trips through serde intact.
+        let port = crate::modes::mesh::config::ServicePort {
+            port: 5353,
+            protocol: AppProtocol::Udp,
+            name: Some("dns".to_string()),
+            target_port: None,
+        };
+        let json = serde_json::to_string(&port).expect("serialize port");
+        let back: crate::modes::mesh::config::ServicePort =
+            serde_json::from_str(&json).expect("deserialize port");
+        assert_eq!(back.protocol, AppProtocol::Udp);
     }
 
     #[test]

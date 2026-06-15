@@ -593,8 +593,14 @@ fn service_app_protocol(port_entry: &Value, port_name: Option<&str>) -> AppProto
 fn workload_port_protocol(protocol: Option<&str>) -> AppProtocol {
     match protocol.unwrap_or("TCP").to_ascii_uppercase().as_str() {
         "TCP" => AppProtocol::Tcp,
-        // The mesh AppProtocol model has no UDP variant today; keep UDP/other
-        // transport hints unknown until UDP workload routing consumes them.
+        // UDP is modeled as a distinct L4 transport so it partitions out of both
+        // HTTP-family routing and the raw-TCP stream lane (it was previously
+        // swallowed as `Unknown`, i.e. silently treated as HTTP-family).
+        // Capture/egress for UDP arrives in a later F3 §3.3 stage; the variant
+        // is inert today, so a UDP port simply materializes no routes.
+        "UDP" => AppProtocol::Udp,
+        // Other K8s Service protocols (e.g. SCTP) have no mesh transport model
+        // yet; keep them unknown until a stage consumes them.
         _ => AppProtocol::Unknown,
     }
 }
@@ -799,6 +805,67 @@ mod tests {
         assert_eq!(
             mesh.workloads[0].spiffe_id.as_str(),
             "spiffe://cluster.local/ns/default/sa/reviews"
+        );
+    }
+
+    #[test]
+    fn workload_port_protocol_classifies_udp_distinctly() {
+        // A K8s Service `protocol: UDP` port must map to the distinct `Udp`
+        // transport, NOT the `Unknown` (HTTP-family) bucket it was silently
+        // swallowed into before. TCP keeps mapping to `Tcp`; an unknown
+        // transport (e.g. SCTP) still falls through to `Unknown`.
+        assert_eq!(workload_port_protocol(Some("UDP")), AppProtocol::Udp);
+        assert_eq!(workload_port_protocol(Some("udp")), AppProtocol::Udp);
+        assert_eq!(workload_port_protocol(Some("TCP")), AppProtocol::Tcp);
+        assert_eq!(workload_port_protocol(None), AppProtocol::Tcp);
+        assert_eq!(workload_port_protocol(Some("SCTP")), AppProtocol::Unknown);
+    }
+
+    #[test]
+    fn core_service_udp_port_translates_to_udp_app_protocol() {
+        // End-to-end: a K8s Service with a `protocol: UDP` port (no
+        // HTTP-classifying appProtocol/name hint) materializes a mesh service
+        // whose port carries `AppProtocol::Udp` — so it partitions out of HTTP
+        // route materialization instead of being mis-routed as HTTP.
+        let udp_service = object(
+            "Service",
+            "default",
+            "dns",
+            json!({
+                "ports": [{
+                    "name": "dns",
+                    "port": 53,
+                    "targetPort": 53,
+                    "protocol": "UDP"
+                }]
+            }),
+        );
+        let translation = translate_k8s_objects(
+            &[udp_service, ready_pod("dns-v1", "10.1.0.11"), {
+                let mut slice = endpoint_slice(vec![("dns-v1", "10.1.0.11")]);
+                slice.metadata.name = "dns-abc".to_string();
+                slice
+                    .metadata
+                    .labels
+                    .insert("kubernetes.io/service-name".to_string(), "dns".to_string());
+                slice.spec["ports"] = json!([{"name": "dns", "port": 53}]);
+                slice
+            }],
+            options(),
+        )
+        .expect("core translation succeeds");
+
+        let mesh = translation.config.mesh.expect("mesh config");
+        let svc = mesh
+            .services
+            .iter()
+            .find(|s| s.name == "dns")
+            .expect("dns service materialized");
+        assert_eq!(svc.ports[0].port, 53);
+        assert_eq!(
+            svc.ports[0].protocol,
+            AppProtocol::Udp,
+            "Service protocol: UDP port must classify as AppProtocol::Udp"
         );
     }
 

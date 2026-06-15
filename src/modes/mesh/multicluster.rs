@@ -519,11 +519,12 @@ fn app_protocol_sort_key(protocol: AppProtocol) -> u8 {
         AppProtocol::Grpc => 2,
         AppProtocol::Tcp => 3,
         AppProtocol::Tls => 4,
-        AppProtocol::Mongo => 5,
-        AppProtocol::Redis => 6,
-        AppProtocol::Mysql => 7,
-        AppProtocol::Postgres => 8,
-        AppProtocol::Unknown => 9,
+        AppProtocol::Udp => 5,
+        AppProtocol::Mongo => 6,
+        AppProtocol::Redis => 7,
+        AppProtocol::Mysql => 8,
+        AppProtocol::Postgres => 9,
+        AppProtocol::Unknown => 10,
     }
 }
 
