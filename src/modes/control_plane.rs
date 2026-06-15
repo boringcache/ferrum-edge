@@ -371,6 +371,7 @@ async fn load_incremental_config_multi(
     let split_upstreams = split_ids(known_upstream_ids, upstream_ns);
 
     let empty: HashSet<String> = HashSet::new();
+    let mut combined_poll_timestamp = None;
     let mut combined = IncrementalResult {
         added_or_modified_proxies: Vec::new(),
         removed_proxy_ids: Vec::new(),
@@ -421,13 +422,25 @@ async fn load_incremental_config_multi(
         combined
             .removed_upstream_ids
             .append(&mut delta.removed_upstream_ids);
-        // Use the latest namespace's poll timestamp as the combined value;
-        // the small skew between namespaces is bounded by the per-call
-        // duration and absorbed by the 1-second safety margin in
-        // `load_incremental_config`.
-        combined.poll_timestamp = delta.poll_timestamp;
+        // Keep the earliest per-namespace poll start. Writes that land in an
+        // early-polled namespace while later namespaces are still being read
+        // must remain behind the next `since` watermark.
+        let poll_timestamp =
+            min_incremental_poll_timestamp(combined_poll_timestamp, delta.poll_timestamp);
+        combined_poll_timestamp = Some(poll_timestamp);
+        combined.poll_timestamp = poll_timestamp;
     }
     Ok(combined)
+}
+
+fn min_incremental_poll_timestamp(
+    current: Option<chrono::DateTime<chrono::Utc>>,
+    next: chrono::DateTime<chrono::Utc>,
+) -> chrono::DateTime<chrono::Utc> {
+    match current {
+        Some(current) if current <= next => current,
+        _ => next,
+    }
 }
 
 /// Load and merge per-namespace `GatewayConfig`s into a single combined config.
@@ -2101,6 +2114,20 @@ mod tests {
         let mut known: HashSet<String> = ["a"].iter().map(|s| s.to_string()).collect();
         update_known_ids(&mut known, &vec![], &[]);
         assert_eq!(known.len(), 1);
+    }
+
+    #[test]
+    fn multi_namespace_poll_timestamp_keeps_earliest_namespace_start() {
+        let base = Utc::now();
+        let first_namespace = base + chrono::Duration::seconds(2);
+        let later_namespace = base + chrono::Duration::seconds(5);
+        let earliest_namespace = base + chrono::Duration::seconds(1);
+
+        let first = min_incremental_poll_timestamp(None, first_namespace);
+        let second = min_incremental_poll_timestamp(Some(first), later_namespace);
+        let third = min_incremental_poll_timestamp(Some(second), earliest_namespace);
+
+        assert_eq!(third, earliest_namespace);
     }
 
     // apply_incremental_to_config
