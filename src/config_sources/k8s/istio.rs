@@ -3964,6 +3964,23 @@ fn app_protocol(value: Option<&str>) -> AppProtocol {
     }
 }
 
+/// Whether an Istio `ServiceEntry` `spec.ports[].protocol` string names a UDP
+/// port.
+///
+/// Routes the raw token through the SAME [`app_protocol`] classifier the
+/// ServiceEntry translator uses to populate `ServicePort.protocol`, then checks
+/// for [`AppProtocol::Udp`] — so the Istio status writer's UDP-deferral
+/// detection can never diverge from what the translator classifies (and thus
+/// from what the EgressGateway materializer skips as inert in F3 §3.3 stage 1,
+/// which keys off `AppProtocol::Udp`). Used by `istio_status::service_entry_status`
+/// to surface the deferred UDP egress lane in `deferred_fields`. Shared (like
+/// [`cors_policy_translatable`] / [`sidecar_ingress_protocol_is_http_family`]) so
+/// the predicate lives in one place and translation/materialization and the
+/// status report stay in lock-step.
+pub(crate) fn service_entry_port_protocol_is_udp(protocol: Option<&str>) -> bool {
+    matches!(app_protocol(protocol), AppProtocol::Udp)
+}
+
 /// Map a Sidecar `ingress[].port.protocol` string to the `AppProtocol` carried on
 /// [`MeshSidecarIngress`], distinguishing a recognized protocol from an
 /// unrecognized one.
