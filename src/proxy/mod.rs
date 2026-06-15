@@ -1358,7 +1358,6 @@ pub(crate) fn is_h3_transport_error_class(class: retry::ErrorClass) -> bool {
             | retry::ErrorClass::ProtocolError
             | retry::ErrorClass::DnsLookupError
             | retry::ErrorClass::PortExhaustion
-            | retry::ErrorClass::ConnectionPoolError
     )
 }
 
@@ -22345,7 +22344,6 @@ mod tests {
             retry::ErrorClass::ProtocolError,
             retry::ErrorClass::DnsLookupError,
             retry::ErrorClass::PortExhaustion,
-            retry::ErrorClass::ConnectionPoolError,
         ] {
             assert!(
                 is_h3_transport_error_class(class),
@@ -22373,12 +22371,17 @@ mod tests {
         // `ReadWriteTimeout` is excluded for the same capability reason:
         // a backend that stalls after accepting a request is slow or wedged,
         // but it has not proved that the native H3 pool itself is invalid.
+        //
+        // `ConnectionPoolError` is also excluded: local QUIC endpoint/config
+        // failures such as CID exhaustion or endpoint shutdown are gateway-side
+        // resource conditions, not evidence that the backend lost H3 support.
         for class in [
             retry::ErrorClass::ClientDisconnect,
             retry::ErrorClass::RequestBodyTooLarge,
             retry::ErrorClass::ResponseBodyTooLarge,
             retry::ErrorClass::GracefulRemoteClose,
             retry::ErrorClass::ReadWriteTimeout,
+            retry::ErrorClass::ConnectionPoolError,
             retry::ErrorClass::DispatchPolicyRejected,
             retry::ErrorClass::RequestError,
         ] {

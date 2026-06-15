@@ -57,6 +57,8 @@ thread_local! {
 /// lookups are fine.
 fn with_http2_pool_key<R>(
     proxy: &Proxy,
+    client_cert_path: Option<&str>,
+    client_key_path: Option<&str>,
     svid_generation: Option<u64>,
     f: impl FnOnce(&mut String) -> R,
 ) -> R {
@@ -67,6 +69,8 @@ fn with_http2_pool_key<R>(
             &proxy.backend_host,
             proxy.backend_port,
             proxy,
+            client_cert_path,
+            client_key_path,
             svid_generation,
         );
         f(&mut buf)
@@ -78,6 +82,8 @@ fn write_http2_pool_key(
     host: &str,
     port: u16,
     proxy: &Proxy,
+    client_cert_path: Option<&str>,
+    client_key_path: Option<&str>,
     svid_generation: Option<u64>,
 ) {
     use std::fmt::Write;
@@ -95,8 +101,8 @@ fn write_http2_pool_key(
     append_backend_tls_pool_key_fields(
         buf,
         &proxy.resolved_tls,
-        proxy.resolved_tls.client_cert_path.as_deref(),
-        proxy.resolved_tls.client_key_path.as_deref(),
+        client_cert_path,
+        client_key_path,
         proxy.resolved_tls.verify_server_cert,
         svid_generation,
     );
@@ -109,6 +115,8 @@ fn pool_key_owned(proxy: &Proxy, svid_generation: Option<u64>) -> String {
         &proxy.backend_host,
         proxy.backend_port,
         proxy,
+        proxy.resolved_tls.client_cert_path.as_deref(),
+        proxy.resolved_tls.client_key_path.as_deref(),
         svid_generation,
     );
     buf
@@ -281,54 +289,54 @@ impl Http2PoolManager {
         proxy: &Proxy,
         svid_generation: Option<u64>,
     ) -> Result<Arc<rustls::ClientConfig>, Http2PoolError> {
-        self.tls_configs
-            .get_or_try_build(pool_key_owned(proxy, svid_generation), || {
-                let crls = self.crls.load_full();
-                let mut tls_config = BackendTlsConfigBuilder {
-                    proxy,
-                    policy: self.tls_policy.as_deref(),
-                    global_ca: self
-                        .global_env_config
-                        .tls_ca_bundle_path
-                        .as_deref()
-                        .map(Path::new),
-                    global_no_verify: self.global_env_config.tls_no_verify,
-                    global_client_cert: self
-                        .global_env_config
-                        .backend_tls_client_cert_path
-                        .as_deref()
-                        .map(Path::new),
-                    global_client_key: self
-                        .global_env_config
-                        .backend_tls_client_key_path
-                        .as_deref()
-                        .map(Path::new),
-                    crls: crls.as_ref().as_slice(),
-                }
-                .build_rustls()
-                .map_err(|e| {
-                    let message = format!("Failed to build backend TLS config: {}", e);
-                    let source = match e {
-                        crate::tls::backend::TlsError::Io { source, .. } => {
-                            Some(InternalSource::Io(source))
-                        }
-                        crate::tls::backend::TlsError::Pem { .. }
-                        | crate::tls::backend::TlsError::Rustls(_) => {
-                            Some(InternalSource::Message(message.clone()))
-                        }
-                    };
-                    Http2PoolError::Internal { message, source }
-                })?;
+        let cache_key = self.pool_key_owned(proxy, svid_generation);
+        self.tls_configs.get_or_try_build(cache_key, || {
+            let crls = self.crls.load_full();
+            let mut tls_config = BackendTlsConfigBuilder {
+                proxy,
+                policy: self.tls_policy.as_deref(),
+                global_ca: self
+                    .global_env_config
+                    .tls_ca_bundle_path
+                    .as_deref()
+                    .map(Path::new),
+                global_no_verify: self.global_env_config.tls_no_verify,
+                global_client_cert: self
+                    .global_env_config
+                    .backend_tls_client_cert_path
+                    .as_deref()
+                    .map(Path::new),
+                global_client_key: self
+                    .global_env_config
+                    .backend_tls_client_key_path
+                    .as_deref()
+                    .map(Path::new),
+                crls: crls.as_ref().as_slice(),
+            }
+            .build_rustls()
+            .map_err(|e| {
+                let message = format!("Failed to build backend TLS config: {}", e);
+                let source = match e {
+                    crate::tls::backend::TlsError::Io { source, .. } => {
+                        Some(InternalSource::Io(source))
+                    }
+                    crate::tls::backend::TlsError::Pem { .. }
+                    | crate::tls::backend::TlsError::Rustls(_) => {
+                        Some(InternalSource::Message(message.clone()))
+                    }
+                };
+                Http2PoolError::Internal { message, source }
+            })?;
 
-                // Advertise both `h2` and `http/1.1` — the backend picks.
-                // If it picks h2 we use this pool; if it picks http/1.1 the
-                // caller (create_tls_connection) returns
-                // `BackendSelectedHttp1` so the dispatcher can route via
-                // reqwest. Advertising only `h2` would fail the handshake
-                // against h1-only servers with no graceful recovery.
-                tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-                Ok::<rustls::ClientConfig, Http2PoolError>(tls_config)
-            })
+            // Advertise both `h2` and `http/1.1` — the backend picks.
+            // If it picks h2 we use this pool; if it picks http/1.1 the
+            // caller (create_tls_connection) returns
+            // `BackendSelectedHttp1` so the dispatcher can route via
+            // reqwest. Advertising only `h2` would fail the handshake
+            // against h1-only servers with no graceful recovery.
+            tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+            Ok::<rustls::ClientConfig, Http2PoolError>(tls_config)
+        })
     }
 
     async fn create_tls_connection(
@@ -372,7 +380,7 @@ impl Http2PoolManager {
         // rather than trying an h2 handshake that will fail anyway. Capability
         // learning happens outside this pool now, so we return the signal but
         // do not cache it here.
-        let pool_key = pool_key_owned(proxy, svid_generation);
+        let pool_key = self.pool_key_owned(proxy, svid_generation);
         let negotiated_is_h2 = matches!(tls_stream.get_ref().1.alpn_protocol(), Some(b"h2"));
         if !negotiated_is_h2 {
             return Err(Http2PoolError::BackendSelectedHttp1 { pool_key });
@@ -414,7 +422,7 @@ impl PoolManager for Http2PoolManager {
     type Connection = http2::SendRequest<Incoming>;
 
     fn build_key(&self, proxy: &Proxy, host: &str, port: u16, shard: usize, buf: &mut String) {
-        write_http2_pool_key(
+        self.write_pool_key(
             buf,
             host,
             port,
@@ -449,13 +457,54 @@ impl Http2PoolManager {
         self.backend_svid_generation.load(Ordering::Acquire)
     }
 
-    fn svid_generation_for_proxy(&self, proxy: &Proxy) -> Option<u64> {
-        let effective_client_cert_path = proxy.resolved_tls.client_cert_path.as_deref().or(self
+    fn effective_client_cert_path<'a>(&'a self, proxy: &'a Proxy) -> Option<&'a str> {
+        proxy.resolved_tls.client_cert_path.as_deref().or(self
             .global_env_config
             .backend_tls_client_cert_path
-            .as_deref());
+            .as_deref())
+    }
+
+    fn effective_client_key_path<'a>(&'a self, proxy: &'a Proxy) -> Option<&'a str> {
+        proxy.resolved_tls.client_key_path.as_deref().or(self
+            .global_env_config
+            .backend_tls_client_key_path
+            .as_deref())
+    }
+
+    fn write_pool_key(
+        &self,
+        buf: &mut String,
+        host: &str,
+        port: u16,
+        proxy: &Proxy,
+        svid_generation: Option<u64>,
+    ) {
+        write_http2_pool_key(
+            buf,
+            host,
+            port,
+            proxy,
+            self.effective_client_cert_path(proxy),
+            self.effective_client_key_path(proxy),
+            svid_generation,
+        );
+    }
+
+    fn pool_key_owned(&self, proxy: &Proxy, svid_generation: Option<u64>) -> String {
+        let mut buf = String::with_capacity(128);
+        self.write_pool_key(
+            &mut buf,
+            &proxy.backend_host,
+            proxy.backend_port,
+            proxy,
+            svid_generation,
+        );
+        buf
+    }
+
+    fn svid_generation_for_proxy(&self, proxy: &Proxy) -> Option<u64> {
         backend_svid_generation_for_client_cert(
-            effective_client_cert_path,
+            self.effective_client_cert_path(proxy),
             self.workload_svid_cert_path.as_deref(),
             self.current_svid_generation(),
         )
@@ -593,6 +642,22 @@ impl Http2ConnectionPool {
         write_http2_shard_key_inplace(buf, base_len, shard);
     }
 
+    fn with_pool_key<R>(
+        &self,
+        proxy: &Proxy,
+        svid_generation: Option<u64>,
+        f: impl FnOnce(&mut String) -> R,
+    ) -> R {
+        let manager = self.pool.manager();
+        with_http2_pool_key(
+            proxy,
+            manager.effective_client_cert_path(proxy),
+            manager.effective_client_key_path(proxy),
+            svid_generation,
+            f,
+        )
+    }
+
     pub async fn get_sender(
         &self,
         proxy: &Proxy,
@@ -611,7 +676,7 @@ impl Http2ConnectionPool {
         // polls once without yielding, and DashMap lookups never await — so
         // the `RefCell::borrow_mut()` lifetime stays inside this block.
         let svid_generation = self.pool.manager().svid_generation_for_proxy(proxy);
-        let phase1 = with_http2_pool_key(proxy, svid_generation, |key_buf| -> Phase1 {
+        let phase1 = self.with_pool_key(proxy, svid_generation, |key_buf| -> Phase1 {
             let base_len = key_buf.len();
 
             // Round-robin counter is per-host, but on FIRST access we seed it
@@ -698,7 +763,7 @@ impl Http2ConnectionPool {
                 // the same thread-local buffer and probe alternative shards.
                 // The proxy outlives this future and is read-only, so the
                 // build is identical to phase 1's prelude.
-                let recovered = with_http2_pool_key(proxy, svid_generation, |key_buf| {
+                let recovered = self.with_pool_key(proxy, svid_generation, |key_buf| {
                     debug_assert_eq!(key_buf.len(), base_len);
                     for offset in 1..shard_count {
                         let shard = (start + offset) % shard_count;
@@ -1482,6 +1547,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn http2_manager_pool_key_uses_global_mtls_fallback() {
+        let proxy = http2_pool_test_proxy();
+        let mut env_config = crate::config::EnvConfig::default();
+        env_config.backend_tls_client_cert_path = Some("/global/client.pem".to_string());
+        env_config.backend_tls_client_key_path = Some("/global/client.key".to_string());
+        let pool = Http2ConnectionPool::new(
+            PoolConfig::default(),
+            env_config,
+            DnsCache::new(DnsConfig::default()),
+            None,
+            Arc::new(Vec::new()),
+        );
+
+        let key = pool.with_pool_key(&proxy, None, |buf| buf.clone());
+
+        assert!(
+            key.contains("|/global/client.pem|/global/client.key|"),
+            "runtime H2 pool key must include global backend mTLS fallback: {key}"
+        );
+    }
+
     #[tokio::test]
     async fn force_drain_svid_generation_removes_rr_counter_keys() {
         let pool = Http2ConnectionPool::default();
@@ -1514,11 +1601,25 @@ mod tests {
     /// the H2 pool would silently fragment (one allocation path inserts
     /// keys, the other looks them up — a mismatch would never hit a cached
     /// connection).
+    fn with_http2_test_pool_key<R>(
+        proxy: &Proxy,
+        svid_generation: Option<u64>,
+        f: impl FnOnce(&mut String) -> R,
+    ) -> R {
+        with_http2_pool_key(
+            proxy,
+            proxy.resolved_tls.client_cert_path.as_deref(),
+            proxy.resolved_tls.client_key_path.as_deref(),
+            svid_generation,
+            f,
+        )
+    }
+
     #[test]
     fn with_http2_pool_key_matches_pool_key_owned() {
         let proxy = http2_pool_test_proxy();
         let owned = pool_key_owned(&proxy, None);
-        let from_thread_local = with_http2_pool_key(&proxy, None, |buf| buf.clone());
+        let from_thread_local = with_http2_test_pool_key(&proxy, None, |buf| buf.clone());
         assert_eq!(
             owned, from_thread_local,
             "thread-local key must equal pool_key_owned bytes — divergence would split the cache"
@@ -1532,14 +1633,14 @@ mod tests {
     #[test]
     fn with_http2_pool_key_is_idempotent_across_calls() {
         let proxy = http2_pool_test_proxy();
-        let k1 = with_http2_pool_key(&proxy, None, |buf| buf.clone());
+        let k1 = with_http2_test_pool_key(&proxy, None, |buf| buf.clone());
         // Force the buffer to grow in between by running a different proxy
         // with a longer host through the helper.
         let mut other = http2_pool_test_proxy();
         other.backend_host =
             "very-long-backend-hostname-that-grows-the-buffer.subdomain.example.com".to_string();
-        let _ = with_http2_pool_key(&other, None, |buf| buf.clone());
-        let k2 = with_http2_pool_key(&proxy, None, |buf| buf.clone());
+        let _ = with_http2_test_pool_key(&other, None, |buf| buf.clone());
+        let k2 = with_http2_test_pool_key(&proxy, None, |buf| buf.clone());
         assert_eq!(k1, k2, "same proxy must always yield the same key");
     }
 
@@ -1557,7 +1658,7 @@ mod tests {
         // the key. The thread-local was constructed with capacity 128
         // (well above the typical key length), so this should not realloc.
         let (first_ptr, first_capacity) =
-            with_http2_pool_key(&proxy, None, |buf| (buf.as_ptr() as usize, buf.capacity()));
+            with_http2_test_pool_key(&proxy, None, |buf| (buf.as_ptr() as usize, buf.capacity()));
         assert!(
             first_capacity >= 128,
             "expected pre-sized capacity (>=128), got {first_capacity}"
@@ -1567,8 +1668,9 @@ mod tests {
         // optimization regresses to per-call `String::with_capacity(...)`,
         // the pointer would change on every iteration.
         for i in 0..1024 {
-            let (ptr, cap) =
-                with_http2_pool_key(&proxy, None, |buf| (buf.as_ptr() as usize, buf.capacity()));
+            let (ptr, cap) = with_http2_test_pool_key(&proxy, None, |buf| {
+                (buf.as_ptr() as usize, buf.capacity())
+            });
             assert_eq!(
                 ptr, first_ptr,
                 "iteration {i}: heap pointer changed (was {first_ptr:#x}, now {ptr:#x}) — \
@@ -1591,8 +1693,8 @@ mod tests {
     #[test]
     fn with_http2_pool_key_base_len_is_stable() {
         let proxy = http2_pool_test_proxy();
-        let len1 = with_http2_pool_key(&proxy, None, |buf| buf.len());
-        let len2 = with_http2_pool_key(&proxy, None, |buf| buf.len());
+        let len1 = with_http2_test_pool_key(&proxy, None, |buf| buf.len());
+        let len2 = with_http2_test_pool_key(&proxy, None, |buf| buf.len());
         assert_eq!(
             len1, len2,
             "base_len must be deterministic across calls — \
