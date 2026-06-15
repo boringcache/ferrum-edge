@@ -3057,7 +3057,11 @@ impl LoadBalancer {
     /// Returns `Some(target)` only when the orig-dst matches a pool target AND
     /// that target is currently healthy (active + passive). On no match or an
     /// unhealthy match it returns `None`, signalling the caller to fall back to
-    /// round-robin — an ejected orig-dst target must not be dialed.
+    /// round-robin — an ejected orig-dst target must not be dialed. The passive
+    /// `max_ejection_percent` cap is sized against the SAME candidate pool the
+    /// match is scoped to (subset / port / subset∩port), so ejections outside
+    /// the pool cannot dilute the cap and readmit/keep-ejected the matched
+    /// target against the outlier policy.
     ///
     /// Hot-path clean: a single match scan over the (already small) target set,
     /// no per-request allocation. The orig-dst IP is canonicalized the SAME way
@@ -3111,15 +3115,47 @@ impl LoadBalancer {
         })?;
 
         // Respect active + passive health: never dial an ejected orig-dst
-        // target. Use the same health computation the load-balanced path uses
-        // so the max-ejection-percent re-admission stays consistent; the Vec
-        // path covers the rare >128-target pool the bitset can't represent.
+        // target. Compute health over the SAME candidate pool the load-balanced
+        // path would select from (subset / port / subset∩port), so the passive
+        // `max_ejection_percent` cap is sized against THAT pool — mirroring
+        // `select_from_subset` / `select_for_port` / `select_for_port_from_subset`.
+        // Scoping the match to the pool but the cap to the whole upstream would
+        // let ejections OUTSIDE the pool dilute the cap and wrongly readmit (or
+        // keep ejected) the matched orig-dst target, contrary to the outlier
+        // policy. The Vec path covers the rare >128-target pool the bitset
+        // can't represent.
         let matched_healthy = if self.targets.len() > MAX_BITSET_TARGETS {
-            self.healthy_targets_vec(health)
-                .iter()
-                .any(|(idx, _)| *idx == matched_idx)
+            // >128 targets: cap against the candidate-pool index set.
+            match (subset_indices, port_indices) {
+                (Some(s), Some(p)) => {
+                    let intersection = self.subset_port_intersection_vec(s, p);
+                    self.healthy_targets_vec_for_indices(health, &intersection)
+                        .iter()
+                        .any(|(idx, _)| *idx == matched_idx)
+                }
+                (Some(indices), None) | (None, Some(indices)) => self
+                    .healthy_targets_vec_for_indices(health, indices)
+                    .iter()
+                    .any(|(idx, _)| *idx == matched_idx),
+                (None, None) => self
+                    .healthy_targets_vec(health)
+                    .iter()
+                    .any(|(idx, _)| *idx == matched_idx),
+            }
         } else {
-            self.compute_health_bitset(health).contains(matched_idx)
+            // ≤128 targets: cap against the candidate-pool bitset/mask
+            // (alloc-free stack `u128`s, no per-request `Vec`).
+            match (subset_indices, port_indices) {
+                (Some(s), Some(p)) => {
+                    let intersection = self.subset_port_mask(s, p);
+                    self.compute_health_bitset_for_mask(health, &intersection)
+                        .contains(matched_idx)
+                }
+                (Some(indices), None) | (None, Some(indices)) => self
+                    .compute_health_bitset_for_indices(health, indices)
+                    .contains(matched_idx),
+                (None, None) => self.compute_health_bitset(health).contains(matched_idx),
+            }
         };
         if !matched_healthy {
             return None;

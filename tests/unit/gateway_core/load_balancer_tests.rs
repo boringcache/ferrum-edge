@@ -1769,6 +1769,134 @@ fn ejection_cap_does_not_affect_active_health_ejections() {
     assert!(seen.contains("host2"));
 }
 
+/// PASSTHROUGH (loadBalancer.simple=PASSTHROUGH) must size the passive
+/// `max_ejection_percent` cap against the SAME candidate pool the orig-dst
+/// match is scoped to — NOT the whole upstream. Otherwise ejections OUTSIDE
+/// the selected subset/port pool dilute the cap and can readmit (or keep
+/// ejected) the matched in-pool orig-dst target against the outlier policy.
+///
+/// Regression for the F5.7 finding: the match was subset-scoped but the health
+/// computation used the whole upstream. Here the in-subset orig-dst target is
+/// passively ejected; the assertion is that out-of-pool ejections do NOT change
+/// whether it is dialed. With a 1-target subset and a 25% cap, the in-pool
+/// target stays ejected (`ceil(1*25/100)=1`, one ejection within cap → 0
+/// readmit) regardless of how many out-of-pool targets are ejected. Under the
+/// old whole-upstream cap (`ceil(4*25/100)=1`), ejecting the 3 out-of-pool
+/// targets too (4 > 1) would readmit the earliest — the matched in-pool target
+/// — flipping the result to a dial.
+#[test]
+fn passthrough_ejection_cap_scoped_to_candidate_pool_not_whole_upstream() {
+    use ferrum_edge::config::types::{PassiveHealthCheck, SubsetDefinition};
+    use ferrum_edge::health_check::HealthChecker;
+
+    // idx0 is the only v1 (in-pool) target; idx1..=3 are v2 (out-of-pool).
+    // IP-literal hosts so orig-dst matching can fire.
+    let mut t0 = UpstreamTarget {
+        host: "10.0.0.1".into(),
+        port: 8080,
+        weight: 1,
+        tags: HashMap::new(),
+        locality: None,
+        path: None,
+    };
+    t0.tags.insert("version".into(), "v1".into());
+    let targets = {
+        let mut v = vec![t0];
+        for i in 2..=4u8 {
+            let mut t = UpstreamTarget {
+                host: format!("10.0.0.{i}"),
+                port: 8080,
+                weight: 1,
+                tags: HashMap::new(),
+                locality: None,
+                path: None,
+            };
+            t.tags.insert("version".into(), "v2".into());
+            v.push(t);
+        }
+        v
+    };
+    let subsets = vec![
+        SubsetDefinition {
+            name: "v1".into(),
+            labels: HashMap::from([("version".into(), "v1".into())]),
+            traffic_policy: None,
+        },
+        SubsetDefinition {
+            name: "v2".into(),
+            labels: HashMap::from([("version".into(), "v2".into())]),
+            traffic_policy: None,
+        },
+    ];
+    let lb = LoadBalancer::with_subsets(
+        TEST_UPSTREAM,
+        LoadBalancerAlgorithm::Passthrough,
+        &targets,
+        None,
+        Some(&subsets),
+    );
+
+    let config = PassiveHealthCheck {
+        unhealthy_status_codes: vec![500],
+        unhealthy_threshold: 1,
+        unhealthy_window_seconds: 60,
+        healthy_after_seconds: 30,
+        max_ejection_percent: None,
+        gateway_error_codes: None,
+        split_external_local_origin_errors: None,
+    };
+    let active: DashMap<String, u64> = DashMap::new();
+    let in_pool: std::net::SocketAddr = "10.0.0.1:8080".parse().unwrap();
+
+    // Helper: passthrough-select the in-subset orig-dst with the given passive
+    // ejections (host:port → ejected_at_ms) and a 25% cap scoped to subset v1.
+    let dial_decision = |ejected: &[(&UpstreamTarget, u64)]| -> bool {
+        let checker = HealthChecker::new();
+        for (t, _) in ejected {
+            checker.report_response("test-proxy", t, 500, false, Some(&config));
+        }
+        let proxy_passive = checker
+            .passive_health
+            .get("test-proxy")
+            .map(|e| e.clone())
+            .expect("passive state should be created");
+        // Deterministic ejection timestamps (earliest = the in-pool target).
+        for (t, ts) in ejected {
+            proxy_passive.unhealthy.insert(target_host_port_key(t), *ts);
+        }
+        let ctx = HealthContext {
+            active_unhealthy: &active,
+            proxy_passive: Some(proxy_passive),
+            max_ejection_percent: Some(25),
+        };
+        lb.select_passthrough(in_pool, None, Some("v1"), Some(&ctx))
+            .is_some()
+    };
+
+    // Only the in-pool target ejected (earliest ts): with the pool-scoped cap it
+    // stays ejected → not dialed.
+    let only_in_pool = dial_decision(&[(&targets[0], 100)]);
+    // Additionally eject all 3 out-of-pool targets (later ts). Pool-scoped, the
+    // v1 pool is unchanged (still just the ejected in-pool target) → identical.
+    let plus_out_of_pool = dial_decision(&[
+        (&targets[0], 100),
+        (&targets[1], 200),
+        (&targets[2], 300),
+        (&targets[3], 400),
+    ]);
+
+    assert!(
+        !only_in_pool,
+        "in-pool orig-dst ejected within the subset cap must not be dialed"
+    );
+    assert_eq!(
+        only_in_pool, plus_out_of_pool,
+        "ejections OUTSIDE the candidate pool must NOT change whether the \
+         in-pool orig-dst target is dialed (cap denominator is the candidate \
+         pool, not the whole upstream)"
+    );
+}
+
 // ─── Subset Routing Tests ────────────────────────────────────────────────────
 
 fn make_tagged_targets() -> Vec<UpstreamTarget> {
