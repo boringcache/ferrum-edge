@@ -3937,6 +3937,17 @@ fn workload_ports(object: &K8sObject) -> Result<Vec<WorkloadPort>, K8sTranslateE
     Ok(workload_ports)
 }
 
+/// Map an Istio `ServiceEntry` port `protocol` token to an [`AppProtocol`].
+///
+/// The ServiceEntry port `protocol` field is the L4/L7 transport descriptor (its
+/// only protocol field — there is no separate `appProtocol` on a ServiceEntry
+/// port), so `protocol: UDP` mirrors the K8s Service L4 mapping
+/// (`core::workload_port_protocol`) to `AppProtocol::Udp` rather than the
+/// `Unknown` (HTTP-family) catch-all — otherwise a UDP ServiceEntry would still
+/// be classified HTTP-family and routed into HTTP/stream materialization. UDP is
+/// inert in this F3 §3.3 stage (no UDP capture/egress yet); the classification
+/// just keeps it partitioned out of the other lanes. Unrecognized tokens (e.g.
+/// `sctp`) stay `Unknown`.
 fn app_protocol(value: Option<&str>) -> AppProtocol {
     match value.unwrap_or_default().to_ascii_lowercase().as_str() {
         "http" => AppProtocol::Http,
@@ -3944,12 +3955,30 @@ fn app_protocol(value: Option<&str>) -> AppProtocol {
         "grpc" => AppProtocol::Grpc,
         "tcp" => AppProtocol::Tcp,
         "tls" => AppProtocol::Tls,
+        "udp" => AppProtocol::Udp,
         "mongo" => AppProtocol::Mongo,
         "redis" => AppProtocol::Redis,
         "mysql" => AppProtocol::Mysql,
         "postgres" => AppProtocol::Postgres,
         _ => AppProtocol::Unknown,
     }
+}
+
+/// Whether an Istio `ServiceEntry` `spec.ports[].protocol` string names a UDP
+/// port.
+///
+/// Routes the raw token through the SAME [`app_protocol`] classifier the
+/// ServiceEntry translator uses to populate `ServicePort.protocol`, then checks
+/// for [`AppProtocol::Udp`] — so the Istio status writer's UDP-deferral
+/// detection can never diverge from what the translator classifies (and thus
+/// from what the EgressGateway materializer skips as inert in F3 §3.3 stage 1,
+/// which keys off `AppProtocol::Udp`). Used by `istio_status::service_entry_status`
+/// to surface the deferred UDP egress lane in `deferred_fields`. Shared (like
+/// [`cors_policy_translatable`] / [`sidecar_ingress_protocol_is_http_family`]) so
+/// the predicate lives in one place and translation/materialization and the
+/// status report stay in lock-step.
+pub(crate) fn service_entry_port_protocol_is_udp(protocol: Option<&str>) -> bool {
+    matches!(app_protocol(protocol), AppProtocol::Udp)
 }
 
 /// Map a Sidecar `ingress[].port.protocol` string to the `AppProtocol` carried on
@@ -4974,6 +5003,47 @@ mod tests {
         let mesh = result.config.mesh.expect("mesh config");
         assert_eq!(mesh.service_entries[0].hosts, vec!["api.example.com"]);
         assert_eq!(mesh.service_entries[0].ports[0].protocol, AppProtocol::Tls);
+    }
+
+    #[test]
+    fn service_entry_udp_port_classifies_as_udp_app_protocol() {
+        // An Istio ServiceEntry port with `protocol: UDP` must classify as the
+        // distinct `AppProtocol::Udp` (mirroring the K8s Service L4 mapping), NOT
+        // the `Unknown` (HTTP-family) catch-all it landed in before — otherwise a
+        // UDP ServiceEntry would be mis-routed into HTTP/stream materialization.
+        // The ServiceEntry `protocol` field is the L4 transport descriptor.
+        let result = translate_k8s_objects(
+            &[object(
+                "ServiceEntry",
+                serde_json::json!({
+                    "hosts": ["dns.external.com"],
+                    "resolution": "DNS",
+                    "ports": [{"number": 53, "name": "dns", "protocol": "UDP"}]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        assert_eq!(mesh.service_entries[0].ports[0].port, 53);
+        assert_eq!(
+            mesh.service_entries[0].ports[0].protocol,
+            AppProtocol::Udp,
+            "ServiceEntry protocol: UDP must classify as AppProtocol::Udp"
+        );
+    }
+
+    #[test]
+    fn app_protocol_classifies_udp_token() {
+        // Direct unit on the ServiceEntry protocol classifier: `udp`/`UDP` →
+        // `Udp`; an unrecognized transport (e.g. sctp) stays `Unknown`; the
+        // existing recognized tokens are unaffected.
+        assert_eq!(app_protocol(Some("udp")), AppProtocol::Udp);
+        assert_eq!(app_protocol(Some("UDP")), AppProtocol::Udp);
+        assert_eq!(app_protocol(Some("tcp")), AppProtocol::Tcp);
+        assert_eq!(app_protocol(Some("sctp")), AppProtocol::Unknown);
+        assert_eq!(app_protocol(None), AppProtocol::Unknown);
     }
 
     #[test]

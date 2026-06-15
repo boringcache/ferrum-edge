@@ -24,8 +24,15 @@ use crate::identity::{JwtAuthority as IdentityJwtAuthority, TrustBundle as Ident
 /// Application-layer protocol classification for mesh ports.
 ///
 /// Mirrors Istio's `appProtocol` field on `Service` ports + endpoints. Phase
-/// A serialises lowercase ("http", "http2", "grpc", "tcp", "tls", "mongo",
-/// "redis", "mysql", "postgres", "unknown").
+/// A serialises lowercase ("http", "http2", "grpc", "tcp", "tls", "udp",
+/// "mongo", "redis", "mysql", "postgres", "unknown").
+///
+/// `Udp` is a distinct L4 transport: it is NOT HTTP-family (no HTTP route
+/// materialization) and NOT part of the raw-TCP stream lane (REDIRECT /
+/// `SO_ORIGINAL_DST` capture does not apply to UDP). It partitions out of both
+/// the HTTP-family and TCP-stream port predicates so a Service `protocol: UDP`
+/// port is never mis-classified as HTTP (its prior fate as `Unknown`). UDP
+/// capture/egress arrives in a later F3 §3.3 stage; this variant is inert today.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AppProtocol {
@@ -34,6 +41,7 @@ pub enum AppProtocol {
     Grpc,
     Tcp,
     Tls,
+    Udp,
     Mongo,
     Redis,
     Mysql,

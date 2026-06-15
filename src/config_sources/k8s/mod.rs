@@ -18,6 +18,13 @@ pub(crate) use istio::cors_policy_translatable;
 // is one predicate, so an HTTPS (→ Unknown → HTTP-family) listener is never
 // modeled by resolution yet reported as a deferred non-HTTP listener.
 pub(crate) use istio::sidecar_ingress_protocol_is_http_family;
+// Shared with the Istio status writer the same way: the ServiceEntry UDP-port
+// classification used by translation/materialization (a `protocol: UDP` port is
+// classified `AppProtocol::Udp` and its egress materialization is deferred/inert
+// in F3 §3.3 stage 1) and by the status writer's deferred-field reporting is one
+// predicate, so a UDP ServiceEntry is never reported as fully accepted while its
+// egress lane is silently skipped.
+pub(crate) use istio::service_entry_port_protocol_is_udp;
 
 use std::collections::{HashMap, HashSet};
 

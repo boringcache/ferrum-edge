@@ -67,7 +67,8 @@ use tracing::warn;
 
 use crate::config_sources::k8s::{
     K8sObject, K8sTranslateError, K8sTranslation, K8sTranslationOptions,
-    sidecar_selector_from_istio, translate_k8s_objects_with_filter,
+    service_entry_port_protocol_is_udp, sidecar_selector_from_istio,
+    translate_k8s_objects_with_filter,
 };
 
 /// Field manager used on every `patch_status` call. Kubernetes uses this
@@ -840,6 +841,16 @@ fn virtual_service_deferred_fields(spec: &Value) -> Vec<&'static str> {
 /// Status for `ServiceEntry`. Reports the resolved `resolution`/`location`
 /// (both default when omitted, matching Istio) and host/endpoint/port
 /// counts so operators can confirm Ferrum's view of an external service.
+///
+/// A `protocol: UDP` port is ACCEPTED (it translates to `AppProtocol::Udp`) but
+/// its egress lane is INERT in F3 §3.3 stage 1: the EgressGateway materializer
+/// skips UDP ports (no UDP capture/egress datapath yet), so the resource would
+/// otherwise show as fully accepted in `kubectl describe` while no
+/// proxy/listener/upstream is produced. Surface that gap as a `deferred_fields`
+/// entry (keeping `FerrumAccepted=True` — it IS accepted/translated, just
+/// inert), detected via the SHARED `service_entry_port_protocol_is_udp` predicate
+/// so the status report can never diverge from the translator's classification or
+/// the materializer's skip.
 fn service_entry_status(
     object: &K8sObject,
     result: Result<&K8sTranslation, &K8sTranslateError>,
@@ -875,11 +886,45 @@ fn service_entry_status(
         .map(|v| v.len())
         .unwrap_or(0);
 
+    // F3 §3.3 stage 1 accepts a `protocol: UDP` ServiceEntry (it translates to
+    // `AppProtocol::Udp`) but the EgressGateway materializer skips UDP ports as
+    // inert (no UDP capture/egress datapath yet — see `build_egress_proxies_and_upstreams`
+    // in `src/modes/mesh/mod.rs`, which keys its one-time deferral warning off
+    // `AppProtocol::Udp`). Surface that gap as a deferred field so the resource
+    // does not appear fully accepted while no proxy/listener/upstream is produced.
+    // Detect UDP ports on the raw spec via the SHARED predicate the translator's
+    // classifier feeds, so this report stays in lock-step with the materializer's
+    // skip.
+    let has_udp_port = object
+        .spec
+        .get("ports")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|port| {
+            service_entry_port_protocol_is_udp(port.get("protocol").and_then(Value::as_str))
+        });
+    let mut deferred: Vec<&'static str> = Vec::new();
+    if has_udp_port {
+        deferred.push(
+            "spec.ports[].protocol: UDP — egress materialization deferred \
+             (F3 §3.3 UDP capture/egress not yet implemented)",
+        );
+    }
+
     match result {
         Ok(_translation) => {
-            let message = format!(
-                "Ferrum accepted this ServiceEntry ({host_count} host(s), resolution: {resolution}, location: {location})"
-            );
+            let message = if deferred.is_empty() {
+                format!(
+                    "Ferrum accepted this ServiceEntry ({host_count} host(s), resolution: {resolution}, location: {location})"
+                )
+            } else {
+                format!(
+                    "Ferrum accepted this ServiceEntry ({host_count} host(s), resolution: {resolution}, \
+                     location: {location}); deferred fields: {}",
+                    deferred.join(", ")
+                )
+            };
             let detail = json!({
                 "translation": {
                     "hosts": host_count,
@@ -887,6 +932,7 @@ fn service_entry_status(
                     "ports": port_count,
                     "resolution": resolution,
                     "location": location,
+                    "deferred_fields": deferred,
                 }
             });
             accepted_status(object, true, "Accepted", &message, Some(detail))
@@ -2485,6 +2531,103 @@ mod tests {
             Some("MESH_EXTERNAL")
         );
         assert_eq!(detail["translation"]["ports"].as_u64(), Some(1));
+        // A TLS-only (non-UDP) ServiceEntry must NOT surface the UDP egress
+        // deferral — its egress lane is fully materialized.
+        let deferred: Vec<&str> = detail["translation"]["deferred_fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            deferred.is_empty(),
+            "TLS-only ServiceEntry must surface no deferred fields, got {deferred:?}"
+        );
+    }
+
+    #[test]
+    fn service_entry_udp_port_surfaces_egress_deferral_but_stays_accepted() {
+        // F3 §3.3 stage 1: a `protocol: UDP` ServiceEntry translates fine
+        // (`AppProtocol::Udp`) but the EgressGateway materializer skips UDP ports
+        // as inert — so `kubectl describe` must show it ACCEPTED yet flag the
+        // deferred egress lane in `deferred_fields`, never silently fully-accepted
+        // while no proxy/listener/upstream is produced.
+        let obj = object(
+            "networking.istio.io/v1",
+            "ServiceEntry",
+            "udp-dns",
+            json!({
+                "hosts": ["dns.external.com"],
+                "resolution": "DNS",
+                "location": "MESH_EXTERNAL",
+                "ports": [ { "number": 53, "name": "dns", "protocol": "UDP" } ]
+            }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options());
+        let c = find_condition(
+            updates[0].status["conditions"].as_array().unwrap(),
+            "FerrumAccepted",
+        );
+        // Still accepted (deferral, not rejection — rejecting would break the CRD).
+        assert_eq!(c["status"].as_str(), Some("True"));
+        assert_eq!(c["reason"].as_str(), Some("Accepted"));
+        assert!(
+            c["message"].as_str().unwrap().contains("deferred"),
+            "message should flag the deferral, got {:?}",
+            c["message"].as_str()
+        );
+        let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        let deferred: Vec<&str> = detail["translation"]["deferred_fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            deferred
+                .iter()
+                .any(|f| f.contains("UDP") && f.contains("egress materialization deferred")),
+            "deferred_fields should mention the deferred UDP egress lane, got {deferred:?}"
+        );
+    }
+
+    #[test]
+    fn service_entry_mixed_tcp_udp_ports_surface_udp_egress_deferral() {
+        // A DNS-like ServiceEntry exposing BOTH TCP/53 and UDP/53: the UDP port
+        // alone is enough to surface the deferral (the TCP lane materializes; the
+        // UDP lane is inert), and the resource stays accepted. Mirrors the
+        // materializer test `egress_materializes_tcp_but_not_udp_for_dual_protocol_service`.
+        let obj = object(
+            "networking.istio.io/v1",
+            "ServiceEntry",
+            "dual-dns",
+            json!({
+                "hosts": ["dns.external.com"],
+                "resolution": "DNS",
+                "location": "MESH_EXTERNAL",
+                "ports": [
+                    { "number": 53, "name": "dns-tcp", "protocol": "TCP" },
+                    { "number": 53, "name": "dns-udp", "protocol": "UDP" }
+                ]
+            }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options());
+        let c = find_condition(
+            updates[0].status["conditions"].as_array().unwrap(),
+            "FerrumAccepted",
+        );
+        assert_eq!(c["status"].as_str(), Some("True"));
+        let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        let deferred: Vec<&str> = detail["translation"]["deferred_fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            deferred.iter().any(|f| f.contains("UDP")),
+            "a UDP port among TCP ports must still surface the UDP egress deferral, got {deferred:?}"
+        );
     }
 
     #[test]
