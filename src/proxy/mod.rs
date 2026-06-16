@@ -15874,7 +15874,7 @@ pub(crate) fn resolve_backend_http1_max_pending_requests(
 /// MIGHT negotiate h2 is left uncapped (an `http1*` knob must not 503 an h2
 /// backend — that is `http2MaxRequests`'s job).
 ///
-/// HTTP/1.1 is *known* in exactly three cases:
+/// HTTP/1.1 is *known* in exactly four cases:
 ///
 /// * `proxy.forces_backend_http1_only()` — DestinationRule
 ///   `h2UpgradePolicy: DO_NOT_UPGRADE` restricts the reqwest client's ALPN to
@@ -15886,20 +15886,36 @@ pub(crate) fn resolve_backend_http1_max_pending_requests(
 ///   dial is HTTP/1.1 regardless of `enable_http2`; or
 /// * the backend is **HTTPS but `enable_http2 == false`** — the per-proxy
 ///   reqwest client never advertises h2 ALPN, so every TLS dial falls to
-///   HTTP/1.1.
+///   HTTP/1.1; or
+/// * the backend is **HTTPS, h2 enabled, but the capability registry has
+///   already classified this target H2/TLS-unsupported (H1-only)** — the
+///   direct-H2 pool fork (`direct_h2_known_unsupported` in `proxy_to_backend`)
+///   then bypasses the H2 pool and falls to this reqwest path, where the ALPN
+///   handshake re-negotiates HTTP/1.1 every time. The verdict was learned from
+///   a prior `Http2PoolError::BackendSelectedHttp1` fallback (or a startup
+///   probe), so the dispatch is known HTTP/1.1 at acquire time and must be
+///   capped — otherwise the most common "h2-enabled default config in front of
+///   an HTTP/1.1-only backend" case escapes the gate entirely.
 ///
-/// A **HTTPS** backend with `enable_http2 == true` MAY negotiate h2 via ALPN —
-/// unknown until the TLS handshake completes — so it is deliberately NOT capped
-/// (this preserves the round-1 "don't apply the H1 cap to a reqwest dispatch
-/// that becomes h2" fix). The direct-H2 pool is also bypassed onto this reqwest
-/// path for a buffered / retained request body
+/// A **HTTPS** backend with `enable_http2 == true` and **no** H1-only registry
+/// verdict MAY still negotiate h2 via ALPN — unknown until the TLS handshake
+/// completes — so it is deliberately NOT capped (this preserves the round-1
+/// "don't apply the H1 cap to a reqwest dispatch that becomes h2" fix). The
+/// direct-H2 pool is also bypassed onto this reqwest path for a buffered /
+/// retained request body
 /// (`enable_http2 && (retain_request_body || requires_request_body_buffering)`),
-/// where ALPN can still pick h2, so that case stays uncapped too.
+/// where ALPN can still pick h2 absent a registry verdict, so that case stays
+/// uncapped too.
 ///
 /// Only ever called after a non-`None` `http1MaxPendingRequests` cap has been
 /// resolved (the rare case a DestinationRule sets the knob), so the
-/// `for_proxy` pool-config resolve never runs on the no-cap hot path.
-pub(crate) fn reqwest_dispatch_is_http1_only(state: &ProxyState, proxy: &Proxy) -> bool {
+/// `for_proxy` pool-config resolve and registry lookup never run on the no-cap
+/// hot path.
+pub(crate) fn reqwest_dispatch_is_http1_only(
+    state: &ProxyState,
+    proxy: &Proxy,
+    upstream_target: Option<&UpstreamTarget>,
+) -> bool {
     if proxy.forces_backend_http1_only() {
         return true;
     }
@@ -15911,12 +15927,30 @@ pub(crate) fn reqwest_dispatch_is_http1_only(state: &ProxyState, proxy: &Proxy) 
     }
     // HTTPS backend: HTTP/1.1 is only *known* when h2 ALPN is disabled; with
     // h2 enabled the transport is unknown until the handshake, so leave it
-    // uncapped.
-    !state
+    // uncapped...
+    if !state
         .connection_pool
         .global_pool_config()
         .for_proxy(proxy)
         .enable_http2
+    {
+        return true;
+    }
+    // ...UNLESS the capability registry has already classified this target
+    // H2/TLS-unsupported. `proxy_to_backend`'s direct-H2 fork keys this exact
+    // verdict (`record.plain_http.h2_tls == Unsupported`) to bypass the H2 pool
+    // and fall to reqwest-H1, so the dispatch is known HTTP/1.1 at acquire time
+    // and must be capped despite `enable_http2`. Lookup is the same alloc-free
+    // thread-local-keyed `get` the H2 fork uses (`registry.get(proxy, target)`).
+    state
+        .backend_capabilities
+        .get(proxy, upstream_target)
+        .is_some_and(|record| {
+            matches!(
+                record.plain_http.h2_tls,
+                crate::proxy::backend_capabilities::ProtocolSupport::Unsupported
+            )
+        })
 }
 
 /// Resolve the per-port retry lane after a concrete target has failed.
@@ -16140,15 +16174,16 @@ pub(crate) async fn proxy_to_backend_retry(
     // returns), so a retry no longer overlaps it — without acquiring here, a
     // `retry_on_connect_failure`-driven retry storm would dial this destination
     // unboundedly, bypassing the cap. Acquire under the SAME H1 predicate
-    // (`reqwest_dispatch_is_http1_only`): the retry replays a buffered body, so
-    // there is no streamed-upload exclusion to apply. The slot is released the
+    // (`reqwest_dispatch_is_http1_only`). Under the in-flight reinterpretation
+    // (see `proxy_to_backend` / `docs/mesh.md`) every H1-determined attempt
+    // counts, so there is no body-shape exclusion. The slot is released the
     // instant this attempt's `send()` returns (the `drop` below), so it spans
-    // only this attempt's connection-wait and an attempt never double-counts.
+    // only this attempt's in-flight window and an attempt never double-counts.
     let retry_dispatch_port = upstream_target
         .map(|t| t.port)
         .unwrap_or(proxy.backend_port);
     let retry_pending_cap = resolve_backend_http1_max_pending_requests(proxy, retry_dispatch_port)
-        .filter(|_| reqwest_dispatch_is_http1_only(state, proxy));
+        .filter(|_| reqwest_dispatch_is_http1_only(state, proxy, upstream_target));
     let retry_pending_slot = match state.backend_pending_limit.try_acquire(
         effective_host,
         retry_dispatch_port,
@@ -16167,7 +16202,10 @@ pub(crate) async fn proxy_to_backend_retry(
             // Gateway-side capacity shed before the retry dial: classify
             // `DispatchPolicyRejected` (NOT a connection_error) so the retry
             // loop does not treat the shed as another connect failure and
-            // amplify the overflow, mirroring the initial-attempt shed.
+            // amplify the overflow. That class is a no-backend-signal
+            // (`client_side_no_backend_signal`), so this overflow 503 stays
+            // NEUTRAL to backend health/CB/AC, mirroring the initial-attempt
+            // shed.
             return retry::BackendResponse {
                 status_code: 503,
                 body: ResponseBody::Buffered(
@@ -16186,11 +16224,11 @@ pub(crate) async fn proxy_to_backend_retry(
     let mut reqwest_backend_guard =
         Some(crate::runtime_metrics::global_ref().reqwest_backend_request_guard());
     let send_result = req_builder.send().await;
-    // Release this retry attempt's pending slot the instant dispatch returns —
-    // the connection-wait phase is over (capacity obtained / dial failed),
-    // BEFORE any response-body collection — so it spans connection-wait only and
-    // never the response lifetime. A no-cap / non-HTTP-1.1 retry holds `None`
-    // here, so the drop is a no-op.
+    // Release this retry attempt's in-flight slot the instant `send()` resolves
+    // (response headers / dial failure) — BEFORE any response-body collection —
+    // so it spans this attempt's dispatch → response-headers window only, never
+    // the response lifetime. A no-cap / non-HTTP-1.1 retry holds `None` here, so
+    // the drop is a no-op.
     drop(retry_pending_slot);
     match send_result {
         Ok(response) => {
@@ -17298,21 +17336,19 @@ async fn proxy_to_backend(
     }
 
     // DestinationRule `connectionPool.http.http1MaxPendingRequests`: bound the
-    // number of requests simultaneously waiting on connection capacity for this
-    // backend destination on the reqwest/HTTP-1.1 dispatch path. This is the
-    // *pending-acquire phase* — acquired here, AFTER local 413 / plugin
-    // rejections and request-body collection / final-body hooks, immediately
-    // before backend admission and the dispatch onto the shared reqwest client.
-    // Acquiring after body handling means a slow client upload does not hold a
-    // "pending backend connection" slot while its body is still streaming in;
-    // the slot reflects requests genuinely *waiting on connection capacity*.
+    // number of concurrent in-flight HTTP/1.1 requests to this backend
+    // destination on the reqwest/HTTP-1.1 dispatch path (in-flight
+    // reinterpretation — see the detailed note below and `docs/mesh.md`). The
+    // slot is acquired here, AFTER local 413 / plugin rejections and
+    // request-body collection / final-body hooks, immediately before backend
+    // admission and the dispatch onto the shared reqwest client.
     //
     // Released the moment `send().await` returns (see the explicit `drop` below)
-    // — BEFORE any response-body collection — so a request counts as "pending"
-    // exactly while it waits for a connection slot, matching Envoy's
-    // pending-request gauge, NOT for the response-stream / response-buffering
-    // lifetime. When the queue is full the request is shed with a 503 ("upstream
-    // overflow"), NOT queued unboundedly.
+    // — BEFORE any response-body collection — so the slot spans dispatch →
+    // response-headers (the in-flight window reqwest exposes), NOT the
+    // response-stream / response-buffering lifetime. When the destination is at
+    // its in-flight cap the request is shed with a 503 ("upstream overflow"),
+    // NOT queued unboundedly.
     //
     // HTTP/1.1-scoped: the direct-H2 / gRPC / H3 / HBONE / mesh-mTLS branches
     // above already returned before reaching here, so the multiplexed transports
@@ -17324,28 +17360,29 @@ async fn proxy_to_backend(
     // (`reqwest_dispatch_is_http1_only`). Their concurrency is instead governed
     // by `http2MaxRequests` → `h2_max_concurrent_streams`.
     //
-    // Streamed request bodies are EXCLUDED from the cap (`!stream_request_body`):
-    // with a streamed body the reqwest body is built from the live client
-    // `Incoming` above, so `send().await` does not just wait for connection
-    // capacity — it then drives the entire (possibly slow / large) client upload
-    // while holding the slot. reqwest exposes no post-connect / pre-upload hook
-    // to release the slot once capacity is obtained, so capping streamed uploads
-    // would shed unrelated requests based on upload duration rather than
-    // connection-wait. The cap therefore governs buffered-body H1 dispatch only;
-    // see the accepted-limitation note in `docs/mesh.md`. The connection-failure
-    // retry path (`proxy_to_backend_retry`) replays a buffered body and re-enters
-    // this same gate per attempt (see its own acquire), so retries are bounded
-    // too; the initial slot is already released before the retry loop runs, so an
-    // attempt and its retry never double-count.
+    // In-flight reinterpretation (codex r3, finding 3): reqwest's `send()`
+    // resolves when RESPONSE HEADERS arrive, not when a connection slot is
+    // assigned, and reqwest exposes no connection-acquisition hook — so a slot
+    // held acquire-before-send / release-after-send inevitably spans
+    // connection-wait + upload + backend-TTFB. We therefore CANNOT implement
+    // Envoy's true pending-queue depth over reqwest. Mirroring how this repo
+    // honestly reinterprets DR `maxRetries` as a per-request cap, the knob is
+    // reframed as a **max concurrent in-flight HTTP/1.1 requests per
+    // `(host, port)`** cap (measured dispatch → response-headers), shedding
+    // excess with a 503 ("upstream overflow"). Under that framing a streamed
+    // upload IS legitimately in-flight, so there is NO body-shape exclusion —
+    // bodyless GET/HEAD/OPTIONS (where `stream_request_body` is true) are capped
+    // too, which is the most common H1 traffic. The connection-failure retry
+    // path (`proxy_to_backend_retry`) re-enters this same gate per attempt (see
+    // its own acquire); the initial slot is already released before the retry
+    // loop runs, so an attempt and its retry never double-count.
     let pending_dispatch_port = upstream_target
         .map(|t| t.port)
         .unwrap_or(proxy.backend_port);
     let pending_cap = resolve_backend_http1_max_pending_requests(proxy, pending_dispatch_port)
-        // Only an HTTP/1.1-bound reqwest dispatch consults the gate; a reqwest
-        // fallback that will ALPN-negotiate h2 ignores the `http1*` cap. Streamed
-        // uploads are excluded — the slot would otherwise span the upload, not
-        // the connection-wait (no reqwest post-connect/pre-upload hook).
-        .filter(|_| !stream_request_body && reqwest_dispatch_is_http1_only(state, proxy));
+        // Only an HTTP/1.1-determined reqwest dispatch consults the gate; a
+        // reqwest fallback that may ALPN-negotiate h2 ignores the `http1*` cap.
+        .filter(|_| reqwest_dispatch_is_http1_only(state, proxy, upstream_target));
     let pending_slot = match state.backend_pending_limit.try_acquire(
         effective_host,
         pending_dispatch_port,
@@ -17371,11 +17408,15 @@ async fn proxy_to_backend(
                     ),
                     headers: HashMap::new(),
                     // Gateway-side capacity shed before any backend dial: the
-                    // request never reached the backend application layer, but
-                    // it is classified `DispatchPolicyRejected` (NOT a transport
-                    // connection_error) so retries do not amplify the overflow
-                    // or trip backend circuit breakers — mirrors the
-                    // backend-TLS-SNI gateway reject above.
+                    // request never reached the backend application layer, so it
+                    // is classified `DispatchPolicyRejected` (NOT a transport
+                    // connection_error). That class is now a no-backend-signal
+                    // (`client_side_no_backend_signal`), so this overflow 503 is
+                    // NEUTRAL to backend health: it is not retried, does not trip
+                    // the backend circuit breaker / passive health, and does not
+                    // shrink the adaptive-concurrency permit for a backend that
+                    // was never dialed — mirrors the backend-TLS-SNI gateway
+                    // reject above.
                     connection_error: false,
                     backend_resolved_ip: resolved_ip.clone(),
                     error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
@@ -17404,14 +17445,15 @@ async fn proxy_to_backend(
     let mut reqwest_backend_guard =
         Some(crate::runtime_metrics::global_ref().reqwest_backend_request_guard());
     let send_result = req_builder.send().await;
-    // Release the pending-request slot the instant dispatch returns: the
-    // connection-wait phase is over once `send()` resolves (capacity obtained
-    // and the response has begun, or the dial failed). Dropping here — before
-    // response-body collection / eager buffering / response-inspection — keeps
-    // the gauge measuring connection-wait only, never the response lifetime.
-    // RAII covers all the early returns ABOVE this point (admission reject); this
-    // explicit drop covers the response-handling tail BELOW it. A no-cap /
-    // non-HTTP-1.1 dispatch holds `None` here, so the drop is a no-op.
+    // Release the in-flight slot the instant `send()` resolves — i.e. when
+    // RESPONSE HEADERS arrive (or the dial failed). This is the only join point
+    // reqwest exposes, so under the in-flight reinterpretation it IS the correct
+    // release point by definition (codex r3, finding 3): the slot spans dispatch
+    // → response-headers. Dropping here — before response-body collection /
+    // eager buffering / response-inspection — keeps the slot off the
+    // response-streaming lifetime. RAII covers all the early returns ABOVE this
+    // point (admission reject); this explicit drop covers the response-handling
+    // tail BELOW it. A no-cap / non-HTTP-1.1 dispatch holds `None`, so it no-ops.
     drop(pending_slot);
     let response = match send_result {
         Ok(response) => {

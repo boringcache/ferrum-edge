@@ -1,14 +1,28 @@
-//! Per-destination backend *pending-request* limiting for the HTTP/1.1
+//! Per-destination backend HTTP/1.1 *in-flight-request* limiting for the
 //! upstream-dispatch path.
 //!
 //! Enforces the Istio DestinationRule `connectionPool.http.http1MaxPendingRequests`
 //! cap (materialized onto
 //! `Upstream.port_overrides[port].http1_max_pending_requests`, see
-//! [`crate::config::types::UpstreamPortOverride`]) by bounding how many
-//! requests can be *simultaneously waiting on connection capacity* for a given
-//! backend destination. When the pending queue is full, the new request is shed
-//! immediately with a 503 ("upstream overflow" in Envoy terms) instead of being
-//! queued unboundedly.
+//! [`crate::config::types::UpstreamPortOverride`]).
+//!
+//! # Honest reinterpretation — max concurrent in-flight H1 requests
+//!
+//! Envoy's `http1MaxPendingRequests` bounds the depth of the *pending queue*:
+//! requests admitted but not yet assigned a connection slot. Ferrum dispatches
+//! HTTP/1.1 over reqwest, whose `send().await` resolves when **response
+//! headers** arrive — reqwest exposes **no connection-acquisition hook**, so a
+//! slot held acquire-before-send / release-after-send unavoidably spans
+//! connection-wait + request-upload + backend-TTFB, not the pending phase alone.
+//! True pending-queue depth is therefore not implementable over reqwest.
+//!
+//! Mirroring how this repo honestly reinterprets DR `maxRetries` as a
+//! per-request cap (see `docs/mesh.md`), this limiter reframes the knob as a
+//! **max concurrent in-flight HTTP/1.1 requests per `(host, port)`** cap,
+//! measured from dispatch to response-headers. When a destination is already at
+//! its cap, the new request is shed immediately with a 503 ("upstream overflow"
+//! in Envoy terms) instead of being queued unboundedly. This bounds H1
+//! concurrency to a destination and approximates Envoy's overflow protection.
 //!
 //! # Scope — HTTP/1.1 reqwest dispatch only
 //!
@@ -16,13 +30,15 @@
 //! **only on the reqwest/HTTP-1.1 backend-dispatch path** in
 //! `proxy_to_backend` (`src/proxy/mod.rs`), the path Ferrum uses for plain
 //! HTTP/1.1 upstreams (and the H1 fallback when a backend does not negotiate
-//! HTTP/2). It is acquired in the *pending-acquire phase* — immediately before
-//! the request is dispatched onto the shared reqwest client — and released by
-//! its RAII guard the moment dispatch returns (i.e. once the request has
-//! obtained connection capacity and the response has begun, or the dial has
-//! failed). That matches Envoy's pending-request gauge: a request is "pending"
-//! exactly while it is waiting for a connection slot, not for the lifetime of
-//! the response stream.
+//! HTTP/2 — including a backend the capability registry has classified
+//! H2/TLS-unsupported). It is acquired immediately before the request is
+//! dispatched onto the shared reqwest client and released by its RAII guard the
+//! moment dispatch returns (response headers arrived, or the dial failed). Under
+//! the in-flight reinterpretation that release point is correct by definition:
+//! the slot counts a request as in-flight from dispatch to response-headers, not
+//! for the lifetime of the response stream. Because every H1-determined dispatch
+//! is in-flight, there is **no body-shape exclusion** — bodyless GET/HEAD and
+//! streamed-upload requests are capped alike.
 //!
 //! The multiplexed transports — direct HTTP/2, gRPC, HTTP/3, HBONE, and
 //! mesh-mTLS — do **not** consume this limiter. They are not HTTP/1.1, and
@@ -37,6 +53,14 @@
 //! - When no cap is configured for a destination port (`cap == None`),
 //!   [`BackendPendingLimiter::try_acquire`] returns `Ok(None)` after a single
 //!   `Option` check and never touches the `DashMap`.
+//! - On the capped hit path the destination counter is looked up with a
+//!   **borrowed `&str`** key built into a reused thread-local buffer (mirroring
+//!   `backend_capabilities` / `pool` / `api_chargeback`): the `DashMap` is keyed
+//!   by a flat `host|port` `String`, and `DashMap::get` accepts `&str` via
+//!   `String: Borrow<str>`, so a repeat request to a known destination allocates
+//!   nothing. Only the cold first request to a new destination allocates the
+//!   owned key for the `entry` insert. This satisfies the hot-path no-alloc
+//!   contract (the previous `host.to_string()` probe allocated per request).
 //! - The counter map is a sharded [`dashmap::DashMap`] sized via
 //!   [`crate::util::sharding::pool_shard_amount`]; counters are
 //!   [`crossbeam_utils::CachePadded`] so a hot destination's count does not
@@ -44,8 +68,8 @@
 //! - Acquisition uses a compare-exchange CAS loop so two concurrent requests
 //!   can never both squeak past `cap - 1`.
 //! - [`BackendPendingGuard`]'s `Drop` decrements exactly once on every dispatch
-//!   exit (success, early return, error, task cancellation), so a pending slot
-//!   can never leak and wedge a destination.
+//!   exit (success, early return, error, task cancellation), so an in-flight
+//!   slot can never leak and wedge a destination.
 //!
 //! The implementation is deliberately a counting gate (a `CachePadded` atomic
 //! with a try-increment CAS), not a `tokio::sync::Semaphore`: a semaphore would
@@ -54,30 +78,47 @@
 //! `Arc<Semaphore>` would need the same `DashMap` plumbing anyway. The atomic
 //! counter gives lock-free, alloc-free try-acquire/reject on the request path.
 
+use std::cell::RefCell;
+use std::fmt::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crossbeam_utils::CachePadded;
 use dashmap::DashMap;
 
-/// `(host, port)` identity for a backend destination. Owned `String` host so
-/// the key survives DNS-cache-refreshed connect attempts and target rotation
-/// without reborrowing from the `Proxy`/`UpstreamTarget` it came from.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct BackendPendingKey {
-    host: String,
-    port: u16,
+thread_local! {
+    /// Reused per-thread buffer for `(host, port)` counter-key lookups on the
+    /// capped hot path. Mirrors the zero-allocation strategy of
+    /// `backend_capabilities` / `pool` / `api_chargeback` so a repeat capped
+    /// request to a known destination allocates nothing.
+    static PENDING_KEY_BUF: RefCell<String> = RefCell::new(String::with_capacity(96));
+}
+
+/// Build the flat `host|port` counter-key for a destination into `buf`. `|` is
+/// the codebase's pool-key delimiter; a bare host never contains it, so the
+/// flat key is unambiguous and round-trips the `(host, port)` identity.
+#[inline]
+fn write_pending_key(buf: &mut String, host: &str, port: u16) {
+    buf.push_str(host);
+    buf.push('|');
+    let _ = write!(buf, "{port}");
 }
 
 /// Shared per-destination pending-request counter map.
 ///
+/// Keyed by a flat `host|port` `String` (an owned key survives DNS-cache
+/// refreshes and target rotation without reborrowing from the
+/// `Proxy`/`UpstreamTarget`) and looked up on the hit path by borrowed `&str`
+/// via `String: Borrow<str>`, so the capped hot path allocates nothing on a
+/// repeat request.
+///
 /// One instance lives on `ProxyState` and is shared across every reqwest/H1
-/// dispatch for the gateway lifetime, so the cap bounds concurrent pending
+/// dispatch for the gateway lifetime, so the cap bounds concurrent in-flight
 /// requests per `(host, port)` across all proxies that dial the same
 /// destination — matching how the cap is materialized per upstream destination
 /// port rather than per proxy.
 pub struct BackendPendingLimiter {
-    inner: Arc<DashMap<BackendPendingKey, Arc<CachePadded<AtomicU64>>>>,
+    inner: Arc<DashMap<String, Arc<CachePadded<AtomicU64>>>>,
 }
 
 impl Default for BackendPendingLimiter {
@@ -105,34 +146,38 @@ impl BackendPendingLimiter {
     }
 
     /// Look up or insert the counter for a destination, returning a cheap `Arc`
-    /// handle. Two-phase: a cheap read first, falling back to the entry API
-    /// only on the (cold) first request to a new destination.
+    /// handle. Two-phase: a borrowed-`&str` read first (the flat key is built
+    /// into a reused thread-local buffer, so the hit path allocates nothing),
+    /// falling back to the owned-key entry API only on the (cold) first request
+    /// to a new destination.
     fn counter_for(&self, host: &str, port: u16) -> Arc<CachePadded<AtomicU64>> {
-        if let Some(existing) = self.inner.get(&BackendPendingKey {
-            host: host.to_string(),
-            port,
-        }) {
-            return existing.clone();
-        }
-        self.inner
-            .entry(BackendPendingKey {
-                host: host.to_string(),
-                port,
-            })
-            .or_insert_with(|| Arc::new(CachePadded::new(AtomicU64::new(0))))
-            .clone()
+        PENDING_KEY_BUF.with(|buf| {
+            let mut buf = buf.borrow_mut();
+            buf.clear();
+            write_pending_key(&mut buf, host, port);
+            // Hit path: borrowed `&str` lookup (`String: Borrow<str>`), no alloc.
+            if let Some(existing) = self.inner.get(buf.as_str()) {
+                return existing.clone();
+            }
+            // Cold path: a new destination — allocate the owned key once.
+            self.inner
+                .entry(buf.clone())
+                .or_insert_with(|| Arc::new(CachePadded::new(AtomicU64::new(0))))
+                .clone()
+        })
     }
 
-    /// Try to acquire one pending-request slot for `(host, port)`.
+    /// Try to acquire one in-flight slot for `(host, port)`.
     ///
     /// * `Ok(None)` — no cap configured (`cap` is `None`). Hot path: a single
     ///   `Option` check, no `DashMap` touch, no counter held. The caller
     ///   dispatches unconditionally.
     /// * `Ok(Some(guard))` — a slot was reserved. The returned guard's `Drop`
-    ///   releases it. The caller holds the guard only for the connection-pending
-    ///   phase (until backend dispatch returns).
-    /// * `Err(BackendPendingLimitExceeded)` — the pending queue is full. The
-    ///   caller sheds the request with a 503 ("upstream overflow").
+    ///   releases it. The caller holds the guard only for the in-flight window
+    ///   (dispatch until backend `send()` returns / response headers arrive).
+    /// * `Err(BackendPendingLimitExceeded)` — the destination is at its
+    ///   in-flight cap. The caller sheds the request with a 503 ("upstream
+    ///   overflow").
     ///
     /// `cap == Some(0)` always rejects. A `http1MaxPendingRequests: 0`
     /// DestinationRule is rejected at translate time, so production never sees
@@ -170,24 +215,27 @@ impl BackendPendingLimiter {
         }
     }
 
-    /// Current pending count for a destination. Test/metrics only — the hot
+    /// Current in-flight count for a destination. Test/metrics only — the hot
     /// path uses `try_acquire` directly.
     #[allow(dead_code)]
     pub fn current(&self, host: &str, port: u16) -> u64 {
-        self.inner
-            .get(&BackendPendingKey {
-                host: host.to_string(),
-                port,
-            })
-            .map(|c| c.load(Ordering::Relaxed))
-            .unwrap_or(0)
+        PENDING_KEY_BUF.with(|buf| {
+            let mut buf = buf.borrow_mut();
+            buf.clear();
+            write_pending_key(&mut buf, host, port);
+            self.inner
+                .get(buf.as_str())
+                .map(|c| c.load(Ordering::Relaxed))
+                .unwrap_or(0)
+        })
     }
 }
 
-/// RAII guard that holds one pending-request slot for a destination and
-/// releases it on drop. Hold this only for the connection-pending phase (until
-/// backend dispatch returns) so the count reflects requests *waiting on
-/// connection capacity*, not the full response-stream lifetime.
+/// RAII guard that holds one in-flight slot for a destination and releases it
+/// on drop. Hold this only for the in-flight window (dispatch until backend
+/// `send()` returns / response headers arrive) so the count reflects requests
+/// *currently in flight to the destination*, not the full response-stream
+/// lifetime.
 #[derive(Debug)]
 pub struct BackendPendingGuard {
     counter: Arc<CachePadded<AtomicU64>>,
