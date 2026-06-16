@@ -507,6 +507,8 @@ fn workload_endpoint_key(workload: &Workload) -> WorkloadEndpointKey {
         spiffe_id: workload.spiffe_id.as_str().to_string(),
         namespace: workload.namespace.clone(),
         service_name: workload.service_name.clone(),
+        cluster: workload.cluster.clone(),
+        network: workload.network.clone(),
         addresses,
         ports,
     }
@@ -533,6 +535,8 @@ struct WorkloadEndpointKey {
     spiffe_id: String,
     namespace: String,
     service_name: String,
+    cluster: Option<String>,
+    network: Option<String>,
     addresses: Vec<String>,
     ports: Vec<(u16, AppProtocol, Option<String>)>,
 }
@@ -1806,6 +1810,81 @@ mod tests {
         assert_eq!(workloads.len(), 2);
         assert_eq!(workloads[0].addresses, vec!["10.1.0.1".to_string()]);
         assert_eq!(workloads[1].addresses, vec!["10.9.9.9".to_string()]);
+    }
+
+    #[test]
+    fn merge_keeps_same_remote_endpoint_on_distinct_networks() {
+        let remote_spiffe = "spiffe://remote.local/ns/default/sa/shared";
+        let remote_workload = |cluster: &str, network: &str| Workload {
+            cluster: Some(cluster.to_string()),
+            network: Some(network.to_string()),
+            locality: Some(default_remote_locality(cluster, Some(network))),
+            ..workload(remote_spiffe, "reviews", "10.9.9.9", None)
+        };
+        let mut clusters = HashMap::new();
+        clusters.insert(
+            "east".to_string(),
+            RemoteClusterEntry::new(
+                "east".to_string(),
+                td("remote.local"),
+                Some("net-a".to_string()),
+                Some("https://cp-east.remote.example:15010".to_string()),
+                RemoteClusterEndpoints {
+                    workloads: vec![remote_workload("east", "net-a")],
+                    services: vec![],
+                },
+                1,
+            ),
+        );
+        clusters.insert(
+            "west".to_string(),
+            RemoteClusterEntry::new(
+                "west".to_string(),
+                td("remote.local"),
+                Some("net-b".to_string()),
+                Some("https://cp-west.remote.example:15010".to_string()),
+                RemoteClusterEndpoints {
+                    workloads: vec![remote_workload("west", "net-b")],
+                    services: vec![],
+                },
+                1,
+            ),
+        );
+        let snapshot = RemoteEndpointSnapshot { clusters };
+        let candidate = MultiClusterConfig {
+            remote_clusters: vec![
+                RemoteCluster {
+                    name: "east".to_string(),
+                    trust_domain: td("remote.local"),
+                    network: Some("net-a".to_string()),
+                    control_plane_url: Some("https://cp-east.remote.example:15010".to_string()),
+                    federation_endpoint: None,
+                },
+                RemoteCluster {
+                    name: "west".to_string(),
+                    trust_domain: td("remote.local"),
+                    network: Some("net-b".to_string()),
+                    control_plane_url: Some("https://cp-west.remote.example:15010".to_string()),
+                    federation_endpoint: None,
+                },
+            ],
+            ..MultiClusterConfig::default()
+        };
+
+        let (workloads, _) =
+            merge_remote_endpoints_into_mesh(&[], &[], &snapshot, Some(&candidate));
+
+        assert_eq!(
+            workloads.len(),
+            2,
+            "same address/SPIFFE endpoints from distinct networks must not collapse"
+        );
+        let networks: HashSet<_> = workloads
+            .iter()
+            .filter_map(|workload| workload.network.as_deref())
+            .collect();
+        assert!(networks.contains("net-a"));
+        assert!(networks.contains("net-b"));
     }
 
     #[test]
