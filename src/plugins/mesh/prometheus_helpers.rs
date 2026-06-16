@@ -1,6 +1,7 @@
 //! Prometheus helpers for Istio/GAMMA-style mesh metrics.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -732,35 +733,46 @@ pub fn render_mesh_histogram(
     key: &MeshRequestKey,
     histogram: &HistogramBuckets,
 ) {
+    let base_labels = mesh_label_base_fragment(key);
     for (i, boundary) in histogram.boundaries.iter().enumerate() {
-        let le = boundary.to_string();
-        let labels = mesh_label_fragment(key, Some(&le));
         let count = histogram.counts[i].load(Ordering::Relaxed);
-        output.push_str(&format!(
-            "ferrum_mesh_request_duration_ms_bucket{{{}}} {}\n",
-            labels, count
-        ));
+        let _ = writeln!(
+            output,
+            "ferrum_mesh_request_duration_ms_bucket{{{},le=\"{}\"}} {}",
+            base_labels, boundary, count
+        );
     }
     let total_count = histogram.count.load(Ordering::Relaxed);
-    let labels = mesh_label_fragment(key, Some("+Inf"));
-    output.push_str(&format!(
-        "ferrum_mesh_request_duration_ms_bucket{{{}}} {}\n",
-        labels, total_count
-    ));
-    let labels = mesh_label_fragment(key, None);
+    let _ = writeln!(
+        output,
+        "ferrum_mesh_request_duration_ms_bucket{{{},le=\"+Inf\"}} {}",
+        base_labels, total_count
+    );
     let sum = f64::from_bits(histogram.sum.load(Ordering::Relaxed));
-    output.push_str(&format!(
-        "ferrum_mesh_request_duration_ms_sum{{{}}} {:.2}\n",
-        labels, sum
-    ));
-    output.push_str(&format!(
-        "ferrum_mesh_request_duration_ms_count{{{}}} {}\n",
-        labels, total_count
-    ));
+    let _ = writeln!(
+        output,
+        "ferrum_mesh_request_duration_ms_sum{{{}}} {:.2}",
+        base_labels, sum
+    );
+    let _ = writeln!(
+        output,
+        "ferrum_mesh_request_duration_ms_count{{{}}} {}",
+        base_labels, total_count
+    );
 }
 
 pub fn mesh_label_fragment(key: &MeshRequestKey, le: Option<&str>) -> String {
-    let mut labels = format!(
+    let mut labels = mesh_label_base_fragment(key);
+    if let Some(le) = le {
+        let _ = write!(labels, ",le=\"{}\"", le);
+    }
+    labels
+}
+
+fn mesh_label_base_fragment(key: &MeshRequestKey) -> String {
+    let mut labels = String::with_capacity(512);
+    let _ = write!(
+        labels,
         "source_workload=\"{}\",source_namespace=\"{}\",source_principal=\"{}\",source_app=\"{}\",source_service=\"{}\",destination_workload=\"{}\",destination_namespace=\"{}\",destination_principal=\"{}\",destination_app=\"{}\",destination_service=\"{}\",request_protocol=\"{}\",response_code=\"{}\",response_flags=\"{}\",connection_security_policy=\"{}\"",
         escape_label_value(&key.source_workload),
         escape_label_value(&key.source_namespace),
@@ -777,9 +789,6 @@ pub fn mesh_label_fragment(key: &MeshRequestKey, le: Option<&str>) -> String {
         escape_label_value(&key.response_flags),
         escape_label_value(&key.connection_security_policy)
     );
-    if let Some(le) = le {
-        labels.push_str(&format!(",le=\"{}\"", le));
-    }
     labels
 }
 

@@ -8,10 +8,12 @@
 //! The node agent does NOT run proxy listeners. Traffic capture is its sole
 //! responsibility.
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::{Arc, LazyLock};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use dashmap::DashMap;
 use futures_util::StreamExt;
@@ -46,6 +48,13 @@ const DEFAULT_CGROUP_ROOT: &str = "/sys/fs/cgroup";
 const DEFAULT_BPF_FS_PATH: &str = "/sys/fs/bpf";
 const DEFAULT_FALLBACK_MODE: &str = "fail";
 const CNI_METADATA_FETCH_TIMEOUT: Duration = Duration::from_millis(750);
+const POD_ENROLLMENT_RETRY_BACKOFF: Duration = Duration::from_secs(30);
+
+static FAILED_POD_ENROLLMENT_ATTEMPTS: LazyLock<DashMap<String, FailedPodEnrollmentAttempt>> =
+    LazyLock::new(DashMap::new);
+static WORKLOAD_IDENTITY_RECONCILE_FINGERPRINTS: LazyLock<
+    DashMap<String, CgroupTreeChangeFingerprint>,
+> = LazyLock::new(DashMap::new);
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -1183,6 +1192,165 @@ pub struct PodEvent<'a> {
     pub veth_iface_override: Option<&'a str>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PodEnrollmentAttemptSignature {
+    namespace: String,
+    service_account: Option<String>,
+    pod_ip: Option<std::net::Ipv4Addr>,
+    cgroup_path: Option<String>,
+    veth_iface: Option<String>,
+    labels_fingerprint: u64,
+    annotations_fingerprint: u64,
+}
+
+#[derive(Debug, Clone)]
+struct FailedPodEnrollmentAttempt {
+    signature: PodEnrollmentAttemptSignature,
+    last_attempt: Instant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CgroupTreeChangeFingerprint {
+    root_inode: Option<u64>,
+    root_modified_nanos: Option<u128>,
+    child_count: usize,
+    child_hash: u64,
+}
+
+fn pod_state_key(pod_states: &DashMap<String, PodAttachmentState>, pod_uid: &str) -> String {
+    format!("{:p}:{pod_uid}", pod_states)
+}
+
+fn map_fingerprint(map: &HashMap<String, String>) -> u64 {
+    let mut entries: Vec<_> = map.iter().collect();
+    entries.sort_unstable_by(|(left_key, _), (right_key, _)| left_key.cmp(right_key));
+    let mut hasher = DefaultHasher::new();
+    for (key, value) in entries {
+        key.hash(&mut hasher);
+        value.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+fn pod_enrollment_attempt_signature(
+    event: &PodEvent<'_>,
+    pod_ip: Option<std::net::Ipv4Addr>,
+    cgroup_path: &Option<String>,
+    veth_iface: &Option<String>,
+) -> PodEnrollmentAttemptSignature {
+    PodEnrollmentAttemptSignature {
+        namespace: event.namespace.to_string(),
+        service_account: event.service_account.map(ToOwned::to_owned),
+        pod_ip,
+        cgroup_path: cgroup_path.clone(),
+        veth_iface: veth_iface.clone(),
+        labels_fingerprint: map_fingerprint(event.labels),
+        annotations_fingerprint: map_fingerprint(event.annotations),
+    }
+}
+
+fn recently_failed_pod_enrollment(
+    state_key: &str,
+    signature: &PodEnrollmentAttemptSignature,
+) -> bool {
+    let Some(previous) = FAILED_POD_ENROLLMENT_ATTEMPTS.get(state_key) else {
+        return false;
+    };
+    if &previous.value().signature != signature {
+        return false;
+    }
+    if previous.last_attempt.elapsed() >= POD_ENROLLMENT_RETRY_BACKOFF {
+        drop(previous);
+        FAILED_POD_ENROLLMENT_ATTEMPTS.remove(state_key);
+        return false;
+    }
+    true
+}
+
+fn remember_failed_pod_enrollment(state_key: &str, signature: PodEnrollmentAttemptSignature) {
+    FAILED_POD_ENROLLMENT_ATTEMPTS.insert(
+        state_key.to_string(),
+        FailedPodEnrollmentAttempt {
+            signature,
+            last_attempt: Instant::now(),
+        },
+    );
+}
+
+fn forget_failed_pod_enrollment(state_key: &str) {
+    FAILED_POD_ENROLLMENT_ATTEMPTS.remove(state_key);
+}
+
+fn forget_pod_enrollment_attempt(state_key: &str) {
+    FAILED_POD_ENROLLMENT_ATTEMPTS.remove(state_key);
+    WORKLOAD_IDENTITY_RECONCILE_FINGERPRINTS.remove(state_key);
+}
+
+fn cgroup_tree_change_fingerprint(cgroup_path: &str) -> Option<CgroupTreeChangeFingerprint> {
+    let path = std::path::Path::new(cgroup_path);
+    let metadata = std::fs::metadata(path).ok()?;
+    if !metadata.is_dir() {
+        return None;
+    }
+
+    let mut children = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            if !entry.file_type().map(|kind| kind.is_dir()).unwrap_or(true) {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let inode = std::fs::metadata(entry.path())
+                .ok()
+                .and_then(|metadata| metadata_inode(&metadata));
+            children.push((name, inode));
+        }
+    }
+    children.sort_unstable();
+
+    let mut hasher = DefaultHasher::new();
+    for child in &children {
+        child.hash(&mut hasher);
+    }
+
+    Some(CgroupTreeChangeFingerprint {
+        root_inode: metadata_inode(&metadata),
+        root_modified_nanos: metadata
+            .modified()
+            .ok()
+            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_nanos()),
+        child_count: children.len(),
+        child_hash: hasher.finish(),
+    })
+}
+
+#[cfg(unix)]
+fn metadata_inode(metadata: &std::fs::Metadata) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+
+    Some(metadata.ino())
+}
+
+#[cfg(not(unix))]
+fn metadata_inode(_metadata: &std::fs::Metadata) -> Option<u64> {
+    None
+}
+
+fn workload_identity_tree_unchanged(state_key: &str, cgroup_path: &str) -> bool {
+    let Some(fingerprint) = cgroup_tree_change_fingerprint(cgroup_path) else {
+        return false;
+    };
+    if WORKLOAD_IDENTITY_RECONCILE_FINGERPRINTS
+        .get(state_key)
+        .is_some_and(|previous| previous.value() == &fingerprint)
+    {
+        return true;
+    }
+    WORKLOAD_IDENTITY_RECONCILE_FINGERPRINTS.insert(state_key.to_string(), fingerprint);
+    false
+}
+
 /// Reject a `pod_uid` that could escape the registry directory. A pod UID is a
 /// Kubernetes-assigned value; treating it as a path component without checks
 /// would let an empty, slash-, backslash-, or `..`-bearing value write or
@@ -1294,6 +1462,7 @@ fn handle_pod_added(
     event: &PodEvent<'_>,
 ) {
     let (pod_uid, pod_name, namespace) = (event.pod_uid, event.pod_name, event.namespace);
+    let state_key = pod_state_key(pod_states, pod_uid);
     let decision = pod_watcher::evaluate_enrollment(
         event.labels,
         event.annotations,
@@ -1301,6 +1470,7 @@ fn handle_pod_added(
         &config.excluded_namespaces,
     );
     if decision != EnrollmentDecision::Enroll {
+        forget_pod_enrollment_attempt(&state_key);
         if pod_states.contains_key(pod_uid) {
             handle_pod_removed(backend, pod_states, config, metrics, pod_uid);
         }
@@ -1344,6 +1514,7 @@ fn handle_pod_added(
             reconcile_existing_pod_workload_identity(
                 backend,
                 config,
+                &state_key,
                 pod_uid,
                 namespace,
                 event.service_account,
@@ -1352,6 +1523,16 @@ fn handle_pod_added(
             debug!(pod_uid, pod_name, "Pod already enrolled, reconciled state");
             return;
         }
+    }
+
+    let attempt_signature =
+        pod_enrollment_attempt_signature(event, pod_ip, &cgroup_path, &veth_iface);
+    if recently_failed_pod_enrollment(&state_key, &attempt_signature) {
+        debug!(
+            pod_uid,
+            pod_name, namespace, "Skipping repeated pod enrollment attempt during retry backoff"
+        );
+        return;
     }
 
     let mut state = PodAttachmentState {
@@ -1428,6 +1609,7 @@ fn handle_pod_added(
                 );
                 metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
                 cleanup_partial_pod_enrollment(backend, pod_uid, &state);
+                remember_failed_pod_enrollment(&state_key, attempt_signature);
                 return;
             };
 
@@ -1435,6 +1617,7 @@ fn handle_pod_added(
                 warn!(pod_uid, iface, error = %e, "Failed to attach tc program");
                 metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
                 cleanup_partial_pod_enrollment(backend, pod_uid, &state);
+                remember_failed_pod_enrollment(&state_key, attempt_signature);
                 return;
             }
             if let Some(ip) = pod_ip {
@@ -1446,6 +1629,7 @@ fn handle_pod_added(
                     warn!(pod_uid, %ip, error = %e, "Failed to update pod IP map");
                     metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
                     cleanup_partial_pod_enrollment(backend, pod_uid, &state);
+                    remember_failed_pod_enrollment(&state_key, attempt_signature);
                     return;
                 }
             }
@@ -1462,6 +1646,7 @@ fn handle_pod_added(
             );
         } else {
             cleanup_partial_pod_enrollment(backend, pod_uid, &state);
+            remember_failed_pod_enrollment(&state_key, attempt_signature);
         }
     } else {
         warn!(
@@ -1469,10 +1654,15 @@ fn handle_pod_added(
             pod_name, "Could not resolve cgroup path, skipping attachment"
         );
         metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
+        remember_failed_pod_enrollment(&state_key, attempt_signature);
         return;
     }
 
     if state.attached {
+        forget_failed_pod_enrollment(&state_key);
+        if let Some(cgroup_path_value) = state.cgroup_path.as_deref() {
+            let _ = workload_identity_tree_unchanged(&state_key, cgroup_path_value);
+        }
         pod_states.insert(pod_uid.to_string(), state);
         // Publish to the in-netns capture registry only AFTER enrollment fully
         // succeeded (programs attached, pod-IP + identity written), so a failed
@@ -1727,6 +1917,7 @@ fn reconcile_existing_pod_include_ports(
 fn reconcile_existing_pod_workload_identity(
     backend: &mut dyn EbpfBackend,
     config: &NodeAgentConfig,
+    state_key: &str,
     pod_uid: &str,
     namespace: &str,
     service_account: Option<&str>,
@@ -1735,6 +1926,11 @@ fn reconcile_existing_pod_workload_identity(
     let Some(cgroup_path) = state.cgroup_path.clone() else {
         return;
     };
+    if !state.workload_identity_cgroup_ids.is_empty()
+        && workload_identity_tree_unchanged(state_key, &cgroup_path)
+    {
+        return;
+    }
     let current = cgroup::collect_cgroup_tree_inodes(std::path::Path::new(&cgroup_path));
     if current.is_empty() {
         return;
@@ -1821,6 +2017,8 @@ pub fn handle_pod_removed(
     metrics: &NodeAgentMetrics,
     pod_uid: &str,
 ) {
+    let state_key = pod_state_key(pod_states, pod_uid);
+    forget_pod_enrollment_attempt(&state_key);
     // Drop this pod's per-pod registry entry (if publishing is enabled) so the
     // mesh proxy's in-netns capture listeners stop discovering a torn-down pod.
     // Best-effort and independent of whether the pod was actually attached: a
@@ -3284,6 +3482,79 @@ mod tests {
         assert!(!state.workload_identity_cgroup_ids.contains(&container1_ino));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn reconcile_skips_workload_identity_walk_when_cgroup_fingerprint_unchanged() {
+        let _veth_guard = crate::ebpf::veth::tests::TestOverrideGuard::new("veth_test");
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+
+        let cgroup_root = tempfile::tempdir().unwrap();
+        let pod_uid = "22222222-2222-2222-2222-222222222222";
+        let pod_cgroup = cgroup_root.path().join(format!("kubepods/pod{pod_uid}"));
+        let container1 = pod_cgroup.join("crio-aaaa.scope");
+        std::fs::create_dir_all(&container1).unwrap();
+
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: cgroup_root.path().to_string_lossy().to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        };
+        let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+        let event = PodEvent {
+            pod_uid,
+            pod_name: "test-pod",
+            namespace: "default",
+            service_account: Some("api"),
+            labels: &labels,
+            annotations: &HashMap::new(),
+            pod_ip_str: Some("10.0.0.5"),
+            pod_pid: None,
+            veth_iface_override: Some("veth-mock"),
+        };
+
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+        let identity_ops_after_enroll = backend
+            .operations
+            .iter()
+            .filter(|op| op.starts_with("update_workload_identity:"))
+            .count();
+        assert!(identity_ops_after_enroll >= 2);
+
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+        let identity_ops_after_unchanged_apply = backend
+            .operations
+            .iter()
+            .filter(|op| op.starts_with("update_workload_identity:"))
+            .count();
+        assert_eq!(
+            identity_ops_after_unchanged_apply, identity_ops_after_enroll,
+            "unchanged Apply must skip the deep cgroup-tree identity reconcile"
+        );
+
+        let container2 = pod_cgroup.join("crio-bbbb.scope");
+        std::fs::create_dir_all(&container2).unwrap();
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+
+        let identity_ops_after_changed_apply = backend
+            .operations
+            .iter()
+            .filter(|op| op.starts_with("update_workload_identity:"))
+            .count();
+        assert!(
+            identity_ops_after_changed_apply > identity_ops_after_unchanged_apply,
+            "new container cgroup must still trigger workload identity reconciliation"
+        );
+    }
+
     #[test]
     fn handle_pod_added_missing_cgroup_does_not_poison_state() {
         let mut backend = MockEbpfBackend::default();
@@ -3317,6 +3588,99 @@ mod tests {
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
 
         assert!(!pod_states.contains_key("pod-uid-1"));
+        assert_eq!(metrics.attach_errors.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn handle_pod_added_repeated_missing_cgroup_is_backed_off_but_late_cgroup_retries() {
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let cgroup_root = tempfile::tempdir().unwrap();
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: cgroup_root.path().to_string_lossy().to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        };
+        let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+        let event = PodEvent {
+            pod_uid: "pod-uid-1",
+            pod_name: "test-pod",
+            namespace: "default",
+            service_account: None,
+            labels: &labels,
+            annotations: &HashMap::new(),
+            pod_ip_str: Some("10.0.0.5"),
+            pod_pid: None,
+            veth_iface_override: Some("veth-mock"),
+        };
+
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+        assert_eq!(
+            metrics.attach_errors.load(Ordering::Relaxed),
+            1,
+            "unchanged failed Apply should not inflate attach_errors during backoff"
+        );
+
+        std::fs::create_dir_all(cgroup_root.path().join("kubepods/podpod-uid-1")).unwrap();
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+
+        assert!(pod_states.contains_key("pod-uid-1"));
+        assert_eq!(metrics.pods_enrolled.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn handle_pod_added_repeated_missing_veth_skips_bpf_attach_retry() {
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let cgroup_root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(cgroup_root.path().join("kubepods/podpod-uid-1")).unwrap();
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: cgroup_root.path().to_string_lossy().to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        };
+        let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+        let event = PodEvent {
+            pod_uid: "pod-uid-1",
+            pod_name: "test-pod",
+            namespace: "default",
+            service_account: None,
+            labels: &labels,
+            annotations: &HashMap::new(),
+            pod_ip_str: Some("10.0.0.5"),
+            pod_pid: None,
+            veth_iface_override: None,
+        };
+
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+        let cgroup_attachments_after_first = backend.cgroup_attachments.len();
+        assert!(cgroup_attachments_after_first > 0);
+        assert_eq!(metrics.attach_errors.load(Ordering::Relaxed), 1);
+
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+
+        assert_eq!(
+            backend.cgroup_attachments.len(),
+            cgroup_attachments_after_first,
+            "unchanged failed Apply should not retry cgroup attaches during backoff"
+        );
         assert_eq!(metrics.attach_errors.load(Ordering::Relaxed), 1);
     }
 

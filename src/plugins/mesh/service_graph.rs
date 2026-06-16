@@ -23,8 +23,16 @@ pub fn global_service_graph() -> &'static ServiceGraphRegistry {
 }
 
 pub fn record_transaction(summary: &TransactionSummary) {
+    let mesh_key = mesh_request_key(summary);
+    record_transaction_with_mesh_key(summary, mesh_key.as_ref());
+}
+
+pub fn record_transaction_with_mesh_key(
+    summary: &TransactionSummary,
+    mesh_key: Option<&MeshRequestKey>,
+) {
     GLOBAL_SERVICE_GRAPH.ensure_snapshot_worker();
-    GLOBAL_SERVICE_GRAPH.record_transaction(summary);
+    GLOBAL_SERVICE_GRAPH.record_transaction_with_mesh_key(summary, mesh_key);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -135,10 +143,19 @@ impl Drop for SnapshotWorkerGuard {
 
 impl ServiceGraphRegistry {
     pub fn record_transaction(&self, summary: &TransactionSummary) {
+        let mesh_key = mesh_request_key(summary);
+        self.record_transaction_with_mesh_key(summary, mesh_key.as_ref());
+    }
+
+    pub fn record_transaction_with_mesh_key(
+        &self,
+        summary: &TransactionSummary,
+        mesh_key: Option<&MeshRequestKey>,
+    ) {
         if summary.mirror {
             return;
         }
-        let Some(mesh_key) = mesh_request_key(summary) else {
+        let Some(mesh_key) = mesh_key else {
             return;
         };
         let now_unix_ms = now_unix_ms();
