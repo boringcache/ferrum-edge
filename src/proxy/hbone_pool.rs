@@ -628,9 +628,9 @@ impl HboneConnectionPool {
     /// before the dial. Distinct from [`Self::get_tunnel`], which hardcodes the
     /// `hbone` marker on the pooled byte-stream path.
     //
-    // The only caller is the mesh UDP capture egress path, which is Linux-only
-    // (`IP_TRANSPARENT`); silence the dead-code warning on non-Linux builds.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    // Callers: the mesh UDP capture egress datapath (Linux-only, `IP_TRANSPARENT`)
+    // AND the cross-platform UDP capability probe ([`Self::warmup_datagram_connection`]),
+    // so this is reachable on every platform.
     pub async fn get_datagram_tunnel(
         &self,
         proxy: &Proxy,
@@ -679,6 +679,41 @@ impl HboneConnectionPool {
                 proxy.backend_connect_timeout_ms
             ),
         })?
+    }
+
+    /// Capability probe for a UDP egress target: open a `udp`-marked
+    /// datagram-over-HBONE CONNECT exactly as [`Self::get_datagram_tunnel`]
+    /// would, then DROP the tunnel. A UDP egress target's destination relay
+    /// branches on the `udp` marker (`is_udp_hbone_connect`) and unframes the
+    /// stream into a local `UdpSocket`; probing it with the byte-stream
+    /// [`Self::warmup_connection`] (which stamps the `hbone` marker) hits the
+    /// WRONG relay on the destination — the byte-stream path that TCP-connects
+    /// to the app port — so the probe must carry the SAME `udp` marker the
+    /// dispatch datapath uses, or it would prove the wrong capability (codex r1
+    /// P1). Like the dispatch path this dials its OWN H2 connection (no pooled
+    /// `hbone`-vs-`udp` marker ambiguity); the connection is dropped with the
+    /// tunnel when the probe returns.
+    pub async fn warmup_datagram_connection(
+        &self,
+        proxy: &Proxy,
+        target_host: &str,
+        target_port: u16,
+        hbone_port: u16,
+        expected_peer: Option<&crate::identity::SpiffeId>,
+    ) -> Result<(), HbonePoolError> {
+        // dial_host == app_host == target_host (mirrors the egress datapath,
+        // which dials the peer pod IP and CONNECTs to that same app addr:port).
+        let _tunnel = self
+            .get_datagram_tunnel(
+                proxy,
+                target_host,
+                hbone_port,
+                target_host,
+                target_port,
+                expected_peer,
+            )
+            .await?;
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]

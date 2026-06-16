@@ -344,6 +344,13 @@ pub async fn start_mesh_udp_capture_listener(
 #[cfg(target_os = "linux")]
 const EGRESS_CHANNEL_DEPTH: usize = 1024;
 
+/// Monotonic, process-wide generator of per-session identity tokens. Stamped on
+/// every admitted session and re-checked at teardown so a task only ever removes
+/// ITS OWN map entry. Wraparound is a non-issue: a `u64` at any realistic admit
+/// rate never recycles a live token within one session's lifetime.
+#[cfg(target_os = "linux")]
+static NEXT_SESSION_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Per-(client, orig-dst) capture session (Stage 4). `last_activity` is
 /// monotonic millis from [`crate::socket_opts::monotonic_now_ms`] (never goes
 /// backwards under NTP slew, so idle expiry always fires). `tx` hands captured
@@ -354,6 +361,13 @@ const EGRESS_CHANNEL_DEPTH: usize = 1024;
 #[cfg(target_os = "linux")]
 struct CaptureSession {
     last_activity: u64,
+    /// Unique identity token for THIS session, stamped at admit from
+    /// [`NEXT_SESSION_ID`]. The egress task removes its own map entry only when
+    /// the stored token still matches (`remove_if`), so a replacement session
+    /// admitted in the gap between the idle sweep dropping this entry's `tx` and
+    /// this task observing the closed channel is never clobbered (codex r1 P2:
+    /// remove-after-replace race).
+    session_id: u64,
     /// Egress channel to the per-session task. `None` for a session whose
     /// orig-dst matched no routable `mesh_udp_egress` entry — but such flows are
     /// never inserted (they drop without a session), so in practice this is
@@ -427,7 +441,11 @@ fn handle_captured_datagram(
         resolve_entry,
     ) {
         SessionAdmission::Refreshed => true,
-        SessionAdmission::Admitted { entry, rx } => {
+        SessionAdmission::Admitted {
+            entry,
+            rx,
+            session_id,
+        } => {
             // Spawn the per-session egress task (tunnel dial + return path); the
             // session's `tx` (already inserted by the bookkeeping above) feeds it.
             spawn_udp_egress_session(
@@ -435,6 +453,7 @@ fn handle_captured_datagram(
                 sessions.clone(),
                 active_sessions.clone(),
                 key,
+                session_id,
                 entry,
                 rx,
             );
@@ -451,10 +470,13 @@ enum SessionAdmission {
     /// (or dropped-on-full, which still counts as "accounted" for the flow).
     Refreshed,
     /// A NEW routable flow was admitted: the caller must spawn the egress task
-    /// driven by `rx`, relaying to `entry`'s LB-selected workload.
+    /// driven by `rx`, relaying to `entry`'s LB-selected workload. `session_id`
+    /// is the unique token stamped on the inserted map entry, handed to the task
+    /// so its teardown only removes its own entry (`remove_if`).
     Admitted {
         entry: std::sync::Arc<crate::router_cache::MeshTcpEgressEntry>,
         rx: tokio::sync::mpsc::Receiver<bytes::Bytes>,
+        session_id: u64,
     },
     /// The datagram was dropped (not routable, or the session cap was reached).
     Dropped,
@@ -539,11 +561,18 @@ where
             // alive (returned below), so this enqueue of the first datagram
             // cannot fail.
             let _ = tx.try_send(bytes::Bytes::copy_from_slice(data));
+            // Stamp a unique identity token so teardown removes only THIS entry.
+            let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
             vacant.insert(CaptureSession {
                 last_activity: now,
+                session_id,
                 tx: Some(tx),
             });
-            SessionAdmission::Admitted { entry, rx }
+            SessionAdmission::Admitted {
+                entry,
+                rx,
+                session_id,
+            }
         }
     }
 }
@@ -567,6 +596,7 @@ fn spawn_udp_egress_session(
     >,
     active_sessions: std::sync::Arc<std::sync::atomic::AtomicU64>,
     key: CaptureSessionKey,
+    session_id: u64,
     entry: std::sync::Arc<crate::router_cache::MeshTcpEgressEntry>,
     rx: tokio::sync::mpsc::Receiver<bytes::Bytes>,
 ) {
@@ -575,10 +605,38 @@ fn spawn_udp_egress_session(
         // Session teardown: remove the map entry and decrement the live count so
         // a finished/failed flow frees its slot immediately (the idle sweep is a
         // backstop for sessions whose task is still alive but quiescent).
-        if sessions.remove(&key).is_some() {
-            active_sessions.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        }
+        //
+        // CONDITIONAL removal (codex r1 P2): see [`remove_session_if_owned`].
+        remove_session_if_owned(&sessions, &active_sessions, &key, session_id);
     });
+}
+
+/// Tear down a finished/failed egress session: remove its map entry and
+/// decrement the live-session count, but ONLY if the map entry is still THIS
+/// task's session (its `session_id` matches).
+///
+/// If the idle sweep already reaped this entry and a new datagram on the same
+/// `(client, orig-dst)` admitted a REPLACEMENT session in the gap before this
+/// task observed its closed channel, the map now holds the replacement's
+/// `session_id`, not ours. `remove_if` removes (and we decrement) ONLY when the
+/// stored token is still ours — so we never clobber the replacement and never
+/// double-decrement the cap counter. Factored out (pure over the map + atomic)
+/// so the remove-after-replace race is unit-testable without a live tunnel.
+#[cfg(target_os = "linux")]
+fn remove_session_if_owned(
+    sessions: &dashmap::DashMap<CaptureSessionKey, CaptureSession, ahash::RandomState>,
+    active_sessions: &std::sync::atomic::AtomicU64,
+    key: &CaptureSessionKey,
+    session_id: u64,
+) {
+    // `remove_if` returns `Some` only when the predicate held and the entry was
+    // removed; a non-matching (replaced) entry is left intact.
+    if sessions
+        .remove_if(key, |_, session| session.session_id == session_id)
+        .is_some()
+    {
+        active_sessions.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Body of the per-session egress task. Returns when the session ends (client
@@ -590,6 +648,7 @@ async fn run_udp_egress_session(
     key: CaptureSessionKey,
     mut rx: tokio::sync::mpsc::Receiver<bytes::Bytes>,
 ) {
+    use super::LoadBalancerConnectionGuard;
     use crate::load_balancer::LoadBalancerCache;
     use tracing::{debug, warn};
 
@@ -611,6 +670,20 @@ async fn run_udp_egress_session(
         return;
     };
     let target = selection.target;
+
+    // Least-connection accounting parity with the raw-TCP / HTTP relay paths
+    // (mirrors handle_mesh_tcp_egress): acquire the guard immediately after
+    // target selection and HOLD it for the session's lifetime so per-target
+    // active-connection counts include long-lived UDP sessions. Dropped on any
+    // early return below and at session teardown, so least-connections LB sees a
+    // UDP session start/stop exactly once.
+    let balancer = epoch
+        .load_balancer
+        .balancers()
+        .get(&entry.upstream_id)
+        .cloned();
+    let _lb_guard =
+        LoadBalancerConnectionGuard::new(Some(std::sync::Arc::clone(&target)), balancer);
 
     if state.gateway_svid_bundle.load().is_none() {
         warn!(
@@ -1090,6 +1163,79 @@ mod tests {
         );
         assert!(matches!(refreshed, SessionAdmission::Refreshed));
         assert_eq!(sessions.len(), 1);
+    }
+
+    #[test]
+    fn admitted_sessions_get_distinct_identity_tokens() {
+        // Two admits for the SAME key (the second after the first is removed)
+        // must stamp DISTINCT session_ids, so a teardown carrying the old token
+        // can be told apart from the replacement.
+        let sessions = new_sessions(0);
+        let active = std::sync::atomic::AtomicU64::new(0);
+        let k = key("10.0.0.5:40000", "10.96.0.10:53");
+
+        let (first_id, _rx1) =
+            match admit_or_refresh_session(&sessions, &active, k, b"x", 1000, routable) {
+                SessionAdmission::Admitted { session_id, rx, .. } => (session_id, rx),
+                other => panic!("expected Admitted, got {}", admission_name(&other)),
+            };
+        // Simulate the idle sweep reaping the first session.
+        sessions.remove(&k);
+        active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+
+        let (second_id, _rx2) =
+            match admit_or_refresh_session(&sessions, &active, k, b"x", 1000, routable) {
+                SessionAdmission::Admitted { session_id, rx, .. } => (session_id, rx),
+                other => panic!("expected Admitted, got {}", admission_name(&other)),
+            };
+        assert_ne!(first_id, second_id, "replacement must get a fresh token");
+    }
+
+    #[test]
+    fn teardown_does_not_clobber_replacement_session() {
+        // Regression for codex r1 P2 (remove-after-replace race): a stale task's
+        // teardown carrying the OLD session_id must NOT remove a replacement
+        // session that reused the same (client, orig-dst) key, and must NOT
+        // decrement the cap counter for it.
+        let sessions = new_sessions(0);
+        let active = std::sync::atomic::AtomicU64::new(0);
+        let k = key("10.0.0.5:40000", "10.96.0.10:53");
+
+        // Admit the original (session_id A), then simulate the idle sweep
+        // reaping it (drop entry + decrement), exactly as the sweep would.
+        let old_id = match admit_or_refresh_session(&sessions, &active, k, b"x", 1000, routable) {
+            SessionAdmission::Admitted { session_id, .. } => session_id,
+            other => panic!("expected Admitted, got {}", admission_name(&other)),
+        };
+        sessions.remove(&k);
+        active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(active.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+        // A new datagram on the same key admits a REPLACEMENT (session_id B).
+        let (new_id, _rx) =
+            match admit_or_refresh_session(&sessions, &active, k, b"x", 1000, routable) {
+                SessionAdmission::Admitted { session_id, rx, .. } => (session_id, rx),
+                other => panic!("expected Admitted, got {}", admission_name(&other)),
+            };
+        assert_ne!(old_id, new_id);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(active.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        // The OLD task finally runs its teardown with the stale token: it must be
+        // a no-op (replacement survives, counter unchanged).
+        remove_session_if_owned(&sessions, &active, &k, old_id);
+        assert_eq!(sessions.len(), 1, "replacement session must survive");
+        assert_eq!(
+            active.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "cap counter must not be decremented for the replacement"
+        );
+
+        // The replacement's OWN teardown (matching token) removes it and frees
+        // the slot.
+        remove_session_if_owned(&sessions, &active, &k, new_id);
+        assert_eq!(sessions.len(), 0);
+        assert_eq!(active.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 
     fn admission_name(a: &SessionAdmission) -> &'static str {

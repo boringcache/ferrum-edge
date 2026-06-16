@@ -266,6 +266,11 @@ struct HboneProbeTarget<'a> {
     /// Pinned destination identity for the probe handshake (mirrors dispatch).
     expected_peer: Option<&'a crate::identity::SpiffeId>,
     previous_hbone: Option<ProtocolSupport>,
+    /// `true` for a UDP egress target: probe with a `udp`-marked datagram-over-
+    /// HBONE CONNECT (the marker the dispatch datapath uses) instead of the
+    /// `hbone` byte-stream marker, so the probe reaches the destination's `udp`
+    /// relay rather than its byte-stream relay (codex r1 P1).
+    is_udp: bool,
 }
 
 fn gateway_managed_plugin_timestamp() -> chrono::DateTime<chrono::Utc> {
@@ -4636,6 +4641,10 @@ impl ProxyState {
                     hbone_port: target.hbone_port,
                     expected_peer: target.hbone_expected_peer.as_ref(),
                     previous_hbone,
+                    // A UDP egress target's destination relay expects the `udp`
+                    // marker; probe it with the matching datagram CONNECT so the
+                    // handshake reaches the right relay (codex r1 P1).
+                    is_udp: matches!(scheme, BackendScheme::Udp),
                 },
                 &mut record,
             )
@@ -4756,18 +4765,29 @@ impl ProxyState {
             return;
         }
 
-        match tokio::time::timeout(
-            probe_timeout,
-            self.hbone_pool.warmup_connection(
-                probe_proxy,
-                host,
-                port,
-                hbone_port,
-                target.expected_peer,
-            ),
-        )
-        .await
-        {
+        // A UDP egress target rides a `udp`-marked datagram CONNECT, which the
+        // destination unframes into a local `UdpSocket`; a byte-stream
+        // (`hbone`-marked) probe would hit the wrong relay there. Probe with the
+        // SAME marker the dispatch path uses so the handshake proves the
+        // capability the egress datapath actually needs (codex r1 P1).
+        let warmup = async {
+            if target.is_udp {
+                self.hbone_pool
+                    .warmup_datagram_connection(
+                        probe_proxy,
+                        host,
+                        port,
+                        hbone_port,
+                        target.expected_peer,
+                    )
+                    .await
+            } else {
+                self.hbone_pool
+                    .warmup_connection(probe_proxy, host, port, hbone_port, target.expected_peer)
+                    .await
+            }
+        };
+        match tokio::time::timeout(probe_timeout, warmup).await {
             Ok(Ok(())) => {
                 record.hbone = ProtocolSupport::Supported;
             }

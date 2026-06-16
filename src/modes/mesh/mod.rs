@@ -665,6 +665,9 @@ impl MeshRuntimeConfig {
                         addr: self.inbound_listen_addr,
                     },
                 ];
+                // No-op for Sidecar (UDP egress deferred): the helper is
+                // Ambient-gated and returns None here, emitting a one-time warn
+                // when the capture flag is set. Called so that warn fires.
                 listeners.extend(self.udp_capture_listener());
                 listeners
             }
@@ -700,15 +703,26 @@ impl MeshRuntimeConfig {
         }
     }
 
-    /// The optional UDP TPROXY capture listener (F3 §3.3 Stage 3), emitted only
-    /// in the captured topologies (Sidecar / Ambient) that also run the
-    /// outbound :15001 capture listener — UDP egress capture is an outbound
-    /// concern, and NodeWaypoint/ServiceWaypoint have no outbound capture
-    /// listener (and UDP stays mesh-wide-only there per the per-pod-scope
-    /// notes). Returns at most one listener, gated on
-    /// `FERRUM_MESH_CAPTURE_UDP_ENABLED` (default-off via
-    /// [`crate::capture::udp_capture_settings_from_env`]), bound on the
-    /// **dual-stack IPv6 wildcard** (`[::]`, independent of
+    /// The optional UDP TPROXY capture listener (F3 §3.3), emitted only in the
+    /// **Ambient** topology — the one that actually **relays** captured UDP
+    /// (datagram-over-HBONE egress, Stage 4). UDP egress materialization is
+    /// Ambient-only (`materialize_mesh_outbound_udp_upstreams` gates `Ambient =>
+    /// HBONE, _ => return`), so emitting this listener for **Sidecar** (whose UDP
+    /// egress is deferred — no `:15008` HBONE listener) would divert the pod's UDP
+    /// into a listener with no relay and **black-hole every captured datagram**
+    /// (codex r1 P2). Gating it to Ambient leaves Sidecar UDP **un-captured**
+    /// (it passes through) rather than captured-then-dropped. NodeWaypoint/
+    /// ServiceWaypoint also have no outbound capture listener (and UDP stays
+    /// mesh-wide-only there per the per-pod-scope notes).
+    ///
+    /// NOTE: the injector/init TPROXY-rule emission for a Sidecar pod is a
+    /// SEPARATE concern (`crate::capture::udp_tproxy_commands_for_family` gates
+    /// only on `host_netns`, not topology) — gating those rules to Ambient is a
+    /// tracked follow-up. This is the mesh-runtime listener gate.
+    ///
+    /// Returns at most one listener, gated on `FERRUM_MESH_CAPTURE_UDP_ENABLED`
+    /// (default-off via [`crate::capture::udp_capture_settings_from_env`]), bound
+    /// on the **dual-stack IPv6 wildcard** (`[::]`, independent of
     /// `FERRUM_MESH_OUTBOUND_LISTEN_ADDR`'s family) on the Stage-2 UDP capture
     /// port (`FERRUM_MESH_CAPTURE_UDP_PORT`): TPROXY leaves each datagram's
     /// original (non-local) destination intact, so a specific-IP bind would miss
@@ -731,6 +745,26 @@ impl MeshRuntimeConfig {
             }
         };
         if !settings.udp_capture_enabled {
+            return None;
+        }
+        // Ambient-only: only Ambient relays captured UDP (Stage 4 egress). For a
+        // non-Ambient captured topology (Sidecar) with the flag on, emit a loud
+        // ONE-TIME warning and DO NOT emit the listener — capturing UDP we cannot
+        // relay would black-hole it; leaving it un-captured lets it pass through.
+        // `listener_plan()` is called many times (serving, predicates, tests), so
+        // the warn is gated behind a `Once` to avoid log spam.
+        if self.topology != MeshTopology::Ambient {
+            static SIDECAR_UDP_DEFER_WARN: std::sync::Once = std::sync::Once::new();
+            SIDECAR_UDP_DEFER_WARN.call_once(|| {
+                warn!(
+                    topology = ?self.topology,
+                    "FERRUM_MESH_CAPTURE_UDP_ENABLED is set but UDP egress is only supported on \
+                     the Ambient topology (datagram-over-HBONE over :15008). Sidecar UDP egress \
+                     is deferred (no :15008 HBONE listener), so the UDP capture listener is NOT \
+                     emitted on this topology — UDP egress passes through un-captured rather than \
+                     being captured and dropped. Disable the flag to silence this warning."
+                );
+            });
             return None;
         }
         // Bind the capture port on the DUAL-STACK IPv6 WILDCARD (`[::]`), not the
@@ -9857,6 +9891,8 @@ mod tests {
             "FERRUM_SHUTDOWN_DRAIN_SECONDS",
             "FERRUM_MESH_CA_BACKEND",
             "FERRUM_MESH_ALLOW_NO_CA",
+            "FERRUM_MESH_CAPTURE_UDP_ENABLED",
+            "FERRUM_MESH_CAPTURE_UDP_PORT",
         ];
 
         for key in keys {
@@ -16184,6 +16220,73 @@ mod tests {
                         && listener.kind == MeshListenerKind::HboneTermination
                         && listener.addr.port() == 15008
                 }));
+            },
+        );
+    }
+
+    #[test]
+    fn mesh_runtime_listener_plan_ambient_emits_udp_capture_when_enabled() {
+        // Ambient relays captured UDP (Stage 4 egress), so with the capture flag
+        // on it MUST emit the PlaintextUdpCapture listener (dual-stack `[::]`).
+        with_mesh_env(
+            &[
+                ("FERRUM_MODE", "mesh"),
+                ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+                (
+                    "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                    "secret-padding-for-32-char-min!!",
+                ),
+                ("FERRUM_MESH_TOPOLOGY", "ambient"),
+                ("FERRUM_MESH_CAPTURE_UDP_ENABLED", "true"),
+            ],
+            || {
+                let env = EnvConfig::from_env().expect("mesh env config");
+                let runtime =
+                    MeshRuntimeConfig::from_env_config(&env).expect("mesh runtime config");
+                let plan = runtime.listener_plan();
+                assert!(
+                    plan.iter().any(|listener| {
+                        listener.kind == MeshListenerKind::PlaintextUdpCapture
+                            && listener.direction == MeshTrafficDirection::Outbound
+                    }),
+                    "Ambient must emit the UDP capture listener when capture is enabled"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn mesh_runtime_listener_plan_sidecar_omits_udp_capture_when_enabled() {
+        // Regression for codex r1 P2: Sidecar UDP egress is deferred (no
+        // `:15008`), so even with the capture flag on the Sidecar plan must NOT
+        // emit the PlaintextUdpCapture listener — capturing UDP it cannot relay
+        // would black-hole every datagram. Leaving it un-emitted lets UDP pass
+        // through un-captured.
+        with_mesh_env(
+            &[
+                ("FERRUM_MODE", "mesh"),
+                ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+                (
+                    "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                    "secret-padding-for-32-char-min!!",
+                ),
+                // Sidecar is the default topology; set it explicitly for clarity.
+                ("FERRUM_MESH_TOPOLOGY", "sidecar"),
+                ("FERRUM_MESH_CAPTURE_UDP_ENABLED", "true"),
+            ],
+            || {
+                let env = EnvConfig::from_env().expect("mesh env config");
+                let runtime =
+                    MeshRuntimeConfig::from_env_config(&env).expect("mesh runtime config");
+                let plan = runtime.listener_plan();
+                assert!(
+                    !plan
+                        .iter()
+                        .any(|listener| { listener.kind == MeshListenerKind::PlaintextUdpCapture }),
+                    "Sidecar must NOT emit the UDP capture listener (UDP egress deferred)"
+                );
+                // The standard Sidecar listeners are still present.
+                assert_eq!(plan.len(), 2);
             },
         );
     }

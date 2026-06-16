@@ -1686,11 +1686,19 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   listener) rather than silently omitting the listener while the Stage-2 rules
   still divert UDP to a now-unbound port.
 - **Stages 3–4 — consuming UDP listener + datagram-over-HBONE egress (Ambient).**
-  When `FERRUM_MESH_CAPTURE_UDP_ENABLED=true`, the captured topologies
-  (**Sidecar** / **Ambient** — the same ones that run the outbound `:15001` TCP
-  capture listener) emit a **`PlaintextUdpCapture` mesh listener** bound on the
-  **dual-stack IPv6 wildcard** (`[::]`, independent of the TCP outbound listener
-  family) and the Stage-2 `FERRUM_MESH_CAPTURE_UDP_PORT` (default `15011`) — a
+  When `FERRUM_MESH_CAPTURE_UDP_ENABLED=true`, **only the Ambient topology** —
+  the one that actually **relays** captured UDP (Stage 4 egress) — emits the
+  **`PlaintextUdpCapture` mesh listener**. UDP egress materialization is
+  Ambient-only, so emitting this listener for **Sidecar** (UDP egress deferred —
+  no `:15008` HBONE listener) would divert the pod's UDP into a listener with no
+  relay and **black-hole every captured datagram**; instead, a non-Ambient
+  topology with the flag set logs a **one-time warning** and emits **no** capture
+  listener, leaving UDP **un-captured** (it passes through) rather than
+  captured-then-dropped. (The injector/init TPROXY-rule emission for a Sidecar
+  pod is gated separately — a tracked follow-up; this is the mesh-runtime listener
+  gate.) On Ambient the listener is bound on the **dual-stack IPv6 wildcard**
+  (`[::]`, independent of the TCP outbound listener family) and the Stage-2
+  `FERRUM_MESH_CAPTURE_UDP_PORT` (default `15011`) — a
   wildcard bind because TPROXY (`--on-port` only, no `--on-ip`) leaves each
   datagram's original (non-local) destination intact, so a specific-IP socket
   would never receive them; only a wildcard `IP_TRANSPARENT` socket claims the

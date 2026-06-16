@@ -1018,27 +1018,46 @@ async fn resolve_local_udp_dest(
 
 /// Two-way datagram relay between an upgraded `udp`-CONNECT tunnel (framed) and a
 /// connected local `UdpSocket` (raw datagrams). Tunnel → unframe → `send`; `recv`
-/// → frame → tunnel. Either direction ending (EOF, error, or idle) ends the
-/// relay; on exit the tunnel write half is half-closed (h2 end-stream).
+/// → frame → tunnel. Either direction ending (EOF, error) ends the relay; on
+/// exit the tunnel write half is half-closed (h2 end-stream).
+///
+/// The idle window is refreshed on activity in **EITHER** direction — a shared
+/// `last_activity` timestamp bumped by both the tunnel→app reads and the
+/// app→tunnel reads, watched by a single watchdog (mirrors the plain UDP / DTLS
+/// proxy's bidirectional keepalive). Without this a one-way flow (e.g.
+/// telemetry/StatsD streaming tunnel→app while the app never replies) would time
+/// out after `udp_idle_timeout_seconds` even though the tunnel is actively
+/// delivering datagrams (codex r1 P2).
 async fn relay_hbone_udp<S>(tunnel: S, socket: tokio::net::UdpSocket, idle: Option<Duration>)
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     use bytes::BytesMut;
+    use std::sync::atomic::AtomicU64;
     use tokio::io::{AsyncWriteExt, split};
 
     let socket = Arc::new(socket);
     let (mut tunnel_read, mut tunnel_write) = split(tunnel);
     let max = crate::proxy::mesh_udp_frame::MAX_FRAME_PAYLOAD;
 
+    // Shared last-activity clock (monotonic millis — never rewinds under NTP
+    // slew). Bumped on a delivered datagram in either direction; read by the
+    // watchdog.
+    let last_activity = Arc::new(AtomicU64::new(crate::socket_opts::monotonic_now_ms()));
+
     // Tunnel → local app: read framed datagrams off the tunnel and send each to
-    // the connected destination socket.
+    // the connected destination socket. Activity here keeps the session alive.
     let send_socket = socket.clone();
+    let to_app_activity = last_activity.clone();
     let to_app = async move {
         let mut buf = BytesMut::with_capacity(max);
         while let Ok(Some(payload)) =
             crate::proxy::mesh_udp_frame::read_datagram(&mut tunnel_read, &mut buf).await
         {
+            to_app_activity.store(
+                crate::socket_opts::monotonic_now_ms(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
             if send_socket.send(&payload).await.is_err() {
                 break;
             }
@@ -1046,22 +1065,22 @@ where
     };
 
     // Local app → tunnel: receive datagrams from the destination socket, frame
-    // each, and write onto the tunnel. An idle window with no reply ends it.
+    // each, and write onto the tunnel. Activity here also keeps the session
+    // alive; idle expiry is enforced by the shared watchdog below, not a
+    // per-recv timeout (which would ignore tunnel→app activity).
+    let from_app_activity = last_activity.clone();
     let from_app = async move {
         let mut recv_buf = vec![0u8; max];
         let mut frame = BytesMut::with_capacity(2 + max);
         loop {
-            let recvd = match idle {
-                Some(d) => match tokio::time::timeout(d, socket.recv(&mut recv_buf)).await {
-                    Ok(r) => r,
-                    Err(_) => break, // idle timeout
-                },
-                None => socket.recv(&mut recv_buf).await,
-            };
-            let n = match recvd {
+            let n = match socket.recv(&mut recv_buf).await {
                 Ok(n) => n,
                 Err(_) => break,
             };
+            from_app_activity.store(
+                crate::socket_opts::monotonic_now_ms(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
             frame.clear();
             if crate::proxy::mesh_udp_frame::encode_datagram(&mut frame, &recv_buf[..n]).is_err() {
                 continue;
@@ -1073,9 +1092,31 @@ where
         let _ = tunnel_write.shutdown().await;
     };
 
+    // Idle watchdog: ends the relay when neither direction has been active for
+    // `idle`. `None` disables it (the future never resolves, so the two relay
+    // arms drive). Polls at a fraction of the window (clamped 100ms..1s) so an
+    // expiry fires within ~one poll of the deadline (mirrors the DTLS watchdog).
+    let watchdog = async move {
+        let Some(idle) = idle else {
+            std::future::pending::<()>().await;
+            return;
+        };
+        let idle_ms = idle.as_millis().min(u64::MAX as u128) as u64;
+        let poll_ms = (idle_ms / 4).clamp(100, 1_000);
+        let mut interval = tokio::time::interval(Duration::from_millis(poll_ms));
+        loop {
+            interval.tick().await;
+            let last = last_activity.load(std::sync::atomic::Ordering::Relaxed);
+            if crate::socket_opts::monotonic_now_ms().saturating_sub(last) > idle_ms {
+                break;
+            }
+        }
+    };
+
     tokio::select! {
         _ = to_app => {}
         _ = from_app => {}
+        _ = watchdog => {}
     }
 }
 
