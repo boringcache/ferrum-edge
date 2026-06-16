@@ -777,7 +777,7 @@ fn prepare_normalized_gateway_config_for_mesh(
     // Outbound (egress) runs after inbound and before `apply_destination_rules`
     // so the materialized outbound upstreams pick up port-level DR policy
     // (re-keyed there to the resolved dial port). Topology-aware: Ambient emits
-    // HBONE routes; Sidecar (SVID-mTLS) lands in a follow-up.
+    // HBONE routes; Sidecar emits SVID-mTLS routes.
     materialize_mesh_outbound_proxies(&mut config, runtime, mesh_slice);
     materialize_mesh_outbound_tcp_upstreams(&mut config, runtime, mesh_slice);
     apply_destination_rules(&mut config, runtime, mesh_slice)?;
@@ -1282,6 +1282,7 @@ fn build_east_west_service_proxies_and_upstreams(
             continue;
         }
 
+        let cluster_domain = cluster_domain.trim_matches('.');
         let sni_hostname = format!(
             "{}.{}.svc.{}",
             service.name, service.namespace, cluster_domain
@@ -15672,6 +15673,7 @@ mod tests {
                 ("FERRUM_NAMESPACE", "default"),
                 ("FERRUM_MESH_TOPOLOGY", "east_west_gateway"),
                 ("FERRUM_MESH_EAST_WEST_LISTEN_PORT", "15443"),
+                ("FERRUM_MESH_CLUSTER_DOMAIN", "cluster.local."),
             ],
             || {
                 let env = EnvConfig::from_env().expect("mesh env config");
