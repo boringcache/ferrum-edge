@@ -2143,7 +2143,7 @@ mod tests {
         SvidBundle {
             spiffe_id: SpiffeId::from_parts(&td, "ns/default/sa/gateway").unwrap(),
             cert_chain_der: vec![leaf.to_vec()],
-            private_key_pkcs8_der: Vec::new(),
+            private_key_pkcs8_der: Vec::new().into(),
             trust_bundles: TrustBundleSet::local_only(TrustBundle {
                 trust_domain: td,
                 x509_authorities: vec![],
@@ -2548,7 +2548,7 @@ mod tests {
         let bundle = SvidBundle {
             spiffe_id: SpiffeId::from_parts(&td, "ns/default/sa/gateway").unwrap(),
             cert_chain_der: vec![b"leaf-cert".to_vec(), b"intermediate".to_vec()],
-            private_key_pkcs8_der: Vec::new(),
+            private_key_pkcs8_der: Vec::new().into(),
             trust_bundles: TrustBundleSet::local_only(TrustBundle {
                 trust_domain: td,
                 x509_authorities: vec![],

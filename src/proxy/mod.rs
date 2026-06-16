@@ -24464,7 +24464,7 @@ mod tests {
         crate::identity::SvidBundle {
             spiffe_id,
             cert_chain_der: vec![vec![42]],
-            private_key_pkcs8_der: Vec::new(),
+            private_key_pkcs8_der: Vec::new().into(),
             trust_bundles,
         }
     }

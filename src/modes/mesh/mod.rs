@@ -9337,7 +9337,7 @@ mod tests {
             Some(crate::identity::SvidBundle {
                 spiffe_id: SpiffeId::from_parts(&trust_domain, "ns/test/sa/test").unwrap(),
                 cert_chain_der,
-                private_key_pkcs8_der: key.secret_der().to_vec(),
+                private_key_pkcs8_der: key.secret_der().to_vec().into(),
                 trust_bundles: crate::identity::TrustBundleSet::local_only(
                     crate::identity::TrustBundle {
                         trust_domain,
@@ -17597,7 +17597,7 @@ mod tests {
         let original = Arc::new(Some(SvidBundle {
             spiffe_id: id.clone(),
             cert_chain_der: vec![vec![1, 2, 3]],
-            private_key_pkcs8_der: Vec::new(),
+            private_key_pkcs8_der: Vec::new().into(),
             trust_bundles: TrustBundleSet::local_only(TrustBundle {
                 trust_domain: td.clone(),
                 x509_authorities: vec![vec![4, 5, 6]],
@@ -17619,7 +17619,7 @@ mod tests {
         let replacement = Arc::new(Some(SvidBundle {
             spiffe_id: id,
             cert_chain_der: vec![vec![7, 8, 9]],
-            private_key_pkcs8_der: Vec::new(),
+            private_key_pkcs8_der: Vec::new().into(),
             trust_bundles: TrustBundleSet::local_only(TrustBundle {
                 trust_domain: td,
                 x509_authorities: vec![vec![10, 11, 12]],
@@ -17659,7 +17659,7 @@ mod tests {
         let svid_bundle = |local_roots: Vec<Vec<u8>>| SvidBundle {
             spiffe_id: id.clone(),
             cert_chain_der: vec![vec![1, 2, 3]],
-            private_key_pkcs8_der: Vec::new(),
+            private_key_pkcs8_der: Vec::new().into(),
             trust_bundles: TrustBundleSet {
                 local: TrustBundle {
                     trust_domain: td.clone(),
@@ -18438,7 +18438,7 @@ mod tests {
         let bundle = SvidBundle {
             spiffe_id: id,
             cert_chain_der: vec![vec![1, 2, 3]],
-            private_key_pkcs8_der: Vec::new(),
+            private_key_pkcs8_der: Vec::new().into(),
             trust_bundles: TrustBundleSet::local_only(TrustBundle {
                 trust_domain: td,
                 x509_authorities: vec![vec![4, 5, 6]],
@@ -18470,7 +18470,7 @@ mod tests {
         let bundle = SvidBundle {
             spiffe_id: id,
             cert_chain_der: cert_chain_der.clone(),
-            private_key_pkcs8_der: key_pair.serialize_der(),
+            private_key_pkcs8_der: key_pair.serialize_der().into(),
             trust_bundles: TrustBundleSet::local_only(TrustBundle {
                 trust_domain: td,
                 x509_authorities: cert_chain_der,
