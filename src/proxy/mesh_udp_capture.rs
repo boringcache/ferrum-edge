@@ -44,6 +44,12 @@ pub struct MeshUdpCaptureConfig {
     /// Address+port to bind. The port is the Stage-2 TPROXY listener port
     /// (`FERRUM_MESH_CAPTURE_UDP_PORT`, default 15011).
     pub addr: StdSocketAddr,
+    /// Shared proxy state — threaded in for Stage 4 so the listener can consult
+    /// the `mesh_udp_egress` route table, LB-select a workload, gate on the
+    /// gateway SVID + HBONE capability, and open the datagram-over-HBONE tunnel.
+    /// (Stage 3 dropped captured datagrams and needed no state; this is the
+    /// enabling refactor.)
+    pub state: std::sync::Arc<super::ProxyState>,
     /// Per-listener shutdown receiver (config-driven removal).
     pub shutdown: watch::Receiver<bool>,
     /// Gateway-wide shutdown receiver (SIGTERM/SIGINT). When `Some`, the recv
@@ -106,6 +112,7 @@ pub async fn start_mesh_udp_capture_listener(
 
     let MeshUdpCaptureConfig {
         addr,
+        state,
         shutdown,
         global_shutdown,
         max_sessions,
@@ -219,7 +226,7 @@ pub async fn start_mesh_udp_capture_listener(
         addr = %addr,
         v4_origdst,
         v6_origdst,
-        "Mesh UDP capture listener started (capture→drop; egress is Stage 4)"
+        "Mesh UDP capture listener started (capture→datagram-over-HBONE egress; Ambient only)"
     );
 
     // Idle-session sweep — reaps captured sessions whose last datagram is older
@@ -278,16 +285,37 @@ pub async fn start_mesh_udp_capture_listener(
                         Ok(n) if n > 0 => {
                             for i in 0..n {
                                 let (data, client) = recv_batch.datagram(i);
-                                let data_len = data.len();
                                 let orig_dst = recv_batch.orig_dst(i);
-                                handle_captured_datagram(
-                                    &sessions,
-                                    &active_sessions,
-                                    client,
-                                    orig_dst,
-                                    data_len,
-                                    max_sessions,
-                                );
+                                let gro = recv_batch.gro_segment_size(i);
+                                // GRO may coalesce many datagrams into one buffer;
+                                // frame EACH segment separately (a coalesced
+                                // superblock is N datagrams, not one — risk #8).
+                                match gro {
+                                    Some(seg) if (seg as usize) < data.len() => {
+                                        for chunk in data.chunks(seg as usize) {
+                                            handle_captured_datagram(
+                                                &sessions,
+                                                &active_sessions,
+                                                &state,
+                                                client,
+                                                orig_dst,
+                                                chunk,
+                                                max_sessions,
+                                            );
+                                        }
+                                    }
+                                    _ => {
+                                        handle_captured_datagram(
+                                            &sessions,
+                                            &active_sessions,
+                                            &state,
+                                            client,
+                                            orig_dst,
+                                            data,
+                                            max_sessions,
+                                        );
+                                    }
+                                }
                             }
                             total_drained += n;
                             // Bound the per-wakeup drain so one busy socket can't
@@ -305,89 +333,497 @@ pub async fn start_mesh_udp_capture_listener(
     Ok(())
 }
 
-/// Per-(client, orig-dst) capture session. Stage 3 holds no backend leg — it
-/// exists only so the listener can bound concurrent flows and age them out for
-/// DoS resistance. `last_activity` is monotonic millis from
-/// [`crate::socket_opts::monotonic_now_ms`] (never goes backwards under NTP
-/// slew, so idle expiry always fires).
+/// Bounded depth of a per-session egress channel. Captured datagrams are
+/// queued here from the (synchronous, hot-path-light) recv loop and drained by
+/// the async egress task that frames + writes them onto the HBONE tunnel. A
+/// full channel DROPS the datagram (UDP-appropriate backpressure — UDP gives no
+/// delivery guarantee, and blocking the bounded recv-loop drain would let one
+/// slow session starve every other captured flow). Sized generously so a brief
+/// tunnel-dial stall (the channel buffers datagrams until the tunnel is ready)
+/// does not shed a normal burst.
+#[cfg(target_os = "linux")]
+const EGRESS_CHANNEL_DEPTH: usize = 1024;
+
+/// Per-(client, orig-dst) capture session (Stage 4). `last_activity` is
+/// monotonic millis from [`crate::socket_opts::monotonic_now_ms`] (never goes
+/// backwards under NTP slew, so idle expiry always fires). `tx` hands captured
+/// datagram payloads to the per-session egress task; when the session is reaped
+/// (idle sweep) or the map entry is replaced, dropping `tx` closes the channel,
+/// which ends the egress task and tears the tunnel down (its `poll_shutdown`
+/// sends the h2 end-stream).
 #[cfg(target_os = "linux")]
 struct CaptureSession {
     last_activity: u64,
+    /// Egress channel to the per-session task. `None` for a session whose
+    /// orig-dst matched no routable `mesh_udp_egress` entry — but such flows are
+    /// never inserted (they drop without a session), so in practice this is
+    /// always `Some` for a live session. Kept as `Option` only so the unit
+    /// tests can exercise the keying/cap logic without a live tunnel.
+    tx: Option<tokio::sync::mpsc::Sender<bytes::Bytes>>,
 }
 
-/// Record a captured datagram against its session, then DROP it (Stage 3).
+/// Record a captured datagram against its session and forward it toward mesh
+/// egress (Stage 4).
 ///
-/// Inserts/refreshes the `(client, orig-dst)` session under the
-/// `max_sessions` cap and logs the drop at `debug!`. A datagram from a NEW flow
-/// once the cap is reached is dropped without inserting (cheap flood shield);
-/// an existing flow is always refreshed (it already holds a slot). Returns
-/// `true` if the datagram was accounted (existing or newly admitted), `false`
-/// if it was shed at the cap — exposed for unit testing the keying/cap logic.
+/// On a NEW `(client, orig-dst)` flow this consults the `mesh_udp_egress` route
+/// table; only a routable (`Relay`) destination admits a session (under the
+/// `max_sessions` cap) and spawns the per-session egress task. A non-routable
+/// orig-dst (no match, or a declared-but-`CloseNotRoutable` pair) DROPS the
+/// datagram WITHOUT creating a session — fail closed, never guessed, and never
+/// holding a slot for un-routable traffic. An EXISTING flow refreshes its
+/// `last_activity` and enqueues the payload (drop-on-full).
+///
+/// Returns `true` if the datagram was accounted (existing or newly admitted),
+/// `false` if it was dropped (no orig-dst, not routable, cap reached, or the
+/// egress channel was full) — exposed for unit testing the keying/cap logic.
 #[cfg(target_os = "linux")]
 fn handle_captured_datagram(
-    sessions: &dashmap::DashMap<CaptureSessionKey, CaptureSession, ahash::RandomState>,
-    active_sessions: &std::sync::atomic::AtomicU64,
+    sessions: &std::sync::Arc<
+        dashmap::DashMap<CaptureSessionKey, CaptureSession, ahash::RandomState>,
+    >,
+    active_sessions: &std::sync::Arc<std::sync::atomic::AtomicU64>,
+    state: &std::sync::Arc<super::ProxyState>,
     client: SocketAddr,
     orig_dst: Option<SocketAddr>,
-    data_len: usize,
+    data: &[u8],
     max_sessions: usize,
 ) -> bool {
-    use dashmap::mapref::entry::Entry;
-    use std::sync::atomic::Ordering;
     use tracing::debug;
 
     let Some(orig_dst) = orig_dst else {
         // No orig-dst cmsg ⇒ we cannot tell where the pod dialed, so there is
-        // nothing to route in Stage 4 and nothing meaningful to key on. Drop.
+        // nothing to route and nothing meaningful to key on. Drop.
         debug!(
             client = %client,
-            size = data_len,
+            size = data.len(),
             "Mesh UDP capture: dropping datagram with no original destination cmsg"
         );
         return false;
     };
 
     let key = CaptureSessionKey { client, orig_dst };
+
+    // Routability is resolved ONCE per (potentially new) flow via a closure so
+    // the cap/keying bookkeeping (`admit_or_refresh_session`) stays a pure,
+    // unit-testable function: it only evaluates the closure on the Vacant path
+    // (an existing flow already proved routable when it was admitted). A
+    // captured datagram whose orig-dst matches no declared `(VIP, UDP port)`
+    // pair — or matches a declared-but-`CloseNotRoutable` pair — drops here,
+    // holding no slot and spawning no task (fail closed, never guessed).
+    let resolve_entry = || {
+        let epoch = state.request_epoch.load();
+        match epoch.route_table.mesh_udp_egress_decision(orig_dst) {
+            Some(crate::router_cache::MeshTcpEgressDecision::Relay(entry)) => Some(entry.clone()),
+            _ => None,
+        }
+    };
+
+    match admit_or_refresh_session(
+        sessions,
+        active_sessions,
+        key,
+        data,
+        max_sessions,
+        resolve_entry,
+    ) {
+        SessionAdmission::Refreshed => true,
+        SessionAdmission::Admitted { entry, rx } => {
+            // Spawn the per-session egress task (tunnel dial + return path); the
+            // session's `tx` (already inserted by the bookkeeping above) feeds it.
+            spawn_udp_egress_session(
+                state.clone(),
+                sessions.clone(),
+                active_sessions.clone(),
+                key,
+                entry,
+                rx,
+            );
+            true
+        }
+        SessionAdmission::Dropped => false,
+    }
+}
+
+/// Outcome of [`admit_or_refresh_session`].
+#[cfg(target_os = "linux")]
+enum SessionAdmission {
+    /// An existing flow's session was refreshed and the datagram enqueued
+    /// (or dropped-on-full, which still counts as "accounted" for the flow).
+    Refreshed,
+    /// A NEW routable flow was admitted: the caller must spawn the egress task
+    /// driven by `rx`, relaying to `entry`'s LB-selected workload.
+    Admitted {
+        entry: std::sync::Arc<crate::router_cache::MeshTcpEgressEntry>,
+        rx: tokio::sync::mpsc::Receiver<bytes::Bytes>,
+    },
+    /// The datagram was dropped (not routable, or the session cap was reached).
+    Dropped,
+}
+
+/// Pure cap/keying bookkeeping for one captured datagram, factored out of
+/// [`handle_captured_datagram`] so it is unit-testable without a live
+/// `ProxyState`/tunnel. Refreshes-or-admits the `(client, orig-dst)` session
+/// under `max_sessions` using a SINGLE DashMap `entry()` guard:
+///
+/// - Occupied flow → refresh `last_activity`, enqueue the payload (drop-on-full),
+///   return [`SessionAdmission::Refreshed`].
+/// - Vacant flow → evaluate `resolve_entry` (the routability gate); on `None`
+///   drop without holding a slot; on `Some(entry)` reserve a slot via the cheap
+///   `active_sessions` atomic (NOT `DashMap::len()`, which walks/locks every
+///   shard on the per-datagram flood path the cap defends against), insert the
+///   session with a fresh channel, enqueue the first datagram, and return
+///   [`SessionAdmission::Admitted`] with the receiver for the caller to drive.
+///
+/// Only the atomic (never another `sessions.*` op) is touched while the entry
+/// guard is held, so this cannot self-deadlock the way a nested `len()` did.
+#[cfg(target_os = "linux")]
+fn admit_or_refresh_session<F>(
+    sessions: &dashmap::DashMap<CaptureSessionKey, CaptureSession, ahash::RandomState>,
+    active_sessions: &std::sync::atomic::AtomicU64,
+    key: CaptureSessionKey,
+    data: &[u8],
+    max_sessions: usize,
+    resolve_entry: F,
+) -> SessionAdmission
+where
+    F: FnOnce() -> Option<std::sync::Arc<crate::router_cache::MeshTcpEgressEntry>>,
+{
+    use dashmap::mapref::entry::Entry;
+    use std::sync::atomic::Ordering;
+    use tracing::debug;
+
     let now = crate::socket_opts::monotonic_now_ms();
-    // A single `entry()` guard refreshes-or-admits without re-entering the map.
-    // An Occupied flow already holds a slot, so it is always refreshed (even at
-    // the cap). A Vacant flow reserves a slot via the cheap `active_sessions`
-    // atomic — NOT `DashMap::len()`, which walks/locks every shard on the exact
-    // per-datagram flood path the cap defends against (codex r3 P2) — and is
-    // inserted only when under the cap. Only the atomic (never another
-    // `sessions.*` op) is touched while the entry guard is held, so this cannot
-    // self-deadlock the way a nested `len()` did (codex r1 P1).
     match sessions.entry(key) {
         Entry::Occupied(mut occupied) => {
-            occupied.get_mut().last_activity = now;
+            let session = occupied.get_mut();
+            session.last_activity = now;
+            if let Some(tx) = session.tx.as_ref() {
+                // Drop-on-full: UDP backpressure is "drop", and we must never
+                // block the bounded recv-loop drain.
+                if tx.try_send(bytes::Bytes::copy_from_slice(data)).is_err() {
+                    debug!(
+                        client = %key.client,
+                        orig_dst = %key.orig_dst,
+                        "Mesh UDP capture: egress channel full or closed; dropping datagram"
+                    );
+                }
+            }
+            SessionAdmission::Refreshed
         }
         Entry::Vacant(vacant) => {
-            // Reserve a slot atomically; hand it back and shed if over the cap
-            // (mirrors `udp_proxy`'s `active_sessions` admit-or-shed).
+            // Routability gate BEFORE reserving a slot.
+            let Some(entry) = resolve_entry() else {
+                debug!(
+                    client = %key.client,
+                    orig_dst = %key.orig_dst,
+                    "Mesh UDP capture: captured datagram is not a routable mesh UDP destination; \
+                     dropping"
+                );
+                return SessionAdmission::Dropped;
+            };
+
+            // Reserve a slot atomically; hand it back and shed if over the cap.
             let prev = active_sessions.fetch_add(1, Ordering::Relaxed);
             if prev >= max_sessions as u64 {
                 active_sessions.fetch_sub(1, Ordering::Relaxed);
                 debug!(
-                    client = %client,
-                    orig_dst = %orig_dst,
+                    client = %key.client,
+                    orig_dst = %key.orig_dst,
                     "Mesh UDP capture: session cap reached, dropping datagram from new flow"
                 );
-                return false;
+                return SessionAdmission::Dropped;
             }
-            vacant.insert(CaptureSession { last_activity: now });
+
+            let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(EGRESS_CHANNEL_DEPTH);
+            // The bounded channel was just created with depth >= 1 and `rx` is
+            // alive (returned below), so this enqueue of the first datagram
+            // cannot fail.
+            let _ = tx.try_send(bytes::Bytes::copy_from_slice(data));
+            vacant.insert(CaptureSession {
+                last_activity: now,
+                tx: Some(tx),
+            });
+            SessionAdmission::Admitted { entry, rx }
         }
     }
-    let admitted = true;
+}
 
-    // Stage 3: capture → DROP. Egress relay (forward over the mesh transport to
-    // `orig_dst`'s workload) is Stage 4.
+/// Spawn the per-session UDP egress task: open a `udp`-marked datagram-over-HBONE
+/// tunnel to the LB-selected workload, frame + write captured datagrams onto it,
+/// and (return path) read framed replies back off it and send them to the client
+/// SOURCED FROM the captured original destination so the pod sees replies from
+/// the VIP:port it dialed.
+///
+/// All the fail-closed gates from the raw-TCP egress path apply (LB selection,
+/// gateway SVID present, HBONE capability proven, pinned-peer identity intact);
+/// any gate failure logs and ends the session (the recv loop already created the
+/// map entry, so it is cleaned up by the idle sweep — the channel just goes
+/// undrained and fills, which drop-on-full handles harmlessly).
+#[cfg(target_os = "linux")]
+fn spawn_udp_egress_session(
+    state: std::sync::Arc<super::ProxyState>,
+    sessions: std::sync::Arc<
+        dashmap::DashMap<CaptureSessionKey, CaptureSession, ahash::RandomState>,
+    >,
+    active_sessions: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    key: CaptureSessionKey,
+    entry: std::sync::Arc<crate::router_cache::MeshTcpEgressEntry>,
+    rx: tokio::sync::mpsc::Receiver<bytes::Bytes>,
+) {
+    tokio::spawn(async move {
+        run_udp_egress_session(&state, &entry, key, rx).await;
+        // Session teardown: remove the map entry and decrement the live count so
+        // a finished/failed flow frees its slot immediately (the idle sweep is a
+        // backstop for sessions whose task is still alive but quiescent).
+        if sessions.remove(&key).is_some() {
+            active_sessions.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+}
+
+/// Body of the per-session egress task. Returns when the session ends (client
+/// idle, tunnel closed, or a fail-closed gate tripped). Never panics.
+#[cfg(target_os = "linux")]
+async fn run_udp_egress_session(
+    state: &std::sync::Arc<super::ProxyState>,
+    entry: &std::sync::Arc<crate::router_cache::MeshTcpEgressEntry>,
+    key: CaptureSessionKey,
+    mut rx: tokio::sync::mpsc::Receiver<bytes::Bytes>,
+) {
+    use crate::load_balancer::LoadBalancerCache;
+    use tracing::{debug, warn};
+
+    let proxy = entry.relay_proxy.as_ref();
+    let epoch = state.request_epoch.load();
+
+    // ── Fail-closed egress gates (mirrors handle_mesh_tcp_egress) ──────────
+    let Some(selection) = LoadBalancerCache::select_target_from(
+        &epoch.load_balancer,
+        &entry.upstream_id,
+        &proxy.id,
+        None,
+    ) else {
+        warn!(
+            service = %entry.service_fqdn,
+            orig_dst = %key.orig_dst,
+            "Mesh UDP egress has no selectable workload target; ending session"
+        );
+        return;
+    };
+    let target = selection.target;
+
+    if state.gateway_svid_bundle.load().is_none() {
+        warn!(
+            service = %entry.service_fqdn,
+            "Mesh UDP egress requires a loaded gateway SVID; ending session"
+        );
+        return;
+    }
+
+    // UDP egress is Ambient-only: the materializer stamps `mesh.hbone` (Sidecar
+    // UDP is deferred), so a target must carry the HBONE tag.
+    if !crate::proxy::hbone_pool::target_hbone_enabled(&target) {
+        warn!(
+            service = %entry.service_fqdn,
+            target_host = %target.host,
+            "Mesh UDP egress target is not HBONE-tagged (Sidecar UDP egress is not supported); \
+             ending session"
+        );
+        return;
+    }
+    // HBONE capability must be proven (the enrollment pass + widened probe gate
+    // keep these records alive; the dispatch gate fails closed until proven).
+    if !state
+        .backend_capabilities
+        .get(proxy, Some(&target))
+        .is_some_and(|record| record.hbone.is_supported())
+    {
+        debug!(
+            service = %entry.service_fqdn,
+            target_host = %target.host,
+            target_port = target.port,
+            "Mesh UDP egress target has no proven HBONE capability yet; ending session \
+             (retry after the next capability refresh)"
+        );
+        return;
+    }
+    // Pinned peer identity: present-but-corrupt fails closed.
+    let expected_peer = match crate::proxy::hbone_pool::target_expected_peer_spiffe(&target) {
+        Ok(peer) => peer,
+        Err(err) => {
+            warn!(
+                service = %entry.service_fqdn,
+                target_host = %target.host,
+                error = %err,
+                "Mesh UDP egress target carries a corrupt pinned identity; refusing dial"
+            );
+            return;
+        }
+    };
+    let hbone_port = crate::proxy::hbone_pool::target_hbone_port(&target);
+
+    // ── Open the udp-marked datagram-over-HBONE tunnel ─────────────────────
+    let tunnel = match state
+        .hbone_pool
+        .get_datagram_tunnel(
+            proxy,
+            &target.host,
+            hbone_port,
+            &target.host,
+            target.port,
+            expected_peer.as_ref(),
+        )
+        .await
+    {
+        Ok(tunnel) => tunnel,
+        Err(err) => {
+            warn!(
+                service = %entry.service_fqdn,
+                target_host = %target.host,
+                target_port = target.port,
+                error = %err,
+                "Mesh UDP egress datagram tunnel failed; ending session"
+            );
+            return;
+        }
+    };
+
+    // ── Return-path socket: a transparent UDP socket bound NON-LOCALLY to the
+    // captured original destination so replies to the pod appear sourced from
+    // the VIP:port it dialed (IP_TRANSPARENT lets us bind a non-local addr;
+    // the reply's source IP AND port then come from this bind). Risk #1. ──────
+    let reply_socket = match build_transparent_reply_socket(key.orig_dst) {
+        Ok(sock) => std::sync::Arc::new(sock),
+        Err(e) => {
+            warn!(
+                service = %entry.service_fqdn,
+                orig_dst = %key.orig_dst,
+                error = %e,
+                "Mesh UDP egress could not bind a transparent reply socket; ending session \
+                 (replies must be sourced from the captured destination)"
+            );
+            return;
+        }
+    };
+
     debug!(
-        client = %client,
-        orig_dst = %orig_dst,
-        size = data_len,
-        "Mesh UDP capture: captured datagram (Stage 3 drop; egress is Stage 4)"
+        service = %entry.service_fqdn,
+        orig_dst = %key.orig_dst,
+        client = %key.client,
+        target_host = %target.host,
+        target_port = target.port,
+        "Mesh UDP egress session established (datagram-over-HBONE)"
     );
-    admitted
+
+    let (mut tunnel_read, mut tunnel_write) = tokio::io::split(tunnel);
+    let idle = udp_session_idle_timeout(proxy);
+
+    // Return path: read framed datagrams off the tunnel and reply to the client
+    // from the transparent socket. Runs concurrently with the egress loop.
+    let return_client = key.client;
+    let return_socket = reply_socket.clone();
+    let return_path = async move {
+        let mut buf = bytes::BytesMut::with_capacity(super::mesh_udp_frame::MAX_FRAME_PAYLOAD);
+        loop {
+            match super::mesh_udp_frame::read_datagram(&mut tunnel_read, &mut buf).await {
+                Ok(Some(payload)) => {
+                    // Best-effort reply; a send error (client gone) ends the
+                    // return path, which tears the session down.
+                    if let Err(e) = return_socket.send_to(&payload, return_client).await {
+                        debug!(
+                            client = %return_client,
+                            error = %e,
+                            "Mesh UDP egress: reply send to client failed; ending return path"
+                        );
+                        break;
+                    }
+                }
+                Ok(None) => break, // tunnel half-closed
+                Err(_) => break,   // tunnel read error
+            }
+        }
+    };
+
+    // Egress loop: drain captured datagrams, frame each, write onto the tunnel.
+    // An idle timeout (no captured datagram within the window) ends the session.
+    let egress_loop = async move {
+        use tokio::io::AsyncWriteExt;
+        let mut frame =
+            bytes::BytesMut::with_capacity(2 + super::mesh_udp_frame::MAX_FRAME_PAYLOAD);
+        loop {
+            let next = match idle {
+                Some(d) => match tokio::time::timeout(d, rx.recv()).await {
+                    Ok(v) => v,
+                    Err(_) => {
+                        debug!("Mesh UDP egress: session idle timeout; ending");
+                        None
+                    }
+                },
+                None => rx.recv().await,
+            };
+            let Some(payload) = next else { break };
+            frame.clear();
+            if super::mesh_udp_frame::encode_datagram(&mut frame, &payload).is_err() {
+                // A captured datagram cannot exceed MAX_FRAME_PAYLOAD, so this is
+                // unreachable for real traffic; skip rather than tear down.
+                continue;
+            }
+            if let Err(e) = tunnel_write.write_all(&frame).await {
+                debug!(error = %e, "Mesh UDP egress: tunnel write failed; ending session");
+                break;
+            }
+        }
+        // Half-close the tunnel write side (h2 end-stream) on the way out.
+        let _ = tunnel_write.shutdown().await;
+    };
+
+    // Either side completing ends the session.
+    tokio::select! {
+        _ = return_path => {}
+        _ = egress_loop => {}
+    }
+}
+
+/// Build a transparent UDP socket bound (non-locally) to `orig_dst` so replies
+/// to the captured client carry `orig_dst` as their source address AND port.
+/// `IP_TRANSPARENT` (Linux, needs `CAP_NET_ADMIN`) is what permits binding to a
+/// non-local address; `SO_REUSEADDR` mirrors the capture socket so multiple
+/// sessions to the same VIP:port coexist. This is the TPROXY return-path
+/// pattern: the kernel emits replies from the bound transparent address rather
+/// than the host's own IP.
+#[cfg(target_os = "linux")]
+fn build_transparent_reply_socket(
+    orig_dst: SocketAddr,
+) -> Result<tokio::net::UdpSocket, anyhow::Error> {
+    use std::net::IpAddr;
+    use std::os::fd::AsRawFd;
+
+    let domain = match orig_dst.ip() {
+        IpAddr::V4(_) => socket2::Domain::IPV4,
+        IpAddr::V6(_) => socket2::Domain::IPV6,
+    };
+    let socket = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
+    socket.set_reuse_address(true)?;
+    socket.set_nonblocking(true)?;
+    let fd = socket.as_raw_fd();
+    match orig_dst.ip() {
+        IpAddr::V4(_) => crate::socket_opts::set_ip_transparent(fd)?,
+        IpAddr::V6(_) => crate::socket_opts::set_ipv6_transparent(fd)?,
+    }
+    // Bind to the captured original destination (the VIP:port the pod dialed).
+    // IP_TRANSPARENT makes this non-local bind succeed; replies sent on this
+    // socket then originate from orig_dst.
+    socket.bind(&orig_dst.into())?;
+    Ok(tokio::net::UdpSocket::from_std(socket.into())?)
+}
+
+/// Resolve the per-session idle timeout for an egress session from the relay
+/// proxy's `udp_idle_timeout_seconds` (the materialized relay proxy carries the
+/// repo's stream-proxy default). `0` disables the idle timeout.
+#[cfg(target_os = "linux")]
+fn udp_session_idle_timeout(proxy: &crate::config::types::Proxy) -> Option<std::time::Duration> {
+    let secs = proxy.udp_idle_timeout_seconds;
+    (secs > 0).then(|| std::time::Duration::from_secs(secs))
 }
 
 /// Spawn the idle-session sweep for the capture listener. Removes sessions
@@ -446,6 +882,13 @@ fn spawn_capture_session_cleanup(
 pub async fn start_mesh_udp_capture_listener(
     cfg: MeshUdpCaptureConfig,
 ) -> Result<(), anyhow::Error> {
+    // Touch the Stage-4 fields so the non-Linux build doesn't flag them dead
+    // (their only real consumer is the Linux listener / egress path).
+    let _ = &cfg.state;
+    let _ = cfg.max_sessions;
+    let _ = cfg.cleanup_interval_seconds;
+    let _ = cfg.recvmmsg_batch_size;
+    let _ = cfg.session_shard_amount;
     let _ = cfg.shutdown;
     let _ = cfg.global_shutdown;
     // Fire the startup-ready signal before returning: mesh startup's
@@ -481,15 +924,54 @@ mod tests {
         )
     }
 
+    /// A minimal routable egress entry for the keying/cap tests (no live tunnel
+    /// is dialed — `admit_or_refresh_session` only stores the entry/channel).
+    fn fake_entry() -> std::sync::Arc<crate::router_cache::MeshTcpEgressEntry> {
+        let proxy = crate::modes::mesh::mesh_outbound_udp_relay_proxy(
+            "default",
+            "dns",
+            53,
+            "__mesh-out-udp-upstream-default-dns-53",
+        );
+        std::sync::Arc::new(crate::router_cache::MeshTcpEgressEntry {
+            upstream_id: "__mesh-out-udp-upstream-default-dns-53".to_string(),
+            relay_proxy: std::sync::Arc::new(proxy),
+            service_fqdn: "dns.default.svc.cluster.local".to_string(),
+        })
+    }
+
+    /// `resolve_entry` closure that always routes (returns a fake entry).
+    fn routable() -> Option<std::sync::Arc<crate::router_cache::MeshTcpEgressEntry>> {
+        Some(fake_entry())
+    }
+
+    /// `resolve_entry` closure that never routes (no declared mesh UDP dest).
+    fn unroutable() -> Option<std::sync::Arc<crate::router_cache::MeshTcpEgressEntry>> {
+        None
+    }
+
+    fn key(client: &str, dst: &str) -> CaptureSessionKey {
+        CaptureSessionKey {
+            client: client.parse().unwrap(),
+            orig_dst: dst.parse().unwrap(),
+        }
+    }
+
     #[test]
-    fn datagram_without_origdst_is_dropped_unaccounted() {
+    fn unroutable_destination_is_dropped_without_a_slot() {
+        // A captured datagram whose orig-dst matches no mesh UDP destination is
+        // dropped: no session, no slot consumed (fail closed).
         let sessions = new_sessions(0);
         let active = std::sync::atomic::AtomicU64::new(0);
-        let client: SocketAddr = "10.0.0.5:40000".parse().unwrap();
-        // No orig-dst ⇒ dropped, not accounted, no session created.
-        assert!(!handle_captured_datagram(
-            &sessions, &active, client, None, 32, 1000
-        ));
+        let outcome = admit_or_refresh_session(
+            &sessions,
+            &active,
+            key("10.0.0.5:40000", "1.1.1.1:53"),
+            b"q",
+            1000,
+            unroutable,
+        );
+        assert!(matches!(outcome, SessionAdmission::Dropped));
         assert_eq!(sessions.len(), 0);
         assert_eq!(active.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
@@ -498,75 +980,70 @@ mod tests {
     fn session_keyed_by_client_and_origdst() {
         let sessions = new_sessions(0);
         let active = std::sync::atomic::AtomicU64::new(0);
-        let client: SocketAddr = "10.0.0.5:40000".parse().unwrap();
-        let dst_a: SocketAddr = "10.96.0.10:53".parse().unwrap();
-        let dst_b: SocketAddr = "10.96.0.11:53".parse().unwrap();
+        // Hold the receivers so refreshes' channel sends don't fail (irrelevant
+        // to the keying assertions, but keeps the sessions' channels open).
+        let mut keepalive = Vec::new();
 
         // Same client, two distinct destinations ⇒ two sessions.
-        assert!(handle_captured_datagram(
-            &sessions,
-            &active,
-            client,
-            Some(dst_a),
-            16,
-            1000
-        ));
-        assert!(handle_captured_datagram(
-            &sessions,
-            &active,
-            client,
-            Some(dst_b),
-            16,
-            1000
-        ));
+        for dst in ["10.96.0.10:53", "10.96.0.11:53"] {
+            match admit_or_refresh_session(
+                &sessions,
+                &active,
+                key("10.0.0.5:40000", dst),
+                b"x",
+                1000,
+                routable,
+            ) {
+                SessionAdmission::Admitted { rx, .. } => keepalive.push(rx),
+                other => panic!("expected Admitted, got {}", admission_name(&other)),
+            }
+        }
         assert_eq!(sessions.len(), 2);
 
-        // A second datagram on the same (client, dst_a) flow refreshes the
-        // existing session — does NOT create a third.
-        assert!(handle_captured_datagram(
+        // A second datagram on an existing (client, dst) flow refreshes — no new
+        // session.
+        let outcome = admit_or_refresh_session(
             &sessions,
             &active,
-            client,
-            Some(dst_a),
-            16,
-            1000
-        ));
+            key("10.0.0.5:40000", "10.96.0.10:53"),
+            b"x",
+            1000,
+            routable,
+        );
+        assert!(matches!(outcome, SessionAdmission::Refreshed));
         assert_eq!(sessions.len(), 2);
 
-        // A different client to dst_a is a distinct session.
-        let client2: SocketAddr = "10.0.0.6:50000".parse().unwrap();
-        assert!(handle_captured_datagram(
+        // A different client to the same dst is a distinct session.
+        match admit_or_refresh_session(
             &sessions,
             &active,
-            client2,
-            Some(dst_a),
-            16,
-            1000
-        ));
+            key("10.0.0.6:50000", "10.96.0.10:53"),
+            b"x",
+            1000,
+            routable,
+        ) {
+            SessionAdmission::Admitted { rx, .. } => keepalive.push(rx),
+            other => panic!("expected Admitted, got {}", admission_name(&other)),
+        }
         assert_eq!(sessions.len(), 3);
     }
 
     #[test]
     fn first_datagram_new_session_does_not_deadlock() {
-        // Regression for codex r1 P1: the first datagram for a fresh
-        // (client, orig-dst) must admit a session WITHOUT re-entering the
-        // DashMap (`len()`) while an entry guard is held — otherwise this call
-        // self-deadlocks and the test hangs. A plain return here is the proof
-        // it no longer nests map ops under a guard.
+        // Regression for codex r1 P1: admitting a fresh flow must not re-enter
+        // the DashMap (`len()`) while an entry guard is held — a plain return
+        // here is the proof it no longer nests map ops under a guard.
         let sessions = new_sessions(0);
         let active = std::sync::atomic::AtomicU64::new(0);
-        let client: SocketAddr = "10.0.0.5:40000".parse().unwrap();
-        let dst: SocketAddr = "10.96.0.10:53".parse().unwrap();
-        // Cap well above 1 so the new flow is admitted via the count-then-insert
-        // path (the exact path that previously held a guard across `len()`).
-        assert!(handle_captured_datagram(
+        let outcome = admit_or_refresh_session(
             &sessions,
             &active,
-            client,
-            Some(dst),
+            key("10.0.0.5:40000", "10.96.0.10:53"),
+            b"x",
             64,
-            1000
-        ));
+            routable,
+        );
+        assert!(matches!(outcome, SessionAdmission::Admitted { .. }));
         assert_eq!(sessions.len(), 1);
     }
 
@@ -574,41 +1051,52 @@ mod tests {
     fn session_cap_sheds_new_flows_but_serves_existing() {
         let sessions = new_sessions(0);
         let active = std::sync::atomic::AtomicU64::new(0);
-        let dst: SocketAddr = "10.96.0.10:53".parse().unwrap();
-        let client_a: SocketAddr = "10.0.0.5:40000".parse().unwrap();
-        let client_b: SocketAddr = "10.0.0.6:40000".parse().unwrap();
 
         // Cap of 1: first new flow admitted.
-        assert!(handle_captured_datagram(
+        let first = admit_or_refresh_session(
             &sessions,
             &active,
-            client_a,
-            Some(dst),
-            8,
-            1
-        ));
+            key("10.0.0.5:40000", "10.96.0.10:53"),
+            b"x",
+            1,
+            routable,
+        );
+        let _rx = match first {
+            SessionAdmission::Admitted { rx, .. } => rx,
+            other => panic!("expected Admitted, got {}", admission_name(&other)),
+        };
         assert_eq!(sessions.len(), 1);
 
         // Second NEW flow is shed at the cap.
-        assert!(!handle_captured_datagram(
+        let second = admit_or_refresh_session(
             &sessions,
             &active,
-            client_b,
-            Some(dst),
-            8,
-            1
-        ));
+            key("10.0.0.6:40000", "10.96.0.10:53"),
+            b"x",
+            1,
+            routable,
+        );
+        assert!(matches!(second, SessionAdmission::Dropped));
         assert_eq!(sessions.len(), 1);
 
         // The already-admitted flow is still served (refresh), even at the cap.
-        assert!(handle_captured_datagram(
+        let refreshed = admit_or_refresh_session(
             &sessions,
             &active,
-            client_a,
-            Some(dst),
-            8,
-            1
-        ));
+            key("10.0.0.5:40000", "10.96.0.10:53"),
+            b"x",
+            1,
+            routable,
+        );
+        assert!(matches!(refreshed, SessionAdmission::Refreshed));
         assert_eq!(sessions.len(), 1);
+    }
+
+    fn admission_name(a: &SessionAdmission) -> &'static str {
+        match a {
+            SessionAdmission::Refreshed => "Refreshed",
+            SessionAdmission::Admitted { .. } => "Admitted",
+            SessionAdmission::Dropped => "Dropped",
+        }
     }
 }

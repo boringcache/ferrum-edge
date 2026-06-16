@@ -14,7 +14,7 @@ use hyper::upgrade::OnUpgrade;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpStream;
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 
 use super::{
     ClientRequestBody, LoadBalancerConnectionGuard, ProxyBody, ProxyState, backend_dispatch,
@@ -55,10 +55,39 @@ pub(super) fn tag_request_metadata(ctx: &mut RequestContext) {
     );
 }
 
+/// Tag metadata for a datagram-over-HBONE CONNECT (F3 §3.3 Stage 4). Same
+/// HBONE connection-security policy (it rides the same SVID-mTLS H2 CONNECT)
+/// but a distinct `request_protocol` so logs/metrics can tell the datagram
+/// tunnel apart from the byte-stream relay.
+pub(super) fn tag_udp_request_metadata(ctx: &mut RequestContext) {
+    ctx.metadata
+        .insert("request_protocol".to_string(), "hbone-udp".to_string());
+    ctx.metadata.insert(
+        "connection_security_policy".to_string(),
+        "hbone".to_string(),
+    );
+}
+
 pub(super) fn is_connect_request<B>(req: &Request<B>, env_config: &EnvConfig) -> bool {
     env_config.mode == OperatingMode::Mesh
         && req.extensions().get::<hyper::ext::Protocol>().is_none()
         && crate::modes::mesh::hbone::is_hbone_connect(req.method(), req.version(), req.headers())
+}
+
+/// Whether `req` is a datagram-over-HBONE CONNECT (F3 §3.3 Stage 4): a bare
+/// HTTP/2 CONNECT (no `:protocol` extension) in mesh mode carrying the EXPLICIT
+/// `x-ferrum-mesh-protocol: udp` marker. Mutually exclusive with
+/// [`is_connect_request`] (which matches the `hbone`/marker-less byte-stream
+/// shape): a `udp`-marked CONNECT is NOT an `is_connect_request` (its marker is
+/// not `hbone`), so the two never both fire for one request.
+pub(super) fn is_udp_connect_request<B>(req: &Request<B>, env_config: &EnvConfig) -> bool {
+    env_config.mode == OperatingMode::Mesh
+        && req.extensions().get::<hyper::ext::Protocol>().is_none()
+        && crate::modes::mesh::hbone::is_udp_hbone_connect(
+            req.method(),
+            req.version(),
+            req.headers(),
+        )
 }
 
 pub(super) fn strip_egress_baggage_in_vec(
@@ -695,6 +724,393 @@ pub(super) async fn handle_hbone_request(
                 r#"{"error":"Internal server error"}"#,
             )
         })
+}
+
+/// Destination-side handler for a datagram-over-HBONE CONNECT (F3 §3.3 Stage 4).
+///
+/// The source gateway opened a `udp`-marked CONNECT whose `:authority` is the
+/// destination workload's UDP app `host:port`. This handler:
+/// 1. requires an authenticated mesh peer (same trust boundary as the byte-stream
+///    relay — a marker alone never authorizes a tunnel);
+/// 2. opens a LOCAL `UdpSocket` connected to the CONNECT authority (the open-relay
+///    guard already bounded the authority to a loopback / slice-known workload
+///    addr+port when the synthesized relay proxy was built);
+/// 3. on upgrade, runs two tasks over the tunnel: tunnel → unframe → `socket.send`
+///    (datagram to the local app) and `socket.recv` → frame → tunnel (reply back).
+///
+/// Unlike the byte-stream relay there is NO TCP backend connect, circuit breaker,
+/// or load balancer — the destination is a single local UDP socket. Backend dial
+/// failure (bind/connect) fails closed with a 502 before the 200 CONNECT response.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn handle_hbone_udp_request(
+    state: &ProxyState,
+    proxy: &Arc<Proxy>,
+    epoch: &RequestEpoch,
+    ctx: &mut RequestContext,
+    client_request_body: ClientRequestBody,
+    plugins: &[Arc<dyn Plugin>],
+    start_time: Instant,
+    method: &str,
+    plugin_execution_ns: u64,
+) -> Response<ProxyBody> {
+    let proxy_arc = ctx
+        .apply_route_overrides_with_upstreams(Arc::clone(proxy), epoch.load_balancer.upstreams());
+    let proxy: &Arc<Proxy> = &proxy_arc;
+    ctx.matched_proxy = Some(Arc::clone(proxy));
+
+    // Same trust boundary as the byte-stream relay: only an authenticated,
+    // trust-domain-verified mesh peer may open a datagram tunnel into a local
+    // socket. A bare/`udp`-marked CONNECT from an unauthenticated peer is
+    // rejected before any socket is opened.
+    if ctx.peer_spiffe_id.is_none() {
+        warn!(
+            proxy_id = %proxy.id,
+            "Rejected datagram-over-HBONE CONNECT with no authenticated peer identity"
+        );
+        ctx.metadata.insert(
+            "mesh_authz.deny_policy".to_string(),
+            "hbone_udp_unauthenticated_peer".to_string(),
+        );
+        let reject = finalize_reject_response_with_after_proxy_hooks(
+            plugins,
+            ctx,
+            StatusCode::FORBIDDEN,
+            br#"{"error":"HBONE UDP tunnel requires an authenticated mesh peer"}"#,
+            HashMap::new(),
+            false,
+        )
+        .await;
+        log_rejected_request(
+            plugins,
+            ctx,
+            reject.http_status.as_u16(),
+            start_time,
+            "hbone_udp_unauthenticated_peer",
+            plugin_execution_ns,
+        )
+        .await;
+        record_request(state, reject.http_status.as_u16());
+        return build_response_from_normalized_reject(reject);
+    }
+
+    // The CONNECT authority is the destination UDP app addr+port. For the
+    // transparent inbound relay it is carried as the synthesized proxy's
+    // backend_host:backend_port (already bounded by the open-relay guard); an
+    // LB-selected target (route-override path) wins when present.
+    let selection = backend_dispatch::select_upstream_target(
+        proxy,
+        state,
+        epoch,
+        &ctx.client_ip,
+        &ctx.headers,
+        ctx.orig_dst,
+    );
+    let upstream_target = selection.target;
+    let (app_host, app_port) = upstream_target
+        .as_deref()
+        .map(|t| (t.host.as_str(), t.port))
+        .unwrap_or((proxy.backend_host.as_str(), proxy.backend_port));
+    if app_host.is_empty() || app_port == 0 {
+        error!(proxy_id = %proxy.id, "HBONE UDP CONNECT has no resolvable local destination");
+        let reject = finalize_reject_response_with_after_proxy_hooks(
+            plugins,
+            ctx,
+            StatusCode::BAD_GATEWAY,
+            br#"{"error":"HBONE UDP destination unresolved"}"#,
+            HashMap::new(),
+            false,
+        )
+        .await;
+        log_rejected_request(
+            plugins,
+            ctx,
+            reject.http_status.as_u16(),
+            start_time,
+            "hbone_udp_no_destination",
+            plugin_execution_ns,
+        )
+        .await;
+        record_request(state, reject.http_status.as_u16());
+        return build_response_from_normalized_reject(reject);
+    }
+
+    // Extract the upgrade handle BEFORE building the 200 (the framed datagrams
+    // ride the upgraded CONNECT body). Same invariant as the byte-stream relay:
+    // the body must be streaming and carry an `OnUpgrade`.
+    let on_upgrade = match client_request_body {
+        ClientRequestBody::Streaming(request) => {
+            let (mut parts, _body) = (*request).into_parts();
+            match parts.extensions.remove::<OnUpgrade>() {
+                Some(on_upgrade) => on_upgrade,
+                None => {
+                    return hbone_udp_internal_error(
+                        state,
+                        plugins,
+                        ctx,
+                        start_time,
+                        plugin_execution_ns,
+                        "hbone_udp_upgrade_missing",
+                        br#"{"error":"HBONE UDP upgrade handle missing"}"#,
+                    )
+                    .await;
+                }
+            }
+        }
+        ClientRequestBody::Buffered(_) => {
+            return hbone_udp_internal_error(
+                state,
+                plugins,
+                ctx,
+                start_time,
+                plugin_execution_ns,
+                "hbone_udp_request_buffered",
+                br#"{"error":"HBONE UDP request buffering invariant violated"}"#,
+            )
+            .await;
+        }
+    };
+
+    // Open a local UDP socket connected to the CONNECT authority. `connect`
+    // pins the peer so `recv`/`send` only talk to that destination. Bind to the
+    // unspecified address of the destination's family.
+    let dest_addr = match resolve_local_udp_dest(state, proxy, app_host, app_port).await {
+        Ok(addr) => addr,
+        Err((status, body, phase, message)) => {
+            warn!(proxy_id = %proxy.id, error = %message, "HBONE UDP backend resolution failed");
+            let reject = finalize_reject_response_with_after_proxy_hooks(
+                plugins,
+                ctx,
+                status,
+                body,
+                HashMap::new(),
+                false,
+            )
+            .await;
+            log_rejected_request(
+                plugins,
+                ctx,
+                reject.http_status.as_u16(),
+                start_time,
+                phase,
+                plugin_execution_ns,
+            )
+            .await;
+            record_request(state, reject.http_status.as_u16());
+            return build_response_from_normalized_reject(reject);
+        }
+    };
+
+    let bind_addr = match dest_addr {
+        SocketAddr::V4(_) => "0.0.0.0:0",
+        SocketAddr::V6(_) => "[::]:0",
+    };
+    let socket = match tokio::net::UdpSocket::bind(bind_addr).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(proxy_id = %proxy.id, error = %e, "HBONE UDP local socket bind failed");
+            let reject = finalize_reject_response_with_after_proxy_hooks(
+                plugins,
+                ctx,
+                StatusCode::BAD_GATEWAY,
+                br#"{"error":"HBONE UDP local socket bind failed"}"#,
+                HashMap::new(),
+                false,
+            )
+            .await;
+            log_rejected_request(
+                plugins,
+                ctx,
+                reject.http_status.as_u16(),
+                start_time,
+                "hbone_udp_bind",
+                plugin_execution_ns,
+            )
+            .await;
+            record_request(state, reject.http_status.as_u16());
+            return build_response_from_normalized_reject(reject);
+        }
+    };
+    if let Err(e) = socket.connect(dest_addr).await {
+        warn!(proxy_id = %proxy.id, error = %e, "HBONE UDP local socket connect failed");
+        let reject = finalize_reject_response_with_after_proxy_hooks(
+            plugins,
+            ctx,
+            StatusCode::BAD_GATEWAY,
+            br#"{"error":"HBONE UDP local socket connect failed"}"#,
+            HashMap::new(),
+            false,
+        )
+        .await;
+        log_rejected_request(
+            plugins,
+            ctx,
+            reject.http_status.as_u16(),
+            start_time,
+            "hbone_udp_connect",
+            plugin_execution_ns,
+        )
+        .await;
+        record_request(state, reject.http_status.as_u16());
+        return build_response_from_normalized_reject(reject);
+    }
+
+    let relay_proxy_id = proxy.id.clone();
+    let relay_method = method.to_string();
+    // `udp_idle_timeout_seconds == 0` disables the idle window (None).
+    let idle = relay_timeout(proxy.udp_idle_timeout_seconds);
+    tokio::spawn(async move {
+        match on_upgrade.await {
+            Ok(upgraded) => {
+                let io = TokioIo::new(upgraded);
+                relay_hbone_udp(io, socket, idle).await;
+                debug!(
+                    proxy_id = %relay_proxy_id,
+                    method = %relay_method,
+                    "HBONE UDP tunnel relay completed"
+                );
+            }
+            Err(err) => {
+                warn!(proxy_id = %relay_proxy_id, error = %err, "HBONE UDP client upgrade failed");
+            }
+        }
+    });
+
+    record_request(state, StatusCode::OK.as_u16());
+    Response::builder()
+        .status(StatusCode::OK)
+        .body(ProxyBody::empty())
+        .unwrap_or_else(|err| {
+            error!(error = %err, "Failed to build HBONE UDP CONNECT response");
+            build_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                r#"{"error":"Internal server error"}"#,
+            )
+        })
+}
+
+/// Resolve the CONNECT authority `host:port` to a concrete `SocketAddr` for the
+/// local UDP dial (DNS via the shared cache; the relay destination is normally a
+/// loopback / pod IP already). Returns a reject tuple on failure.
+async fn resolve_local_udp_dest(
+    state: &ProxyState,
+    proxy: &Proxy,
+    host: &str,
+    port: u16,
+) -> Result<SocketAddr, (StatusCode, &'static [u8], &'static str, String)> {
+    let ip = state
+        .dns_cache
+        .resolve(
+            host,
+            proxy.dns_override.as_deref(),
+            proxy.dns_cache_ttl_seconds,
+        )
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                br#"{"error":"HBONE UDP destination DNS resolution failed"}"#.as_slice(),
+                "hbone_udp_dns",
+                e.to_string(),
+            )
+        })?;
+    Ok(SocketAddr::new(ip, port))
+}
+
+/// Two-way datagram relay between an upgraded `udp`-CONNECT tunnel (framed) and a
+/// connected local `UdpSocket` (raw datagrams). Tunnel → unframe → `send`; `recv`
+/// → frame → tunnel. Either direction ending (EOF, error, or idle) ends the
+/// relay; on exit the tunnel write half is half-closed (h2 end-stream).
+async fn relay_hbone_udp<S>(tunnel: S, socket: tokio::net::UdpSocket, idle: Option<Duration>)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    use bytes::BytesMut;
+    use tokio::io::{AsyncWriteExt, split};
+
+    let socket = Arc::new(socket);
+    let (mut tunnel_read, mut tunnel_write) = split(tunnel);
+    let max = crate::proxy::mesh_udp_frame::MAX_FRAME_PAYLOAD;
+
+    // Tunnel → local app: read framed datagrams off the tunnel and send each to
+    // the connected destination socket.
+    let send_socket = socket.clone();
+    let to_app = async move {
+        let mut buf = BytesMut::with_capacity(max);
+        while let Ok(Some(payload)) =
+            crate::proxy::mesh_udp_frame::read_datagram(&mut tunnel_read, &mut buf).await
+        {
+            if send_socket.send(&payload).await.is_err() {
+                break;
+            }
+        }
+    };
+
+    // Local app → tunnel: receive datagrams from the destination socket, frame
+    // each, and write onto the tunnel. An idle window with no reply ends it.
+    let from_app = async move {
+        let mut recv_buf = vec![0u8; max];
+        let mut frame = BytesMut::with_capacity(2 + max);
+        loop {
+            let recvd = match idle {
+                Some(d) => match tokio::time::timeout(d, socket.recv(&mut recv_buf)).await {
+                    Ok(r) => r,
+                    Err(_) => break, // idle timeout
+                },
+                None => socket.recv(&mut recv_buf).await,
+            };
+            let n = match recvd {
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            frame.clear();
+            if crate::proxy::mesh_udp_frame::encode_datagram(&mut frame, &recv_buf[..n]).is_err() {
+                continue;
+            }
+            if tunnel_write.write_all(&frame).await.is_err() {
+                break;
+            }
+        }
+        let _ = tunnel_write.shutdown().await;
+    };
+
+    tokio::select! {
+        _ = to_app => {}
+        _ = from_app => {}
+    }
+}
+
+/// Shared INTERNAL_SERVER_ERROR reject for the HBONE UDP upgrade-handle
+/// invariants (missing handle / buffered body), mirroring the byte-stream relay.
+async fn hbone_udp_internal_error(
+    state: &ProxyState,
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    start_time: Instant,
+    plugin_execution_ns: u64,
+    phase: &'static str,
+    body: &'static [u8],
+) -> Response<ProxyBody> {
+    error!(phase, "HBONE UDP relay invariant violated");
+    let reject = finalize_reject_response_with_after_proxy_hooks(
+        plugins,
+        ctx,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        body,
+        HashMap::new(),
+        false,
+    )
+    .await;
+    log_rejected_request(
+        plugins,
+        ctx,
+        reject.http_status.as_u16(),
+        start_time,
+        phase,
+        plugin_execution_ns,
+    )
+    .await;
+    record_request(state, reject.http_status.as_u16());
+    build_response_from_normalized_reject(reject)
 }
 
 #[cfg(test)]

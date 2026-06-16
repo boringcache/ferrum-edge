@@ -210,6 +210,12 @@ pub(crate) struct HostRouteTable {
     /// `cluster_ips`); Ambient-only relay (the materializer skips non-Ambient
     /// topologies, so non-Ambient entries are always `CloseNotRoutable`). Empty
     /// outside mesh mode.
+    //
+    // Consumed by the mesh UDP capture listener, which is Linux-only
+    // (`IP_TRANSPARENT` + recvmsg cmsg). The field is still built on every
+    // platform (the route table is platform-agnostic), so silence the dead-code
+    // warning where the only consumer is `#[cfg(not(linux))]`-compiled out.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     mesh_udp_egress: HashMap<(std::net::IpAddr, u16), MeshTcpEgressDecision>,
 }
 
@@ -531,6 +537,9 @@ impl HostRouteTable {
     /// UDP service port)` pair: the datagram is NOT mesh-routable and is dropped
     /// by the capture listener (UDP has no fall-through HTTP path). A declared
     /// but unroutable pair is `CloseNotRoutable` — fail closed, never guessed.
+    //
+    // Linux-only consumer (the UDP capture listener); see the field comment.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn mesh_udp_egress_decision(
         &self,
         orig_dst: std::net::SocketAddr,
@@ -3498,6 +3507,76 @@ mod tests {
         let table = cache.route_table.load();
         assert!(matches!(
             table.mesh_tcp_egress_decision("10.96.0.1:6379".parse().expect("addr")),
+            Some(MeshTcpEgressDecision::CloseNotRoutable)
+        ));
+    }
+
+    #[test]
+    fn mesh_udp_egress_table_routes_by_vip_and_port() {
+        // F3 §3.3 Stage 4: a UDP service port × VIP routes through the per-port
+        // UDP upstream; an undeclared port / different IP misses; a declared pair
+        // whose upstream did not materialize is CloseNotRoutable (fail closed).
+        use crate::modes::mesh::config::{AppProtocol, MeshConfig, MeshService, ServicePort};
+        let service = MeshService {
+            name: "dns".to_string(),
+            namespace: "default".to_string(),
+            ports: vec![ServicePort {
+                port: 53,
+                protocol: AppProtocol::Udp,
+                name: Some("dns".to_string()),
+                target_port: None,
+            }],
+            workloads: Vec::new(),
+            protocol_overrides: std::collections::HashMap::new(),
+            cluster_ips: vec!["10.96.0.10".to_string()],
+        };
+        let upstream: crate::config::types::Upstream = serde_json::from_value(serde_json::json!({
+            "id": "__mesh-out-udp-upstream-default-dns-53",
+            "name": "dns.default.svc.cluster.local",
+            "targets": [{"host": "10.0.0.9", "port": 53}],
+        }))
+        .expect("upstream deserializes");
+        let config = GatewayConfig {
+            upstreams: vec![upstream],
+            mesh: Some(Box::new(MeshConfig {
+                services: vec![service.clone()],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+        let cache = RouterCache::new(&config, 100);
+        let table = cache.route_table.load();
+        let decision =
+            |addr: &str| table.mesh_udp_egress_decision(addr.parse().expect("socket addr"));
+
+        match decision("10.96.0.10:53") {
+            Some(MeshTcpEgressDecision::Relay(entry)) => {
+                assert_eq!(entry.upstream_id, "__mesh-out-udp-upstream-default-dns-53");
+                assert_eq!(entry.service_fqdn, "dns.default.svc.cluster.local");
+            }
+            _ => panic!("expected Relay decision for an exact (VIP, UDP port) match"),
+        }
+        // Mapped-IPv6 capture of the same IPv4 VIP still matches.
+        assert!(matches!(
+            decision("[::ffff:10.96.0.10]:53"),
+            Some(MeshTcpEgressDecision::Relay(_))
+        ));
+        // Undeclared port / different IP miss (not mesh UDP destinations).
+        assert!(decision("10.96.0.10:54").is_none());
+        assert!(decision("10.96.0.11:53").is_none());
+
+        // Declared pair whose upstream did NOT materialize: CloseNotRoutable.
+        let config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                services: vec![service],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+        let cache = RouterCache::new(&config, 100);
+        let table = cache.route_table.load();
+        assert!(matches!(
+            table.mesh_udp_egress_decision("10.96.0.10:53".parse().expect("addr")),
             Some(MeshTcpEgressDecision::CloseNotRoutable)
         ));
     }

@@ -606,6 +606,81 @@ impl HboneConnectionPool {
         })?
     }
 
+    /// Open a datagram-over-HBONE CONNECT tunnel to a peer's HBONE listener over
+    /// a FRESH SVID-mTLS H2 connection (F3 §3.3 Stage 4), stamping the `udp`
+    /// protocol marker (NOT `hbone`) and the W3C source-identity baggage. The
+    /// connection is DIALED to `dial_host:hbone_port` (the peer's pod address +
+    /// `:15008`/`mesh.hbone_port`); the CONNECT `:authority` is `app_host:app_port`
+    /// — the destination workload's UDP app address+port the peer unframes the
+    /// tunnel into a local `UdpSocket` toward. The returned [`H2ConnectTunnel`]
+    /// carries length-delimited datagrams (see `crate::proxy::mesh_udp_frame`),
+    /// NOT a raw byte stream.
+    ///
+    /// Like [`Self::get_ws_byte_tunnel`] this dials its OWN H2 connection carrying
+    /// exactly ONE CONNECT stream (1:1, dropped when the UDP session ends) rather
+    /// than multiplexing over the pooled HBONE connections. A dedicated connection
+    /// per UDP session is deliberate: it keeps the wire-visible `udp` marker on a
+    /// stream that is unambiguously a datagram tunnel (no risk of a pooled
+    /// connection caching a per-connection `hbone`-vs-`udp` verdict by its first
+    /// marker), and a captured UDP flow is already a distinct session with its own
+    /// lifetime. SVID rotation is automatic (each session dials with the current
+    /// SVID). The dial PINS `expected_peer`; a missing gateway SVID fails closed
+    /// before the dial. Distinct from [`Self::get_tunnel`], which hardcodes the
+    /// `hbone` marker on the pooled byte-stream path.
+    //
+    // The only caller is the mesh UDP capture egress path, which is Linux-only
+    // (`IP_TRANSPARENT`); silence the dead-code warning on non-Linux builds.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub async fn get_datagram_tunnel(
+        &self,
+        proxy: &Proxy,
+        dial_host: &str,
+        hbone_port: u16,
+        app_host: &str,
+        app_port: u16,
+        expected_peer: Option<&crate::identity::SpiffeId>,
+    ) -> Result<H2ConnectTunnel, HbonePoolError> {
+        let (source_identity, _fingerprint) = self.current_svid_identity_cached()?;
+        let pool_config = self.pool_config.for_proxy(proxy);
+        // DR keepalive override resolved for the destination's APP port, not the
+        // transport `hbone_port` (mirrors the WS byte-tunnel path).
+        let keepalive_override = proxy
+            .dispatch_port_overrides
+            .as_ref()
+            .and_then(|m| m.get(&app_port))
+            .and_then(|o| o.tcp_keepalive.as_ref());
+        let sender = dial_h2_connect_sender(
+            &self.dns_cache,
+            &self.gateway_svid,
+            proxy,
+            dial_host,
+            hbone_port,
+            expected_peer,
+            &pool_config,
+            keepalive_override,
+        )
+        .await?;
+        let baggage = baggage_header_for_source(&source_identity);
+        tokio::time::timeout(
+            Duration::from_millis(proxy.backend_connect_timeout_ms),
+            open_h2_connect_stream(
+                sender,
+                app_host,
+                app_port,
+                Some(&baggage),
+                Some(crate::modes::mesh::hbone::UDP_PROTOCOL),
+            ),
+        )
+        .await
+        .map_err(|_| HbonePoolError::ConnectStream {
+            authority: authority_for_host_port(app_host, app_port),
+            message: format!(
+                "timed out after {}ms waiting for datagram-over-HBONE CONNECT response",
+                proxy.backend_connect_timeout_ms
+            ),
+        })?
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn get_or_create_sender(
         &self,

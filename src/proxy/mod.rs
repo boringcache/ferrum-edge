@@ -1113,6 +1113,14 @@ pub fn is_hbone_connect_request<B>(req: &Request<B>, env_config: &EnvConfig) -> 
     hbone_proxy::is_connect_request(req, env_config)
 }
 
+/// Whether `req` is a datagram-over-HBONE CONNECT (F3 §3.3 Stage 4). Disjoint
+/// from [`is_hbone_connect_request`]; the dispatch ladder treats EITHER as a
+/// CONNECT-relay (shared path normalization, body-buffering avoidance, route-miss
+/// relay synthesis) but routes the `udp` flavor to the unframing UDP handler.
+pub fn is_udp_hbone_connect_request<B>(req: &Request<B>, env_config: &EnvConfig) -> bool {
+    hbone_proxy::is_udp_connect_request(req, env_config)
+}
+
 /// Whether an authenticated inbound HBONE CONNECT to `host:port` may be
 /// transparently relayed. SAFE local targets only: a loopback address on an
 /// application port declared by the slice, or an in-mesh workload address+port
@@ -9519,17 +9527,24 @@ pub(crate) async fn start_mesh_udp_capture_listener_with_signal(
     );
     let _ = tls_config;
     let env = &state.env_config;
+    let max_sessions = env.udp_max_sessions;
+    let cleanup_interval_seconds = env.udp_cleanup_interval_seconds;
+    let recvmmsg_batch_size = env.udp_recvmmsg_batch_size;
+    let session_shard_amount = env.pool_shard_amount;
     mesh_udp_capture::start_mesh_udp_capture_listener(mesh_udp_capture::MeshUdpCaptureConfig {
         addr,
+        // Stage 4 needs the full proxy state for egress (route table, LB,
+        // capability registry, HBONE pool, SVID).
+        state: Arc::new(state),
         shutdown,
         // In mesh mode the per-listener `shutdown` is the runtime's
         // SIGINT/SIGTERM-driven channel, so a separate global receiver is
         // unnecessary here.
         global_shutdown: None,
-        max_sessions: env.udp_max_sessions,
-        cleanup_interval_seconds: env.udp_cleanup_interval_seconds,
-        recvmmsg_batch_size: env.udp_recvmmsg_batch_size,
-        session_shard_amount: env.pool_shard_amount,
+        max_sessions,
+        cleanup_interval_seconds,
+        recvmmsg_batch_size,
+        session_shard_amount,
         started_tx,
     })
     .await
@@ -10927,8 +10942,16 @@ async fn handle_proxy_request_inner(
     let method = req.method().as_str().to_owned();
     let inbound_version = req.version();
     let is_hbone_connect = is_hbone_connect_request(&req, &state.env_config);
+    // Datagram-over-HBONE CONNECT (F3 §3.3 Stage 4) — disjoint from the
+    // byte-stream `is_hbone_connect` (different wire marker). EITHER shape is a
+    // CONNECT-relay for the shared dispatch machinery (path normalization,
+    // body-buffering avoidance, route-miss relay synthesis, CONNECT-405 bypass),
+    // so the combined `is_hbone_connect_any` drives those; the `udp` flavor is
+    // routed to the unframing UDP handler at the final dispatch branch.
+    let is_udp_hbone_connect = is_udp_hbone_connect_request(&req, &state.env_config);
+    let is_hbone_connect_any = is_hbone_connect || is_udp_hbone_connect;
     let raw_path = req.uri().path();
-    let path = if is_hbone_connect && raw_path.is_empty() {
+    let path = if is_hbone_connect_any && raw_path.is_empty() {
         "/".to_string()
     } else {
         raw_path.to_string()
@@ -11112,7 +11135,7 @@ async fn handle_proxy_request_inner(
     // Note: we enable_connect_protocol() on the h2 server to support WebSocket,
     // which means h2 will deliver Extended CONNECT requests to us — we must
     // filter non-WebSocket ones here before routing.
-    if method == "CONNECT" && !is_h2_websocket_connect(&req) && !is_hbone_connect {
+    if method == "CONNECT" && !is_h2_websocket_connect(&req) && !is_hbone_connect_any {
         warn!("Rejected non-WebSocket CONNECT request");
         record_request(&state, 405);
         return Ok(build_response(
@@ -11122,6 +11145,8 @@ async fn handle_proxy_request_inner(
     }
     if is_hbone_connect {
         hbone_proxy::tag_request_metadata(&mut ctx);
+    } else if is_udp_hbone_connect {
+        hbone_proxy::tag_udp_request_metadata(&mut ctx);
     }
 
     // TLS 1.3 0-RTT early data enforcement (RFC 8470).
@@ -11480,9 +11505,14 @@ async fn handle_proxy_request_inner(
             // proxy is built only on the inbound listener (`mesh_direction ==
             // Inbound`) and only for a loopback / slice-known workload
             // destination, with loopback ports constrained to the slice's
-            // declared workload application ports; `handle_hbone_request`
-            // re-checks the authenticated-peer gate before dialing.
-            let hbone_relay = if is_hbone_connect
+            // declared workload application ports; `handle_hbone_request` /
+            // `handle_hbone_udp_request` re-checks the authenticated-peer gate
+            // before dialing. A datagram-over-HBONE CONNECT (`is_udp_hbone_connect`)
+            // takes the SAME transparent-relay synthesis — the open-relay guard
+            // (`inbound_hbone_relay_destination_allowed`) bounds the authority to
+            // a loopback / slice-known workload addr+port the same way — and is
+            // then routed to the UDP unframing handler at the dispatch branch.
+            let hbone_relay = if is_hbone_connect_any
                 && ctx.mesh_direction == Some(crate::modes::mesh::MeshTrafficDirection::Inbound)
             {
                 build_inbound_hbone_relay_proxy(req.uri().authority(), epoch.config.mesh.as_deref())
@@ -11648,7 +11678,7 @@ async fn handle_proxy_request_inner(
     // WebSocket Extended CONNECT is also excluded: DATA frames after the 200
     // response are WebSocket bytes, not an HTTP request body to drain before
     // authentication.
-    let requires_body_before_authenticate = !is_hbone_connect
+    let requires_body_before_authenticate = !is_hbone_connect_any
         && allows_request_body_buffering
         && capabilities.has(PluginCapabilities::HAS_BODY_BEFORE_AUTHENTICATE)
         && plugins.iter().any(|plugin| {
@@ -11791,7 +11821,7 @@ async fn handle_proxy_request_inner(
     // HBONE CONNECT requests must keep hyper's upgrade handle in the streaming
     // body (see `handle_hbone_request`), so pre-`before_proxy` buffering is
     // skipped — same reason as the pre-authenticate buffering guard above.
-    let requires_request_body_buffering = !is_hbone_connect
+    let requires_request_body_buffering = !is_hbone_connect_any
         && allows_request_body_buffering
         && maybe_requires_request_body_buffering
         && plugins
@@ -11957,6 +11987,24 @@ async fn handle_proxy_request_inner(
     // before backend connect, mirroring the H1/H2/H3 dispatch contract.
     if is_hbone_connect {
         return Ok(hbone_proxy::handle_hbone_request(
+            &state,
+            &proxy,
+            &epoch,
+            &mut ctx,
+            client_request_body,
+            &plugins,
+            start_time,
+            &method,
+            plugin_execution_ns,
+        )
+        .await);
+    }
+    // Datagram-over-HBONE CONNECT (F3 §3.3 Stage 4): same short-circuit as the
+    // byte-stream HBONE relay, but the destination side UNFRAMES the tunnel into
+    // a local `UdpSocket` toward the CONNECT authority instead of byte-relaying
+    // to a TCP backend.
+    if is_udp_hbone_connect {
+        return Ok(hbone_proxy::handle_hbone_udp_request(
             &state,
             &proxy,
             &epoch,
@@ -21217,6 +21265,83 @@ mod tests {
         assert!(
             enrolled.hbone_hint,
             "the enrolled per-workload target opts into HBONE probing"
+        );
+        assert_eq!(
+            enrolled.hbone_expected_peer.as_ref().map(|p| p.as_str()),
+            Some(spiffe),
+            "the HBONE probe pins the same destination identity dispatch uses"
+        );
+    }
+
+    /// F3 §3.3 Stage 4: the UDP egress upstreams are referenced by NO config
+    /// proxy, so without a dedicated enrollment pass `retain_keys` would evict
+    /// their HBONE records and every Ambient UDP dial would 502 forever.
+    /// `collect_mesh_tcp_egress_capability_targets` must enroll the Ambient
+    /// `mesh.hbone` UDP per-port targets (keyed by the SAME deterministic UDP
+    /// relay proxy dispatch uses).
+    #[test]
+    fn collect_mesh_udp_egress_capability_targets_enrolls_hbone() {
+        use crate::modes::mesh::config::{AppProtocol, MeshConfig, MeshService, ServicePort};
+
+        let spiffe = "spiffe://cluster.local/ns/default/sa/dns";
+        let svc = MeshService {
+            name: "dns".to_string(),
+            namespace: "default".to_string(),
+            ports: vec![ServicePort {
+                port: 53,
+                protocol: AppProtocol::Udp,
+                name: Some("dns".to_string()),
+                target_port: None,
+            }],
+            workloads: Vec::new(),
+            protocol_overrides: HashMap::new(),
+            cluster_ips: vec!["10.96.0.10".to_string()],
+        };
+        let udp_id = crate::modes::mesh::mesh_outbound_udp_upstream_id("default", "dns", 53);
+        let upstream: Upstream = serde_json::from_value(json!({
+            "id": udp_id,
+            "name": "dns.default.svc.cluster.local",
+            "targets": [{
+                "host": "10.0.0.9",
+                "port": 53,
+                "tags": {"mesh.hbone": "true", "mesh.spiffe_id": spiffe},
+            }],
+        }))
+        .expect("upstream deserializes");
+        let config = GatewayConfig {
+            upstreams: vec![upstream],
+            mesh: Some(Box::new(MeshConfig {
+                services: vec![svc],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+
+        let upstream_map: HashMap<&str, &Upstream> = config
+            .upstreams
+            .iter()
+            .map(|u| (u.id.as_str(), u))
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        let mut targets = Vec::new();
+        ProxyState::collect_mesh_tcp_egress_capability_targets(
+            &config,
+            &upstream_map,
+            &mut seen,
+            &mut targets,
+        );
+
+        let relay =
+            crate::modes::mesh::mesh_outbound_udp_relay_proxy("default", "dns", 53, &udp_id);
+        let expected =
+            BackendCapabilityProbeTarget::from_proxy(&relay, Some(&config.upstreams[0].targets[0]));
+        let enrolled = targets
+            .iter()
+            .find(|t| t.key == expected.key)
+            .expect("the UDP Ambient HBONE target is enrolled for probing");
+        assert!(
+            enrolled.hbone_hint,
+            "the enrolled UDP target opts into HBONE probing"
         );
         assert_eq!(
             enrolled.hbone_expected_peer.as_ref().map(|p| p.as_str()),

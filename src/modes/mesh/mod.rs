@@ -11329,6 +11329,104 @@ mod tests {
     }
 
     #[test]
+    fn mesh_outbound_udp_upstreams_materialize_ambient_only() {
+        // UDP egress (F3 §3.3 Stage 4): Ambient materializes one per-port UDP
+        // upstream with `mesh.hbone`-tagged, identity-pinned targets dialing the
+        // resolved targetPort; NO route proxy (datagrams carry no Host). Distinct
+        // id space from the TCP/HTTP lanes.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/dns";
+        let mut svc = http_mesh_service("dns", 53, spiffe);
+        svc.ports[0].protocol = AppProtocol::Udp;
+        svc.ports[0].target_port = Some(ServiceTargetPort::Number(5353));
+        svc.cluster_ips = vec!["10.96.0.10".to_string()];
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            workloads: vec![workload_with_address("dns", "dns", "10.0.0.9")],
+            services: vec![svc],
+            ..MeshSlice::default()
+        };
+        let mut config = GatewayConfig::default();
+        materialize_mesh_outbound_udp_upstreams(&mut config, &ambient_runtime(), &slice);
+        assert!(
+            config.proxies.is_empty(),
+            "UDP egress materializes upstreams only, never route proxies"
+        );
+        let upstream = config
+            .upstreams
+            .iter()
+            .find(|u| u.id == "__mesh-out-udp-upstream-default-dns-53")
+            .expect("per-port UDP upstream");
+        assert_eq!(
+            upstream.name.as_deref(),
+            Some("dns.default.svc.cluster.local"),
+            "FQDN-named so DestinationRules match"
+        );
+        let target = &upstream.targets[0];
+        assert_eq!(target.host, "10.0.0.9");
+        assert_eq!(target.port, 5353, "targets dial the resolved targetPort");
+        assert_eq!(
+            target.tags.get("mesh.hbone").map(String::as_str),
+            Some("true"),
+            "UDP egress rides the HBONE transport"
+        );
+        assert_eq!(
+            target.tags.get("mesh.protocol").map(String::as_str),
+            Some("udp"),
+        );
+        assert_eq!(
+            target.tags.get("mesh.spiffe_id").map(String::as_str),
+            Some(spiffe),
+            "destination identity stays pinned"
+        );
+    }
+
+    #[test]
+    fn mesh_outbound_udp_upstreams_skip_for_sidecar() {
+        // Sidecar UDP egress is DEFERRED (no `:15008` HBONE listener) — the
+        // materializer gates Ambient-only, so a Sidecar topology materializes NO
+        // UDP upstream and UDP stays outside the mesh.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/dns";
+        let mut svc = http_mesh_service("dns", 53, spiffe);
+        svc.ports[0].protocol = AppProtocol::Udp;
+        svc.cluster_ips = vec!["10.96.0.10".to_string()];
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            workloads: vec![workload_with_address("dns", "dns", "10.0.0.9")],
+            services: vec![svc],
+            ..MeshSlice::default()
+        };
+        let runtime = test_mesh_runtime_config();
+        assert_eq!(runtime.topology, MeshTopology::Sidecar);
+        let mut config = GatewayConfig::default();
+        materialize_mesh_outbound_udp_upstreams(&mut config, &runtime, &slice);
+        assert!(
+            config.upstreams.is_empty(),
+            "Sidecar UDP egress is deferred; no UDP upstream materializes"
+        );
+    }
+
+    #[test]
+    fn mesh_outbound_udp_upstreams_skip_vipless() {
+        // VIP-less (headless) UDP service: a datagram carries no Host and a bare
+        // port is ambiguous, so no `__mesh-out-udp-upstream-*` materializes.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/dns";
+        let mut headless = http_mesh_service("dns", 53, spiffe);
+        headless.ports[0].protocol = AppProtocol::Udp;
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            workloads: vec![workload_with_address("dns", "dns", "10.0.0.9")],
+            services: vec![headless],
+            ..MeshSlice::default()
+        };
+        let mut config = GatewayConfig::default();
+        materialize_mesh_outbound_udp_upstreams(&mut config, &ambient_runtime(), &slice);
+        assert!(
+            config.upstreams.is_empty(),
+            "VIP-less UDP service is not egress-routable"
+        );
+    }
+
+    #[test]
     fn mesh_outbound_tcp_upstreams_skip_vipless_for_the_vip_path() {
         // VIP-less (headless) service: a raw stream carries no Host and a bare
         // port number is ambiguous, so the captured original destination cannot

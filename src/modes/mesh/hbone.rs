@@ -1382,6 +1382,99 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
+    // is_udp_hbone_connect (F3 §3.3 Stage 4 datagram marker)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn is_udp_hbone_connect_requires_explicit_udp_marker() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ferrum-mesh-protocol", "udp".parse().unwrap());
+        assert!(is_udp_hbone_connect(
+            &Method::CONNECT,
+            Version::HTTP_2,
+            &headers
+        ));
+        // Case-insensitive like the hbone marker.
+        let mut upper = HeaderMap::new();
+        upper.insert("x-ferrum-mesh-protocol", "UDP".parse().unwrap());
+        assert!(is_udp_hbone_connect(
+            &Method::CONNECT,
+            Version::HTTP_2,
+            &upper
+        ));
+        // x-istio-protocol fallback also honored.
+        let mut istio = HeaderMap::new();
+        istio.insert("x-istio-protocol", "udp".parse().unwrap());
+        assert!(is_udp_hbone_connect(
+            &Method::CONNECT,
+            Version::HTTP_2,
+            &istio
+        ));
+    }
+
+    #[test]
+    fn is_udp_hbone_connect_rejects_markerless_and_hbone() {
+        // A marker-LESS CONNECT is byte-stream HBONE, NOT udp.
+        let empty = HeaderMap::new();
+        assert!(!is_udp_hbone_connect(
+            &Method::CONNECT,
+            Version::HTTP_2,
+            &empty
+        ));
+        // An explicit `hbone` marker is byte-stream, NOT udp.
+        let mut hbone = HeaderMap::new();
+        hbone.insert("x-ferrum-mesh-protocol", "hbone".parse().unwrap());
+        assert!(!is_udp_hbone_connect(
+            &Method::CONNECT,
+            Version::HTTP_2,
+            &hbone
+        ));
+    }
+
+    #[test]
+    fn udp_and_hbone_predicates_are_disjoint() {
+        // The two transports must never both fire for one request — the skew
+        // posture relies on it (an old dest with no udp branch sees
+        // is_hbone_connect==false for a udp CONNECT and 404s).
+        let mut udp = HeaderMap::new();
+        udp.insert("x-ferrum-mesh-protocol", "udp".parse().unwrap());
+        assert!(is_udp_hbone_connect(
+            &Method::CONNECT,
+            Version::HTTP_2,
+            &udp
+        ));
+        assert!(!is_hbone_connect(&Method::CONNECT, Version::HTTP_2, &udp));
+
+        let markerless = HeaderMap::new();
+        assert!(is_hbone_connect(
+            &Method::CONNECT,
+            Version::HTTP_2,
+            &markerless
+        ));
+        assert!(!is_udp_hbone_connect(
+            &Method::CONNECT,
+            Version::HTTP_2,
+            &markerless
+        ));
+    }
+
+    #[test]
+    fn is_udp_hbone_connect_rejects_non_connect_and_non_h2() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ferrum-mesh-protocol", "udp".parse().unwrap());
+        assert!(!is_udp_hbone_connect(
+            &Method::POST,
+            Version::HTTP_2,
+            &headers
+        ));
+        assert!(!is_udp_hbone_connect(
+            &Method::CONNECT,
+            Version::HTTP_11,
+            &headers
+        ));
+    }
+
+    // ---------------------------------------------------------------
     // baggage parsing edge cases
     // ---------------------------------------------------------------
 
