@@ -2464,9 +2464,11 @@ mod tests {
     #[tokio::test]
     async fn grpc_manager_pool_key_uses_global_mtls_fallback() {
         let proxy = grpc_pool_test_proxy();
-        let mut env_config = crate::config::EnvConfig::default();
-        env_config.backend_tls_client_cert_path = Some("/global/grpc-client.pem".to_string());
-        env_config.backend_tls_client_key_path = Some("/global/grpc-client.key".to_string());
+        let env_config = crate::config::EnvConfig {
+            backend_tls_client_cert_path: Some("/global/grpc-client.pem".to_string()),
+            backend_tls_client_key_path: Some("/global/grpc-client.key".to_string()),
+            ..Default::default()
+        };
         let pool = GrpcConnectionPool::new(
             PoolConfig::default(),
             env_config,
