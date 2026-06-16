@@ -1303,10 +1303,12 @@ fn parse_keepalive_duration_seconds(
 /// `cap_proxy_retry_for_target`). It is still validated as a positive
 /// integer here (zero/negative rejected) like the other uint32 knobs.
 ///
-/// `http1MaxPendingRequests` is enforced faithfully as the HTTP/1.1
-/// connection-pending-queue cap (Envoy "upstream overflow" → 503), scoped to
-/// the reqwest/H1 dispatch path; it is validated as a positive integer here
-/// (zero rejected) like the other uint32 knobs.
+/// `http1MaxPendingRequests` is honestly reinterpreted as a max-concurrent-
+/// in-flight-HTTP/1.1-requests cap, NOT Envoy's connection-pending-queue:
+/// reqwest's `send()` resolves at response headers with no connection-acquire
+/// hook, so true pending-queue depth is unmeasurable (see `docs/mesh.md`;
+/// "upstream overflow" → 503). Scoped to the reqwest/H1 dispatch path; validated
+/// as a positive integer here (zero rejected) like the other uint32 knobs.
 ///
 /// `scope` distinguishes top-level/`portLevelSettings` (where `h2UpgradePolicy`
 /// / `maxRetries` / `http1MaxPendingRequests` ARE applied) from a SUBSET
