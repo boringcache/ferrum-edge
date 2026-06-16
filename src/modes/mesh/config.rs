@@ -2688,7 +2688,23 @@ fn validate_mesh_config_internal(
             &dr.host,
             &mut errors,
         );
-        for port in dr.port_level_settings.keys() {
+        // `connectionPool.http.http1MaxPendingRequests` is enforced by the
+        // limiter as a per-`(host, port)` pending gate where `Some(0)` is
+        // hard-overflow (sheds EVERY H1 request). The K8s translator rejects
+        // 0/negative at parse time (`translate_http_uint32`), but the
+        // native/file slice path bypasses that translator, so apply the same
+        // positive-value check here — matching the repo invariant that
+        // native/file slices run the validation the K8s translator does.
+        // Walk every place a `connectionPool.http` block can ride a DR:
+        // top-level `trafficPolicy`, per-port `portLevelSettings`, and each
+        // `subsets[].trafficPolicy` (the translator rejects subset-scoped 0 too,
+        // before it drops the field from the unused subset overlay).
+        validate_dr_connection_pool_http(
+            &format!("MeshDestinationRule '{}'.trafficPolicy", dr.name),
+            dr.traffic_policy.as_ref(),
+            &mut errors,
+        );
+        for (port, policy) in &dr.port_level_settings {
             validate_non_zero_port(
                 format!(
                     "MeshDestinationRule '{}'.port_level_settings[{}]",
@@ -2697,11 +2713,27 @@ fn validate_mesh_config_internal(
                 *port,
                 &mut errors,
             );
+            validate_dr_connection_pool_http(
+                &format!(
+                    "MeshDestinationRule '{}'.port_level_settings[{}].trafficPolicy",
+                    dr.name, port
+                ),
+                Some(policy),
+                &mut errors,
+            );
         }
         for (i, subset) in dr.subsets.iter().enumerate() {
             validate_non_empty_string(
                 format!("MeshDestinationRule '{}'.subsets[{}].name", dr.name, i),
                 &subset.name,
+                &mut errors,
+            );
+            validate_dr_connection_pool_http(
+                &format!(
+                    "MeshDestinationRule '{}'.subsets[{}].trafficPolicy",
+                    dr.name, i
+                ),
+                subset.traffic_policy.as_ref(),
                 &mut errors,
             );
         }
@@ -2803,6 +2835,32 @@ fn validate_non_empty_string(context: String, value: &str, errors: &mut Vec<Stri
 fn validate_non_zero_port(context: String, port: u16, errors: &mut Vec<String>) {
     if port == 0 {
         errors.push(format!("{context}: port must be greater than 0"));
+    }
+}
+
+/// Validate a DestinationRule `connectionPool.http` block from the native/file
+/// mesh slice path, matching the positive-value checks the K8s translator
+/// (`translate_http_uint32`) enforces at parse time.
+///
+/// `http1MaxPendingRequests` is the load-bearing one: the
+/// [`crate::backend_pending_limit::BackendPendingLimiter`] treats `Some(0)` as a
+/// hard-overflow that sheds every HTTP/1.1 request, so an accidental `0` on a
+/// hand-authored native/file DR would silently blackhole all H1 traffic to the
+/// matched destination. The K8s translator rejects 0/negative; this keeps the
+/// native/file path equivalent (negatives are already impossible — the field
+/// deserializes as `u32` — so only the zero case needs rejecting here).
+fn validate_dr_connection_pool_http(
+    context: &str,
+    policy: Option<&MeshTrafficPolicy>,
+    errors: &mut Vec<String>,
+) {
+    let Some(http) = policy.and_then(|p| p.connection_pool_http.as_ref()) else {
+        return;
+    };
+    if http.http1_max_pending_requests == Some(0) {
+        errors.push(format!(
+            "{context}.connectionPool.http.http1MaxPendingRequests must be positive (0 would shed every HTTP/1.1 request)"
+        ));
     }
 }
 
