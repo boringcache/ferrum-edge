@@ -73,6 +73,7 @@ const DEFAULT_DNS_ENABLED: bool = false;
 const DEFAULT_DNS_MAX_CONCURRENT_QUERIES: usize = 1024;
 const DEFAULT_EGRESS_LISTEN_ADDR: &str = "0.0.0.0:15090";
 const MESH_CA_INITIAL_SVID_TIMEOUT: Duration = Duration::from_secs(30);
+const INTERNAL_MESH_CA_FAILURE_BACKOFF_INITIAL_SECS: u64 = 5;
 
 pub const MESH_SPIFFE_IDENTITY_PLUGIN_ID: &str = "__mesh_spiffe_identity";
 pub const MESH_AUTHZ_PLUGIN_ID: &str = "__mesh_authz";
@@ -5761,14 +5762,10 @@ fn merge_tracing_config(
     if next.disable_span_reporting.is_some() {
         current.disable_span_reporting = next.disable_span_reporting;
     }
-    if !next.custom_tags.is_empty() {
-        current.custom_tags.clone_from(&next.custom_tags);
-    }
-    if !next.custom_header_tags.is_empty() {
-        current
-            .custom_header_tags
-            .clone_from(&next.custom_header_tags);
-    }
+    current.custom_tags.extend(next.custom_tags.clone());
+    current
+        .custom_header_tags
+        .extend(next.custom_header_tags.clone());
     if !next.providers.is_empty() {
         current.providers.clone_from(&next.providers);
     }
@@ -7360,8 +7357,12 @@ async fn run_internal_mesh_svid_rotation_loop(
     trust_overlay_slot: SharedMeshInboundTrustOverlaySlot,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
+    let mut retry_after_failure = None;
+    let mut failure_backoff_secs = INTERNAL_MESH_CA_FAILURE_BACKOFF_INITIAL_SECS;
     loop {
-        let next_tick = {
+        let next_tick = if let Some(delay) = retry_after_failure.take() {
+            delay
+        } else {
             let snapshot = proxy_state.gateway_svid_bundle.load_full();
             snapshot
                 .as_ref()
@@ -7392,7 +7393,7 @@ async fn run_internal_mesh_svid_rotation_loop(
             continue;
         }
 
-        if let Err(error) = issue_and_install_mesh_ca_svid(
+        match issue_and_install_mesh_ca_svid(
             &proxy_state,
             ca.as_ref(),
             &spiffe_id,
@@ -7403,14 +7404,26 @@ async fn run_internal_mesh_svid_rotation_loop(
         )
         .await
         {
-            crate::plugins::mesh::prometheus_helpers::increment_mesh_cert_rotation_failure(
-                &spiffe_id, "internal",
-            );
-            warn!(
-                error = %error,
-                spiffe_id = %spiffe_id,
-                "internal mesh CA SVID rotation failed; keeping current identity"
-            );
+            Ok(()) => {
+                failure_backoff_secs = INTERNAL_MESH_CA_FAILURE_BACKOFF_INITIAL_SECS;
+            }
+            Err(error) => {
+                let retry_delay = crate::util::backoff::jittered_backoff(failure_backoff_secs);
+                let retry_after_ms = retry_delay.as_millis();
+                retry_after_failure = Some(retry_delay);
+                failure_backoff_secs = failure_backoff_secs
+                    .saturating_mul(2)
+                    .min(crate::util::backoff::BACKOFF_MAX_SECS);
+                crate::plugins::mesh::prometheus_helpers::increment_mesh_cert_rotation_failure(
+                    &spiffe_id, "internal",
+                );
+                warn!(
+                    error = %error,
+                    spiffe_id = %spiffe_id,
+                    retry_after_ms,
+                    "internal mesh CA SVID rotation failed; keeping current identity"
+                );
+            }
         }
     }
 }
@@ -7636,6 +7649,32 @@ fn retain_svid_local_trust_only(bundle: &mut crate::identity::SvidBundle) {
     bundle.trust_bundles.federated.clear();
 }
 
+fn merge_trust_bundle_authorities(
+    target: &mut crate::identity::TrustBundle,
+    overlay: &crate::identity::TrustBundle,
+) {
+    for authority in &overlay.x509_authorities {
+        if !target
+            .x509_authorities
+            .iter()
+            .any(|existing| existing == authority)
+        {
+            target.x509_authorities.push(authority.clone());
+        }
+    }
+    for authority in &overlay.jwt_authorities {
+        if !target.jwt_authorities.iter().any(|existing| {
+            existing.key_id == authority.key_id
+                && existing.public_key_pem == authority.public_key_pem
+        }) {
+            target.jwt_authorities.push(authority.clone());
+        }
+    }
+    if target.refresh_hint_seconds.is_none() {
+        target.refresh_hint_seconds = overlay.refresh_hint_seconds;
+    }
+}
+
 fn merge_trust_overlay_into_svid_bundle(
     bundle: &mut crate::identity::SvidBundle,
     runtime: &crate::identity::TrustBundleSet,
@@ -7643,8 +7682,8 @@ fn merge_trust_overlay_into_svid_bundle(
     // CP-pushed slice trust is authoritative for inbound federation. Drop raw
     // federated bundles from the SVID source before adding accepted slice
     // bundles. The local bundle stays anchored to the gateway SVID's own trust
-    // domain (we do not let the slice override the local roots the SVID itself
-    // chains to).
+    // domain, but same-domain slice authorities are additive so a CP can stage
+    // CA-root rotation without replacing the freshly loaded SVID roots.
     retain_svid_local_trust_only(bundle);
     for (trust_domain, federated) in &runtime.federated {
         bundle
@@ -7653,16 +7692,18 @@ fn merge_trust_overlay_into_svid_bundle(
             .entry(trust_domain.clone())
             .or_insert_with(|| federated.clone());
     }
+    if runtime.local.trust_domain == bundle.trust_bundles.local.trust_domain {
+        merge_trust_bundle_authorities(&mut bundle.trust_bundles.local, &runtime.local);
+        return;
+    }
     // If the slice's local bundle is for a different trust domain than the
     // SVID's, treat it as a federated peer trust domain so cross-trust peers
     // still validate.
-    if runtime.local.trust_domain != bundle.trust_bundles.local.trust_domain {
-        bundle
-            .trust_bundles
-            .federated
-            .entry(runtime.local.trust_domain.clone())
-            .or_insert_with(|| runtime.local.clone());
-    }
+    bundle
+        .trust_bundles
+        .federated
+        .entry(runtime.local.trust_domain.clone())
+        .or_insert_with(|| runtime.local.clone());
 }
 
 /// Rebuild the inbound SPIFFE trust-bundle from the gateway SVID files plus the
@@ -14679,7 +14720,7 @@ mod tests {
     }
 
     #[test]
-    fn telemetry_tracing_merge_replaces_tags_and_providers_across_scopes() {
+    fn telemetry_tracing_merge_combines_tags_and_replaces_providers_across_scopes() {
         let mesh_slice = MeshSlice {
             node_id: "node-a".to_string(),
             namespace: "default".to_string(),
@@ -14751,12 +14792,21 @@ mod tests {
             tracing.custom_tags.get("env").map(String::as_str),
             Some("prod")
         );
-        assert!(!tracing.custom_tags.contains_key("mesh"));
+        assert_eq!(
+            tracing.custom_tags.get("mesh").map(String::as_str),
+            Some("ferrum")
+        );
         assert_eq!(
             tracing.custom_tags.get("region").map(String::as_str),
             Some("us-east")
         );
-        assert!(!tracing.custom_header_tags.contains_key("mesh-tenant"));
+        assert_eq!(
+            tracing
+                .custom_header_tags
+                .get("mesh-tenant")
+                .map(String::as_str),
+            Some("x-mesh-tenant")
+        );
         assert_eq!(
             tracing.custom_header_tags.get("tenant").map(String::as_str),
             Some("x-tenant")
@@ -17686,7 +17736,7 @@ mod tests {
             trust_bundles: Some(config::TrustBundleSet {
                 local: config::TrustBundle {
                     trust_domain: td.clone(),
-                    x509_authorities: vec![engine.encode(b"old-local-root")],
+                    x509_authorities: vec![engine.encode(b"slice-extra-local-root")],
                     jwt_authorities: Vec::new(),
                     refresh_hint_seconds: None,
                 },
@@ -17715,8 +17765,8 @@ mod tests {
         let bundle = active.as_ref().as_ref().expect("inbound bundle");
         assert_eq!(
             bundle.trust_bundles.local.x509_authorities,
-            vec![vec![9]],
-            "runtime CA local roots must come from the rotated SVID, not the stale slice overlay"
+            vec![vec![9], b"slice-extra-local-root".to_vec()],
+            "runtime CA local roots must keep the rotated SVID root and add accepted slice roots"
         );
         assert!(
             bundle
