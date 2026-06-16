@@ -1718,3 +1718,192 @@ fn half_open_probe_failure_after_recovery_counts_toward_threshold_not_reopen() {
         "the threshold is reached via the counted failures"
     );
 }
+
+#[test]
+fn open_epoch_is_visible_to_a_probe_admitted_immediately_after_open() {
+    // #1649 R5 finding 2: the open generation must be published BEFORE OPEN
+    // becomes observable, so a request that observes OPEN and immediately
+    // re-enters HALF_OPEN (possible because `timeout_seconds == 0`) captures the
+    // NEW generation — never the pre-open value. A deferred streaming outcome
+    // compares the captured generation at completion, so capturing the stale
+    // generation would wrongly neutralize a valid probe and the breaker could
+    // never heal/reopen. This single-threaded test asserts the observable
+    // invariant the ordering fix guarantees.
+    let config = CircuitBreakerConfig {
+        failure_threshold: 1,
+        success_threshold: 1,
+        timeout_seconds: 0, // OPEN is immediately re-admissible as HALF_OPEN
+        failure_status_codes: vec![500],
+        half_open_max_requests: 1,
+        trip_on_connection_errors: true,
+    };
+    let cb = CircuitBreaker::new(config);
+    assert_eq!(cb.open_epoch(), 0, "fresh breaker starts at generation 0");
+
+    // CLOSED -> OPEN advances the generation.
+    cb.record_failure(500, false, false);
+    assert_eq!(cb.state_name(), "open");
+    let gen_after_open = cb.open_epoch();
+    assert_eq!(gen_after_open, 1, "opening advances the generation");
+
+    // A probe admitted immediately after open observes the NEW generation — the
+    // increment is published with (not after) the OPEN/HALF_OPEN transition.
+    assert!(
+        cb.can_execute().unwrap(),
+        "timeout=0 admits a probe at once"
+    );
+    assert_eq!(cb.state_name(), "half_open");
+    assert_eq!(
+        cb.open_epoch(),
+        gen_after_open,
+        "HALF_OPEN admission does not change the generation (same open cycle)"
+    );
+
+    // Reopening (a probe fails in HALF_OPEN) advances the generation again.
+    cb.record_failure(500, false, true);
+    assert_eq!(cb.state_name(), "open");
+    assert_eq!(
+        cb.open_epoch(),
+        gen_after_open + 1,
+        "reopening after a probe failure advances the generation"
+    );
+}
+
+#[test]
+fn peek_is_read_only_and_does_not_create_or_resurrect() {
+    // #1649 R8: the deferred stale check must inspect the cached breaker WITHOUT
+    // mutating the cache. `peek` returns None for an absent key (never inserting),
+    // and after a config reload it returns the CURRENT cached breaker — so the
+    // stale check can never write a request-scoped (old-config) breaker back in.
+    let cache = CircuitBreakerCache::new();
+    let cfg_a = default_config();
+    let tk = target_key("10.0.0.1", 8080);
+
+    // Absent key: peek returns None and must NOT create an entry.
+    assert!(cache.peek("proxy-x", Some(&tk)).is_none());
+    assert_eq!(cache.len(), 0, "peek must not insert a breaker");
+
+    // After a real admission the breaker is cached and peek observes it.
+    let _ = cache.can_execute("proxy-x", Some(&tk), &cfg_a);
+    assert_eq!(cache.len(), 1);
+    assert_eq!(
+        cache
+            .peek("proxy-x", Some(&tk))
+            .expect("breaker is cached")
+            .config()
+            .failure_threshold,
+        cfg_a.failure_threshold,
+        "peek observes the cached breaker's config"
+    );
+
+    // A config reload replaces the cached breaker; peek returns the NEW one, and
+    // the cache still holds exactly one entry (no resurrection of the old config).
+    let cfg_b = CircuitBreakerConfig {
+        failure_threshold: cfg_a.failure_threshold + 5,
+        ..default_config()
+    };
+    let _new = cache.get_or_create("proxy-x", Some(&tk), &cfg_b);
+    assert_eq!(cache.len(), 1, "reload replaces in place");
+    let peeked_b = cache
+        .peek("proxy-x", Some(&tk))
+        .expect("new breaker is cached");
+    assert_eq!(
+        peeked_b.config().failure_threshold,
+        cfg_b.failure_threshold,
+        "peek returns the current (reloaded) config, never resurrecting the old one"
+    );
+}
+
+#[test]
+fn open_generation_is_preserved_across_non_open_transitions() {
+    // #1649 R7: the generation is packed into the same atomic as state+count and
+    // must be PRESERVED by every non-open transition (probe admission, slot
+    // release, recovery/close) and advanced ONLY by opens. A packing bug that
+    // dropped or mutated the generation on a slot release or a close would silently
+    // break the deferred-streaming stale check. Drive a full open → probe →
+    // recover → re-trip cycle and assert the generation only moves on opens.
+    let config = CircuitBreakerConfig {
+        failure_threshold: 1,
+        success_threshold: 2, // two probes recover -> exercises slot churn + close
+        timeout_seconds: 0,
+        failure_status_codes: vec![500],
+        half_open_max_requests: 2,
+        trip_on_connection_errors: true,
+    };
+    let cb = CircuitBreaker::new(config);
+    assert_eq!(cb.open_epoch(), 0);
+
+    cb.record_failure(500, false, false); // CLOSED -> OPEN, gen 1
+    assert_eq!(cb.state_name(), "open");
+    assert_eq!(cb.open_epoch(), 1);
+
+    // Admit two probes (slot acquisitions) — generation preserved.
+    assert!(cb.can_execute().unwrap());
+    assert!(cb.can_execute().unwrap());
+    assert_eq!(cb.half_open_in_flight(), 2);
+    assert_eq!(cb.open_epoch(), 1, "admission preserves the generation");
+
+    // Two successes release slots and close the breaker (recovery) — generation
+    // preserved (a close is not a new open cycle).
+    cb.record_success(true);
+    cb.record_success(true);
+    assert_eq!(cb.state_name(), "closed");
+    assert_eq!(cb.half_open_in_flight(), 0);
+    assert_eq!(
+        cb.open_epoch(),
+        1,
+        "recovery/close and slot releases preserve the generation"
+    );
+
+    // Re-trip: a brand-new open cycle advances the generation again.
+    cb.record_failure(500, false, false);
+    assert_eq!(cb.state_name(), "open");
+    assert_eq!(cb.open_epoch(), 2, "a fresh open advances the generation");
+}
+
+#[test]
+fn can_execute_with_admission_epoch_returns_the_admitted_generation() {
+    // #1649 R6 finding 3: the admission epoch must reflect the generation the
+    // request is admitted under. A CLOSED admission captures the last open
+    // generation; a HALF_OPEN probe captures the generation it is probing. (The
+    // pre-admission snapshot also guarantees the captured value is never NEWER than
+    // the admission generation, so a concurrent open can only neutralize — never
+    // wrongly heal — a deferred outcome; that race is not reproducible
+    // single-threaded, but the per-state values are asserted here.)
+    let config = CircuitBreakerConfig {
+        failure_threshold: 1,
+        success_threshold: 1,
+        timeout_seconds: 0,
+        failure_status_codes: vec![500],
+        half_open_max_requests: 1,
+        trip_on_connection_errors: true,
+    };
+    let cache = CircuitBreakerCache::new();
+    let proxy_id = "epoch-proxy";
+    let tk = target_key("10.0.0.1", 8080);
+
+    // CLOSED admission captures generation 0 and is not a probe.
+    let (_cb, is_probe, epoch) = cache
+        .can_execute_with_admission_epoch(proxy_id, Some(&tk), &config)
+        .expect("closed admits");
+    assert!(!is_probe, "closed-state admission is not a half-open probe");
+    assert_eq!(epoch, 0, "closed admission captures the current generation");
+
+    // Trip the breaker (generation -> 1).
+    let (cb, _, _) = cache
+        .can_execute_with_admission_epoch(proxy_id, Some(&tk), &config)
+        .expect("still closed");
+    cb.record_failure(500, false, false);
+    assert_eq!(cb.state_name(), "open");
+
+    // The next admission (timeout=0) is a HALF_OPEN probe and captures generation 1
+    // — the cycle it is probing — not the pre-trip generation 0.
+    let (_cb, is_probe, epoch) = cache
+        .can_execute_with_admission_epoch(proxy_id, Some(&tk), &config)
+        .expect("half-open admits a probe");
+    assert!(is_probe, "open+timeout=0 admits a half-open probe");
+    assert_eq!(
+        epoch, 1,
+        "the probe captures the generation it is probing, not the pre-open value"
+    );
+}
