@@ -579,11 +579,7 @@ pub async fn start_xds_client_with_shutdown(
         let is_primary = current_cp_index == 0;
         let is_fallback = !is_primary && cp_urls.len() > 1;
         let mut stream_shutdown_rx = shutdown_rx.clone();
-        let should_race_primary = should_race_primary_retry(
-            is_fallback,
-            config.primary_retry_secs,
-            state.has_first_slice(),
-        );
+        let should_race_primary = should_race_primary_retry(is_fallback, config.primary_retry_secs);
         let result = if should_race_primary {
             tokio::select! {
                 result = connect_ads(
@@ -594,7 +590,10 @@ pub async fn start_xds_client_with_shutdown(
                     tls_config.as_ref(),
                     &mut stream_state,
                 ) => result,
-                _ = tokio::time::sleep(Duration::from_secs(config.primary_retry_secs)) => {
+                _ = wait_for_first_slice_then_primary_retry(
+                    state.clone(),
+                    Duration::from_secs(config.primary_retry_secs),
+                ) => {
                     info!(
                         primary_retry_secs = config.primary_retry_secs,
                         cp_url = %cp_url,
@@ -674,6 +673,11 @@ pub async fn start_xds_client_with_shutdown(
         }
         backoff_secs = next_backoff_secs(backoff_secs, increase_backoff);
     }
+}
+
+async fn wait_for_first_slice_then_primary_retry(state: MeshRuntimeState, interval: Duration) {
+    state.wait_for_first_slice().await;
+    tokio::time::sleep(interval).await;
 }
 
 async fn connect_ads(
@@ -2027,11 +2031,35 @@ mod tests {
     }
 
     #[test]
-    fn primary_retry_waits_for_initial_mesh_slice() {
-        assert!(!should_race_primary_retry(true, 300, false));
-        assert!(should_race_primary_retry(true, 300, true));
-        assert!(!should_race_primary_retry(false, 300, true));
-        assert!(!should_race_primary_retry(true, 0, true));
+    fn primary_retry_races_on_fallback_when_configured() {
+        assert!(should_race_primary_retry(true, 300));
+        assert!(!should_race_primary_retry(false, 300));
+        assert!(!should_race_primary_retry(true, 0));
+    }
+
+    #[tokio::test]
+    async fn primary_retry_waits_until_first_slice_on_fallback_stream() {
+        let state = MeshRuntimeState::new();
+        let retry = tokio::spawn(wait_for_first_slice_then_primary_retry(
+            state.clone(),
+            Duration::from_millis(1),
+        ));
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            !retry.is_finished(),
+            "timer must not run before the first slice arrives"
+        );
+
+        state.install_slice(MeshSlice {
+            version: "first".to_string(),
+            ..MeshSlice::default()
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), retry)
+            .await
+            .expect("primary retry wait should complete after first slice")
+            .expect("primary retry wait task should join");
     }
 
     #[test]
