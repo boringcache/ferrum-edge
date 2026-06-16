@@ -93,6 +93,12 @@ pub enum MeshListenerKind {
     PlaintextCapture,
     MtlsTermination,
     HboneTermination,
+    /// UDP TPROXY capture listener (F3 §3.3 Stage 3). Plaintext; bound to the
+    /// Stage-2 `FERRUM_MESH_CAPTURE_UDP_PORT`. Receives TPROXY-diverted UDP
+    /// datagrams, recovers per-datagram orig-dst from the `IP_RECVORIGDSTADDR`
+    /// cmsg, and (Stage 3) drops them — the egress relay is Stage 4. Only
+    /// emitted when `FERRUM_MESH_CAPTURE_UDP_ENABLED` is set (default-off).
+    PlaintextUdpCapture,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -646,30 +652,38 @@ impl MeshRuntimeConfig {
 
     pub fn listener_plan(&self) -> Vec<MeshListener> {
         match self.topology {
-            MeshTopology::Sidecar => vec![
-                MeshListener {
-                    direction: MeshTrafficDirection::Outbound,
-                    kind: MeshListenerKind::PlaintextCapture,
-                    addr: self.outbound_listen_addr,
-                },
-                MeshListener {
-                    direction: MeshTrafficDirection::Inbound,
-                    kind: MeshListenerKind::MtlsTermination,
-                    addr: self.inbound_listen_addr,
-                },
-            ],
-            MeshTopology::Ambient => vec![
-                MeshListener {
-                    direction: MeshTrafficDirection::Outbound,
-                    kind: MeshListenerKind::PlaintextCapture,
-                    addr: self.outbound_listen_addr,
-                },
-                MeshListener {
-                    direction: MeshTrafficDirection::Inbound,
-                    kind: MeshListenerKind::HboneTermination,
-                    addr: self.hbone_listen_addr,
-                },
-            ],
+            MeshTopology::Sidecar => {
+                let mut listeners = vec![
+                    MeshListener {
+                        direction: MeshTrafficDirection::Outbound,
+                        kind: MeshListenerKind::PlaintextCapture,
+                        addr: self.outbound_listen_addr,
+                    },
+                    MeshListener {
+                        direction: MeshTrafficDirection::Inbound,
+                        kind: MeshListenerKind::MtlsTermination,
+                        addr: self.inbound_listen_addr,
+                    },
+                ];
+                listeners.extend(self.udp_capture_listener());
+                listeners
+            }
+            MeshTopology::Ambient => {
+                let mut listeners = vec![
+                    MeshListener {
+                        direction: MeshTrafficDirection::Outbound,
+                        kind: MeshListenerKind::PlaintextCapture,
+                        addr: self.outbound_listen_addr,
+                    },
+                    MeshListener {
+                        direction: MeshTrafficDirection::Inbound,
+                        kind: MeshListenerKind::HboneTermination,
+                        addr: self.hbone_listen_addr,
+                    },
+                ];
+                listeners.extend(self.udp_capture_listener());
+                listeners
+            }
             MeshTopology::NodeWaypoint | MeshTopology::ServiceWaypoint => {
                 vec![MeshListener {
                     direction: MeshTrafficDirection::Inbound,
@@ -684,6 +698,38 @@ impl MeshRuntimeConfig {
                 addr: self.egress_listen_addr,
             }],
         }
+    }
+
+    /// The optional UDP TPROXY capture listener (F3 §3.3 Stage 3), emitted only
+    /// in the captured topologies (Sidecar / Ambient) that also run the
+    /// outbound :15001 capture listener — UDP egress capture is an outbound
+    /// concern, and NodeWaypoint/ServiceWaypoint have no outbound capture
+    /// listener (and UDP stays mesh-wide-only there per the per-pod-scope
+    /// notes). Returns at most one listener, gated on
+    /// `FERRUM_MESH_CAPTURE_UDP_ENABLED` (default-off via
+    /// [`crate::capture::udp_capture_settings_from_env`]), bound on the same IP
+    /// as the outbound capture listener (so it follows
+    /// `FERRUM_MESH_OUTBOUND_LISTEN_ADDR`) but on the Stage-2 UDP capture port
+    /// (`FERRUM_MESH_CAPTURE_UDP_PORT`). A parse error or disabled flag yields
+    /// no listener — the capture path stays inert.
+    fn udp_capture_listener(&self) -> Option<MeshListener> {
+        let settings = match crate::capture::udp_capture_settings_from_env() {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("Skipping mesh UDP capture listener: {e}");
+                return None;
+            }
+        };
+        if !settings.udp_capture_enabled {
+            return None;
+        }
+        let addr =
+            std::net::SocketAddr::new(self.outbound_listen_addr.ip(), settings.udp_outbound_port);
+        Some(MeshListener {
+            direction: MeshTrafficDirection::Outbound,
+            kind: MeshListenerKind::PlaintextUdpCapture,
+            addr,
+        })
     }
 
     /// Whether this topology runs an inbound **TLS-terminating** listener (mTLS
@@ -6922,6 +6968,20 @@ async fn serve_mesh_runtime(
                     Some(started_tx),
                 )
                 .await
+            } else if matches!(kind, MeshListenerKind::PlaintextUdpCapture) {
+                // UDP TPROXY capture listener (F3 §3.3 Stage 3) — plaintext,
+                // distinct from the TCP capture/HTTP path: it binds a transparent
+                // UDP socket, recovers per-datagram orig-dst from cmsg, and drops
+                // (egress is Stage 4). `tls_config` is always None here.
+                proxy::start_mesh_udp_capture_listener_with_signal(
+                    addr,
+                    state,
+                    shutdown,
+                    tls_config,
+                    Some(direction),
+                    Some(started_tx),
+                )
+                .await
             } else {
                 // Outbound capture (plaintext) — non-mTLS mesh listener. Use the
                 // generic listener entry but stamp direction by routing through
@@ -8500,7 +8560,9 @@ fn listener_tls_config(
     frontend_tls: Option<Arc<rustls::ServerConfig>>,
 ) -> Option<Arc<rustls::ServerConfig>> {
     match listener.kind {
-        MeshListenerKind::PlaintextCapture => None,
+        // Both plaintext listeners (TCP outbound capture and the UDP TPROXY
+        // capture listener) terminate no TLS.
+        MeshListenerKind::PlaintextCapture | MeshListenerKind::PlaintextUdpCapture => None,
         MeshListenerKind::MtlsTermination | MeshListenerKind::HboneTermination => frontend_tls,
     }
 }

@@ -52,6 +52,13 @@ pub struct RecvMmsgBatch {
     /// IPv6 replies (notably link-local `fe80::/10`) egress the correct
     /// interface zone on send; for IPv4 it's informational.
     local_addrs: Vec<Option<crate::socket_opts::PktinfoLocal>>,
+    /// Per-slot original (pre-`TPROXY`) destination address parsed from the
+    /// IP(v6)_RECVORIGDSTADDR cmsg. `None` unless the socket has
+    /// `IP_RECVORIGDSTADDR` / `IPV6_RECVORIGDSTADDR` enabled (the mesh UDP
+    /// capture listener does; plain UDP proxy listeners do not). This is how a
+    /// TPROXY-captured datagram recovers the `service:port` the pod dialed,
+    /// since TPROXY delivers without rewriting the destination.
+    orig_dsts: Vec<Option<SocketAddr>>,
     /// Maximum datagrams per recvmmsg call.
     capacity: usize,
     /// Number of datagrams received in the last `recv()` call.
@@ -95,6 +102,7 @@ impl RecvMmsgBatch {
             cmsg_bufs: (0..capacity).map(|_| vec![0u8; cmsg_space]).collect(),
             gro_segments: vec![None; capacity],
             local_addrs: vec![None; capacity],
+            orig_dsts: vec![None; capacity],
             capacity,
             count: 0,
         }
@@ -135,6 +143,16 @@ impl RecvMmsgBatch {
     pub fn local_addr(&self, i: usize) -> Option<crate::socket_opts::PktinfoLocal> {
         debug_assert!(i < self.count);
         self.local_addrs[i]
+    }
+
+    /// Returns the original (pre-`TPROXY`) destination address for slot `i`,
+    /// parsed from the IP(v6)_RECVORIGDSTADDR cmsg. `None` when the socket does
+    /// not have `IP_RECVORIGDSTADDR` / `IPV6_RECVORIGDSTADDR` enabled or the
+    /// datagram carried no such cmsg. The mesh UDP capture listener keys each
+    /// session by `(client, orig-dst)` from this value.
+    pub fn orig_dst(&self, i: usize) -> Option<SocketAddr> {
+        debug_assert!(i < self.count);
+        self.orig_dsts[i]
     }
 
     /// Receive up to `max_count` datagrams in a single `recvmmsg` syscall.
@@ -212,6 +230,11 @@ impl RecvMmsgBatch {
             // `None` otherwise (non-Linux, pktinfo disabled, or connected socket).
             self.local_addrs[i] =
                 crate::socket_opts::extract_pktinfo_local_addr(&self.msgs[i].msg_hdr);
+            // Parse IP(v6)_RECVORIGDSTADDR cmsg to recover the original
+            // (pre-TPROXY) destination. Present only on the mesh UDP capture
+            // socket (which enables IP_RECVORIGDSTADDR); `None` for plain UDP
+            // proxy listeners and non-Linux.
+            self.orig_dsts[i] = crate::socket_opts::extract_origdst(&self.msgs[i].msg_hdr);
         }
         self.count = received;
         Ok(received)

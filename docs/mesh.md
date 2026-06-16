@@ -1580,7 +1580,7 @@ The container runs as `FERRUM_MESH_PROXY_UID` (default 1337) with `allowPrivileg
 | `iptables` | Inject init container with `NET_ADMIN`/`NET_RAW` capabilities that sets up iptables rules to redirect traffic through the sidecar (inbound to 15006, outbound to 15001) |
 | `ebpf` | eBPF-based capture handled by a node-level agent (requires kernel 5.7+). The injector does not inject a privileged init container for this mode -- the node agent's DaemonSet manages eBPF program attachment. Capture planning infrastructure (`EbpfPlan` with iptables fallback for pre-5.7 kernels) is available in `src/capture/mod.rs` for the node agent path. **Build requirement:** real eBPF attachment needs a binary built with the Cargo `ebpf` feature (`cargo build --features ebpf`, Linux only; Docker `--build-arg FEATURES=cloud-secrets,ebpf`). The **default published image uses a no-op mock backend** (`MockEbpfBackend`) that attaches nothing and sets `ferrum_mesh_node_topology_degraded` — see [Maturity and Support Status](#maturity-and-support-status) |
 
-#### UDP TPROXY capture (F3 §3.3, flag-gated, Stage 2 — capture rules only)
+#### UDP TPROXY capture (F3 §3.3, flag-gated, Stages 2–3 — capture rules + listener, capture→drop)
 
 TCP mesh capture uses iptables `REDIRECT` in the `nat` table: REDIRECT rewrites the
 packet's destination to the proxy port, and the proxy recovers the pre-NAT
@@ -1670,10 +1670,37 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   marked packets into Ferrum's table and break Istio traffic. Within Ferrum it is
   collision-free — Ferrum uses no other packet marks; the `1337` proxy UID is a
   socket-owner match, a disjoint namespace from `skb->mark`.
-- **Default OFF.** The consuming UDP listener arrives in **Stage 3**; an upgraded
-  injector with UDP capture on but no listener would redirect UDP into a void, so
-  the flag defaults off and, when off, emits **no** `mangle`/TPROXY/routing rules
-  at all. This stage is rules-only/inert.
+- **Default OFF.** The flag defaults off and, when off, emits **no**
+  `mangle`/TPROXY/routing rules and binds **no** listener. When on, the capture
+  rules (Stage 2) and the consuming UDP listener (Stage 3) come up together
+  behind the **same** `FERRUM_MESH_CAPTURE_UDP_ENABLED` flag, so an upgraded
+  injector never redirects UDP into a void.
+- **Stage 3 — consuming UDP listener (capture → drop, egress deferred to Stage 4).**
+  When `FERRUM_MESH_CAPTURE_UDP_ENABLED=true`, the captured topologies
+  (**Sidecar** / **Ambient** — the same ones that run the outbound `:15001` TCP
+  capture listener) emit a **`PlaintextUdpCapture` mesh listener** bound on the
+  outbound listener's IP and the Stage-2 `FERRUM_MESH_CAPTURE_UDP_PORT`
+  (default `15011`). The listener (`src/proxy/mesh_udp_capture.rs`, Linux-only):
+  binds a **transparent** UDP socket (`IP_TRANSPARENT`/`IPV6_TRANSPARENT`, so it
+  can claim the TPROXY-diverted datagrams whose destination is the captured
+  pod's real `service:port`, not the listener's own bind address), enables
+  **`IP_RECVORIGDSTADDR`/`IPV6_RECVORIGDSTADDR`** to recover each datagram's
+  original destination **per-datagram from the cmsg** (TPROXY delivers without
+  rewriting the destination, so — unlike the TCP path's `SO_ORIGINAL_DST`
+  getsockopt — the orig-dst rides ancillary data), drains datagrams via
+  `recvmmsg` (always, since the orig-dst lives in the cmsg `recv_from` cannot
+  surface), and keys a lightweight session by **`(client SocketAddr, orig-dst
+  SocketAddr)`**. **For now each captured datagram is DROPPED** with a `debug!`
+  log — the egress relay (forwarding the datagram over the topology's mesh
+  transport to the destination workload) is **Stage 4**. DoS bounds are reused
+  from the plain UDP proxy: a bounded session map (`FERRUM_UDP_MAX_SESSIONS`),
+  an idle-expiry sweep (`FERRUM_UDP_CLEANUP_INTERVAL_SECONDS`), and the recvmmsg
+  batch cap (`FERRUM_UDP_RECVMMSG_BATCH_SIZE`). The listener carries
+  `node_waypoint_policy_scope: None` (UDP has no per-source-pod cookie — see the
+  UDP/DTLS limitation above). **Linux-only** (`IP_TRANSPARENT` + recvmsg cmsg);
+  on other platforms the listener is a no-op stub. This stage is still inert:
+  with the flag off there is no listener, and even on, captured UDP is dropped
+  (no egress until Stage 4).
 - **Locally-generated pod UDP egress: OUTPUT-MARK → lo-reroute → PREROUTING-TPROXY
   loop.** TPROXY runs **only in `PREROUTING`**, never for locally-generated (OUTPUT)
   packets — jumping into a `-j TPROXY` chain from `mangle OUTPUT` is invalid and can
